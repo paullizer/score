@@ -1,15 +1,17 @@
 import assert from 'node:assert/strict'
 import { after, before, beforeEach, test } from 'node:test'
-import { mkdtemp, rm } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { mkdir, rm } from 'node:fs/promises'
+import { randomUUID } from 'node:crypto'
+import { join, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { build } from 'esbuild'
+import { docxFile, legacyDocFile } from '../../server-tests/word-fixtures.mjs'
 
 let outputDirectory
 let client
 let projection
 let requests
+const originalFetch = globalThis.fetch
 
 function json(body, status = 200) {
   return new Response(JSON.stringify(body), {
@@ -47,7 +49,8 @@ function summary(id, updatedAt, rubric = null) {
 }
 
 before(async () => {
-  outputDirectory = await mkdtemp(join(tmpdir(), 'score-real-jobs-test-'))
+  outputDirectory = resolve(`.real-job-client-tests-${randomUUID()}`)
+  await mkdir(outputDirectory)
   const outfile = join(outputDirectory, 'realJobs.mjs')
   await build({
     entryPoints: ['src/services/realJobs.ts'],
@@ -72,6 +75,7 @@ before(async () => {
 })
 
 after(async () => {
+  globalThis.fetch = originalFetch
   await rm(outputDirectory, { recursive: true, force: true })
 })
 
@@ -119,6 +123,7 @@ test('uploads actual PDF bytes with stable request metadata', async () => {
   await client.importRealJobPdf('workspace-1', file, 'stable-key', 'batch-key')
 
   assert.equal(requests.length, 1)
+  assert.equal(requests[0].url, '/api/workspaces/workspace-1/jobs/pdf')
   assert.equal(requests[0].init.method, 'POST')
   assert.equal(requests[0].init.headers.get('Content-Type'), 'application/pdf')
   assert.equal(requests[0].init.headers.get('X-File-Name'), 'role%20details.pdf')
@@ -126,6 +131,48 @@ test('uploads actual PDF bytes with stable request metadata', async () => {
   assert.equal(requests[0].init.headers.get('X-Import-Batch'), 'batch-key')
   assert.equal(requests[0].init.headers.get('X-Score-Request'), 'workspace')
   assert.deepEqual([...new Uint8Array(requests[0].init.body)], [37, 80, 68, 70])
+})
+
+test('Word capability is fail-closed and legacy byte limits remain compatible', async () => {
+  globalThis.fetch = async () => json({ realJobImports: true, limits: { maxPdfBytes: 9 * 1024 * 1024 } })
+  const old = await client.fetchJobProcessingFeatures()
+  assert.equal(old.wordDocumentImports, false)
+  assert.equal(old.limits.maxFileBytes, 9 * 1024 * 1024)
+  assert.equal(old.limits.maxPdfPages, 50)
+  globalThis.fetch = async () => json({ realJobImports: true, wordDocumentImports: true })
+  assert.equal((await client.fetchJobProcessingFeatures()).wordDocumentImports, true)
+})
+
+test('generic job file uploads preserve Word bytes and retry keys while keeping PDF on its legacy endpoint', async () => {
+  globalThis.fetch = async (url, init) => { requests.push({ url, init }); return json({ job: summary('file-job', '2026-09-17T00:00:00.000Z') }, 202) }
+  const files = [
+    [new File([docxFile()], 'Rôle.DOCX'), 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', 'file'],
+    [new File([legacyDocFile()], 'Legacy.DOC', { type: 'application/octet-stream' }), 'application/msword', 'file'],
+    [new File(['%PDF-source'], 'Role.PDF'), 'application/pdf', 'pdf'],
+  ]
+  for (const [file, type, endpoint] of files) {
+    const key = randomUUID()
+    await client.importRealJobFile('workspace-one', file, key, 'unchanged-batch')
+    await client.importRealJobFile('workspace-one', file, key, 'unchanged-batch')
+    const pair = requests.slice(-2)
+    for (const request of pair) {
+      assert.equal(request.url, `/api/workspaces/workspace-one/jobs/${endpoint}`)
+      assert.equal(request.init.headers.get('Content-Type'), type)
+      assert.equal(request.init.headers.get('X-File-Name'), encodeURIComponent(file.name))
+      assert.equal(request.init.headers.get('Idempotency-Key'), key)
+      assert.equal(request.init.headers.get('X-Import-Batch'), 'unchanged-batch')
+      assert.equal(request.init.credentials, 'include')
+      assert.deepEqual(new Uint8Array(request.init.body), new Uint8Array(await file.arrayBuffer()))
+    }
+  }
+  const before = requests.length
+  await assert.rejects(client.importRealJobPdf('w', files[0][0], 'key'), /DOCX uploads are not enabled/)
+  await assert.rejects(client.importRealJobFile('w', new File(['x'], 'macro.docm'), 'key'), /Other formats/)
+  await assert.rejects(client.importRealJobFile('w', new File([docxFile()], 'docx', {
+    type: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  }), 'key'), /supported file/)
+  await assert.rejects(client.importRealJobFile('w', new File([], 'empty.docx'), 'key'), /empty/)
+  assert.equal(requests.length, before)
 })
 
 test('sends direct URL imports as JSON with the same idempotency key', async () => {

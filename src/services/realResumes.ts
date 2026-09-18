@@ -7,6 +7,8 @@ import {
   type ResumeProcessingFeatures,
 } from '../domain/real-resumes'
 import { cloudJsonRequest } from './cloudWorkspace'
+import { UPLOAD_CONTENT_TYPES, type UploadFormat } from '../domain/document-formats'
+import { requireUploadFile } from './documentUploads'
 
 const uuid = /^[\da-f]{8}-[\da-f]{4}-[\da-f]{4}-[\da-f]{4}-[\da-f]{12}$/i
 
@@ -32,7 +34,15 @@ function importHeaders(key: string, batchId: string, inputCount: number): Record
 
 export async function fetchResumeProcessingFeatures(signal?: AbortSignal): Promise<ResumeProcessingFeatures> {
   const features = await cloudJsonRequest<Partial<ResumeProcessingFeatures>>('/features', { method: 'GET', signal })
-  return { realResumeImports: features.realResumeImports === true, resumeLimits: features.resumeLimits ?? RESUME_IMPORT_LIMITS }
+  return {
+    realResumeImports: features.realResumeImports === true,
+    wordDocumentImports: features.wordDocumentImports === true,
+    resumeLimits: {
+      ...RESUME_IMPORT_LIMITS,
+      ...features.resumeLimits,
+      maxFileBytes: features.resumeLimits?.maxFileBytes ?? features.resumeLimits?.maxPdfBytes ?? RESUME_IMPORT_LIMITS.maxFileBytes,
+    },
+  }
 }
 
 export async function listAllRealResumes(workspaceId: string, signal?: AbortSignal): Promise<RealResumeSummary[]> {
@@ -66,10 +76,24 @@ export async function getRealResume(workspaceId: string, resumeId: string, signa
 export async function importRealResumePdf(
   workspaceId: string, file: File, key: string, batchId: string, inputCount: number, signal?: AbortSignal,
 ): Promise<RealResumeSummary> {
-  const headers = { ...importHeaders(key, batchId, inputCount), 'Content-Type': 'application/pdf', 'X-File-Name': encodeURIComponent(file.name) }
-  if (!file.size || file.size > RESUME_IMPORT_LIMITS.maxPdfBytes) throw new Error('Choose a nonempty PDF no larger than 10 MiB.')
+  requireUploadFile(file, ['pdf'])
+  return importFile(workspaceId, file, 'pdf', key, batchId, inputCount, signal)
+}
+
+export async function importRealResumeFile(
+  workspaceId: string, file: File, key: string, batchId: string, inputCount: number, signal?: AbortSignal,
+): Promise<RealResumeSummary> {
+  return importFile(workspaceId, file, requireUploadFile(file), key, batchId, inputCount, signal)
+}
+
+async function importFile(
+  workspaceId: string, file: File, format: UploadFormat, key: string, batchId: string, inputCount: number, signal?: AbortSignal,
+): Promise<RealResumeSummary> {
+  const headers = { ...importHeaders(key, batchId, inputCount), 'Content-Type': UPLOAD_CONTENT_TYPES[format], 'X-File-Name': encodeURIComponent(file.name) }
+  signal?.throwIfAborted()
   const bytes = await file.arrayBuffer()
-  const result = await cloudJsonRequest<ResumeMutationResponse>(`${base(workspaceId)}/pdf`, { method: 'POST', headers, body: bytes, signal })
+  signal?.throwIfAborted()
+  const result = await cloudJsonRequest<ResumeMutationResponse>(`${base(workspaceId)}/${format === 'pdf' ? 'pdf' : 'file'}`, { method: 'POST', headers, body: bytes, signal })
   return checked(result.resume, workspaceId)
 }
 

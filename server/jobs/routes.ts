@@ -4,6 +4,8 @@ import ipaddr from 'ipaddr.js'
 import type { RealJobDetail, RealJobRecord, RealJobSummary } from '../../src/domain/real-jobs'
 import { JOB_IMPORT_LIMITS } from '../../src/domain/real-jobs'
 import type { Job, Rubric, SourceDocument } from '../../src/domain/types'
+import { originalExtension, UPLOAD_CONTENT_TYPES, uploadFormatFromContentType, uploadFormatFromFilename, type UploadFormat } from '../../src/domain/document-formats'
+import { validateWordUpload } from '../documents/upload'
 import type { AuthenticatedPrincipal } from '../auth'
 import { conflict, invalidRequest, notFound, preconditionRequired, unavailable } from '../errors'
 import { getPrincipal } from '../request-context'
@@ -27,6 +29,7 @@ interface RealJobsRouterDeps {
   readonly repository: WorkspaceRepository
   readonly jobs?: RealJobsDeps
   readonly now?: () => Date
+  readonly wordDocumentImports?: boolean
 }
 
 interface AuthorizedRequest extends Request {
@@ -82,11 +85,11 @@ function hash(value: Uint8Array | string): string {
   return createHash('sha256').update(value).digest('hex')
 }
 
-function inputFingerprint(kind: 'pdf' | 'url', values: readonly string[]): string {
+function inputFingerprint(kind: UploadFormat | 'url', values: readonly string[]): string {
   return hash([kind, ...values].join('\0'))
 }
 
-function decodeFilename(value: string | undefined): string {
+function decodeFilename(value: string | undefined, format: UploadFormat = 'pdf'): string {
   if (!value) throw invalidRequest('X-File-Name is required.')
   let filename: string
   try {
@@ -99,8 +102,8 @@ function decodeFilename(value: string | undefined): string {
     return code < 32 || code === 127 || character === '/' || character === '\\'
   })
   if (!filename || filename.length > MAX_FILENAME_LENGTH || filename === '.' || filename === '..' ||
-    unsafeCharacter || !/\.pdf$/i.test(filename)) {
-    throw invalidRequest('X-File-Name must be a safe PDF basename.')
+    unsafeCharacter || uploadFormatFromFilename(filename) !== format) {
+    throw invalidRequest(`X-File-Name must be a safe ${format.toUpperCase()} basename.`)
   }
   return filename
 }
@@ -153,7 +156,7 @@ function emptyJob(
   jobId: string,
   documentId: string,
   title: string,
-  source: 'pdf' | 'url',
+  source: UploadFormat | 'url',
   sourceLabel: string,
   batchId: string | undefined,
   createdAt: string,
@@ -299,30 +302,47 @@ export function createRealJobsRouter(deps: RealJobsRouterDeps): Router {
   }))
 
   router.post(
-    `${base}/pdf`,
+    [`${base}/pdf`, `${base}/file`],
     authorize(deps.repository, 'write'),
     available(deps.jobs),
-    express.raw({ type: 'application/pdf', limit: JOB_IMPORT_LIMITS.maxPdfBytes }),
+    (req, _res, next) => {
+      try {
+        const format = uploadFormatFromContentType(req.header('Content-Type') ?? '')
+        if (!format || (req.path.endsWith('/pdf') && format !== 'pdf')) throw invalidRequest('Content-Type must match a supported PDF, DOCX, or DOC file.')
+        if (format !== 'pdf' && !deps.wordDocumentImports) throw unavailable('Word document imports are not enabled for this deployment.')
+        decodeFilename(req.header('x-file-name'), format)
+        requireUuidHeader(req, 'Idempotency-Key')
+        optionalUuid(req.header('x-import-batch'), 'X-Import-Batch')
+        if (req.header('Content-Encoding') && req.header('Content-Encoding')?.toLowerCase() !== 'identity') {
+          throw invalidRequest('Compressed uploads are not supported. Upload the original document bytes.')
+        }
+        next()
+      } catch (error) { next(error) }
+    },
+    express.raw({ type: Object.values(UPLOAD_CONTENT_TYPES), limit: JOB_IMPORT_LIMITS.maxFileBytes, inflate: false }),
     asyncHandler(async (req, res) => {
       const jobs = requireJobs(deps.jobs)
-      if (!req.is('application/pdf') || !Buffer.isBuffer(req.body)) throw invalidRequest('Content-Type must be application/pdf.')
-      const filename = decodeFilename(req.header('x-file-name'))
+      const format = uploadFormatFromContentType(req.header('Content-Type') ?? '')
+      if (!format || !Buffer.isBuffer(req.body)) throw invalidRequest('The request must contain raw document bytes.')
+      const mime = UPLOAD_CONTENT_TYPES[format]
+      const filename = decodeFilename(req.header('x-file-name'), format)
       const key = requireUuidHeader(req, 'Idempotency-Key')
       const batchId = optionalUuid(req.header('x-import-batch'), 'X-Import-Batch')
       const bytes = req.body as Buffer
-      if (bytes.byteLength === 0) throw invalidRequest('PDF body must not be empty.')
-      if (bytes.subarray(0, Math.min(bytes.byteLength, 1024)).indexOf(PDF_MAGIC) < 0) {
+      if (bytes.byteLength === 0) throw invalidRequest('Document body must not be empty.')
+      if (format === 'pdf' && bytes.subarray(0, Math.min(bytes.byteLength, 1024)).indexOf(PDF_MAGIC) < 0) {
         throw invalidRequest('The uploaded file does not have a valid PDF header.')
       }
+      if (format !== 'pdf') await validateWordUpload(bytes, format)
 
       const workspaceId = pathParam(req, 'workspaceId')
       const jobId = `job-${key}`
       const documentId = `document-${key}`
-      const blobName = originalBlobName(workspaceId, jobId, 'pdf')
+      const blobName = originalBlobName(workspaceId, jobId, format)
       const batch = batchId ?? ''
-      const fingerprint = inputFingerprint('pdf', [filename, batch, hash(bytes)])
-      const sourceBlob = await jobs.blobs.putImmutable(blobName, bytes, 'application/pdf')
-      if (sourceBlob.blob.sha256 !== hash(bytes) || sourceBlob.blob.contentType !== 'application/pdf') {
+      const fingerprint = inputFingerprint(format, [filename, batch, hash(bytes)])
+      const sourceBlob = await jobs.blobs.putImmutable(blobName, bytes, mime)
+      if (sourceBlob.blob.sha256 !== hash(bytes) || sourceBlob.blob.contentType !== mime) {
         throw conflict('This idempotency key was already used for different input.')
       }
 
@@ -332,12 +352,12 @@ export function createRealJobsRouter(deps: RealJobsRouterDeps): Router {
         id: jobId,
         workspaceId,
         recordType: 'job',
-        job: emptyJob(jobId, documentId, filename, 'pdf', filename, batchId, timestamp),
+        job: emptyJob(jobId, documentId, filename, format, filename, batchId, timestamp),
         source: {
-          kind: 'pdf',
+          kind: format,
           displayName: filename,
           originalBlobName: blobName,
-          originalContentType: 'application/pdf',
+          originalContentType: mime,
           sha256: sourceBlob.blob.sha256,
           bytes: sourceBlob.blob.bytes.byteLength,
         },
@@ -493,18 +513,20 @@ export function createRealJobsRouter(deps: RealJobsRouterDeps): Router {
     const blob = await jobs.blobs.read(blobName)
     if (!blob) throw notFound('The original source is not available.')
     const expectedContentType = current.record.source.originalContentType
-    if (!expectedContentType || blob.contentType !== expectedContentType) {
+    if (!expectedContentType || blob.contentType !== expectedContentType ||
+      (current.record.source.sha256 && hash(blob.bytes) !== current.record.source.sha256) ||
+      (current.record.source.bytes !== undefined && blob.bytes.byteLength !== current.record.source.bytes)) {
       throw unavailable('The original source has invalid stored metadata.')
     }
     const sourceHost = new URL(
       current.record.source.finalUrl ?? current.record.source.url ?? 'https://source.invalid',
     ).hostname
-    const filename = expectedContentType === 'application/pdf'
-      ? current.record.source.kind === 'pdf' ? current.record.source.displayName : `${sourceHost}.pdf`
-      : `${sourceHost}.html`
+    const filename = current.record.source.kind !== 'url'
+      ? current.record.source.displayName : `${sourceHost}.${originalExtension(expectedContentType)}`
     res.setHeader('Content-Type', expectedContentType)
     res.setHeader('Content-Disposition', attachmentHeader(filename))
     res.setHeader('X-Content-Type-Options', 'nosniff')
+    res.setHeader('Content-Security-Policy', "sandbox; default-src 'none'; frame-ancestors 'none'")
     res.send(Buffer.from(blob.bytes))
   }))
 

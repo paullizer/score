@@ -3,6 +3,8 @@ import { ArrowUpRight, ChevronDown, FileText, Layers3, LoaderCircle, Quote, Scan
 import { useRealAnalyses } from '../../app/real-analyses-context'
 import type { RealAnalysisComparisonDetail, RealAnalysisDocumentResponse, RealCriterionResult } from '../../domain/real-analyses'
 import type { Citation } from '../../domain/types'
+import { documentPagination } from '../../domain/document-formats'
+import { gradeSourcePagination } from '../grade-ladders/gradeUi'
 import { Badge, Button, EmptyState, InlineError, Score, SegmentedControl } from '../../components/ui'
 import { DocumentViewer } from '../../components/documents/DocumentViewer'
 import { citationMatches, targetVersionLabel } from './realAnalysisUi'
@@ -162,16 +164,16 @@ function SavedEvidence({ detail, selection }: { detail: RealAnalysisComparisonDe
         pagination = resume.extraction.pagination
       } else if (target.kind === 'job' && target.document.id === citation.documentId && target.document.version === citation.documentVersion) {
         document = target.document
-        pagination = target.original.contentType === 'application/pdf' ? 'pdf-pages' : 'html-sections'
+        pagination = documentPagination(target.original.contentType)
       } else if (target.kind === 'grade' && target.seed.document.id === citation.documentId && target.seed.document.version === citation.documentVersion) {
         document = target.seed.document
-        pagination = target.seed.source.originalContentType === 'application/pdf' || target.seed.source.kind === 'pdf' ? 'pdf-pages' : 'html-sections'
+        pagination = target.seed.source.originalContentType ? documentPagination(target.seed.source.originalContentType) : 'captured-sections'
       } else {
         const reference = target.kind === 'grade' ? target.references.find((item) => item.document.documentId === citation.documentId && item.document.documentVersion === citation.documentVersion) : undefined
         if (!reference) throw new Error('This requirement quotation is not part of this comparison’s frozen target sources.')
         if (!service.current) throw new Error('The private analysis document service is unavailable.')
         document = await service.current.document(detail.comparison.runId, detail.comparison.id, citation.documentId, citation.documentVersion, controller.signal)
-        pagination = reference.source.origin === 'upload' || reference.source.selectedPages.length > 0 ? 'pdf-pages' : 'captured-sections'
+        pagination = gradeSourcePagination(reference.source)
       }
       if (!citationMatches(document, citation)) throw new Error('The quotation, paragraph, or version does not exactly match the saved source. Treat this evidence as unresolved; no alternate passage is highlighted.')
       if (!controller.signal.aborted) setLoaded({ key, document, pagination })

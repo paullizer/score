@@ -7,7 +7,9 @@ import type { RealResumeSummary } from '../../domain/real-resumes'
 import type { RealAnalysisResumeSelection } from '../../domain/real-analyses'
 import { dateLabel } from '../../domain/selectors'
 import { Badge, Button, EmptyState, ExternalSource, InlineError, PageHeader, SearchField } from '../../components/ui'
-import { DocumentViewer } from '../../components/documents/DocumentViewer'
+import { PrivateDocumentViewer } from '../../components/documents/PrivateDocumentViewer'
+import { UPLOAD_CONTENT_TYPES, supportedUploadFormats } from '../../domain/document-formats'
+import { uploadFormatNames } from '../../services/documentUploads'
 import { realAnalysisLink, realResumeSelection } from '../analyses/realAnalysisUi'
 import { readyRealResume, resumeErrorMessage, resumeName, resumeWorkActive } from './resumeImportUi'
 import { RealAddResumesDialog } from './RealAddResumesDialog'
@@ -107,7 +109,7 @@ function RealResumesLibrary() {
               <p className="row-meta">{summary.resume.role ?? 'Role not stated'}</p><p className="row-meta">{summary.resume.location ?? 'Location not stated'} · {summary.resume.experience ?? 'Experience not stated'}</p></td>
             <td className="min-w-[230px] max-w-[440px]"><RealResumeStatus summary={summary} />
               <p className="mt-2 break-all text-[11px] text-muted">{summary.source.displayName}</p>
-              <p className="mt-1 text-[10px] text-muted">{summary.source.kind === 'pdf' ? 'PDF' : 'Public URL'} · added {dateLabel(summary.resume.createdAt)} · attempt {summary.attempts}</p>
+              <p className="mt-1 text-[10px] text-muted">{summary.source.kind === 'url' ? 'Public URL' : summary.source.kind === 'doc' ? 'Word DOC (97–2003)' : summary.source.kind.toUpperCase()} · added {dateLabel(summary.resume.createdAt)} · attempt {summary.attempts}</p>
               {summary.nextAttemptAt && <p className="mt-1 text-[10px] text-muted">Automatic retry scheduled: {dateLabel(summary.nextAttemptAt)}</p>}
               {message && <p className="mt-2 text-[11px] text-[var(--cp-danger)]">{message}</p>}
               {summary.duplicates.map((warning, index) => <p key={index} className="mt-2 text-[11px] text-muted">{warning.message} Records remain separate.</p>)}
@@ -119,7 +121,7 @@ function RealResumesLibrary() {
       </table></div> : <EmptyState icon={api.phase === 'loading' ? LoaderCircle : Users}
         title={api.phase === 'loading' ? 'Loading private resumes' : api.phase === 'error' ? 'Resume service unavailable' : search ? 'No matching real resumes' : 'Import your first real resume'}
         description={api.phase === 'loading' ? 'Loading every page of authorized resume summaries.' : api.phase === 'error' ? 'No samples are substituted. Retry the service when available.'
-          : search ? 'Try a stated name, role, or source label. Hidden selections are retained.' : 'Choose actual PDFs or public URLs. Inaccessible inputs get individual errors; successful imports remain available.'}
+          : search ? 'Try a stated name, role, or source label. Hidden selections are retained.' : `Choose actual ${uploadFormatNames(supportedUploadFormats(api.features))} files or public HTML/PDF URLs. Inaccessible inputs get individual errors; successful imports remain available.`}
         action={search ? <Button onClick={() => setSearch('')}>Clear search</Button> : <Button disabled={!api.canWrite || api.phase !== 'ready'} icon={Plus} onClick={() => setAdding(true)}>Add real resumes</Button>} />}
       <div className="table-bottom"><span>{visible.length} of {api.summaries.length} real sources</span><span>Private server records · no sample autosave</span></div>
     </section>
@@ -156,7 +158,7 @@ function RealResumeDetail({ id }: { id: string }) {
     {(entry.error || api.error) && <div className="mb-5"><InlineError>{entry.error ?? api.error} The last acknowledged source is shown. <Button size="sm" onClick={() => void ensure(id, true)}>Reload source</Button></InlineError></div>}
     {message && <div className="mb-5"><InlineError>{message}{summary.error?.retryable === false && <p>Automatic retries are stopped for this error; you can still explicitly retry processing. {summary.capture
       ? 'The saved capture is preserved and will be reused, not fetched again. Import a new source separately if its content needs to change.'
-      : summary.source.kind === 'url' ? 'No source has been captured yet. A manual retry can succeed if this URL has become publicly accessible; Score will not sign in or bypass restrictions.' : 'The same submitted PDF is reused; choose a new import if you need to supply a different file.'}</p>}</InlineError></div>}
+      : summary.source.kind === 'url' ? 'No source has been captured yet. A manual retry can succeed if this URL has become publicly accessible; Score will not sign in or bypass restrictions.' : 'The same submitted file is reused; choose a new import if you need to supply a different file.'}</p>}</InlineError></div>}
     {(detail.source.kind === 'url' || summary.warnings.length > 0) && <div className="info-callout mb-5"><FileText size={18} aria-hidden="true" /><div><strong>Source limitations</strong>
       {detail.source.kind === 'url' && <p>A public profile may be sparse. Missing names, roles, experience, or evidence are never inferred from a URL or filename.</p>}
       {summary.warnings.map((warning, index) => <p key={index}>{warning}</p>)}</div></div>}
@@ -164,10 +166,11 @@ function RealResumeDetail({ id }: { id: string }) {
     <div className="grid items-start gap-5 xl:grid-cols-[minmax(0,1fr)_320px]">
       <section className="detail-panel" aria-label="Actual resume source">
         <div className="section-heading"><div><h2>Inspect the captured evidence</h2><p>Normalized text from this private capture, not a fictional replacement</p></div></div>
-        {detail.document ? <DocumentViewer document={detail.document} pagination={detail.extraction?.pagination ?? (detail.capture?.original.contentType === 'text/html' ? 'html-sections' : 'pdf-pages')} />
+        {detail.document ? <PrivateDocumentViewer document={detail.document} originalUrl={api.originalUrl(id)} pagination={detail.extraction?.pagination}
+          original={detail.capture?.original ?? { contentType: detail.source.kind === 'url' ? undefined : UPLOAD_CONTENT_TYPES[detail.source.kind] }} />
           : <EmptyState icon={resumeWorkActive(summary) ? LoaderCircle : FileText} title="No normalized source is available yet"
             description={resumeWorkActive(summary) ? 'The server is processing this source. Accepted work continues independently after the browser closes.' : 'Processing did not produce a readable document. Review the item error; no document or profile was invented.'} />}
-        <div className="source-footer"><span className="break-all">{detail.source.displayName}</span><span>{detail.source.kind === 'pdf' ? 'Uploaded PDF' : 'Public source capture'}</span></div>
+        <div className="source-footer"><span className="break-all">{detail.source.displayName}</span><span>{detail.source.kind === 'url' ? 'Public source capture' : `Uploaded ${detail.source.kind.toUpperCase()}`}</span></div>
       </section>
       <aside className="space-y-5" aria-label="Resume profile and capture provenance">
         <section className="detail-panel"><div className="section-heading"><h2>Source-backed profile</h2></div>
@@ -181,7 +184,7 @@ function RealResumeDetail({ id }: { id: string }) {
             <p>{detail.capture ? `Captured ${dateLabel(detail.capture.capturedAt)} · ${detail.capture.original.contentType} · ${detail.capture.original.bytes.toLocaleString()} bytes` : 'No source capture has been acknowledged yet.'}</p>
             {detail.capture && <><code className="block break-all text-[10px]">Original SHA-256 {detail.capture.original.sha256}</code>
               <a className="button button-secondary button-sm" download href={api.originalUrl(id)}><Download size={14} aria-hidden="true" />Download captured original</a></>}
-            {detail.extraction && <p>{detail.extraction.method} · parser {detail.extraction.version} · {detail.extraction.pagination === 'pdf-pages' ? `${detail.extraction.pageCount ?? 'Unknown'} PDF pages` : 'Captured HTML sections, not PDF pages'}</p>}
+            {detail.extraction && <p>{detail.extraction.method} · parser {detail.extraction.version} · {detail.extraction.pagination === 'pdf-pages' ? `${detail.extraction.pageCount ?? 'Unknown'} PDF pages` : detail.extraction.pagination === 'captured-sections' ? 'Captured Word sections, not printed pages' : 'Captured HTML sections, not PDF pages'}</p>}
             {detail.documentRef && <div><p>Saved document v{detail.documentRef.documentVersion}</p><code className="block break-all text-[10px]">{detail.documentRef.documentId}<br />SHA-256 {detail.documentRef.sha256}</code></div>}
             <p>Processing attempt {summary.attempts} · {summary.retryCount} manual retries</p>
             {detail.profile && <p>Profile extraction: {detail.profile.provenance.model} · {detail.profile.provenance.promptVersion} · {detail.profile.provenance.schemaVersion}</p>}

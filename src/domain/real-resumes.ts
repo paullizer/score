@@ -1,6 +1,8 @@
 import type { Citation, SourceDocument } from './types'
+import type { DocumentPagination, OriginalContentType, UploadContentType, UploadFormat, WordImportFeatures } from './document-formats'
 
 export const RESUME_IMPORT_LIMITS = {
+  maxFileBytes: 10 * 1024 * 1024,
   maxPdfBytes: 10 * 1024 * 1024,
   maxPdfPages: 50,
   maxSourceCharacters: 180_000,
@@ -30,7 +32,7 @@ export type RealResumeStatus = 'queued' | 'parsing' | 'profiling' | 'ready' | 'e
 
 export type ResumeProcessingErrorCode =
   | 'access-blocked' | 'not-found' | 'network-error' | 'unsupported-content'
-  | 'unreadable-document' | 'pdf-too-large' | 'pdf-too-many-pages' | 'source-too-large'
+  | 'unreadable-document' | 'pdf-too-large' | 'file-too-large' | 'pdf-too-many-pages' | 'source-too-large'
   | 'multiple-profiles' | 'not-a-profile' | 'invalid-profile' | 'invalid-source'
   | 'invalid-model-output' | 'service-unavailable' | 'storage-error' | 'timeout' | 'internal-error'
 
@@ -42,11 +44,11 @@ export interface ResumeProcessingError {
 }
 
 export type RealResumeSource =
-  | { kind: 'pdf'; displayName: string; fileName: string }
+  | { kind: UploadFormat; displayName: string; fileName: string }
   | { kind: 'url'; displayName: string; url: string }
 
 export interface ResumeSourceCapture {
-  original: ImmutableBlobReference & { contentType: 'application/pdf' | 'text/html' }
+  original: ImmutableBlobReference & { contentType: OriginalContentType }
   capturedAt: string
   finalUrl?: string
   redirects: string[]
@@ -63,10 +65,10 @@ export interface ResumeCaptureManifest {
 }
 
 export interface ResumeExtractionProvenance {
-  method: 'document-intelligence' | 'html' | 'browser'
+  method: 'document-intelligence' | 'html' | 'browser' | 'legacy-word'
   version: string
   extractedAt: string
-  pagination: 'pdf-pages' | 'html-sections'
+  pagination: DocumentPagination
   pageCount: number | null
   normalizedCharacters: number
   document: ImmutableDocumentReference
@@ -203,7 +205,7 @@ export interface RealResumesPage {
   continuationToken?: string
 }
 
-export interface ResumeProcessingFeatures {
+export interface ResumeProcessingFeatures extends WordImportFeatures {
   realResumeImports: boolean
   resumeLimits: typeof RESUME_IMPORT_LIMITS
 }
@@ -218,6 +220,11 @@ export interface ResumeImportHeaders {
 export interface ResumePdfImportHeaders extends ResumeImportHeaders {
   'Content-Type': 'application/pdf'
   // Percent-encoded safe basename, for display only.
+  'X-File-Name': string
+}
+
+export interface ResumeFileImportHeaders extends ResumeImportHeaders {
+  'Content-Type': UploadContentType
   'X-File-Name': string
 }
 

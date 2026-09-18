@@ -7,6 +7,8 @@ import {
   type RealJobSummary,
 } from '../domain/real-jobs'
 import { cloudJsonRequest } from './cloudWorkspace'
+import { UPLOAD_CONTENT_TYPES, type UploadFormat } from '../domain/document-formats'
+import { requireUploadFile } from './documentUploads'
 
 type RealJobWireSummary = RealJobSummary
 
@@ -27,7 +29,12 @@ export async function fetchJobProcessingFeatures(signal?: AbortSignal): Promise<
   const features = await cloudJsonRequest<JobProcessingFeatures>('/features', { method: 'GET', signal })
   return {
     realJobImports: features.realJobImports === true,
-    limits: features.limits ?? JOB_IMPORT_LIMITS,
+    wordDocumentImports: features.wordDocumentImports === true,
+    limits: {
+      ...JOB_IMPORT_LIMITS,
+      ...features.limits,
+      maxFileBytes: features.limits?.maxFileBytes ?? features.limits?.maxPdfBytes ?? JOB_IMPORT_LIMITS.maxFileBytes,
+    },
   }
 }
 
@@ -66,14 +73,38 @@ export async function importRealJobPdf(
   batchId?: string,
   signal?: AbortSignal,
 ): Promise<RealJobSummary> {
+  requireUploadFile(file, ['pdf'])
+  return importFile(workspaceId, file, 'pdf', idempotencyKey, batchId, signal)
+}
+
+export async function importRealJobFile(
+  workspaceId: string,
+  file: File,
+  idempotencyKey: string,
+  batchId?: string,
+  signal?: AbortSignal,
+): Promise<RealJobSummary> {
+  return importFile(workspaceId, file, requireUploadFile(file), idempotencyKey, batchId, signal)
+}
+
+async function importFile(
+  workspaceId: string,
+  file: File,
+  format: UploadFormat,
+  idempotencyKey: string,
+  batchId?: string,
+  signal?: AbortSignal,
+): Promise<RealJobSummary> {
   const headers = new Headers({
-    'Content-Type': 'application/pdf',
+    'Content-Type': UPLOAD_CONTENT_TYPES[format],
     'X-File-Name': encodeURIComponent(file.name),
     'Idempotency-Key': idempotencyKey,
   })
   if (batchId) headers.set('X-Import-Batch', batchId)
+  signal?.throwIfAborted()
   const bytes = await file.arrayBuffer()
-  const response = await cloudJsonRequest<{ job: RealJobWireSummary }>(`${jobsPath(workspaceId)}/pdf`, {
+  signal?.throwIfAborted()
+  const response = await cloudJsonRequest<{ job: RealJobWireSummary }>(`${jobsPath(workspaceId)}/${format === 'pdf' ? 'pdf' : 'file'}`, {
     method: 'POST',
     headers,
     body: bytes,

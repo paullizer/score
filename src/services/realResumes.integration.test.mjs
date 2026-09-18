@@ -8,6 +8,7 @@ import { build } from 'esbuild'
 import React, { act } from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { JSDOM } from 'jsdom'
+import { docxFile, legacyDocFile } from '../../server-tests/word-fixtures.mjs'
 
 const output = resolve(`.real-resume-client-tests-${randomUUID()}`)
 const originalFetch = globalThis.fetch
@@ -98,11 +99,20 @@ after(async () => {
 
 test('features are additive and missing resume support fails closed', async () => {
   globalThis.fetch = async () => json({ realJobImports: true, realGradeLadders: true, realResumeImports: true, resumeLimits: { maxBatchItems: 10, maxPdfPages: 50 } })
-  assert.deepEqual(await client.fetchResumeProcessingFeatures(), { realResumeImports: true, resumeLimits: { maxBatchItems: 10, maxPdfPages: 50 } })
+  const enabled = await client.fetchResumeProcessingFeatures()
+  assert.equal(enabled.realResumeImports, true)
+  assert.equal(enabled.wordDocumentImports, false)
+  assert.equal(enabled.resumeLimits.maxBatchItems, 10)
+  assert.equal(enabled.resumeLimits.maxPdfPages, 50)
   globalThis.fetch = async () => json({ realJobImports: true })
   const unavailable = await client.fetchResumeProcessingFeatures()
   assert.equal(unavailable.realResumeImports, false)
   assert.equal(unavailable.resumeLimits.maxPdfBytes, 10 * 1024 * 1024)
+  assert.equal(unavailable.wordDocumentImports, false)
+  globalThis.fetch = async () => json({ realResumeImports: true, wordDocumentImports: true, resumeLimits: { maxPdfBytes: 8 * 1024 * 1024 } })
+  const word = await client.fetchResumeProcessingFeatures()
+  assert.equal(word.wordDocumentImports, true)
+  assert.equal(word.resumeLimits.maxFileBytes, 8 * 1024 * 1024)
 })
 
 test('resumes consume all pages, encode tokens, reject repeated tokens and foreign/sample records', async () => {
@@ -149,6 +159,27 @@ test('URL imports contain only a URL body and stable batch headers; 0/11 inputs 
   for (const count of [0, 11, 1.5]) await assert.rejects(client.importRealResumeUrl('w', 'https://example.test/profile', key, batchId, count), /between 1 and 10/)
   await assert.rejects(client.importRealResumeUrl('w', 'https://example.test/profile', 'bad-key', batchId, 1), /UUID/)
   assert.equal(requests.length, 1)
+})
+
+test('generic resume files use canonical MIME and immutable keys without changing legacy PDF routing', async () => {
+  globalThis.fetch = async (url, init) => { requests.push({ url, init }); return json({ resume: summary('accepted', 'w', 'queued') }, 202) }
+  for (const [name, bytes, type, endpoint] of [
+    ['Résumé.DOCX', docxFile(), 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', 'file'],
+    ['Résumé.DOC', legacyDocFile(), 'application/msword', 'file'],
+    ['Résumé.PDF', Buffer.from('%PDF-bytes'), 'application/pdf', 'pdf'],
+  ]) {
+    const file = new File([bytes], name)
+    await client.importRealResumeFile('w', file, key, batchId, 3)
+    const request = requests.at(-1)
+    assert.equal(request.url, `/api/workspaces/w/resumes/${endpoint}`)
+    assert.equal(request.init.headers.get('Content-Type'), type)
+    assert.equal(request.init.headers.get('X-File-Name'), encodeURIComponent(name))
+    assert.equal(request.init.headers.get('Idempotency-Key'), key)
+    assert.equal(request.init.headers.get('X-Import-Batch'), batchId)
+    assert.equal(request.init.headers.get('X-Import-Count'), '3')
+    assert.deepEqual(Buffer.from(request.init.body), bytes)
+  }
+  await assert.rejects(client.importRealResumePdf('w', new File([docxFile()], 'word.docx'), key, batchId, 1), /DOCX uploads are not enabled/)
 })
 
 test('detail is unwrapped; original downloads stay authorized; retry/cancel send displayed ETags and empty bodies', async () => {
@@ -214,6 +245,29 @@ test('PDF size/URL bounds are per-item; no credential or nonpublic fallback is p
   assert.equal(ui.resumeName(summary()), 'Name not stated')
   assert.equal(ui.readyRealResume(summary()), true)
   assert.equal(ui.readyRealResume(summary('queued', 'w', 'queued')), false)
+})
+
+test('mixed Word inputs are gated, retain valid neighbors, and never gain printed-page limits', () => {
+  const formats = ['pdf', 'docx', 'doc']
+  const docx = new File([docxFile()], 'profile.DOCX')
+  const doc = new File([legacyDocFile()], 'profile.DOC', { type: 'application/octet-stream' })
+  const inputs = [ui.resumeFileInput(docx), ui.resumeFileInput(doc), ui.resumeFileInput(new File(['bad'], 'profile.docm')),
+    { kind: 'url', url: 'https://example.test/profile.DOCX' }, { kind: 'pdf', file: new File(['%PDF-one'], 'profile.pdf') }]
+  assert.deepEqual(inputs.slice(0, 2).map((input) => input.kind), ['docx', 'doc'])
+  const initial = { id: batchId, inputCount: null, items: [] }
+  const off = ui.appendResumeInputs(initial, inputs)
+  assert.deepEqual(off.items.map((item) => item.state), ['invalid', 'invalid', 'invalid', 'invalid', 'pending'])
+  const on = ui.appendResumeInputs(initial, inputs, undefined, formats)
+  assert.deepEqual(on.items.map((item) => item.state), ['pending', 'pending', 'invalid', 'invalid', 'pending'])
+  assert.equal(on.items[0].source.file, docx)
+  assert.equal(on.items[1].source.file, doc)
+  assert.match(on.items[3].error, /Word URLs/)
+  assert.equal(ui.validateResumeInput({ kind: 'docx', file: new File([new Uint8Array(10 * 1024 * 1024)], 'exact.docx') }, undefined, formats), undefined)
+  assert.match(ui.validateResumeInput({ kind: 'doc', file: new File([new Uint8Array(10 * 1024 * 1024 + 1)], 'large.doc') }, undefined, formats), /exceeds 10 MiB/)
+  assert.match(ui.validateResumeInput({ kind: 'docx', file: new File(['x'], 'mismatch.docx', { type: 'application/pdf' }) }, undefined, formats), /disagree/)
+  assert.match(ui.validateResumeInput({ kind: 'docx', file: new File([docxFile()], 'docx', {
+    type: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  }) }, undefined, formats), /supported file/)
 })
 
 test('real HTML source rendering uses captured sections, actual text, and never invented PDF pages', () => {
@@ -354,6 +408,36 @@ test('provider retains independent accepted/unconfirmed uploads after dialog unm
   assert.equal(dom.window.localStorage.length, 0)
 })
 
+test('provider releases acknowledged DOCX/DOC files and retries an unconfirmed Word source with unchanged keys and bytes', async () => {
+  let wordAttempts = 0
+  globalThis.fetch = async (url, init) => {
+    requests.push({ url, init })
+    if (url === '/api/features') return json({ realResumeImports: true, wordDocumentImports: true })
+    if (init.method === 'GET') return json({ resumes: [] })
+    if (init.headers.get('Content-Type') === 'application/msword' && wordAttempts++ === 0) return json({ error: { code: 'unavailable', message: 'Response lost.' } }, 503)
+    return json({ resume: summary(`word-${requests.length}`, 'workspace-one', 'queued') }, 202)
+  }
+  await mount()
+  await settle(() => current?.phase === 'ready')
+  const docx = new File([docxFile()], 'same-name.DOCX')
+  const doc = new File([legacyDocFile()], 'same-name.DOC')
+  await act(async () => current.stage([ui.resumeFileInput(docx), ui.resumeFileInput(doc), ui.resumeFileInput(new File(['invalid'], 'bad.docm'))]))
+  const first = current.batches[0]
+  await act(async () => current.submitBatch(first.id))
+  assert.deepEqual(current.batches[0].items.map((item) => item.state), ['accepted', 'unconfirmed', 'invalid'])
+  assert.equal(current.batches[0].items[0].source.file, null)
+  assert.equal(current.batches[0].items[0].source.kind, 'docx')
+  assert.equal(current.batches[0].items[1].source.file, doc)
+  await act(async () => current.submitBatch(first.id, [first.items[1].key]))
+  assert.equal(current.batches[0].items[1].source.file, null)
+  const attempts = requests.filter((request) => request.init.headers?.get('Content-Type') === 'application/msword')
+  assert.equal(attempts.length, 2)
+  assert.equal(attempts[0].init.headers.get('Idempotency-Key'), attempts[1].init.headers.get('Idempotency-Key'))
+  assert.equal(attempts[0].init.headers.get('X-Import-Batch'), first.id)
+  assert.equal(attempts[1].init.headers.get('X-Import-Count'), '3')
+  assert.deepEqual(new Uint8Array(attempts[0].init.body), new Uint8Array(attempts[1].init.body))
+  assert.equal(dom.window.localStorage.length, 0)
+})
 test('workspace switching ignores late library and action responses; viewers cannot mutate', async () => {
   const oldList = deferred()
   const oldAction = deferred()

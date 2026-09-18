@@ -11,6 +11,7 @@ import type {
   ReferenceDocument,
 } from './real-grades'
 import type { RealJobSource } from './real-jobs'
+import type { OriginalContentType } from './document-formats'
 import type {
   ImmutableBlobReference,
   ImmutableDocumentReference,
@@ -147,7 +148,7 @@ export interface FrozenJobTargetSnapshot extends FrozenAnalysisTargetBase {
   document: RealJobDocument
   source: RealJobSource
   // Immutable original copied into analysis-sources.
-  original: ImmutableBlobReference & { contentType: 'application/pdf' | 'text/html' }
+  original: ImmutableBlobReference & { contentType: OriginalContentType }
 }
 
 export interface FrozenAnalysisReference {

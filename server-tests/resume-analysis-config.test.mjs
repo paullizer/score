@@ -90,10 +90,11 @@ test('feature discovery keeps existing fields, authenticated privacy, and author
   assert.equal(features.realGradeLadders, false)
   assert.equal(features.realResumeImports, false)
   assert.equal(features.realAnalyses, false)
+  assert.equal(features.wordDocumentImports, false)
   assert.equal(features.limits.maxPdfBytes, 10 * 1024 * 1024)
   assert.ok(features.gradeLimits)
   assert.deepEqual(features.resumeLimits, {
-    maxPdfBytes: 10 * 1024 * 1024, maxPdfPages: 50, maxSourceCharacters: 180_000,
+    maxFileBytes: 10 * 1024 * 1024, maxPdfBytes: 10 * 1024 * 1024, maxPdfPages: 50, maxSourceCharacters: 180_000,
     maxBatchItems: 10, maxUrlLength: 4096, maxAutomaticAttempts: 3,
   })
   assert.deepEqual(features.analysisLimits, {

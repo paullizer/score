@@ -6,7 +6,7 @@ import type { FrozenReferenceSource, ReferenceDocument, ReferenceSourceRecord } 
 import { DocumentViewer } from '../../components/documents/DocumentViewer'
 import { Badge, Button, EmptyState, ExternalSource, InlineError, Modal } from '../../components/ui'
 import { GradeIssueResolutions, GradeIssues } from './GradeShared'
-import { sourcePurposeLabels } from './gradeUi'
+import { gradeSourcePagination, sourcePurposeLabels } from './gradeUi'
 
 export interface GradeSourceSelection {
   sourceId?: string
@@ -18,6 +18,7 @@ export interface GradeSourceSelection {
 export function GradeSourceProvenance({ source }: { source: ReferenceSourceRecord | FrozenReferenceSource }) {
   const live = 'recordType' in source ? source : null
   const url = live ? live.finalUrl ?? live.requestedUrl : 'url' in source ? source.url : undefined
+  const pagination = gradeSourcePagination(source)
   return <div className="grade-provenance">
     <div className="flex flex-wrap gap-2"><Badge tone="accent">{sourcePurposeLabels[source.purpose]}</Badge><Badge>{source.origin === 'opm' ? 'Discovered OPM reference' : source.origin === 'seed-job' ? 'Automatically captured seed' : 'User supplied · not verified OPM authority'}</Badge><Badge tone={source.authorityStatus === 'current' ? 'neutral' : 'warning'}>{source.authorityStatus} authority / revision</Badge></div>
     <dl>
@@ -27,7 +28,9 @@ export function GradeSourceProvenance({ source }: { source: ReferenceSourceRecor
       <div><dt>Applicability</dt><dd>{source.coverage.state} · {source.coverage.explanation || 'Coverage has not been established.'}</dd></div>
       <div><dt>Series / grades / functions</dt><dd>{source.coverage.series.join(', ') || 'Unresolved series'} · {source.coverage.grades.map((grade) => `GS-${grade}`).join(', ') || 'No explicit grade coverage'} · {source.coverage.functions.join(', ') || 'No explicit functional coverage'}</dd></div>
       <div><dt>Intended section</dt><dd>{source.intendedSection || 'Whole reference / not specified'}</dd></div>
-      <div><dt>Extraction completeness</dt><dd>{source.completeness} · {source.selectedPages.length ? `Selected original pages ${source.selectedPages.join(', ')}` : 'Full document requested'} · {source.pageCount === undefined ? 'Page count pending' : `${source.pageCount} original pages`}</dd></div>
+      <div><dt>Extraction completeness</dt><dd>{source.completeness} · {source.selectedPages.length ? `Selected original pages ${source.selectedPages.join(', ')}` : 'Full document requested'} · {pagination === 'pdf-pages'
+        ? source.pageCount === undefined ? 'Page count pending' : `${source.pageCount} original pages`
+        : `${source.pageCount ?? 'Pending'} ${pagination === 'html-sections' ? 'HTML' : 'captured'} ${source.pageCount === 1 ? 'section' : 'sections'} · printed page numbers unavailable`}</dd></div>
       <div><dt>Captured content fingerprint</dt><dd><code>{source.sha256 || 'Capture pending — no verified hash yet'}</code></dd></div>
       {url && <div><dt>Source URL</dt><dd><ExternalSource url={url}>{url}</ExternalSource></dd></div>}
       {live && <>
@@ -100,10 +103,11 @@ export function GradeSourceInspector({ ladderId, selection, onClose }: { ladderI
       {loaded.sourceSetId && <div className="grade-snapshot-label"><FileSearch size={15} aria-hidden="true" /><span>Frozen {loaded.capturedAt} · <code>{loaded.sourceSetId}</code></span></div>}
       {citation && <div className="mb-4"><span className="grade-field-kicker">Claim's exact quotation, not interpretation</span><blockquote className="source-quote">“{citation.quote}”</blockquote></div>}
       {!matches && <InlineError>The cited quotation or locator does not match this captured paragraph. Treat it as an unresolved citation; it must not support approval.</InlineError>}
-      {highlighted && !paragraph && <InlineError>This passage is not in the selected extraction pages. Omitted pages were not examined.</InlineError>}
+      {highlighted && !paragraph && <InlineError>{gradeSourcePagination(loaded.source) === 'pdf-pages'
+        ? 'This passage is not in the selected extraction pages. Omitted pages were not examined.'
+        : 'This passage is not in the captured source sections.'}</InlineError>}
       <DocumentViewer document={loaded.document} highlightedId={highlighted} quote={matches ? citation?.quote : undefined}
-        pagination={'originalContentType' in loaded.source ? loaded.source.originalContentType === 'text/html' ? 'html-sections' : 'pdf-pages'
-          : loaded.source.origin === 'upload' || loaded.source.selectedPages.length > 0 ? 'pdf-pages' : 'captured-sections'} compact />
+        pagination={gradeSourcePagination(loaded.source)} compact />
       <details className="mt-5" open><summary className="cursor-pointer text-[13px] font-semibold">Provenance, applicability, and captured version</summary><GradeSourceProvenance source={loaded.source} /></details>
     </>}
   </Modal>

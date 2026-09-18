@@ -40,6 +40,7 @@ const PARAGRAPH_OPTIONS: ParagraphOptions = {
   minimumTextLength: 1,
   emptySourceMessage: 'The source did not contain readable resume text.',
 }
+export { RESUME_SECTIONS, PARAGRAPH_OPTIONS as RESUME_PARAGRAPH_OPTIONS }
 const BLOCK_TAGS = new Set([
   'ADDRESS', 'ARTICLE', 'ASIDE', 'BLOCKQUOTE', 'DD', 'DIV', 'DL', 'DT', 'FIGCAPTION', 'FIGURE',
   'FOOTER', 'H1', 'H2', 'H3', 'H4', 'H5', 'H6', 'HEADER', 'HR', 'LI', 'MAIN', 'OL', 'P',

@@ -1,12 +1,21 @@
 import assert from 'node:assert/strict'
-import { readFileSync } from 'node:fs'
+import { spawnSync } from 'node:child_process'
+import { createHash, randomUUID } from 'node:crypto'
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { join } from 'node:path'
 import test from 'node:test'
 import {
-  WORKER_DEFINITIONS, configureScheduledWorker, validateFeatureSettings, validateRendererTemplate, validateWorkerImage, validateWorkerTemplate,
+  WORD_WORKER_ARTIFACTS, WORD_WORKER_CAPABILITY, WORD_WORKER_EXTRACTION_VERSION, WORKER_DEFINITIONS, configureScheduledWorker, configureWorkerDeployment,
+  disableWordAdmission, validateFeatureSettings, validateRendererTemplate, validateWorkerImage, validateWorkerTemplate, verifyWordWorkerReadiness,
+  wordWorkerVerificationArgs,
 } from '../scripts/azure-worker.mjs'
 
 const group = '/subscriptions/00000000-0000-4000-8000-000000000001/resourceGroups/score-test'
 const env = {
+  AZURE_SUBSCRIPTION_ID: '00000000-0000-4000-8000-000000000001',
+  AZURE_RESOURCE_GROUP: 'score-test', AZURE_APP_SERVICE_NAME: 'score-web',
+  AZURE_COSMOS_ACCOUNT_NAME: 'score-cosmos', AZURE_STORAGE_ACCOUNT_NAME: 'scorestorage',
+  AZURE_AI_ACCOUNT_NAME: 'score-ai', AZURE_DOCUMENT_INTELLIGENCE_NAME: 'score-ocr',
   AZURE_TENANT_ID: '00000000-0000-4000-8000-000000000002',
   AZURE_CONTAINER_REGISTRY_ENDPOINT: 'scoretest.azurecr.io',
   AZURE_COSMOS_ENDPOINT: 'https://cosmos.example.com:443/',
@@ -15,9 +24,11 @@ const env = {
   AZURE_RUBRIC_MODEL_DEPLOYMENT: 'job-rubric',
   AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT: 'https://ocr.example.com',
   AZURE_JOB_RENDERER_URL: 'https://renderer.internal.example.com',
+  AZURE_JOB_RENDERER_ID: `${group}/providers/Microsoft.App/containerApps/renderer`,
   ...Object.fromEntries(WORKER_DEFINITIONS.map(worker => [worker.idKey, `${group}/providers/Microsoft.App/jobs/${worker.kind}`])),
 }
-const image = `${env.AZURE_CONTAINER_REGISTRY_ENDPOINT}/score-worker:resume-analysis-20260918000000`
+const image = `${env.AZURE_CONTAINER_REGISTRY_ENDPOINT}/score-worker:resume-analysis-word-v1-20260918000000`
+const rendererImage = `${env.AZURE_CONTAINER_REGISTRY_ENDPOINT}/score-renderer:resume-analysis-word-v1-20260918000000`
 
 function template(definition) {
   const identityId = `${group}/providers/Microsoft.ManagedIdentity/userAssignedIdentities/id-${definition.kind}-worker-test`
@@ -56,19 +67,22 @@ function appSettings() {
   return {
     COSMOS_CONTAINER: 'workspaces', WORKSPACE_BLOB_CONTAINER: 'workspace-state',
     REAL_JOB_IMPORTS_ENABLED: 'true', REAL_GRADE_LADDERS_ENABLED: 'false', REAL_RESUME_IMPORTS_ENABLED: 'true',
+    REAL_ANALYSES_ENABLED: 'true', WORD_DOCUMENT_IMPORTS_ENABLED: 'true',
     ...Object.fromEntries(WORKER_DEFINITIONS.flatMap(worker => [
       [worker.recordsSetting, worker.records], [worker.sourcesSetting, worker.sources],
     ])),
   }
 }
 
-test('deployment accepts only the new shared entry-point image family in the deployment registry', () => {
+test('deployment requires the versioned Word image family, not an arbitrary older resume-analysis image', () => {
   validateWorkerImage(env, image)
   for (const invalid of [
     undefined, 'mcr.microsoft.com/k8se/quickstart-jobs:latest',
     `${env.AZURE_CONTAINER_REGISTRY_ENDPOINT}/score-worker:job-old`,
+    `${env.AZURE_CONTAINER_REGISTRY_ENDPOINT}/score-worker:resume-analysis-20260918`,
     'other.azurecr.io/score-worker:resume-analysis-20260918',
     `${env.AZURE_CONTAINER_REGISTRY_ENDPOINT}/score-worker:resume-analysis-`,
+    `${env.AZURE_CONTAINER_REGISTRY_ENDPOINT}/score-worker:resume-analysis-word-v1-`,
     `${image}/unexpected`,
   ]) assert.throws(() => validateWorkerImage(env, invalid), /older worker images/)
 })
@@ -160,6 +174,7 @@ test('API enablement requires separate provisioned stores but not enabled mutabl
 
 function deploymentHarness(definition, status = 'Succeeded') {
   let current = template(definition)
+  let executionTemplate
   const identity = current.identity
   const operations = []
   return {
@@ -173,18 +188,26 @@ function deploymentHarness(definition, status = 'Succeeded') {
           current = { ...structuredClone(body), identity, properties: { ...structuredClone(body.properties), provisioningState: 'Succeeded' } }
           return current
         }
-        if (url.includes('/start?')) { operations.push({ action: 'start' }); return { name: 'initial-test' } }
-        if (url.includes('/executions/')) { operations.push({ action: status }); return { properties: { status } } }
+        if (url.includes('/start?')) {
+          operations.push({ action: 'start' })
+          executionTemplate = structuredClone(current.properties.template)
+          return { name: 'initial-test' }
+        }
+        if (url.includes('/executions/')) {
+          operations.push({ action: status })
+          return { properties: { status, template: executionTemplate } }
+        }
         return structuredClone(current)
       },
     },
   }
 }
 
-test('each new worker remains manual until successful execution, then schedules and saves only its own pin', async () => {
-  for (const definition of WORKER_DEFINITIONS.filter(worker => worker.kind === 'resume' || worker.kind === 'analysis')) {
+test('each worker verifies Word artifacts before its initial execution, then schedules and saves only its own pin', async () => {
+  for (const definition of WORKER_DEFINITIONS) {
     const { hooks, operations } = deploymentHarness(definition)
-    await configureScheduledWorker(env, {}, definition, image, hooks)
+    const verified = await configureScheduledWorker(env, {}, definition, image, hooks)
+    assert.deepEqual(verified, { kind: definition.kind, image, executionName: 'initial-test' })
     assert.deepEqual(operations.map(operation => operation.action), ['Manual', 'start', 'Succeeded', 'Schedule', 'pin'])
     assert.equal(operations.at(-1).key, definition.imageKey)
     assert.equal(operations.at(-1).value, image)
@@ -194,11 +217,12 @@ test('each new worker remains manual until successful execution, then schedules 
     assert.equal(payload.properties.configuration.manualTriggerConfig, undefined)
     assert.equal(payload.properties.configuration.scheduleTriggerConfig.parallelism, 1)
     assert.deepEqual(payload.properties.template.containers[0].args, [definition.entryPoint])
+    assert.deepEqual(operations[0].payload.properties.template.containers[0].args, wordWorkerVerificationArgs(definition))
   }
 })
 
 test('failed initial execution never schedules or saves an unverified image pin', async () => {
-  for (const definition of WORKER_DEFINITIONS.filter(worker => worker.kind === 'resume' || worker.kind === 'analysis')) {
+  for (const definition of WORKER_DEFINITIONS) {
     const { hooks, operations } = deploymentHarness(definition, 'Failed')
     await assert.rejects(configureScheduledWorker(env, {}, definition, image, hooks), /initial execution.*Failed/)
     assert.deepEqual(operations.map(operation => operation.action), ['Manual', 'start', 'Failed'])
@@ -211,6 +235,299 @@ test('initial execution timeout is bounded and never publishes a schedule or ima
   await assert.rejects(configureScheduledWorker(env, {}, definition, image, hooks), /did not finish its initial execution/)
   assert.equal(operations.filter(operation => operation.action === 'Running').length, 90)
   assert.ok(operations.every(operation => !['Schedule', 'pin'].includes(operation.action)))
+})
+
+test('a successful but stale execution cannot verify another image or bypass the artifact probe', async () => {
+  const definition = WORKER_DEFINITIONS[0]
+  for (const change of [
+    container => { container.image = image.replace('20260918000000', 'older') },
+    container => { container.args = [definition.entryPoint] },
+  ]) {
+    const { hooks, operations } = deploymentHarness(definition)
+    const send = hooks.request
+    hooks.request = async (...args) => {
+      const response = await send(...args)
+      if (args[2].includes('/executions/')) change(response.properties.template.containers[0])
+      return response
+    }
+    await assert.rejects(configureScheduledWorker(env, {}, definition, image, hooks), /not bound to the verified Word image/)
+    assert.ok(operations.every(operation => !['Schedule', 'pin'].includes(operation.action)))
+  }
+})
+
+test('the in-container probe rejects old, incomplete, or modified artifacts before starting a worker', t => {
+  const root = join(process.cwd(), 'server-tests', `.word-readiness-${randomUUID()}`)
+  mkdirSync(join(root, 'dist-worker'), { recursive: true })
+  t.after(() => rmSync(root, { recursive: true, force: true }))
+  const definition = WORKER_DEFINITIONS[0]
+  const files = Object.fromEntries(WORD_WORKER_ARTIFACTS.map(name => [
+    name,
+    WORKER_DEFINITIONS.some(worker => worker.entryPoint === `dist-worker/${name}`)
+      ? [
+        "import { resolve } from 'node:path';",
+        "import { fileURLToPath } from 'node:url';",
+        'if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {',
+        "if (process.execArgv.length) throw new Error('Parser threads must not inherit probe arguments.');",
+        "console.log('worker-entry-started');",
+        '}',
+      ].join('\n')
+      : name === 'runtime.mjs'
+        ? `export const WORD_EXTRACTION_VERSION = ${JSON.stringify(WORD_WORKER_EXTRACTION_VERSION)};\n`
+        : `// ${name}\n`,
+  ]))
+  const manifest = {
+    schemaVersion: 1, capability: WORD_WORKER_CAPABILITY,
+    artifacts: Object.fromEntries(Object.entries(files).map(([name, contents]) =>
+      [name, createHash('sha256').update(contents).digest('hex')])),
+  }
+  const writeManifest = value => writeFileSync(join(root, 'dist-worker', 'word-imports.json'), JSON.stringify(value))
+  function reset() {
+    for (const [name, contents] of Object.entries(files)) writeFileSync(join(root, 'dist-worker', name), contents)
+    writeManifest(manifest)
+  }
+  function probe() {
+    return spawnSync(process.execPath, wordWorkerVerificationArgs(definition), { cwd: root, encoding: 'utf8', timeout: 10_000 })
+  }
+  reset()
+  const docker = readFileSync(new URL('../Dockerfile.worker', import.meta.url), 'utf8')
+  const packaging = docker.split('\n').find(line => line.includes('word-imports.json')).match(/-e "(.*)"/)[1]
+  const packaged = spawnSync(process.execPath, ['--input-type=module', '--eval', packaging], {
+    cwd: root, encoding: 'utf8', timeout: 10_000,
+  })
+  assert.equal(packaged.status, 0, packaged.stderr)
+  assert.deepEqual(JSON.parse(readFileSync(join(root, 'dist-worker', 'word-imports.json'), 'utf8')), manifest)
+  for (const worker of WORKER_DEFINITIONS) {
+    const ready = spawnSync(process.execPath, wordWorkerVerificationArgs(worker), { cwd: root, encoding: 'utf8', timeout: 10_000 })
+    assert.equal(ready.status, 0, ready.stderr)
+    assert.match(ready.stdout, /worker-entry-started/, `${worker.kind} must actually run its guarded entry point`)
+  }
+  for (const damage of [
+    () => rmSync(join(root, 'dist-worker', 'word-imports.json')),
+    () => writeManifest({ ...manifest, schemaVersion: 0 }),
+    () => writeManifest({ ...manifest, capability: 'resume-analysis-only' }),
+    () => writeManifest({ ...manifest, artifacts: {} }),
+    () => writeFileSync(join(root, 'dist-worker', 'word-parser.mjs'), '// modified parser\n'),
+    () => rmSync(join(root, 'dist-worker', 'grade-worker.mjs')),
+  ]) {
+    reset()
+    damage()
+    const result = probe()
+    assert.notEqual(result.status, 0)
+    assert.doesNotMatch(result.stdout, /worker-entry-started/)
+  }
+  for (const olderRuntime of [
+    '// Historical PDF/HTML runtime without a Word capability export.\n',
+    "export const WORD_EXTRACTION_VERSION = 'older-word-extraction';\n",
+  ]) {
+    reset()
+    writeFileSync(join(root, 'dist-worker', 'runtime.mjs'), olderRuntime)
+    writeManifest({
+      ...manifest, artifacts: { ...manifest.artifacts, 'runtime.mjs': createHash('sha256').update(olderRuntime).digest('hex') },
+    })
+    const result = probe()
+    assert.notEqual(result.status, 0)
+    assert.match(result.stderr, /required Word extraction version/)
+    assert.doesNotMatch(result.stdout, /worker-entry-started/, 'a valid hash manifest cannot certify an old extraction runtime')
+  }
+  reset()
+  const failingWorker = 'process.exitCode = 7\n'
+  writeFileSync(join(root, 'dist-worker', 'worker.mjs'), failingWorker)
+  writeManifest({
+    ...manifest, artifacts: { ...manifest.artifacts, 'worker.mjs': createHash('sha256').update(failingWorker).digest('hex') },
+  })
+  assert.equal(probe().status, 7, 'the probe must propagate an ordinary worker startup/execution failure')
+})
+
+function rolloutHarness(options = {}) {
+  let settings = { ...appSettings(), CUSTOM_EXISTING_SETTING: 'unchanged' }
+  const workers = new Map(WORKER_DEFINITIONS.map(definition => [definition.kind, template(definition)]))
+  const executions = new Map()
+  const operations = []
+  const pins = new Map(WORKER_DEFINITIONS.map(definition => [definition.imageKey, `${definition.kind}-previous-pin`]))
+  const pullId = `${group}/providers/Microsoft.ManagedIdentity/userAssignedIdentities/id-render-pull-test`
+  let renderer = {
+    location: 'northcentralus', tags: {},
+    identity: { type: 'UserAssigned', userAssignedIdentities: { [pullId]: { clientId: 'renderer-client' } } },
+    properties: {
+      environmentId: `${group}/providers/Microsoft.App/managedEnvironments/workers`,
+      configuration: {
+        ingress: { external: false }, identitySettings: [{ identity: pullId, lifecycle: 'None' }],
+        registries: [{ server: env.AZURE_CONTAINER_REGISTRY_ENDPOINT, identity: pullId }],
+      },
+    },
+  }
+  let enableFailed = false
+  const hooks = {
+    delay: async () => {},
+    setEnvironment: (key, value) => { pins.set(key, value); operations.push({ action: 'pin', key, value }) },
+    request: async (_credential, _audience, url, method = 'GET', body) => {
+      const path = new URL(url).pathname
+      if (path.includes('/config/appsettings')) {
+        if (method === 'PUT') {
+          if (options.denyDisable && body.properties.WORD_DOCUMENT_IMPORTS_ENABLED === 'false') throw new Error('Settings update denied.')
+          settings = structuredClone(body.properties)
+          operations.push({ action: 'settings', settings: structuredClone(settings) })
+          if (options.failEnable && settings.WORD_DOCUMENT_IMPORTS_ENABLED === 'true' && !enableFailed) {
+            enableFailed = true
+            throw new Error('Ambiguous feature enablement response.')
+          }
+        }
+        return { properties: structuredClone(settings) }
+      }
+      if (path === env.AZURE_JOB_RENDERER_ID) {
+        if (method === 'PUT') {
+          assert.equal(settings.WORD_DOCUMENT_IMPORTS_ENABLED, 'false', 'Word must be off before renderer mutation')
+          operations.push({ action: 'renderer' })
+          renderer = {
+            ...structuredClone(body), identity: renderer.identity,
+            properties: {
+              ...structuredClone(body.properties), provisioningState: options.failRenderer ? 'Failed' : 'Succeeded',
+              latestRevisionName: 'new-revision', latestReadyRevisionName: 'new-revision',
+            },
+          }
+        }
+        return structuredClone(renderer)
+      }
+      const definition = WORKER_DEFINITIONS.find(worker =>
+        path === env[worker.idKey] || path.startsWith(`${env[worker.idKey]}/`))
+      if (definition) {
+        const current = workers.get(definition.kind)
+        const suffix = path.slice(env[definition.idKey].length)
+        if (suffix === '') {
+          if (method === 'PUT') {
+            assert.equal(settings.WORD_DOCUMENT_IMPORTS_ENABLED, 'false', 'Word must be off before worker mutation')
+            operations.push({ action: 'worker', kind: definition.kind, trigger: body.properties.configuration.triggerType })
+            workers.set(definition.kind, {
+              ...structuredClone(body), identity: current.identity,
+              properties: { ...structuredClone(body.properties), provisioningState: 'Succeeded' },
+            })
+          }
+          const response = structuredClone(workers.get(definition.kind))
+          if (options.driftKind === definition.kind &&
+            [...workers.values()].every(worker => worker.properties.configuration.triggerType === 'Schedule')) {
+            response.properties.template.containers[0].image = image.replace('20260918000000', 'other-build')
+          }
+          return response
+        }
+        if (suffix === '/start') {
+          const status = options.failedKind === definition.kind ? 'Failed' : 'Succeeded'
+          executions.set(definition.kind, { properties: { status, template: structuredClone(current.properties.template) } })
+          operations.push({ action: 'execution', kind: definition.kind, status })
+          return { name: `verified-${definition.kind}` }
+        }
+        if (suffix.startsWith('/executions/')) return structuredClone(executions.get(definition.kind))
+        if (suffix === '/executions') {
+          operations.push({ action: 'history', kind: definition.kind })
+          if (options.oldExecutionKind === definition.kind) {
+            if (options.secondPage && !new URL(url).searchParams.has('skiptoken')) {
+              return { value: [], nextLink: `${url}&skiptoken=older` }
+            }
+            return { value: [{ properties: { status: 'Running', template: template(definition).properties.template } }] }
+          }
+          return { value: [structuredClone(executions.get(definition.kind))] }
+        }
+      }
+      if (path.includes('/Microsoft.DocumentDB/')) {
+        return { properties: { resource: { id: path.split('/').at(-1), partitionKey: { paths: ['/workspaceId'] } } } }
+      }
+      if (path.includes('/Microsoft.Storage/')) return { properties: { publicAccess: 'None' } }
+      if (path.includes('/Microsoft.CognitiveServices/')) return { properties: { provisioningState: 'Succeeded' } }
+      throw new Error(`Unexpected mocked management request: ${method} ${path}`)
+    },
+  }
+  return { hooks, operations, pins, settings: () => settings }
+}
+
+test('Word is disabled before any shared consumer changes and enabled only after all four verified workers', async () => {
+  const { hooks, operations, pins, settings } = rolloutHarness()
+  await configureWorkerDeployment(env, {}, { image, rendererImage }, hooks)
+  assert.equal(operations[0].action, 'settings')
+  assert.equal(operations[0].settings.WORD_DOCUMENT_IMPORTS_ENABLED, 'false')
+  const last = operations.at(-1)
+  assert.equal(last.action, 'settings')
+  assert.equal(last.settings.WORD_DOCUMENT_IMPORTS_ENABLED, 'true')
+  for (const operation of operations.filter(operation => operation.action === 'settings').slice(0, -1)) {
+    assert.equal(operation.settings.WORD_DOCUMENT_IMPORTS_ENABLED, 'false')
+  }
+  assert.deepEqual(operations.filter(operation => operation.action === 'history').map(operation => operation.kind), ['job', 'grade', 'resume', 'analysis'])
+  for (const definition of WORKER_DEFINITIONS) {
+    assert.equal(pins.get(definition.imageKey), image)
+    if (definition.feature) assert.equal(settings()[definition.feature], 'true')
+  }
+  assert.equal(settings().REAL_JOB_IMPORTS_ENABLED, 'true')
+  assert.equal(settings().CUSTOM_EXISTING_SETTING, 'unchanged')
+})
+
+test('pre-provision and pre-web hooks close Word without changing other feature flags or pins', async () => {
+  const { hooks, operations, settings } = rolloutHarness()
+  await disableWordAdmission(env, {}, hooks)
+  await disableWordAdmission(env, {}, hooks)
+  assert.deepEqual(operations.map(operation => operation.action), ['settings'], 'repeated disablement is idempotent')
+  assert.equal(settings().WORD_DOCUMENT_IMPORTS_ENABLED, 'false')
+  for (const [key, value] of Object.entries(appSettings())) {
+    if (key !== 'WORD_DOCUMENT_IMPORTS_ENABLED') assert.equal(settings()[key], value)
+  }
+  const yaml = readFileSync(new URL('../azure.yaml', import.meta.url), 'utf8')
+  assert.match(yaml, /predeploy:[\s\S]*?azure-before-deploy\.mjs[\s\S]*?azure-worker\.mjs disable-word\r?\n\s+if \(\$LASTEXITCODE -ne 0\) \{ exit \$LASTEXITCODE \}/)
+  assert.match(yaml, /preprovision:[\s\S]*?azure-worker\.mjs disable-word --if-provisioned\r?\n\s+if \(\$LASTEXITCODE -ne 0\) \{ exit \$LASTEXITCODE \}/)
+})
+
+test('a failure in any worker leaves Word off while preserving only independently verified pins', async () => {
+  for (const [index, definition] of WORKER_DEFINITIONS.entries()) {
+    const { hooks, operations, pins, settings } = rolloutHarness({ failedKind: definition.kind })
+    await assert.rejects(configureWorkerDeployment(env, {}, { image, rendererImage }, hooks), /initial execution.*Failed/)
+    assert.equal(settings().WORD_DOCUMENT_IMPORTS_ENABLED, 'false')
+    for (const [otherIndex, other] of WORKER_DEFINITIONS.entries()) {
+      assert.equal(pins.get(other.imageKey), otherIndex < index ? image : `${other.kind}-previous-pin`)
+    }
+    assert.ok(operations.filter(operation => operation.action === 'settings').every(operation =>
+      operation.settings.WORD_DOCUMENT_IMPORTS_ENABLED === 'false'))
+  }
+})
+
+test('renderer failures and renderer-only rollouts cannot enable Word or change worker pins', async () => {
+  for (const failRenderer of [false, true]) {
+    const { hooks, operations, pins, settings } = rolloutHarness({ failRenderer })
+    const result = configureWorkerDeployment(env, {}, { rendererImage, rendererOnly: true }, hooks)
+    if (failRenderer) await assert.rejects(result, /renderer failed/)
+    else await result
+    assert.equal(settings().WORD_DOCUMENT_IMPORTS_ENABLED, 'false')
+    assert.equal(settings().REAL_RESUME_IMPORTS_ENABLED, 'true')
+    assert.equal(settings().REAL_ANALYSES_ENABLED, 'true')
+    assert.ok(operations.every(operation => operation.action !== 'worker'))
+    for (const definition of WORKER_DEFINITIONS) assert.equal(pins.get(definition.imageKey), `${definition.kind}-previous-pin`)
+  }
+})
+
+test('unconfirmed gate disablement blocks all consumer changes and ambiguous enablement is closed again', async () => {
+  const blocked = rolloutHarness({ denyDisable: true })
+  await assert.rejects(configureWorkerDeployment(env, {}, { image, rendererImage }, blocked.hooks), /Settings update denied/)
+  assert.ok(blocked.operations.every(operation => !['renderer', 'worker', 'pin'].includes(operation.action)))
+  const ambiguous = rolloutHarness({ failEnable: true })
+  await assert.rejects(configureWorkerDeployment(env, {}, { image, rendererImage }, ambiguous.hooks), /Ambiguous feature enablement/)
+  assert.equal(ambiguous.settings().WORD_DOCUMENT_IMPORTS_ENABLED, 'false')
+})
+
+test('current image drift or an older in-flight execution blocks Word even after successful smoke executions', async () => {
+  for (const options of [
+    { driftKind: 'job' },
+    { oldExecutionKind: 'grade' },
+    { oldExecutionKind: 'resume', secondPage: true },
+    { oldExecutionKind: 'analysis' },
+  ]) {
+    const { hooks, settings } = rolloutHarness(options)
+    await assert.rejects(configureWorkerDeployment(env, {}, { image, rendererImage }, hooks), /verified scheduled Word build|not bound to the verified Word image/)
+    assert.equal(settings().WORD_DOCUMENT_IMPORTS_ENABLED, 'false')
+  }
+})
+
+test('saved image pins or an incomplete verification set cannot reopen Word admission', async () => {
+  const verified = WORKER_DEFINITIONS.map(definition => ({ kind: definition.kind, image, executionName: 'verified' }))
+  for (const results of [[], verified.slice(1), [...verified.slice(1), verified[1]], verified.map(value => ({ ...value, image: `${image}-older` }))]) {
+    await assert.rejects(verifyWordWorkerReadiness(env, {}, image, results, {
+      request: async () => { assert.fail('Incomplete readiness must fail before any management request') },
+    }), /All four workers must pass/)
+  }
 })
 
 test('infrastructure composes private stores and identities without new model/search or legacy access', () => {
@@ -237,6 +554,7 @@ test('infrastructure composes private stores and identities without new model/se
   }
   assert.match(resources, /REAL_RESUME_IMPORTS_ENABLED: resumes\.outputs\.isDeployed \? 'true' : 'false'/)
   assert.match(resources, /REAL_ANALYSES_ENABLED: analyses\.outputs\.isDeployed \? 'true' : 'false'/)
+  assert.match(resources, /WORD_DOCUMENT_IMPORTS_ENABLED: 'false'/)
 })
 
 test('worker build and shared container packaging include both new entry points and runtime bundles', () => {
@@ -253,4 +571,9 @@ test('worker build and shared container packaging include both new entry points 
   for (const kind of ['RESUME', 'ANALYSIS']) {
     assert.ok(provision.includes(`Set-EnvironmentValue 'AZURE_${kind}_WORKER_CONTAINER_IMAGE' 'mcr.microsoft.com/k8se/quickstart-jobs:latest'`))
   }
+  assert.ok(docker.includes("'word-parser'"))
+  assert.ok(docker.includes('word-imports.json'))
+  assert.ok(docker.includes(WORD_WORKER_CAPABILITY))
+  const serverDocker = readFileSync(new URL('../Dockerfile', import.meta.url), 'utf8')
+  assert.ok(serverDocker.includes("accessSync('dist-server/word-parser.mjs')"))
 })

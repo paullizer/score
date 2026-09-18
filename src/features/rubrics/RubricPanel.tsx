@@ -28,6 +28,8 @@ export function RubricPanel({ rubric, onSelectCriterion, onVersionSaved, readOnl
   const duplicatingRef = useRef(false)
   const job = workspace.jobs.find((item) => item.id === rubric.jobId)
   const document = workspace.documents.find((item) => item.id === job?.documentId)
+  const wordSource = rubric.dataKind === 'real' && (job?.source === 'docx' || job?.source === 'doc')
+  const sourceLocation = (page: number) => wordSource ? `Captured section ${page}` : `p. ${page}`
   const realGrade = rubric.dataKind === 'real' && rubric.kind === 'grade'
   const viewer = Boolean(cloud && cloud.workspaces.find((item) => item.id === cloud.currentWorkspaceId)?.role === 'viewer')
   const editable = !realGrade && !(viewer && rubric.dataKind === 'real') && (rubric.kind === 'grade' || job?.status === 'ready') && (rubric.dataKind !== 'real' || Boolean(document))
@@ -135,10 +137,10 @@ export function RubricPanel({ rubric, onSelectCriterion, onVersionSaved, readOnl
                 {citationSource && (onSelectCriterion
                   ? <button type="button" className="link-button inline-flex items-start gap-1.5 text-[10px]" onClick={() => onSelectCriterion(criterion, citation)}>
                     <FileSearch size={13} className="mt-0.5 shrink-0" aria-hidden="true" />
-                    <span>View exact source · p. {citationSource.page} · {citationSource.heading}</span>
+                    <span>View exact source · {sourceLocation(citationSource.page)} · {citationSource.heading}</span>
                   </button>
                   : <Link to={`/jobs/${job.id}`} className="text-link text-[10px]">
-                    <FileSearch size={13} aria-hidden="true" />Job source · p. {citationSource.page} · {citationSource.heading}
+                    <FileSearch size={13} aria-hidden="true" />Job source · {sourceLocation(citationSource.page)} · {citationSource.heading}
                   </Link>)}
                 {!citationSource && <p className="text-[10px] text-muted">This cited source paragraph is unavailable.</p>}
               </div>
@@ -147,10 +149,10 @@ export function RubricPanel({ rubric, onSelectCriterion, onVersionSaved, readOnl
               {onSelectCriterion
                 ? <button type="button" className="link-button inline-flex items-start gap-1.5 text-[10px]" onClick={() => onSelectCriterion(criterion)}>
                   <FileSearch size={13} className="mt-0.5 shrink-0" aria-hidden="true" />
-                  <span>View source · p. {source.page} · {source.heading}</span>
+                  <span>View source · {sourceLocation(source.page)} · {source.heading}</span>
                 </button>
                 : <Link to={`/jobs/${job.id}`} className="text-link text-[10px]">
-                  <FileSearch size={13} aria-hidden="true" />Job source · p. {source.page} · {source.heading}
+                  <FileSearch size={13} aria-hidden="true" />Job source · {sourceLocation(source.page)} · {source.heading}
                 </Link>}
             </div>}
             {rubric.dataKind === 'real' && !citations.length && <div className="mt-3"><InlineError>This criterion has no exact source citation. Review the generated rubric before saving edits.</InlineError></div>}

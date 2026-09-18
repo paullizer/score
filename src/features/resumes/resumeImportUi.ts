@@ -1,10 +1,12 @@
 import { RESUME_IMPORT_LIMITS, type RealResumeSummary } from '../../domain/real-resumes'
+import type { UploadFormat } from '../../domain/document-formats'
+import { selectedUploadFormat, validateUploadFile } from '../../services/documentUploads'
 
-export type RealResumeImportSource = { kind: 'pdf'; file: File } | { kind: 'url'; url: string }
+export type RealResumeImportSource = { kind: UploadFormat; file: File } | { kind: 'url'; url: string }
 
 export interface RealResumeImportItem {
   key: string
-  source: RealResumeImportSource | { kind: 'pdf'; file: null }
+  source: RealResumeImportSource | { kind: UploadFormat; file: null }
   label: string
   state: 'pending' | 'invalid' | 'uploading' | 'accepted' | 'unconfirmed'
   error?: string
@@ -19,18 +21,22 @@ export interface RealResumeImportBatch {
   items: RealResumeImportItem[]
 }
 
-export function validateResumeInput(source: RealResumeImportSource, limits = RESUME_IMPORT_LIMITS): string | undefined {
-  if (source.kind === 'pdf') {
-    if (!source.file.name.trim() || (!/\.pdf$/i.test(source.file.name) && source.file.type !== 'application/pdf')) return 'Choose a PDF file (.pdf). No other file format is supported.'
-    if (!source.file.size) return 'This file is empty and could not be processed. Choose a readable PDF.'
-    if (source.file.size > limits.maxPdfBytes) return `This PDF exceeds ${limits.maxPdfBytes / 1024 / 1024} MiB and could not be processed. Choose a smaller PDF.`
-    return undefined
+export function resumeFileInput(file: File): RealResumeImportSource {
+  return { kind: selectedUploadFormat(file) ?? 'pdf', file }
+}
+
+export function validateResumeInput(source: RealResumeImportSource, limits = RESUME_IMPORT_LIMITS, formats: readonly UploadFormat[] = ['pdf']): string | undefined {
+  if (source.kind !== 'url') {
+    const error = validateUploadFile(source.file, formats, limits.maxFileBytes ?? limits.maxPdfBytes)
+    if (error) return error
+    return selectedUploadFormat(source.file) === source.kind ? undefined : 'The selected source type does not match this file. Add the original file again.'
   }
   if (source.url.length > limits.maxUrlLength) return `This URL exceeds ${limits.maxUrlLength} characters and could not be processed.`
   if (!URL.canParse(source.url)) return 'Use a complete public http or https resume/profile URL.'
   const url = new URL(source.url)
   if (!['http:', 'https:'].includes(url.protocol)) return 'Only public http or https resume/profile URLs can be processed.'
   if (url.username || url.password) return 'URLs with embedded usernames or passwords cannot be processed. Supply a publicly accessible URL without credentials.'
+  if (/\.(docx?|docm|dotx?)$/i.test(url.pathname)) return 'Word URLs cannot be imported. Download the document and upload a supported file instead.'
   return undefined
 }
 
@@ -38,18 +44,18 @@ export function resumeUrlLines(text: string): string[] {
   return text.split(/\r?\n/).map((line) => line.trim()).filter(Boolean)
 }
 
-export function appendResumeInputs(batch: RealResumeImportBatch, inputs: RealResumeImportSource[], limits = RESUME_IMPORT_LIMITS): RealResumeImportBatch {
+export function appendResumeInputs(batch: RealResumeImportBatch, inputs: RealResumeImportSource[], limits = RESUME_IMPORT_LIMITS, formats: readonly UploadFormat[] = ['pdf']): RealResumeImportBatch {
   if (batch.inputCount !== null) throw new Error('This batch has already been submitted. Retry its unchanged items, or explicitly start another batch.')
   if (batch.items.length + inputs.length > limits.maxBatchItems) {
-    throw new Error(`A batch can contain at most ${limits.maxBatchItems} total PDFs and URLs. Nothing was truncated; your existing selection is unchanged.`)
+    throw new Error(`A batch can contain at most ${limits.maxBatchItems} total files and URLs. Nothing was truncated; your existing selection is unchanged.`)
   }
   const existingUrls = new Set(batch.items.flatMap((item) => item.source.kind === 'url' ? [item.source.url] : []))
   const items = inputs.map((source): RealResumeImportItem => {
-    const error = validateResumeInput(source, limits)
+    const error = validateResumeInput(source, limits, formats)
     const repeated = source.kind === 'url' && existingUrls.has(source.url)
     if (source.kind === 'url') existingUrls.add(source.url)
     return {
-      key: crypto.randomUUID(), source, label: source.kind === 'pdf' ? source.file.name : source.url,
+      key: crypto.randomUUID(), source, label: source.kind === 'url' ? source.url : source.file.name,
       state: error ? 'invalid' : 'pending', error,
       warning: repeated ? 'This URL is repeated in the batch. It remains a separate input; the server will report duplicate evidence.' : undefined,
     }
@@ -74,6 +80,6 @@ export function resumeName(summary: RealResumeSummary): string {
 export function resumeErrorMessage(summary: RealResumeSummary): string | null {
   if (!summary.error) return null
   return summary.error.code === 'access-blocked'
-    ? 'This URL is not publicly accessible and could not be processed. Use a publicly accessible resume/profile URL, or upload a PDF you are authorized to use. Score cannot sign in or bypass site restrictions.'
+    ? 'This URL is not publicly accessible and could not be processed. Use a publicly accessible resume/profile URL, or upload a supported document you are authorized to use. Score cannot sign in or bypass site restrictions.'
     : summary.error.message
 }

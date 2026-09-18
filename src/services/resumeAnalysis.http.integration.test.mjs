@@ -4,6 +4,7 @@ import { after, before, test } from 'node:test'
 import {
   allPages,
   buildResumeAnalysisTestRuntime,
+  importResumeFile,
   importResumePdf,
   importResumeUrl,
   jsonResponse,
@@ -17,6 +18,7 @@ import {
   startResumeAnalysisFixture,
 } from './resumeAnalysis.test-support.mjs'
 import { seededLadder, seedRealJob } from './gradeLadders.test-support.mjs'
+import { docxFile, legacyDocFile } from '../../server-tests/word-fixtures.mjs'
 
 let runtime
 before(async () => { runtime = await buildResumeAnalysisTestRuntime() })
@@ -30,6 +32,77 @@ function importHeaders(batchId = randomUUID(), inputCount = 1, key = randomUUID(
     'X-Import-Count': String(inputCount),
   }
 }
+
+test('Word file HTTP intake matches frontend client routing and keeps private byte-identical originals and stable replay', async () => {
+  const fixture = await startResumeAnalysisFixture(runtime, { configOverrides: { wordDocumentImports: true } })
+  const restore = fixture.installClientFetch()
+  try {
+    const features = await jsonResponse(await fixture.request('/api/features'))
+    assert.equal(features.wordDocumentImports, true)
+    const batchId = randomUUID()
+    for (const [format, bytes, contentType] of [
+      ['docx', docxFile(), 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'],
+      ['doc', legacyDocFile(), 'application/msword'],
+    ]) {
+      const file = new File([bytes], `Rôle résumé.${format.toUpperCase()}`)
+      const key = randomUUID()
+      const job = await runtime.jobsClient.importRealJobFile(fixture.workspaceId, file, key, batchId)
+      assert.equal(job.source.kind, format)
+      assert.equal(job.source.originalContentType, contentType)
+      assert.equal(job.job.status, 'queued')
+      const replay = await runtime.jobsClient.importRealJobFile(fixture.workspaceId, file, key, batchId)
+      assert.equal(replay.job.id, job.job.id)
+      const resume = await importResumeFile(fixture, file, { batchId, inputCount: 2 })
+      assert.equal(resume.summary.source.kind, format)
+      assert.equal(resume.summary.resume.status, 'queued')
+      assert.equal(resume.summary.capture.original.contentType, contentType)
+      const replayResume = await importResumeFile(fixture, file, { key: resume.key, batchId, inputCount: 2 })
+      assert.equal(replayResume.summary.resume.id, resume.summary.resume.id)
+      for (const path of [
+        runtime.jobsClient.realJobOriginalUrl(fixture.workspaceId, job.job.id),
+        `/api/workspaces/${fixture.workspaceId}/resumes/${resume.summary.resume.id}/original`,
+      ]) {
+        const original = await fixture.request(path)
+        assert.equal(original.status, 200)
+        assert.equal(original.headers.get('content-type'), contentType)
+        assert.match(original.headers.get('content-disposition'), /^attachment;/)
+        assert.match(original.headers.get('cache-control'), /no-store/)
+        assert.equal(original.headers.get('x-content-type-options'), 'nosniff')
+        assert.deepEqual(Buffer.from(await original.arrayBuffer()), bytes)
+      }
+    }
+    assert.equal(fixture.analyses.store.values.size, 0, 'Importing Word prepares sources, never starts scoring.')
+    assert.equal(fixture.state.saves.length, 0, 'Word bytes and metadata never enter sample autosave.')
+    assert.equal(fixture.requests.filter((request) => request.method === 'POST' && /\/jobs\/file$/.test(request.url)).length, 4)
+    assert.equal(fixture.requests.filter((request) => request.method === 'POST' && /\/resumes\/file$/.test(request.url)).length, 4)
+  } finally { restore(); await fixture.close() }
+})
+
+test('Word file HTTP capabilities fail closed while existing PDF wrapper and receipt behavior stays unchanged', async () => {
+  const fixture = await startResumeAnalysisFixture(runtime)
+  try {
+    const features = await jsonResponse(await fixture.request('/api/features'))
+    assert.equal(features.wordDocumentImports, false)
+    const file = new File([docxFile()], 'word.docx')
+    for (const kind of ['jobs', 'resumes']) {
+      const headers = {
+        ...importHeaders(), 'Content-Type': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+        'X-File-Name': encodeURIComponent(file.name),
+      }
+      const rejected = await fixture.request(`/api/workspaces/${fixture.workspaceId}/${kind}/file`, { method: 'POST', headers, body: Buffer.from(await file.arrayBuffer()) })
+      assert.equal(rejected.status, 503)
+      assert.match(await rejected.text(), /Word.*not enabled/i)
+      const pdfOnly = await fixture.request(`/api/workspaces/${fixture.workspaceId}/${kind}/pdf`, { method: 'POST', headers, body: Buffer.from(await file.arrayBuffer()) })
+      assert.equal(pdfOnly.status, 400)
+    }
+    const pdf = await resumePdf()
+    const imported = await importResumePdf(fixture, pdf)
+    const replay = await importResumeFile(fixture, pdf, { key: imported.key, batchId: imported.batchId })
+    assert.equal(replay.summary.resume.id, imported.summary.resume.id)
+    assert.equal(replay.summary.capture.original.contentType, 'application/pdf')
+    assert.equal(fixture.requests.filter((request) => request.method === 'POST' && /\/resumes\/pdf$/.test(request.url)).length, 3)
+  } finally { await fixture.close() }
+})
 
 test('real resume intake preserves actual bytes, same-basename people, duplicate warnings, and idempotent batch receipts', async () => {
   const fixture = await startResumeAnalysisFixture(runtime)

@@ -9,6 +9,11 @@ import {
 import { invalidRequest } from '../errors'
 import { WORKSPACE_ID_PATTERN } from '../ids'
 import type { ResumeBlob } from './store'
+import {
+  DOCUMENT_BLOB_CONTENT_TYPES, ORIGINAL_CONTENT_TYPES, UPLOAD_CONTENT_TYPES, UPLOAD_FORMATS,
+  isOriginalContentType, isWordContentType, originalExtension, storedDocumentContentType,
+  uploadFormatFromFilename, type OriginalContentType, type UploadFormat,
+} from '../../src/domain/document-formats'
 
 const UUID = '[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}'
 const UUID_PATTERN = new RegExp(`^${UUID}$`)
@@ -16,7 +21,7 @@ const RESUME_ID_PATTERN = new RegExp(`^resume-${UUID}$`)
 const DOCUMENT_ID_PATTERN = new RegExp(`^document-${UUID}$`)
 const BATCH_ID_PATTERN = new RegExp(`^resume-batch-${UUID}$`)
 const VERSION = '(?:[1-9][0-9]{0,5}|1000000)'
-const BLOB_FILE = new RegExp(`^(?:original\\.(?:pdf|html)|capture\\.json|import-receipt\\.json|(?:source-document|profile)-v${VERSION}\\.json)$`)
+const BLOB_FILE = new RegExp(`^(?:original\\.(?:pdf|docx|doc|html)|capture\\.json|import-receipt\\.json|(?:source-document|profile)-v${VERSION}\\.json)$`)
 
 export const RESUME_BLOB_LIMITS = {
   maxHtmlBytes: 24 * 1024 * 1024,
@@ -58,10 +63,11 @@ function versionNumber(version: number): number {
 }
 
 export function resumeOriginalBlobName(
-  workspaceId: string, resumeId: string, kind: 'pdf' | 'html' | 'application/pdf' | 'text/html',
+  workspaceId: string, resumeId: string, kind: UploadFormat | 'html' | OriginalContentType,
 ): string {
-  if (!['pdf', 'html', 'application/pdf', 'text/html'].includes(kind)) throw new Error('Invalid resume original type.')
-  return `${prefix(workspaceId, resumeId)}original.${kind === 'pdf' || kind === 'application/pdf' ? 'pdf' : 'html'}`
+  const contentType = isOriginalContentType(kind) ? kind : kind === 'html' ? 'text/html' : UPLOAD_CONTENT_TYPES[kind]
+  if (!contentType) throw new Error('Invalid resume original type.')
+  return `${prefix(workspaceId, resumeId)}original.${originalExtension(contentType)}`
 }
 export function resumeCaptureBlobName(workspaceId: string, resumeId: string): string {
   return `${prefix(workspaceId, resumeId)}capture.json`
@@ -86,15 +92,17 @@ export function isBlobInResumePrefix(value: string, workspaceId: string, resumeI
   return isSafeResumeBlobName(value) && value.startsWith(`${workspaceId}/${resumeId}/`)
 }
 
-export function resumeBlobContentType(name: string): 'application/pdf' | 'text/html' | 'application/json' {
+export function resumeBlobContentType(name: string): OriginalContentType | 'application/json' {
   if (!isSafeResumeBlobName(name)) throw new Error('Invalid resume blob name.')
-  return name.endsWith('.pdf') ? 'application/pdf' : name.endsWith('.html') ? 'text/html' : 'application/json'
+  const contentType = storedDocumentContentType(name)
+  if (!contentType) throw new Error('Invalid resume blob type.')
+  return contentType
 }
 
 export function resumeBlobLimit(name: string): number {
   const contentType = resumeBlobContentType(name)
-  return contentType === 'application/pdf' ? LIMITS.maxPdfBytes
-    : contentType === 'text/html' ? RESUME_BLOB_LIMITS.maxHtmlBytes : RESUME_BLOB_LIMITS.maxJsonBytes
+  return contentType === 'text/html' ? RESUME_BLOB_LIMITS.maxHtmlBytes
+    : contentType === 'application/json' ? RESUME_BLOB_LIMITS.maxJsonBytes : LIMITS.maxFileBytes
 }
 
 export function resumeSha256(value: Uint8Array | string): string {
@@ -124,7 +132,7 @@ export function resumeBlobReference(blobName: string, blob: ResumeBlob): Immutab
 }
 
 export function isSafeResumeFilename(value: string): boolean {
-  return value.length > 0 && value.length <= 255 && value.trim() === value && /\.pdf$/i.test(value) &&
+  return value.length > 0 && value.length <= 255 && value.trim() === value && uploadFormatFromFilename(value) !== undefined &&
     !/[:*?"<>|/\\]/.test(value) && ![...value].some(character => {
       const code = character.charCodeAt(0)
       return code < 32 || (code >= 127 && code <= 159) || (character.length === 1 && code >= 0xd800 && code <= 0xdfff)
@@ -174,16 +182,17 @@ const page = z.number().int().min(1).max(100_000)
 const url = z.string().max(LIMITS.maxUrlLength).refine(value => {
   try { return normalizeResumePublicUrl(value) === value } catch { return false }
 }, 'Must be a normalized public HTTP(S) URL without credentials.')
-const filename = z.string().refine(isSafeResumeFilename, 'Must be a safe PDF basename.')
+const filename = z.string().refine(isSafeResumeFilename, 'Must be a safe PDF, DOCX, or DOC basename.')
 const source = z.discriminatedUnion('kind', [
-  z.strictObject({ kind: z.literal('pdf'), displayName: filename, fileName: filename })
-    .refine(value => value.displayName === value.fileName, 'PDF display name must match its original filename.'),
+  z.strictObject({ kind: z.enum(UPLOAD_FORMATS), displayName: filename, fileName: filename })
+    .refine(value => value.displayName === value.fileName && uploadFormatFromFilename(value.fileName) === value.kind,
+      'Upload display name and format must match its original filename.'),
   z.strictObject({ kind: z.literal('url'), displayName: url, url })
     .refine(value => value.displayName === value.url, 'URL display name must match its requested URL.'),
 ])
 const blobShape = {
   blobName: z.string().max(400).refine(isSafeResumeBlobName, 'Invalid resume blob namespace.'),
-  contentType: z.enum(['application/pdf', 'text/html', 'application/json']),
+  contentType: z.enum(DOCUMENT_BLOB_CONTENT_TYPES),
   sha256, bytes: z.number().int().min(1).max(RESUME_BLOB_LIMITS.maxHtmlBytes),
 }
 const jsonBlob = z.strictObject({ ...blobShape, contentType: z.literal('application/json') })
@@ -191,17 +200,17 @@ const documentBlob = z.strictObject({
   ...blobShape, contentType: z.literal('application/json'), documentId, documentVersion: version,
 })
 const capture = z.strictObject({
-  original: z.strictObject({ ...blobShape, contentType: z.enum(['application/pdf', 'text/html']) }),
+  original: z.strictObject({ ...blobShape, contentType: z.enum(ORIGINAL_CONTENT_TYPES) }),
   capturedAt: timestamp, finalUrl: url.optional(), redirects: z.array(url).max(20),
 })
 const extraction = z.strictObject({
-  method: z.enum(['document-intelligence', 'html', 'browser']), version: text(200), extractedAt: timestamp,
-  pagination: z.enum(['pdf-pages', 'html-sections']), pageCount: z.number().int().min(1).max(LIMITS.maxPdfPages).nullable(),
+  method: z.enum(['document-intelligence', 'html', 'browser', 'legacy-word']), version: text(200), extractedAt: timestamp,
+  pagination: z.enum(['pdf-pages', 'html-sections', 'captured-sections']), pageCount: z.number().int().min(1).max(LIMITS.maxPdfPages).nullable(),
   normalizedCharacters: z.number().int().min(1).max(LIMITS.maxSourceCharacters), document: documentBlob,
 })
 const processingError = z.strictObject({
   code: z.enum([
-    'access-blocked', 'not-found', 'network-error', 'unsupported-content', 'unreadable-document', 'pdf-too-large',
+    'access-blocked', 'not-found', 'network-error', 'unsupported-content', 'unreadable-document', 'pdf-too-large', 'file-too-large',
     'pdf-too-many-pages', 'source-too-large', 'multiple-profiles', 'not-a-profile', 'invalid-profile', 'invalid-source',
     'invalid-model-output', 'service-unavailable', 'storage-error', 'timeout', 'internal-error',
   ]),
@@ -248,11 +257,11 @@ function checkReference(reference: ImmutableBlobReference, name: string): void {
 
 function checkCapture(value: ResumeSourceCapture, workspace: string, id: string, input: ResumeCaptureManifest['source']): void {
   checkReference(value.original, resumeOriginalBlobName(workspace, id, value.original.contentType))
-  if (input.kind === 'pdf') {
-    assert(value.original.contentType === 'application/pdf' && value.finalUrl === undefined && !value.redirects.length,
-      'Uploaded PDF capture cannot contain URL provenance.')
+  if (input.kind !== 'url') {
+    assert(value.original.contentType === UPLOAD_CONTENT_TYPES[input.kind] && value.finalUrl === undefined && !value.redirects.length,
+      'Uploaded capture must match its file type and cannot contain URL provenance.')
   } else {
-    assert(value.finalUrl, 'A URL capture must identify its final public URL.')
+    assert(value.finalUrl && !isWordContentType(value.original.contentType), 'A URL capture must identify its final public URL and contain PDF or HTML.')
   }
 }
 
@@ -281,7 +290,7 @@ export function parseResumeEntity(value: unknown): ResumeEntity {
   }
   assert(Boolean(record.capture) === Boolean(record.captureManifest), 'Captured originals must have an immutable manifest.')
   if (record.captureManifest) checkReference(record.captureManifest, resumeCaptureBlobName(record.workspaceId, record.id))
-  if (record.source.kind === 'pdf') assert(record.capture, 'PDF records require their original capture before publication.')
+  if (record.source.kind !== 'url') assert(record.capture, 'Upload records require their original capture before publication.')
   if (record.extraction) {
     assert(record.capture, 'Extraction requires a captured original.')
     const extracted = record.extraction
@@ -290,8 +299,11 @@ export function parseResumeEntity(value: unknown): ResumeEntity {
       'Extraction does not match the stable source document identity.')
     assert(extracted.extractedAt >= record.capture.capturedAt, 'Extraction predates its capture.')
     const pdf = record.capture.original.contentType === 'application/pdf'
+    const word = isWordContentType(record.capture.original.contentType)
     assert(pdf ? extracted.method === 'document-intelligence' && extracted.pagination === 'pdf-pages' && extracted.pageCount !== null
-      : ['html', 'browser'].includes(extracted.method) && extracted.pagination === 'html-sections' && extracted.pageCount === null,
+      : word ? extracted.method === (record.capture.original.contentType === UPLOAD_CONTENT_TYPES.doc ? 'legacy-word' : 'document-intelligence') &&
+        extracted.pagination === 'captured-sections' && extracted.pageCount === null
+        : ['html', 'browser'].includes(extracted.method) && extracted.pagination === 'html-sections' && extracted.pageCount === null,
     'Extraction method, pagination, and page count do not match the original content.')
   }
   if (record.profileBlob) {

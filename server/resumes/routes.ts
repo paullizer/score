@@ -1,5 +1,6 @@
 import express, { type NextFunction, type Request, type RequestHandler, type Response, type Router } from 'express'
 import { RESUME_IMPORT_LIMITS } from '../../src/domain/real-resumes'
+import { UPLOAD_CONTENT_TYPES, uploadFormatFromContentType, uploadFormatFromFilename, type UploadFormat } from '../../src/domain/document-formats'
 import { HttpError, invalidRequest, notFound, preconditionRequired, unavailable } from '../errors'
 import type { WorkspaceRepository } from '../repository'
 import { getPrincipal } from '../request-context'
@@ -13,6 +14,7 @@ interface RealResumesRouterDeps {
   repository: WorkspaceRepository
   resumes?: RealResumesDeps
   now?: () => Date
+  wordDocumentImports?: boolean
 }
 
 function param(req: Request, name: string): string {
@@ -44,14 +46,14 @@ function importRequest(req: Request): ResumeImportRequest {
   }
 }
 
-function filename(req: Request): string {
+function filename(req: Request, format: UploadFormat = 'pdf'): string {
   const header = req.header('X-File-Name')
   if (!header || header.length > 255 * 12 || !/^(?:[A-Za-z0-9_.!~*'()-]|%[0-9A-Fa-f]{2})+$/.test(header)) {
-    throw invalidRequest('X-File-Name must contain a percent-encoded safe PDF basename.')
+    throw invalidRequest('X-File-Name must contain a percent-encoded safe document basename.')
   }
   let value: string
   try { value = decodeURIComponent(header) } catch { throw invalidRequest('X-File-Name must use valid percent encoding.') }
-  if (!isSafeResumeFilename(value)) throw invalidRequest('X-File-Name must be a safe PDF basename.')
+  if (!isSafeResumeFilename(value) || uploadFormatFromFilename(value) !== format) throw invalidRequest(`X-File-Name must be a safe ${format.toUpperCase()} basename.`)
   return value
 }
 
@@ -127,28 +129,31 @@ export function createRealResumesRouter(deps: RealResumesRouterDeps): Router {
     res.setHeader('Referrer-Policy', 'no-referrer')
     res.send(Buffer.from(original.bytes))
   })
-  router.post(`${base}/pdf`,
+  router.post([`${base}/pdf`, `${base}/file`],
     (req: Request, _res: Response, next: NextFunction) => {
       try {
         importRequest(req)
-        filename(req)
-        if (!req.is('application/pdf')) throw invalidRequest('Content-Type must be application/pdf.')
+        const format = uploadFormatFromContentType(req.header('Content-Type') ?? '')
+        if (!format || (req.path.endsWith('/pdf') && format !== 'pdf')) throw invalidRequest('Content-Type must match a supported PDF, DOCX, or DOC file.')
+        if (format !== 'pdf' && !deps.wordDocumentImports) throw unavailable('Word document imports are not enabled for this deployment.')
+        filename(req, format)
         if (req.header('Content-Encoding') && req.header('Content-Encoding')?.toLowerCase() !== 'identity') {
-          throw invalidRequest('Compressed PDF uploads are not supported. Upload the original PDF bytes.')
+          throw invalidRequest('Compressed uploads are not supported. Upload the original document bytes.')
         }
         next()
       } catch (error) { next(error) }
     },
-    express.raw({ type: 'application/pdf', limit: RESUME_IMPORT_LIMITS.maxPdfBytes, inflate: false }),
+    express.raw({ type: Object.values(UPLOAD_CONTENT_TYPES), limit: RESUME_IMPORT_LIMITS.maxFileBytes, inflate: false }),
     async (req: Request, res: Response) => {
-      if (!Buffer.isBuffer(req.body)) throw invalidRequest('The request must contain raw PDF bytes.')
-      const result = await requireService().importPdf(param(req, 'workspaceId'), importRequest(req), filename(req), req.body)
+      const format = uploadFormatFromContentType(req.header('Content-Type') ?? '')
+      if (!format || !Buffer.isBuffer(req.body)) throw invalidRequest('The request must contain raw document bytes.')
+      const result = await requireService().importFile(param(req, 'workspaceId'), importRequest(req), filename(req, format), req.body, UPLOAD_CONTENT_TYPES[format])
       res.setHeader('ETag', result.resume.etag)
       res.status(result.created ? 202 : 200).json({ resume: result.resume })
     },
     (error: unknown, _req: Request, _res: Response, next: NextFunction) => {
       if (typeof error === 'object' && error !== null && 'type' in error && error.type === 'entity.too.large') {
-        next(new HttpError(413, 'invalid_request', 'Resume PDFs may not exceed 10 MiB.'))
+        next(new HttpError(413, 'invalid_request', 'Resume files may not exceed 10 MiB.'))
       } else next(error)
     },
   )

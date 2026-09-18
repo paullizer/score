@@ -6,6 +6,7 @@ import {
   cancelRealJob,
   fetchJobProcessingFeatures,
   getRealJob,
+  importRealJobFile,
   importRealJobPdf,
   importRealJobUrl,
   listAllRealJobs,
@@ -107,7 +108,7 @@ export function RealJobsBridge({
       setFeatures(value)
       if (!value.realJobImports) {
         setPhase('unavailable')
-        setListError('Real PDF and direct URL imports are not available in this deployment.')
+        setListError('Real file and direct URL imports are not available in this deployment.')
         return
       }
       void refresh()
@@ -187,6 +188,12 @@ export function RealJobsBridge({
     return summary
   }
 
+  async function importFile(file: File, idempotencyKey: string, batchId?: string) {
+    const summary = await importRealJobFile(workspaceId, file, idempotencyKey, batchId)
+    if (aliveRef.current) upsertSummary(summary)
+    return summary
+  }
+
   async function importUrl(url: string, idempotencyKey: string, batchId?: string) {
     const summary = await importRealJobUrl(workspaceId, url, idempotencyKey, batchId)
     if (aliveRef.current) upsertSummary(summary)
@@ -255,6 +262,7 @@ export function RealJobsBridge({
     ensureDetail,
     refresh,
     importPdf,
+    importFile,
     importUrl,
     originalUrl: (jobId) => realJobOriginalUrl(workspaceId, jobId),
   }

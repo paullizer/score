@@ -5,6 +5,7 @@ import { BlobServiceClient } from '@azure/storage-blob'
 import type { BlockBlobClient } from '@azure/storage-blob'
 import type { TokenCredential } from '@azure/identity'
 import { GRADE_LADDER_LIMITS, type GradeEntity, type GradeWorkRecord, type VersionedGradeEntity } from '../../src/domain/real-grades'
+import { WORD_DOCUMENT_LIMITS, isWordContentType, storedDocumentContentType } from '../../src/domain/document-formats'
 import { WORKSPACE_ID_PATTERN } from '../ids'
 import { StoreConflictError, StoreNotFoundError } from '../store'
 import { fetchCosmosPage } from '../cosmos-query'
@@ -228,13 +229,18 @@ interface GradeBlobContainer {
 }
 
 function blobLimit(name: string): number {
-  if (name.endsWith('.pdf')) return GRADE_LADDER_LIMITS.maxPdfBytes
-  if (name.endsWith('.html')) return 24 * 1024 * 1024
+  const contentType = storedDocumentContentType(name)
+  if (contentType === 'application/pdf') return GRADE_LADDER_LIMITS.maxPdfBytes
+  if (contentType === 'text/html') return 24 * 1024 * 1024
+  if (isWordContentType(contentType)) return WORD_DOCUMENT_LIMITS.maxFileBytes
+  if (contentType !== 'application/json') throw new Error('Unsupported grade blob content type.')
   return GRADE_LADDER_LIMITS.maxSourceCharacters * 8 + 4 * 1024 * 1024
 }
 
 function mime(name: string): string {
-  return name.endsWith('.pdf') ? 'application/pdf' : name.endsWith('.html') ? 'text/html' : 'application/json'
+  const contentType = storedDocumentContentType(name)
+  if (!contentType) throw new Error('Unsupported grade blob content type.')
+  return contentType
 }
 
 async function readBounded(stream: NodeJS.ReadableStream, length: number | undefined, maximum: number): Promise<Uint8Array> {
@@ -250,6 +256,7 @@ async function readBounded(stream: NodeJS.ReadableStream, length: number | undef
     if (size > maximum) throw new Error('Stored grade blob exceeds the supported size.')
     chunks.push(bytes)
   }
+  if (!size || (length !== undefined && size !== length)) throw new Error('Stored grade blob is empty or truncated.')
   return Buffer.concat(chunks, size)
 }
 
@@ -263,7 +270,7 @@ export function createGradeBlobStoreFromContainer(container: GradeBlobContainer)
     if (!isSafeGradeBlobName(name)) throw new Error('Invalid grade blob name.')
     try {
       const response = await container.getBlockBlobClient(name).download()
-      if (!response.readableStreamBody || !response.etag || response.contentType !== mime(name)) {
+      if (!response.readableStreamBody || !response.etag || typeof response.contentType !== 'string' || response.contentType !== mime(name)) {
         throw new Error('Grade blob has invalid stored content metadata.')
       }
       const bytes = await readBounded(response.readableStreamBody, response.contentLength, blobLimit(name))

@@ -4,11 +4,13 @@ import { Link } from 'react-router-dom'
 import { useRealResumes } from '../../app/real-resumes-context'
 import { Badge, Button, EmptyState, InlineError, Modal, SegmentedControl } from '../../components/ui'
 import { RESUME_IMPORT_LIMITS } from '../../domain/real-resumes'
-import { resumeErrorMessage, resumeUrlLines, type RealResumeImportSource } from './resumeImportUi'
+import { supportedUploadFormats, uploadAccept } from '../../domain/document-formats'
+import { uploadFormatNames } from '../../services/documentUploads'
+import { resumeErrorMessage, resumeFileInput, resumeUrlLines, type RealResumeImportSource } from './resumeImportUi'
 
 export function RealAddResumesDialog({ open, onOpenChange }: { open: boolean; onOpenChange: (open: boolean) => void }) {
   const api = useRealResumes()
-  const [mode, setMode] = useState<'pdf' | 'url'>('pdf')
+  const [mode, setMode] = useState<'file' | 'url'>('file')
   const [urls, setUrls] = useState('')
   const [error, setError] = useState('')
   const fileInput = useRef<HTMLInputElement>(null)
@@ -19,6 +21,8 @@ export function RealAddResumesDialog({ open, onOpenChange }: { open: boolean; on
   const accepted = items.filter((item) => item.state === 'accepted').length
   const valid = items.filter((item) => item.state === 'pending' || item.state === 'unconfirmed').length
   const limits = api?.features?.resumeLimits ?? RESUME_IMPORT_LIMITS
+  const formats = supportedUploadFormats(api?.features)
+  const wordEnabled = formats.includes('docx')
   const unavailable = !api || api.phase !== 'ready' || !api.canWrite
   const locked = batch?.inputCount !== null && batch?.inputCount !== undefined
 
@@ -38,7 +42,7 @@ export function RealAddResumesDialog({ open, onOpenChange }: { open: boolean; on
   }
 
   return <Modal open={open} onOpenChange={onOpenChange} title="Add real resumes"
-    description="Upload actual PDF bytes or import publicly accessible resume/profile URLs. Each input is processed independently."
+    description={`Upload actual ${wordEnabled ? 'PDF or Word' : 'PDF'} files or import publicly accessible resume/profile URLs. Each input is processed independently.`}
     footer={<>
       <span className="mr-auto text-[11px] text-muted" role="status">{accepted} accepted / {items.length} inputs{uploading ? ' · Uploading — not yet accepted' : ''}</span>
       <Button onClick={() => onOpenChange(false)}>{uploading ? 'Close — keep uploading' : 'Close'}</Button>
@@ -50,30 +54,31 @@ export function RealAddResumesDialog({ open, onOpenChange }: { open: boolean; on
       {!api.canWrite && <div className="mb-4"><InlineError>This workspace is read-only. An owner or editor can import resumes.</InlineError></div>}
       {error && <div className="mb-4"><InlineError>{error}</InlineError></div>}
       <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
-        <SegmentedControl value={mode} onChange={setMode} label="Resume source type" options={[{ value: 'pdf', label: 'PDF files' }, { value: 'url', label: 'Public URLs' }]} />
+        <SegmentedControl value={mode} onChange={setMode} label="Resume source type" options={[{ value: 'file', label: wordEnabled ? 'PDF / Word files' : 'PDF files' }, { value: 'url', label: 'Public URLs' }]} />
         <Badge>{items.length} / {limits.maxBatchItems} total inputs</Badge>
       </div>
-      <p className="mb-4 text-[11px] text-muted">PDFs and URLs share one batch limit. Changing this tab keeps the entire batch. Importing does not start an analysis.</p>
-      {mode === 'pdf' ? <div className="drop-zone" onDragOver={(event) => event.preventDefault()} onDrop={(event) => {
+      <p className="mb-4 text-[11px] text-muted">Files and URLs share one batch limit. Changing this tab keeps the entire batch. Importing does not start an analysis.</p>
+      {mode === 'file' ? <div className="drop-zone" onDragOver={(event) => event.preventDefault()} onDrop={(event) => {
         event.preventDefault()
-        if (!unavailable && !locked && !uploading) stage(Array.from(event.dataTransfer.files, (file) => ({ kind: 'pdf' as const, file })))
+        if (!unavailable && !locked && !uploading) stage(Array.from(event.dataTransfer.files, resumeFileInput))
       }}>
-        <UploadCloud size={30} className="text-accent" aria-hidden="true" /><strong>Choose resume PDFs</strong>
-        <p id={hintId} className="text-[11px] text-muted">Up to {limits.maxPdfBytes / 1024 / 1024} MiB and {limits.maxPdfPages} pages per PDF. The server validates readability and page count. Different files may have the same filename.</p>
-        <input ref={fileInput} type="file" accept=".pdf,application/pdf" multiple className="sr-only" tabIndex={-1}
-          aria-label="Choose resume PDF files" aria-describedby={hintId} disabled={unavailable || locked || uploading}
+        <UploadCloud size={30} className="text-accent" aria-hidden="true" /><strong>{wordEnabled ? 'Choose resume PDF or Word files' : 'Choose resume PDFs'}</strong>
+        <p id={hintId} className="text-[11px] text-muted">{uploadFormatNames(formats)} · Up to {(limits.maxFileBytes ?? limits.maxPdfBytes) / 1024 / 1024} MiB per file. PDFs only: {limits.maxPdfPages} printed pages. The server validates actual bytes and readability. Different files may have the same filename.</p>
+        {wordEnabled && <p className="text-[11px] text-muted">DOC means Word 97–2003, not DOCM, RTF or templates. Word citations use captured sections, not printed pages. Embedded images are not extracted as evidence; use PDF/OCR for image-only resumes. Up to {limits.maxSourceCharacters.toLocaleString()} normalized characters per source.</p>}
+        <input ref={fileInput} type="file" accept={uploadAccept(formats)} multiple className="sr-only" tabIndex={-1}
+          aria-label={wordEnabled ? 'Choose resume PDF or Word files' : 'Choose resume PDF files'} aria-describedby={hintId} disabled={unavailable || locked || uploading}
           onChange={(event) => {
             const files = Array.from(event.currentTarget.files ?? [])
             event.currentTarget.value = ''
-            if (files.length) stage(files.map((file) => ({ kind: 'pdf', file })))
+            if (files.length) stage(files.map(resumeFileInput))
           }} />
-        <Button icon={Plus} disabled={unavailable || locked || uploading} onClick={() => fileInput.current?.click()}>Choose PDFs</Button>
+        <Button icon={Plus} disabled={unavailable || locked || uploading} onClick={() => fileInput.current?.click()}>{wordEnabled ? 'Choose files' : 'Choose PDFs'}</Button>
       </div> : <div className="space-y-3">
         <label className="field"><span className="field-label">Public resume or profile URLs</span>
           <textarea className="input" rows={5} value={urls} disabled={unavailable || locked || uploading}
             onChange={(event) => setUrls(event.target.value)}
             placeholder={'https://example.org/resume.pdf\nhttps://www.linkedin.com/in/public-profile'} />
-          <span className="field-hint">One URL per line, at most {limits.maxUrlLength} characters each. Public LinkedIn profiles are supported only when accessible without sign-in.</span>
+          <span className="field-hint">One public HTML or PDF URL per line, at most {limits.maxUrlLength} characters each. Word URLs are not supported. Public LinkedIn profiles are supported only when accessible without sign-in.</span>
         </label>
         <Button icon={Plus} disabled={unavailable || locked || uploading || !urls.trim()}
           onClick={() => stage(resumeUrlLines(urls).map((url) => ({ kind: 'url', url })))}>Add URLs to batch</Button>
@@ -85,10 +90,10 @@ export function RealAddResumesDialog({ open, onOpenChange }: { open: boolean; on
           {items.map((item, index) => {
             const summary = api.summaries.find((entry) => entry.resume.id === item.resumeId)
             return <li key={item.key} className="flex items-start gap-3 bg-surface p-3">
-              {item.source.kind === 'pdf' ? <FileText size={17} className="mt-1 shrink-0 text-muted" aria-hidden="true" /> : <Link2 size={17} className="mt-1 shrink-0 text-muted" aria-hidden="true" />}
+              {item.source.kind === 'url' ? <Link2 size={17} className="mt-1 shrink-0 text-muted" aria-hidden="true" /> : <FileText size={17} className="mt-1 shrink-0 text-muted" aria-hidden="true" />}
               <div className="min-w-0 flex-1">
                 <p className="break-all text-[11px] font-semibold">{index + 1}. {item.label}</p>
-                <p className="mt-1 text-[10px] text-muted">{item.state === 'pending' ? 'Ready to send — not accepted yet' : item.state === 'uploading' ? 'Sending source — server acceptance not confirmed yet'
+                <p className="mt-1 text-[10px] text-muted">{item.source.kind !== 'url' && `${item.source.kind.toUpperCase()} · `}{item.state === 'pending' ? 'Ready to send — not accepted yet' : item.state === 'uploading' ? 'Sending source — server acceptance not confirmed yet'
                   : item.state === 'accepted' ? `Accepted by the server · ${summary?.resume.status ?? 'processing status in library'}` : item.state === 'invalid' ? 'Invalid input — not sent' : 'Acceptance not confirmed — check the library or retry the unchanged request'}</p>
                 {item.error && <p className="mt-2 text-[11px] text-[var(--cp-danger)]" role="alert">{item.error}</p>}
                 {summary?.error && <p className="mt-2 text-[11px] text-[var(--cp-danger)]" role="alert">{resumeErrorMessage(summary)}</p>}

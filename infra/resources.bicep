@@ -374,6 +374,8 @@ resource appSettings 'Microsoft.Web/sites/config@2024-11-01' = {
     STORAGE_ACCOUNT_URL: storage.properties.primaryEndpoints.blob
     WORKSPACE_BLOB_CONTAINER: stateContainer.name
     REAL_JOB_IMPORTS_ENABLED: 'true'
+    // Provisioning never infers Word readiness from saved image tags.
+    WORD_DOCUMENT_IMPORTS_ENABLED: 'false'
     JOB_RECORDS_CONTAINER: 'job-records'
     JOB_SOURCE_CONTAINER: 'job-sources'
     REAL_GRADE_LADDERS_ENABLED: grades.outputs.isDeployed ? 'true' : 'false'

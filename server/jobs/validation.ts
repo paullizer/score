@@ -2,11 +2,15 @@ import { JOB_IMPORT_LIMITS } from '../../src/domain/real-jobs'
 import type { RealJobRecord } from '../../src/domain/real-jobs'
 import type { Citation, Rubric, SourceDocument } from '../../src/domain/types'
 import { isValidWorkspaceId } from '../ids'
+import {
+  isOriginalContentType, isUploadFormat, isWordContentType, originalExtension, UPLOAD_CONTENT_TYPES,
+  uploadFormatFromFilename, type OriginalContentType, type UploadFormat,
+} from '../../src/domain/document-formats'
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
 const JOB_ID_PATTERN = new RegExp(`^job-${UUID_PATTERN.source.slice(1, -1)}$`, 'i')
 const DOCUMENT_ID_PATTERN = new RegExp(`^document-${UUID_PATTERN.source.slice(1, -1)}$`, 'i')
-const SAFE_BLOB_FILE_PATTERN = /^(?:original\.pdf|original\.html|source-document\.json)$/
+const SAFE_BLOB_FILE_PATTERN = /^(?:original\.(?:pdf|docx|doc|html)|source-document\.json)$/
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
@@ -39,9 +43,12 @@ export function isValidDocumentId(value: string): boolean {
 export function originalBlobName(
   workspaceId: string,
   jobId: string,
-  kindOrContentType: 'pdf' | 'url' | 'application/pdf' | 'text/html',
+  kindOrContentType: UploadFormat | 'url' | OriginalContentType,
 ): string {
-  const extension = kindOrContentType === 'pdf' || kindOrContentType === 'application/pdf' ? 'pdf' : 'html'
+  const contentType = isOriginalContentType(kindOrContentType) ? kindOrContentType
+    : kindOrContentType === 'url' ? 'text/html' : UPLOAD_CONTENT_TYPES[kindOrContentType]
+  if (!contentType) throw new Error('Invalid job original type.')
+  const extension = originalExtension(contentType)
   return `${workspaceId}/${jobId}/original.${extension}`
 }
 
@@ -235,7 +242,7 @@ export function validateRealJobRecord(value: unknown): value is RealJobRecord {
       'kind', 'displayName', 'url', 'finalUrl', 'originalBlobName', 'originalContentType', 'sha256', 'bytes',
       'capturedAt', 'extractionMethod',
     ]) ||
-    (value.source.kind !== 'pdf' && value.source.kind !== 'url') || !isNonBlank(value.source.displayName) ||
+    (!isUploadFormat(value.source.kind) && value.source.kind !== 'url') || !isNonBlank(value.source.displayName) ||
     !isNonBlank(value.inputFingerprint) || !isNonBlank(value.createdBy) || !isTimestamp(value.updatedAt) ||
     !Number.isInteger(value.attempts) || Number(value.attempts) < 0 || !Array.isArray(value.warnings) ||
     !value.warnings.every((warning) => typeof warning === 'string')) {
@@ -243,7 +250,7 @@ export function validateRealJobRecord(value: unknown): value is RealJobRecord {
   }
   if (value.source.originalBlobName !== undefined) {
     if (typeof value.source.originalBlobName !== 'string' ||
-      (value.source.originalContentType !== 'application/pdf' && value.source.originalContentType !== 'text/html') ||
+      !isOriginalContentType(value.source.originalContentType) ||
       !isBlobInJobPrefix(value.source.originalBlobName, value.workspaceId, value.id) ||
       value.source.originalBlobName !== originalBlobName(value.workspaceId, value.id, value.source.originalContentType)) {
       return false
@@ -254,11 +261,13 @@ export function validateRealJobRecord(value: unknown): value is RealJobRecord {
       value.extractedBlobName !== extractedBlobName(value.workspaceId, value.id))) {
     return false
   }
-  if (value.source.kind === 'pdf' &&
-    (value.source.originalContentType !== 'application/pdf' || value.source.originalBlobName === undefined)) {
-    return false
+  if (value.source.kind !== 'url') {
+    const format = value.source.kind
+    if (!isUploadFormat(format) || value.source.originalContentType !== UPLOAD_CONTENT_TYPES[format] ||
+      value.source.originalBlobName === undefined || uploadFormatFromFilename(value.source.displayName) !== format ||
+      value.source.url !== undefined || value.source.finalUrl !== undefined) return false
   }
-  if (value.source.kind === 'url' && !isNonBlank(value.source.url)) {
+  if (value.source.kind === 'url' && (!isNonBlank(value.source.url) || isWordContentType(value.source.originalContentType))) {
     return false
   }
   const job = value.job
@@ -280,7 +289,10 @@ export function validateRealJobRecord(value: unknown): value is RealJobRecord {
   if (value.source.bytes !== undefined && (!Number.isInteger(value.source.bytes) || Number(value.source.bytes) < 0)) return false
   if (value.source.capturedAt !== undefined && !isTimestamp(value.source.capturedAt)) return false
   if (value.source.extractionMethod !== undefined &&
-    !['document-intelligence', 'html', 'browser'].includes(String(value.source.extractionMethod))) return false
+    !['document-intelligence', 'html', 'browser', 'legacy-word'].includes(String(value.source.extractionMethod))) return false
+  if (value.source.extractionMethod === 'legacy-word' && value.source.originalContentType !== UPLOAD_CONTENT_TYPES.doc) return false
+  if (isWordContentType(value.source.originalContentType) && value.source.extractionMethod !== undefined &&
+    value.source.extractionMethod !== (value.source.kind === 'doc' ? 'legacy-word' : 'document-intelligence')) return false
   if (value.job.source !== value.source.kind || value.job.sourceLabel !== value.source.displayName ||
     !['queued', 'parsing', 'generating', 'ready', 'error', 'cancelled'].includes(String(value.job.status))) {
     return false

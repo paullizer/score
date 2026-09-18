@@ -1,6 +1,8 @@
 import type { Job, Rubric, SourceDocument } from './types'
+import type { OriginalContentType, UploadFormat, WordImportFeatures } from './document-formats'
 
 export const JOB_IMPORT_LIMITS = {
+  maxFileBytes: 10 * 1024 * 1024,
   maxPdfBytes: 10 * 1024 * 1024,
   maxPdfPages: 50,
   maxSourceCharacters: 180_000,
@@ -16,16 +18,16 @@ export interface JobImportError {
 }
 
 export interface RealJobSource {
-  kind: 'pdf' | 'url'
+  kind: UploadFormat | 'url'
   displayName: string
   url?: string
   finalUrl?: string
   originalBlobName?: string
-  originalContentType?: 'application/pdf' | 'text/html'
+  originalContentType?: OriginalContentType
   sha256?: string
   bytes?: number
   capturedAt?: string
-  extractionMethod?: 'document-intelligence' | 'html' | 'browser'
+  extractionMethod?: 'document-intelligence' | 'html' | 'browser' | 'legacy-word'
 }
 
 export interface RealJobRecord {
@@ -71,7 +73,7 @@ export interface RealJobsPage {
   continuationToken?: string
 }
 
-export interface JobProcessingFeatures {
+export interface JobProcessingFeatures extends WordImportFeatures {
   realJobImports: boolean
   limits: typeof JOB_IMPORT_LIMITS
 }

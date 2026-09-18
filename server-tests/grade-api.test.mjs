@@ -3,6 +3,7 @@ import { createHash, randomUUID } from 'node:crypto'
 import { createServer } from 'node:http'
 import test from 'node:test'
 import { PDFDocument } from 'pdf-lib'
+import { docxFile, legacyDocFile } from './word-fixtures.mjs'
 import {
   createApp, StoreConflictError, parseGradeEntity, gradeContentHash, gradeVersionHash, gradeSourceSetHash, gradeRecordHash,
   parseGradeSeedSnapshot, validateGradeVersion, validateGradeApproval, validateReferenceDocument, loadConfig,
@@ -13,6 +14,10 @@ import {
 } from './helpers.mjs'
 
 const NOW = '2026-09-17T20:30:00.000Z'
+const WORD_TYPES = {
+  docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  doc: 'application/msword',
+}
 const CONTEXT = {
   series: '0801', agency: 'Example federal agency', agencyType: 'other-federal',
   supervision: 'nonsupervisory', functions: [], specialty: 'Engineering', confirmed: true, answers: {},
@@ -171,7 +176,7 @@ async function start(options = {}) {
   return api
 }
 
-async function seed(api, title = 'Engineer') {
+async function seed(api, title = 'Engineer', format = 'pdf') {
   const key = randomUUID()
   const workspaceId = api.workspaceId
   const id = `job-${key}`
@@ -192,19 +197,22 @@ async function seed(api, title = 'Engineer') {
       weight: 100, guidance, requirementType: 'required', sourceCitations: [citation],
     }],
   }
-  const original = await api.jobs.blobs.putImmutable(`${workspaceId}/${id}/original.pdf`, await pdf(), 'application/pdf')
+  const contentType = format === 'pdf' ? 'application/pdf' : WORD_TYPES[format]
+  const wordText = [document.title, ...document.paragraphs.flatMap(paragraph => [paragraph.heading, paragraph.text])].join('\n')
+  const original = await api.jobs.blobs.putImmutable(`${workspaceId}/${id}/original.${format}`,
+    format === 'pdf' ? await pdf() : format === 'docx' ? docxFile(wordText) : legacyDocFile(wordText), contentType)
   await api.jobs.blobs.putImmutable(`${workspaceId}/${id}/source-document.json`, Buffer.from(JSON.stringify(document)), 'application/json')
   const record = {
     id, workspaceId, recordType: 'job',
     job: {
       id, title, organization: 'Example federal agency', location: '', arrangement: '', employmentType: '',
-      grade: '', series: '0801', source: 'pdf', sourceLabel: 'job.pdf', documentId: document.id,
+      grade: '', series: '0801', source: format, sourceLabel: `job.${format}`, documentId: document.id,
       rubricId: rubric.id, status: 'ready', createdAt: NOW, dataKind: 'real',
     },
     source: {
-      kind: 'pdf', displayName: 'job.pdf', originalBlobName: `${workspaceId}/${id}/original.pdf`,
-      originalContentType: 'application/pdf', sha256: original.blob.sha256, bytes: original.blob.bytes.byteLength,
-      capturedAt: NOW, extractionMethod: 'document-intelligence',
+      kind: format, displayName: `job.${format}`, originalBlobName: `${workspaceId}/${id}/original.${format}`,
+      originalContentType: contentType, sha256: original.blob.sha256, bytes: original.blob.bytes.byteLength,
+      capturedAt: NOW, extractionMethod: format === 'doc' ? 'legacy-word' : 'document-intelligence',
     },
     inputFingerprint: sha(Buffer.from(id)), createdBy: 'test-seed', updatedAt: NOW,
     attempts: 1, warnings: [], extractedBlobName: `${workspaceId}/${id}/source-document.json`,
@@ -444,6 +452,121 @@ test('ladder creation freezes the explicitly selected authorized real job rubric
     assert.equal((await api.request(`${api.base}/${detail.ladder.id}/sources/${seedSource.id}/original`)).status, 200)
   } finally { await api.close() }
 })
+
+for (const format of ['docx', 'doc']) {
+  test(`${format.toUpperCase()} jobs remain private immutable GS seeds with byte-identical historical downloads, never standalone references`, async () => {
+    const api = await start()
+    try {
+      const seeded = await seed(api, 'Word engineering seed', format)
+      const original = await api.jobs.blobs.read(seeded.record.source.originalBlobName)
+      const created = await create(api, { seed: seeded })
+      let detail = created.detail
+      const source = detail.sources[0]
+      const address = `${api.base}/${detail.ladder.id}`
+      assert.equal(source.origin, 'seed-job')
+      assert.equal(source.purpose, 'job-context')
+      assert.equal(source.extractionMethod, 'seed-snapshot')
+      assert.equal(source.pageCount, 1)
+      assert.deepEqual(source.selectedPages, [])
+      assert.equal(source.originalContentType, WORD_TYPES[format])
+      assert.equal(source.sha256, original.sha256)
+      assert.equal(source.bytes, original.bytes.byteLength)
+      assert.equal(source.originalBlobName, `${api.workspaceId}/${detail.ladder.id}/${source.id}/original.${format}`)
+      const snapshot = parseGradeSeedSnapshot(JSON.parse(Buffer.from(
+        (await api.grades.blobs.read(detail.ladder.seedBlobName)).bytes).toString()))
+      assert.equal(snapshot.source.extractionMethod, format === 'doc' ? 'legacy-word' : 'document-intelligence')
+      assert.deepEqual(snapshot.document, seeded.document)
+      assert.deepEqual(snapshot.rubric.criteria[0].sourceCitations, seeded.rubric.criteria[0].sourceCitations)
+      assert.deepEqual(Buffer.from((await api.grades.blobs.read(source.originalBlobName)).bytes), Buffer.from(original.bytes))
+
+      const document = await api.request(`${address}/sources/${source.id}/document`)
+      assert.equal(document.status, 200)
+      assert.deepEqual((await document.json()).paragraphs, seeded.document.paragraphs)
+      const download = await api.request(`${address}/sources/${source.id}/original`)
+      assert.equal(download.status, 200)
+      assert.equal(download.headers.get('content-type'), WORD_TYPES[format])
+      assert.equal(download.headers.get('cache-control'), 'no-store')
+      assert.equal(download.headers.get('x-content-type-options'), 'nosniff')
+      assert.equal(download.headers.get('content-disposition'), `attachment; filename="${source.id}.${format}"`)
+      assert.deepEqual(Buffer.from(await download.arrayBuffer()), Buffer.from(original.bytes))
+      assert.equal((await api.request(`${address}/sources/${source.id}`, 'PATCH', { selectedPages: [1] },
+        { 'if-match': detail.etag })).status, 400)
+      assert.equal((await api.request(`${address}/sources/${source.id}/original`, 'GET', undefined, {}, OTHER_ALLOWED_OID)).status, 404)
+
+      const independent = await fetch(`${api.baseUrl}${address}/sources/pdf`, {
+        method: 'POST', headers: writeHeaders({
+          'content-type': WORD_TYPES[format], 'x-file-name': `reference.${format}`, 'idempotency-key': randomUUID(),
+        }), body: original.bytes,
+      })
+      assert.equal(independent.status, 400)
+      for (const origin of ['upload', 'url', 'opm']) {
+        assert.throws(() => parseGradeEntity({ ...source, origin, purpose: 'agency',
+          ...(origin === 'url' ? { requestedUrl: `https://agency.example.gov/reference.${format}` } : {}) }))
+      }
+
+      detail = await finishDiscovery(api, detail)
+      const confirmation = await api.request(`${address}/source-set`, 'POST', { decisions: [] },
+        { 'idempotency-key': randomUUID(), 'if-match': detail.etag })
+      assert.equal(confirmation.status, 200)
+      const frozen = (await confirmation.json()).ladder.sourceSet
+      assert.equal(frozen.sources.length, 1)
+      assert.equal(frozen.sources[0].sha256, original.sha256)
+      assert.equal(frozen.sources[0].originalBlobName, source.originalBlobName)
+      assert.equal(frozen.contentHash, gradeSourceSetHash(frozen))
+
+      api.jobRecords.clear()
+      api.jobRubrics.clear()
+      api.jobs.blobs.values.clear()
+      api.grades.store.values.delete(`${api.workspaceId}/${source.id}`)
+      const historical = await api.request(`${address}/sources/${source.id}/original?sourceSetId=${frozen.id}`)
+      assert.equal(historical.status, 200)
+      assert.equal(historical.headers.get('content-type'), WORD_TYPES[format])
+      assert.deepEqual(Buffer.from(await historical.arrayBuffer()), Buffer.from(original.bytes))
+      const oldDocument = await api.request(`${address}/sources/${source.id}/document?sourceSetId=${frozen.id}`)
+      assert.equal(oldDocument.status, 200)
+      assert.deepEqual((await oldDocument.json()).paragraphs, seeded.document.paragraphs)
+      const stored = api.grades.blobs.values.get(source.originalBlobName)
+      api.grades.blobs.values.set(source.originalBlobName, { ...stored, bytes: Buffer.from('changed bytes with a forged hash field') })
+      assert.equal((await api.request(`${address}/sources/${source.id}/original?sourceSetId=${frozen.id}`)).status, 503)
+    } finally { await api.close() }
+  })
+
+  test(`${format.toUpperCase()} GS creation rejects changed originals, foreign ownership and format/provenance mismatches`, async () => {
+    const api = await start()
+    try {
+      const seeded = await seed(api, 'Word engineering seed', format)
+      const key = `${api.workspaceId}/${seeded.record.id}`
+      const original = await api.jobs.blobs.read(seeded.record.source.originalBlobName)
+      for (const corrupt of [
+        value => { value.source.bytes++ },
+        value => { value.source.sha256 = '0'.repeat(64) },
+        value => { delete value.source.sha256 },
+        value => { delete value.source.bytes },
+        value => { delete value.source.capturedAt },
+        value => { delete value.source.extractionMethod },
+        value => { value.workspaceId = 'other-workspace' },
+        value => { value.source.originalBlobName = value.source.originalBlobName.replace(api.workspaceId, 'other-workspace') },
+        value => { value.source.originalContentType = 'text/html' },
+        value => { value.source.displayName = value.job.sourceLabel = 'mismatched.pdf' },
+        value => { value.source.displayName = value.job.sourceLabel = format },
+        value => { value.source.extractionMethod = 'html' },
+        value => { value.source.kind = value.job.source = 'url'; value.source.url = 'https://example.gov/word-source' },
+      ]) {
+        const record = clone(seeded.record)
+        corrupt(record)
+        api.jobRecords.set(key, { record, etag: '"invalid-word-seed"' })
+        const rejected = await create(api, { seed: seeded, allowFailure: true })
+        assert.ok([400, 404, 409, 503].includes(rejected.response.status), JSON.stringify(rejected.body))
+      }
+      api.jobRecords.set(key, { record: seeded.record, etag: '"job-seed"' })
+      api.jobs.blobs.values.set(seeded.record.source.originalBlobName, { ...original, bytes: Buffer.from('changed private original') })
+      assert.equal((await create(api, { seed: seeded, allowFailure: true })).response.status, 503)
+      api.jobs.blobs.values.set(seeded.record.source.originalBlobName, { ...original, contentType: 'text/html' })
+      assert.equal((await create(api, { seed: seeded, allowFailure: true })).response.status, 503)
+      assert.equal([...api.grades.store.values.values()].filter(value => value.record.recordType === 'grade-ladder').length, 0)
+    } finally { await api.close() }
+  })
+}
 
 test('historical rubric selection snapshots the selected ID without changing the live job rubric pointer', async () => {
   const api = await start()

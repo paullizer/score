@@ -7,6 +7,7 @@ import type { TokenCredential } from '@azure/identity'
 import { JOB_IMPORT_LIMITS } from '../../src/domain/real-jobs'
 import type { RealJobRecord, VersionedRealJob } from '../../src/domain/real-jobs'
 import type { Rubric } from '../../src/domain/types'
+import { storedDocumentContentType } from '../../src/domain/document-formats'
 import { StoreConflictError } from '../store'
 import { fetchCosmosPage } from '../cosmos-query'
 import type { JobBlob, JobBlobStore, RealJobsConfig, RealJobStore } from './store'
@@ -35,7 +36,7 @@ const MAX_DOCUMENT_BYTES = JOB_IMPORT_LIMITS.maxSourceCharacters * 8
 function maxBlobBytes(blobName: string): number {
   if (blobName.endsWith('/original.html')) return MAX_HTML_BYTES
   if (blobName.endsWith('/source-document.json')) return MAX_DOCUMENT_BYTES
-  return JOB_IMPORT_LIMITS.maxPdfBytes
+  return JOB_IMPORT_LIMITS.maxFileBytes
 }
 
 function cosmosStatus(error: unknown): number | undefined {
@@ -290,7 +291,8 @@ export function createJobBlobStoreFromContainer(container: JobBlobContainer): Jo
     try {
       const response = await container.getBlockBlobClient(blobName).download()
       if (!response.readableStreamBody) throw new Error('Blob download returned no content stream.')
-      if (typeof response.etag !== 'string' || typeof response.contentType !== 'string') {
+      if (typeof response.etag !== 'string' || typeof response.contentType !== 'string' ||
+        response.contentType !== storedDocumentContentType(blobName)) {
         throw new Error('Blob download did not return required metadata.')
       }
       const bytes = await readBounded(response.readableStreamBody, response.contentLength, maxBlobBytes(blobName))
@@ -304,7 +306,7 @@ export function createJobBlobStoreFromContainer(container: JobBlobContainer): Jo
   async function putImmutable(blobName: string, bytes: Uint8Array, contentType: string) {
     if (!isSafeJobBlobName(blobName)) throw new Error('Invalid job blob name.')
     if (bytes.byteLength > maxBlobBytes(blobName)) throw new Error('Job blob exceeds the supported size.')
-    if (!['application/pdf', 'text/html', 'application/json'].includes(contentType)) throw new Error('Unsupported job blob content type.')
+    if (contentType !== storedDocumentContentType(blobName)) throw new Error('Unsupported job blob content type.')
     const body = Buffer.from(bytes)
     try {
       const response = await container.getBlockBlobClient(blobName).upload(body, body.byteLength, {

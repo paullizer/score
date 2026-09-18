@@ -8,10 +8,12 @@ import {
   type GradeLadderSummary,
   type GradeLevelDetail,
   type GradeRubricVersionRecord,
+  type FrozenReferenceSource,
   type ReferenceSourceRecord,
   type SourceDecision,
 } from '../../domain/real-grades'
 import type { Citation, Rubric, Workspace } from '../../domain/types'
+import { documentPagination, isOriginalContentType, storedDocumentContentType } from '../../domain/document-formats'
 
 export const gradeStatusLabels = {
   draft: 'Draft',
@@ -33,6 +35,13 @@ export const sourcePurposeLabels = {
   background: 'Background',
   issuance: 'Issuance / version evidence',
 } as const
+
+export function gradeSourcePagination(source: ReferenceSourceRecord | FrozenReferenceSource) {
+  const contentType = ('originalContentType' in source ? source.originalContentType : undefined) ??
+    storedDocumentContentType(source.originalBlobName ?? '')
+  if (isOriginalContentType(contentType)) return documentPagination(contentType)
+  return source.origin === 'upload' || source.selectedPages.length > 0 ? 'pdf-pages' : 'captured-sections'
+}
 
 export function gradeLadderLink(ladderId: string, grade?: number, versionId?: string): string {
   const query = new URLSearchParams()

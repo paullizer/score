@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
 import type { RealResumeDetail, RealResumeSummary, ResumeProcessingFeatures } from '../domain/real-resumes'
+import { supportedUploadFormats } from '../domain/document-formats'
 import * as api from '../services/realResumes'
 import { CloudConflictError } from '../services/cloudWorkspace'
 import { appendResumeInputs, resumeWorkActive, type RealResumeImportBatch, type RealResumeImportSource } from '../features/resumes/resumeImportUi'
@@ -171,10 +172,10 @@ function RealResumesProvider({ workspaceId, children }: { workspaceId: string; c
 
   function stage(inputs: RealResumeImportSource[]) {
     assertWritable()
-    if (!inputs.length) throw new Error('Choose PDFs or enter at least one public URL, one per line.')
+    if (!inputs.length) throw new Error('Choose supported files or enter at least one public URL, one per line.')
     const id = currentBatchRef.current ?? newBatch()
     const batch = batchesRef.current.find((item) => item.id === id)!
-    const next = appendResumeInputs(batch, inputs, featuresRef.current?.resumeLimits)
+    const next = appendResumeInputs(batch, inputs, featuresRef.current?.resumeLimits, supportedUploadFormats(featuresRef.current))
     putBatches(batchesRef.current.map((item) => item.id === id ? next : item))
   }
 
@@ -198,12 +199,12 @@ function RealResumesProvider({ workspaceId, children }: { workspaceId: string; c
       try {
         const summary = await mutate(`import:${item.key}`, () => {
           if (item.source.kind === 'url') return api.importRealResumeUrl(workspaceId, item.source.url, item.key, batchId, inputCount)
-          if (!item.source.file) throw new Error('The accepted PDF is now server-owned. Inspect its saved record instead of resending it.')
-          return api.importRealResumePdf(workspaceId, item.source.file, item.key, batchId, inputCount)
+          if (!item.source.file) throw new Error('The accepted file is now server-owned. Inspect its saved record instead of resending it.')
+          return api.importRealResumeFile(workspaceId, item.source.file, item.key, batchId, inputCount)
         })
         updateItem(batchId, item.key, {
           state: 'accepted', resumeId: summary.resume.id, error: undefined,
-          source: item.source.kind === 'pdf' ? { kind: 'pdf', file: null } : item.source,
+          source: item.source.kind === 'url' ? item.source : { kind: item.source.kind, file: null },
         })
       } catch (caught) {
         // A request can be accepted even when its response is lost. Retrying preserves both keys and bytes.

@@ -8,6 +8,7 @@ import {
 } from '../../src/domain/real-grades'
 import type { RealResumeProfile, RealResumeRecord } from '../../src/domain/real-resumes'
 import type { RealJobRecord } from '../../src/domain/real-jobs'
+import { WORD_DOCUMENT_LIMITS, isOriginalContentType, isWordContentType, originalExtension } from '../../src/domain/document-formats'
 import type { RealJobsDeps } from '../jobs/routes'
 import type { RealGradesDeps } from '../grades/service'
 import type { RealResumesDeps } from '../resumes/store'
@@ -39,7 +40,9 @@ type ResolvedGrade = Omit<FrozenGradeTargetSnapshot, 'schemaVersion' | 'snapshot
 export type ResolvedAnalysisTarget = ResolvedJob | ResolvedGrade
 
 function checkedBlob(blob: AnalysisBlob | undefined, contentType: string, hash?: string, bytes?: number): AnalysisBlob {
-  if (!blob || blob.contentType !== contentType || blob.bytes.byteLength > (contentType === 'application/json' ? MAX_ANALYSIS_JSON_BYTES : MAX_ANALYSIS_ORIGINAL_BYTES) ||
+  const maximum = isWordContentType(contentType) ? WORD_DOCUMENT_LIMITS.maxFileBytes
+    : contentType === 'application/json' ? MAX_ANALYSIS_JSON_BYTES : MAX_ANALYSIS_ORIGINAL_BYTES
+  if (!blob || blob.contentType !== contentType || !blob.bytes.byteLength || blob.bytes.byteLength > maximum ||
     blob.sha256 !== analysisBytesHash(blob.bytes) || (hash !== undefined && blob.sha256 !== hash) ||
     (bytes !== undefined && blob.bytes.byteLength !== bytes)) throw unavailable('An exact captured analysis input is unavailable or has changed.')
   return blob
@@ -282,7 +285,8 @@ export async function copyAnalysisTargetEvidence(
   const base = { schemaVersion: 1 as const, snapshotId, workspaceId, dataKind: 'real' as const, frozenAt }
   if (resolved.kind === 'job') {
     const original = resolved.original
-    const blobName = `${workspaceId}/${runId}/evidence/${original.sha256}.${original.contentType === 'application/pdf' ? 'pdf' : 'html'}`
+    assertAnalysis(isOriginalContentType(original.contentType), 'Unsupported captured job original content type.')
+    const blobName = `${workspaceId}/${runId}/evidence/${original.sha256}.${originalExtension(original.contentType)}`
     const saved = (await blobs.putImmutable(blobName, original.bytes, original.contentType)).blob
     checkedBlob(saved, original.contentType, original.sha256, original.bytes.byteLength)
     return parseFrozenTargetSnapshot({
