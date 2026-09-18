@@ -19,8 +19,21 @@ import { GRADE_LADDER_LIMITS } from '../src/domain/real-grades'
 import { RESUME_IMPORT_LIMITS } from '../src/domain/real-resumes'
 import { ANALYSIS_LIMITS } from '../src/domain/real-analyses'
 import type { DirectoryStore, StateStore } from './store'
+import { createLifecycleDependencies } from './lifecycle/dependencies'
+import { WorkspaceLifecycleService } from './lifecycle/service'
+import type { WorkspaceLifecycleParticipant } from './lifecycle/contracts'
+import { createJobLifecycleParticipant } from './jobs/lifecycle'
+import { createGradeLifecycleParticipant } from './grades/lifecycle'
+import { createResumeLifecycleParticipant } from './resumes/lifecycle'
+import { createAnalysisLifecycleParticipant } from './analyses/library-lifecycle'
+export { WorkspaceRepository } from './repository'
+export { WorkspaceLifecycleService } from './lifecycle/service'
+export { createLifecycleDependencies } from './lifecycle/dependencies'
+export { applySampleLifecycle } from '../src/domain/lifecycle'
+export { createAnalysisRun } from '../src/services/mockWorkspace'
 export { StoreConflictError, StoreNotFoundError } from './store'
 export { createStateStoreFromContainer } from './azure-state-store'
+export { createDirectoryStoreFromContainer } from './azure-directory-store'
 export { createJobBlobStoreFromContainer } from './jobs/azure-store'
 export {
   createAzureGradeStore, createAzureGradeBlobStore, createGradeStoreFromContainer, createGradeBlobStoreFromContainer,
@@ -89,6 +102,11 @@ function noStore(_req: Request, res: Response, next: NextFunction): void {
   next()
 }
 
+function unavailableParticipant(name: string): WorkspaceLifecycleParticipant {
+  const fail = async (): Promise<never> => { throw unavailable(`${name} storage is unavailable. Workspace lifecycle cleanup cannot skip it.`) }
+  return { setState: fail, cancel: fail, purge: fail, counts: fail, pendingWorkspaces: fail, resume: fail }
+}
+
 /**
  * Builds the Express app: static SPA serving plus the fixed cloud API. Does not call `listen` —
  * that is server/index.ts's job — so tests can exercise the app in-process or against an ephemeral
@@ -103,6 +121,18 @@ export function createApp(deps: AppDeps): Express {
   }
   const distDir = deps.distDir ?? DEFAULT_DIST_DIR
   const repository = new WorkspaceRepository({ directory, state, now: deps.now })
+  const participants: WorkspaceLifecycleParticipant[] = []
+  if (deps.analyses) participants.push(createAnalysisLifecycleParticipant(deps.analyses))
+  else if (config.realAnalyses || config.analysisLifecycleStore) participants.push(unavailableParticipant('Analysis'))
+  if (deps.resumes) participants.push(createResumeLifecycleParticipant(deps.resumes))
+  else if (config.realResumes || config.resumeLifecycleStore) participants.push(unavailableParticipant('Resume'))
+  if (deps.grades) participants.push(createGradeLifecycleParticipant(deps.grades))
+  else if (config.realGrades || config.gradeLifecycleStore) participants.push(unavailableParticipant('Grade'))
+  if (deps.jobs) participants.push(createJobLifecycleParticipant(deps.jobs))
+  else if (config.realJobs || config.jobLifecycleStore) participants.push(unavailableParticipant('Job'))
+  const lifecycle = createLifecycleDependencies(state, deps.jobs, deps.grades, Boolean(config.realGrades || config.gradeLifecycleStore),
+    deps.analyses, Boolean(config.realAnalyses || config.analysisLifecycleStore))
+  const workspaceLifecycle = new WorkspaceLifecycleService({ repository, directory, state, participants, lifecycle, now: deps.now })
   const checkHealth = createHealthCheck({ directory, state })
   const jobs = config.realJobs && deps.jobs?.store && deps.jobs.blobs ? deps.jobs : undefined
   const grades = config.realGrades && deps.grades?.store && deps.grades.blobs ? deps.grades : undefined
@@ -113,6 +143,7 @@ export function createApp(deps: AppDeps): Express {
   const wordDocumentImports = config.wordDocumentImports === true
 
   const app = express()
+  app.locals.reconcileLifecycle = () => workspaceLifecycle.reconcile()
   app.disable('x-powered-by')
   const parseJson = express.json({ limit: MAX_JSON_BODY })
   app.use((req, res, next) => {
@@ -139,9 +170,9 @@ export function createApp(deps: AppDeps): Express {
       wordDocumentImports: wordDocumentImports && Boolean(jobs || resumes),
     })
   })
-  api.use(createRealJobsRouter({ repository, jobs, now: deps.now, wordDocumentImports }))
-  api.use(createRealGradesRouter({ repository, grades, jobs, now: deps.now }))
-  api.use(createRealResumesRouter({ repository, resumes, now: deps.now, wordDocumentImports }))
+  api.use(createRealJobsRouter({ repository, jobs, lifecycle, now: deps.now, wordDocumentImports }))
+  api.use(createRealGradesRouter({ repository, grades, jobs, lifecycle, now: deps.now }))
+  api.use(createRealResumesRouter({ repository, resumes, lifecycle, now: deps.now, wordDocumentImports }))
   api.use(createRealAnalysesRouter({ repository, analyses, resumes, jobs, grades, now: deps.now }))
 
   api.get('/session', async (req, res) => {
@@ -162,6 +193,16 @@ export function createApp(deps: AppDeps): Express {
     const name = pickAllowedField(req.body, 'name', ['name'])
     const workspace = await repository.renameWorkspace(getPrincipal(req), req.params.id, name, readIfMatch(req))
     res.json({ workspace })
+  })
+
+  api.get('/workspaces/:id/lifecycle', async (req, res) => {
+    res.json(await workspaceLifecycle.impact(getPrincipal(req), req.params.id))
+  })
+
+  api.post('/workspaces/:id/lifecycle', async (req, res) => {
+    const action = pickAllowedField(req.body, 'action', ['action'])
+    const result = await workspaceLifecycle.change(getPrincipal(req), req.params.id, action, readIfMatch(req))
+    res.status(result.operation && result.operation.status !== 'complete' ? 202 : 200).json(result)
   })
 
   api.get('/workspaces/:id/state', async (req, res) => {

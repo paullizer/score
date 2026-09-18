@@ -90,6 +90,23 @@
   .mini-path span { @apply flex h-9 w-9 items-center justify-center rounded-[10px] border; background: var(--cp-panel); }
   .mini-path span:last-child { color: var(--cp-accent); border-color: var(--cp-accent-soft); }
   .library-toolbar { @apply flex flex-wrap items-center justify-between gap-3 border-b p-4; }
+  .lifecycle-actions { @apply inline-flex flex-wrap items-center gap-1; }
+  .lifecycle-banner { @apply mb-5 flex items-start gap-3 rounded-[10px] border p-4 text-[12px]; background: var(--cp-surface-soft); color: var(--cp-text-muted); }
+  .lifecycle-banner > svg { @apply mt-0.5 shrink-0; }
+  .lifecycle-banner strong { color: var(--cp-text); }
+  .lifecycle-banner p { @apply mt-1 text-[11px]; }
+  .lifecycle-banner strong, .lifecycle-banner p { overflow-wrap: anywhere; }
+  .lifecycle-operation-list .lifecycle-banner { @apply flex-wrap; }
+  .lifecycle-operation-list .lifecycle-banner > div { flex-basis: 220px; }
+  .lifecycle-counts { @apply my-4 grid grid-cols-2 gap-2; }
+  .lifecycle-counts > div { @apply flex justify-between gap-3 rounded-[10px] border px-3 py-2 text-[12px]; background: var(--cp-surface-soft); }
+  .lifecycle-counts dt { color: var(--cp-text-muted); }
+  .lifecycle-counts dd { @apply font-semibold; }
+  .lifecycle-blockers ul { @apply my-4 list-disc space-y-2 pl-5; }
+  .lifecycle-blockers a { overflow-wrap: anywhere; }
+  .lifecycle-confirmation { @apply my-4 items-start text-[12px]; }
+  .workspace-directory { @apply w-full text-left; }
+  .workspace-operation { @apply w-full space-y-2 border-t pt-3 text-[11px]; color: var(--cp-text-muted); }
   .library-kind-switcher { @apply flex flex-wrap items-center justify-between gap-3 border-b px-4 py-3; background: var(--cp-sheen); }
   .library-kind-switcher > span { @apply text-[10px]; color: var(--cp-text-soft); }
   .segmented { @apply inline-flex flex-wrap gap-0.5 rounded-[10px] p-1; background: var(--cp-surface-soft); }
@@ -103,10 +120,16 @@
   .search-field input:focus-visible { outline: none; }
   .search-field input::placeholder { color: var(--cp-text-soft); }
   .filter-select { @apply rounded-[10px] border px-2.5 py-2 text-[11px]; background: var(--cp-surface); color: var(--cp-text-muted); min-height: 34px; }
+  .table-sort-select { @apply inline-flex min-w-0 max-w-full items-center gap-2 text-[10px]; color: var(--cp-text-muted); }
+  .table-sort-select select { min-width: 0; max-width: 100%; }
   .table-wrap { @apply relative overflow-x-auto; }
   .data-table { @apply w-full border-collapse text-left; }
   .data-table thead { background: var(--cp-bg-elevated); }
   .data-table th { @apply border-b px-4 py-3 text-[9px] font-medium uppercase tracking-[0.08em]; color: var(--cp-text-soft); white-space: nowrap; }
+  .table-sort-button { @apply inline-flex items-center gap-1.5 rounded py-1; min-height: 24px; color: inherit; text-align: inherit; text-transform: inherit; letter-spacing: inherit; }
+  .table-sort-button:hover:not(:disabled), th[aria-sort] .table-sort-button { color: var(--cp-text); }
+  .table-sort-button > svg { flex-shrink: 0; }
+  .table-sort-button:disabled { opacity: .45; }
   .data-table td { @apply border-b px-4 py-4 align-middle; }
   .data-table tr:last-child td { border-bottom: 0; }
   .data-table tbody tr { transition: background 150ms; }
@@ -348,7 +371,7 @@
   .workspace-switcher-trigger strong, .workspace-switcher-trigger span { @apply truncate; }
   .workspace-switcher-caret { @apply ml-auto shrink-0; color: var(--cp-text-soft); }
   .workspace-switcher-list { @apply space-y-2; }
-  .workspace-switcher-item { @apply flex items-center gap-2 rounded-xl border p-2.5; background: var(--cp-surface); }
+  .workspace-switcher-item { @apply flex flex-wrap items-center gap-2 rounded-xl border p-2.5; background: var(--cp-surface); }
   .workspace-switcher-item.is-current { border-color: var(--cp-accent-soft); background: var(--cp-accent-soft); }
   .workspace-switcher-name { @apply flex min-w-0 flex-1 items-center gap-2 rounded-lg px-2 py-1.5 text-left text-[12px] font-medium; color: var(--cp-text); }
   .workspace-switcher-name:hover:not(:disabled) { color: var(--cp-accent); }
@@ -567,6 +590,8 @@
   .library-toolbar { padding: 12px; }
   .library-toolbar > .toolbar { width: 100%; }
   .library-toolbar .search-field { width: auto; flex: 1; }
+  .table-sort-select { width: 100%; }
+  .table-sort-select select { flex: 1; }
   .mobile-hide { display: none; }
   .job-cell { min-width: 0; }
   .job-monogram { height: 33px; width: 33px; }

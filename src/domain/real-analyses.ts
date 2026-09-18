@@ -24,12 +24,13 @@ import type {
   ResumeSourceCapture,
 } from './real-resumes'
 import type { Citation, Job, Rubric, SourceDocument } from './types'
+import type { LifecycleMetadata, LifecycleOperation } from './lifecycle'
 
 export const ANALYSIS_LIMITS = {
   maxComparisons: 500,
   initializationChunkSize: 25,
   maxAutomaticAttempts: 3,
-  maxOutputCorrections: 1,
+  maxOutputCorrections: 2,
 } as const
 
 export interface RealAnalysisResumeSelection {
@@ -254,6 +255,7 @@ export interface RealAnalysisProgress {
 
 export interface RealAnalysisRunRecord extends AnalysisEntityBase, AnalysisWorkState {
   recordType: 'analysis-run'
+  lifecycle?: LifecycleMetadata
   name: string
   createdBy: string
   idempotencyKey: string
@@ -415,12 +417,16 @@ export interface VersionedAnalysisEntity<T extends AnalysisEntity = AnalysisEnti
 export interface RealAnalysisRunSummary {
   run: RealAnalysisRunRecord
   etag: string
+  lifecycle?: LifecycleMetadata
+  operation?: LifecycleOperation
 }
 
 export interface RealAnalysisRunDetail extends RealAnalysisRunSummary {
   resumes: RealAnalysisResumeSummary[]
   targets: RealAnalysisTargetSummary[]
 }
+
+export type RealAnalysisDetail = RealAnalysisRunDetail
 
 export interface RealAnalysesPage {
   runs: RealAnalysisRunSummary[]
@@ -492,7 +498,8 @@ export function analysisRecordIs<K extends AnalysisEntity['recordType']>(
 }
 
 export function analysisRunCanScore(run: RealAnalysisRunRecord): boolean {
-  return !run.cancellation && run.progress.initialized === run.progress.total &&
+  return !run.lifecycle?.archivedAt && !run.lifecycle?.deletingAt && !run.lifecycle?.deletedAt &&
+    !run.cancellation && run.progress.initialized === run.progress.total &&
     Boolean(run.initialization.completedAt) && (run.status === 'queued' || run.status === 'running')
 }
 

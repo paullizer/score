@@ -138,6 +138,39 @@ test('report GET permits authenticated viewers, enforces workspace read authoriz
   } finally { await http.close() }
 })
 
+test('archived analyses remain exportable but pending and completed deletion fence report reads', async () => {
+  const f = fixture()
+  const { run } = await createRun(f)
+  const ids = comparisons(f, run.id).map(value => value.record.id)
+  await publishResult(f, run.id, ids[0])
+  const lifecycle = new api.AnalysisLibraryLifecycleService(f.analysis, () => new Date(f.now))
+  const current = await f.analysis.store.get(f.workspaceId, run.id)
+  const archived = await lifecycle.change(f.workspaceId, run.id, 'archive', current.etag, ACTOR)
+  assert.ok(archived.analysis.lifecycle.archivedAt)
+  const http = await startHttp(f)
+  try {
+    const response = await http.request(reportPath(run.id, ids), 'GET', undefined, { role: 'viewer' })
+    assert.equal(response.status, 200)
+    assert.equal((await response.json()).comparisons[0].overall.score, 80)
+    f.analysis.blobs._beforeDelete(() => { throw new Error('Cleanup is temporarily unavailable.') })
+    const pending = await lifecycle.change(f.workspaceId, run.id, 'delete', archived.etag, ACTOR)
+    assert.equal(pending.pending, true)
+    assert.ok(pending.analysis.lifecycle.deletingAt)
+    f.analysis.blobs.events.length = 0
+    const unavailable = await http.request(reportPath(run.id, ids), 'GET', undefined, { role: 'viewer' })
+    assert.equal(unavailable.status, 404)
+    assert.equal(unavailable.headers.get('cache-control'), 'no-store')
+    assert.deepEqual(reads(f), [], 'Deletion fences reports before captured evidence is read.')
+    f.analysis.blobs._beforeDelete(undefined)
+    const deleting = await f.analysis.store.get(f.workspaceId, run.id)
+    const removed = await lifecycle.change(f.workspaceId, run.id, 'delete', deleting.etag, ACTOR)
+    assert.equal(removed.deleted, true)
+    f.analysis.blobs.events.length = 0
+    assert.equal((await http.request(reportPath(run.id, ids))).status, 404)
+    assert.deepEqual(reads(f), [])
+  } finally { await http.close() }
+})
+
 test('report query accepts exactly 25 distinct IDs and rejects malformed, duplicate, oversized or extra input before reading private stores', async () => {
   const f = fixture()
   const { run } = await createRun(f, 25, 1)

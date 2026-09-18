@@ -11,6 +11,7 @@ import { RESUME_IMPORT_LIMITS as LIMITS } from '../../src/domain/real-resumes'
 import { documentPagination, isWordContentType, UPLOAD_CONTENT_TYPES } from '../../src/domain/document-formats'
 import { hasOleSignature, hasZipSignature } from '../../server/documents/word'
 import type { ResumeBlob, ResumeBlobStore, ResumeStore } from '../../server/resumes/store'
+import { assertResumeWritable, putResumeBlob, resumeIsLocked, resumeIsRemoved } from '../../server/resumes/guards'
 import {
   normalizeResumePublicUrl, parseRealResumeProfile, parseResumeCaptureManifest, parseResumeEntity,
   resumeBlobReference, resumeCaptureBlobName, resumeContentHash, resumeDocumentBlobName, resumeDocumentId,
@@ -264,6 +265,10 @@ class ResumeLease {
   private async owned(allowAborted = false): Promise<VersionedResumeEntity<RealResumeRecord>> {
     this.checkSignal(allowAborted)
     const initial = this.claimed.record
+    try { await assertResumeWritable(this.dependencies.store, initial.workspaceId, initial.id) } catch (error) {
+      if (conflict(error)) return this.markLost()
+      throw error
+    }
     const value = await this.dependencies.store.get(initial.workspaceId, initial.id)
     this.checkSignal(allowAborted)
     if (!value) return this.markLost()
@@ -272,7 +277,7 @@ class ResumeLease {
     if (record.workspaceId !== initial.workspaceId || record.id !== initial.id ||
       record.inputFingerprint !== initial.inputFingerprint || record.retryCount !== initial.retryCount ||
       record.attempts !== initial.attempts ||
-      record.attemptId !== initial.attemptId || !ACTIVE.has(record.resume.status) ||
+      record.attemptId !== initial.attemptId || !ACTIVE.has(record.resume.status) || resumeIsLocked(record.lifecycle) ||
       record.lease?.owner !== this.owner || Date.parse(record.lease.expiresAt) <= this.clock.now().getTime()) {
       return this.markLost()
     }
@@ -281,6 +286,12 @@ class ResumeLease {
 
   check(): Promise<VersionedResumeEntity<RealResumeRecord>> {
     return this.exclusive(() => this.owned())
+  }
+
+  async putBlob(blobs: ResumeBlobStore, name: string, bytes: Uint8Array, contentType: string) {
+    return putResumeBlob(this.dependencies.store, blobs, name, bytes, contentType, {
+      signal: this.signal, assertActive: () => this.check(),
+    })
   }
 
   async run<T>(operation: () => Promise<T>): Promise<T> {
@@ -366,7 +377,8 @@ async function saveBlob(
 ): Promise<ResumeBlob> {
   await lease.check()
   let blob: ResumeBlob
-  try { blob = (await blobs.putImmutable(name, bytes, contentType)).blob } catch {
+  try { blob = (await lease.putBlob(blobs, name, bytes, contentType)).blob } catch {
+    await lease.check()
     const winner = await readBlob(blobs, name)
     if (!winner) throw failure('storage-error', true)
     blob = winner
@@ -665,7 +677,7 @@ async function duplicateWarnings(
     for (const value of page.items) {
       const other = decodeRecord(value).record
       if (other.workspaceId !== record.workspaceId) throw failure('storage-error')
-      if (other.id === record.id || result.some(item => item.resumeId === other.id)) continue
+      if (other.id === record.id || resumeIsRemoved(other.lifecycle) || result.some(item => item.resumeId === other.id)) continue
       if (record.capture && other.capture && record.capture.original.sha256 === other.capture.original.sha256) {
         result.push({
           kind: 'exact-content', resumeId: other.id,
@@ -853,6 +865,11 @@ async function claim(
   dependencies: ResumeWorkerDependencies, candidate: VersionedResumeEntity<RealResumeRecord>, owner: string, clock: Clock,
 ): Promise<VersionedResumeEntity<RealResumeRecord> | undefined> {
   const { record, etag } = decodeRecord(candidate)
+  if (resumeIsLocked(record.lifecycle)) return undefined
+  try { await assertResumeWritable(dependencies.store, record.workspaceId, record.id) } catch (error) {
+    if (conflict(error)) return undefined
+    throw error
+  }
   const time = clock.now()
   if (['ready', 'cancelled', 'error'].includes(record.resume.status) ||
     (record.nextAttemptAt && Date.parse(record.nextAttemptAt) > time.getTime()) ||

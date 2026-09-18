@@ -102,10 +102,16 @@ before(async () => {
 })
 after(async () => { await browser?.close(); await runtime?.close() })
 
-test('a read-only reviewer downloads genuine CSV, PDF, Word and PowerPoint files from grouped frozen results without new AI calls', { timeout: 180_000 }, async () => {
+test('a read-only reviewer downloads genuine CSV, PDF, Word and PowerPoint files from archived frozen results without new AI calls', { timeout: 180_000 }, async () => {
   const { fixture, stubs, runId, pairs } = await completedFixture()
   const { context, page, errors } = await newPage()
   try {
+    const detail = await jsonResponse(await fixture.request(`/api/workspaces/${fixture.workspaceId}/analyses/${runId}`))
+    const archived = await jsonResponse(await fixture.request(`/api/workspaces/${fixture.workspaceId}/analyses/${runId}/lifecycle`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json', 'If-Match': detail.etag },
+      body: JSON.stringify({ action: 'archive' }),
+    }))
+    assert.ok(archived.analysis.lifecycle.archivedAt)
     fixture.setRole('viewer')
     await page.route('**/api/features', async (route) => {
       const response = await route.fetch()
@@ -177,8 +183,36 @@ test('sample exports stay fictional, include the entire grouped analysis from an
     for (const pair of run.comparisons) {
       assert.equal(selected.bytes.toString('utf8').includes(pair.id), pair.targetId === run.targets[1].id)
     }
+    await dialog.getByRole('button', { name: 'Close', exact: true }).click()
+    await page.goto(`${fixture.origin}/workspaces/${fixture.workspaceId}/analyses/${run.id}?data=samples`)
+    await page.getByRole('searchbox', { name: 'Search comparisons', exact: true }).fill('No candidate matches this filter')
+    await visible(page.getByRole('heading', { name: 'No matching comparisons', exact: true }))
+    await page.getByRole('button', { name: 'Export report', exact: true }).click()
+    const filteredTableExport = await download(page, 'csv')
+    for (const pair of run.comparisons) assert.ok(filteredTableExport.bytes.toString('utf8').includes(pair.id))
     assert.ok(!fixture.requests.some((request) => request.url.includes('/report-comparisons')))
     await saveArtifact('browser-sample.csv', entire.bytes)
+    assert.deepEqual(errors, [])
+  } finally { await context.close(); await fixture.close() }
+})
+
+test('archived sample analyses retain read-only exports alongside lifecycle controls', { timeout: 90_000 }, async () => {
+  const fixture = await startResumeAnalysisFixture(runtime, { injectAuth: true })
+  const sample = runtime.fixtures.createInitialWorkspace()
+  fixture.state.states.set(fixture.workspaceId, { content: JSON.stringify(sample), etag: '"report-archive"' })
+  const run = sample.runs[0]
+  const { context, page, errors } = await newPage()
+  try {
+    await page.goto(`${fixture.origin}/workspaces/${fixture.workspaceId}/analyses/${run.id}?data=samples`)
+    await page.getByRole('button', { name: `Archive ${run.name}`, exact: true }).click()
+    const archive = await visible(page.getByRole('dialog', { name: `Archive ${run.name}?`, exact: true }))
+    await archive.getByRole('button', { name: 'Archive', exact: true }).click()
+    await archive.waitFor({ state: 'hidden' })
+    await visible(page.getByText('Archived · read only', { exact: true }))
+    assert.equal(await page.getByRole('button', { name: 'New run with these inputs', exact: true }).isDisabled(), true)
+    await page.getByRole('button', { name: 'Export report', exact: true }).click()
+    const output = await download(page, 'csv')
+    for (const pair of run.comparisons) assert.ok(output.bytes.toString('utf8').includes(pair.id))
     assert.deepEqual(errors, [])
   } finally { await context.close(); await fixture.close() }
 })
@@ -278,13 +312,48 @@ test('losing access to saved history cancels a pending export without a late pri
     await dialog.getByLabel('Report format', { exact: true }).selectOption('csv')
     await dialog.getByRole('button', { name: 'Download CSV', exact: true }).click()
     await captured.promise
-    await page.route(`**/api/workspaces/${fixture.workspaceId}/analyses`, (route) => route.fulfill({
+    await page.route(`**/api/workspaces/${fixture.workspaceId}/analyses**`, (route) => route.fulfill({
       status: 403, contentType: 'application/json', body: JSON.stringify({ error: { code: 'forbidden', message: 'Workspace access is no longer available.' } }),
     }))
-    await visible(dialog.getByRole('alert').getByText(/Saved analysis access became unavailable/))
+    await visible(page.getByRole('heading', { name: 'This real analysis could not be opened', exact: true }))
+    await dialog.waitFor({ state: 'hidden' })
     release.resolve()
     await finished.promise
-    assert.equal(await dialog.getByRole('button', { name: 'Download CSV', exact: true }).isDisabled(), true)
+    assert.equal(await page.getByRole('button', { name: 'Export report', exact: true }).count(), 0)
+    assert.equal(downloads.length, 0)
+    assert.deepEqual(errors, [])
+  } finally { release.resolve(); await context.close(); await fixture.close() }
+})
+
+test('analysis deletion removes the export controls and cancels a delayed report download', { timeout: 90_000 }, async () => {
+  const { fixture, runId } = await completedFixture({ partial: true })
+  const { context, page, errors } = await newPage()
+  const captured = deferred(), release = deferred(), finished = deferred()
+  const downloads = []
+  page.on('download', (value) => downloads.push(value))
+  try {
+    await page.goto(`${fixture.origin}/workspaces/${fixture.workspaceId}/analyses/${runId}?data=real`)
+    await page.route('**/report-comparisons?*', async (route) => {
+      const response = await route.fetch()
+      captured.resolve()
+      await release.promise
+      try { await route.fulfill({ response }) } finally { finished.resolve() }
+    })
+    await page.getByRole('button', { name: 'Export report', exact: true }).click()
+    const dialog = page.getByRole('dialog', { name: 'Export analysis report', exact: true })
+    await dialog.getByLabel('Report format', { exact: true }).selectOption('csv')
+    await dialog.getByRole('button', { name: 'Download CSV', exact: true }).click()
+    await captured.promise
+    const detail = await jsonResponse(await fixture.request(`/api/workspaces/${fixture.workspaceId}/analyses/${runId}`))
+    const removed = await jsonResponse(await fixture.request(`/api/workspaces/${fixture.workspaceId}/analyses/${runId}/lifecycle`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json', 'If-Match': detail.etag },
+      body: JSON.stringify({ action: 'delete' }),
+    }))
+    assert.equal(removed.deleted, true)
+    await dialog.waitFor({ state: 'hidden' })
+    release.resolve()
+    await finished.promise
+    assert.equal(await page.getByRole('button', { name: 'Export report', exact: true }).count(), 0)
     assert.equal(downloads.length, 0)
     assert.deepEqual(errors, [])
   } finally { release.resolve(); await context.close(); await fixture.close() }

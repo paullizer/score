@@ -12,6 +12,9 @@ const bundled = await build({
       export * from './worker/resumes/runtime'
       export * from './server/resumes/validation'
       export { RealResumeService } from './server/resumes/service'
+      export * from './server/resumes/guards'
+      export * from './server/resumes/lifecycle'
+      export { StoreConflictError, StoreNotFoundError } from './server/store'
     `,
     resolveDir: process.cwd(), sourcefile: 'resume-runtime-test-bundle.ts',
   },
@@ -27,6 +30,8 @@ const {
   parseResumeEntity, parseResumeCaptureManifest, parseRealResumeProfile, resumeContentHash, resumeSha256,
   resumeBlobReference, resumeCaptureBlobName, resumeOriginalBlobName, resumeDocumentBlobName, resumeProfileBlobName,
   validateResumeDocumentBinding, validateRealResumeProfile,
+  checkResumeReplacement, prepareResumeTransaction, parseResumeControl, resumeControlId,
+  resumeIsLocked, StoreConflictError, ResumeLifecycleService, createResumeLifecycleParticipant,
 } = module.exports
 
 const WORKSPACE = 'resume-worker-tests'
@@ -36,11 +41,10 @@ const ROLE = 'Software engineer'
 const EXPERIENCE = 'Built accessible case management services.'
 const clone = value => structuredClone(value)
 const key = (workspaceId, id) => `${workspaceId}/${id}`
-const failure = name => Object.assign(new Error('Private storage failure marker.'), { name })
-const equal = (a, b) => resumeContentHash(a) === resumeContentHash(b)
 
 class MemoryStore {
   values = new Map()
+  controls = new Map()
   serial = 0
   writes = []
 
@@ -65,32 +69,55 @@ class MemoryStore {
   }
   async create(record) {
     const current = await this.get(record.workspaceId, record.id)
-    return current ? { created: false, value: current } : { created: true, value: this.save(record) }
+    if (current) {
+      await prepareResumeTransaction(this, record.workspaceId, [{ kind: 'create', record }])
+      return { created: false, value: current }
+    }
+    await this.transact(record.workspaceId, [{ kind: 'create', record }])
+    return { created: true, value: await this.get(record.workspaceId, record.id) }
   }
   async replace(record, etag) {
     const current = this.values.get(key(record.workspaceId, record.id))
-    if (!current) throw failure('StoreNotFoundError')
-    if (current.etag !== etag) throw failure('StoreConflictError')
-    assert.ok(record.updatedAt >= current.record.updatedAt)
-    if (record.recordType === 'resume') {
-      for (const field of ['capture', 'captureManifest', 'extraction', 'profileBlob']) {
-        if (current.record[field] !== undefined) assert.ok(equal(current.record[field], record[field]), `${field} must remain immutable`)
-      }
-      if (current.record.resume.status === 'ready') assert.ok(equal(current.record, record), 'Ready records cannot change')
-    }
-    return this.save(record)
+    checkResumeReplacement(current, record, etag)
+    await this.transact(record.workspaceId, [{ kind: 'replace', record, etag }])
+    return this.get(record.workspaceId, record.id)
   }
-  async transact(workspaceId, operations) {
+  async transact(workspaceId, operations, options) {
+    const controls = await prepareResumeTransaction(this, workspaceId, operations, options)
     for (const operation of operations) {
       const current = this.values.get(key(workspaceId, operation.record.id))
-      if (operation.kind === 'create' ? current : !current || current.etag !== operation.etag) throw failure('StoreConflictError')
+      if (operation.kind === 'create' ? current : !current || current.etag !== operation.etag) throw new StoreConflictError()
       parseResumeEntity(operation.record)
     }
-    for (const operation of operations) this.save(operation.record)
+    for (const control of controls) {
+      if (this.controls.get(key(workspaceId, control.record.id))?.etag !== control.etag) throw new StoreConflictError()
+      parseResumeControl(control.record)
+    }
+    for (const operation of operations) {
+      if (operation.kind === 'delete') this.values.delete(key(workspaceId, operation.record.id))
+      else this.save(operation.record)
+    }
+    for (const control of controls) this.controls.set(key(workspaceId, control.record.id), {
+      record: clone(control.record), etag: `"control-${++this.serial}"`,
+    })
+  }
+  async getControl(workspaceId, resumeId) { return clone(this.controls.get(key(workspaceId, resumeControlId(resumeId)))) }
+  async listControls(workspaceId, continuationToken) {
+    const all = [...this.controls.values()].filter(value => value.record.workspaceId === workspaceId)
+    const offset = Number(continuationToken ?? 0)
+    return { items: clone(all.slice(offset, offset + 100)),
+      ...(offset + 100 < all.length ? { continuationToken: String(offset + 100) } : {}) }
+  }
+  async pendingLifecycleWorkspaces(limit) {
+    return [...new Set([...this.controls.values()].filter(({ record }) => record.state === 'deleting' ||
+      (record.operation && record.operation.status !== 'complete') || Date.parse(record.preparation?.expiresAt) <= Date.now())
+      .map(value => value.record.workspaceId))].slice(0, limit)
   }
   async listPending(now, limit) {
     return clone([...this.values.values()].filter(({ record }) =>
-      record.recordType === 'resume' && (!record.nextAttemptAt || record.nextAttemptAt <= now) &&
+      record.recordType === 'resume' && !resumeIsLocked(record.lifecycle) &&
+      (!this.controls.get(key(record.workspaceId, resumeControlId())) || this.controls.get(key(record.workspaceId, resumeControlId())).record.state === 'active') &&
+      (!record.nextAttemptAt || record.nextAttemptAt <= now) &&
       (record.resume.status === 'queued' && !record.lease ||
         ['parsing', 'profiling'].includes(record.resume.status) && record.lease?.expiresAt <= now),
     ).slice(0, limit))
@@ -113,6 +140,22 @@ class MemoryBlobs {
     return existing ? { created: false, blob: clone(existing) }
       : { created: true, blob: this.save(name, bytes, contentType) }
   }
+  async putFenced(name, bytes, contentType, fence) {
+    fence.signal?.throwIfAborted()
+    await fence.assertActive()
+    const result = await this.putImmutable(name, bytes, contentType)
+    await fence.assertActive()
+    return result
+  }
+  async listFamilies(workspaceId) {
+    return { resumeIds: [...new Set([...this.values.keys()].filter(name => name.startsWith(`${workspaceId}/`)).map(name => name.split('/')[1]))] }
+  }
+  async listPage(workspaceId, resumeId, token) {
+    const all = [...this.values.keys()].filter(name => name.startsWith(`${workspaceId}/${resumeId}/`)).sort()
+    const offset = Number(token ?? 0)
+    return { names: all.slice(offset, offset + 100), ...(offset + 100 < all.length ? { continuationToken: String(offset + 100) } : {}) }
+  }
+  async delete(name) { this.values.delete(name) }
   putJson(name, value) { return this.save(name, Buffer.from(JSON.stringify(value)), 'application/json') }
 }
 
@@ -1251,6 +1294,126 @@ test('heartbeats extend the same attempt and observe cancellation while a model 
   assert.deepEqual(await processing, { claimed: 1, completed: 0 })
   assert.equal((await run.record(id)).resume.status, 'cancelled')
   assert.equal(await run.blobs.read(resumeProfileBlobName(WORKSPACE, id)), undefined)
+})
+
+for (const scope of ['resume', 'workspace']) {
+  test(`a ${scope} archive fence rejects stale claim pages before any retrieval or processing`, async () => {
+    const run = fixture()
+    const id = await run.url()
+    const candidate = await run.store.get(WORKSPACE, id)
+    if (scope === 'resume') {
+      await new ResumeLifecycleService(run.deps, undefined, run.clock.now).change(WORKSPACE, id, 'archive', candidate.etag)
+    } else await createResumeLifecycleParticipant(run.deps).setState(WORKSPACE, 'archived', NOW)
+    run.store.listPending = async () => [candidate]
+    assert.deepEqual(await runResumeWorker(run.deps), { claimed: 0, completed: 0 })
+    assert.equal(run.requests.public.length, 0)
+    assert.equal(run.requests.ocr.length, 0)
+    assert.equal(run.requests.model.length, 0)
+    assert.equal(await run.blobs.read(resumeProfileBlobName(WORKSPACE, id)), undefined)
+  })
+}
+
+for (const action of ['archive', 'delete']) {
+  for (const during of ['download', 'model']) {
+    test(`resume ${action} during ${during} blocks late source/profile publication and never operates on frozen analysis work`, async () => {
+      const frozen = Object.freeze({ id: 'independent-frozen-analysis', status: 'running', profileVersion: 1 })
+      let run, id
+      let dependencyCalls = 0
+      const transition = async () => {
+        const current = await run.store.get(WORKSPACE, id)
+        const lifecycle = new ResumeLifecycleService(run.deps, {
+          async impact(workspaceId, target) {
+            dependencyCalls++
+            assert.equal(workspaceId, WORKSPACE)
+            assert.deepEqual(target, { kind: 'resume', id })
+            return []
+          },
+        }, run.clock.now)
+        await lifecycle.change(WORKSPACE, id, action, current.etag)
+      }
+      run = fixture(during === 'download' ? {
+        transport: async () => { await transition(); return http() },
+      } : {
+        modelFetch: async body => { await transition(); return modelResponse(body) },
+      })
+      id = await run.url()
+      assert.deepEqual(await runResumeWorker(run.deps), { claimed: 1, completed: 0 })
+      if (action === 'archive') {
+        const archived = await run.record(id)
+        assert.ok(archived.lifecycle.archivedAt)
+        assert.equal(archived.resume.status, 'cancelled')
+        assert.equal(archived.attemptId, undefined)
+        assert.equal(archived.lease, undefined)
+        assert.equal(dependencyCalls, 0)
+        if (during === 'model') assert.ok(archived.extraction)
+      } else {
+        assert.equal(await run.store.get(WORKSPACE, id), undefined)
+        assert.equal((await run.store.getControl(WORKSPACE, id)).record.state, 'deleted')
+        assert.equal([...run.blobs.values.keys()].some(name => name.startsWith(`${WORKSPACE}/${id}/`)), false)
+        assert.equal(dependencyCalls, 1)
+      }
+      assert.equal(await run.blobs.read(resumeProfileBlobName(WORKSPACE, id)), undefined)
+      assert.equal(frozen.status, 'running')
+    })
+  }
+}
+
+test('workspace archive is observed by heartbeat before cancellation recovery runs', async t => {
+  t.mock.timers.enable({ apis: ['setInterval'] })
+  let release, reached, modelSignal
+  const started = new Promise(resolve => { reached = resolve })
+  const run = fixture({ modelFetch: async (body, init) => {
+    modelSignal = init.signal
+    reached()
+    await new Promise(resolve => { release = resolve })
+    return modelResponse(body)
+  } })
+  const id = await run.url()
+  const processing = runResumeWorker(run.deps)
+  await started
+  const participant = createResumeLifecycleParticipant(run.deps)
+  await participant.setState(WORKSPACE, 'archived', NOW)
+  run.clock.advance(25_000)
+  t.mock.timers.tick(25_000)
+  await flush()
+  assert.equal(modelSignal.aborted, true)
+  await participant.cancel(WORKSPACE, run.clock.now().toISOString())
+  await participant.setState(WORKSPACE, 'active', run.clock.now().toISOString())
+  release()
+  assert.deepEqual(await processing, { claimed: 1, completed: 0 })
+  assert.equal((await run.record(id)).resume.status, 'cancelled')
+  assert.equal(await run.blobs.read(resumeProfileBlobName(WORKSPACE, id)), undefined)
+})
+
+test('a pre-archive callback cannot publish after restore and an explicit new retry, even under the same worker owner', async () => {
+  let release, reached
+  let calls = 0
+  const started = new Promise(resolve => { reached = resolve })
+  const run = fixture({ modelFetch: async body => {
+    if (++calls === 1) {
+      reached()
+      await new Promise(resolve => { release = resolve })
+      return modelResponse(body)
+    }
+    return modelResponse(body, { name: { status: 'unavailable', value: null, citations: [] } })
+  } })
+  const id = await run.url()
+  const first = runResumeWorker(run.deps)
+  await started
+  const lifecycle = new ResumeLifecycleService(run.deps, undefined, run.clock.now)
+  const current = await run.store.get(WORKSPACE, id)
+  await lifecycle.change(WORKSPACE, id, 'archive', current.etag)
+  const archived = await run.store.get(WORKSPACE, id)
+  await lifecycle.change(WORKSPACE, id, 'unarchive', archived.etag)
+  const restored = await run.store.get(WORKSPACE, id)
+  assert.equal(restored.record.resume.status, 'cancelled')
+  await run.service.retry(WORKSPACE, id, restored.etag)
+  assert.deepEqual(await runResumeWorker(run.deps), { claimed: 1, completed: 1 })
+  const winner = await run.store.get(WORKSPACE, id)
+  release()
+  assert.deepEqual(await first, { claimed: 1, completed: 0 })
+  assert.deepEqual(await run.store.get(WORKSPACE, id), winner)
+  assert.equal((await run.detail(id)).resume.name, null)
 })
 
 test('a heartbeat queued behind successful publication cannot turn its ready count into a lost lease', async t => {

@@ -3,8 +3,10 @@ import type {
 } from '../../domain/real-analyses'
 import type { RealResumeSummary } from '../../domain/real-resumes'
 import { analysisCancellationNeedsRetry } from '../../domain/real-analyses'
-import type { Citation, SourceDocument } from '../../domain/types'
+import type { Citation, SourceDocument, Workspace } from '../../domain/types'
 import type { ReferenceDocument } from '../../domain/real-grades'
+import { gradeHeadId } from '../../domain/real-grades'
+import { isEntityArchived, isEntityRemoved, type LifecycleTarget } from '../../domain/lifecycle'
 import { readyRealResume, resumeName } from '../resumes/resumeImportUi'
 
 export interface SelectedRealResume {
@@ -50,6 +52,26 @@ export function targetIdentity(selection: RealAnalysisTargetSelection): string {
 
 export function targetFamilyIdentity(selection: RealAnalysisTargetSelection): string {
   return selection.kind === 'job' ? `job:${selection.jobId}:${selection.rubricId}` : `grade:${selection.ladderId}:${selection.grade}`
+}
+
+export function realTargetLifecycleTargets(workspace: Workspace, selection: RealAnalysisTargetSelection): LifecycleTarget[] {
+  if (selection.kind === 'grade') return [{ kind: 'ladder', id: selection.ladderId }, { kind: 'rubric', id: gradeHeadId(selection.ladderId, selection.grade) }]
+  const rubric = workspace.rubrics.find((item) => item.id === selection.rubricId && item.jobId === selection.jobId)
+    ?? workspace.rubrics.find((item) => item.jobId === selection.jobId && item.dataKind === 'real')
+  return [{ kind: 'job', id: selection.jobId }, { kind: 'rubric', id: rubric?.groupId ?? selection.rubricId }]
+}
+
+export function realTargetArchived(workspace: Workspace, selection: RealAnalysisTargetSelection): boolean {
+  return realTargetLifecycleTargets(workspace, selection).some((target) => isEntityArchived(workspace, target))
+}
+
+export function realTargetAvailable(workspace: Workspace, selection: RealAnalysisTargetSelection): boolean {
+  return !realTargetArchived(workspace, selection) && !realTargetRemoved(workspace, selection)
+}
+
+export function realTargetRemoved(workspace: Workspace, selection: RealAnalysisTargetSelection): boolean {
+  if (selection.kind === 'job' && workspace.jobs.find((item) => item.id === selection.jobId)?.rubricDeletedAt) return true
+  return realTargetLifecycleTargets(workspace, selection).some((target) => isEntityRemoved(workspace, target))
 }
 
 export function currentRealTarget(selection: RealAnalysisTargetSelection, targets: RealAnalysisTargetSummary[]): RealAnalysisTargetSummary | undefined {
@@ -269,18 +291,22 @@ export function initialRealSelections(
   return { resumes: chosenResumes, targets: chosenTargets, errors }
 }
 
-export function resumeSelectionIssue(choice: SelectedRealResume, current: RealResumeSummary[]): string | null {
+export function resumeSelectionIssue(choice: SelectedRealResume, current: RealResumeSummary[], workspace?: Workspace): string | null {
   if (!choice.selection) return choice.issue ?? 'No exact resume version is selected.'
+  if (workspace && (isEntityArchived(workspace, { kind: 'resume', id: choice.selection.resumeId }) || isEntityRemoved(workspace, { kind: 'resume', id: choice.selection.resumeId }))) {
+    return 'This selected resume is archived or removed. Choose an active source; saved analyses keep their original evidence.'
+  }
   const available = current.find((item) => item.resume.id === choice.selection?.resumeId)
-  if (!available || !readyRealResume(available)) return 'This selected resume is missing or no longer ready in this workspace. Nothing was substituted.'
+  if (!available || !readyRealResume(available)) return 'This selected resume is archived, missing, or no longer ready in this workspace. Nothing was substituted.'
   if (!sameResumeSelection(choice.selection, realResumeSelection(available))) {
     return `The saved selection is document v${choice.selection.documentVersion}; the current ready source is v${available.documentRef?.documentVersion}. Its identity or hash changed. Review and explicitly select the current source.`
   }
   return null
 }
 
-export function targetSelectionIssue(choice: SelectedRealTarget, current: RealAnalysisTargetSummary[]): string | null {
+export function targetSelectionIssue(choice: SelectedRealTarget, current: RealAnalysisTargetSummary[], workspace?: Workspace): string | null {
   if (!choice.selection) return choice.issue ?? 'No exact target version is selected.'
+  if (workspace && !realTargetAvailable(workspace, choice.selection)) return 'This target or its parent is archived or removed. Unarchive the input before starting a new run; retained analysis snapshots are unchanged.'
   const available = currentRealTarget(choice.selection, current)
   if (!available) return 'This exact real target is no longer eligible. Unapproved, missing, and sample rubrics cannot be used.'
   if (!sameTargetSelection(choice.selection, available.selection)) {

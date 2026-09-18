@@ -484,3 +484,27 @@ export function createInitialWorkspace(): Workspace {
   }))
   return workspace
 }
+
+/** A deliberate reset creates new identities; permanently deleted fixtures are never resurrected. */
+export function createFreshInitialWorkspace(): Workspace {
+  const workspace = createInitialWorkspace()
+  const identities = new Map<string, string>()
+  JSON.stringify(workspace, (key, value: unknown) => {
+    if ((key === 'id' || key === 'groupId') && typeof value === 'string' && !identities.has(value)) {
+      identities.set(value, crypto.randomUUID())
+    }
+    return value
+  })
+  const fresh = JSON.parse(JSON.stringify(workspace, (_key, value: unknown) =>
+    typeof value === 'string' ? identities.get(value) ?? value : value)) as Workspace
+  const ladders = new Map<string, string>()
+  const entities: NonNullable<Workspace['lifecycle']>['entities'] = {}
+  for (const rubric of fresh.rubrics.filter((item) => item.kind === 'grade' && item.ladder)) {
+    const name = rubric.ladder!
+    if (!ladders.has(name)) ladders.set(name, crypto.randomUUID())
+    const parentKey = `ladder:${ladders.get(name)}`
+    entities[parentKey] = {}
+    entities[`rubric:${rubric.groupId}`] = { parentKey }
+  }
+  return { ...fresh, lifecycle: { entities } }
+}

@@ -1,3 +1,4 @@
+import type { WorkspaceLifecycle } from './lifecycle'
 import type { UploadFormat } from './document-formats'
 
 export type SourceKind = UploadFormat | 'url' | 'website'
@@ -63,6 +64,7 @@ export interface Job {
   batchId?: string
   documentId: string
   rubricId: string | null
+  rubricDeletedAt?: string
   status: JobStatus
   errorStage?: 'download' | 'parsing' | 'rubric'
   error?: string
@@ -138,6 +140,7 @@ export interface AnalysisRun {
 
 export interface Workspace {
   schemaVersion: 1
+  lifecycle?: WorkspaceLifecycle
   jobs: Job[]
   resumes: Resume[]
   documents: SourceDocument[]

@@ -9,17 +9,22 @@ import type {
 import { RESUME_IMPORT_LIMITS } from '../../src/domain/real-resumes'
 import type { Citation } from '../../src/domain/types'
 import {
-  ANALYSIS_MODEL_LIMITS, assessmentInputSchema, assessmentSchemaForInput, groundingSchemaForInput,
+  assessmentInputSchema, assessmentSchemaForInput, groundingSchemaForInput,
   type ModelResumeQuote,
 } from './model-schema'
+import {
+  analysisOutputCitationDiagnostics, analysisResumeCitationDiagnostics, describeAnalysisCitationFailure,
+  type AnalysisCitationDiagnostics, type AnalysisModelStage,
+} from './citation-diagnostics'
 
-export type AnalysisModelStage = 'assessment' | 'grounding'
+export type { AnalysisModelStage } from './citation-diagnostics'
 
 export interface AnalysisModelErrorOptions {
   retryable?: boolean
   stage?: AnalysisModelStage
   correctable?: boolean
   cancelled?: boolean
+  citationDiagnostics?: AnalysisCitationDiagnostics
 }
 
 export class AnalysisModelError extends Error {
@@ -28,6 +33,7 @@ export class AnalysisModelError extends Error {
   readonly stage: AnalysisModelStage
   readonly correctable: boolean
   readonly cancelled: boolean
+  readonly citationDiagnostics?: AnalysisCitationDiagnostics
 
   constructor(code: AnalysisProcessingErrorCode, message: string, options: AnalysisModelErrorOptions = {}) {
     super(message)
@@ -37,6 +43,7 @@ export class AnalysisModelError extends Error {
     this.stage = options.stage ?? 'assessment'
     this.correctable = options.correctable ?? false
     this.cancelled = options.cancelled ?? false
+    this.citationDiagnostics = options.citationDiagnostics
   }
 }
 
@@ -49,6 +56,12 @@ function invalidInput(message: string): never {
 
 function invalidOutput(message: string, stage: AnalysisModelStage = 'assessment', citation = false): never {
   throw new AnalysisModelError(citation ? 'invalid-citation' : 'invalid-model-output', message, { stage, correctable: true })
+}
+
+function invalidCitations(diagnostics: AnalysisCitationDiagnostics, stage: AnalysisModelStage): never {
+  throw new AnalysisModelError('invalid-citation', describeAnalysisCitationFailure(diagnostics, stage), {
+    stage, correctable: true, citationDiagnostics: diagnostics,
+  })
 }
 
 function unique(values: string[]): boolean {
@@ -121,22 +134,12 @@ export function validateAnalysisAssessmentInput(value: unknown): RealAnalysisAss
 export function buildAnalysisResumeCitations(
   quotes: ModelResumeQuote[], input: RealAnalysisAssessmentInput, stage: AnalysisModelStage = 'assessment',
 ): Citation[] {
-  if (!Array.isArray(quotes) || quotes.length > ANALYSIS_MODEL_LIMITS.maxCitations ||
-    quotes.some(value => !value || Object.keys(value).length !== 2 ||
-      !Object.hasOwn(value, 'paragraphId') || !Object.hasOwn(value, 'quote') ||
-      typeof value.paragraphId !== 'string' || typeof value.quote !== 'string' ||
-      value.quote.length > ANALYSIS_MODEL_LIMITS.maxQuoteCharacters)) {
-    invalidOutput('Analysis citations accept only bounded resume paragraph IDs and literal quotes; ownership is assigned by trusted code.', stage, true)
-  }
+  const diagnostics = analysisResumeCitationDiagnostics(quotes, input)
+  if (diagnostics) invalidCitations(diagnostics, stage)
   const paragraphs = new Map(input.resume.paragraphs.map(paragraph => [paragraph.id, paragraph]))
-  const seen = new Set<string>()
   return quotes.map(value => {
     const paragraph = paragraphs.get(value.paragraphId)
-    const key = JSON.stringify([value.paragraphId, value.quote])
-    if (!paragraph || !value.quote.trim() || !paragraph.text.includes(value.quote) || seen.has(key)) {
-      invalidOutput('Analysis evidence must quote the exact supplied resume paragraph, without substitutions or duplicate citations.', stage, true)
-    }
-    seen.add(key)
+    if (!paragraph) invalidOutput('The cited paragraph is not in the saved resume.', stage, true)
     return {
       documentId: input.resume.id,
       documentVersion: input.resume.version,
@@ -174,6 +177,8 @@ function personalTraitCriterion(label: string, description: string): boolean {
 }
 
 export function validateAnalysisAssessment(value: unknown, input: RealAnalysisAssessmentInput): RealAnalysisAssessmentOutput {
+  const diagnostics = analysisOutputCitationDiagnostics(value, input, 'assessment')
+  if (diagnostics) invalidCitations(diagnostics, 'assessment')
   const parsed = assessmentSchemaForInput(input).safeParse(value)
   if (!parsed.success) {
     const citation = parsed.error.issues.some(issue => issue.path.includes('citations'))
@@ -306,6 +311,8 @@ export function describeAnalysisAssessment(summary: RealAnalysisResultSummary, q
 export function validateAnalysisGroundingReview(
   value: unknown, input: RealAnalysisAssessmentInput,
 ): RealAnalysisGroundingReviewOutput {
+  const diagnostics = analysisOutputCitationDiagnostics(value, input, 'grounding')
+  if (diagnostics) invalidCitations(diagnostics, 'grounding')
   const parsed = groundingSchemaForInput(input).safeParse(value)
   if (!parsed.success) {
     const citation = parsed.error.issues.some(issue => issue.path.includes('citations'))

@@ -376,13 +376,13 @@ test('another comparison may change the parent ETag during publication without d
   const mock = modelFor(f)
   const transact = f.analysis.store.transact.bind(f.analysis.store)
   let raced = false
-  f.analysis.store.transact = async (workspaceId, operations) => {
+  f.analysis.store.transact = async (workspaceId, operations, options) => {
     if (!raced && operations.some(item => item.record.recordType === 'analysis-comparison' && item.record.status === 'complete')) {
       raced = true
       const other = comparisons(f, created.run.id).find(item => item.record.status === 'queued')
       await cancelComparison(f, other)
     }
-    return transact(workspaceId, operations)
+    return transact(workspaceId, operations, options)
   }
   assert.deepEqual(await runAnalysisWorker(mock.deps, { maxItems: 1 }), { claimed: 1, completed: 1 })
   assert.equal(mock.calls.length, 2, 'A parent progress race must not repeat a long assessment')
@@ -401,6 +401,8 @@ test('invalid model citations fail only that comparison and never produce a zero
     value.criteria[0].citations[0].quote = 'PRIVATE-MODEL-SENTINEL not in the document'
     return value
   })
+  const events = []
+  mock.deps.onEvent = event => events.push(event)
   assert.deepEqual(await runAnalysisWorker(mock.deps, { maxItems: 2 }), { claimed: 2, completed: 1 })
   const [failed, complete] = comparisons(f, created.run.id).map(item => item.record)
   assert.equal(failed.status, 'failed')
@@ -408,9 +410,62 @@ test('invalid model citations fail only that comparison and never produce a zero
   assert.equal(failed.attempts, 1)
   assert.equal(failed.result, undefined)
   assert.doesNotMatch(JSON.stringify(failed.error), /PRIVATE-MODEL-SENTINEL/)
-  assert.equal(mock.calls.filter(call => call.kind === 'resume_rubric_assessment' && call.body.input.rubric.id === invalidRubric).length, 2)
+  assert.equal(mock.calls.filter(call => call.kind === 'resume_rubric_assessment' && call.body.input.rubric.id === invalidRubric).length, 3)
+  assert.match(failed.error.message, /Assessment criterion 1, citation 1/)
+  assert.match(failed.error.message, /2-correction limit/)
+  assert.equal(failed.error.retryable, false)
+  assert.equal(failed.nextAttemptAt, undefined)
+  const failures = events.filter(event => event.comparisonId === failed.id)
+  assert.ok(failures.every(event => event.workspaceId === f.workspaceId && event.runId === created.run.id && event.attemptId === failed.attemptId))
+  assert.deepEqual(failures.filter(event => event.event === 'correction').map(event => event.correctionCount), [1, 2])
+  assert.equal(failures.filter(event => event.event === 'validation-failed').length, 3)
+  assert.equal(failures.at(-1).event, 'comparison-outcome')
+  assert.equal(failures.at(-1).outcome, 'failed')
+  assert.equal(failures.at(-1).code, 'invalid-citation')
+  assert.equal(failures.at(-1).correctionCount, 2)
+  assert.equal(failures.at(-1).stage, 'assessment')
+  assert.doesNotMatch(JSON.stringify(events), /PRIVATE-MODEL-SENTINEL|test-token/)
   assert.equal(complete.status, 'complete')
   assert.equal(complete.resultSummary.overall.score, 60)
+  assert.equal(events.find(event => event.comparisonId === complete.id && event.event === 'comparison-outcome').outcome, 'complete')
+})
+
+test('two semantic corrections publish three bound reviews and correlated completion without extra worker attempts', async () => {
+  const f = fixture()
+  const created = await createRun(f)
+  let assessments = 0, reviews = 0
+  const mock = modelFor(f, ({ kind, body }) => {
+    if (kind === 'resume_rubric_assessment') {
+      const value = modelAssessment(body.input)
+      assessments++
+      for (const row of value.criteria) row.score = assessments
+      return value
+    }
+    if (++reviews <= 2) return {
+      outcome: 'needs-correction',
+      issues: [{
+        code: 'unsupported-score', message: 'Compare the stated responsibility scope with the saved score anchors.',
+        criterionId: body.input.rubric.criteria[0].id, qualificationId: null, citations: [],
+      }],
+    }
+  })
+  const events = []
+  mock.deps.onEvent = event => events.push(event)
+  assert.deepEqual(await runAnalysisWorker(mock.deps), { claimed: 1, completed: 1 })
+  const saved = comparisons(f, created.run.id)[0].record
+  const detail = await f.service.comparisonDetail(f.workspaceId, created.run.id, saved.id)
+  assert.equal(mock.calls.length, 6)
+  assert.equal(saved.attempts, 1)
+  assert.equal(saved.retryCount, 0)
+  assert.equal(detail.result.provenance.correctionCount, 2)
+  assert.equal(detail.result.provenance.groundingReviews.length, 3)
+  assert.equal(new Set(detail.result.provenance.groundingReviews.map(review => review.assessmentSha256)).size, 3)
+  assert.equal(detail.result.provenance.groundingReviews.at(-1).assessmentSha256, detail.result.provenance.assessmentSha256)
+  assert.equal(detail.result.overall.score, 60)
+  assert.ok(events.every(event => event.comparisonId === saved.id && event.attemptId === saved.attemptId))
+  assert.equal(events.at(-1).outcome, 'complete')
+  assert.equal(events.at(-1).stage, 'publication')
+  assert.equal(events.at(-1).correctionCount, 2)
 })
 
 test('corrupt snapshot bytes fail independently before inference', async () => {
@@ -458,11 +513,11 @@ test('missing snapshot retries stop after three attempts; manual retry uses orig
   assert.equal(failed.nextAttemptAt, undefined)
   assert.equal(failed.lease, undefined)
   f.analysis.blobs.values.set(reference.blobName, original)
+  const current = await f.analysis.store.get(f.workspaceId, first.record.id)
+  await f.service.comparisonAction(f.workspaceId, created.run.id, first.record.id, 'retry', current.etag)
   f.resumeValues.clear()
   f.jobValues.clear()
   f.rubricValues.clear()
-  const current = await f.analysis.store.get(f.workspaceId, first.record.id)
-  await f.service.comparisonAction(f.workspaceId, created.run.id, first.record.id, 'retry', current.etag)
   assert.deepEqual(await runAnalysisWorker(mock.deps, { maxItems: 1 }), { claimed: 1, completed: 1 })
   const retried = await f.analysis.store.get(f.workspaceId, first.record.id)
   assert.equal(retried.record.attempts, 1)
@@ -659,8 +714,8 @@ test('ambiguous claim, immutable-result, and completion commits recover winning 
     const created = await createRun(f)
     const transact = f.analysis.store.transact.bind(f.analysis.store)
     let interrupted = false
-    f.analysis.store.transact = async (workspaceId, operations) => {
-      await transact(workspaceId, operations)
+    f.analysis.store.transact = async (workspaceId, operations, options) => {
+      await transact(workspaceId, operations, options)
       const target = operations.find(item => item.record.recordType === 'analysis-comparison')
       if (!interrupted && ((lost === 'claim' && target?.record.status === 'running') ||
         (lost === 'complete' && target?.record.status === 'complete'))) {
@@ -915,10 +970,10 @@ test('initialization backoff stops after three failures and explicit retry keeps
   assert.equal(current.record.nextAttemptAt, undefined)
   assert.deepEqual(await runAnalysisWorker(mock.deps), { claimed: 0, completed: 0 })
   f.analysis.blobs.values.set(created.run.manifest.blobName, manifest)
+  const retried = await f.service.retry(f.workspaceId, created.run.id, {}, current.etag)
   f.resumeValues.clear()
   f.jobValues.clear()
   f.rubricValues.clear()
-  const retried = await f.service.retry(f.workspaceId, created.run.id, {}, current.etag)
   assert.equal(retried.run.status, 'queued')
   assert.equal(retried.run.progress.initialized, 30)
   assert.equal(retried.run.retryCount, 1)
@@ -1038,13 +1093,13 @@ test('a heartbeat storage outage aborts inference and retains only a safe retrya
   const mock = modelFor(f, async ({ call }) => { if (call === 1) await blocked })
   const transact = f.analysis.store.transact.bind(f.analysis.store)
   let interrupted = false
-  f.analysis.store.transact = async (workspaceId, operations) => {
+  f.analysis.store.transact = async (workspaceId, operations, options) => {
     if (!interrupted && operations.some(item => item.record.recordType === 'analysis-comparison' &&
       item.record.status === 'running' && item.record.lease.heartbeatAt !== NOW)) {
       interrupted = true
       throw new Error('PRIVATE-STORAGE-SENTINEL https://private.example.test/resume')
     }
-    return transact(workspaceId, operations)
+    return transact(workspaceId, operations, options)
   }
   const work = runAnalysisWorker(mock.deps, { maxItems: 1 })
   try {
@@ -1107,4 +1162,122 @@ test('the default worker claim budget matches the two-item deployment default', 
   assert.equal(mock.calls.length, 4)
   assert.deepEqual(await runAnalysisWorker(mock.deps), { claimed: 1, completed: 1 })
   assert.equal((await f.analysis.store.get(f.workspaceId, created.run.id)).record.status, 'complete')
+})
+
+test('archiving input libraries does not cancel admitted runs or require new live-source worker access', async () => {
+  for (const kind of ['job', 'grade']) {
+    const f = fixture()
+    const resume = await seedResume(f)
+    const job = await seedJob(f)
+    const grade = kind === 'grade' ? await seedGrade(f, job) : undefined
+    const created = await f.service.create(f.workspaceId, randomUUID(), {
+      name: 'Retained evidence', resumes: [resume.selection], targets: [(grade ?? job).selection],
+    }, ACTOR)
+    const frozen = clone([...f.analysis.blobs.values])
+    f.resumeValues.get(`${f.workspaceId}/${resume.record.id}`).record.lifecycle = { archivedAt: NOW }
+    f.jobValues.get(`${f.workspaceId}/${job.record.id}`).record.lifecycle = { archivedAt: NOW }
+    f.jobValues.get(`${f.workspaceId}/${job.record.id}`).record.rubricLifecycle = { archivedAt: NOW }
+    if (grade) {
+      f.gradeValues.get(`${f.workspaceId}/${grade.head.id}`).record.lifecycle = { archivedAt: NOW }
+      f.gradeValues.get(`${f.workspaceId}/${grade.ladder.id}`).record.lifecycle = { archivedAt: NOW }
+    }
+    const mock = modelFor(f)
+    assert.deepEqual(await runAnalysisWorker(mock.deps, { maxItems: 1 }), { claimed: 1, completed: 1 })
+    for (const [name, blob] of frozen) assert.deepEqual(f.analysis.blobs.values.get(name), blob)
+    const completed = comparisons(f, created.run.id)[0]
+    assert.equal(completed.record.status, 'complete')
+    assert.ok((await f.service.comparisonDetail(f.workspaceId, created.run.id, completed.record.id)).result)
+  }
+})
+
+test('archiving a run during an in-flight model call cancels the owned comparison and fences late results', async () => {
+  const f = fixture()
+  const created = await createRun(f)
+  let release
+  const blocked = new Promise(resolve => { release = resolve })
+  const mock = modelFor(f, async ({ call }) => { if (call === 1) await blocked })
+  const work = runAnalysisWorker(mock.deps, { maxItems: 1 })
+  await until(() => mock.calls.length === 1)
+  const live = await f.analysis.store.get(f.workspaceId, created.run.id)
+  const library = new api.AnalysisLibraryLifecycleService(f.analysis, () => new Date(f.now))
+  const archived = await library.change(f.workspaceId, created.run.id, 'archive', live.etag, ACTOR)
+  assert.equal(archived.analysis.run.progress.cancelled, 1)
+  release()
+  assert.deepEqual(await work, { claimed: 1, completed: 0 })
+  assert.equal(comparisons(f, created.run.id)[0].record.status, 'cancelled')
+  assert.equal([...f.analysis.blobs.values.keys()].some(name => name.includes('/results/')), false)
+  await library.change(f.workspaceId, created.run.id, 'unarchive', archived.etag, ACTOR)
+  const count = mock.calls.length
+  assert.deepEqual(await runAnalysisWorker(mock.deps), { claimed: 0, completed: 0 })
+  assert.equal(mock.calls.length, count)
+})
+
+test('archive cancellation of 500 comparisons can finish in the existing worker without starting any scoring', async () => {
+  const f = fixture()
+  const created = await createRun(f, 125, 4)
+  const library = new api.AnalysisLibraryLifecycleService(f.analysis, () => new Date(f.now))
+  const pending = await library.change(f.workspaceId, created.run.id, 'archive', created.etag, ACTOR)
+  assert.equal(pending.pending, true)
+  const mock = modelFor(f)
+  assert.deepEqual(await runAnalysisWorker(mock.deps, { maxItems: 1 }), { claimed: 1, completed: 0 })
+  const run = await f.analysis.store.get(f.workspaceId, created.run.id)
+  assert.equal(run.record.progress.initialized, 500)
+  assert.equal(run.record.progress.cancelled, 500)
+  assert.equal(run.record.cancellation.nextComparisonIndex, 500)
+  assert.ok(run.record.cancellation.completedAt)
+  assert.equal(mock.calls.length, 0)
+  await api.createAnalysisLifecycleParticipant(f.analysis).resume(f.workspaceId, f.now)
+  assert.equal((await f.analysis.store.getControl(f.workspaceId, created.run.id)).record.operation.status, 'complete')
+  assert.ok(f.analysis.store.batches.every(batch => batch.length <= 26))
+})
+
+test('a stale pending page cannot start scoring behind an archived workspace control or after unarchive cancellation', async () => {
+  const f = fixture()
+  const created = await createRun(f)
+  const candidate = comparisons(f, created.run.id)[0]
+  f.analysis.store.listPending = async () => [clone(candidate)]
+  const participant = api.createAnalysisLifecycleParticipant(f.analysis)
+  await participant.setState(f.workspaceId, 'archived', NOW)
+  const mock = modelFor(f)
+  assert.deepEqual(await runAnalysisWorker(mock.deps), { claimed: 0, completed: 0 })
+  assert.equal(mock.calls.length, 0)
+  await participant.cancel(f.workspaceId, NOW)
+  await participant.setState(f.workspaceId, 'active', NOW)
+  assert.equal((await f.analysis.store.get(f.workspaceId, created.run.id)).record.progress.cancelled, 1)
+  assert.deepEqual(await runAnalysisWorker(mock.deps), { claimed: 0, completed: 0 })
+  assert.equal(mock.calls.length, 0)
+})
+
+test('deletion racing a leased result upload drains the writer, removes its orphan result, and fences old claimed attempts', async () => {
+  const f = fixture()
+  const created = await createRun(f)
+  const pairId = comparisons(f, created.run.id)[0].record.id
+  const library = new api.AnalysisLibraryLifecycleService(f.analysis, () => new Date(f.now))
+  let deletion
+  let claimed
+  f.analysis.blobs._afterPut(async name => {
+    if (!name.includes('/results/')) return
+    claimed = await f.analysis.store.get(f.workspaceId, pairId)
+    const run = await f.analysis.store.get(f.workspaceId, created.run.id)
+    deletion = await library.change(f.workspaceId, created.run.id, 'delete', run.etag, ACTOR)
+  })
+  const mock = modelFor(f)
+  assert.deepEqual(await runAnalysisWorker(mock.deps, { maxItems: 1 }), { claimed: 1, completed: 0 })
+  assert.equal(deletion.pending, true)
+  assert.equal(deletion.operation.status, 'pending')
+  assert.ok(deletion.analysis.run.lifecycle.deletingAt)
+  assert.equal(await f.analysis.store.get(f.workspaceId, pairId), undefined)
+  assert.equal((await f.analysis.store.get(f.workspaceId, created.run.id)).record.progress.complete, 0)
+  await api.updateAnalysisControl(f.analysis.store, f.workspaceId, created.run.id, record => ({
+    ...record, writers: Object.fromEntries(Object.entries(record.writers).map(([id, writer]) =>
+      [id, { ...writer, expiresAt: new Date(Date.now() - 1).toISOString() }])),
+  }))
+  await api.createAnalysisLifecycleParticipant(f.analysis).resume(f.workspaceId, f.now)
+  assert.equal(await f.analysis.store.get(f.workspaceId, created.run.id), undefined)
+  assert.equal(f.analysis.blobs.values.size, 0)
+  const calls = mock.calls.length
+  assert.equal(await processClaimedComparison(claimed, mock.deps), false)
+  assert.equal(mock.calls.length, calls)
+  assert.equal(f.analysis.blobs.values.size, 0)
+  assert.equal((await f.analysis.store.getControl(f.workspaceId, created.run.id)).record.state, 'deleted')
 })

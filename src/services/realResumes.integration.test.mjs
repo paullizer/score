@@ -9,6 +9,7 @@ import React, { act } from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { JSDOM } from 'jsdom'
 import { docxFile, legacyDocFile } from '../../server-tests/word-fixtures.mjs'
+import { frontendWorkspaceContext } from './frontend.test-support.mjs'
 
 const output = resolve(`.real-resume-client-tests-${randomUUID()}`)
 const originalFetch = globalThis.fetch
@@ -448,7 +449,8 @@ test('Markdown resume library and detail identify uploads and sections rather th
   root = createRoot(dom.window.document.getElementById('root'))
   for (const id of [undefined, saved.resume.id]) {
     await act(async () => root.render(React.createElement(ui.MemoryRouter, { key: id ?? 'library', future: { v7_startTransition: true, v7_relativeSplatPath: true } },
-      React.createElement(ui.RealResumesContext.Provider, { value: api }, React.createElement(ui.RealResumesPage, { id })))))
+      React.createElement(ui.WorkspaceContext.Provider, { value: frontendWorkspaceContext({ cloud: { currentWorkspaceId: api.workspaceId } }, { resumes: api.summaries }) },
+        React.createElement(ui.RealResumesContext.Provider, { value: api }, React.createElement(ui.RealResumesPage, { id }))))))
     if (!id) {
       assert.match(dom.window.document.querySelector('tbody').textContent, /Markdown · added/)
       assert.doesNotMatch(dom.window.document.querySelector('tbody').textContent, /Public URL/)
@@ -555,7 +557,8 @@ test('resume detail reflects newly discovered duplicates without changing the im
     pending: () => false, originalUrl: () => '/api/workspaces/workspace-one/resumes/resume-one/original' }
   function content(value) {
     return React.createElement(ui.MemoryRouter, { initialEntries: ['/resumes/resume-one?data=real'], future: { v7_startTransition: true, v7_relativeSplatPath: true } },
-      React.createElement(ui.RealResumesContext.Provider, { value }, React.createElement(ui.RealResumesPage, { id: 'resume-one' })))
+      React.createElement(ui.WorkspaceContext.Provider, { value: frontendWorkspaceContext({ cloud: { currentWorkspaceId: value.workspaceId } }, { resumes: value.summaries }) },
+        React.createElement(ui.RealResumesContext.Provider, { value }, React.createElement(ui.RealResumesPage, { id: 'resume-one' }))))
   }
   root = createRoot(dom.window.document.getElementById('root'))
   await act(async () => root.render(content(api)))
@@ -575,8 +578,10 @@ test('manual resume retries ignore automatic retry policy and retain the exact r
     error: { code: 'invalid-model-output', stage: 'profiling', message: 'Profile output was invalid.', retryable: false } }
   const api = { canWrite: true, phase: 'ready', pending: () => false,
     retry: async (id, etag) => { calls.push({ id, etag }); return id === blocked.resume.id ? blocked : captured } }
-  const content = (value, canWrite = true) => React.createElement(ui.RealResumesContext.Provider, { value: { ...api, canWrite } },
-    React.createElement(ui.RealResumeActions, { summary: value }))
+  const content = (value, canWrite = true) => React.createElement(ui.WorkspaceContext.Provider, {
+    value: frontendWorkspaceContext({ cloud: { currentWorkspaceId: 'workspace-one' } }, { resumes: [value] }),
+  }, React.createElement(ui.RealResumesContext.Provider, { value: { ...api, canWrite } },
+    React.createElement(ui.RealResumeActions, { summary: value })))
   root = createRoot(dom.window.document.getElementById('root'))
   for (const value of [blocked, captured]) {
     const before = JSON.stringify(value)
@@ -621,10 +626,10 @@ function Probe() { current = ui.useRealResumes(); return React.createElement('sp
 const sample = { schemaVersion: 1, jobs: [], resumes: [], rubrics: [], documents: [], runs: [] }
 function tree(workspaceId, showProbe = true, role = 'owner', showDialog = false) {
   return React.createElement(ui.MemoryRouter, { future: { v7_startTransition: true, v7_relativeSplatPath: true } },
-    React.createElement(ui.WorkspaceContext.Provider, { value: {
+    React.createElement(ui.WorkspaceContext.Provider, { value: frontendWorkspaceContext({
     workspace: sample, cloud: { currentWorkspaceId: workspaceId, workspaces: [{ id: workspaceId, role }] },
     addResumes: () => { throw new Error('Real input reached sample intake') }, startAnalysis: () => { throw new Error('Real input reached sample scoring') },
-  } }, React.createElement(ui.RealResumesBridge, { workspaceId },
+  }) }, React.createElement(ui.RealResumesBridge, { workspaceId },
     React.createElement(React.Fragment, null, showProbe ? React.createElement(Probe) : null,
       showDialog ? React.createElement(ui.RealAddResumesDialog, { open: true, onOpenChange() {} }) : null))))
 }

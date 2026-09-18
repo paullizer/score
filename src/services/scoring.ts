@@ -1,4 +1,5 @@
 import { latestRubrics } from '../domain/selectors'
+import { assertEntityWritable } from '../domain/lifecycle'
 import type {
   AnalysisRun, AnalysisTarget, Citation, Comparison, CriterionResult, ResumeSnapshot, Rubric, SourceDocument, Workspace,
 } from '../domain/types'
@@ -125,6 +126,7 @@ export function snapshotAnalysisRun(
   name: string | undefined,
   identity: RunIdentity,
 ): AnalysisRun {
+  assertEntityWritable(workspace, { kind: 'workspace', id: 'sample' })
   assertSelection(resumeIds, 'resume')
   assertSelection(rubricIds, 'rubric target')
   for (const rubric of workspace.rubrics.filter((item) => rubricIds.includes(item.id))) assertDemoRubric(rubric)
@@ -133,6 +135,7 @@ export function snapshotAnalysisRun(
     const matches = workspace.resumes.filter((resume) => resume.id === id)
     const resume = matches[0]
     if (!resume || matches.length !== 1) throw new Error(`Selected resume "${id}" is missing or has an ambiguous ID.`)
+    assertEntityWritable(workspace, { kind: 'resume', id: resume.id })
     const documents = workspace.documents.filter((document) => document.id === resume.documentId)
     const document = documents[0]
     if (!document || documents.length !== 1) throw new Error(`The source document for "${resume.name}" is missing or ambiguous.`)
@@ -144,6 +147,7 @@ export function snapshotAnalysisRun(
     const matches = workspace.rubrics.filter((rubric) => rubric.id === id)
     const rubric = matches[0]
     if (!rubric || matches.length !== 1) throw new Error(`Selected rubric "${id}" is missing or has an ambiguous ID.`)
+    assertEntityWritable(workspace, { kind: 'rubric', id: rubric.groupId })
     let target: AnalysisTarget
     if (rubric.kind === 'grade') {
       if (latest.get(rubric.groupId) !== rubric.id) {
@@ -160,6 +164,8 @@ export function snapshotAnalysisRun(
       const jobs = workspace.jobs.filter((job) => job.id === rubric.jobId)
       const job = jobs[0]
       if (!job || jobs.length !== 1) throw new Error(`The job linked to "${rubric.name}" is missing or ambiguous.`)
+      assertEntityWritable(workspace, { kind: 'job', id: job.id })
+      if (job.rubricDeletedAt) throw new Error(`"${job.title}" has No rubric. Select another job with an active current rubric.`)
       if (job.status !== 'ready') throw new Error(`"${job.title}" is ${job.status}, not analysis-ready. Finish or retry the import first.`)
       if (job.rubricId !== rubric.id) throw new Error(`"${rubric.name}" is not the job's current linked rubric. Select its current version.`)
       const documents = workspace.documents.filter((document) => document.id === job.documentId)

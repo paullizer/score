@@ -6,6 +6,7 @@ import {
   createGradeStoreFromContainer, createGradeBlobStoreFromContainer,
   StoreConflictError, StoreNotFoundError, gradeVersionHash, gradeSourceSetHash,
 } from '../dist-server/app.mjs'
+import { gradeLifecycleTesting } from './grade-lifecycle-fakes.mjs'
 
 const WORKSPACE = 'workspace-one'
 const LADDER = `ladder-${randomUUID()}`
@@ -67,28 +68,43 @@ function container() {
       query(spec, options) {
         queries.push({ spec, options })
         const parameter = name => spec.parameters.find(value => value.name === name)?.value
-        const records = () => [...values.values()].filter(record =>
+        const records = () => {
+          if (spec.query.includes('VALUE c.workspaceId')) return [...new Set([...values.values()].filter(record =>
+            (record.recordType === 'grade-lifecycle' && record.ladderId && (record.state === 'deleting' || record.pending?.length ||
+              (record.preparation && record.preparation.expiresAt <= parameter('@now')))) ||
+            (['grade-ladder', 'grade-head'].includes(record.recordType) && record.lifecycle?.deletingAt))
+            .map(record => record.workspaceId))].slice(0, parameter('@limit'))
+          return [...values.values()].filter(record =>
           (!options?.partitionKey || record.workspaceId === options.partitionKey) &&
-          record.recordType === parameter('@recordType') &&
-          (!parameter('@ladderId') || record.ladderId === parameter('@ladderId')) &&
-          (!parameter('@grade') || record.grade === parameter('@grade')) &&
+          (parameter('@recordType') ? record.recordType === parameter('@recordType') : record.recordType !== 'grade-lifecycle') &&
+          (!parameter('@ladderId') || record.ladderId === parameter('@ladderId') ||
+            (spec.query.includes('c.id = @ladderId') && record.id === parameter('@ladderId'))) &&
+          (!parameter('@grade') || record.grade === parameter('@grade') ||
+            (spec.query.includes('c.input.grade') && record.input?.grade === parameter('@grade'))) &&
           (!parameter('@generationId') || record.generationId === parameter('@generationId')) &&
           (!parameter('@status') || record.status === parameter('@status')) &&
           (!parameter('@now') || (['queued', 'running'].includes(record.status) &&
             (!record.nextAttemptAt || record.nextAttemptAt <= parameter('@now')) &&
             (!record.lease || record.lease.expiresAt <= parameter('@now')))))
-          .sort((a, b) => parameter('@now') ? a.createdAt.localeCompare(b.createdAt) : b.createdAt.localeCompare(a.createdAt))
-          .slice(0, parameter('@limit') ?? options?.maxItemCount ?? 100).map(value => structuredClone(value))
+          .sort((a, b) => spec.query.includes('ORDER BY c.id') ? a.id.localeCompare(b.id) :
+            parameter('@now') ? a.createdAt.localeCompare(b.createdAt) : b.createdAt.localeCompare(a.createdAt))
+          .map(value => structuredClone(value))
+        }
         return {
-          async fetchNext() { return { resources: records(), continuationToken: undefined } },
-          async fetchAll() { return { resources: records() } },
+          async fetchNext() {
+            const found = records()
+            const start = Number(options?.continuationToken ?? 0)
+            const limit = parameter('@limit') ?? options?.maxItemCount ?? 100
+            return { resources: found.slice(start, start + limit), continuationToken: start + limit < found.length ? String(start + limit) : undefined }
+          },
+          async fetchAll() { return { resources: records().slice(0, parameter('@limit') ?? 100) } },
         }
       },
       async batch(operations, workspaceId) {
         batches.push({ operations: structuredClone(operations), workspaceId })
         if (race) { const callback = race; race = null; callback() }
         const bad = resultCode ?? operations.map(operation => {
-          const previous = values.get(key(workspaceId, operation.resourceBody.id))
+          const previous = values.get(key(workspaceId, operation.id ?? operation.resourceBody.id))
           return operation.operationType === 'Create' ? previous ? 409 : 201
             : !previous ? 404 : previous._etag !== operation.ifMatch ? 412 : 200
         }).find(code => code >= 400)
@@ -96,9 +112,13 @@ function container() {
         if (bad) return { code: bad, result: operations.map((_operation, index) => ({ statusCode: index ? 424 : bad })) }
         return {
           code: 200,
-          result: operations.map(operation => ({
-            statusCode: operation.operationType === 'Create' ? 201 : 200, eTag: save(operation.resourceBody)._etag,
-          })),
+          result: operations.map(operation => {
+            if (operation.operationType === 'Delete') {
+              values.delete(key(workspaceId, operation.id))
+              return { statusCode: 204 }
+            }
+            return { statusCode: operation.operationType === 'Create' ? 201 : 200, eTag: save(operation.resourceBody)._etag }
+          }),
         }
       },
     },
@@ -111,16 +131,30 @@ test('Azure grade adapter publishes one same-workspace transactional batch with 
   const root = ladder()
   const created = await store.create(root)
   assert.equal(created.created, true)
+  assert.equal(cosmos.batches.length, 1)
+  const initial = cosmos.batches[0]
+  assert.equal(initial.workspaceId, WORKSPACE)
+  assert.deepEqual(initial.operations.map(operation => [operation.operationType, operation.resourceBody.id]), [
+    ['Create', root.id], ['Create', 'grade-lifecycle-workspace'], ['Create', `grade-lifecycle-${LADDER}`],
+  ])
+  assert.deepEqual(initial.operations[0].resourceBody, root)
+  const workspaceControl = await store.getControl(WORKSPACE)
+  const familyControl = await store.getControl(WORKSPACE, LADDER)
   const task = work()
   await store.transact(WORKSPACE, [
     { kind: 'replace', record: { ...root, status: 'discovering' }, etag: created.value.etag },
     { kind: 'create', record: task },
   ])
-  assert.equal(cosmos.batches.length, 1)
+  assert.equal(cosmos.batches.length, 2)
   assert.equal(cosmos.replacements.length, 0)
-  assert.equal(cosmos.batches[0].workspaceId, WORKSPACE)
-  assert.deepEqual(cosmos.batches[0].operations.map(value => value.operationType), ['Replace', 'Create'])
-  assert.equal(cosmos.batches[0].operations[0].ifMatch, created.value.etag)
+  const publication = cosmos.batches[1]
+  assert.equal(publication.workspaceId, WORKSPACE)
+  assert.deepEqual(publication.operations, [
+    { operationType: 'Replace', id: root.id, resourceBody: { ...root, status: 'discovering' }, ifMatch: created.value.etag },
+    { operationType: 'Create', resourceBody: task },
+    { operationType: 'Replace', id: workspaceControl.record.id, resourceBody: workspaceControl.record, ifMatch: workspaceControl.etag },
+    { operationType: 'Replace', id: familyControl.record.id, resourceBody: familyControl.record, ifMatch: familyControl.etag },
+  ])
   assert.equal((await store.get(WORKSPACE, root.id)).record.status, 'discovering')
   assert.equal((await store.get(WORKSPACE, task.id)).record.status, 'queued')
   assert.equal((await store.create(root)).created, false)
@@ -155,8 +189,18 @@ test('ETag races fail atomically; batch HTTP/operation failures never partially 
   assert.equal(await store.get(WORKSPACE, task.id), undefined)
   assert.equal((await store.get(WORKSPACE, root.id)).record.name, 'Concurrent editor')
   const latest = await store.get(WORKSPACE, root.id)
+  const workspaceControl = await store.getControl(WORKSPACE)
+  const familyControl = await store.getControl(WORKSPACE, LADDER)
+  const previousBatches = cosmos.batches.length
   await store.replace({ ...latest.record, name: 'Fresh editor' }, latest.etag)
-  assert.deepEqual(cosmos.replacements[0].options, { accessCondition: { type: 'IfMatch', condition: latest.etag } })
+  assert.equal(cosmos.batches.length, previousBatches + 1)
+  assert.equal(cosmos.replacements.length, 0)
+  assert.equal(cosmos.batches.at(-1).workspaceId, WORKSPACE)
+  assert.deepEqual(cosmos.batches.at(-1).operations, [
+    { operationType: 'Replace', id: root.id, resourceBody: { ...latest.record, name: 'Fresh editor' }, ifMatch: latest.etag },
+    { operationType: 'Replace', id: workspaceControl.record.id, resourceBody: workspaceControl.record, ifMatch: workspaceControl.etag },
+    { operationType: 'Replace', id: familyControl.record.id, resourceBody: familyControl.record, ifMatch: familyControl.etag },
+  ])
 })
 
 test('optional discovery metadata round-trips while legacy drafts and missing series titles remain valid', async () => {
@@ -558,3 +602,328 @@ for (const statusCode of [409, 412]) {
     assert.equal(result.blob.etag, '"first-capture"')
   })
 }
+
+test('workspace lifecycle fences are checked in the same Cosmos batch as create, claim and publication', async () => {
+  const cosmos = container()
+  const store = createGradeStoreFromContainer(cosmos)
+  const root = (await store.create(ladder())).value
+  const task = (await store.create(work())).value
+  const control = await store.getControl(WORKSPACE)
+  cosmos._race(() => cosmos.save({ ...control.record, state: 'archived', updatedAt: NOW }))
+  await assert.rejects(store.replace({ ...task.record, status: 'running',
+    lease: { owner: 'worker', expiresAt: '2026-09-18T00:00:00.000Z' } }, task.etag), StoreConflictError)
+  assert.equal((await store.get(WORKSPACE, task.record.id)).record.status, 'queued')
+  const guardedBatch = cosmos.batches.at(-1)
+  assert.equal(guardedBatch.operations.find(operation => operation.id === control.record.id).ifMatch, control.etag)
+  await assert.rejects(store.create(work()), StoreConflictError)
+  await assert.rejects(store.replace({ ...root.record, name: 'Archived update' }, root.etag), StoreConflictError)
+  await assert.rejects(store.transact(WORKSPACE, [{ kind: 'replace', ...task }]), StoreConflictError)
+  assert.equal((await store.get(WORKSPACE, root.record.id)).record.name, root.record.name)
+})
+
+test('head archive is independently guarded and cannot be cleared through ordinary replacement', async () => {
+  const cosmos = container()
+  const store = createGradeStoreFromContainer(cosmos)
+  const root = ladder()
+  root.grades = [9, 12]
+  await store.create(root)
+  const generationId = randomUUID()
+  const sourceSetId = `source-set-${randomUUID()}`
+  const head = grade => ({
+    id: `grade-head-${LADDER.slice(7)}-${grade}`, workspaceId: WORKSPACE, ladderId: LADDER,
+    recordType: 'grade-head', createdAt: NOW, updatedAt: NOW, grade, status: 'queued', issues: [], generationId, sourceSetId,
+  })
+  const nine = (await store.create(head(9))).value
+  const twelve = (await store.create(head(12))).value
+  const task = grade => work({ input: { kind: 'generate-grade', grade, generationId, sourceSetId, competencyPlanId: `competency-plan-${randomUUID()}` } })
+  const nineTask = (await store.create(task(9))).value
+  const twelveTask = (await store.create(task(12))).value
+  await store.transact(WORKSPACE, [{ kind: 'replace', etag: nine.etag,
+    record: { ...nine.record, lifecycle: { archivedAt: NOW } } }], { lifecycle: true })
+  const archived = await store.get(WORKSPACE, nine.record.id)
+  await assert.rejects(store.replace(nine.record, archived.etag), StoreConflictError)
+  await assert.rejects(store.replace({ ...nineTask.record, status: 'running' }, nineTask.etag), StoreConflictError)
+  const siblingClaim = await store.replace({ ...twelveTask.record, status: 'running' }, twelveTask.etag)
+  assert.equal(siblingClaim.record.status, 'running')
+  assert.deepEqual((await store.get(WORKSPACE, twelve.record.id)).record, twelve.record)
+  assert.equal((await store.listScope(WORKSPACE, { ladderId: LADDER, grade: 9 })).items.length, 2)
+  assert.equal((await store.listScope('workspace-two', { ladderId: LADDER, grade: 9 })).items.length, 0)
+})
+
+test('permanent cleanup requires a deleting fence and pages more than one Cosmos batch without dropping sibling families', async () => {
+  const cosmos = container()
+  const store = createGradeStoreFromContainer(cosmos)
+  const root = (await store.create(ladder())).value
+  const otherId = `ladder-${randomUUID()}`
+  const other = { ...ladder(), id: otherId, seedBlobName: `${WORKSPACE}/${otherId}/seed.json` }
+  await store.create(other)
+  const items = Array.from({ length: 125 }, () => work({ status: 'succeeded' }))
+  for (const item of items) cosmos.save(item)
+  const first = await store.get(WORKSPACE, items[0].id)
+  await assert.rejects(store.transact(WORKSPACE, [{ kind: 'delete', ...first }], { lifecycle: true }), StoreConflictError)
+  await assert.rejects(store.transact(WORKSPACE, [{ kind: 'delete', ...first }]), /fenced lifecycle/)
+  const firstPage = await store.listScope(WORKSPACE, { ladderId: LADDER, limit: 50 })
+  assert.equal(firstPage.items.length, 50)
+  assert.ok(firstPage.continuationToken)
+  assert.equal((await store.listScope(WORKSPACE, { ladderId: LADDER, limit: 50, continuationToken: firstPage.continuationToken })).items.length, 50)
+  await store.transact(WORKSPACE, [{ kind: 'replace', etag: root.etag,
+    record: { ...root.record, lifecycle: { deletingAt: NOW } } }], { lifecycle: true })
+  const lifecycle = new gradeLifecycleTesting.GradeLifecycleService({
+    store, blobs: { listPage: async () => ({ names: [] }), delete: async () => {} },
+  }, { impact: async () => [] }, () => new Date(NOW))
+  const pending = await store.get(WORKSPACE, LADDER)
+  assert.deepEqual(await lifecycle.change(WORKSPACE, LADDER, 'delete', pending.etag), { deleted: true })
+  assert.deepEqual((await store.listScope(WORKSPACE, { ladderId: LADDER })).items, [])
+  assert.ok(await store.get(WORKSPACE, otherId))
+  assert.equal((await store.getControl(WORKSPACE, LADDER)).record.state, 'deleted')
+  assert.ok(cosmos.batches.filter(batch => batch.operations.some(operation => operation.operationType === 'Delete')).length > 4)
+  assert.ok(cosmos.batches.every(batch => batch.operations.length <= 100 && Buffer.byteLength(JSON.stringify(batch.operations)) <= 1_800_000))
+  await assert.rejects(store.create(root.record), StoreConflictError)
+  await assert.rejects(store.create(items[0]), StoreConflictError)
+})
+
+test('scoped blob enumeration validates every page and cleanup deletes snapshots without accepting broad prefixes', async () => {
+  const names = Array.from({ length: 207 }, (_, index) => `${WORKSPACE}/${LADDER}/${seedId}/chunks/v1-page-${index}.json`).sort()
+  const calls = []
+  let injectForeign = false
+  const blobs = createGradeBlobStoreFromContainer({
+    listBlobsFlat({ prefix }) {
+      assert.equal(prefix, `${WORKSPACE}/${LADDER}/`)
+      return {
+        byPage({ continuationToken, maxPageSize }) {
+          assert.equal(maxPageSize, 100)
+          const start = Number(continuationToken ?? 0)
+          return (async function* () {
+            yield { segment: { blobItems: (injectForeign ? [`other-workspace/${LADDER}/seed.json`] : names.slice(start, start + maxPageSize)).map(name => ({ name })) },
+              continuationToken: start + maxPageSize < names.length ? String(start + maxPageSize) : undefined }
+          })()
+        },
+      }
+    },
+    getBlockBlobClient(name) {
+      return { async deleteIfExists(options) { calls.push({ name, options }) } }
+    },
+  })
+  const first = await blobs.listPage(WORKSPACE, LADDER)
+  assert.equal(first.names.length, 100)
+  const second = await blobs.listPage(WORKSPACE, LADDER, first.continuationToken)
+  assert.equal(second.names.length, 100)
+  const last = await blobs.listPage(WORKSPACE, LADDER, second.continuationToken)
+  assert.equal(last.names.length, 7)
+  assert.equal(last.continuationToken, undefined)
+  await blobs.delete(first.names[0])
+  assert.deepEqual(calls[0], { name: first.names[0], options: { deleteSnapshots: 'include' } })
+  await assert.rejects(blobs.listPage('../workspace', LADDER), /workspace/)
+  await assert.rejects(blobs.listPage(WORKSPACE, '../ladder'), /ID|scope/)
+  await assert.rejects(blobs.delete(`${WORKSPACE}/${LADDER}/../secret.json`), /Invalid grade blob/)
+  injectForeign = true
+  await assert.rejects(blobs.listPage(WORKSPACE, LADDER), /invalid scoped name/)
+  assert.equal(calls.length, 1)
+})
+
+test('bounded grade uploads pass their cancellation signal through to the Azure request', async () => {
+  const controller = new AbortController()
+  const blobs = createGradeBlobStoreFromContainer({
+    getBlockBlobClient() {
+      return { async upload(_bytes, _length, options) {
+        assert.equal(options.abortSignal, controller.signal)
+        return { etag: '"bounded-upload"' }
+      } }
+    },
+  })
+  assert.equal((await blobs.putImmutable(`${WORKSPACE}/${LADDER}/seed.json`, Buffer.from('{}'), 'application/json',
+    { signal: controller.signal })).created, true)
+})
+
+test('workspace blob enumeration discovers legacy unpublished families using only an exact workspace prefix', async () => {
+  const otherLadder = `ladder-${randomUUID()}`
+  const owned = [`${WORKSPACE}/${LADDER}/initialization.json`, `${WORKSPACE}/${otherLadder}/seed.json`]
+  let invalidName
+  const blobs = createGradeBlobStoreFromContainer({
+    listBlobsFlat({ prefix }) {
+      assert.equal(prefix, `${WORKSPACE}/`)
+      return {
+        byPage({ continuationToken, maxPageSize }) {
+          assert.equal(maxPageSize, 100)
+          assert.equal(continuationToken, undefined)
+          return (async function* () {
+            yield { segment: { blobItems: (invalidName ? [invalidName] : owned).map(name => ({ name })) } }
+          })()
+        },
+      }
+    },
+    getBlockBlobClient() { throw new Error('Enumeration cannot mutate content.') },
+  })
+  assert.deepEqual((await blobs.listFamilies(WORKSPACE)).ladderIds, [LADDER, otherLadder])
+  for (const name of [
+    `${WORKSPACE}-other/${otherLadder}/seed.json`, `${WORKSPACE}/not-a-ladder/seed.json`,
+    `${WORKSPACE}/ladder-not-a-uuid/initialization.json`, `${WORKSPACE}/${LADDER}/../seed.json`,
+  ]) {
+    invalidName = name
+    await assert.rejects(blobs.listFamilies(WORKSPACE), /invalid scoped name/)
+  }
+  await assert.rejects(blobs.listFamilies('../unsafe'), /workspace/)
+})
+
+test('workspace purge discovers and deletes paginated legacy seed and reference blobs without any records or controls', async () => {
+  const cosmos = container()
+  const store = createGradeStoreFromContainer(cosmos)
+  const secondLadder = `ladder-${randomUUID()}`
+  const secondSource = `source-${randomUUID()}`
+  const names = [
+    `${WORKSPACE}/${LADDER}/initialization.json`, `${WORKSPACE}/${LADDER}/seed.json`,
+    `${WORKSPACE}/${LADDER}/${seedId}/original.pdf`, `${WORKSPACE}/${LADDER}/${seedId}/document-v1.json`,
+    `${WORKSPACE}/${LADDER}/${seedId}/capture.json`, `${WORKSPACE}/${LADDER}/discovery-${randomUUID()}.json`,
+    `${WORKSPACE}/${LADDER}/requests/${randomUUID()}.json`,
+    ...Array.from({ length: 115 }, (_, index) => `${WORKSPACE}/${LADDER}/${seedId}/chunks/v1-legacy-${index}.json`),
+    `${WORKSPACE}/${secondLadder}/initialization.json`, `${WORKSPACE}/${secondLadder}/${secondSource}/original.html`,
+    `${WORKSPACE}/${secondLadder}/${secondSource}/document-v3.json`,
+  ]
+  const foreign = [
+    `workspace-two/${LADDER}/seed.json`, `${WORKSPACE}-other/${secondLadder}/initialization.json`,
+    `workspace-two/${LADDER}/${seedId}/original.pdf`,
+  ]
+  const remaining = new Set([...names, ...foreign])
+  const enumerations = []
+  const deleted = []
+  const blobs = createGradeBlobStoreFromContainer({
+    listBlobsFlat({ prefix }) {
+      assert.ok([`${WORKSPACE}/`, `${WORKSPACE}/${LADDER}/`, `${WORKSPACE}/${secondLadder}/`].includes(prefix))
+      return {
+        byPage({ continuationToken, maxPageSize }) {
+          enumerations.push({ prefix, continuationToken })
+          assert.equal(maxPageSize, 100)
+          const matches = [...remaining].filter(name => name.startsWith(prefix)).sort()
+          const start = Number(continuationToken ?? 0)
+          return (async function* () {
+            yield { segment: { blobItems: matches.slice(start, start + maxPageSize).map(name => ({ name })) },
+              continuationToken: start + maxPageSize < matches.length ? String(start + maxPageSize) : undefined }
+          })()
+        },
+      }
+    },
+    getBlockBlobClient(name) {
+      return {
+        async deleteIfExists(options) {
+          assert.ok(names.includes(name), 'Cleanup may delete only validated artifacts owned by this workspace.')
+          assert.deepEqual(options, { deleteSnapshots: 'include' })
+          deleted.push(name)
+          remaining.delete(name)
+        },
+      }
+    },
+  })
+  assert.equal(cosmos.values.size, 0)
+  assert.deepEqual((await store.listScope(WORKSPACE, {})).items, [])
+  assert.deepEqual((await store.listControls(WORKSPACE)).items, [])
+  for (const ladderId of [LADDER, secondLadder]) {
+    assert.equal(await store.get(WORKSPACE, ladderId), undefined)
+    assert.equal(await store.getControl(WORKSPACE, ladderId), undefined)
+  }
+  const participant = gradeLifecycleTesting.createGradeLifecycleParticipant({ store, blobs })
+  await participant.setState(WORKSPACE, 'deleting', NOW)
+  await participant.cancel(WORKSPACE, NOW)
+  await participant.purge(WORKSPACE, NOW)
+  await participant.setState(WORKSPACE, 'deleted', NOW)
+  assert.deepEqual(remaining, new Set(foreign))
+  assert.deepEqual(new Set(deleted), new Set(names))
+  assert.ok(enumerations.some(page => page.prefix === `${WORKSPACE}/` && page.continuationToken !== undefined))
+  assert.deepEqual((await store.listScope(WORKSPACE, {})).items, [])
+  assert.equal((await store.getControl(WORKSPACE, LADDER)).record.state, 'deleted')
+  assert.equal((await store.getControl(WORKSPACE, secondLadder)).record.state, 'deleted')
+  assert.ok([...cosmos.values.values()].every(record => record.recordType === 'grade-lifecycle' && record.state === 'deleted'))
+  const deletionCalls = deleted.length
+  const retryStart = cosmos.batches.length
+  const restarted = gradeLifecycleTesting.createGradeLifecycleParticipant({ store, blobs })
+  await restarted.setState(WORKSPACE, 'deleting', '2026-09-18T21:00:00.000Z')
+  assert.equal((await store.getControl(WORKSPACE)).record.state, 'deleted')
+  await restarted.cancel(WORKSPACE, '2026-09-18T21:00:00.000Z')
+  await restarted.purge(WORKSPACE, '2026-09-18T21:00:00.000Z')
+  await restarted.setState(WORKSPACE, 'deleted', '2026-09-18T21:00:00.000Z')
+  assert.equal(deleted.length, deletionCalls)
+  assert.deepEqual(remaining, new Set(foreign))
+  assert.ok(cosmos.batches.slice(retryStart).flatMap(batch => batch.operations)
+    .filter(operation => operation.resourceBody?.recordType === 'grade-lifecycle')
+    .every(operation => operation.resourceBody.state === 'deleted'), 'A coordinator retry must never regress terminal controls.')
+  for (const state of ['active', 'archived']) {
+    await assert.rejects(restarted.setState(WORKSPACE, state, NOW), error => error.status === 409)
+  }
+  assert.equal((await store.getControl(WORKSPACE)).record.state, 'deleted')
+})
+
+test('pending lifecycle discovery returns bounded distinct workspace IDs, not completed archives or private records', async () => {
+  const cosmos = container()
+  const store = createGradeStoreFromContainer(cosmos)
+  await store.create(ladder())
+  await gradeLifecycleTesting.updateGradeControl(store, WORKSPACE, LADDER, control => ({
+    ...control, pending: [{ action: 'archive', updatedAt: NOW }],
+  }))
+  const secondId = `ladder-${randomUUID()}`
+  cosmos.save({ ...ladder(), id: secondId, workspaceId: 'workspace-two', lifecycle: { deletingAt: NOW },
+    seedBlobName: `workspace-two/${secondId}/seed.json` })
+  const thirdId = `ladder-${randomUUID()}`
+  const third = (await store.create({ ...ladder(), id: thirdId, workspaceId: 'workspace-three',
+    seedBlobName: `workspace-three/${thirdId}/seed.json` })).value
+  await store.transact('workspace-three', [{ kind: 'replace', etag: third.etag,
+    record: { ...third.record, lifecycle: { archivedAt: NOW } } }], { lifecycle: true })
+  await gradeLifecycleTesting.updateGradeControl(store, 'workspace-four', `ladder-${randomUUID()}`, control => ({
+    ...control, state: 'deleting',
+  }))
+  assert.deepEqual(new Set(await store.pendingLifecycleWorkspaces(20)), new Set([WORKSPACE, 'workspace-two', 'workspace-four']))
+  assert.equal((await store.pendingLifecycleWorkspaces(1)).length, 1)
+  assert.match(cosmos.queries.at(-1).spec.query, /SELECT DISTINCT TOP @limit VALUE c\.workspaceId/)
+  await assert.rejects(store.pendingLifecycleWorkspaces(0), /limit/)
+  await assert.rejects(store.pendingLifecycleWorkspaces(101), /limit/)
+})
+
+test('unpublished creation reservations are immutable and cleared atomically only by their matching ladder publication', async () => {
+  const cosmos = container()
+  const store = createGradeStoreFromContainer(cosmos)
+  const root = ladder()
+  const preparation = { inputFingerprint: root.inputFingerprint, expiresAt: new Date(Date.now() + 60_000).toISOString() }
+  await gradeLifecycleTesting.updateGradeControl(store, WORKSPACE, LADDER, control => ({ ...control, preparation }), false)
+  const reserved = await store.getControl(WORKSPACE, LADDER)
+  await assert.rejects(store.transact(WORKSPACE, [], {
+    controls: [{ etag: reserved.etag, record: { ...reserved.record, preparation: { ...preparation, expiresAt: '2099-01-01T00:00:00.000Z' } } }],
+  }), StoreConflictError)
+  await assert.rejects(store.create({ ...root, inputFingerprint: 'b'.repeat(64) }), StoreConflictError)
+  cosmos._code(412)
+  await assert.rejects(store.create(root), StoreConflictError)
+  assert.deepEqual((await store.getControl(WORKSPACE, LADDER)).record.preparation, preparation)
+  assert.equal(await store.get(WORKSPACE, LADDER), undefined)
+  const created = await store.create(root)
+  assert.equal(created.created, true)
+  assert.equal((await store.getControl(WORKSPACE, LADDER)).record.preparation, undefined)
+  const publication = cosmos.batches.at(-1).operations
+  assert.ok(publication.some(operation => operation.operationType === 'Create' && operation.resourceBody.id === LADDER))
+  assert.ok(publication.some(operation => operation.id === reserved.record.id &&
+    operation.resourceBody.preparation === undefined && operation.ifMatch === reserved.etag))
+})
+
+test('expired preparation discovery is scoped and conditional orphan cleanup cannot erase a racing published ladder', async () => {
+  const cosmos = container()
+  const store = createGradeStoreFromContainer(cosmos)
+  const root = ladder()
+  await gradeLifecycleTesting.updateGradeControl(store, WORKSPACE, LADDER, control => ({
+    ...control, preparation: { inputFingerprint: root.inputFingerprint, expiresAt: NOW },
+  }))
+  const futureId = `ladder-${randomUUID()}`
+  await gradeLifecycleTesting.updateGradeControl(store, 'workspace-future', futureId, control => ({
+    ...control, preparation: { inputFingerprint: 'b'.repeat(64), expiresAt: '2099-01-01T00:00:00.000Z' },
+  }))
+  assert.deepEqual(await store.pendingLifecycleWorkspaces(20), [WORKSPACE])
+  assert.match(cosmos.queries.at(-1).spec.query, /c\.preparation\.expiresAt <= @now/)
+  await assert.rejects(store.create(root), StoreConflictError)
+  const expired = await store.getControl(WORKSPACE, LADDER)
+  cosmos._race(() => {
+    cosmos.save(root)
+    cosmos.save({ ...expired.record, preparation: undefined })
+  })
+  let deletedBlobs = 0
+  await assert.rejects(gradeLifecycleTesting.discardGradePreparation({
+    store, blobs: { listPage: async () => ({ names: [] }), delete: async () => { deletedBlobs++ } },
+  }, WORKSPACE, LADDER, NOW), StoreConflictError)
+  assert.deepEqual((await store.get(WORKSPACE, LADDER)).record, root)
+  assert.equal((await store.getControl(WORKSPACE, LADDER)).record.state, 'active')
+  assert.equal(deletedBlobs, 0)
+})

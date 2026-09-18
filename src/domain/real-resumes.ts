@@ -1,6 +1,7 @@
 import type { Citation, SourceDocument } from './types'
 import type { DocumentPagination, OriginalContentType, UploadContentType, UploadFormat, WordImportFeatures } from './document-formats'
 import { MAX_MARKDOWN_BYTES } from './source-files'
+import type { LifecycleMetadata, LifecycleOperation } from './lifecycle'
 
 export const RESUME_IMPORT_LIMITS = {
   maxFileBytes: 10 * 1024 * 1024,
@@ -134,6 +135,7 @@ export interface ResumeEntityBase {
 
 export interface RealResumeRecord extends ResumeEntityBase {
   recordType: 'resume'
+  lifecycle?: LifecycleMetadata
   resume: RealResume
   source: RealResumeSource
   batchId: string
@@ -171,6 +173,8 @@ export interface ResumeImportBatchRecord extends ResumeEntityBase {
   createdBy: string
   inputCount: number
   items: ResumeBatchItem[]
+  // Removed admissions still consume their original slots; deleting an item cannot reopen a batch.
+  removedCount?: number
 }
 
 export type ResumeEntity = RealResumeRecord | ResumeImportBatchRecord
@@ -181,6 +185,8 @@ export interface VersionedResumeEntity<T extends ResumeEntity = ResumeEntity> {
 }
 
 export interface RealResumeSummary {
+  lifecycle?: LifecycleMetadata
+  lifecycleOperation?: LifecycleOperation
   resume: RealResume
   workspaceId: string
   source: RealResumeSource

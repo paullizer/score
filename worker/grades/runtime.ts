@@ -21,6 +21,7 @@ import type {
 import type { DocumentIntelligenceClientOptions } from '../runtime'
 import { GradeModelError } from './model-errors'
 import { reconcileReferenceIssues } from '../references/issue-lifecycle'
+import { assertGradeWritable, gradeIsLocked, guardedGradeBlobs } from '../../server/grades/guards'
 
 const LEASE_MS = 120_000
 const HEARTBEAT_MS = 25_000
@@ -151,13 +152,13 @@ function ensureSourceInLadder(source: ReferenceSourceRecord, ladder: GradeLadder
 }
 
 function ensureGeneration(ladder: GradeLadderRecord, sourceSetId: string, generationId: string): void {
-  if (ladder.sourceSetId !== sourceSetId || ladder.generationId !== generationId || ladder.status === 'cancelled') {
+  if (gradeIsLocked(ladder.lifecycle) || ladder.sourceSetId !== sourceSetId || ladder.generationId !== generationId || ladder.status === 'cancelled') {
     throw new LostGradeWork()
   }
 }
 
 function ensureHeadGeneration(head: GradeHeadRecord, sourceSetId: string, generationId: string): void {
-  if (head.sourceSetId !== sourceSetId || head.generationId !== generationId || head.status === 'cancelled') {
+  if (gradeIsLocked(head.lifecycle) || head.sourceSetId !== sourceSetId || head.generationId !== generationId || head.status === 'cancelled') {
     throw new LostGradeWork()
   }
 }
@@ -206,9 +207,16 @@ class GradeLease {
 
   private async current(allowAborted = false): Promise<VersionedGradeEntity<GradeWorkRecord>> {
     if (this.signal.aborted && !allowAborted) throw this.signal.reason
-    const live = await requireRecord(this.store, this.claimed.record.workspaceId, this.claimed.record.id, 'grade-work')
-    if (live.record.status !== 'running' || live.record.lease?.owner !== this.owner) throw new LostGradeWork()
-    return live
+    const live = await this.store.get(this.claimed.record.workspaceId, this.claimed.record.id)
+    if (!live || live.record.recordType !== 'grade-work' || live.record.status !== 'running' || live.record.lease?.owner !== this.owner) throw new LostGradeWork()
+    try {
+      await assertGradeWritable(this.store, live.record.workspaceId, live.record.ladderId,
+        'grade' in live.record.input ? live.record.input.grade : undefined)
+    } catch (error) {
+      if (error instanceof StoreConflictError) throw new LostGradeWork()
+      throw error
+    }
+    return live as VersionedGradeEntity<GradeWorkRecord>
   }
 
   async check(): Promise<void> {
@@ -253,7 +261,7 @@ class GradeLease {
 
 async function activeLadder(deps: GradeWorkerDependencies, work: GradeWorkRecord): Promise<VersionedGradeEntity<GradeLadderRecord>> {
   const ladder = await requireRecord(deps.store, work.workspaceId, work.ladderId, 'grade-ladder')
-  if (ladder.record.status === 'cancelled') throw new LostGradeWork()
+  if (gradeIsLocked(ladder.record.lifecycle) || ladder.record.status === 'cancelled') throw new LostGradeWork()
   return ladder
 }
 
@@ -593,7 +601,7 @@ async function planCompetencies(deps: GradeWorkerDependencies, lease: GradeLease
     const operations: GradeTransaction[] = [{ kind: 'create', record: plan }]
     for (const grade of input.sourceSet.grades) {
       const head = await requireRecord(deps.store, work.workspaceId, gradeHeadId(work.ladderId, grade), 'grade-head')
-      if (head.record.status === 'cancelled') continue
+      if (head.record.status === 'cancelled' || gradeIsLocked(head.record.lifecycle)) continue
       ensureHeadGeneration(head.record, sourceSetId, generationId)
       operations.push({
         kind: 'create',
@@ -824,6 +832,8 @@ async function claim(
     nextAttemptAt: new Date(time.getTime() + LEASE_MS).toISOString(), error: undefined, updatedAt: time.toISOString(),
   }
   try {
+    await assertGradeWritable(deps.store, record.workspaceId, record.ladderId,
+      'grade' in record.input ? record.input.grade : undefined)
     const result = await deps.store.replace(record, candidate.etag)
     if (!gradeRecordIs(result.record, 'grade-work')) throw new GradeWorkerError('work-record-type', 'The grade store returned an unexpected task type.')
     return { record: result.record, etag: result.etag }
@@ -837,6 +847,7 @@ export async function processGradeWork(
   claimed: VersionedGradeEntity<GradeWorkRecord>, deps: GradeWorkerDependencies,
   options: { owner: string; deadline: number; signal?: AbortSignal; attemptLimitReached?: boolean },
 ): Promise<'succeeded' | 'failed' | 'deferred' | 'cancelled'> {
+  deps = { ...deps, blobs: guardedGradeBlobs(deps.store, deps.blobs) }
   const now = deps.now ?? (() => new Date())
   const lease = new GradeLease(claimed, deps.store, options.owner, now, options.deadline, options.signal)
   lease.start()
@@ -854,6 +865,7 @@ export async function processGradeWork(
   } catch (caught) {
     const error = lease.signal.aborted ? lease.signal.reason : caught
     const authoritative = await deps.store.get(claimed.record.workspaceId, claimed.record.id)
+    if (!authoritative) return 'cancelled'
     if (authoritative && gradeRecordIs(authoritative.record, 'grade-work') && authoritative.record.status === 'succeeded') {
       return 'succeeded'
     }
@@ -861,7 +873,14 @@ export async function processGradeWork(
       return 'cancelled'
     }
     try { await recordFailure(deps, lease, error, now) } catch (failure) {
-      if (!(failure instanceof LostGradeWork)) throw failure
+      if (failure instanceof LostGradeWork) return 'cancelled'
+      if (!(failure instanceof StoreConflictError)) throw failure
+      try { await assertGradeWritable(deps.store, claimed.record.workspaceId, claimed.record.ladderId,
+        'grade' in claimed.record.input ? claimed.record.input.grade : undefined) } catch (guardError) {
+        if (guardError instanceof StoreConflictError) return 'cancelled'
+        throw guardError
+      }
+      throw failure
     }
     if (error instanceof LostGradeWork) return 'cancelled'
     if (error instanceof DeferredGradeWork) return 'deferred'

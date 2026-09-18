@@ -131,6 +131,31 @@ export function createFakeDirectoryStore() {
       partition.set('workspace', { doc: updated, etag })
       return { metadata: updated, etag }
     },
+    async replaceMetadata(metadata, expectedEtag) {
+      const partition = partitions.get(metadata.workspaceId)
+      const entry = partition?.get('workspace')
+      if (!entry) throw new StoreNotFoundError()
+      if (entry.etag !== expectedEtag) throw new StoreConflictError()
+      const etag = nextEtag()
+      partition.set('workspace', { doc: metadata, etag })
+      if (metadata.deletedAt && metadata.lifecycleOperation?.action === 'delete' && metadata.lifecycleOperation.status === 'complete') {
+        partition.delete(membershipIdFor(metadata.ownerId))
+      }
+      return { metadata, etag }
+    },
+    async deleteMemberships(workspaceId) {
+      const partition = partitions.get(workspaceId)
+      if (!partition) return
+      const ownerId = membershipIdFor(partition.get('workspace').doc.ownerId)
+      for (const [id, entry] of partition) {
+        if (entry.doc.principalType === 'user' && id !== ownerId) partition.delete(id)
+      }
+    },
+    async listLifecycleOperations(limit) {
+      return [...partitions.values()].map(partition => partition.get('workspace'))
+        .filter(entry => entry?.doc.lifecycleOperation && entry.doc.lifecycleOperation.status !== 'complete')
+        .slice(0, limit).map(entry => ({ metadata: entry.doc, etag: entry.etag }))
+    },
     async deleteWorkspace(workspaceId, ownerMembershipId) {
       const partition = partitions.get(workspaceId)
       if (!partition) return
@@ -165,6 +190,7 @@ export function createFakeDirectoryStore() {
 /** In-memory stand-in for the real Blob-backed StateStore, with the same ETag-conditioned contract. */
 export function createFakeStateStore() {
   const blobs = new Map()
+  const leases = new Set()
   let etagCounter = 0
   let accessError = null
   const nextEtag = () => `"state-etag-${(etagCounter += 1)}"`
@@ -188,8 +214,19 @@ export function createFakeStateStore() {
       blobs.set(workspaceId, { content, etag })
       return { etag }
     },
-    async deleteState(workspaceId) {
+    async deleteState(workspaceId, expectedEtag) {
+      if (expectedEtag !== undefined && blobs.has(workspaceId) && blobs.get(workspaceId).etag !== expectedEtag) {
+        throw new StoreConflictError()
+      }
       blobs.delete(workspaceId)
+    },
+    async acquireMutationLease(workspaceId) {
+      if (leases.has(workspaceId)) throw new StoreConflictError('Another workspace change is in progress.')
+      leases.add(workspaceId)
+      return {
+        async renew() { if (!leases.has(workspaceId)) throw new StoreConflictError('Lease lost.') },
+        async release() { leases.delete(workspaceId) },
+      }
     },
     async checkAccess() {
       if (accessError) throw accessError
@@ -211,7 +248,7 @@ export async function startTestServer(overrides = {}) {
   const state = overrides.state ?? createFakeStateStore()
   const config = overrides.config ?? baseConfig()
   const distDir = overrides.distDir ?? FIXTURE_DIST_DIR
-  const app = createApp({ config, directory, state, distDir, now: overrides.now })
+  const app = createApp({ config, directory, state, distDir, now: overrides.now, jobs: overrides.jobs, grades: overrides.grades })
   const server = createServer(app)
   await new Promise((resolve, reject) => {
     server.once('error', reject)

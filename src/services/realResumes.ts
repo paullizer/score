@@ -7,7 +7,8 @@ import {
   type ResumeProcessingFeatures,
 } from '../domain/real-resumes'
 import { isSafeUploadedFilename, uploadedFileKind } from '../domain/source-files'
-import { cloudJsonRequest } from './cloudWorkspace'
+import { cloudJsonRequest, cloudLifecycleRequest } from './cloudWorkspace'
+import type { LifecycleAction, LifecycleImpact, LifecycleOperation } from '../domain/lifecycle'
 import { UPLOAD_CONTENT_TYPES, type UploadFormat } from '../domain/document-formats'
 import { requireUploadFile, uploadFileByteLimit } from './documentUploads'
 
@@ -144,4 +145,28 @@ export function cancelRealResume(workspaceId: string, resumeId: string, etag: st
 
 export function realResumeOriginalUrl(workspaceId: string, resumeId: string): string {
   return `/api${base(workspaceId, resumeId)}/original`
+}
+
+export interface RealResumeLifecycleResponse {
+  resume?: RealResumeDetail
+  deleted?: true
+  operation?: LifecycleOperation
+  etag?: string
+}
+
+export async function getRealResumeLifecycleImpact(workspaceId: string, resumeId: string, signal?: AbortSignal): Promise<LifecycleImpact> {
+  const result = await cloudJsonRequest<{ impact: LifecycleImpact }>(`${base(workspaceId, resumeId)}/lifecycle`, { signal })
+  return result.impact
+}
+
+export async function changeRealResumeLifecycle(workspaceId: string, resumeId: string, action: LifecycleAction, etag: string): Promise<RealResumeLifecycleResponse> {
+  if (!etag) throw new Error('Reload the exact resume version before changing its lifecycle.')
+  const result = await cloudLifecycleRequest<RealResumeLifecycleResponse>(`${base(workspaceId, resumeId)}/lifecycle`, {
+    method: 'POST', headers: { 'If-Match': etag }, body: JSON.stringify({ action }),
+  })
+  if (result.value.resume) {
+    checked(result.value.resume, workspaceId)
+    if (result.value.resume.resume.id !== resumeId) throw new Error('The lifecycle response belongs to another resume.')
+  }
+  return { ...result.value, etag: result.value.etag ?? result.etag }
 }

@@ -26,6 +26,8 @@ import {
 } from './validation'
 import { analysisPageCursor, analysisPageToken, validateAnalysisPage } from './paging'
 import { parseAnalysisJson } from './snapshots'
+import { analysisIsLocked } from './guards'
+import { assertWorkspaceMutationLease } from '../lifecycle/lease'
 
 export interface AnalysisSourceDeps {
   resumes?: RealResumesDeps
@@ -75,6 +77,12 @@ export class RealAnalysisTargets {
 
   private async jobTarget(workspaceId: string, job: RealJobRecord, selection?: RealJobTargetSelection): Promise<ResolvedJob[]> {
     if (!this.deps.jobs) throw unavailable('Real job targets are unavailable.')
+    if ((await this.deps.jobs.store.getWorkspaceLifecycle(workspaceId)).state !== 'active') {
+      throw conflict('The selected job workspace is archived or removed.')
+    }
+    if (analysisIsLocked(job.lifecycle) || analysisIsLocked(job.rubricLifecycle) || job.job.rubricDeletedAt) {
+      throw conflict('Archived or removed jobs and job rubrics cannot be selected for new analysis work.')
+    }
     if (job.job.status !== 'ready') throw conflict('Analysis requires a ready real job.')
     const source = job.source
     if (!job.extractedBlobName || !source.originalBlobName || !source.originalContentType || !source.sha256 || !source.bytes) {
@@ -117,8 +125,26 @@ export class RealAnalysisTargets {
     })
   }
 
+  private async gradeEligible(workspaceId: string, head: GradeHeadRecord): Promise<boolean> {
+    if (!this.deps.grades) throw unavailable('Real grade targets are unavailable.')
+    const [ladder, workspace, family] = await Promise.all([
+      this.grade(workspaceId, head.ladderId, 'grade-ladder'),
+      this.deps.grades.store.getControl(workspaceId),
+      this.deps.grades.store.getControl(workspaceId, head.ladderId),
+    ])
+    if (analysisIsLocked(head.lifecycle) || analysisIsLocked(ladder.lifecycle) ||
+      (workspace && workspace.record.state !== 'active') || (family && family.record.state !== 'active')) return false
+    if (!this.deps.jobs) throw unavailable('The approved grade seed eligibility is unavailable.')
+    if ((await this.deps.jobs.store.getWorkspaceLifecycle(workspaceId)).state !== 'active') return false
+    const seed = await this.deps.jobs.store.get(workspaceId, ladder.seedJobId)
+    if (!seed) throw notFound('The approved grade seed job is no longer available for a new analysis.')
+    const job = validateJob(seed.record, workspaceId, ladder.seedJobId)
+    return !analysisIsLocked(job.lifecycle) && !analysisIsLocked(job.rubricLifecycle) && !job.job.rubricDeletedAt
+  }
+
   private async gradeTarget(workspaceId: string, head: GradeHeadRecord, requested?: RealGradeTargetSelection): Promise<ResolvedGrade> {
     if (!this.deps.grades) throw unavailable('Real grade targets are unavailable.')
+    if (!await this.gradeEligible(workspaceId, head)) throw conflict('Archived or removed ladders, grades, and seed rubrics cannot start new analysis work.')
     if (!head.approvedVersionId || !head.approvalId) throw conflict('This grade has no approved version.')
     // Current draft context, generation and review pointers are deliberately not used here.
     const [version, approval] = await Promise.all([
@@ -185,6 +211,7 @@ export class RealAnalysisTargets {
   }
 
   async resolve(workspaceId: string, selection: RealAnalysisTargetSelection): Promise<ResolvedAnalysisTarget> {
+    assertWorkspaceMutationLease(workspaceId)
     if (selection.kind === 'job') {
       if (!this.deps.jobs) throw unavailable('Real job targets are unavailable.')
       const value = await this.deps.jobs.store.get(workspaceId, selection.jobId)
@@ -203,7 +230,7 @@ export class RealAnalysisTargets {
     if (!this.deps.jobs && !this.deps.grades) throw unavailable('Real analysis target libraries are unavailable.')
     const summaries: RealAnalysisTargetSummary[] = []
     let count = 0
-    if (this.deps.jobs) {
+    if (this.deps.jobs && (await this.deps.jobs.store.getWorkspaceLifecycle(workspaceId)).state === 'active') {
       let token: string | undefined
       const seen = new Set<string>()
       do {
@@ -211,7 +238,10 @@ export class RealAnalysisTargets {
         for (const value of page.jobs) {
           const job = validateJob(value.record, workspaceId)
           if (++count > 10_000) throw unavailable('The target library exceeds the safe discovery budget.')
-          if (job.job.status === 'ready') summaries.push(...(await this.jobTarget(workspaceId, job)).map(item => item.summary))
+          if (job.job.status === 'ready' && !analysisIsLocked(job.lifecycle) &&
+            !analysisIsLocked(job.rubricLifecycle) && !job.job.rubricDeletedAt) {
+            summaries.push(...(await this.jobTarget(workspaceId, job)).map(item => item.summary))
+          }
           if (summaries.length > 10_000) throw unavailable('The saved target version library exceeds the safe discovery budget.')
         }
         token = page.continuationToken
@@ -228,7 +258,9 @@ export class RealAnalysisTargets {
           const head = parseGradeEntity(value.record)
           if (head.recordType !== 'grade-head' || head.workspaceId !== workspaceId) throw unavailable('Grade target ownership is invalid.')
           if (++count > 10_000) throw unavailable('The target library exceeds the safe discovery budget.')
-          if (head.approvedVersionId && head.approvalId) summaries.push((await this.gradeTarget(workspaceId, head)).summary)
+          if (head.approvedVersionId && head.approvalId && await this.gradeEligible(workspaceId, head)) {
+            summaries.push((await this.gradeTarget(workspaceId, head)).summary)
+          }
         }
         token = page.continuationToken
         if (token && (seen.has(token) || seen.size >= 10_000)) throw unavailable('Grade target pagination did not advance within the safe budget.')
@@ -245,6 +277,7 @@ export class RealAnalysisTargets {
 export async function resolveAnalysisResume(
   deps: RealResumesDeps | undefined, workspaceId: string, selection: RealAnalysisResumeSelection, snapshotId: string, frozenAt: string,
 ): Promise<FrozenRealResumeSnapshot> {
+  assertWorkspaceMutationLease(workspaceId)
   if (!deps) throw unavailable('Real resume sources are unavailable.')
   const stored = await deps.store.get(workspaceId, selection.resumeId)
   if (!stored) throw notFound('The selected real resume was not found.')
@@ -253,6 +286,11 @@ export async function resolveAnalysisResume(
     throw notFound('The selected resume was not found in this workspace.')
   }
   const record: RealResumeRecord = entity
+  if (analysisIsLocked(record.lifecycle)) throw conflict('Archived or removed resumes cannot be selected for new analysis work.')
+  const [workspace, control] = await Promise.all([deps.store.getControl(workspaceId), deps.store.getControl(workspaceId, record.id)])
+  if ((workspace && workspace.record.state !== 'active') || (control && control.record.state !== 'active')) {
+    throw conflict('The selected resume or its workspace is archived or removed.')
+  }
   if (record.resume.status !== 'ready' || !record.capture || !record.captureManifest || !record.extraction || !record.profileBlob) {
     throw conflict('Every selected resume must be ready with complete captured source and profile evidence.')
   }

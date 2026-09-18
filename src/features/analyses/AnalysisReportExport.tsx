@@ -7,7 +7,7 @@ import type { AnalysisRun } from '../../domain/types'
 import { Badge, Button, InlineError, Modal } from '../../components/ui'
 
 type ReportSource =
-  | { kind: 'sample'; run: AnalysisRun }
+  | { kind: 'sample'; run: AnalysisRun; available: boolean }
   | { kind: 'real'; workspaceId: string; detail: RealAnalysisRunDetail; comparisons: RealAnalysisComparisonSummary[] | null; available: boolean }
 
 const descriptions: Record<AnalysisReportFormat, string> = {
@@ -29,7 +29,7 @@ export function AnalysisReportExport({ source }: { source: ReportSource }) {
   const [success, setSuccess] = useState('')
   const active = useRef<AbortController | null>(null)
   const identity = source.kind === 'sample' ? `sample:${source.run.id}` : `${source.workspaceId}:${source.detail.run.id}`
-  const historyAvailable = source.kind === 'sample' || source.available
+  const historyAvailable = source.available
   useEffect(() => {
     setOpen(false)
     setTargetId('')
@@ -58,9 +58,10 @@ export function AnalysisReportExport({ source }: { source: ReportSource }) {
   const selected = comparisons.filter((comparison) => !targetId || comparison.targetId === targetId)
   const complete = selected.filter((comparison) => comparison.status === 'complete').length
   const candidateCount = source.kind === 'sample' ? source.run.resumes.length : source.detail.resumes.length
-  const ready = source.kind === 'sample' || (source.available && source.comparisons !== null)
+  const ready = historyAvailable && (source.kind === 'sample' || source.comparisons !== null)
   const totalComplete = comparisons.filter((comparison) => comparison.status === 'complete').length
-  const disabledReason = !ready ? 'Load the saved analysis and its comparison list before exporting.'
+  const disabledReason = !historyAvailable ? 'This analysis is not currently available to read or export.'
+    : !ready ? 'Load the saved analysis and its comparison list before exporting.'
     : totalComplete === 0 ? 'At least one completed comparison is needed. A withheld overall score is still exportable.' : ''
   const busy = stage !== null
 

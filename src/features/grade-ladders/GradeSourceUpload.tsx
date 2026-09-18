@@ -10,6 +10,7 @@ import { useGradeRequestKey } from './grade-request-hooks'
 
 export function GradeSourceUpload({ detail, onClose }: { detail: GradeLadderDetail; onClose: () => void }) {
   const api = useGradeLadders()
+  const editable = api?.canEdit(detail.ladder.id) ?? false
   const limits = api?.features?.gradeLimits ?? GRADE_LADDER_LIMITS
   const [kind, setKind] = useState<'pdf' | 'url'>('pdf')
   const [file, setFile] = useState<File | null>(null)
@@ -54,7 +55,7 @@ export function GradeSourceUpload({ detail, onClose }: { detail: GradeLadderDeta
 
   async function submit(event: FormEvent) {
     event.preventDefault()
-    if (!api || submitting.current || !api.canWrite) return
+    if (!api || submitting.current || !editable) return
     setError('')
     let selectedPages: number[]
     try {
@@ -91,12 +92,12 @@ export function GradeSourceUpload({ detail, onClose }: { detail: GradeLadderDeta
   }
 
   const sourceLimit = detail.sources.filter((source) => source.origin !== 'seed-job' && source.status !== 'cancelled').length >= limits.maxSources
-  const disabled = !api?.canWrite || saving || reading || api.mutationPending || sourceLimit
+  const disabled = !editable || saving || reading || api?.mutationPending || sourceLimit
   return <Modal open onOpenChange={(open) => { if (!open) close() }} title="Add supporting evidence" description="Upload actual PDF bytes or request a public URL. Documents are private, versioned references — not job imports."
     footer={<><Button onClick={close}>Cancel</Button><Button type="submit" form="grade-source-upload" variant="primary" icon={saving ? LoaderCircle : kind === 'pdf' ? FileUp : Link2} disabled={disabled}>{saving ? 'Submitting source…' : 'Capture supporting source'}</Button></>}>
     <form id="grade-source-upload" onSubmit={submit} className="space-y-5">
       <SegmentedControl label="Supporting source type" value={kind} onChange={(value) => { if (!saving && !reading) setKind(value) }} options={[{ value: 'pdf', label: 'Actual PDF' }, { value: 'url', label: 'Public URL' }]} />
-      <fieldset disabled={saving || reading || !api?.canWrite} className="space-y-4">
+      <fieldset disabled={saving || reading || !editable} className="space-y-4">
         {kind === 'pdf' ? <label className="field"><span className="field-label">Supporting PDF</span><input className="input" aria-label="Supporting PDF" type="file" accept=".pdf,application/pdf" onChange={(event) => void chooseFile(event.target.files?.[0] ?? null)} />
           {file && <span className="field-hint">{file.name} · {(file.size / (1024 * 1024)).toFixed(2)} MiB · {reading ? 'Reading page metadata…' : pageCount === null ? 'Page count unavailable' : `${pageCount} original pages`}</span>}</label>
           : <label className="field"><span className="field-label">Direct public reference URL</span><input className="input" aria-label="Direct public reference URL" type="url" value={url} maxLength={limits.maxUrlLength} onChange={(event) => setUrl(event.target.value)} placeholder="https://agency.gov/published-standard.pdf" /><span className="field-hint">Public PDF or substantive HTML page, including an intended section fragment. The server validates every redirect; private or credentialed URLs are not accepted.</span></label>}

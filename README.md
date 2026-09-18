@@ -39,6 +39,10 @@ The application uses React 18, TypeScript, Vite, Tailwind CSS, React Router, and
 5. **Evidence:** Open a comparison to inspect criterion assessments, an available weighted 0-100 score, evidence gaps, and exact resume quotations beside the frozen job/GS requirement citations. Results retain their original documents, rubric versions, and approval provenance even after later edits.
 6. **Reports:** Open a saved analysis and choose **Export report** for CSV, PDF, Word, or PowerPoint. Export the entire group or one exact job/grade, including completed evidence reviews and clearly labeled unfinished comparisons.
 
+Jobs, Resumes, and Analyses support reversible column sorting and a sorting selector, including on smaller screens. Sort names and labels alphabetically, counts numerically, dates chronologically, or processing status with attention-needed or completed work first. The default-order option restores each view's original order. Sorting does not change selections or saved records; processing completion is not a record of human review.
+
+Inside an analysis, **Search comparisons** finds saved candidate names, roles, document labels, and job or grade names. Choose one exact target before sorting evidence-match scores high-to-low or low-to-high; **All targets** keeps the separate comparisons visible without combining their scores into a ranking. Missing or withheld scores stay after numeric scores in either direction, and zero remains a real score. Search, target, and sort choices remain in place while opening a comparison and returning, but reset when leaving the view or changing runs/workspaces. Searches use saved summary metadata, not full document text, and are not stored in browser storage or URLs.
+
 Use the sample import and analysis **Demo scenario** controls to explore simulated failures, partial results, cancellation, and retry. Real imports and analyses instead show durable server progress and actual processing errors. One inaccessible URL or failed comparison does not discard successful items.
 
 Custom criteria in sample rubrics have no fixture assessment. They are explicitly marked not assessed, and the overall score is withheld rather than invented. Other mock scores follow synthetic evidence profiles; editing sample criterion wording does not invoke a real assessment. Real analyses evaluate the exact saved criteria, including custom wording, against the frozen resume evidence.
@@ -173,11 +177,39 @@ If cancellation pauses after processing errors or exhausted automatic retries, c
 
 The assessment follows the saved criteria and 0-5 scoring anchors. Positive scores require exact citations from the correct frozen resume document. Absence of supporting evidence is an explicit evidence gap, not a claim about the person's ability. An unassessable positively weighted criterion withholds the overall score rather than becoming an invented zero or silently changing the weights. Source-supported GS not-applicable rows remain unscored and zero-weight. **GS qualifications remain separate and unscored for human review**, not official eligibility findings.
 
-Schema/coverage/citation checks and an independent grounding review precede publication; one bounded output correction is allowed. Weighted totals are calculated deterministically from validated criterion scores and unchanged rubric weights, not supplied by the model. Full-input context limits are reported as actionable limitations rather than silently dropping resume sections. Model identity, prompt/schema versions, grounding-review results, and frozen input identities/hashes are retained. Traceable quotations do not guarantee correct interpretation: humans must review the evidence and limitations. Different job or grade totals are not combined into a hiring ranking.
+Schema/coverage/citation checks and an independent grounding review precede publication; at most **two output corrections total per processing attempt** are shared across assessment validation, grounding-review validation, and semantic reassessment. Changing stages does not reset that budget. Weighted totals are calculated deterministically from validated criterion scores and unchanged rubric weights, not supplied by the model. Full-input context limits are reported as actionable limitations rather than silently dropping resume sections. Model identity, prompt/schema versions, grounding-review results, and frozen input identities/hashes are retained. Traceable quotations do not guarantee correct interpretation: humans must review the evidence and limitations. Different job or grade totals are not combined into a hiring ranking.
+
+### Analysis failure diagnostics and retries
+
+`invalid-citation` is a local evidence-validation failure, not an HTTP rate-limit response. Model-written quotations must be exact contiguous substrings of the specified frozen resume paragraph, preserving whitespace and punctuation; repeated citations within one list are also rejected. Shorter literal quotations are allowed, but rewritten text, normalized whitespace, or spliced passages are not. Errors identify the assessment or grounding-review stage and the affected row/citation. When deterministically identifiable, diagnostics distinguish whitespace changes and a quotation found in a different supplied paragraph; neither is silently accepted or reassigned.
+
+Correction requests receive bounded, citation-specific findings and supplemental copies of relevant trusted source paragraphs. The complete frozen input is still supplied unchanged, and omitted supplemental paragraphs/findings are counted explicitly. Raw invalid model output is not echoed back. A corrected assessment still needs a supported independent review before publication. Two semantic reassessments can produce up to three saved reviews and six logical model calls; the existing bounded transport retries remain separate. Once the correction budget is exhausted, invalid output fails that comparison without a score or an automatic validation-retry loop.
+
+Transient service failures retain their separate transport retries and up to three automatic processing attempts. **Retry saved pair** starts a fresh processing cycle against the same immutable inputs, so different model output can succeed without the resume changing. Completed comparisons are not replayed. `service-unavailable`, `timeout`, and citation/grounding failures remain distinct.
+
+The analysis worker writes structured JSON events with `component: "score-analysis"` to the existing `ContainerAppConsoleLogs` table. Events include model responses, validation failures, correction attempts, and comparison outcomes, correlated by workspace, run, comparison, processing-attempt, and model-call IDs. They record stage, deployment, actual response model when available, prompt/schema versions, correction and transport-attempt numbers, HTTP status, bounded request IDs, durations, and privacy-safe citation reason/location metadata. Raw resumes, quotations, model output, credentials, and arbitrary upstream error bodies are not logged. An HTTP 200 followed by `validation-failed` is therefore distinguishable from an HTTP 429 without retaining private content.
+
+For an authorized operator investigating a specific saved run:
+
+```kusto
+ContainerAppConsoleLogs
+| where TimeGenerated > ago(24h)
+| where JobName == "<analysis-worker-job-name>"
+| extend Event = parse_json(Log)
+| where Event.component == "score-analysis" and Event.runId == "<saved-run-id>"
+| project TimeGenerated, Event.event, Event.comparisonId, Event.attemptId,
+    Event.modelCallId, Event.stage, Event.httpStatus, Event.correctionCount,
+    Event.code, Event.outcome, Event.citationDiagnostics
+| order by TimeGenerated asc
+```
+
+Deploy and confirm readiness of API readers that accept two corrections and three grounding reviews **before** activating the updated analysis worker. The `azure.yaml` web deployment precedes its post-deploy worker update; preserve that compatibility order. After expanded provenance has been saved, any rollback must retain compatible readers rather than rejecting historical two-correction results. Deployment does not authorize automatic retries of an existing failed cohort.
 
 ### Analysis report exports
 
 Choose **Export report** from a real or sample analysis, including while inspecting an individual comparison. The default is the **entire grouped analysis**, not just the open comparison. A multi-target run can be narrowed to one exact saved job or grade. Workspace viewers can export the history they are authorized to read; new-run readiness and Word-upload admission do not control historical exports.
+
+Archived analyses remain exportable for authorized readers. Analyses being permanently deleted or already removed cannot be exported; deletion or loss of read access cancels an open export rather than downloading stale cached evidence. Table search and sort controls do not silently narrow the report's explicit export scope.
 
 | Format | Contents |
 | --- | --- |
@@ -206,7 +238,7 @@ The resume worker identity can access only its own records/sources, OCR, and the
 
 Actual resume/profile content can contain personal or sensitive information. PDF and DOCX bytes are processed by Azure Document Intelligence; Markdown and legacy DOC text extraction is local to the Node worker, but the extracted text still goes to Foundry. Resume text and selected rubric/source evidence are processed by Foundry for profiling, assessment, and grounding review. They reuse the existing **GPT-5 mini `job-rubric` deployment and US Data Zone Standard inference** described above, not a North Central US-only processing guarantee. Word previews add no external processing service. Do not import data without the appropriate authority and organizational review. Routine logs must not contain resume text, contact details, raw model responses, or personal source URLs.
 
-This release retains private immutable captures and results. **Reset samples does not delete real resumes, analyses, jobs, grade ladders, or their source/version history.** Resume replacement/editing, deletion, and retention administration are not provided by this release; operators must establish an appropriate retention/deletion process. Blob soft-delete retention also applies after operator deletion.
+This release retains private immutable captures and results until an authorized lifecycle deletion completes. **Reset samples does not delete real resumes, analyses, jobs, grade ladders, or their source/version history.** Real and sample libraries provide archive, unarchive, and confirmed deletion with dependency protection. Resume replacement/editing and infrastructure retention administration remain separate concerns. Existing Blob soft-delete retention also applies after application deletion.
 
 ## Deployment to Azure
 
@@ -306,7 +338,7 @@ This refreshes App Service's versionless Key Vault reference. `.azure\` and loca
 
 ### Cloud workspaces and future groups
 
-The cloud build uses `VITE_DEPLOYMENT_MODE=cloud`. It never falls back to local fixtures if authentication or cloud storage fails. Each user can create, rename, and switch between multiple personal workspaces. Cloud links include `/workspaces/<id>/` so a bookmark cannot silently resolve against a different selected workspace.
+The cloud build uses `VITE_DEPLOYMENT_MODE=cloud`. It never falls back to local fixtures if authentication or cloud storage fails. Each user can create, rename, switch, archive, unarchive, and delete personal workspaces. Cloud links include `/workspaces/<id>/` so a bookmark cannot silently resolve against a different selected workspace.
 
 Cosmos stores directory and membership documents together under the `/workspaceId` partition key. Legacy sample workspace state is stored in a private Blob rather than a single Cosmos item, avoiding Cosmos's per-item size limit. Sample saves require the current Blob ETag; metadata renames require the metadata ETag. Real job, grade, resume, and analysis mutations use separate versioned APIs and Cosmos ETags. Concurrent edits produce an explicit conflict instead of silently overwriting another session.
 
@@ -315,6 +347,29 @@ Initialization prepares state before atomically publishing directory metadata an
 Cloud mode keeps document state in memory, not browser local storage. Only theme and the last-selected workspace ID are remembered locally, with the latter scoped to tenant and user. Writes are queued and acknowledged before showing a saved state. Switching or signing out flushes pending changes and pauses browser-only demo simulations. Save failures retain the newest edits; conflict recovery is explicit.
 
 The data model reserves `group` workspaces and `owner`/`editor`/`viewer` memberships. Group creation, sharing administration, and Entra group resolution are deliberately not enabled yet. They must use these same server-side membership boundaries rather than client-side filters.
+
+### Archive, search, and permanent deletion
+
+Workspace, job, resume, rubric, ladder, and analysis controls distinguish **Archive** from **Delete**. Normal browsing shows active items; searching automatically includes archived matches with an **Archived** badge. The archive-state filter also lets you browse archived records without knowing their names. Workspace search is in the workspace picker; content searches remain within the selected workspace.
+
+Archived content is read-only and cannot be selected for new analyses or ladder seeds. Archiving cancels its unfinished work while retaining completed results. Unarchive never restarts cancelled processing. A workspace's contents, a job's rubrics, and a ladder's grade rubrics inherit their parent's archive state, without changing each child's own setting. Restoring a parent therefore does not restore children that were separately archived. Independent analyses and ladders that already captured a source are unchanged when that source is archived.
+
+Delete requires a confirmation describing the affected content. Existing analyses block deletion of their inputs, including references to older rubric versions and references from archived analyses. A ladder also protects its captured seed job and rubric until the ladder is deleted. The confirmation links to blocking records rather than deleting those dependencies implicitly. Lifecycle management remains available on archived records, so archived analyses can be deleted without making the workspace editable.
+
+| Delete target | Effect after dependencies have been removed |
+| --- | --- |
+| Workspace | Removes its owned content and private source artifacts. All analyses must be explicitly deleted first. |
+| Job | Removes its source and complete job-rubric history. |
+| Resume | Removes the profile and its otherwise unreferenced source document. |
+| Rubric | Removes the logical rubric's complete version history, not just its latest version. A job and its source remain readable with **No rubric**; a grade's parent ladder and shared evidence remain. |
+| Ladder | Removes its grade histories, approvals, reference captures, and processing artifacts, but not its independent seed job. |
+| Analysis | Removes the run, comparisons, and saved input/evidence snapshots. |
+
+Workspace lifecycle changes are owner-only. Owners and editors can manage individual items; viewers can search and inspect archived content. You may archive or delete the last active workspace: the workspace picker offers creation and restoration instead of automatically rebuilding deleted samples. Standalone browser mode remains a single local demo with lifecycle controls for its sample entities, not a separate local workspace directory.
+
+Cloud changes are version-checked and coordinated with saves, imports, and workers. An interrupted cleanup remains protected and reports its pending or failed state; retry finishes the same operation instead of restoring half-deleted data. Pending workspace deletions remain discoverable by their owner until finalization commits. Server recovery also resumes unfinished workspace operations and individual deletions after the browser closes. Minimal non-content deletion markers prevent old requests, saved tabs, and default initialization from bringing deleted identities back.
+
+**Permanent deletion is irreversible through Score, not a promise of immediate physical erasure from infrastructure backups.** The existing Azure Blob policy retains service-level soft-deleted blobs for seven days. This feature does not change that account-wide retention policy or touch shared knowledge content. Archive retains the original content and is the appropriate choice when it may be needed again.
 
 ### Foundry IQ boundary
 
@@ -352,6 +407,6 @@ Reloading during a simulation presents unfinished work as interrupted/cancelled 
 | `infra` | Bicep resource definitions |
 | `scripts` | Container build, deployment, identity, and knowledge-base configuration |
 
-Authenticated LinkedIn access, whole-site discovery and multi-page crawling, resume editing/deletion administration, group-workspace administration, and ATS integrations remain deferred. Direct job/profile URL rendering is not a general-purpose crawler. Real imports and assessments remain separate from sample simulations.
+Authenticated LinkedIn access, whole-site discovery and multi-page crawling, resume editing, infrastructure retention administration, group-workspace administration, and ATS integrations remain deferred. Direct job/profile URL rendering is not a general-purpose crawler. Real imports and assessments remain separate from sample simulations.
 
 When hosting the built `dist` directory, configure SPA fallback to `index.html` so direct links to job, rubric, and analysis routes work.

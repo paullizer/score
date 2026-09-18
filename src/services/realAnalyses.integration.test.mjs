@@ -8,6 +8,7 @@ import { build } from 'esbuild'
 import React, { act } from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { JSDOM } from 'jsdom'
+import { frontendWorkspaceContext } from './frontend.test-support.mjs'
 
 const output = resolve(`.real-analysis-client-tests-${randomUUID()}`)
 const originalFetch = globalThis.fetch
@@ -421,9 +422,27 @@ test('results display server totals, limited completion, exact statuses and unsc
   assert.match(renderToStaticMarkup(React.createElement(ui.RealComparisonValue, { summary })), />73<\/strong>/)
 })
 
+test('saved two-correction results display all three grounding reviews without recomputing the server score', () => {
+  const detail = comparisonDetail()
+  detail.result.provenance.correctionCount = 2
+  const original = detail.result.provenance.groundingReviews[0]
+  detail.result.provenance.groundingReviews = Array.from({ length: 3 }, (_, index) => ({
+    ...structuredClone(original), id: `grounding-${index}`, outcome: index === 2 ? 'supported' : 'needs-correction',
+  }))
+  const html = renderToStaticMarkup(React.createElement(ui.RealComparisonReview, { detail }))
+  assert.match(html, /2 bounded corrections/)
+  assert.match(html, /needs-correction.*needs-correction.*supported/)
+  assert.match(html, />36<\/strong>/)
+})
+
 async function render(element) {
   root ??= createRoot(dom.window.document.getElementById('root'))
-  await act(async () => { root.render(element); await new Promise((resolve) => setTimeout(resolve, 0)) })
+  await act(async () => {
+    root.render(React.createElement(ui.WorkspaceContext.Provider, {
+      value: frontendWorkspaceContext({ cloud: { currentWorkspaceId: workspaceId } }, { resumes: [resumeSummary()], analyses: [runSummary()] }),
+    }, element))
+    await new Promise((resolve) => setTimeout(resolve, 0))
+  })
 }
 async function settle(predicate) {
   for (let index = 0; index < 30 && !predicate(); index++) await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)) })
@@ -598,9 +617,9 @@ test('saved GS results and comparison-scoped evidence remain readable when new-r
     }
     return json({ error: { code: 'forbidden', message: 'This reference is not included in the requested comparison.' } }, 403)
   }
-  await render(router(React.createElement(ui.WorkspaceContext.Provider, { value: {
+  await render(router(React.createElement(ui.WorkspaceContext.Provider, { value: frontendWorkspaceContext({
     workspace: legacy, cloud: { currentWorkspaceId: workspaceId, workspaces: [{ id: workspaceId, role: 'owner' }] },
-  } }, React.createElement(ui.RealAnalysesBridge, { workspaceId }, React.createElement(React.Fragment, null,
+  }) }, React.createElement(ui.RealAnalysesBridge, { workspaceId }, React.createElement(React.Fragment, null,
     React.createElement(Probe), React.createElement(ui.RealAnalysisDetail, { id: 'run-one' })))), '/analyses/run-one?data=real&result=comparison-one'))
   await settle(() => current?.phase === 'ready')
   await settle(() => dom.window.document.querySelector('button[aria-label^="View requirement evidence for Supported work"]'))
@@ -685,7 +704,10 @@ test('paused cancellation exposes run-level cleanup recovery without restarting 
 
 test('manual run and pair retries stay available after automatic retries stop and reuse saved identities', async () => {
   const failed = runSummary('run-one', 'failed')
-  failed.run.error = { code: 'invalid-model-output', stage: 'assessment', message: 'Automatic model attempts exhausted.', retryable: false }
+  failed.run.error = {
+    code: 'invalid-citation', stage: 'grounding', retryable: false,
+    message: 'Grounding review issue 1, citation 1: the quotation changes whitespace in the saved resume paragraph. The 2-correction limit was reached; no result was published.',
+  }
   const pair = comparisonDetail()
   pair.comparison.status = 'failed'
   pair.comparison.error = failed.run.error
@@ -701,6 +723,8 @@ test('manual run and pair retries stay available after automatic retries stop an
   const content = (canWrite = true) => router(React.createElement(ui.RealAnalysesContext.Provider, { value: { ...api, canWrite } },
     React.createElement(ui.RealAnalysisDetail, { id: 'run-one' })), '/analyses/run-one?data=real')
   await render(content())
+  assert.match(dom.window.document.body.textContent, /invalid-citation: Grounding review issue 1, citation 1/)
+  assert.match(dom.window.document.body.textContent, /2-correction limit/)
   const retryPair = [...dom.window.document.querySelectorAll('button')].find((button) => button.textContent === 'Retry saved pair')
   const retryRun = [...dom.window.document.querySelectorAll('button')].find((button) => button.textContent === 'Retry failed / cancelled')
   assert.equal(retryPair.disabled, false)
@@ -721,7 +745,7 @@ test('manual run and pair retries stay available after automatic retries stop an
 function Probe() { current = ui.useRealAnalyses(); return React.createElement('span', null, current.phase) }
 const legacy = { schemaVersion: 1, jobs: [], resumes: [], rubrics: [], documents: [], runs: [] }
 function bridge(workspace = workspaceId, role = 'owner', show = true) {
-  return router(React.createElement(ui.WorkspaceContext.Provider, { value: { workspace: legacy, cloud: { currentWorkspaceId: workspace, workspaces: [{ id: workspace, role }] } } },
+  return router(React.createElement(ui.WorkspaceContext.Provider, { value: frontendWorkspaceContext({ workspace: legacy, cloud: { currentWorkspaceId: workspace, workspaces: [{ id: workspace, role }] } }) },
     React.createElement(ui.RealAnalysesBridge, { workspaceId: workspace }, show ? React.createElement(Probe) : null)))
 }
 function deferred() { let resolve; const promise = new Promise((done) => { resolve = done }); return { promise, resolve } }
@@ -824,13 +848,15 @@ test('historical initialization and cancellation keep polling while new-run read
 
 test('analysis provider keeps uncertain creation keys across view remounts and never writes sample storage', async () => {
   let attempts = 0
+  let accepted = null
   globalThis.fetch = async (url, init) => {
     requests.push({ url, init })
     if (url === '/api/features') return json({ realAnalyses: true })
     if (url.endsWith('/targets')) return json({ targets: [target()] })
-    if (init.method === 'GET') return json({ runs: [] })
+    if (init.method === 'GET') return json({ runs: accepted ? [accepted] : [] })
     if (++attempts === 1) throw new TypeError('Response lost')
-    return json({ run: runSummary('accepted-real', 'queued') }, 202)
+    accepted = runSummary('accepted-real', 'queued')
+    return json({ run: accepted }, 202)
   }
   const before = JSON.stringify(legacy)
   dom.window.localStorage.clear()

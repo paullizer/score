@@ -31,6 +31,10 @@ export interface Config {
   readonly storage: StorageConfig
   readonly realJobs: RealJobsConfig | undefined
   readonly realGrades?: RealGradesConfig
+  readonly jobLifecycleStore?: RealJobsConfig
+  readonly gradeLifecycleStore?: RealGradesConfig
+  readonly resumeLifecycleStore?: RealResumesConfig
+  readonly analysisLifecycleStore?: RealAnalysesConfig
   readonly realResumes?: RealResumesConfig
   readonly realAnalyses?: RealAnalysesConfig
   readonly wordDocumentImports: boolean
@@ -177,6 +181,24 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   const realAnalyses: RealAnalysesConfig | undefined = analysesEnabled
     ? { ...shared, container: analysisRecords, blobContainer: analysisSources } : undefined
 
+  const configuredJobRecords = optional(env, 'JOB_RECORDS_CONTAINER')
+  const configuredJobSources = optional(env, 'JOB_SOURCE_CONTAINER')
+  if (Boolean(configuredJobRecords) !== Boolean(configuredJobSources)) {
+    throw new ConfigError('Both job storage containers must be configured so lifecycle cleanup cannot skip existing data.')
+  }
+  const jobLifecycleStore = realJobs ?? (configuredJobRecords && configuredJobSources ? {
+    ...shared, container: jobRecords, blobContainer: jobSources,
+  } : undefined)
+  const gradeLifecycleStore = realGrades ?? (optional(env, 'GRADE_RECORDS_CONTAINER') || optional(env, 'GRADE_SOURCE_CONTAINER') ? {
+    ...shared, container: gradeRecords, blobContainer: gradeSources,
+  } : undefined)
+  const resumeLifecycleStore = realResumes ?? (optional(env, 'RESUME_RECORDS_CONTAINER') || optional(env, 'RESUME_SOURCE_CONTAINER') ? {
+    ...shared, container: resumeRecords, blobContainer: resumeSources,
+  } : undefined)
+  const analysisLifecycleStore = realAnalyses ?? (optional(env, 'ANALYSIS_RECORDS_CONTAINER') || optional(env, 'ANALYSIS_SOURCE_CONTAINER') ? {
+    ...shared, container: analysisRecords, blobContainer: analysisSources,
+  } : undefined)
+
   return {
     authMode,
     tenantId: requireGuid(env, 'AZURE_TENANT_ID'),
@@ -186,6 +208,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     storage,
     realJobs,
     realGrades,
+    jobLifecycleStore,
+    gradeLifecycleStore,
+    resumeLifecycleStore,
+    analysisLifecycleStore,
     realResumes,
     realAnalyses,
     wordDocumentImports,

@@ -85,6 +85,7 @@ import { validatePreviewArchive } from './src/components/documents/docxPreviewSa
 import { importRealJobFile, importRealJobPdf, importRealJobUrl } from './src/services/realJobs';
 import { JOB_IMPORT_LIMITS } from './src/domain/real-jobs';
 import { RESUME_IMPORT_LIMITS } from './src/domain/real-resumes';
+import { frontendWorkspaceContext } from './src/services/frontend.test-support.mjs';
 const root = createRoot(document.getElementById('root'));
 let config = await (await fetch('/test-state')).json();
 const noop = () => {};
@@ -128,6 +129,7 @@ function tree() {
     extraction:{method:format==='doc'?'legacy-word':'document-intelligence',version:'test',extractedAt:stamp,pagination:'captured-sections',pageCount:null,normalizedCharacters:text.length,document:docRef},
     etag:'"resume-one"',updatedAt:stamp,attempts:1,retryCount:0,warnings:[],duplicates:[]};
   const resumes = {workspaceId,canWrite:true,phase:'ready',features,error:null,summaries:[resumeDetail],detail:()=>({state:'ready',value:resumeDetail}),ensureDetail:done,refresh:done,pending:()=>false,originalUrl:id=>originalUrl('resumes',id)};
+  const contextual = frontendWorkspaceContext(value, {resumes:mode==='resume'?[resumeDetail]:[]});
   const content = mode==='resume'
     ? <RealResumesContext.Provider value={resumes}><RealResumesPage id={resumeId}/></RealResumesContext.Provider>
     : mode==='resume-import'
@@ -135,7 +137,7 @@ function tree() {
     : mode==='job-import'||mode==='sample-import' ? <JobImport onClose={noop}/> : mode==='jobs' ? <JobsPage/>
     : <Routes><Route path="/jobs/:id" element={<JobDetail/>}/></Routes>;
   return <MemoryRouter key={workspaceId+':'+id+':'+mode+':'+format} initialEntries={['/jobs/'+jobId]} future={{v7_startTransition:true,v7_relativeSplatPath:true}}>
-    <WorkspaceContext.Provider value={value}>{content}</WorkspaceContext.Provider></MemoryRouter>;
+    <WorkspaceContext.Provider value={contextual}>{content}</WorkspaceContext.Provider></MemoryRouter>;
 }
 window.wordTest = {
   render(overrides){config={...config,...overrides};root.render(tree());},
@@ -162,8 +164,8 @@ export async function buildWordPreviewTestRuntime() {
     const css = await postcss([tailwind(), autoprefixer()]).process(await readFile(join('src', 'styles', 'globals.css'), 'utf8'), { from: join('src', 'styles', 'globals.css') })
     await writeFile(join(directory, 'browser.css'), css.css)
     await writeFile(join(directory, 'index.html'), '<!doctype html><html lang="en"><head><meta charset="utf-8"><title>Private Word browser tests</title><link rel="stylesheet" href="/browser.css"></head><body><div id="root"></div><script type="module" src="/browser.js"></script></body></html>')
-    return { directory, close: () => rm(directory, { recursive: true, force: true }) }
-  } catch (error) { await rm(directory, { recursive: true, force: true }); throw error }
+    return { directory, close: () => rm(directory, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }) }
+  } catch (error) { await rm(directory, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); throw error }
 }
 
 export async function startWordPreviewFixture(runtime, options = {}) {

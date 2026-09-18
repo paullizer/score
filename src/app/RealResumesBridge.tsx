@@ -1,20 +1,24 @@
-import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import type { RealResumeDetail, RealResumeSummary, ResumeProcessingFeatures } from '../domain/real-resumes'
 import { supportedUploadFormats } from '../domain/document-formats'
 import * as api from '../services/realResumes'
-import { CloudConflictError } from '../services/cloudWorkspace'
+import { CloudApiError, CloudConflictError, LifecycleOperationError } from '../services/cloudWorkspace'
+import { lifecycleIsRemoved, type LifecycleAction, type LifecycleTarget } from '../domain/lifecycle'
 import { appendResumeInputs, resumeWorkActive, type RealResumeImportBatch, type RealResumeImportSource } from '../features/resumes/resumeImportUi'
-import { useWorkspace } from './workspace-context'
+import { WorkspaceContext, useWorkspace, type PendingLifecycleChange } from './workspace-context'
 import { useGradeLeaveGuard } from './grade-navigation-context'
 import { RealResumesContext, type RealResumesContextValue } from './real-resumes-context'
 import { RealRequestScope, realRequestError, type RealLoadState } from './real-request-scope'
+import { assertRealLifecyclePermission, discoveredLifecycle, projectRealLifecycle, realWorkspaceWritable, reconcileLifecycleOperations } from './real-lifecycle'
 
 export function RealResumesBridge({ workspaceId, children }: { workspaceId: string; children: ReactNode }) {
   return <RealResumesProvider key={workspaceId} workspaceId={workspaceId}>{children}</RealResumesProvider>
 }
 
 function RealResumesProvider({ workspaceId, children }: { workspaceId: string; children: ReactNode }) {
-  const { cloud } = useWorkspace()
+  const parent = useWorkspace()
+  const parentRef = useRef(parent)
+  parentRef.current = parent
   const [scope] = useState(() => new RealRequestScope())
   const [features, setFeatures] = useState<ResumeProcessingFeatures | null>(null)
   const featuresRef = useRef(features)
@@ -22,6 +26,7 @@ function RealResumesProvider({ workspaceId, children }: { workspaceId: string; c
   const [error, setError] = useState<string | null>(null)
   const [summaries, setSummaries] = useState<RealResumeSummary[]>([])
   const summariesRef = useRef(summaries)
+  const knownIds = useRef(new Set<string>())
   const [details, setDetails] = useState<Record<string, RealLoadState<RealResumeDetail>>>({})
   const detailsRef = useRef(details)
   const [pendingCount, setPendingCount] = useState(0)
@@ -29,7 +34,13 @@ function RealResumesProvider({ workspaceId, children }: { workspaceId: string; c
   const batchesRef = useRef(batches)
   const [currentBatchId, setCurrentBatchId] = useState<string | null>(null)
   const currentBatchRef = useRef(currentBatchId)
-  const canWrite = cloud?.workspaces.some((item) => item.id === workspaceId && item.role !== 'viewer') ?? false
+  const [pendingLifecycle, setPendingLifecycleState] = useState<PendingLifecycleChange[]>([])
+  const pendingLifecycleRef = useRef(pendingLifecycle)
+  const setPendingLifecycle = useCallback((next: PendingLifecycleChange[]) => {
+    pendingLifecycleRef.current = next
+    setPendingLifecycleState(next)
+  }, [])
+  const canWrite = realWorkspaceWritable(parent, workspaceId)
   const leaveGuard = useGradeLeaveGuard(false, pendingCount > 0, 'Resume upload or processing request (not yet acknowledged)')
 
   const putDetail = useCallback((id: string, entry: RealLoadState<RealResumeDetail>) => {
@@ -37,18 +48,34 @@ function RealResumesProvider({ workspaceId, children }: { workspaceId: string; c
     setDetails(detailsRef.current)
   }, [])
 
+  const removeResume = useCallback((id: string, sequence: number) => {
+    if (!scope.accept(`resume:${id}`, sequence)) return
+    scope.cancelReads((key) => key === `detail:${id}`)
+    summariesRef.current = summariesRef.current.filter((item) => item.resume.id !== id)
+    setSummaries(summariesRef.current)
+    putDetail(id, { state: 'error', error: 'This resume was removed or is no longer available in this workspace. Its cached source has been cleared.' })
+  }, [putDetail, scope])
+
   const remember = useCallback((summary: RealResumeSummary, sequence: number) => {
-    if (!scope.accept(summary.resume.id, sequence)) return false
+    if (!scope.accept(`resume:${summary.resume.id}`, sequence)) return false
+    knownIds.current.add(summary.resume.id)
     summariesRef.current = [summary, ...summariesRef.current.filter((item) => item.resume.id !== summary.resume.id)]
       .sort((a, b) => b.resume.createdAt.localeCompare(a.resume.createdAt))
     setSummaries(summariesRef.current)
     const cached = detailsRef.current[summary.resume.id]
-    if (cached?.state === 'ready' && cached.value.etag !== summary.etag) putDetail(summary.resume.id, { state: 'idle' })
+    if (lifecycleIsRemoved(summary.lifecycle)) putDetail(summary.resume.id, { state: 'error', error: 'Resume cleanup is incomplete. Only lifecycle recovery metadata is available until deletion is acknowledged.' })
+    else if (cached?.state === 'ready' && cached.value.etag !== summary.etag) putDetail(summary.resume.id, { state: 'idle' })
     return true
   }, [putDetail, scope])
 
+  useEffect(() => {
+    setPendingLifecycle(reconcileLifecycleOperations(pendingLifecycleRef.current, summaries.map((summary) =>
+      discoveredLifecycle({ kind: 'resume', id: summary.resume.id }, summary.resume.name ?? summary.source.displayName, summary.lifecycle, summary.lifecycleOperation))))
+  }, [setPendingLifecycle, summaries])
+
   const ensureDetail = useCallback(async function loadDetail(id: string, force = false): Promise<void> {
     if (!featuresRef.current?.realResumeImports) return
+    if (lifecycleIsRemoved(summariesRef.current.find((item) => item.resume.id === id)?.lifecycle)) return
     const previous = detailsRef.current[id]
     if (!force && previous && !['idle', 'loading'].includes(previous.state)) return
     const ticket = scope.read(`detail:${id}`)
@@ -58,17 +85,20 @@ function RealResumesProvider({ workspaceId, children }: { workspaceId: string; c
     try {
       const detail = await api.getRealResume(workspaceId, id, ticket.controller.signal)
       if (!scope.current(ticket)) return
+      if (lifecycleIsRemoved(detail.lifecycle)) { superseded = !remember(detail, ticket.sequence); return }
       if (remember(detail, ticket.sequence) || summariesRef.current.find((item) => item.resume.id === id)?.etag === detail.etag) putDetail(id, { state: 'ready', value: detail })
       else superseded = true
     } catch (caught) {
       if (!scope.current(ticket)) return
+      if (!scope.canAccept(`resume:${id}`, ticket.sequence)) { superseded = true; return }
+      if (caught instanceof CloudApiError && [403, 404].includes(caught.status)) { removeResume(id, ticket.sequence); return }
       const message = realRequestError(caught, 'The private resume could not be loaded.')
       putDetail(id, previous?.state === 'ready' ? { ...previous, error: message } : { state: 'error', error: message })
     } finally {
       scope.finish(ticket)
       if (superseded) void loadDetail(id, true)
     }
-  }, [putDetail, remember, scope, workspaceId])
+  }, [putDetail, remember, removeResume, scope, workspaceId])
 
   const refresh = useCallback(async () => {
     const ticket = scope.read('$list')
@@ -85,6 +115,10 @@ function RealResumesProvider({ workspaceId, children }: { workspaceId: string; c
       }
       const items = await api.listAllRealResumes(workspaceId, ticket.controller.signal)
       if (!scope.current(ticket)) return
+      scope.reconcile('resume:', ticket.sequence)
+      const present = new Set(items.map((item) => item.resume.id))
+      const cachedIds = new Set([...summariesRef.current.map((item) => item.resume.id), ...Object.keys(detailsRef.current)])
+      for (const id of cachedIds) if (!present.has(id)) removeResume(id, ticket.sequence)
       for (const item of items) remember(item, ticket.sequence)
       setPhase('ready')
       setError(null)
@@ -93,10 +127,14 @@ function RealResumesProvider({ workspaceId, children }: { workspaceId: string; c
       }
     } catch (caught) {
       if (!scope.current(ticket)) return
+      if (caught instanceof CloudApiError && [401, 403].includes(caught.status)) {
+        scope.reconcile('resume:', ticket.sequence)
+        for (const item of summariesRef.current) removeResume(item.resume.id, ticket.sequence)
+      }
       setPhase('error')
       setError(realRequestError(caught, 'The real resume service is unavailable.'))
     } finally { scope.finish(ticket) }
-  }, [ensureDetail, remember, scope, workspaceId])
+  }, [ensureDetail, remember, removeResume, scope, workspaceId])
 
   useEffect(() => {
     scope.activate()
@@ -121,20 +159,30 @@ function RealResumesProvider({ workspaceId, children }: { workspaceId: string; c
     return () => window.removeEventListener('focus', focus)
   }, [refresh])
 
-  function assertWritable() {
-    if (!canWrite) throw new Error('This workspace is read-only. An owner or editor must import, retry, or cancel resumes.')
+  function assertWritable(id?: string) {
+    if (!realWorkspaceWritable(parentRef.current, workspaceId)) throw new Error('This workspace is archived, read-only, or unavailable. An owner or editor must import, retry, or cancel resumes.')
     if (!featuresRef.current?.realResumeImports || phase !== 'ready') throw new Error('Real resume imports are unavailable. Check the service before submitting.')
+    if (id) {
+      const summary = summariesRef.current.find((item) => item.resume.id === id)
+      if (!summary || summary.lifecycle?.archivedAt || lifecycleIsRemoved(summary.lifecycle) || pendingLifecycleRef.current.some((item) => item.target.id === id)) {
+        throw new Error('This resume is archived, removed, or has incomplete cleanup. Unarchive it before starting new processing.')
+      }
+    }
   }
 
-  async function mutate(key: string, operation: () => Promise<RealResumeSummary>): Promise<RealResumeSummary> {
-    assertWritable()
+  async function mutate<T>(key: string, operation: () => Promise<T>, commit: (value: T, sequence: number) => void, lifecycle = false, resumeId?: string): Promise<T> {
+    if (lifecycle) {
+      assertRealLifecyclePermission(parentRef.current, workspaceId)
+      await parentRef.current.cloud?.flushSave()
+      assertRealLifecyclePermission(parentRef.current, workspaceId)
+    } else assertWritable(resumeId)
     const ticket = scope.mutate(key)
     leaveGuard.hold()
     setPendingCount((value) => value + 1)
     try {
       const summary = await operation()
       if (!scope.mutationCurrent(ticket)) throw new Error('The workspace changed before acknowledgement. Reopen the original workspace to check the server state.')
-      remember(summary, ticket.sequence)
+      commit(summary, ticket.sequence)
       return summary
     } catch (caught) {
       if (caught instanceof CloudConflictError) {
@@ -147,6 +195,7 @@ function RealResumesProvider({ workspaceId, children }: { workspaceId: string; c
       if (current) {
         setPendingCount((value) => value - 1)
         if (!scope.busy) { leaveGuard.release(); void refresh() }
+        void parentRef.current.cloud?.refreshWorkspaces().catch(() => undefined)
       }
     }
   }
@@ -210,7 +259,7 @@ function RealResumesProvider({ workspaceId, children }: { workspaceId: string; c
             throw new Error('Word document imports are not enabled in this deployment.')
           }
           return api.importRealResumeFile(workspaceId, item.source.file, item.key, batchId, inputCount)
-        })
+        }, remember)
         updateItem(batchId, item.key, {
           state: 'accepted', resumeId: summary.resume.id, error: undefined,
           source: item.source.kind === 'url' || item.source.kind === 'unsupported' ? item.source : { kind: item.source.kind, file: null },
@@ -228,8 +277,8 @@ function RealResumesProvider({ workspaceId, children }: { workspaceId: string; c
     workspaceId, canWrite, phase, features, error, summaries, refresh, ensureDetail,
     detail: (id) => details[id] ?? { state: 'idle' },
     pending: (id) => scope.pending(`resume:${id}`),
-    retry: (id, etag) => mutate(`resume:${id}`, () => api.retryRealResume(workspaceId, id, etag)),
-    cancel: (id, etag) => mutate(`resume:${id}`, () => api.cancelRealResume(workspaceId, id, etag)),
+    retry: (id, etag) => mutate(`resume:${id}`, () => api.retryRealResume(workspaceId, id, etag), remember, false, id),
+    cancel: (id, etag) => mutate(`resume:${id}`, () => api.cancelRealResume(workspaceId, id, etag), remember, false, id),
     originalUrl: (id) => api.realResumeOriginalUrl(workspaceId, id),
     batches, currentBatchId, newBatch, stage, submitBatch,
     selectBatch: (id) => {
@@ -244,5 +293,43 @@ function RealResumesProvider({ workspaceId, children }: { workspaceId: string; c
       putBatches(batchesRef.current.map((item) => item.id === batch.id ? { ...item, items: item.items.filter((input) => input.key !== key) } : item))
     },
   }
-  return <RealResumesContext.Provider value={value}>{children}</RealResumesContext.Provider>
+  function owns(target: LifecycleTarget) {
+    return target.kind === 'resume' && (knownIds.current.has(target.id) || pendingLifecycleRef.current.some((item) => item.target.id === target.id))
+  }
+
+  async function changeLifecycle(target: LifecycleTarget, action: LifecycleAction) {
+    if (!owns(target)) return parentRef.current.changeLifecycle(target, action)
+    const pending = pendingLifecycleRef.current.find((item) => item.target.id === target.id)
+    if (pending && pending.operation.action !== action) throw new Error('Finish the incomplete resume lifecycle operation before choosing another action.')
+    const result = await mutate(`resume:${target.id}`, async () => {
+      const fresh = await api.getRealResume(workspaceId, target.id)
+      return api.changeRealResumeLifecycle(workspaceId, target.id, action, fresh.etag)
+    }, (response, sequence) => {
+      if (response.resume) {
+        remember(response.resume, sequence)
+        if (!lifecycleIsRemoved(response.resume.lifecycle)) putDetail(target.id, { state: 'ready', value: response.resume })
+      }
+      if (response.operation && response.operation.status !== 'complete') {
+        const summary = summariesRef.current.find((item) => item.resume.id === target.id)
+        setPendingLifecycle(reconcileLifecycleOperations(pendingLifecycleRef.current, [{
+          target, name: summary?.resume.name ?? summary?.source.displayName ?? pending?.name ?? 'Real resume', operation: response.operation,
+        }]))
+        if (action === 'delete') putDetail(target.id, { state: 'error', error: 'Deletion is still incomplete. Retry the lifecycle operation; cached source content has been cleared.' })
+      } else if (response.deleted) removeResume(target.id, sequence)
+    }, true)
+    if (result.operation && result.operation.status !== 'complete') throw new LifecycleOperationError(result.operation)
+    if (!result.resume && !result.deleted) throw new Error('The resume service has not acknowledged a completed lifecycle change. Refresh status before retrying.')
+    setPendingLifecycle(pendingLifecycleRef.current.filter((item) => item.target.id !== target.id))
+    parentRef.current.notify(action === 'delete' ? 'Permanent resume deletion acknowledged.' : action === 'archive' ? 'Resume archived. Its unfinished processing was stopped; saved analyses are unchanged.' : 'Resume unarchived. Processing has not restarted.')
+  }
+
+  const workspace = useMemo(() => projectRealLifecycle(parent.workspace, 'resume', summaries.map((item) => ({
+    id: item.resume.id, lifecycle: item.lifecycle,
+  }))), [parent.workspace, summaries])
+  const projected = {
+    ...parent, workspace, changeLifecycle,
+    getLifecycleImpact: (target: LifecycleTarget) => owns(target) ? api.getRealResumeLifecycleImpact(workspaceId, target.id) : parentRef.current.getLifecycleImpact(target),
+    lifecycleOperations: [...(parent.lifecycleOperations ?? []), ...pendingLifecycle],
+  }
+  return <WorkspaceContext.Provider value={projected}><RealResumesContext.Provider value={value}>{children}</RealResumesContext.Provider></WorkspaceContext.Provider>
 }

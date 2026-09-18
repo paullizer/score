@@ -5,6 +5,9 @@ import { Badge, Button, Modal } from '../../components/ui'
 import { GradeCitations, GradeIssues, GradeStatus } from './GradeShared'
 import { gradeApprovalBlockers, relevantIssues } from './gradeUi'
 import type { GradeSourceSelection } from './GradeSourceInspector'
+import { useWorkspace } from '../../app/workspace-context'
+import { getEntityLifecycle, isEntityArchived, isEntityRemoved, matchesArchiveFilter, type ArchiveFilter } from '../../domain/lifecycle'
+import { ArchivedBadge, ArchiveStateFilter, EntityLifecycleActions, LifecycleBanner } from '../../components/lifecycle/LifecycleControls'
 
 interface GradeMatrixActions {
   onSource: (selection: GradeSourceSelection) => void
@@ -22,7 +25,12 @@ export function GradeMatrix({ detail, selectedGrade, onGrade, canWrite, pending,
   unsavedSources: boolean
 } & GradeMatrixActions) {
   const [approving, setApproving] = useState<number | null>(null)
-  const levels = [...detail.levels].sort((a, b) => a.head.grade - b.head.grade)
+  const { workspace } = useWorkspace()
+  const [archiveFilter, setArchiveFilter] = useState<ArchiveFilter>(() => isEntityArchived(workspace, { kind: 'ladder', id: detail.ladder.id }) || detail.levels.some((level) => level.head.grade === selectedGrade && isEntityArchived(workspace, { kind: 'rubric', id: level.head.id })) ? 'all' : 'default')
+  const levels = [...detail.levels]
+    .filter((level) => matchesArchiveFilter(isEntityArchived(workspace, { kind: 'rubric', id: level.head.id }), '', archiveFilter))
+    .map((level) => isEntityRemoved(workspace, { kind: 'rubric', id: level.head.id }) ? { ...level, version: null, review: null, approval: null } : level)
+    .sort((a, b) => a.head.grade - b.head.grade)
   const competencyRows = new Map<string, { label: string; generations: Set<string> }>()
   for (const level of levels) for (const criterion of level.version?.rubric.criteria ?? []) {
     const current = competencyRows.get(criterion.competencyId)
@@ -33,14 +41,24 @@ export function GradeMatrix({ detail, selectedGrade, onGrade, canWrite, pending,
   const approveLevel = levels.find((level) => level.head.grade === approving)
 
   function header(level: GradeLevelDetail) {
+    const target = { kind: 'rubric' as const, id: level.head.id }
+    const archived = isEntityArchived(workspace, target)
+    const removed = isEntityRemoved(workspace, target)
+    const deleting = Boolean(getEntityLifecycle(workspace, target)?.deletingAt || getEntityLifecycle(workspace, { kind: 'ladder', id: detail.ladder.id })?.deletingAt)
+    const editable = canWrite && !archived && !removed
     const reasons = gradeApprovalBlockers(detail, level)
     if (!canWrite) reasons.unshift('Only an owner or editor can approve a grade.')
+    if (archived) reasons.unshift('Archived grades are read-only. Unarchive the parent and grade first.')
+    if (removed) reasons.unshift('This rubric is being deleted or was removed. Finish cleanup before starting new work.')
     if (unsavedSources) reasons.unshift('Finish or discard unsaved source decisions before approval.')
     return <div className="grade-column-header">
-      <h3>GS-{level.head.grade}</h3><GradeStatus status={level.head.status} />
-      <p>{level.version ? `Saved version ${level.version.version}` : 'Draft not generated yet'}{level.approval && level.approval.versionId !== level.version?.id ? ' · older approved version retained' : ''}</p>
+      <h3>GS-{level.head.grade}</h3>{deleting ? <Badge tone="warning">Deletion pending</Badge> : level.head.lifecycle?.deletedAt ? <Badge>No rubric</Badge> : <GradeStatus status={level.head.status} />}<ArchivedBadge target={{ kind: 'rubric', id: level.head.id }} />
+      <p>{level.head.lifecycle?.deletedAt ? 'Permanently removed. A deliberate new generation is required; history does not fall back to an older version.' : level.version ? `Saved version ${level.version.version}` : 'Draft not generated yet'}{level.approval && level.approval.versionId !== level.version?.id ? ' · older approved version retained' : ''}</p>
+      {(archived || removed) && <LifecycleBanner target={target} />}
+      <EntityLifecycleActions target={{ kind: 'rubric', id: level.head.id }} name={`${detail.ladder.name} · GS-${level.head.grade}`}
+        restoreOnly={Boolean(level.head.lifecycle?.deletedAt)} />
       {level.version?.generationId !== detail.ladder.generationId && level.version && <Badge tone="warning">Previous generation retained</Badge>}
-      <div className="flex flex-wrap gap-2"><Button size="sm" icon={Pencil} disabled={!canWrite || pending || unsavedSources || !level.version || ['queued', 'processing'].includes(level.head.status) || level.version.sourceSetId !== detail.ladder.sourceSetId}
+      <div className="flex flex-wrap gap-2"><Button size="sm" icon={Pencil} disabled={!editable || pending || unsavedSources || !level.version || ['queued', 'processing'].includes(level.head.status) || level.version.sourceSetId !== detail.ladder.sourceSetId}
         title={!canWrite ? 'Viewer access is read-only.' : !level.version ? 'Generate a draft first.' : level.version.sourceSetId !== detail.ladder.sourceSetId ? 'Confirm current sources and generate a new version before editing.' : 'Saving appends a version and requests fresh grounding review.'} onClick={() => actions.onEdit(level)}>Edit draft</Button>
         <Button size="sm" variant="ghost" icon={History} onClick={() => actions.onHistory(level.head.grade)}>History</Button></div>
       <Button size="sm" variant="primary" icon={Check} disabled={pending || reasons.length > 0} title={reasons[0]} onClick={() => setApproving(level.head.grade)}>
@@ -57,7 +75,8 @@ export function GradeMatrix({ detail, selectedGrade, onGrade, canWrite, pending,
   }
 
   return <section className="panel grade-matrix-section" aria-label="Side-by-side GS grade expectations">
-    <div className="section-heading"><div><h2>Common competencies, distinct grade expectations</h2><p>Rows align by stable competency IDs, never just names. Older generation results are identified, not silently replaced.</p></div></div>
+    <div className="section-heading"><div><h2>Common competencies, distinct grade expectations</h2><p>Rows align by stable competency IDs, never just names. Older generation results are identified, not silently replaced.</p></div><ArchiveStateFilter value={archiveFilter} onChange={setArchiveFilter} label="Grade archive state" /></div>
+    {!levels.length && <p className="p-5 text-[12px] text-muted">No grades match this archive filter. Choose Active and archived to inspect retained grades.</p>}
     <div className="grade-mobile-tabs" role="tablist" aria-label="Choose a GS grade">{levels.map((level) => <button key={level.head.id} id={`grade-tab-${level.head.grade}`} type="button" role="tab" aria-selected={active?.head.grade === level.head.grade} aria-controls="grade-mobile-panel" tabIndex={active?.head.grade === level.head.grade ? 0 : -1}
       onClick={() => onGrade(level.head.grade)} onKeyDown={(event) => {
         const index = levels.findIndex((item) => item.head.grade === level.head.grade)

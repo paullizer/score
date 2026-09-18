@@ -100,6 +100,7 @@ export const retryAnalysisInputSchema = z.strictObject({
 })
 export const emptyAnalysisInputSchema = z.strictObject({})
 export const reportComparisonIdsSchema = z.array(comparisonId).min(1).max(REPORT_LIMITS.batchComparisons).refine(unique)
+export const analysisLifecycleInputSchema = z.strictObject({ action: z.enum(['archive', 'unarchive', 'delete']) })
 
 const targetSummaryBase = {
   id: identifier, workspaceId: workspace, dataKind: z.literal('real'),
@@ -156,6 +157,10 @@ const resultSummarySchema = z.strictObject({
 })
 const runSchema = z.strictObject({
   ...base, id: runId, recordType: z.literal('analysis-run'), name: text(160), createdBy: text(200),
+  lifecycle: z.strictObject({
+    archivedAt: timestamp.optional(), deletingAt: timestamp.optional(), deletedAt: timestamp.optional(),
+    parentKey: text(250).optional(),
+  }).optional(),
   idempotencyKey: z.string().uuid(), inputFingerprint: hash,
   status: z.enum(['initializing', 'queued', 'running', 'complete', 'partial', 'failed', 'cancelled']),
   manifest: jsonReferenceSchema,
@@ -546,7 +551,7 @@ const resultSchema = analysisAssessmentOutputSchema.extend({
     attemptId: z.string().uuid(), manifestSha256: hash,
     resumeSnapshot: z.strictObject({ snapshotId, sha256: hash }), targetSnapshot: z.strictObject({ snapshotId, sha256: hash }),
     assessmentSha256: hash, assessment: modelProvenanceSchema,
-    groundingReviews: z.array(groundingReviewSchema).min(1).max(2),
+    groundingReviews: z.array(groundingReviewSchema).min(1).max(ANALYSIS_LIMITS.maxOutputCorrections + 1),
     correctionCount: z.number().int().min(0).max(ANALYSIS_LIMITS.maxOutputCorrections),
     calculationVersion: z.literal('weighted-0-100-v1'),
   }),

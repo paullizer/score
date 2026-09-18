@@ -1,4 +1,5 @@
 import type { Job, Rubric, SourceDocument } from './types'
+import type { LifecycleMetadata } from './lifecycle'
 import type { OriginalContentType, UploadFormat, WordImportFeatures } from './document-formats'
 import { MAX_MARKDOWN_BYTES } from './source-files'
 
@@ -47,6 +48,8 @@ export interface RealJobRecord {
   extractedBlobName?: string
   error?: JobImportError
   warnings: string[]
+  lifecycle?: LifecycleMetadata
+  rubricLifecycle?: LifecycleMetadata
 }
 
 export interface VersionedRealJob {
@@ -63,6 +66,8 @@ export interface RealJobSummary {
   attempts: number
   error?: JobImportError
   warnings: string[]
+  lifecycle?: LifecycleMetadata
+  rubricLifecycle?: LifecycleMetadata
 }
 
 export interface RealJobDetail extends RealJobSummary {

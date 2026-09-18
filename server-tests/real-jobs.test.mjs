@@ -15,6 +15,7 @@ import {
   membershipFor,
   startTestServer,
 } from './helpers.mjs'
+import { createFakeRealJobs } from './job-lifecycle-fakes.mjs'
 
 const CSRF = { origin: APP_ORIGIN, 'x-score-request': 'workspace' }
 const MAX_MARKDOWN = 10 * 1024 * 1024
@@ -28,112 +29,6 @@ const REAL_JOBS_CONFIG = {
 
 function clone(value) {
   return structuredClone(value)
-}
-
-function createFakeRealJobs() {
-  const records = new Map()
-  const rubrics = new Map()
-  const blobs = new Map()
-  const publicationEvents = []
-  let etagCounter = 0
-  let failNextReplace = false
-  const nextEtag = () => `"job-etag-${++etagCounter}"`
-  const recordKey = (workspaceId, jobId) => `${workspaceId}/${jobId}`
-  const rubricKey = (workspaceId, jobId) => `${workspaceId}/${jobId}`
-
-  const store = {
-    async get(workspaceId, jobId) {
-      const value = records.get(recordKey(workspaceId, jobId))
-      return value ? clone(value) : undefined
-    },
-    async list(workspaceId, continuationToken) {
-      const offset = continuationToken ? Number(continuationToken) : 0
-      const values = [...records.values()]
-        .filter((value) => value.record.workspaceId === workspaceId)
-        .sort((a, b) => b.record.updatedAt.localeCompare(a.record.updatedAt))
-      const page = values.slice(offset, offset + 50).map(clone)
-      return { jobs: page, ...(offset + page.length < values.length ? { continuationToken: String(offset + page.length) } : {}) }
-    },
-    async create(record) {
-      const key = recordKey(record.workspaceId, record.id)
-      const existing = records.get(key)
-      if (existing) return { created: false, value: clone(existing) }
-      assert.ok(record.source.kind === 'url' || blobs.has(record.source.originalBlobName), 'source bytes must precede record publication')
-      const value = { record: clone(record), etag: nextEtag() }
-      records.set(key, value)
-      publicationEvents.push({ type: 'job', key })
-      return { created: true, value: clone(value) }
-    },
-    async replace(record, expectedEtag) {
-      const key = recordKey(record.workspaceId, record.id)
-      const current = records.get(key)
-      if (failNextReplace || !current || current.etag !== expectedEtag) {
-        failNextReplace = false
-        throw new StoreConflictError()
-      }
-      const value = { record: clone(record), etag: nextEtag() }
-      records.set(key, value)
-      return clone(value)
-    },
-    async listPending(now, limit) {
-      return [...records.values()]
-        .filter(({ record }) =>
-          ['queued', 'parsing', 'generating'].includes(record.job.status) &&
-          (!record.nextAttemptAt || record.nextAttemptAt <= now) &&
-          (!record.lease || record.lease.expiresAt <= now))
-        .slice(0, limit)
-        .map(clone)
-    },
-    async getRubric(workspaceId, rubricId) {
-      return [...rubrics.entries()]
-        .filter(([key]) => key.startsWith(`${workspaceId}/`))
-        .flatMap(([, values]) => values)
-        .filter((rubric) => rubric.id === rubricId)
-        .sort((a, b) => b.version - a.version)
-        .map(clone)[0]
-    },
-    async listRubrics(workspaceId, jobId) {
-      return (rubrics.get(rubricKey(workspaceId, jobId)) ?? []).slice().sort((a, b) => a.version - b.version).map(clone)
-    },
-    async publish(record, expectedEtag, rubric) {
-      const key = recordKey(record.workspaceId, record.id)
-      const current = records.get(key)
-      const versions = rubrics.get(rubricKey(record.workspaceId, record.id)) ?? []
-      if (!current || current.etag !== expectedEtag || versions.some((value) => value.id === rubric.id && value.version === rubric.version)) {
-        throw new StoreConflictError()
-      }
-      const value = { record: clone(record), etag: nextEtag() }
-      rubrics.set(rubricKey(record.workspaceId, record.id), [...versions, clone(rubric)])
-      records.set(key, value)
-      return clone(value)
-    },
-    _failNextReplace() {
-      failNextReplace = true
-    },
-  }
-
-  const blobStore = {
-    async read(blobName) {
-      const value = blobs.get(blobName)
-      return value ? clone(value) : undefined
-    },
-    async putImmutable(blobName, bytes, contentType) {
-      const existing = blobs.get(blobName)
-      if (existing) return { created: false, blob: clone(existing) }
-      const body = Uint8Array.from(bytes)
-      const blob = {
-        bytes: body,
-        contentType,
-        sha256: createHash('sha256').update(body).digest('hex'),
-        etag: `"blob-${blobs.size + 1}"`,
-      }
-      blobs.set(blobName, blob)
-      publicationEvents.push({ type: 'blob', key: blobName })
-      return { created: true, blob: clone(blob) }
-    },
-  }
-
-  return { store, blobs: blobStore, publicationEvents }
 }
 
 async function startRealJobsServer() {

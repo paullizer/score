@@ -27,6 +27,7 @@ export class RealRequestScope {
   private reads = new Map<string, RealReadTicket>()
   private mutations = new Map<string, RealMutationTicket>()
   private accepted = new Map<string, number>()
+  private authoritative = new Map<string, number>()
 
   activate() { this.alive = true }
   close() { this.alive = false; this.lifetime++; this.invalidateReads(); this.mutations.clear() }
@@ -52,9 +53,25 @@ export class RealRequestScope {
   }
 
   accept(key: string, sequence: number): boolean {
-    if ((this.accepted.get(key) ?? 0) > sequence) return false
+    if (!this.canAccept(key, sequence)) return false
     this.accepted.set(key, sequence)
     return true
+  }
+
+  canAccept(key: string, sequence: number): boolean {
+    return (this.accepted.get(key) ?? 0) <= sequence
+      && [...this.authoritative].every(([prefix, stamp]) => !key.startsWith(prefix) || stamp <= sequence)
+  }
+
+  reconcile(prefix: string, sequence: number) {
+    this.authoritative.set(prefix, Math.max(this.authoritative.get(prefix) ?? 0, sequence))
+  }
+
+  cancelReads(matches: (key: string) => boolean) {
+    for (const [key, ticket] of this.reads) if (matches(key)) {
+      ticket.controller.abort()
+      this.reads.delete(key)
+    }
   }
 
   mutate(key: string): RealMutationTicket {

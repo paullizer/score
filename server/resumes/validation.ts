@@ -226,6 +226,10 @@ const duplicate = z.strictObject({
 const base = { workspaceId, dataKind: z.literal('real'), createdAt: timestamp, updatedAt: timestamp }
 const resumeRecord = z.strictObject({
   ...base, id: resumeId, recordType: z.literal('resume'),
+  lifecycle: z.strictObject({
+    archivedAt: timestamp.optional(), deletingAt: timestamp.optional(), deletedAt: timestamp.optional(),
+    parentKey: z.string().min(1).max(400).optional(),
+  }).optional(),
   resume: z.strictObject({
     id: resumeId, dataKind: z.literal('real'),
     name: text(2000).nullable(), role: text(2000).nullable(), location: text(2000).nullable(), experience: text(2000).nullable(),
@@ -245,7 +249,8 @@ const batchRecord = z.strictObject({
   ...base, id: z.string().regex(BATCH_ID_PATTERN), recordType: z.literal('resume-batch'), batchId: uuid,
   createdBy: text(200), inputCount: z.number().int().min(1).max(LIMITS.maxBatchItems),
   items: z.array(z.strictObject({ idempotencyKey: uuid, inputFingerprint: sha256, resumeId, acceptedAt: timestamp }))
-    .min(1).max(LIMITS.maxBatchItems),
+    .max(LIMITS.maxBatchItems),
+  removedCount: z.number().int().min(1).max(LIMITS.maxBatchItems).optional(),
 })
 const entity = z.discriminatedUnion('recordType', [resumeRecord, batchRecord])
 
@@ -276,7 +281,8 @@ export function parseResumeEntity(value: unknown): ResumeEntity {
   assert(record.updatedAt >= record.createdAt, 'updatedAt precedes createdAt.')
   if (record.recordType === 'resume-batch') {
     assert(record.id === resumeBatchRecordId(record.batchId), 'Batch identity mismatch.')
-    assert(record.items.length <= record.inputCount, 'Batch exceeds its declared input count.')
+    assert(record.items.length + (record.removedCount ?? 0) <= record.inputCount, 'Batch exceeds its declared input count.')
+    assert(record.items.length || record.removedCount, 'An empty batch must retain its consumed admission count.')
     assert(new Set(record.items.map(item => item.idempotencyKey)).size === record.items.length &&
       new Set(record.items.map(item => item.resumeId)).size === record.items.length, 'Batch items must have unique keys and IDs.')
     for (const item of record.items) {
@@ -286,6 +292,12 @@ export function parseResumeEntity(value: unknown): ResumeEntity {
     return record
   }
   const { resume } = record
+  if (record.lifecycle) {
+    for (const field of ['archivedAt', 'deletingAt', 'deletedAt'] as const) {
+      const value = record.lifecycle[field]
+      if (value) assert(value >= record.createdAt && value <= record.updatedAt, 'Invalid resume lifecycle timestamp.')
+    }
+  }
   assert(record.id === resumeIdForKey(record.idempotencyKey) && resume.id === record.id &&
     resume.documentId === resumeDocumentId(record.id) && resume.batchId === record.batchId &&
     resume.createdAt === record.createdAt && resume.sourceLabel === record.source.displayName, 'Resume identity or source binding mismatch.')

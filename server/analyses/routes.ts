@@ -1,4 +1,4 @@
-import express, { type Request, type RequestHandler, type Router } from 'express'
+import express, { type Request, type RequestHandler, type Response, type Router } from 'express'
 import type { WorkspaceRepository } from '../repository'
 import type { RealJobsDeps } from '../jobs/routes'
 import type { RealGradesDeps } from '../grades/service'
@@ -8,8 +8,10 @@ import { invalidRequest, notFound, preconditionRequired, unavailable } from '../
 import { isUuid } from '../jobs/validation'
 import type { RealAnalysesDeps } from './store'
 import { RealAnalysisService } from './service'
+import { AnalysisLibraryLifecycleService } from './library-lifecycle'
 import {
-  createAnalysisInputSchema, emptyAnalysisInputSchema, isAnalysisId, reportComparisonIdsSchema, retryAnalysisInputSchema,
+  analysisLifecycleInputSchema, createAnalysisInputSchema, emptyAnalysisInputSchema,
+  isAnalysisId, reportComparisonIdsSchema, retryAnalysisInputSchema,
 } from './validation'
 
 export type { RealAnalysesDeps } from './store'
@@ -73,6 +75,7 @@ export function createRealAnalysesRouter(deps: RealAnalysesRouterDeps): Router {
   const router = express.Router()
   const base = '/workspaces/:workspaceId/analyses'
   const service = deps.analyses ? new RealAnalysisService(deps.analyses, deps, deps.now) : undefined
+  const lifecycle = deps.analyses ? new AnalysisLibraryLifecycleService(deps.analyses, deps.now) : undefined
   const requireService = () => {
     if (!service) throw unavailable('Real analysis is not enabled for this deployment.')
     return service
@@ -80,11 +83,16 @@ export function createRealAnalysesRouter(deps: RealAnalysesRouterDeps): Router {
   const authorize: RequestHandler = async (req, res, next) => {
     res.setHeader('Cache-Control', 'no-store')
     try {
-      await deps.repository.authorizeWorkspace(getPrincipal(req), param(req, 'workspaceId'), req.method === 'GET' ? 'read' : 'write')
+      await deps.repository.authorizeWorkspace(getPrincipal(req), param(req, 'workspaceId'),
+        req.method === 'GET' ? 'read' : req.path.endsWith('/lifecycle') ? 'manage' : 'write')
       requireService()
       next()
     } catch (error) { next(error) }
   }
+  const mutate = (access: 'write' | 'manage', callback: (req: Request, res: Response) => Promise<void>): RequestHandler =>
+    async (req, res) => {
+      await deps.repository.withWorkspaceMutation(getPrincipal(req), param(req, 'workspaceId'), access, () => callback(req, res))
+    }
   router.use(base, authorize)
   router.get(`${base}/targets`, async (req, res) => {
     const options = page(req)
@@ -94,18 +102,35 @@ export function createRealAnalysesRouter(deps: RealAnalysesRouterDeps): Router {
     const options = page(req)
     res.json(await requireService().list(param(req, 'workspaceId'), options.continuationToken, options.limit))
   })
-  router.post(base, async (req, res) => {
+  router.post(base, mutate('write', async (req, res) => {
     query(req, [])
     const run = await requireService().create(param(req, 'workspaceId'), key(req), body(createAnalysisInputSchema, req.body), getPrincipal(req).principalKey)
     res.setHeader('ETag', run.etag)
     res.status(202).json({ run })
-  })
+  }))
   router.get(`${base}/:runId`, async (req, res) => {
     query(req, [])
     const detail = await requireService().detail(param(req, 'workspaceId'), recordId(req, 'run'))
     res.setHeader('ETag', detail.etag)
     res.json(detail)
   })
+  router.get(`${base}/:runId/lifecycle`, async (req, res) => {
+    query(req, [])
+    requireService()
+    res.json({ impact: await lifecycle!.impact(param(req, 'workspaceId'), recordId(req, 'run')) })
+  })
+  router.post(`${base}/:runId/lifecycle`, mutate('manage', async (req, res) => {
+    query(req, [])
+    const { action } = body(analysisLifecycleInputSchema, req.body)
+    const result = await lifecycle!.change(
+      param(req, 'workspaceId'), recordId(req, 'run'), action, match(req), getPrincipal(req).principalKey,
+    )
+    if (result.etag) res.setHeader('ETag', result.etag)
+    if (result.pending) {
+      res.status(202).json({ operation: result.operation, ...(result.etag ? { etag: result.etag } : {}),
+        ...(result.analysis ? { analysis: result.analysis } : {}) })
+    } else res.json(result.deleted ? { deleted: true } : { analysis: result.analysis })
+  }))
   router.get(`${base}/:runId/comparisons`, async (req, res) => {
     const options = page(req)
     res.json(await requireService().comparisons(param(req, 'workspaceId'), recordId(req, 'run'), options.continuationToken, options.limit))
@@ -145,21 +170,21 @@ export function createRealAnalysesRouter(deps: RealAnalysesRouterDeps): Router {
       param(req, 'workspaceId'), recordId(req, 'run'), recordId(req, 'comparison'), param(req, 'documentId'), Number(version),
     ))
   })
-  router.post(`${base}/:runId/retry`, async (req, res) => {
+  router.post(`${base}/:runId/retry`, mutate('write', async (req, res) => {
     query(req, [])
     const run = await requireService().retry(param(req, 'workspaceId'), recordId(req, 'run'), body(retryAnalysisInputSchema, actionBody(req)), match(req))
     res.setHeader('ETag', run.etag)
     res.json({ run })
-  })
-  router.post(`${base}/:runId/cancel`, async (req, res) => {
+  }))
+  router.post(`${base}/:runId/cancel`, mutate('write', async (req, res) => {
     query(req, [])
     body(emptyAnalysisInputSchema, actionBody(req))
     const run = await requireService().cancel(param(req, 'workspaceId'), recordId(req, 'run'), getPrincipal(req).principalKey, match(req))
     res.setHeader('ETag', run.etag)
     res.json({ run })
-  })
+  }))
   for (const action of ['retry', 'cancel'] as const) {
-    router.post(`${base}/:runId/comparisons/:comparisonId/${action}`, async (req, res) => {
+    router.post(`${base}/:runId/comparisons/:comparisonId/${action}`, mutate('write', async (req, res) => {
       query(req, [])
       body(emptyAnalysisInputSchema, actionBody(req))
       const comparison = await requireService().comparisonAction(
@@ -167,7 +192,7 @@ export function createRealAnalysesRouter(deps: RealAnalysesRouterDeps): Router {
       )
       res.setHeader('ETag', comparison.etag)
       res.json({ comparison })
-    })
+    }))
   }
   return router
 }

@@ -3,6 +3,10 @@ import { Link, useLocation, useNavigate, useSearchParams } from 'react-router-do
 import { ArrowLeft, ArrowRight, BriefcaseBusiness, Check, Layers3, LoaderCircle, RotateCcw, ShieldCheck, Users } from 'lucide-react'
 import { useRealAnalyses } from '../../app/real-analyses-context'
 import { useRealResumes } from '../../app/real-resumes-context'
+import { useWorkspace } from '../../app/workspace-context'
+import { isEntityArchived, isEntityRemoved, matchesArchiveFilter, type ArchiveFilter } from '../../domain/lifecycle'
+import { ArchivedBadge, ArchiveStateFilter, LifecycleBanner } from '../../components/lifecycle/LifecycleControls'
+import { useLifecycleAccess } from '../../components/lifecycle/useLifecycleAccess'
 import type { CreateRealAnalysisInput, RealAnalysisRunDetail, RealAnalysisTargetSummary } from '../../domain/real-analyses'
 import type { RealResumeSummary } from '../../domain/real-resumes'
 import { ANALYSIS_LIMITS } from '../../domain/real-analyses'
@@ -10,7 +14,7 @@ import { Badge, Button, EmptyState, InlineError, PageHeader, SearchField, Segmen
 import { readyRealResume, resumeName } from '../resumes/resumeImportUi'
 import {
   currentRealTarget, initialRealSelections, newerSavedJobTarget, realResumeSelection, resumeSelectionIssue, targetIdentity, targetSelectionIssue,
-  resolveRealAnalysisNavigation, targetVersionLabel, type SelectedRealResume, type SelectedRealTarget,
+  resolveRealAnalysisNavigation, targetVersionLabel, realTargetAvailable, realTargetArchived, realTargetRemoved, type SelectedRealResume, type SelectedRealTarget,
 } from './realAnalysisUi'
 
 export function RealAnalysisSetup() {
@@ -49,11 +53,15 @@ function RealAnalysisBuilder({ previous, params, fragment, transferred }: {
 }) {
   const api = useRealAnalyses()!
   const resumeApi = useRealResumes()!
+  const { workspace } = useWorkspace()
+  const { canEdit } = useLifecycleAccess(previous ? { kind: 'analysis', id: previous.run.id } : undefined)
   const navigate = useNavigate()
   const currentTargets = api.targets.state === 'ready' ? api.targets.value : []
   const [draft, setDraft] = useState(() => initialRealSelections(params, resumeApi.summaries, currentTargets, previous, fragment))
   const [resumeSearch, setResumeSearch] = useState('')
   const [targetSearch, setTargetSearch] = useState('')
+  const [resumeArchiveFilter, setResumeArchiveFilter] = useState<ArchiveFilter>('default')
+  const [targetArchiveFilter, setTargetArchiveFilter] = useState<ArchiveFilter>('default')
   const [targetType, setTargetType] = useState<'job' | 'grade'>(() => draft.targets.length && draft.targets.every((target) => target.selection?.kind === 'grade') ? 'grade' : 'job')
   const [name, setName] = useState('')
   const [error, setError] = useState('')
@@ -62,14 +70,20 @@ function RealAnalysisBuilder({ previous, params, fragment, transferred }: {
   const inFlight = useRef(false)
   const alive = useRef(true)
   useEffect(() => { alive.current = true; return () => { alive.current = false } }, [])
-  const ready = resumeApi.summaries.filter(readyRealResume)
-  const shownResumes = resumeApi.summaries.filter((item) => [item.resume.name, item.resume.role, item.resume.sourceLabel].join(' ').toLocaleLowerCase().includes(resumeSearch.trim().toLocaleLowerCase()))
-  const shownTargets = currentTargets.filter((target) => target.kind === targetType && `${target.label} ${target.sublabel}`.toLocaleLowerCase().includes(targetSearch.trim().toLocaleLowerCase()))
+  const resumeReady = (item: RealResumeSummary) => readyRealResume(item) && !isEntityArchived(workspace, { kind: 'resume', id: item.resume.id }) && !isEntityRemoved(workspace, { kind: 'resume', id: item.resume.id })
+  const ready = resumeApi.summaries.filter(resumeReady)
+  const activeTargets = currentTargets.filter((target) => realTargetAvailable(workspace, target.selection))
+  const shownResumes = resumeApi.summaries.filter((item) => !item.lifecycle?.deletedAt &&
+    matchesArchiveFilter(isEntityArchived(workspace, { kind: 'resume', id: item.resume.id }), resumeSearch, resumeArchiveFilter) &&
+    [item.resume.name, item.resume.role, item.resume.sourceLabel].join(' ').toLocaleLowerCase().includes(resumeSearch.trim().toLocaleLowerCase()))
+  const shownTargets = currentTargets.filter((target) => !realTargetRemoved(workspace, target.selection) &&
+    matchesArchiveFilter(realTargetArchived(workspace, target.selection), targetSearch, targetArchiveFilter) &&
+    target.kind === targetType && `${target.label} ${target.sublabel}`.toLocaleLowerCase().includes(targetSearch.trim().toLocaleLowerCase()))
   const count = draft.resumes.length * draft.targets.length
   const limit = api.features?.analysisLimits.maxComparisons ?? ANALYSIS_LIMITS.maxComparisons
   const duplicateInputs = new Set(draft.resumes.map((item) => item.id)).size !== draft.resumes.length || new Set(draft.targets.map((item) => item.id)).size !== draft.targets.length
-  const resumeIssues = draft.resumes.map((item) => resumeSelectionIssue(item, resumeApi.summaries))
-  const targetIssues = draft.targets.map((item) => targetSelectionIssue(item, currentTargets))
+  const resumeIssues = draft.resumes.map((item) => resumeSelectionIssue(item, resumeApi.summaries, workspace))
+  const targetIssues = draft.targets.map((item) => targetSelectionIssue(item, currentTargets, workspace))
   const invalid = draft.errors.length > 0 || duplicateInputs || resumeIssues.some(Boolean) || targetIssues.some(Boolean)
   const unavailable = !api.features?.realAnalyses || api.phase !== 'ready' || resumeApi.phase !== 'ready' || api.targets.state !== 'ready' || Boolean(api.targets.error)
   const locked = starting || Boolean(attempt)
@@ -77,7 +91,7 @@ function RealAnalysisBuilder({ previous, params, fragment, transferred }: {
   const grades = draft.targets.filter((target) => target.selection?.kind === 'grade').length
 
   function selectResume(summary: RealResumeSummary, replace = false) {
-    if (locked) return
+    if (locked || !canEdit || !api.canWrite || !resumeReady(summary)) return
     const choice: SelectedRealResume = { id: summary.resume.id, label: resumeName(summary), selection: realResumeSelection(summary) }
     setDraft((current) => ({ ...current, resumes: current.resumes.some((item) => item.id === choice.id)
       ? replace ? current.resumes.map((item) => item.id === choice.id ? choice : item) : current.resumes.filter((item) => item.id !== choice.id)
@@ -85,7 +99,7 @@ function RealAnalysisBuilder({ previous, params, fragment, transferred }: {
   }
 
   function selectTarget(target: RealAnalysisTargetSummary, replaceId?: string) {
-    if (locked) return
+    if (locked || !canEdit || !api.canWrite || !realTargetAvailable(workspace, target.selection)) return
     const choice: SelectedRealTarget = { id: targetIdentity(target.selection), label: target.label, selection: target.selection, summary: target }
     setDraft((current) => ({ ...current, targets: replaceId
       ? current.targets.map((item) => item.id === replaceId ? choice : item)
@@ -93,7 +107,7 @@ function RealAnalysisBuilder({ previous, params, fragment, transferred }: {
   }
 
   async function run() {
-    if (inFlight.current || !api.canWrite || unavailable) return
+    if (inFlight.current || !canEdit || !api.canWrite || unavailable) return
     setError('')
     let request = attempt
     if (!request) {
@@ -123,6 +137,8 @@ function RealAnalysisBuilder({ previous, params, fragment, transferred }: {
     <Link className="back-link" to="/analyses?data=real"><ArrowLeft size={14} aria-hidden="true" />Back to real analyses</Link>
     <PageHeader eyebrow="MANUAL, EVIDENCE-LED REVIEW" title="Build a real analysis" description="Select ready real resumes and exact saved job or approved GS targets. Nothing runs until you choose Run analysis."
       actions={<Button icon={RotateCcw} disabled={starting} onClick={() => { void api.refreshTargets(); void resumeApi.refresh() }}>Refresh available inputs</Button>} />
+    <LifecycleBanner target={previous ? { kind: 'analysis', id: previous.run.id } : undefined} />
+    {previous && !canEdit && <InlineError>This saved analysis is read-only. Unarchive it and its workspace before creating a run from its selections, or open a separate analysis with active inputs.</InlineError>}
     {transferred && <div className="info-callout mb-5"><Layers3 size={18} aria-hidden="true" /><div><strong>All exact selections were transferred with this navigation.</strong>
       <p>The URL stays short; this history entry carries only IDs, versions, and hashes. A copied URL without that state cannot restore the selection. After you manually create a run, its saved-run link can be reopened normally.</p></div></div>}
     {previous && <div className="info-callout mb-5"><Layers3 size={18} aria-hidden="true" /><div><strong>A new run, with reviewable selections.</strong>
@@ -136,8 +152,9 @@ function RealAnalysisBuilder({ previous, params, fragment, transferred }: {
       <div className="space-y-5">
         <section className="panel"><div className="section-heading"><div><StepLabel number={1} complete={draft.resumes.length > 0}>Choose ready real resumes</StepLabel><p>Missing profile metadata is not replaced by filenames.</p></div><Badge>{draft.resumes.length} selected</Badge></div>
           <div className="library-toolbar"><SearchField value={resumeSearch} onChange={setResumeSearch} placeholder="Search stated names, roles, or sources…" label="Search analysis resumes" />
-            <Button size="sm" variant="ghost" disabled={locked || !shownResumes.some(readyRealResume)} onClick={() => {
-              const visible = shownResumes.filter(readyRealResume)
+            <ArchiveStateFilter value={resumeArchiveFilter} onChange={setResumeArchiveFilter} label="Real resume input archive state" />
+            <Button size="sm" variant="ghost" disabled={locked || !canEdit || !api.canWrite || !shownResumes.some(resumeReady)} onClick={() => {
+              const visible = shownResumes.filter(resumeReady)
               setDraft((current) => {
                 const all = visible.every((item) => current.resumes.some((choice) => choice.id === item.resume.id))
                 return { ...current, resumes: all ? current.resumes.filter((choice) => !visible.some((item) => item.resume.id === choice.id))
@@ -147,27 +164,29 @@ function RealAnalysisBuilder({ previous, params, fragment, transferred }: {
             }}>Toggle ready visible</Button></div>
           <div className="builder-options">
             {shownResumes.map((summary) => <label className="selection-card" key={summary.resume.id}>
-              <input type="checkbox" checked={draft.resumes.some((item) => item.id === summary.resume.id)} disabled={locked || !readyRealResume(summary)}
+              <input type="checkbox" checked={draft.resumes.some((item) => item.id === summary.resume.id)} disabled={locked || !canEdit || !api.canWrite || !resumeReady(summary)}
                 aria-label={`Include ${resumeName(summary)} from ${summary.source.displayName}`} onChange={() => selectResume(summary)} />
               <Users size={17} className="shrink-0 text-muted" aria-hidden="true" /><div className="min-w-0"><strong className="block text-[12px]">{resumeName(summary)}</strong>
                 <span className="row-meta block">{summary.resume.role ?? 'Role not stated'}</span><span className="row-meta block break-all">{summary.source.displayName}</span>
-                <div className="mt-2"><Badge tone={readyRealResume(summary) ? 'success' : 'warning'}>{summary.resume.status}{summary.documentRef ? ` · document v${summary.documentRef.documentVersion}` : ''}</Badge></div></div>
+                <div className="mt-2"><Badge tone={resumeReady(summary) ? 'success' : 'warning'}>{summary.resume.status}{summary.documentRef ? ` · document v${summary.documentRef.documentVersion}` : ''}</Badge><ArchivedBadge target={{ kind: 'resume', id: summary.resume.id }} /></div></div>
             </label>)}
-            {!shownResumes.length && <div className="col-span-full"><EmptyState title="No real resumes to show" description="Import actual PDFs, local Markdown files, or public profile URLs and wait for ready status before selecting them."
+            {!shownResumes.length && <div className="col-span-full"><EmptyState title="No real resumes to show" description="Search or change the archive filter to inspect retained inputs. Only active, ready real sources can start new analyses; supported PDF, Markdown, Word and public URL imports remain in the real resume library."
               action={<Link className="button button-secondary button-md" to="/resumes?data=real">Open real resumes</Link>} /></div>}
           </div>
           <div className="border-t px-5 py-3 text-[11px] text-muted">{ready.length} ready · public profiles may be sparse · imports do not automatically run analyses</div>
         </section>
         <section className="panel"><div className="section-heading"><div><StepLabel number={2} complete={draft.targets.length > 0}>Choose exact real targets</StepLabel><p>All eligible saved job versions and approved GS targets, not only previously opened rubrics. Each selected version is a separate target.</p></div><Badge>{draft.targets.length} selected</Badge></div>
           <div className="library-toolbar"><SegmentedControl label="Real target type" value={targetType} onChange={setTargetType}
-            options={[{ value: 'job', label: 'Real jobs', count: currentTargets.filter((target) => target.kind === 'job').length }, { value: 'grade', label: 'Approved GS versions', count: currentTargets.filter((target) => target.kind === 'grade').length }]} />
-            <SearchField value={targetSearch} onChange={setTargetSearch} placeholder="Search eligible targets…" label="Search real analysis targets" /></div>
+            options={[{ value: 'job', label: 'Real jobs', count: activeTargets.filter((target) => target.kind === 'job').length }, { value: 'grade', label: 'Approved GS versions', count: activeTargets.filter((target) => target.kind === 'grade').length }]} />
+            <SearchField value={targetSearch} onChange={setTargetSearch} placeholder="Search eligible targets…" label="Search real analysis targets" />
+            <ArchiveStateFilter value={targetArchiveFilter} onChange={setTargetArchiveFilter} label="Real target input archive state" /></div>
           <div className="builder-options">{shownTargets.map((target) => <label className="selection-card" key={target.id}>
-            <input type="checkbox" checked={draft.targets.some((item) => item.id === targetIdentity(target.selection))} disabled={locked}
+            <input type="checkbox" checked={draft.targets.some((item) => item.id === targetIdentity(target.selection))} disabled={locked || !canEdit || !api.canWrite || !realTargetAvailable(workspace, target.selection)}
               aria-label={`Include ${target.label}, ${targetVersionLabel(target.selection)}`} onChange={() => selectTarget(target)} />
             <span className="target-symbol">{target.kind === 'job' ? <BriefcaseBusiness size={16} aria-hidden="true" /> : <Layers3 size={16} aria-hidden="true" />}</span>
             <div className="min-w-0"><strong className="block text-[12px]">{target.label}</strong><span className="row-meta block">{target.sublabel}</span>
               <div className="mt-2 flex flex-wrap gap-1.5"><Badge>{targetVersionLabel(target.selection)}</Badge><Badge>{target.criterionCount} criteria</Badge>
+                {realTargetArchived(workspace, target.selection) && <Badge tone="warning">Archived · read only</Badge>}
                 {target.kind === 'grade' && target.newerDraftAvailable && <Badge tone="warning">Newer draft exists · not selected</Badge>}</div>
               {target.kind === 'grade' && <p className="mt-2 text-[10px] text-muted">Approved {target.approvedAt} · series {target.context.series} · {target.context.agency || 'Agency not stated'} · {target.context.supervision}. Context belongs to this approved capture, not the newer draft.</p>}
             </div>
@@ -181,16 +200,16 @@ function RealAnalysisBuilder({ previous, params, fragment, transferred }: {
           <div className="section-heading"><div><h2>Review your exact selection</h2><p>Unknown, mixed, or changed inputs block submission. Refresh never silently changes these selections.</p></div></div>
           <ul className="divide-y">{draft.resumes.map((choice, index) => {
             const issue = resumeIssues[index]
-            const current = resumeApi.summaries.find((item) => item.resume.id === choice.id && readyRealResume(item))
+            const current = resumeApi.summaries.find((item) => item.resume.id === choice.id && resumeReady(item))
             return <li key={`resume-${index}`} className="space-y-2 p-4">
               <div className="flex flex-wrap items-center justify-between gap-2"><strong className="text-[12px]">{choice.label}</strong><Button size="sm" variant="ghost" disabled={locked} onClick={() => setDraft((value) => ({ ...value, resumes: value.resumes.filter((_, itemIndex) => itemIndex !== index) }))}>Remove resume</Button></div>
               <p className="break-all text-[10px] text-muted">{choice.id}{choice.selection ? ` · document v${choice.selection.documentVersion} · SHA-256 ${choice.selection.documentSha256}` : ''}</p>
-              {issue ? <InlineError>{issue}{current && <Button className="mt-2" size="sm" disabled={locked} onClick={() => selectResume(current, true)}>Use current saved resume</Button>}</InlineError> : <Badge tone="success">Exact ready source selected</Badge>}
+              {issue ? <InlineError>{issue}{current && <Button className="mt-2" size="sm" disabled={locked || !canEdit} onClick={() => selectResume(current, true)}>Use current saved resume</Button>}</InlineError> : <Badge tone="success">Exact ready source selected</Badge>}
             </li>
           })}{draft.targets.map((choice, index) => {
             const issue = targetIssues[index]
-            const current = choice.selection ? currentRealTarget(choice.selection, currentTargets) : undefined
-            const newer = choice.selection ? newerSavedJobTarget(choice.selection, currentTargets) : undefined
+            const current = choice.selection ? currentRealTarget(choice.selection, activeTargets) : undefined
+            const newer = choice.selection ? newerSavedJobTarget(choice.selection, activeTargets) : undefined
             const currentAlreadySelected = current && currentTargetsSelectedElsewhere(current)
             const newerAlreadySelected = newer && currentTargetsSelectedElsewhere(newer)
             function currentTargetsSelectedElsewhere(target: RealAnalysisTargetSummary) {
@@ -201,12 +220,12 @@ function RealAnalysisBuilder({ previous, params, fragment, transferred }: {
               {choice.selection && <><Badge>{targetVersionLabel(choice.selection)}</Badge><p className="break-all text-[10px] text-muted">{choice.selection.kind === 'job'
                 ? `Rubric SHA-256 ${choice.selection.rubricHash} · document ${choice.selection.documentId} v${choice.selection.documentVersion}`
                 : `Version ${choice.selection.versionId} · approval ${choice.selection.approvalId} · source set ${choice.selection.sourceSetId}`}</p></>}
-              {issue ? <InlineError>{issue}{current && <Button className="mt-2" size="sm" disabled={locked || currentAlreadySelected}
+              {issue ? <InlineError>{issue}{current && <Button className="mt-2" size="sm" disabled={locked || !canEdit || currentAlreadySelected}
                 title={currentAlreadySelected ? 'The eligible replacement is already selected. Remove this unavailable selection explicitly.' : undefined}
                 onClick={() => selectTarget(current, choice.id)}>Use current eligible version</Button>}</InlineError> : <Badge tone="success"><Check size={11} aria-hidden="true" />Exact eligible version selected</Badge>}
               {!issue && newer && <div className="space-y-2 text-[11px] text-muted"><p>A newer saved job rubric v{newer.rubricVersion} is available. This selection still uses v{choice.selection?.kind === 'job' ? choice.selection.rubricVersion : ''}; it has not been replaced.</p>
                 {newerAlreadySelected ? <p>The newer version is also selected as a separate comparison target.</p>
-                  : <Button size="sm" disabled={locked} onClick={() => selectTarget(newer, choice.id)}>Use newer saved version instead</Button>}</div>}
+                  : <Button size="sm" disabled={locked || !canEdit} onClick={() => selectTarget(newer, choice.id)}>Use newer saved version instead</Button>}</div>}
             </li>
           })}</ul>
         </section>}
@@ -214,7 +233,7 @@ function RealAnalysisBuilder({ previous, params, fragment, transferred }: {
       <aside className="analysis-summary panel" aria-label="Real analysis summary">
         <div className="section-heading"><StepLabel number={3}>Review, then run</StepLabel></div>
         <div className="space-y-5 p-5">
-          <label className="field"><span className="field-label">Analysis name (optional)</span><input className="input" value={name} maxLength={160} disabled={locked}
+          <label className="field"><span className="field-label">Analysis name (optional)</span><input className="input" value={name} maxLength={160} disabled={locked || !canEdit || !api.canWrite}
             onChange={(event) => setName(event.target.value)} placeholder="Resume evidence review" /></label>
           <div className="space-y-3 border-y py-4"><div className="metric-line"><span>Real resumes</span><strong>{draft.resumes.length}</strong></div><div className="metric-line"><span>Job rubrics</span><strong>{jobs}</strong></div><div className="metric-line"><span>Approved GS versions</span><strong>{grades}</strong></div></div>
           <div className="comparison-count" aria-live="polite"><strong>{count}</strong><span>individual comparisons<small>Maximum {limit}. No truncation.</small></span></div>
@@ -224,7 +243,7 @@ function RealAnalysisBuilder({ previous, params, fragment, transferred }: {
           {attempt && !starting && <div className="space-y-3 text-[11px] text-muted"><p>Acceptance was not confirmed. A lost response can still represent a saved run. Retrying sends the same complete request and UUID; it never binds newer input versions.</p>
             <Button size="sm" disabled={starting} onClick={() => { setAttempt(null); setError(''); void api.refresh(); void api.refreshTargets() }}>Review selections before a different request</Button></div>}
           <Button variant="primary" icon={starting ? LoaderCircle : ArrowRight} className="w-full"
-            disabled={starting || !api.canWrite || unavailable || (!attempt && (invalid || !draft.resumes.length || !draft.targets.length || count > limit))}
+            disabled={starting || !canEdit || !api.canWrite || unavailable || (!attempt && (invalid || !draft.resumes.length || !draft.targets.length || count > limit))}
             onClick={() => void run()}>{starting ? 'Awaiting server acceptance…' : attempt ? 'Retry unchanged submission' : 'Run analysis'}</Button>
           <div className="flex items-start gap-2 text-[10px] text-muted"><ShieldCheck size={15} className="shrink-0" aria-hidden="true" /><p>Human review only. Evidence gaps are not proof of missing skills. GS qualifications stay unscored and are not official eligibility decisions.</p></div>
         </div>

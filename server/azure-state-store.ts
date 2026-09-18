@@ -1,9 +1,10 @@
 import { BlobServiceClient, RestError } from '@azure/storage-blob'
-import type { BlockBlobClient } from '@azure/storage-blob'
+import type { BlobLeaseClient, BlockBlobClient } from '@azure/storage-blob'
 import { buffer as streamToBuffer } from 'node:stream/consumers'
 import type { TokenCredential } from '@azure/identity'
 import type { StorageConfig } from './config'
 import { StoreConflictError, type StateStore } from './store'
+import { isValidWorkspaceId } from './ids'
 
 function statusCodeOf(error: unknown): number | undefined {
   return error instanceof RestError ? error.statusCode : undefined
@@ -17,6 +18,8 @@ interface StateBlobContainer {
   getBlockBlobClient(path: string): {
     download(): Promise<Pick<Awaited<ReturnType<BlockBlobClient['download']>>, 'readableStreamBody' | 'etag'>>
     upload(...args: Parameters<BlockBlobClient['upload']>): Promise<Pick<Awaited<ReturnType<BlockBlobClient['upload']>>, 'etag'>>
+    deleteIfExists?(...args: Parameters<BlockBlobClient['deleteIfExists']>): Promise<unknown>
+    getBlobLeaseClient?(): Pick<BlobLeaseClient, 'acquireLease' | 'renewLease' | 'releaseLease'>
   }
   getProperties(): Promise<unknown>
 }
@@ -85,6 +88,48 @@ export function createStateStoreFromContainer(containerClient: StateBlobContaine
     await containerClient.getProperties()
   }
 
-  const store: StateStore = { getState, createState, putState, checkAccess }
+  async function deleteState(workspaceId: string, expectedEtag: string) {
+    const blob = containerClient.getBlockBlobClient(blobPathFor(workspaceId))
+    if (!blob.deleteIfExists) throw new Error('The state store does not support deletion.')
+    if (!expectedEtag || expectedEtag === '*') throw new StoreConflictError('An exact state ETag is required.')
+    try {
+      await blob.deleteIfExists({ conditions: { ifMatch: expectedEtag }, deleteSnapshots: 'include' })
+    } catch (error) {
+      if ([409, 412].includes(statusCodeOf(error) ?? 0)) throw new StoreConflictError('The workspace state changed during deletion.')
+      throw error
+    }
+  }
+
+  async function acquireMutationLease(workspaceId: string) {
+    if (!isValidWorkspaceId(workspaceId)) throw new Error('Invalid workspace mutation scope.')
+    // Kept separately from state.json so an interrupted purge can still be resumed under a lease.
+    const blob = containerClient.getBlockBlobClient(`${workspaceId}/mutation.lock`)
+    if (!blob.getBlobLeaseClient) throw new Error('The state store does not support mutation leases.')
+    try {
+      await blob.upload(Buffer.alloc(0), 0, { conditions: { ifNoneMatch: '*' } })
+    } catch (error) {
+      if (![409, 412].includes(statusCodeOf(error) ?? 0)) throw error
+    }
+    const lease = blob.getBlobLeaseClient()
+    try {
+      await lease.acquireLease(60)
+    } catch (error) {
+      if ([409, 412].includes(statusCodeOf(error) ?? 0)) {
+        throw new StoreConflictError('Another workspace change is in progress. Reload and retry.')
+      }
+      throw error
+    }
+    return {
+      async renew() {
+        try { await lease.renewLease() } catch (error) {
+          if ([404, 409, 412].includes(statusCodeOf(error) ?? 0)) throw new StoreConflictError('The workspace mutation lease was lost.')
+          throw error
+        }
+      },
+      async release() { await lease.releaseLease() },
+    }
+  }
+
+  const store: StateStore = { getState, createState, putState, deleteState, acquireMutationLease, checkAccess }
   return store
 }

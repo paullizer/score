@@ -17,8 +17,10 @@ import {
   analysisHash, analysisResultBlobName, assertAnalysisResultBinding, parseAnalysisEntity, parseAnalysisResult,
 } from '../../server/analyses/validation'
 import type { AnalysisBlobStore, AnalysisStore } from '../../server/analyses/store'
+import { analysisIsRemoved, fencedAnalysisBlobs } from '../../server/analyses/guards'
 import { systemClock, type Clock, type RubricModelOptions } from '../runtime'
 import { AnalysisModelError, assessResumeAgainstTarget } from './model'
+import { emitAnalysisTelemetry, type AnalysisTelemetrySink } from './telemetry'
 
 const LEASE_MS = 90_000
 const HEARTBEAT_MS = 25_000
@@ -32,6 +34,7 @@ export interface AnalysisWorkerDependencies {
   model: RubricModelOptions
   clock?: Clock
   owner?: string
+  onEvent?: AnalysisTelemetrySink
 }
 
 export interface AnalysisWorkerOptions {
@@ -97,6 +100,9 @@ function inputBlobs(blobs: AnalysisBlobStore, stage: Stage): AnalysisBlobStore {
       return blob
     },
     putImmutable: (name, bytes, contentType) => blobs.putImmutable(name, bytes, contentType),
+    putFenced: (name, bytes, contentType, fence) => blobs.putFenced(name, bytes, contentType, fence),
+    list: (workspaceId, runId, token) => blobs.list(workspaceId, runId, token),
+    delete: (workspaceId, runId, name, etag) => blobs.delete(workspaceId, runId, name, etag),
   }
 }
 
@@ -106,7 +112,12 @@ function due(record: RealAnalysisRunRecord | RealAnalysisComparisonRecord, times
 }
 
 function runNeedsWork(run: RealAnalysisRunRecord): boolean {
-  return run.status === 'initializing' || Boolean(run.cancellation && !run.cancellation.completedAt)
+  return !analysisIsRemoved(run.lifecycle) &&
+    ((!run.lifecycle?.archivedAt && run.status === 'initializing') || Boolean(run.cancellation && !run.cancellation.completedAt))
+}
+async function workspaceAllowsWork(store: AnalysisStore, workspaceId: string, cancelling = false): Promise<boolean> {
+  const state = (await store.getControl(workspaceId))?.record.state ?? 'active'
+  return state === 'active' || (state === 'archived' && cancelling)
 }
 
 function timeAfter(clock: Clock, ...records: { updatedAt: string }[]): string {
@@ -200,7 +211,8 @@ class ComparisonLease {
       loadAnalysisComparison(this.store, record.workspaceId, record.runId, record.id),
     ])
     if (!run || !comparison || !canScore(run.record) || comparison.record.status !== 'running' ||
-      !liveLease(comparison.record, this.claimed, this.clock.now().toISOString())) throw new LostAnalysisWork()
+      !liveLease(comparison.record, this.claimed, this.clock.now().toISOString()) ||
+      !await workspaceAllowsWork(this.store, record.workspaceId)) throw new LostAnalysisWork()
     if (!allowAborted) this.control.check()
     return { run, comparison }
   }
@@ -258,6 +270,7 @@ async function claimComparison(
     const now = clock.now().toISOString()
     if (signal?.aborted || clock.now().getTime() >= deadline) return
     if (!run || !current || !canScore(run.record) || !['queued', 'running'].includes(current.record.status) || !due(current.record, now)) return
+    if (!await workspaceAllowsWork(deps.store, run.record.workspaceId)) return
     const attemptLimitReached = current.record.attempts >= ANALYSIS_LIMITS.maxAutomaticAttempts
     const timestamp = timeAfter(clock, run.record, current.record)
     const record: RealAnalysisComparisonRecord = {
@@ -313,7 +326,8 @@ async function storeResult(
   const { run, comparison } = await lease.check()
   const name = analysisResultBlobName(run.record.workspaceId, run.record.id, comparison.record.id, comparison.record.attemptId!)
   let reference: ImmutableJsonBlobReference
-  try { reference = await lease.control.wait(() => putAnalysisJson(deps.blobs, name, result)) } catch (error) {
+  const blobs = fencedAnalysisBlobs(deps, run.record.workspaceId, run.record.id, lease.control.signal)
+  try { reference = await lease.control.wait(() => putAnalysisJson(blobs, name, result)) } catch (error) {
     lease.control.check()
     const winning = await lease.control.wait(() => deps.blobs.read(name))
     if (!winning) throw error
@@ -334,7 +348,26 @@ export async function processClaimedComparison(
   if (deps.owner && deps.owner !== claimed.record.lease?.owner) return false
   const clock = deps.clock ?? systemClock
   const lease = new ComparisonLease(claimed, deps.store, clock, options.deadline ?? clock.now().getTime() + RUN_BUDGET_MS, options.signal)
+  const startedAt = clock.now().getTime()
+  const context = {
+    workspaceId: claimed.record.workspaceId, runId: claimed.record.runId,
+    comparisonId: claimed.record.id, attemptId: claimed.record.attemptId,
+  }
   let stage: Stage = 'assessment'
+  let correctionCount = 0
+  const onEvent: AnalysisTelemetrySink = event => {
+    stage = event.stage
+    correctionCount = event.correctionCount ?? correctionCount
+    emitAnalysisTelemetry(deps.onEvent, { ...event, ...context })
+  }
+  const outcome = (status: 'complete' | 'failed' | 'queued' | 'abandoned', failure?: AnalysisProcessingError) => {
+    const timestamp = clock.now().toISOString()
+    emitAnalysisTelemetry(deps.onEvent, {
+      ...context, event: 'comparison-outcome', timestamp, stage: failure?.stage ?? stage, outcome: status,
+      correctionCount, code: failure?.code, retryable: failure?.retryable,
+      durationMilliseconds: Math.max(0, Date.parse(timestamp) - startedAt),
+    })
+  }
   let readingInputs = true
   let published: ImmutableJsonBlobReference | undefined
   try {
@@ -351,7 +384,7 @@ export async function processClaimedComparison(
       qualifications: target.kind === 'grade' ? target.version.qualifications : [],
       requirementEvidence: target.requirementEvidence,
     }, {
-      model: deps.model, clock, signal: lease.control.signal,
+      model: deps.model, clock, signal: lease.control.signal, onEvent,
       resumeSnapshotSha256: comparison.record.resume.blob.sha256,
       targetSnapshotSha256: comparison.record.target.blob.sha256,
     })
@@ -372,32 +405,41 @@ export async function processClaimedComparison(
     } satisfies RealAnalysisResult)
     assertAnalysisResultBinding(result, current.run.record, current.comparison.record, snapshots.resumeSnapshot, target)
     const saved = await storeResult(deps, lease, snapshots, result)
+    correctionCount = saved.result.provenance.correctionCount
     published = saved.reference
     await lease.atomic((record, timestamp, liveRun) => {
       assertAnalysisResultBinding(saved.result, liveRun, record, snapshots.resumeSnapshot, target)
       return completedComparison(record, saved.reference, resultSummary(saved.result), timestamp)
     })
+    outcome('complete')
     return true
   } catch (caught) {
     const error = lease.control.signal.aborted ? lease.control.signal.reason : caught
     const latest = await loadAnalysisComparison(deps.store, claimed.record.workspaceId, claimed.record.runId, claimed.record.id)
     if (published && latest?.record.status === 'complete' && latest.record.attemptId === claimed.record.attemptId &&
-      analysisHash(latest.record.result) === analysisHash(published)) return true
-    if (error instanceof LostAnalysisWork) return false
+      analysisHash(latest.record.result) === analysisHash(published)) {
+      outcome('complete')
+      return true
+    }
+    if (error instanceof LostAnalysisWork) { outcome('abandoned'); return false }
     const failure = failureFor(error, stage, readingInputs)
     try {
+      let status: 'queued' | 'failed' = 'failed'
       await lease.atomic((record, timestamp) => {
         const retry = failure.retryable && record.attempts < ANALYSIS_LIMITS.maxAutomaticAttempts
+        status = retry ? 'queued' : 'failed'
         const next: RealAnalysisComparisonRecord = {
-          ...record, status: retry ? 'queued' : 'failed', updatedAt: timestamp, error: failure,
+          ...record, status, updatedAt: timestamp, error: failure,
         }
         delete next.lease
         delete next.nextAttemptAt
         if (retry) next.nextAttemptAt = retryAt(clock, record.attempts)
         return next
       }, true)
+      outcome(status, failure)
     } catch (failure) {
       if (!(failure instanceof LostAnalysisWork)) throw failure
+      outcome('abandoned')
     }
     return false
   } finally {
@@ -413,6 +455,7 @@ async function claimRun(
     const current = await loadAnalysisRun(deps.store, candidate.record.workspaceId, candidate.record.id)
     if (signal?.aborted || clock.now().getTime() >= deadline) return
     if (!current || !runNeedsWork(current.record) || !due(current.record, clock.now().toISOString())) return
+    if (!await workspaceAllowsWork(deps.store, current.record.workspaceId, Boolean(current.record.cancellation))) return
     if (current.record.cancellation && current.record.error &&
       (!current.record.error.retryable || current.record.attempts >= ANALYSIS_LIMITS.maxAutomaticAttempts)) return
     // A new cancellation is a different work cycle from the completed initializer.
@@ -443,7 +486,8 @@ async function runChange(
 ): Promise<Run> {
   for (let race = 0; race < FENCE_ATTEMPTS; race++) {
     const current = await loadAnalysisRun(deps.store, claimed.record.workspaceId, claimed.record.id)
-    if (!current || !runNeedsWork(current.record) || !liveLease(current.record, claimed, clock.now().toISOString())) throw new LostAnalysisWork()
+    if (!current || !runNeedsWork(current.record) || !liveLease(current.record, claimed, clock.now().toISOString()) ||
+      !await workspaceAllowsWork(deps.store, current.record.workspaceId, Boolean(current.record.cancellation))) throw new LostAnalysisWork()
     const record = change(structuredClone(current.record), timeAfter(clock, current.record))
     parseAnalysisEntity(record)
     try { return await deps.store.replace(record, current.etag) } catch (error) {
@@ -467,7 +511,10 @@ async function processRun(
     create: record => deps.store.create(record),
     replace: (record, etag) => deps.store.replace(record, etag),
     listPending: (now, limit) => deps.store.listPending(now, limit),
-    async transact(workspaceId, operations) {
+    getControl: (workspaceId, runId) => deps.store.getControl(workspaceId, runId),
+    listControls: (workspaceId, token) => deps.store.listControls(workspaceId, token),
+    pendingLifecycleWorkspaces: limit => deps.store.pendingLifecycleWorkspaces(limit),
+    async transact(workspaceId, operations, options) {
       control.check()
       const current = await loadAnalysisRun(deps.store, claimed.record.workspaceId, claimed.record.id)
       const parent = operations.find(operation => operation.record.recordType === 'analysis-run')
@@ -479,7 +526,7 @@ async function processRun(
       const fenced = operations.map(operation => operation === parent && operation.record.recordType === 'analysis-run' &&
         runNeedsWork(operation.record) && !operation.record.lease
         ? { ...operation, record: { ...operation.record, lease: current.record.lease } } : operation)
-      await deps.store.transact(workspaceId, fenced)
+      await deps.store.transact(workspaceId, fenced, options)
     },
   }
   try {
