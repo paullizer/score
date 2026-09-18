@@ -4,9 +4,14 @@ import { ArrowLeft, ArrowUpRight, Layers3, LoaderCircle, RotateCcw, ShieldCheck,
 import { useRealAnalyses } from '../../app/real-analyses-context'
 import type { RealAnalysisComparisonSummary, RealAnalysisRunSummary } from '../../domain/real-analyses'
 import { dateLabel } from '../../domain/selectors'
-import { Badge, Button, EmptyState, InlineError, PageHeader, Score } from '../../components/ui'
+import { Badge, Button, EmptyState, InlineError, PageHeader, Score, SearchField } from '../../components/ui'
+import { SortableHeader, TableSortSelect } from '../../components/ui/TableSorting'
+import type { TableSort } from '../../domain/tableSorting'
 import { RealAnalysisStatus } from './RealAnalysesPage'
-import { realAnalysisCancellationPaused, realAnalysisCancellationPending, realAnalysisLink, targetVersionLabel } from './realAnalysisUi'
+import { realAnalysisCancellationPaused, realAnalysisCancellationPending, realAnalysisLink, targetIdentity, targetVersionLabel } from './realAnalysisUi'
+import {
+  distinctTargetLabels, realComparisonSortOptions, realComparisonTargetLabel, selectRealComparisons, targetScoreSortExplanation, type RealComparisonSortKey,
+} from './analysisTableBrowsing'
 import { RealComparisonReview } from './RealComparisonReview'
 
 export function RealComparisonValue({ summary }: { summary: RealAnalysisComparisonSummary }) {
@@ -73,7 +78,15 @@ function RealRunActions({ summary }: { summary: RealAnalysisRunSummary }) {
 
 export function RealAnalysisDetail({ id }: { id: string }) {
   const api = useRealAnalyses()
+  return <RealAnalysisView key={`${api?.workspaceId ?? 'unavailable'}:${id}`} id={id} />
+}
+
+function RealAnalysisView({ id }: { id: string }) {
+  const api = useRealAnalyses()
   const [params, setParams] = useSearchParams()
+  const [query, setQuery] = useState('')
+  const [targetId, setTargetId] = useState('')
+  const [sort, setSort] = useState<TableSort<RealComparisonSortKey> | null>(null)
   const entry = api?.detail(id)
   const pairs = api?.comparisons(id)
   const ensure = api?.ensureDetail
@@ -95,6 +108,18 @@ export function RealAnalysisDetail({ id }: { id: string }) {
   const summary = api.summaries.find((item) => item.run.id === id) ?? detail
   const run = summary.run
   const finished = run.progress.complete + run.progress.failed + run.progress.cancelled
+  const savedPairs = pairs?.state === 'ready' ? pairs.value : []
+  const browsing = selectRealComparisons(savedPairs, detail.targets, { query, targetId, sort }, summary)
+  const targetLabels = distinctTargetLabels(browsing.targets, realComparisonTargetLabel)
+  const sortOptions = realComparisonSortOptions.map((option) => ({
+    ...option, disabled: option.key === 'score' && !browsing.scoreEnabled,
+    title: option.key === 'score' && !browsing.scoreEnabled ? targetScoreSortExplanation : undefined,
+  }))
+  const listError = pairs?.state === 'error' || (pairs?.state === 'ready' && pairs.error) || api.phase === 'error'
+  function chooseTarget(next: string) {
+    setTargetId(next)
+    if (!next && browsing.targets.length > 1 && sort?.key === 'score') setSort(null)
+  }
   function openPair(pairId: string) {
     const next = new URLSearchParams(params)
     next.set('data', 'real')
@@ -119,10 +144,18 @@ export function RealAnalysisDetail({ id }: { id: string }) {
     {selectedId ? <SelectedRealComparison runId={id} comparisonId={selectedId} /> : <section className="panel mt-5" aria-label="Real comparisons">
       <div className="section-heading"><div><h2>Separate comparisons, not a cross-job ranking</h2><p>Open a result for the complete criterion breakdown and exact source quotations.</p></div>
         <Button size="sm" icon={RotateCcw} onClick={() => { void api.ensureDetail(id, true); void api.ensureComparisons(id, true) }}>Refresh pairs</Button></div>
+      <div className="library-toolbar">
+        <SearchField label="Search comparisons" value={query} onChange={setQuery} placeholder="Find a candidate, document, or target…" />
+        <label className="table-sort-select"><span>Target</span><select className="filter-select" aria-label="Comparison target" value={targetId} onChange={(event) => chooseTarget(event.target.value)}>
+          <option value="">All targets</option>{browsing.targets.map((target, index) => <option key={targetIdentity(target.selection)} value={targetIdentity(target.selection)}>{targetLabels[index]}</option>)}
+        </select></label>
+        <TableSortSelect label="Sort comparisons" defaultLabel="Saved order" options={sortOptions} sort={browsing.sort} onChange={setSort} />
+      </div>
+      {!browsing.scoreEnabled && <p className="px-4 pb-4 text-[11px] text-muted">{targetScoreSortExplanation}</p>}
       {(pairs?.state === 'error' || (pairs?.state === 'ready' && pairs.error)) && <div className="p-4"><InlineError>{pairs.error} <Button size="sm" onClick={() => void api.ensureComparisons(id, true)}>Retry comparison list</Button></InlineError></div>}
-      {pairs?.state === 'ready' && pairs.value.length > 0 ? <div className="table-wrap"><table className="data-table comparison-table">
-        <thead><tr><th scope="col">Saved resume</th><th scope="col">Exact target</th><th scope="col">Assessment / evidence match</th><th scope="col">Actions</th></tr></thead>
-        <tbody>{pairs.value.map((pair) => {
+      {browsing.rows.length > 0 ? <div className="table-wrap"><table className="data-table comparison-table">
+        <thead><tr>{sortOptions.map((option) => <SortableHeader key={option.key} option={option} sort={browsing.sort} onChange={setSort} />)}</tr></thead>
+        <tbody>{browsing.rows.map((pair) => {
           const comparison = pair.comparison
           const resume = comparison.resume.summary
           const target = comparison.target.summary
@@ -132,13 +165,17 @@ export function RealAnalysisDetail({ id }: { id: string }) {
               {target.kind === 'grade' && target.newerDraftAvailable && <p className="row-meta">An unapproved newer draft was not used.</p>}</td>
             <td><RealComparisonValue summary={pair} />{comparison.error && <p className="mt-2 max-w-xs text-[11px] text-[var(--cp-danger)]">{comparison.error.code}: {comparison.error.message}</p>}
               {comparison.nextAttemptAt && <p className="row-meta">Automatic retry {dateLabel(comparison.nextAttemptAt)}</p>}<p className="row-meta">Attempt {comparison.attempts} · manual retries {comparison.retryCount}</p></td>
-            <td><div className="space-y-3"><Button size="sm" variant="ghost" icon={ArrowUpRight} aria-label={`Review comparison ${comparison.index + 1}: ${resume.name ?? 'Name not stated'} against ${target.label}`}
+            <td><div className="space-y-3"><div><Badge dot tone={comparison.status === 'complete' ? 'success' : ['failed', 'cancelled'].includes(comparison.status) ? 'warning' : 'neutral'}>
+              {{ queued: 'Queued', running: 'Running', complete: 'Complete', failed: 'Failed', cancelled: 'Cancelled' }[comparison.status]}</Badge></div>
+              <Button size="sm" variant="ghost" icon={ArrowUpRight} aria-label={`Review comparison ${comparison.index + 1}: ${resume.name ?? 'Name not stated'} against ${target.label}`}
               onClick={() => openPair(comparison.id)}>Review saved pair</Button><RealComparisonActions summary={pair} /></div></td>
           </tr>
         })}</tbody>
-      </table></div> : <EmptyState icon={LoaderCircle} title={pairs?.state === 'ready' ? 'Comparison initialization is still pending' : 'Loading independent comparisons'}
-        description="The server materializes the frozen comparison plan in bounded batches. No scores or source snapshots are fabricated while work is pending." />}
-      <div className="table-bottom"><span>{pairs?.state === 'ready' ? pairs.value.length : 0} saved comparison records / {run.progress.total} planned</span><span>Retries reuse saved inputs, not current live sources.</span></div>
+      </table></div> : savedPairs.length ? <EmptyState title="No matching comparisons" description="Try a different candidate, document, or target. Only saved summary metadata is searched."
+        action={<Button onClick={() => { setQuery(''); chooseTarget('') }}>Clear comparison filters</Button>} />
+        : <EmptyState icon={listError ? Layers3 : LoaderCircle} title={listError ? 'The comparison list could not be loaded' : pairs?.state === 'ready' ? 'Comparison initialization is still pending' : 'Loading independent comparisons'}
+          description={listError ? 'Retry the real comparison service. No sample rows or scores are substituted.' : 'The server materializes the frozen comparison plan in bounded batches. No scores or source snapshots are fabricated while work is pending.'} />}
+      <div className="table-bottom"><span>Showing {browsing.rows.length} of {savedPairs.length} saved comparison records / {run.progress.total} planned</span><span>Retries reuse saved inputs, not current live sources.</span></div>
     </section>}
     <div className="info-callout mt-5"><ShieldCheck size={18} aria-hidden="true" /><p>Human review only. Scores describe evidence in the submitted document, not a person’s intrinsic ability. Missing evidence is not proof of missing skills; GS assessments are not official qualification or eligibility determinations.</p></div>
   </>

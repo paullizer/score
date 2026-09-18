@@ -103,10 +103,16 @@
   .search-field input:focus-visible { outline: none; }
   .search-field input::placeholder { color: var(--cp-text-soft); }
   .filter-select { @apply rounded-[10px] border px-2.5 py-2 text-[11px]; background: var(--cp-surface); color: var(--cp-text-muted); min-height: 34px; }
+  .table-sort-select { @apply inline-flex min-w-0 max-w-full items-center gap-2 text-[10px]; color: var(--cp-text-muted); }
+  .table-sort-select select { min-width: 0; max-width: 100%; }
   .table-wrap { @apply relative overflow-x-auto; }
   .data-table { @apply w-full border-collapse text-left; }
   .data-table thead { background: var(--cp-bg-elevated); }
   .data-table th { @apply border-b px-4 py-3 text-[9px] font-medium uppercase tracking-[0.08em]; color: var(--cp-text-soft); white-space: nowrap; }
+  .table-sort-button { @apply inline-flex items-center gap-1.5 rounded py-1; min-height: 24px; color: inherit; text-align: inherit; text-transform: inherit; letter-spacing: inherit; }
+  .table-sort-button:hover:not(:disabled), th[aria-sort] .table-sort-button { color: var(--cp-text); }
+  .table-sort-button > svg { flex-shrink: 0; }
+  .table-sort-button:disabled { opacity: .45; }
   .data-table td { @apply border-b px-4 py-4 align-middle; }
   .data-table tr:last-child td { border-bottom: 0; }
   .data-table tbody tr { transition: background 150ms; }
@@ -558,6 +564,8 @@
   .library-toolbar { padding: 12px; }
   .library-toolbar > .toolbar { width: 100%; }
   .library-toolbar .search-field { width: auto; flex: 1; }
+  .table-sort-select { width: 100%; }
+  .table-sort-select select { flex: 1; }
   .mobile-hide { display: none; }
   .job-cell { min-width: 0; }
   .job-monogram { height: 33px; width: 33px; }

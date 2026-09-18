@@ -6,6 +6,9 @@ import { dateLabel, runStatus } from '../../domain/selectors'
 import { Avatar, Badge, Button, DemoNote, EmptyState, PageHeader, SearchField, SegmentedControl } from '../../components/ui'
 import { useRealAnalyses } from '../../app/real-analyses-context'
 import { dataMode, sampleDataLink } from '../../app/real-data-mode'
+import { SortableHeader, TableSortSelect } from '../../components/ui/TableSorting'
+import type { TableSort } from '../../domain/tableSorting'
+import { sampleAnalysisSortOptions, selectSampleAnalysisRuns, type SampleAnalysisSortKey } from './analysisTableBrowsing'
 import { RealAnalysesPage } from './RealAnalysesPage'
 
 export { AnalysisSetup } from './AnalysisSetup'
@@ -22,7 +25,7 @@ export function AnalysesPage() {
     {cloud && <div className="library-kind-switcher mb-5 rounded-xl border"><SegmentedControl label="Choose real analyses or samples" value={mode}
       onChange={(value) => navigate(`/analyses?data=${value}`)} options={[{ value: 'real', label: 'Real analyses', count: real?.summaries.length ?? 0 }, { value: 'samples', label: 'Samples', count: workspace.runs.length }]} />
       <span>{mode === 'real' ? 'Durable private results · real evidence' : 'Fictional inputs · simulated scoring'}</span></div>}
-    {mode === 'real' ? <RealAnalysesPage /> : <SampleAnalysesPage />}
+    {mode === 'real' ? <RealAnalysesPage /> : <SampleAnalysesPage key={cloud?.currentWorkspaceId ?? 'standalone'} />}
   </>
 }
 
@@ -31,16 +34,18 @@ function SampleAnalysesPage() {
   const navigate = useNavigate()
   const [query, setQuery] = useState('')
   const [filter, setFilter] = useState<'all' | 'complete' | 'attention'>('all')
-  const runs = workspace.runs.filter((run) => run.name.toLowerCase().includes(query.toLowerCase()) &&
-    (filter === 'all' || (filter === 'complete' ? runStatus(run) === 'Complete' : runStatus(run) !== 'Complete')))
+  const [sort, setSort] = useState<TableSort<SampleAnalysisSortKey> | null>(null)
+  const runs = selectSampleAnalysisRuns(workspace.runs, query, filter, sort)
   return <>
     <PageHeader eyebrow="THE FULL PICTURE" title="Your analyses" description="Every comparison, with the reasoning kept intact."
       actions={<Button variant="primary" icon={Plus} onClick={() => navigate(sampleDataLink('/analyses/new', Boolean(cloud)))}>New analysis</Button>} />
     <section className="panel" aria-label="Analysis history">
       <div className="library-toolbar"><SegmentedControl label="Filter analyses" value={filter} onChange={setFilter} options={[{ value: 'all', label: 'All analyses', count: workspace.runs.length }, { value: 'complete', label: 'Complete' }, { value: 'attention', label: 'In progress / attention' }]} />
-        <SearchField value={query} onChange={setQuery} placeholder="Find an analysis..." /></div>
+        <SearchField value={query} onChange={setQuery} placeholder="Find an analysis..." />
+        <TableSortSelect label="Sort analyses" options={sampleAnalysisSortOptions} sort={sort} onChange={setSort} /></div>
       {runs.length ? <div className="table-wrap"><table className="data-table">
-        <thead><tr><th>Analysis</th><th>Resumes</th><th>Targets</th><th>Status</th><th className="mobile-hide">Created</th><th><span className="sr-only">Open analysis</span></th></tr></thead>
+        <thead><tr>{sampleAnalysisSortOptions.map((option) => <SortableHeader key={option.key} option={option} sort={sort} onChange={setSort}
+          className={option.key === 'created' ? 'mobile-hide' : undefined} />)}<th scope="col"><span className="sr-only">Open analysis</span></th></tr></thead>
         <tbody>{runs.map((run) => {
           const status = runStatus(run)
           const jobs = run.targets.filter((target) => target.kind === 'job').length

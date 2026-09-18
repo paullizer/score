@@ -5,6 +5,9 @@ import { useRealAnalyses } from '../../app/real-analyses-context'
 import type { RealAnalysisRunSummary } from '../../domain/real-analyses'
 import { dateLabel } from '../../domain/selectors'
 import { Badge, Button, EmptyState, InlineError, PageHeader, SearchField, SegmentedControl } from '../../components/ui'
+import { SortableHeader, TableSortSelect } from '../../components/ui/TableSorting'
+import type { TableSort } from '../../domain/tableSorting'
+import { realAnalysisSortOptions, selectRealAnalysisRuns, type RealAnalysisSortKey } from './analysisTableBrowsing'
 import { realAnalysisCancellationPaused, realAnalysisCancellationPending } from './realAnalysisUi'
 
 export function RealAnalysisStatus({ summary }: { summary: RealAnalysisRunSummary }) {
@@ -16,14 +19,19 @@ export function RealAnalysisStatus({ summary }: { summary: RealAnalysisRunSummar
 
 export function RealAnalysesPage() {
   const api = useRealAnalyses()
+  return <RealAnalysesHistory key={api?.workspaceId ?? 'unavailable'} />
+}
+
+function RealAnalysesHistory() {
+  const api = useRealAnalyses()
   const navigate = useNavigate()
   const [query, setQuery] = useState('')
   const [filter, setFilter] = useState<'all' | 'complete' | 'attention'>('all')
+  const [sort, setSort] = useState<TableSort<RealAnalysisSortKey> | null>(null)
   if (!api) return <EmptyState title="Real analyses require a cloud workspace" description="Standalone mode only contains explicitly fictional analyses. No sample results replace unavailable real results." />
   if (api.phase === 'unavailable') return <EmptyState title="Saved real analyses are unavailable" description={api.error ?? 'The private analysis history service is not available. No samples are substituted.'}
     action={<Button onClick={() => void api.refresh()}>Check availability</Button>} />
-  const runs = api.summaries.filter((item) => item.run.name.toLocaleLowerCase().includes(query.toLocaleLowerCase())
-    && (filter === 'all' || (filter === 'complete' ? item.run.status === 'complete' : item.run.status !== 'complete')))
+  const runs = selectRealAnalysisRuns(api.summaries, query, filter, sort)
   return <>
     <PageHeader eyebrow="SAVED REAL EVIDENCE" title="Your analyses" description="Durable runs with frozen inputs, independent comparisons, and inspectable evidence."
       actions={<><Button icon={RotateCcw} onClick={() => void api.refresh()}>Refresh</Button><Button icon={Plus} variant="primary" disabled={!api.canWrite || api.phase !== 'ready' || !api.features?.realAnalyses} onClick={() => navigate('/analyses/new?data=real')}>New analysis</Button></>} />
@@ -34,10 +42,12 @@ export function RealAnalysesPage() {
     <section className="panel" aria-label="Real analysis history">
       <div className="library-toolbar"><SegmentedControl label="Filter real analyses" value={filter} onChange={setFilter}
         options={[{ value: 'all', label: 'All real analyses', count: api.summaries.length }, { value: 'complete', label: 'Complete' }, { value: 'attention', label: 'In progress / attention' }]} />
-        <SearchField value={query} onChange={setQuery} placeholder="Find a real analysis…" /></div>
+        <SearchField value={query} onChange={setQuery} placeholder="Find a real analysis…" />
+        <TableSortSelect label="Sort real analyses" options={realAnalysisSortOptions} sort={sort} onChange={setSort} /></div>
       {runs.length ? <div className="table-wrap"><table className="data-table">
         <caption className="sr-only">Saved real analysis runs. Progress and score availability are separate; there is no combined ranking.</caption>
-        <thead><tr><th scope="col">Analysis</th><th scope="col">Status</th><th scope="col">Independent comparisons</th><th scope="col">Created</th><th scope="col"><span className="sr-only">Open analysis</span></th></tr></thead>
+        <thead><tr>{realAnalysisSortOptions.map((option) => <SortableHeader key={option.key} option={option} sort={sort} onChange={setSort} />)}
+          <th scope="col"><span className="sr-only">Open analysis</span></th></tr></thead>
         <tbody>{runs.map((summary) => <tr key={summary.run.id}>
           <td><div className="flex min-w-[200px] items-center gap-3"><span className="job-monogram"><BarChart3 size={18} aria-hidden="true" /></span><div>
             <Link className="row-title" to={`/analyses/${encodeURIComponent(summary.run.id)}?data=real`}>{summary.run.name}</Link><p className="row-meta">Real evidence · immutable input snapshots</p></div></div></td>

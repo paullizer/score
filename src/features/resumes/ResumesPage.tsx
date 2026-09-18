@@ -4,11 +4,22 @@ import { ArrowLeft, ArrowRight, BriefcaseBusiness, FileText, MapPin, Plus, Users
 import { useWorkspace } from '../../app/workspace-context'
 import { DocumentViewer } from '../../components/documents/DocumentViewer'
 import { Avatar, Badge, Button, DemoNote, EmptyState, InlineError, PageHeader, SearchField, SegmentedControl } from '../../components/ui'
+import { SortableHeader, TableSortSelect, type TableSortOption } from '../../components/ui/TableSorting'
 import { dateLabel, runStatus } from '../../domain/selectors'
+import { sortTableRows, type TableSort } from '../../domain/tableSorting'
 import { AddResumesDialog } from './AddResumesDialog'
 import { RealResumesPage } from './RealResumesPage'
 import { useRealResumes } from '../../app/real-resumes-context'
 import { dataMode, sampleDataLink } from '../../app/real-data-mode'
+
+type ResumeSortKey = 'name' | 'location' | 'experience' | 'sourceLabel' | 'added'
+const resumeSortOptions: Record<ResumeSortKey, TableSortOption<ResumeSortKey>> = {
+  name: { key: 'name', label: 'Candidate name', ascendingLabel: 'A–Z', descendingLabel: 'Z–A' },
+  location: { key: 'location', label: 'Location', ascendingLabel: 'A–Z', descendingLabel: 'Z–A' },
+  experience: { key: 'experience', label: 'Experience text', ascendingLabel: 'A–Z', descendingLabel: 'Z–A' },
+  sourceLabel: { key: 'sourceLabel', label: 'Document label', ascendingLabel: 'A–Z', descendingLabel: 'Z–A' },
+  added: { key: 'added', label: 'Added date', ascendingLabel: 'Oldest first', descendingLabel: 'Newest first', initialDirection: 'desc' },
+}
 
 function analysisLink(ids: string[], cloud: boolean): string {
   return sampleDataLink(`/analyses/new?${new URLSearchParams({ resumes: ids.join(',') }).toString()}`, cloud)
@@ -18,11 +29,13 @@ function ResumesLibrary() {
   const { workspace, cloud } = useWorkspace()
   const navigate = useNavigate()
   const [search, setSearch] = useState('')
+  const [sort, setSort] = useState<TableSort<ResumeSortKey> | null>(null)
   const [selection, setSelection] = useState<string[]>([])
   const [adding, setAdding] = useState(false)
   const [importError, setImportError] = useState('')
   const query = search.trim().toLocaleLowerCase()
-  const visible = workspace.resumes.filter((resume) => [resume.name, resume.role, resume.location, resume.experience, resume.sourceLabel].join(' ').toLocaleLowerCase().includes(query))
+  const visible = sortTableRows(workspace.resumes.filter((resume) => [resume.name, resume.role, resume.location, resume.experience, resume.sourceLabel].join(' ').toLocaleLowerCase().includes(query)),
+    sort, (resume, key) => key === 'added' ? Date.parse(resume.createdAt) : resume[key])
   const selected = workspace.resumes.filter((resume) => selection.includes(resume.id))
   const allVisibleSelected = visible.length > 0 && visible.every((resume) => selection.includes(resume.id))
   const someVisibleSelected = visible.some((resume) => selection.includes(resume.id))
@@ -60,7 +73,8 @@ function ResumesLibrary() {
     <section className="panel">
       <div className="library-toolbar">
         <div className="flex items-center gap-2.5"><Users size={16} className="text-muted" aria-hidden="true" /><h2 className="text-[12px] font-semibold">Your resume library</h2><Badge>{workspace.resumes.length}</Badge></div>
-        <SearchField value={search} onChange={setSearch} placeholder="Search people, roles, or filenames…" label="Search resume library" />
+        <div className="toolbar"><SearchField value={search} onChange={setSearch} placeholder="Search people, roles, or filenames…" label="Search resume library" />
+          <TableSortSelect options={Object.values(resumeSortOptions)} sort={sort} onChange={setSort} label="Sort resumes" /></div>
       </div>
       <div className={`flex flex-wrap items-center justify-between gap-3 border-b px-5 py-3 ${selected.length ? 'bg-accent-soft' : ''}`}>
         <p className="text-[11px] text-muted" role="status" aria-live="polite">
@@ -86,10 +100,10 @@ function ResumesLibrary() {
                 onChange={toggleVisible}
                 aria-label="Select all visible resumes"
               /></th>
-              <th scope="col">Candidate</th>
-              <th scope="col">Location</th>
-              <th scope="col">Experience</th>
-              <th scope="col">Document label</th>
+              <SortableHeader option={resumeSortOptions.name} sort={sort} onChange={setSort}>Candidate</SortableHeader>
+              <SortableHeader option={resumeSortOptions.location} sort={sort} onChange={setSort} />
+              <SortableHeader option={resumeSortOptions.experience} sort={sort} onChange={setSort}>Experience</SortableHeader>
+              <SortableHeader option={resumeSortOptions.sourceLabel} sort={sort} onChange={setSort} />
               <th scope="col"><span className="sr-only">View profile</span></th>
             </tr></thead>
             <tbody>{visible.map((resume) => <tr key={resume.id} className={selection.includes(resume.id) ? 'row-selected' : ''}>
@@ -232,6 +246,6 @@ export function ResumesPage() {
     {cloud && !id && <div className="library-kind-switcher mb-5 rounded-xl border"><SegmentedControl label="Choose real resumes or samples" value={mode}
       onChange={(value) => navigate(`/resumes?data=${value}`)} options={[{ value: 'real', label: 'Real resumes', count: real?.summaries.length ?? 0 }, { value: 'samples', label: 'Samples', count: workspace.resumes.length }]} />
       <span>{mode === 'real' ? 'Actual private sources · manual analysis' : 'Fictional profiles · filenames only · simulated scoring'}</span></div>}
-    {mode === 'real' ? <RealResumesPage id={id} /> : id ? <ResumeDetail key={id} id={id} /> : <ResumesLibrary />}
+    {mode === 'real' ? <RealResumesPage id={id} /> : id ? <ResumeDetail key={id} id={id} /> : <ResumesLibrary key={cloud?.currentWorkspaceId ?? 'local'} />}
   </>
 }
