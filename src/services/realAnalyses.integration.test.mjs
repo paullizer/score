@@ -40,6 +40,14 @@ function target(kind = 'job', version = 1) {
       context: { series: '0801', agency: 'Captured agency', agencyType: 'other-federal', supervision: 'nonsupervisory', specialty: 'Captured engineering scope', functions: [], answers: {}, confirmed: true },
       approvedAt: timestamp, newerDraftAvailable: true }
 }
+function jobTargets(count) {
+  return Array.from({ length: count }, (_, index) => {
+    const value = target('job')
+    const jobId = `job-${index + 1}`, rubricId = `rubric-${jobId}`
+    return { ...value, id: `target-${jobId}`, label: `Saved engineering role ${index + 1}`, rubricId,
+      selection: { ...value.selection, jobId, rubricId, documentId: `document-${jobId}` } }
+  })
+}
 function runSummary(id = 'run-one', status = 'complete', workspace = workspaceId) {
   return { etag: `"${id}-${status}"`, run: {
     id, recordType: 'analysis-run', workspaceId: workspace, dataKind: 'real', name: 'Saved evidence review', createdAt: timestamp, updatedAt: timestamp, createdBy: 'reviewer',
@@ -184,16 +192,16 @@ test('feature flags fail closed and every target/run/comparison page is consumed
   }
 })
 
-test('run creation sends typed exact selections only, preserves UUIDs, allows 100 and rejects 101 without truncation', async () => {
+test('run creation sends typed exact selections only, preserves UUIDs, allows 500 and rejects 501 without truncation', async () => {
   globalThis.fetch = async (url, init) => { requests.push({ url, init }); return json({ run: runSummary() }, 202) }
-  const input = { name: 'Manual review', resumes: Array.from({ length: 100 }, (_, index) => resumeSelection(`resume-${index}`)), targets: [target('job').selection] }
+  const input = { name: 'Manual review', resumes: Array.from({ length: 500 }, (_, index) => resumeSelection(`resume-${index}`)), targets: [target('job').selection] }
   await client.createRealAnalysis(workspaceId, input, key)
   assert.deepEqual(JSON.parse(requests[0].init.body), input)
   assert.equal(requests[0].init.headers.get('Idempotency-Key'), key)
   assert.equal(requests[0].init.headers.get('X-Score-Request'), 'workspace')
   assert.equal(requests[0].init.credentials, 'include')
   assert.equal(requests[0].init.cache, 'no-store')
-  await assert.rejects(client.createRealAnalysis(workspaceId, { ...input, resumes: [...input.resumes, resumeSelection('resume-101')] }, key), /at most 100/)
+  await assert.rejects(client.createRealAnalysis(workspaceId, { ...input, resumes: [...input.resumes, resumeSelection('resume-501')] }, key), /at most 500/)
   assert.equal(requests.length, 1)
   await assert.rejects(client.createRealAnalysis(workspaceId, { ...input, resumes: [resumeSelection(), resumeSelection()] }, key), /only once/)
   await assert.rejects(client.createRealAnalysis(workspaceId, { ...input, resumes: [{ resumeId: 'sample', sample: true }] }, key), /exact ready resume/)
@@ -202,6 +210,19 @@ test('run creation sends typed exact selections only, preserves UUIDs, allows 10
   assert.deepEqual(Object.keys(JSON.parse(requests.at(-1).init.body)).sort(), ['name', 'resumes', 'targets'])
   assert.equal(JSON.parse(requests.at(-1).init.body).resumes[0].document, undefined)
   assert.equal(JSON.parse(requests.at(-1).init.body).targets[0].approved, undefined)
+})
+
+test('103 resumes against four jobs are submitted as one complete 412-comparison request', async () => {
+  globalThis.fetch = async (url, init) => { requests.push({ url, init }); return json({ run: runSummary() }, 202) }
+  const input = {
+    name: 'Full resume library review',
+    resumes: Array.from({ length: 103 }, (_, index) => resumeSelection(`resume-${index}`)),
+    targets: jobTargets(4).map(item => item.selection),
+  }
+  await client.createRealAnalysis(workspaceId, input, key)
+  assert.equal(requests.length, 1)
+  assert.deepEqual(JSON.parse(requests[0].init.body), input)
+  assert.equal(input.resumes.length * input.targets.length, 412)
 })
 
 test('unwrapped details retain independent snapshots and authorized documents require exact saved versions', async () => {
@@ -413,7 +434,7 @@ function router(element, location = '/analyses/new?data=real') {
   const entry = url ? { pathname: url.pathname, search: url.search, hash: url.hash, state: location.state } : location
   return React.createElement(ui.MemoryRouter, { initialEntries: [entry], future: { v7_startTransition: true, v7_relativeSplatPath: true } }, element)
 }
-const baseApi = { workspaceId, canWrite: true, phase: 'ready', features: { realAnalyses: true, analysisLimits: { maxComparisons: 100 } },
+const baseApi = { workspaceId, canWrite: true, phase: 'ready', features: { realAnalyses: true, analysisLimits: { maxComparisons: 500 } },
   error: null, summaries: [], pending: () => false, detail: () => ({ state: 'idle' }), ensureDetail: async () => {}, refresh: async () => {}, refreshTargets: async () => {}, requestKey: () => key }
 const baseResumes = { workspaceId, canWrite: true, phase: 'ready', error: null, features: { realResumeImports: true }, refresh: async () => {} }
 function builder(api, resumes, location) {
@@ -421,13 +442,13 @@ function builder(api, resumes, location) {
     React.createElement(ui.RealResumesContext.Provider, { value: { ...baseResumes, summaries: resumes } }, React.createElement(ui.RealAnalysisSetup))), location)
 }
 
-test('100-resume library navigation preserves every exact selection and requires manual review before 100 comparisons', async () => {
+test('103-resume library navigation preserves every exact selection and requires manual review before 412 comparisons', async () => {
   dom.window.localStorage.clear()
-  const summaries = Array.from({ length: 100 }, (_, index) => resumeSummary(`resume-${index}`))
+  const summaries = Array.from({ length: 103 }, (_, index) => resumeSummary(`resume-${index}`))
   const exact = summaries.map(ui.realResumeSelection)
-  const chosenTarget = target('job', 2)
+  const chosenTargets = jobTargets(4)
   const calls = []
-  const api = { ...baseApi, targets: { state: 'ready', value: [chosenTarget] },
+  const api = { ...baseApi, targets: { state: 'ready', value: chosenTargets },
     create: async (input) => { calls.push(input); throw new Error('Controlled acceptance-response failure.') } }
   const resumes = { ...baseResumes, summaries, batches: [], currentBatchId: null, pending: () => false }
   let navigation
@@ -445,7 +466,7 @@ test('100-resume library navigation preserves every exact selection and requires
   }, content)
   await render(application())
   await act(async () => [...dom.window.document.querySelectorAll('button')].find((button) => button.textContent === 'Select ready visible').click())
-  const build = [...dom.window.document.querySelectorAll('button')].find((button) => button.textContent === 'Build analysis (100)')
+  const build = [...dom.window.document.querySelectorAll('button')].find((button) => button.textContent === 'Build analysis (103)')
   assert.equal(build.disabled, false)
   await act(async () => build.click())
   const href = navigation.pathname + navigation.search + navigation.hash
@@ -454,22 +475,24 @@ test('100-resume library navigation preserves every exact selection and requires
   assert.deepEqual(navigation.state.input.resumes, exact)
   assert.deepEqual(dom.window.history.state.usr.input.resumes, exact)
   assert.ok(dom.window.location.href.length < 2048)
-  assert.equal(dom.window.document.querySelectorAll('input[type="checkbox"]:checked').length, 100)
+  assert.equal(dom.window.document.querySelectorAll('input[type="checkbox"]:checked').length, 103)
   assert.equal(calls.length, 0)
   await act(async () => root.unmount()); root = null
   await render(application())
-  assert.equal(dom.window.document.querySelectorAll('input[type="checkbox"]:checked').length, 100, 'a reload-style remount restores the same browser history entry')
+  assert.equal(dom.window.document.querySelectorAll('input[type="checkbox"]:checked').length, 103, 'a reload-style remount restores the same browser history entry')
   assert.deepEqual(navigation.state.input.resumes, exact)
-  const chooseTarget = dom.window.document.querySelector('input[aria-label^="Include Saved engineering role"]')
-  await act(async () => chooseTarget.click())
+  const chooseTargets = dom.window.document.querySelectorAll('input[aria-label^="Include Saved engineering role"]')
+  assert.equal(chooseTargets.length, 4)
+  await act(async () => { for (const checkbox of chooseTargets) checkbox.click() })
   const run = [...dom.window.document.querySelectorAll('button')].find((button) => button.textContent === 'Run analysis')
   assert.equal(run.disabled, false)
+  assert.equal(dom.window.document.querySelector('.comparison-count strong').textContent, '412')
   assert.equal(calls.length, 0, 'navigating and selecting do not automatically start scoring')
   await act(async () => run.click())
   assert.equal(calls.length, 1)
   assert.deepEqual(calls[0].resumes, exact)
-  assert.deepEqual(calls[0].targets, [chosenTarget.selection])
-  assert.equal(calls[0].resumes.length * calls[0].targets.length, 100)
+  assert.deepEqual(calls[0].targets, chosenTargets.map(item => item.selection))
+  assert.equal(calls[0].resumes.length * calls[0].targets.length, 412)
   assert.equal(dom.window.localStorage.length, 0)
 
   await act(async () => root.unmount()); root = null
@@ -508,12 +531,32 @@ test('builder requires a manual click, keeps exact versions while targets refres
   assert.deepEqual(calls[1], calls[0])
 })
 
-test('builder visibly rejects 101 comparisons without dropping inputs; viewer and pending sources cannot run', async () => {
-  const resumes = Array.from({ length: 101 }, (_, index) => resumeSummary(`resume-${index}`))
+test('builder allows exactly 500 comparisons and submits every pair only after a manual click', async () => {
+  const resumes = Array.from({ length: 125 }, (_, index) => resumeSummary(`resume-${index}`))
+  const targets = jobTargets(4)
+  const calls = []
+  const api = { ...baseApi, targets: { state: 'ready', value: targets },
+    create: async (input) => { calls.push(input); throw new Error('Controlled acceptance-response failure.') } }
+  const selected = { resumes: resumes.map(ui.realResumeSelection), targets: targets.map(item => item.selection) }
+  await render(builder(api, resumes, ui.realAnalysisLink(selected, workspaceId)))
+  assert.equal(dom.window.document.querySelector('.comparison-count strong').textContent, '500')
+  assert.match(dom.window.document.body.textContent, /Maximum 500\. No truncation\./)
+  const run = [...dom.window.document.querySelectorAll('button')].find(item => item.textContent === 'Run analysis')
+  assert.equal(run.disabled, false)
+  assert.equal(calls.length, 0)
+  await act(async () => run.click())
+  assert.equal(calls.length, 1)
+  assert.deepEqual(calls[0].resumes, selected.resumes)
+  assert.deepEqual(calls[0].targets, selected.targets)
+})
+
+test('builder visibly rejects 501 comparisons without dropping inputs; viewer and pending sources cannot run', async () => {
+  const resumes = Array.from({ length: 501 }, (_, index) => resumeSummary(`resume-${index}`))
   const eligible = target()
   const api = { ...baseApi, targets: { state: 'ready', value: [eligible] }, create: () => { throw new Error('Oversized run was sent') } }
   await render(builder(api, resumes, ui.realAnalysisLink({ resumes: resumes.map(ui.realResumeSelection), targets: [eligible.selection] }, workspaceId)))
-  assert.match(dom.window.document.body.textContent, /101 comparisons exceeds the 100-comparison limit/)
+  assert.match(dom.window.document.body.textContent, /501 comparisons exceeds the 500-comparison limit/)
+  assert.equal(dom.window.document.querySelectorAll('input[type="checkbox"]:checked').length, 502)
   assert.equal([...dom.window.document.querySelectorAll('button')].find((item) => item.textContent === 'Run analysis').disabled, true)
   await act(async () => root.unmount()); root = null
   await render(builder({ ...api, canWrite: false }, [resumeSummary('pending', 1, 'queued')], '/analyses/new?data=real'))

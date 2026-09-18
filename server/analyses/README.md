@@ -3,7 +3,9 @@
 Real analysis is explicitly started **after** resume import. The server accepts only
 typed real selections and exact document/version/content hashes. It never calls the
 sample scorer, chooses an unapproved draft, drops an invalid selection, or invents a
-score. A run contains 1–100 resume/target pairs.
+score. A run contains 1–500 resume/target pairs. The cap is on the total pair count,
+so 103 resumes against four targets fit in one 412-comparison run. Larger runs use
+the same worker concurrency and bounded processing, not a higher processing rate.
 
 ## Composition and authorization
 

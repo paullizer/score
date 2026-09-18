@@ -377,17 +377,17 @@ test('real analyses score exact saved job and approved GS versions and retain in
   } finally { await fixture.close() }
 })
 
-test('one hundred real comparisons initialize in bounded chunks; a unique 101st target is rejected without work', async () => {
-  const fixture = await startResumeAnalysisFixture(runtime, { pageSize: 7 })
+test('500 real comparisons finish across bounded chunks and pages; a unique 501st target is rejected without work', async () => {
+  const fixture = await startResumeAnalysisFixture(runtime, { pageSize: 50 })
   try {
     const imported = await importResumePdf(fixture, await resumePdf())
     const stubs = processingStubs(fixture)
     await processAllResumes(fixture, stubs)
     const resume = await jsonResponse(await fixture.request(`/api/workspaces/${fixture.workspaceId}/resumes/${imported.summary.resume.id}`))
-    for (let index = 0; index < 101; index++) await seedRealJob(fixture)
+    for (let index = 0; index < 501; index++) await seedRealJob(fixture)
     const targets = (await allPages(fixture, `/api/workspaces/${fixture.workspaceId}/analyses/targets`, 'targets'))
       .filter((target) => target.kind === 'job' && target.selection.rubricVersion === 2)
-    assert.equal(targets.length, 101)
+    assert.equal(targets.length, 501)
     const input = { name: 'Bounded comparison batch', resumes: [resumeSelection(resume)], targets: targets.map((target) => target.selection) }
     const oversized = await fixture.request(`/api/workspaces/${fixture.workspaceId}/analyses`, {
       method: 'POST', headers: { 'Content-Type': 'application/json', 'Idempotency-Key': randomUUID() }, body: JSON.stringify(input),
@@ -398,25 +398,25 @@ test('one hundred real comparisons initialize in bounded chunks; a unique 101st 
 
     const created = (await jsonResponse(await fixture.request(`/api/workspaces/${fixture.workspaceId}/analyses`, {
       method: 'POST', headers: { 'Content-Type': 'application/json', 'Idempotency-Key': randomUUID() },
-      body: JSON.stringify({ ...input, targets: input.targets.slice(0, 100) }),
+      body: JSON.stringify({ ...input, targets: input.targets.slice(0, 500) }),
     }), [200, 202])).run
     await processAllAnalyses(fixture, stubs)
     const runPath = `/api/workspaces/${fixture.workspaceId}/analyses/${created.run.id}`
     const run = await jsonResponse(await fixture.request(runPath))
     const comparisons = await allPages(fixture, `${runPath}/comparisons`, 'comparisons')
     assert.equal(run.run.status, 'complete')
-    assert.equal(run.run.progress.total, 100)
-    assert.equal(run.run.progress.initialized, 100)
-    assert.equal(run.run.progress.complete, 100)
-    assert.equal(comparisons.length, 100)
-    assert.equal(new Set(comparisons.map(({ comparison }) => comparison.id)).size, 100)
+    assert.equal(run.run.progress.total, 500)
+    assert.equal(run.run.progress.initialized, 500)
+    assert.equal(run.run.progress.complete, 500)
+    assert.equal(comparisons.length, 500)
+    assert.equal(new Set(comparisons.map(({ comparison }) => comparison.id)).size, 500)
     assert.ok(comparisons.every(({ comparison }) => comparison.resultSummary.overall.score === 60))
     const chunks = fixture.analyses.store.transactions.filter((operations) =>
       operations.some((operation) => operation.kind === 'create' && operation.record.recordType === 'analysis-comparison'))
-    assert.ok(chunks.length >= 4)
+    assert.ok(chunks.length >= 20)
     assert.ok(chunks.every((operations) => operations.filter((operation) => operation.kind === 'create' &&
       operation.record.recordType === 'analysis-comparison').length <= 25))
-    assert.equal(stubs.modelCalls.filter((request) => request.response_format.json_schema.name === 'resume_rubric_assessment').length, 100)
+    assert.equal(stubs.modelCalls.filter((request) => request.response_format.json_schema.name === 'resume_rubric_assessment').length, 500)
     assert.equal(fixture.state.saves.length, 0)
   } finally { await fixture.close() }
 })

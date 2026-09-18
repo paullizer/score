@@ -97,7 +97,7 @@ test('feature discovery keeps existing fields, authenticated privacy, and author
     maxBatchItems: 10, maxUrlLength: 4096, maxAutomaticAttempts: 3,
   })
   assert.deepEqual(features.analysisLimits, {
-    maxComparisons: 100, initializationChunkSize: 25, maxAutomaticAttempts: 3, maxOutputCorrections: 1,
+    maxComparisons: 500, initializationChunkSize: 25, maxAutomaticAttempts: 3, maxOutputCorrections: 1,
   })
 })
 
