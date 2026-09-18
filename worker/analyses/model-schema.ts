@@ -15,6 +15,9 @@ export const ANALYSIS_MODEL_LIMITS = {
   maxRationaleCharacters: 2_000,
   maxLimitationCharacters: 1_200,
   maxReviewIssues: 64,
+  maxCitationFindings: 32,
+  maxCorrectionSources: 8,
+  maxCorrectionSourceCharacters: 8_000,
 } as const
 
 export const ANALYSIS_MODEL_SCHEMA_VERSIONS = {

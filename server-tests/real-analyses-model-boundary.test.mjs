@@ -52,6 +52,7 @@ function assessmentResponse(input, { scores = [4], unassessed = false, unassesse
 }
 
 async function realModelPublication(f, resume, target, options = {}) {
+  const corrections = options.corrections ?? (options.corrected ? 1 : 0)
   const created = await f.service.create(f.workspaceId, randomUUID(), {
     name: 'Actual model-helper boundary', resumes: [resume.selection], targets: [target.selection],
   }, ACTOR)
@@ -97,11 +98,11 @@ async function realModelPublication(f, resume, target, options = {}) {
         assert.deepEqual(payload.input, model.validateAnalysisAssessmentInput(input))
         if (!payload.assessment) {
           assessed++
-          return response(assessmentResponse(input, { ...options, ...(options.corrected && assessed === 1 ? { scores: [1] } : {}) }),
+          return response(assessmentResponse(input, { ...options, ...(assessed <= corrections ? { scores: [assessed] } : {}) }),
             'actual-boundary-assessor')
         }
         reviewed++
-        if (options.corrected && reviewed === 1) return response({
+        if (reviewed <= corrections) return response({
           outcome: 'needs-correction', issues: [{
             code: 'unsupported-score', message: 'Review the cited scope against the saved score guidance.',
             criterionId: input.rubric.criteria[0].id, qualificationId: null,
@@ -112,8 +113,8 @@ async function realModelPublication(f, resume, target, options = {}) {
       },
     },
   })
-  assert.equal(assessed, options.corrected ? 2 : 1)
-  assert.equal(reviewed, options.corrected ? 2 : 1)
+  assert.equal(assessed, corrections + 1)
+  assert.equal(reviewed, corrections + 1)
   assert.equal(actual.assessmentSha256, api.analysisHash(actual.assessment))
   assert.equal(actual.assessmentSha256, api.analysisAssessmentHash(actual.assessment))
   assert.equal(model.hashAnalysisAssessment(actual.assessment), actual.assessmentSha256)
@@ -188,6 +189,27 @@ test('actual assessment and grounding output survives API publication/readback w
   f.resumes.blobs.values.clear()
   f.jobs.blobs.values.clear()
   assert.deepEqual((await f.service.comparisonDetail(f.workspaceId, published.run.record.id, published.comparison.id)).result, published.result)
+})
+
+test('two corrections and three reviews survive publication/readback without widening provenance guarantees', async () => {
+  const f = fixture()
+  const published = await realModelPublication(f, await seedResume(f), await seedJob(f), { corrections: 2 })
+  assert.equal(published.calls.length, 6)
+  assert.equal(published.result.provenance.correctionCount, 2)
+  assert.equal(published.result.provenance.groundingReviews.length, 3)
+  assert.equal(new Set(published.result.provenance.groundingReviews.map(review => review.assessmentSha256)).size, 3)
+  assert.deepEqual(published.detail.result, published.result)
+  for (const mutate of [
+    result => { result.provenance.correctionCount = 3 },
+    result => { result.provenance.correctionCount = 1 },
+    result => { result.provenance.groundingReviews.push(clone(result.provenance.groundingReviews.at(-1))) },
+    result => { result.provenance.groundingReviews.at(-1).assessmentSha256 = '0'.repeat(64) },
+    result => { result.provenance.groundingReviews[1].resumeSnapshotSha256 = '0'.repeat(64) },
+  ]) {
+    const invalid = clone(published.result)
+    mutate(invalid)
+    assert.throws(() => api.parseAnalysisResult(invalid))
+  }
 })
 
 for (const seededJobId of [false, true]) {

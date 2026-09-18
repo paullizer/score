@@ -401,6 +401,8 @@ test('invalid model citations fail only that comparison and never produce a zero
     value.criteria[0].citations[0].quote = 'PRIVATE-MODEL-SENTINEL not in the document'
     return value
   })
+  const events = []
+  mock.deps.onEvent = event => events.push(event)
   assert.deepEqual(await runAnalysisWorker(mock.deps, { maxItems: 2 }), { claimed: 2, completed: 1 })
   const [failed, complete] = comparisons(f, created.run.id).map(item => item.record)
   assert.equal(failed.status, 'failed')
@@ -408,9 +410,62 @@ test('invalid model citations fail only that comparison and never produce a zero
   assert.equal(failed.attempts, 1)
   assert.equal(failed.result, undefined)
   assert.doesNotMatch(JSON.stringify(failed.error), /PRIVATE-MODEL-SENTINEL/)
-  assert.equal(mock.calls.filter(call => call.kind === 'resume_rubric_assessment' && call.body.input.rubric.id === invalidRubric).length, 2)
+  assert.equal(mock.calls.filter(call => call.kind === 'resume_rubric_assessment' && call.body.input.rubric.id === invalidRubric).length, 3)
+  assert.match(failed.error.message, /Assessment criterion 1, citation 1/)
+  assert.match(failed.error.message, /2-correction limit/)
+  assert.equal(failed.error.retryable, false)
+  assert.equal(failed.nextAttemptAt, undefined)
+  const failures = events.filter(event => event.comparisonId === failed.id)
+  assert.ok(failures.every(event => event.workspaceId === f.workspaceId && event.runId === created.run.id && event.attemptId === failed.attemptId))
+  assert.deepEqual(failures.filter(event => event.event === 'correction').map(event => event.correctionCount), [1, 2])
+  assert.equal(failures.filter(event => event.event === 'validation-failed').length, 3)
+  assert.equal(failures.at(-1).event, 'comparison-outcome')
+  assert.equal(failures.at(-1).outcome, 'failed')
+  assert.equal(failures.at(-1).code, 'invalid-citation')
+  assert.equal(failures.at(-1).correctionCount, 2)
+  assert.equal(failures.at(-1).stage, 'assessment')
+  assert.doesNotMatch(JSON.stringify(events), /PRIVATE-MODEL-SENTINEL|test-token/)
   assert.equal(complete.status, 'complete')
   assert.equal(complete.resultSummary.overall.score, 60)
+  assert.equal(events.find(event => event.comparisonId === complete.id && event.event === 'comparison-outcome').outcome, 'complete')
+})
+
+test('two semantic corrections publish three bound reviews and correlated completion without extra worker attempts', async () => {
+  const f = fixture()
+  const created = await createRun(f)
+  let assessments = 0, reviews = 0
+  const mock = modelFor(f, ({ kind, body }) => {
+    if (kind === 'resume_rubric_assessment') {
+      const value = modelAssessment(body.input)
+      assessments++
+      for (const row of value.criteria) row.score = assessments
+      return value
+    }
+    if (++reviews <= 2) return {
+      outcome: 'needs-correction',
+      issues: [{
+        code: 'unsupported-score', message: 'Compare the stated responsibility scope with the saved score anchors.',
+        criterionId: body.input.rubric.criteria[0].id, qualificationId: null, citations: [],
+      }],
+    }
+  })
+  const events = []
+  mock.deps.onEvent = event => events.push(event)
+  assert.deepEqual(await runAnalysisWorker(mock.deps), { claimed: 1, completed: 1 })
+  const saved = comparisons(f, created.run.id)[0].record
+  const detail = await f.service.comparisonDetail(f.workspaceId, created.run.id, saved.id)
+  assert.equal(mock.calls.length, 6)
+  assert.equal(saved.attempts, 1)
+  assert.equal(saved.retryCount, 0)
+  assert.equal(detail.result.provenance.correctionCount, 2)
+  assert.equal(detail.result.provenance.groundingReviews.length, 3)
+  assert.equal(new Set(detail.result.provenance.groundingReviews.map(review => review.assessmentSha256)).size, 3)
+  assert.equal(detail.result.provenance.groundingReviews.at(-1).assessmentSha256, detail.result.provenance.assessmentSha256)
+  assert.equal(detail.result.overall.score, 60)
+  assert.ok(events.every(event => event.comparisonId === saved.id && event.attemptId === saved.attemptId))
+  assert.equal(events.at(-1).outcome, 'complete')
+  assert.equal(events.at(-1).stage, 'publication')
+  assert.equal(events.at(-1).correctionCount, 2)
 })
 
 test('corrupt snapshot bytes fail independently before inference', async () => {
