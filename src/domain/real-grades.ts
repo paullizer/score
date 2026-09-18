@@ -220,6 +220,7 @@ export interface FrozenReferenceSource {
   documentVersion: number
   documentBlobName: string
   originalBlobName: string
+  originalContentType?: OriginalContentType
   sha256: string
   url?: string
   intendedSection?: string

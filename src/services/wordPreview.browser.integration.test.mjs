@@ -380,3 +380,31 @@ test('resume drop handles mixed files/URLs with per-item errors and releases acc
   await visible(sample.page.getByText('Choose PDF files only. File contents will not be read.', { exact: true }))
   assert.equal(uploads(sample.fixture).length, 0)
 })
+
+test('browser picker combines Markdown and Word in one batch without capability cross-enabling', { timeout: 60_000 }, async (t) => {
+  const { page, fixture } = await open(t, { state: { mode: 'resume-import', markdownResumeEnabled: true, markdownJobEnabled: true, wordEnabled: true } })
+  const dialog = await visible(page.getByRole('dialog', { name: 'Add real resumes', exact: true }))
+  const picker = dialog.getByLabel('Choose resume PDF or Markdown or Word files', { exact: true })
+  await page.waitForFunction(() => !document.querySelector('input[type=file]').disabled)
+  const accept = (await picker.getAttribute('accept')).split(',')
+  for (const extension of ['.pdf', '.md', '.markdown', '.docx', '.doc']) assert.ok(accept.includes(extension))
+  await picker.setInputFiles([
+    { name: 'profile.MD', mimeType: 'text/plain', buffer: Buffer.from('# Markdown profile') },
+    { name: 'profile.DOCX', mimeType: '', buffer: docxFile() },
+    { name: 'profile.DOC', mimeType: '', buffer: legacyDocFile() },
+    { name: 'profile.PDF', mimeType: '', buffer: Buffer.from('%PDF-source') },
+    { name: 'unsupported.rtf', mimeType: '', buffer: Buffer.from('unsupported') },
+  ])
+  await dialog.getByRole('button', { name: 'Import 4 valid inputs', exact: true }).click()
+  await visible(dialog.getByText('4 accepted / 5 inputs', { exact: true }))
+  assert.deepEqual(uploads(fixture).map((request) => request.url.split('/').at(-1)).sort(), ['file', 'file', 'markdown', 'pdf'])
+  assert.ok(uploads(fixture).every((request) => request.headers['x-import-count'] === '5'))
+  assert.equal(new Set(uploads(fixture).map((request) => request.headers['x-import-batch'])).size, 1)
+  assert.deepEqual(await page.evaluate(() => window.wordTest.resumeItems().filter((item) => item.state === 'accepted').map((item) => item.hasFile)), [false, false, false, false])
+
+  const isolated = await open(t, { state: { mode: 'resume-import', markdownJobEnabled: true, wordEnabled: false } })
+  const pdfOnly = isolated.page.getByLabel('Choose resume PDF files', { exact: true })
+  await visible(isolated.page.getByRole('button', { name: 'Choose PDFs', exact: true }))
+  assert.equal(await pdfOnly.getAttribute('accept'), '.pdf,application/pdf')
+  assert.equal(uploads(isolated.fixture).length, 0)
+})

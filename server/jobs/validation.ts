@@ -1,16 +1,17 @@
 import { JOB_IMPORT_LIMITS } from '../../src/domain/real-jobs'
 import type { RealJobRecord } from '../../src/domain/real-jobs'
+import { isSafeUploadedFilename } from '../../src/domain/source-files'
 import type { Citation, Rubric, SourceDocument } from '../../src/domain/types'
 import { isValidWorkspaceId } from '../ids'
 import {
-  isOriginalContentType, isUploadFormat, isWordContentType, originalExtension, UPLOAD_CONTENT_TYPES,
-  uploadFormatFromFilename, type OriginalContentType, type UploadFormat,
+  isOriginalContentType, isUploadFormat, originalExtension, storedDocumentContentType, UPLOAD_CONTENT_TYPES,
+  type OriginalContentType, type UploadFormat,
 } from '../../src/domain/document-formats'
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
 const JOB_ID_PATTERN = new RegExp(`^job-${UUID_PATTERN.source.slice(1, -1)}$`, 'i')
 const DOCUMENT_ID_PATTERN = new RegExp(`^document-${UUID_PATTERN.source.slice(1, -1)}$`, 'i')
-const SAFE_BLOB_FILE_PATTERN = /^(?:original\.(?:pdf|docx|doc|html)|source-document\.json)$/
+const SAFE_BLOB_FILE_PATTERN = /^(?:original\.(?:pdf|docx|doc|html|md)|source-document\.json)$/
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
@@ -46,7 +47,7 @@ export function originalBlobName(
   kindOrContentType: UploadFormat | 'url' | OriginalContentType,
 ): string {
   const contentType = isOriginalContentType(kindOrContentType) ? kindOrContentType
-    : kindOrContentType === 'url' ? 'text/html' : UPLOAD_CONTENT_TYPES[kindOrContentType]
+    : kindOrContentType === 'url' ? 'text/html' : isUploadFormat(kindOrContentType) ? UPLOAD_CONTENT_TYPES[kindOrContentType] : undefined
   if (!contentType) throw new Error('Invalid job original type.')
   const extension = originalExtension(contentType)
   return `${workspaceId}/${jobId}/original.${extension}`
@@ -68,7 +69,14 @@ export function isBlobInJobPrefix(value: string, workspaceId: string, jobId: str
   return isSafeJobBlobName(value) && value.startsWith(`${workspaceId}/${jobId}/`)
 }
 
-export function validateRealSourceDocument(value: unknown): string[] {
+export function jobBlobContentType(name: string): OriginalContentType | 'application/json' {
+  if (!isSafeJobBlobName(name)) throw new Error('Invalid job blob name.')
+  const contentType = storedDocumentContentType(name)
+  if (!contentType) throw new Error('Invalid job blob content type.')
+  return contentType
+}
+
+export function validateRealSourceDocument(value: unknown, contentType?: OriginalContentType): string[] {
   const errors: string[] = []
   if (!isRecord(value)) return ['Source document must be an object.']
   if (!hasOnlyKeys(value, ['id', 'title', 'kind', 'version', 'paragraphs', 'sample'])) {
@@ -95,7 +103,7 @@ export function validateRealSourceDocument(value: unknown): string[] {
     else if (paragraphIds.has(paragraphValue.id)) errors.push(`Source document repeats paragraph id "${paragraphValue.id}".`)
     else paragraphIds.add(paragraphValue.id)
     if (!Number.isInteger(paragraphValue.page) || Number(paragraphValue.page) < 1 ||
-      Number(paragraphValue.page) > JOB_IMPORT_LIMITS.maxPdfPages) {
+      Number(paragraphValue.page) > (contentType === 'application/pdf' ? JOB_IMPORT_LIMITS.maxPdfPages : 100_000)) {
       errors.push('Source paragraph page is outside the supported range.')
     }
     if (typeof paragraphValue.heading !== 'string') errors.push('Every source paragraph needs a heading string.')
@@ -125,8 +133,8 @@ function citationErrors(citation: unknown, document: SourceDocument, context: st
   return []
 }
 
-export function validateRealRubric(rubric: Rubric, document: SourceDocument): string[] {
-  const errors = validateRealSourceDocument(document)
+export function validateRealRubric(rubric: Rubric, document: SourceDocument, contentType?: OriginalContentType): string[] {
+  const errors = validateRealSourceDocument(document, contentType)
   if (!isRecord(rubric)) return [...errors, 'Rubric must be an object.']
   if (!hasOnlyKeys(rubric as unknown as Record<string, unknown>, [
     'id', 'groupId', 'kind', 'jobId', 'name', 'description', 'version', 'criteria', 'createdAt', 'dataKind', 'provenance',
@@ -264,10 +272,16 @@ export function validateRealJobRecord(value: unknown): value is RealJobRecord {
   if (value.source.kind !== 'url') {
     const format = value.source.kind
     if (!isUploadFormat(format) || value.source.originalContentType !== UPLOAD_CONTENT_TYPES[format] ||
-      value.source.originalBlobName === undefined || uploadFormatFromFilename(value.source.displayName) !== format ||
+      value.source.originalBlobName === undefined ||
       value.source.url !== undefined || value.source.finalUrl !== undefined) return false
+    if (format !== 'pdf' && (!isSafeUploadedFilename(value.source.displayName, format) ||
+      typeof value.source.sha256 !== 'string' || !Number.isInteger(value.source.bytes) ||
+      Number(value.source.bytes) < 1 || Number(value.source.bytes) >
+        (format === 'markdown' ? JOB_IMPORT_LIMITS.maxMarkdownBytes : JOB_IMPORT_LIMITS.maxFileBytes))) return false
   }
-  if (value.source.kind === 'url' && (!isNonBlank(value.source.url) || isWordContentType(value.source.originalContentType))) {
+  if (value.source.kind === 'url' &&
+    (!isNonBlank(value.source.url) || (value.source.originalContentType !== undefined &&
+      value.source.originalContentType !== 'application/pdf' && value.source.originalContentType !== 'text/html'))) {
     return false
   }
   const job = value.job
@@ -288,11 +302,24 @@ export function validateRealJobRecord(value: unknown): value is RealJobRecord {
   }
   if (value.source.bytes !== undefined && (!Number.isInteger(value.source.bytes) || Number(value.source.bytes) < 0)) return false
   if (value.source.capturedAt !== undefined && !isTimestamp(value.source.capturedAt)) return false
-  if (value.source.extractionMethod !== undefined &&
-    !['document-intelligence', 'html', 'browser', 'legacy-word'].includes(String(value.source.extractionMethod))) return false
-  if (value.source.extractionMethod === 'legacy-word' && value.source.originalContentType !== UPLOAD_CONTENT_TYPES.doc) return false
-  if (isWordContentType(value.source.originalContentType) && value.source.extractionMethod !== undefined &&
-    value.source.extractionMethod !== (value.source.kind === 'doc' ? 'legacy-word' : 'document-intelligence')) return false
+  if (value.source.extractionMethod !== undefined) {
+    switch (value.source.originalContentType) {
+      case 'application/pdf':
+      case UPLOAD_CONTENT_TYPES.docx:
+        if (value.source.extractionMethod !== 'document-intelligence') return false
+        break
+      case UPLOAD_CONTENT_TYPES.doc:
+        if (value.source.extractionMethod !== 'legacy-word') return false
+        break
+      case 'text/html':
+        if (!['html', 'browser'].includes(String(value.source.extractionMethod))) return false
+        break
+      case 'text/markdown':
+        if (value.source.extractionMethod !== 'markdown') return false
+        break
+      default: return false
+    }
+  }
   if (value.job.source !== value.source.kind || value.job.sourceLabel !== value.source.displayName ||
     !['queued', 'parsing', 'generating', 'ready', 'error', 'cancelled'].includes(String(value.job.status))) {
     return false

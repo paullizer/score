@@ -11,7 +11,7 @@ import {
 import { seedRealJob } from '../src/services/gradeLadders.test-support.mjs'
 import { docxFile, legacyDocFile } from './word-fixtures.mjs'
 
-const MIME = { docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', doc: 'application/msword' }
+const MIME = { pdf: 'application/pdf', markdown: 'text/markdown', docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', doc: 'application/msword' }
 const resumeText = resumeParagraphs.map(paragraph => paragraph.text).join('\n')
 const jobText = 'Engineering specialist\nRequirements\nApply engineering methods to defined projects and communicate findings.'
 const file = (format, text) => format === 'docx' ? docxFile(text) : legacyDocFile(text)
@@ -43,16 +43,16 @@ async function upload(fixture, collection, format, bytes, options = {}) {
   return { response, key, batch }
 }
 
-function wordOcr(fixture, bytes, text, calls = []) {
+function wordOcr(fixture, bytes, text, calls = [], endpoint = 'https://word-service.example.test') {
   return {
-    endpoint: 'https://word-service.example.test', clock: fixture.clock, getToken: async () => 'synthetic-token',
+    endpoint, clock: fixture.clock, getToken: async () => 'synthetic-token',
     fetch: async (_url, init = {}) => {
       calls.push(init.method ?? 'GET')
       if (init.method === 'POST') {
         assert.equal(init.headers['content-type'], MIME.docx)
         assert.deepEqual(Buffer.from(init.body), bytes)
         return new Response(null, { status: 202, headers: {
-          'operation-location': 'https://word-service.example.test/documentintelligence/operations/word',
+          'operation-location': `${endpoint}/documentintelligence/operations/word`,
         } })
       }
       return Response.json({ status: 'succeeded', analyzeResult: {
@@ -180,6 +180,88 @@ for (const format of ['docx', 'doc']) {
   })
 }
 
+test('PDF, Markdown, DOCX, and DOC share one durable batch and retain distinct evidence in a mixed analysis', async (t) => {
+  const fixture = await startResumeAnalysisFixture(runtime, { configOverrides: { wordDocumentImports: true } })
+  t.after(() => fixture.close())
+  const features = await jsonResponse(await fixture.request('/api/features'))
+  assert.equal(features.markdownJobImports, true)
+  assert.equal(features.markdownResumeImports, true)
+  assert.equal(features.wordDocumentImports, true)
+  assert.equal(features.analysisLimits.maxComparisons, 500)
+  const pdf = await resumePdf()
+  const inputs = [
+    { format: 'pdf', bytes: Buffer.from(await pdf.arrayBuffer()), route: 'pdf', filename: 'resume.pdf' },
+    { format: 'markdown', bytes: Buffer.from(`# Jordan Example\n\n${resumeParagraphs.slice(1).map(paragraph => paragraph.text).join('\n\n')}`), route: 'markdown', filename: 'resume.MARKDOWN' },
+    { format: 'docx', bytes: docxFile(resumeText), route: 'file', filename: 'resume.docx' },
+    { format: 'doc', bytes: legacyDocFile(resumeText), route: 'file', filename: 'resume.doc' },
+  ]
+  const batch = randomUUID()
+  const accepted = []
+  for (const input of inputs) {
+    const request = await upload(fixture, 'resumes', input.format, input.bytes, { ...input, batch, count: inputs.length })
+    accepted.push({ input, request, summary: (await jsonResponse(request.response, [202])).resume })
+  }
+  const full = await upload(fixture, 'resumes', 'markdown', Buffer.from('# Another resume'), {
+    route: 'markdown', filename: 'extra.md', batch, count: inputs.length,
+  })
+  assert.equal(full.response.status, 409)
+  const stubs = processingStubs(fixture)
+  const pdfFetch = stubs.resumes.documentIntelligence.fetch
+  const docx = inputs.find(input => input.format === 'docx')
+  const docxOcr = wordOcr(fixture, docx.bytes, resumeText, [], stubs.resumes.documentIntelligence.endpoint)
+  let wordOperation = false
+  stubs.resumes.documentIntelligence.fetch = (url, init = {}) => {
+    if (init.method === 'POST') wordOperation = init.headers['content-type'] === MIME.docx
+    return wordOperation ? docxOcr.fetch(url, init) : pdfFetch(url, init)
+  }
+  await processAllResumes(fixture, stubs)
+  const details = []
+  for (const { input, request, summary } of accepted) {
+    const detail = await jsonResponse(await fixture.request(`/api/workspaces/${fixture.workspaceId}/resumes/${summary.resume.id}`))
+    assert.equal(detail.resume.status, 'ready', JSON.stringify(detail.error))
+    assert.equal(detail.source.kind, input.format)
+    assert.equal(detail.capture.original.contentType, MIME[input.format])
+    assert.equal(detail.extraction.pagination, input.format === 'pdf' ? 'pdf-pages' : input.format === 'markdown' ? 'markdown-sections' : 'captured-sections')
+    const receipt = JSON.parse(Buffer.from((await fixture.resumes.blobs.read(`${fixture.workspaceId}/${summary.resume.id}/import-receipt.json`)).bytes))
+    const digest = createHash('sha256').update(input.bytes).digest('hex')
+    if (input.format === 'pdf' || input.format === 'markdown') {
+      assert.equal(receipt.schemaVersion, 1)
+      assert.equal(receipt[input.format === 'pdf' ? 'pdfSha256' : 'markdownSha256'], digest)
+      assert.equal(receipt.fileSha256, undefined)
+    } else {
+      assert.equal(receipt.schemaVersion, 2)
+      assert.equal(receipt.fileSha256, digest)
+      assert.equal(receipt.markdownSha256, undefined)
+    }
+    assert.equal((await upload(fixture, 'resumes', input.format, input.bytes, {
+      ...input, key: request.key, batch, count: inputs.length,
+    })).response.status, 200)
+    details.push(detail)
+  }
+  assert.equal([...fixture.resumes.store.values.values()].find(value => value.record.recordType === 'resume-batch').record.items.length, 4)
+  const jobDocx = docxFile(jobText)
+  await jsonResponse((await upload(fixture, 'jobs', 'docx', jobDocx)).response, [202])
+  await jsonResponse((await upload(fixture, 'jobs', 'markdown', Buffer.from('# Engineering specialist\n\n## Requirements\n\nApply engineering methods to defined projects and communicate findings.'), {
+    route: 'markdown', filename: 'job.md',
+  })).response, [202])
+  await processJob(fixture, jobDocx, jobText)
+  await processJob(fixture, jobDocx, jobText)
+  const targets = await jsonResponse(await fixture.request(`/api/workspaces/${fixture.workspaceId}/analyses/targets`))
+  assert.equal(targets.targets.length, 2)
+  assert.equal(fixture.analyses.store.values.size, 0)
+  const created = await jsonResponse(await fixture.request(`/api/workspaces/${fixture.workspaceId}/analyses`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json', 'Idempotency-Key': randomUUID() },
+    body: JSON.stringify({ name: 'Merged format evidence', resumes: details.map(resumeSelection), targets: targets.targets.map(target => target.selection) }),
+  }), [202])
+  await processAllAnalyses(fixture, stubs)
+  const comparisons = [...fixture.analyses.store.values.values()].filter(value => value.record.recordType === 'analysis-comparison')
+  assert.equal(comparisons.length, 8)
+  assert.ok(comparisons.every(value => value.record.status === 'complete'), JSON.stringify(comparisons.map(value => value.record.error)))
+  const run = await jsonResponse(await fixture.request(`/api/workspaces/${fixture.workspaceId}/analyses/${created.run.run.id}`))
+  assert.equal(run.run.progress.total, 8)
+  assert.equal(fixture.state.saves.length, 0)
+})
+
 test('Word admissions are gated, actual formats are checked, and membership is checked before parsing', async (t) => {
   const disabled = await startResumeAnalysisFixture(runtime)
   t.after(() => disabled.close())
@@ -203,6 +285,9 @@ test('Word admissions are gated, actual formats are checked, and membership is c
   fixture.setRole('viewer')
   for (const collection of ['jobs', 'resumes']) {
     assert.equal((await upload(fixture, collection, 'docx', Buffer.from('invalid'))).response.status, 403)
+    assert.equal((await upload(fixture, collection, 'docx', Buffer.from('{invalid JSON'), {
+      contentType: 'application/json',
+    })).response.status, 403, 'Workspace authorization must precede JSON parsing for /file uploads too.')
   }
 })
 

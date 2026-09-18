@@ -1,9 +1,11 @@
 import type { Citation, SourceDocument } from './types'
 import type { DocumentPagination, OriginalContentType, UploadContentType, UploadFormat, WordImportFeatures } from './document-formats'
+import { MAX_MARKDOWN_BYTES } from './source-files'
 
 export const RESUME_IMPORT_LIMITS = {
   maxFileBytes: 10 * 1024 * 1024,
   maxPdfBytes: 10 * 1024 * 1024,
+  maxMarkdownBytes: MAX_MARKDOWN_BYTES,
   maxPdfPages: 50,
   maxSourceCharacters: 180_000,
   maxBatchItems: 10,
@@ -65,7 +67,7 @@ export interface ResumeCaptureManifest {
 }
 
 export interface ResumeExtractionProvenance {
-  method: 'document-intelligence' | 'html' | 'browser' | 'legacy-word'
+  method: 'document-intelligence' | 'html' | 'browser' | 'markdown' | 'legacy-word'
   version: string
   extractedAt: string
   pagination: DocumentPagination
@@ -207,6 +209,7 @@ export interface RealResumesPage {
 
 export interface ResumeProcessingFeatures extends WordImportFeatures {
   realResumeImports: boolean
+  markdownResumeImports: boolean
   resumeLimits: typeof RESUME_IMPORT_LIMITS
 }
 
@@ -225,6 +228,11 @@ export interface ResumePdfImportHeaders extends ResumeImportHeaders {
 
 export interface ResumeFileImportHeaders extends ResumeImportHeaders {
   'Content-Type': UploadContentType
+  'X-File-Name': string
+}
+
+export interface ResumeMarkdownImportHeaders extends ResumeImportHeaders {
+  'Content-Type': 'text/markdown'
   'X-File-Name': string
 }
 

@@ -30,6 +30,7 @@ export function GradeSourceProvenance({ source }: { source: ReferenceSourceRecor
       <div><dt>Intended section</dt><dd>{source.intendedSection || 'Whole reference / not specified'}</dd></div>
       <div><dt>Extraction completeness</dt><dd>{source.completeness} · {source.selectedPages.length ? `Selected original pages ${source.selectedPages.join(', ')}` : 'Full document requested'} · {pagination === 'pdf-pages'
         ? source.pageCount === undefined ? 'Page count pending' : `${source.pageCount} original pages`
+        : pagination === 'markdown-sections' ? 'Markdown sections, not PDF pages'
         : `${source.pageCount ?? 'Pending'} ${pagination === 'html-sections' ? 'HTML' : 'captured'} ${source.pageCount === 1 ? 'section' : 'sections'} · printed page numbers unavailable`}</dd></div>
       <div><dt>Captured content fingerprint</dt><dd><code>{source.sha256 || 'Capture pending — no verified hash yet'}</code></dd></div>
       {url && <div><dt>Source URL</dt><dd><ExternalSource url={url}>{url}</ExternalSource></dd></div>}

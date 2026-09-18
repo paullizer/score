@@ -33,6 +33,6 @@ function PrivateDocumentView({ document, originalUrl, original, highlighted, pag
     {mode === 'formatted' && docx
       ? <Suspense fallback={<p className="word-preview-status" role="status">Loading the private Word preview…</p>}><DocxPreview originalUrl={originalUrl} original={original} /></Suspense>
       : <DocumentViewer document={document} highlightedId={highlighted?.id} quote={highlighted?.quote}
-        pagination={docx || legacy ? 'captured-sections' : pagination ?? (original.contentType ? documentPagination(original.contentType) : 'pdf-pages')} />}
+        pagination={docx || legacy ? 'captured-sections' : pagination ?? documentPagination(original.contentType)} />}
   </>
 }

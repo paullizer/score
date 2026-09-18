@@ -68,7 +68,7 @@ test('browser imports actual PDF bytes, explicitly runs real analysis, opens cit
     const dialog = await visible(page.getByRole('dialog', { name: 'Add real resumes', exact: true }))
     const file = await resumePdf()
     const bytes = Buffer.from(await file.arrayBuffer())
-    await dialog.getByLabel('Choose resume PDF files', { exact: true }).setInputFiles({
+    await dialog.getByLabel('Choose resume PDF or Markdown files', { exact: true }).setInputFiles({
       name: file.name, mimeType: 'application/pdf', buffer: bytes,
     })
     await dialog.getByRole('button', { name: 'Import 1 valid input', exact: true }).click()
@@ -266,40 +266,57 @@ test('browser approved GS analysis opens copied reference evidence through its e
   } finally { await context.close() }
 })
 
-test('browser preserves a full 100-resume selection across navigation and reload without oversized HTTP targets', { timeout: 120_000 }, async (t) => {
+test('browser preserves 103 resumes across navigation and reload and submits all 412 comparisons against four jobs', { timeout: 120_000 }, async (t) => {
   const fixture = await startResumeAnalysisFixture(runtime, { injectAuth: true, pageSize: 25 })
   t.after(() => fixture.close())
-  await seedRealJob(fixture)
+  for (let index = 0; index < 4; index++) await seedRealJob(fixture)
   const bytes = await (await resumePdf()).arrayBuffer()
-  for (let batchIndex = 0; batchIndex < 10; batchIndex++) {
+  for (let offset = 0; offset < 103; offset += 10) {
     const batchId = randomUUID()
-    await Promise.all(Array.from({ length: 10 }, (_, index) => importResumePdf(fixture,
-      new File([bytes], `resume-${batchIndex * 10 + index + 1}.pdf`, { type: 'application/pdf' }), { batchId, inputCount: 10 })))
+    const inputCount = Math.min(10, 103 - offset)
+    await Promise.all(Array.from({ length: inputCount }, (_, index) => importResumePdf(fixture,
+      new File([bytes], `resume-${offset + index + 1}.pdf`, { type: 'application/pdf' }), { batchId, inputCount })))
   }
-  await processAllResumes(fixture, processingStubs(fixture))
+  const stubs = processingStubs(fixture)
+  await processAllResumes(fixture, stubs)
   const { context, page, errors } = await newPage()
   try {
     await page.goto(`${fixture.origin}/workspaces/${fixture.workspaceId}/resumes?data=real`)
     await page.getByRole('button', { name: 'Select ready visible', exact: true }).click()
-    await page.getByRole('button', { name: 'Build analysis (100)', exact: true }).click()
+    await page.getByRole('button', { name: 'Build analysis (103)', exact: true }).click()
     await visible(page.getByRole('heading', { name: 'Build a real analysis', exact: true }))
     const location = new URL(page.url())
     assert.ok(location.pathname.length + location.search.length <= 2048)
     const selected = page.getByRole('checkbox', { name: /^Include Jordan Example from resume-/ })
-    assert.equal(await selected.count(), 100)
-    assert.equal(await selected.evaluateAll((elements) => elements.filter((element) => element.checked).length), 100)
+    assert.equal(await selected.count(), 103)
+    assert.equal(await selected.evaluateAll((elements) => elements.filter((element) => element.checked).length), 103)
     await page.reload()
     await visible(page.getByRole('heading', { name: 'Build a real analysis', exact: true }))
-    assert.equal(await selected.count(), 100)
-    assert.equal(await selected.evaluateAll((elements) => elements.filter((element) => element.checked).length), 100)
-    await page.getByRole('checkbox', { name: /^Include Engineering specialist, Job rubric v2/ }).check()
+    assert.equal(await selected.count(), 103)
+    assert.equal(await selected.evaluateAll((elements) => elements.filter((element) => element.checked).length), 103)
+    const targets = page.getByRole('checkbox', { name: /^Include Engineering specialist, Job rubric v2/ })
+    assert.equal(await targets.count(), 4)
+    for (const target of await targets.all()) await target.check()
     assert.equal(await page.getByRole('button', { name: 'Run analysis', exact: true }).isEnabled(), true)
-    assert.equal(await page.locator('.comparison-count strong').textContent(), '100')
-    await page.getByRole('checkbox', { name: /^Include Engineering specialist, Job rubric v1/ }).check()
+    assert.equal(await page.locator('.comparison-count strong').textContent(), '412')
+    const extra = page.getByRole('checkbox', { name: /^Include Engineering specialist, Job rubric v1/ }).first()
+    await extra.check()
     assert.equal(await page.getByRole('button', { name: 'Run analysis', exact: true }).isDisabled(), true)
-    await visible(page.getByText(/200 comparisons exceeds the 100-comparison limit/))
+    await visible(page.getByText(/515 comparisons exceeds the 500-comparison limit/))
+    assert.equal(await selected.evaluateAll((elements) => elements.filter((element) => element.checked).length), 103)
+    await extra.uncheck()
     assert.ok(fixture.requests.filter((request) => request.url.startsWith('/workspaces/')).every((request) => request.url.length <= 2048))
     assert.equal(fixture.analyses.store.values.size, 0, 'Navigation and selection never submit analyses automatically.')
+    await page.getByLabel('Analysis name (optional)', { exact: true }).fill('Full resume library review')
+    await page.getByRole('button', { name: 'Run analysis', exact: true }).click()
+    await visible(page.getByRole('heading', { name: 'Full resume library review', exact: true }))
+    const runs = [...fixture.analyses.store.values.values()].filter(({ record }) => record.recordType === 'analysis-run')
+    assert.equal(runs.length, 1)
+    assert.equal(runs[0].record.progress.total, 412)
+    const detail = await jsonResponse(await fixture.request(`/api/workspaces/${fixture.workspaceId}/analyses/${runs[0].record.id}`))
+    assert.equal(detail.resumes.length, 103)
+    assert.equal(new Set(detail.targets.map(item => item.selection.jobId)).size, 4)
+    assert.equal(stubs.modelCalls.filter(request => request.response_format.json_schema.name === 'resume_rubric_assessment').length, 0)
     assert.deepEqual(errors, [])
   } finally { await context.close() }
 })

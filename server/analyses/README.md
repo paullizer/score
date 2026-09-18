@@ -3,11 +3,13 @@
 Real analysis is explicitly started **after** resume import. The server accepts only
 typed real selections and exact document/version/content hashes. It never calls the
 sample scorer, chooses an unapproved draft, drops an invalid selection, or invents a
-score. A run contains 1–100 resume/target pairs.
+score. A run contains 1–500 resume/target pairs. The cap is on the total pair count,
+so 103 resumes against four targets fit in one 412-comparison run. Larger runs use
+the same worker concurrency and bounded processing, not a higher processing rate.
 
-Ready DOCX and legacy DOC resumes/jobs are supported real inputs alongside existing PDF/HTML.
-Word is file-upload only. A Word-backed job can also appear as a captured GS seed, but Word is
-not an independent agency/OPM reference upload or URL format. None of this starts scoring
+Ready Markdown, DOCX, and legacy DOC resumes/jobs are supported real inputs alongside PDF/HTML.
+Markdown and Word are file-upload only. Those jobs can also appear as captured GS seeds, but
+neither format is an independent agency/OPM reference upload or URL format. None of this starts scoring
 automatically or changes sample-analysis behavior.
 
 ## Composition and authorization
@@ -45,6 +47,8 @@ reading already frozen runs.
 schemas or historical reads. Upgraded validators must accept already-frozen Word evidence
 even while that flag is off. Real analysis creation still needs its existing configured
 source services and explicit user request; no additional storage or identity grant is needed.
+Markdown intake follows the advertised `markdownJobImports` / `markdownResumeImports` real-service
+capabilities, without a new global environment flag. The Word gate does not control Markdown.
 
 All paths below have prefix `/api/workspaces/:workspaceId/analyses`:
 
@@ -95,12 +99,18 @@ reference libraries are never embedded in comparison records or sent wholesale t
 the model. Snapshot provenance can retain original library references for
 inspection, but worker reads use only copies in `analysis-sources`.
 
-Frozen Word sources preserve their real MIME types and `.docx`/`.doc` suffixes, rather than
-falling through to `.html` or being converted to PDF. Copied job/GS-seed originals retain
+Frozen Markdown and Word sources preserve their real MIME types and `.md`/`.docx`/`.doc` suffixes,
+rather than falling through to `.html` or being converted to PDF. `.markdown` uploads retain
+their display filename but use the canonical `.md` blob suffix. Copied job/GS-seed originals retain
 their immutable byte hashes, lengths, ownership, and capture bindings. Resume snapshots
-retain the existing immutable-original-reference policy; Word support does not broaden the
-analysis worker's access to resume/job/grade containers. Existing PDF/HTML snapshots and their
+retain the existing immutable-original-reference policy; these formats do not broaden the
+analysis worker's access to resume/job/grade containers. Existing snapshots and their
 hashes are not rewritten or supplied new defaults on read.
+
+Markdown is strictly decoded as UTF-8 and extracted locally with `marked`; provenance uses
+`markdown-sections` and a null physical page count. Headings, lists, tables, and code become
+ordered citable text. Embedded HTML and front matter stay inert text, and linked images/assets
+are not fetched. The evidence viewer never executes Markdown or renders it as HTML.
 
 DOCX source text comes from the existing Azure Document Intelligence service; legacy DOC
 text comes from local pure-Node binary Word extraction with method/version provenance.
@@ -110,7 +120,7 @@ Word section indices must not be displayed as printed-page numbers or validated 
 the PDF-only 50-page limit. Resume extraction records retain `pageCount: null`; the existing
 normalized GS seed-reference model retains `pageCount: 1` as a captured-section count,
 not a physical Word page count. The original 10 MiB upload, 10-input batch, and 180,000 normalized
-source-character limits still apply to Word intake. Word-image OCR is not supported: use
+source-character limits apply to Markdown and Word intake. Word-image OCR is not supported: use
 the existing PDF/OCR path when meaningful content is image-only.
 
 Optional formatted DOCX previews are approximate, sanitized Mammoth output in a sandbox,

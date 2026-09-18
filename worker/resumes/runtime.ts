@@ -18,7 +18,7 @@ import {
   validateRealResumeProfile, validateResumeDocumentBinding,
 } from '../../server/resumes/validation'
 import {
-  analyzePdf, extractWordDocument, nodePinnedTransport, normalizeText, safeFetch, systemClock, WorkerError,
+  analyzePdf, extractMarkdown, extractWordDocument, nodePinnedTransport, normalizeText, safeFetch, systemClock, WorkerError,
   WORD_EXTRACTION_VERSION, wordSourceWarnings,
   type BrowserRenderer, type Clock, type DocumentIntelligenceClientOptions, type RubricModelOptions,
   type SafeFetchOptions,
@@ -28,6 +28,7 @@ import {
   RESUME_PARAGRAPH_OPTIONS, RESUME_SECTIONS,
 } from './extraction'
 import { extractResumeProfile, ResumeProfileError } from './model'
+import { MARKDOWN_EXTRACTION_VERSION } from '../markdown'
 
 const LEASE_MILLISECONDS = 90_000
 const HEARTBEAT_MILLISECONDS = 25_000
@@ -91,7 +92,7 @@ const MESSAGES: Record<ResumeProcessingErrorCode, string> = {
   'access-blocked': 'This URL is not publicly accessible and could not be processed.',
   'not-found': 'The public resume URL could not be found. Check the URL and import it again.',
   'network-error': 'The public resume source could not be retrieved because of a network error. Please retry.',
-  'unsupported-content': 'Use a PDF, DOCX, or DOC upload, or a public PDF/HTML profile URL. Word documents must be uploaded as files, not imported by URL.',
+  'unsupported-content': 'Use a PDF, Markdown, DOCX, or DOC upload, or a public PDF/HTML profile URL. Markdown and Word documents must be uploaded as files, not imported by URL.',
   'unreadable-document': 'This public page did not provide readable resume text. Try another publicly accessible profile URL.',
   'pdf-too-large': 'Resume PDFs may not exceed 10 MiB.',
   'file-too-large': 'Resume files may not exceed 10 MiB.',
@@ -119,6 +120,8 @@ function processingError(
     code === 'unreadable-document' && contentType === 'application/pdf' ? UNREADABLE_PDF_MESSAGE
       : code === 'unreadable-document' && isWordContentType(contentType)
         ? 'The Word document did not provide readable text. Remove protection or save a new DOCX. For content in images, export a PDF for OCR.'
+      : code === 'unreadable-document' && contentType === 'text/markdown'
+        ? 'The Markdown file did not contain readable resume text. Upload a UTF-8 Markdown resume.'
         : MESSAGES[code]
   if (error instanceof ResumeEncodingError) {
     return { code: error.code, stage: error.stage, retryable: false, message: error.message }
@@ -127,6 +130,12 @@ function processingError(
     return { code: error.code, stage: error.stage, retryable: error.retryable, message: message(error.code) }
   }
   if (error instanceof WorkerError) {
+    if (error.code === 'invalid-markdown' || error.code === 'markdown-too-large') {
+      return {
+        code: error.code === 'markdown-too-large' ? 'source-too-large' : 'unreadable-document',
+        stage: 'parsing', message: error.message, retryable: false,
+      }
+    }
     let code: ResumeProcessingErrorCode
     switch (error.code) {
       case 'source-access-denied': code = 'access-blocked'; break
@@ -208,7 +217,7 @@ class ResumeLease {
   ) {
     this.stage = claimed.record.resume.status === 'profiling' ? 'profiling' : 'parsing'
     this.contentType = claimed.record.capture?.original.contentType ??
-      (claimed.record.source.kind === 'pdf' ? 'application/pdf' : undefined)
+      (claimed.record.source.kind !== 'url' ? UPLOAD_CONTENT_TYPES[claimed.record.source.kind] : undefined)
   }
 
   start(): void {
@@ -621,7 +630,8 @@ async function captureSource(dependencies: ResumeWorkerDependencies, lease: Resu
     blob: original, capture: manifest.capture,
     method: manifest.capture.original.contentType === UPLOAD_CONTENT_TYPES.doc ? 'legacy-word'
       : manifest.capture.original.contentType === 'application/pdf' || manifest.capture.original.contentType === UPLOAD_CONTENT_TYPES.docx ? 'document-intelligence'
-      : matchingDownload ? downloaded!.method : 'html',
+      : manifest.capture.original.contentType === 'text/markdown' ? 'markdown'
+        : matchingDownload ? downloaded!.method : 'html',
   }
 }
 
@@ -685,6 +695,7 @@ async function extractSource(
   const pdf = original.blob.contentType === 'application/pdf'
   const word = isWordContentType(original.blob.contentType)
   const wordFormat = original.blob.contentType === UPLOAD_CONTENT_TYPES.doc ? 'doc' : 'docx'
+  const markdown = original.blob.contentType === 'text/markdown'
   const pageCount = pdf ? await pdfPageCount(original.blob.bytes) : null
   const name = resumeDocumentBlobName(record.workspaceId, record.id, record.resume.documentVersion)
   let blob = await readBlob(dependencies.blobs, name, record.extraction?.document)
@@ -726,6 +737,15 @@ async function extractSource(
         title: record.source.kind !== 'url' ? record.source.fileName : 'Imported resume',
         paragraphs: extracted.paragraphs,
       }
+    } else if (markdown) {
+      const extracted = extractMarkdown(original.blob.bytes, {
+        defaultHeading: 'Resume', maxCharacters: LIMITS.maxSourceCharacters,
+        emptySourceMessage: 'The Markdown file did not contain readable resume text.',
+      })
+      document = {
+        id: resumeDocumentId(record.id), kind: 'resume', sample: false, version: record.resume.documentVersion,
+        title: extracted.title?.slice(0, 500) ?? record.source.displayName, paragraphs: extracted.paragraphs,
+      }
     } else {
       const extracted = extractResumeHtml(decodeHtml(original.blob.bytes), original.capture.finalUrl!)
       sourceWarnings = extracted.warnings
@@ -737,13 +757,13 @@ async function extractSource(
     if (characterCount(document) > LIMITS.maxSourceCharacters) throw failure('source-too-large', false, 'parsing')
     if (validateRealResumeDocument(document).length) throw failure('invalid-source', false, 'parsing')
     blob = await saveBlob(lease, dependencies.blobs, name, Buffer.from(JSON.stringify(document)), 'application/json')
-  } else if (!pdf && !word) {
+  } else if (original.blob.contentType === 'text/html') {
     // Re-check retained HTML, including access walls, rather than trusting a cache to legitimize it.
     sourceWarnings = extractResumeHtml(decodeHtml(original.blob.bytes), original.capture.finalUrl!).warnings
   }
   const document = documentFromBlob(blob, record)
   const extraction: ResumeExtractionProvenance = record.extraction ?? {
-    method: original.method, version: word ? WORD_EXTRACTION_VERSION : EXTRACTION_VERSION, extractedAt: updatedAt(record, lease.clock),
+    method: original.method, version: word ? WORD_EXTRACTION_VERSION : markdown ? MARKDOWN_EXTRACTION_VERSION : EXTRACTION_VERSION, extractedAt: updatedAt(record, lease.clock),
     pagination: documentPagination(original.capture.original.contentType), pageCount, normalizedCharacters: characterCount(document),
     document: {
       ...jsonReference(name, blob), documentId: document.id, documentVersion: document.version,

@@ -7,10 +7,11 @@ import {
   type ResumeCaptureManifest, type ResumeDuplicateWarning, type ResumeEntity, type ResumeImportBatchRecord,
   type VersionedResumeEntity,
 } from '../../src/domain/real-resumes'
+import { decodeMarkdown, MarkdownInputError } from '../documents/markdown'
 import { conflict, HttpError, invalidRequest, notFound, unavailable } from '../errors'
 import { WORKSPACE_ID_PATTERN } from '../ids'
 import { StoreConflictError, StoreNotFoundError } from '../store'
-import { originalExtension, UPLOAD_CONTENT_TYPES, uploadFormatFromFilename, type UploadContentType } from '../../src/domain/document-formats'
+import { originalExtension, UPLOAD_CONTENT_TYPES, uploadFormatFromFilename, type UploadContentType, type UploadFormat } from '../../src/domain/document-formats'
 import { validateWordUpload } from '../documents/upload'
 import type { RealResumesDeps, ResumeBlob, ResumeTransaction } from './store'
 import {
@@ -44,6 +45,7 @@ interface ImportReceipt extends ResumeImportRequest {
   inputFingerprint: string
   pdfSha256?: string
   fileSha256?: string
+  markdownSha256?: string
 }
 
 const receiptShape = {
@@ -55,7 +57,11 @@ const receiptShape = {
   inputFingerprint: z.string().regex(/^[a-f0-9]{64}$/),
 }
 const receiptSchema = z.discriminatedUnion('schemaVersion', [
-  z.strictObject({ ...receiptShape, schemaVersion: z.literal(1), pdfSha256: z.string().regex(/^[a-f0-9]{64}$/).optional() }),
+  z.strictObject({
+    ...receiptShape, schemaVersion: z.literal(1),
+    pdfSha256: z.string().regex(/^[a-f0-9]{64}$/).optional(),
+    markdownSha256: z.string().regex(/^[a-f0-9]{64}$/).optional(),
+  }),
   z.strictObject({ ...receiptShape, schemaVersion: z.literal(2), fileSha256: z.string().regex(/^[a-f0-9]{64}$/) }),
 ])
 const same = (left: unknown, right: unknown) => resumeContentHash(left) === resumeContentHash(right)
@@ -327,7 +333,8 @@ export class RealResumeService {
       stored.batchId !== candidate.batchId || stored.idempotencyKey !== candidate.idempotencyKey ||
       stored.createdBy !== candidate.createdBy || stored.inputCount !== candidate.inputCount ||
       stored.schemaVersion !== candidate.schemaVersion ||
-      (stored.schemaVersion === 1 ? stored.pdfSha256 !== candidate.pdfSha256 : stored.fileSha256 !== candidate.fileSha256) ||
+      (stored.schemaVersion === 1 ? stored.pdfSha256 !== candidate.pdfSha256 || stored.markdownSha256 !== candidate.markdownSha256
+        : stored.fileSha256 !== candidate.fileSha256) ||
       !same(stored.source, candidate.source)) {
       throw unavailable('The saved resume import receipt does not match its immutable request binding.')
     }
@@ -339,7 +346,9 @@ export class RealResumeService {
   ): Promise<ResumeImportResult> {
     const word = source.kind === 'docx' || source.kind === 'doc'
     const fileHash = file ? resumeSha256(file) : undefined
-    const hashFields = word ? { fileSha256: fileHash } : { pdfSha256: fileHash }
+    // Preserve each format's original receipt and fingerprint fields on replay.
+    const hashFields = word ? { fileSha256: fileHash }
+      : source.kind === 'markdown' ? { markdownSha256: fileHash } : { pdfSha256: fileHash }
     const inputFingerprint = resumeContentHash({ source, batchId: input.batchId, inputCount: input.inputCount, createdBy: input.createdBy, ...hashFields })
     const candidate: ImportReceipt = {
       ...input, schemaVersion: word ? 2 : 1, dataKind: 'real', workspaceId, resumeId: resumeIdForKey(input.idempotencyKey),
@@ -370,7 +379,8 @@ export class RealResumeService {
       const name = resumeOriginalBlobName(workspaceId, record.id, source.kind)
       const result = await this.blobs.putImmutable(name, file, contentType)
       const original = resumeBlobReference(name, result.blob)
-      if (original.sha256 !== (word ? receipt.fileSha256 : receipt.pdfSha256) ||
+      const expectedHash = word ? receipt.fileSha256 : source.kind === 'markdown' ? receipt.markdownSha256 : receipt.pdfSha256
+      if (original.sha256 !== expectedHash ||
         original.bytes !== file.byteLength || original.contentType !== contentType) {
         throw conflict('The original saved under this idempotency key is different. Nothing has been overwritten.')
       }
@@ -436,12 +446,35 @@ export class RealResumeService {
     throw conflict('This import batch is busy. Retry this item with the same idempotency key and batch headers.')
   }
 
-  async importPdf(workspaceId: string, input: ResumeImportRequest, filename: string, bytes: Uint8Array): Promise<ResumeImportResult> {
+  private async importUploadedFile(
+    workspaceId: string, input: ResumeImportRequest, kind: UploadFormat, filename: string, bytes: Uint8Array,
+  ): Promise<ResumeImportResult> {
     validateRequest(workspaceId, input)
-    if (!isSafeResumeFilename(filename) || uploadFormatFromFilename(filename) !== 'pdf') throw invalidRequest('X-File-Name must be a safe PDF basename.')
+    const label = kind === 'markdown' ? 'Markdown' : kind.toUpperCase()
+    if (!isSafeResumeFilename(filename, kind)) throw invalidRequest(`X-File-Name must be a safe ${label} basename.`)
+    if (!(bytes instanceof Uint8Array)) throw invalidRequest(`The request must contain raw ${label} bytes.`)
     const body = Buffer.from(bytes)
-    await validatePdf(body)
-    return this.import(workspaceId, input, { kind: 'pdf', displayName: filename, fileName: filename }, body)
+    if (kind === 'pdf') await validatePdf(body)
+    else if (kind === 'markdown') {
+      try { decodeMarkdown(body, LIMITS.maxMarkdownBytes) } catch (error) {
+        if (error instanceof MarkdownInputError) {
+          throw new HttpError(error.code === 'markdown-too-large' ? 413 : 400, 'invalid_request', error.message)
+        }
+        throw error
+      }
+    } else {
+      if (body.byteLength > LIMITS.maxFileBytes) throw new HttpError(413, 'invalid_request', 'Resume files may not exceed 10 MiB.')
+      await validateWordUpload(body, kind)
+    }
+    return this.import(workspaceId, input, { kind, displayName: filename, fileName: filename }, body)
+  }
+
+  async importPdf(workspaceId: string, input: ResumeImportRequest, filename: string, bytes: Uint8Array): Promise<ResumeImportResult> {
+    return this.importUploadedFile(workspaceId, input, 'pdf', filename, bytes)
+  }
+
+  async importMarkdown(workspaceId: string, input: ResumeImportRequest, filename: string, bytes: Uint8Array): Promise<ResumeImportResult> {
+    return this.importUploadedFile(workspaceId, input, 'markdown', filename, bytes)
   }
 
   async importFile(
@@ -449,14 +482,10 @@ export class RealResumeService {
   ): Promise<ResumeImportResult> {
     validateRequest(workspaceId, input)
     const format = uploadFormatFromFilename(filename)
-    if (!isSafeResumeFilename(filename) || !format || UPLOAD_CONTENT_TYPES[format] !== contentType) {
-      throw invalidRequest('The upload filename and Content-Type must match a supported PDF, DOCX, or DOC file.')
+    if (!format || UPLOAD_CONTENT_TYPES[format] !== contentType) {
+      throw invalidRequest('The upload filename and Content-Type must match a supported PDF, Markdown, DOCX, or DOC file.')
     }
-    if (format === 'pdf') return this.importPdf(workspaceId, input, filename, bytes)
-    if (bytes.byteLength > LIMITS.maxFileBytes) throw new HttpError(413, 'invalid_request', 'Resume files may not exceed 10 MiB.')
-    const body = Buffer.from(bytes)
-    await validateWordUpload(body, format)
-    return this.import(workspaceId, input, { kind: format, displayName: filename, fileName: filename }, body)
+    return this.importUploadedFile(workspaceId, input, format, filename, bytes)
   }
 
   async importUrl(workspaceId: string, input: ResumeImportRequest, value: unknown): Promise<ResumeImportResult> {

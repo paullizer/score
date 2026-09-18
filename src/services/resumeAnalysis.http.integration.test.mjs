@@ -104,6 +104,40 @@ test('Word file HTTP capabilities fail closed while existing PDF wrapper and rec
   } finally { await fixture.close() }
 })
 
+test('combined Markdown and Word file HTTP batches preserve dedicated routes, exact bytes and declared mixed-batch size', async () => {
+  const fixture = await startResumeAnalysisFixture(runtime, { configOverrides: { wordDocumentImports: true } })
+  try {
+    const features = await jsonResponse(await fixture.request('/api/features'))
+    assert.equal(features.markdownJobImports, true)
+    assert.equal(features.markdownResumeImports, true)
+    assert.equal(features.wordDocumentImports, true)
+    const batchId = randomUUID()
+    const files = [
+      new File(['# Jordan Example\n\nEngineering experience.'], 'resume.MD', { type: 'text/plain' }),
+      new File([docxFile()], 'resume.DOCX'),
+      new File([legacyDocFile()], 'resume.DOC'),
+      await resumePdf(),
+    ]
+    const saved = []
+    for (const file of files) {
+      const imported = await importResumeFile(fixture, file, { batchId, inputCount: 5 })
+      saved.push(imported.summary)
+      const original = await fixture.request(`/api/workspaces/${fixture.workspaceId}/resumes/${imported.summary.resume.id}/original`)
+      assert.equal(original.status, 200)
+      assert.deepEqual(Buffer.from(await original.arrayBuffer()), Buffer.from(await file.arrayBuffer()))
+    }
+    assert.deepEqual(saved.map((item) => item.source.kind), ['markdown', 'docx', 'doc', 'pdf'])
+    assert.equal(new Set(saved.map((item) => item.resume.id)).size, 4)
+    const batch = [...fixture.resumes.store.values.values()].find(({ record }) => record.recordType === 'resume-batch').record
+    assert.equal(batch.inputCount, 5, 'The invalid frontend item still occupies its declared batch slot, but is not uploaded.')
+    assert.equal(batch.items.length, 4)
+    const posts = fixture.requests.filter((request) => request.method === 'POST')
+    assert.deepEqual(posts.map((request) => request.url.split('/').at(-1)), ['markdown', 'file', 'file', 'pdf'])
+    assert.equal(fixture.analyses.store.values.size, 0)
+    assert.equal(fixture.state.saves.length, 0)
+  } finally { await fixture.close() }
+})
+
 test('real resume intake preserves actual bytes, same-basename people, duplicate warnings, and idempotent batch receipts', async () => {
   const fixture = await startResumeAnalysisFixture(runtime)
   try {
@@ -450,17 +484,17 @@ test('real analyses score exact saved job and approved GS versions and retain in
   } finally { await fixture.close() }
 })
 
-test('one hundred real comparisons initialize in bounded chunks; a unique 101st target is rejected without work', async () => {
-  const fixture = await startResumeAnalysisFixture(runtime, { pageSize: 7 })
+test('500 real comparisons finish across bounded chunks and pages; a unique 501st target is rejected without work', async () => {
+  const fixture = await startResumeAnalysisFixture(runtime, { pageSize: 50 })
   try {
     const imported = await importResumePdf(fixture, await resumePdf())
     const stubs = processingStubs(fixture)
     await processAllResumes(fixture, stubs)
     const resume = await jsonResponse(await fixture.request(`/api/workspaces/${fixture.workspaceId}/resumes/${imported.summary.resume.id}`))
-    for (let index = 0; index < 101; index++) await seedRealJob(fixture)
+    for (let index = 0; index < 501; index++) await seedRealJob(fixture)
     const targets = (await allPages(fixture, `/api/workspaces/${fixture.workspaceId}/analyses/targets`, 'targets'))
       .filter((target) => target.kind === 'job' && target.selection.rubricVersion === 2)
-    assert.equal(targets.length, 101)
+    assert.equal(targets.length, 501)
     const input = { name: 'Bounded comparison batch', resumes: [resumeSelection(resume)], targets: targets.map((target) => target.selection) }
     const oversized = await fixture.request(`/api/workspaces/${fixture.workspaceId}/analyses`, {
       method: 'POST', headers: { 'Content-Type': 'application/json', 'Idempotency-Key': randomUUID() }, body: JSON.stringify(input),
@@ -471,25 +505,25 @@ test('one hundred real comparisons initialize in bounded chunks; a unique 101st 
 
     const created = (await jsonResponse(await fixture.request(`/api/workspaces/${fixture.workspaceId}/analyses`, {
       method: 'POST', headers: { 'Content-Type': 'application/json', 'Idempotency-Key': randomUUID() },
-      body: JSON.stringify({ ...input, targets: input.targets.slice(0, 100) }),
+      body: JSON.stringify({ ...input, targets: input.targets.slice(0, 500) }),
     }), [200, 202])).run
     await processAllAnalyses(fixture, stubs)
     const runPath = `/api/workspaces/${fixture.workspaceId}/analyses/${created.run.id}`
     const run = await jsonResponse(await fixture.request(runPath))
     const comparisons = await allPages(fixture, `${runPath}/comparisons`, 'comparisons')
     assert.equal(run.run.status, 'complete')
-    assert.equal(run.run.progress.total, 100)
-    assert.equal(run.run.progress.initialized, 100)
-    assert.equal(run.run.progress.complete, 100)
-    assert.equal(comparisons.length, 100)
-    assert.equal(new Set(comparisons.map(({ comparison }) => comparison.id)).size, 100)
+    assert.equal(run.run.progress.total, 500)
+    assert.equal(run.run.progress.initialized, 500)
+    assert.equal(run.run.progress.complete, 500)
+    assert.equal(comparisons.length, 500)
+    assert.equal(new Set(comparisons.map(({ comparison }) => comparison.id)).size, 500)
     assert.ok(comparisons.every(({ comparison }) => comparison.resultSummary.overall.score === 60))
     const chunks = fixture.analyses.store.transactions.filter((operations) =>
       operations.some((operation) => operation.kind === 'create' && operation.record.recordType === 'analysis-comparison'))
-    assert.ok(chunks.length >= 4)
+    assert.ok(chunks.length >= 20)
     assert.ok(chunks.every((operations) => operations.filter((operation) => operation.kind === 'create' &&
       operation.record.recordType === 'analysis-comparison').length <= 25))
-    assert.equal(stubs.modelCalls.filter((request) => request.response_format.json_schema.name === 'resume_rubric_assessment').length, 100)
+    assert.equal(stubs.modelCalls.filter((request) => request.response_format.json_schema.name === 'resume_rubric_assessment').length, 500)
     assert.equal(fixture.state.saves.length, 0)
   } finally { await fixture.close() }
 })

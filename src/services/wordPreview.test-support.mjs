@@ -111,7 +111,7 @@ function tree() {
   const source = {kind:format,displayName:fileName,originalContentType:original.contentType,bytes:original.bytes,sha256:original.sha256,capturedAt:stamp};
   const summary = {job,source,rubric,etag:'"one"',updatedAt:stamp,attempts:1,warnings:[]};
   const detail = {...summary,document:sourceDocument,rubricVersions:[rubric]};
-  const features = {realJobImports:true,realResumeImports:true,wordDocumentImports:config.wordEnabled,limits:JOB_IMPORT_LIMITS,resumeLimits:RESUME_IMPORT_LIMITS};
+  const features = {realJobImports:true,realResumeImports:true,markdownJobImports:config.markdownJobEnabled===true,markdownResumeImports:config.markdownResumeEnabled===true,wordDocumentImports:config.wordEnabled,limits:JOB_IMPORT_LIMITS,resumeLimits:RESUME_IMPORT_LIMITS};
   const originalUrl = (kind, recordId) => '/api/workspaces/'+encodeURIComponent(workspaceId)+'/'+kind+'/'+encodeURIComponent(recordId)+'/original';
   const realJobs = {phase:'ready',features,summaries:mode==='job-import'?[]:[summary],error:null,detail:()=>({state:'ready',value:detail}),source:()=>source,ensureDetail:done,refresh:done,
     importFile:(file,key,batch)=>importRealJobFile(workspaceId,file,key,batch),importPdf:(file,key,batch)=>importRealJobPdf(workspaceId,file,key,batch),importUrl:(url,key,batch)=>importRealJobUrl(workspaceId,url,key,batch),
@@ -182,7 +182,7 @@ export async function startWordPreviewFixture(runtime, options = {}) {
       requests.push(request)
       const json = (value, status = 200) => { res.writeHead(status, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' }); res.end(JSON.stringify(value)) }
       if (path === '/test-state') { json(state); return }
-      if (path === '/api/features') { json({ realJobImports: true, realResumeImports: true, wordDocumentImports: state.wordEnabled }); return }
+      if (path === '/api/features') { json({ realJobImports: true, realResumeImports: true, markdownJobImports: state.markdownJobEnabled === true, markdownResumeImports: state.markdownResumeEnabled === true, wordDocumentImports: state.wordEnabled }); return }
       if (/\/original$/.test(path)) {
         if (!req.headers.cookie?.includes('private-session=authorized')) { json({ error: 'Unauthorized' }, 401); return }
         if (controls.original && await controls.original(req, res, request)) return
@@ -190,13 +190,14 @@ export async function startWordPreviewFixture(runtime, options = {}) {
         res.end(bytes)
         return
       }
-      if (/\/(?:resumes|jobs)\/(?:file|pdf|url)$/.test(path) && req.method === 'POST') {
+      if (/\/(?:resumes|jobs)\/(?:file|pdf|markdown|url)$/.test(path) && req.method === 'POST') {
         const chunks = []
         for await (const chunk of req) chunks.push(chunk)
         request.bytes = Buffer.concat(chunks)
         if (controls.upload && await controls.upload(req, res, request)) return
         const name = decodeURIComponent(req.headers['x-file-name'] ?? '')
-        const type = name.split('.').at(-1).toLowerCase()
+        const extension = name.split('.').at(-1).toLowerCase()
+        const type = extension === 'md' ? 'markdown' : extension
         const id = `${path.includes('/resumes/') ? 'resume' : 'job'}-${requests.filter((entry) => entry.method === 'POST').length}`
         const stamp = '2026-09-18T10:00:00.000Z'
         const source = path.endsWith('/url') ? { kind: 'url', displayName: 'Public profile', url: JSON.parse(request.bytes).url } : { kind: type, displayName: name, fileName: name }

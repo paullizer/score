@@ -87,18 +87,23 @@ test('feature discovery keeps existing fields, authenticated privacy, and author
   assert.equal(response.headers.get('cache-control'), 'no-store')
   const features = await response.json()
   assert.equal(features.realJobImports, false)
+  assert.equal(features.markdownJobImports, false)
   assert.equal(features.realGradeLadders, false)
   assert.equal(features.realResumeImports, false)
+  assert.equal(features.markdownResumeImports, false)
   assert.equal(features.realAnalyses, false)
   assert.equal(features.wordDocumentImports, false)
+  assert.equal(features.limits.maxFileBytes, 10 * 1024 * 1024)
   assert.equal(features.limits.maxPdfBytes, 10 * 1024 * 1024)
+  assert.equal(features.limits.maxMarkdownBytes, 10 * 1024 * 1024)
   assert.ok(features.gradeLimits)
   assert.deepEqual(features.resumeLimits, {
-    maxFileBytes: 10 * 1024 * 1024, maxPdfBytes: 10 * 1024 * 1024, maxPdfPages: 50, maxSourceCharacters: 180_000,
+    maxFileBytes: 10 * 1024 * 1024, maxPdfBytes: 10 * 1024 * 1024, maxMarkdownBytes: 10 * 1024 * 1024,
+    maxPdfPages: 50, maxSourceCharacters: 180_000,
     maxBatchItems: 10, maxUrlLength: 4096, maxAutomaticAttempts: 3,
   })
   assert.deepEqual(features.analysisLimits, {
-    maxComparisons: 100, initializationChunkSize: 25, maxAutomaticAttempts: 3, maxOutputCorrections: 1,
+    maxComparisons: 500, initializationChunkSize: 25, maxAutomaticAttempts: 3, maxOutputCorrections: 1,
   })
 })
 
@@ -113,6 +118,8 @@ test('resume availability requires both explicit configuration and constructed d
     const url = await featureServer(t, config, deps)
     const features = await (await fetch(url, { headers: authHeaders() })).json()
     assert.equal(features.realResumeImports, expected)
+    assert.equal(features.markdownResumeImports, expected)
+    assert.equal(features.wordDocumentImports, false)
     assert.equal(features.realAnalyses, false)
   }
 })

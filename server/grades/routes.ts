@@ -3,7 +3,7 @@ import ipaddr from 'ipaddr.js'
 import { PDFDocument } from 'pdf-lib'
 import { z } from 'zod'
 import { GRADE_LADDER_LIMITS } from '../../src/domain/real-grades'
-import { originalExtension } from '../../src/domain/document-formats'
+import { isOriginalContentType, originalExtension } from '../../src/domain/document-formats'
 import { HttpError, invalidRequest, notFound, preconditionRequired, unavailable } from '../errors'
 import type { RealJobsDeps } from '../jobs/routes'
 import { isUuid } from '../jobs/validation'
@@ -249,6 +249,7 @@ export function createRealGradesRouter(deps: GradeRouterDeps): Router {
   })
   router.get(`${base}/:ladderId/sources/:sourceId/original`, async (req, res) => {
     const blob = await requireService().original(workspaceId(req), ladderId(req), sourceId(req), historicalSourceSet(req))
+    if (!isOriginalContentType(blob.contentType)) throw unavailable('The source original has invalid content metadata.')
     res.setHeader('Content-Type', blob.contentType)
     res.setHeader('Content-Disposition', `attachment; filename="${sourceId(req)}.${originalExtension(blob.contentType)}"`)
     res.setHeader('X-Content-Type-Options', 'nosniff')

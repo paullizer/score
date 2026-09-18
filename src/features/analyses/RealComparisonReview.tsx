@@ -3,14 +3,13 @@ import { ArrowUpRight, ChevronDown, FileText, Layers3, LoaderCircle, Quote, Scan
 import { useRealAnalyses } from '../../app/real-analyses-context'
 import type { RealAnalysisComparisonDetail, RealAnalysisDocumentResponse, RealCriterionResult } from '../../domain/real-analyses'
 import type { Citation } from '../../domain/types'
-import { documentPagination } from '../../domain/document-formats'
+import { documentPagination, type DocumentPagination } from '../../domain/document-formats'
 import { gradeSourcePagination } from '../grade-ladders/gradeUi'
 import { Badge, Button, EmptyState, InlineError, Score, SegmentedControl } from '../../components/ui'
 import { DocumentViewer } from '../../components/documents/DocumentViewer'
 import { citationMatches, targetVersionLabel } from './realAnalysisUi'
 
 type EvidenceSelection = { kind: 'resume' | 'requirement'; citation: Citation; label: string }
-type Pagination = 'pdf-pages' | 'html-sections' | 'captured-sections'
 const evidenceLabels = { supported: 'Supported', partial: 'Partial support', missing: 'Missing evidence', 'not-assessed': 'Not assessed', 'not-applicable': 'Not applicable · unscored' }
 
 function EvidenceStatus({ status }: { status: RealCriterionResult['evidenceStatus'] }) {
@@ -141,7 +140,7 @@ function SavedEvidence({ detail, selection }: { detail: RealAnalysisComparisonDe
   const api = useRealAnalyses()
   const service = useRef(api)
   service.current = api
-  const [loaded, setLoaded] = useState<{ key: string; document: RealAnalysisDocumentResponse['document']; pagination: Pagination } | null>(null)
+  const [loaded, setLoaded] = useState<{ key: string; document: RealAnalysisDocumentResponse['document']; pagination: DocumentPagination } | null>(null)
   const [failure, setFailure] = useState<{ key: string; message: string } | null>(null)
   const [retry, setRetry] = useState(0)
   const key = selection ? JSON.stringify([selection.kind, selection.citation]) : ''
@@ -155,7 +154,7 @@ function SavedEvidence({ detail, selection }: { detail: RealAnalysisComparisonDe
       const resume = detail.resumeSnapshot
       const target = detail.targetSnapshot
       let document: RealAnalysisDocumentResponse['document']
-      let pagination: Pagination
+      let pagination: DocumentPagination
       if (kind === 'resume') {
         if (resume.document.id !== citation.documentId || resume.document.version !== citation.documentVersion) {
           throw new Error('This quotation does not belong to this comparison’s saved resume. No other applicant or requirement source can substitute for it.')
@@ -167,7 +166,7 @@ function SavedEvidence({ detail, selection }: { detail: RealAnalysisComparisonDe
         pagination = documentPagination(target.original.contentType)
       } else if (target.kind === 'grade' && target.seed.document.id === citation.documentId && target.seed.document.version === citation.documentVersion) {
         document = target.seed.document
-        pagination = target.seed.source.originalContentType ? documentPagination(target.seed.source.originalContentType) : 'captured-sections'
+        pagination = documentPagination(target.seed.source.originalContentType)
       } else {
         const reference = target.kind === 'grade' ? target.references.find((item) => item.document.documentId === citation.documentId && item.document.documentVersion === citation.documentVersion) : undefined
         if (!reference) throw new Error('This requirement quotation is not part of this comparison’s frozen target sources.')

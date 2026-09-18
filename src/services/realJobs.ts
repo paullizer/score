@@ -6,9 +6,10 @@ import {
   type RealJobsPage,
   type RealJobSummary,
 } from '../domain/real-jobs'
+import { isSafeUploadedFilename, uploadedFileKind } from '../domain/source-files'
 import { cloudJsonRequest } from './cloudWorkspace'
 import { UPLOAD_CONTENT_TYPES, type UploadFormat } from '../domain/document-formats'
-import { requireUploadFile } from './documentUploads'
+import { requireUploadFile, uploadFileByteLimit } from './documentUploads'
 
 type RealJobWireSummary = RealJobSummary
 
@@ -26,14 +27,15 @@ function normalizeSummary(summary: RealJobWireSummary): RealJobSummary {
 }
 
 export async function fetchJobProcessingFeatures(signal?: AbortSignal): Promise<JobProcessingFeatures> {
-  const features = await cloudJsonRequest<JobProcessingFeatures>('/features', { method: 'GET', signal })
+  const features = await cloudJsonRequest<Partial<JobProcessingFeatures>>('/features', { method: 'GET', signal })
   return {
     realJobImports: features.realJobImports === true,
-    wordDocumentImports: features.wordDocumentImports === true,
+    markdownJobImports: features.realJobImports === true && features.markdownJobImports === true,
+    wordDocumentImports: features.realJobImports === true && features.wordDocumentImports === true,
     limits: {
       ...JOB_IMPORT_LIMITS,
       ...features.limits,
-      maxFileBytes: features.limits?.maxFileBytes ?? features.limits?.maxPdfBytes ?? JOB_IMPORT_LIMITS.maxFileBytes,
+      maxFileBytes: Math.min(features.limits?.maxFileBytes ?? JOB_IMPORT_LIMITS.maxFileBytes, JOB_IMPORT_LIMITS.maxFileBytes),
     },
   }
 }
@@ -66,37 +68,26 @@ export async function getRealJob(workspaceId: string, jobId: string, signal?: Ab
   return { ...normalizeSummary(detail), document: detail.document, rubricVersions: detail.rubricVersions }
 }
 
-export async function importRealJobPdf(
+async function importRealJobUpload(
   workspaceId: string,
   file: File,
+  kind: UploadFormat,
   idempotencyKey: string,
   batchId?: string,
   signal?: AbortSignal,
 ): Promise<RealJobSummary> {
-  requireUploadFile(file, ['pdf'])
-  return importFile(workspaceId, file, 'pdf', idempotencyKey, batchId, signal)
-}
-
-export async function importRealJobFile(
-  workspaceId: string,
-  file: File,
-  idempotencyKey: string,
-  batchId?: string,
-  signal?: AbortSignal,
-): Promise<RealJobSummary> {
-  return importFile(workspaceId, file, requireUploadFile(file), idempotencyKey, batchId, signal)
-}
-
-async function importFile(
-  workspaceId: string,
-  file: File,
-  format: UploadFormat,
-  idempotencyKey: string,
-  batchId?: string,
-  signal?: AbortSignal,
-): Promise<RealJobSummary> {
+  const label = kind === 'markdown' ? 'Markdown' : kind.toUpperCase()
+  const actualKind = uploadedFileKind(file)
+  // Only legacy job PDF calls leave malformed PDF basenames to the server.
+  if (actualKind !== kind && !(kind === 'pdf' && actualKind === undefined && file.type === 'application/pdf')) {
+    throw new Error(`${actualKind?.toUpperCase() ?? 'Unsupported'} uploads are not enabled for this method. Choose a ${label} file with a safe ${kind === 'markdown' ? '.md or .markdown' : `.${kind}`} filename.`)
+  }
+  if (kind !== 'pdf' && !isSafeUploadedFilename(file.name, kind)) throw new Error(`Choose a ${label} file with a safe ${kind === 'markdown' ? '.md or .markdown' : `.${kind}`} filename.`)
+  const maxBytes = uploadFileByteLimit(kind, JOB_IMPORT_LIMITS)
+  if (!file.size || file.size > maxBytes) throw new Error(`Choose a nonempty ${label} file no larger than ${maxBytes / 1024 / 1024} MiB.`)
+  if (kind === 'docx' || kind === 'doc') requireUploadFile(file, [kind])
   const headers = new Headers({
-    'Content-Type': UPLOAD_CONTENT_TYPES[format],
+    'Content-Type': UPLOAD_CONTENT_TYPES[kind],
     'X-File-Name': encodeURIComponent(file.name),
     'Idempotency-Key': idempotencyKey,
   })
@@ -104,13 +95,33 @@ async function importFile(
   signal?.throwIfAborted()
   const bytes = await file.arrayBuffer()
   signal?.throwIfAborted()
-  const response = await cloudJsonRequest<{ job: RealJobWireSummary }>(`${jobsPath(workspaceId)}/${format === 'pdf' ? 'pdf' : 'file'}`, {
+  const response = await cloudJsonRequest<{ job: RealJobWireSummary }>(`${jobsPath(workspaceId)}/${kind === 'pdf' || kind === 'markdown' ? kind : 'file'}`, {
     method: 'POST',
     headers,
     body: bytes,
     signal,
   })
   return normalizeSummary(response.job)
+}
+
+export function importRealJobPdf(
+  workspaceId: string, file: File, idempotencyKey: string, batchId?: string, signal?: AbortSignal,
+): Promise<RealJobSummary> {
+  return importRealJobUpload(workspaceId, file, 'pdf', idempotencyKey, batchId, signal)
+}
+
+export function importRealJobMarkdown(
+  workspaceId: string, file: File, idempotencyKey: string, batchId?: string, signal?: AbortSignal,
+): Promise<RealJobSummary> {
+  return importRealJobUpload(workspaceId, file, 'markdown', idempotencyKey, batchId, signal)
+}
+
+export async function importRealJobFile(
+  workspaceId: string, file: File, idempotencyKey: string, batchId?: string, signal?: AbortSignal,
+): Promise<RealJobSummary> {
+  const kind = uploadedFileKind(file) ?? (file.type === 'application/pdf' ? 'pdf' : undefined)
+  if (!kind) throw new Error('Choose a supported file: PDF, Markdown (.md or .markdown), DOCX or DOC. Other formats are not supported.')
+  return importRealJobUpload(workspaceId, file, kind, idempotencyKey, batchId, signal)
 }
 
 export async function importRealJobUrl(

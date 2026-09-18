@@ -175,7 +175,9 @@ function RealResumesProvider({ workspaceId, children }: { workspaceId: string; c
     if (!inputs.length) throw new Error('Choose supported files or enter at least one public URL, one per line.')
     const id = currentBatchRef.current ?? newBatch()
     const batch = batchesRef.current.find((item) => item.id === id)!
-    const next = appendResumeInputs(batch, inputs, featuresRef.current?.resumeLimits, supportedUploadFormats(featuresRef.current))
+    const next = appendResumeInputs(batch, inputs, featuresRef.current?.resumeLimits, supportedUploadFormats({
+      markdownResumeImports: featuresRef.current?.markdownResumeImports, wordDocumentImports: featuresRef.current?.wordDocumentImports,
+    }))
     putBatches(batchesRef.current.map((item) => item.id === id ? next : item))
   }
 
@@ -199,12 +201,19 @@ function RealResumesProvider({ workspaceId, children }: { workspaceId: string; c
       try {
         const summary = await mutate(`import:${item.key}`, () => {
           if (item.source.kind === 'url') return api.importRealResumeUrl(workspaceId, item.source.url, item.key, batchId, inputCount)
+          if (item.source.kind === 'unsupported') throw new Error('This file type is not supported. It has not been sent.')
           if (!item.source.file) throw new Error('The accepted file is now server-owned. Inspect its saved record instead of resending it.')
+          if (item.source.kind === 'markdown' && !featuresRef.current?.markdownResumeImports) {
+            throw new Error('Markdown resume imports are not enabled in this deployment. PDFs and public URLs are still supported.')
+          }
+          if ((item.source.kind === 'docx' || item.source.kind === 'doc') && !featuresRef.current?.wordDocumentImports) {
+            throw new Error('Word document imports are not enabled in this deployment.')
+          }
           return api.importRealResumeFile(workspaceId, item.source.file, item.key, batchId, inputCount)
         })
         updateItem(batchId, item.key, {
           state: 'accepted', resumeId: summary.resume.id, error: undefined,
-          source: item.source.kind === 'url' ? item.source : { kind: item.source.kind, file: null },
+          source: item.source.kind === 'url' || item.source.kind === 'unsupported' ? item.source : { kind: item.source.kind, file: null },
         })
       } catch (caught) {
         // A request can be accepted even when its response is lost. Retrying preserves both keys and bytes.

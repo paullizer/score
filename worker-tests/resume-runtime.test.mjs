@@ -249,6 +249,9 @@ function fixture(options = {}) {
     async upload(bytes, name = 'same-name.pdf', workspace = WORKSPACE, extra) {
       return (await service.importPdf(workspace, request(extra), name, bytes)).resume.resume.id
     },
+    async markdown(bytes, name = 'same-name.md', workspace = WORKSPACE, extra) {
+      return (await service.importMarkdown(workspace, request(extra), name, bytes)).resume.resume.id
+    },
     async record(id, workspace = WORKSPACE) { return (await store.get(workspace, id)).record },
     async detail(id, workspace = WORKSPACE) { return service.detail(workspace, id) },
     async cancel(id) {
@@ -294,6 +297,63 @@ async function assertReady(run, id, workspace = WORKSPACE) {
   }
   return { record, detail }
 }
+
+test('Markdown resume originals produce grounded metadata and section citations without OCR or public requests', async () => {
+  const bytes = Buffer.from(`\ufeff# ${NAME}\r\n\r\n${ROLE}\r\n\r\nSeattle, Washington\r\n\r\n## Experience\r\n\r\n${EXPERIENCE}\r\n`)
+  const run = fixture({ browser: { render: async () => { throw new Error('Markdown must not render HTML') } } })
+  const id = await run.markdown(bytes, 'Filename is not a person.MARKDOWN')
+  assert.equal((await run.record(id)).resume.name, null)
+  assert.deepEqual(await runResumeWorker(run.deps), { claimed: 1, completed: 1 })
+  const { record, detail } = await assertReady(run, id)
+  assert.equal(detail.resume.name, NAME)
+  assert.equal(detail.resume.role, ROLE)
+  assert.equal(record.capture.original.contentType, 'text/markdown')
+  assert.ok(record.capture.original.blobName.endsWith('/original.md'))
+  assert.equal(record.capture.finalUrl, undefined)
+  assert.deepEqual(record.capture.redirects, [])
+  assert.equal(record.extraction.method, 'markdown')
+  assert.equal(record.extraction.version, 'score-markdown-extraction-v1')
+  assert.equal(record.extraction.pagination, 'markdown-sections')
+  assert.equal(record.extraction.pageCount, null)
+  assert.equal(run.requests.public.length, 0)
+  assert.equal(run.requests.ocr.length, 0)
+  assert.equal(run.requests.model.length, 1)
+  const original = await run.service.original(WORKSPACE, id)
+  assert.equal(original.filename, 'Filename is not a person.MARKDOWN')
+  assert.deepEqual(Buffer.from(original.bytes), bytes)
+  assert.deepEqual(await runResumeWorker(run.deps), { claimed: 0, completed: 0 })
+})
+
+test('cancelled Markdown profiling retries the identical original and cached document without OCR or refetch', async () => {
+  let cancelled = false
+  const run = fixture({
+    async modelFetch(body) {
+      if (!cancelled) {
+        cancelled = true
+        await run.cancel(id)
+      }
+      return modelResponse(body)
+    },
+  })
+  const bytes = Buffer.from(`# ${NAME}\n\n${ROLE}\n\n## Experience\n\n${EXPERIENCE}`)
+  const id = await run.markdown(bytes)
+  assert.deepEqual(await runResumeWorker(run.deps), { claimed: 1, completed: 0 })
+  const stopped = await run.record(id)
+  assert.equal(stopped.resume.status, 'cancelled')
+  assert.ok(stopped.extraction)
+  assert.equal(stopped.profileBlob, undefined)
+  const current = await run.store.get(WORKSPACE, id)
+  await run.service.retry(WORKSPACE, id, current.etag)
+  assert.deepEqual(await runResumeWorker(run.deps), { claimed: 1, completed: 1 })
+  const { record } = await assertReady(run, id)
+  assert.equal(record.retryCount, 1)
+  assert.deepEqual(record.capture, stopped.capture)
+  assert.deepEqual(record.extraction, stopped.extraction)
+  assert.equal(run.blobs.writes.filter(name => name === stopped.extraction.document.blobName).length, 1)
+  assert.deepEqual(Buffer.from((await run.service.original(WORKSPACE, id)).bytes), bytes)
+  assert.equal(run.requests.ocr.length, 0)
+  assert.equal(run.requests.public.length, 0)
+})
 
 test('actual uploaded PDF bytes take OCR and grounded profile paths; API validates every reference and quote', async () => {
   const bytes = await pdf()

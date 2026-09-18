@@ -5,6 +5,7 @@ import { WORD_DOCUMENT_LIMITS, isWordContentType, storedDocumentContentType } fr
 import {
   ANALYSIS_LIMITS, analysisRunCanScore, type AnalysisEntity, type VersionedAnalysisEntity,
 } from '../../src/domain/real-analyses'
+import { MAX_MARKDOWN_BYTES } from '../../src/domain/source-files'
 import { WORKSPACE_ID_PATTERN } from '../ids'
 import { StoreConflictError } from '../store'
 import { fetchCosmosPage } from '../cosmos-query'
@@ -291,6 +292,7 @@ function mime(name: string): string {
 function maximum(name: string): number {
   const contentType = mime(name)
   if (isWordContentType(contentType)) return WORD_DOCUMENT_LIMITS.maxFileBytes
+  if (contentType === 'text/markdown') return MAX_MARKDOWN_BYTES
   if (contentType === 'application/pdf') return 10 * 1024 * 1024
   if (contentType === 'text/html') return MAX_ANALYSIS_ORIGINAL_BYTES
   assertAnalysis(contentType === 'application/json', 'Unsupported analysis blob content type.')

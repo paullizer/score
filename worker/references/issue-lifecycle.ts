@@ -62,7 +62,8 @@ function fullExtraction(evidence: CapturedReferenceEvidence): boolean {
 }
 
 function archivedSource(source: ReferenceSourceRecord): boolean {
-  if (!source.sha256 || !/^[a-f0-9]{64}$/.test(source.sha256) || !source.originalContentType) return false
+  if (!source.sha256 || !/^[a-f0-9]{64}$/.test(source.sha256) ||
+    (source.originalContentType !== 'application/pdf' && source.originalContentType !== 'text/html')) return false
   const extension = source.originalContentType === 'application/pdf' ? 'pdf' : 'html'
   return source.originalBlobName === `${source.workspaceId}/${source.ladderId}/${source.id}/original.${extension}`
 }

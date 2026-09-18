@@ -13,6 +13,7 @@ import {
   WORD_DOCUMENT_LIMITS, isOriginalContentType, isWordContentType, originalExtension, storedDocumentContentType,
   type OriginalContentType,
 } from '../../src/domain/document-formats'
+import { isSafeUploadedFilename, MAX_MARKDOWN_BYTES } from '../../src/domain/source-files'
 import type { RealJobsDeps } from '../jobs/routes'
 import {
   extractedBlobName, isBlobInJobPrefix, originalBlobName, validateRealJobRecord,
@@ -88,6 +89,8 @@ function frozen(source: ReferenceSourceRecord): FrozenReferenceSource {
     sourceId: source.id, title: source.title, origin: source.origin, purpose: source.purpose, publisher: source.publisher,
     documentId: source.documentId, documentVersion: source.documentVersion,
     documentBlobName: source.documentBlobName, originalBlobName: source.originalBlobName, sha256: source.sha256,
+    // Preserve legacy PDF/HTML snapshot shapes and hashes.
+    ...(source.originalContentType === 'text/markdown' ? { originalContentType: source.originalContentType } : {}),
     ...(source.finalUrl ?? source.requestedUrl ? { url: source.finalUrl ?? source.requestedUrl } : {}),
     ...(source.intendedSection !== undefined ? { intendedSection: source.intendedSection } : {}),
     ...(source.revision !== undefined ? { revision: source.revision } : {}),
@@ -324,8 +327,8 @@ export class GradeService {
       extractedBlobName: extractedBlobName(workspaceId, parsed.job.id), inputFingerprint: 'captured-seed',
       createdBy: 'seed-capture', updatedAt: parsed.capturedAt, attempts: 0, warnings: [],
     }
-    if (!validateRealJobRecord(check) || validateRealSourceDocument(parsed.document).length ||
-      validateRealRubric(parsed.rubric, parsed.document).length) {
+    if (!validateRealJobRecord(check) || validateRealSourceDocument(parsed.document, parsed.source.originalContentType).length ||
+      validateRealRubric(parsed.rubric, parsed.document, parsed.source.originalContentType).length) {
       throw unavailable('The prepared seed contains invalid job, rubric, or source data.')
     }
     return parsed
@@ -355,9 +358,9 @@ export class GradeService {
       if (!current.record.extractedBlobName || !source.originalBlobName || !source.originalContentType ||
         !isBlobInJobPrefix(current.record.extractedBlobName, workspaceId, input.jobId) ||
         !isBlobInJobPrefix(source.originalBlobName, workspaceId, input.jobId) ||
-        (isWordContentType(source.originalContentType) &&
+        ((isWordContentType(source.originalContentType) || source.originalContentType === 'text/markdown') &&
           (!source.sha256 || !source.bytes || !source.capturedAt || !source.extractionMethod ||
-            !source.displayName.toLowerCase().endsWith(`.${originalExtension(source.originalContentType)}`)))) {
+            source.kind === 'url' || !isSafeUploadedFilename(source.displayName, source.kind)))) {
         throw conflict('The seed job does not have complete captured source evidence.')
       }
       const [documentBlob, original] = await Promise.all([
@@ -366,16 +369,19 @@ export class GradeService {
       if (!documentBlob || !original || original.contentType !== source.originalContentType || !original.bytes.byteLength ||
         original.sha256 !== digest(original.bytes) || (source.sha256 && original.sha256 !== source.sha256) ||
         (source.bytes !== undefined && original.bytes.byteLength !== source.bytes) ||
-        (isWordContentType(source.originalContentType) && original.bytes.byteLength > WORD_DOCUMENT_LIMITS.maxFileBytes)) {
+        (isWordContentType(source.originalContentType) && original.bytes.byteLength > WORD_DOCUMENT_LIMITS.maxFileBytes) ||
+        (source.originalContentType === 'text/markdown' && original.bytes.byteLength > MAX_MARKDOWN_BYTES)) {
         throw unavailable('The seed job evidence is unavailable or has changed.')
       }
       const document = json(documentBlob) as GradeSeedSnapshot['document']
-      if (validateRealSourceDocument(document).length || document.id !== current.record.job.documentId ||
-        validateRealRubric(rubric, document).length) throw unavailable('The selected seed rubric or document has invalid stored evidence.')
+      if (validateRealSourceDocument(document, source.originalContentType).length || document.id !== current.record.job.documentId ||
+        validateRealRubric(rubric, document, source.originalContentType).length) {
+        throw unavailable('The selected seed rubric or document has invalid stored evidence.')
+      }
       const originalName = `${workspaceId}/${ladderId}/source-${key}/original.${originalExtension(source.originalContentType)}`
       const captured = await this.blobs.putImmutable(originalName, original.bytes, original.contentType)
-      if (captured.blob.sha256 !== original.sha256 || captured.blob.contentType !== original.contentType ||
-        captured.blob.bytes.byteLength !== original.bytes.byteLength || digest(captured.blob.bytes) !== original.sha256) {
+      if (captured.blob.sha256 !== original.sha256 || digest(captured.blob.bytes) !== original.sha256 ||
+        captured.blob.bytes.byteLength !== original.bytes.byteLength || captured.blob.contentType !== original.contentType) {
         throw conflict('The prepared seed original differs from this request. Use a new idempotency key.')
       }
       const seed: GradeSeedSnapshot = {
@@ -641,6 +647,8 @@ export class GradeService {
     const contentType = storedDocumentContentType(name)
     if (!isOriginalContentType(contentType) || blob.sha256 !== sha256 || digest(blob.bytes) !== sha256 ||
       blob.contentType !== contentType || !blob.bytes.byteLength || (bytes !== undefined && blob.bytes.byteLength !== bytes) ||
+      !name.endsWith(`/original.${originalExtension(contentType)}`) ||
+      (contentType === 'text/markdown' && blob.bytes.byteLength > MAX_MARKDOWN_BYTES) ||
       (isWordContentType(contentType) && blob.bytes.byteLength > WORD_DOCUMENT_LIMITS.maxFileBytes)) {
       throw unavailable('The captured source original does not match its immutable metadata.')
     }

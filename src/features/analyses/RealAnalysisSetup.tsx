@@ -153,7 +153,7 @@ function RealAnalysisBuilder({ previous, params, fragment, transferred }: {
                 <span className="row-meta block">{summary.resume.role ?? 'Role not stated'}</span><span className="row-meta block break-all">{summary.source.displayName}</span>
                 <div className="mt-2"><Badge tone={readyRealResume(summary) ? 'success' : 'warning'}>{summary.resume.status}{summary.documentRef ? ` · document v${summary.documentRef.documentVersion}` : ''}</Badge></div></div>
             </label>)}
-            {!shownResumes.length && <div className="col-span-full"><EmptyState title="No real resumes to show" description="Import actual PDFs or public profile URLs and wait for ready status before selecting them."
+            {!shownResumes.length && <div className="col-span-full"><EmptyState title="No real resumes to show" description="Import actual PDFs, local Markdown files, or public profile URLs and wait for ready status before selecting them."
               action={<Link className="button button-secondary button-md" to="/resumes?data=real">Open real resumes</Link>} /></div>}
           </div>
           <div className="border-t px-5 py-3 text-[11px] text-muted">{ready.length} ready · public profiles may be sparse · imports do not automatically run analyses</div>

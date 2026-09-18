@@ -217,6 +217,22 @@ async function pdf() {
   }
   return originalPdf
 }
+async function sourceFile(document, options) {
+  if (typeof options === 'string') options = { kind: options === 'html' ? 'url' : options }
+  const kind = options.kind ?? 'pdf'
+  assert.ok([...api.UPLOAD_FORMATS, 'url'].includes(kind))
+  const contentType = kind === 'url' ? 'text/html' : api.UPLOAD_CONTENT_TYPES[kind]
+  const extension = api.originalExtension(contentType)
+  const url = `https://example.org/${document.kind}`
+  const text = [document.title, ...document.paragraphs.flatMap(paragraph => [paragraph.heading, paragraph.text])].join('\n')
+  return {
+    kind, contentType, extension, url, fileName: options.fileName ?? `${document.kind}.${extension}`,
+    bytes: kind === 'pdf' ? await pdf() : kind === 'docx' || kind === 'doc' ? evidenceOriginal(kind, text)
+      : Buffer.from(kind === 'markdown'
+        ? document.paragraphs.map(item => `# ${item.heading}\r\n\r\n${item.text}\r\n`).join('\r\n')
+        : `<html><body>${document.paragraphs.map(item => `<h1>${item.heading}</h1><p>${item.text}</p>`).join('')}</body></html>`),
+  }
+}
 async function putJson(store, name, value) {
   const saved = await store.putImmutable(name, jsonBytes(value), 'application/json')
   return { blobName: name, contentType: 'application/json', sha256: saved.blob.sha256, bytes: saved.blob.bytes.byteLength }
@@ -227,7 +243,7 @@ export function evidenceOriginal(format, text) {
   if (format === 'doc') return legacyDocFile(text)
   throw new Error('Unsupported synthetic evidence format.')
 }
-export async function seedResume(f, name = 'Jordan Example', key = randomUUID(), format = 'pdf') {
+export async function seedResume(f, name = 'Jordan Example', key = randomUUID(), options = {}) {
   const id = `resume-${key}`
   const document = {
     id: `document-${key}`, kind: 'resume', sample: false, title: 'Professional resume', version: 1,
@@ -237,16 +253,14 @@ export async function seedResume(f, name = 'Jordan Example', key = randomUUID(),
     ...await putJson(f.resumes.blobs, `${f.workspaceId}/${id}/source-document-v1.json`, document),
     documentId: document.id, documentVersion: 1,
   }
-  const contentType = format === 'html' ? 'text/html' : api.UPLOAD_CONTENT_TYPES[format]
-  const originalName = `${f.workspaceId}/${id}/original.${format}`
-  const original = (await f.resumes.blobs.putImmutable(originalName, format === 'pdf' ? await pdf() : evidenceOriginal(format,
-    [document.title, ...document.paragraphs.flatMap(paragraph => [paragraph.heading, paragraph.text])].join('\n')), contentType)).blob
-  const source = format === 'html' ? { kind: 'url', displayName: 'https://example.gov/resume', url: 'https://example.gov/resume' }
-    : { kind: format, displayName: `resume.${format}`, fileName: `resume.${format}` }
+  const file = await sourceFile(document, options)
+  const originalName = `${f.workspaceId}/${id}/original.${file.extension}`
+  const original = (await f.resumes.blobs.putImmutable(originalName, file.bytes, file.contentType)).blob
+  const source = file.kind === 'url' ? { kind: 'url', displayName: file.url, url: file.url }
+    : { kind: file.kind, displayName: file.fileName, fileName: file.fileName }
   const capture = {
-    original: { blobName: originalName, contentType, sha256: original.sha256, bytes: original.bytes.byteLength },
-    capturedAt: NOW, redirects: [],
-    ...(format === 'html' ? { finalUrl: source.url } : {}),
+    original: { blobName: originalName, contentType: file.contentType, sha256: original.sha256, bytes: original.bytes.byteLength },
+    capturedAt: NOW, redirects: [], ...(file.kind === 'url' ? { finalUrl: file.url } : {}),
   }
   const inputFingerprint = sha(Buffer.from(id))
   const captureManifest = await putJson(f.resumes.blobs, `${f.workspaceId}/${id}/capture.json`, {
@@ -270,20 +284,23 @@ export async function seedResume(f, name = 'Jordan Example', key = randomUUID(),
     },
     source, batchId, idempotencyKey: key, inputFingerprint, createdBy: ACTOR, capture, captureManifest,
     extraction: {
-      method: format === 'doc' ? 'legacy-word' : format === 'html' ? 'html' : 'document-intelligence',
-      version: 'resume-source-v1', extractedAt: NOW, pagination: api.documentPagination(contentType), pageCount: format === 'pdf' ? 1 : null,
+      method: file.kind === 'doc' ? 'legacy-word' : file.kind === 'markdown' ? 'markdown'
+        : file.kind === 'url' ? 'html' : 'document-intelligence',
+      version: file.kind === 'markdown' ? 'markdown-v1' : 'resume-source-v1', extractedAt: NOW,
+      pagination: api.documentPagination(file.contentType),
+      pageCount: file.kind === 'pdf' ? 1 : null,
       normalizedCharacters: document.paragraphs.reduce((sum, item) => sum + item.heading.length + item.text.length, 0), document: docRef,
     },
     profileBlob, attempts: 1, retryCount: 0, completedAt: NOW, warnings: [], duplicates: [],
   })
   f.resumeValues.set(`${f.workspaceId}/${id}`, { record, etag: '"resume-ready"' })
-  return { record, document, profile, selection: { resumeId: id, documentId: document.id, documentVersion: 1, documentSha256: docRef.sha256 } }
+  return { record, document, profile, original, selection: { resumeId: id, documentId: document.id, documentVersion: 1, documentSha256: docRef.sha256 } }
 }
-export async function seedJob(f, title = 'Engineering role', key = randomUUID(), format = 'pdf') {
+export async function seedJob(f, title = 'Engineering role', key = randomUUID(), options = {}) {
   const id = `job-${key}`
   const document = {
     id: `document-${key}`, kind: 'job', sample: false, title, version: 1,
-    paragraphs: [{ id: 'job-p1', page: 1, heading: 'Duties', text: 'Evaluate engineering systems independently and explain evidence-based recommendations.' }],
+    paragraphs: [{ id: 'job-p1', page: options.page ?? 1, heading: 'Duties', text: 'Evaluate engineering systems independently and explain evidence-based recommendations.' }],
   }
   const rubric = {
     id: `rubric-${key}`, groupId: `rubric-group-${key}`, kind: 'job', dataKind: 'real', jobId: id,
@@ -293,23 +310,22 @@ export async function seedJob(f, title = 'Engineering role', key = randomUUID(),
       weight: 100, guidance, requirementType: 'required', sourceCitations: [citation(document)] }],
   }
   const documentRef = await putJson(f.jobs.blobs, `${f.workspaceId}/${id}/source-document.json`, document)
-  const contentType = format === 'html' ? 'text/html' : api.UPLOAD_CONTENT_TYPES[format]
-  const originalName = `${f.workspaceId}/${id}/original.${format}`
-  const original = (await f.jobs.blobs.putImmutable(originalName, format === 'pdf' ? await pdf() : evidenceOriginal(format,
-    [document.title, ...document.paragraphs.flatMap(paragraph => [paragraph.heading, paragraph.text])].join('\n')), contentType)).blob
-  const kind = format === 'html' ? 'url' : format
-  const displayName = format === 'html' ? 'https://example.gov/job' : `job.${format}`
+  const file = await sourceFile(document, options)
+  const originalName = `${f.workspaceId}/${id}/original.${file.extension}`
+  const original = (await f.jobs.blobs.putImmutable(originalName, file.bytes, file.contentType)).blob
+  const displayName = file.kind === 'url' ? file.url : file.fileName
   const record = {
     id, recordType: 'job', workspaceId: f.workspaceId,
     job: {
       id, title, organization: 'Example agency', location: '', arrangement: '', employmentType: '', grade: '', series: '0801',
-      source: kind, sourceLabel: displayName, documentId: document.id, rubricId: rubric.id, status: 'ready', createdAt: NOW, dataKind: 'real',
+      source: file.kind, sourceLabel: displayName, documentId: document.id, rubricId: rubric.id, status: 'ready', createdAt: NOW, dataKind: 'real',
     },
     source: {
-      kind, displayName, originalBlobName: originalName, originalContentType: contentType,
+      kind: file.kind, displayName, originalBlobName: originalName, originalContentType: file.contentType,
       sha256: original.sha256, bytes: original.bytes.byteLength, capturedAt: NOW,
-      extractionMethod: format === 'doc' ? 'legacy-word' : format === 'html' ? 'html' : 'document-intelligence',
-      ...(format === 'html' ? { url: displayName, finalUrl: displayName } : {}),
+      extractionMethod: file.kind === 'doc' ? 'legacy-word' : file.kind === 'markdown' ? 'markdown'
+        : file.kind === 'url' ? 'html' : 'document-intelligence',
+      ...(file.kind === 'url' ? { url: file.url, finalUrl: file.url } : {}),
     },
     inputFingerprint: sha(Buffer.from(id)), createdBy: ACTOR, updatedAt: NOW, attempts: 1, warnings: [],
     extractedBlobName: documentRef.blobName,
@@ -317,7 +333,7 @@ export async function seedJob(f, title = 'Engineering role', key = randomUUID(),
   f.jobValues.set(`${f.workspaceId}/${id}`, { record, etag: '"job-ready"' })
   f.rubricValues.set(`${f.workspaceId}/${id}`, [rubric])
   return {
-    record, document, rubric,
+    record, document, rubric, original,
     selection: { kind: 'job', jobId: id, rubricId: rubric.id, rubricVersion: 1, rubricHash: api.analysisHash(rubric),
       documentId: document.id, documentVersion: 1, documentSha256: documentRef.sha256 },
   }
@@ -344,6 +360,7 @@ export async function seedGrade(f, job, options = {}) {
   }
   const seedDocument = { ...clone(job.document), kind: 'reference', pageCount: 1, selectedPages: [], completeness: 'complete' }
   const jobOriginal = await f.jobs.blobs.read(job.record.source.originalBlobName)
+  assert.ok(jobOriginal)
   const seedOriginalName = `${f.workspaceId}/${ladderId}/${seedId}/original.${api.originalExtension(jobOriginal.contentType)}`
   const seedOriginal = (await f.grades.blobs.putImmutable(seedOriginalName, jobOriginal.bytes, jobOriginal.contentType)).blob
   const agencyOriginalName = `${f.workspaceId}/${ladderId}/${sourceId}/original.pdf`
@@ -361,6 +378,7 @@ export async function seedGrade(f, job, options = {}) {
     sourceId: id, title: doc.title, origin, purpose, publisher: 'Example agency', documentId: doc.id, documentVersion: 1,
     documentBlobName: `${f.workspaceId}/${ladderId}/${id}/document-v1.json`,
     originalBlobName: `${f.workspaceId}/${ladderId}/${id}/original.${api.originalExtension(original.contentType)}`, sha256: original.sha256,
+    ...(options.includeContentType ? { originalContentType: original.contentType } : {}),
     authorityStatus: 'supplied', coverage, pageCount: 1, selectedPages: [], completeness: 'complete', issues: [],
   })
   const sourceSet = {

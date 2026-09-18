@@ -130,9 +130,9 @@ after(async () => { globalThis.fetch = originalFetch; await rm(outputDirectory, 
 test('grade feature discovery stays separate from job Word-capability defaults', async () => {
   globalThis.fetch = async () => json({ realJobImports: true, limits: { maxPdfPages: 50 }, realGradeLadders: true, gradeLimits: { maxSources: 15 } })
   assert.deepEqual(await jobClient.fetchJobProcessingFeatures(), {
-    realJobImports: true, wordDocumentImports: false,
+    realJobImports: true, markdownJobImports: false, wordDocumentImports: false,
     limits: {
-      maxFileBytes: 10 * 1024 * 1024, maxPdfBytes: 10 * 1024 * 1024, maxPdfPages: 50,
+      maxFileBytes: 10 * 1024 * 1024, maxPdfBytes: 10 * 1024 * 1024, maxMarkdownBytes: 10 * 1024 * 1024, maxPdfPages: 50,
       maxSourceCharacters: 180_000, maxBatchFiles: 10, maxUrlLength: 4096, maxCriteria: 20,
     },
   })

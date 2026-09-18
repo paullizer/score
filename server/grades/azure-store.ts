@@ -6,6 +6,7 @@ import type { BlockBlobClient } from '@azure/storage-blob'
 import type { TokenCredential } from '@azure/identity'
 import { GRADE_LADDER_LIMITS, type GradeEntity, type GradeWorkRecord, type VersionedGradeEntity } from '../../src/domain/real-grades'
 import { WORD_DOCUMENT_LIMITS, isWordContentType, storedDocumentContentType } from '../../src/domain/document-formats'
+import { MAX_MARKDOWN_BYTES } from '../../src/domain/source-files'
 import { WORKSPACE_ID_PATTERN } from '../ids'
 import { StoreConflictError, StoreNotFoundError } from '../store'
 import { fetchCosmosPage } from '../cosmos-query'
@@ -232,6 +233,7 @@ function blobLimit(name: string): number {
   const contentType = storedDocumentContentType(name)
   if (contentType === 'application/pdf') return GRADE_LADDER_LIMITS.maxPdfBytes
   if (contentType === 'text/html') return 24 * 1024 * 1024
+  if (contentType === 'text/markdown') return MAX_MARKDOWN_BYTES
   if (isWordContentType(contentType)) return WORD_DOCUMENT_LIMITS.maxFileBytes
   if (contentType !== 'application/json') throw new Error('Unsupported grade blob content type.')
   return GRADE_LADDER_LIMITS.maxSourceCharacters * 8 + 4 * 1024 * 1024

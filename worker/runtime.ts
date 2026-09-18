@@ -16,6 +16,8 @@ import {
   type OriginalContentType, type WordFormat,
 } from '../src/domain/document-formats'
 import { hasOleSignature, hasZipSignature, parseWordFile, WordDocumentError } from '../server/documents/word'
+import { MarkdownInputError } from '../server/documents/markdown'
+import { extractMarkdownBlocks } from './markdown'
 
 const COGNITIVE_SCOPE = 'https://cognitiveservices.azure.com/.default'
 const DOCUMENT_API_VERSION = '2024-11-30'
@@ -367,6 +369,25 @@ export function createParagraphs(
     throw new WorkerError('empty-source', options.emptySourceMessage ?? 'The source did not contain readable job-posting text.', false, 'parsing')
   }
   return paragraphs
+}
+
+export function extractMarkdown(bytes: Uint8Array, options: ParagraphOptions = {}): {
+  title?: string
+  paragraphs: DocumentParagraph[]
+} {
+  try {
+    const extracted = extractMarkdownBlocks(bytes)
+    return {
+      title: extracted.title ? normalizeText(extracted.title) : undefined,
+      paragraphs: createParagraphs(extracted.blocks, {
+        defaultHeading: 'Markdown source', minimumTextLength: 1,
+        emptySourceMessage: 'The Markdown file did not contain readable source text.', ...options,
+      }),
+    }
+  } catch (error) {
+    if (error instanceof MarkdownInputError) throw new WorkerError(error.code, error.message, false, 'parsing', { cause: error })
+    throw error
+  }
 }
 
 function jobPostingJsonLd(document: Document): Record<string, unknown> | undefined {
@@ -1452,7 +1473,7 @@ export interface WorkerDependencies {
   blobs: JobBlobStore
   documentIntelligence: Omit<DocumentIntelligenceClientOptions, 'signal'>
   model: RubricModelOptions
-  validateRealRubric: (rubric: Rubric, document: SourceDocument) => string[]
+  validateRealRubric: (rubric: Rubric, document: SourceDocument, contentType?: OriginalContentType) => string[]
   browser?: BrowserRenderer
   safeFetchOptions?: Omit<SafeFetchOptions, 'signal'>
   clock?: Clock
@@ -1543,7 +1564,7 @@ async function saveOriginal(
     if (!isOriginalContentType(type) || (record.source.originalContentType && record.source.originalContentType !== type) ||
       (record.source.sha256 && sha256(saved.bytes) !== record.source.sha256) ||
       (record.source.bytes !== undefined && record.source.bytes !== saved.bytes.byteLength) ||
-      (record.source.kind === 'url' && isWordContentType(type))) {
+      (record.source.kind === 'url' ? !['application/pdf', 'text/html'].includes(type) : UPLOAD_CONTENT_TYPES[record.source.kind] !== type)) {
       throw new WorkerError('invalid-source-type', 'The saved original does not match its captured type or content.', false, 'parsing')
     }
     return {
@@ -1556,7 +1577,7 @@ async function saveOriginal(
         bytes: record.source.bytes ?? saved.bytes.byteLength,
         capturedAt: record.source.capturedAt ?? clock.now().toISOString(),
         extractionMethod: record.source.extractionMethod ?? (type === UPLOAD_CONTENT_TYPES.doc ? 'legacy-word'
-          : type === 'text/html' ? 'html' : 'document-intelligence'),
+          : type === 'text/markdown' ? 'markdown' : type === 'text/html' ? 'html' : 'document-intelligence'),
       },
     }
   }
@@ -1593,6 +1614,9 @@ async function saveOriginal(
   let bytes = fetched.body
   if (isWordContentType(contentType(fetched)) || hasOleSignature(bytes) || hasZipSignature(bytes)) {
     throw new WorkerError('unsupported-content', 'Word documents must be uploaded as files. Public URL imports support PDF or HTML job descriptions only.', false, 'download')
+  }
+  if (contentType(fetched) === 'text/markdown') {
+    throw new WorkerError('unsupported-content', 'Markdown documents must be uploaded as files. Public URL imports support PDF or HTML job descriptions only.', false, 'download')
   }
   const type: 'application/pdf' | 'text/html' = contentType(fetched) === 'application/pdf' || looksLikePdf(bytes) ? 'application/pdf' : 'text/html'
   let finalUrl = fetched.url
@@ -1699,6 +1723,10 @@ async function loadOrExtract(
     })
     paragraphs = extracted.paragraphs
     sourceWarnings = extracted.warnings
+  } else if (original.contentType === 'text/markdown') {
+    const extracted = extractMarkdown(original.bytes, { defaultHeading: 'Job description' })
+    title = extracted.title ?? title
+    paragraphs = extracted.paragraphs
   } else {
     const html = Buffer.from(original.bytes).toString('utf8')
     const extracted = extractHtml(html, original.source.finalUrl ?? original.source.url ?? 'https://invalid.example')
@@ -1784,7 +1812,7 @@ export async function processClaimedJob(
     const generated = await generateGroundedRubric(
       artifact.document,
       dependencies.model,
-      dependencies.validateRealRubric,
+      (rubric, document) => dependencies.validateRealRubric(rubric, document, artifact.source.originalContentType),
       claimed.record.id,
       clock.now().toISOString(),
       controller.signal,

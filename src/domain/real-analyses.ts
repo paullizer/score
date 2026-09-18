@@ -26,7 +26,7 @@ import type {
 import type { Citation, Job, Rubric, SourceDocument } from './types'
 
 export const ANALYSIS_LIMITS = {
-  maxComparisons: 100,
+  maxComparisons: 500,
   initializationChunkSize: 25,
   maxAutomaticAttempts: 3,
   maxOutputCorrections: 1,
@@ -192,7 +192,7 @@ export interface AnalysisComparisonPlan {
   targetSnapshotId: string
 }
 
-// Blob-only: the run record keeps a reference and a cursor, not source text or 100 work items.
+// Blob-only: the run record keeps a reference and a cursor, not source text or work-item arrays.
 export interface RealAnalysisInitializationManifest {
   schemaVersion: 1
   dataKind: 'real'

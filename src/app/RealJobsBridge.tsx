@@ -7,6 +7,7 @@ import {
   fetchJobProcessingFeatures,
   getRealJob,
   importRealJobFile,
+  importRealJobMarkdown,
   importRealJobPdf,
   importRealJobUrl,
   listAllRealJobs,
@@ -15,6 +16,7 @@ import {
   saveRealJobRubric,
 } from '../services/realJobs'
 import type { Rubric } from '../domain/types'
+import { uploadedFileKind } from '../domain/source-files'
 import { WorkspaceContext, type CloudWorkspaceStatus, type WorkspaceContextValue } from './workspace-context'
 import { projectRealJobs } from './realJobsProjection'
 
@@ -108,7 +110,7 @@ export function RealJobsBridge({
       setFeatures(value)
       if (!value.realJobImports) {
         setPhase('unavailable')
-        setListError('Real file and direct URL imports are not available in this deployment.')
+        setListError('Real job imports are not available in this deployment.')
         return
       }
       void refresh()
@@ -188,7 +190,24 @@ export function RealJobsBridge({
     return summary
   }
 
+  function assertMarkdownAvailable() {
+    if (!features?.realJobImports || !features.markdownJobImports) {
+      throw new Error('Markdown job imports are not enabled in this deployment. PDF and direct URL imports are unchanged.')
+    }
+  }
+
+  async function importMarkdown(file: File, idempotencyKey: string, batchId?: string) {
+    assertMarkdownAvailable()
+    const summary = await importRealJobMarkdown(workspaceId, file, idempotencyKey, batchId)
+    if (aliveRef.current) upsertSummary(summary)
+    return summary
+  }
+
   async function importFile(file: File, idempotencyKey: string, batchId?: string) {
+    if (uploadedFileKind(file) === 'markdown') assertMarkdownAvailable()
+    if (['docx', 'doc'].includes(uploadedFileKind(file) ?? '') && (!features?.realJobImports || !features.wordDocumentImports)) {
+      throw new Error('Word document imports are not enabled in this deployment.')
+    }
     const summary = await importRealJobFile(workspaceId, file, idempotencyKey, batchId)
     if (aliveRef.current) upsertSummary(summary)
     return summary
@@ -262,6 +281,7 @@ export function RealJobsBridge({
     ensureDetail,
     refresh,
     importPdf,
+    importMarkdown,
     importFile,
     importUrl,
     originalUrl: (jobId) => realJobOriginalUrl(workspaceId, jobId),
