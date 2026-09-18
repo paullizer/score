@@ -12,30 +12,67 @@ const runComparisons = (f, runId) => [...f.analysis.store.values.values()]
   .filter(value => value.record.recordType === 'analysis-comparison' && value.record.runId === runId)
   .sort((a, b) => a.record.index - b.record.index)
 
-test('exactly 100 comparisons initialize in bounded, resumable 25-pair batches; 101 is rejected without truncation', async () => {
+for (const [resumeCount, targetCount] of [[10, 10], [103, 4], [500, 1], [1, 500]]) {
+  const total = resumeCount * targetCount
+  test(`${resumeCount} resumes against ${targetCount} targets initialize all ${total} comparisons in resumable 25-pair batches`, async () => {
+    const f = fixture()
+    const created = await createRun(f, resumeCount, targetCount)
+    assert.equal(created.run.progress.total, total)
+    assert.equal(created.run.progress.initialized, 25)
+    assert.equal(created.run.status, 'initializing')
+    assert.equal(f.analysis.store.batches.length, 1)
+    let finished = { record: created.run, etag: created.etag }
+    while (finished.record.status === 'initializing') {
+      const previous = finished.record.progress.initialized
+      finished = await finishInitialization(f, created.run.id)
+      assert.ok(finished.record.progress.initialized > previous)
+    }
+    assert.equal(finished.record.progress.initialized, total)
+    assert.equal(finished.record.progress.queued, total)
+    assert.equal(finished.record.status, 'queued')
+    const batchSizes = Array.from({ length: Math.ceil(total / 25) }, (_, index) => Math.min(25, total - index * 25) + 1)
+    assert.deepEqual(f.analysis.store.batches.map(batch => batch.length), batchSizes)
+    assert.equal(runComparisons(f, created.run.id).length, total)
+    assert.equal(new Set(runComparisons(f, created.run.id).map(item => item.record.id)).size, total)
+    const detail = await f.service.detail(f.workspaceId, created.run.id)
+    assert.deepEqual(detail.resumes.map(item => item.selection), created.request.resumes)
+    assert.deepEqual(detail.targets.map(item => item.selection), created.request.targets)
+    const comparisons = []
+    let token
+    do {
+      const page = await f.service.comparisons(f.workspaceId, created.run.id, token, 50)
+      assert.ok(page.comparisons.length <= 50)
+      comparisons.push(...page.comparisons)
+      token = page.continuationToken
+    } while (token)
+    assert.deepEqual(comparisons.map(item => item.comparison.index), Array.from({ length: total }, (_, index) => index))
+    await finishInitialization(f, created.run.id)
+    const replay = await f.service.create(f.workspaceId, created.key, created.request, ACTOR)
+    assert.equal(replay.run.id, created.run.id)
+    assert.deepEqual(replay.run.manifest, created.run.manifest)
+    assert.equal(f.analysis.store.batches.length, batchSizes.length)
+    assert.equal(f.analysis.store.values.size, total + 1)
+    for (const { record } of f.analysis.store.values.values()) {
+      assert.ok(jsonBytes(record).byteLength < api.MAX_ANALYSIS_RECORD_BYTES)
+      assert.ok(!JSON.stringify(record).includes('Evaluated engineering systems independently'))
+    }
+  })
+}
+
+test('more than 500 pairs are rejected before any analysis snapshots or work are published', async () => {
   const f = fixture()
-  const created = await createRun(f, 10, 10)
-  assert.equal(created.run.progress.total, 100)
-  assert.equal(created.run.progress.initialized, 25)
-  assert.equal(created.run.status, 'initializing')
-  assert.equal(f.analysis.store.batches.length, 1)
-  const finished = await finishInitialization(f, created.run.id)
-  assert.equal(finished.record.progress.initialized, 100)
-  assert.equal(finished.record.progress.queued, 100)
-  assert.equal(finished.record.status, 'queued')
-  assert.deepEqual(f.analysis.store.batches.map(batch => batch.length), [26, 26, 26, 26])
-  assert.equal(runComparisons(f, created.run.id).length, 100)
-  assert.equal(new Set(runComparisons(f, created.run.id).map(item => item.record.id)).size, 100)
-  await finishInitialization(f, created.run.id)
-  assert.equal(f.analysis.store.batches.length, 4)
-  const tooMany = clone(created.request)
-  tooMany.resumes = Array.from({ length: 101 }, () => ({ ...tooMany.resumes[0], resumeId: `resume-${randomUUID()}` }))
-  tooMany.targets = [tooMany.targets[0]]
-  await assert.rejects(f.service.create(f.workspaceId, randomUUID(), tooMany, ACTOR), status(400))
-  assert.equal(f.analysis.store.values.size, 101)
-  for (const { record } of f.analysis.store.values.values()) {
-    assert.ok(jsonBytes(record).byteLength < api.MAX_ANALYSIS_RECORD_BYTES)
-    assert.ok(!JSON.stringify(record).includes('Evaluated engineering systems independently'))
+  const resume = await seedResume(f)
+  const job = await seedJob(f)
+  for (const [resumeCount, targetCount] of [[501, 1], [1, 501], [3, 167], [126, 4]]) {
+    const request = {
+      name: 'Oversized selection',
+      resumes: Array.from({ length: resumeCount }, () => ({ ...resume.selection, resumeId: `resume-${randomUUID()}` })),
+      targets: Array.from({ length: targetCount }, () => ({ ...job.selection, jobId: `job-${randomUUID()}` })),
+    }
+    await assert.rejects(f.service.create(f.workspaceId, randomUUID(), request, ACTOR),
+      error => error.status === 400 && /500/.test(error.message))
+    assert.equal(f.analysis.store.values.size, 0)
+    assert.equal(f.analysis.blobs.values.size, 0)
   }
 })
 
@@ -261,6 +298,42 @@ test('initialization resumes after a pre-commit failure and cancellation fences 
   await finishInitialization(racing, race.run.id)
   assert.ok(runComparisons(racing, race.run.id).every(item => item.record.status === 'cancelled'))
   assert.equal((await racing.analysis.store.listPending(NOW, 100)).length, 0)
+})
+
+test('500-pair cancellation and explicit bulk retry preserve completed evidence and every frozen pair', async () => {
+  const f = fixture()
+  const created = await createRun(f, 125, 4)
+  let current = { record: created.run, etag: created.etag }
+  while (current.record.status === 'initializing') {
+    const previous = current.record.progress.initialized
+    current = await finishInitialization(f, created.run.id)
+    assert.ok(current.record.progress.initialized > previous)
+  }
+  const original = runComparisons(f, created.run.id)
+  const completed = await publishResult(f, created.run.id, original[0].record.id)
+  const before = await f.service.detail(f.workspaceId, created.run.id)
+  const cancelled = await f.service.cancel(f.workspaceId, created.run.id, ACTOR, before.etag)
+  current = { record: cancelled.run, etag: cancelled.etag }
+  while (!current.record.cancellation.completedAt) {
+    const previous = current.record.cancellation.nextComparisonIndex
+    current = await finishInitialization(f, created.run.id)
+    assert.ok(current.record.cancellation.nextComparisonIndex > previous)
+  }
+  assert.equal(current.record.progress.total, 500)
+  assert.equal(current.record.progress.complete, 1)
+  assert.equal(current.record.progress.cancelled, 499)
+  assert.equal(current.record.cancellation.nextComparisonIndex, 500)
+  const comparisonIds = original.slice(1).map(item => item.record.id)
+  const retried = await f.service.retry(f.workspaceId, created.run.id, { comparisonIds }, current.etag)
+  assert.equal(retried.run.progress.queued, 499)
+  assert.equal(retried.run.progress.complete, 1)
+  assert.equal(retried.run.progress.cancelled, 0)
+  assert.equal(retried.run.cancellation, undefined)
+  assert.deepEqual(retried.run.manifest, created.run.manifest)
+  const identities = pairs => pairs.map(({ record }) => ({ id: record.id, resume: record.resume, target: record.target }))
+  assert.deepEqual(identities(runComparisons(f, created.run.id)), identities(original))
+  assert.deepEqual((await f.service.comparisonDetail(f.workspaceId, created.run.id, original[0].record.id)).result, completed.result)
+  assert.ok(f.analysis.store.batches.every(batch => batch.length <= 26))
 })
 
 test('comparison paging and document delivery are scoped by workspace, run and exact version', async () => {
