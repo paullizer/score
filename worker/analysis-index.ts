@@ -5,6 +5,7 @@ import { fileURLToPath } from 'node:url'
 import { createAzureAnalysisBlobStore, createAzureAnalysisStore } from '../server/analyses/azure-store'
 import { loadAnalysisWorkerConfig, type AnalysisWorkerConfig } from './analyses/config'
 import { runAnalysisWorker, type AnalysisWorkerDependencies } from './analyses/runtime'
+import { logAnalysisTelemetry } from './analyses/telemetry'
 
 export { loadAnalysisWorkerConfig } from './analyses/config'
 export { runAnalysisWorker } from './analyses/runtime'
@@ -15,6 +16,7 @@ export function createAnalysisWorkerDependencies(
   return {
     store: createAzureAnalysisStore(config.stores, credential),
     blobs: createAzureAnalysisBlobStore(config.stores, credential),
+    onEvent: logAnalysisTelemetry,
     model: {
       endpoint: config.modelEndpoint, deployment: config.modelDeployment,
       modelName: config.modelName, reasoningEffort: config.reasoningEffort,

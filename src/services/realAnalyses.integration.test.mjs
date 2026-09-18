@@ -422,6 +422,19 @@ test('results display server totals, limited completion, exact statuses and unsc
   assert.match(renderToStaticMarkup(React.createElement(ui.RealComparisonValue, { summary })), />73<\/strong>/)
 })
 
+test('saved two-correction results display all three grounding reviews without recomputing the server score', () => {
+  const detail = comparisonDetail()
+  detail.result.provenance.correctionCount = 2
+  const original = detail.result.provenance.groundingReviews[0]
+  detail.result.provenance.groundingReviews = Array.from({ length: 3 }, (_, index) => ({
+    ...structuredClone(original), id: `grounding-${index}`, outcome: index === 2 ? 'supported' : 'needs-correction',
+  }))
+  const html = renderToStaticMarkup(React.createElement(ui.RealComparisonReview, { detail }))
+  assert.match(html, /2 bounded corrections/)
+  assert.match(html, /needs-correction.*needs-correction.*supported/)
+  assert.match(html, />36<\/strong>/)
+})
+
 async function render(element) {
   root ??= createRoot(dom.window.document.getElementById('root'))
   await act(async () => {
@@ -691,7 +704,10 @@ test('paused cancellation exposes run-level cleanup recovery without restarting 
 
 test('manual run and pair retries stay available after automatic retries stop and reuse saved identities', async () => {
   const failed = runSummary('run-one', 'failed')
-  failed.run.error = { code: 'invalid-model-output', stage: 'assessment', message: 'Automatic model attempts exhausted.', retryable: false }
+  failed.run.error = {
+    code: 'invalid-citation', stage: 'grounding', retryable: false,
+    message: 'Grounding review issue 1, citation 1: the quotation changes whitespace in the saved resume paragraph. The 2-correction limit was reached; no result was published.',
+  }
   const pair = comparisonDetail()
   pair.comparison.status = 'failed'
   pair.comparison.error = failed.run.error
@@ -707,6 +723,8 @@ test('manual run and pair retries stay available after automatic retries stop an
   const content = (canWrite = true) => router(React.createElement(ui.RealAnalysesContext.Provider, { value: { ...api, canWrite } },
     React.createElement(ui.RealAnalysisDetail, { id: 'run-one' })), '/analyses/run-one?data=real')
   await render(content())
+  assert.match(dom.window.document.body.textContent, /invalid-citation: Grounding review issue 1, citation 1/)
+  assert.match(dom.window.document.body.textContent, /2-correction limit/)
   const retryPair = [...dom.window.document.querySelectorAll('button')].find((button) => button.textContent === 'Retry saved pair')
   const retryRun = [...dom.window.document.querySelectorAll('button')].find((button) => button.textContent === 'Retry failed / cancelled')
   assert.equal(retryPair.disabled, false)

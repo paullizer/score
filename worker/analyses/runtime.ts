@@ -20,6 +20,7 @@ import type { AnalysisBlobStore, AnalysisStore } from '../../server/analyses/sto
 import { analysisIsRemoved, fencedAnalysisBlobs } from '../../server/analyses/guards'
 import { systemClock, type Clock, type RubricModelOptions } from '../runtime'
 import { AnalysisModelError, assessResumeAgainstTarget } from './model'
+import { emitAnalysisTelemetry, type AnalysisTelemetrySink } from './telemetry'
 
 const LEASE_MS = 90_000
 const HEARTBEAT_MS = 25_000
@@ -33,6 +34,7 @@ export interface AnalysisWorkerDependencies {
   model: RubricModelOptions
   clock?: Clock
   owner?: string
+  onEvent?: AnalysisTelemetrySink
 }
 
 export interface AnalysisWorkerOptions {
@@ -346,7 +348,26 @@ export async function processClaimedComparison(
   if (deps.owner && deps.owner !== claimed.record.lease?.owner) return false
   const clock = deps.clock ?? systemClock
   const lease = new ComparisonLease(claimed, deps.store, clock, options.deadline ?? clock.now().getTime() + RUN_BUDGET_MS, options.signal)
+  const startedAt = clock.now().getTime()
+  const context = {
+    workspaceId: claimed.record.workspaceId, runId: claimed.record.runId,
+    comparisonId: claimed.record.id, attemptId: claimed.record.attemptId,
+  }
   let stage: Stage = 'assessment'
+  let correctionCount = 0
+  const onEvent: AnalysisTelemetrySink = event => {
+    stage = event.stage
+    correctionCount = event.correctionCount ?? correctionCount
+    emitAnalysisTelemetry(deps.onEvent, { ...event, ...context })
+  }
+  const outcome = (status: 'complete' | 'failed' | 'queued' | 'abandoned', failure?: AnalysisProcessingError) => {
+    const timestamp = clock.now().toISOString()
+    emitAnalysisTelemetry(deps.onEvent, {
+      ...context, event: 'comparison-outcome', timestamp, stage: failure?.stage ?? stage, outcome: status,
+      correctionCount, code: failure?.code, retryable: failure?.retryable,
+      durationMilliseconds: Math.max(0, Date.parse(timestamp) - startedAt),
+    })
+  }
   let readingInputs = true
   let published: ImmutableJsonBlobReference | undefined
   try {
@@ -363,7 +384,7 @@ export async function processClaimedComparison(
       qualifications: target.kind === 'grade' ? target.version.qualifications : [],
       requirementEvidence: target.requirementEvidence,
     }, {
-      model: deps.model, clock, signal: lease.control.signal,
+      model: deps.model, clock, signal: lease.control.signal, onEvent,
       resumeSnapshotSha256: comparison.record.resume.blob.sha256,
       targetSnapshotSha256: comparison.record.target.blob.sha256,
     })
@@ -384,32 +405,41 @@ export async function processClaimedComparison(
     } satisfies RealAnalysisResult)
     assertAnalysisResultBinding(result, current.run.record, current.comparison.record, snapshots.resumeSnapshot, target)
     const saved = await storeResult(deps, lease, snapshots, result)
+    correctionCount = saved.result.provenance.correctionCount
     published = saved.reference
     await lease.atomic((record, timestamp, liveRun) => {
       assertAnalysisResultBinding(saved.result, liveRun, record, snapshots.resumeSnapshot, target)
       return completedComparison(record, saved.reference, resultSummary(saved.result), timestamp)
     })
+    outcome('complete')
     return true
   } catch (caught) {
     const error = lease.control.signal.aborted ? lease.control.signal.reason : caught
     const latest = await loadAnalysisComparison(deps.store, claimed.record.workspaceId, claimed.record.runId, claimed.record.id)
     if (published && latest?.record.status === 'complete' && latest.record.attemptId === claimed.record.attemptId &&
-      analysisHash(latest.record.result) === analysisHash(published)) return true
-    if (error instanceof LostAnalysisWork) return false
+      analysisHash(latest.record.result) === analysisHash(published)) {
+      outcome('complete')
+      return true
+    }
+    if (error instanceof LostAnalysisWork) { outcome('abandoned'); return false }
     const failure = failureFor(error, stage, readingInputs)
     try {
+      let status: 'queued' | 'failed' = 'failed'
       await lease.atomic((record, timestamp) => {
         const retry = failure.retryable && record.attempts < ANALYSIS_LIMITS.maxAutomaticAttempts
+        status = retry ? 'queued' : 'failed'
         const next: RealAnalysisComparisonRecord = {
-          ...record, status: retry ? 'queued' : 'failed', updatedAt: timestamp, error: failure,
+          ...record, status, updatedAt: timestamp, error: failure,
         }
         delete next.lease
         delete next.nextAttemptAt
         if (retry) next.nextAttemptAt = retryAt(clock, record.attempts)
         return next
       }, true)
+      outcome(status, failure)
     } catch (failure) {
       if (!(failure instanceof LostAnalysisWork)) throw failure
+      outcome('abandoned')
     }
     return false
   } finally {
