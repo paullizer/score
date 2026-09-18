@@ -19,8 +19,9 @@ const OUTSIDER = '9c9c9c9c-9c9c-49c9-8c9c-9c9c9c9c9c9c'
 const ORIGIN = 'https://resume-api.example.test'
 const NOW = '2026-09-18T02:30:00.000Z'
 const MAX_PDF = 10 * 1024 * 1024
+const MAX_MARKDOWN = 10 * 1024 * 1024
 const clone = value => structuredClone(value)
-const output = join(process.cwd(), 'dist-server', 'real-resumes-isolated-tests.mjs')
+const output = join(process.cwd(), 'dist-server', `real-resumes-isolated-tests-${process.pid}.mjs`)
 let api
 let pdfBytes
 
@@ -202,7 +203,7 @@ function fakeCosmosContainer(events, blobValues) {
           const record = operation.resourceBody
           if (record.recordType === 'resume' && operation.operationType === 'Create' && blobValues) {
             assert.ok(blobValues.has(api.resumeImportReceiptBlobName(workspaceId, record.id)), 'immutable receipt must precede queue publication')
-            if (record.source.kind === 'pdf') {
+            if (record.source.kind !== 'url') {
               assert.ok(blobValues.has(record.capture.original.blobName), 'original bytes must precede eligible work')
               assert.ok(blobValues.has(record.captureManifest.blobName), 'capture manifest must precede eligible work')
             }
@@ -317,6 +318,20 @@ async function importPdf(server, options = {}) {
   })
 }
 
+async function importMarkdown(server, options = {}) {
+  const request = input(options.input)
+  return fetch(`${server.path(options.workspaceId)}/markdown`, {
+    method: 'POST',
+    headers: headers({
+      oid: options.oid,
+      'content-type': 'text/markdown', 'x-file-name': encodeURIComponent(options.filename ?? 'resume.md'),
+      'idempotency-key': request.idempotencyKey, 'x-import-batch': request.batchId, 'x-import-count': String(request.inputCount),
+      ...options.headers,
+    }),
+    body: options.bytes ?? Buffer.from('# Alex Example\n\nEngineer based in Portland.\n'),
+  })
+}
+
 async function importUrl(server, options = {}) {
   const request = input(options.input)
   return fetch(`${server.path(options.workspaceId)}/url`, {
@@ -365,25 +380,28 @@ async function captureHtml(server, id) {
   return bytes
 }
 
-async function profileResume(server, id, status = 'ready') {
+async function profileResume(server, id, status = 'ready', page = 1) {
   const current = await server.store.get(WORKSPACE, id)
   const record = current.record
   const document = {
     id: record.resume.documentId, title: 'Captured resume', kind: 'resume', version: 1, sample: false,
-    paragraphs: [{ id: 'p-1', page: 1, heading: 'Profile', text: 'Alex Example. Engineer. Portland. Ten years of engineering experience.' }],
+    paragraphs: [{ id: 'p-1', page, heading: 'Profile', text: 'Alex Example. Engineer. Portland. Ten years of engineering experience.' }],
   }
   const documentRef = await putJson(server, api.resumeDocumentBlobName(WORKSPACE, id), document)
+  const format = {
+    'application/pdf': { method: 'document-intelligence', pagination: 'pdf-pages', pageCount: 1 },
+    'text/html': { method: 'html', pagination: 'html-sections', pageCount: null },
+    'text/markdown': { method: 'markdown', pagination: 'markdown-sections', pageCount: null },
+  }[record.capture.original.contentType]
   const extraction = {
-    method: record.capture.original.contentType === 'application/pdf' ? 'document-intelligence' : 'html',
+    ...format,
     version: 'resume-extraction-v1', extractedAt: NOW,
-    pagination: record.capture.original.contentType === 'application/pdf' ? 'pdf-pages' : 'html-sections',
-    pageCount: record.capture.original.contentType === 'application/pdf' ? 1 : null,
     normalizedCharacters: document.paragraphs[0].heading.length + document.paragraphs[0].text.length,
     document: { ...documentRef, documentId: document.id, documentVersion: document.version },
   }
   const field = value => ({
     status: 'available', value, citations: [{
-      documentId: document.id, documentVersion: 1, paragraphId: 'p-1', page: 1, heading: 'Profile', quote: value,
+      documentId: document.id, documentVersion: 1, paragraphId: 'p-1', page, heading: 'Profile', quote: value,
     }],
   })
   const profile = {
@@ -440,6 +458,274 @@ test('actual PDF bytes, receipts, and captures are durable before atomic admissi
     assert.equal(original.headers.get('content-type'), 'application/pdf')
     assert.equal(original.headers.get('x-content-type-options'), 'nosniff')
     assert.deepEqual(Buffer.from(await original.arrayBuffer()), pdfBytes)
+  } finally { await server.close() }
+})
+
+test('Markdown resume imports preserve both extensions, original UTF-8 bytes and immutable provenance before atomic batch publication', async () => {
+  const server = await fixture()
+  try {
+    for (const filename of ['resume.md', 'resume.MD', 'Résumé candidate.markdown', "Résumé candidate's.MARKDOWN"]) {
+      const request = input()
+      const bytes = Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), Buffer.from('# Alex Example\r\n\r\nEngineer.\tCafé 😀\r\n')])
+      const response = await importMarkdown(server, {
+        input: request, filename, bytes, headers: { 'content-type': 'text/markdown; charset="UTF-8"', 'content-encoding': 'identity' },
+      })
+      const { resume: accepted } = await bodyOf(response, 202)
+      const id = api.resumeIdForKey(request.idempotencyKey)
+      assert.equal(accepted.resume.id, id)
+      assert.equal(accepted.resume.status, 'queued')
+      assert.equal(response.headers.get('etag'), accepted.etag)
+      assert.deepEqual(accepted.source, { kind: 'markdown', displayName: filename, fileName: filename })
+      assert.deepEqual(['name', 'role', 'location', 'experience'].map(field => accepted.resume[field]), [null, null, null, null])
+      assert.equal(accepted.capture.original.blobName, `${WORKSPACE}/${id}/original.md`)
+      assert.equal(accepted.capture.original.contentType, 'text/markdown')
+      assert.equal(accepted.capture.original.sha256, api.resumeSha256(bytes))
+      assert.equal(accepted.capture.original.bytes, bytes.byteLength)
+      assert.equal(accepted.capture.finalUrl, undefined)
+      assert.deepEqual(accepted.capture.redirects, [])
+      assert.deepEqual(server.events.slice(-4).map(event => event.kind), ['blob', 'blob', 'blob', 'transaction'])
+      const receipt = JSON.parse(server.blobContainer.values.get(api.resumeImportReceiptBlobName(WORKSPACE, id)).bytes.toString('utf8'))
+      assert.equal(receipt.markdownSha256, api.resumeSha256(bytes))
+      assert.equal(Object.hasOwn(receipt, 'pdfSha256'), false)
+      assert.equal(receipt.inputFingerprint, api.resumeContentHash({
+        source: accepted.source, batchId: request.batchId, inputCount: request.inputCount,
+        createdBy: request.createdBy, markdownSha256: api.resumeSha256(bytes),
+      }))
+      const original = await fetch(`${server.path()}/${id}/original`, { headers: auth() })
+      assert.equal(original.status, 200)
+      assert.equal(original.headers.get('content-type'), 'text/markdown')
+      assert.match(original.headers.get('content-disposition'), /^attachment;/)
+      assert.equal(decodeURIComponent(original.headers.get('content-disposition').split("filename*=UTF-8''")[1]), filename)
+      assert.equal(original.headers.get('x-content-type-options'), 'nosniff')
+      assert.match(original.headers.get('content-security-policy'), /sandbox; default-src 'none'/)
+      assert.equal(original.headers.get('referrer-policy'), 'no-referrer')
+      assert.match(original.headers.get('cache-control'), /private, no-store/)
+      assert.deepEqual(Buffer.from(await original.arrayBuffer()), bytes)
+      const replay = (await bodyOf(await importMarkdown(server, { input: request, filename, bytes }), 200)).resume
+      assert.equal(replay.etag, accepted.etag)
+      assert.equal((await server.store.get(WORKSPACE, api.resumeBatchRecordId(request.batchId))).record.items.length, 1)
+    }
+    assert.equal(api.isSafeResumeFilename('resume.md'), false, 'legacy helper callers must remain PDF-only by default')
+    assert.equal(api.isSafeResumeFilename('resume.MARKDOWN', 'markdown'), true)
+    assert.equal(api.isSafeResumeFilename('resume.PDF'), true)
+  } finally { await server.close() }
+})
+
+test('Markdown resume metadata, UTF-8, binary controls, empty inputs, compressed bodies, and 10 MiB byte limits are strictly validated', async () => {
+  const server = await fixture()
+  try {
+    for (const filename of [
+      '../resume.md', 'x\\resume.markdown', 'resume.pdf', 'resume.md.exe', 'x:resume.md', 'NUL.markdown',
+      'resume\u0085.md', ' resume.md', 'resume.md ', 'x'.repeat(256) + '.md',
+    ]) await bodyOf(await importMarkdown(server, { filename }), 400)
+    for (const headers of [
+      { 'x-file-name': '' }, { 'x-file-name': '%ZZ.md' }, { 'x-file-name': 'not encoded.md' }, { 'x-file-name': '%ED%A0%80.md' },
+      { 'content-type': 'text/plain' }, { 'content-type': 'application/pdf' },
+      { 'content-type': 'text/markdown; charset=utf-16' }, { 'content-type': 'text/markdown; charset=iso-8859-1' },
+      { 'content-type': 'text/markdown; unexpected=value' },
+      { 'content-encoding': 'gzip' }, { 'content-encoding': 'br' }, { 'content-encoding': 'deflate' },
+    ]) await bodyOf(await importMarkdown(server, { headers }), 400)
+    for (const name of ['idempotency-key', 'x-import-batch']) {
+      for (const value of ['', 'not-a-uuid', `${randomUUID()}, ${randomUUID()}`]) {
+        await bodyOf(await importMarkdown(server, { headers: { [name]: value } }), 400)
+      }
+    }
+    for (const count of ['', '0', '11', '-1', '01', '1.0', '1e1', '1, 2']) {
+      await bodyOf(await importMarkdown(server, { headers: { 'x-import-count': count } }), 400)
+    }
+    for (const bytes of [
+      Buffer.alloc(0), Buffer.from(' \t\r\n'), Buffer.from([0xef, 0xbb, 0xbf]), Buffer.from([0xc3, 0x28]),
+      Buffer.from('# Resume', 'utf16le'), Buffer.from('# Resume\0binary'), Buffer.from('# Resume\u0085binary'),
+      Buffer.from('# Resume\u0001binary'), Buffer.from('# Resume\fbinary'), Buffer.from('%PDF-1.7\nnot Markdown'),
+      Buffer.from([0xff, 0xfe, 0x41, 0x00]),
+    ]) await bodyOf(await importMarkdown(server, { bytes }), 400)
+    const oversized = await bodyOf(await importMarkdown(server, { bytes: Buffer.alloc(MAX_MARKDOWN + 1, 'x') }), 413)
+    assert.match(oversized.error.message, /10 MiB/)
+    assert.equal(server.blobContainer.values.size, 0)
+    assert.equal(server.cosmos.values.size, 0)
+    const bytes = Buffer.alloc(MAX_MARKDOWN, 'x')
+    const accepted = (await bodyOf(await importMarkdown(server, { bytes }), 202)).resume
+    assert.equal(accepted.capture.original.bytes, MAX_MARKDOWN)
+    assert.deepEqual(server.blobContainer.values.get(accepted.capture.original.blobName).bytes, bytes)
+    await assert.rejects(server.service.importMarkdown(WORKSPACE, input(), 'resume.md', Buffer.alloc(MAX_MARKDOWN + 1, 'x')),
+      error => error instanceof api.HttpError && error.status === 413)
+    await assert.rejects(server.service.importMarkdown(WORKSPACE, input(), 'resume.md', Buffer.from([0x80])),
+      error => error instanceof api.HttpError && error.status === 400 && /UTF-8/.test(error.message))
+  } finally { await server.close() }
+})
+
+test('Markdown resume authentication, CSRF, workspace access, read-only membership and disabled service checks precede raw parsing', async () => {
+  const server = await fixture()
+  try {
+    const bytes = Buffer.alloc(MAX_MARKDOWN + 1, 'x')
+    assert.equal((await fetch(`${server.path()}/markdown`, {
+      method: 'POST', headers: { 'content-type': 'text/markdown' }, body: bytes,
+    })).status, 401)
+    assert.equal((await importMarkdown(server, { bytes, oid: VIEWER })).status, 403)
+    assert.equal((await importMarkdown(server, { bytes, oid: OUTSIDER })).status, 404)
+    assert.equal((await importMarkdown(server, { bytes, headers: { origin: 'https://foreign.example' } })).status, 403)
+    assert.equal((await importMarkdown(server, { bytes, headers: { 'x-score-request': '' } })).status, 403)
+    assert.equal(server.blobContainer.values.size, 0)
+    const initial = (await bodyOf(await importMarkdown(server), 202)).resume
+    for (const suffix of ['', `/${initial.resume.id}`, `/${initial.resume.id}/original`]) {
+      assert.equal((await fetch(`${server.path()}${suffix}`, { headers: auth(VIEWER) })).status, 200)
+      assert.equal((await fetch(`${server.path()}${suffix}`, { headers: auth(OUTSIDER) })).status, 404)
+    }
+    assert.equal((await action(server, initial.resume.id, 'cancel', initial.etag, undefined, { ...auth(VIEWER) })).status, 403)
+    assert.equal((await fetch(`${server.path(OTHER_WORKSPACE)}/${initial.resume.id}/original`, { headers: auth(OUTSIDER) })).status, 404)
+  } finally { await server.close() }
+  const disabled = await fixture({ disabled: true })
+  try {
+    assert.equal((await importMarkdown(disabled, { bytes: Buffer.alloc(MAX_MARKDOWN + 1, 'x') })).status, 503)
+    assert.equal(disabled.blobContainer.values.size, 0)
+  } finally { await disabled.close() }
+})
+
+test('Markdown receipt replay survives failed publication and binds source bytes, filename, batch, count, actor, and kind without overwrites', async () => {
+  const server = await fixture()
+  try {
+    const request = input()
+    server.cosmos.failBefore()
+    await bodyOf(await importMarkdown(server, { input: request }), 503)
+    assert.equal(server.blobContainer.values.size, 3)
+    assert.equal(server.cosmos.values.size, 0)
+    const winners = [...server.blobContainer.values.entries()].map(([name, blob]) => [name, Buffer.from(blob.bytes)])
+    for (const options of [
+      { filename: 'changed.md' }, { filename: 'resume.markdown' }, { bytes: Buffer.from('# Changed profile\n') },
+      { input: { ...request, batchId: randomUUID() } }, { input: { ...request, inputCount: 2 } },
+    ]) await bodyOf(await importMarkdown(server, { input: request, ...options }), 409)
+    await bodyOf(await importPdf(server, { input: request }), 409)
+    await bodyOf(await importUrl(server, { input: request }), 409)
+    await assert.rejects(server.service.importMarkdown(WORKSPACE, { ...request, createdBy: 'different-actor' }, 'resume.md',
+      Buffer.from('# Alex Example\n\nEngineer based in Portland.\n')), error => error instanceof api.HttpError && error.status === 409)
+    server.advance('2026-09-18T02:31:00.000Z')
+    const recovered = (await bodyOf(await importMarkdown(server, { input: request }), 202)).resume
+    assert.equal(recovered.resume.createdAt, NOW)
+    assert.equal(recovered.capture.capturedAt, NOW)
+    await bodyOf(await importMarkdown(server, { input: request }), 200)
+    for (const [name, bytes] of winners) assert.deepEqual(server.blobContainer.values.get(name).bytes, bytes)
+    assert.equal((await server.store.get(WORKSPACE, api.resumeBatchRecordId(request.batchId))).record.items.length, 1)
+    const racing = input()
+    const alternatives = [Buffer.from('# First profile\n'), Buffer.from('# Second profile\n')]
+    const outcomes = await Promise.all(alternatives.map(bytes => importMarkdown(server, { input: racing, bytes })))
+    assert.deepEqual(outcomes.map(response => response.status).sort(), [202, 409])
+    const winner = outcomes.findIndex(response => response.status === 202)
+    const record = (await server.store.get(WORKSPACE, api.resumeIdForKey(racing.idempotencyKey))).record
+    assert.deepEqual(server.blobContainer.values.get(record.capture.original.blobName).bytes, alternatives[winner])
+  } finally { await server.close() }
+})
+
+test('legacy PDF and URL receipts retain their original fingerprints and exact field sets when replayed after Markdown support', async () => {
+  const server = await fixture()
+  try {
+    for (const kind of ['pdf', 'url']) {
+      const request = input()
+      const source = kind === 'pdf'
+        ? { kind: 'pdf', displayName: 'resume.pdf', fileName: 'resume.pdf' }
+        : { kind: 'url', displayName: 'https://example.com/resume', url: 'https://example.com/resume' }
+      const pdfSha256 = kind === 'pdf' ? api.resumeSha256(pdfBytes) : undefined
+      const fingerprint = api.resumeContentHash({
+        source, batchId: request.batchId, inputCount: request.inputCount, createdBy: request.createdBy, pdfSha256,
+      })
+      const id = api.resumeIdForKey(request.idempotencyKey)
+      const receipt = {
+        ...request, schemaVersion: 1, dataKind: 'real', workspaceId: WORKSPACE, resumeId: id,
+        createdAt: NOW, source, inputFingerprint: fingerprint, ...(pdfSha256 ? { pdfSha256 } : {}),
+      }
+      const name = api.resumeImportReceiptBlobName(WORKSPACE, id)
+      const originalBytes = Buffer.from(JSON.stringify(receipt))
+      await server.blobs.putImmutable(name, originalBytes, 'application/json')
+      server.advance('2026-09-18T02:31:00.000Z')
+      const submit = kind === 'pdf' ? importPdf : importUrl
+      const accepted = (await bodyOf(await submit(server, { input: request }), 202)).resume
+      assert.equal(accepted.resume.createdAt, NOW)
+      const record = (await server.store.get(WORKSPACE, id)).record
+      assert.equal(record.inputFingerprint, fingerprint)
+      assert.deepEqual(server.blobContainer.values.get(name).bytes, originalBytes)
+      await bodyOf(await submit(server, { input: request }), 200)
+      assert.deepEqual(JSON.parse(server.blobContainer.values.get(name).bytes.toString('utf8')), receipt)
+      if (kind === 'pdf') assert.equal(JSON.parse(originalBytes.toString('utf8')).pdfSha256, api.resumeSha256(pdfBytes))
+      assert.equal(Object.hasOwn(JSON.parse(originalBytes.toString('utf8')), 'markdownSha256'), false)
+    }
+  } finally { await server.close() }
+})
+
+test('mixed PDF and Markdown resume batches share admission limits and keep same-content imports separate with scoped duplicate warnings', async () => {
+  const server = await fixture()
+  try {
+    const batchId = randomUUID()
+    const firstInput = input({ batchId, inputCount: 3 })
+    const first = (await bodyOf(await importPdf(server, { input: firstInput }), 202)).resume
+    await bodyOf(await importMarkdown(server, { input: { batchId, inputCount: 3 }, bytes: Buffer.from([0x80]) }), 400)
+    const markdownInput = input({ batchId, inputCount: 3 })
+    const second = (await bodyOf(await importMarkdown(server, { input: markdownInput }), 202)).resume
+    assert.deepEqual(second.duplicates, [])
+    const third = (await bodyOf(await importMarkdown(server, { input: { batchId, inputCount: 3 }, filename: 'renamed.MARKDOWN' }), 202)).resume
+    assert.deepEqual(third.duplicates.map(warning => [warning.kind, warning.resumeId]), [['exact-content', second.resume.id]])
+    assert.notEqual(third.resume.id, second.resume.id)
+    await bodyOf(await importPdf(server, { input: firstInput }), 200)
+    await bodyOf(await importMarkdown(server, { input: markdownInput }), 200)
+    await bodyOf(await importMarkdown(server, { input: { batchId, inputCount: 3 } }), 409)
+    await bodyOf(await importMarkdown(server, { input: { batchId, inputCount: 4 } }), 409)
+    assert.equal((await server.store.get(WORKSPACE, api.resumeBatchRecordId(batchId))).record.items.length, 3)
+    const detail = await server.service.detail(WORKSPACE, second.resume.id)
+    assert.deepEqual(detail.duplicates.map(warning => [warning.kind, warning.resumeId]), [['exact-content', third.resume.id]])
+    const foreign = (await bodyOf(await importMarkdown(server, { workspaceId: OTHER_WORKSPACE, oid: OUTSIDER }), 202)).resume
+    assert.deepEqual(foreign.duplicates, [])
+    assert.equal((await server.service.detail(WORKSPACE, first.resume.id)).duplicates.length, 0)
+    const fullBatch = randomUUID()
+    const outcomes = await Promise.all(Array.from({ length: 11 }, (_, index) =>
+      (index % 2 ? importPdf : importMarkdown)(server, { input: { batchId: fullBatch, inputCount: 10 } })))
+    assert.equal(outcomes.filter(response => response.status === 202).length, 10)
+    assert.equal(outcomes.filter(response => response.status === 409).length, 1)
+    const admitted = (await server.store.get(WORKSPACE, api.resumeBatchRecordId(fullBatch))).record.items
+    assert.equal(admitted.length, 10)
+    const kinds = await Promise.all(admitted.map(async item => (await server.store.get(WORKSPACE, item.resumeId)).record.source.kind))
+    assert.deepEqual([...new Set(kinds)].sort(), ['markdown', 'pdf'])
+  } finally { await server.close() }
+})
+
+test('Markdown captures require matching extraction method and section provenance, reject URL capture substitution, and do not use PDF page limits', async () => {
+  const server = await fixture()
+  try {
+    const initial = (await bodyOf(await importMarkdown(server), 202)).resume
+    const ready = await profileResume(server, initial.resume.id, 'ready', 75)
+    const detail = await server.service.detail(WORKSPACE, initial.resume.id)
+    assert.equal(detail.document.paragraphs[0].page, 75)
+    assert.equal(detail.extraction.method, 'markdown')
+    assert.equal(detail.extraction.pagination, 'markdown-sections')
+    assert.equal(detail.extraction.pageCount, null)
+    assert.deepEqual(api.validateResumeDocumentBinding(ready.document, ready.record), [])
+    for (const mutate of [
+      value => { value.extraction.method = 'html' },
+      value => { value.extraction.method = 'document-intelligence' },
+      value => { value.extraction.pagination = 'pdf-pages' },
+      value => { value.extraction.pagination = 'html-sections' },
+      value => { value.extraction.pageCount = 1 },
+      value => { value.capture.original.contentType = 'application/pdf' },
+      value => { value.capture.original.contentType = 'text/html' },
+      value => { value.capture.finalUrl = 'https://example.com/resume.md' },
+      value => { value.capture.redirects = ['https://example.com/resume.md'] },
+      value => { delete value.capture; delete value.captureManifest },
+    ]) {
+      const invalid = clone(ready.record)
+      mutate(invalid)
+      assert.throws(() => api.parseResumeEntity(invalid))
+    }
+    const source = { kind: 'url', url: 'https://example.com/resume.md', displayName: 'https://example.com/resume.md' }
+    assert.throws(() => api.parseResumeCaptureManifest({
+      schemaVersion: 1, dataKind: 'real', workspaceId: WORKSPACE, resumeId: initial.resume.id,
+      inputFingerprint: ready.record.inputFingerprint, source,
+      capture: { ...ready.record.capture, finalUrl: source.url },
+    }), /PDF or HTML/)
+    const urlRecord = {
+      ...ready.record, source, resume: { ...ready.record.resume, sourceLabel: source.displayName },
+      capture: { ...ready.record.capture, finalUrl: source.url },
+    }
+    assert.throws(() => api.parseResumeEntity(urlRecord), /PDF or HTML/)
+    const raw = server.blobContainer.values.get(ready.record.capture.original.blobName)
+    raw.contentType = 'text/html'
+    assert.equal((await fetch(`${server.path()}/${initial.resume.id}/original`, { headers: auth() })).status, 503)
   } finally { await server.close() }
 })
 
@@ -1110,6 +1396,57 @@ test('immutable Blob adapter bounds actual bytes, validates metadata and namespa
   }
   container.override(undefined)
   assert.deepEqual((await store.read(name)).bytes, pdfBytes)
+})
+
+test('Markdown resume Blob adapters use explicit canonical MIME/size maps and preserve exact winning bytes without HTML or JSON fallbacks', async () => {
+  const container = fakeBlobContainer([])
+  const store = api.createResumeBlobStoreFromContainer(container)
+  const id = api.resumeIdForKey(randomUUID())
+  const name = api.resumeOriginalBlobName(WORKSPACE, id, 'markdown')
+  assert.equal(name, `${WORKSPACE}/${id}/original.md`)
+  assert.equal(api.resumeOriginalBlobName(WORKSPACE, id, 'text/markdown'), name)
+  assert.equal(api.resumeBlobContentType(name), 'text/markdown')
+  assert.equal(api.resumeBlobLimit(name), MAX_MARKDOWN)
+  assert.throws(() => api.resumeOriginalBlobName(WORKSPACE, id, 'text/plain'))
+  const bytes = Buffer.alloc(MAX_MARKDOWN, 'x')
+  bytes.set(Buffer.from('\uFEFF# Résumé\r\n\t😀\r\n'))
+  const original = await store.putImmutable(name, bytes, 'text/markdown')
+  assert.equal(original.created, true)
+  const reference = api.resumeBlobReference(name, original.blob)
+  assert.equal(reference.contentType, 'text/markdown')
+  assert.equal(reference.bytes, MAX_MARKDOWN)
+  assert.equal(reference.sha256, api.resumeSha256(bytes))
+  const replay = await store.putImmutable(name, Buffer.from('# Changed original\n'), 'text/markdown')
+  assert.equal(replay.created, false)
+  assert.deepEqual(replay.blob.bytes, bytes)
+  assert.equal(replay.blob.etag, original.blob.etag)
+  assert.deepEqual((await store.read(name)).bytes, bytes)
+  for (const contentType of ['application/pdf', 'text/html', 'application/json', 'text/plain', 'application/octet-stream']) {
+    await assert.rejects(store.putImmutable(name, bytes, contentType), /content type/)
+    assert.throws(() => api.resumeBlobReference(name, { ...original.blob, contentType }))
+  }
+  await assert.rejects(store.putImmutable(name, Buffer.alloc(MAX_MARKDOWN + 1, 'x'), 'text/markdown'), /size/)
+  await assert.rejects(store.putImmutable(name, Buffer.alloc(0), 'text/markdown'), /empty/)
+  for (const file of ['original.markdown', 'original.MD', 'original.txt', 'original.json', '../original.md']) {
+    const invalid = `${WORKSPACE}/${id}/${file}`
+    assert.throws(() => api.resumeBlobContentType(invalid))
+    assert.throws(() => api.resumeBlobLimit(invalid))
+    await assert.rejects(store.putImmutable(invalid, Buffer.from('# Resume'), 'text/markdown'))
+    await assert.rejects(store.read(invalid))
+  }
+  for (const change of [
+    response => ({ ...response, contentType: 'text/html' }),
+    response => ({ ...response, contentType: 'application/pdf' }),
+    response => ({ ...response, contentType: 'application/json' }),
+    response => ({ ...response, contentLength: MAX_MARKDOWN + 1 }),
+    response => ({ ...response, contentLength: bytes.length - 1 }),
+    response => ({ ...response, contentLength: undefined, readableStreamBody: Readable.from([bytes, Buffer.from('x')]) }),
+  ]) {
+    container.override(change)
+    await assert.rejects(store.read(name))
+  }
+  container.override(undefined)
+  assert.deepEqual((await store.read(name)).bytes, bytes)
 })
 
 test('document/profile validation is strict, source-bounded, version-bound, and requires exact quotations for every available field', async () => {

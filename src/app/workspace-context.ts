@@ -38,6 +38,8 @@ export interface CloudWorkspaceStatus {
     ensureDetail: (jobId: string, force?: boolean) => Promise<void>
     refresh: () => Promise<void>
     importPdf: (file: File, idempotencyKey: string, batchId?: string) => Promise<RealJobSummary>
+    importMarkdown: (file: File, idempotencyKey: string, batchId?: string) => Promise<RealJobSummary>
+    importFile: (file: File, idempotencyKey: string, batchId?: string) => Promise<RealJobSummary>
     importUrl: (url: string, idempotencyKey: string, batchId?: string) => Promise<RealJobSummary>
     originalUrl: (jobId: string) => string
   }

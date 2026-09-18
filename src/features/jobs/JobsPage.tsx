@@ -3,11 +3,15 @@ import { Link, useNavigate, useParams } from 'react-router-dom'
 import { ArrowLeft, ArrowRight, ArrowUpRight, BarChart3, BriefcaseBusiness, Building2, ChevronRight, Download, FileText, Globe2, Layers3, Link2, LoaderCircle, MapPin, Plus, RotateCcw, ScanLine, ShieldCheck, Sparkles, X } from 'lucide-react'
 import { useWorkspace } from '../../app/workspace-context'
 import type { Citation, Criterion, SourceKind } from '../../domain/types'
+import { documentPagination } from '../../domain/source-files'
 import { dateLabel } from '../../domain/selectors'
 import { sortTableRows, type TableSort } from '../../domain/tableSorting'
 import { Badge, Button, DemoNote, EmptyState, ExternalSource, InlineError, PageHeader, SearchField, SegmentedControl, StatusBadge } from '../../components/ui'
 import { SortableHeader, TableSortSelect, type TableSortOption } from '../../components/ui/TableSorting'
 import { DocumentViewer } from '../../components/documents/DocumentViewer'
+import { PrivateDocumentViewer } from '../../components/documents/PrivateDocumentViewer'
+import { UPLOAD_CONTENT_TYPES, supportedUploadFormats } from '../../domain/document-formats'
+import { uploadFormatNames } from '../../services/documentUploads'
 import { RubricPanel } from '../rubrics/RubricPanel'
 import { JobImport } from './JobImport'
 import { useGradeLadders } from '../../app/grade-ladders-context'
@@ -16,8 +20,8 @@ import { sampleDataLink } from '../../app/real-data-mode'
 import { realAnalysisLink } from '../analyses/realAnalysisUi'
 import type { RealAnalysisTargetSelection } from '../../domain/real-analyses'
 
-const sourceNames = { pdf: 'PDF document', url: 'Direct URL', website: 'Website' }
-const sourceIcons = { pdf: FileText, url: Link2, website: Globe2 }
+const sourceNames = { pdf: 'PDF document', markdown: 'Markdown document', docx: 'Word DOCX', doc: 'Word DOC (97–2003)', url: 'Direct URL', website: 'Website' }
+const sourceIcons = { pdf: FileText, markdown: FileText, docx: FileText, doc: FileText, url: Link2, website: Globe2 }
 type JobSortKey = 'title' | 'source' | 'status' | 'added' | 'actions'
 const jobSortOptions: Record<JobSortKey, TableSortOption<JobSortKey>> = {
   title: { key: 'title', label: 'Job title', ascendingLabel: 'A–Z', descendingLabel: 'Z–A' },
@@ -50,6 +54,9 @@ function JobsLibrary({ libraryKind, onLibraryKindChange }: {
   const [importOpen, setImportOpen] = useState(false)
   const activeSort = sort ?? defaultJobSort
   const libraryJobs = workspace.jobs.filter((job) => libraryKind === 'real' ? job.dataKind === 'real' : job.dataKind !== 'real')
+  const wordFilters = libraryKind === 'real' && (cloud?.realJobs.features?.wordDocumentImports || libraryJobs.some((job) => job.source === 'docx' || job.source === 'doc'))
+  const markdownFilter = libraryKind === 'real' && (cloud?.realJobs.features?.markdownJobImports || libraryJobs.some((job) => job.source === 'markdown'))
+  const formats = supportedUploadFormats({ markdownJobImports: cloud?.realJobs.features?.markdownJobImports, wordDocumentImports: cloud?.realJobs.features?.wordDocumentImports })
   const readyCount = libraryJobs.filter((job) => job.status === 'ready').length
   const attentionCount = libraryJobs.filter((job) => job.status === 'error' || job.status === 'cancelled').length
   const filtered = sortTableRows(libraryJobs.filter((job) => {
@@ -105,8 +112,8 @@ function JobsLibrary({ libraryKind, onLibraryKindChange }: {
         <div className="toolbar"><SearchField value={query} onChange={setQuery} placeholder="Search jobs, organizations..." />
           <select aria-label="Filter by source" className="filter-select" value={source} onChange={(event) => {
             const value = event.target.value
-            if (value === 'all' || value === 'pdf' || value === 'url' || value === 'website') setSource(value)
-          }}><option value="all">All sources</option><option value="pdf">PDF files</option><option value="url">Direct URLs</option><option value="website">Websites</option></select>
+            if (value === 'all' || value === 'pdf' || value === 'markdown' || value === 'docx' || value === 'doc' || value === 'url' || value === 'website') setSource(value)
+          }}><option value="all">All sources</option><option value="pdf">PDF files</option>{markdownFilter && <option value="markdown">Markdown files</option>}{wordFilters && <><option value="docx">Word DOCX files</option><option value="doc">Word DOC files</option></>}<option value="url">Direct URLs</option><option value="website">Websites</option></select>
           <TableSortSelect options={[jobSortOptions.title, jobSortOptions.source, jobSortOptions.status, jobSortOptions.added]}
             sort={sort?.key === 'actions' ? { ...sort, key: 'status' } : sort} onChange={setSort} label="Sort jobs" defaultLabel="Newest first (default)" />
         </div>
@@ -148,7 +155,7 @@ function JobsLibrary({ libraryKind, onLibraryKindChange }: {
         ? <EmptyState icon={LoaderCircle} title="Loading real jobs" description="Score is retrieving every page of server-owned job records for this workspace." />
         : libraryKind === 'real' && cloud && cloud.realJobs.phase !== 'ready'
           ? <EmptyState icon={BriefcaseBusiness} title="Real job imports are unavailable" description={cloud.realJobs.error ?? 'This deployment does not have real job processing enabled. Samples remain available in their separate view.'} action={<Button onClick={() => onLibraryKindChange('samples')}>View samples</Button>} />
-          : <EmptyState icon={BriefcaseBusiness} title={libraryJobs.length ? 'No jobs match these filters' : libraryKind === 'real' ? 'Import your first real job' : cloud ? 'Explore the sample jobs' : 'Your next great match starts here'} description={libraryJobs.length ? 'Try another search or choose All jobs to see the rest of your library.' : libraryKind === 'real' ? 'Upload an actual PDF or enter a direct posting URL. Score will create a durable queued job and source-grounded rubric.' : cloud ? 'Fictional examples remain available for the simulated workflow.' : 'Add a PDF, a job URL, or a collection of roles from a website.'}
+          : <EmptyState icon={BriefcaseBusiness} title={libraryJobs.length ? 'No jobs match these filters' : libraryKind === 'real' ? 'Import your first real job' : cloud ? 'Explore the sample jobs' : 'Your next great match starts here'} description={libraryJobs.length ? 'Try another search or choose All jobs to see the rest of your library.' : libraryKind === 'real' ? `Upload an actual ${uploadFormatNames(formats)} file or enter a direct HTML/PDF posting URL. Score will create a durable queued job and source-grounded rubric.` : cloud ? 'Fictional examples remain available for the simulated workflow.' : 'Add a PDF, a job URL, or a collection of roles from a website.'}
             action={<Button onClick={() => { if (!libraryJobs.length && libraryKind === 'real') setImportOpen(true); else { setQuery(''); setFilter('all'); setSource('all') } }}>{libraryJobs.length ? 'Clear filters' : libraryKind === 'real' ? 'Import a real job' : 'Show all samples'}</Button>} />}
       <div className="table-bottom"><span>Showing {filtered.length} of {libraryJobs.length} {libraryKind === 'real' ? 'real' : 'sample'} jobs</span></div>
     </section>
@@ -229,7 +236,10 @@ export function JobDetail() {
     <div className="split-layout">
       <section className={`detail-panel ${pane !== 'document' ? 'mobile-pane-hidden' : ''}`} aria-label="Job description">
         <div className="section-heading"><div><h2>The role, in its own words</h2><p>Source context for every criterion</p></div><FileText size={17} className="text-muted" /></div>
-        {document ? <DocumentViewer document={document} highlightedId={highlighted?.id} quote={highlighted?.quote} pagination={real && source?.originalContentType === 'text/html' ? 'html-sections' : 'pdf-pages'} /> : real && (detail?.state === 'idle' || detail?.state === 'loading')
+        {document ? real && source && cloud
+          ? <PrivateDocumentViewer document={document} originalUrl={cloud.realJobs.originalUrl(job.id)} highlighted={highlighted}
+            original={{ contentType: source.originalContentType ?? (source.kind === 'url' ? undefined : UPLOAD_CONTENT_TYPES[source.kind]), bytes: source.bytes, sha256: source.sha256 }} />
+          : <DocumentViewer document={document} highlightedId={highlighted?.id} quote={highlighted?.quote} pagination={real ? documentPagination(source?.originalContentType) : 'pdf-pages'} /> : real && (detail?.state === 'idle' || detail?.state === 'loading')
           ? <EmptyState icon={LoaderCircle} title="Loading the parsed source" description="Score is retrieving the private source document and exact paragraph references." />
           : processing ? <EmptyState icon={LoaderCircle} title="Source processing is not complete" description="The worker is reading this source asynchronously. This page will refresh while the durable job remains queued." />
             : <EmptyState title="Source document unavailable" description={real ? 'The server has not returned a parsed source document. Review the job error or retry the import.' : 'This sample could not be opened. Reset the demo to restore the original document.'} />}

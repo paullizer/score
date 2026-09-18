@@ -193,6 +193,38 @@ test('optional discovery metadata round-trips while legacy drafts and missing se
   assert.equal(legacy.record.discovery, undefined)
 })
 
+test('Markdown seed-source Cosmos metadata reloads exactly and cannot become supporting-reference evidence', async () => {
+  const cosmos = container()
+  const store = createGradeStoreFromContainer(cosmos)
+  const source = {
+    id: seedId, workspaceId: WORKSPACE, ladderId: LADDER, recordType: 'grade-source',
+    createdAt: NOW, updatedAt: NOW, origin: 'seed-job', purpose: 'job-context',
+    title: 'Markdown engineering role', publisher: 'Imported job', redirects: [], discoveryPath: [],
+    coverage: { series: ['0801'], grades: [9], functions: [], state: 'confirmed', explanation: 'Captured seed role context.' },
+    authorityStatus: 'supplied', relatedLinks: [], status: 'ready', documentId: 'document-markdown-seed', documentVersion: 1,
+    originalBlobName: `${WORKSPACE}/${LADDER}/${seedId}/original.md`, originalContentType: 'text/markdown',
+    documentBlobName: `${WORKSPACE}/${LADDER}/${seedId}/document-v1.json`, sha256: 'a'.repeat(64), bytes: 123,
+    capturedAt: NOW, extractionMethod: 'seed-snapshot', extractionVersion: 'grade-seed-v1',
+    completeness: 'complete', pageCount: 1, selectedPages: [], issues: [], inputFingerprint: 'b'.repeat(64),
+  }
+  const created = await store.create(source)
+  const restored = await store.get(WORKSPACE, seedId)
+  assert.deepEqual(restored.record, source)
+  assert.equal(restored.etag, created.value.etag)
+  for (const overrides of [
+    { origin: 'upload', purpose: 'agency' },
+    { origin: 'url', purpose: 'agency', requestedUrl: 'https://example.org/reference.md' },
+    { extractionMethod: 'html' },
+    { extractionMethod: 'markdown' },
+    { bytes: 10 * 1024 * 1024 + 1 },
+    { originalContentType: 'text/html' },
+    { originalBlobName: source.originalBlobName.replace(/\.md$/, '.html') },
+  ]) await assert.rejects(store.replace({ ...source, ...overrides }, restored.etag))
+  await assert.rejects(store.replace({ ...source, sha256: 'c'.repeat(64) }, restored.etag), /immutable/)
+  assert.deepEqual((await store.get(WORKSPACE, seedId)), restored)
+  assert.equal(cosmos.replacements.length, 0)
+})
+
 test('stored entity decoding is strict about nested fields, ownership, hashes, record bounds, and identities', async () => {
   const cosmos = container()
   const store = createGradeStoreFromContainer(cosmos)
@@ -428,6 +460,68 @@ test('grade Blob adapter bounds declared and streamed bytes, rejects unsafe path
       },
     })
     await assert.rejects(bounded.read(pdfName), /exceeds the supported size/)
+  }
+})
+
+test('grade seed Markdown originals preserve raw bytes, hashes and ETags and enforce the 10 MiB MIME-specific budget', async () => {
+  const name = `${WORKSPACE}/${LADDER}/${seedId}/original.md`
+  const maximum = 10 * 1024 * 1024
+  let saved
+  const service = createGradeBlobStoreFromContainer({
+    getBlockBlobClient(requested) {
+      assert.equal(requested, name)
+      return {
+        async upload(bytes, length, options) {
+          assert.deepEqual(options.conditions, { ifNoneMatch: '*' })
+          assert.equal(options.blobHTTPHeaders.blobContentType, 'text/markdown')
+          assert.equal(length, bytes.byteLength)
+          if (saved) throw Object.assign(new Error('Already captured'), { statusCode: 409 })
+          saved = Buffer.from(bytes)
+          return { etag: '"markdown-seed"' }
+        },
+        async download() {
+          return { etag: '"markdown-seed"', contentType: 'text/markdown', contentLength: saved.byteLength,
+            readableStreamBody: Readable.from([saved]) }
+        },
+      }
+    },
+  })
+  const bytes = Buffer.from('# Engineering role\r\n\r\nExact **Markdown** bytes.\r\n')
+  const first = await service.putImmutable(name, bytes, 'text/markdown')
+  assert.deepEqual(await service.read(name), first.blob)
+  assert.deepEqual(first.blob.bytes, bytes)
+  const repeated = await service.putImmutable(name, Buffer.from('Different Markdown'), 'text/markdown')
+  assert.equal(repeated.created, false)
+  assert.deepEqual(repeated.blob, first.blob)
+  for (const contentType of ['text/html', 'application/json', 'application/pdf', 'text/plain']) {
+    await assert.rejects(service.putImmutable(name, bytes, contentType), /content type/)
+  }
+  await assert.rejects(service.putImmutable(name.replace(/\.md$/, '.markdown'), bytes, 'text/markdown'), /blob name/)
+  await assert.rejects(service.putImmutable(name, Buffer.alloc(maximum + 1), 'text/markdown'), /supported size/)
+  saved = undefined
+  const boundary = Buffer.alloc(maximum, 0x61)
+  assert.equal((await service.putImmutable(name, boundary, 'text/markdown')).created, true)
+  assert.equal((await service.read(name)).bytes.byteLength, maximum)
+  for (const contentLength of [maximum + 1, undefined]) {
+    const bounded = createGradeBlobStoreFromContainer({
+      getBlockBlobClient() {
+        return { async upload() {}, async download() {
+          return { etag: '"oversized"', contentType: 'text/markdown', contentLength,
+            readableStreamBody: Readable.from([boundary, Buffer.from('x')]) }
+        } }
+      },
+    })
+    await assert.rejects(bounded.read(name), /supported size/)
+  }
+  for (const contentType of ['text/html', 'application/json']) {
+    const wrongMedia = createGradeBlobStoreFromContainer({
+      getBlockBlobClient() {
+        return { async upload() {}, async download() {
+          return { etag: '"wrong-media"', contentType, contentLength: bytes.length, readableStreamBody: Readable.from([bytes]) }
+        } }
+      },
+    })
+    await assert.rejects(wrongMedia.read(name), /content metadata/)
   }
 })
 

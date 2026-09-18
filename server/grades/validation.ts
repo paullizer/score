@@ -6,8 +6,13 @@ import {
   type ReferenceDocument, type FrozenReferenceSource, type GradeSeedSnapshot, type GradeContext, type ReferenceCoverage,
 } from '../../src/domain/real-grades'
 import type { Citation } from '../../src/domain/types'
+import {
+  ORIGINAL_CONTENT_TYPES, UPLOAD_CONTENT_TYPES, UPLOAD_FORMATS, WORD_DOCUMENT_LIMITS, isOriginalContentType, isWordContentType,
+  originalExtension, storedDocumentContentType, type OriginalContentType,
+} from '../../src/domain/document-formats'
+import { isSafeUploadedFilename, MAX_MARKDOWN_BYTES } from '../../src/domain/source-files'
 import { WORKSPACE_ID_PATTERN } from '../ids'
-import { validateRealRubric, validateRealSourceDocument } from '../jobs/validation'
+import { originalBlobName, validateRealJobRecord, validateRealRubric, validateRealSourceDocument } from '../jobs/validation'
 
 const UUID = '[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}'
 const identifier = z.string().min(1).max(180).regex(/^[a-zA-Z0-9][a-zA-Z0-9_.:-]*$/)
@@ -29,6 +34,7 @@ const purpose = z.enum(['grading', 'classification', 'qualification', 'agency', 
 const origin = z.enum(['opm', 'upload', 'url', 'seed-job'])
 const authority = z.enum(['current', 'superseded', 'unknown', 'conflicting', 'supplied'])
 const completeness = z.enum(['complete', 'selected-pages', 'incomplete'])
+const originalContentTypes = z.enum(ORIGINAL_CONTENT_TYPES)
 
 export const gradeContextSchema = z.strictObject({
   series: z.string().regex(/^\d{4}$/),
@@ -107,6 +113,7 @@ export const sourceDecisionSchema = z.strictObject({
 const frozenSource = z.strictObject({
   sourceId, title: text(500), origin, purpose, publisher: text(300),
   documentId: identifier, documentVersion: integer, documentBlobName: blobName, originalBlobName: blobName,
+  originalContentType: originalContentTypes.optional(),
   sha256: hash, url: url.optional(), intendedSection: z.string().max(2000).optional(),
   revision: text(1000).optional(), authorityStatus: authority, coverage,
   pageCount: z.number().int().min(1).max(100_000), selectedPages: pages, completeness, issues,
@@ -134,7 +141,7 @@ const sourceSchema = z.strictObject({
   relatedLinks: z.array(relatedLink).max(LIMITS.maxReferenceLinks),
   status: z.enum(['queued', 'extracting', 'ready', 'error', 'cancelled']),
   documentId: identifier, documentVersion: integer,
-  originalBlobName: blobName.optional(), originalContentType: z.enum(['application/pdf', 'text/html']).optional(),
+  originalBlobName: blobName.optional(), originalContentType: originalContentTypes.optional(),
   documentBlobName: blobName.optional(), sha256: hash.optional(),
   bytes: z.number().int().min(1).max(24 * 1024 * 1024).optional(), capturedAt: timestamp.optional(),
   extractionMethod: z.enum(['document-intelligence', 'html', 'browser', 'seed-snapshot']).optional(),
@@ -247,7 +254,7 @@ export function isSafeGradeBlobName(value: string): boolean {
     new RegExp(`^discovery-${UUID}\\.json$`).test(parts[2])
   if (parts.length === 4 && parts[2] === 'requests') return new RegExp(`^${UUID}\\.json$`).test(parts[3])
   if (!isGradeId(parts[2] ?? '', 'source')) return false
-  if (parts.length === 4) return /^(?:original\.(?:pdf|html)|capture\.json|document-v(?:[1-9]\d{0,5}|1000000)\.json)$/.test(parts[3])
+  if (parts.length === 4) return /^(?:original\.(?:pdf|md|docx|doc|html)|capture\.json|document-v(?:[1-9]\d{0,5}|1000000)\.json)$/.test(parts[3])
   return parts.length === 5 && parts[3] === 'chunks' &&
     /^v(?:[1-9]\d{0,5}|1000000)-[A-Za-z0-9._-]{1,120}\.json$/.test(parts[4])
 }
@@ -298,33 +305,55 @@ const seedSnapshotSchema = z.strictObject({
   job: z.strictObject({
     id: id('job'), title: text(500), organization: z.string().max(1000), location: z.string().max(1000),
     arrangement: z.string().max(1000), employmentType: z.string().max(1000),
-    grade: z.string().max(200), series: z.string().max(200), source: z.enum(['pdf', 'url']),
+    grade: z.string().max(200), series: z.string().max(200), source: z.enum([...UPLOAD_FORMATS, 'url']),
     sourceLabel: text(LIMITS.maxUrlLength), batchId: z.string().uuid().optional(),
     documentId: identifier, rubricId: identifier, status: z.literal('ready'), createdAt: timestamp, dataKind: z.literal('real'),
     errorStage: z.enum(['download', 'parsing', 'rubric']).optional(), error: text(2000).optional(),
   }),
   rubric: z.unknown(), document: z.unknown(),
   source: z.strictObject({
-    kind: z.enum(['pdf', 'url']), displayName: text(LIMITS.maxUrlLength), url: url.optional(), finalUrl: url.optional(),
-    originalBlobName: blobName, originalContentType: z.enum(['application/pdf', 'text/html']),
+    kind: z.enum([...UPLOAD_FORMATS, 'url']), displayName: text(LIMITS.maxUrlLength), url: url.optional(), finalUrl: url.optional(),
+    originalBlobName: blobName, originalContentType: originalContentTypes,
     sha256: hash, bytes: z.number().int().min(1).max(24 * 1024 * 1024),
-    capturedAt: timestamp.optional(), extractionMethod: z.enum(['document-intelligence', 'html', 'browser']).optional(),
+    capturedAt: timestamp.optional(), extractionMethod: z.enum(['document-intelligence', 'legacy-word', 'html', 'browser', 'markdown']).optional(),
   }),
   capturedAt: timestamp,
 })
 
 export function parseGradeSeedSnapshot(value: unknown): GradeSeedSnapshot {
   const snapshot = seedSnapshotSchema.parse(value) as GradeSeedSnapshot
-  assert(validateRealSourceDocument(snapshot.document).length === 0, 'Seed job document is invalid.')
-  assert(snapshot.rubric && validateRealRubric(snapshot.rubric, snapshot.document).length === 0, 'Seed job rubric is invalid.')
+  assert(validateRealSourceDocument(snapshot.document, snapshot.source.originalContentType).length === 0, 'Seed job document is invalid.')
+  assert(snapshot.rubric && validateRealRubric(snapshot.rubric, snapshot.document, snapshot.source.originalContentType).length === 0,
+    'Seed job rubric is invalid.')
   assert(snapshot.job.documentId === snapshot.document.id && snapshot.job.rubricId === snapshot.rubric.id &&
     snapshot.rubric.jobId === snapshot.job.id && snapshot.job.source === snapshot.source.kind &&
     snapshot.job.sourceLabel === snapshot.source.displayName, 'Seed evidence identity mismatch.')
   const name = snapshot.source.originalBlobName!
   const parts = name.split('/')
   assert(parts.length === 4 && isGradeId(parts[2], 'source') &&
-    parts[3] === (snapshot.source.originalContentType === 'application/pdf' ? 'original.pdf' : 'original.html'),
+    parts[3] === `original.${originalExtension(snapshot.source.originalContentType!)}`,
   'Seed original must be an independently captured grade source.')
+  assert(validateRealJobRecord({
+    id: snapshot.job.id, workspaceId: parts[0], recordType: 'job', job: snapshot.job,
+    source: { ...snapshot.source, originalBlobName: originalBlobName(parts[0], snapshot.job.id, snapshot.source.originalContentType!) },
+    inputFingerprint: 'captured-seed', createdBy: 'seed-capture', updatedAt: snapshot.capturedAt, attempts: 0, warnings: [],
+  }), 'Seed source format or provenance is invalid.')
+  assert(snapshot.source.extractionMethod !== 'legacy-word' || snapshot.source.originalContentType === UPLOAD_CONTENT_TYPES.doc,
+    'Legacy Word extraction requires a DOC seed original.')
+  assert(snapshot.source.extractionMethod !== 'markdown' || snapshot.source.originalContentType === 'text/markdown',
+    'Markdown extraction requires a Markdown seed original.')
+  if (isWordContentType(snapshot.source.originalContentType) || snapshot.source.originalContentType === 'text/markdown') {
+    const markdown = snapshot.source.originalContentType === 'text/markdown'
+    assert(snapshot.source.kind !== 'url' && snapshot.source.originalContentType === UPLOAD_CONTENT_TYPES[snapshot.source.kind] &&
+      snapshot.source.extractionMethod === (markdown ? 'markdown'
+        : snapshot.source.originalContentType === UPLOAD_CONTENT_TYPES.doc ? 'legacy-word' : 'document-intelligence') &&
+      isSafeUploadedFilename(snapshot.source.displayName, snapshot.source.kind) &&
+      snapshot.source.url === undefined && snapshot.source.finalUrl === undefined &&
+      snapshot.source.capturedAt && snapshot.source.capturedAt >= snapshot.job.createdAt && snapshot.source.capturedAt <= snapshot.capturedAt &&
+      snapshot.source.bytes! <= (markdown ? MAX_MARKDOWN_BYTES : WORD_DOCUMENT_LIMITS.maxFileBytes) &&
+      (markdown || snapshot.document.paragraphs.every(paragraph => paragraph.page === 1)),
+    'Uploaded seed extraction must preserve captured sections without printed page numbers.')
+  }
   return snapshot
 }
 
@@ -352,12 +381,22 @@ function assertSourceAuthority(source: {
 
 function assertSourceBinding(source: {
   sourceId: string; documentVersion: number; originalBlobName: string; documentBlobName: string;
-  selectedPages: number[]; pageCount: number; completeness: string;
+  selectedPages: number[]; pageCount: number; completeness: string; origin: string; purpose: string; url?: string;
+  originalContentType?: OriginalContentType;
 }, workspaceId: string, ladderId: string): void {
   const prefix = `${workspaceId}/${ladderId}/${source.sourceId}/`
+  const contentType = storedDocumentContentType(source.originalBlobName)
   assert(source.documentBlobName === `${prefix}document-v${source.documentVersion}.json`, 'Document blob/version ownership mismatch.')
-  assert(source.originalBlobName === `${prefix}original.pdf` || source.originalBlobName === `${prefix}original.html`,
-    'Original blob ownership mismatch.')
+  assert(isOriginalContentType(contentType) && source.originalBlobName === `${prefix}original.${originalExtension(contentType)}`,
+  'Original blob ownership mismatch.')
+  if (isWordContentType(contentType) || contentType === 'text/markdown') {
+    assert(source.origin === 'seed-job' && source.purpose === 'job-context' && !source.url &&
+      source.selectedPages.length === 0 && source.completeness === 'complete',
+    'Original blob ownership mismatch: Word and Markdown require a complete captured seed.')
+    if (isWordContentType(contentType)) assert(source.pageCount === 1, 'Word evidence must be a single captured seed section.')
+  }
+  if (source.originalContentType !== undefined) assert(source.originalContentType === contentType,
+    'Original blob content type mismatch.')
   assert(source.selectedPages.every(page => page <= source.pageCount), 'Selected page exceeds the original page count.')
   assert(source.completeness !== 'selected-pages' || source.selectedPages.length > 0, 'Selected-page extraction must identify its pages.')
   assert(source.selectedPages.length > 0 || source.pageCount <= LIMITS.maxPdfPages, 'Large references require page selection.')
@@ -383,8 +422,18 @@ export function parseGradeEntity(value: unknown): GradeEntity {
     const prefix = `${record.workspaceId}/${record.ladderId}/${record.id}/`
     if (record.documentBlobName) assert(record.documentBlobName === `${prefix}document-v${record.documentVersion}.json`,
       'Document blob/version ownership mismatch.')
-    if (record.originalBlobName) assert(record.originalBlobName === `${prefix}original.${record.originalContentType === 'application/pdf' ? 'pdf' : 'html'}` &&
-      record.originalContentType, 'Original blob ownership mismatch.')
+    if (record.originalBlobName) assert(record.originalContentType &&
+      record.originalBlobName === `${prefix}original.${originalExtension(record.originalContentType)}`, 'Original blob ownership mismatch.')
+    if (isWordContentType(record.originalContentType) || record.originalContentType === 'text/markdown') {
+      const markdown = record.originalContentType === 'text/markdown'
+      assert(record.origin === 'seed-job' && record.purpose === 'job-context' &&
+        record.originalBlobName && record.documentBlobName && record.sha256 && record.bytes && record.capturedAt &&
+        record.bytes <= (markdown ? MAX_MARKDOWN_BYTES : WORD_DOCUMENT_LIMITS.maxFileBytes) &&
+        record.extractionMethod === 'seed-snapshot' && record.extractionVersion && (!markdown || record.status === 'ready') &&
+        !record.requestedUrl && !record.finalUrl && record.redirects.length === 0 &&
+        record.selectedPages.length === 0 && (markdown || record.pageCount === 1) && record.completeness === 'complete',
+      'Word and Markdown originals are only supported as immutable captured seed-job context.')
+    }
     if (record.pageCount) assert(record.selectedPages.every(page => page <= record.pageCount!), 'Selected page exceeds page count.')
     if (record.status === 'ready') {
       assert(record.originalBlobName && record.documentBlobName && record.sha256 && record.bytes &&

@@ -1,9 +1,11 @@
 import { CosmosClient, type Container, type JSONObject, type OperationInput, type SqlParameter } from '@azure/cosmos'
 import { BlobServiceClient, type BlockBlobClient } from '@azure/storage-blob'
 import type { TokenCredential } from '@azure/identity'
+import { WORD_DOCUMENT_LIMITS, isWordContentType, storedDocumentContentType } from '../../src/domain/document-formats'
 import {
   ANALYSIS_LIMITS, analysisRunCanScore, type AnalysisEntity, type VersionedAnalysisEntity,
 } from '../../src/domain/real-analyses'
+import { MAX_MARKDOWN_BYTES } from '../../src/domain/source-files'
 import { WORKSPACE_ID_PATTERN } from '../ids'
 import { StoreConflictError } from '../store'
 import { fetchCosmosPage } from '../cosmos-query'
@@ -282,8 +284,20 @@ interface AnalysisBlobContainer {
     upload(...args: Parameters<BlockBlobClient['upload']>): Promise<Pick<Awaited<ReturnType<BlockBlobClient['upload']>>, 'etag'>>
   }
 }
-const mime = (name: string) => name.endsWith('.pdf') ? 'application/pdf' : name.endsWith('.html') ? 'text/html' : 'application/json'
-const maximum = (name: string) => name.endsWith('.pdf') ? 10 * 1024 * 1024 : name.endsWith('.html') ? MAX_ANALYSIS_ORIGINAL_BYTES : MAX_ANALYSIS_JSON_BYTES
+function mime(name: string): string {
+  const contentType = storedDocumentContentType(name)
+  assertAnalysis(contentType, 'Unsupported analysis blob content type.')
+  return contentType
+}
+function maximum(name: string): number {
+  const contentType = mime(name)
+  if (isWordContentType(contentType)) return WORD_DOCUMENT_LIMITS.maxFileBytes
+  if (contentType === 'text/markdown') return MAX_MARKDOWN_BYTES
+  if (contentType === 'application/pdf') return 10 * 1024 * 1024
+  if (contentType === 'text/html') return MAX_ANALYSIS_ORIGINAL_BYTES
+  assertAnalysis(contentType === 'application/json', 'Unsupported analysis blob content type.')
+  return MAX_ANALYSIS_JSON_BYTES
+}
 async function readBounded(stream: NodeJS.ReadableStream, length: number | undefined, max: number): Promise<Uint8Array> {
   if (length !== undefined && length > max) {
     if ('destroy' in stream && typeof stream.destroy === 'function') stream.destroy()
@@ -308,7 +322,8 @@ export function createAnalysisBlobStoreFromContainer(container: AnalysisBlobCont
     assertAnalysis(isSafeAnalysisBlobName(name), 'Invalid analysis blob name.')
     try {
       const response = await container.getBlockBlobClient(name).download()
-      assertAnalysis(response.readableStreamBody && response.etag && response.contentType === mime(name), 'Invalid analysis blob content metadata.')
+      assertAnalysis(response.readableStreamBody && response.etag && typeof response.contentType === 'string' &&
+        response.contentType === mime(name), 'Invalid analysis blob content metadata.')
       const bytes = await readBounded(response.readableStreamBody, response.contentLength, maximum(name))
       return { bytes, contentType: response.contentType, sha256: analysisBytesHash(bytes), etag: response.etag }
     } catch (error) {

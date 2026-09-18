@@ -68,7 +68,7 @@ test('browser imports actual PDF bytes, explicitly runs real analysis, opens cit
     const dialog = await visible(page.getByRole('dialog', { name: 'Add real resumes', exact: true }))
     const file = await resumePdf()
     const bytes = Buffer.from(await file.arrayBuffer())
-    await dialog.getByLabel('Choose resume PDF files', { exact: true }).setInputFiles({
+    await dialog.getByLabel('Choose resume PDF or Markdown files', { exact: true }).setInputFiles({
       name: file.name, mimeType: 'application/pdf', buffer: bytes,
     })
     await dialog.getByRole('button', { name: 'Import 1 valid input', exact: true }).click()

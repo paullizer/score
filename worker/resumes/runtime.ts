@@ -8,6 +8,8 @@ import type {
   ResumeProcessingErrorCode, ResumeSourceCapture, VersionedResumeEntity,
 } from '../../src/domain/real-resumes'
 import { RESUME_IMPORT_LIMITS as LIMITS } from '../../src/domain/real-resumes'
+import { documentPagination, isWordContentType, UPLOAD_CONTENT_TYPES } from '../../src/domain/document-formats'
+import { hasOleSignature, hasZipSignature } from '../../server/documents/word'
 import type { ResumeBlob, ResumeBlobStore, ResumeStore } from '../../server/resumes/store'
 import {
   normalizeResumePublicUrl, parseRealResumeProfile, parseResumeCaptureManifest, parseResumeEntity,
@@ -16,12 +18,17 @@ import {
   validateRealResumeProfile, validateResumeDocumentBinding,
 } from '../../server/resumes/validation'
 import {
-  analyzePdf, nodePinnedTransport, normalizeText, safeFetch, systemClock, WorkerError,
+  analyzePdf, extractMarkdown, extractWordDocument, nodePinnedTransport, normalizeText, safeFetch, systemClock, WorkerError,
+  WORD_EXTRACTION_VERSION, wordSourceWarnings,
   type BrowserRenderer, type Clock, type DocumentIntelligenceClientOptions, type RubricModelOptions,
   type SafeFetchOptions,
 } from '../runtime'
-import { documentIntelligenceResumeParagraphs, extractResumeHtml, ResumeExtractionError, ResumeHtmlShellError } from './extraction'
+import {
+  documentIntelligenceResumeParagraphs, extractResumeHtml, ResumeExtractionError, ResumeHtmlShellError,
+  RESUME_PARAGRAPH_OPTIONS, RESUME_SECTIONS,
+} from './extraction'
 import { extractResumeProfile, ResumeProfileError } from './model'
+import { MARKDOWN_EXTRACTION_VERSION } from '../markdown'
 
 const LEASE_MILLISECONDS = 90_000
 const HEARTBEAT_MILLISECONDS = 25_000
@@ -85,9 +92,10 @@ const MESSAGES: Record<ResumeProcessingErrorCode, string> = {
   'access-blocked': 'This URL is not publicly accessible and could not be processed.',
   'not-found': 'The public resume URL could not be found. Check the URL and import it again.',
   'network-error': 'The public resume source could not be retrieved because of a network error. Please retry.',
-  'unsupported-content': 'This source is not a supported PDF or HTML professional profile.',
+  'unsupported-content': 'Use a PDF, Markdown, DOCX, or DOC upload, or a public PDF/HTML profile URL. Markdown and Word documents must be uploaded as files, not imported by URL.',
   'unreadable-document': 'This public page did not provide readable resume text. Try another publicly accessible profile URL.',
   'pdf-too-large': 'Resume PDFs may not exceed 10 MiB.',
+  'file-too-large': 'Resume files may not exceed 10 MiB.',
   'pdf-too-many-pages': 'Resume PDFs may contain at most 50 pages.',
   'source-too-large': 'The resume source exceeds its supported size or the 180,000-character extracted source limit. No content was truncated.',
   'multiple-profiles': 'This source contains multiple people or a profile directory. Import one person’s profile per item.',
@@ -109,7 +117,12 @@ function processingError(
   error: unknown, stage: ResumeProcessingError['stage'], contentType?: ResumeSourceCapture['original']['contentType'],
 ): ResumeProcessingError {
   const message = (code: ResumeProcessingErrorCode): string =>
-    code === 'unreadable-document' && contentType === 'application/pdf' ? UNREADABLE_PDF_MESSAGE : MESSAGES[code]
+    code === 'unreadable-document' && contentType === 'application/pdf' ? UNREADABLE_PDF_MESSAGE
+      : code === 'unreadable-document' && isWordContentType(contentType)
+        ? 'The Word document did not provide readable text. Remove protection or save a new DOCX. For content in images, export a PDF for OCR.'
+      : code === 'unreadable-document' && contentType === 'text/markdown'
+        ? 'The Markdown file did not contain readable resume text. Upload a UTF-8 Markdown resume.'
+        : MESSAGES[code]
   if (error instanceof ResumeEncodingError) {
     return { code: error.code, stage: error.stage, retryable: false, message: error.message }
   }
@@ -117,6 +130,12 @@ function processingError(
     return { code: error.code, stage: error.stage, retryable: error.retryable, message: message(error.code) }
   }
   if (error instanceof WorkerError) {
+    if (error.code === 'invalid-markdown' || error.code === 'markdown-too-large') {
+      return {
+        code: error.code === 'markdown-too-large' ? 'source-too-large' : 'unreadable-document',
+        stage: 'parsing', message: error.message, retryable: false,
+      }
+    }
     let code: ResumeProcessingErrorCode
     switch (error.code) {
       case 'source-access-denied': code = 'access-blocked'; break
@@ -129,6 +148,10 @@ function processingError(
         code = 'invalid-source'; break
       case 'source-too-large': case 'source-too-long': code = 'source-too-large'; break
       case 'pdf-too-large': code = 'pdf-too-large'; break
+      case 'word-too-large': code = 'file-too-large'; break
+      case 'word-expansion-limit': code = 'source-too-large'; break
+      case 'word-timeout': code = 'timeout'; break
+      case 'invalid-word': case 'encrypted-word': code = 'unreadable-document'; break
       case 'pdf-too-many-pages': code = 'pdf-too-many-pages'; break
       case 'password-protected-pdf': case 'invalid-pdf': case 'ocr-failed': case 'ocr-rejected':
       case 'ocr-invalid-page': case 'empty-source':
@@ -136,7 +159,10 @@ function processingError(
       case 'request-timeout': case 'ocr-timeout': code = 'timeout'; break
       default: code = 'service-unavailable'
     }
-    return { code, stage, message: message(code), retryable: error.retryable }
+    return {
+      code, stage, message: ['word-too-large', 'word-expansion-limit', 'word-timeout', 'invalid-word', 'encrypted-word'].includes(error.code)
+        ? error.message : message(code), retryable: error.retryable,
+    }
   }
   if (error instanceof Response) {
     return {
@@ -191,7 +217,7 @@ class ResumeLease {
   ) {
     this.stage = claimed.record.resume.status === 'profiling' ? 'profiling' : 'parsing'
     this.contentType = claimed.record.capture?.original.contentType ??
-      (claimed.record.source.kind === 'pdf' ? 'application/pdf' : undefined)
+      (claimed.record.source.kind !== 'url' ? UPLOAD_CONTENT_TYPES[claimed.record.source.kind] : undefined)
   }
 
   start(): void {
@@ -487,6 +513,9 @@ async function downloadSource(
   const type = contentType?.split(';', 1)[0].trim().toLowerCase()
   const finalUrl = publicUrl(response.url)
   const redirects = (response.redirects ?? []).map(publicUrl)
+  if (isWordContentType(type) || hasOleSignature(response.body) || hasZipSignature(response.body)) {
+    throw failure('unsupported-content', false, 'download')
+  }
   if (type === 'application/pdf' || pdfSignature(response.body)) {
     lease.contentType = 'application/pdf'
     await pdfPageCount(response.body)
@@ -551,7 +580,7 @@ async function captureSource(dependencies: ResumeWorkerDependencies, lease: Resu
   let savedManifest = await readBlob(dependencies.blobs, name, record.captureManifest)
   let downloaded: DownloadedSource | undefined
   if (!savedManifest) {
-    if (record.capture || record.captureManifest || record.source.kind === 'pdf') throw failure('storage-error', true)
+    if (record.capture || record.captureManifest || record.source.kind !== 'url') throw failure('storage-error', true)
     for (const type of ['pdf', 'html'] as const) {
       const orphan = await readBlob(dependencies.blobs, resumeOriginalBlobName(record.workspaceId, record.id, type))
       // Without a manifest there is no trustworthy final URL for an orphaned original.
@@ -599,8 +628,10 @@ async function captureSource(dependencies: ResumeWorkerDependencies, lease: Resu
     downloaded.finalUrl === manifest.capture.finalUrl
   return {
     blob: original, capture: manifest.capture,
-    method: manifest.capture.original.contentType === 'application/pdf' ? 'document-intelligence'
-      : matchingDownload ? downloaded!.method : 'html',
+    method: manifest.capture.original.contentType === UPLOAD_CONTENT_TYPES.doc ? 'legacy-word'
+      : manifest.capture.original.contentType === 'application/pdf' || manifest.capture.original.contentType === UPLOAD_CONTENT_TYPES.docx ? 'document-intelligence'
+      : manifest.capture.original.contentType === 'text/markdown' ? 'markdown'
+        : matchingDownload ? downloaded!.method : 'html',
   }
 }
 
@@ -662,10 +693,13 @@ async function extractSource(
 ): Promise<RealResumeDocument> {
   const { record } = await lease.check()
   const pdf = original.blob.contentType === 'application/pdf'
+  const word = isWordContentType(original.blob.contentType)
+  const wordFormat = original.blob.contentType === UPLOAD_CONTENT_TYPES.doc ? 'doc' : 'docx'
+  const markdown = original.blob.contentType === 'text/markdown'
   const pageCount = pdf ? await pdfPageCount(original.blob.bytes) : null
   const name = resumeDocumentBlobName(record.workspaceId, record.id, record.resume.documentVersion)
   let blob = await readBlob(dependencies.blobs, name, record.extraction?.document)
-  let sourceWarnings: string[] = []
+  let sourceWarnings: string[] = word ? wordSourceWarnings(wordFormat) : []
   if (!blob) {
     if (record.extraction) throw failure('storage-error', true)
     let document: RealResumeDocument
@@ -689,8 +723,28 @@ async function extractSource(
       }
       document = {
         id: resumeDocumentId(record.id), kind: 'resume', sample: false, version: record.resume.documentVersion,
-        title: record.source.kind === 'pdf' ? record.source.fileName : 'Imported resume',
+        title: record.source.kind !== 'url' ? record.source.fileName : 'Imported resume',
         paragraphs: documentIntelligenceResumeParagraphs(analysis),
+      }
+    } else if (word) {
+      const extracted = await extractWordDocument(original.blob.bytes, wordFormat, {
+        ...dependencies.documentIntelligence, clock: dependencies.documentIntelligence.clock ?? lease.clock, signal: lease.signal,
+      }, { ...RESUME_PARAGRAPH_OPTIONS, sectionHeadingPattern: RESUME_SECTIONS })
+      await lease.check()
+      sourceWarnings = extracted.warnings
+      document = {
+        id: resumeDocumentId(record.id), kind: 'resume', sample: false, version: record.resume.documentVersion,
+        title: record.source.kind !== 'url' ? record.source.fileName : 'Imported resume',
+        paragraphs: extracted.paragraphs,
+      }
+    } else if (markdown) {
+      const extracted = extractMarkdown(original.blob.bytes, {
+        defaultHeading: 'Resume', maxCharacters: LIMITS.maxSourceCharacters,
+        emptySourceMessage: 'The Markdown file did not contain readable resume text.',
+      })
+      document = {
+        id: resumeDocumentId(record.id), kind: 'resume', sample: false, version: record.resume.documentVersion,
+        title: extracted.title?.slice(0, 500) ?? record.source.displayName, paragraphs: extracted.paragraphs,
       }
     } else {
       const extracted = extractResumeHtml(decodeHtml(original.blob.bytes), original.capture.finalUrl!)
@@ -703,14 +757,14 @@ async function extractSource(
     if (characterCount(document) > LIMITS.maxSourceCharacters) throw failure('source-too-large', false, 'parsing')
     if (validateRealResumeDocument(document).length) throw failure('invalid-source', false, 'parsing')
     blob = await saveBlob(lease, dependencies.blobs, name, Buffer.from(JSON.stringify(document)), 'application/json')
-  } else if (!pdf) {
+  } else if (original.blob.contentType === 'text/html') {
     // Re-check retained HTML, including access walls, rather than trusting a cache to legitimize it.
     sourceWarnings = extractResumeHtml(decodeHtml(original.blob.bytes), original.capture.finalUrl!).warnings
   }
   const document = documentFromBlob(blob, record)
   const extraction: ResumeExtractionProvenance = record.extraction ?? {
-    method: original.method, version: EXTRACTION_VERSION, extractedAt: updatedAt(record, lease.clock),
-    pagination: pdf ? 'pdf-pages' : 'html-sections', pageCount, normalizedCharacters: characterCount(document),
+    method: original.method, version: word ? WORD_EXTRACTION_VERSION : markdown ? MARKDOWN_EXTRACTION_VERSION : EXTRACTION_VERSION, extractedAt: updatedAt(record, lease.clock),
+    pagination: documentPagination(original.capture.original.contentType), pageCount, normalizedCharacters: characterCount(document),
     document: {
       ...jsonReference(name, blob), documentId: document.id, documentVersion: document.version,
     },

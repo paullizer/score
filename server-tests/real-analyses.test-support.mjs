@@ -8,6 +8,7 @@ import { after } from 'node:test'
 import { build } from 'esbuild'
 import express from 'express'
 import { PDFDocument } from 'pdf-lib'
+import { docxFile, legacyDocFile } from './word-fixtures.mjs'
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 const bundle = path.join(root, 'dist-server', `real-analyses-unit-${process.pid}.mjs`)
@@ -22,8 +23,11 @@ await build({
       "\nexport * from './server/ids.ts'; export * from './server/middleware.ts';" +
       "\nexport { analysisRunCanScore } from './src/domain/real-analyses.ts';" +
       "\nexport { WorkspaceRepository } from './server/repository.ts';" +
-      "\nexport { parseGradeEntity, gradeContentHash, gradeVersionHash, gradeSourceSetHash, validateGradeApproval } from './server/grades/validation.ts';" +
-      "\nexport { parseResumeEntity } from './server/resumes/validation.ts';",
+      "\nexport { parseGradeEntity, parseGradeSeedSnapshot, gradeContentHash, gradeVersionHash, gradeSourceSetHash, validateGradeApproval } from './server/grades/validation.ts';" +
+      "\nexport { createGradeBlobStoreFromContainer } from './server/grades/azure-store.ts';" +
+      "\nexport { parseResumeEntity } from './server/resumes/validation.ts';" +
+      "\nexport * from './src/domain/document-formats.ts';" +
+      "\nexport { gradeSourcePagination } from './src/features/grade-ladders/gradeUi.ts';",
   },
   bundle: true, platform: 'node', format: 'esm', packages: 'external', outfile: bundle, logLevel: 'silent',
 })
@@ -213,11 +217,33 @@ async function pdf() {
   }
   return originalPdf
 }
+async function sourceFile(document, options) {
+  if (typeof options === 'string') options = { kind: options === 'html' ? 'url' : options }
+  const kind = options.kind ?? 'pdf'
+  assert.ok([...api.UPLOAD_FORMATS, 'url'].includes(kind))
+  const contentType = kind === 'url' ? 'text/html' : api.UPLOAD_CONTENT_TYPES[kind]
+  const extension = api.originalExtension(contentType)
+  const url = `https://example.org/${document.kind}`
+  const text = [document.title, ...document.paragraphs.flatMap(paragraph => [paragraph.heading, paragraph.text])].join('\n')
+  return {
+    kind, contentType, extension, url, fileName: options.fileName ?? `${document.kind}.${extension}`,
+    bytes: kind === 'pdf' ? await pdf() : kind === 'docx' || kind === 'doc' ? evidenceOriginal(kind, text)
+      : Buffer.from(kind === 'markdown'
+        ? document.paragraphs.map(item => `# ${item.heading}\r\n\r\n${item.text}\r\n`).join('\r\n')
+        : `<html><body>${document.paragraphs.map(item => `<h1>${item.heading}</h1><p>${item.text}</p>`).join('')}</body></html>`),
+  }
+}
 async function putJson(store, name, value) {
   const saved = await store.putImmutable(name, jsonBytes(value), 'application/json')
   return { blobName: name, contentType: 'application/json', sha256: saved.blob.sha256, bytes: saved.blob.bytes.byteLength }
 }
-export async function seedResume(f, name = 'Jordan Example', key = randomUUID()) {
+export function evidenceOriginal(format, text) {
+  if (format === 'html') return Buffer.from('<html><body>Synthetic captured evidence.</body></html>')
+  if (format === 'docx') return docxFile(text)
+  if (format === 'doc') return legacyDocFile(text)
+  throw new Error('Unsupported synthetic evidence format.')
+}
+export async function seedResume(f, name = 'Jordan Example', key = randomUUID(), options = {}) {
   const id = `resume-${key}`
   const document = {
     id: `document-${key}`, kind: 'resume', sample: false, title: 'Professional resume', version: 1,
@@ -227,12 +253,14 @@ export async function seedResume(f, name = 'Jordan Example', key = randomUUID())
     ...await putJson(f.resumes.blobs, `${f.workspaceId}/${id}/source-document-v1.json`, document),
     documentId: document.id, documentVersion: 1,
   }
-  const originalName = `${f.workspaceId}/${id}/original.pdf`
-  const original = (await f.resumes.blobs.putImmutable(originalName, await pdf(), 'application/pdf')).blob
-  const source = { kind: 'pdf', displayName: 'resume.pdf', fileName: 'resume.pdf' }
+  const file = await sourceFile(document, options)
+  const originalName = `${f.workspaceId}/${id}/original.${file.extension}`
+  const original = (await f.resumes.blobs.putImmutable(originalName, file.bytes, file.contentType)).blob
+  const source = file.kind === 'url' ? { kind: 'url', displayName: file.url, url: file.url }
+    : { kind: file.kind, displayName: file.fileName, fileName: file.fileName }
   const capture = {
-    original: { blobName: originalName, contentType: 'application/pdf', sha256: original.sha256, bytes: original.bytes.byteLength },
-    capturedAt: NOW, redirects: [],
+    original: { blobName: originalName, contentType: file.contentType, sha256: original.sha256, bytes: original.bytes.byteLength },
+    capturedAt: NOW, redirects: [], ...(file.kind === 'url' ? { finalUrl: file.url } : {}),
   }
   const inputFingerprint = sha(Buffer.from(id))
   const captureManifest = await putJson(f.resumes.blobs, `${f.workspaceId}/${id}/capture.json`, {
@@ -256,19 +284,23 @@ export async function seedResume(f, name = 'Jordan Example', key = randomUUID())
     },
     source, batchId, idempotencyKey: key, inputFingerprint, createdBy: ACTOR, capture, captureManifest,
     extraction: {
-      method: 'document-intelligence', version: 'resume-source-v1', extractedAt: NOW, pagination: 'pdf-pages', pageCount: 1,
+      method: file.kind === 'doc' ? 'legacy-word' : file.kind === 'markdown' ? 'markdown'
+        : file.kind === 'url' ? 'html' : 'document-intelligence',
+      version: file.kind === 'markdown' ? 'markdown-v1' : 'resume-source-v1', extractedAt: NOW,
+      pagination: api.documentPagination(file.contentType),
+      pageCount: file.kind === 'pdf' ? 1 : null,
       normalizedCharacters: document.paragraphs.reduce((sum, item) => sum + item.heading.length + item.text.length, 0), document: docRef,
     },
     profileBlob, attempts: 1, retryCount: 0, completedAt: NOW, warnings: [], duplicates: [],
   })
   f.resumeValues.set(`${f.workspaceId}/${id}`, { record, etag: '"resume-ready"' })
-  return { record, document, profile, selection: { resumeId: id, documentId: document.id, documentVersion: 1, documentSha256: docRef.sha256 } }
+  return { record, document, profile, original, selection: { resumeId: id, documentId: document.id, documentVersion: 1, documentSha256: docRef.sha256 } }
 }
-export async function seedJob(f, title = 'Engineering role', key = randomUUID()) {
+export async function seedJob(f, title = 'Engineering role', key = randomUUID(), options = {}) {
   const id = `job-${key}`
   const document = {
     id: `document-${key}`, kind: 'job', sample: false, title, version: 1,
-    paragraphs: [{ id: 'job-p1', page: 1, heading: 'Duties', text: 'Evaluate engineering systems independently and explain evidence-based recommendations.' }],
+    paragraphs: [{ id: 'job-p1', page: options.page ?? 1, heading: 'Duties', text: 'Evaluate engineering systems independently and explain evidence-based recommendations.' }],
   }
   const rubric = {
     id: `rubric-${key}`, groupId: `rubric-group-${key}`, kind: 'job', dataKind: 'real', jobId: id,
@@ -278,17 +310,22 @@ export async function seedJob(f, title = 'Engineering role', key = randomUUID())
       weight: 100, guidance, requirementType: 'required', sourceCitations: [citation(document)] }],
   }
   const documentRef = await putJson(f.jobs.blobs, `${f.workspaceId}/${id}/source-document.json`, document)
-  const originalName = `${f.workspaceId}/${id}/original.pdf`
-  const original = (await f.jobs.blobs.putImmutable(originalName, await pdf(), 'application/pdf')).blob
+  const file = await sourceFile(document, options)
+  const originalName = `${f.workspaceId}/${id}/original.${file.extension}`
+  const original = (await f.jobs.blobs.putImmutable(originalName, file.bytes, file.contentType)).blob
+  const displayName = file.kind === 'url' ? file.url : file.fileName
   const record = {
     id, recordType: 'job', workspaceId: f.workspaceId,
     job: {
       id, title, organization: 'Example agency', location: '', arrangement: '', employmentType: '', grade: '', series: '0801',
-      source: 'pdf', sourceLabel: 'job.pdf', documentId: document.id, rubricId: rubric.id, status: 'ready', createdAt: NOW, dataKind: 'real',
+      source: file.kind, sourceLabel: displayName, documentId: document.id, rubricId: rubric.id, status: 'ready', createdAt: NOW, dataKind: 'real',
     },
     source: {
-      kind: 'pdf', displayName: 'job.pdf', originalBlobName: originalName, originalContentType: 'application/pdf',
-      sha256: original.sha256, bytes: original.bytes.byteLength, capturedAt: NOW, extractionMethod: 'document-intelligence',
+      kind: file.kind, displayName, originalBlobName: originalName, originalContentType: file.contentType,
+      sha256: original.sha256, bytes: original.bytes.byteLength, capturedAt: NOW,
+      extractionMethod: file.kind === 'doc' ? 'legacy-word' : file.kind === 'markdown' ? 'markdown'
+        : file.kind === 'url' ? 'html' : 'document-intelligence',
+      ...(file.kind === 'url' ? { url: file.url, finalUrl: file.url } : {}),
     },
     inputFingerprint: sha(Buffer.from(id)), createdBy: ACTOR, updatedAt: NOW, attempts: 1, warnings: [],
     extractedBlobName: documentRef.blobName,
@@ -296,7 +333,7 @@ export async function seedJob(f, title = 'Engineering role', key = randomUUID())
   f.jobValues.set(`${f.workspaceId}/${id}`, { record, etag: '"job-ready"' })
   f.rubricValues.set(`${f.workspaceId}/${id}`, [rubric])
   return {
-    record, document, rubric,
+    record, document, rubric, original,
     selection: { kind: 'job', jobId: id, rubricId: rubric.id, rubricVersion: 1, rubricHash: api.analysisHash(rubric),
       documentId: document.id, documentVersion: 1, documentSha256: documentRef.sha256 },
   }
@@ -322,8 +359,10 @@ export async function seedGrade(f, job, options = {}) {
     ],
   }
   const seedDocument = { ...clone(job.document), kind: 'reference', pageCount: 1, selectedPages: [], completeness: 'complete' }
-  const seedOriginalName = `${f.workspaceId}/${ladderId}/${seedId}/original.pdf`
-  const seedOriginal = (await f.grades.blobs.putImmutable(seedOriginalName, await pdf(), 'application/pdf')).blob
+  const jobOriginal = await f.jobs.blobs.read(job.record.source.originalBlobName)
+  assert.ok(jobOriginal)
+  const seedOriginalName = `${f.workspaceId}/${ladderId}/${seedId}/original.${api.originalExtension(jobOriginal.contentType)}`
+  const seedOriginal = (await f.grades.blobs.putImmutable(seedOriginalName, jobOriginal.bytes, jobOriginal.contentType)).blob
   const agencyOriginalName = `${f.workspaceId}/${ladderId}/${sourceId}/original.pdf`
   const agencyOriginal = (await f.grades.blobs.putImmutable(agencyOriginalName, await pdf(), 'application/pdf')).blob
   await putJson(f.grades.blobs, `${f.workspaceId}/${ladderId}/${seedId}/document-v1.json`, seedDocument)
@@ -338,7 +377,8 @@ export async function seedGrade(f, job, options = {}) {
   const frozen = (id, doc, origin, purpose, original) => ({
     sourceId: id, title: doc.title, origin, purpose, publisher: 'Example agency', documentId: doc.id, documentVersion: 1,
     documentBlobName: `${f.workspaceId}/${ladderId}/${id}/document-v1.json`,
-    originalBlobName: `${f.workspaceId}/${ladderId}/${id}/original.pdf`, sha256: original.sha256,
+    originalBlobName: `${f.workspaceId}/${ladderId}/${id}/original.${api.originalExtension(original.contentType)}`, sha256: original.sha256,
+    ...(options.includeContentType ? { originalContentType: original.contentType } : {}),
     authorityStatus: 'supplied', coverage, pageCount: 1, selectedPages: [], completeness: 'complete', issues: [],
   })
   const sourceSet = {

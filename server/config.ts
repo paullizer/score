@@ -33,6 +33,7 @@ export interface Config {
   readonly realGrades?: RealGradesConfig
   readonly realResumes?: RealResumesConfig
   readonly realAnalyses?: RealAnalysesConfig
+  readonly wordDocumentImports: boolean
   readonly appOrigin: string
   readonly isProduction: boolean
   readonly isAppService: boolean
@@ -143,6 +144,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   const gradesEnabled = featureEnabled(env, 'REAL_GRADE_LADDERS_ENABLED')
   const resumesEnabled = featureEnabled(env, 'REAL_RESUME_IMPORTS_ENABLED')
   const analysesEnabled = featureEnabled(env, 'REAL_ANALYSES_ENABLED')
+  const wordDocumentImports = featureEnabled(env, 'WORD_DOCUMENT_IMPORTS_ENABLED')
   const jobRecords = jobsEnabled ? required(env, 'JOB_RECORDS_CONTAINER') : optional(env, 'JOB_RECORDS_CONTAINER') ?? 'job-records'
   const jobSources = jobsEnabled ? required(env, 'JOB_SOURCE_CONTAINER') : optional(env, 'JOB_SOURCE_CONTAINER') ?? 'job-sources'
   const gradeRecords = optional(env, 'GRADE_RECORDS_CONTAINER') ?? 'grade-records'
@@ -186,6 +188,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     realGrades,
     realResumes,
     realAnalyses,
+    wordDocumentImports,
     appOrigin: requireHttpsOrigin(env, 'APP_ORIGIN'),
     isProduction,
     isAppService,

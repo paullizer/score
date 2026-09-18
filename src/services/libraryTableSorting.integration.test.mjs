@@ -373,6 +373,49 @@ test('job real/sample and workspace boundaries reset browsing and selection with
   noMutations()
 })
 
+test('merged Markdown and Word job sources retain filtering, source sorting, selections, and sample resets', async () => {
+  const items = freeze([
+    job('job-docx', 'Zora role', { dataKind: 'real', source: 'docx' }),
+    job('job-pdf', 'PDF role', { dataKind: 'real' }),
+    job('job-markdown', 'Markdown role', { dataKind: 'real', source: 'markdown' }),
+    job('job-doc', 'Legacy role', { dataKind: 'real', source: 'doc' }),
+    job('job-url', 'URL role', { dataKind: 'real', source: 'url' }),
+    job('job-website', 'Website role', { dataKind: 'real', source: 'website' }),
+  ])
+  const context = workspaceContext({ jobRows: [...items, job('sample-one', 'Sample role')], cloud: true })
+  context.cloud.realJobs.features = { realJobImports: true, markdownJobImports: false, wordDocumentImports: false }
+  const analyses = analysesApi(items.map((item) => target(item)))
+  await renderPage(ui.JobsPage, { context, analyses, url: '/jobs' })
+  await sortHeader('Source')
+  order(['job-url', 'job-markdown', 'job-pdf', 'job-website', 'job-doc', 'job-docx'])
+  await sortHeader('Source')
+  order(['job-docx', 'job-doc', 'job-website', 'job-pdf', 'job-markdown', 'job-url'])
+  await click(checkbox('job-docx'))
+  for (const [label, id] of [['Markdown files', 'job-markdown'], ['Word DOC files', 'job-doc'], ['Word DOCX files', 'job-docx']]) {
+    await choose('Filter by source', label)
+    order([id])
+    await choose('Sort jobs', 'Job title: A–Z')
+    assert.equal(button('Analyze selected').disabled, false)
+    if (id !== 'job-docx') assert.match(document.querySelector('.selection-bar').textContent, /including hidden rows/)
+  }
+  assert.equal(checkbox('job-docx').checked, true)
+  await segment('Choose real jobs or samples', 'Samples')
+  order(['sample-one'])
+  assert.equal(selectedOption('Filter by source'), 'All sources')
+  assert.equal(selectedOption('Sort jobs'), 'Newest first (default)')
+  assert.equal(document.querySelector('.selection-bar'), null)
+  assert.ok([...selector('Filter by source').options].every((option) => !['markdown', 'doc', 'docx'].includes(option.value)))
+  await segment('Choose real jobs or samples', 'Real jobs')
+  order(items.map((item) => item.id))
+  assert.equal(selectedOption('Filter by source'), 'All sources')
+  assert.equal(checkbox('job-docx').checked, false)
+  await click(checkbox('job-docx'))
+  await choose('Filter by source', 'Markdown files')
+  await click(button('Analyze selected'))
+  assert.deepEqual(JSON.parse(new URLSearchParams(navigation.search).get('targetSelections')), [target(items[0]).selection])
+  noMutations()
+})
+
 test('sample resumes sort displayed text naturally, keep missing fields last, and use the same order for desktop and cards', async () => {
   const context = workspaceContext()
   const initial = context.workspace.resumes.map((item) => item.id)
@@ -491,6 +534,38 @@ test('real resume headers and selector sort nullable names, displayed source lab
   }
   assert.equal(JSON.stringify(resumes.summaries), snapshot)
   assert.equal(navigation.search, '?data=real')
+  noMutations()
+})
+
+test('merged Markdown and Word resumes remain selectable and sortable with format admission disabled', async () => {
+  const formats = [
+    { id: 'word-new', kind: 'docx', name: 'Zora', label: 'Resume 10.docx' },
+    { id: 'markdown', kind: 'markdown', name: 'Mara', label: 'alpha.md' },
+    { id: 'word-old', kind: 'doc', name: 'Lee', label: 'Resume 2.doc' },
+    { id: 'pdf', kind: 'pdf', name: 'Parker', label: 'zeta.pdf' },
+  ]
+  const summaries = freeze(formats.map(({ id, kind, name, label }) => ({
+    ...realResume(id, name, 'ready', label), source: { kind, fileName: label, displayName: label },
+  })))
+  const resumes = resumesApi(summaries, { features: { realResumeImports: true, markdownResumeImports: false, wordDocumentImports: false } })
+  await renderPage(ui.RealResumesPage, { resumes, url: '/resumes?data=real' })
+  await choose('Sort real resumes', 'Source label: A–Z')
+  order(['markdown', 'word-old', 'word-new', 'pdf'])
+  await choose('Sort real resumes', 'Source label: Z–A')
+  order(['pdf', 'word-new', 'word-old', 'markdown'])
+  for (const { id } of formats) assert.equal(checkbox(id).disabled, false)
+  assert.match(row('word-new').textContent, /DOCX · added/)
+  assert.match(row('word-old').textContent, /Word DOC/)
+  assert.match(row('markdown').textContent, /Markdown/)
+  await click(checkbox('word-new'))
+  await search('Mara')
+  order(['markdown'])
+  assert.match(document.querySelector('[role="status"]').textContent, /1 selected · 1 hidden by search/)
+  await choose('Sort real resumes', 'Processing status: Complete first')
+  await click(button('Build analysis (1)'))
+  assert.deepEqual(JSON.parse(new URLSearchParams(navigation.search).get('resumeSelections')), [{
+    resumeId: 'word-new', documentId: 'document-word-new', documentVersion: 1, documentSha256: hash,
+  }])
   noMutations()
 })
 

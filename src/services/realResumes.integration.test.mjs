@@ -8,6 +8,7 @@ import { build } from 'esbuild'
 import React, { act } from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { JSDOM } from 'jsdom'
+import { docxFile, legacyDocFile } from '../../server-tests/word-fixtures.mjs'
 
 const output = resolve(`.real-resume-client-tests-${randomUUID()}`)
 const originalFetch = globalThis.fetch
@@ -46,6 +47,17 @@ function detail(id = 'resume-one', workspaceId = 'workspace-one') {
   }
 }
 
+function markdownDetail() {
+  const value = detail()
+  return {
+    ...value,
+    resume: { ...value.resume, sourceLabel: 'resume.MD' },
+    source: { kind: 'markdown', displayName: 'resume.MD', fileName: 'resume.MD' },
+    capture: { ...value.capture, original: { ...value.capture.original, contentType: 'text/markdown' } },
+    extraction: { ...value.extraction, method: 'markdown', version: 'markdown-v1', pagination: 'markdown-sections', pageCount: null },
+  }
+}
+
 function deferred() {
   let resolvePromise
   const promise = new Promise((resolve) => { resolvePromise = resolve })
@@ -54,10 +66,12 @@ function deferred() {
 
 before(async () => {
   await mkdir(output)
-  dom = new JSDOM('<!doctype html><div id="root"></div>', { url: 'https://score.test/' })
+  dom = new JSDOM('<!doctype html><div id="root"></div>', { url: 'https://score.test/', pretendToBeVisual: true })
   for (const [name, value] of Object.entries({
     window: dom.window, document: dom.window.document, navigator: dom.window.navigator, HTMLElement: dom.window.HTMLElement,
-    Element: dom.window.Element, Node: dom.window.Node, localStorage: dom.window.localStorage, CSS: { escape: (value) => value },
+    HTMLInputElement: dom.window.HTMLInputElement, Element: dom.window.Element, Node: dom.window.Node, NodeFilter: dom.window.NodeFilter,
+    DocumentFragment: dom.window.DocumentFragment, CustomEvent: dom.window.CustomEvent, MutationObserver: dom.window.MutationObserver,
+    getComputedStyle: dom.window.getComputedStyle, localStorage: dom.window.localStorage, CSS: { escape: (value) => value },
     IS_REACT_ACT_ENVIRONMENT: true,
   })) {
     originals.set(name, Object.getOwnPropertyDescriptor(globalThis, name))
@@ -77,6 +91,12 @@ before(async () => {
       export { RealResumesContext, useRealResumes } from './src/app/real-resumes-context';
       export { DocumentViewer } from './src/components/documents/DocumentViewer';
       export { RealResumeStatus, RealResumeActions, RealResumesPage } from './src/features/resumes/RealResumesPage';
+      export { RealAddResumesDialog } from './src/features/resumes/RealAddResumesDialog';
+      export { RealComparisonReview } from './src/features/analyses/RealComparisonReview';
+      export { RealAnalysesContext } from './src/app/real-analyses-context';
+      export { RESUME_IMPORT_LIMITS } from './src/domain/real-resumes';
+      export { supportedUploadFormats } from './src/domain/document-formats';
+      export { uploadFileByteLimit } from './src/services/documentUploads';
       export { MemoryRouter } from 'react-router-dom';
     ` }, outfile: join(output, 'ui.mjs'), bundle: true, packages: 'external', format: 'esm', platform: 'node',
       jsx: 'automatic', logLevel: 'silent', define: { 'import.meta.env.VITE_DEPLOYMENT_MODE': '"cloud"' } }),
@@ -85,10 +105,17 @@ before(async () => {
 })
 
 beforeEach(() => { requests = []; current = null })
-afterEach(async () => { if (root) { await act(async () => root.unmount()); root = null } })
+afterEach(async () => {
+  if (root) {
+    await act(async () => root.unmount())
+    root = null
+    // Radix restores focus on the next task; keep the JSDOM event constructors alive until then.
+    await new Promise((resolve) => setTimeout(resolve, 0))
+  }
+})
 after(async () => {
   globalThis.fetch = originalFetch
-  dom.window.close()
+  dom?.window.close()
   for (const [name, descriptor] of originals) {
     if (descriptor) Object.defineProperty(globalThis, name, descriptor)
     else delete globalThis[name]
@@ -98,11 +125,39 @@ after(async () => {
 
 test('features are additive and missing resume support fails closed', async () => {
   globalThis.fetch = async () => json({ realJobImports: true, realGradeLadders: true, realResumeImports: true, resumeLimits: { maxBatchItems: 10, maxPdfPages: 50 } })
-  assert.deepEqual(await client.fetchResumeProcessingFeatures(), { realResumeImports: true, resumeLimits: { maxBatchItems: 10, maxPdfPages: 50 } })
+  const enabled = await client.fetchResumeProcessingFeatures()
+  assert.equal(enabled.realResumeImports, true)
+  assert.equal(enabled.wordDocumentImports, false)
+  assert.equal(enabled.markdownResumeImports, false)
+  assert.equal(enabled.resumeLimits.maxBatchItems, 10)
+  assert.equal(enabled.resumeLimits.maxPdfPages, 50)
   globalThis.fetch = async () => json({ realJobImports: true })
   const unavailable = await client.fetchResumeProcessingFeatures()
   assert.equal(unavailable.realResumeImports, false)
+  assert.equal(unavailable.markdownResumeImports, false)
   assert.equal(unavailable.resumeLimits.maxPdfBytes, 10 * 1024 * 1024)
+  assert.equal(unavailable.wordDocumentImports, false)
+  globalThis.fetch = async () => json({ realResumeImports: true, wordDocumentImports: true, resumeLimits: { maxPdfBytes: 8 * 1024 * 1024 } })
+  const word = await client.fetchResumeProcessingFeatures()
+  assert.equal(word.wordDocumentImports, true)
+  assert.equal(word.resumeLimits.maxFileBytes, 10 * 1024 * 1024)
+  assert.equal(ui.uploadFileByteLimit('pdf', word.resumeLimits), 8 * 1024 * 1024)
+})
+
+test('Markdown resume capability must be advertised explicitly with real resume support', async () => {
+  for (const features of [
+    { realResumeImports: true }, { realResumeImports: true, markdownResumeImports: false },
+    { realResumeImports: false, markdownResumeImports: true }, { markdownResumeImports: true },
+    { realResumeImports: true, markdownResumeImports: 'true' },
+  ]) {
+    globalThis.fetch = async () => json(features)
+    const result = await client.fetchResumeProcessingFeatures()
+    assert.equal(result.markdownResumeImports, false)
+    assert.equal(result.realResumeImports, features.realResumeImports === true)
+    assert.equal(result.resumeLimits.maxMarkdownBytes, 10 * 1024 * 1024)
+  }
+  globalThis.fetch = async () => json({ realResumeImports: true, markdownResumeImports: true })
+  assert.equal((await client.fetchResumeProcessingFeatures()).markdownResumeImports, true)
 })
 
 test('resumes consume all pages, encode tokens, reject repeated tokens and foreign/sample records', async () => {
@@ -141,6 +196,44 @@ test('actual PDF bytes and both UUIDs are preserved, with a consistent declared 
   }
 })
 
+test('Markdown resume clients dispatch by extension and preserve original bytes, names, and batch headers regardless of MIME', async () => {
+  globalThis.fetch = async (url, init) => { requests.push({ url, init }); return json({ resume: summary('accepted', 'w', 'queued') }, 202) }
+  const bytes = new Uint8Array([239, 187, 191, ...new TextEncoder().encode('# Résumé\r\n\r\n- Original **evidence**\r\n')])
+  for (const [name, type] of [
+    ['résumé.MD', ''], ['resume.MarkDown', 'text/plain'], ['resume.md', 'application/octet-stream'],
+    ['resume.MARKDOWN', 'application/pdf'], ['resume.md', 'text/markdown'],
+  ]) {
+    const file = new File([bytes], name, { type })
+    await client.importRealResumeFile('w', file, key, batchId, 4)
+    const request = requests.at(-1)
+    assert.equal(request.url, '/api/workspaces/w/resumes/markdown')
+    assert.equal(request.init.headers.get('Content-Type'), 'text/markdown')
+    assert.equal(request.init.headers.get('X-File-Name'), encodeURIComponent(name))
+    assert.equal(request.init.headers.get('Idempotency-Key'), key)
+    assert.equal(request.init.headers.get('X-Import-Batch'), batchId)
+    assert.equal(request.init.headers.get('X-Import-Count'), '4')
+    assert.deepEqual(new Uint8Array(request.init.body), bytes)
+  }
+  await client.importRealResumeMarkdown('w', new File([bytes], 'resume.md'), key, batchId, 4)
+  assert.equal(requests.at(-1).url, '/api/workspaces/w/resumes/markdown')
+  await client.importRealResumeFile('w', new File(['%PDF-source'], 'resume.PDF'), key, batchId, 4)
+  assert.equal(requests.at(-1).url, '/api/workspaces/w/resumes/pdf')
+  assert.equal(requests.at(-1).init.headers.get('Content-Type'), 'application/pdf')
+})
+
+test('unsupported, unsafe, empty, oversized, or mismatched resume files never become guessed uploads', async () => {
+  globalThis.fetch = async (url, init) => { requests.push({ url, init }); throw new Error('Unexpected upload') }
+  for (const file of [
+    new File(['# Profile'], 'resume.txt', { type: 'text/markdown' }), new File(['Profile'], 'resume.docm'),
+    new File(['%PDF-source'], 'Role: engineer.pdf'), new File(['%PDF-source'], 'CON.pdf'),
+    new File(['# Profile'], 'LPT1.md'), new File(['# Profile'], 'folder\\resume.md'),
+    new File([], 'empty.markdown'), new File([new Uint8Array(10 * 1024 * 1024 + 1)], 'oversized.MD'),
+  ]) await assert.rejects(client.importRealResumeFile('w', file, key, batchId, 1), /not supported|safe|nonempty|10 MiB/)
+  await assert.rejects(client.importRealResumePdf('w', new File(['# Profile'], 'resume.md', { type: 'application/pdf' }), key, batchId, 1), /safe .pdf filename/)
+  await assert.rejects(client.importRealResumeMarkdown('w', new File(['%PDF-source'], 'resume.pdf'), key, batchId, 1), /safe .md or .markdown filename/)
+  assert.equal(requests.length, 0)
+})
+
 test('URL imports contain only a URL body and stable batch headers; 0/11 inputs and invalid keys are rejected', async () => {
   globalThis.fetch = async (url, init) => { requests.push({ url, init }); return json({ resume: summary('accepted', 'w', 'queued') }, 202) }
   await client.importRealResumeUrl('w', 'https://www.linkedin.com/in/public-profile', key, batchId, 10)
@@ -149,6 +242,27 @@ test('URL imports contain only a URL body and stable batch headers; 0/11 inputs 
   for (const count of [0, 11, 1.5]) await assert.rejects(client.importRealResumeUrl('w', 'https://example.test/profile', key, batchId, count), /between 1 and 10/)
   await assert.rejects(client.importRealResumeUrl('w', 'https://example.test/profile', 'bad-key', batchId, 1), /UUID/)
   assert.equal(requests.length, 1)
+})
+
+test('generic resume files use canonical MIME and immutable keys without changing legacy PDF routing', async () => {
+  globalThis.fetch = async (url, init) => { requests.push({ url, init }); return json({ resume: summary('accepted', 'w', 'queued') }, 202) }
+  for (const [name, bytes, type, endpoint] of [
+    ['Résumé.DOCX', docxFile(), 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', 'file'],
+    ['Résumé.DOC', legacyDocFile(), 'application/msword', 'file'],
+    ['Résumé.PDF', Buffer.from('%PDF-bytes'), 'application/pdf', 'pdf'],
+  ]) {
+    const file = new File([bytes], name)
+    await client.importRealResumeFile('w', file, key, batchId, 3)
+    const request = requests.at(-1)
+    assert.equal(request.url, `/api/workspaces/w/resumes/${endpoint}`)
+    assert.equal(request.init.headers.get('Content-Type'), type)
+    assert.equal(request.init.headers.get('X-File-Name'), encodeURIComponent(name))
+    assert.equal(request.init.headers.get('Idempotency-Key'), key)
+    assert.equal(request.init.headers.get('X-Import-Batch'), batchId)
+    assert.equal(request.init.headers.get('X-Import-Count'), '3')
+    assert.deepEqual(Buffer.from(request.init.body), bytes)
+  }
+  await assert.rejects(client.importRealResumePdf('w', new File([docxFile()], 'word.docx'), key, batchId, 1), /DOCX uploads are not enabled/)
 })
 
 test('detail is unwrapped; original downloads stay authorized; retry/cancel send displayed ETags and empty bodies', async () => {
@@ -199,6 +313,41 @@ test('mixed PDF/URL batches keep good and invalid items, allow identical basenam
   assert.throws(() => ui.appendResumeInputs({ ...ten, inputCount: 10 }, [{ kind: 'pdf', file: first }]), /already been submitted/)
 })
 
+test('mixed PDF/Markdown/URL batches retain invalid entries and same-named Markdown files as separate inputs', () => {
+  const files = [
+    new File(['%PDF-source'], 'resume.PDF'),
+    new File(['# First profile'], 'resume.MD'),
+    new File(['# Second profile'], 'resume.MD', { type: 'text/plain' }),
+    new File(['# Third profile'], 'profile.MaRkDoWn', { type: 'application/pdf' }),
+    new File(['# Not a supported file'], 'notes.txt', { type: 'text/markdown' }),
+  ]
+  const inputs = [...files.map(ui.resumeFileSource), { kind: 'url', url: 'https://example.test/profile' }, { kind: 'url', url: 'not a URL' }]
+  assert.deepEqual(inputs.slice(0, 5).map((item) => item.kind), ['pdf', 'markdown', 'markdown', 'markdown', 'unsupported'])
+  const initial = { id: batchId, inputCount: null, items: [] }
+  const batch = ui.appendResumeInputs(initial, inputs, ui.RESUME_IMPORT_LIMITS, true)
+  assert.deepEqual(batch.items.map((item) => item.state), ['pending', 'pending', 'pending', 'pending', 'invalid', 'pending', 'invalid'])
+  assert.equal(new Set(batch.items.map((item) => item.key)).size, 7)
+  assert.equal(batch.items[1].source.file, files[1])
+  assert.equal(batch.items[2].source.file, files[2])
+  assert.equal(batch.items[1].label, batch.items[2].label)
+  const ten = ui.appendResumeInputs(batch, Array.from({ length: 3 }, (_, index) => ({ kind: 'url', url: `https://example.test/extra-${index}` })), ui.RESUME_IMPORT_LIMITS, true)
+  assert.equal(ten.items.length, 10)
+  assert.throws(() => ui.appendResumeInputs(ten, [ui.resumeFileSource(new File(['# Extra'], 'extra.md'))], ui.RESUME_IMPORT_LIMITS, true), /Nothing was truncated/)
+  const disabled = ui.appendResumeInputs(initial, inputs)
+  assert.deepEqual(disabled.items.map((item) => item.state), ['pending', 'invalid', 'invalid', 'invalid', 'invalid', 'pending', 'invalid'])
+  assert.match(disabled.items[1].error, /not enabled/)
+})
+
+test('Markdown file validation uses bytes rather than PDF pages or pre-normalization character counts', () => {
+  const limits = { ...ui.RESUME_IMPORT_LIMITS, maxPdfPages: 0 }
+  const atLimit = ui.resumeFileSource(new File([new Uint8Array(10 * 1024 * 1024)], 'limit.MD'))
+  assert.equal(ui.validateResumeInput(atLimit, limits, true), undefined)
+  assert.match(ui.validateResumeInput(ui.resumeFileSource(new File([new Uint8Array(10 * 1024 * 1024 + 1)], 'large.markdown')), limits, true), /exceeds 10 MiB/)
+  assert.match(ui.validateResumeInput(ui.resumeFileSource(new File([], 'empty.md')), limits, true), /empty/)
+  assert.match(ui.validateResumeInput(ui.resumeFileSource(new File(['# Source'], 'unsafe\n.md')), limits, true), /safe filename/)
+  assert.match(ui.validateResumeInput(atLimit, limits), /not enabled/)
+})
+
 test('PDF size/URL bounds are per-item; no credential or nonpublic fallback is provided', () => {
   assert.equal(ui.validateResumeInput({ kind: 'pdf', file: new File([new Uint8Array(10 * 1024 * 1024)], 'limit.pdf') }), undefined)
   assert.match(ui.validateResumeInput({ kind: 'pdf', file: new File([new Uint8Array(10 * 1024 * 1024 + 1)], 'large.pdf') }), /exceeds 10 MiB/)
@@ -216,6 +365,55 @@ test('PDF size/URL bounds are per-item; no credential or nonpublic fallback is p
   assert.equal(ui.readyRealResume(summary('queued', 'w', 'queued')), false)
 })
 
+test('mixed Word inputs are gated, retain valid neighbors, and never gain printed-page limits', () => {
+  const formats = ['pdf', 'docx', 'doc']
+  const docx = new File([docxFile()], 'profile.DOCX')
+  const doc = new File([legacyDocFile()], 'profile.DOC', { type: 'application/octet-stream' })
+  const inputs = [ui.resumeFileInput(docx), ui.resumeFileInput(doc), ui.resumeFileInput(new File(['bad'], 'profile.docm')),
+    { kind: 'url', url: 'https://example.test/profile.DOCX' }, { kind: 'pdf', file: new File(['%PDF-one'], 'profile.pdf') }]
+  assert.deepEqual(inputs.slice(0, 2).map((input) => input.kind), ['docx', 'doc'])
+  const initial = { id: batchId, inputCount: null, items: [] }
+  const off = ui.appendResumeInputs(initial, inputs)
+  assert.deepEqual(off.items.map((item) => item.state), ['invalid', 'invalid', 'invalid', 'invalid', 'pending'])
+  const on = ui.appendResumeInputs(initial, inputs, undefined, formats)
+  assert.deepEqual(on.items.map((item) => item.state), ['pending', 'pending', 'invalid', 'invalid', 'pending'])
+  assert.equal(on.items[0].source.file, docx)
+  assert.equal(on.items[1].source.file, doc)
+  assert.match(on.items[3].error, /Word URLs/)
+  assert.equal(ui.validateResumeInput({ kind: 'docx', file: new File([new Uint8Array(10 * 1024 * 1024)], 'exact.docx') }, undefined, formats), undefined)
+  assert.match(ui.validateResumeInput({ kind: 'doc', file: new File([new Uint8Array(10 * 1024 * 1024 + 1)], 'large.doc') }, undefined, formats), /exceeds 10 MiB/)
+  assert.match(ui.validateResumeInput({ kind: 'docx', file: new File(['x'], 'mismatch.docx', { type: 'application/pdf' }) }, undefined, formats), /disagree/)
+  assert.match(ui.validateResumeInput({ kind: 'docx', file: new File([docxFile()], 'docx', {
+    type: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  }) }, undefined, formats), /supported file/)
+})
+
+test('resume format capabilities never cross-enable Markdown or Word and retain narrower per-format limits', async () => {
+  for (const [advertised, expected] of [
+    [{ realResumeImports: true, markdownJobImports: true }, ['pdf']],
+    [{ realResumeImports: true, markdownJobImports: true, wordDocumentImports: true }, ['pdf', 'docx', 'doc']],
+    [{ realResumeImports: true, markdownResumeImports: true }, ['pdf', 'markdown']],
+    [{ realResumeImports: true, markdownResumeImports: true, wordDocumentImports: true }, ['pdf', 'markdown', 'docx', 'doc']],
+    [{ realResumeImports: false, markdownResumeImports: true, wordDocumentImports: true }, ['pdf']],
+  ]) {
+    globalThis.fetch = async () => json(advertised)
+    const features = await client.fetchResumeProcessingFeatures()
+    assert.deepEqual(ui.supportedUploadFormats(features), expected)
+    assert.equal(features.markdownJobImports, undefined)
+  }
+  globalThis.fetch = async () => json({ realResumeImports: true, markdownResumeImports: true, wordDocumentImports: true,
+    resumeLimits: { maxFileBytes: 8, maxPdfBytes: 2, maxMarkdownBytes: 4 } })
+  const { resumeLimits } = await client.fetchResumeProcessingFeatures()
+  assert.equal(resumeLimits.maxBatchItems, 10)
+  const formats = ['pdf', 'markdown', 'docx', 'doc']
+  assert.deepEqual(formats.map((format) => ui.uploadFileByteLimit(format, resumeLimits)), [2, 4, 8, 8])
+  assert.match(ui.validateResumeInput(ui.resumeFileSource(new File(['123'], 'small.pdf')), resumeLimits, formats), /exceeds/)
+  assert.equal(ui.validateResumeInput(ui.resumeFileSource(new File(['123'], 'small.md')), resumeLimits, formats), undefined)
+  assert.match(ui.validateResumeInput(ui.resumeFileSource(new File(['12345'], 'large.markdown')), resumeLimits, formats), /exceeds/)
+  assert.equal(ui.validateResumeInput(ui.resumeFileSource(new File(['12345'], 'small.docx')), resumeLimits, formats), undefined)
+  assert.match(ui.validateResumeInput({ kind: 'url', url: 'https://example.test/profile.MD' }, resumeLimits, formats), /Markdown URLs cannot be imported/)
+})
+
 test('real HTML source rendering uses captured sections, actual text, and never invented PDF pages', () => {
   const html = renderToStaticMarkup(React.createElement(ui.DocumentViewer, {
     document: detail().document, pagination: 'html-sections', highlightedId: 'resume-p1', quote: 'accessible project documentation',
@@ -226,6 +424,129 @@ test('real HTML source rendering uses captured sections, actual text, and never 
   assert.doesNotMatch(html, /Original page|Sample content|Fictional/)
 })
 
+test('Markdown evidence displays headings and literal text with only the exact quotation highlighted', () => {
+  const document = detail().document
+  document.paragraphs[0].text = 'Exact **source** text. <script>alert("not executed")</script> [link](https://example.test/)'
+  const html = renderToStaticMarkup(React.createElement(ui.DocumentViewer, {
+    document, pagination: 'markdown-sections', highlightedId: 'resume-p1', quote: '**source** text',
+  }))
+  assert.match(html, /Markdown section 1 of 1/)
+  assert.match(html, /aria-label="Captured professional profile, Markdown section 1"/)
+  assert.match(html, /<h3>.*Experience<\/h3>/)
+  assert.match(html, /<mark>\*\*source\*\* text<\/mark>/)
+  assert.match(html, /&lt;script&gt;/)
+  assert.doesNotMatch(html, /<script|<a href=|Original page|Captured HTML|Fictional/)
+})
+
+test('Markdown resume library and detail identify uploads and sections rather than public URLs or PDF pages', async () => {
+  const saved = markdownDetail()
+  const api = {
+    workspaceId: 'workspace-one', canWrite: true, phase: 'ready', features: { realResumeImports: true, markdownResumeImports: true, resumeLimits: ui.RESUME_IMPORT_LIMITS },
+    error: null, summaries: [saved], detail: () => ({ state: 'ready', value: saved }), ensureDetail: async () => {}, refresh: async () => {},
+    pending: () => false, originalUrl: () => '/api/saved-original', batches: [], currentBatchId: null,
+  }
+  root = createRoot(dom.window.document.getElementById('root'))
+  for (const id of [undefined, saved.resume.id]) {
+    await act(async () => root.render(React.createElement(ui.MemoryRouter, { key: id ?? 'library', future: { v7_startTransition: true, v7_relativeSplatPath: true } },
+      React.createElement(ui.RealResumesContext.Provider, { value: api }, React.createElement(ui.RealResumesPage, { id })))))
+    if (!id) {
+      assert.match(dom.window.document.querySelector('tbody').textContent, /Markdown · added/)
+      assert.doesNotMatch(dom.window.document.querySelector('tbody').textContent, /Public URL/)
+    } else {
+      assert.match(dom.window.document.querySelector('.source-footer').textContent, /Uploaded Markdown/)
+      assert.match(dom.window.document.querySelector('.document-viewer').textContent, /Markdown section 1 of 1/)
+      assert.match(dom.window.document.body.textContent, /Markdown sections, not PDF pages/)
+      assert.doesNotMatch(dom.window.document.querySelector('.document-viewer').textContent, /Original page|Captured HTML/)
+    }
+  }
+})
+
+function markdownComparison(kind) {
+  const saved = markdownDetail()
+  const jobDocument = {
+    id: 'frozen-job', kind: 'job', title: 'Frozen Markdown requirements', sample: false, version: 3,
+    paragraphs: [{ id: 'job-p1', page: 1, heading: 'Responsibilities', text: 'Coordinate documented engineering projects.' }],
+  }
+  const resumeCitation = {
+    documentId: saved.document.id, documentVersion: 1, paragraphId: 'resume-p1', page: 1,
+    heading: 'Experience', quote: 'accessible project documentation',
+  }
+  const requirementCitation = {
+    documentId: jobDocument.id, documentVersion: 3, paragraphId: 'job-p1', page: 1,
+    heading: 'Responsibilities', quote: 'documented engineering projects',
+  }
+  const criterion = { id: 'criterion-one', label: 'Documentation', weight: 100, description: 'Document engineering work.', guidance: 'Assess exact source evidence.', requirementType: 'required' }
+  const rubric = { version: 2, criteria: [criterion] }
+  const target = {
+    kind, summary: { label: 'Saved requirements', sublabel: 'Exact Markdown source' },
+    selection: kind === 'job' ? { kind, rubricVersion: 2, documentVersion: 3 } : { kind, grade: 9, version: 2 },
+    requirementEvidence: [{ kind: 'criterion', criterionId: criterion.id, citations: [requirementCitation] }],
+    ...(kind === 'job' ? { rubric, document: jobDocument, original: { contentType: 'text/markdown' } }
+      : { version: { id: 'approved-version', rubric, qualifications: [] }, approval: { id: 'approval' }, review: { id: 'review' },
+        sourceSet: { id: 'frozen-set' }, seed: { document: jobDocument, source: { kind: 'markdown', originalContentType: 'text/markdown' } }, references: [] }),
+  }
+  return {
+    comparison: { id: `comparison-${kind}`, runId: 'run-one', status: 'complete' },
+    resumeSnapshot: { resume: saved.resume, document: saved.document, extraction: saved.extraction },
+    targetSnapshot: target,
+    result: {
+      completion: 'complete', overall: { status: 'available', score: 100 }, summary: 'Review the captured evidence.', limitations: [],
+      coverage: { supported: 1, partial: 0, missing: 0, notAssessed: 0, notApplicable: 0, assessedWeight: 100, totalWeight: 100 },
+      criteria: [{ criterionId: criterion.id, evidenceStatus: 'supported', score: 5, rationale: 'Saved evidence supports the requirement.',
+        citations: [resumeCitation], requirementCitations: [requirementCitation] }], qualifications: [],
+      createdAt: timestamp, provenance: {
+        assessment: { model: 'test', deployment: 'test', promptVersion: 'test', schemaVersion: 'test' }, calculationVersion: 'test',
+        groundingReviews: [], correctionCount: 0, resumeSnapshot: { snapshotId: 'resume-snapshot', sha256: hash },
+        targetSnapshot: { snapshotId: 'target-snapshot', sha256: hash },
+      },
+    },
+  }
+}
+
+test('frozen Markdown resume, job and grade-seed evidence keep section labels and exact citations', async () => {
+  root = createRoot(dom.window.document.getElementById('root'))
+  for (const kind of ['job', 'grade']) {
+    const saved = markdownComparison(kind)
+    await act(async () => root.render(React.createElement(ui.RealComparisonReview, { key: kind, detail: saved })))
+    assert.match(dom.window.document.querySelector('.document-viewer').textContent, /Markdown section 1 of 1/)
+    await act(async () => dom.window.document.querySelector('button[aria-label^="View resume evidence"]').click())
+    await settle(() => dom.window.document.querySelector('.document-viewer mark')?.textContent === 'accessible project documentation')
+    await act(async () => dom.window.document.querySelector('button[aria-label^="View requirement evidence"]').click())
+    await settle(() => dom.window.document.querySelector('.document-viewer mark')?.textContent === 'documented engineering projects')
+    const viewer = dom.window.document.querySelector('.document-viewer')
+    assert.match(viewer.textContent, /Markdown section 1 of 1/)
+    assert.equal(viewer.querySelector('h3').textContent, 'Responsibilities')
+    assert.doesNotMatch(viewer.textContent, /Original page|Captured HTML|Fictional/)
+  }
+  const mismatched = markdownComparison('job')
+  mismatched.result.criteria[0].requirementCitations[0].quote = 'An absent quotation'
+  await act(async () => root.render(React.createElement(ui.RealComparisonReview, { key: 'invalid', detail: mismatched })))
+  await act(async () => dom.window.document.querySelector('button[aria-label^="View requirement evidence"]').click())
+  await settle(() => dom.window.document.querySelector('[role="alert"]')?.textContent.includes('does not exactly match'))
+  assert.equal(dom.window.document.querySelector('.document-viewer mark'), null)
+})
+
+test('copied frozen Markdown seed references use their captured MIME and the exact authorized document', async () => {
+  const saved = markdownComparison('grade')
+  const reference = { ...saved.targetSnapshot.seed.document, id: 'copied-markdown-seed', kind: 'reference', pageCount: 1, selectedPages: [], completeness: 'complete' }
+  saved.result.criteria[0].requirementCitations[0].documentId = reference.id
+  saved.targetSnapshot.references = [{
+    source: { origin: 'seed-job', selectedPages: [], originalContentType: 'text/markdown' },
+    document: { documentId: reference.id, documentVersion: reference.version },
+  }]
+  const calls = []
+  const api = { document: async (...args) => { calls.push(args); return reference } }
+  root = createRoot(dom.window.document.getElementById('root'))
+  await act(async () => root.render(React.createElement(ui.RealAnalysesContext.Provider, { value: api },
+    React.createElement(ui.RealComparisonReview, { detail: saved }))))
+  await act(async () => dom.window.document.querySelector('button[aria-label^="View requirement evidence"]').click())
+  await settle(() => dom.window.document.querySelector('.document-viewer mark')?.textContent === 'documented engineering projects')
+  assert.equal(calls.length, 1)
+  assert.deepEqual(calls[0].slice(0, 4), ['run-one', 'comparison-grade', reference.id, reference.version])
+  const viewer = dom.window.document.querySelector('.document-viewer')
+  assert.match(viewer.textContent, /Markdown section 1 of 1/)
+  assert.doesNotMatch(viewer.textContent, /Original page|Captured HTML/)
+})
 test('resume detail reflects newly discovered duplicates without changing the immutable record ETag', async () => {
   const captured = detail()
   const first = summary()
@@ -298,15 +619,18 @@ test('request scope fences stale reads and workspace lifetimes without cancellin
 
 function Probe() { current = ui.useRealResumes(); return React.createElement('span', null, current.phase) }
 const sample = { schemaVersion: 1, jobs: [], resumes: [], rubrics: [], documents: [], runs: [] }
-function tree(workspaceId, showProbe = true, role = 'owner') {
-  return React.createElement(ui.WorkspaceContext.Provider, { value: {
+function tree(workspaceId, showProbe = true, role = 'owner', showDialog = false) {
+  return React.createElement(ui.MemoryRouter, { future: { v7_startTransition: true, v7_relativeSplatPath: true } },
+    React.createElement(ui.WorkspaceContext.Provider, { value: {
     workspace: sample, cloud: { currentWorkspaceId: workspaceId, workspaces: [{ id: workspaceId, role }] },
     addResumes: () => { throw new Error('Real input reached sample intake') }, startAnalysis: () => { throw new Error('Real input reached sample scoring') },
-  } }, React.createElement(ui.RealResumesBridge, { workspaceId }, showProbe ? React.createElement(Probe) : null))
+  } }, React.createElement(ui.RealResumesBridge, { workspaceId },
+    React.createElement(React.Fragment, null, showProbe ? React.createElement(Probe) : null,
+      showDialog ? React.createElement(ui.RealAddResumesDialog, { open: true, onOpenChange() {} }) : null))))
 }
-async function mount(workspaceId = 'workspace-one', showProbe = true, role = 'owner') {
+async function mount(workspaceId = 'workspace-one', showProbe = true, role = 'owner', showDialog = false) {
   root ??= createRoot(dom.window.document.getElementById('root'))
-  await act(async () => { root.render(tree(workspaceId, showProbe, role)); await new Promise((resolve) => setTimeout(resolve, 0)) })
+  await act(async () => { root.render(tree(workspaceId, showProbe, role, showDialog)); await new Promise((resolve) => setTimeout(resolve, 0)) })
 }
 async function settle(predicate) {
   for (let index = 0; index < 30 && !predicate(); index++) await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)) })
@@ -352,6 +676,205 @@ test('provider retains independent accepted/unconfirmed uploads after dialog unm
   assert.equal(urlRequests[0].init.body, urlRequests[1].init.body)
   assert.equal(JSON.stringify(sample), before)
   assert.equal(dom.window.localStorage.length, 0)
+})
+
+test('provider releases acknowledged DOCX/DOC files and retries an unconfirmed Word source with unchanged keys and bytes', async () => {
+  let wordAttempts = 0
+  globalThis.fetch = async (url, init) => {
+    requests.push({ url, init })
+    if (url === '/api/features') return json({ realResumeImports: true, wordDocumentImports: true })
+    if (init.method === 'GET') return json({ resumes: [] })
+    if (init.headers.get('Content-Type') === 'application/msword' && wordAttempts++ === 0) return json({ error: { code: 'unavailable', message: 'Response lost.' } }, 503)
+    return json({ resume: summary(`word-${requests.length}`, 'workspace-one', 'queued') }, 202)
+  }
+  await mount()
+  await settle(() => current?.phase === 'ready')
+  const docx = new File([docxFile()], 'same-name.DOCX')
+  const doc = new File([legacyDocFile()], 'same-name.DOC')
+  await act(async () => current.stage([ui.resumeFileInput(docx), ui.resumeFileInput(doc), ui.resumeFileInput(new File(['invalid'], 'bad.docm'))]))
+  const first = current.batches[0]
+  await act(async () => current.submitBatch(first.id))
+  assert.deepEqual(current.batches[0].items.map((item) => item.state), ['accepted', 'unconfirmed', 'invalid'])
+  assert.equal(current.batches[0].items[0].source.file, null)
+  assert.equal(current.batches[0].items[0].source.kind, 'docx')
+  assert.equal(current.batches[0].items[1].source.file, doc)
+  await act(async () => current.submitBatch(first.id, [first.items[1].key]))
+  assert.equal(current.batches[0].items[1].source.file, null)
+  const attempts = requests.filter((request) => request.init.headers?.get('Content-Type') === 'application/msword')
+  assert.equal(attempts.length, 2)
+  assert.equal(attempts[0].init.headers.get('Idempotency-Key'), attempts[1].init.headers.get('Idempotency-Key'))
+  assert.equal(attempts[0].init.headers.get('X-Import-Batch'), first.id)
+  assert.equal(attempts[1].init.headers.get('X-Import-Count'), '3')
+  assert.deepEqual(new Uint8Array(attempts[0].init.body), new Uint8Array(attempts[1].init.body))
+  assert.equal(dom.window.localStorage.length, 0)
+})
+
+test('mixed Markdown batches preserve retries, invalid entries and same-named files while releasing accepted file bytes', async () => {
+  let lostKey
+  let firstMarkdown = true
+  let accepted = 0
+  globalThis.fetch = async (url, init) => {
+    requests.push({ url, init })
+    if (url === '/api/features') return json({ realResumeImports: true, markdownResumeImports: true })
+    if (init.method === 'GET') return json({ resumes: [] })
+    if (url.endsWith('/markdown') && firstMarkdown) {
+      firstMarkdown = false
+      lostKey = init.headers.get('Idempotency-Key')
+      return json({ error: { code: 'unavailable', message: 'Acceptance response lost.' } }, 503)
+    }
+    return json({ resume: summary(`accepted-${++accepted}`, 'workspace-one', 'queued') }, 202)
+  }
+  await mount()
+  await settle(() => current?.phase === 'ready')
+  const files = [
+    new File(['%PDF-one'], 'resume.pdf'),
+    new File(['# First profile\r\nExact bytes'], 'resume.MD'),
+    new File(['# Second profile'], 'resume.MD', { type: 'application/pdf' }),
+    new File(['invalid'], 'resume.docx'),
+  ]
+  const initial = JSON.stringify(sample)
+  dom.window.localStorage.clear()
+  await act(async () => current.stage([...files.map(ui.resumeFileSource), { kind: 'url', url: 'https://example.test/profile' }]))
+  const batch = current.batches[0]
+  const originalKeys = batch.items.map((item) => item.key)
+  await act(async () => current.submitBatch(batch.id))
+  assert.deepEqual(current.batches[0].items.map((item) => item.state), ['accepted', 'unconfirmed', 'accepted', 'invalid', 'accepted'])
+  assert.equal(current.batches[0].inputCount, 5)
+  assert.equal(current.batches[0].items[0].source.file, null)
+  assert.equal(current.batches[0].items[2].source.file, null, 'accepted Markdown bytes are released')
+  assert.equal(current.batches[0].items[2].source.kind, 'markdown', 'source label survives byte disposal')
+  assert.equal(current.batches[0].items[1].source.file, files[1], 'unconfirmed source bytes stay in memory for an unchanged retry')
+  assert.equal(current.batches[0].items[3].source.file, files[3], 'invalid input remains visible and is never sent')
+  await mount('workspace-one', false)
+  await mount()
+  await act(async () => current.submitBatch(batch.id, [lostKey]))
+  const posts = requests.filter((request) => request.init.method === 'POST')
+  assert.equal(posts.length, 5)
+  assert.deepEqual(posts.slice(0, 4).map((request) => request.url.split('/').at(-1)).sort(), ['markdown', 'markdown', 'pdf', 'url'])
+  assert.equal(posts[4].url.split('/').at(-1), 'markdown')
+  assert.equal(new Set(posts.slice(0, 4).map((request) => request.init.headers.get('Idempotency-Key'))).size, 4)
+  const retries = posts.filter((request) => request.init.headers.get('Idempotency-Key') === lostKey)
+  assert.equal(retries.length, 2)
+  for (const request of posts) {
+    assert.equal(request.init.headers.get('X-Import-Batch'), batch.id)
+    assert.equal(request.init.headers.get('X-Import-Count'), '5')
+  }
+  assert.deepEqual(new Uint8Array(retries[0].init.body), new Uint8Array(retries[1].init.body))
+  assert.deepEqual(current.batches[0].items.map((item) => item.key), originalKeys)
+  assert.equal(current.batches[0].items[1].source.file, null)
+  assert.equal(JSON.stringify(sample), initial)
+  assert.equal(dom.window.localStorage.length, 0)
+})
+
+test('one advertised resume picker admits Markdown and Word in the same immutable batch and releases all accepted files', async () => {
+  globalThis.fetch = async (url, init) => {
+    requests.push({ url, init })
+    if (url === '/api/features') return json({ realResumeImports: true, markdownResumeImports: true, wordDocumentImports: true })
+    if (init.method === 'GET') return json({ resumes: [] })
+    return json({ resume: summary(`accepted-${requests.length}`, 'workspace-one', 'queued') }, 202)
+  }
+  await mount('workspace-one', true, 'owner', true)
+  await settle(() => current?.phase === 'ready')
+  const input = dom.window.document.querySelector('input[type="file"]')
+  assert.equal(input.getAttribute('aria-label'), 'Choose resume PDF or Markdown or Word files')
+  for (const extension of ['.pdf', '.md', '.markdown', '.docx', '.doc']) assert.ok(input.accept.split(',').includes(extension))
+  const files = [
+    new File(['# Markdown source'], 'resume.MarkDown', { type: 'application/pdf' }),
+    new File([docxFile()], 'resume.DOCX'), new File([legacyDocFile()], 'resume.DOC'),
+    new File(['%PDF-source'], 'resume.PDF'), new File(['not supported'], 'resume.docm'),
+  ]
+  Object.defineProperty(input, 'files', { configurable: true, value: files })
+  await act(async () => input.dispatchEvent(new dom.window.Event('change', { bubbles: true })))
+  await act(async () => current.stage([{ kind: 'url', url: 'https://example.test/profile' }]))
+  const batch = current.batches[0]
+  assert.deepEqual(batch.items.map((item) => item.state), ['pending', 'pending', 'pending', 'pending', 'invalid', 'pending'])
+  await act(async () => current.submitBatch(batch.id))
+  const posts = requests.filter((request) => request.init.method === 'POST')
+  assert.deepEqual(posts.map((request) => request.url.split('/').at(-1)).sort(), ['file', 'file', 'markdown', 'pdf', 'url'])
+  assert.ok(posts.every((request) => request.init.headers.get('X-Import-Count') === '6' && request.init.headers.get('X-Import-Batch') === batch.id))
+  assert.deepEqual(current.batches[0].items.map((item) => item.key), batch.items.map((item) => item.key))
+  for (const item of current.batches[0].items.slice(0, 4)) {
+    assert.equal(item.state, 'accepted')
+    assert.equal(item.source.file, null)
+  }
+  assert.equal(current.batches[0].items[4].source.file, files[4])
+  assert.equal(dom.window.localStorage.length, 0)
+})
+
+test('unadvertised Markdown remains an invalid item while a mixed batch still sends PDF and URL inputs', async () => {
+  globalThis.fetch = async (url, init) => {
+    requests.push({ url, init })
+    if (url === '/api/features') return json({ realResumeImports: true })
+    if (init.method === 'GET') return json({ resumes: [] })
+    return json({ resume: summary(`accepted-${requests.length}`, 'workspace-one', 'queued') }, 202)
+  }
+  await mount()
+  await settle(() => current?.phase === 'ready')
+  await act(async () => current.stage([
+    ui.resumeFileSource(new File(['# Source'], 'resume.md')),
+    ui.resumeFileSource(new File(['%PDF-source'], 'resume.pdf')),
+    { kind: 'url', url: 'https://example.test/profile' },
+    ui.resumeFileSource(new File(['unknown'], 'resume.txt')),
+  ]))
+  assert.deepEqual(current.batches[0].items.map((item) => item.state), ['invalid', 'pending', 'pending', 'invalid'])
+  assert.match(current.batches[0].items[0].error, /not enabled/)
+  await act(async () => current.submitBatch(current.batches[0].id))
+  const posts = requests.filter((request) => request.init.method === 'POST')
+  assert.deepEqual(posts.map((request) => request.url.split('/').at(-1)).sort(), ['pdf', 'url'])
+  assert.equal(posts.every((request) => request.init.headers.get('X-Import-Count') === '4'), true)
+  assert.deepEqual(current.batches[0].items.map((item) => item.state), ['invalid', 'accepted', 'accepted', 'invalid'])
+})
+
+test('a capability removed after staging is checked again before Markdown submission', async () => {
+  let enabled = true
+  globalThis.fetch = async (url, init) => {
+    requests.push({ url, init })
+    if (url === '/api/features') return json({ realResumeImports: true, ...(enabled ? { markdownResumeImports: true } : {}) })
+    return json({ resumes: [] })
+  }
+  await mount()
+  await settle(() => current?.phase === 'ready')
+  await act(async () => current.stage([ui.resumeFileSource(new File(['# Source'], 'resume.md'))]))
+  assert.equal(current.batches[0].items[0].state, 'pending')
+  enabled = false
+  await act(async () => current.refresh())
+  await act(async () => current.submitBatch(current.batches[0].id))
+  assert.equal(requests.some((request) => request.init.method === 'POST'), false)
+  assert.match(current.batches[0].items[0].error, /not enabled/)
+})
+
+test('resume picker, drop zone and URL tab preserve one mixed batch with unknown files explicitly invalid', async () => {
+  globalThis.fetch = async (url) => url === '/api/features'
+    ? json({ realResumeImports: true, markdownResumeImports: true }) : json({ resumes: [] })
+  await mount('workspace-one', true, 'owner', true)
+  await settle(() => current?.phase === 'ready')
+  const input = dom.window.document.querySelector('input[type="file"]')
+  assert.equal(input.getAttribute('aria-label'), 'Choose resume PDF or Markdown files')
+  for (const extension of ['.pdf', '.md', '.markdown']) assert.ok(input.accept.split(',').includes(extension))
+  const files = [new File(['%PDF-source'], 'resume.PDF'), new File(['# Experience'], 'resume.MD', { type: 'text/plain' })]
+  Object.defineProperty(input, 'files', { configurable: true, value: files })
+  await act(async () => input.dispatchEvent(new dom.window.Event('change', { bubbles: true })))
+  const keys = current.batches[0].items.map((item) => item.key)
+  const drop = new dom.window.Event('drop', { bubbles: true, cancelable: true })
+  Object.defineProperty(drop, 'dataTransfer', { value: { files: [new File(['# Other'], 'other.MarkDown'), new File(['unknown'], 'notes.txt')] } })
+  await act(async () => dom.window.document.querySelector('.drop-zone').dispatchEvent(drop))
+  assert.deepEqual(current.batches[0].items.map((item) => item.source.kind), ['pdf', 'markdown', 'markdown', 'unsupported'])
+  const tab = [...dom.window.document.querySelectorAll('button')].find((button) => button.textContent === 'Public URLs')
+  await act(async () => tab.click())
+  const textarea = dom.window.document.querySelector('textarea')
+  await act(async () => {
+    Object.getOwnPropertyDescriptor(dom.window.HTMLTextAreaElement.prototype, 'value').set.call(textarea, 'https://example.test/profile')
+    textarea.dispatchEvent(new dom.window.Event('input', { bubbles: true }))
+  })
+  const add = [...dom.window.document.querySelectorAll('button')].find((button) => button.textContent === 'Add URLs to batch')
+  assert.equal(add.disabled, false)
+  await act(async () => add.click())
+  assert.equal(current.batches.length, 1)
+  assert.equal(current.batches[0].items.length, 5)
+  assert.deepEqual(current.batches[0].items.slice(0, 2).map((item) => item.key), keys)
+  assert.equal(current.batches[0].items[3].state, 'invalid')
+  assert.match(dom.window.document.querySelector('[aria-label="Real resume import batch"]').textContent, /Unsupported file/)
+  assert.match(dom.window.document.body.textContent, /Import 4 valid inputs/)
 })
 
 test('workspace switching ignores late library and action responses; viewers cannot mutate', async () => {

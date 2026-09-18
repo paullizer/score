@@ -13,6 +13,7 @@ export { parseResumeEntity, validateRealResumeDocument, parseRealResumeProfile }
 export { parseAnalysisEntity } from './server/analyses/validation.ts'
 export * as resumeWorker from './worker/resumes/runtime.ts'
 export * as analysisWorker from './worker/analyses/runtime.ts'
+${options.serverExports ?? ''}
 `,
   })
 }
@@ -167,6 +168,24 @@ export async function importResumePdf(fixture, file, { key = randomUUID(), batch
       'Idempotency-Key': key,
       'X-Import-Batch': batchId,
       'X-Import-Count': String(inputCount),
+    },
+    body: Buffer.from(await file.arrayBuffer()),
+  })
+  const body = await jsonResponse(response, [200, 202])
+  return { summary: body.resume, key, batchId }
+}
+
+export async function importResumeFile(fixture, file, { key = randomUUID(), batchId = randomUUID(), inputCount = 1 } = {}) {
+  const extension = file.name.split('.').at(-1).toLowerCase()
+  const format = extension === 'md' ? 'markdown' : extension
+  if (format === 'pdf') return importResumePdf(fixture, file, { key, batchId, inputCount })
+  const contentType = { markdown: 'text/markdown', docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', doc: 'application/msword' }[format]
+  assert.ok(contentType, 'Upload fixture needs a supported extension.')
+  const response = await fixture.request(`/api/workspaces/${fixture.workspaceId}/resumes/${format === 'markdown' ? 'markdown' : 'file'}`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': contentType, 'X-File-Name': encodeURIComponent(file.name), 'Idempotency-Key': key,
+      'X-Import-Batch': batchId, 'X-Import-Count': String(inputCount),
     },
     body: Buffer.from(await file.arrayBuffer()),
   })

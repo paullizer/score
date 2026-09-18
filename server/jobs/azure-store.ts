@@ -7,11 +7,13 @@ import type { TokenCredential } from '@azure/identity'
 import { JOB_IMPORT_LIMITS } from '../../src/domain/real-jobs'
 import type { RealJobRecord, VersionedRealJob } from '../../src/domain/real-jobs'
 import type { Rubric } from '../../src/domain/types'
+import { UPLOAD_CONTENT_TYPES } from '../../src/domain/document-formats'
 import { StoreConflictError } from '../store'
 import { fetchCosmosPage } from '../cosmos-query'
 import type { JobBlob, JobBlobStore, RealJobsConfig, RealJobStore } from './store'
 import {
   isSafeJobBlobName,
+  jobBlobContentType,
   validateRealJobRecord,
   validateStoredRealRubric,
 } from './validation'
@@ -33,9 +35,13 @@ const MAX_HTML_BYTES = 24 * 1024 * 1024
 const MAX_DOCUMENT_BYTES = JOB_IMPORT_LIMITS.maxSourceCharacters * 8
 
 function maxBlobBytes(blobName: string): number {
-  if (blobName.endsWith('/original.html')) return MAX_HTML_BYTES
-  if (blobName.endsWith('/source-document.json')) return MAX_DOCUMENT_BYTES
-  return JOB_IMPORT_LIMITS.maxPdfBytes
+  switch (jobBlobContentType(blobName)) {
+    case 'application/pdf': return JOB_IMPORT_LIMITS.maxPdfBytes
+    case UPLOAD_CONTENT_TYPES.docx: case UPLOAD_CONTENT_TYPES.doc: return JOB_IMPORT_LIMITS.maxFileBytes
+    case 'text/markdown': return JOB_IMPORT_LIMITS.maxMarkdownBytes
+    case 'text/html': return MAX_HTML_BYTES
+    case 'application/json': return MAX_DOCUMENT_BYTES
+  }
 }
 
 function cosmosStatus(error: unknown): number | undefined {
@@ -263,15 +269,23 @@ async function readBounded(
   declaredLength: number | undefined,
   maximumBytes: number,
 ): Promise<Uint8Array> {
-  if (declaredLength !== undefined && declaredLength > maximumBytes) throw new Error('Stored job blob exceeds the supported size.')
+  const destroy = () => { if ('destroy' in stream && typeof stream.destroy === 'function') stream.destroy() }
+  if (declaredLength !== undefined && (!Number.isInteger(declaredLength) || declaredLength < 1 || declaredLength > maximumBytes)) {
+    destroy()
+    throw new Error('Stored job blob exceeds the supported size or is empty.')
+  }
   const chunks: Buffer[] = []
   let length = 0
   for await (const chunk of stream) {
     const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)
     length += buffer.byteLength
-    if (length > maximumBytes) throw new Error('Stored job blob exceeds the supported size.')
+    if (length > maximumBytes) {
+      destroy()
+      throw new Error('Stored job blob exceeds the supported size.')
+    }
     chunks.push(buffer)
   }
+  if (!length || (declaredLength !== undefined && length !== declaredLength)) throw new Error('Stored job blob length is invalid.')
   return Buffer.concat(chunks, length)
 }
 
@@ -290,7 +304,7 @@ export function createJobBlobStoreFromContainer(container: JobBlobContainer): Jo
     try {
       const response = await container.getBlockBlobClient(blobName).download()
       if (!response.readableStreamBody) throw new Error('Blob download returned no content stream.')
-      if (typeof response.etag !== 'string' || typeof response.contentType !== 'string') {
+      if (typeof response.etag !== 'string' || !response.etag.trim() || response.contentType !== jobBlobContentType(blobName)) {
         throw new Error('Blob download did not return required metadata.')
       }
       const bytes = await readBounded(response.readableStreamBody, response.contentLength, maxBlobBytes(blobName))
@@ -303,15 +317,17 @@ export function createJobBlobStoreFromContainer(container: JobBlobContainer): Jo
 
   async function putImmutable(blobName: string, bytes: Uint8Array, contentType: string) {
     if (!isSafeJobBlobName(blobName)) throw new Error('Invalid job blob name.')
-    if (bytes.byteLength > maxBlobBytes(blobName)) throw new Error('Job blob exceeds the supported size.')
-    if (!['application/pdf', 'text/html', 'application/json'].includes(contentType)) throw new Error('Unsupported job blob content type.')
+    if (!(bytes instanceof Uint8Array) || !bytes.byteLength || bytes.byteLength > maxBlobBytes(blobName)) {
+      throw new Error('Job blob exceeds the supported size or is empty.')
+    }
+    if (contentType !== jobBlobContentType(blobName)) throw new Error('Unsupported job blob content type for its namespace.')
     const body = Buffer.from(bytes)
     try {
       const response = await container.getBlockBlobClient(blobName).upload(body, body.byteLength, {
         conditions: { ifNoneMatch: '*' },
-        blobHTTPHeaders: { blobContentType: contentType },
+        blobHTTPHeaders: { blobContentType: contentType, blobCacheControl: 'private, no-store' },
       })
-      if (typeof response.etag !== 'string') throw new Error('Blob upload did not return an etag.')
+      if (typeof response.etag !== 'string' || !response.etag.trim()) throw new Error('Blob upload did not return an etag.')
       return {
         created: true,
         blob: { bytes: body, contentType, sha256: hash(body), etag: response.etag },

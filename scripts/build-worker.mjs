@@ -1,6 +1,7 @@
 import { build } from 'esbuild'
 
 for (const [entry, output] of [
+  ['server/documents/word-parser-worker.ts', 'dist-worker/word-parser.mjs'],
   ['worker/index.ts', 'dist-worker/worker.mjs'],
   ['worker/runtime.ts', 'dist-worker/runtime.mjs'],
   ['worker/grades/runtime.ts', 'dist-worker/grade-runtime.mjs'],
