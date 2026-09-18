@@ -18,7 +18,8 @@ import {
   type UpdateGradeLadderInput,
   type UpdateGradeSourceInput,
 } from '../domain/real-grades'
-import { cloudJsonRequest } from './cloudWorkspace'
+import { cloudJsonRequest, cloudLifecycleRequest } from './cloudWorkspace'
+import type { LifecycleAction, LifecycleImpact, LifecycleOperation } from '../domain/lifecycle'
 
 // Real job rubric IDs survive edits; selecting a seed requires its saved version as well.
 export type GradeLadderCreationRequest = CreateGradeLadderInput
@@ -155,4 +156,20 @@ export function getGradeSourceDocument(workspaceId: string, ladderId: string, so
 
 export function gradeSourceOriginalUrl(workspaceId: string, ladderId: string, sourceId: string, sourceSetId?: string): string {
   return `/api${sourcePath(workspaceId, ladderId, sourceId, 'original', sourceSetId)}`
+}
+
+export async function getGradeLifecycleImpact(workspaceId: string, ladderId: string, grade?: number): Promise<LifecycleImpact> {
+  return (await getGradeLifecycleState(workspaceId, ladderId, grade)).impact
+}
+
+export async function getGradeLifecycleState(workspaceId: string, ladderId: string, grade?: number): Promise<{ impact: LifecycleImpact; etag?: string }> {
+  const result = await cloudLifecycleRequest<{ impact: LifecycleImpact }>(`${base(workspaceId, ladderId)}/lifecycle${grade === undefined ? '' : `?grade=${grade}`}`)
+  return { ...result.value, etag: result.etag }
+}
+
+export async function changeGradeLifecycle(workspaceId: string, ladderId: string, action: LifecycleAction, etag: string, grade?: number): Promise<{ ladder?: GradeLadderDetail; deleted?: true; pending?: true; etag?: string; operation?: LifecycleOperation }> {
+  const result = await cloudLifecycleRequest<{ ladder?: GradeLadderDetail; deleted?: true; pending?: true; etag?: string; operation?: LifecycleOperation }>(`${base(workspaceId, ladderId)}/lifecycle`, {
+    method: 'POST', headers: concurrency(etag), body: JSON.stringify({ action, ...(grade === undefined ? {} : { grade }) }),
+  })
+  return { ...result.value, etag: result.value.etag ?? result.etag }
 }

@@ -114,8 +114,8 @@ before(async () => {
     platform: 'node', format: 'esm', define: { 'import.meta.env.VITE_DEPLOYMENT_MODE': '"cloud"' }, logLevel: 'silent',
   })))
   await build({
-    stdin: { contents: `export { DocumentViewer } from './src/components/documents/DocumentViewer'; export { GradeMatrix } from './src/features/grade-ladders/GradeMatrix';`, resolveDir: process.cwd(), loader: 'tsx' },
-    outfile: join(outputDirectory, 'components.mjs'), bundle: true, packages: 'external', platform: 'node', format: 'esm', jsx: 'automatic', logLevel: 'silent',
+    stdin: { contents: `export { DocumentViewer } from './src/components/documents/DocumentViewer'; export { GradeMatrix } from './src/features/grade-ladders/GradeMatrix'; export { WorkspaceContext } from './src/app/workspace-context';`, resolveDir: process.cwd(), loader: 'tsx' },
+    outfile: join(outputDirectory, 'components.mjs'), bundle: true, packages: 'external', platform: 'node', format: 'esm', jsx: 'automatic', define: { 'import.meta.env.VITE_DEPLOYMENT_MODE': '"cloud"' }, logLevel: 'silent',
   })
   ;[client, jobClient, ui, scoring, fixtures, validation, components] = await Promise.all(['client', 'jobs', 'ui', 'scoring', 'fixtures', 'validation', 'components'].map((name) => import(pathToFileURL(join(outputDirectory, `${name}.mjs`)).href)))
 })
@@ -182,6 +182,30 @@ test('all ladder operations use exact methods, endpoint paths, ETags and stable 
   }
   assert.deepEqual(JSON.parse(requests[6].init.body), { grade: 9 })
   assert.deepEqual(JSON.parse(requests[7].init.body), { workId: 'grade-work-one' })
+})
+
+test('grade lifecycle scopes previews and mutations to the logical grade with its exact head ETag', async () => {
+  const impact = { target: { kind: 'rubric', id: 'grade-head-one-9' }, name: 'GS-9 rubric', counts: { versions: 2 }, blockers: [] }
+  const operation = { id: 'lifecycle-one', action: 'delete', status: 'failed', updatedAt: timestamp, error: 'Cleanup is incomplete.' }
+  globalThis.fetch = async (url, init) => {
+    requests.push({ url, init })
+    return init.method === 'POST' ? json({ pending: true, etag: '"pending-head"', operation }, 503) : json({ impact })
+  }
+  assert.deepEqual(await client.getGradeLifecycleImpact('workspace one', 'ladder/one', 9), impact)
+  const result = await client.changeGradeLifecycle('workspace one', 'ladder/one', 'delete', '"head-exact"', 9)
+  assert.equal(requests[0].url, '/api/workspaces/workspace%20one/grade-ladders/ladder%2Fone/lifecycle?grade=9')
+  assert.equal(requests[1].init.headers.get('If-Match'), '"head-exact"')
+  assert.deepEqual(JSON.parse(requests[1].init.body), { action: 'delete', grade: 9 })
+  assert.deepEqual(result.operation, operation)
+  assert.equal(result.etag, '"pending-head"')
+  assert.equal(result.deleted, undefined)
+})
+
+test('an authoritative empty grade list evicts all history projections without changing samples', () => {
+  const workspace = fixtures.createInitialWorkspace(), baseline = structuredClone(workspace)
+  const result = ui.projectRealGrades(workspace, [makeVersion()], [])
+  assert.equal(result.rubrics.some((rubric) => rubric.dataKind === 'real'), false)
+  assert.deepEqual(workspace, baseline)
 })
 
 test('draft and approval use grade-head ETags, never accept client review/provenance state', async () => {
@@ -390,12 +414,17 @@ test('source-cited not-applicable exclusions allow approval only with exact froz
   assert.deepEqual(ui.gradeApprovalBlockers(detail, detail.levels[0]), [], 'an evidenced exclusion warning is not a support gap')
 })
 
+function renderMatrix(props) {
+  const value = { workspace: fixtures.createInitialWorkspace(), getLifecycleImpact() {}, changeLifecycle() {} }
+  return renderToStaticMarkup(React.createElement(components.WorkspaceContext.Provider, { value }, React.createElement(components.GradeMatrix, props)))
+}
+
 test('matrix shows sourced exclusions as unscored before and after approval, not as zero scores or draft gaps', () => {
   const detail = detailWithExclusion()
-  const render = () => renderToStaticMarkup(React.createElement(components.GradeMatrix, {
+  const render = () => renderMatrix({
     detail, selectedGrade: 9, onGrade() {}, canWrite: true, pending: false, unsavedSources: false,
     onSource() {}, onEdit() {}, onHistory() {}, async onApprove() {},
-  }))
+  })
   let html = render()
   const approvalButtons = html.match(/<button\b[^>]*>[\s\S]*?<\/button>/g).filter((button) => button.includes('Approve supported version'))
   assert.ok(approvalButtons.length)
@@ -441,9 +470,9 @@ test('matrix renders distinct competency IDs, separate unscored qualifications, 
   higher.rubric.criteria[0].competencyId = 'different-competency-same-label'
   higher.rubric.criteria[0].support = 'gap'
   detail.levels.push({ ...structuredClone(detail.levels[0]), head: { ...detail.levels[0].head, id: 'head-11', grade: 11, status: 'needs-sources' }, version: higher, review: null })
-  const html = renderToStaticMarkup(React.createElement(components.GradeMatrix, {
+  const html = renderMatrix({
     detail, selectedGrade: 9, onGrade() {}, canWrite: false, pending: false, unsavedSources: false, onSource() {}, onEdit() {}, onHistory() {}, async onApprove() {},
-  }))
+  })
   assert.match(html, /common-engineering/)
   assert.match(html, /different-competency-same-label/)
   assert.match(html, /Minimum qualifications/)

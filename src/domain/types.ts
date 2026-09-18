@@ -1,3 +1,5 @@
+import type { WorkspaceLifecycle } from './lifecycle'
+
 export type SourceKind = 'pdf' | 'url' | 'website'
 export type CriterionKey = 'technical' | 'delivery' | 'analysis' | 'communication' | 'leadership' | 'policy' | 'custom'
 export type JobStatus = 'queued' | 'parsing' | 'generating' | 'ready' | 'error' | 'cancelled'
@@ -61,6 +63,7 @@ export interface Job {
   batchId?: string
   documentId: string
   rubricId: string | null
+  rubricDeletedAt?: string
   status: JobStatus
   errorStage?: 'download' | 'parsing' | 'rubric'
   error?: string
@@ -136,6 +139,7 @@ export interface AnalysisRun {
 
 export interface Workspace {
   schemaVersion: 1
+  lifecycle?: WorkspaceLifecycle
   jobs: Job[]
   resumes: Resume[]
   documents: SourceDocument[]

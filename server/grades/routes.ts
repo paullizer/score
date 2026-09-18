@@ -9,9 +9,11 @@ import { isUuid } from '../jobs/validation'
 import type { WorkspaceRepository } from '../repository'
 import { getPrincipal } from '../request-context'
 import { GradeService, requireGradePathId, type RealGradesDeps } from './service'
+import type { LifecycleDependencies } from '../lifecycle/contracts'
+import { GradeLifecycleService } from './lifecycle'
 import {
   addGradeUrlInputSchema, approveGradeInputSchema, confirmGradeInputSchema, createGradeInputSchema,
-  editGradeInputSchema, emptyGradeInputSchema, gradeActionInputSchema, updateGradeInputSchema, updateGradeSourceInputSchema,
+  editGradeInputSchema, emptyGradeInputSchema, gradeActionInputSchema, gradeLifecycleInputSchema, updateGradeInputSchema, updateGradeSourceInputSchema,
 } from './validation'
 
 export type { RealGradesDeps } from './service'
@@ -20,6 +22,7 @@ interface GradeRouterDeps {
   repository: WorkspaceRepository
   grades?: RealGradesDeps
   jobs?: RealJobsDeps
+  lifecycle?: LifecycleDependencies
   now?: () => Date
 }
 
@@ -125,27 +128,34 @@ export function createRealGradesRouter(deps: GradeRouterDeps): Router {
   const router = express.Router()
   const base = '/workspaces/:workspaceId/grade-ladders'
   const service = deps.grades ? new GradeService(deps.grades, deps.jobs, deps.now) : undefined
+  const lifecycle = deps.grades ? new GradeLifecycleService(deps.grades, deps.lifecycle, deps.now) : undefined
   const requireService = () => {
     if (!service) throw unavailable('Real grade ladders are not enabled for this deployment.')
     return service
   }
   const authorize: RequestHandler = async (req, _res, next) => {
     try {
-      await deps.repository.authorizeWorkspace(getPrincipal(req), workspaceId(req), req.method === 'GET' ? 'read' : 'write')
+      await deps.repository.authorizeWorkspace(getPrincipal(req), workspaceId(req),
+        /\/lifecycle\/?$/.test(req.path) ? 'manage' : req.method === 'GET' ? 'read' : 'write')
       requireService()
       next()
     } catch (error) { next(error) }
   }
   router.use(base, authorize)
-  const mutation = (
-    callback: (service: GradeService, req: Request) => ReturnType<GradeService['detail']>, status = 200,
+  const mutating = (
+    access: 'write' | 'manage', callback: (req: Request, res: express.Response) => Promise<void>,
   ): RequestHandler => async (req, res, next) => {
     try {
-      const detail = await callback(requireService(), req)
-      res.setHeader('ETag', detail.etag)
-      res.status(status).json({ ladder: detail })
+      await deps.repository.withWorkspaceMutation(getPrincipal(req), workspaceId(req), access, () => callback(req, res))
     } catch (error) { next(error) }
   }
+  const mutation = (
+    callback: (service: GradeService, req: Request) => ReturnType<GradeService['detail']>, status = 200,
+  ): RequestHandler => mutating('write', async (req, res) => {
+    const detail = await callback(requireService(), req)
+    res.setHeader('ETag', detail.etag)
+    res.status(status).json({ ladder: detail })
+  })
 
   router.get(base, async (req, res) => {
     const options = page(req)
@@ -161,6 +171,34 @@ export function createRealGradesRouter(deps: GradeRouterDeps): Router {
     res.setHeader('ETag', detail.etag)
     res.json(detail)
   })
+  router.get(`${base}/:ladderId/lifecycle`, async (req, res) => {
+    const value = req.query.grade
+    if (value !== undefined && (typeof value !== 'string' || !/^(?:[1-9]|1[0-5])$/.test(value))) {
+      throw invalidRequest('grade must be an integer between 1 and 15.')
+    }
+    const selected = value === undefined ? undefined : Number(value)
+    const [impact, currentEtag] = await Promise.all([
+      lifecycle!.impact(workspaceId(req), ladderId(req), selected), lifecycle!.etag(workspaceId(req), ladderId(req), selected),
+    ])
+    res.setHeader('ETag', currentEtag)
+    res.json({ impact })
+  })
+  router.post(`${base}/:ladderId/lifecycle`, mutating('manage', async (req, res) => {
+    const input = parse(gradeLifecycleInputSchema, req.body)
+    const result = await lifecycle!.change(workspaceId(req), ladderId(req), input.action, etag(req), input.grade)
+    if (result.pending) {
+      if (result.etag) res.setHeader('ETag', result.etag)
+      res.status(202).json(result)
+    } else if (result.deleted) res.json({ deleted: true })
+    else {
+      const detail = await requireService().detail(workspaceId(req), ladderId(req))
+      const targetEtag = input.grade === undefined ? detail.etag :
+        detail.levels.find(level => level.head.grade === input.grade)?.etag ??
+          await lifecycle!.etag(workspaceId(req), ladderId(req), input.grade)
+      res.setHeader('ETag', targetEtag)
+      res.json({ ladder: detail })
+    }
+  }))
   router.patch(`${base}/:ladderId`, mutation((service, req) => {
     const input = parse(updateGradeInputSchema, req.body)
     input.grades?.sort((a, b) => a - b)

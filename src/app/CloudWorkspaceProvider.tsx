@@ -1,13 +1,16 @@
-import { useEffect, useRef, useState, type ReactNode } from 'react'
+import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from 'react'
 import { AlertTriangle, RotateCcw, ShieldCheck } from 'lucide-react'
 import { type CloudSaveState, type CloudWorkspaceStatus, type WorkspaceContextValue } from './workspace-context'
 import { useWorkspaceEngine, type PersistenceResult, type WorkspaceEngine } from './useWorkspaceEngine'
 import type { Workspace } from '../domain/types'
-import type { CloudUser, WorkspaceSummary } from '../domain/cloud'
+import type { CloudUser, CloudWorkspaceSnapshot, WorkspaceSummary } from '../domain/cloud'
 import { authLoginUrl, CloudApiError, CloudAuthError, CloudConflictError, fetchSession, loadWorkspaceState, saveWorkspaceState } from '../services/cloudWorkspace'
 import { recoverInterrupted, validateWorkspace, WorkspaceValidationError } from '../domain/workspace-validation'
 import { Button, InlineError } from '../components/ui'
 import type { GradeLeaveProtectionApi } from './grade-navigation-context'
+import { workspaceLifecycleTransitionErrors, type LifecycleTarget } from '../domain/lifecycle'
+import { WorkspaceSwitcher } from '../components/workspace/WorkspaceSwitcher'
+import { LifecycleDialogProvider } from '../components/lifecycle/LifecycleControls'
 
 const SAVE_DEBOUNCE_MS = 700
 
@@ -22,6 +25,9 @@ export interface CloudWorkspaceProviderApi {
   /** Flushes any pending/in-flight save to completion. Used before switching workspaces or signing out. */
   flush: () => Promise<Result>
   prepareToLeave: () => Promise<Result>
+  refreshState: () => Promise<Result>
+  hasPendingChanges: () => boolean
+  discardPendingChanges: () => Promise<void>
 }
 
 function sleep(ms: number): Promise<void> {
@@ -40,6 +46,8 @@ export function CloudWorkspaceProvider({
   workspaceId, user, workspaces, apiRef, onAuthError,
   switchWorkspace, createWorkspace, renameWorkspace, onSignedOut, children,
   leaveProtectionRef,
+  refreshWorkspaces, getWorkspaceLifecycleImpact, changeWorkspaceLifecycle,
+  leaveUnavailableWorkspace,
 }: {
   workspaceId: string
   user: CloudUser
@@ -53,10 +61,15 @@ export function CloudWorkspaceProvider({
   /** Called once pending saves have been flushed and it is safe to redirect to /.auth/logout. */
   onSignedOut: () => void
   children: CloudWorkspaceContent
+  refreshWorkspaces: CloudWorkspaceStatus['refreshWorkspaces']
+  getWorkspaceLifecycleImpact: CloudWorkspaceStatus['getWorkspaceLifecycleImpact']
+  changeWorkspaceLifecycle: CloudWorkspaceStatus['changeWorkspaceLifecycle']
+  leaveUnavailableWorkspace: CloudWorkspaceStatus['leaveUnavailableWorkspace']
 }) {
   const [phase, setPhase] = useState<{ kind: 'loading' } | { kind: 'error'; message: string } | { kind: 'ready' }>({ kind: 'loading' })
-  const [generation, setGeneration] = useState(0)
   const [recoveredNotice, setRecoveredNotice] = useState<string | null>(null)
+  const [syncingState, setSyncingState] = useState(false)
+  const [snapshotRevision, setSnapshotRevision] = useState(0)
   const aliveRef = useRef(true)
   const etagRef = useRef<string>('')
   const pendingRef = useRef<Workspace | null>(null)
@@ -67,6 +80,15 @@ export function CloudWorkspaceProvider({
   const statusRef = useRef<SaveStatus>({ state: 'saved', error: null, conflict: null })
   const [status, setStatusState] = useState<SaveStatus>(statusRef.current)
   const initialWorkspaceRef = useRef<Workspace | null>(null)
+  const metadataRef = useRef(workspaces.find((item) => item.id === workspaceId))
+  metadataRef.current = workspaces.find((item) => item.id === workspaceId)
+  const metadataStamp = JSON.stringify([metadataRef.current?.archivedAt, metadataRef.current?.deletedAt, metadataRef.current?.lifecycleOperation])
+  const appliedMetadataStamp = useRef(metadataStamp)
+  const metadataGeneration = useRef({ stamp: metadataStamp, value: 0 })
+  if (metadataGeneration.current.stamp !== metadataStamp) {
+    metadataGeneration.current = { stamp: metadataStamp, value: metadataGeneration.current.value + 1 }
+  }
+  const stateRefreshRef = useRef<Promise<Result> | null>(null)
 
   function setStatus(next: SaveStatus) {
     statusRef.current = next
@@ -78,11 +100,26 @@ export function CloudWorkspaceProvider({
     debounceRef.current = null
   }
 
+  async function loadCurrentSnapshot(signal?: AbortSignal): Promise<CloudWorkspaceSnapshot & { metadataGeneration: number }> {
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const generation = metadataGeneration.current.value
+      const snapshot = await loadWorkspaceState(workspaceId, signal)
+      if (generation === metadataGeneration.current.value) return { ...snapshot, metadataGeneration: generation }
+    }
+    throw new CloudConflictError('Workspace lifecycle changed repeatedly while loading. Keep this tab open and reload the latest state before continuing.')
+  }
+
+  function requireCurrentSnapshot(snapshot: CloudWorkspaceSnapshot & { metadataGeneration: number }) {
+    if (snapshot.metadataGeneration !== metadataGeneration.current.value) {
+      throw new CloudConflictError('Workspace lifecycle changed before the loaded state could be applied. Reload the latest state; the obsolete snapshot was not installed.')
+    }
+  }
+
   function saveFailure(error: unknown): Result {
     clearDebounce()
     if (error instanceof CloudConflictError) {
-      setStatus({ state: 'conflict', error: null, conflict: { detectedAt: new Date().toISOString() } })
-      return { ok: false, message: 'Another session already saved a newer version of this workspace.' }
+      setStatus({ state: 'conflict', error: error.message, conflict: { detectedAt: new Date().toISOString() } })
+      return { ok: false, message: error.message }
     }
     const message = error instanceof CloudApiError ? error.message : 'Score could not complete the cloud request. Your changes are still in this tab; retry when the connection is available.'
     setStatus({ state: 'error', error: message, conflict: null, authenticationRequired: error instanceof CloudAuthError })
@@ -97,8 +134,9 @@ export function CloudWorkspaceProvider({
     pendingRef.current = null
     savingRef.current = false
     setRecoveredNotice(null)
-    loadWorkspaceState(workspaceId, controller.signal).then((snapshot) => {
+    loadCurrentSnapshot(controller.signal).then((snapshot) => {
       if (!aliveRef.current || controller.signal.aborted) return
+      requireCurrentSnapshot(snapshot)
       let validated: Workspace
       try {
         validated = validateWorkspace(snapshot.workspace)
@@ -172,7 +210,7 @@ export function CloudWorkspaceProvider({
         const result = await saveWorkspaceState(workspaceId, snapshot, etagRef.current)
         if (!aliveRef.current) break
         etagRef.current = result.etag
-        if (!pendingRef.current && !resolvingRef.current) setStatus({ state: 'saved', error: null, conflict: null })
+        if (!pendingRef.current && !resolvingRef.current && statusRef.current.state !== 'conflict') setStatus({ state: 'saved', error: null, conflict: null })
       } catch (error) {
         if (!aliveRef.current) break
         // Edits made while this request was in flight are newer than the failed snapshot.
@@ -195,6 +233,10 @@ export function CloudWorkspaceProvider({
   }
 
   async function flush(): Promise<Result> {
+    if (stateRefreshRef.current) {
+      const refreshed = await stateRefreshRef.current
+      if (!refreshed.ok) return refreshed
+    }
     clearDebounce()
     const blocked = blockedSave()
     if (blocked) return blocked
@@ -202,6 +244,63 @@ export function CloudWorkspaceProvider({
     if (statusRef.current.state === 'error') return { ok: false, message: statusRef.current.error ?? 'This workspace has unsaved changes that could not be saved.' }
     return { ok: true }
   }
+
+  async function flushSave() {
+    const result = await flush()
+    if (!result.ok) throw new Error(result.message)
+  }
+
+  function refreshState(): Promise<Result> {
+    if (stateRefreshRef.current) return stateRefreshRef.current
+    if (pendingRef.current || savingRef.current || resolvingRef.current) {
+      const message = 'The workspace lifecycle changed in another session. Your unsaved changes are kept in this tab. Reload the latest state before continuing; deleted content cannot be overwritten.'
+      setStatus({ state: 'conflict', error: message, conflict: { detectedAt: new Date().toISOString() } })
+      return Promise.resolve({ ok: false, message })
+    }
+    clearDebounce()
+    resolvingRef.current = true
+    setSyncingState(true)
+    engineRef.current?.setExternalArchive(true)
+    const request = (async (): Promise<Result> => {
+      try {
+        const snapshot = await loadCurrentSnapshot()
+        if (!aliveRef.current) return { ok: false, message: 'The workspace changed while its state was loading.' }
+        requireCurrentSnapshot(snapshot)
+        const validated = recoverInterrupted(validateWorkspace(snapshot.workspace))
+        etagRef.current = snapshot.etag
+        initialWorkspaceRef.current = validated
+        engineRef.current?.replaceWorkspace(validated)
+        setSnapshotRevision((value) => value + 1)
+        setStatus({ state: 'saved', error: null, conflict: null })
+        return { ok: true }
+      } catch (error) {
+        return aliveRef.current ? saveFailure(error) : { ok: false, message: 'The workspace changed while its state was loading.' }
+      } finally {
+        resolvingRef.current = false
+        stateRefreshRef.current = null
+        if (aliveRef.current) setSyncingState(false)
+      }
+    })()
+    stateRefreshRef.current = request
+    return request
+  }
+
+  useEffect(() => {
+    if (appliedMetadataStamp.current === metadataStamp) return
+    appliedMetadataStamp.current = metadataStamp
+    if (!engineRef.current) return
+    const metadata = metadataRef.current
+    if (!metadata || metadata.deletedAt || (metadata.lifecycleOperation && metadata.lifecycleOperation.status !== 'complete')) {
+      clearDebounce()
+      if (pendingRef.current || savingRef.current) {
+        setStatus({ state: 'conflict', error: 'Workspace lifecycle work is incomplete or this workspace was deleted elsewhere. Unsaved sample changes are kept here, not uploaded over it.', conflict: { detectedAt: new Date().toISOString() } })
+      }
+      return
+    }
+    void refreshState()
+    // Metadata changes must refresh the sample ETag without remounting unsaved real-grade editors.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [metadataStamp])
 
   async function prepareToLeave(): Promise<Result> {
     if (leaveProtectionRef?.current && !await leaveProtectionRef.current.confirmLeave()) {
@@ -212,7 +311,17 @@ export function CloudWorkspaceProvider({
   }
 
   useEffect(() => {
-    apiRef.current = { flush, prepareToLeave }
+    apiRef.current = {
+      flush, prepareToLeave, refreshState,
+      hasPendingChanges: () => Boolean(pendingRef.current || savingRef.current || resolvingRef.current),
+      discardPendingChanges: async () => {
+        clearDebounce()
+        engineRef.current?.setExternalArchive(true)
+        while (savingRef.current || resolvingRef.current) await sleep(50)
+        pendingRef.current = null
+        setStatus({ state: 'saved', error: null, conflict: null })
+      },
+    }
     return () => { apiRef.current = null }
   })
 
@@ -223,14 +332,16 @@ export function CloudWorkspaceProvider({
     engineRef.current?.stopPendingOperations('Demo operations paused while resolving a cloud save conflict.')
     while (savingRef.current) await sleep(50)
     try {
-      const snapshot = await loadWorkspaceState(workspaceId)
+      const snapshot = await loadCurrentSnapshot()
       if (!aliveRef.current) return
+      requireCurrentSnapshot(snapshot)
       const validated = recoverInterrupted(validateWorkspace(snapshot.workspace))
       etagRef.current = snapshot.etag
       initialWorkspaceRef.current = validated
       pendingRef.current = null
       setStatus({ state: 'saved', error: null, conflict: null })
-      setGeneration((value) => value + 1) // remount the engine with the freshly loaded content
+      engineRef.current?.replaceWorkspace(validated)
+      setSnapshotRevision((value) => value + 1)
     } catch (error) {
       if (!aliveRef.current) return
       if (error instanceof CloudAuthError) { saveFailure(error); return }
@@ -250,8 +361,21 @@ export function CloudWorkspaceProvider({
     const toSave = pendingRef.current
     if (!toSave) { resolvingRef.current = false; setStatus({ ...statusRef.current, error: 'There is nothing to overwrite with yet.' }); return }
     try {
-      const fresh = await loadWorkspaceState(workspaceId) // only to obtain a current, valid etag
+      const fresh = await loadCurrentSnapshot()
       if (!aliveRef.current) return
+      requireCurrentSnapshot(fresh)
+      const serverWorkspace = validateWorkspace(fresh.workspace)
+      const metadata = metadataRef.current
+      if (!metadata || metadata.deletedAt || metadata.archivedAt || (metadata.lifecycleOperation && metadata.lifecycleOperation.status !== 'complete')) {
+        throw new CloudConflictError('This workspace is archived, unavailable, or has an incomplete lifecycle operation. Reload the server state; overwriting cannot restore it.')
+      }
+      if (serverWorkspace.lifecycle?.archivedAt !== toSave.lifecycle?.archivedAt) {
+        throw new CloudConflictError('Workspace archive state changed in another session. Reload the authoritative state; a sample overwrite cannot change its parent archive.')
+      }
+      const transitionErrors = workspaceLifecycleTransitionErrors(serverWorkspace, toSave)
+      if (transitionErrors.length) {
+        throw new CloudConflictError(`Keep mine cannot resurrect removed content or overwrite protected evidence. ${transitionErrors[0]} Reload the latest workspace before continuing.`)
+      }
       const result = await saveWorkspaceState(workspaceId, toSave, fresh.etag)
       if (!aliveRef.current) return
       etagRef.current = result.etag
@@ -296,11 +420,13 @@ export function CloudWorkspaceProvider({
     <p>Loading your saved jobs, resumes, rubrics, and analyses from the cloud.</p>
   </div></main>
 
-  if (phase.kind === 'error') return <main className="recovery-page"><div className="panel recovery-card">
+  if (phase.kind === 'error') return <LifecycleDialogProvider><main className="recovery-page"><div className="panel recovery-card">
     <AlertTriangle size={32} /><h1>This workspace could not be opened</h1>
     <InlineError>{phase.message}</InlineError>
     <div className="flex flex-wrap gap-3"><Button variant="primary" icon={RotateCcw} onClick={() => window.location.reload()}>Try again</Button></div>
-  </div></main>
+    <p className="mt-4 text-[12px] text-muted">Choose another workspace, or open the workspace picker to retry an unfinished lifecycle operation. Missing content is never replaced with samples.</p>
+    <WorkspaceSwitcher cloud={{ workspaces, currentWorkspaceId: workspaceId, switchWorkspace, createWorkspace, renameWorkspace, refreshWorkspaces, getWorkspaceLifecycleImpact, changeWorkspaceLifecycle }} />
+  </div></main></LifecycleDialogProvider>
 
   async function signOut() {
     const result = await prepareToLeave()
@@ -318,21 +444,25 @@ export function CloudWorkspaceProvider({
   const initialWorkspace = initialWorkspaceRef.current
   if (!initialWorkspace) throw new Error('The cloud workspace did not finish initialization.')
   return <CloudWorkspaceReady
-    key={generation}
     initialWorkspace={initialWorkspace}
     persist={enqueue}
     recoveredNotice={recoveredNotice}
     engineRef={engineRef} resumeAuthentication={resumeAuthentication}
-    user={user} workspaces={workspaces} workspaceId={workspaceId} status={status}
+    user={user} workspaces={workspaces} workspaceId={workspaceId} status={status} syncingState={syncingState} snapshotRevision={snapshotRevision}
     retrySave={() => { void runSaveLoop() }}
     reloadFromServer={reloadFromServer} keepMineAndOverwrite={keepMineAndOverwrite}
     switchWorkspace={switchWorkspace} createWorkspace={createWorkspace} renameWorkspace={renameWorkspace} signOut={signOut}
+    flushSave={flushSave} refreshWorkspaces={refreshWorkspaces} getWorkspaceLifecycleImpact={getWorkspaceLifecycleImpact} changeWorkspaceLifecycle={changeWorkspaceLifecycle}
+    leaveUnavailableWorkspace={leaveUnavailableWorkspace}
   >{children}</CloudWorkspaceReady>
 }
 
 function CloudWorkspaceReady({
   initialWorkspace, persist, recoveredNotice, user, workspaces, workspaceId, status, retrySave,
   reloadFromServer, keepMineAndOverwrite, switchWorkspace, createWorkspace, renameWorkspace, signOut, children, engineRef, resumeAuthentication,
+  flushSave, refreshWorkspaces, getWorkspaceLifecycleImpact, changeWorkspaceLifecycle,
+  syncingState,
+  snapshotRevision, leaveUnavailableWorkspace,
 }: {
   initialWorkspace: Workspace
   persist: (next: Workspace) => PersistenceResult
@@ -351,8 +481,24 @@ function CloudWorkspaceReady({
   renameWorkspace: (id: string, name: string) => Promise<Result>
   signOut: () => Promise<void>
   children: CloudWorkspaceContent
+  flushSave: CloudWorkspaceStatus['flushSave']
+  refreshWorkspaces: CloudWorkspaceStatus['refreshWorkspaces']
+  getWorkspaceLifecycleImpact: CloudWorkspaceStatus['getWorkspaceLifecycleImpact']
+  changeWorkspaceLifecycle: CloudWorkspaceStatus['changeWorkspaceLifecycle']
+  syncingState: boolean
+  snapshotRevision: number
+  leaveUnavailableWorkspace: CloudWorkspaceStatus['leaveUnavailableWorkspace']
 }) {
   const engine = useWorkspaceEngine(initialWorkspace, persist)
+  const pendingLifecycle = useRef(new Set<string>())
+  useEffect(() => { pendingLifecycle.current.clear() }, [snapshotRevision])
+  const metadata = workspaces.find((item) => item.id === workspaceId)
+  const writable = Boolean(metadata && metadata.role !== 'viewer' && !metadata.archivedAt && !metadata.deletedAt && !syncingState && (!metadata.lifecycleOperation || metadata.lifecycleOperation.status === 'complete'))
+  const access = useRef({ metadata, writable })
+  access.current = { metadata, writable }
+  useLayoutEffect(() => {
+    engine.setExternalArchive(!writable)
+  }, [engine, writable])
   useEffect(() => {
     engineRef.current = engine
     return () => { engineRef.current = null }
@@ -379,14 +525,50 @@ function CloudWorkspaceReady({
   if (!engine.workspace) throw new Error('The cloud workspace engine has no document state.')
   const cloud: Omit<CloudWorkspaceStatus, 'realJobs'> = {
     user, workspaces, currentWorkspaceId: workspaceId,
-    saveState: status.state, saveError: status.error, conflict: status.conflict,
+    saveState: status.state, saveError: status.error, conflict: status.conflict, syncingState,
     retrySave, reloadFromServer, keepMineAndOverwrite, switchWorkspace, createWorkspace, renameWorkspace, signOut,
+    flushSave, refreshWorkspaces, getWorkspaceLifecycleImpact, changeWorkspaceLifecycle,
+    leaveUnavailableWorkspace,
+  }
+  function assertWritable() {
+    if (!access.current.writable) throw new Error('This workspace is read-only. Unarchive it or ask an owner or editor to make changes.')
+  }
+  function assertLifecyclePermission(target: LifecycleTarget) {
+    const current = access.current.metadata
+    if (!current || current.deletedAt || current.role === 'viewer' || (target.kind === 'workspace' && current.role !== 'owner')) {
+      throw new Error('Your role does not allow this lifecycle change.')
+    }
+  }
+  const workspace: Workspace = {
+    ...engine.workspace,
+    lifecycle: { entities: engine.workspace.lifecycle?.entities ?? {}, ...engine.workspace.lifecycle, archivedAt: metadata?.archivedAt },
   }
   const value: Omit<WorkspaceContextValue, 'cloud'> = {
-    workspace: engine.workspace, storageError: null, notice: engine.notice, clearNotice: engine.clearNotice, notify: engine.notify,
-    addJobs: engine.addJobs, addResumes: engine.addResumes, cancelJob: engine.cancelJob, retryJob: engine.retryJob,
-    saveRubric: engine.saveRubric, startAnalysis: engine.startAnalysis, cancelRun: engine.cancelRun, retryRun: engine.retryRun,
-    resetDemo: engine.resetDemo, retrySave,
+    workspace, storageError: null, notice: engine.notice, clearNotice: engine.clearNotice, notify: engine.notify,
+    addJobs: (...args) => { assertWritable(); return engine.addJobs(...args) },
+    addResumes: (...args) => { assertWritable(); return engine.addResumes(...args) },
+    cancelJob: (id) => { assertWritable(); return engine.cancelJob(id) },
+    retryJob: (id) => { assertWritable(); return engine.retryJob(id) },
+    saveRubric: (...args) => { assertWritable(); return engine.saveRubric(...args) },
+    startAnalysis: (...args) => { assertWritable(); return engine.startAnalysis(...args) },
+    cancelRun: (id) => { assertWritable(); return engine.cancelRun(id) },
+    retryRun: (id) => { assertWritable(); return engine.retryRun(id) },
+    resetDemo: () => { assertWritable(); engine.resetDemo() }, retrySave,
+    getLifecycleImpact: (target) => target.kind === 'workspace' ? getWorkspaceLifecycleImpact(workspaceId) : engine.getLifecycleImpact(target),
+    changeLifecycle: async (target, action) => {
+      assertLifecyclePermission(target)
+      if (target.kind === 'workspace') return changeWorkspaceLifecycle(workspaceId, action)
+      const key = `${target.kind}:${target.id}:${action}`
+      await flushSave()
+      if (!pendingLifecycle.current.has(key)) {
+        engine.changeLifecycle(target, action)
+        pendingLifecycle.current.add(key)
+        engine.clearNotice()
+        await flushSave()
+      }
+      pendingLifecycle.current.delete(key)
+      engine.notify(action === 'delete' ? 'Permanent deletion saved.' : action === 'archive' ? 'Archive saved. Owned unfinished work is cancelled.' : 'Unarchive saved. Cancelled work has not restarted.')
+    },
   }
   return children(value, cloud)
 }

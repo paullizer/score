@@ -45,19 +45,28 @@ function main(): void {
   const credential = createCredential(config)
   const directory = createAzureDirectoryStore(config.cosmos, credential)
   const state = createAzureStateStore(config.storage, credential)
-  const jobs = config.realJobs
+  const jobStorage = config.realJobs ?? config.jobLifecycleStore
+  const gradeStorage = config.realGrades ?? config.gradeLifecycleStore
+  const jobs = jobStorage
     ? {
-        store: createAzureJobStore(config.realJobs, credential),
-        blobs: createAzureJobBlobStore(config.realJobs, credential),
+        store: createAzureJobStore(jobStorage, credential),
+        blobs: createAzureJobBlobStore(jobStorage, credential),
       }
     : undefined
-  const grades = config.realGrades
+  const grades = gradeStorage
     ? {
-        store: createAzureGradeStore(config.realGrades, credential),
-        blobs: createAzureGradeBlobStore(config.realGrades, credential),
+        store: createAzureGradeStore(gradeStorage, credential),
+        blobs: createAzureGradeBlobStore(gradeStorage, credential),
       }
     : undefined
   const app = createApp({ config, directory, state, jobs, grades })
+  const reconcile = app.locals.reconcileLifecycle as () => Promise<void>
+  const recoverLifecycle = () => { void reconcile().catch((error: unknown) => {
+    console.error('Lifecycle recovery is unavailable:', { name: error instanceof Error ? error.name : 'UnknownError' })
+  }) }
+  recoverLifecycle()
+  const lifecycleTimer = setInterval(recoverLifecycle, 60_000)
+  lifecycleTimer.unref()
 
   const port = readPort()
   const host = config.authMode === 'dev-header' ? '127.0.0.1' : '0.0.0.0'

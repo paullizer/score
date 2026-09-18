@@ -1,5 +1,6 @@
 import type { Citation, Criterion, DocumentParagraph, Job, Rubric, SourceDocument } from './types'
 import type { RealJobSource } from './real-jobs'
+import type { LifecycleMetadata, LifecycleOperation } from './lifecycle'
 
 export const GRADE_LADDER_LIMITS = {
   maxSources: 15,
@@ -74,6 +75,7 @@ export type GradeLevelStatus = 'draft' | 'queued' | 'processing' | 'needs-source
 
 export interface GradeLadderRecord extends GradeEntityBase {
   recordType: 'grade-ladder'
+  lifecycle?: LifecycleMetadata
   name: string
   context: GradeContext
   grades: number[]
@@ -328,6 +330,7 @@ export interface GradeApprovalRecord extends GradeEntityBase {
 
 export interface GradeHeadRecord extends GradeEntityBase {
   recordType: 'grade-head'
+  lifecycle?: LifecycleMetadata
   ladderId: string
   grade: number
   status: GradeLevelStatus
@@ -384,6 +387,8 @@ export interface GradeLadderSummary {
   ladder: GradeLadderRecord
   etag: string
   levels: GradeLevelSummary[]
+  pending?: true
+  operation?: LifecycleOperation
 }
 
 export interface GradeLadderDetail extends GradeLadderSummary {

@@ -1,4 +1,5 @@
 import type { Workspace } from './types'
+import type { LifecycleOperation } from './lifecycle'
 
 export interface CloudUser {
   id: string
@@ -18,6 +19,9 @@ export interface WorkspaceSummary {
   createdAt: string
   updatedAt: string
   etag: string
+  archivedAt?: string
+  deletedAt?: string
+  lifecycleOperation?: LifecycleOperation
 }
 
 export interface CloudSession {

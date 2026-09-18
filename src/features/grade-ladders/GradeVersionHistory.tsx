@@ -3,11 +3,14 @@ import { Link } from 'react-router-dom'
 import { History, LoaderCircle } from 'lucide-react'
 import { useGradeLadders } from '../../app/grade-ladders-context'
 import type { GradeLadderDetail, GradeRubricVersionRecord, GradeSourceSetRecord } from '../../domain/real-grades'
+import { gradeHeadId } from '../../domain/real-grades'
 import { Badge, Button, EmptyState, InlineError } from '../../components/ui'
 import { GradeCitations, GradeIssues } from './GradeShared'
 import { GradeCriterionCell, GradeQualifications } from './GradeMatrix'
 import { gradeLadderLink } from './gradeUi'
 import type { GradeSourceSelection } from './GradeSourceInspector'
+import { ArchivedBadge, EntityLifecycleActions } from '../../components/lifecycle/LifecycleControls'
+import { useLifecycleAccess } from '../../components/lifecycle/useLifecycleAccess'
 
 export function GradeVersionHistory({ detail, grade, requestedVersion, onSource }: { detail: GradeLadderDetail; grade: number; requestedVersion?: string; onSource: (selection: GradeSourceSelection) => void }) {
   const api = useGradeLadders()
@@ -20,16 +23,19 @@ export function GradeVersionHistory({ detail, grade, requestedVersion, onSource 
   const [retry, setRetry] = useState(0)
   const level = detail.levels.find((item) => item.head.grade === grade)
   const headVersion = level?.head.latestVersionId
+  const lifecycle = useLifecycleAccess({ kind: 'rubric', id: level?.head.id ?? gradeHeadId(detail.ladder.id, grade) })
+  const removed = !level || lifecycle.removed
   useEffect(() => {
     const controller = new AbortController()
     setVersions(null)
     setError('')
+    if (removed) { setVersions([]); return () => controller.abort() }
     void service.current?.versions(detail.ladder.id, grade, controller.signal).then((items) => {
       if (!controller.signal.aborted) setVersions([...items].sort((a, b) => b.version - a.version))
     }).catch((caught: unknown) => { if (!controller.signal.aborted) setError(caught instanceof Error ? caught.message : 'History could not be loaded.') })
     return () => controller.abort()
-  }, [detail.ladder.id, grade, headVersion, retry])
-  const version = requestedVersion ? versions?.find((item) => item.id === requestedVersion || item.rubric.id === requestedVersion) : versions?.[0]
+  }, [detail.ladder.id, grade, headVersion, removed, retry])
+  const version = removed ? undefined : requestedVersion ? versions?.find((item) => item.id === requestedVersion || item.rubric.id === requestedVersion) : versions?.[0]
   useEffect(() => {
     const controller = new AbortController()
     setFrozen(null)
@@ -41,11 +47,17 @@ export function GradeVersionHistory({ detail, grade, requestedVersion, onSource 
   }, [detail.ladder.id, retry, version])
 
   return <section className="panel grade-version-history" aria-label={`GS-${grade} immutable version history`}>
-    <div className="section-heading"><div><h2>GS-{grade} · immutable history</h2><p>Every saved draft keeps its original context, quotations, and source-set version.</p></div><History size={18} aria-hidden="true" /></div>
+    <div className="section-heading"><div><h2>GS-{grade} · immutable history</h2><p>Every retained draft keeps its original context, quotations, and source-set version.</p></div><History size={18} aria-hidden="true" />
+      {level && <div className="flex flex-wrap items-center gap-2"><ArchivedBadge target={{ kind: 'rubric', id: level.head.id }} />
+        <EntityLifecycleActions target={{ kind: 'rubric', id: level.head.id }} name={`${detail.ladder.name} · GS-${grade}`} restoreOnly={Boolean(level.head.lifecycle?.deletedAt)} />
+      </div>}</div>
     {error && <div className="p-5"><InlineError>{error}<Button size="sm" onClick={() => setRetry((value) => value + 1)}>Retry history</Button></InlineError></div>}
     {!versions && !error && <EmptyState icon={LoaderCircle} title="Opening preserved versions" description="Retrieving every immutable version page from the private service." />}
-    {versions?.length === 0 && <EmptyState icon={History} title="No saved versions for this grade yet" description="Generate and save a grade draft first. A processing failure is not an unsupported-content judgment." />}
-    {versions && versions.length > 0 && <div className="grade-history-layout">
+    {removed ? <EmptyState icon={History} title={lifecycle.deleting ? 'Grade deletion pending' : 'No rubric'} description={lifecycle.deleting
+      ? 'Cleanup is incomplete and this grade’s history is hidden. Retry the lifecycle operation to finish deletion; no prior version is substituted.'
+      : 'This logical grade rubric and its version history were permanently removed. Older versions are not substituted. A deliberate new generation is required for a new rubric.'} />
+      : versions?.length === 0 && <EmptyState icon={History} title="No saved versions for this grade yet" description="Generate and save a grade draft first. A processing failure is not an unsupported-content judgment." />}
+    {!removed && versions && versions.length > 0 && <div className="grade-history-layout">
       <nav aria-label={`GS-${grade} saved versions`} className="grade-history-nav">{versions.map((item) => <Link key={item.id} to={gradeLadderLink(detail.ladder.id, grade, item.id)} aria-current={item.id === version?.id ? 'page' : undefined}>
         <strong>Version {item.version}</strong><span>{item.createdAt}</span>{item.id === headVersion && <Badge>Current head</Badge>}{item.id === level?.head.approvedVersionId && <Badge tone="success">Approved version</Badge>}
         {item.generationId !== detail.ladder.generationId && <span>Prior generation</span>}

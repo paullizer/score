@@ -2,13 +2,16 @@ import { useEffect, useState } from 'react'
 import { Link, useNavigate, useParams } from 'react-router-dom'
 import { ArrowLeft, ArrowRight, ArrowUpRight, BarChart3, BriefcaseBusiness, Building2, ChevronRight, Download, FileText, Globe2, Layers3, Link2, LoaderCircle, MapPin, Plus, RotateCcw, ScanLine, ShieldCheck, Sparkles, X } from 'lucide-react'
 import { useWorkspace } from '../../app/workspace-context'
-import type { Citation, Criterion, SourceKind } from '../../domain/types'
+import type { Citation, Criterion, Job, SourceKind } from '../../domain/types'
 import { dateLabel } from '../../domain/selectors'
 import { Badge, Button, DemoNote, EmptyState, ExternalSource, InlineError, PageHeader, SearchField, SegmentedControl, StatusBadge } from '../../components/ui'
 import { DocumentViewer } from '../../components/documents/DocumentViewer'
 import { RubricPanel } from '../rubrics/RubricPanel'
 import { JobImport } from './JobImport'
 import { useGradeLadders } from '../../app/grade-ladders-context'
+import { getEntityLifecycle, isEntityArchived, isEntityRemoved, matchesArchiveFilter, type ArchiveFilter } from '../../domain/lifecycle'
+import { ArchivedBadge, ArchiveStateFilter, EntityLifecycleActions, LifecycleBanner } from '../../components/lifecycle/LifecycleControls'
+import { useLifecycleAccess } from '../../components/lifecycle/useLifecycleAccess'
 
 const sourceNames = { pdf: 'PDF document', url: 'Direct URL', website: 'Website' }
 const sourceIcons = { pdf: FileText, url: Link2, website: Globe2 }
@@ -23,38 +26,50 @@ export function JobsPage() {
   const [selected, setSelected] = useState<string[]>([])
   const [importOpen, setImportOpen] = useState(false)
   const [libraryKind, setLibraryKind] = useState<'real' | 'samples'>(() => cloud ? 'real' : 'samples')
+  const [archiveFilter, setArchiveFilter] = useState<ArchiveFilter>('default')
+  const { canEdit } = useLifecycleAccess()
   const libraryJobs = workspace.jobs.filter((job) => libraryKind === 'real' ? job.dataKind === 'real' : job.dataKind !== 'real')
-  const readyCount = libraryJobs.filter((job) => job.status === 'ready').length
-  const attentionCount = libraryJobs.filter((job) => job.status === 'error' || job.status === 'cancelled').length
+  const activeJobs = libraryJobs.filter((job) => !isEntityArchived(workspace, { kind: 'job', id: job.id }) && !isEntityRemoved(workspace, { kind: 'job', id: job.id }))
+  const scopedCount = libraryJobs.filter((job) => matchesArchiveFilter(isEntityArchived(workspace, { kind: 'job', id: job.id }), query, archiveFilter)).length
+  const previewRun = workspace.runs.find((run) => !isEntityArchived(workspace, { kind: 'analysis', id: run.id }))
+  const readyCount = activeJobs.filter((job) => job.status === 'ready' && !job.rubricDeletedAt && workspace.rubrics.some((rubric) => rubric.id === job.rubricId)).length
+  const attentionCount = activeJobs.filter((job) => !job.rubricDeletedAt && (job.status === 'error' || job.status === 'cancelled')).length
+  function selectable(job: Job) {
+    const rubric = workspace.rubrics.find((item) => item.id === job.rubricId)
+    return canEdit && job.dataKind !== 'real' && job.status === 'ready' && !job.rubricDeletedAt && Boolean(rubric) &&
+      !isEntityArchived(workspace, { kind: 'job', id: job.id }) && !isEntityArchived(workspace, { kind: 'rubric', id: rubric!.groupId })
+  }
   const filtered = libraryJobs.filter((job) => {
-    const matchesQuery = `${job.title} ${job.organization} ${job.grade} ${job.location}`.toLowerCase().includes(query.toLowerCase())
-    return matchesQuery && (source === 'all' || job.source === source) &&
-      (filter === 'all' || (filter === 'ready' ? job.status === 'ready' : job.status === 'error' || job.status === 'cancelled'))
+    const matchesQuery = `${job.title} ${job.organization} ${job.grade} ${job.location}`.toLowerCase().includes(query.trim().toLowerCase())
+    const deleting = Boolean(getEntityLifecycle(workspace, { kind: 'job', id: job.id })?.deletingAt)
+    return matchesQuery && matchesArchiveFilter(isEntityArchived(workspace, { kind: 'job', id: job.id }), query, archiveFilter) && (source === 'all' || job.source === source) &&
+      (deleting || filter === 'all' || (filter === 'ready' ? job.status === 'ready' && !job.rubricDeletedAt && workspace.rubrics.some((rubric) => rubric.id === job.rubricId) : !job.rubricDeletedAt && (job.status === 'error' || job.status === 'cancelled')))
   }).sort((a, b) => sort === 'title' ? a.title.localeCompare(b.title) : b.createdAt.localeCompare(a.createdAt))
-  const visibleReady = filtered.filter((job) => job.status === 'ready' && job.dataKind !== 'real').map((job) => job.id)
-  const selectedJobs = workspace.jobs.filter((job) => selected.includes(job.id) && job.dataKind !== 'real')
+  const visibleReady = filtered.filter(selectable).map((job) => job.id)
+  const selectedJobs = workspace.jobs.filter((job) => selected.includes(job.id) && selectable(job))
   const allVisible = visibleReady.length > 0 && visibleReady.every((id) => selected.includes(id))
   function toggle(id: string) { setSelected((values) => values.includes(id) ? values.filter((value) => value !== id) : [...values, id]) }
 
   return <>
     <PageHeader eyebrow="A CLEARER STARTING POINT" title="Your jobs" description="Bring the roles together. Define what a great match looks like."
-      actions={<><Button icon={Layers3} onClick={() => navigate('/rubrics')}>Rubric library</Button><Button variant="primary" icon={Plus} onClick={() => setImportOpen(true)}>Add jobs</Button></>} />
+      actions={<><Button icon={Layers3} onClick={() => navigate('/rubrics')}>Rubric library</Button><Button variant="primary" icon={Plus} disabled={!canEdit} onClick={() => setImportOpen(true)}>Add jobs</Button></>} />
     <div className="welcome-panel">
       <div className="flex items-center"><span className="welcome-symbol"><ScanLine size={25} strokeWidth={1.4} /></span><div><h2>Good matches start with clear criteria.</h2><p>Every job gets its own rubric. Every score leads back to evidence. Nothing important stays a black box.</p></div></div>
       <div className="welcome-action"><div className="mini-path" aria-hidden="true"><span><BriefcaseBusiness size={16} /></span><ChevronRight size={11} /><span><Layers3 size={16} /></span><ChevronRight size={11} /><span><BarChart3 size={16} /></span></div>
-        <Button size="sm" icon={ArrowUpRight} onClick={() => navigate(workspace.runs.length ? `/analyses/${workspace.runs[0].id}` : '/analyses/new')}>See it in action</Button>
+        <Button size="sm" icon={ArrowUpRight} disabled={!previewRun && !canEdit} onClick={() => navigate(previewRun ? `/analyses/${previewRun.id}` : '/analyses/new')}>See it in action</Button>
       </div>
     </div>
     <section className="panel" aria-label="Job library">
       {cloud && <div className="library-kind-switcher"><SegmentedControl label="Choose real jobs or samples" value={libraryKind} onChange={(value) => { setLibraryKind(value); setSelected([]) }} options={[
-        { value: 'real', label: 'Real jobs', count: workspace.jobs.filter((job) => job.dataKind === 'real').length },
-        { value: 'samples', label: 'Samples', count: workspace.jobs.filter((job) => job.dataKind !== 'real').length },
+        { value: 'real', label: 'Real jobs', count: workspace.jobs.filter((job) => job.dataKind === 'real' && !isEntityArchived(workspace, { kind: 'job', id: job.id })).length },
+        { value: 'samples', label: 'Samples', count: workspace.jobs.filter((job) => job.dataKind !== 'real' && !isEntityArchived(workspace, { kind: 'job', id: job.id })).length },
       ]} /><span>{libraryKind === 'real' ? 'Private source imports and generated rubrics' : 'Fictional examples for the simulated preview'}</span></div>}
       <div className="library-toolbar">
         <SegmentedControl label="Filter jobs by status" value={filter} onChange={setFilter} options={[
-          { value: 'all', label: 'All jobs', count: libraryJobs.length }, { value: 'ready', label: 'Ready', count: readyCount }, { value: 'attention', label: 'Needs attention', count: attentionCount },
+          { value: 'all', label: 'All jobs', count: activeJobs.length }, { value: 'ready', label: 'Ready', count: readyCount }, { value: 'attention', label: 'Needs attention', count: attentionCount },
         ]} />
         <div className="toolbar"><SearchField value={query} onChange={setQuery} placeholder="Search jobs, organizations..." />
+          <ArchiveStateFilter value={archiveFilter} onChange={setArchiveFilter} label="Job archive state" />
           <select aria-label="Filter by source" className="filter-select" value={source} onChange={(event) => {
             const value = event.target.value
             if (value === 'all' || value === 'pdf' || value === 'url' || value === 'website') setSource(value)
@@ -72,16 +87,22 @@ export function JobsPage() {
         <tbody>{filtered.map((job) => {
           const Icon = sourceIcons[job.source]
           const rubric = workspace.rubrics.find((item) => item.id === job.rubricId)
+          const rubricRemoving = cloud?.realJobs.summaries.find((item) => item.job.id === job.id)?.rubricLifecycle?.deletingAt
+          const deleting = Boolean(getEntityLifecycle(workspace, { kind: 'job', id: job.id })?.deletingAt)
+          const editable = canEdit && !isEntityArchived(workspace, { kind: 'job', id: job.id }) && !isEntityRemoved(workspace, { kind: 'job', id: job.id })
+          const canRetry = editable && !rubricRemoving && !job.rubricDeletedAt && (!rubric || !isEntityArchived(workspace, { kind: 'rubric', id: rubric.groupId }))
           const processing = job.status === 'queued' || job.status === 'parsing' || job.status === 'generating'
+          const statusBadge = deleting ? <Badge tone="warning">Deletion pending</Badge> : rubricRemoving ? <Badge tone="warning">Rubric deletion pending</Badge> : job.rubricDeletedAt ? <Badge>No rubric</Badge> : <StatusBadge status={job.status} />
           return <tr key={job.id} className={selected.includes(job.id) ? 'row-selected' : ''}>
-            <td className="checkbox-cell"><input type="checkbox" aria-label={`Select ${job.title}`} disabled={job.status !== 'ready' || job.dataKind === 'real'} checked={selected.includes(job.id)} title={job.dataKind === 'real' ? 'Real jobs cannot use demo scoring.' : job.status === 'ready' ? 'Select for analysis' : 'The rubric must be ready before analysis'} onChange={() => toggle(job.id)} /></td>
-            <td><div className="job-cell"><span className="job-monogram"><Building2 size={19} strokeWidth={1.4} /></span><div><Link to={`/jobs/${job.id}`} className="row-title">{job.title}</Link><div className="row-meta">{job.organization}</div>{(job.grade || job.arrangement) && <div className="job-submeta">{[job.grade, job.arrangement].filter(Boolean).join(' / ')}</div>}<div className="job-mobile-status"><StatusBadge status={job.status} /><span className="source-type"><Icon size={12} />{sourceNames[job.source]}</span></div></div></div></td>
+            <td className="checkbox-cell"><input type="checkbox" aria-label={`Select ${job.title}`} disabled={!selectable(job)} checked={selectedJobs.some((item) => item.id === job.id)} title={job.dataKind === 'real' ? 'Real jobs cannot use demo scoring.' : !editable ? 'Archived content and viewer access are read-only.' : 'An active, ready rubric is required.'} onChange={() => toggle(job.id)} /></td>
+            <td><div className="job-cell"><span className="job-monogram"><Building2 size={19} strokeWidth={1.4} /></span><div><Link to={`/jobs/${job.id}`} className="row-title">{job.title}</Link> <ArchivedBadge target={{ kind: 'job', id: job.id }} /><div className="row-meta">{job.organization}</div>{(job.grade || job.arrangement) && <div className="job-submeta">{[job.grade, job.arrangement].filter(Boolean).join(' / ')}</div>}<div className="job-mobile-status">{statusBadge}<span className="source-type"><Icon size={12} />{sourceNames[job.source]}</span></div></div></div></td>
             <td className="mobile-hide"><span className="source-type"><Icon size={13} />{sourceNames[job.source]}</span><div className="row-meta">{job.dataKind === 'real' ? 'Private source' : job.batchId ? 'Batch import' : 'Sample source'}</div></td>
-            <td className="mobile-hide"><StatusBadge status={job.status} /><div className="row-meta">{rubric ? `${rubric.criteria.length} criteria / v${rubric.version}` : job.status === 'error' ? `${job.errorStage === 'rubric' ? 'Rubric' : 'Document'} needs a retry` : processing ? job.dataKind === 'real' ? 'Server processing in progress' : 'Simulated import in progress' : job.status === 'queued' ? 'Waiting for a worker' : 'Not yet assessed'}</div></td>
+            <td className="mobile-hide">{statusBadge}{rubric && <ArchivedBadge target={{ kind: 'rubric', id: rubric.groupId }} />}<div className="row-meta">{deleting || rubricRemoving ? 'Cleanup is incomplete · retry the lifecycle operation' : job.rubricDeletedAt ? 'Permanently removed · source retained' : rubric ? `${rubric.criteria.length} criteria / v${rubric.version}` : job.status === 'error' ? `${job.errorStage === 'rubric' ? 'Rubric' : 'Document'} needs a retry` : processing ? job.dataKind === 'real' ? 'Server processing in progress' : 'Simulated import in progress' : 'Not yet assessed'}</div></td>
             <td className="mobile-hide"><span className="text-[11px] text-muted">{dateLabel(job.createdAt)}</span></td>
-            <td>{processing || job.status === 'queued' ? <Button size="sm" variant="ghost" aria-label={`Cancel ${job.title} import`} icon={X} onClick={() => void cancelJob(job.id)}>Cancel</Button>
-              : job.status === 'error' || job.status === 'cancelled' ? <Button size="sm" icon={RotateCcw} onClick={() => void retryJob(job.id)}>Retry</Button>
-                : <Link to={`/jobs/${job.id}`} className="button button-ghost icon-button" aria-label={`Open ${job.title}`}><ArrowUpRight size={16} /></Link>}</td>
+            <td><div className="flex flex-wrap items-center gap-1">{deleting ? <Link to={`/jobs/${job.id}`} className="button button-ghost button-sm">View cleanup</Link> : processing ? <Button size="sm" variant="ghost" disabled={!editable} aria-label={`Cancel ${job.title} import`} icon={X} onClick={() => void cancelJob(job.id)}>Cancel</Button>
+              : !job.rubricDeletedAt && (job.status === 'error' || job.status === 'cancelled') ? <Button size="sm" disabled={!canRetry} icon={RotateCcw} onClick={() => void retryJob(job.id)}>Retry</Button>
+                : <Link to={`/jobs/${job.id}`} className="button button-ghost icon-button" aria-label={`Open ${job.title}`}><ArrowUpRight size={16} /></Link>}
+              <EntityLifecycleActions target={{ kind: 'job', id: job.id }} name={job.title} compact /></div></td>
           </tr>
         })}</tbody>
       </table></div> : libraryKind === 'real' && cloud?.realJobs.phase === 'loading'
@@ -89,8 +110,8 @@ export function JobsPage() {
         : libraryKind === 'real' && cloud && cloud.realJobs.phase !== 'ready'
           ? <EmptyState icon={BriefcaseBusiness} title="Real job imports are unavailable" description={cloud.realJobs.error ?? 'This deployment does not have real job processing enabled. Samples remain available in their separate view.'} action={<Button onClick={() => setLibraryKind('samples')}>View samples</Button>} />
           : <EmptyState icon={BriefcaseBusiness} title={libraryJobs.length ? 'No jobs match these filters' : libraryKind === 'real' ? 'Import your first real job' : cloud ? 'Explore the sample jobs' : 'Your next great match starts here'} description={libraryJobs.length ? 'Try another search or choose All jobs to see the rest of your library.' : libraryKind === 'real' ? 'Upload an actual PDF or enter a direct posting URL. Score will create a durable queued job and source-grounded rubric.' : cloud ? 'Fictional examples remain available for the simulated workflow.' : 'Add a PDF, a job URL, or a collection of roles from a website.'}
-            action={<Button onClick={() => { if (!libraryJobs.length && libraryKind === 'real') setImportOpen(true); else { setQuery(''); setFilter('all'); setSource('all') } }}>{libraryJobs.length ? 'Clear filters' : libraryKind === 'real' ? 'Import a real job' : 'Show all samples'}</Button>} />}
-      <div className="table-bottom"><span>Showing {filtered.length} of {libraryJobs.length} {libraryKind === 'real' ? 'real' : 'sample'} jobs</span><label className="flex items-center gap-2">Sort by<select className="bg-transparent text-[10px] outline-offset-2" value={sort} onChange={(event) => setSort(event.target.value)} aria-label="Sort jobs"><option value="newest">Newest first</option><option value="title">Job title</option></select></label></div>
+            action={<Button disabled={!canEdit && !libraryJobs.length && libraryKind === 'real'} onClick={() => { if (!libraryJobs.length && libraryKind === 'real') setImportOpen(true); else { setQuery(''); setFilter('all'); setSource('all'); setArchiveFilter('all') } }}>{libraryJobs.length ? 'Show active and archived' : libraryKind === 'real' ? 'Import a real job' : 'Show all samples'}</Button>} />}
+      <div className="table-bottom"><span>Showing {filtered.length} of {scopedCount} {libraryKind === 'real' ? 'real' : 'sample'} jobs in this archive view</span><label className="flex items-center gap-2">Sort by<select className="bg-transparent text-[10px] outline-offset-2" value={sort} onChange={(event) => setSort(event.target.value)} aria-label="Sort jobs"><option value="newest">Newest first</option><option value="title">Job title</option></select></label></div>
     </section>
     <div className="library-note"><DemoNote>{libraryKind === 'real' ? 'Real PDF and URL content is privately read and stored. Resume import and scoring remain simulated.' : cloud ? 'Sample jobs and rubrics are fictional and remain separate from real imports.' : 'Example jobs and rubrics are fictional. Add a source to explore the import workflow.'}</DemoNote><Link className="text-link shrink-0 mobile-hide" to="/rubrics">How rubrics work <ArrowRight size={12} /></Link></div>
     {importOpen && <JobImport onClose={() => setImportOpen(false)} />}
@@ -105,6 +126,7 @@ export function JobDetail() {
   const [highlighted, setHighlighted] = useState<{ id: string; quote?: string }>()
   const [pane, setPane] = useState<'document' | 'rubric'>('document')
   const job = workspace.jobs.find((item) => item.id === id)
+  const { canEdit, deleting } = useLifecycleAccess({ kind: 'job', id: id ?? '' })
   const real = job?.dataKind === 'real'
   const detail = real && id && cloud ? cloud.realJobs.detail(id) : undefined
   useEffect(() => {
@@ -122,7 +144,11 @@ export function JobDetail() {
   const processing = job.status === 'queued' || job.status === 'parsing' || job.status === 'generating'
   const source = real && cloud ? cloud.realJobs.source(job.id) : undefined
   const summary = real && cloud ? cloud.realJobs.summaries.find((item) => item.job.id === job.id) : undefined
-  const canRetry = job.status === 'error' || job.status === 'cancelled'
+  const rubricRemoving = summary?.rubricLifecycle?.deletingAt
+  const rubricArchived = rubric && isEntityArchived(workspace, { kind: 'rubric', id: rubric.groupId })
+  const canRetry = canEdit && !rubricRemoving && !rubricArchived && !job.rubricDeletedAt && (job.status === 'error' || job.status === 'cancelled')
+  const ready = canEdit && job.status === 'ready' && rubric && !rubricArchived && !job.rubricDeletedAt
+  const statusBadge = deleting ? <Badge tone="warning">Deletion pending</Badge> : rubricRemoving ? <Badge tone="warning">Rubric deletion pending</Badge> : job.rubricDeletedAt ? <Badge>No rubric</Badge> : <StatusBadge status={job.status} />
   function selectCriterion(criterion: Criterion, selectedCitation?: Citation) {
     const citation = selectedCitation ?? criterion.sourceCitations?.[0]
     const paragraphId = citation?.paragraphId ?? criterion.sourceParagraphId
@@ -133,18 +159,19 @@ export function JobDetail() {
   return <>
     <Link className="back-link" to="/jobs"><ArrowLeft size={14} />Back to jobs</Link>
     <PageHeader eyebrow="JOB WORKSPACE" title={job.title} description={job.organization}
-      actions={<>{real && <Button icon={Layers3} disabled={job.status !== 'ready' || !rubric || !gradeLadders?.canWrite || gradeLadders.phase !== 'ready'}
+      actions={<><EntityLifecycleActions target={{ kind: 'job', id: job.id }} name={job.title} onComplete={(action) => { if (action === 'delete') navigate('/jobs') }} />{real && <Button icon={Layers3} disabled={!ready || !gradeLadders?.canWrite || gradeLadders.phase !== 'ready'}
         title={!gradeLadders?.canWrite ? 'An owner or editor in a grade-enabled workspace can create a ladder.' : job.status !== 'ready' || !rubric ? 'Wait for the real job and saved rubric to be ready.' : gradeLadders.phase !== 'ready' ? 'Real grade processing is not currently available.' : 'Capture this real job and exact saved rubric version as a new grade family.'}
         onClick={() => navigate(`/grade-ladders/new?${new URLSearchParams({ job: job.id, rubric: rubric!.id, rubricVersion: String(rubric!.version) })}`)}>Create grade ladder</Button>}
-        <Button variant="primary" icon={Sparkles} disabled={job.status !== 'ready' || real} title={real ? 'Real job scoring is not enabled in this preview.' : undefined} onClick={() => navigate(`/analyses/new?rubrics=${job.rubricId}`)}>Analyze applicants</Button></>} />
-    <div className="detail-metadata">{job.location && <span><MapPin size={13} />{job.location}</span>}{(job.arrangement || job.employmentType) && <span><BriefcaseBusiness size={13} />{[job.arrangement, job.employmentType].filter(Boolean).join(' / ')}</span>}{job.grade && <Badge>{job.grade}</Badge>}{job.series && <Badge>Series {job.series}</Badge>}<StatusBadge status={job.status} /></div>
+        <Button variant="primary" icon={Sparkles} disabled={!ready || real} title={real ? 'Real job scoring is not enabled in this preview.' : undefined} onClick={() => navigate(`/analyses/new?rubrics=${job.rubricId}`)}>Analyze applicants</Button></>} />
+    <LifecycleBanner target={{ kind: 'job', id: job.id }} />
+    <div className="detail-metadata">{job.location && <span><MapPin size={13} />{job.location}</span>}{(job.arrangement || job.employmentType) && <span><BriefcaseBusiness size={13} />{[job.arrangement, job.employmentType].filter(Boolean).join(' / ')}</span>}{job.grade && <Badge>{job.grade}</Badge>}{job.series && <Badge>Series {job.series}</Badge>}{statusBadge}<ArchivedBadge target={{ kind: 'job', id: job.id }} /></div>
     {real && <div className="info-callout mb-5"><ShieldCheck size={18} /><div><strong>Generated from the private source</strong><p>This job and rubric are server-owned. Demo scoring is disabled; review and edit the source-grounded criteria instead.</p></div></div>}
-    {job.error && <div className="mb-5"><InlineError>
+    {job.error && !job.rubricDeletedAt && !rubricRemoving && <div className="mb-5"><InlineError>
       <strong>{job.errorStage === 'rubric' ? 'The job is preserved; its rubric needs attention. ' : summary?.error?.code ? `${summary.error.code}: ` : ''}</strong>
       {job.error}
       {canRetry
         ? <button className="ml-2 underline" onClick={() => void retryJob(job.id)}>Retry import</button>
-        : summary?.error?.retryable && <span className="ml-2">The server will retry automatically; this durable job remains queued.</span>}
+        : canEdit && summary?.error?.retryable && <span className="ml-2">The server will retry automatically; this durable job remains queued.</span>}
     </InlineError></div>}
     {summary?.warnings.length ? <div className="mb-5 info-callout"><FileText size={18} /><div><strong>Processing warnings</strong><ul className="mt-1 list-disc space-y-1 pl-4 text-[11px] text-muted">{summary.warnings.map((warning) => <li key={warning}>{warning}</li>)}</ul></div></div> : null}
     {detail?.state === 'error' && <div className="mb-5"><InlineError>{detail.error} <button className="ml-2 underline" onClick={() => cloud && void cloud.realJobs.ensureDetail(job.id, true)}>Retry loading</button></InlineError></div>}
@@ -152,21 +179,25 @@ export function JobDetail() {
     <div className="split-layout">
       <section className={`detail-panel ${pane !== 'document' ? 'mobile-pane-hidden' : ''}`} aria-label="Job description">
         <div className="section-heading"><div><h2>The role, in its own words</h2><p>Source context for every criterion</p></div><FileText size={17} className="text-muted" /></div>
-        {document ? <DocumentViewer document={document} highlightedId={highlighted?.id} quote={highlighted?.quote} /> : real && (detail?.state === 'idle' || detail?.state === 'loading')
+        {deleting ? <EmptyState title="Job deletion pending" description="Only recovery metadata remains available while cleanup finishes. Retry the lifecycle operation above; this source cannot be edited or reused." />
+          : document ? <DocumentViewer document={document} highlightedId={highlighted?.id} quote={highlighted?.quote} /> : real && (detail?.state === 'idle' || detail?.state === 'loading')
           ? <EmptyState icon={LoaderCircle} title="Loading the parsed source" description="Score is retrieving the private source document and exact paragraph references." />
           : processing ? <EmptyState icon={LoaderCircle} title="Source processing is not complete" description="The worker is reading this source asynchronously. This page will refresh while the durable job remains queued." />
-            : <EmptyState title="Source document unavailable" description={real ? 'The server has not returned a parsed source document. Review the job error or retry the import.' : 'This sample could not be opened. Reset the demo to restore the original document.'} />}
+            : <EmptyState title="Source document unavailable" description={job.rubricDeletedAt ? 'The job and its original source are retained, but no parsed source was returned. Its deliberately removed rubric cannot be restored by retry.' : real ? 'The server has not returned a parsed source document. Review the job error or retry the import.' : 'This sample could not be opened. Add a fresh sample in an active workspace.'} />}
         <div className="source-footer"><span className="min-w-0">{source?.kind === 'url' && (source.finalUrl || source.url) ? <ExternalSource url={source.finalUrl ?? source.url!}>{source.displayName}</ExternalSource> : <span className="source-label">{source?.displayName ?? job.sourceLabel}</span>}</span><span>{real ? 'Private source' : 'Demo'} / {sourceNames[job.source]}</span></div>
-        {real && source && <div className="source-provenance">
+        {real && source && !deleting && <div className="source-provenance">
           <div><strong>Source provenance</strong><span>{source.capturedAt ? `Captured ${dateLabel(source.capturedAt)}` : `Added ${dateLabel(job.createdAt)}`}</span>{source.bytes !== undefined && <span>{new Intl.NumberFormat('en', { style: 'unit', unit: 'byte', notation: 'compact' }).format(source.bytes)}</span>}{source.sha256 && <code title={source.sha256}>SHA-256 {source.sha256.slice(0, 12)}…</code>}{summary && <span>{summary.attempts} processing {summary.attempts === 1 ? 'attempt' : 'attempts'}</span>}</div>
           <a className="button button-secondary button-sm" href={cloud?.realJobs.originalUrl(job.id)} download={source.displayName}><Download size={14} />View original</a>
         </div>}
       </section>
       <section className={`detail-panel ${pane !== 'rubric' ? 'mobile-pane-hidden' : ''}`} aria-label="Associated job rubric">
-        {rubric ? <RubricPanel rubric={rubric} onSelectCriterion={selectCriterion} /> : <div className="p-6">
-          <div className="mb-5 flex items-center justify-between"><h2 className="font-semibold">Your job rubric</h2><StatusBadge status={job.status} /></div>
-          {processing ? <><div className="loading-pulse space-y-4" aria-hidden="true">{[1, 2, 3].map((key) => <div key={key} className="h-20 rounded-xl border bg-soft" />)}</div><p role="status" className="mt-5 text-[12px] text-muted">{real ? 'The server is extracting source paragraphs and generating grounded criteria. Scheduled work may take a minute to start.' : 'Preparing sample criteria and linking them to this job...'}</p><Button size="sm" className="mt-4" onClick={() => void cancelJob(job.id)}>Cancel import</Button></>
-            : <EmptyState icon={Layers3} title="The rubric is not ready" description={real ? 'Retry server processing. The uploaded source is preserved.' : 'Finish the simulated import before using this job in an analysis.'} action={<Button icon={RotateCcw} onClick={() => void retryJob(job.id)}>Retry import</Button>} />}
+        {deleting ? <EmptyState title="Cleanup is incomplete" description="Job and rubric deletion has not been acknowledged as complete. Use the explicit lifecycle retry above; unarchive and import retries remain locked." />
+          : rubric ? <RubricPanel rubric={rubric} onSelectCriterion={selectCriterion} /> : <div className="p-6">
+          <div className="mb-5 flex items-center justify-between"><h2 className="font-semibold">Your job rubric</h2>{statusBadge}</div>
+          {rubricRemoving ? <EmptyState icon={Layers3} title="Rubric deletion pending" description="The logical rubric is locked while cleanup finishes. Use Retry lifecycle operation above; an import retry cannot finish or undo this deletion." />
+            : job.rubricDeletedAt ? <EmptyState icon={Layers3} title="No rubric" description="This job’s rubric and all its versions were permanently deleted. The job and its original source are preserved. It cannot be used for analysis or as a ladder seed; retry will not restore the rubric." />
+            : processing ? <><div className="loading-pulse space-y-4" aria-hidden="true">{[1, 2, 3].map((key) => <div key={key} className="h-20 rounded-xl border bg-soft" />)}</div><p role="status" className="mt-5 text-[12px] text-muted">{real ? 'The server is extracting source paragraphs and generating grounded criteria. Scheduled work may take a minute to start.' : 'Preparing sample criteria and linking them to this job...'}</p><Button size="sm" className="mt-4" disabled={!canEdit} onClick={() => void cancelJob(job.id)}>Cancel import</Button></>
+            : <EmptyState icon={Layers3} title="The rubric is not ready" description={real ? 'The uploaded source is preserved. An active job may be explicitly retried.' : 'Finish the simulated import before using this job in an analysis.'} action={<Button icon={RotateCcw} disabled={!canRetry} onClick={() => void retryJob(job.id)}>Retry import</Button>} />}
         </div>}
       </section>
     </div>

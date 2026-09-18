@@ -1,8 +1,8 @@
 import assert from 'node:assert/strict'
 import { after, before, beforeEach, test } from 'node:test'
-import { mkdtemp, rm } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { mkdir, rm } from 'node:fs/promises'
+import { randomUUID } from 'node:crypto'
+import { join, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { build } from 'esbuild'
 
@@ -47,10 +47,11 @@ function summary(id, updatedAt, rubric = null) {
 }
 
 before(async () => {
-  outputDirectory = await mkdtemp(join(tmpdir(), 'score-real-jobs-test-'))
+  outputDirectory = resolve(`.real-jobs-client-tests-${randomUUID()}`)
+  await mkdir(outputDirectory)
   const outfile = join(outputDirectory, 'realJobs.mjs')
   await build({
-    entryPoints: ['src/services/realJobs.ts'],
+    entryPoints: [join('src', 'services', 'realJobs.ts')],
     outfile,
     bundle: true,
     format: 'esm',
@@ -61,7 +62,7 @@ before(async () => {
   client = await import(`${pathToFileURL(outfile).href}?test=${Date.now()}`)
   const projectionOutfile = join(outputDirectory, 'realJobsProjection.mjs')
   await build({
-    entryPoints: ['src/app/realJobsProjection.ts'],
+    entryPoints: [join('src', 'app', 'realJobsProjection.ts')],
     outfile: projectionOutfile,
     bundle: true,
     format: 'esm',
@@ -216,4 +217,52 @@ test('unwraps authoritative rubric detail from the PUT job envelope', async () =
   assert.equal(detail.rubricVersions.at(-1).id, 'rubric-v2')
   assert.equal(requests[0].init.headers.get('If-Match'), '"etag-1"')
   assert.deepEqual(JSON.parse(requests[0].init.body), { rubric: edited })
+})
+
+test('lifecycle preview and mutation use logical scope, exact ETag, and preserve incomplete acknowledgement', async () => {
+  const impact = { target: { kind: 'rubric', id: 'logical-group' }, name: 'Saved rubric', counts: { rubricVersions: 3 }, blockers: [] }
+  const operation = { id: 'pending-op', action: 'delete', status: 'running', updatedAt: '2026-09-18T00:00:00.000Z' }
+  globalThis.fetch = async (url, init) => {
+    requests.push({ url, init })
+    return init.method === 'POST' ? json({ operation }, 202) : json({ impact })
+  }
+  assert.deepEqual(await client.getRealJobLifecycleImpact('workspace one', 'job/one', 'rubric'), impact)
+  const result = await client.changeRealJobLifecycle('workspace one', 'job/one', 'rubric', 'delete', '"exact-etag"')
+  assert.equal(requests[0].url, '/api/workspaces/workspace%20one/jobs/job%2Fone/lifecycle?scope=rubric')
+  assert.equal(requests[1].init.headers.get('If-Match'), '"exact-etag"')
+  assert.deepEqual(JSON.parse(requests[1].init.body), { action: 'delete', scope: 'rubric' })
+  assert.deepEqual(result.operation, operation)
+  assert.equal(result.deleted, undefined)
+})
+
+test('authoritative projections discard stale deleted rubric details and never write real lifecycle into samples', () => {
+  const time = '2026-09-18T00:00:00.000Z'
+  const rubric = { id: 'old-version', groupId: 'real-group', jobId: 'real-job', kind: 'job', name: 'Real rubric', description: '', version: 1, criteria: [], createdAt: time, dataKind: 'real' }
+  const old = summary('real-job', time, rubric)
+  const legacy = { schemaVersion: 1, jobs: [], resumes: [], documents: [], rubrics: [], runs: [], lifecycle: { entities: { 'resume:sample-resume': { archivedAt: time } } } }
+  const baseline = structuredClone(legacy)
+  const current = { ...old, etag: '"new"', lifecycle: { archivedAt: time }, rubricLifecycle: { deletedAt: time }, job: { ...old.job, rubricId: null, rubricDeletedAt: time }, rubric: null }
+  const staleDetail = { ...old, document: { id: 'real-document' }, rubricVersions: [rubric] }
+  const projected = projection.projectRealJobs(legacy, [current], [staleDetail])
+  assert.deepEqual(projected.rubrics, [])
+  assert.deepEqual(projected.documents, [])
+  assert.equal(projected.lifecycle.entities['job:real-job'].archivedAt, time)
+  assert.deepEqual(legacy, baseline)
+  const deleted = projection.projectRealJobs(legacy, [], [staleDetail])
+  assert.deepEqual(deleted.jobs, [])
+  assert.deepEqual(deleted.rubrics, [])
+  assert.deepEqual(deleted.documents, [])
+})
+
+test('pending deletion retains only recovery metadata, never source documents or rubric histories', () => {
+  const time = '2026-09-18T00:00:00.000Z'
+  const rubric = { id: 'pending-rubric', groupId: 'pending-group', jobId: 'pending-job', kind: 'job', name: 'Pending rubric', description: '', version: 1, criteria: [], createdAt: time, dataKind: 'real' }
+  const pending = { ...summary('pending-job', time, rubric), lifecycle: { deletingAt: time } }
+  const legacy = { schemaVersion: 1, jobs: [], resumes: [], documents: [], rubrics: [], runs: [] }
+  const projected = projection.projectRealJobs(legacy, [pending], [{ ...pending, document: { id: 'private-source' }, rubricVersions: [rubric] }])
+  assert.equal(projected.jobs[0].id, 'pending-job')
+  assert.equal(projected.lifecycle.entities['job:pending-job'].deletingAt, time)
+  assert.deepEqual(projected.documents, [])
+  assert.deepEqual(projected.rubrics, [])
+  assert.deepEqual(legacy.jobs, [])
 })

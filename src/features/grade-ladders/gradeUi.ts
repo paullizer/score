@@ -12,6 +12,7 @@ import {
   type SourceDecision,
 } from '../../domain/real-grades'
 import type { Citation, Rubric, Workspace } from '../../domain/types'
+import { lifecycleIsRemoved } from '../../domain/lifecycle'
 
 export const gradeStatusLabels = {
   draft: 'Draft',
@@ -135,6 +136,7 @@ function isFrozenExclusionCitation(citation: Citation, detail: GradeLadderDetail
 
 export function gradeApprovalBlockers(detail: GradeLadderDetail, level: GradeLevelDetail): string[] {
   const { head, version, review } = level
+  if (detail.ladder.lifecycle?.archivedAt || head.lifecycle?.archivedAt || lifecycleIsRemoved(detail.ladder.lifecycle) || lifecycleIsRemoved(head.lifecycle)) return ['Archived or removed grades are read-only. Unarchive the ladder and grade before approval.']
   if (!version) return ['No generated version is available yet.']
   if (head.approvedVersionId === version.id) return ['This immutable version is already approved.']
   const reasons: string[] = []
@@ -188,9 +190,13 @@ export function gradeWorkActive(detail: GradeLadderSummary): boolean {
     ('workItems' in detail && (detail as GradeLadderDetail).workItems.some((work) => work.status === 'queued' || work.status === 'running'))
 }
 
-export function projectRealGrades(workspace: Workspace, versions: GradeRubricVersionRecord[]): Workspace {
+export function projectRealGrades(workspace: Workspace, versions: GradeRubricVersionRecord[], summaries?: GradeLadderSummary[]): Workspace {
   const projected = new Map<string, Rubric>()
+  const families = new Map((summaries ?? []).map((summary) => [summary.ladder.id, summary]))
   for (const version of versions) {
+    const summary = families.get(version.ladderId)
+    const level = summary?.levels.find((level) => level.head.grade === version.grade)
+    if (summaries && (!summary || !level || lifecycleIsRemoved(summary.ladder.lifecycle) || lifecycleIsRemoved(level.head.lifecycle))) continue
     if ((projected.get(version.rubric.id)?.version ?? 0) > version.version) continue
     projected.set(version.rubric.id, {
       ...version.rubric,
@@ -199,5 +205,18 @@ export function projectRealGrades(workspace: Workspace, versions: GradeRubricVer
       groupId: gradeHeadId(version.ladderId, version.grade),
     })
   }
-  return { ...workspace, rubrics: [...workspace.rubrics.filter((rubric) => !projected.has(rubric.id)), ...projected.values()] }
+  return {
+    ...workspace,
+    lifecycle: {
+      ...workspace.lifecycle,
+      entities: {
+        ...workspace.lifecycle?.entities,
+        ...Object.fromEntries((summaries ?? []).flatMap(({ ladder, levels }) => [
+          [`ladder:${ladder.id}`, ladder.lifecycle ?? {}],
+          ...levels.map(({ head }) => [`rubric:${head.id}`, { ...head.lifecycle, parentKey: `ladder:${ladder.id}` }]),
+        ])),
+      },
+    },
+    rubrics: [...workspace.rubrics.filter((rubric) => !projected.has(rubric.id) && !(rubric.kind === 'grade' && rubric.dataKind === 'real')), ...projected.values()],
+  }
 }

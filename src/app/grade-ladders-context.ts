@@ -14,6 +14,7 @@ export type GradeLoadState<T> =
 export interface GradeLaddersContextValue {
   workspaceId: string
   canWrite: boolean
+  canEdit: (id: string, grade?: number) => boolean
   phase: 'loading' | 'ready' | 'unavailable' | 'error'
   features: GradeProcessingFeatures | null
   error: string | null

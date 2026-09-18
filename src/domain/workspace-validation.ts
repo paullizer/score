@@ -1,6 +1,7 @@
 import { z } from 'zod'
 import type { AnalysisRun, Job, Resume, Rubric, SourceDocument, Workspace } from './types'
 import { validateRubric, weightedScore } from '../services/scoring'
+import { isEntityArchived, isEntityRemoved } from './lifecycle'
 
 // Pure Zod schema + cross-reference validation shared by the browser demo (src/services/persistence.ts)
 // and the cloud server (server/repository.ts). Nothing here touches storage, network, or the DOM.
@@ -56,6 +57,7 @@ const jobSchema = z.strictObject({
   batchId: text.optional(),
   documentId: text,
   rubricId: text.nullable(),
+  rubricDeletedAt: timestamp.optional(),
   status: z.enum(['parsing', 'generating', 'ready', 'error', 'cancelled']),
   errorStage: z.enum(['parsing', 'rubric']).optional(),
   error: text.optional(),
@@ -127,6 +129,16 @@ const runSchema = z.strictObject({
 })
 const workspaceSchema: z.ZodType<Workspace> = z.strictObject({
   schemaVersion: z.literal(1),
+  lifecycle: z.strictObject({
+    archivedAt: timestamp.optional(),
+    epoch: text.optional(),
+    entities: z.record(z.string().regex(/^(workspace|job|resume|rubric|ladder|analysis):\S(?:.*\S)?$/), z.strictObject({
+      archivedAt: timestamp.optional(),
+      deletingAt: timestamp.optional(),
+      deletedAt: timestamp.optional(),
+      parentKey: z.string().regex(/^(job|ladder):\S(?:.*\S)?$/).optional(),
+    })),
+  }).optional(),
   jobs: z.array(jobSchema),
   resumes: z.array(resumeSchema),
   documents: z.array(documentSchema),
@@ -296,18 +308,33 @@ function referenceErrors(workspace: Workspace): string[] {
   const groupVersions = new Map<string, Set<number>>()
   const groups = new Map<string, Rubric>()
 
+  if (workspace.documents.length && isEntityRemoved(workspace, { kind: 'workspace', id: 'sample' })) {
+    errors.push('A deleted workspace cannot retain source documents.')
+  }
   for (const document of workspace.documents) checkDocument(document, `Document "${document.title}"`, errors)
   for (const job of workspace.jobs) {
     if (documents.get(job.documentId)?.kind !== 'job') errors.push(`Job "${job.title}" is missing its source document.`)
-    if (job.status === 'ready' && job.rubricId === null) errors.push(`Ready job "${job.title}" has no linked rubric.`)
+    if (job.status === 'ready' && job.rubricId === null && !job.rubricDeletedAt) errors.push(`Ready job "${job.title}" has no linked rubric or intentional rubric-removal marker.`)
+    if (job.rubricDeletedAt && (job.rubricId !== null || job.status !== 'ready' || workspace.rubrics.some((rubric) => rubric.jobId === job.id))) {
+      errors.push(`Job "${job.title}" marked No rubric must retain its ready source, with no linked rubric or older rubric versions.`)
+    }
+    if (isEntityRemoved(workspace, { kind: 'job', id: job.id })) errors.push(`Deleted job "${job.title}" cannot remain in the workspace.`)
+    if ((job.status === 'parsing' || job.status === 'generating') && (
+      isEntityArchived(workspace, { kind: 'job', id: job.id }) ||
+      workspace.rubrics.some((rubric) => rubric.jobId === job.id && isEntityArchived(workspace, { kind: 'rubric', id: rubric.groupId }))
+    )) errors.push(`Archived job "${job.title}" cannot keep unfinished processing. Archive must cancel it.`)
     if (job.rubricId !== null) {
       const rubric = rubrics.get(job.rubricId)
       if (!rubric || rubric.kind !== 'job' || rubric.jobId !== job.id) errors.push(`Job "${job.title}" has a missing or mismatched linked rubric.`)
     }
     if ((job.status === 'error' || job.status === 'cancelled') && !job.error) errors.push(`Job "${job.title}" needs an explanation for its ${job.status} state.`)
   }
-  for (const resume of workspace.resumes) checkResume(resume, documents.get(resume.documentId), `Resume "${resume.name}"`, errors)
+  for (const resume of workspace.resumes) {
+    if (isEntityRemoved(workspace, { kind: 'resume', id: resume.id })) errors.push(`Deleted resume "${resume.name}" cannot remain in the workspace.`)
+    checkResume(resume, documents.get(resume.documentId), `Resume "${resume.name}"`, errors)
+  }
   for (const rubric of workspace.rubrics) {
+    if (isEntityRemoved(workspace, { kind: 'rubric', id: rubric.groupId })) errors.push(`Deleted rubric "${rubric.name}" cannot retain any versions.`)
     const versions = groupVersions.get(rubric.groupId) ?? new Set<number>()
     if (versions.has(rubric.version)) errors.push(`Rubric group "${rubric.name}" contains a duplicate version ${rubric.version}.`)
     versions.add(rubric.version)
@@ -318,7 +345,24 @@ function referenceErrors(workspace: Workspace): string[] {
     const job = rubric.jobId === undefined ? undefined : jobs.get(rubric.jobId)
     checkRubric(rubric, job, job ? documents.get(job.documentId) : undefined, `Rubric "${rubric.name}"`, errors)
   }
-  for (const run of workspace.runs) checkRun(run, errors)
+  for (const [key, metadata] of Object.entries(workspace.lifecycle?.entities ?? {})) {
+    if (!metadata.parentKey) continue
+    if (!key.startsWith('rubric:')) errors.push(`Only owned rubrics may specify lifecycle parent metadata (${key}).`)
+    const rubric = groups.get(key.slice('rubric:'.length))
+    if (rubric?.kind === 'job' && metadata.parentKey !== `job:${rubric.jobId}`) {
+      errors.push(`Rubric "${rubric.name}" has lifecycle metadata pointing outside its owning job.`)
+    }
+    if (rubric?.kind === 'grade' && !metadata.parentKey.startsWith('ladder:')) {
+      errors.push(`Standalone grade rubric "${rubric.name}" can only inherit from its ladder.`)
+    }
+  }
+  for (const run of workspace.runs) {
+    if (isEntityRemoved(workspace, { kind: 'analysis', id: run.id })) errors.push(`Deleted analysis "${run.name}" cannot remain in the workspace.`)
+    if (isEntityArchived(workspace, { kind: 'analysis', id: run.id }) && run.comparisons.some((item) => item.status === 'queued' || item.status === 'running')) {
+      errors.push(`Archived analysis "${run.name}" cannot keep unfinished comparisons. Archive must cancel them.`)
+    }
+    checkRun(run, errors)
+  }
   return errors
 }
 

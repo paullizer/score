@@ -5,12 +5,13 @@ import test from 'node:test'
 import { PDFDocument } from 'pdf-lib'
 import {
   createApp, StoreConflictError, parseGradeEntity, gradeContentHash, gradeVersionHash, gradeSourceSetHash, gradeRecordHash,
-  parseGradeSeedSnapshot, validateGradeVersion, validateGradeApproval, validateReferenceDocument, loadConfig,
+  parseGradeSeedSnapshot, validateGradeVersion, validateGradeApproval, validateReferenceDocument, loadConfig, WorkspaceRepository,
 } from '../dist-server/app.mjs'
 import {
   ALLOWED_OID, OTHER_ALLOWED_OID, APP_ORIGIN, TENANT_ID,
   authHeaders, baseConfig, createFakeDirectoryStore, createFakeStateStore, membershipFor,
 } from './helpers.mjs'
+import { installGradeLifecycleFake, installGradeBlobLifecycleFake, gradeLifecycleTesting } from './grade-lifecycle-fakes.mjs'
 
 const NOW = '2026-09-17T20:30:00.000Z'
 const CONTEXT = {
@@ -40,7 +41,7 @@ const guidance = [
 function blobs() {
   const values = new Map()
   const events = []
-  return {
+  return installGradeBlobLifecycleFake({
     values, events,
     async read(name) { events.push(['read', name]); return clone(values.get(name)) },
     async putImmutable(name, bytes, contentType) {
@@ -50,7 +51,7 @@ function blobs() {
       values.set(name, blob)
       return { created: true, blob: clone(blob) }
     },
-  }
+  })
 }
 
 function gradeStore() {
@@ -65,7 +66,7 @@ function gradeStore() {
     values.set(key(record.workspaceId, record.id), value)
     return clone(value)
   }
-  return {
+  const store = {
     values, events,
     async get(workspaceId, id) { return clone(values.get(key(workspaceId, id))) },
     async list(workspaceId, options) {
@@ -115,6 +116,7 @@ function gradeStore() {
     _after(callback) { after = callback },
     _unsafe(record) { values.set(key(record.workspaceId, record.id), { record: clone(record), etag: `"unsafe-${++next}"` }) },
   }
+  return installGradeLifecycleFake(store, { values, remove: (workspaceId, id) => values.delete(key(workspaceId, id)), StoreConflictError })
 }
 
 async function pdf(pages = 1) {
@@ -509,12 +511,13 @@ test('prepared seed timestamps and snapshots survive failed and ambiguous Cosmos
     const prepared = await api.grades.blobs.read(name)
     assert.ok(prepared)
     api.setNow('2026-09-17T21:00:00.000Z')
-    api.jobRubrics.set(`${api.workspaceId}/${seeded.record.id}`, [{ ...seeded.rubric, version: 2, name: 'Changed after interrupted creation' }])
+    api.jobRubrics.set(`${api.workspaceId}/${seeded.record.id}`, [
+      seeded.rubric, { ...seeded.rubric, version: 2, name: 'Changed after interrupted creation' },
+    ])
     const second = await create(api, { seed: seeded, key })
     assert.equal(second.detail.ladder.createdAt, NOW)
     assert.equal(second.detail.ladder.seedRubricVersion, 1)
     assert.deepEqual(await api.grades.blobs.read(name), prepared)
-    api.jobRubrics.get(`${api.workspaceId}/${seeded.record.id}`).push(seeded.rubric)
     const duplicateKey = randomUUID()
     const simultaneous = await Promise.all([create(api, { seed: seeded, key: duplicateKey }), create(api, { seed: seeded, key: duplicateKey })])
     assert.equal(simultaneous[0].detail.ladder.id, simultaneous[1].detail.ladder.id)
@@ -1438,5 +1441,1083 @@ test('work retry requires both the active source set and generation on the work 
       const changedHead = await stored(api, originalHead.record.id)
       await api.grades.store.replace({ ...originalHead.record, status: 'error' }, changedHead.etag)
     }
+  } finally { await api.close() }
+})
+
+test('grade lifecycle routes enforce exact target ETags and preserve independent archive state and immutable evidence', async () => {
+  const api = await start()
+  try {
+    const { detail, document } = await generated(api)
+    const nine = await publishGrade(api, detail, document, 9)
+    const twelve = await publishGrade(api, detail, document, 12)
+    const address = `${api.base}/${detail.ladder.id}`
+    const immutable = [...api.grades.store.values.values()].filter(value =>
+      ['grade-version', 'grade-review', 'grade-source-set'].includes(value.record.recordType)).map(value => clone(value.record))
+    const work = grade => ({
+      id: `grade-work-${randomUUID()}`, workspaceId: api.workspaceId, ladderId: detail.ladder.id, recordType: 'grade-work',
+      createdAt: NOW, updatedAt: NOW, status: 'running', attempts: 1,
+      lease: { owner: 'late-worker', expiresAt: '2026-09-18T20:00:00.000Z' },
+      input: { kind: 'review-grade', grade, generationId: detail.ladder.generationId, sourceSetId: detail.ladder.sourceSetId,
+        versionId: grade === 9 ? nine.version.id : twelve.version.id },
+    })
+    const nineWork = work(9), twelveWork = work(12)
+    await api.grades.store.create(nineWork)
+    await api.grades.store.create(twelveWork)
+    const impact = await api.request(`${address}/lifecycle?grade=9`)
+    assert.equal(impact.status, 200)
+    assert.deepEqual((await impact.json()).impact.target, { kind: 'rubric', id: nine.head.record.id })
+    assert.equal(impact.headers.get('etag'), nine.head.etag)
+    assert.equal((await api.request(`${address}/lifecycle?grade=0`)).status, 400)
+    assert.equal((await api.request(`${address}/lifecycle`, 'POST', { action: 'archive', grade: 9 })).status, 428)
+    assert.equal((await api.request(`${address}/lifecycle`, 'POST', { action: 'archive', grade: 9 }, { 'if-match': '*' })).status, 400)
+    assert.equal((await api.request(`${address}/lifecycle`, 'POST', { action: 'archive', grade: 9 }, { 'if-match': detail.etag })).status, 409)
+    assert.equal((await api.request(`/workspaces/${randomUUID()}/grade-ladders/${detail.ladder.id}/lifecycle`, 'POST',
+      { action: 'archive' }, { 'if-match': detail.etag })).status, 404)
+    assert.equal((await api.request(`${address}/lifecycle`, 'POST', { action: 'archive' }, { 'if-match': detail.etag }, OTHER_ALLOWED_OID)).status, 404)
+    api.directory._addMembership(api.workspaceId, membershipFor(api.workspaceId, { oid: OTHER_ALLOWED_OID, role: 'viewer' }))
+    assert.equal((await api.request(`${address}/lifecycle`, 'POST', { action: 'archive' }, { 'if-match': detail.etag }, OTHER_ALLOWED_OID)).status, 403)
+    const archived = await api.request(`${address}/lifecycle`, 'POST', { action: 'archive', grade: 9 }, { 'if-match': nine.head.etag })
+    assert.equal(archived.status, 200, JSON.stringify(await archived.clone().json()))
+    let current = (await archived.json()).ladder
+    assert.ok(current.levels.find(level => level.head.grade === 9).head.lifecycle.archivedAt)
+    assert.equal(current.levels.find(level => level.head.grade === 12).head.lifecycle, undefined)
+    assert.equal((await stored(api, nineWork.id)).record.status, 'cancelled')
+    assert.equal((await stored(api, nineWork.id)).record.lease, undefined)
+    assert.equal((await stored(api, twelveWork.id)).record.status, 'running')
+    assert.equal((await api.request(`${address}/grades/9/versions`)).status, 200)
+    assert.equal((await api.request(`${address}/grades/9/versions`, 'GET', undefined, {}, OTHER_ALLOWED_OID)).status, 200)
+    assert.equal((await api.request(`${address}/grades/9/approve`, 'POST',
+      { versionId: nine.version.id, reviewId: nine.review.id },
+      { 'if-match': current.levels.find(level => level.head.grade === 9).etag })).status, 409)
+    const familyArchived = await api.request(`${address}/lifecycle`, 'POST', { action: 'archive' }, { 'if-match': current.etag })
+    assert.equal(familyArchived.status, 200)
+    current = (await familyArchived.json()).ladder
+    assert.ok(current.ladder.lifecycle.archivedAt)
+    assert.ok(current.sources.every(source => source.status === 'ready'))
+    assert.equal((await api.request(address, 'PATCH', { name: 'Forbidden rename' }, { 'if-match': current.etag })).status, 409)
+    assert.equal((await api.request(api.base)).status, 200)
+    assert.ok((await (await api.request(api.base)).json()).ladders.some(value => value.ladder.id === detail.ladder.id))
+    const restored = await api.request(`${address}/lifecycle`, 'POST', { action: 'unarchive' }, { 'if-match': current.etag })
+    assert.equal(restored.status, 200)
+    current = (await restored.json()).ladder
+    assert.equal(current.ladder.lifecycle.archivedAt, undefined)
+    assert.ok(current.levels.find(level => level.head.grade === 9).head.lifecycle.archivedAt)
+    assert.equal((await stored(api, twelveWork.id)).record.status, 'cancelled')
+    const restoreGrade = await api.request(`${address}/lifecycle`, 'POST', { action: 'unarchive', grade: 9 },
+      { 'if-match': current.levels.find(level => level.head.grade === 9).etag })
+    assert.equal(restoreGrade.status, 200)
+    assert.equal((await stored(api, nineWork.id)).record.status, 'cancelled')
+    for (const record of immutable) assert.deepEqual((await stored(api, record.id)).record, record)
+  } finally { await api.close() }
+})
+
+test('archived seed jobs and archived or removed logical seed rubrics cannot initialize a new ladder', async () => {
+  const api = await start()
+  try {
+    for (const field of ['lifecycle', 'rubricLifecycle']) {
+      const seeded = await seed(api)
+      seeded.record[field] = { archivedAt: NOW }
+      api.jobRecords.set(`${api.workspaceId}/${seeded.record.id}`, { record: seeded.record, etag: '"archived-seed"' })
+      const result = await create(api, { seed: seeded, allowFailure: true })
+      assert.equal(result.response.status, 409)
+      assert.equal([...api.grades.blobs.values.keys()].length, 0)
+    }
+    const seeded = await seed(api)
+    seeded.record.rubricLifecycle = { deletedAt: NOW }
+    seeded.record.job.rubricDeletedAt = NOW
+    seeded.record.job.rubricId = null
+    api.jobRecords.set(`${api.workspaceId}/${seeded.record.id}`, { record: seeded.record, etag: '"removed-seed-rubric"' })
+    assert.equal((await create(api, { seed: seeded, allowFailure: true })).response.status, 409)
+  } finally { await api.close() }
+})
+
+test('logical grade deletion checks blockers and removes every version without removing sibling history or shared sources', async () => {
+  const api = await start()
+  try {
+    const { detail, document } = await generated(api)
+    const nine = await publishGrade(api, detail, document, 9)
+    const twelve = await publishGrade(api, detail, document, 12)
+    const address = `${api.base}/${detail.ladder.id}`
+    for (const published of [nine, twelve]) {
+      const response = await api.request(`${address}/grades/${published.version.grade}/approve`, 'POST',
+        { versionId: published.version.id, reviewId: published.review.id }, { 'if-match': published.head.etag })
+      assert.equal(response.status, 200, JSON.stringify(await response.clone().json()))
+      published.head = await stored(api, published.head.record.id)
+    }
+    const siblingApproval = (await stored(api, twelve.head.record.approvalId)).record
+    const secondId = `grade-version-${randomUUID()}`
+    const second = { ...clone(nine.version), id: secondId, version: 2,
+      rubric: { ...clone(nine.version.rubric), id: secondId, version: 2 }, contentHash: '' }
+    second.contentHash = gradeVersionHash(second)
+    await api.grades.store.create(second)
+    const oldWork = {
+      id: `grade-work-${randomUUID()}`, workspaceId: api.workspaceId, ladderId: detail.ladder.id, recordType: 'grade-work',
+      createdAt: NOW, updatedAt: NOW, status: 'cancelled', attempts: 1,
+      input: { kind: 'review-grade', grade: 9, generationId: detail.ladder.generationId, sourceSetId: detail.ladder.sourceSetId, versionId: nine.version.id },
+    }
+    await api.grades.store.create(oldWork)
+    let blocked = true
+    const targets = []
+    const service = new gradeLifecycleTesting.GradeLifecycleService(api.grades, {
+      async impact(workspaceId, target) {
+        assert.equal(workspaceId, api.workspaceId)
+        targets.push(target)
+        return blocked ? [{ kind: 'analysis', id: 'archived-analysis', name: 'Archived comparison', href: '/analyses/archived-analysis' }] : []
+      },
+    }, () => new Date(NOW))
+    const impact = await service.impact(api.workspaceId, detail.ladder.id, 9)
+    assert.equal(impact.counts['grade-version'], 2)
+    assert.equal(impact.counts['grade-approval'], 1)
+    assert.equal(impact.blockers[0].id, 'archived-analysis')
+    await assert.rejects(service.change(api.workspaceId, detail.ladder.id, 'delete', nine.head.etag, 9), error => error.status === 409)
+    const uncoordinated = new gradeLifecycleTesting.GradeLifecycleService(api.grades)
+    await assert.rejects(uncoordinated.change(api.workspaceId, detail.ladder.id, 'delete', nine.head.etag, 9), error => error.status === 503)
+    assert.ok(await api.grades.store.get(api.workspaceId, second.id))
+    blocked = false
+    const beforeBlobs = new Map(api.grades.blobs.values)
+    assert.deepEqual(await service.change(api.workspaceId, detail.ladder.id, 'delete', nine.head.etag, 9), {})
+    assert.ok(targets.every(target => target.kind === 'rubric' && target.id === nine.head.record.id))
+    let current = await (await api.request(address)).json()
+    const empty = current.levels.find(level => level.head.grade === 9)
+    assert.ok(empty.head.lifecycle.deletedAt)
+    assert.equal(empty.version, null)
+    assert.equal(empty.review, null)
+    assert.equal(empty.approval, null)
+    assert.equal(empty.head.generationId, undefined)
+    assert.equal(empty.head.latestVersionId, undefined)
+    assert.equal((await api.request(`${address}/grades/9/versions`)).status, 200)
+    assert.deepEqual((await (await api.request(`${address}/grades/9/versions`)).json()).versions, [])
+    for (const id of [nine.version.id, second.id, nine.review.id, nine.head.record.approvalId, oldWork.id]) {
+      assert.equal(await api.grades.store.get(api.workspaceId, id), undefined)
+    }
+    assert.deepEqual((await stored(api, twelve.version.id)).record, twelve.version)
+    assert.deepEqual((await stored(api, siblingApproval.id)).record, siblingApproval)
+    assert.throws(() => parseGradeEntity({ ...nine.version, lifecycle: { archivedAt: NOW } }))
+    assert.throws(() => parseGradeEntity({ ...empty.head, latestVersionId: nine.version.id }))
+    assert.deepEqual(api.grades.blobs.values, beforeBlobs)
+    assert.equal((await api.request(`${address}/source-sets/${detail.sourceSet.id}`)).status, 200)
+    const historical = detail.sourceSet.sources.find(source => source.origin !== 'seed-job')
+    assert.equal((await api.request(`${address}/sources/${historical.sourceId}/document?sourceSetId=${detail.sourceSet.id}`)).status, 200)
+    assert.equal((await api.request(`${address}/retry`, 'POST', { workId: oldWork.id }, { 'if-match': current.etag })).status, 404)
+    assert.equal((await api.request(`${address}/retry`, 'POST', { grade: 9 }, { 'if-match': current.etag })).status, 409)
+    const restored = await api.request(`${address}/lifecycle`, 'POST', { action: 'unarchive', grade: 9 }, { 'if-match': empty.etag })
+    assert.equal(restored.status, 200)
+    current = (await restored.json()).ladder
+    assert.ok(current.levels.find(level => level.head.grade === 9).head.lifecycle.deletedAt)
+    const regenerate = await api.request(`${address}/generate`, 'POST', {},
+      { 'if-match': current.etag, 'idempotency-key': randomUUID() })
+    assert.equal(regenerate.status, 200, JSON.stringify(await regenerate.clone().json()))
+    const next = (await regenerate.json()).ladder
+    assert.notEqual(next.ladder.generationId, detail.ladder.generationId)
+    assert.equal(next.levels.find(level => level.head.grade === 9).head.lifecycle.deletedAt, undefined)
+    assert.equal(next.levels.find(level => level.head.grade === 9).version, null)
+    await assert.rejects(api.grades.store.create(nine.version), /changed|removed/)
+  } finally { await api.close() }
+})
+
+test('grade cleanup follows empty and retained-head pages without skipping later immutable versions', async () => {
+  const api = await start()
+  try {
+    const { detail, document } = await generated(api)
+    const nine = await publishGrade(api, detail, document, 9)
+    const twelve = await publishGrade(api, detail, document, 12)
+    const original = api.grades.store.listScope
+    const seen = []
+    api.grades.store.listScope = async (workspaceId, options) => {
+      if (options.ladderId !== detail.ladder.id || options.grade !== 9) return original(workspaceId, options)
+      seen.push(options.continuationToken)
+      if (!options.continuationToken) return {
+        items: [await api.grades.store.get(workspaceId, nine.head.record.id)], continuationToken: 'empty-page',
+      }
+      if (options.continuationToken === 'empty-page') return { items: [], continuationToken: 'owned-history' }
+      assert.equal(options.continuationToken, 'owned-history')
+      const page = await original(workspaceId, { ...options, continuationToken: undefined })
+      return { items: page.items.filter(value => value.record.id !== nine.head.record.id) }
+    }
+    const response = await api.request(`${api.base}/${detail.ladder.id}/lifecycle`, 'POST',
+      { action: 'delete', grade: 9 }, { 'if-match': nine.head.etag })
+    assert.equal(response.status, 200, JSON.stringify(await response.clone().json()))
+    assert.equal(await api.grades.store.get(api.workspaceId, nine.version.id), undefined)
+    assert.equal(await api.grades.store.get(api.workspaceId, nine.review.id), undefined)
+    assert.ok((await api.grades.store.get(api.workspaceId, nine.head.record.id)).record.lifecycle.deletedAt)
+    assert.deepEqual((await stored(api, twelve.version.id)).record, twelve.version)
+    assert.ok(seen.includes('empty-page') && seen.includes('owned-history'))
+  } finally { await api.close() }
+})
+
+test('family cleanup follows empty Cosmos and Blob pages through final empty verification', async () => {
+  const api = await start()
+  try {
+    const { detail } = await create(api)
+    const list = api.grades.store.listScope, blobs = api.grades.blobs.listPage
+    api.grades.store.listScope = async (workspaceId, options) => {
+      if (options.ladderId !== detail.ladder.id) return list(workspaceId, options)
+      if (!options.continuationToken) return { items: [], continuationToken: 'records-next' }
+      assert.equal(options.continuationToken, 'records-next')
+      return list(workspaceId, { ...options, continuationToken: undefined })
+    }
+    let verificationPages = 0
+    api.grades.blobs.listPage = async (workspaceId, ladderId, token) => {
+      if (ladderId !== detail.ladder.id) return blobs(workspaceId, ladderId, token)
+      if (!token) return { names: [], continuationToken: 'blobs-next' }
+      assert.equal(token, 'blobs-next')
+      const page = await blobs(workspaceId, ladderId)
+      if (!page.names.length) verificationPages++
+      return page
+    }
+    const response = await api.request(`${api.base}/${detail.ladder.id}/lifecycle`, 'POST',
+      { action: 'delete' }, { 'if-match': detail.etag })
+    assert.equal(response.status, 200, JSON.stringify(await response.clone().json()))
+    assert.deepEqual(await response.json(), { deleted: true })
+    assert.ok(verificationPages > 0)
+    assert.equal(await api.grades.store.get(api.workspaceId, detail.ladder.id), undefined)
+    assert.ok(![...api.grades.blobs.values.keys()].some(name => name.startsWith(`${api.workspaceId}/${detail.ladder.id}/`)))
+  } finally { await api.close() }
+})
+
+test('grade record cleanup restarts pagination after deletion rather than following an offset into changed history', async () => {
+  const api = await start()
+  try {
+    const { detail, document } = await generated(api)
+    const nine = await publishGrade(api, detail, document, 9)
+    const extraId = `grade-version-${randomUUID()}`
+    const extra = { ...clone(nine.version), id: extraId, version: 2,
+      rubric: { ...clone(nine.version.rubric), id: extraId, version: 2 }, contentHash: '' }
+    extra.contentHash = gradeVersionHash(extra)
+    await api.grades.store.create(extra)
+    const original = api.grades.store.listScope
+    const restarts = []
+    api.grades.store.listScope = async (workspaceId, options) => {
+      if (options.ladderId !== detail.ladder.id || options.grade !== 9) return original(workspaceId, options)
+      const all = await original(workspaceId, { ...options, limit: 100, continuationToken: undefined })
+      const head = all.items.find(item => item.record.id === nine.head.record.id)
+      const history = all.items.filter(item => item !== head)
+      if (!options.continuationToken) {
+        restarts.push(history.length)
+        return { items: head ? [head] : [], continuationToken: `history:${history.length}:0` }
+      }
+      const [, expected, offset] = /^history:(\d+):(\d+)$/.exec(options.continuationToken)
+      assert.equal(history.length, Number(expected), 'A delete changed offsets; pagination must restart from the first page.')
+      const index = Number(offset)
+      return { items: history.slice(index, index + 1),
+        ...(index + 1 < history.length ? { continuationToken: `history:${history.length}:${index + 1}` } : {}) }
+    }
+    const response = await api.request(`${api.base}/${detail.ladder.id}/lifecycle`, 'POST',
+      { action: 'delete', grade: 9 }, { 'if-match': nine.head.etag })
+    assert.equal(response.status, 200, JSON.stringify(await response.clone().json()))
+    assert.ok([3, 2, 1, 0].every(count => restarts.includes(count)))
+    assert.equal(await api.grades.store.get(api.workspaceId, nine.version.id), undefined)
+    assert.equal(await api.grades.store.get(api.workspaceId, extra.id), undefined)
+    assert.equal(await api.grades.store.get(api.workspaceId, nine.review.id), undefined)
+  } finally { await api.close() }
+})
+
+for (const kind of ['record token', 'blob token', 'blob sweeps']) {
+  test(`cleanup rejects nonadvancing ${kind} without reporting a completed family deletion`, async () => {
+    const api = await start()
+    try {
+      const { detail } = await create(api)
+      const lifecycle = new gradeLifecycleTesting.GradeLifecycleService(api.grades, { impact: async () => [] }, () => new Date(NOW))
+      const participant = gradeLifecycleTesting.createGradeLifecycleParticipant(api.grades)
+      api.grades.store._after(() => { throw new Error('Persisted deletion fence before interruption') })
+      const stopped = await lifecycle.change(api.workspaceId, detail.ladder.id, 'delete', detail.etag)
+      assert.equal(stopped.operation.status, 'failed')
+      let calls = 0
+      const originalScope = api.grades.store.listScope
+      const originalPage = api.grades.blobs.listPage
+      const originalDelete = api.grades.blobs.delete
+      if (kind === 'record token') {
+        api.grades.store.listScope = async (workspaceId, options) => {
+          if (options.ladderId !== detail.ladder.id) return originalScope(workspaceId, options)
+          calls++
+          return { items: [], continuationToken: 'same-record-token' }
+        }
+      } else if (kind === 'blob token') {
+        api.grades.blobs.listPage = async (_workspaceId, _ladderId, _token) => {
+          calls++
+          return { names: [], continuationToken: 'same-blob-token' }
+        }
+      } else {
+        api.grades.blobs.listPage = async () => {
+          calls++
+          return { names: [detail.ladder.seedBlobName] }
+        }
+        api.grades.blobs.delete = async () => {}
+      }
+      await assert.rejects(participant.resume(api.workspaceId, NOW), /did not advance|could not verify/)
+      assert.equal(calls, kind === 'blob sweeps' ? 100 : 2)
+      assert.ok((await stored(api, detail.ladder.id)).record.lifecycle.deletingAt)
+      assert.notEqual((await api.grades.store.getControl(api.workspaceId, detail.ladder.id)).record.state, 'deleted')
+      api.grades.store.listScope = originalScope
+      api.grades.blobs.listPage = originalPage
+      api.grades.blobs.delete = originalDelete
+      await participant.resume(api.workspaceId, NOW)
+      assert.equal(await api.grades.store.get(api.workspaceId, detail.ladder.id), undefined)
+    } finally { await api.close() }
+  })
+}
+
+test('family deletion is paginated, resumable, scoped and leaves only a noncontent idempotency tombstone', async () => {
+  const api = await start()
+  try {
+    const seeded = await seed(api)
+    const first = await generated(api, { seed: seeded })
+    const published = await publishGrade(api, first.detail, first.document, 9)
+    const approval = await api.request(`${api.base}/${first.detail.ladder.id}/grades/9/approve`, 'POST',
+      { versionId: published.version.id, reviewId: published.review.id }, { 'if-match': published.head.etag })
+    assert.equal(approval.status, 200)
+    first.detail = (await approval.json()).ladder
+    await api.grades.store.create({
+      id: `competency-plan-${randomUUID()}`, workspaceId: api.workspaceId, ladderId: first.detail.ladder.id,
+      recordType: 'grade-competency-plan', createdAt: NOW, updatedAt: NOW,
+      generationId: first.detail.ladder.generationId, sourceSetId: first.detail.sourceSet.id,
+      competencies: [{ id: 'engineering', label: 'Engineering', description: 'Shared evidence plan', seedCriterionIds: [], citations: [] }],
+      issues: [], model: 'test', promptVersion: 'test',
+    })
+    const sibling = await create(api, { seed: seeded })
+    const detail = first.detail
+    const address = `${api.base}/${detail.ladder.id}`
+    for (let index = 0; index < 125; index++) {
+      await api.grades.store.create({
+        id: `grade-work-${randomUUID()}`, workspaceId: api.workspaceId, ladderId: detail.ladder.id, recordType: 'grade-work',
+        createdAt: NOW, updatedAt: NOW, status: 'succeeded', attempts: 1, input: { kind: 'discover' },
+      })
+      await api.grades.blobs.putImmutable(`${api.workspaceId}/${detail.ladder.id}/requests/${randomUUID()}.json`, Buffer.from('{"obsolete":"receipt"}'), 'application/json')
+    }
+    const originalDelete = api.grades.blobs.delete
+    let fail = true
+    api.grades.blobs.delete = async name => {
+      if (fail) { fail = false; throw new Error('Injected blob cleanup interruption') }
+      return originalDelete(name)
+    }
+    const interrupted = await api.request(`${address}/lifecycle`, 'POST', { action: 'delete' }, { 'if-match': detail.etag })
+    assert.equal(interrupted.status, 202, JSON.stringify(await interrupted.clone().json()))
+    const failed = await interrupted.json()
+    assert.equal(failed.pending, true)
+    assert.equal(failed.operation.status, 'failed')
+    assert.match(failed.operation.error, /Cleanup is incomplete/)
+    assert.equal(failed.etag, interrupted.headers.get('etag'))
+    assert.equal(failed.ladder, undefined)
+    assert.equal(failed.deleted, undefined)
+    const recovering = await api.request(address)
+    assert.equal(recovering.status, 200)
+    const recovery = await recovering.json()
+    assert.ok(recovery.ladder.lifecycle.deletingAt)
+    assert.equal(recovery.pending, true)
+    assert.deepEqual(recovery.operation, {
+      id: detail.ladder.id, action: 'delete', status: 'pending', updatedAt: recovery.ladder.lifecycle.deletingAt,
+    })
+    assert.equal(recovery.etag, recovering.headers.get('etag'))
+    assert.equal(recovery.etag, failed.etag)
+    assert.equal(recovery.ladder.name, detail.ladder.name)
+    assert.deepEqual(recovery.levels, [])
+    assert.deepEqual(recovery.sources, [])
+    assert.deepEqual(recovery.workItems, [])
+    assert.equal(recovery.sourceSet, null)
+    assert.deepEqual(recovery.ladder.sourceIds, [])
+    assert.equal(recovery.ladder.seedBlobName, '')
+    assert.equal(recovery.ladder.seedJobTitle, '')
+    assert.equal(recovery.ladder.context.agency, '')
+    assert.deepEqual(recovery.ladder.context.answers, {})
+    const listedRecovery = (await (await api.request(api.base)).json()).ladders.find(value => value.ladder.id === detail.ladder.id)
+    assert.ok(listedRecovery)
+    assert.equal(listedRecovery.pending, true)
+    assert.deepEqual(listedRecovery.operation, recovery.operation)
+    assert.equal(listedRecovery.etag, recovery.etag)
+    const reloaded = new gradeLifecycleTesting.GradeService(api.grades, api.jobs, () => new Date(NOW))
+    assert.deepEqual(await reloaded.detail(api.workspaceId, detail.ladder.id), recovery)
+    for (const path of [`${address}/grades/9/versions`, `${address}/source-sets/${detail.sourceSet.id}`,
+      `${address}/sources/${detail.sources[0].id}/document`, `${address}/sources/${detail.sources[0].id}/original`]) {
+      assert.equal((await api.request(path)).status, 404, path)
+    }
+    const pending = await stored(api, detail.ladder.id)
+    assert.equal(failed.etag, pending.etag)
+    assert.ok(pending.record.lifecycle.deletingAt)
+    assert.equal((await api.request(`${address}/lifecycle`, 'POST', { action: 'unarchive' }, { 'if-match': pending.etag })).status, 409)
+    const preview = await api.request(`${address}/lifecycle`)
+    assert.equal(preview.status, 200)
+    assert.equal(preview.headers.get('etag'), pending.etag)
+    const deleted = await api.request(`${address}/lifecycle`, 'POST', { action: 'delete' }, { 'if-match': pending.etag })
+    assert.equal(deleted.status, 200, JSON.stringify(await deleted.clone().json()))
+    assert.deepEqual(await deleted.json(), { deleted: true })
+    assert.equal((await api.request(address)).status, 404)
+    assert.ok(!(await (await api.request(api.base)).json()).ladders.some(value => value.ladder.id === detail.ladder.id))
+    assert.deepEqual((await api.grades.store.listScope(api.workspaceId, { ladderId: detail.ladder.id })).items, [])
+    assert.ok(![...api.grades.blobs.values.keys()].some(name => name.startsWith(`${api.workspaceId}/${detail.ladder.id}/`)))
+    assert.ok([...api.grades.blobs.values.keys()].some(name => name.startsWith(`${api.workspaceId}/${sibling.detail.ladder.id}/`)))
+    assert.ok(await api.jobs.store.get(api.workspaceId, seeded.record.id))
+    assert.ok(await api.jobs.blobs.read(seeded.record.source.originalBlobName))
+    const tombstone = (await api.grades.store.getControl(api.workspaceId, detail.ladder.id)).record
+    assert.equal(tombstone.state, 'deleted')
+    assert.ok(Object.keys(tombstone).every(key => ['id', 'recordType', 'workspaceId', 'ladderId', 'state', 'updatedAt', 'writers'].includes(key)))
+    assert.ok(api.grades.store.lifecycleBatches.filter(batch => batch.operations.some(value => value.kind === 'delete')).length > 4)
+    assert.ok(api.grades.store.lifecycleBatches.every(batch => batch.operations.length + batch.controls.length <= 100))
+    const replay = await create(api, { seed: seeded, key: detail.ladder.id.slice(7), allowFailure: true })
+    assert.equal(replay.response.status, 409)
+    assert.equal((await api.request(`${address}/sources/${detail.sources[0].id}/original`)).status, 404)
+  } finally { await api.close() }
+})
+
+test('in-flight uploads keep family deletion pending and late uploads are removed before completion', async () => {
+  const api = await start()
+  try {
+    const { detail } = await create(api)
+    const address = `${api.base}/${detail.ladder.id}`
+    const name = `${api.workspaceId}/${detail.ladder.id}/${detail.sources[0].id}/chunks/v1-late.json`
+    const put = api.grades.blobs.putImmutable
+    let begin, release
+    const started = new Promise(resolve => { begin = resolve })
+    const finish = new Promise(resolve => { release = resolve })
+    api.grades.blobs.putImmutable = async (...args) => {
+      if (args[0] === name) { begin(); await finish }
+      return put(...args)
+    }
+    const uploads = gradeLifecycleTesting.guardedGradeBlobs(api.grades.store, api.grades.blobs)
+    const upload = uploads.putImmutable(name, Buffer.from('{"late":"output"}'), 'application/json')
+    const uploadRejected = assert.rejects(upload, /archived|removed/)
+    await started
+    const pending = await api.request(`${address}/lifecycle`, 'POST', { action: 'delete' }, { 'if-match': detail.etag })
+    assert.equal(pending.status, 202)
+    assert.equal((await pending.json()).operation.status, 'pending')
+    assert.ok((await stored(api, detail.ladder.id)).record.lifecycle.deletingAt)
+    release()
+    await uploadRejected
+    assert.equal(await api.grades.blobs.read(name), undefined)
+    const latest = await stored(api, detail.ladder.id)
+    const complete = await api.request(`${address}/lifecycle`, 'POST', { action: 'delete' }, { 'if-match': latest.etag })
+    assert.equal(complete.status, 200)
+    assert.deepEqual(await complete.json(), { deleted: true })
+    assert.ok(![...api.grades.blobs.values.keys()].some(value => value.startsWith(`${api.workspaceId}/${detail.ladder.id}/`)))
+  } finally { await api.close() }
+})
+
+test('workspace participant inherits archive state, hides deleting content, and purges unpublished preparation artifacts', async () => {
+  const api = await start()
+  try {
+    const { detail } = await generated(api)
+    const address = `${api.base}/${detail.ladder.id}`
+    const nine = detail.levels.find(level => level.head.grade === 9)
+    const archive = await api.request(`${address}/lifecycle`, 'POST', { action: 'archive', grade: 9 }, { 'if-match': nine.etag })
+    assert.equal(archive.status, 200)
+    const participant = gradeLifecycleTesting.createGradeLifecycleParticipant(api.grades)
+    await participant.setState(api.workspaceId, 'archived', NOW)
+    await participant.cancel(api.workspaceId, NOW)
+    let current = await (await api.request(address)).json()
+    assert.equal(current.ladder.lifecycle, undefined)
+    assert.ok(current.levels.find(level => level.head.grade === 9).head.lifecycle.archivedAt)
+    assert.equal(current.levels.find(level => level.head.grade === 12).head.lifecycle, undefined)
+    assert.equal((await api.request(address, 'PATCH', { name: 'No write' }, { 'if-match': current.etag })).status, 409)
+    await participant.setState(api.workspaceId, 'active', NOW)
+    current = await (await api.request(address)).json()
+    assert.ok(current.workItems.every(work => !['queued', 'running'].includes(work.status)))
+    assert.ok(current.levels.find(level => level.head.grade === 9).head.lifecycle.archivedAt)
+    const orphan = `ladder-${randomUUID()}`
+    await gradeLifecycleTesting.guardedGradeBlobs(api.grades.store, api.grades.blobs)
+      .putImmutable(`${api.workspaceId}/${orphan}/initialization.json`, Buffer.from('{"private":"prepared seed"}'), 'application/json')
+    const legacyOrphan = `ladder-${randomUUID()}`
+    await api.grades.blobs.putImmutable(`${api.workspaceId}/${legacyOrphan}/initialization.json`,
+      Buffer.from('{"private":"pre-lifecycle interrupted preparation"}'), 'application/json')
+    assert.equal(await api.grades.store.getControl(api.workspaceId, legacyOrphan), undefined)
+    await participant.setState(api.workspaceId, 'deleting', NOW)
+    await assert.rejects(participant.setState(api.workspaceId, 'active', NOW), error => error.status === 409)
+    assert.deepEqual((await (await api.request(api.base)).json()).ladders, [])
+    for (const path of [address, `${address}/grades/9/versions`, `${address}/source-sets/${detail.sourceSet.id}`,
+      `${address}/sources/${detail.sources[0].id}/document`, `${address}/sources/${detail.sources[0].id}/original`]) {
+      assert.equal((await api.request(path)).status, 404, path)
+    }
+    await participant.cancel(api.workspaceId, NOW)
+    await participant.purge(api.workspaceId, NOW)
+    await participant.setState(api.workspaceId, 'deleted', NOW)
+    assert.deepEqual(await participant.counts(api.workspaceId), { ladders: 0, rubrics: 0, rubricVersions: 0, sourceArtifacts: 0 })
+    assert.ok(![...api.grades.blobs.values.keys()].some(name => name.startsWith(`${api.workspaceId}/`)))
+    assert.equal((await api.grades.store.getControl(api.workspaceId, orphan)).record.state, 'deleted')
+    assert.equal((await api.grades.store.getControl(api.workspaceId, legacyOrphan)).record.state, 'deleted')
+  } finally { await api.close() }
+})
+
+test('every grade mutation handler runs inside the workspace lease with the correct access mode', async () => {
+  const api = await start()
+  const originalMutation = WorkspaceRepository.prototype.withWorkspaceMutation
+  const originalAcquire = api.state.acquireMutationLease.bind(api.state)
+  let leased = false
+  let executing = false
+  const calls = []
+  try {
+    const { detail } = await create(api)
+    const address = `${api.base}/${detail.ladder.id}`
+    api.state.acquireMutationLease = async workspaceId => {
+      const lease = await originalAcquire(workspaceId)
+      leased = true
+      return {
+        renew: () => lease.renew(),
+        async release() { await lease.release(); leased = false },
+      }
+    }
+    WorkspaceRepository.prototype.withWorkspaceMutation = function(principal, workspaceId, access, operation, ...rest) {
+      calls.push({ workspaceId, access })
+      return originalMutation.call(this, principal, workspaceId, access, async () => {
+        assert.equal(leased, true)
+        executing = true
+        try { return await operation() } finally { executing = false }
+      }, ...rest)
+    }
+    for (const [path, method, access] of [
+      [api.base, 'POST', 'write'], [address, 'PATCH', 'write'],
+      [`${address}/discover`, 'POST', 'write'], [`${address}/sources/url`, 'POST', 'write'],
+      [`${address}/sources/${detail.sources[0].id}`, 'PATCH', 'write'],
+      [`${address}/source-set`, 'POST', 'write'], [`${address}/generate`, 'POST', 'write'],
+      [`${address}/cancel`, 'POST', 'write'], [`${address}/retry`, 'POST', 'write'],
+      [`${address}/grades/9/draft`, 'PUT', 'write'], [`${address}/grades/9/approve`, 'POST', 'write'],
+      [`${address}/lifecycle`, 'POST', 'manage'],
+    ]) {
+      calls.length = 0
+      const response = await api.request(path, method, { unexpected: true },
+        { 'if-match': detail.etag, 'idempotency-key': randomUUID() })
+      assert.equal(response.status, 400, `${method} ${path}`)
+      assert.deepEqual(calls, [{ workspaceId: api.workspaceId, access }], path)
+      assert.equal(leased, false)
+    }
+    calls.length = 0
+    const put = api.grades.blobs.putImmutable
+    api.grades.blobs.putImmutable = async (...args) => {
+      assert.equal(leased, true)
+      assert.equal(executing, true)
+      return put(...args)
+    }
+    const upload = await fetch(`${api.baseUrl}${address}/sources/pdf`, {
+      method: 'POST', headers: writeHeaders({
+        'content-type': 'application/pdf', 'x-file-name': 'lease-test.pdf', 'idempotency-key': randomUUID(),
+      }), body: await pdf(),
+    })
+    assert.equal(upload.status, 200, JSON.stringify(await upload.clone().json()))
+    assert.deepEqual(calls, [{ workspaceId: api.workspaceId, access: 'write' }])
+    assert.equal(leased, false)
+    calls.length = 0
+    assert.equal((await api.request(`${address}/lifecycle`)).status, 200)
+    assert.deepEqual(calls, [])
+  } finally {
+    WorkspaceRepository.prototype.withWorkspaceMutation = originalMutation
+    api.state.acquireMutationLease = originalAcquire
+    await api.close()
+  }
+})
+
+test('grade mutation authorization is rechecked after acquiring the workspace lease', async () => {
+  const api = await start()
+  try {
+    const { detail } = await create(api)
+    const originalAcquire = api.state.acquireMutationLease.bind(api.state)
+    api.directory._addMembership(api.workspaceId, membershipFor(api.workspaceId, { oid: OTHER_ALLOWED_OID, role: 'editor' }))
+    let acquired = false
+    api.state.acquireMutationLease = async workspaceId => {
+      const lease = await originalAcquire(workspaceId)
+      acquired = true
+      api.directory._addMembership(api.workspaceId, membershipFor(api.workspaceId, { oid: OTHER_ALLOWED_OID, role: 'viewer' }))
+      return lease
+    }
+    const response = await api.request(`${api.base}/${detail.ladder.id}`, 'PATCH', { name: 'Revoked editor' },
+      { 'if-match': detail.etag }, OTHER_ALLOWED_OID)
+    assert.equal(response.status, 403)
+    assert.equal(acquired, true)
+    assert.equal((await stored(api, detail.ladder.id)).record.name, detail.ladder.name)
+  } finally { await api.close() }
+})
+
+test('disconnecting a grade mutation client does not release its workspace lease before publication settles', { timeout: 15_000 }, async () => {
+  const api = await start()
+  let release
+  let pending
+  try {
+    const { detail } = await create(api)
+    const originalAcquire = api.state.acquireMutationLease.bind(api.state)
+    let leased = false
+    let signalReleased
+    const released = new Promise(resolve => { signalReleased = resolve })
+    api.state.acquireMutationLease = async workspaceId => {
+      const lease = await originalAcquire(workspaceId)
+      leased = true
+      return {
+        renew: () => lease.renew(),
+        async release() {
+          await lease.release()
+          leased = false
+          signalReleased()
+        },
+      }
+    }
+    let signalStarted
+    const started = new Promise(resolve => { signalStarted = resolve })
+    const finish = new Promise(resolve => { release = resolve })
+    api.grades.store._before(async () => {
+      signalStarted()
+      await finish
+      assert.equal(leased, true)
+    })
+    const address = `${api.base}/${detail.ladder.id}`
+    const controller = new AbortController()
+    pending = fetch(`${api.baseUrl}${address}`, {
+      method: 'PATCH', headers: writeHeaders({ 'content-type': 'application/json', 'if-match': detail.etag }),
+      body: JSON.stringify({ name: 'Finished after disconnect' }), signal: controller.signal,
+    }).then(() => undefined, error => error)
+    await started
+    controller.abort()
+    assert.equal((await pending).name, 'AbortError')
+    await new Promise(resolve => setTimeout(resolve, 25))
+    assert.equal(leased, true)
+    const competing = await api.request(address, 'PATCH', { name: 'Racing replacement' }, { 'if-match': detail.etag })
+    assert.equal(competing.status, 409)
+    assert.equal((await stored(api, detail.ladder.id)).record.name, detail.ladder.name)
+    release()
+    await released
+    assert.equal(leased, false)
+    assert.equal((await stored(api, detail.ladder.id)).record.name, 'Finished after disconnect')
+  } finally {
+    release?.()
+    await pending
+    await api.close()
+  }
+})
+
+test('web-owned grade recovery completes interrupted archive and unarchive checkpoints without restarting work', async () => {
+  const api = await start()
+  try {
+    const { detail } = await create(api)
+    const address = `${api.base}/${detail.ladder.id}`
+    api.grades.store._after(() => { throw new Error('Archive fence committed but its response was lost') })
+    const interrupted = await api.request(`${address}/lifecycle`, 'POST', { action: 'archive' }, { 'if-match': detail.etag })
+    assert.equal(interrupted.status, 202)
+    const failedArchive = await interrupted.json()
+    assert.equal(failedArchive.operation.status, 'failed')
+    assert.match(failedArchive.operation.error, /Cleanup is incomplete/)
+    assert.equal(failedArchive.etag, interrupted.headers.get('etag'))
+    const participant = gradeLifecycleTesting.createGradeLifecycleParticipant(api.grades)
+    assert.deepEqual(await participant.pendingWorkspaces(20), [api.workspaceId])
+    assert.equal((await api.grades.store.getControl(api.workspaceId, detail.ladder.id)).record.pending[0].action, 'archive')
+    await participant.resume(api.workspaceId, NOW)
+    assert.deepEqual(await participant.pendingWorkspaces(20), [])
+    let current = await (await api.request(address)).json()
+    assert.ok(current.ladder.lifecycle.archivedAt)
+    assert.ok(current.workItems.every(work => !['queued', 'running'].includes(work.status)))
+
+    api.grades.store._before(() => {
+      api.grades.store._before(() => { throw new Error('Restore completion could not be saved') })
+    })
+    const restore = await api.request(`${address}/lifecycle`, 'POST', { action: 'unarchive' }, { 'if-match': current.etag })
+    assert.equal(restore.status, 202)
+    const failedRestore = await restore.json()
+    assert.equal(failedRestore.operation.status, 'failed')
+    assert.equal(failedRestore.etag, restore.headers.get('etag'))
+    assert.ok((await stored(api, detail.ladder.id)).record.lifecycle.archivedAt)
+    assert.equal((await api.grades.store.getControl(api.workspaceId, detail.ladder.id)).record.pending[0].action, 'unarchive')
+    assert.deepEqual(await participant.pendingWorkspaces(20), [api.workspaceId])
+    await participant.resume(api.workspaceId, NOW)
+    current = await (await api.request(address)).json()
+    assert.equal(current.ladder.lifecycle.archivedAt, undefined)
+    assert.ok(current.workItems.every(work => !['queued', 'running'].includes(work.status)))
+    assert.deepEqual(await participant.pendingWorkspaces(20), [])
+    await participant.resume(api.workspaceId, NOW)
+    assert.equal((await stored(api, detail.ladder.id)).record.lifecycle.archivedAt, undefined)
+  } finally { await api.close() }
+})
+
+test('grade recovery resumes logical and family deletes, including legacy deleting markers, without touching siblings', async () => {
+  const api = await start()
+  try {
+    const { detail, document } = await generated(api)
+    const nine = await publishGrade(api, detail, document, 9)
+    const twelve = await publishGrade(api, detail, document, 12)
+    const address = `${api.base}/${detail.ladder.id}`
+    const transact = api.grades.store.transact.bind(api.grades.store)
+    let failDelete = true
+    api.grades.store.transact = async (workspaceId, operations, options) => {
+      if (failDelete && operations.some(operation => operation.kind === 'delete' && operation.record.grade === 9)) {
+        failDelete = false
+        throw new Error('Interrupted grade cleanup batch')
+      }
+      return transact(workspaceId, operations, options)
+    }
+    const response = await api.request(`${address}/lifecycle`, 'POST', { action: 'delete', grade: 9 }, { 'if-match': nine.head.etag })
+    assert.equal(response.status, 202)
+    const failedGrade = await response.json()
+    assert.equal(failedGrade.operation.status, 'failed')
+    assert.equal(failedGrade.etag, response.headers.get('etag'))
+    assert.equal(failedGrade.etag, (await stored(api, nine.head.record.id)).etag)
+    const participant = gradeLifecycleTesting.createGradeLifecycleParticipant(api.grades)
+    assert.deepEqual(await participant.pendingWorkspaces(20), [api.workspaceId])
+    await gradeLifecycleTesting.updateGradeControl(api.grades.store, api.workspaceId, detail.ladder.id,
+      control => ({ ...control, pending: undefined }))
+    assert.ok((await stored(api, nine.head.record.id)).record.lifecycle.deletingAt)
+    assert.deepEqual(await participant.pendingWorkspaces(20), [api.workspaceId], 'Legacy deleting markers must remain resumable.')
+    await participant.resume(api.workspaceId, NOW)
+    assert.equal(await api.grades.store.get(api.workspaceId, nine.version.id), undefined)
+    assert.equal(await api.grades.store.get(api.workspaceId, nine.review.id), undefined)
+    assert.ok((await stored(api, nine.head.record.id)).record.lifecycle.deletedAt)
+    assert.deepEqual((await stored(api, twelve.version.id)).record, twelve.version)
+    assert.deepEqual((await stored(api, detail.sourceSet.id)).record, detail.sourceSet)
+    assert.deepEqual(await participant.pendingWorkspaces(20), [])
+
+    const other = await create(api)
+    const removeBlob = api.grades.blobs.delete
+    let failBlob = true
+    api.grades.blobs.delete = async name => {
+      if (failBlob) { failBlob = false; throw new Error('Interrupted family artifact cleanup') }
+      return removeBlob(name)
+    }
+    const current = await stored(api, detail.ladder.id)
+    assert.equal((await api.request(`${address}/lifecycle`, 'POST', { action: 'delete' }, { 'if-match': current.etag })).status, 202)
+    assert.deepEqual(await participant.pendingWorkspaces(20), [api.workspaceId])
+    await participant.resume(api.workspaceId, NOW)
+    assert.equal(await api.grades.store.get(api.workspaceId, detail.ladder.id), undefined)
+    assert.equal((await api.grades.store.getControl(api.workspaceId, detail.ladder.id)).record.pending, undefined)
+    assert.equal((await api.grades.store.getControl(api.workspaceId, detail.ladder.id)).record.state, 'deleted')
+    assert.deepEqual(await participant.pendingWorkspaces(20), [])
+    assert.ok(await api.grades.store.get(api.workspaceId, other.detail.ladder.id))
+    assert.equal((await stored(api, other.detail.workItems[0].id)).record.status, 'queued')
+    assert.ok(await api.jobs.store.get(api.workspaceId, detail.ladder.seedJobId))
+  } finally { await api.close() }
+})
+
+test('lifecycle mutations return the exact historical head ETag even when its grade leaves the current range', async () => {
+  const api = await start()
+  try {
+    const { detail } = await create(api)
+    const address = `${api.base}/${detail.ladder.id}`
+    const updated = await api.request(address, 'PATCH', { grades: [9] }, { 'if-match': detail.etag })
+    assert.equal(updated.status, 200)
+    assert.deepEqual((await updated.json()).ladder.levels.map(level => level.head.grade), [9])
+    const preview = await api.request(`${address}/lifecycle?grade=12`)
+    assert.equal(preview.status, 200)
+    const archived = await api.request(`${address}/lifecycle`, 'POST', { action: 'archive', grade: 12 },
+      { 'if-match': preview.headers.get('etag') })
+    assert.equal(archived.status, 200)
+    const current = await stored(api, headId(detail.ladder.id, 12))
+    assert.ok(current.record.lifecycle.archivedAt)
+    assert.equal(archived.headers.get('etag'), current.etag)
+    assert.notEqual(archived.headers.get('etag'), (await archived.json()).ladder.etag)
+  } finally { await api.close() }
+})
+
+test('workspace grade counts merge logical rubrics and version/artifact totals without counting empty slots as rubrics', async () => {
+  const api = await start()
+  try {
+    const { detail, document } = await generated(api)
+    const participant = gradeLifecycleTesting.createGradeLifecycleParticipant(api.grades)
+    let counts = await participant.counts(api.workspaceId)
+    assert.equal(counts.ladders, 1)
+    assert.equal(counts.rubrics, 0)
+    assert.equal(counts.rubricVersions, 0)
+    assert.equal(counts.gradeSlots, 2)
+    const nine = await publishGrade(api, detail, document, 9)
+    await publishGrade(api, detail, document, 12)
+    const versionId = `grade-version-${randomUUID()}`
+    const version = { ...clone(nine.version), id: versionId, version: 2,
+      rubric: { ...clone(nine.version.rubric), id: versionId, version: 2 }, contentHash: '' }
+    version.contentHash = gradeVersionHash(version)
+    await api.grades.store.create(version)
+    for (let index = 0; index < 100; index++) {
+      const id = `grade-version-${randomUUID()}`
+      const historical = { ...clone(version), id, version: index + 3,
+        rubric: { ...clone(version.rubric), id, version: index + 3 }, contentHash: '' }
+      historical.contentHash = gradeVersionHash(historical)
+      await api.grades.store.create(historical)
+      await api.grades.blobs.putImmutable(`${api.workspaceId}/${detail.ladder.id}/requests/${randomUUID()}.json`,
+        Buffer.from('{}'), 'application/json')
+    }
+    const orphan = `ladder-${randomUUID()}`
+    await api.grades.blobs.putImmutable(`${api.workspaceId}/${orphan}/initialization.json`, Buffer.from('{}'), 'application/json')
+    const foreignId = `ladder-${randomUUID()}`
+    await api.grades.store.create({ ...clone(detail.ladder), id: foreignId, workspaceId: 'workspace-other',
+      seedBlobName: `workspace-other/${foreignId}/seed.json` })
+    await api.grades.blobs.putImmutable(`workspace-other/${foreignId}/seed.json`, Buffer.from('{}'), 'application/json')
+    const address = `${api.base}/${detail.ladder.id}`
+    const archive = await api.request(`${address}/lifecycle`, 'POST', { action: 'archive', grade: 9 },
+      { 'if-match': nine.head.etag })
+    assert.equal(archive.status, 200)
+    counts = await participant.counts(api.workspaceId)
+    assert.equal(counts.ladders, 1)
+    assert.equal(counts.rubrics, 2)
+    assert.equal(counts.rubricVersions, 103)
+    assert.equal(counts.referenceSources, detail.sources.length)
+    assert.equal(counts.sourceSets, 1)
+    assert.equal(counts.sourceArtifacts, [...api.grades.blobs.values.keys()].filter(name => name.startsWith(`${api.workspaceId}/`)).length)
+    assert.ok(!Object.keys(counts).some(key => key.startsWith('grade-')))
+    const remove = await api.request(`${address}/lifecycle`, 'POST', { action: 'delete', grade: 9 },
+      { 'if-match': archive.headers.get('etag') })
+    assert.equal(remove.status, 200)
+    counts = await participant.counts(api.workspaceId)
+    assert.equal(counts.ladders, 1)
+    assert.equal(counts.rubrics, 1)
+    assert.equal(counts.rubricVersions, 1)
+    assert.equal(counts.gradeSlots, 2)
+  } finally { await api.close() }
+})
+
+for (const change of ['deleted job', 'deleted rubric', 'missing saved version', 'changed saved version', 'archived job', 'archived rubric', 'unready job']) {
+  test(`unpublished ladder retries revalidate a ${change} instead of trusting initialization.json`, async () => {
+    const api = await start()
+    try {
+      const seeded = await seed(api)
+      const key = randomUUID()
+      const ladderId = `ladder-${key}`
+      const jobKey = `${api.workspaceId}/${seeded.record.id}`
+      api.grades.store._before(() => { throw new Error('Interrupted initial ladder publication') })
+      assert.equal((await create(api, { seed: seeded, key, allowFailure: true })).response.status, 503)
+      assert.equal(await api.grades.store.get(api.workspaceId, ladderId), undefined)
+      const initialization = await api.grades.blobs.read(`${api.workspaceId}/${ladderId}/initialization.json`)
+      assert.ok(initialization)
+      const originalJob = clone(api.jobRecords.get(jobKey))
+      const originalRubrics = clone(api.jobRubrics.get(jobKey))
+      const current = api.jobRecords.get(jobKey)
+      if (change === 'deleted job') {
+        api.jobRecords.delete(jobKey)
+        api.jobRubrics.delete(jobKey)
+      } else if (change === 'deleted rubric') {
+        current.record.rubricLifecycle = { deletedAt: NOW }
+        current.record.job.rubricId = null
+        current.record.job.rubricDeletedAt = NOW
+        api.jobRubrics.set(jobKey, [])
+      } else if (change === 'missing saved version') {
+        api.jobRubrics.set(jobKey, [{ ...seeded.rubric, version: 2 }])
+      } else if (change === 'changed saved version') {
+        api.jobRubrics.set(jobKey, [{ ...seeded.rubric, description: 'A different body cannot occupy the captured immutable version.' }])
+      } else if (change === 'archived job') current.record.lifecycle = { archivedAt: NOW }
+      else if (change === 'archived rubric') current.record.rubricLifecycle = { archivedAt: NOW }
+      else current.record.job.status = 'error'
+      const retry = await create(api, { seed: seeded, key, allowFailure: true })
+      assert.equal(retry.response.status, ['deleted job', 'missing saved version'].includes(change) ? 404 : 409, JSON.stringify(retry.body))
+      assert.equal(await api.grades.store.get(api.workspaceId, ladderId), undefined)
+      assert.equal((await api.grades.store.listScope(api.workspaceId, { ladderId })).items.length, 0)
+      const permanent = ['deleted job', 'deleted rubric', 'missing saved version', 'changed saved version'].includes(change)
+      const control = await api.grades.store.getControl(api.workspaceId, ladderId)
+      assert.equal(control.record.state, permanent ? 'deleted' : 'active')
+      if (permanent) {
+        assert.equal(control.record.preparation, undefined)
+        assert.equal((await api.grades.blobs.listPage(api.workspaceId, ladderId)).names.length, 0)
+      } else {
+        assert.deepEqual(await api.grades.blobs.read(`${api.workspaceId}/${ladderId}/initialization.json`), initialization)
+        assert.ok(control.record.preparation)
+      }
+      api.jobRecords.set(jobKey, originalJob)
+      api.jobRubrics.set(jobKey, originalRubrics)
+      const restored = await create(api, { seed: seeded, key, allowFailure: true })
+      assert.equal(restored.response.status, permanent ? 409 : 202)
+      if (!permanent) {
+        assert.equal(restored.detail.ladder.createdAt, NOW)
+        assert.equal((await api.grades.store.getControl(api.workspaceId, ladderId)).record.preparation, undefined)
+      }
+    } finally { await api.close() }
+  })
+}
+
+for (const change of ['deleted job', 'deleted rubric', 'missing saved version', 'archived job', 'archived rubric']) {
+  test(`final ladder publication rechecks its ${change} after all seed blobs have been captured`, async () => {
+    const api = await start()
+    try {
+      const seeded = await seed(api)
+      const key = randomUUID()
+      const ladderId = `ladder-${key}`
+      const jobKey = `${api.workspaceId}/${seeded.record.id}`
+      const put = api.grades.blobs.putImmutable
+      let captured = false
+      api.grades.blobs.putImmutable = async (...args) => {
+        const result = await put(...args)
+        if (args[0] === `${api.workspaceId}/${ladderId}/source-${key}/document-v1.json`) {
+          captured = true
+          if (change === 'deleted job') {
+            api.jobRecords.delete(jobKey)
+            api.jobRubrics.delete(jobKey)
+          } else if (change === 'deleted rubric') {
+            const current = api.jobRecords.get(jobKey).record
+            current.rubricLifecycle = { deletedAt: NOW }
+            current.job.rubricId = null
+            current.job.rubricDeletedAt = NOW
+            api.jobRubrics.set(jobKey, [])
+          } else if (change === 'missing saved version') {
+            api.jobRubrics.set(jobKey, [{ ...seeded.rubric, version: 2 }])
+          } else {
+            api.jobRecords.get(jobKey).record[change === 'archived job' ? 'lifecycle' : 'rubricLifecycle'] = { archivedAt: NOW }
+          }
+        }
+        return result
+      }
+      const result = await create(api, { seed: seeded, key, allowFailure: true })
+      assert.equal(captured, true)
+      assert.equal(result.response.status, ['deleted job', 'missing saved version'].includes(change) ? 404 : 409)
+      assert.deepEqual((await api.grades.store.listScope(api.workspaceId, { ladderId })).items, [])
+      assert.equal((await api.grades.store.getControl(api.workspaceId, ladderId)).record.state,
+        change.startsWith('archived') ? 'active' : 'deleted')
+      if (!change.startsWith('archived')) assert.deepEqual((await api.grades.blobs.listPage(api.workspaceId, ladderId)).names, [])
+      assert.ok(await api.jobs.blobs.read(seeded.record.source.originalBlobName), 'Discarding a preparation cannot remove the job source.')
+    } finally { await api.close() }
+  })
+}
+
+test('unpublished seed cleanup is fenced and resumable when the exact saved seed version disappears', async () => {
+  const api = await start()
+  try {
+    const seeded = await seed(api)
+    const key = randomUUID()
+    const ladderId = `ladder-${key}`
+    api.grades.store._before(() => { throw new Error('Initial publication was not saved') })
+    assert.equal((await create(api, { seed: seeded, key, allowFailure: true })).response.status, 503)
+    const original = await api.grades.blobs.read(`${api.workspaceId}/${ladderId}/initialization.json`)
+    const mismatched = await create(api, { seed: seeded, key, input: { jobId: `job-${randomUUID()}` }, allowFailure: true })
+    assert.equal(mismatched.response.status, 409)
+    assert.deepEqual(await api.grades.blobs.read(`${api.workspaceId}/${ladderId}/initialization.json`), original)
+    api.jobRubrics.set(`${api.workspaceId}/${seeded.record.id}`, [])
+    const remove = api.grades.blobs.delete
+    let fail = true
+    api.grades.blobs.delete = async name => {
+      if (fail) { fail = false; throw new Error('Preparation blob cleanup interrupted') }
+      return remove(name)
+    }
+    const rejected = await create(api, { seed: seeded, key, allowFailure: true })
+    assert.equal(rejected.response.status, 503)
+    assert.match(rejected.body.error.message, /cleanup remains pending/)
+    assert.equal((await api.grades.store.getControl(api.workspaceId, ladderId)).record.state, 'deleting')
+    assert.equal((await create(api, { seed: seeded, key, allowFailure: true })).response.status, 409)
+    const participant = gradeLifecycleTesting.createGradeLifecycleParticipant(api.grades)
+    assert.deepEqual(await participant.pendingWorkspaces(20), [api.workspaceId])
+    await participant.resume(api.workspaceId, NOW)
+    assert.deepEqual((await api.grades.blobs.listPage(api.workspaceId, ladderId)).names, [])
+    assert.equal((await api.grades.store.getControl(api.workspaceId, ladderId)).record.state, 'deleted')
+    assert.deepEqual(await participant.pendingWorkspaces(20), [])
+  } finally { await api.close() }
+})
+
+test('unpublished preparations expire into scoped cleanup without removing published ladders or seed jobs', async () => {
+  const api = await start()
+  try {
+    const seeded = await seed(api)
+    const key = randomUUID()
+    const ladderId = `ladder-${key}`
+    api.grades.store._before(() => { throw new Error('Publication failure leaves an expiring preparation') })
+    assert.equal((await create(api, { seed: seeded, key, allowFailure: true })).response.status, 503)
+    const control = await api.grades.store.getControl(api.workspaceId, ladderId)
+    assert.ok(Date.parse(control.record.preparation.expiresAt) > Date.now())
+    assert.equal(Object.keys(control.record.preparation).sort().join(','), 'expiresAt,inputFingerprint')
+    const sibling = await create(api, { seed: seeded })
+    assert.equal((await api.grades.store.getControl(api.workspaceId, sibling.detail.ladder.id)).record.preparation, undefined)
+    const participant = gradeLifecycleTesting.createGradeLifecycleParticipant(api.grades)
+    assert.deepEqual(await participant.pendingWorkspaces(20), [])
+    await gradeLifecycleTesting.updateGradeControl(api.grades.store, api.workspaceId, ladderId,
+      value => ({ ...value, preparation: { ...value.preparation, expiresAt: NOW } }))
+    await gradeLifecycleTesting.updateGradeControl(api.grades.store, api.workspaceId, sibling.detail.ladder.id,
+      value => ({ ...value, preparation: { inputFingerprint: sibling.detail.ladder.inputFingerprint, expiresAt: NOW } }))
+    assert.deepEqual(await participant.pendingWorkspaces(20), [api.workspaceId])
+    assert.equal((await create(api, { seed: seeded, key, allowFailure: true })).response.status, 409)
+    await participant.resume(api.workspaceId, new Date().toISOString())
+    assert.equal((await api.grades.store.getControl(api.workspaceId, ladderId)).record.state, 'deleted')
+    assert.equal((await api.grades.store.getControl(api.workspaceId, ladderId)).record.preparation, undefined)
+    assert.deepEqual((await api.grades.blobs.listPage(api.workspaceId, ladderId)).names, [])
+    assert.deepEqual((await stored(api, sibling.detail.ladder.id)).record, sibling.detail.ladder)
+    assert.ok(await api.grades.blobs.read(sibling.detail.ladder.seedBlobName))
+    assert.equal((await api.grades.store.getControl(api.workspaceId, sibling.detail.ladder.id)).record.preparation, undefined)
+    assert.ok(await api.jobs.store.get(api.workspaceId, seeded.record.id))
+    assert.deepEqual(await participant.pendingWorkspaces(20), [])
+    assert.equal((await create(api, { seed: seeded, key, allowFailure: true })).response.status, 409)
+  } finally { await api.close() }
+})
+
+test('an archived grade can be deleted, unarchived as an empty slot, and deliberately generated with fresh identities', async () => {
+  const api = await start()
+  try {
+    const { detail, document } = await generated(api)
+    const nine = await publishGrade(api, detail, document, 9)
+    const twelve = await publishGrade(api, detail, document, 12)
+    const address = `${api.base}/${detail.ladder.id}`
+    const oldWork = {
+      id: `grade-work-${randomUUID()}`, recordType: 'grade-work', workspaceId: api.workspaceId, ladderId: detail.ladder.id,
+      createdAt: NOW, updatedAt: NOW, status: 'running', attempts: 1,
+      lease: { owner: 'old-reviewer', expiresAt: new Date(Date.now() + 60_000).toISOString() },
+      input: { kind: 'review-grade', grade: 9, generationId: detail.ladder.generationId,
+        sourceSetId: detail.sourceSet.id, versionId: nine.version.id },
+    }
+    await api.grades.store.create(oldWork)
+    const archived = await api.request(`${address}/lifecycle`, 'POST', { action: 'archive', grade: 9 }, { 'if-match': nine.head.etag })
+    assert.equal(archived.status, 200)
+    const deleted = await api.request(`${address}/lifecycle`, 'POST', { action: 'delete', grade: 9 },
+      { 'if-match': archived.headers.get('etag') })
+    assert.equal(deleted.status, 200)
+    let current = (await deleted.json()).ladder
+    let empty = current.levels.find(level => level.head.grade === 9)
+    assert.ok(empty.head.lifecycle.archivedAt)
+    assert.ok(empty.head.lifecycle.deletedAt)
+    const removedAt = empty.head.lifecycle.deletedAt
+    assert.equal(empty.version, null)
+    assert.equal(empty.review, null)
+    assert.equal(empty.approval, null)
+    assert.equal(await api.grades.store.get(api.workspaceId, oldWork.id), undefined)
+    for (const id of [nine.version.id, nine.review.id]) assert.equal(await api.grades.store.get(api.workspaceId, id), undefined)
+    const unarchived = await api.request(`${address}/lifecycle`, 'POST', { action: 'unarchive', grade: 9 }, { 'if-match': empty.etag })
+    assert.equal(unarchived.status, 200, JSON.stringify(await unarchived.clone().json()))
+    current = (await unarchived.json()).ladder
+    empty = current.levels.find(level => level.head.grade === 9)
+    assert.equal(empty.head.lifecycle.archivedAt, undefined)
+    assert.equal(empty.head.lifecycle.deletedAt, removedAt)
+    assert.equal(empty.head.generationId, undefined)
+    assert.equal(empty.head.latestVersionId, undefined)
+    assert.equal(empty.version, null)
+    assert.deepEqual((await (await api.request(`${address}/grades/9/versions`)).json()).versions, [])
+    assert.equal((await api.request(`${address}/retry`, 'POST', { grade: 9 }, { 'if-match': current.etag })).status, 409)
+    assert.equal((await api.request(`${address}/retry`, 'POST', { workId: oldWork.id }, { 'if-match': current.etag })).status, 404)
+    assert.ok(!current.workItems.some(work => 'grade' in work.input && work.input.grade === 9))
+    const freshKey = randomUUID()
+    const generatedResponse = await api.request(`${address}/generate`, 'POST', {}, { 'if-match': current.etag, 'idempotency-key': freshKey })
+    assert.equal(generatedResponse.status, 200)
+    current = (await generatedResponse.json()).ladder
+    assert.equal(current.ladder.generationId, freshKey)
+    assert.notEqual(current.ladder.generationId, detail.ladder.generationId)
+    empty = current.levels.find(level => level.head.grade === 9)
+    assert.equal(empty.head.lifecycle.deletedAt, undefined)
+    assert.equal(empty.head.generationId, freshKey)
+    assert.equal(empty.version, null)
+    assert.ok(current.workItems.some(work => work.id === `grade-work-${freshKey}` && work.status === 'queued'))
+    const replacement = await publishGrade(api, current, document, 9)
+    assert.notEqual(replacement.version.id, nine.version.id)
+    assert.equal(replacement.version.generationId, freshKey)
+    const versions = (await (await api.request(`${address}/grades/9/versions`)).json()).versions
+    assert.deepEqual(versions.map(version => version.id), [replacement.version.id])
+    assert.deepEqual((await stored(api, twelve.version.id)).record, twelve.version)
+    assert.deepEqual((await stored(api, detail.sourceSet.id)).record, detail.sourceSet)
+    await assert.rejects(api.grades.store.create(nine.version), /changed|removed/)
+    const participant = gradeLifecycleTesting.createGradeLifecycleParticipant(api.grades)
+    await participant.resume(api.workspaceId, NOW)
+    assert.ok(await api.grades.store.get(api.workspaceId, replacement.version.id))
+  } finally { await api.close() }
+})
+
+test('pending per-head archive and unarchive actions resume independently without restarting or cancelling sibling work', async () => {
+  const api = await start()
+  try {
+    const { detail, document } = await generated(api)
+    const nine = await publishGrade(api, detail, document, 9)
+    const twelve = await publishGrade(api, detail, document, 12)
+    const work = (grade, versionId) => ({
+      id: `grade-work-${randomUUID()}`, recordType: 'grade-work', workspaceId: api.workspaceId, ladderId: detail.ladder.id,
+      createdAt: NOW, updatedAt: NOW, status: 'running', attempts: 1,
+      lease: { owner: `reviewer-${grade}`, expiresAt: new Date(Date.now() + 60_000).toISOString() },
+      input: { kind: 'review-grade', grade, generationId: detail.ladder.generationId, sourceSetId: detail.sourceSet.id, versionId },
+    })
+    const nineWork = work(9, nine.version.id), twelveWork = work(12, twelve.version.id)
+    await api.grades.store.create(nineWork)
+    await api.grades.store.create(twelveWork)
+    const participant = gradeLifecycleTesting.createGradeLifecycleParticipant(api.grades)
+    for (const action of ['archive', 'unarchive']) {
+      const head = await stored(api, nine.head.record.id)
+      api.grades.store._after(() => { throw new Error(`Interrupted grade ${action} checkpoint`) })
+      const response = await api.request(`${api.base}/${detail.ladder.id}/lifecycle`, 'POST',
+        { action, grade: 9 }, { 'if-match': head.etag })
+      assert.equal(response.status, 202)
+      assert.equal((await response.json()).operation.status, 'failed')
+      assert.deepEqual(await participant.pendingWorkspaces(20), [api.workspaceId])
+      await participant.resume(api.workspaceId, NOW)
+      assert.equal(Boolean((await stored(api, nine.head.record.id)).record.lifecycle.archivedAt), action === 'archive')
+      assert.equal((await stored(api, nineWork.id)).record.status, 'cancelled')
+      assert.equal((await stored(api, twelveWork.id)).record.status, 'running')
+      assert.deepEqual((await stored(api, twelve.version.id)).record, twelve.version)
+      assert.deepEqual(await participant.pendingWorkspaces(20), [])
+    }
+    assert.deepEqual((await stored(api, nine.version.id)).record, nine.version)
   } finally { await api.close() }
 })

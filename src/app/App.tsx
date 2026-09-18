@@ -3,7 +3,7 @@ import { Link, NavLink, Navigate, Route, Routes, useLocation, useNavigate } from
 import { ArrowUpRight, BarChart3, BriefcaseBusiness, Check, ChevronRight, CircleHelp, Files, FlaskConical, Layers3, LogOut, Menu, Plus, RotateCcw, ShieldCheck, X } from 'lucide-react'
 import { useWorkspace } from './workspace-context'
 import { ThemeControl } from './ThemeControl'
-import { Badge, Button, EmptyState, Modal } from '../components/ui'
+import { Badge, Button, EmptyState, InlineError, Modal } from '../components/ui'
 import { WorkspaceSwitcher } from '../components/workspace/WorkspaceSwitcher'
 import { CloudSaveBanner, CloudSaveIndicator } from '../components/workspace/CloudSaveStatus'
 import { JobsPage, JobDetail } from '../features/jobs/JobsPage'
@@ -14,17 +14,20 @@ import { latestRubrics } from '../domain/selectors'
 import { useGradeLadders } from './grade-ladders-context'
 import { CreateGradeLadder } from '../features/grade-ladders/CreateGradeLadder'
 import { GradeLadderPage } from '../features/grade-ladders/GradeLadderPage'
+import { isEntityArchived, isEntityRemoved } from '../domain/lifecycle'
+import { EntityLifecycleActions, LifecycleBanner, LifecycleDialogProvider, LifecycleOperationBanner } from '../components/lifecycle/LifecycleControls'
+import { useLifecycleAccess } from '../components/lifecycle/useLifecycleAccess'
 
 function Navigation({ onNavigate }: { onNavigate?: () => void }) {
   const { workspace } = useWorkspace()
   const gradeLadders = useGradeLadders()
   const location = useLocation()
-  const realGrades = gradeLadders?.summaries.reduce((count, family) => count + family.levels.filter((level) => level.head.latestVersionId).length, 0) ?? 0
+  const realGrades = gradeLadders?.summaries.reduce((count, family) => count + family.levels.filter((level) => level.head.latestVersionId && !isEntityRemoved(workspace, { kind: 'rubric', id: level.head.id }) && !isEntityArchived(workspace, { kind: 'rubric', id: level.head.id })).length, 0) ?? 0
   const items = [
-    { to: '/jobs', label: 'Jobs', icon: BriefcaseBusiness, count: workspace.jobs.length },
-    { to: '/resumes', label: 'Resumes', icon: Files, count: workspace.resumes.length },
-    { to: '/rubrics', label: 'Rubrics', icon: Layers3, count: latestRubrics(workspace).filter((rubric) => !(rubric.kind === 'grade' && rubric.dataKind === 'real')).length + realGrades },
-    { to: '/analyses', label: 'Analyses', icon: BarChart3, count: workspace.runs.length },
+    { to: '/jobs', label: 'Jobs', icon: BriefcaseBusiness, count: workspace.jobs.filter((job) => !isEntityArchived(workspace, { kind: 'job', id: job.id }) && !isEntityRemoved(workspace, { kind: 'job', id: job.id })).length },
+    { to: '/resumes', label: 'Resumes', icon: Files, count: workspace.resumes.filter((resume) => !isEntityArchived(workspace, { kind: 'resume', id: resume.id })).length },
+    { to: '/rubrics', label: 'Rubrics', icon: Layers3, count: latestRubrics(workspace).filter((rubric) => !(rubric.kind === 'grade' && rubric.dataKind === 'real') && !isEntityArchived(workspace, { kind: 'rubric', id: rubric.groupId })).length + realGrades },
+    { to: '/analyses', label: 'Analyses', icon: BarChart3, count: workspace.runs.filter((run) => !isEntityArchived(workspace, { kind: 'analysis', id: run.id })).length },
   ]
   return <nav className="main-nav" aria-label="Main navigation">{items.map(({ to, label, icon: Icon, count }) =>
     <NavLink key={to} to={to} onClick={onNavigate} className={({ isActive }) => isActive || (to === '/rubrics' && location.pathname.startsWith('/grade-ladders')) ? 'nav-item is-active' : 'nav-item'}>
@@ -53,12 +56,22 @@ export function App() {
   const section = location.pathname.startsWith('/grade-ladders') ? 'rubrics' : location.pathname.split('/')[1] || 'jobs'
   const isDetail = location.pathname.split('/').filter(Boolean).length > 1
   const currentWorkspaceName = cloud?.workspaces.find((item) => item.id === cloud.currentWorkspaceId)?.name
+  const { canEdit } = useLifecycleAccess()
+  const localRemoved = !cloud && isEntityRemoved(workspace, { kind: 'workspace', id: 'workspace' })
 
-  return <div className="app-layout">
+  if (localRemoved) return <main className="recovery-page"><div className="panel recovery-card">
+    <h1>{storageError ? 'Workspace deletion is not saved' : 'Your local workspace was deleted'}</h1>
+    <p>{storageError ? 'The change exists only in this tab. Keep it open and retry saving before leaving or creating another workspace.' : 'Its content was permanently removed. No samples are recreated automatically. You can explicitly create a fresh demo workspace.'}</p>
+    {storageError && <><InlineError>{storageError}</InlineError><Button onClick={retrySave}>Retry saving deletion</Button></>}
+    <Button variant="primary" icon={Plus} disabled={Boolean(storageError)} onClick={() => { resetDemo(); navigate('/jobs') }}>Create demo workspace</Button>
+  </div></main>
+
+  return <LifecycleDialogProvider><div className="app-layout">
     <a className="skip-link" href="#main-content">Skip to content</a>
     <aside className="sidebar">
       <Link to="/jobs" className="brand" aria-label="Score home"><span className="brand-mark"><Layers3 size={22} strokeWidth={2} /></span><span>score<span className="brand-period">.</span></span></Link>
       {cloud ? <WorkspaceSwitcher cloud={cloud} /> : <div className="workspace-label"><span className="workspace-monogram">S</span><div><strong>My workspace</strong><span>Personal / local</span></div><span className="workspace-online" /></div>}
+      {!cloud && <div className="mb-4"><EntityLifecycleActions target={{ kind: 'workspace', id: 'workspace' }} name="My workspace" compact /></div>}
       <div className="nav-heading">WORKSPACE</div>
       <Navigation />
       <div className="sidebar-bottom">
@@ -67,7 +80,7 @@ export function App() {
         </div>
         <div className="sidebar-utility"><span>Appearance</span><ThemeControl /></div>
         {cloud && <AccountPanel cloud={cloud} />}
-        <button className="reset-button" onClick={() => setShowReset(true)}><RotateCcw size={14} />Reset {cloud ? 'samples' : 'demo workspace'}</button>
+        <button className="reset-button" disabled={!canEdit} onClick={() => setShowReset(true)}><RotateCcw size={14} />Reset {cloud ? 'samples' : 'demo workspace'}</button>
         <div className="sidebar-version">SCORE / UI PREVIEW <span>V0.1</span></div>
       </div>
     </aside>
@@ -79,11 +92,13 @@ export function App() {
         <div className="topbar-actions">
           {cloud ? <CloudSaveIndicator cloud={cloud} /> : <span className={`save-status ${storageError ? 'is-error' : ''}`}><span />{storageError ? 'Changes not saved' : 'Saved on this device'}</span>}
           <button className="demo-chip" onClick={() => setShowAbout(true)}><FlaskConical size={13} />{cloud ? 'Demo scoring / preview' : 'Demo workspace'}</button>
-          <Button variant="primary" size="sm" icon={Plus} onClick={() => navigate('/analyses/new')}>New analysis</Button>
+          <Button variant="primary" size="sm" icon={Plus} disabled={!canEdit} onClick={() => navigate('/analyses/new')}>New analysis</Button>
         </div>
       </header>
       {cloud ? <CloudSaveBanner cloud={cloud} /> : storageError && <div className="storage-banner" role="alert"><span>{storageError}</span><Button size="sm" onClick={retrySave}>Retry saving</Button></div>}
       <main id="main-content" className="main-content">
+        <LifecycleBanner />
+        <LifecycleOperationBanner />
         <Routes>
           <Route path="/" element={<Navigate to="/jobs" replace />} />
           <Route path="/jobs" element={<JobsPage />} />
@@ -101,20 +116,21 @@ export function App() {
         </Routes>
         <footer className="workspace-footer">
           <span><ShieldCheck size={13} />{cloud ? 'Real jobs and GS references are read and stored privately. Resume imports and scoring remain mock preview features.' : 'Private by design. This preview stays in your browser.'}</span>
-          <span>{workspace.jobs.length} jobs / {workspace.resumes.length} resumes</span>
+          <span>{workspace.jobs.filter((job) => !isEntityArchived(workspace, { kind: 'job', id: job.id }) && !isEntityRemoved(workspace, { kind: 'job', id: job.id })).length} active jobs / {workspace.resumes.filter((resume) => !isEntityArchived(workspace, { kind: 'resume', id: resume.id })).length} active resumes</span>
         </footer>
       </main>
     </div>
     {notice && <div className="toast" role="status"><span className="toast-icon"><Check size={16} /></span><p>{notice}</p><Button variant="ghost" className="icon-button" size="sm" icon={X} aria-label="Dismiss notification" onClick={clearNotice} /></div>}
     <Modal open={mobileNav} onOpenChange={setMobileNav} title="Your workspace" description="Explore your jobs, resumes, rubrics, and analyses." drawer>
       {cloud && <div className="mb-5 space-y-3"><WorkspaceSwitcher cloud={cloud} /><AccountPanel cloud={cloud} /></div>}
+      {!cloud && <EntityLifecycleActions target={{ kind: 'workspace', id: 'workspace' }} name="My workspace" />}
       <Navigation onNavigate={() => setMobileNav(false)} /><div className="mobile-appearance"><span>Appearance</span><ThemeControl /></div>
-      <Button icon={RotateCcw} onClick={() => { setMobileNav(false); setShowReset(true) }}>Reset {cloud ? 'samples' : 'demo workspace'}</Button>
+      <Button icon={RotateCcw} disabled={!canEdit} onClick={() => { setMobileNav(false); setShowReset(true) }}>Reset {cloud ? 'samples' : 'demo workspace'}</Button>
     </Modal>
     <Modal open={showReset} onOpenChange={setShowReset}
       title={cloud ? 'Reset sample content?' : 'A fresh starting point'}
       description={cloud ? `Reset only the fictional preview content in ${currentWorkspaceName ?? 'this workspace'}?` : 'Reset your demo workspace?'}
-      footer={<><Button onClick={() => setShowReset(false)}>Keep my workspace</Button><Button variant="danger" icon={RotateCcw} onClick={() => { resetDemo(); setShowReset(false); navigate('/jobs') }}>Reset {cloud ? 'samples' : 'demo'}</Button></>}>
+      footer={<><Button onClick={() => setShowReset(false)}>Keep my workspace</Button><Button variant="danger" icon={RotateCcw} disabled={!canEdit} onClick={() => { resetDemo(); setShowReset(false); navigate('/jobs') }}>Reset {cloud ? 'samples' : 'demo'}</Button></>}>
       {cloud ? <>
         <p>This resets only the legacy sample imports, rubric edits, and simulated analysis history in <strong>{currentWorkspaceName ?? 'this workspace'}</strong>. Server-owned real jobs, grade ladders, reference captures, approvals, and all their versions are not deleted or changed.</p>
         <p className="mt-4 text-muted">Your other workspaces are not affected.</p>
@@ -132,5 +148,5 @@ export function App() {
         : <div className="info-callout mt-5"><CircleHelp size={18} /><div><strong>Nothing is uploaded or evaluated by AI.</strong><p>Selected file contents are never read. URLs are not fetched. Scores and quotations come from synthetic fixtures, and GS examples are not official eligibility assessments.</p></div></div>}
       <div className="mt-5 flex flex-wrap gap-2"><Badge>{cloud ? 'Cloud workspace storage' : 'Local demo storage'}</Badge><Badge>Human review first</Badge><Badge>No automatic hiring decisions</Badge></div>
     </Modal>
-  </div>
+  </div></LifecycleDialogProvider>
 }

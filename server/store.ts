@@ -1,4 +1,5 @@
 import type { WorkspaceKind, WorkspaceRole } from '../src/domain/cloud'
+import type { LifecycleOperation } from '../src/domain/lifecycle'
 
 /** Per-workspace metadata document; Cosmos item id is always the literal string 'workspace'. */
 export interface WorkspaceMetadataDoc {
@@ -11,6 +12,10 @@ export interface WorkspaceMetadataDoc {
   readonly tenantId: string
   readonly createdAt: string
   readonly updatedAt: string
+  readonly archivedAt?: string
+  readonly deletedAt?: string
+  readonly lifecycleOperation?: LifecycleOperation
+  readonly lifecycleStage?: 'memberships'
 }
 
 /** A stored metadata document plus its Cosmos `_etag`, used for optimistic concurrency on rename. */
@@ -65,6 +70,11 @@ export interface DirectoryStore {
   createWorkspace(metadata: WorkspaceMetadataDoc, membership: MembershipDoc): Promise<{ created: boolean }>
   /** Conditional rename; throws {@link StoreConflictError} on etag mismatch, {@link StoreNotFoundError} if gone. */
   renameWorkspace(workspaceId: string, name: string, updatedAt: string, expectedEtag: string): Promise<StoredMetadata>
+  /** A completed deletion atomically publishes the tombstone and removes the final owner membership. */
+  replaceMetadata(metadata: WorkspaceMetadataDoc, expectedEtag: string): Promise<StoredMetadata>
+  /** Removes other memberships, preserving the owner's recovery access until final publication. */
+  deleteMemberships(workspaceId: string): Promise<void>
+  listLifecycleOperations(limit: number): Promise<StoredMetadata[]>
   /** Cheap read used by /healthz to confirm the container is reachable with the current identity. */
   checkAccess(): Promise<void>
 }
@@ -72,6 +82,11 @@ export interface DirectoryStore {
 export interface StateStoreEntry {
   readonly content: string
   readonly etag: string
+}
+
+export interface WorkspaceMutationLease {
+  renew(): Promise<void>
+  release(): Promise<void>
 }
 
 /**
@@ -85,6 +100,8 @@ export interface StateStore {
   createState(workspaceId: string, content: string): Promise<{ created: boolean; etag: string }>
   /** Throws {@link StoreConflictError} if `expectedEtag` no longer matches the stored blob. */
   putState(workspaceId: string, content: string, expectedEtag: string): Promise<{ etag: string }>
+  deleteState(workspaceId: string, expectedEtag: string): Promise<void>
+  acquireMutationLease(workspaceId: string): Promise<WorkspaceMutationLease>
   /** Cheap read used by /healthz to confirm the container is reachable with the current identity. */
   checkAccess(): Promise<void>
 }

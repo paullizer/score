@@ -6,6 +6,9 @@ import { DocumentViewer } from '../../components/documents/DocumentViewer'
 import { Avatar, Badge, Button, DemoNote, EmptyState, InlineError, PageHeader, SearchField } from '../../components/ui'
 import { dateLabel, runStatus } from '../../domain/selectors'
 import { AddResumesDialog } from './AddResumesDialog'
+import { isEntityArchived, matchesArchiveFilter, type ArchiveFilter } from '../../domain/lifecycle'
+import { ArchivedBadge, ArchiveStateFilter, EntityLifecycleActions, LifecycleBanner } from '../../components/lifecycle/LifecycleControls'
+import { useLifecycleAccess } from '../../components/lifecycle/useLifecycleAccess'
 
 function analysisLink(ids: string[]): string {
   return `/analyses/new?${new URLSearchParams({ resumes: ids.join(',') }).toString()}`
@@ -18,11 +21,16 @@ function ResumesLibrary() {
   const [selection, setSelection] = useState<string[]>([])
   const [adding, setAdding] = useState(false)
   const [importError, setImportError] = useState('')
+  const [archiveFilter, setArchiveFilter] = useState<ArchiveFilter>('default')
+  const { canEdit } = useLifecycleAccess()
   const query = search.trim().toLocaleLowerCase()
-  const visible = workspace.resumes.filter((resume) => [resume.name, resume.role, resume.location, resume.experience, resume.sourceLabel].join(' ').toLocaleLowerCase().includes(query))
-  const selected = workspace.resumes.filter((resume) => selection.includes(resume.id))
-  const allVisibleSelected = visible.length > 0 && visible.every((resume) => selection.includes(resume.id))
-  const someVisibleSelected = visible.some((resume) => selection.includes(resume.id))
+  const eligible = (id: string) => canEdit && !isEntityArchived(workspace, { kind: 'resume', id })
+  const visible = workspace.resumes.filter((resume) => matchesArchiveFilter(isEntityArchived(workspace, { kind: 'resume', id: resume.id }), search, archiveFilter) && [resume.name, resume.role, resume.location, resume.experience, resume.sourceLabel].join(' ').toLocaleLowerCase().includes(query))
+  const scopedCount = workspace.resumes.filter((resume) => matchesArchiveFilter(isEntityArchived(workspace, { kind: 'resume', id: resume.id }), search, archiveFilter)).length
+  const readyVisible = visible.filter((resume) => eligible(resume.id))
+  const selected = workspace.resumes.filter((resume) => selection.includes(resume.id) && eligible(resume.id))
+  const allVisibleSelected = readyVisible.length > 0 && readyVisible.every((resume) => selection.includes(resume.id))
+  const someVisibleSelected = readyVisible.some((resume) => selection.includes(resume.id))
   const hiddenCount = selected.filter((resume) => !visible.some((item) => item.id === resume.id)).length
 
   function toggle(id: string) {
@@ -31,8 +39,8 @@ function ResumesLibrary() {
 
   function toggleVisible() {
     setSelection((value) => allVisibleSelected
-      ? value.filter((id) => !visible.some((resume) => resume.id === id))
-      : [...new Set([...value, ...visible.map((resume) => resume.id)])])
+      ? value.filter((id) => !readyVisible.some((resume) => resume.id === id))
+      : [...new Set([...value, ...readyVisible.map((resume) => resume.id)])])
   }
 
   function openImport() {
@@ -47,7 +55,7 @@ function ResumesLibrary() {
       description="Get to know the people behind the profiles. Compare one resume, or bring a whole batch."
       actions={<>
         <Button icon={ArrowRight} disabled={!selected.length} onClick={() => navigate(analysisLink(selected.map((resume) => resume.id)))}>Match to jobs{selected.length ? ` (${selected.length})` : ''}</Button>
-        <Button variant="primary" icon={Plus} onClick={openImport}>Add resumes</Button>
+        <Button variant="primary" icon={Plus} disabled={!canEdit} onClick={openImport}>Add resumes</Button>
       </>}
     />
 
@@ -56,8 +64,8 @@ function ResumesLibrary() {
     </InlineError></div>}
     <section className="panel">
       <div className="library-toolbar">
-        <div className="flex items-center gap-2.5"><Users size={16} className="text-muted" aria-hidden="true" /><h2 className="text-[12px] font-semibold">Your resume library</h2><Badge>{workspace.resumes.length}</Badge></div>
-        <SearchField value={search} onChange={setSearch} placeholder="Search people, roles, or filenames…" label="Search resume library" />
+        <div className="flex items-center gap-2.5"><Users size={16} className="text-muted" aria-hidden="true" /><h2 className="text-[12px] font-semibold">Your resume library</h2><Badge>{workspace.resumes.filter((resume) => !isEntityArchived(workspace, { kind: 'resume', id: resume.id })).length}</Badge></div>
+        <div className="toolbar"><SearchField value={search} onChange={setSearch} placeholder="Search people, roles, or filenames…" label="Search resume library" /><ArchiveStateFilter value={archiveFilter} onChange={setArchiveFilter} label="Resume archive state" /></div>
       </div>
       <div className={`flex flex-wrap items-center justify-between gap-3 border-b px-5 py-3 ${selected.length ? 'bg-accent-soft' : ''}`}>
         <p className="text-[11px] text-muted" role="status" aria-live="polite">
@@ -67,7 +75,7 @@ function ResumesLibrary() {
         </p>
         <div className="flex items-center gap-4">
           {selected.length > 0 && <button type="button" className="link-button text-[11px]" onClick={() => setSelection([])}>Clear selection</button>}
-          {visible.length > 0 && <button type="button" className="link-button text-[11px]" onClick={toggleVisible}>{allVisibleSelected ? 'Deselect visible' : 'Select visible'}</button>}
+          {readyVisible.length > 0 && <button type="button" className="link-button text-[11px]" onClick={toggleVisible}>{allVisibleSelected ? 'Deselect visible' : 'Select visible'}</button>}
         </div>
       </div>
 
@@ -79,6 +87,7 @@ function ResumesLibrary() {
               <th scope="col" className="checkbox-cell"><input
                 type="checkbox"
                 checked={allVisibleSelected}
+                disabled={!readyVisible.length}
                 ref={(element) => { if (element) element.indeterminate = someVisibleSelected && !allVisibleSelected }}
                 onChange={toggleVisible}
                 aria-label="Select all visible resumes"
@@ -90,17 +99,17 @@ function ResumesLibrary() {
               <th scope="col"><span className="sr-only">View profile</span></th>
             </tr></thead>
             <tbody>{visible.map((resume) => <tr key={resume.id} className={selection.includes(resume.id) ? 'row-selected' : ''}>
-              <td className="checkbox-cell"><input type="checkbox" checked={selection.includes(resume.id)} onChange={() => toggle(resume.id)} aria-label={`Select ${resume.name}`} /></td>
+              <td className="checkbox-cell"><input type="checkbox" checked={eligible(resume.id) && selection.includes(resume.id)} disabled={!eligible(resume.id)} onChange={() => toggle(resume.id)} aria-label={`Select ${resume.name}`} /></td>
               <td>
                 <div className="flex min-w-[200px] items-center gap-3">
                   <Avatar initials={resume.initials} />
-                  <div className="min-w-0"><Link to={`/resumes/${resume.id}`} className="row-title">{resume.name}</Link><p className="row-meta">{resume.role}</p></div>
+                  <div className="min-w-0"><Link to={`/resumes/${resume.id}`} className="row-title">{resume.name}</Link> <ArchivedBadge target={{ kind: 'resume', id: resume.id }} /><p className="row-meta">{resume.role}</p></div>
                 </div>
               </td>
               <td><span className="text-[11px] text-muted">{resume.location}</span></td>
               <td><span className="whitespace-nowrap text-[11px]">{resume.experience}</span></td>
               <td><div className="flex items-start gap-2 text-[11px] text-muted"><FileText size={14} className="mt-0.5 shrink-0" aria-hidden="true" /><div className="min-w-0 max-w-[210px]"><p className="break-words">{resume.sourceLabel}</p><p className="mt-1 text-[9px]">Fictional content · {dateLabel(resume.createdAt)}</p></div></div></td>
-              <td><Link to={`/resumes/${resume.id}`} className="inline-flex rounded-lg p-2 text-muted hover:bg-soft hover:text-accent" aria-label={`View ${resume.name}'s resume`}><ArrowRight size={16} aria-hidden="true" /></Link></td>
+              <td><div className="flex items-center gap-1"><Link to={`/resumes/${resume.id}`} className="inline-flex rounded-lg p-2 text-muted hover:bg-soft hover:text-accent" aria-label={`View ${resume.name}'s resume`}><ArrowRight size={16} aria-hidden="true" /></Link><EntityLifecycleActions target={{ kind: 'resume', id: resume.id }} name={resume.name} compact /></div></td>
             </tr>)}</tbody>
           </table>
         </div>
@@ -108,24 +117,25 @@ function ResumesLibrary() {
         <div className="space-y-3 p-4 md:hidden">
           {visible.map((resume) => <article className={`resume-card ${selection.includes(resume.id) ? 'border-accent bg-accent-soft' : ''}`} key={resume.id}>
             <div className="flex items-start gap-3">
-              <input type="checkbox" className="mt-3" checked={selection.includes(resume.id)} onChange={() => toggle(resume.id)} aria-label={`Select ${resume.name}`} />
+              <input type="checkbox" className="mt-3" checked={eligible(resume.id) && selection.includes(resume.id)} disabled={!eligible(resume.id)} onChange={() => toggle(resume.id)} aria-label={`Select ${resume.name}`} />
               <Avatar initials={resume.initials} />
-              <div className="min-w-0 flex-1"><h3><Link to={`/resumes/${resume.id}`} className="row-title text-[13px]">{resume.name}</Link></h3><p className="mt-1 text-[11px] text-muted">{resume.role}</p></div>
+              <div className="min-w-0 flex-1"><h3><Link to={`/resumes/${resume.id}`} className="row-title text-[13px]">{resume.name}</Link></h3><ArchivedBadge target={{ kind: 'resume', id: resume.id }} /><p className="mt-1 text-[11px] text-muted">{resume.role}</p></div>
             </div>
             <div className="mt-4 flex flex-wrap gap-x-4 gap-y-2 text-[10px] text-muted">
               <span className="inline-flex items-center gap-1.5"><MapPin size={12} aria-hidden="true" />{resume.location}</span>
               <span className="inline-flex items-center gap-1.5"><BriefcaseBusiness size={12} aria-hidden="true" />{resume.experience}</span>
             </div>
             <div className="mt-3 border-t pt-3"><p className="break-words text-[10px] text-muted">{resume.sourceLabel}</p><div className="mt-3 flex items-center justify-between gap-2"><Badge>Fictional profile</Badge><Link to={`/resumes/${resume.id}`} className="text-link text-[11px]">View resume <ArrowRight size={12} aria-hidden="true" /></Link></div></div>
+            <EntityLifecycleActions target={{ kind: 'resume', id: resume.id }} name={resume.name} />
           </article>)}
         </div>
       </> : <EmptyState
         icon={Users}
         title={query ? 'No matching resumes' : 'A fresh page for your next review'}
         description={query ? 'Try another name, role, location, or filename. Resumes selected outside this search stay selected.' : 'Add PDF filenames or load a sample batch to explore fictional profiles and their supporting experience.'}
-        action={query ? <Button onClick={() => setSearch('')}>Clear search</Button> : <Button icon={Plus} onClick={openImport}>Add sample resumes</Button>}
+        action={query ? <Button onClick={() => setSearch('')}>Clear search</Button> : <><Button onClick={() => setArchiveFilter('all')}>Show active and archived</Button><Button icon={Plus} disabled={!canEdit} onClick={openImport}>Add sample resumes</Button></>}
       />}
-      <div className="table-bottom"><span>Showing {visible.length} of {workspace.resumes.length} fictional profiles</span><span>PDF filenames only · Sample document content</span></div>
+      <div className="table-bottom"><span>Showing {visible.length} of {scopedCount} fictional profiles in this archive view</span><span>PDF filenames only · Sample document content</span></div>
     </section>
     <div className="mt-5"><DemoNote>Every candidate is fictional. Added PDFs are represented by replacement sample documents; no file contents are read, uploaded, or stored.</DemoNote></div>
 
@@ -147,6 +157,7 @@ function ResumeDetail({ id }: { id: string }) {
   const navigate = useNavigate()
   const resume = workspace.resumes.find((item) => item.id === id)
   const document = workspace.documents.find((item) => item.id === resume?.documentId)
+  const { canEdit } = useLifecycleAccess({ kind: 'resume', id })
 
   if (!resume) return <>
     <Link className="back-link" to="/resumes"><ArrowLeft size={14} aria-hidden="true" />Back to resumes</Link>
@@ -154,7 +165,7 @@ function ResumeDetail({ id }: { id: string }) {
     <section className="panel"><EmptyState icon={Users} title="This resume is no longer here" description="It may belong to a workspace that was reset. Return to the library to choose another fictional profile." action={<Button onClick={() => navigate('/resumes')}>Open resume library</Button>} /></section>
   </>
 
-  const recentRuns = workspace.runs.filter((run) => run.resumes.some((snapshot) => snapshot.resume.id === resume.id)).sort((left, right) => right.createdAt.localeCompare(left.createdAt)).slice(0, 5)
+  const recentRuns = workspace.runs.filter((run) => !isEntityArchived(workspace, { kind: 'analysis', id: run.id }) && run.resumes.some((snapshot) => snapshot.resume.id === resume.id)).sort((left, right) => right.createdAt.localeCompare(left.createdAt)).slice(0, 5)
   const available = Boolean(document?.paragraphs.length)
 
   return <>
@@ -163,10 +174,12 @@ function ResumeDetail({ id }: { id: string }) {
       eyebrow="FICTIONAL CANDIDATE PROFILE"
       title={resume.name}
       description={resume.role}
-      actions={<Button icon={ArrowRight} variant="primary" disabled={!available} onClick={() => navigate(analysisLink([resume.id]))}>Match to jobs</Button>}
+      actions={<><EntityLifecycleActions target={{ kind: 'resume', id }} name={resume.name} onComplete={(action) => { if (action === 'delete') navigate('/resumes') }} /><Button icon={ArrowRight} variant="primary" disabled={!available || !canEdit} onClick={() => navigate(analysisLink([resume.id]))}>Match to jobs</Button></>}
     />
+    <LifecycleBanner target={{ kind: 'resume', id }} />
     <div className="detail-metadata">
       <Badge tone="accent">Fictional profile</Badge>
+      <ArchivedBadge target={{ kind: 'resume', id }} />
       <span><MapPin size={13} aria-hidden="true" />{resume.location}</span>
       <span><BriefcaseBusiness size={13} aria-hidden="true" />{resume.experience}</span>
       <span>Added {dateLabel(resume.createdAt)}</span>
@@ -209,7 +222,7 @@ function ResumeDetail({ id }: { id: string }) {
                 <p className="mt-2 text-[10px] text-muted">{comparisons} {comparisons === 1 ? 'comparison' : 'comparisons'} for this resume · saved input versions</p>
               </li>
             })}
-          </ul> : <div className="p-5"><p className="text-[12px] font-medium">No comparisons yet.</p><p className="mt-2 text-[11px] text-muted">Start with one job or an independent grade rubric. The resulting evidence will appear here.</p><Button className="mt-4" size="sm" icon={ArrowRight} disabled={!available} onClick={() => navigate(analysisLink([resume.id]))}>Start an analysis</Button></div>}
+          </ul> : <div className="p-5"><p className="text-[12px] font-medium">No active comparisons.</p><p className="mt-2 text-[11px] text-muted">Search the analysis library to find archived runs, or start a new comparison with active inputs.</p><Button className="mt-4" size="sm" icon={ArrowRight} disabled={!available || !canEdit} onClick={() => navigate(analysisLink([resume.id]))}>Start an analysis</Button></div>}
         </section>
       </aside>
     </div>

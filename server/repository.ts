@@ -1,7 +1,9 @@
 import { createInitialWorkspace } from '../src/data/fixtures'
+import { setTimeout as delay } from 'node:timers/promises'
 import type { CloudSession, CloudWorkspaceSnapshot, WorkspaceRole, WorkspaceSummary } from '../src/domain/cloud'
 import type { Workspace } from '../src/domain/types'
 import { validateWorkspace, WorkspaceValidationError } from '../src/domain/workspace-validation'
+import { workspaceLifecycleTransitionErrors } from '../src/domain/lifecycle'
 import type { AuthenticatedPrincipal } from './auth'
 import { conflict, forbidden, invalidRequest, notFound, preconditionRequired, unavailable } from './errors'
 import { defaultPersonalWorkspaceId, isValidWorkspaceId, membershipIdFor, newWorkspaceId } from './ids'
@@ -12,7 +14,9 @@ import {
   type MembershipDoc,
   type StateStore,
   type WorkspaceMetadataDoc,
+  type StoredMetadata,
 } from './store'
+import { assertWorkspaceMutationLease, withWorkspaceMutationLease } from './lifecycle/lease'
 
 const MIN_NAME_LENGTH = 1
 const MAX_NAME_LENGTH = 80
@@ -33,7 +37,7 @@ function validateName(name: unknown): string {
   return trimmed
 }
 
-function toSummary(metadata: WorkspaceMetadataDoc, etag: string, role: WorkspaceRole): WorkspaceSummary {
+export function toSummary(metadata: WorkspaceMetadataDoc, etag: string, role: WorkspaceRole): WorkspaceSummary {
   return {
     id: metadata.workspaceId,
     name: metadata.name,
@@ -42,10 +46,12 @@ function toSummary(metadata: WorkspaceMetadataDoc, etag: string, role: Workspace
     createdAt: metadata.createdAt,
     updatedAt: metadata.updatedAt,
     etag,
+    ...(metadata.archivedAt ? { archivedAt: metadata.archivedAt } : {}),
+    ...(metadata.lifecycleOperation ? { lifecycleOperation: metadata.lifecycleOperation } : {}),
   }
 }
 
-function decodeWorkspace(content: string): Workspace {
+export function decodeWorkspace(content: string): Workspace {
   try {
     return validateWorkspace(JSON.parse(content))
   } catch (error) {
@@ -101,6 +107,7 @@ export class WorkspaceRepository {
           console.warn('An unpublished workspace membership has no directory metadata and was excluded from the workspace list.')
           return undefined
         }
+        if (stored.metadata.deletedAt) return undefined
         if (stored.metadata.tenantId !== principal.tenantId || membership.principalId !== principal.principalKey) return undefined
         return toSummary(stored.metadata, stored.etag, membership.role)
       }),
@@ -117,15 +124,49 @@ export class WorkspaceRepository {
    */
   private async ensureDefaultWorkspace(principal: AuthenticatedPrincipal): Promise<void> {
     const workspaceId = defaultPersonalWorkspaceId(principal.principalKey)
+    if (await this.directory.getMetadata(workspaceId)) {
+      await this.initializeDefaultWorkspace(principal, false)
+      return
+    }
+    // A stale first-use request must not prepare new state after another tab deletes the default.
+    for (let attempt = 0; attempt < 100; attempt++) {
+      try {
+        await withWorkspaceMutationLease(this.state, workspaceId, () => this.initializeDefaultWorkspace(principal, true))
+        return
+      } catch (error) {
+        if (!(error instanceof StoreConflictError)) throw error
+        if (await this.directory.getMetadata(workspaceId)) {
+          await this.initializeDefaultWorkspace(principal, false)
+          return
+        }
+        if (attempt < 99) await delay(50)
+      }
+    }
+    throw unavailable('Workspace initialization is still in progress. Retry shortly; no existing content has been replaced.')
+  }
+
+  private async initializeDefaultWorkspace(principal: AuthenticatedPrincipal, allowCreation: boolean): Promise<void> {
+    const workspaceId = defaultPersonalWorkspaceId(principal.principalKey)
     const membershipId = membershipIdFor(principal.principalKey)
     const existingMetadata = await this.directory.getMetadata(workspaceId)
     if (existingMetadata) {
+      if (existingMetadata.metadata.ownerId !== principal.principalKey || existingMetadata.metadata.tenantId !== principal.tenantId) {
+        throw notFound()
+      }
+      if (existingMetadata.metadata.deletedAt) return
+      if (existingMetadata.metadata.lifecycleOperation?.status !== undefined &&
+        existingMetadata.metadata.lifecycleOperation.status !== 'complete') return
       await this.requireMembership(principal, workspaceId)
       const existingState = await this.state.getState(workspaceId)
-      if (!existingState) throw unavailable("Your default workspace's saved data is unavailable. It has not been replaced.")
+      if (!existingState) {
+        const latest = await this.directory.getMetadata(workspaceId)
+        if (latest?.metadata.deletedAt || (latest?.metadata.lifecycleOperation && latest.metadata.lifecycleOperation.status !== 'complete')) return
+        throw unavailable("Your default workspace's saved data is unavailable. It has not been replaced.")
+      }
       decodeWorkspace(existingState.content)
       return
     }
+    if (!allowCreation) throw unavailable('The workspace directory changed during initialization. Retry without recreating saved content.')
 
     const timestamp = this.now()
     const metadata: WorkspaceMetadataDoc = {
@@ -196,7 +237,7 @@ export class WorkspaceRepository {
       this.directory.getMetadata(workspaceId),
       this.directory.getMembership(workspaceId, membershipIdFor(principal.principalKey)),
     ])
-    if (!stored || !membership || stored.metadata.tenantId !== principal.tenantId ||
+    if (!stored || stored.metadata.deletedAt || !membership || stored.metadata.tenantId !== principal.tenantId ||
       stored.metadata.workspaceId !== workspaceId || membership.workspaceId !== workspaceId ||
       membership.principalId !== principal.principalKey || membership.principalType !== 'user' ||
       !['owner', 'editor', 'viewer'].includes(membership.role)) {
@@ -209,14 +250,52 @@ export class WorkspaceRepository {
   async authorizeWorkspace(
     principal: AuthenticatedPrincipal,
     workspaceId: string,
-    access: 'read' | 'write',
+    access: 'read' | 'write' | 'manage',
+    allowPendingLifecycle = false,
   ): Promise<WorkspaceRole> {
     if (!isValidWorkspaceId(workspaceId)) throw notFound()
     const membership = await this.requireMembership(principal, workspaceId)
-    if (access === 'write' && membership.role === 'viewer') {
-      throw forbidden('Viewers cannot change jobs in this workspace.')
+    if (access !== 'read' && membership.role === 'viewer') {
+      throw forbidden('Viewers cannot change this workspace.')
+    }
+    if (access !== 'read') {
+      const stored = await this.directory.getMetadata(workspaceId)
+      if (!stored || stored.metadata.deletedAt) throw notFound()
+      if (!allowPendingLifecycle && stored.metadata.lifecycleOperation && stored.metadata.lifecycleOperation.status !== 'complete') {
+        throw conflict('A workspace lifecycle operation must finish or be retried before other changes can be made.')
+      }
+      if (access === 'write' && stored.metadata.archivedAt) {
+        throw conflict('This workspace is archived. Unarchive it before editing or starting work.')
+      }
     }
     return membership.role
+  }
+
+  async getWorkspaceMetadata(principal: AuthenticatedPrincipal, workspaceId: string): Promise<StoredMetadata> {
+    await this.authorizeWorkspace(principal, workspaceId, 'read')
+    const stored = await this.directory.getMetadata(workspaceId)
+    if (!stored || stored.metadata.deletedAt) throw notFound()
+    return stored
+  }
+
+  async withWorkspaceMutation<T>(
+    principal: AuthenticatedPrincipal,
+    workspaceId: string,
+    access: 'write' | 'manage',
+    operation: () => Promise<T>,
+    allowPendingLifecycle = false,
+  ): Promise<T> {
+    if (!isValidWorkspaceId(workspaceId)) throw notFound()
+    await this.authorizeWorkspace(principal, workspaceId, access, allowPendingLifecycle)
+    try {
+      return await withWorkspaceMutationLease(this.state, workspaceId, async () => {
+        await this.authorizeWorkspace(principal, workspaceId, access, allowPendingLifecycle)
+        return operation()
+      })
+    } catch (error) {
+      if (error instanceof StoreConflictError) throw conflict(error.message)
+      throw error
+    }
   }
 
   /** PATCH /api/workspaces/:id: owner-only rename, guarded by the metadata etag. */
@@ -231,17 +310,18 @@ export class WorkspaceRepository {
     if (ifMatchEtag === undefined) throw preconditionRequired()
     if (ifMatchEtag === '*') throw invalidRequest('Wildcard If-Match is not accepted; provide the current etag.')
 
-    const membership = await this.requireMembership(principal, workspaceId)
-    if (membership.role !== 'owner') throw forbidden('Only the workspace owner can rename it.')
-
-    try {
-      const updated = await this.directory.renameWorkspace(workspaceId, trimmed, this.now(), ifMatchEtag)
-      return toSummary(updated.metadata, updated.etag, membership.role)
-    } catch (error) {
-      if (error instanceof StoreConflictError) throw conflict()
-      if (error instanceof StoreNotFoundError) throw notFound()
-      throw error
-    }
+    return this.withWorkspaceMutation(principal, workspaceId, 'write', async () => {
+      const membership = await this.requireMembership(principal, workspaceId)
+      if (membership.role !== 'owner') throw forbidden('Only the workspace owner can rename it.')
+      try {
+        assertWorkspaceMutationLease(workspaceId)
+        const updated = await this.directory.renameWorkspace(workspaceId, trimmed, this.now(), ifMatchEtag)
+        return toSummary(updated.metadata, updated.etag, membership.role)
+      } catch (error) {
+        if (error instanceof StoreNotFoundError) throw notFound()
+        throw error
+      }
+    })
   }
 
   /** GET /api/workspaces/:id/state: never seeds/repairs missing or corrupt state, and never recovers interrupted work. */
@@ -263,8 +343,7 @@ export class WorkspaceRepository {
     ifMatchEtag: string | undefined,
   ): Promise<{ etag: string }> {
     if (!isValidWorkspaceId(workspaceId)) throw notFound()
-    const membership = await this.requireMembership(principal, workspaceId)
-    if (membership.role === 'viewer') throw forbidden('Viewers cannot save changes to this workspace.')
+    await this.authorizeWorkspace(principal, workspaceId, 'manage')
     if (ifMatchEtag === undefined) throw preconditionRequired()
     if (ifMatchEtag === '*') throw invalidRequest('Wildcard If-Match is not accepted; provide the current etag.')
 
@@ -276,11 +355,23 @@ export class WorkspaceRepository {
       throw error
     }
 
-    try {
-      return await this.state.putState(workspaceId, JSON.stringify(validated), ifMatchEtag)
-    } catch (error) {
-      if (error instanceof StoreConflictError) throw conflict()
-      throw error
-    }
+    return this.withWorkspaceMutation(principal, workspaceId, 'manage', async () => {
+      const previous = await this.state.getState(workspaceId)
+      if (!previous) throw unavailable("This workspace's saved data is unavailable. Nothing has been recreated.")
+      if (previous.etag !== ifMatchEtag) throw conflict()
+      const current = decodeWorkspace(previous.content)
+      if (current.lifecycle?.archivedAt !== validated.lifecycle?.archivedAt) {
+        throw invalidRequest('Workspace archive state can only be changed through workspace lifecycle controls.')
+      }
+      const roots = (workspace: Workspace) => Object.entries(workspace.lifecycle?.entities ?? {})
+        .filter(([key]) => key.startsWith('workspace:')).sort(([left], [right]) => left.localeCompare(right))
+      if (JSON.stringify(roots(current)) !== JSON.stringify(roots(validated))) {
+        throw invalidRequest('Workspace deletion state can only be changed through owner-only workspace lifecycle controls.')
+      }
+      const errors = workspaceLifecycleTransitionErrors(current, validated)
+      if (errors.length) throw conflict(errors[0])
+      assertWorkspaceMutationLease(workspaceId)
+      return this.state.putState(workspaceId, JSON.stringify(validated), ifMatchEtag)
+    })
   }
 }

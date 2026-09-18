@@ -29,6 +29,8 @@ export interface Config {
   readonly storage: StorageConfig
   readonly realJobs: RealJobsConfig | undefined
   readonly realGrades?: RealGradesConfig
+  readonly jobLifecycleStore?: RealJobsConfig
+  readonly gradeLifecycleStore?: RealGradesConfig
   readonly appOrigin: string
   readonly isProduction: boolean
   readonly isAppService: boolean
@@ -161,6 +163,32 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     }
   }
 
+  const jobRecords = optional(env, 'JOB_RECORDS_CONTAINER')
+  const jobSources = optional(env, 'JOB_SOURCE_CONTAINER')
+  if (Boolean(jobRecords) !== Boolean(jobSources)) {
+    throw new ConfigError('Both job storage containers must be configured so lifecycle cleanup cannot skip existing data.')
+  }
+  const jobLifecycleStore = realJobs ?? (jobRecords && jobSources ? {
+    cosmosEndpoint: cosmos.endpoint, database: cosmos.database, container: jobRecords,
+    storageAccountUrl: storage.accountUrl, blobContainer: jobSources,
+  } : undefined)
+  const gradeRecords = optional(env, 'GRADE_RECORDS_CONTAINER')
+  const gradeSources = optional(env, 'GRADE_SOURCE_CONTAINER')
+  const gradeLifecycleStore = realGrades ?? (gradeRecords || gradeSources ? {
+    cosmosEndpoint: cosmos.endpoint, database: cosmos.database, container: gradeRecords ?? 'grade-records',
+    storageAccountUrl: storage.accountUrl, blobContainer: gradeSources ?? 'grade-sources',
+  } : undefined)
+  if (jobLifecycleStore && (jobLifecycleStore.container === cosmos.container ||
+    jobLifecycleStore.blobContainer === storage.containerName)) {
+    throw new ConfigError('Job lifecycle storage must be separate from workspace storage.')
+  }
+  if (gradeLifecycleStore && (gradeLifecycleStore.container === cosmos.container ||
+    gradeLifecycleStore.container === jobLifecycleStore?.container ||
+    gradeLifecycleStore.blobContainer === storage.containerName ||
+    gradeLifecycleStore.blobContainer === jobLifecycleStore?.blobContainer)) {
+    throw new ConfigError('Grade lifecycle storage must be separate from workspace and job storage.')
+  }
+
   return {
     authMode,
     tenantId: requireGuid(env, 'AZURE_TENANT_ID'),
@@ -170,6 +198,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     storage,
     realJobs,
     realGrades,
+    jobLifecycleStore,
+    gradeLifecycleStore,
     appOrigin: requireHttpsOrigin(env, 'APP_ORIGIN'),
     isProduction,
     isAppService,

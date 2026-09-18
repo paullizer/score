@@ -2,6 +2,13 @@ import { createContext, useContext } from 'react'
 import type { ImportCandidate, Rubric, SourceKind, Workspace } from '../domain/types'
 import type { CloudUser, WorkspaceSummary } from '../domain/cloud'
 import type { JobProcessingFeatures, RealJobDetail, RealJobSource, RealJobSummary } from '../domain/real-jobs'
+import type { LifecycleAction, LifecycleImpact, LifecycleOperation, LifecycleTarget } from '../domain/lifecycle'
+
+export interface PendingLifecycleChange {
+  target: LifecycleTarget
+  name: string
+  operation: LifecycleOperation
+}
 
 /** Cloud-only save status for the currently open workspace's document state. */
 export type CloudSaveState = 'saving' | 'saved' | 'error' | 'conflict'
@@ -17,6 +24,7 @@ export interface CloudWorkspaceStatus {
   workspaces: WorkspaceSummary[]
   currentWorkspaceId: string
   saveState: CloudSaveState
+  syncingState?: boolean
   /** Present when saveState is 'error': a human explanation for the retry banner. */
   saveError: string | null
   /** Present when saveState is 'conflict': another session already saved a newer version. */
@@ -27,6 +35,11 @@ export interface CloudWorkspaceStatus {
   switchWorkspace: (id: string) => Promise<{ ok: true } | { ok: false; message: string }>
   createWorkspace: (name: string) => Promise<{ ok: true } | { ok: false; message: string }>
   renameWorkspace: (id: string, name: string) => Promise<{ ok: true } | { ok: false; message: string }>
+  refreshWorkspaces: () => Promise<void>
+  getWorkspaceLifecycleImpact: (id: string) => Promise<LifecycleImpact>
+  changeWorkspaceLifecycle: (id: string, action: LifecycleAction) => Promise<void>
+  flushSave: () => Promise<void>
+  leaveUnavailableWorkspace: () => Promise<{ ok: true } | { ok: false; message: string }>
   signOut: () => Promise<void>
   realJobs: {
     phase: 'loading' | 'ready' | 'unavailable' | 'error'
@@ -59,6 +72,9 @@ export interface WorkspaceContextValue {
   retryRun: (id: string) => void
   resetDemo: () => void
   retrySave: () => void
+  getLifecycleImpact: (target: LifecycleTarget) => LifecycleImpact | Promise<LifecycleImpact>
+  changeLifecycle: (target: LifecycleTarget, action: LifecycleAction) => void | Promise<void>
+  lifecycleOperations?: PendingLifecycleChange[]
   /** Present only in cloud mode; undefined in the local browser demo. */
   cloud?: CloudWorkspaceStatus
 }

@@ -6,7 +6,8 @@ import {
   type RealJobsPage,
   type RealJobSummary,
 } from '../domain/real-jobs'
-import { cloudJsonRequest } from './cloudWorkspace'
+import { cloudJsonRequest, cloudLifecycleRequest } from './cloudWorkspace'
+import type { LifecycleAction, LifecycleImpact, LifecycleOperation } from '../domain/lifecycle'
 
 type RealJobWireSummary = RealJobSummary
 
@@ -133,4 +134,16 @@ export async function saveRealJobRubric(
 
 export function realJobOriginalUrl(workspaceId: string, jobId: string): string {
   return `/api${jobsPath(workspaceId)}/${encodeURIComponent(jobId)}/original`
+}
+
+export async function getRealJobLifecycleImpact(workspaceId: string, jobId: string, scope: 'job' | 'rubric', signal?: AbortSignal): Promise<LifecycleImpact> {
+  const result = await cloudJsonRequest<{ impact: LifecycleImpact }>(`${jobsPath(workspaceId)}/${encodeURIComponent(jobId)}/lifecycle?scope=${scope}`, { signal })
+  return result.impact
+}
+
+export async function changeRealJobLifecycle(workspaceId: string, jobId: string, scope: 'job' | 'rubric', action: LifecycleAction, etag: string): Promise<{ job?: RealJobDetail; deleted?: true; operation?: LifecycleOperation }> {
+  const result = await cloudLifecycleRequest<{ job?: RealJobDetail; deleted?: true; operation?: LifecycleOperation }>(`${jobsPath(workspaceId)}/${encodeURIComponent(jobId)}/lifecycle`, {
+    method: 'POST', headers: { 'If-Match': etag }, body: JSON.stringify({ action, scope }),
+  })
+  return result.value
 }

@@ -86,11 +86,23 @@ function fakeStore(initial, hooks = {}) {
   let current = structuredClone(initial)
   let version = 1
   let published
+  let workspaceState = 'active'
+  const writers = new Map()
+  const locked = value => value?.archivedAt || value?.deletingAt || value?.deletedAt
+  function assertWritable() {
+    if (workspaceState !== 'active' || !current || locked(current.lifecycle) ||
+      locked(current.rubricLifecycle) || current.job.rubricDeletedAt) {
+      const error = new Error('Lifecycle conflict')
+      error.name = 'StoreConflictError'
+      throw error
+    }
+  }
   return {
     async get() { return current ? { record: structuredClone(current), etag: `"${version}"` } : undefined },
     async listPending() { return current ? [{ record: structuredClone(current), etag: `"${version}"` }] : [] },
     async replace(value, etag) {
       if (hooks.replace) await hooks.replace(value, etag, { get current() { return current }, set current(value) { current = value } })
+      assertWritable()
       if (etag !== `"${version}"`) {
         const error = new Error('conflict')
         error.name = 'StoreConflictError'
@@ -101,6 +113,8 @@ function fakeStore(initial, hooks = {}) {
       return { record: structuredClone(current), etag: `"${version}"` }
     },
     async publish(value, etag, rubric) {
+      if (hooks.publish) await hooks.publish()
+      assertWritable()
       if (etag !== `"${version}"`) throw new Error('publish conflict')
       current = structuredClone(value)
       published = structuredClone(rubric)
@@ -111,6 +125,38 @@ function fakeStore(initial, hooks = {}) {
     async list() { return { jobs: [] } },
     async getRubric() { return published },
     async listRubrics() { return published ? [published] : [] },
+    async getWorkspaceLifecycle() { return { state: workspaceState, updatedAt: now } },
+    async beginBlobWrite(workspaceId, jobId, blobName, owner) {
+      assertWritable()
+      assert.equal(owner, current.lease.owner)
+      const writer = { id: `writer-${writers.size}`, workspaceId, jobId, blobName, owner, expiresAt: new Date(Date.now() + 120_000).toISOString() }
+      writers.set(writer.id, writer)
+      return writer
+    },
+    async assertBlobWrite(writer) {
+      assertWritable()
+      assert.equal(current.lease?.owner, writer.owner)
+      assert.ok(writers.has(writer.id))
+    },
+    async finishBlobWrite(writer) { writers.delete(writer.id) },
+    setWorkspaceState(value) { workspaceState = value },
+    setLifecycle(scope, metadata) {
+      current[scope === 'job' ? 'lifecycle' : 'rubricLifecycle'] = metadata
+      if (locked(metadata)) {
+        current.lease = undefined
+        current.nextAttemptAt = undefined
+        current.job.status = 'cancelled'
+      }
+      version += 1
+    },
+    deleteRubric() {
+      current.rubricLifecycle = { deletedAt: now }
+      current.job = { ...current.job, status: 'ready', rubricId: null, rubricDeletedAt: now }
+      current.lease = undefined
+      current.nextAttemptAt = undefined
+      published = undefined
+      version += 1
+    },
     state: () => structuredClone(current),
     published: () => structuredClone(published),
   }
@@ -128,11 +174,16 @@ function fakeBlobs() {
   let writes = 0
   return {
     async read(name) { return values.get(name) },
-    async putImmutable(name, bytes, contentType) {
+    async putImmutable(name, bytes, contentType, fence) {
+      if (fence) await fence.assertActive()
       writes += 1
       const blob = { bytes, contentType, sha256: 'new', etag: '"new"' }
       if (!values.has(name)) values.set(name, blob)
       return { created: true, blob }
+    },
+    async putFenced(name, bytes, contentType, fence) {
+      await fence.assertActive()
+      return this.putImmutable(name, bytes, contentType, fence)
     },
     writes: () => writes,
   }
@@ -297,6 +348,10 @@ test('immutable extraction conflicts use the durable document for generation and
         },
       }
     },
+    async putFenced(name, _bytes, _contentType, fence) {
+      await fence.assertActive()
+      return this.putImmutable(name)
+    },
   }
   const store = fakeStore(record({ extractedBlobName: undefined }))
   const durableResult = {
@@ -372,4 +427,70 @@ test('run bounds the number of claimed jobs and uses coordinated blob names', as
     claimed: 0,
     completed: 0,
   })
+})
+
+for (const scope of ['job', 'rubric', 'workspace']) {
+  test(`worker skips ${scope} archives before claiming or calling a model`, async () => {
+    const store = fakeStore(record(scope === 'workspace' ? {} : {
+      [scope === 'job' ? 'lifecycle' : 'rubricLifecycle']: { archivedAt: now },
+    }))
+    if (scope === 'workspace') store.setWorkspaceState('archived')
+    let calls = 0
+    const result = await runWorker(dependencies(store, fakeBlobs(), async () => {
+      calls += 1
+      return successfulModel()
+    }))
+    assert.deepEqual(result, { claimed: 0, completed: 0 })
+    assert.equal(calls, 0)
+    assert.equal(store.published(), undefined)
+  })
+}
+
+test('archiving during generation cancels a late result and restoring never restarts it', async () => {
+  const store = fakeStore(record())
+  const blobs = fakeBlobs()
+  await runWorker(dependencies(store, blobs, async () => {
+    store.setLifecycle('rubric', { archivedAt: now })
+    return successfulModel()
+  }))
+  assert.equal(store.published(), undefined)
+  assert.equal(store.state().job.status, 'cancelled')
+  assert.equal(store.state().lease, undefined)
+  assert.ok(await blobs.read(`${workspaceId}/${jobId}/source-document.json`))
+  store.setLifecycle('rubric', {})
+  assert.deepEqual(await runWorker(dependencies(store, blobs, async () => {
+    assert.fail('unarchive must not regenerate')
+  })), { claimed: 0, completed: 0 })
+})
+
+test('workspace fencing at the final publication boundary wins over the worker pre-check', async () => {
+  let store
+  store = fakeStore(record(), { publish: async () => store.setWorkspaceState('archived') })
+  await runWorker(dependencies(store, fakeBlobs(), async () => successfulModel()))
+  assert.equal(store.published(), undefined)
+  assert.equal(store.state().lifecycle, undefined, 'parent archive does not stamp child metadata')
+  assert.notEqual(store.state().job.status, 'ready')
+})
+
+test('deliberate rubric deletion during generation cannot publish or retry an old rubric', async () => {
+  const store = fakeStore(record())
+  const blobs = fakeBlobs()
+  await runWorker(dependencies(store, blobs, async () => {
+    store.deleteRubric()
+    return successfulModel()
+  }))
+  assert.equal(store.published(), undefined)
+  assert.equal(store.state().job.rubricId, null)
+  assert.equal(store.state().job.rubricDeletedAt, now)
+  assert.equal(store.state().job.status, 'ready')
+  assert.ok(await blobs.read(`${workspaceId}/${jobId}/source-document.json`))
+  assert.deepEqual(await runWorker(dependencies(store, blobs, async () => assert.fail('deleted rubric restarted'))), {
+    claimed: 0, completed: 0,
+  })
+})
+
+test('worker explicitly rejects a store without lifecycle fencing', async () => {
+  const store = fakeStore(record())
+  delete store.getWorkspaceLifecycle
+  await assert.rejects(runWorker(dependencies(store, fakeBlobs(), async () => successfulModel())), /fencing is unavailable/)
 })

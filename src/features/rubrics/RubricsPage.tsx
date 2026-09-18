@@ -10,6 +10,9 @@ import { RubricPanel } from './RubricPanel'
 import { useGradeLadders } from '../../app/grade-ladders-context'
 import { GradeLadderLibrary } from '../grade-ladders/GradeLadderLibrary'
 import { gradeLadderLink } from '../grade-ladders/gradeUi'
+import { getEntityLifecycle, isEntityArchived, isEntityRemoved, matchesArchiveFilter, sampleLifecycleTargets, type ArchiveFilter } from '../../domain/lifecycle'
+import { ArchivedBadge, ArchiveStateFilter, EntityLifecycleActions, LifecycleBanner } from '../../components/lifecycle/LifecycleControls'
+import { useLifecycleAccess } from '../../components/lifecycle/useLifecycleAccess'
 
 function analysisLink(ids: string[]): string {
   return `/analyses/new?${new URLSearchParams({ rubrics: ids.join(',') }).toString()}`
@@ -17,7 +20,8 @@ function analysisLink(ids: string[]): string {
 
 function rubricReady(rubric: Rubric, workspace: Workspace): boolean {
   if (rubric.dataKind === 'real') return false
-  return rubric.kind === 'grade' || workspace.jobs.some((job) => job.id === rubric.jobId && job.rubricId === rubric.id && job.status === 'ready')
+  if (isEntityArchived(workspace, { kind: 'rubric', id: rubric.groupId })) return false
+  return rubric.kind === 'grade' || workspace.jobs.some((job) => job.id === rubric.jobId && job.rubricId === rubric.id && job.status === 'ready' && !job.rubricDeletedAt && !isEntityArchived(workspace, { kind: 'job', id: job.id }))
 }
 
 function rubricLink(rubric: Rubric): string {
@@ -34,24 +38,33 @@ function RubricsLibrary() {
   const libraryKind = cloud && params.get('data') !== 'samples' ? 'real' : 'samples'
   const [search, setSearch] = useState('')
   const [selection, setSelection] = useState<string[]>([])
+  const [archiveFilter, setArchiveFilter] = useState<ArchiveFilter>('default')
+  const { canEdit } = useLifecycleAccess()
   const rubrics = latestRubrics(workspace).filter((rubric) => libraryKind === 'real' ? rubric.dataKind === 'real' : rubric.dataKind !== 'real')
   const query = search.trim().toLocaleLowerCase()
   const visible = rubrics.filter((rubric) => {
     const job = workspace.jobs.find((item) => item.id === rubric.jobId)
-    return rubric.kind === kind && [
+    return rubric.kind === kind && matchesArchiveFilter(isEntityArchived(workspace, { kind: 'rubric', id: rubric.groupId }), search, archiveFilter) && [
       rubric.name, rubric.description, rubric.ladder, rubric.grade, job?.title, job?.organization,
       ...rubric.criteria.map((criterion) => criterion.label),
     ].filter(Boolean).join(' ').toLocaleLowerCase().includes(query)
   })
-  const selected = rubrics.filter((rubric) => selection.includes(rubric.id) && rubricReady(rubric, workspace))
+  const selected = rubrics.filter((rubric) => canEdit && selection.includes(rubric.id) && rubricReady(rubric, workspace))
   const hiddenCount = selected.filter((rubric) => !visible.some((item) => item.id === rubric.id)).length
   const groups = new Map<string, Rubric[]>()
+  const familyId = (rubric: Rubric) => getEntityLifecycle(workspace, { kind: 'rubric', id: rubric.groupId })?.parentKey?.replace(/^ladder:/, '') ?? rubric.ladder ?? 'General Schedule'
+  const familyName = (id: string) => rubrics.find((rubric) => rubric.kind === 'grade' && familyId(rubric) === id)?.ladder ?? id
   for (const rubric of visible) {
-    const group = kind === 'grade' ? rubric.ladder || 'General Schedule' : 'Linked to your jobs'
+    const group = kind === 'grade' ? familyId(rubric) : 'Linked to your jobs'
     groups.set(group, [...(groups.get(group) ?? []), rubric])
   }
-  const orderedGroups = [...groups.entries()].sort(([left], [right]) => left.localeCompare(right))
-  const readyVisible = visible.filter((rubric) => rubricReady(rubric, workspace))
+  if (kind === 'grade' && libraryKind === 'samples') {
+    for (const target of sampleLifecycleTargets(workspace).filter((target) => target.kind === 'ladder')) {
+      if (!groups.has(target.id) && matchesArchiveFilter(isEntityArchived(workspace, target), search, archiveFilter) && familyName(target.id).toLocaleLowerCase().includes(query)) groups.set(target.id, [])
+    }
+  }
+  const orderedGroups = [...groups.entries()].sort(([left], [right]) => familyName(left).localeCompare(familyName(right)))
+  const readyVisible = visible.filter((rubric) => canEdit && rubricReady(rubric, workspace))
   const allVisibleSelected = readyVisible.length > 0 && readyVisible.every((rubric) => selection.includes(rubric.id))
 
   function toggle(id: string) {
@@ -87,11 +100,11 @@ function RubricsLibrary() {
           value={kind}
           onChange={(value) => { setSelection([]); setParams({ kind: value, data: libraryKind }, { replace: true }) }}
           options={[
-            { value: 'job', label: 'Job rubrics', count: rubrics.filter((rubric) => rubric.kind === 'job').length },
-            { value: 'grade', label: 'GS / grade rubrics', count: libraryKind === 'real' ? gradeLadders?.summaries.reduce((count, family) => count + family.levels.length, 0) ?? 0 : rubrics.filter((rubric) => rubric.kind === 'grade').length },
+            { value: 'job', label: 'Job rubrics', count: rubrics.filter((rubric) => rubric.kind === 'job' && !isEntityArchived(workspace, { kind: 'rubric', id: rubric.groupId })).length },
+            { value: 'grade', label: 'GS / grade rubrics', count: libraryKind === 'real' ? gradeLadders?.summaries.reduce((count, family) => count + family.levels.filter((level) => !isEntityArchived(workspace, { kind: 'rubric', id: level.head.id }) && !isEntityRemoved(workspace, { kind: 'rubric', id: level.head.id })).length, 0) ?? 0 : rubrics.filter((rubric) => rubric.kind === 'grade' && !isEntityArchived(workspace, { kind: 'rubric', id: rubric.groupId })).length },
           ]}
         />
-        <SearchField value={search} onChange={setSearch} placeholder="Search rubrics, criteria, or grades…" label="Search rubric library" />
+        <div className="toolbar"><SearchField value={search} onChange={setSearch} placeholder="Search rubrics, criteria, or grades…" label="Search rubric library" /><ArchiveStateFilter value={archiveFilter} onChange={setArchiveFilter} label="Rubric archive state" /></div>
       </div>
 
       {!(kind === 'grade' && libraryKind === 'real') && <><div className="flex flex-wrap items-center justify-between gap-3 border-b px-5 py-3">
@@ -116,18 +129,20 @@ function RubricsLibrary() {
         </div>
       </div>}
 
-      {visible.length > 0 ? <div className="space-y-7 p-5">
-        {orderedGroups.map(([family, familyRubrics]) => <section key={family} aria-label={family}>
+      {orderedGroups.length > 0 ? <div className="space-y-7 p-5">
+        {orderedGroups.map(([family, familyRubrics]) => <section key={family} aria-label={kind === 'grade' ? familyName(family) : family}>
           <div className="mb-4 flex flex-wrap items-baseline justify-between gap-2">
-            <h2 className="text-[13px] font-semibold">{family}</h2>
+            <h2 className="text-[13px] font-semibold">{kind === 'grade' ? familyName(family) : family}</h2>
+            {kind === 'grade' && libraryKind === 'samples' && <div className="flex flex-wrap items-center gap-2"><ArchivedBadge target={{ kind: 'ladder', id: family }} /><EntityLifecycleActions target={{ kind: 'ladder', id: family }} name={familyName(family)} /></div>}
             <span className="text-[10px] text-muted">
               {kind === 'grade' ? 'Reusable grade family' : 'Each rubric stays attached to its source job'}
             </span>
           </div>
+          {!familyRubrics.length && <p className="text-[11px] text-muted">No grade rubrics match this view. Search or choose Active and archived to inspect retained rubrics. An empty ladder can still be archived or deleted.</p>}
           <div className="grid gap-4 lg:grid-cols-2 2xl:grid-cols-3">
             {[...familyRubrics].sort((left, right) => (left.grade ?? left.name).localeCompare(right.grade ?? right.name, undefined, { numeric: true })).map((rubric) => {
               const job = workspace.jobs.find((item) => item.id === rubric.jobId)
-              const ready = rubricReady(rubric, workspace)
+              const ready = canEdit && rubricReady(rubric, workspace)
               const checked = selected.some((item) => item.id === rubric.id)
               return <article className={`rubric-card flex min-w-0 flex-col ${checked ? 'border-accent bg-accent-soft' : ''}`} key={rubric.id}>
                 <div className="mb-3 flex items-start justify-between gap-3">
@@ -136,6 +151,7 @@ function RubricsLibrary() {
                       ? <Layers3 size={16} className="text-muted" aria-hidden="true" />
                       : <BriefcaseBusiness size={16} className="text-muted" aria-hidden="true" />}
                     <Badge>{rubric.grade ?? job?.grade ?? 'Job-specific'}</Badge>
+                    <ArchivedBadge target={{ kind: 'rubric', id: rubric.groupId }} />
                     <span className="text-[10px] text-muted">v{rubric.version}</span>
                   </div>
                   <input
@@ -166,6 +182,7 @@ function RubricsLibrary() {
                   <Link to={rubricLink(rubric)} className="text-link text-[11px]">Inspect rubric <ArrowRight size={13} aria-hidden="true" /></Link>
                   <Button size="sm" variant="ghost" disabled={!ready} title={rubric.dataKind === 'real' ? 'Real job scoring is not enabled in this preview.' : undefined} onClick={() => navigate(analysisLink([rubric.id]))}>Use rubric</Button>
                 </div>
+                <div className="mt-3"><EntityLifecycleActions target={{ kind: 'rubric', id: rubric.groupId }} name={rubric.name} /></div>
               </article>
             })}
           </div>
@@ -186,7 +203,7 @@ function RubricsLibrary() {
       />}
       <div className="table-bottom"><span>{visible.length} {visible.length === 1 ? 'rubric' : 'rubrics'} in this view</span><span>Latest versions only · Previous versions are preserved</span></div>
       </>}
-      {kind === 'grade' && libraryKind === 'real' && <GradeLadderLibrary search={search} />}
+      {kind === 'grade' && libraryKind === 'real' && <GradeLadderLibrary search={search} archiveFilter={archiveFilter} />}
     </section>
     <div className="mt-5"><DemoNote>{cloud ? 'Real job and grade rubrics are private, source-grounded, and excluded from demo scoring. Samples remain fictional. Reset samples never changes real ladders or captured source history.' : 'Generated job rubrics and grade templates use fictional demo content. Every saved version remains inspectable, including the version used by a past analysis.'}</DemoNote></div>
   </>
@@ -203,6 +220,7 @@ function RubricDetail({ id }: { id: string }) {
   const document = workspace.documents.find((item) => item.id === job?.documentId)
   const requestedJobId = params.get('job') ?? job?.id
   const realDetail = requestedJobId && cloud ? cloud.realJobs.detail(requestedJobId) : undefined
+  const { canEdit } = useLifecycleAccess({ kind: 'rubric', id: rubric?.groupId ?? id })
 
   useEffect(() => {
     if (requestedJobId && cloud) void cloud.realJobs.ensureDetail(requestedJobId)
@@ -226,7 +244,7 @@ function RubricDetail({ id }: { id: string }) {
   )].sort((left, right) => right.version - left.version)
   const current = versions[0] ?? rubric
   const historic = rubric.id !== current.id
-  const ready = rubricReady(current, workspace)
+  const ready = canEdit && rubricReady(current, workspace)
 
   return <>
     <Link className="back-link" to={`/rubrics?kind=${rubric.kind}`}><ArrowLeft size={14} aria-hidden="true" />Back to rubrics</Link>
@@ -236,15 +254,17 @@ function RubricDetail({ id }: { id: string }) {
       description={rubric.kind === 'grade'
         ? 'A reusable set of expectations. Compare directly to this grade, with or without a job.'
         : 'A job-specific standard, with traceable source references and preserved version history.'}
-      actions={<>{rubric.kind === 'job' && rubric.dataKind === 'real' && <Button icon={Layers3} disabled={!gradeLadders?.canWrite || gradeLadders.phase !== 'ready' || job?.status !== 'ready'}
+      actions={<>{rubric.kind === 'job' && rubric.dataKind === 'real' && <Button icon={Layers3} disabled={!canEdit || !gradeLadders?.canWrite || gradeLadders.phase !== 'ready' || job?.status !== 'ready' || Boolean(job?.rubricDeletedAt)}
         title={!gradeLadders?.canWrite ? 'Only an owner or editor in a grade-enabled workspace can create a ladder.' : 'Capture this exact saved job rubric version as a new GS family.'}
         onClick={() => navigate(`/grade-ladders/new?${new URLSearchParams({ job: job!.id, rubric: rubric.id, rubricVersion: String(rubric.version) })}`)}>Create grade ladder</Button>}
         <Button variant="primary" icon={ArrowRight} disabled={!ready} title={rubric.dataKind === 'real' ? 'Real job scoring is not enabled in this preview.' : undefined} onClick={() => navigate(analysisLink([current.id]))}>
         {historic ? `Analyze with latest (v${current.version})` : 'Analyze with this rubric'}
       </Button></>}
     />
+    <LifecycleBanner target={{ kind: 'rubric', id: rubric.groupId }} />
     <div className="detail-metadata">
       <Badge tone="accent">{rubric.kind === 'grade' ? 'Grade rubric' : 'Job rubric'}</Badge>
+      <ArchivedBadge target={{ kind: 'rubric', id: rubric.groupId }} />
       {rubric.ladder && <span>{rubric.ladder}</span>}
       {(rubric.grade ?? job?.grade) && <span>{rubric.grade ?? job?.grade}</span>}
       <span>Version {rubric.version}</span>
@@ -262,7 +282,7 @@ function RubricDetail({ id }: { id: string }) {
         <RubricPanel
           key={rubric.id}
           rubric={rubric}
-          readOnly={historic}
+          readOnly={historic || !canEdit}
           onSelectCriterion={(criterion, citation) => setSourceSelection({ criterion, citation })}
           onVersionSaved={(savedId) => navigate(`/rubrics/${savedId}${job ? `?job=${encodeURIComponent(job.id)}` : ''}`)}
         />
@@ -277,7 +297,7 @@ function RubricDetail({ id }: { id: string }) {
                 <div><dt className="mb-1 text-[10px] text-muted">Grade family</dt><dd>{rubric.ladder || 'Not specified'}</dd></div>
                 <div><dt className="mb-1 text-[10px] text-muted">Grade</dt><dd>{rubric.grade || 'Not specified'}</dd></div>
               </> : <>
-                <div><dt className="mb-1 text-[10px] text-muted">Linked job</dt><dd>{job ? <Link to={`/jobs/${job.id}`} className="link-button">{job.title}</Link> : 'Job unavailable'}</dd></div>
+                <div><dt className="mb-1 text-[10px] text-muted">Linked job</dt><dd>{job ? <><Link to={`/jobs/${job.id}`} className="link-button">{job.title}</Link> <ArchivedBadge target={{ kind: 'job', id: job.id }} /></> : 'Job unavailable'}</dd></div>
                 <div><dt className="mb-1 text-[10px] text-muted">Source label</dt><dd className="break-words">{job?.sourceLabel || 'Source label unavailable'}</dd></div>
                 <div><dt className="mb-1 text-[10px] text-muted">Reference content</dt><dd>{document ? document.sample ? 'Fictional sample document' : 'Actual private source document' : rubric.dataKind === 'real' && realDetail?.state === 'loading' ? 'Loading private source' : 'Source document unavailable'}</dd></div>
               </>}

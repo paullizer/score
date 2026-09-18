@@ -1,15 +1,19 @@
 import { createHash } from 'node:crypto'
 import express, { type NextFunction, type Request, type RequestHandler, type Response, type Router } from 'express'
 import ipaddr from 'ipaddr.js'
-import type { RealJobDetail, RealJobRecord, RealJobSummary } from '../../src/domain/real-jobs'
+import type { RealJobDetail, RealJobRecord, RealJobSummary, VersionedRealJob } from '../../src/domain/real-jobs'
 import { JOB_IMPORT_LIMITS } from '../../src/domain/real-jobs'
 import type { Job, Rubric, SourceDocument } from '../../src/domain/types'
 import type { AuthenticatedPrincipal } from '../auth'
 import { conflict, invalidRequest, notFound, preconditionRequired, unavailable } from '../errors'
 import { getPrincipal } from '../request-context'
 import type { WorkspaceRepository } from '../repository'
+import type { LifecycleDependencies } from '../lifecycle/contracts'
+import { assertWorkspaceMutationLease } from '../lifecycle/lease'
 import { StoreConflictError } from '../store'
-import type { JobBlobStore, RealJobStore } from './store'
+import type { JobBlobStore, JobLifecycleScope, RealJobStore } from './store'
+import { assertJobWritable, putJobBlob } from './guards'
+import { JobCleanupPendingError, jobLifecycleImpact, purgeJob, purgeJobRubric, requireJobLifecycle } from './lifecycle'
 import {
   isValidJobId,
   isUuid,
@@ -23,10 +27,11 @@ export interface RealJobsDeps {
   readonly blobs: JobBlobStore
 }
 
-interface RealJobsRouterDeps {
+export interface RealJobsRouterDeps {
   readonly repository: WorkspaceRepository
   readonly jobs?: RealJobsDeps
   readonly now?: () => Date
+  readonly lifecycle?: LifecycleDependencies
 }
 
 interface AuthorizedRequest extends Request {
@@ -183,25 +188,53 @@ function requireJobs(jobs: RealJobsDeps | undefined): RealJobsDeps {
   return jobs
 }
 
-async function summary(store: RealJobStore, value: Awaited<ReturnType<RealJobStore['get']>>): Promise<RealJobSummary> {
-  if (!value) throw notFound('The requested job was not found.')
-  const rubric = value.record.job.rubricId
-    ? await store.getRubric(value.record.workspaceId, value.record.job.rubricId)
-    : undefined
+function requireEtag(req: Request): string {
+  const etag = req.header('if-match')
+  if (!etag) throw preconditionRequired()
+  if (etag === '*' || etag.startsWith('W/') || etag.includes(',')) {
+    throw invalidRequest('If-Match must be exactly the current job etag.')
+  }
+  return etag
+}
+
+function lifecycleScope(value: unknown): JobLifecycleScope {
+  if (value !== 'job' && value !== 'rubric') throw invalidRequest('scope must be job or rubric.')
+  return value
+}
+
+async function requireMutableWorkspace(store: RealJobStore, workspaceId: string): Promise<void> {
+  if (!store.getWorkspaceLifecycle) throw unavailable('Job workspace lifecycle fencing is unavailable.')
+  if ((await store.getWorkspaceLifecycle(workspaceId)).state !== 'active') {
+    throw conflict('This workspace is archived or removed.')
+  }
+}
+
+function summaryMetadata(value: VersionedRealJob, rubric: Rubric | null = null): RealJobSummary {
   return {
     job: value.record.job,
     source: value.record.source,
-    rubric: rubric ?? null,
+    rubric,
     etag: value.etag,
     updatedAt: value.record.updatedAt,
     attempts: value.record.attempts,
     ...(value.record.error ? { error: value.record.error } : {}),
     warnings: value.record.warnings,
+    ...(value.record.lifecycle ? { lifecycle: value.record.lifecycle } : {}),
+    ...(value.record.rubricLifecycle ? { rubricLifecycle: value.record.rubricLifecycle } : {}),
   }
 }
 
+async function summary(store: RealJobStore, value: Awaited<ReturnType<RealJobStore['get']>>): Promise<RealJobSummary> {
+  if (!value) throw notFound('The requested job was not found.')
+  const rubric = value.record.job.rubricId && !value.record.lifecycle?.deletingAt && !value.record.lifecycle?.deletedAt &&
+    !value.record.rubricLifecycle?.deletingAt && !value.record.rubricLifecycle?.deletedAt
+    ? await store.getRubric(value.record.workspaceId, value.record.job.rubricId)
+    : undefined
+  return summaryMetadata(value, rubric ?? null)
+}
+
 async function readDocument(blobs: JobBlobStore, record: RealJobRecord): Promise<SourceDocument | null> {
-  if (!record.extractedBlobName) return null
+  if (!record.extractedBlobName || record.lifecycle?.deletingAt || record.lifecycle?.deletedAt) return null
   const blob = await blobs.read(record.extractedBlobName)
   if (!blob) throw unavailable('The extracted job document is temporarily unavailable.')
   if (blob.contentType !== 'application/json') throw unavailable('The extracted job document has invalid metadata.')
@@ -223,12 +256,13 @@ async function detail(jobs: RealJobsDeps, value: Awaited<ReturnType<RealJobStore
   const [base, document, rubricVersions] = await Promise.all([
     summary(jobs.store, value),
     readDocument(jobs.blobs, value.record),
-    jobs.store.listRubrics(value.record.workspaceId, value.record.id),
+    value.record.lifecycle?.deletingAt || value.record.rubricLifecycle?.deletingAt || value.record.rubricLifecycle?.deletedAt
+      ? Promise.resolve([]) : jobs.store.listRubrics(value.record.workspaceId, value.record.id),
   ])
   return { ...base, document, rubricVersions }
 }
 
-function authorize(repository: WorkspaceRepository, access: 'read' | 'write'): RequestHandler {
+function authorize(repository: WorkspaceRepository, access: 'read' | 'write' | 'manage'): RequestHandler {
   return async (req, _res, next) => {
     try {
       await repository.authorizeWorkspace(getPrincipal(req), pathParam(req, 'workspaceId'), access)
@@ -253,6 +287,7 @@ function available(jobs: RealJobsDeps | undefined): RequestHandler {
 
 async function replaceOrConflict(store: RealJobStore, record: RealJobRecord, etag: string) {
   try {
+    assertWorkspaceMutationLease(record.workspaceId)
     return await store.replace(record, etag)
   } catch (error) {
     if (error instanceof StoreConflictError) throw conflict('This job changed since you last loaded it.')
@@ -272,17 +307,24 @@ function attachmentHeader(filename: string): string {
   return `attachment; filename="${fallback}"; filename*=UTF-8''${encodeURIComponent(filename)}`
 }
 
-function asyncHandler(
-  handler: (req: Request, res: Response, next: NextFunction) => Promise<void>,
-): RequestHandler {
+type AsyncJobHandler = (req: Request, res: Response, next: NextFunction) => Promise<void>
+
+function asyncHandler(handler: AsyncJobHandler): RequestHandler {
   return (req, res, next) => {
-    void handler(req, res, next).catch(next)
+    void handler(req, res, next).catch(error => {
+      next(error instanceof StoreConflictError ? conflict(error.message) : error)
+    })
   }
 }
 
 export function createRealJobsRouter(deps: RealJobsRouterDeps): Router {
   const router = express.Router()
   const clock = deps.now ?? (() => new Date())
+  const mutation = (access: 'write' | 'manage', handler: AsyncJobHandler): RequestHandler => asyncHandler(
+    (req, res, next) => deps.repository.withWorkspaceMutation(
+      getPrincipal(req), pathParam(req, 'workspaceId'), access, () => handler(req, res, next),
+    ),
+  )
 
   const base = '/workspaces/:workspaceId/jobs'
 
@@ -298,12 +340,89 @@ export function createRealJobsRouter(deps: RealJobsRouterDeps): Router {
     res.json(await detail(jobs, await jobs.store.get(pathParam(req, 'workspaceId'), jobParam(req))))
   }))
 
+  router.get(`${base}/:jobId/lifecycle`, authorize(deps.repository, 'manage'), asyncHandler(async (req, res) => {
+    const jobs = requireJobs(deps.jobs)
+    const scope = lifecycleScope(req.query.scope ?? 'job')
+    const current = await jobs.store.get(pathParam(req, 'workspaceId'), jobParam(req))
+    if (!current) throw notFound('The requested job was not found.')
+    res.json({ impact: await jobLifecycleImpact(jobs, current, scope, deps.lifecycle) })
+  }))
+
+  router.post(`${base}/:jobId/lifecycle`, authorize(deps.repository, 'manage'), mutation('manage', async (req, res) => {
+    const jobs = requireJobs(deps.jobs)
+    requireJobLifecycle(jobs)
+    const expectedEtag = requireEtag(req)
+    const body = bodyRecord(req.body, ['action', 'scope'])
+    const scope = lifecycleScope(body.scope)
+    const action = body.action
+    if (action !== 'archive' && action !== 'unarchive' && action !== 'delete') {
+      throw invalidRequest('action must be archive, unarchive, or delete.')
+    }
+    const workspaceId = pathParam(req, 'workspaceId')
+    const jobId = jobParam(req)
+    const current = await jobs.store.get(workspaceId, jobId)
+    if (!current) throw notFound('The requested job was not found.')
+    if (current.etag !== expectedEtag) throw conflict('This job changed since you last loaded it.')
+    if (action === 'delete') {
+      const impact = await jobLifecycleImpact(jobs, current, scope, deps.lifecycle)
+      if (impact.blockers.length) {
+        res.status(409).json({
+          error: { code: 'conflict', message: 'Delete the linked analyses or seed ladders before deleting this item.' },
+          impact,
+        })
+        return
+      }
+      if (scope === 'rubric' && current.record.rubricLifecycle?.deletedAt) {
+        res.json({ job: await detail(jobs, current) })
+        return
+      }
+    }
+    const timestamp = clock().toISOString()
+    assertWorkspaceMutationLease(workspaceId)
+    const updated = await jobs.store.transitionLifecycle(workspaceId, jobId, expectedEtag, scope, action, timestamp)
+    if (action !== 'delete') {
+      res.json({ job: await detail(jobs, updated) })
+      return
+    }
+    try {
+      if (scope === 'job') {
+        await purgeJob(jobs, updated, timestamp)
+        res.json({ deleted: true })
+      } else {
+        res.json({ job: await detail(jobs, await purgeJobRubric(jobs, updated, timestamp)) })
+      }
+    } catch (error) {
+      const pending = error instanceof JobCleanupPendingError
+      if (!pending) console.error('Job lifecycle cleanup incomplete:', {
+        workspaceId, jobId, scope, name: error instanceof Error ? error.name : 'UnknownError',
+      })
+      const latest = await jobs.store.get(workspaceId, jobId).catch(() => updated) ?? updated
+      const responseJob = await detail(jobs, latest).catch(() => ({
+        ...summaryMetadata(latest), document: null, rubricVersions: [],
+      }))
+      const operation = {
+        id: `${scope}-delete:${jobId}`,
+        action: 'delete',
+        status: pending ? 'pending' : 'failed',
+        updatedAt: timestamp,
+        error: pending ? error.message : 'Cleanup did not complete. This item remains locked; retry deletion to finish it.',
+        ...(pending ? { retryAt: error.retryAt } : {}),
+      }
+      if (pending) res.setHeader('Retry-After', Math.max(1, Math.ceil((Date.parse(error.retryAt) - Date.now()) / 1000)))
+      res.status(202).json({
+        job: responseJob,
+        operation,
+        ...(!pending ? { error: { code: 'unavailable', message: operation.error } } : {}),
+      })
+    }
+  }))
+
   router.post(
     `${base}/pdf`,
     authorize(deps.repository, 'write'),
     available(deps.jobs),
     express.raw({ type: 'application/pdf', limit: JOB_IMPORT_LIMITS.maxPdfBytes }),
-    asyncHandler(async (req, res) => {
+    mutation('write', async (req, res) => {
       const jobs = requireJobs(deps.jobs)
       if (!req.is('application/pdf') || !Buffer.isBuffer(req.body)) throw invalidRequest('Content-Type must be application/pdf.')
       const filename = decodeFilename(req.header('x-file-name'))
@@ -321,7 +440,15 @@ export function createRealJobsRouter(deps: RealJobsRouterDeps): Router {
       const blobName = originalBlobName(workspaceId, jobId, 'pdf')
       const batch = batchId ?? ''
       const fingerprint = inputFingerprint('pdf', [filename, batch, hash(bytes)])
-      const sourceBlob = await jobs.blobs.putImmutable(blobName, bytes, 'application/pdf')
+      await requireMutableWorkspace(jobs.store, workspaceId)
+      const existing = await jobs.store.get(workspaceId, jobId)
+      if (existing) {
+        assertJobWritable(existing.record)
+        if (existing.record.inputFingerprint !== fingerprint) throw conflict('This idempotency key was already used for different input.')
+        res.json({ job: await summary(jobs.store, existing) })
+        return
+      }
+      const sourceBlob = await putJobBlob(jobs.store, jobs.blobs, workspaceId, jobId, blobName, bytes, 'application/pdf')
       if (sourceBlob.blob.sha256 !== hash(bytes) || sourceBlob.blob.contentType !== 'application/pdf') {
         throw conflict('This idempotency key was already used for different input.')
       }
@@ -348,6 +475,7 @@ export function createRealJobsRouter(deps: RealJobsRouterDeps): Router {
         nextAttemptAt: timestamp,
         warnings: [],
       }
+      assertWorkspaceMutationLease(workspaceId)
       const created = await jobs.store.create(record)
       if (!created.created && created.value.record.inputFingerprint !== fingerprint) {
         throw conflict('This idempotency key was already used for different input.')
@@ -356,7 +484,7 @@ export function createRealJobsRouter(deps: RealJobsRouterDeps): Router {
     }),
   )
 
-  router.post(`${base}/url`, authorize(deps.repository, 'write'), asyncHandler(async (req, res) => {
+  router.post(`${base}/url`, authorize(deps.repository, 'write'), mutation('write', async (req, res) => {
     const jobs = requireJobs(deps.jobs)
     const body = bodyRecord(req.body, ['url', 'batchId'])
     const url = validatePublicUrl(body.url)
@@ -365,6 +493,7 @@ export function createRealJobsRouter(deps: RealJobsRouterDeps): Router {
     const fingerprint = inputFingerprint('url', [url, batchId ?? ''])
     const workspaceId = pathParam(req, 'workspaceId')
     const jobId = `job-${key}`
+    await requireMutableWorkspace(jobs.store, workspaceId)
     const timestamp = clock().toISOString()
     const principal = (req as AuthorizedRequest).authorizedPrincipal
     const record: RealJobRecord = {
@@ -380,6 +509,7 @@ export function createRealJobsRouter(deps: RealJobsRouterDeps): Router {
       nextAttemptAt: timestamp,
       warnings: [],
     }
+    assertWorkspaceMutationLease(workspaceId)
     const created = await jobs.store.create(record)
     if (!created.created && created.value.record.inputFingerprint !== fingerprint) {
       throw conflict('This idempotency key was already used for different input.')
@@ -387,10 +517,12 @@ export function createRealJobsRouter(deps: RealJobsRouterDeps): Router {
     res.status(created.created ? 202 : 200).json({ job: await summary(jobs.store, created.value) })
   }))
 
-  router.post(`${base}/:jobId/retry`, authorize(deps.repository, 'write'), asyncHandler(async (req, res) => {
+  router.post(`${base}/:jobId/retry`, authorize(deps.repository, 'write'), mutation('write', async (req, res) => {
     const jobs = requireJobs(deps.jobs)
     const current = await jobs.store.get(pathParam(req, 'workspaceId'), jobParam(req))
     if (!current) throw notFound('The requested job was not found.')
+    await requireMutableWorkspace(jobs.store, current.record.workspaceId)
+    assertJobWritable(current.record)
     if (current.record.job.status !== 'error' && current.record.job.status !== 'cancelled') {
       throw conflict('Only failed or cancelled jobs can be retried.')
     }
@@ -408,10 +540,12 @@ export function createRealJobsRouter(deps: RealJobsRouterDeps): Router {
     res.json({ job: await summary(jobs.store, updated) })
   }))
 
-  router.post(`${base}/:jobId/cancel`, authorize(deps.repository, 'write'), asyncHandler(async (req, res) => {
+  router.post(`${base}/:jobId/cancel`, authorize(deps.repository, 'write'), mutation('write', async (req, res) => {
     const jobs = requireJobs(deps.jobs)
     const current = await jobs.store.get(pathParam(req, 'workspaceId'), jobParam(req))
     if (!current) throw notFound('The requested job was not found.')
+    await requireMutableWorkspace(jobs.store, current.record.workspaceId)
+    assertJobWritable(current.record)
     if (current.record.job.status === 'cancelled') {
       res.json({ job: await summary(jobs.store, current) })
       return
@@ -430,17 +564,17 @@ export function createRealJobsRouter(deps: RealJobsRouterDeps): Router {
     res.json({ job: await summary(jobs.store, updated) })
   }))
 
-  router.put(`${base}/:jobId/rubric`, authorize(deps.repository, 'write'), asyncHandler(async (req, res) => {
+  router.put(`${base}/:jobId/rubric`, authorize(deps.repository, 'write'), mutation('write', async (req, res) => {
     const jobs = requireJobs(deps.jobs)
-    const expectedEtag = req.header('if-match')
-    if (!expectedEtag) throw preconditionRequired()
-    if (expectedEtag === '*') throw invalidRequest('Wildcard If-Match is not accepted; provide the current job etag.')
+    const expectedEtag = requireEtag(req)
     const body = bodyRecord(req.body, ['rubric'])
     if (typeof body.rubric !== 'object' || body.rubric === null || Array.isArray(body.rubric)) {
       throw invalidRequest('rubric must be an object.')
     }
     const current = await jobs.store.get(pathParam(req, 'workspaceId'), jobParam(req))
     if (!current) throw notFound('The requested job was not found.')
+    await requireMutableWorkspace(jobs.store, current.record.workspaceId)
+    assertJobWritable(current.record)
     if (current.etag !== expectedEtag) throw conflict('This job changed since you last loaded it.')
     if (current.record.job.status !== 'ready' || !current.record.job.rubricId) {
       throw conflict('Only ready jobs have an editable rubric.')
@@ -476,6 +610,7 @@ export function createRealJobsRouter(deps: RealJobsRouterDeps): Router {
     const replacement: RealJobRecord = { ...current.record, updatedAt: timestamp }
     let updated
     try {
+      assertWorkspaceMutationLease(current.record.workspaceId)
       updated = await jobs.store.publish(replacement, expectedEtag, rubric)
     } catch (error) {
       if (error instanceof StoreConflictError) throw conflict('This job or rubric changed since you last loaded it.')
@@ -488,6 +623,7 @@ export function createRealJobsRouter(deps: RealJobsRouterDeps): Router {
     const jobs = requireJobs(deps.jobs)
     const current = await jobs.store.get(pathParam(req, 'workspaceId'), jobParam(req))
     if (!current) throw notFound('The requested job was not found.')
+    if (current.record.lifecycle?.deletingAt || current.record.lifecycle?.deletedAt) throw notFound('This job source has been removed.')
     const blobName = current.record.source.originalBlobName
     if (!blobName) throw notFound('The original source is not available yet.')
     const blob = await jobs.blobs.read(blobName)

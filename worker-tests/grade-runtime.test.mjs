@@ -6,6 +6,7 @@ import { pathToFileURL } from 'node:url'
 import { after, before, test } from 'node:test'
 import { build } from 'esbuild'
 import { PDFDocument } from 'pdf-lib'
+import { installGradeLifecycleFake, installGradeBlobLifecycleFake, gradeLifecycleTesting } from '../server-tests/grade-lifecycle-fakes.mjs'
 
 let runtime
 let StoreConflictError
@@ -96,12 +97,12 @@ function fakeStore(initial) {
     values() { return [...records.values()].map(value => structuredClone(value.record)) },
   }
   initial.forEach(record => store.set(record))
-  return store
+  return installGradeLifecycleFake(store, { values: records, remove: (_workspaceId, id) => records.delete(id), StoreConflictError })
 }
 
 function fakeBlobs() {
   const values = new Map()
-  return {
+  return installGradeBlobLifecycleFake({
     values,
     async read(name) { return values.get(name) },
     async putImmutable(name, bytes, contentType) {
@@ -115,7 +116,7 @@ function fakeBlobs() {
       values.set(name, blob)
       return { created: true, blob }
     },
-  }
+  })
 }
 
 function fixture(input = { kind: 'extract-source', sourceId, documentVersion: 1 }) {
@@ -591,4 +592,134 @@ test('an immutable-store conflict returning existing bytes cannot publish a diff
   assert.equal(source.status, 'error')
   assert.equal(source.error.code, 'immutable-grade-artifact-conflict')
   assert.equal(JSON.parse(Buffer.from(f.blobs.values.get(documentName).bytes).toString()).title, 'Preserved original extraction')
+})
+
+test('workspace lifecycle guards fence claims before cancellation and restoring never restarts queued work', async () => {
+  const f = fixture()
+  const participant = gradeLifecycleTesting.createGradeLifecycleParticipant(f.deps)
+  await participant.setState(wid, 'archived', now)
+  const guarded = await runtime.runGradeWorker(f.deps)
+  assert.equal(guarded.claimed, 0)
+  assert.equal((await f.store.get(wid, workId)).record.status, 'queued')
+  assert.equal(f.blobs.values.size, 0)
+  await participant.cancel(wid, now)
+  assert.equal((await f.store.get(wid, workId)).record.status, 'cancelled')
+  assert.equal((await f.store.get(wid, lid)).record.lifecycle, undefined)
+  assert.equal((await f.store.get(wid, headId(9))).record.lifecycle, undefined)
+  await participant.setState(wid, 'active', now)
+  assert.equal((await runtime.runGradeWorker(f.deps)).claimed, 0)
+})
+
+test('archiving a family during extraction rejects late output while retaining captured originals and immutable source sets', async () => {
+  const f = fixture()
+  const lifecycle = new gradeLifecycleTesting.GradeLifecycleService(f.deps, { impact: async () => [] }, () => new Date(now))
+  const originalSet = structuredClone(f.sourceSet)
+  f.deps.extractReference = async () => {
+    const root = await f.store.get(wid, lid)
+    assert.deepEqual(await lifecycle.change(wid, lid, 'archive', root.etag), {})
+    return { document: f.document, method: 'html', extractionVersion: 'test', links: [], warnings: [] }
+  }
+  const result = await runtime.runGradeWorker(f.deps)
+  assert.equal(result.cancelled, 1)
+  assert.equal((await f.store.get(wid, workId)).record.status, 'cancelled')
+  assert.equal((await f.store.get(wid, sourceId)).record.status, 'cancelled')
+  assert.equal(await f.blobs.read(`${wid}/${lid}/${sourceId}/document-v1.json`), undefined)
+  assert.ok(await f.blobs.read(`${wid}/${lid}/${sourceId}/original.html`))
+  assert.deepEqual((await f.store.get(wid, setId)).record, originalSet)
+})
+
+test('archiving one logical grade rejects its late review without cancelling its sibling or shared planning', async () => {
+  const f = fixture()
+  const version = await prepareVersion(f)
+  const siblingId = 'grade-work-f2b18d43-b034-4f5d-8d43-6b7ac9801060'
+  const sibling = { ...f.work, id: siblingId, input: {
+    kind: 'generate-grade', sourceSetId: setId, generationId, competencyPlanId: planId, grade: 11,
+  } }
+  f.store.set(sibling)
+  const lifecycle = new gradeLifecycleTesting.GradeLifecycleService(f.deps, { impact: async () => [] }, () => new Date(now))
+  f.deps.reviewGrade = async () => {
+    const head = await f.store.get(wid, headId(9))
+    assert.deepEqual(await lifecycle.change(wid, lid, 'archive', head.etag, 9), {})
+    return { outcome: 'supported', issues: [], model: 'test', promptVersion: 'test' }
+  }
+  const result = await runtime.runGradeWorker(f.deps, { maxItems: 1 })
+  assert.equal(result.cancelled, 1)
+  assert.equal((await f.store.get(wid, siblingId)).record.status, 'queued')
+  assert.equal((await f.store.get(wid, headId(11))).record.lifecycle, undefined)
+  const head = await f.store.get(wid, headId(9))
+  assert.ok(head.record.lifecycle.archivedAt)
+  assert.equal(head.record.latestVersionId, version.id)
+  assert.equal(head.record.latestReviewId, undefined)
+  assert.deepEqual((await f.store.get(wid, version.id)).record, version)
+  assert.equal(f.store.values().filter(record => record.recordType === 'grade-review').length, 0)
+  await lifecycle.change(wid, lid, 'unarchive', head.etag, 9)
+  assert.equal((await f.store.get(wid, workId)).record.status, 'cancelled')
+})
+
+for (const action of ['archive', 'delete']) {
+  test(`shared planning skips an independently ${action === 'archive' ? 'archived' : 'deleted'} head and continues its sibling`, async () => {
+    const f = fixture({ kind: 'plan-competencies', sourceSetId: setId, generationId })
+    await f.blobs.putImmutable(f.sourceSet.sources[0].documentBlobName, bytesOf(f.document), 'application/json')
+    await f.blobs.putImmutable(f.ladder.seedBlobName, bytesOf({
+      job: { id: f.ladder.seedJobId }, rubric: { id: f.ladder.seedRubricId, version: 1 },
+      document: f.document, source: {}, capturedAt: now,
+    }), 'application/json')
+    const lifecycle = new gradeLifecycleTesting.GradeLifecycleService(f.deps, { impact: async () => [] }, () => new Date(now))
+    const head = await f.store.get(wid, headId(9))
+    assert.deepEqual(await lifecycle.change(wid, lid, action, head.etag, 9), {})
+    const before = structuredClone((await f.store.get(wid, headId(9))).record)
+    const result = await runtime.runGradeWorker(f.deps, { maxItems: 1 })
+    assert.equal(result.succeeded, 1)
+    const drafts = f.store.values().filter(record => record.recordType === 'grade-work' && record.input.kind === 'generate-grade')
+    assert.deepEqual(drafts.map(record => record.input.grade), [11])
+    assert.deepEqual((await f.store.get(wid, headId(9))).record, before)
+  })
+}
+
+test('deleting a grade during generation removes its owned work and no delayed model result can recreate a version', async () => {
+  const f = fixture({ kind: 'generate-grade', sourceSetId: setId, generationId, competencyPlanId: planId, grade: 9 })
+  await f.blobs.putImmutable(f.sourceSet.sources[0].documentBlobName, bytesOf(f.document), 'application/json')
+  f.store.set({ ...base(planId), recordType: 'grade-competency-plan', ladderId: lid, sourceSetId: setId, generationId,
+    competencies: [{ id: 'analysis', label: 'Analysis', description: 'Analyze assigned work', seedCriterionIds: [], citations: [] }],
+    issues: [], model: 'test', promptVersion: 'test' })
+  const lifecycle = new gradeLifecycleTesting.GradeLifecycleService(f.deps, { impact: async () => [] }, () => new Date(now))
+  f.deps.draftGrade = async input => {
+    const head = await f.store.get(wid, headId(9))
+    assert.deepEqual(await lifecycle.change(wid, lid, 'delete', head.etag, 9), {})
+    return {
+      rubric: { id: input.versionId, groupId: headId(9), kind: 'grade', dataKind: 'real', ladder: f.ladder.name, grade: 'GS-9',
+        name: 'Late grade draft', description: 'Must not be published.', version: input.version, createdAt: input.createdAt,
+        criteria: [], provenance: { kind: 'generated', model: 'test', promptVersion: 'test' } },
+      qualifications: [], issues: [],
+    }
+  }
+  const result = await runtime.runGradeWorker(f.deps)
+  assert.equal(result.cancelled, 1)
+  assert.equal(await f.store.get(wid, workId), undefined)
+  const head = (await f.store.get(wid, headId(9))).record
+  assert.ok(head.lifecycle.deletedAt)
+  assert.equal(head.latestVersionId, undefined)
+  assert.equal(head.generationId, undefined)
+  assert.equal(f.store.values().filter(record => record.recordType === 'grade-version').length, 0)
+  assert.ok(await f.store.get(wid, planId))
+  assert.equal((await f.store.get(wid, headId(11))).record.status, 'queued')
+  assert.equal((await runtime.runGradeWorker(f.deps)).claimed, 0)
+})
+
+test('a document upload completing across an archive fence removes its late bytes rather than publishing them', async () => {
+  const f = fixture()
+  const lifecycle = new gradeLifecycleTesting.GradeLifecycleService(f.deps, { impact: async () => [] }, () => new Date(now))
+  const put = f.blobs.putImmutable
+  const documentName = `${wid}/${lid}/${sourceId}/document-v1.json`
+  f.blobs.putImmutable = async (...args) => {
+    if (args[0] === documentName) {
+      const root = await f.store.get(wid, lid)
+      await lifecycle.change(wid, lid, 'archive', root.etag)
+    }
+    return put(...args)
+  }
+  assert.equal((await runtime.runGradeWorker(f.deps)).cancelled, 1)
+  assert.equal(await f.blobs.read(documentName), undefined)
+  assert.ok(await f.blobs.read(`${wid}/${lid}/${sourceId}/original.html`))
+  assert.equal((await f.store.get(wid, workId)).record.status, 'cancelled')
 })

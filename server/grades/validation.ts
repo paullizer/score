@@ -75,6 +75,10 @@ const relatedLink = z.strictObject({
 const base = {
   id: identifier, workspaceId: z.string().regex(WORKSPACE_ID_PATTERN), createdAt: timestamp, updatedAt: timestamp,
 }
+const lifecycle = z.strictObject({
+  archivedAt: timestamp.optional(), deletingAt: timestamp.optional(), deletedAt: timestamp.optional(),
+  parentKey: z.string().min(1).max(240).optional(),
+})
 const child = { ...base, ladderId: id('ladder') }
 const blobName = z.string().max(700).refine(isSafeGradeBlobName, 'Invalid grade blob name.')
 const provenance = z.strictObject({
@@ -114,6 +118,7 @@ const frozenSource = z.strictObject({
 })
 const ladderSchema = z.strictObject({
   ...base, id: id('ladder'), recordType: z.literal('grade-ladder'),
+  lifecycle: lifecycle.optional(),
   name: text(160), context: gradeContextSchema, grades,
   seedJobId: id('job'), seedRubricId: identifier, seedRubricVersion: integer, seedJobTitle: text(500),
   seedBlobName: blobName, sourceIds: z.array(sourceId).min(1).max(LIMITS.maxSources + 1).refine(unique),
@@ -179,6 +184,7 @@ const approvalSchema = z.strictObject({
 })
 const headSchema = z.strictObject({
   ...child, recordType: z.literal('grade-head'), grade,
+  lifecycle: lifecycle.optional(),
   status: z.enum(['draft', 'queued', 'processing', 'needs-sources', 'ready-for-review', 'approved', 'error', 'cancelled']),
   generationId: identifier.optional(), sourceSetId: id('source-set').optional(),
   latestVersionId: id('grade-version').optional(), latestReviewId: id('grade-review').optional(),
@@ -230,6 +236,9 @@ export const editGradeInputSchema = z.strictObject({
 })
 export const approveGradeInputSchema = z.strictObject({ versionId: id('grade-version'), reviewId: id('grade-review') })
 export const emptyGradeInputSchema = z.strictObject({})
+export const gradeLifecycleInputSchema = z.strictObject({
+  action: z.enum(['archive', 'unarchive', 'delete']), grade: grade.optional(),
+})
 
 export const MAX_GRADE_RECORD_BYTES = 512 * 1024
 export const MUTABLE_GRADE_TYPES = new Set<GradeEntity['recordType']>([
@@ -377,6 +386,11 @@ export function parseGradeEntity(value: unknown): GradeEntity {
     assert(Boolean(record.approvalId) === Boolean(record.approvedVersionId), 'Approval pointers must be paired.')
     if (record.status === 'approved') assert(record.approvalId && record.latestVersionId === record.approvedVersionId,
       'An approved head must identify its approved latest version.')
+    if (record.lifecycle?.deletedAt && !record.lifecycle.deletingAt) {
+      assert(record.status === 'draft' && !record.generationId && !record.sourceSetId && !record.latestVersionId &&
+        !record.latestReviewId && !record.approvalId && !record.approvedVersionId && !record.error && !record.issues.length,
+      'A removed grade rubric must be an explicit empty slot without historical pointers or content.')
+    }
   }
   if (record.recordType === 'grade-source') {
     assertSourceAuthority(record)

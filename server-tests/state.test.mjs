@@ -97,14 +97,16 @@ test('PUT state succeeds with the current etag, returns a new etag, and GET refl
     const workspace = await bootstrapWorkspace(server)
     const initial = await (await getState(server, workspace.id)).json()
 
-    const response = await putState(server, workspace.id, sampleWorkspaceBody(), initial.etag)
+    const edited = structuredClone(initial.workspace)
+    edited.jobs[0].title = 'Saved title change'
+    const response = await putState(server, workspace.id, edited, initial.etag)
     assert.equal(response.status, 200)
     const result = await response.json()
     assert.notEqual(result.etag, initial.etag)
     assert.equal(response.headers.get('etag'), result.etag)
 
     const after = await (await getState(server, workspace.id)).json()
-    assert.deepEqual(after.workspace, sampleWorkspaceBody())
+    assert.deepEqual(after.workspace, edited)
     assert.equal(after.etag, result.etag)
   } finally {
     await server.close()
@@ -139,7 +141,10 @@ test('The server never auto-recovers interrupted work on a plain GET (that is a 
     const workspace = await bootstrapWorkspace(server)
     const before = await (await getState(server, workspace.id)).json()
 
-    const put = await putState(server, workspace.id, workspaceWithParsingJob(), before.etag)
+    const incoming = workspaceWithParsingJob()
+    const next = { ...before.workspace, jobs: [...incoming.jobs, ...before.workspace.jobs],
+      documents: [...before.workspace.documents, ...incoming.documents] }
+    const put = await putState(server, workspace.id, next, before.etag)
     assert.equal(put.status, 200)
 
     const after = await (await getState(server, workspace.id)).json()
@@ -164,11 +169,21 @@ test('Viewers can read state but cannot write it; editors can do both', async ()
 
     // Promote to editor and confirm write access now works.
     server.directory._addMembership(workspace.id, membershipFor(workspace.id, { oid: OTHER_ALLOWED_OID, role: 'editor' }))
-    const editorPut = await putState(server, workspace.id, sampleWorkspaceBody(), viewerBody.etag, OTHER_ALLOWED_OID)
+    const editorPut = await putState(server, workspace.id, viewerBody.workspace, viewerBody.etag, OTHER_ALLOWED_OID)
     assert.equal(editorPut.status, 200)
   } finally {
     await server.close()
   }
+})
+
+test('whole-state saves cannot silently remove library records without lifecycle deletion bookkeeping', async () => {
+  const server = await startTestServer()
+  try {
+    const workspace = await bootstrapWorkspace(server)
+    const before = await (await getState(server, workspace.id)).json()
+    assert.equal((await putState(server, workspace.id, sampleWorkspaceBody(), before.etag)).status, 409)
+    assert.deepEqual((await (await getState(server, workspace.id)).json()).workspace, before.workspace)
+  } finally { await server.close() }
 })
 
 test('Corrupt or missing stored state surfaces as unavailable, never fabricated sample data', async () => {

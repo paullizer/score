@@ -24,6 +24,23 @@ export function CloudSaveBanner({ cloud }: { cloud: CloudWorkspaceStatus }) {
   const [confirmReload, setConfirmReload] = useState(false)
   const [confirmKeepMine, setConfirmKeepMine] = useState(false)
   const [busy, setBusy] = useState(false)
+  const [confirmLeave, setConfirmLeave] = useState(false)
+  const [leaveError, setLeaveError] = useState('')
+  const unavailable = cloud.workspaces.find((item) => item.id === cloud.currentWorkspaceId)?.deletedAt
+
+  if (unavailable) return <>
+    <div className="storage-banner" role="alert"><span>This workspace was deleted elsewhere. Unsaved changes remain in this tab, but cannot recreate deleted records.</span>
+      <Button size="sm" onClick={() => setConfirmLeave(true)}>Choose another workspace</Button></div>
+    <Modal open={confirmLeave} onOpenChange={(open) => { if (!busy) setConfirmLeave(open) }} title="Discard unsaved changes and leave?"
+      description="The deleted workspace cannot be restored. This explicitly discards sample changes kept only in this tab before opening the workspace picker."
+      footer={<><Button disabled={busy} onClick={() => setConfirmLeave(false)}>Keep this tab</Button><Button variant="danger" disabled={busy} onClick={() => {
+        setBusy(true); setLeaveError('')
+        void cloud.leaveUnavailableWorkspace().then((result) => { if (!result.ok) setLeaveError(result.message) }).catch((error) => setLeaveError(error instanceof Error ? error.message : 'The workspace could not be left.')).finally(() => setBusy(false))
+      }}>Discard local changes and leave</Button></>}>
+      <p>Saved server data in other workspaces is not affected. Unsaved real-grade edits still require their separate leave confirmation.</p>
+      {leaveError && <p role="alert">{leaveError}</p>}
+    </Modal>
+  </>
 
   if (cloud.saveState === 'error') return <div className="storage-banner" role="alert">
     <span>{cloud.saveError ?? 'This workspace could not be saved to the cloud.'}</span>
@@ -49,12 +66,12 @@ export function CloudSaveBanner({ cloud }: { cloud: CloudWorkspaceStatus }) {
       <p>Any jobs, resumes, rubrics, or analyses changed here since the conflict was detected will be lost. The other session's saved version will replace them.</p>
     </Modal>
     <Modal open={confirmKeepMine} onOpenChange={(open) => { if (!busy) setConfirmKeepMine(open) }} title="Overwrite with your changes?"
-      description="This saves exactly what you see here now, discarding whatever the other session saved in the meantime."
+      description="This replaces ordinary sample edits from another session. Archive and deletion decisions remain protected; removed content cannot be restored by overwriting."
       footer={<>
         <Button disabled={busy} onClick={() => setConfirmKeepMine(false)}>Cancel</Button>
         <Button variant="danger" disabled={busy} onClick={async () => { setBusy(true); await cloud.keepMineAndOverwrite(); setBusy(false); setConfirmKeepMine(false) }}>Overwrite with mine</Button>
       </>}>
-      <p>Whatever the other browser or device saved in the meantime will be replaced by this workspace's current content.</p>
+      <p>If another session archived or deleted content, reload the latest workspace instead. Score will keep your unsaved state in this tab and reject an overwrite that would resurrect removed records.</p>
     </Modal>
   </>
 }

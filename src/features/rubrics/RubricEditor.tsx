@@ -4,6 +4,8 @@ import { useWorkspace } from '../../app/workspace-context'
 import { Badge, Button, DemoNote, InlineError, Modal } from '../../components/ui'
 import type { Criterion, Rubric } from '../../domain/types'
 import { validateRubric } from '../../services/mockWorkspace'
+import { LifecycleBanner } from '../../components/lifecycle/LifecycleControls'
+import { useLifecycleAccess } from '../../components/lifecycle/useLifecycleAccess'
 
 export function RubricEditor({ rubric, onClose, onSaved }: {
   rubric: Rubric
@@ -11,6 +13,7 @@ export function RubricEditor({ rubric, onClose, onSaved }: {
   onSaved: (id: string) => void
 }) {
   const { workspace, saveRubric, cloud } = useWorkspace()
+  const { canEdit } = useLifecycleAccess({ kind: 'rubric', id: rubric.groupId })
   const [draft, setDraft] = useState<Rubric>(() => structuredClone(rubric))
   const [attempted, setAttempted] = useState(false)
   const [error, setError] = useState('')
@@ -72,7 +75,7 @@ export function RubricEditor({ rubric, onClose, onSaved }: {
 
   async function save(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
-    if (submitting.current) return
+    if (submitting.current || !canEdit) return
     setAttempted(true)
     setError('')
     if (errors.length) {
@@ -117,13 +120,14 @@ export function RubricEditor({ rubric, onClose, onSaved }: {
     footer={<>
       <span className="mr-auto text-[11px] text-muted">Weights must total 100%.</span>
       <Button onClick={onClose} disabled={saving}>Cancel</Button>
-      <Button type="submit" form={formId} icon={Save} variant="primary" disabled={saving}>
+      <Button type="submit" form={formId} icon={Save} variant="primary" disabled={saving || !canEdit}>
         {saving ? 'Saving…' : `Save version ${rubric.version + 1}`}
       </Button>
     </>}
   >
+    <LifecycleBanner target={{ kind: 'rubric', id: rubric.groupId }} />
     <form id={formId} onSubmit={save} noValidate aria-describedby={(attempted && errors.length > 0) || error ? errorsId : undefined}>
-      <div className="space-y-5">
+      <fieldset disabled={saving || !canEdit} className="space-y-5">
         <label className="field">
           <span className="field-label">Rubric name</span>
           <input
@@ -301,7 +305,7 @@ export function RubricEditor({ rubric, onClose, onSaved }: {
           </InlineError>}
           {error && <InlineError>{error}</InlineError>}
         </div>}
-      </div>
+      </fieldset>
     </form>
   </Modal>
 }

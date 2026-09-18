@@ -4,8 +4,9 @@ import { createServer } from 'node:http'
 import { mkdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { join, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
-import { build } from 'esbuild'
+import { build, stop } from 'esbuild'
 import { PDFDocument, StandardFonts } from 'pdf-lib'
+import { installGradeBlobLifecycleFake, installGradeLifecycleFake } from '../../server-tests/grade-lifecycle-fakes.mjs'
 
 export const tenantId = '228db43d-371a-49d8-864e-fa202d181ea5'
 export const userId = '1d6312bd-3eaa-4586-8b74-e90eee126f78'
@@ -33,6 +34,16 @@ export async function buildGradeTestRuntime({ browser = false } = {}) {
       entryPoints: [entry], outfile: join(directory, `${name}.mjs`), bundle: true, packages: 'external', platform: 'node',
       format: 'esm', jsx: 'automatic', define: { 'import.meta.env.VITE_DEPLOYMENT_MODE': '"cloud"' }, logLevel: 'silent',
     })))
+    await build({
+      entryPoints: [join('server-tests', 'job-lifecycle-fakes.mjs')], outfile: join(directory, 'job-fakes.mjs'), bundle: true,
+      packages: 'external', platform: 'node', format: 'esm', logLevel: 'silent',
+      plugins: [{
+        name: 'share-integration-server-errors',
+        setup(builder) {
+          builder.onResolve({ filter: /dist-server[/\\]app\.mjs$/ }, () => ({ path: pathToFileURL(join(directory, 'server.mjs')).href, external: true }))
+        },
+      }],
+    })
     if (browser) {
       await build({
         entryPoints: [join('src', 'main.tsx')], outfile: join(directory, 'browser.js'), bundle: true, platform: 'browser',
@@ -45,9 +56,17 @@ export async function buildGradeTestRuntime({ browser = false } = {}) {
       const html = (await readFile('index.html', 'utf8')).replace(/<script type="module" src="\/src\/main\.tsx"><\/script>/, '<link rel="stylesheet" href="/browser.css"><script type="module" src="/browser.js"></script>')
       await writeFile(join(directory, 'index.html'), html)
     }
-    const [api, client, jobsClient, fixtures] = await Promise.all(['server', 'client', 'jobs', 'fixtures'].map((name) => import(pathToFileURL(join(directory, `${name}.mjs`)).href)))
-    return { directory, api, client, jobsClient, fixtures, async close() { await rm(directory, { recursive: true, force: true }) } }
-  } catch (error) { await rm(directory, { recursive: true, force: true }); throw error }
+    const [api, client, jobsClient, fixtures, jobFakes] = await Promise.all(['server', 'client', 'jobs', 'fixtures', 'job-fakes'].map((name) => import(pathToFileURL(join(directory, `${name}.mjs`)).href)))
+    return { directory, api, client, jobsClient, fixtures, jobFakes, async close() {
+      try { stop() } finally { await rm(directory, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 }) }
+    } }
+  } catch (error) {
+    const errors = [error]
+    try { stop() } catch (cleanupError) { errors.push(cleanupError) }
+    try { await rm(directory, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 }) } catch (cleanupError) { errors.push(cleanupError) }
+    if (errors.length > 1) throw new AggregateError(errors, 'Grade test runtime setup and cleanup failed.')
+    throw error
+  }
 }
 
 function memoryBlobs() {
@@ -55,7 +74,9 @@ function memoryBlobs() {
   return {
     values,
     async read(name) { const value = values.get(name); return value ? clone(value) : undefined },
-    async putImmutable(name, bytes, contentType) {
+    async putImmutable(name, bytes, contentType, options) {
+      if (options?.signal?.aborted) throw options.signal.reason
+      await options?.assertActive?.()
       const current = values.get(name)
       if (current) return { created: false, blob: clone(current) }
       const blob = { bytes: Uint8Array.from(bytes), contentType, sha256: hash(bytes), etag: `"blob-${values.size + 1}"` }
@@ -105,48 +126,20 @@ function memoryGrades(api) {
     },
     async listPending() { return [] },
   }
-  return { store, blobs: memoryBlobs() }
+  installGradeLifecycleFake(store, { values, remove: (workspaceId, id) => values.delete(key(workspaceId, id)), StoreConflictError: api.StoreConflictError })
+  return { store, blobs: installGradeBlobLifecycleFake(memoryBlobs()) }
 }
 
-function memoryJobs(api) {
-  const records = new Map(), rubrics = new Map()
-  let counter = 0
-  const key = (workspace, id) => `${workspace}/${id}`
-  return {
-    records, rubrics, blobs: memoryBlobs(),
-    store: {
-      async get(workspace, id) { return clone(records.get(key(workspace, id))) },
-      async list(workspace) { return { jobs: [...records.values()].filter(({ record }) => record.workspaceId === workspace).map(clone) } },
-      async listRubrics(workspace, id) { return clone(rubrics.get(key(workspace, id)) ?? []) },
-      async getRubric(workspace, id) {
-        return [...rubrics.entries()].filter(([key]) => key.startsWith(`${workspace}/`)).flatMap(([, values]) => values).filter((rubric) => rubric.id === id).sort((a, b) => b.version - a.version).map(clone)[0]
-      },
-      async create(record) {
-        const k = key(record.workspaceId, record.id), existing = records.get(k)
-        if (existing) return { created: false, value: clone(existing) }
-        const value = { record: clone(record), etag: `"job-${++counter}"` }
-        records.set(k, value); return { created: true, value: clone(value) }
-      },
-      async replace(record, etag) {
-        const k = key(record.workspaceId, record.id), existing = records.get(k)
-        if (!existing || existing.etag !== etag) throw new api.StoreConflictError()
-        const value = { record: clone(record), etag: `"job-${++counter}"` }; records.set(k, value); return clone(value)
-      },
-      async publish(record, etag, rubric) {
-        const updated = await this.replace(record, etag)
-        const k = key(record.workspaceId, record.id)
-        rubrics.set(k, [...(rubrics.get(k) ?? []), clone(rubric)])
-        return updated
-      },
-      async listPending() { return [] },
-    },
-  }
+function memoryJobs(jobFakes) {
+  const fixture = jobFakes.createFakeRealJobs()
+  return { ...fixture, records: fixture.store._records, rubrics: fixture.store._rubrics, blobs: { ...fixture.blobs, values: fixture.blobs._values } }
 }
 
 function memoryWorkspace(api) {
   const metadata = new Map(), memberships = new Map(), states = new Map()
   let counter = 0
   const saves = []
+  const leases = new Set()
   let nextSaveDelay
   const directory = {
     metadata, memberships,
@@ -165,6 +158,26 @@ function memoryWorkspace(api) {
       const value = { metadata: { ...current.metadata, name, updatedAt }, etag: `"directory-${++counter}"` }; metadata.set(id, value); return clone(value)
     },
     async deleteWorkspace(id) { metadata.delete(id) },
+    async replaceMetadata(record, etag) {
+      if (metadata.get(record.workspaceId)?.etag !== etag) throw new api.StoreConflictError()
+      const value = { metadata: clone(record), etag: `"directory-${++counter}"` }
+      metadata.set(record.workspaceId, value)
+      if (record.deletedAt && record.lifecycleOperation?.action === 'delete' && record.lifecycleOperation.status === 'complete') {
+        memberships.delete(`${record.workspaceId}/${api.membershipIdFor(record.ownerId)}`)
+      }
+      return clone(value)
+    },
+    async deleteMemberships(id) {
+      const current = metadata.get(id)
+      if (!current) throw new api.StoreNotFoundError()
+      const ownerId = api.membershipIdFor(current.metadata.ownerId)
+      for (const [key, membership] of memberships) {
+        if (membership.workspaceId === id && membership.id !== ownerId) memberships.delete(key)
+      }
+    },
+    async listLifecycleOperations(limit) {
+      return [...metadata.values()].filter((value) => value.metadata.lifecycleOperation && value.metadata.lifecycleOperation.status !== 'complete').slice(0, limit).map(clone)
+    },
     async checkAccess() {},
   }
   const state = {
@@ -181,7 +194,19 @@ function memoryWorkspace(api) {
       if (states.get(id)?.etag !== etag) throw new api.StoreConflictError()
       const value = { content, etag: `"state-${++counter}"` }; states.set(id, value); saves.push({ id, content }); return { etag: value.etag }
     },
-    async deleteState(id) { states.delete(id) },
+    async deleteState(id, etag) {
+      if (etag !== undefined && states.has(id) && states.get(id).etag !== etag) throw new api.StoreConflictError()
+      states.delete(id)
+    },
+    async acquireMutationLease(id) {
+      if (leases.has(id)) throw new api.StoreConflictError('A workspace mutation is already in flight.')
+      leases.add(id)
+      let released = false
+      return {
+        async renew() { if (released || !leases.has(id)) throw new api.StoreConflictError('The workspace lease was released.') },
+        async release() { if (!released) { released = true; leases.delete(id) } },
+      }
+    },
     async checkAccess() {},
   }
   return { directory, state }
@@ -189,7 +214,7 @@ function memoryWorkspace(api) {
 
 export async function startGradeFixture(runtime, { injectAuth = false } = {}) {
   const { api } = runtime
-  const grades = memoryGrades(api), jobs = memoryJobs(api), { directory, state } = memoryWorkspace(api)
+  const grades = memoryGrades(api), jobs = memoryJobs(runtime.jobFakes), { directory, state } = memoryWorkspace(api)
   const server = createServer()
   await new Promise((resolve, reject) => { server.once('error', reject); server.listen(0, '127.0.0.1', resolve) })
   const origin = `http://127.0.0.1:${server.address().port}`
@@ -236,7 +261,11 @@ export async function startGradeFixture(runtime, { injectAuth = false } = {}) {
     return nativeFetch(`${origin}${path}`, { ...init, headers })
   }
   const sessionResponse = await request('/api/session')
-  assert.equal(sessionResponse.status, 200)
+  if (sessionResponse.status !== 200) {
+    server.closeAllConnections()
+    await new Promise((resolve) => server.close(resolve))
+    assert.equal(sessionResponse.status, 200, await sessionResponse.text())
+  }
   const session = await sessionResponse.json()
   const workspaceId = session.workspaces[0].id
   return {

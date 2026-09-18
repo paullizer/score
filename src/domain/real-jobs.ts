@@ -1,4 +1,5 @@
 import type { Job, Rubric, SourceDocument } from './types'
+import type { LifecycleMetadata } from './lifecycle'
 
 export const JOB_IMPORT_LIMITS = {
   maxPdfBytes: 10 * 1024 * 1024,
@@ -43,6 +44,8 @@ export interface RealJobRecord {
   extractedBlobName?: string
   error?: JobImportError
   warnings: string[]
+  lifecycle?: LifecycleMetadata
+  rubricLifecycle?: LifecycleMetadata
 }
 
 export interface VersionedRealJob {
@@ -59,6 +62,8 @@ export interface RealJobSummary {
   attempts: number
   error?: JobImportError
   warnings: string[]
+  lifecycle?: LifecycleMetadata
+  rubricLifecycle?: LifecycleMetadata
 }
 
 export interface RealJobDetail extends RealJobSummary {

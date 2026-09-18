@@ -5,6 +5,8 @@ import { useWorkspace } from '../../app/workspace-context'
 import { Badge, Button, DemoNote, EmptyState, InlineError } from '../../components/ui'
 import type { Citation, Criterion, Rubric } from '../../domain/types'
 import { RubricEditor } from './RubricEditor'
+import { ArchivedBadge, EntityLifecycleActions, LifecycleBanner } from '../../components/lifecycle/LifecycleControls'
+import { useLifecycleAccess } from '../../components/lifecycle/useLifecycleAccess'
 
 const scoreLegend = [
   { value: 0, label: 'No support' },
@@ -26,16 +28,17 @@ export function RubricPanel({ rubric, onSelectCriterion, onVersionSaved, readOnl
   const [error, setError] = useState('')
   const [duplicating, setDuplicating] = useState(false)
   const duplicatingRef = useRef(false)
+  const { canEdit } = useLifecycleAccess({ kind: 'rubric', id: rubric.groupId })
   const job = workspace.jobs.find((item) => item.id === rubric.jobId)
   const document = workspace.documents.find((item) => item.id === job?.documentId)
   const realGrade = rubric.dataKind === 'real' && rubric.kind === 'grade'
   const viewer = Boolean(cloud && cloud.workspaces.find((item) => item.id === cloud.currentWorkspaceId)?.role === 'viewer')
-  const editable = !realGrade && !(viewer && rubric.dataKind === 'real') && (rubric.kind === 'grade' || job?.status === 'ready') && (rubric.dataKind !== 'real' || Boolean(document))
+  const editable = canEdit && !readOnly && !realGrade && !viewer && (rubric.kind === 'grade' || (job?.status === 'ready' && !job.rubricDeletedAt)) && (rubric.dataKind !== 'real' || Boolean(document))
   const total = rubric.criteria.reduce((sum, criterion) => sum + criterion.weight, 0)
   const balanced = Number.isFinite(total) && Math.abs(total - 100) <= 0.000001
 
   async function duplicate() {
-    if (duplicatingRef.current || rubric.kind !== 'grade' || rubric.dataKind === 'real') return
+    if (!editable || duplicatingRef.current || rubric.kind !== 'grade' || rubric.dataKind === 'real') return
     duplicatingRef.current = true
     setDuplicating(true)
     setError('')
@@ -58,10 +61,13 @@ export function RubricPanel({ rubric, onSelectCriterion, onVersionSaved, readOnl
     </div>
 
     <div className="space-y-5 p-5">
+      <LifecycleBanner target={{ kind: 'rubric', id: rubric.groupId }} />
+      <EntityLifecycleActions target={{ kind: 'rubric', id: rubric.groupId }} name={rubric.name} />
       <div>
         <div className="mb-3 flex flex-wrap gap-2">
           <Badge tone="accent">{rubric.dataKind === 'real' ? rubric.provenance?.kind === 'edited' ? 'Reviewer edited' : 'Generated from source' : rubric.kind === 'job' ? 'Generated demo' : 'Reusable grade rubric'}</Badge>
           {rubric.grade && <Badge>{rubric.grade}</Badge>}
+          <ArchivedBadge target={{ kind: 'rubric', id: rubric.groupId }} />
           <Badge tone={balanced ? 'neutral' : 'warning'}>{Number.isFinite(total) ? `${Number(total.toFixed(6))}% total weight` : 'Invalid total weight'}</Badge>
         </div>
         <h3 className="text-[15px] font-semibold leading-snug">{rubric.name}</h3>
@@ -90,7 +96,7 @@ export function RubricPanel({ rubric, onSelectCriterion, onVersionSaved, readOnl
 
       {!readOnly && <div className="flex flex-wrap gap-2">
         <Button icon={Pencil} size="sm" disabled={!editable} onClick={() => { setError(''); setEditing(true) }}>Edit rubric</Button>
-        {rubric.kind === 'grade' && rubric.dataKind !== 'real' && <Button icon={Copy} size="sm" variant="ghost" onClick={duplicate} disabled={duplicating}>
+        {rubric.kind === 'grade' && rubric.dataKind !== 'real' && <Button icon={Copy} size="sm" variant="ghost" onClick={duplicate} disabled={duplicating || !editable}>
           {duplicating ? 'Duplicating…' : 'Duplicate as new rubric'}
         </Button>}
       </div>}
