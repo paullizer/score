@@ -271,6 +271,74 @@ test('blob adapter enforces safe namespaces, bounds, exact media metadata and im
   await assert.rejects(store.read(name), /truncated/)
 })
 
+test('analysis Markdown originals round-trip as immutable .md blobs with exact media and 10 MiB bounds', async () => {
+  const prefix = 'workspace-one/analysis-run-00000000-0000-4000-8000-000000000000/evidence'
+  const values = new Map()
+  const store = api.createAnalysisBlobStoreFromContainer({
+    getBlockBlobClient(name) {
+      return {
+        async upload(bytes, length, options) {
+          assert.equal(options.conditions.ifNoneMatch, '*')
+          assert.equal(options.blobHTTPHeaders.blobContentType, 'text/markdown')
+          assert.equal(length, bytes.byteLength)
+          if (values.has(name)) throw Object.assign(new Error('Already captured'), { statusCode: 412 })
+          values.set(name, Buffer.from(bytes))
+          return { etag: '"markdown-original"' }
+        },
+        async download() {
+          const bytes = values.get(name)
+          return { etag: '"markdown-original"', contentType: 'text/markdown', contentLength: bytes.byteLength,
+            readableStreamBody: Readable.from([bytes]) }
+        },
+      }
+    },
+  })
+  const bytes = Buffer.from('# Captured source\r\n\r\nExact **Markdown** bytes.\r\n')
+  const name = `${prefix}/${api.analysisBytesHash(bytes)}.md`
+  const first = await store.putImmutable(name, bytes, 'text/markdown')
+  const restored = await store.read(name)
+  assert.deepEqual(restored, first.blob)
+  assert.deepEqual(restored.bytes, bytes)
+  assert.equal(restored.contentType, 'text/markdown')
+  const repeated = await store.putImmutable(name, Buffer.from('changed'), 'text/markdown')
+  assert.equal(repeated.created, false)
+  assert.deepEqual(repeated.blob, first.blob)
+  const maximum = 10 * 1024 * 1024
+  const boundary = Buffer.alloc(maximum, 0x61)
+  const boundaryName = `${prefix}/${api.analysisBytesHash(boundary)}.md`
+  assert.equal((await store.putImmutable(boundaryName, boundary, 'text/markdown')).created, true)
+  assert.equal((await store.read(boundaryName)).bytes.byteLength, maximum)
+  await assert.rejects(store.putImmutable(name, Buffer.alloc(maximum + 1), 'text/markdown'), /Invalid immutable/)
+  for (const contentType of ['application/json', 'text/html', 'application/pdf', 'text/plain']) {
+    await assert.rejects(store.putImmutable(name, bytes, contentType), /Invalid immutable/)
+  }
+  await assert.rejects(store.putImmutable(name.replace(/\.md$/, '.markdown'), bytes, 'text/markdown'), /Invalid immutable/)
+  for (const contentLength of [maximum + 1, undefined]) {
+    const bounded = api.createAnalysisBlobStoreFromContainer({
+      getBlockBlobClient() {
+        return {
+          async upload() {},
+          async download() {
+            return { etag: '"oversized"', contentType: 'text/markdown', contentLength,
+              readableStreamBody: Readable.from([boundary, Buffer.from('x')]) }
+          },
+        }
+      },
+    })
+    await assert.rejects(bounded.read(name), /bounded size/)
+  }
+  for (const contentType of ['text/html', 'application/json']) {
+    const wrongMedia = api.createAnalysisBlobStoreFromContainer({
+      getBlockBlobClient() {
+        return { async upload() {}, async download() {
+          return { etag: '"wrong-media"', contentType, contentLength: bytes.length, readableStreamBody: Readable.from([bytes]) }
+        } }
+      },
+    })
+    await assert.rejects(wrongMedia.read(name), /content metadata/)
+  }
+})
+
 test('exhausted cancellation and its queued children cannot poison pending discovery or starve a later healthy run', async () => {
   const f = fixture()
   const container = cosmos()

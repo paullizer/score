@@ -124,9 +124,9 @@ async function pdf(pages = 1) {
 }
 
 async function start(options = {}) {
-  const directory = createFakeDirectoryStore()
-  const state = createFakeStateStore()
-  const grades = { store: gradeStore(), blobs: blobs() }
+  const directory = options.persisted?.directory ?? createFakeDirectoryStore()
+  const state = options.persisted?.state ?? createFakeStateStore()
+  const grades = options.persisted?.grades ?? { store: gradeStore(), blobs: blobs() }
   const jobRecords = new Map()
   const jobRubrics = new Map()
   const jobBlobs = blobs()
@@ -171,16 +171,16 @@ async function start(options = {}) {
   return api
 }
 
-async function seed(api, title = 'Engineer') {
+async function seed(api, title = 'Engineer', options = {}) {
   const key = randomUUID()
   const workspaceId = api.workspaceId
   const id = `job-${key}`
   const document = {
     id: `document-${key}`, title, version: 1, kind: 'job', sample: false,
-    paragraphs: [{ id: 'job-p1', page: 1, heading: 'Duties', text: 'Evaluate engineering systems and explain recommendations based on evidence.' }],
+    paragraphs: [{ id: 'job-p1', page: options.page ?? 1, heading: 'Duties', text: 'Evaluate engineering systems and explain recommendations based on evidence.' }],
   }
   const citation = {
-    documentId: document.id, documentVersion: 1, paragraphId: 'job-p1', page: 1, heading: 'Duties',
+    documentId: document.id, documentVersion: 1, paragraphId: 'job-p1', page: document.paragraphs[0].page, heading: 'Duties',
     quote: document.paragraphs[0].text,
   }
   const rubric = {
@@ -192,26 +192,35 @@ async function seed(api, title = 'Engineer') {
       weight: 100, guidance, requirementType: 'required', sourceCitations: [citation],
     }],
   }
-  const original = await api.jobs.blobs.putImmutable(`${workspaceId}/${id}/original.pdf`, await pdf(), 'application/pdf')
+  const kind = options.kind ?? 'pdf'
+  const extension = kind === 'pdf' ? 'pdf' : kind === 'markdown' ? 'md' : 'html'
+  const contentType = kind === 'pdf' ? 'application/pdf' : kind === 'markdown' ? 'text/markdown' : 'text/html'
+  const displayName = kind === 'url' ? 'https://agency.example.gov/engineering-job' : options.fileName ?? `job.${extension}`
+  const bytes = kind === 'pdf' ? await pdf() : Buffer.from(kind === 'markdown'
+    ? `# Duties\r\n\r\n${document.paragraphs[0].text}\r\n`
+    : `<html><body><h1>Duties</h1><p>${document.paragraphs[0].text}</p></body></html>`)
+  const originalName = `${workspaceId}/${id}/original.${extension}`
+  const original = await api.jobs.blobs.putImmutable(originalName, bytes, contentType)
   await api.jobs.blobs.putImmutable(`${workspaceId}/${id}/source-document.json`, Buffer.from(JSON.stringify(document)), 'application/json')
   const record = {
     id, workspaceId, recordType: 'job',
     job: {
       id, title, organization: 'Example federal agency', location: '', arrangement: '', employmentType: '',
-      grade: '', series: '0801', source: 'pdf', sourceLabel: 'job.pdf', documentId: document.id,
+      grade: '', series: '0801', source: kind, sourceLabel: displayName, documentId: document.id,
       rubricId: rubric.id, status: 'ready', createdAt: NOW, dataKind: 'real',
     },
     source: {
-      kind: 'pdf', displayName: 'job.pdf', originalBlobName: `${workspaceId}/${id}/original.pdf`,
-      originalContentType: 'application/pdf', sha256: original.blob.sha256, bytes: original.blob.bytes.byteLength,
-      capturedAt: NOW, extractionMethod: 'document-intelligence',
+      kind, displayName, originalBlobName: originalName,
+      originalContentType: contentType, sha256: original.blob.sha256, bytes: original.blob.bytes.byteLength,
+      capturedAt: NOW, extractionMethod: kind === 'pdf' ? 'document-intelligence' : kind === 'markdown' ? 'markdown' : 'html',
+      ...(kind === 'url' ? { url: displayName, finalUrl: displayName } : {}),
     },
     inputFingerprint: sha(Buffer.from(id)), createdBy: 'test-seed', updatedAt: NOW,
     attempts: 1, warnings: [], extractedBlobName: `${workspaceId}/${id}/source-document.json`,
   }
   api.jobRecords.set(`${workspaceId}/${id}`, { record, etag: '"job-seed"' })
   api.jobRubrics.set(`${workspaceId}/${id}`, [rubric])
-  return { record, rubric, document }
+  return { record, rubric, document, original: original.blob }
 }
 
 async function create(api, options = {}) {
@@ -442,6 +451,261 @@ test('ladder creation freezes the explicitly selected authorized real job rubric
     api.jobs.blobs.values.clear()
     assert.equal((await api.request(`${api.base}/${detail.ladder.id}/sources/${seedSource.id}/document`)).status, 200)
     assert.equal((await api.request(`${api.base}/${detail.ladder.id}/sources/${seedSource.id}/original`)).status, 200)
+  } finally { await api.close() }
+})
+
+for (const fileName of ['job.md', 'job.MARKDOWN']) {
+  test(`Markdown ${fileName} seeds preserve exact frozen evidence and private original downloads after reload`, async () => {
+    const api = await start()
+    let reloaded
+    try {
+      const seeded = await seed(api, 'Markdown engineering role', { kind: 'markdown', fileName })
+      const { detail } = await confirmed(api, { seed: seeded })
+      const source = detail.sources.find(value => value.origin === 'seed-job')
+      assert.equal(source.originalContentType, 'text/markdown')
+      assert.equal(source.extractionMethod, 'seed-snapshot')
+      assert.equal(source.completeness, 'complete')
+      assert.deepEqual(source.selectedPages, [])
+      assert.equal(source.originalBlobName, `${api.workspaceId}/${detail.ladder.id}/${source.id}/original.md`)
+      const blob = await api.grades.blobs.read(detail.ladder.seedBlobName)
+      const persisted = JSON.parse(Buffer.from(blob.bytes).toString('utf8'))
+      const captured = parseGradeSeedSnapshot(persisted)
+      assert.deepEqual(captured, persisted)
+      assert.deepEqual(captured.document, seeded.document)
+      assert.deepEqual(captured.rubric, seeded.rubric)
+      assert.equal(captured.source.kind, 'markdown')
+      assert.equal(captured.source.displayName, fileName)
+      assert.equal(captured.source.sha256, seeded.original.sha256)
+      const original = await api.grades.blobs.read(source.originalBlobName)
+      assert.deepEqual(original.bytes, seeded.original.bytes)
+      assert.equal(original.sha256, seeded.original.sha256)
+      assert.equal(original.contentType, 'text/markdown')
+      assert.deepEqual(parseGradeEntity(JSON.parse(JSON.stringify(detail.sourceSet))), detail.sourceSet)
+      const frozenSeed = detail.sourceSet.sources.find(value => value.origin === 'seed-job')
+      assert.equal(frozenSeed.originalBlobName, source.originalBlobName)
+      assert.equal(frozenSeed.originalContentType, 'text/markdown')
+      assert.equal(frozenSeed.sha256, seeded.original.sha256)
+      assert.ok(detail.sourceSet.sources.filter(value => value.origin !== 'seed-job')
+        .every(value => !Object.hasOwn(value, 'originalContentType')))
+      reloaded = await start({ persisted: api })
+      assert.equal(reloaded.jobRecords.size, 0)
+      const restored = await (await reloaded.request(`${reloaded.base}/${detail.ladder.id}`)).json()
+      assert.deepEqual(restored, detail)
+      const history = await reloaded.request(`${reloaded.base}/${detail.ladder.id}/source-sets/${detail.sourceSet.id}`)
+      assert.equal(history.status, 200)
+      assert.equal((await history.json()).contentHash, detail.sourceSet.contentHash)
+      for (const suffix of ['', `?sourceSetId=${detail.sourceSet.id}`]) {
+        const path = `${reloaded.base}/${detail.ladder.id}/sources/${source.id}`
+        const documentResponse = await reloaded.request(`${path}/document${suffix}`)
+        assert.equal(documentResponse.status, 200)
+        assert.deepEqual((await documentResponse.json()).paragraphs, seeded.document.paragraphs)
+        const response = await reloaded.request(`${path}/original${suffix}`)
+        assert.equal(response.status, 200)
+        assert.match(response.headers.get('content-type'), /^text\/markdown(?:;|$)/)
+        assert.equal(response.headers.get('content-disposition'), `attachment; filename="${source.id}.md"`)
+        assert.equal(response.headers.get('etag'), original.etag)
+        assert.equal(response.headers.get('cache-control'), 'no-store')
+        assert.equal(response.headers.get('x-content-type-options'), 'nosniff')
+        assert.match(response.headers.get('content-security-policy'), /sandbox/)
+        assert.deepEqual(Buffer.from(await response.arrayBuffer()), Buffer.from(seeded.original.bytes))
+      }
+    } finally {
+      if (reloaded) await reloaded.close()
+      await api.close()
+    }
+  })
+}
+
+test('Markdown seed metadata is strict and never extends supporting-reference upload or URL capture kinds', async () => {
+  const api = await start()
+  try {
+    const seeded = await seed(api, 'Markdown engineering role', { kind: 'markdown' })
+    const { detail } = await confirmed(api, { seed: seeded })
+    const seedBlob = await api.grades.blobs.read(detail.ladder.seedBlobName)
+    const snapshot = JSON.parse(Buffer.from(seedBlob.bytes).toString('utf8'))
+    for (const change of [
+      value => { value.source.kind = 'url'; value.job.source = 'url'; value.source.url = 'https://example.org/job.md' },
+      value => { value.source.originalContentType = 'text/html' },
+      value => { value.source.extractionMethod = 'html' },
+      value => { delete value.source.extractionMethod },
+      value => { delete value.source.capturedAt },
+      value => { value.source.bytes = 10 * 1024 * 1024 + 1 },
+      value => { value.source.url = 'https://example.org/job.md' },
+      value => { value.source.finalUrl = 'https://example.org/job.md' },
+      value => { value.source.originalBlobName = value.source.originalBlobName.replace(/\.md$/, '.html') },
+      value => { value.source.originalBlobName = value.source.originalBlobName.replace(/\.md$/, '.markdown') },
+      value => { value.source.displayName = '../job.md'; value.job.sourceLabel = '../job.md' },
+      value => { value.source.displayName = 'job.pdf'; value.job.sourceLabel = 'job.pdf' },
+      value => { value.rubric.criteria[0].sourceCitations[0].quote = 'An uncaptured requirement' },
+    ]) {
+      const invalid = clone(snapshot)
+      change(invalid)
+      assert.throws(() => parseGradeSeedSnapshot(invalid), undefined, change.toString())
+    }
+    const source = detail.sources.find(value => value.origin === 'seed-job')
+    for (const change of [
+      value => { value.origin = 'upload'; value.purpose = 'agency' },
+      value => { value.origin = 'url'; value.purpose = 'agency'; value.requestedUrl = 'https://example.org/job.md' },
+      value => { value.extractionMethod = 'markdown' },
+      value => { value.extractionMethod = 'html' },
+      value => { value.extractionMethod = 'document-intelligence' },
+      value => { value.bytes = 10 * 1024 * 1024 + 1 },
+      value => { value.originalContentType = 'application/pdf' },
+      value => { value.originalBlobName = value.originalBlobName.replace(/\.md$/, '.pdf') },
+      value => { value.requestedUrl = 'https://example.org/job.md' },
+      value => { value.finalUrl = 'https://example.org/job.md' },
+      value => { value.redirects = ['https://example.org/job.md'] },
+      value => { value.selectedPages = [1] },
+      value => { value.completeness = 'incomplete' },
+    ]) {
+      const invalid = clone(source)
+      change(invalid)
+      assert.throws(() => parseGradeEntity(invalid), undefined, change.toString())
+    }
+    for (const origin of ['upload', 'url', 'opm']) {
+      const invalid = clone(detail.sourceSet)
+      const supporting = invalid.sources.find(value => value.origin !== 'seed-job')
+      supporting.origin = origin
+      supporting.originalBlobName = supporting.originalBlobName.replace(/\.pdf$/, '.md')
+      if (origin === 'opm') {
+        supporting.publisher = 'OPM'
+        supporting.url = 'https://www.opm.gov/standard.md'
+        supporting.purpose = 'grading'
+        supporting.authorityStatus = 'current'
+      }
+      invalid.contentHash = gradeSourceSetHash(invalid)
+      assert.throws(() => parseGradeEntity(invalid), /Original blob ownership/)
+    }
+    for (const contentType of ['text/html', 'application/pdf', 'application/json']) {
+      const invalid = clone(detail.sourceSet)
+      invalid.sources.find(value => value.origin === 'seed-job').originalContentType = contentType
+      invalid.contentHash = gradeSourceSetHash(invalid)
+      assert.throws(() => parseGradeEntity(invalid))
+    }
+    const invalidReference = clone(detail.sourceSet)
+    invalidReference.sources.find(value => value.origin !== 'seed-job').originalContentType = 'text/markdown'
+    invalidReference.contentHash = gradeSourceSetHash(invalidReference)
+    assert.throws(() => parseGradeEntity(invalidReference), /Original blob content type/)
+    for (const fileName of ['standard.md', 'standard.pdf']) {
+      const response = await fetch(`${api.baseUrl}${api.base}/${detail.ladder.id}/sources/pdf`, {
+        method: 'POST', headers: writeHeaders({
+          'content-type': 'text/markdown', 'x-file-name': fileName,
+          'idempotency-key': randomUUID(), 'if-match': detail.etag,
+        }), body: '# Supporting reference\nThis is not a PDF.',
+      })
+      assert.equal(response.status, 400)
+      assert.match(JSON.stringify(await response.json()), fileName.endsWith('.md') ? /safe PDF basename/ : /application\/pdf/)
+    }
+  } finally { await api.close() }
+})
+
+test('Markdown seed creation rejects changed byte counts, forged digests and conflicting copied originals', async () => {
+  const api = await start()
+  try {
+    for (const corruption of ['source-length', 'source-bytes', 'source-media', 'copy-digest', 'copy-bytes', 'copy-media']) {
+      const seeded = await seed(api, 'Markdown engineering role', { kind: 'markdown' })
+      const key = randomUUID()
+      if (corruption === 'source-length') seeded.record.source.bytes++
+      if (corruption === 'source-bytes') {
+        api.jobs.blobs.values.get(seeded.record.source.originalBlobName).bytes = Buffer.from('Altered original bytes')
+      }
+      if (corruption === 'source-media') {
+        api.jobs.blobs.values.get(seeded.record.source.originalBlobName).contentType = 'text/html'
+      }
+      if (corruption.startsWith('copy-')) {
+        const original = clone(seeded.original)
+        if (corruption === 'copy-digest') original.sha256 = '0'.repeat(64)
+        if (corruption === 'copy-bytes') original.bytes = Buffer.from('Altered copied bytes')
+        if (corruption === 'copy-media') original.contentType = 'application/pdf'
+        api.grades.blobs.values.set(`${api.workspaceId}/ladder-${key}/source-${key}/original.md`, original)
+      }
+      const result = await create(api, { seed: seeded, key, allowFailure: true })
+      assert.equal(result.response.status, corruption.startsWith('copy-') ? 409 : 503, corruption)
+      assert.equal(await api.grades.store.get(api.workspaceId, `ladder-${key}`), undefined)
+    }
+  } finally { await api.close() }
+})
+
+test('grade seed validation retains the job PDF page limit while preserving Markdown section indices', async () => {
+  const api = await start()
+  try {
+    const pdf = await seed(api, 'PDF role', { kind: 'pdf', page: 51 })
+    const rejected = await create(api, { seed: pdf, allowFailure: true })
+    assert.equal(rejected.response.status, 503)
+    const markdown = await seed(api, 'Markdown role', { kind: 'markdown', page: 51 })
+    const { detail } = await confirmed(api, { seed: markdown })
+    const blob = await api.grades.blobs.read(detail.ladder.seedBlobName)
+    const snapshot = parseGradeSeedSnapshot(JSON.parse(Buffer.from(blob.bytes).toString('utf8')))
+    assert.equal(snapshot.document.paragraphs[0].page, 51)
+    assert.equal(snapshot.rubric.criteria[0].sourceCitations[0].page, 51)
+    assert.equal(detail.sourceSet.sources.find(source => source.origin === 'seed-job').pageCount, 51)
+    const physicalPdf = clone(snapshot)
+    physicalPdf.job.source = 'pdf'
+    physicalPdf.job.sourceLabel = 'job.pdf'
+    Object.assign(physicalPdf.source, {
+      kind: 'pdf', displayName: 'job.pdf', originalContentType: 'application/pdf', extractionMethod: 'document-intelligence',
+      originalBlobName: physicalPdf.source.originalBlobName.replace(/\.md$/, '.pdf'),
+    })
+    assert.throws(() => parseGradeSeedSnapshot(physicalPdf), /Seed job document is invalid/)
+  } finally { await api.close() }
+})
+
+for (const kind of ['pdf', 'url']) {
+  test(`legacy ${kind === 'pdf' ? 'PDF' : 'HTML'} grade seeds keep their serialized metadata and hashes`, async () => {
+    const api = await start()
+    try {
+      const seeded = await seed(api, 'Existing engineering role', { kind })
+      const { detail } = await confirmed(api, { seed: seeded })
+      const blob = await api.grades.blobs.read(detail.ladder.seedBlobName)
+      const snapshot = JSON.parse(Buffer.from(blob.bytes).toString('utf8'))
+      assert.deepEqual(parseGradeSeedSnapshot(snapshot), snapshot)
+      assert.equal(gradeContentHash(parseGradeSeedSnapshot(snapshot)), gradeContentHash(snapshot))
+      assert.deepEqual(parseGradeEntity(detail.sourceSet), detail.sourceSet)
+      assert.equal(gradeSourceSetHash(parseGradeEntity(detail.sourceSet)), detail.sourceSet.contentHash)
+      assert.ok(detail.sourceSet.sources.every(source => !Object.hasOwn(source, 'originalContentType')))
+      const legacy = clone(detail.sourceSet)
+      for (const source of legacy.sources) delete source.originalContentType
+      assert.equal(JSON.stringify(legacy), JSON.stringify(detail.sourceSet))
+      assert.deepEqual(parseGradeEntity(legacy), legacy)
+      assert.equal(gradeSourceSetHash(parseGradeEntity(legacy)), legacy.contentHash)
+      const declared = clone(legacy)
+      for (const source of declared.sources) {
+        source.originalContentType = detail.sources.find(value => value.id === source.sourceId).originalContentType
+      }
+      declared.contentHash = gradeSourceSetHash(declared)
+      assert.deepEqual(parseGradeEntity(declared), declared)
+      const mismatched = clone(declared)
+      mismatched.sources[0].originalContentType = mismatched.sources[0].originalContentType === 'application/pdf'
+        ? 'text/html' : 'application/pdf'
+      mismatched.contentHash = gradeSourceSetHash(mismatched)
+      assert.throws(() => parseGradeEntity(mismatched), /Original blob content type mismatch/)
+      assert.equal(snapshot.source.originalContentType, kind === 'pdf' ? 'application/pdf' : 'text/html')
+      assert.match(snapshot.source.originalBlobName, kind === 'pdf' ? /\/original\.pdf$/ : /\/original\.html$/)
+      const original = await api.grades.blobs.read(snapshot.source.originalBlobName)
+      assert.deepEqual(original.bytes, seeded.original.bytes)
+    } finally { await api.close() }
+  })
+}
+
+test('legacy job PDF basenames remain valid grade seeds through freeze, reload and original downloads', async () => {
+  const api = await start()
+  try {
+    for (const fileName of ['Role: engineer.pdf', 'CON.pdf', ' leading.pdf', '"Role".pdf', 'Role*.pdf', 'Role?.pdf']) {
+      const seeded = await seed(api, 'Existing PDF role', { kind: 'pdf', fileName })
+      const { detail } = await confirmed(api, { seed: seeded })
+      const seedBlob = await api.grades.blobs.read(detail.ladder.seedBlobName)
+      const snapshot = JSON.parse(Buffer.from(seedBlob.bytes).toString('utf8'))
+      assert.deepEqual(parseGradeSeedSnapshot(snapshot), snapshot)
+      assert.equal(snapshot.source.displayName, fileName)
+      assert.equal(snapshot.job.sourceLabel, fileName)
+      const source = detail.sourceSet.sources.find(value => value.origin === 'seed-job')
+      assert.equal(Object.hasOwn(source, 'originalContentType'), false)
+      assert.deepEqual(await (await api.request(`${api.base}/${detail.ladder.id}`)).json(), detail)
+      const original = await api.request(`${api.base}/${detail.ladder.id}/sources/${source.sourceId}/original?sourceSetId=${detail.sourceSet.id}`)
+      assert.equal(original.status, 200)
+      assert.equal(original.headers.get('content-disposition'), `attachment; filename="${source.sourceId}.pdf"`)
+      assert.deepEqual(Buffer.from(await original.arrayBuffer()), Buffer.from(seeded.original.bytes))
+    }
   } finally { await api.close() }
 })
 

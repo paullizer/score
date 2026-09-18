@@ -1,7 +1,9 @@
 import type { Citation, SourceDocument } from './types'
+import { MAX_MARKDOWN_BYTES, type OriginalContentType } from './source-files'
 
 export const RESUME_IMPORT_LIMITS = {
   maxPdfBytes: 10 * 1024 * 1024,
+  maxMarkdownBytes: MAX_MARKDOWN_BYTES,
   maxPdfPages: 50,
   maxSourceCharacters: 180_000,
   maxBatchItems: 10,
@@ -43,10 +45,11 @@ export interface ResumeProcessingError {
 
 export type RealResumeSource =
   | { kind: 'pdf'; displayName: string; fileName: string }
+  | { kind: 'markdown'; displayName: string; fileName: string }
   | { kind: 'url'; displayName: string; url: string }
 
 export interface ResumeSourceCapture {
-  original: ImmutableBlobReference & { contentType: 'application/pdf' | 'text/html' }
+  original: ImmutableBlobReference & { contentType: OriginalContentType }
   capturedAt: string
   finalUrl?: string
   redirects: string[]
@@ -63,10 +66,10 @@ export interface ResumeCaptureManifest {
 }
 
 export interface ResumeExtractionProvenance {
-  method: 'document-intelligence' | 'html' | 'browser'
+  method: 'document-intelligence' | 'html' | 'browser' | 'markdown'
   version: string
   extractedAt: string
-  pagination: 'pdf-pages' | 'html-sections'
+  pagination: 'pdf-pages' | 'html-sections' | 'markdown-sections'
   pageCount: number | null
   normalizedCharacters: number
   document: ImmutableDocumentReference
@@ -205,6 +208,7 @@ export interface RealResumesPage {
 
 export interface ResumeProcessingFeatures {
   realResumeImports: boolean
+  markdownResumeImports: boolean
   resumeLimits: typeof RESUME_IMPORT_LIMITS
 }
 
@@ -218,6 +222,11 @@ export interface ResumeImportHeaders {
 export interface ResumePdfImportHeaders extends ResumeImportHeaders {
   'Content-Type': 'application/pdf'
   // Percent-encoded safe basename, for display only.
+  'X-File-Name': string
+}
+
+export interface ResumeMarkdownImportHeaders extends ResumeImportHeaders {
+  'Content-Type': 'text/markdown'
   'X-File-Name': string
 }
 

@@ -7,6 +7,8 @@ import {
   type ResumeCaptureManifest, type ResumeDuplicateWarning, type ResumeEntity, type ResumeImportBatchRecord,
   type VersionedResumeEntity,
 } from '../../src/domain/real-resumes'
+import { originalFileExtension, type UploadedSourceKind } from '../../src/domain/source-files'
+import { decodeMarkdown, MarkdownInputError } from '../documents/markdown'
 import { conflict, HttpError, invalidRequest, notFound, unavailable } from '../errors'
 import { WORKSPACE_ID_PATTERN } from '../ids'
 import { StoreConflictError, StoreNotFoundError } from '../store'
@@ -41,6 +43,7 @@ interface ImportReceipt extends ResumeImportRequest {
   source: RealResumeSource
   inputFingerprint: string
   pdfSha256?: string
+  markdownSha256?: string
 }
 
 const receiptSchema = z.strictObject({
@@ -50,6 +53,7 @@ const receiptSchema = z.strictObject({
   inputCount: z.number().int().min(1).max(LIMITS.maxBatchItems), createdBy: z.string().min(1).max(200),
   createdAt: z.iso.datetime({ precision: 3 }), source: z.unknown(),
   inputFingerprint: z.string().regex(/^[a-f0-9]{64}$/), pdfSha256: z.string().regex(/^[a-f0-9]{64}$/).optional(),
+  markdownSha256: z.string().regex(/^[a-f0-9]{64}$/).optional(),
 })
 const same = (left: unknown, right: unknown) => resumeContentHash(left) === resumeContentHash(right)
 const active = new Set(['queued', 'parsing', 'profiling'])
@@ -253,8 +257,8 @@ export class RealResumeService {
     const { record } = await this.getResume(workspaceId, resumeId)
     const original = await this.capturedOriginal(record)
     if (!original) throw notFound('The original source has not been captured yet.')
-    const filename = record.source.kind === 'pdf' ? record.source.fileName
-      : `${record.id}.${original.contentType === 'application/pdf' ? 'pdf' : 'html'}`
+    const filename = record.source.kind !== 'url' ? record.source.fileName
+      : `${record.id}.${originalFileExtension(record.capture!.original.contentType)}`
     return { bytes: original.bytes, contentType: original.contentType, filename }
   }
 
@@ -319,20 +323,27 @@ export class RealResumeService {
     if (stored.workspaceId !== candidate.workspaceId || stored.resumeId !== candidate.resumeId ||
       stored.batchId !== candidate.batchId || stored.idempotencyKey !== candidate.idempotencyKey ||
       stored.createdBy !== candidate.createdBy || stored.inputCount !== candidate.inputCount ||
-      stored.pdfSha256 !== candidate.pdfSha256 || !same(stored.source, candidate.source)) {
+      stored.pdfSha256 !== candidate.pdfSha256 || stored.markdownSha256 !== candidate.markdownSha256 ||
+      !same(stored.source, candidate.source)) {
       throw unavailable('The saved resume import receipt does not match its immutable request binding.')
     }
     return { ...candidate, createdAt: stored.createdAt }
   }
 
   private async import(
-    workspaceId: string, input: ResumeImportRequest, source: RealResumeSource, pdf?: Uint8Array,
+    workspaceId: string, input: ResumeImportRequest, source: RealResumeSource, bytes?: Uint8Array,
   ): Promise<ResumeImportResult> {
-    const pdfSha256 = pdf ? resumeSha256(pdf) : undefined
-    const inputFingerprint = resumeContentHash({ source, batchId: input.batchId, inputCount: input.inputCount, createdBy: input.createdBy, pdfSha256 })
+    const pdfSha256 = source.kind === 'pdf' && bytes ? resumeSha256(bytes) : undefined
+    const markdownSha256 = source.kind === 'markdown' && bytes ? resumeSha256(bytes) : undefined
+    // Keep the legacy PDF/URL fingerprint keys and receipt fields unchanged on replay.
+    const inputFingerprint = resumeContentHash({
+      source, batchId: input.batchId, inputCount: input.inputCount, createdBy: input.createdBy, pdfSha256,
+      ...(markdownSha256 ? { markdownSha256 } : {}),
+    })
     const candidate: ImportReceipt = {
       ...input, schemaVersion: 1, dataKind: 'real', workspaceId, resumeId: resumeIdForKey(input.idempotencyKey),
       createdAt: this.now(), source, inputFingerprint, ...(pdfSha256 ? { pdfSha256 } : {}),
+      ...(markdownSha256 ? { markdownSha256 } : {}),
     }
     const existing = await this.accepted(candidate)
     if (existing) return { created: false, resume: summary(existing) }
@@ -353,16 +364,18 @@ export class RealResumeService {
       source, batchId: input.batchId, idempotencyKey: input.idempotencyKey, inputFingerprint, createdBy: receipt.createdBy,
       attempts: 0, retryCount: 0, nextAttemptAt: timestamp, warnings: [], duplicates: [],
     }
-    if (pdf) {
-      const name = resumeOriginalBlobName(workspaceId, record.id, 'pdf')
-      const result = await this.blobs.putImmutable(name, pdf, 'application/pdf')
+    if (bytes && source.kind !== 'url') {
+      const contentType = source.kind === 'pdf' ? 'application/pdf' : 'text/markdown'
+      const name = resumeOriginalBlobName(workspaceId, record.id, source.kind)
+      const result = await this.blobs.putImmutable(name, bytes, contentType)
       const original = resumeBlobReference(name, result.blob)
-      if (original.sha256 !== receipt.pdfSha256 || original.bytes !== pdf.byteLength || original.contentType !== 'application/pdf') {
+      const expectedHash = source.kind === 'pdf' ? receipt.pdfSha256 : receipt.markdownSha256
+      if (original.sha256 !== expectedHash || original.bytes !== bytes.byteLength || original.contentType !== contentType) {
         throw conflict('The original saved under this idempotency key is different. Nothing has been overwritten.')
       }
       const manifest: ResumeCaptureManifest = {
         schemaVersion: 1, dataKind: 'real', workspaceId, resumeId: record.id, inputFingerprint, source,
-        capture: { original: { ...original, contentType: 'application/pdf' }, capturedAt: receipt.createdAt, redirects: [] },
+        capture: { original: { ...original, contentType }, capturedAt: receipt.createdAt, redirects: [] },
       }
       const manifestName = resumeCaptureBlobName(workspaceId, record.id)
       const captured = await this.blobs.putImmutable(manifestName, Buffer.from(JSON.stringify(manifest)), 'application/json')
@@ -422,12 +435,32 @@ export class RealResumeService {
     throw conflict('This import batch is busy. Retry this item with the same idempotency key and batch headers.')
   }
 
-  async importPdf(workspaceId: string, input: ResumeImportRequest, filename: string, bytes: Uint8Array): Promise<ResumeImportResult> {
+  private async importFile(
+    workspaceId: string, input: ResumeImportRequest, kind: UploadedSourceKind, filename: string, bytes: Uint8Array,
+  ): Promise<ResumeImportResult> {
     validateRequest(workspaceId, input)
-    if (!isSafeResumeFilename(filename)) throw invalidRequest('X-File-Name must be a safe PDF basename.')
+    const label = kind === 'pdf' ? 'PDF' : 'Markdown'
+    if (!isSafeResumeFilename(filename, kind)) throw invalidRequest(`X-File-Name must be a safe ${label} basename.`)
+    if (!(bytes instanceof Uint8Array)) throw invalidRequest(`The request must contain raw ${label} bytes.`)
     const body = Buffer.from(bytes)
-    await validatePdf(body)
-    return this.import(workspaceId, input, { kind: 'pdf', displayName: filename, fileName: filename }, body)
+    if (kind === 'pdf') await validatePdf(body)
+    else {
+      try { decodeMarkdown(body, LIMITS.maxMarkdownBytes) } catch (error) {
+        if (error instanceof MarkdownInputError) {
+          throw new HttpError(error.code === 'markdown-too-large' ? 413 : 400, 'invalid_request', error.message)
+        }
+        throw error
+      }
+    }
+    return this.import(workspaceId, input, { kind, displayName: filename, fileName: filename }, body)
+  }
+
+  async importPdf(workspaceId: string, input: ResumeImportRequest, filename: string, bytes: Uint8Array): Promise<ResumeImportResult> {
+    return this.importFile(workspaceId, input, 'pdf', filename, bytes)
+  }
+
+  async importMarkdown(workspaceId: string, input: ResumeImportRequest, filename: string, bytes: Uint8Array): Promise<ResumeImportResult> {
+    return this.importFile(workspaceId, input, 'markdown', filename, bytes)
   }
 
   async importUrl(workspaceId: string, input: ResumeImportRequest, value: unknown): Promise<ResumeImportResult> {

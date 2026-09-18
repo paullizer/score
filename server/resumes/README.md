@@ -20,19 +20,30 @@ Paths below start with `/api/workspaces/:workspaceId`:
 | `GET /resumes/:resumeId` | — | Unwrapped `RealResumeDetail`, with ETag |
 | `GET /resumes/:resumeId/original` | — | Private original bytes as an attachment |
 | `POST /resumes/pdf` | Raw `application/pdf`, import headers, percent-encoded `X-File-Name` | `{ resume: RealResumeSummary }` |
+| `POST /resumes/markdown` | Raw UTF-8 `text/markdown`, import headers, percent-encoded `X-File-Name` ending in `.md` or `.markdown` (case-insensitive) | `{ resume: RealResumeSummary }` |
 | `POST /resumes/url` | JSON `{ "url": "https://…" }`, import headers | `{ resume: RealResumeSummary }` |
 | `POST /resumes/:resumeId/retry` | Exact `If-Match`; no body (empty JSON object also accepted) | `{ resume: RealResumeSummary }` |
 | `POST /resumes/:resumeId/cancel` | Exact `If-Match`; no body (empty JSON object also accepted) | `{ resume: RealResumeSummary }` |
 
-Both imports require UUID `Idempotency-Key`, UUID `X-Import-Batch`, and decimal `X-Import-Count`.
+All imports require UUID `Idempotency-Key`, UUID `X-Import-Batch`, and decimal `X-Import-Count`.
 Every item in a batch must declare the same count (1–10) and importing principal. Each item has
-its own idempotency key. A newly accepted item returns 202; a confirmed replay returns 200.
+its own idempotency key. PDF, Markdown, and URL items share that batch admission limit. A newly
+accepted item returns 202; a confirmed replay returns 200.
 The write responses include the current ETag. Retry/cancel do not accept source text, profiles,
 processing status, or other client-owned overrides.
 
 PDFs are limited to **10 MiB and 50 pages**. The service parses their actual structure before
 publication, rejects malformed/encrypted PDFs, and accepts image-only/scanned PDFs for worker OCR.
 Filenames are display-only safe basenames, never storage paths or candidate names.
+Local Markdown uploads are limited to **10 MiB** of original bytes, with no PDF page limit.
+Use `Content-Type: text/markdown` (optionally `charset=utf-8`); other declared charsets, malformed
+UTF-8, empty/whitespace-only files, binary/control characters, and compressed uploads are rejected
+before publication. An optional UTF-8 BOM and original line endings are preserved in the private
+original. The shared decoder validates input without normalizing, executing, or rendering it as HTML.
+Markdown imports are real-data uploads only: public Markdown URL retrieval, sample imports,
+supporting grade reference uploads, and Markdown exports are not supported. The authenticated
+`/api/features` response advertises `markdownResumeImports` only when the real resume service is
+available and exposes `resumeLimits.maxMarkdownBytes`.
 Public URLs are limited to **4,096 characters** and HTTP(S) standard ports, without credentials,
 private IP literals, or known private hostnames. The worker must separately resolve/pin public DNS
 and validate redirects. LinkedIn or another site requiring sign-in, consent, or an access bypass
@@ -52,9 +63,13 @@ transaction conditionally appends one unique batch item and creates its queued r
 Neither simultaneous submissions nor distinct keys can exceed the batch's declared count or ten
 items. Invalid items do not discard accepted siblings.
 
-Immutable import receipts bind the key to source kind, normalized URL or filename/PDF hash,
+Immutable import receipts bind the key to source kind, normalized URL or filename/original-byte hash,
 batch, count, and importing principal. Uploaded originals and their immutable capture manifests
 are durable **before** publication. The winning receipt supplies stable creation/capture metadata.
+Existing PDF fingerprints and `pdfSha256` receipt fields remain unchanged. Markdown receipts add
+`markdownSha256`, never repurpose `pdfSha256`, and bind the exact uploaded bytes, including BOMs
+and line endings. Reusing a key for changed bytes, filename, source kind, actor, or batch metadata
+is a conflict, not an overwrite.
 After an ambiguous response, retry the same item with the same key, body, and batch headers.
 Never overwrite or delete another attempt's winning blobs to compensate for a failed publication.
 Unpublished receipts/originals may remain after a failure or lost admission race; retention/deletion
@@ -63,14 +78,17 @@ administration is outside this release. Resetting samples does not delete real r
 Blob names are restricted to these exact names beneath `<workspaceId>/<resumeId>/`:
 
 - `import-receipt.json`
-- `original.pdf` or `original.html`
+- `original.pdf`, `original.html`, or `original.md` (canonical even for `.markdown` filenames)
 - `capture.json`
 - `source-document-v<documentVersion>.json`
 - `profile-v<documentVersion>.json`
 
 The container must be private. Authorized original downloads verify recorded MIME, length, SHA-256,
-ownership, and capture manifest. HTML is an attachment with `nosniff` and a sandbox CSP, not
-executable application content. Details also validate the normalized document and profile against
+ownership, and capture manifest. Original MIME and byte limits are explicit per blob namespace;
+unknown types are rejected, never guessed as HTML or JSON. Markdown downloads use `text/markdown`
+and the user's original `.md`/`.markdown` basename in a safely encoded attachment header.
+All originals are private, `no-store` attachments with `nosniff`, a sandbox CSP, and `no-referrer`,
+not executable application content. Details also validate the normalized document and profile against
 the saved immutable references; corrupt state fails closed and is never reseeded.
 
 Duplicate warnings use workspace-local original hashes or normalized requested URLs, not filenames.
@@ -87,9 +105,10 @@ Azure factories:
 - `createResumeStoreFromContainer(container)` and `createResumeBlobStoreFromContainer(container)`
   expose the same adapters for isolated tests.
 
-`RealResumeService(resumes, now?)` exposes `list`, `detail`, `original`, `importPdf`, `importUrl`,
+`RealResumeService(resumes, now?)` exposes `list`, `detail`, `original`, `importPdf`, `importMarkdown`, `importUrl`,
 `retry`, and `cancel`. `importPdf(workspaceId, request, filename, bytes)` and
-`importUrl(workspaceId, request, url)` accept a `ResumeImportRequest` containing
+`importMarkdown(workspaceId, request, filename, bytes)` share file admission and immutable capture;
+`importUrl(workspaceId, request, url)` defers capture to the worker. All accept a `ResumeImportRequest` containing
 `idempotencyKey`, `batchId`, `inputCount`, and server-authenticated `createdBy`.
 
 Reusable validation exports:
@@ -104,6 +123,10 @@ Reusable validation exports:
 - `resumeSha256`, `resumeContentHash` (canonical JSON), `resumeBlobReference`
 - `normalizeResumePublicUrl`, `isSafeResumeFilename`
 
+`isSafeResumeFilename(name)` remains PDF-specific for existing callers; pass `'markdown'` as the
+second argument for a local Markdown filename. `resumeOriginalBlobName` accepts `'markdown'` or
+`'text/markdown'`, both producing `original.md`.
+
 `resumeBlobReference(name, blob)` verifies actual SHA-256, length, MIME, and namespace before
 returning an immutable reference. `validateRealResumeProfile(value, document, expected?)` checks
 exact citations; the optional expected binding contains `workspaceId`, `resumeId`,
@@ -113,16 +136,20 @@ quotations actually occur in the external source document.
 Worker publication rules:
 
 - Capture and capture-manifest references are paired. A URL capture includes a final normalized
-  public URL; an uploaded PDF has no final URL or redirects. Reuse the winning capture, not a later
-  fetch, after retries or ambiguous publication.
+  public URL and is limited to PDF or HTML; uploaded PDF/Markdown sources have no final URL or
+  redirects and must match their declared MIME. Reuse the winning capture, not a later fetch,
+  after retries or ambiguous publication.
 - Captures, extraction provenance/document references, and profiles are immutable once recorded.
   Store writes must preserve them, including during cancellation and manual retry.
 - Parsing/profiling require a UUID `attemptId`, attempts greater than zero (maximum three), and
   a lease with `owner`, `heartbeatAt`, and `expiresAt`. Profiling additionally requires extraction.
   A reclaimed attempt increments the counter and cannot take an unexpired lease.
 - PDF extraction uses `document-intelligence`, `pdf-pages`, and page count 1–50. HTML extraction
-  uses `html` or `browser`, `html-sections`, and null page count. Its section labels are not claims
-  about original PDF pagination.
+  uses `html` or `browser`, `html-sections`, and null page count. Markdown extraction uses
+  `markdown`, `markdown-sections`, and null page count; the worker enforces the same 180,000
+  normalized-character limit without imposing the PDF page limit. Section labels are not claims
+  about original PDF pagination. The existing evidence viewer displays normalized captured text;
+  Markdown is never executed or rendered as an HTML preview.
 - Ready requires capture, manifest, extraction, profile, `completedAt`, and no lease, pending retry
   timestamp, or error. Profile metadata must match the saved profile. Completed records are
   immutable. Error/cancelled records change only through a new explicit retry cycle.

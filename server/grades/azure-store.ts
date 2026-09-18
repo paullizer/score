@@ -5,6 +5,7 @@ import { BlobServiceClient } from '@azure/storage-blob'
 import type { BlockBlobClient } from '@azure/storage-blob'
 import type { TokenCredential } from '@azure/identity'
 import { GRADE_LADDER_LIMITS, type GradeEntity, type GradeWorkRecord, type VersionedGradeEntity } from '../../src/domain/real-grades'
+import { MAX_MARKDOWN_BYTES } from '../../src/domain/source-files'
 import { WORKSPACE_ID_PATTERN } from '../ids'
 import { StoreConflictError, StoreNotFoundError } from '../store'
 import { fetchCosmosPage } from '../cosmos-query'
@@ -229,12 +230,14 @@ interface GradeBlobContainer {
 
 function blobLimit(name: string): number {
   if (name.endsWith('.pdf')) return GRADE_LADDER_LIMITS.maxPdfBytes
+  if (name.endsWith('.md')) return MAX_MARKDOWN_BYTES
   if (name.endsWith('.html')) return 24 * 1024 * 1024
   return GRADE_LADDER_LIMITS.maxSourceCharacters * 8 + 4 * 1024 * 1024
 }
 
 function mime(name: string): string {
-  return name.endsWith('.pdf') ? 'application/pdf' : name.endsWith('.html') ? 'text/html' : 'application/json'
+  return name.endsWith('.pdf') ? 'application/pdf' : name.endsWith('.html') ? 'text/html'
+    : name.endsWith('.md') ? 'text/markdown' : 'application/json'
 }
 
 async function readBounded(stream: NodeJS.ReadableStream, length: number | undefined, maximum: number): Promise<Uint8Array> {

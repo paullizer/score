@@ -6,6 +6,7 @@ import { DocumentViewer } from '../../components/documents/DocumentViewer'
 import { Badge, Button, DemoNote, EmptyState, InlineError, Modal, PageHeader, SearchField, SegmentedControl } from '../../components/ui'
 import { dateLabel, latestRubrics } from '../../domain/selectors'
 import type { Citation, Criterion, Rubric, Workspace } from '../../domain/types'
+import { documentPagination } from '../../domain/source-files'
 import { RubricPanel } from './RubricPanel'
 import { useGradeLadders } from '../../app/grade-ladders-context'
 import { GradeLadderLibrary } from '../grade-ladders/GradeLadderLibrary'
@@ -355,7 +356,7 @@ function RubricDetail({ id }: { id: string }) {
     >
       {document
         ? <DocumentViewer document={document} highlightedId={sourceSelection?.citation?.paragraphId ?? sourceSelection?.criterion.sourceCitations?.[0]?.paragraphId ?? sourceSelection?.criterion.sourceParagraphId} quote={sourceSelection?.citation?.quote ?? sourceSelection?.criterion.sourceCitations?.[0]?.quote}
-          pagination={realDetail?.state === 'ready' && realDetail.value.source.originalContentType === 'text/html' ? 'html-sections' : 'pdf-pages'} />
+          pagination={rubric.dataKind === 'real' ? documentPagination(realDetail?.state === 'ready' ? realDetail.value.source.originalContentType : undefined) : 'pdf-pages'} />
         : rubric.dataKind === 'real' && (realDetail?.state === 'idle' || realDetail?.state === 'loading')
           ? <EmptyState icon={LoaderCircle} title="Loading source document" description="Score is retrieving the parsed source and exact quotations." />
           : <EmptyState icon={FileSearch} title="Source document unavailable" description={rubric.dataKind === 'real' ? 'The server did not return the parsed source. Refresh this real job and try again.' : 'This sample document is missing from the workspace. Open another rubric to inspect its source.'} />}

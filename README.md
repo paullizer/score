@@ -31,8 +31,8 @@ The application uses React 18, TypeScript, Vite, Tailwind CSS, React Router, and
 
 ## Explore the workflow
 
-1. **Jobs:** In Azure, choose **Real jobs**, then **Add jobs** to upload actual PDFs or import direct public posting URLs. Each input creates its own job and associated rubric. The separate **Samples** view and standalone local mode expose fictional jobs and simulated discovery; the OPM preset is not a live website integration.
-2. **Resumes:** In cloud mode, upload actual PDFs or enter public resume/profile URLs, one per line, with up to 10 inputs per batch. Inspect ready documents, provenance, and item-level errors. The separate sample library still contains fictional profiles.
+1. **Jobs:** In Azure, choose **Real jobs**, then **Add jobs** to upload actual PDFs or Markdown files (`.md` / `.markdown`), or import direct public posting URLs. Each input creates its own job and associated rubric. The separate **Samples** view and standalone local mode expose fictional jobs and simulated discovery; the OPM preset is not a live website integration.
+2. **Resumes:** In cloud mode, upload actual PDFs or Markdown files, or enter public resume/profile URLs, one per line, with up to 10 total inputs per batch. Inspect ready documents, provenance, and item-level errors. The separate sample library still contains fictional profiles.
 3. **Rubrics:** Review job-specific criteria or choose **Create grade ladder** from a real job to prepare separate GS levels. Inspect the selected sources and grade matrix before approving supported versions. Sample GS rubrics remain separate. Weights must total 100.
 4. **Analyses:** Select ready real resumes and saved real job rubrics or exact approved GS versions, review the comparison count, then explicitly start the run. The limit is 100 resume/target pairs. Importing never starts scoring automatically. Sample analyses use a separate fixture scorer that rejects real or mixed selections.
 5. **Evidence:** Open a comparison to inspect criterion assessments, an available weighted 0-100 score, evidence gaps, and exact resume quotations beside the frozen job/GS requirement citations. Results retain their original documents, rubric versions, and approval provenance even after later edits.
@@ -45,24 +45,29 @@ Sample GS examples are illustrative. Source-backed grade drafts and real assessm
 
 ## Real job ingestion
 
-The authenticated API accepts raw PDF bytes or a direct public URL. One input must describe one job; listing/search pages and whole-site discovery are outside this release.
+The authenticated API accepts raw PDF or UTF-8 Markdown bytes, or a direct public URL. One input must describe one job; listing/search pages and whole-site discovery are outside this release.
 
 1. The API checks workspace membership, validates the input, and publishes an idempotent job record. Uploaded originals are stored immutably in the private `job-sources` Blob container before publication.
 2. A Container Apps Job runs every minute, claiming pending Cosmos records with ETag leases and heartbeats. Processing continues after the browser closes; an import may wait about a minute before starting.
-3. Azure Document Intelligence extracts PDF text and performs OCR on scanned pages. URLs use bounded HTML/JSON-LD extraction, with a separate private Chromium renderer when JavaScript is needed. Direct links that return PDFs use the same PDF pipeline.
+3. Azure Document Intelligence extracts PDF text and performs OCR on scanned pages. Markdown is parsed directly into ordered, citable text with headings, lists, tables, and code; it uses neither OCR nor a browser renderer. URLs use bounded HTML/JSON-LD extraction, with a separate private Chromium renderer when JavaScript is needed. Direct links that return PDFs use the same PDF pipeline.
 4. Foundry generates a schema-constrained rubric from the extracted source. Criteria include required/preferred distinctions, 0-5 scoring guidance, weights totaling 100, and exact paragraph quotations. Metadata, weights, and citations are validated before publication; invalid output is repaired once or reported as an error, never replaced with a sample rubric.
 5. Open the job to inspect its source beside the saved rubric. Citation links highlight the original passage, and the original file remains downloadable through the authorized API. Reviewer edits require the current job ETag and append an immutable rubric version.
 
 | Limit | Current value |
 | --- | --- |
-| PDF size and page count | 10 MiB and 50 pages per PDF |
-| PDF batch | Up to 10 files; each remains an individual job |
+| Uploaded file size | 10 MiB per PDF or Markdown file |
+| PDF page count | 50 pages; Markdown has no physical page limit |
+| File batch | Up to 10 PDF/Markdown files; each remains an individual job |
 | Normalized source text | 180,000 characters |
 | Direct URL length | 4,096 characters; public HTTP(S), standard ports only |
 | Rubric | Up to 20 criteria; weights must total 100 |
 | Transient processing failures | Up to three automatic attempts with backoff; explicit retry after failure |
 
-Jobs expose queued, parsing, generating, ready, error, and cancelled states. Cancellation prevents late worker results from being published. Retrying reuses any preserved original and extracted source instead of silently changing the evidence. Encrypted/unreadable PDFs, unsupported pages, protected websites, and invalid generated output produce actionable errors. Public URLs do not carry the user's browser login, cookies, or credentials.
+Jobs expose queued, parsing, generating, ready, error, and cancelled states. Cancellation prevents late worker results from being published. Retrying reuses any preserved original and extracted source instead of silently changing the evidence. Encrypted/unreadable PDFs, invalid Markdown encoding, unsupported pages, protected websites, and invalid generated output produce actionable errors. Public URLs do not carry the user's browser login, cookies, or credentials.
+
+Markdown uploads accept `.md` and `.markdown` extensions case-insensitively, with UTF-8 encoding (an optional UTF-8 BOM is supported). Empty, binary, invalidly encoded, and oversized inputs are rejected explicitly; extracted text is never silently truncated. Original bytes and filenames remain downloadable. The evidence viewer shows Markdown as text sections with citation highlighting, not as executable HTML or a rendered Markdown page. Embedded HTML and front matter remain inert text, and linked images/assets are never fetched. Markdown URL ingestion, Markdown export, and Markdown supporting-reference uploads for GS ladders are not included.
+
+Deploy the updated job, resume, grade-ladder, and analysis workers before the web/API release so older workers never encounter Markdown records or snapshots. The authenticated feature response advertises Markdown import availability separately; older API responses do not enable Markdown uploads in the UI.
 
 ### Source isolation and model processing
 
@@ -108,15 +113,15 @@ The cloud feature flag is `REAL_GRADE_LADDERS_ENABLED`. Without configured grade
 
 ## Real resume ingestion
 
-The authenticated API accepts actual PDF bytes and direct public HTTP(S) resume/profile URLs, including LinkedIn profiles **only when publicly accessible**. Each input describes one person, not a directory of profiles or a crawl. Uploads are limited to **10 MiB and 50 pages per PDF**, **10 inputs per batch**, **4,096 characters per URL**, and **180,000 normalized source characters**. A same-named file is not assumed to be the same person; exact source/content repeats produce workspace-local duplicate warnings rather than silently merging profiles.
+The authenticated API accepts actual PDF or UTF-8 Markdown bytes and direct public HTTP(S) resume/profile URLs, including LinkedIn profiles **only when publicly accessible**. Each input describes one person, not a directory of profiles or a crawl. Uploads are limited to **10 MiB per file**, **50 pages per PDF** (no Markdown page limit), **10 total PDF/Markdown/URL inputs per batch**, **4,096 characters per URL**, and **180,000 normalized source characters**, including headings. A same-named file is not assumed to be the same person; exact source/content repeats produce workspace-local duplicate warnings rather than silently merging profiles.
 
-Accepted inputs continue processing after the dialog or browser closes. Per-item states distinguish queued, parsing, profiling, ready, error, and cancelled. Uploaded PDF originals are stored immutably before work is published; URL workers preserve the captured original and manifest before profiling. The dedicated resume worker uses the existing PDF/OCR service, resume-aware HTML extraction, the isolated internal renderer when necessary, and the configured Foundry model for evidence-grounded display metadata. Missing names, roles, or other fields remain unavailable rather than being invented from filenames.
+Accepted inputs continue processing after the dialog or browser closes. Per-item states distinguish queued, parsing, profiling, ready, error, and cancelled. Uploaded originals are stored immutably before work is published; URL workers preserve the captured original and manifest before profiling. The dedicated resume worker uses direct Markdown text extraction, the existing PDF/OCR service, resume-aware HTML extraction, the isolated internal renderer when necessary, and the configured Foundry model for evidence-grounded display metadata. Missing names, roles, or other fields remain unavailable rather than being invented from filenames.
 
 Public fetches never use the browser's signed-in session, cookies, or credentials. Sign-in, access-blocked, consent, and challenge pages cannot become ready resumes. A private or blocked profile reports **“This URL is not publicly accessible and could not be processed.”** There is no LinkedIn account integration, authentication/CAPTCHA bypass, or third-party scraping service. Missing pages, network failures, unreadable PDFs, unsupported content, and service outages retain their distinct error messages; not every failure means a URL is private. Sparse but genuine public profiles may provide much less evidence than full resumes.
 
-Static HTML imports honor supported declared encodings and preserve the original capture bytes. Malformed or unsupported encodings produce explicit errors rather than silently replacing characters in names or evidence. If an encoding error prevents import, supply a UTF-8 public profile page or a readable PDF.
+Static HTML imports honor supported declared encodings and preserve the original capture bytes. Malformed or unsupported encodings produce explicit errors rather than silently replacing characters in names or evidence. If an encoding error prevents import, supply a UTF-8 public profile page, a readable PDF, or a UTF-8 Markdown file.
 
-Inspect the actual document and download its original through workspace-authorized endpoints. Captures preserve source kind, filename or requested/final URL, timestamp, hash, extraction method, and stable document/version/paragraph identities. HTML source is displayed as untrusted text, not executed in the browser. Transient errors receive up to three automatic attempts with backoff; explicit retry reuses preserved evidence instead of silently refetching a different profile. Cancellation and lost worker leases prevent late publication.
+Inspect the actual document and download its original through workspace-authorized endpoints. Captures preserve source kind, filename or requested/final URL, timestamp, hash, extraction method, and stable document/version/paragraph identities. HTML and Markdown sources are displayed as untrusted text, not executed in the browser. Markdown extraction records section provenance rather than physical PDF pages. Transient errors receive up to three automatic attempts with backoff; explicit retry reuses preserved evidence instead of silently refetching a different profile. Cancellation and lost worker leases prevent late publication.
 
 ## Real evidence-backed analyses
 

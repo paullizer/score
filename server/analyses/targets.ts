@@ -8,6 +8,7 @@ import {
 } from '../../src/domain/real-grades'
 import type { RealResumeProfile, RealResumeRecord } from '../../src/domain/real-resumes'
 import type { RealJobRecord } from '../../src/domain/real-jobs'
+import { isOriginalContentType, MAX_MARKDOWN_BYTES, originalFileExtension } from '../../src/domain/source-files'
 import type { RealJobsDeps } from '../jobs/routes'
 import type { RealGradesDeps } from '../grades/service'
 import type { RealResumesDeps } from '../resumes/store'
@@ -39,7 +40,9 @@ type ResolvedGrade = Omit<FrozenGradeTargetSnapshot, 'schemaVersion' | 'snapshot
 export type ResolvedAnalysisTarget = ResolvedJob | ResolvedGrade
 
 function checkedBlob(blob: AnalysisBlob | undefined, contentType: string, hash?: string, bytes?: number): AnalysisBlob {
-  if (!blob || blob.contentType !== contentType || blob.bytes.byteLength > (contentType === 'application/json' ? MAX_ANALYSIS_JSON_BYTES : MAX_ANALYSIS_ORIGINAL_BYTES) ||
+  const maximum = contentType === 'text/markdown' ? MAX_MARKDOWN_BYTES
+    : contentType === 'application/json' ? MAX_ANALYSIS_JSON_BYTES : MAX_ANALYSIS_ORIGINAL_BYTES
+  if (!blob || blob.contentType !== contentType || blob.bytes.byteLength > maximum ||
     blob.sha256 !== analysisBytesHash(blob.bytes) || (hash !== undefined && blob.sha256 !== hash) ||
     (bytes !== undefined && blob.bytes.byteLength !== bytes)) throw unavailable('An exact captured analysis input is unavailable or has changed.')
   return blob
@@ -82,14 +85,16 @@ export class RealAnalysisTargets {
     const documentBlob = checkedBlob(documentValue, 'application/json')
     const original = checkedBlob(originalValue, source.originalContentType, source.sha256, source.bytes)
     const document = parseAnalysisJson(documentBlob) as FrozenJobTargetSnapshot['document']
-    if (validateRealSourceDocument(document).length || document.id !== job.job.documentId) {
+    if (validateRealSourceDocument(document, source.originalContentType).length || document.id !== job.job.documentId) {
       throw unavailable('The selected job document has invalid captured evidence.')
     }
     const rubrics = selection ? savedRubrics.filter(item => item.id === selection.rubricId && item.version === selection.rubricVersion) : savedRubrics
     if (!rubrics.length || (selection && rubrics.length !== 1)) throw conflict('The exact selected saved job rubric version is unavailable.')
     if (new Set(rubrics.map(item => `${item.id}:${item.version}`)).size !== rubrics.length) throw unavailable('Saved job rubric versions are duplicated.')
     return rubrics.map(rubric => {
-      if (rubric.jobId !== job.id || validateRealRubric(rubric, document).length) throw unavailable('The saved real job rubric has invalid source evidence.')
+      if (rubric.jobId !== job.id || validateRealRubric(rubric, document, source.originalContentType).length) {
+        throw unavailable('The saved real job rubric has invalid source evidence.')
+      }
       const exact: RealJobTargetSelection = {
         kind: 'job', jobId: job.id, rubricId: rubric.id, rubricVersion: rubric.version,
         rubricHash: analysisHash(rubric), documentId: document.id, documentVersion: document.version, documentSha256: documentBlob.sha256,
@@ -282,7 +287,8 @@ export async function copyAnalysisTargetEvidence(
   const base = { schemaVersion: 1 as const, snapshotId, workspaceId, dataKind: 'real' as const, frozenAt }
   if (resolved.kind === 'job') {
     const original = resolved.original
-    const blobName = `${workspaceId}/${runId}/evidence/${original.sha256}.${original.contentType === 'application/pdf' ? 'pdf' : 'html'}`
+    assertAnalysis(isOriginalContentType(original.contentType), 'Invalid job original content type.')
+    const blobName = `${workspaceId}/${runId}/evidence/${original.sha256}.${originalFileExtension(original.contentType)}`
     const saved = (await blobs.putImmutable(blobName, original.bytes, original.contentType)).blob
     checkedBlob(saved, original.contentType, original.sha256, original.bytes.byteLength)
     return parseFrozenTargetSnapshot({

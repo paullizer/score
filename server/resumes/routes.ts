@@ -1,5 +1,6 @@
 import express, { type NextFunction, type Request, type RequestHandler, type Response, type Router } from 'express'
 import { RESUME_IMPORT_LIMITS } from '../../src/domain/real-resumes'
+import type { UploadedSourceKind } from '../../src/domain/source-files'
 import { HttpError, invalidRequest, notFound, preconditionRequired, unavailable } from '../errors'
 import type { WorkspaceRepository } from '../repository'
 import { getPrincipal } from '../request-context'
@@ -44,14 +45,15 @@ function importRequest(req: Request): ResumeImportRequest {
   }
 }
 
-function filename(req: Request): string {
+function filename(req: Request, kind: UploadedSourceKind = 'pdf'): string {
+  const label = kind === 'pdf' ? 'PDF' : 'Markdown'
   const header = req.header('X-File-Name')
   if (!header || header.length > 255 * 12 || !/^(?:[A-Za-z0-9_.!~*'()-]|%[0-9A-Fa-f]{2})+$/.test(header)) {
-    throw invalidRequest('X-File-Name must contain a percent-encoded safe PDF basename.')
+    throw invalidRequest(`X-File-Name must contain a percent-encoded safe ${label} basename.`)
   }
   let value: string
   try { value = decodeURIComponent(header) } catch { throw invalidRequest('X-File-Name must use valid percent encoding.') }
-  if (!isSafeResumeFilename(value)) throw invalidRequest('X-File-Name must be a safe PDF basename.')
+  if (!isSafeResumeFilename(value, kind)) throw invalidRequest(`X-File-Name must be a safe ${label} basename.`)
   return value
 }
 
@@ -106,7 +108,7 @@ export function createRealResumesRouter(deps: RealResumesRouterDeps): Router {
     } catch (error) { next(error) }
   }
   // The application mounts this router after its authentication and same-origin CSRF middleware.
-  // Workspace authorization and header checks also precede the raw PDF/body parsers below.
+  // Workspace authorization and header checks also precede the raw upload/body parsers below.
   router.use(base, authorize)
 
   router.get(base, async (req, res) => {
@@ -127,31 +129,48 @@ export function createRealResumesRouter(deps: RealResumesRouterDeps): Router {
     res.setHeader('Referrer-Policy', 'no-referrer')
     res.send(Buffer.from(original.bytes))
   })
-  router.post(`${base}/pdf`,
-    (req: Request, _res: Response, next: NextFunction) => {
-      try {
-        importRequest(req)
-        filename(req)
-        if (!req.is('application/pdf')) throw invalidRequest('Content-Type must be application/pdf.')
-        if (req.header('Content-Encoding') && req.header('Content-Encoding')?.toLowerCase() !== 'identity') {
-          throw invalidRequest('Compressed PDF uploads are not supported. Upload the original PDF bytes.')
-        }
-        next()
-      } catch (error) { next(error) }
-    },
-    express.raw({ type: 'application/pdf', limit: RESUME_IMPORT_LIMITS.maxPdfBytes, inflate: false }),
-    async (req: Request, res: Response) => {
-      if (!Buffer.isBuffer(req.body)) throw invalidRequest('The request must contain raw PDF bytes.')
-      const result = await requireService().importPdf(param(req, 'workspaceId'), importRequest(req), filename(req), req.body)
-      res.setHeader('ETag', result.resume.etag)
-      res.status(result.created ? 202 : 200).json({ resume: result.resume })
-    },
-    (error: unknown, _req: Request, _res: Response, next: NextFunction) => {
-      if (typeof error === 'object' && error !== null && 'type' in error && error.type === 'entity.too.large') {
-        next(new HttpError(413, 'invalid_request', 'Resume PDFs may not exceed 10 MiB.'))
-      } else next(error)
-    },
-  )
+  for (const kind of ['pdf', 'markdown'] as const) {
+    const contentType = kind === 'pdf' ? 'application/pdf' : 'text/markdown'
+    const label = kind === 'pdf' ? 'PDF' : 'Markdown'
+    router.post(`${base}/${kind}`,
+      (req: Request, _res: Response, next: NextFunction) => {
+        try {
+          for (const name of ['content-type', 'content-encoding', 'x-file-name', 'idempotency-key', 'x-import-batch', 'x-import-count']) {
+            if (req.rawHeaders.filter((header, index) => index % 2 === 0 && header.toLowerCase() === name).length > 1) {
+              throw invalidRequest(`${name} must be supplied only once.`)
+            }
+          }
+          importRequest(req)
+          filename(req, kind)
+          if (!req.is(contentType)) throw invalidRequest(`Content-Type must be ${contentType}.`)
+          if (kind === 'markdown' && !/^text\/markdown(?:\s*;\s*charset\s*=\s*(?:utf-8|"utf-8"))?\s*$/i.test(req.header('Content-Type') ?? '')) {
+            throw invalidRequest('Content-Type must be text/markdown with no charset or charset=utf-8.')
+          }
+          if (req.header('Content-Encoding') && req.header('Content-Encoding')?.toLowerCase() !== 'identity') {
+            throw invalidRequest(`Compressed ${label} uploads are not supported. Upload the original ${label} bytes.`)
+          }
+          next()
+        } catch (error) { next(error) }
+      },
+      express.raw({
+        type: contentType, limit: kind === 'pdf' ? RESUME_IMPORT_LIMITS.maxPdfBytes : RESUME_IMPORT_LIMITS.maxMarkdownBytes, inflate: false,
+      }),
+      async (req: Request, res: Response) => {
+        if (!Buffer.isBuffer(req.body)) throw invalidRequest(`The request must contain raw ${label} bytes.`)
+        const service = requireService()
+        const result = await service[kind === 'pdf' ? 'importPdf' : 'importMarkdown'](
+          param(req, 'workspaceId'), importRequest(req), filename(req, kind), req.body,
+        )
+        res.setHeader('ETag', result.resume.etag)
+        res.status(result.created ? 202 : 200).json({ resume: result.resume })
+      },
+      (error: unknown, _req: Request, _res: Response, next: NextFunction) => {
+        if (typeof error === 'object' && error !== null && 'type' in error && error.type === 'entity.too.large') {
+          next(new HttpError(413, 'invalid_request', `Resume ${kind === 'pdf' ? 'PDFs' : 'Markdown files'} may not exceed 10 MiB.`))
+        } else next(error)
+      },
+    )
+  }
   router.post(`${base}/url`,
     (req, _res, next) => {
       try {
