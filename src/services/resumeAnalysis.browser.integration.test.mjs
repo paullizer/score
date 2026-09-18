@@ -372,3 +372,344 @@ test('browser resumes a paused cancellation without scoring or replacing its cap
     assert.deepEqual(errors, [])
   } finally { await context.close() }
 })
+
+const browsingProfiles = [
+  { name: 'Zora Example', fileName: 'resume-10.pdf', score: 3 },
+  { name: 'ada Example', fileName: 'resume-2.pdf', score: 1 },
+  { name: 'Morgan Example', fileName: 'resume-1.pdf', score: 0 },
+  { name: null, fileName: 'resume-20.pdf', score: null },
+]
+
+function modelResponse(output) {
+  return Response.json({ model: 'browsing-fixture', choices: [{ finish_reason: 'stop', message: { content: JSON.stringify(output) } }] })
+}
+
+async function seedBrowsingInputs(fixture) {
+  await seedRealJob(fixture)
+  const resumes = []
+  for (const profile of browsingProfiles) {
+    const paragraphs = resumeParagraphs.map((paragraph, index) => index === 0 ? { ...paragraph, text: profile.name ?? 'Professional profile' } : paragraph)
+    const imported = await importResumePdf(fixture, await resumePdf({ name: profile.fileName, paragraphs }))
+    const imports = processingStubs(fixture, {
+      ocrParagraphs: paragraphs,
+      onModelRequest(request) {
+        if (request.response_format.json_schema.name !== 'resume_profile') return
+        const source = JSON.parse(request.messages[1].content).source.paragraphs
+        function quote(text) {
+          const paragraph = source.find((item) => item.text.includes(text))
+          assert.ok(paragraph, `The fictional source must contain ${text}.`)
+          return { paragraphId: paragraph.paragraphId ?? paragraph.id, quote: paragraph.text }
+        }
+        const field = (text) => text === null ? { status: 'unavailable', value: null, citations: [] }
+          : { status: 'available', value: text, citations: [quote(text)] }
+        return modelResponse({
+          classification: 'single-profile', sparse: false,
+          professionalEvidence: [quote('Applied engineering methods'), quote('Bachelor of Engineering')],
+          name: field(profile.name), role: field('Engineering specialist'), location: field('Remote'),
+          experience: field('Ten years of engineering experience.'),
+        })
+      },
+    })
+    await processAllResumes(fixture, imports)
+    resumes.push(await jsonResponse(await fixture.request(`/api/workspaces/${fixture.workspaceId}/resumes/${imported.summary.resume.id}`)))
+  }
+  const stubs = processingStubs(fixture, {
+    onModelRequest(request) {
+      if (request.response_format.json_schema.name !== 'resume_rubric_assessment') return
+      const input = JSON.parse(request.messages[1].content).input
+      const profile = browsingProfiles.find((item) => item.name && input.resume.paragraphs.some((paragraph) => paragraph.text === item.name))
+        ?? browsingProfiles.at(-1)
+      const work = input.resume.paragraphs.find((paragraph) => paragraph.text.includes('Applied engineering methods'))
+      assert.ok(work)
+      assert.deepEqual(input.qualifications, [])
+      const score = profile.score
+      return modelResponse({
+        criteria: input.rubric.criteria.map((criterion) => ({
+          criterionId: criterion.id, score,
+          evidenceStatus: score === null ? 'not-assessed' : score === 0 ? 'missing' : 'supported',
+          rationale: score === null ? 'The captured source does not establish the scope needed by this saved criterion.'
+            : score === 0 ? 'No supporting evidence was assigned to this criterion in this controlled fixture.'
+              : 'The quoted passage provides the controlled fixture evidence for this saved criterion.',
+          citations: score > 0 ? [{ paragraphId: work.paragraphId ?? work.id, quote: work.text }] : [],
+          limitation: score === null ? { code: 'not-assessable', message: 'The captured source scope requires human evidence review.' } : null,
+        })),
+        qualifications: [],
+      })
+    },
+  })
+  const targets = await allPages(fixture, `/api/workspaces/${fixture.workspaceId}/analyses/targets`, 'targets')
+  assert.equal(targets.length, 2)
+  return { resumes, targets, stubs }
+}
+
+async function createBrowsingRun(fixture, resumes, targets, name) {
+  return (await jsonResponse(await fixture.request(`/api/workspaces/${fixture.workspaceId}/analyses`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json', 'Idempotency-Key': randomUUID() },
+    body: JSON.stringify({ name, resumes: resumes.map(resumeSelection), targets: targets.map((target) => target.selection) }),
+  }), [200, 202])).run
+}
+
+test('browser comparison browsing searches every page, scopes score sorting, and preserves keyboard/mobile navigation', { timeout: 120_000 }, async (t) => {
+  const fixture = await startResumeAnalysisFixture(runtime, { injectAuth: true, pageSize: 2 })
+  t.after(() => fixture.close())
+  const { resumes, targets, stubs } = await seedBrowsingInputs(fixture)
+  const created = await createBrowsingRun(fixture, resumes, targets, 'Searchable evidence review')
+  await processAllAnalyses(fixture, stubs)
+  const runPath = `/api/workspaces/${fixture.workspaceId}/analyses/${created.run.id}`
+  const pairs = await allPages(fixture, `${runPath}/comparisons`, 'comparisons')
+  assert.equal(pairs.length, 8)
+  assert.ok(pairs.every(({ comparison }) => comparison.status === 'complete'))
+  const recordsBefore = JSON.stringify([...fixture.analyses.store.values.values()])
+  const modelCallsBefore = stubs.modelCalls.length
+  const requestStart = fixture.requests.length
+  const { context, page, errors } = await newPage()
+  try {
+    await page.goto(`${fixture.origin}/workspaces/${fixture.workspaceId}/analyses/${created.run.id}?data=real`)
+    const section = await visible(page.getByRole('region', { name: 'Real comparisons', exact: true }))
+    const rows = section.locator('tbody tr')
+    await until(async () => await rows.count() === 8, 'The comparison table must include every continuation page.')
+    assert.ok(fixture.requests.slice(requestStart).some((request) => request.url.includes('/comparisons?continuationToken=')))
+    const names = () => rows.locator('td:first-child .row-title').allTextContents()
+    const search = section.getByRole('searchbox', { name: 'Search comparisons', exact: true })
+    const targetSelect = section.getByRole('combobox', { name: /target/i })
+    const sortSelect = section.getByRole('combobox', { name: /sort/i })
+    const nameHeader = section.getByRole('columnheader').filter({ hasText: 'Saved resume' })
+    const scoreHeader = section.getByRole('columnheader').filter({ hasText: 'Assessment / evidence match' })
+    assert.equal(await scoreHeader.getByRole('button').isDisabled(), true)
+    await nameHeader.getByRole('button').focus()
+    await page.keyboard.press('Enter')
+    assert.equal(await nameHeader.getAttribute('aria-sort'), 'ascending')
+    assert.deepEqual(await names(), ['ada Example', 'ada Example', 'Morgan Example', 'Morgan Example', 'Zora Example', 'Zora Example', 'Name not stated', 'Name not stated'])
+    await page.keyboard.press('Space')
+    assert.equal(await nameHeader.getAttribute('aria-sort'), 'descending')
+    assert.deepEqual(await names(), ['Zora Example', 'Zora Example', 'Morgan Example', 'Morgan Example', 'ada Example', 'ada Example', 'Name not stated', 'Name not stated'])
+
+    const targetOptions = await targetSelect.locator('option').evaluateAll((options) => options.map((option) => ({ value: option.value, label: option.textContent })))
+    const versionTwo = targetOptions.find((option) => option.label.includes('Job rubric v2'))
+    assert.ok(versionTwo, 'Exact same-named targets must expose their saved versions.')
+    await targetSelect.selectOption(versionTwo.value)
+    await until(async () => await rows.count() === 4, 'Selecting one saved version should show only its four comparisons.')
+    assert.ok((await rows.locator('td:nth-child(2)').allTextContents()).every((text) => text.includes('Job rubric v2')))
+    await scoreHeader.getByRole('button').click()
+    assert.equal(await scoreHeader.getAttribute('aria-sort'), 'descending')
+    assert.deepEqual(await names(), ['Zora Example', 'ada Example', 'Morgan Example', 'Name not stated'])
+    await scoreHeader.getByRole('button').click()
+    assert.equal(await scoreHeader.getAttribute('aria-sort'), 'ascending')
+    assert.deepEqual(await names(), ['Morgan Example', 'ada Example', 'Zora Example', 'Name not stated'])
+    assert.match(await rows.first().locator('td:nth-child(3)').textContent(), /0\s*\/\s*100/)
+    assert.match(await rows.last().locator('td:nth-child(3)').textContent(), /No overall score/)
+
+    for (const [query, expected] of [
+      ['  ADA  ', ['ada Example']],
+      ['rEsUmE-10.PdF', ['Zora Example']],
+      ['ENGINEERING SPECIALIST', ['Morgan Example', 'ada Example', 'Zora Example', 'Name not stated']],
+    ]) {
+      await search.fill(query)
+      await until(async () => JSON.stringify(await names()) === JSON.stringify(expected), `Saved metadata search should match ${query}.`)
+    }
+    await search.fill('no-matching-person')
+    await visible(section.getByRole('heading', { name: 'No matching comparisons', exact: true }))
+    assert.equal(await rows.count(), 0)
+    assert.equal(await search.isVisible(), true)
+    assert.equal(await targetSelect.isVisible(), true)
+    assert.equal(await section.getByText('Comparison initialization is still pending', { exact: true }).count(), 0)
+    await search.fill('ADA')
+    await until(async () => await rows.count() === 1, 'Search should restore the matching saved comparison.')
+    const expectedPair = pairs.find(({ comparison }) => comparison.resume.summary.name === 'ada Example' && comparison.target.summary.selection.rubricVersion === 2)
+    const sortValue = await sortSelect.inputValue()
+    await rows.getByRole('button', { name: /^Review comparison / }).click()
+    await visible(page.getByRole('heading', { name: 'Evidence-based assessment', exact: true }))
+    assert.equal(new URL(page.url()).searchParams.get('result'), expectedPair.comparison.id)
+    await page.getByRole('link', { name: 'All saved comparisons', exact: true }).click()
+    assert.equal(await search.inputValue(), 'ADA')
+    assert.equal(await targetSelect.inputValue(), versionTwo.value)
+    assert.equal(await sortSelect.inputValue(), sortValue)
+    assert.deepEqual(await names(), ['ada Example'])
+    await rows.getByRole('button', { name: /^Review comparison / }).click()
+    await visible(page.getByRole('heading', { name: 'Evidence-based assessment', exact: true }))
+    await page.goBack()
+    assert.equal(await search.inputValue(), 'ADA')
+    assert.deepEqual(await names(), ['ada Example'])
+
+    await page.setViewportSize({ width: 390, height: 844 })
+    await visible(search)
+    await visible(targetSelect)
+    await visible(sortSelect)
+    await search.fill('')
+    await targetSelect.selectOption({ label: 'All targets' })
+    assert.equal(await sortSelect.inputValue(), '')
+    assert.equal(await scoreHeader.getByRole('button').isDisabled(), true)
+    await until(async () => await rows.count() === 8, 'All targets should restore the complete saved comparison list.')
+    assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth + 1), 'Only the table wrapper, not the page, may scroll horizontally.')
+    assert.equal(JSON.stringify([...fixture.analyses.store.values.values()]), recordsBefore)
+    assert.equal(stubs.modelCalls.length, modelCallsBefore)
+    assert.equal(fixture.state.saves.length, 0)
+    assert.ok(fixture.requests.slice(requestStart).every((request) => request.method === 'GET'), 'Browsing must not send mutation requests.')
+    const stored = await page.evaluate(() => Object.values(localStorage).join('\n'))
+    assert.doesNotMatch(stored, /ada Example|Zora Example|resume-10\.pdf|no-matching-person/)
+    assert.deepEqual(errors, [])
+  } finally { await context.close() }
+})
+
+test('browser processing-status sorting preserves filters during refresh and cancels the reordered saved pair', { timeout: 120_000 }, async (t) => {
+  const fixture = await startResumeAnalysisFixture(runtime, { injectAuth: true, pageSize: 2 })
+  t.after(() => fixture.close())
+  const { resumes, targets, stubs } = await seedBrowsingInputs(fixture)
+  const created = await createBrowsingRun(fixture, resumes, targets.slice(0, 1), 'Processing status review')
+  const runPath = `/api/workspaces/${fixture.workspaceId}/analyses/${created.run.id}`
+  let pairs = []
+  for (let pass = 0; pass < 4; pass++) {
+    await runtime.api.analysisWorker.runAnalysisWorker(stubs.analyses, { maxItems: 1 })
+    pairs = await allPages(fixture, `${runPath}/comparisons`, 'comparisons')
+    if (pairs.some(({ comparison }) => comparison.status === 'complete')) break
+  }
+  assert.equal(pairs.length, 4)
+  assert.equal(pairs.filter(({ comparison }) => comparison.status === 'complete').length, 1)
+  const cancelled = pairs.find(({ comparison }) => comparison.status === 'queued')
+  await jsonResponse(await fixture.request(`${runPath}/comparisons/${cancelled.comparison.id}/cancel`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json', 'If-Match': cancelled.etag }, body: '{}',
+  }), [200, 202])
+  pairs = await allPages(fixture, `${runPath}/comparisons`, 'comparisons')
+  const queued = pairs.find(({ comparison }) => comparison.status === 'queued')
+  const { context, page, errors } = await newPage()
+  try {
+    await page.goto(`${fixture.origin}/workspaces/${fixture.workspaceId}/analyses/${created.run.id}?data=real`)
+    const section = await visible(page.getByRole('region', { name: 'Real comparisons', exact: true }))
+    const rows = section.locator('tbody tr')
+    await until(async () => await rows.count() === 4, 'All current processing states should be loaded.')
+    const search = section.getByRole('searchbox', { name: 'Search comparisons', exact: true })
+    await search.fill('resume-')
+    const statusHeader = section.getByRole('columnheader').filter({ hasText: /Status.*actions/i })
+    await statusHeader.getByRole('button').click()
+    assert.equal(await statusHeader.getAttribute('aria-sort'), 'ascending')
+    assert.equal(await rows.first().getByRole('button', { name: `Retry comparison ${cancelled.comparison.index + 1} with saved inputs`, exact: true }).count(), 1)
+    const completed = pairs.find(({ comparison }) => comparison.status === 'complete')
+    assert.equal(await rows.last().getByRole('button', { name: new RegExp(`^Review comparison ${completed.comparison.index + 1}:`) }).count(), 1)
+    await statusHeader.getByRole('button').click()
+    assert.equal(await statusHeader.getAttribute('aria-sort'), 'descending')
+    assert.equal(await rows.first().getByRole('button', { name: new RegExp(`^Review comparison ${completed.comparison.index + 1}:`) }).count(), 1)
+
+    const requestStart = fixture.requests.length
+    await rows.getByRole('button', { name: `Cancel comparison ${queued.comparison.index + 1}`, exact: true }).click()
+    await visible(rows.getByRole('button', { name: `Retry comparison ${queued.comparison.index + 1} with saved inputs`, exact: true }))
+    assert.ok(fixture.requests.slice(requestStart).some((request) => request.method === 'POST' && request.url.endsWith(`/comparisons/${queued.comparison.id}/cancel`)))
+    await page.getByRole('button', { name: 'Refresh pairs', exact: true }).click()
+    assert.equal(await search.inputValue(), 'resume-')
+    assert.equal(await statusHeader.getAttribute('aria-sort'), 'descending')
+    await processAllAnalyses(fixture, stubs)
+    await page.getByRole('button', { name: 'Refresh pairs', exact: true }).click()
+    await visible(page.getByText('4 / 4 comparisons finished', { exact: true }))
+    assert.equal(await search.inputValue(), 'resume-')
+    assert.equal(await statusHeader.getAttribute('aria-sort'), 'descending')
+    assert.equal(await rows.count(), 4)
+    assert.equal(fixture.state.saves.length, 0)
+    assert.deepEqual(errors, [])
+  } finally { await context.close() }
+})
+
+test('browser library sorting keeps sample selections and gives mobile cards the same order', { timeout: 90_000 }, async (t) => {
+  const fixture = await startResumeAnalysisFixture(runtime, { injectAuth: true })
+  t.after(() => fixture.close())
+  const samples = runtime.fixtures.createInitialWorkspace()
+  const collator = new Intl.Collator(undefined, { sensitivity: 'base', numeric: true })
+  const orderedNames = samples.resumes.map((resume) => resume.name).sort(collator.compare)
+  const { context, page, errors } = await newPage()
+  try {
+    await page.goto(`${fixture.origin}/workspaces/${fixture.workspaceId}/resumes?data=samples`)
+    await visible(page.getByRole('heading', { name: 'Resumes', exact: true }))
+    const candidateHeader = page.getByRole('columnheader').filter({ hasText: 'Candidate' })
+    await candidateHeader.getByRole('button').click()
+    const tableNames = () => page.locator('.data-table tbody .row-title').allTextContents()
+    assert.deepEqual(await tableNames(), orderedNames)
+    const chosen = samples.resumes[0]
+    await page.getByRole('checkbox', { name: `Select ${chosen.name}`, exact: true }).check()
+    const search = page.getByRole('searchbox', { name: 'Search resume library', exact: true })
+    await search.fill('no-such-sample-profile')
+    await visible(page.getByRole('heading', { name: 'No matching resumes', exact: true }))
+    await visible(page.getByText(/1 hidden by search/))
+    const sort = page.getByRole('combobox', { name: /sort/i })
+    const descending = await sort.locator('option').evaluateAll((options) =>
+      options.find((option) => /Candidate/.test(option.textContent) && /Z.*A/.test(option.textContent))?.value)
+    assert.ok(descending)
+    await sort.selectOption(descending)
+    await search.fill('')
+    assert.deepEqual(await tableNames(), [...orderedNames].reverse())
+    assert.equal(await page.getByRole('checkbox', { name: `Select ${chosen.name}`, exact: true }).isChecked(), true)
+    await page.setViewportSize({ width: 390, height: 844 })
+    await visible(sort)
+    assert.deepEqual(await page.locator('.resume-card .row-title').allTextContents(), [...orderedNames].reverse())
+    assert.equal(await page.getByRole('checkbox', { name: `Select ${chosen.name}`, exact: true }).isChecked(), true)
+    await sort.selectOption('')
+    assert.deepEqual(await page.locator('.resume-card .row-title').allTextContents(), samples.resumes.map((resume) => resume.name))
+    assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth + 1))
+
+    await page.setViewportSize({ width: 1440, height: 1100 })
+    await page.goto(`${fixture.origin}/workspaces/${fixture.workspaceId}/jobs`)
+    await visible(page.getByRole('heading', { name: 'Your jobs', exact: true }))
+    await page.getByRole('button', { name: /^Samples/ }).click()
+    const jobHeader = page.getByRole('columnheader').filter({ hasText: 'Job / organization' })
+    await jobHeader.getByRole('button').click()
+    assert.deepEqual(await tableNames(), samples.jobs.map((job) => job.title).sort(collator.compare))
+    await jobHeader.getByRole('button').click()
+    assert.deepEqual(await tableNames(), samples.jobs.map((job) => job.title).sort((left, right) => collator.compare(right, left)))
+    await page.setViewportSize({ width: 390, height: 844 })
+    await visible(page.getByRole('combobox', { name: /sort/i }))
+    assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth + 1))
+    assert.equal(fixture.analyses.store.values.size, 0)
+    assert.equal(fixture.state.saves.length, 0)
+    assert.deepEqual(errors, [])
+  } finally { await context.close() }
+})
+
+test('browser sample comparison browsing keeps the matrix and remembers search while reviewing one target', { timeout: 90_000 }, async (t) => {
+  const fixture = await startResumeAnalysisFixture(runtime, { injectAuth: true })
+  t.after(() => fixture.close())
+  const samples = runtime.fixtures.createInitialWorkspace()
+  const run = samples.runs.find((item) => item.targets.length > 1)
+  const selected = run.resumes[0].resume
+  const { context, page, errors } = await newPage()
+  try {
+    await page.goto(`${fixture.origin}/workspaces/${fixture.workspaceId}/analyses/${run.id}?data=samples`)
+    await visible(page.getByRole('heading', { name: run.name, exact: true }))
+    const search = page.getByRole('searchbox', { name: 'Search comparisons', exact: true })
+    const targetSelect = page.getByRole('combobox', { name: /target/i })
+    const sortSelect = page.getByRole('combobox', { name: /sort/i })
+    await visible(page.locator('.matrix-table'))
+    assert.equal(await page.locator('.matrix-table tbody tr').count(), run.resumes.length)
+    await search.fill(`  ${selected.name.toUpperCase()}  `)
+    assert.equal(await page.locator('.matrix-table tbody tr').count(), 1)
+    await targetSelect.selectOption(run.targets[0].id)
+    await visible(page.locator('.comparison-table'))
+    const rows = page.locator('.comparison-table tbody tr')
+    assert.equal(await rows.count(), 1)
+    assert.equal(await rows.first().locator('.row-title').textContent(), selected.name)
+    const scoreHeader = page.getByRole('columnheader').filter({ hasText: 'Evidence match' })
+    await scoreHeader.getByRole('button').click()
+    const sortValue = await sortSelect.inputValue()
+    await rows.first().locator('.row-title').click()
+    await visible(page.getByRole('heading', { name: 'The match, criterion by criterion', exact: true }))
+    await page.getByRole('link', { name: 'All comparisons', exact: true }).click()
+    assert.equal(await search.inputValue(), `  ${selected.name.toUpperCase()}  `)
+    assert.equal(await targetSelect.inputValue(), run.targets[0].id)
+    assert.equal(await sortSelect.inputValue(), sortValue)
+    assert.equal(await rows.count(), 1)
+    await search.fill('no-matching-sample')
+    await visible(page.getByRole('heading', { name: 'No matching comparisons', exact: true }))
+    assert.equal(await targetSelect.isVisible(), true)
+    await search.fill(selected.sourceLabel)
+    assert.equal(await rows.count(), 1)
+    await targetSelect.selectOption({ label: 'All targets' })
+    await visible(page.locator('.matrix-table'))
+    assert.equal(await sortSelect.inputValue(), '')
+    await search.fill('')
+    assert.equal(await page.locator('.matrix-table tbody tr').count(), run.resumes.length)
+    await page.setViewportSize({ width: 390, height: 844 })
+    await visible(search)
+    await visible(targetSelect)
+    await visible(sortSelect)
+    assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth + 1))
+    assert.equal(fixture.analyses.store.values.size, 0, 'Sample browsing must never start real processing.')
+    assert.equal(fixture.state.saves.length, 0)
+    assert.deepEqual(errors, [])
+  } finally { await context.close() }
+})

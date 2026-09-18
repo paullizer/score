@@ -6,13 +6,25 @@ import { useRealAnalyses } from '../../app/real-analyses-context'
 import type { RealResumeSummary } from '../../domain/real-resumes'
 import type { RealAnalysisResumeSelection } from '../../domain/real-analyses'
 import { dateLabel } from '../../domain/selectors'
+import { sortTableRows, type TableSort } from '../../domain/tableSorting'
 import { Badge, Button, EmptyState, ExternalSource, InlineError, PageHeader, SearchField } from '../../components/ui'
+import { SortableHeader, TableSortSelect, type TableSortOption } from '../../components/ui/TableSorting'
 import { PrivateDocumentViewer } from '../../components/documents/PrivateDocumentViewer'
 import { UPLOAD_CONTENT_TYPES, supportedUploadFormats } from '../../domain/document-formats'
 import { uploadFormatNames } from '../../services/documentUploads'
 import { realAnalysisLink, realResumeSelection } from '../analyses/realAnalysisUi'
 import { readyRealResume, resumeErrorMessage, resumeName, resumeWorkActive } from './resumeImportUi'
 import { RealAddResumesDialog } from './RealAddResumesDialog'
+
+type RealResumeSortKey = 'name' | 'source' | 'status' | 'added' | 'actions'
+const realResumeSortOptions: Record<RealResumeSortKey, TableSortOption<RealResumeSortKey>> = {
+  name: { key: 'name', label: 'Stated name', ascendingLabel: 'A–Z', descendingLabel: 'Z–A' },
+  source: { key: 'source', label: 'Source label', ascendingLabel: 'A–Z', descendingLabel: 'Z–A' },
+  status: { key: 'status', label: 'Processing status', ascendingLabel: 'Needs attention first', descendingLabel: 'Complete first' },
+  added: { key: 'added', label: 'Added date', ascendingLabel: 'Oldest first', descendingLabel: 'Newest first', initialDirection: 'desc' },
+  actions: { key: 'actions', label: 'Status / actions', ascendingLabel: 'Needs attention first', descendingLabel: 'Complete first', title: 'Sort by processing status, not the action label.' },
+}
+const resumeStatusOrder = { error: 0, cancelled: 0, queued: 1, parsing: 1, profiling: 1, ready: 2 }
 
 export function RealResumeStatus({ summary }: { summary: RealResumeSummary }) {
   const labels = { queued: 'Queued', parsing: 'Reading source', profiling: 'Extracting profile', ready: 'Ready', error: 'Could not process', cancelled: 'Cancelled' }
@@ -46,7 +58,7 @@ export function RealResumesPage({ id }: { id?: string }) {
   const api = useRealResumes()
   if (!api) return <EmptyState title="Real resumes require a cloud workspace" description="Standalone mode contains only fictional samples. No real files, documents, or analysis results enter sample storage." />
   if (api.phase === 'unavailable') return <EmptyState title="Real resume imports are not enabled" description={api.error ?? 'No samples are substituted when real processing is unavailable.'} action={<Button onClick={() => void api.refresh()}>Check availability</Button>} />
-  return id ? <RealResumeDetail key={id} id={id} /> : <RealResumesLibrary />
+  return id ? <RealResumeDetail key={id} id={id} /> : <RealResumesLibrary key={api.workspaceId} />
 }
 
 function RealResumesLibrary() {
@@ -55,10 +67,19 @@ function RealResumesLibrary() {
   const navigate = useNavigate()
   const [params, setParams] = useSearchParams()
   const [search, setSearch] = useState('')
+  const [sort, setSort] = useState<TableSort<RealResumeSortKey> | null>(null)
   const [selected, setSelected] = useState<RealAnalysisResumeSelection[]>([])
   const [adding, setAdding] = useState(false)
   const query = search.trim().toLocaleLowerCase()
-  const visible = api.summaries.filter((item) => [item.resume.name, item.resume.role, item.resume.location, item.resume.experience, item.resume.sourceLabel].join(' ').toLocaleLowerCase().includes(query))
+  const visible = sortTableRows(api.summaries.filter((item) => [item.resume.name, item.resume.role, item.resume.location, item.resume.experience, item.resume.sourceLabel].join(' ').toLocaleLowerCase().includes(query)),
+    sort, (summary, key) => {
+      switch (key) {
+        case 'name': return summary.resume.name
+        case 'source': return summary.source.displayName
+        case 'status': case 'actions': return resumeStatusOrder[summary.resume.status]
+        case 'added': return Date.parse(summary.resume.createdAt)
+      }
+    })
   const readyVisible = visible.filter(readyRealResume)
   const allVisibleSelected = readyVisible.length > 0 && readyVisible.every((item) => selected.some((choice) => choice.resumeId === item.resume.id))
   const hidden = selected.filter((choice) => !visible.some((item) => item.resume.id === choice.resumeId)).length
@@ -88,6 +109,8 @@ function RealResumesLibrary() {
     <section className="panel" aria-label="Real resume library">
       <div className="library-toolbar"><div className="flex items-center gap-2"><Users size={16} className="text-muted" aria-hidden="true" /><h2 className="text-[12px] font-semibold">Private real resumes</h2><Badge>{api.summaries.length}</Badge></div>
         <div className="toolbar"><SearchField value={search} onChange={setSearch} placeholder="Search stated names, roles, or sources…" label="Search real resumes" />
+          <TableSortSelect options={[realResumeSortOptions.name, realResumeSortOptions.source, realResumeSortOptions.status, realResumeSortOptions.added]}
+            sort={sort?.key === 'actions' ? { ...sort, key: 'status' } : sort} onChange={setSort} label="Sort real resumes" />
           <Button size="sm" icon={RotateCcw} onClick={() => void api.refresh()}>Refresh</Button></div></div>
       <div className="flex flex-wrap items-center justify-between gap-3 border-b px-5 py-3">
         <p className="text-[11px] text-muted" role="status">{selected.length ? `${selected.length} selected${hidden ? ` · ${hidden} hidden by search` : ''}` : 'Only ready sources can be selected. Unknown profile fields remain “Not stated”.'}</p>
@@ -98,7 +121,10 @@ function RealResumesLibrary() {
       </div>
       {visible.length ? <div className="table-wrap"><table className="data-table">
         <caption className="sr-only">Real resume processing status. Select ready sources for a separate manually started analysis.</caption>
-        <thead><tr><th scope="col"><span className="sr-only">Select ready resume</span></th><th scope="col">Stated profile</th><th scope="col">Source / progress</th><th scope="col">Actions</th></tr></thead>
+        <thead><tr><th scope="col"><span className="sr-only">Select ready resume</span></th>
+          <SortableHeader option={realResumeSortOptions.name} sort={sort} onChange={setSort}>Stated profile</SortableHeader>
+          <SortableHeader option={realResumeSortOptions.status} sort={sort} onChange={setSort}>Source / progress</SortableHeader>
+          <SortableHeader option={realResumeSortOptions.actions} sort={sort} onChange={setSort} /></tr></thead>
         <tbody>{visible.map((summary) => {
           const checked = selected.some((item) => item.resumeId === summary.resume.id)
           const ready = readyRealResume(summary)

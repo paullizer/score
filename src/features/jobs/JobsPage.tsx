@@ -5,7 +5,9 @@ import { useWorkspace } from '../../app/workspace-context'
 import type { Citation, Criterion, SourceKind } from '../../domain/types'
 import { documentPagination } from '../../domain/source-files'
 import { dateLabel } from '../../domain/selectors'
+import { sortTableRows, type TableSort } from '../../domain/tableSorting'
 import { Badge, Button, DemoNote, EmptyState, ExternalSource, InlineError, PageHeader, SearchField, SegmentedControl, StatusBadge } from '../../components/ui'
+import { SortableHeader, TableSortSelect, type TableSortOption } from '../../components/ui/TableSorting'
 import { DocumentViewer } from '../../components/documents/DocumentViewer'
 import { PrivateDocumentViewer } from '../../components/documents/PrivateDocumentViewer'
 import { UPLOAD_CONTENT_TYPES, supportedUploadFormats } from '../../domain/document-formats'
@@ -20,30 +22,55 @@ import type { RealAnalysisTargetSelection } from '../../domain/real-analyses'
 
 const sourceNames = { pdf: 'PDF document', markdown: 'Markdown document', docx: 'Word DOCX', doc: 'Word DOC (97–2003)', url: 'Direct URL', website: 'Website' }
 const sourceIcons = { pdf: FileText, markdown: FileText, docx: FileText, doc: FileText, url: Link2, website: Globe2 }
+type JobSortKey = 'title' | 'source' | 'status' | 'added' | 'actions'
+const jobSortOptions: Record<JobSortKey, TableSortOption<JobSortKey>> = {
+  title: { key: 'title', label: 'Job title', ascendingLabel: 'A–Z', descendingLabel: 'Z–A' },
+  source: { key: 'source', label: 'Source type', ascendingLabel: 'A–Z', descendingLabel: 'Z–A' },
+  status: { key: 'status', label: 'Processing status', ascendingLabel: 'Needs attention first', descendingLabel: 'Complete first' },
+  added: { key: 'added', label: 'Added date', ascendingLabel: 'Oldest first', descendingLabel: 'Newest first', initialDirection: 'desc' },
+  actions: { key: 'actions', label: 'Status / actions', ascendingLabel: 'Needs attention first', descendingLabel: 'Complete first', title: 'Sort by processing status, not the action label.' },
+}
+const jobStatusOrder = { error: 0, cancelled: 0, queued: 1, parsing: 1, generating: 1, ready: 2 }
+const defaultJobSort: TableSort<JobSortKey> = { key: 'added', direction: 'desc' }
 
 export function JobsPage() {
+  const { cloud } = useWorkspace()
+  const [libraryKind, setLibraryKind] = useState<'real' | 'samples'>(() => cloud ? 'real' : 'samples')
+  return <JobsLibrary key={`${cloud?.currentWorkspaceId ?? 'local'}:${libraryKind}`} libraryKind={libraryKind} onLibraryKindChange={setLibraryKind} />
+}
+
+function JobsLibrary({ libraryKind, onLibraryKindChange }: {
+  libraryKind: 'real' | 'samples'; onLibraryKindChange: (kind: 'real' | 'samples') => void
+}) {
   const { workspace, cancelJob, retryJob, cloud } = useWorkspace()
   const navigate = useNavigate()
   const analyses = useRealAnalyses()
   const [query, setQuery] = useState('')
   const [filter, setFilter] = useState<'all' | 'ready' | 'attention'>('all')
   const [source, setSource] = useState<'all' | SourceKind>('all')
-  const [sort, setSort] = useState('newest')
+  const [sort, setSort] = useState<TableSort<JobSortKey> | null>(null)
   const [selected, setSelected] = useState<string[]>([])
   const [selectedRealTargets, setSelectedRealTargets] = useState<Record<string, RealAnalysisTargetSelection>>({})
   const [importOpen, setImportOpen] = useState(false)
-  const [libraryKind, setLibraryKind] = useState<'real' | 'samples'>(() => cloud ? 'real' : 'samples')
+  const activeSort = sort ?? defaultJobSort
   const libraryJobs = workspace.jobs.filter((job) => libraryKind === 'real' ? job.dataKind === 'real' : job.dataKind !== 'real')
   const wordFilters = libraryKind === 'real' && (cloud?.realJobs.features?.wordDocumentImports || libraryJobs.some((job) => job.source === 'docx' || job.source === 'doc'))
   const markdownFilter = libraryKind === 'real' && (cloud?.realJobs.features?.markdownJobImports || libraryJobs.some((job) => job.source === 'markdown'))
   const formats = supportedUploadFormats({ markdownJobImports: cloud?.realJobs.features?.markdownJobImports, wordDocumentImports: cloud?.realJobs.features?.wordDocumentImports })
   const readyCount = libraryJobs.filter((job) => job.status === 'ready').length
   const attentionCount = libraryJobs.filter((job) => job.status === 'error' || job.status === 'cancelled').length
-  const filtered = libraryJobs.filter((job) => {
-    const matchesQuery = `${job.title} ${job.organization} ${job.grade} ${job.location}`.toLowerCase().includes(query.toLowerCase())
+  const filtered = sortTableRows(libraryJobs.filter((job) => {
+    const matchesQuery = `${job.title} ${job.organization} ${job.grade} ${job.location}`.toLowerCase().includes(query.trim().toLowerCase())
     return matchesQuery && (source === 'all' || job.source === source) &&
       (filter === 'all' || (filter === 'ready' ? job.status === 'ready' : job.status === 'error' || job.status === 'cancelled'))
-  }).sort((a, b) => sort === 'title' ? a.title.localeCompare(b.title) : b.createdAt.localeCompare(a.createdAt))
+  }), activeSort, (job, key) => {
+    switch (key) {
+      case 'title': return job.title
+      case 'source': return sourceNames[job.source]
+      case 'status': case 'actions': return jobStatusOrder[job.status]
+      case 'added': return Date.parse(job.createdAt)
+    }
+  })
   const realTargets = analyses?.targets.state === 'ready' && !analyses.targets.error ? analyses.targets.value : []
   const canSelectReal = analyses?.canWrite && analyses.phase === 'ready' && analyses.features?.realAnalyses
   const visibleReady = filtered.filter((job) => job.status === 'ready' && (job.dataKind !== 'real' || (canSelectReal && targetForJob(job.id)))).map((job) => job.id)
@@ -74,7 +101,7 @@ export function JobsPage() {
       </div>
     </div>
     <section className="panel" aria-label="Job library">
-      {cloud && <div className="library-kind-switcher"><SegmentedControl label="Choose real jobs or samples" value={libraryKind} onChange={(value) => { setLibraryKind(value); selectJobs([]); setSource('all') }} options={[
+      {cloud && <div className="library-kind-switcher"><SegmentedControl label="Choose real jobs or samples" value={libraryKind} onChange={onLibraryKindChange} options={[
         { value: 'real', label: 'Real jobs', count: workspace.jobs.filter((job) => job.dataKind === 'real').length },
         { value: 'samples', label: 'Samples', count: workspace.jobs.filter((job) => job.dataKind !== 'real').length },
       ]} /><span>{libraryKind === 'real' ? 'Private source imports and generated rubrics' : 'Fictional examples for the simulated preview'}</span></div>}
@@ -87,6 +114,8 @@ export function JobsPage() {
             const value = event.target.value
             if (value === 'all' || value === 'pdf' || value === 'markdown' || value === 'docx' || value === 'doc' || value === 'url' || value === 'website') setSource(value)
           }}><option value="all">All sources</option><option value="pdf">PDF files</option>{markdownFilter && <option value="markdown">Markdown files</option>}{wordFilters && <><option value="docx">Word DOCX files</option><option value="doc">Word DOC files</option></>}<option value="url">Direct URLs</option><option value="website">Websites</option></select>
+          <TableSortSelect options={[jobSortOptions.title, jobSortOptions.source, jobSortOptions.status, jobSortOptions.added]}
+            sort={sort?.key === 'actions' ? { ...sort, key: 'status' } : sort} onChange={setSort} label="Sort jobs" defaultLabel="Newest first (default)" />
         </div>
       </div>
       {selectedJobs.length > 0 && <div className="selection-bar"><span><strong>{selectedJobs.length}</strong> {selectedJobs.length === 1 ? 'job' : 'jobs'} selected{selectedJobs.some((job) => !filtered.includes(job)) && ' (including hidden rows)'}</span>
@@ -102,7 +131,11 @@ export function JobsPage() {
       </div>}
       {filtered.length ? <div className="table-wrap"><table className="data-table">
         <thead><tr><th className="checkbox-cell"><input type="checkbox" aria-label="Select all visible ready jobs" checked={allVisible} disabled={!visibleReady.length} onChange={() => selectJobs(allVisible ? selected.filter((id) => !visibleReady.includes(id)) : [...new Set([...selected, ...visibleReady])])} /></th>
-          <th>Job / organization</th><th className="mobile-hide">Source</th><th className="mobile-hide">Rubric</th><th className="mobile-hide">Added</th><th><span className="sr-only">Actions</span></th></tr></thead>
+          <SortableHeader option={jobSortOptions.title} sort={activeSort} onChange={setSort}>Job / organization</SortableHeader>
+          <SortableHeader option={jobSortOptions.source} sort={activeSort} onChange={setSort} className="mobile-hide">Source</SortableHeader>
+          <SortableHeader option={jobSortOptions.status} sort={activeSort} onChange={setSort} className="mobile-hide">Rubric</SortableHeader>
+          <SortableHeader option={jobSortOptions.added} sort={activeSort} onChange={setSort} className="mobile-hide">Added</SortableHeader>
+          <SortableHeader option={jobSortOptions.actions} sort={activeSort} onChange={setSort} /></tr></thead>
         <tbody>{filtered.map((job) => {
           const Icon = sourceIcons[job.source]
           const rubric = workspace.rubrics.find((item) => item.id === job.rubricId)
@@ -121,10 +154,10 @@ export function JobsPage() {
       </table></div> : libraryKind === 'real' && cloud?.realJobs.phase === 'loading'
         ? <EmptyState icon={LoaderCircle} title="Loading real jobs" description="Score is retrieving every page of server-owned job records for this workspace." />
         : libraryKind === 'real' && cloud && cloud.realJobs.phase !== 'ready'
-          ? <EmptyState icon={BriefcaseBusiness} title="Real job imports are unavailable" description={cloud.realJobs.error ?? 'This deployment does not have real job processing enabled. Samples remain available in their separate view.'} action={<Button onClick={() => setLibraryKind('samples')}>View samples</Button>} />
+          ? <EmptyState icon={BriefcaseBusiness} title="Real job imports are unavailable" description={cloud.realJobs.error ?? 'This deployment does not have real job processing enabled. Samples remain available in their separate view.'} action={<Button onClick={() => onLibraryKindChange('samples')}>View samples</Button>} />
           : <EmptyState icon={BriefcaseBusiness} title={libraryJobs.length ? 'No jobs match these filters' : libraryKind === 'real' ? 'Import your first real job' : cloud ? 'Explore the sample jobs' : 'Your next great match starts here'} description={libraryJobs.length ? 'Try another search or choose All jobs to see the rest of your library.' : libraryKind === 'real' ? `Upload an actual ${uploadFormatNames(formats)} file or enter a direct HTML/PDF posting URL. Score will create a durable queued job and source-grounded rubric.` : cloud ? 'Fictional examples remain available for the simulated workflow.' : 'Add a PDF, a job URL, or a collection of roles from a website.'}
             action={<Button onClick={() => { if (!libraryJobs.length && libraryKind === 'real') setImportOpen(true); else { setQuery(''); setFilter('all'); setSource('all') } }}>{libraryJobs.length ? 'Clear filters' : libraryKind === 'real' ? 'Import a real job' : 'Show all samples'}</Button>} />}
-      <div className="table-bottom"><span>Showing {filtered.length} of {libraryJobs.length} {libraryKind === 'real' ? 'real' : 'sample'} jobs</span><label className="flex items-center gap-2">Sort by<select className="bg-transparent text-[10px] outline-offset-2" value={sort} onChange={(event) => setSort(event.target.value)} aria-label="Sort jobs"><option value="newest">Newest first</option><option value="title">Job title</option></select></label></div>
+      <div className="table-bottom"><span>Showing {filtered.length} of {libraryJobs.length} {libraryKind === 'real' ? 'real' : 'sample'} jobs</span></div>
     </section>
     <div className="library-note"><DemoNote>{libraryKind === 'real' ? 'Real sources are private. Select ready real resumes in the separate analysis builder, review exact target versions, then explicitly run evidence assessment. Samples alone use simulated scoring.' : cloud ? 'Sample jobs and rubrics are fictional and remain separate from real imports.' : 'Example jobs and rubrics are fictional. Add a source to explore the import workflow.'}</DemoNote><Link className="text-link shrink-0 mobile-hide" to="/rubrics">How rubrics work <ArrowRight size={12} /></Link></div>
     {importOpen && <JobImport onClose={() => setImportOpen(false)} />}

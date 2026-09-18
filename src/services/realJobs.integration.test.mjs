@@ -652,8 +652,9 @@ test('real job source badges and Markdown filtering do not add Markdown controls
   assert.match(dom.window.document.querySelector('tbody').textContent, /markdown-job/)
   const samples = [...dom.window.document.querySelectorAll('[aria-label="Choose real jobs or samples"] button')].find((button) => button.textContent.startsWith('Samples'))
   await act(async () => samples.click())
-  assert.equal(select.value, 'all')
-  assert.equal(select.querySelector('option[value="markdown"]'), null)
+  const sampleSource = dom.window.document.querySelector('select[aria-label="Filter by source"]')
+  assert.equal(sampleSource.value, 'all')
+  assert.equal(sampleSource.querySelector('option[value="markdown"]'), null)
   assert.match(dom.window.document.querySelector('tbody').textContent, /pdf-job/)
 })
 
