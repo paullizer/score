@@ -4,6 +4,8 @@ import type {
 } from '../../src/domain/real-analyses'
 import type { ReferenceDocument } from '../../src/domain/real-grades'
 import type { ImmutableBlobReference, ImmutableJsonBlobReference } from '../../src/domain/real-resumes'
+import { ANALYSIS_LIMITS } from '../../src/domain/real-analyses'
+import { invalidRequest } from '../errors'
 import { validateGradeApproval, validateReferenceDocument } from '../grades/validation'
 import type { AnalysisBlob, AnalysisBlobStore } from './store'
 import {
@@ -16,6 +18,8 @@ export interface AnalysisSnapshots {
   resumeSnapshot: FrozenRealResumeSnapshot
   targetSnapshot: FrozenRealAnalysisTargetSnapshot
 }
+
+type AnalysisBlobReader = Pick<AnalysisBlobStore, 'read'>
 
 export function parseAnalysisJson(blob: AnalysisBlob): unknown {
   assertAnalysis(blob.contentType === 'application/json' && blob.bytes.byteLength <= MAX_ANALYSIS_JSON_BYTES &&
@@ -31,7 +35,7 @@ export function analysisBlobReference(name: string, blob: AnalysisBlob): Immutab
 }
 
 export async function readAnalysisBlob(
-  blobs: AnalysisBlobStore, reference: ImmutableBlobReference, workspaceId: string, runId: string,
+  blobs: AnalysisBlobReader, reference: ImmutableBlobReference, workspaceId: string, runId: string,
 ): Promise<AnalysisBlob> {
   assertAnalysis(analysisBlobInRun(reference.blobName, workspaceId, runId), 'Blob is outside the analysis run.')
   const blob = await blobs.read(reference.blobName)
@@ -53,7 +57,7 @@ export async function putAnalysisJson(
 }
 
 export async function readAnalysisManifest(
-  blobs: AnalysisBlobStore, run: RealAnalysisRunRecord,
+  blobs: AnalysisBlobReader, run: RealAnalysisRunRecord,
 ): Promise<RealAnalysisInitializationManifest> {
   parseAnalysisEntity(run)
   const manifest = parseAnalysisInitializationManifest(parseAnalysisJson(await readAnalysisBlob(blobs, run.manifest, run.workspaceId, run.id)))
@@ -75,14 +79,21 @@ export function assertComparisonManifestBinding(
     analysisHash(target ?? null) === analysisHash(comparison.target), 'Comparison does not match its immutable plan.')
 }
 
-export async function readAnalysisReferenceDocuments(
-  blobs: AnalysisBlobStore, run: RealAnalysisRunRecord, target: FrozenGradeTargetSnapshot,
+async function validatedReferenceDocument(
+  blobs: AnalysisBlobReader, run: RealAnalysisRunRecord, reference: ImmutableJsonBlobReference,
+): Promise<ReferenceDocument> {
+  const document = parseAnalysisJson(await readAnalysisBlob(blobs, reference, run.workspaceId, run.id)) as ReferenceDocument
+  assertAnalysis(validateReferenceDocument(document).length === 0, 'Invalid frozen reference document.')
+  return document
+}
+
+async function bindReferenceDocuments(
+  target: FrozenGradeTargetSnapshot, read: (reference: ImmutableJsonBlobReference) => Promise<ReferenceDocument>,
 ): Promise<ReferenceDocument[]> {
   const documents: ReferenceDocument[] = []
   for (const reference of target.references) {
-    const document = parseAnalysisJson(await readAnalysisBlob(blobs, reference.document, run.workspaceId, run.id)) as ReferenceDocument
-    assertAnalysis(validateReferenceDocument(document).length === 0 &&
-      document.id === reference.source.documentId && document.version === reference.source.documentVersion &&
+    const document = await read(reference.document)
+    assertAnalysis(document.id === reference.source.documentId && document.version === reference.source.documentVersion &&
       document.pageCount === reference.source.pageCount && document.completeness === reference.source.completeness &&
       analysisHash([...document.selectedPages].sort((a, b) => a - b)) ===
         analysisHash([...reference.source.selectedPages].sort((a, b) => a - b)), 'Frozen reference document binding mismatch.')
@@ -96,8 +107,28 @@ export async function readAnalysisReferenceDocuments(
   return documents
 }
 
+export async function readAnalysisReferenceDocuments(
+  blobs: AnalysisBlobReader, run: RealAnalysisRunRecord, target: FrozenGradeTargetSnapshot,
+): Promise<ReferenceDocument[]> {
+  return bindReferenceDocuments(target, reference => validatedReferenceDocument(blobs, run, reference))
+}
+
+function assertSnapshotSummaryBinding(
+  manifest: RealAnalysisInitializationManifest, comparison: RealAnalysisComparisonRecord,
+  { resumeSnapshot, targetSnapshot }: AnalysisSnapshots,
+): void {
+  assertAnalysis(resumeSnapshot.workspaceId === manifest.workspaceId && resumeSnapshot.snapshotId === comparison.resume.snapshotId &&
+    targetSnapshot.workspaceId === manifest.workspaceId && targetSnapshot.snapshotId === comparison.target.snapshotId &&
+    resumeSnapshot.frozenAt === manifest.createdAt && targetSnapshot.frozenAt === manifest.createdAt &&
+    analysisHash(resumeSnapshot.selection) === analysisHash(comparison.resume.summary.selection) &&
+    analysisHash(targetSnapshot.summary) === analysisHash(comparison.target.summary) &&
+    resumeSnapshot.resume.name === comparison.resume.summary.name && resumeSnapshot.resume.role === comparison.resume.summary.role &&
+    resumeSnapshot.resume.sourceLabel === comparison.resume.summary.sourceLabel &&
+    resumeSnapshot.capture.capturedAt === comparison.resume.summary.capturedAt, 'Snapshot does not match its manifest summary.')
+}
+
 export async function readAnalysisSnapshots(
-  blobs: AnalysisBlobStore, run: RealAnalysisRunRecord, comparison: RealAnalysisComparisonRecord,
+  blobs: AnalysisBlobReader, run: RealAnalysisRunRecord, comparison: RealAnalysisComparisonRecord,
 ): Promise<AnalysisSnapshots> {
   parseAnalysisEntity(comparison)
   const manifest = await readAnalysisManifest(blobs, run)
@@ -108,14 +139,7 @@ export async function readAnalysisSnapshots(
   ])
   const resumeSnapshot = parseFrozenResumeSnapshot(parseAnalysisJson(resumeBlob))
   const targetSnapshot = parseFrozenTargetSnapshot(parseAnalysisJson(targetBlob))
-  assertAnalysis(resumeSnapshot.workspaceId === run.workspaceId && resumeSnapshot.snapshotId === comparison.resume.snapshotId &&
-    targetSnapshot.workspaceId === run.workspaceId && targetSnapshot.snapshotId === comparison.target.snapshotId &&
-    resumeSnapshot.frozenAt === manifest.createdAt && targetSnapshot.frozenAt === manifest.createdAt &&
-    analysisHash(resumeSnapshot.selection) === analysisHash(comparison.resume.summary.selection) &&
-    analysisHash(targetSnapshot.summary) === analysisHash(comparison.target.summary) &&
-    resumeSnapshot.resume.name === comparison.resume.summary.name && resumeSnapshot.resume.role === comparison.resume.summary.role &&
-    resumeSnapshot.resume.sourceLabel === comparison.resume.summary.sourceLabel &&
-    resumeSnapshot.capture.capturedAt === comparison.resume.summary.capturedAt, 'Snapshot does not match its manifest summary.')
+  assertSnapshotSummaryBinding(manifest, comparison, { resumeSnapshot, targetSnapshot })
   if (targetSnapshot.kind === 'grade') {
     await readAnalysisReferenceDocuments(blobs, run, targetSnapshot)
   } else {
@@ -125,7 +149,7 @@ export async function readAnalysisSnapshots(
 }
 
 export async function readAnalysisResult(
-  blobs: AnalysisBlobStore, run: RealAnalysisRunRecord, comparison: RealAnalysisComparisonRecord, snapshots?: AnalysisSnapshots,
+  blobs: AnalysisBlobReader, run: RealAnalysisRunRecord, comparison: RealAnalysisComparisonRecord, snapshots?: AnalysisSnapshots,
 ): Promise<RealAnalysisResult | null> {
   parseAnalysisEntity(comparison)
   if (!comparison.result) return null
@@ -135,4 +159,93 @@ export async function readAnalysisResult(
   assertAnalysis(analysisHash({ completion: result.completion, overall: result.overall, coverage: result.coverage }) ===
     analysisHash(comparison.resultSummary), 'Comparison summary differs from its immutable result.')
   return result
+}
+
+export interface AnalysisSnapshotReader {
+  snapshots(comparison: RealAnalysisComparisonRecord): Promise<AnalysisSnapshots>
+  result(comparison: RealAnalysisComparisonRecord, snapshots: AnalysisSnapshots): Promise<RealAnalysisResult | null>
+}
+
+/** Only the caller's bounded read operation owns these caches; nothing survives the request. */
+export function createAnalysisSnapshotReader(
+  blobs: AnalysisBlobReader, run: RealAnalysisRunRecord,
+  options: { maxComparisons: number; maxBytes: number; signal?: AbortSignal },
+): AnalysisSnapshotReader {
+  assertAnalysis(Number.isInteger(options.maxComparisons) && options.maxComparisons > 0 &&
+    options.maxComparisons <= ANALYSIS_LIMITS.maxComparisons && Number.isSafeInteger(options.maxBytes) &&
+    options.maxBytes > 0, 'A bounded snapshot read budget is required.')
+  let bytesRead = 0
+  const boundedBlobs: AnalysisBlobReader = {
+    async read(name) {
+      options.signal?.throwIfAborted()
+      const blob = await blobs.read(name)
+      options.signal?.throwIfAborted()
+      bytesRead += blob?.bytes.byteLength ?? 0
+      if (bytesRead > options.maxBytes) {
+        throw invalidRequest('The frozen report sources exceed the read budget. Narrow the export to one exact job/grade target; no evidence was omitted.')
+      }
+      return blob
+    },
+  }
+  const comparisons = new Set<string>()
+  const resumes = new Map<string, Promise<FrozenRealResumeSnapshot>>()
+  const targets = new Map<string, Promise<FrozenRealAnalysisTargetSnapshot>>()
+  const references = new Map<string, Promise<ReferenceDocument>>()
+  const originals = new Map<string, Promise<void>>()
+  let manifest: Promise<RealAnalysisInitializationManifest> | undefined
+  const read = (reference: ImmutableBlobReference) => readAnalysisBlob(boundedBlobs, reference, run.workspaceId, run.id)
+  const referenceDocument = (reference: ImmutableJsonBlobReference) => {
+    const key = analysisHash(reference)
+    let document = references.get(key)
+    if (!document) {
+      document = validatedReferenceDocument(boundedBlobs, run, reference)
+      references.set(key, document)
+    }
+    return document
+  }
+  const snapshots = async (comparison: RealAnalysisComparisonRecord): Promise<AnalysisSnapshots> => {
+    options.signal?.throwIfAborted()
+    parseAnalysisEntity(comparison)
+    comparisons.add(comparison.id)
+    assertAnalysis(comparisons.size <= options.maxComparisons, 'Snapshot reader comparison budget exceeded.')
+    const plan = await (manifest ??= readAnalysisManifest(boundedBlobs, run))
+    assertComparisonManifestBinding(plan, comparison)
+    let resume = resumes.get(comparison.resume.snapshotId)
+    if (!resume) {
+      resume = read(comparison.resume.blob).then(blob => parseFrozenResumeSnapshot(parseAnalysisJson(blob)))
+      resumes.set(comparison.resume.snapshotId, resume)
+    }
+    let target = targets.get(comparison.target.snapshotId)
+    if (!target) {
+      target = (async () => {
+        const saved = parseFrozenTargetSnapshot(parseAnalysisJson(await read(comparison.target.blob)))
+        if (saved.kind === 'grade') {
+          await bindReferenceDocuments(saved, referenceDocument)
+        } else {
+          const key = analysisHash(saved.original)
+          let verified = originals.get(key)
+          if (!verified) {
+            verified = read(saved.original).then(() => undefined)
+            originals.set(key, verified)
+          }
+          await verified
+        }
+        return saved
+      })()
+      targets.set(comparison.target.snapshotId, target)
+    }
+    const [resumeSnapshot, targetSnapshot] = await Promise.all([resume, target])
+    options.signal?.throwIfAborted()
+    const saved = { resumeSnapshot, targetSnapshot }
+    assertSnapshotSummaryBinding(plan, comparison, saved)
+    return saved
+  }
+  return {
+    snapshots,
+    async result(comparison, saved) {
+      options.signal?.throwIfAborted()
+      assertAnalysis(comparisons.has(comparison.id), 'Read the bound snapshots before reading a report result.')
+      return readAnalysisResult(boundedBlobs, run, comparison, saved)
+    },
+  }
 }

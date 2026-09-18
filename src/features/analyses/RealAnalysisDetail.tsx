@@ -8,6 +8,7 @@ import { Badge, Button, EmptyState, InlineError, PageHeader, Score } from '../..
 import { RealAnalysisStatus } from './RealAnalysesPage'
 import { realAnalysisCancellationPaused, realAnalysisCancellationPending, realAnalysisLink, targetVersionLabel } from './realAnalysisUi'
 import { RealComparisonReview } from './RealComparisonReview'
+import { AnalysisReportExport } from './AnalysisReportExport'
 
 export function RealComparisonValue({ summary }: { summary: RealAnalysisComparisonSummary }) {
   const { comparison } = summary
@@ -103,7 +104,10 @@ export function RealAnalysisDetail({ id }: { id: string }) {
   }
   return <>{back}
     <PageHeader eyebrow="REAL EVIDENCE · FROZEN INPUTS" title={run.name} description="Review each saved resume/target pair independently. Completion, coverage, and overall-score availability are separate."
-      actions={<><RealRunActions summary={summary} />{api.features?.realAnalyses
+      actions={<><RealRunActions summary={summary} /><AnalysisReportExport source={{
+        kind: 'real', workspaceId: api.workspaceId, detail: { ...detail, ...summary },
+        comparisons: pairs?.state === 'ready' ? pairs.value : null, available: api.phase === 'ready',
+      }} />{api.features?.realAnalyses
         ? <Link className="button button-secondary button-md" {...realAnalysisLink({ from: id }, api.workspaceId)}><Layers3 size={15} aria-hidden="true" />New run with these inputs</Link>
         : <Button icon={Layers3} disabled title={api.creationError ?? 'New-run readiness has not been confirmed.'}>New run with these inputs</Button>}</>} />
     <div className="analysis-meta"><Badge tone="accent">Real evidence assessment</Badge><RealAnalysisStatus summary={summary} /><span>{detail.resumes.length} resumes</span><span>{detail.targets.length} separate targets</span><span>{dateLabel(run.createdAt)}</span><span className="flex items-center gap-1.5"><ShieldCheck size={13} aria-hidden="true" />Immutable snapshots</span></div>

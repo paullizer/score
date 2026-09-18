@@ -21,6 +21,7 @@ npm run lint
 npm run test:server
 npm run test:worker
 npm run test:renderer
+npm run test:reports
 node --test src\services\*.integration.test.mjs
 npm run preview
 ```
@@ -36,6 +37,7 @@ The application uses React 18, TypeScript, Vite, Tailwind CSS, React Router, and
 3. **Rubrics:** Review job-specific criteria or choose **Create grade ladder** from a real job to prepare separate GS levels. Inspect the selected sources and grade matrix before approving supported versions. Sample GS rubrics remain separate. Weights must total 100.
 4. **Analyses:** Select ready real resumes and saved real job rubrics or exact approved GS versions, review the comparison count, then explicitly start the run. The limit is 500 resume/target pairs. Importing never starts scoring automatically. Sample analyses use a separate fixture scorer that rejects real or mixed selections.
 5. **Evidence:** Open a comparison to inspect criterion assessments, an available weighted 0-100 score, evidence gaps, and exact resume quotations beside the frozen job/GS requirement citations. Results retain their original documents, rubric versions, and approval provenance even after later edits.
+6. **Reports:** Open a saved analysis and choose **Export report** for CSV, PDF, Word, or PowerPoint. Export the entire group or one exact job/grade, including completed evidence reviews and clearly labeled unfinished comparisons.
 
 Use the sample import and analysis **Demo scenario** controls to explore simulated failures, partial results, cancellation, and retry. Real imports and analyses instead show durable server progress and actual processing errors. One inaccessible URL or failed comparison does not discard successful items.
 
@@ -172,6 +174,29 @@ If cancellation pauses after processing errors or exhausted automatic retries, c
 The assessment follows the saved criteria and 0-5 scoring anchors. Positive scores require exact citations from the correct frozen resume document. Absence of supporting evidence is an explicit evidence gap, not a claim about the person's ability. An unassessable positively weighted criterion withholds the overall score rather than becoming an invented zero or silently changing the weights. Source-supported GS not-applicable rows remain unscored and zero-weight. **GS qualifications remain separate and unscored for human review**, not official eligibility findings.
 
 Schema/coverage/citation checks and an independent grounding review precede publication; one bounded output correction is allowed. Weighted totals are calculated deterministically from validated criterion scores and unchanged rubric weights, not supplied by the model. Full-input context limits are reported as actionable limitations rather than silently dropping resume sections. Model identity, prompt/schema versions, grounding-review results, and frozen input identities/hashes are retained. Traceable quotations do not guarantee correct interpretation: humans must review the evidence and limitations. Different job or grade totals are not combined into a hiring ranking.
+
+### Analysis report exports
+
+Choose **Export report** from a real or sample analysis, including while inspecting an individual comparison. The default is the **entire grouped analysis**, not just the open comparison. A multi-target run can be narrowed to one exact saved job or grade. Workspace viewers can export the history they are authorized to read; new-run readiness and Word-upload admission do not control historical exports.
+
+| Format | Contents |
+| --- | --- |
+| CSV | One header row and one row per candidate/target comparison. Candidate name and job/grade title come first, followed by individual criterion scores, overall score/assessment, and status, coverage, ranking, limitation, and saved-version metadata. |
+| PDF | A searchable-text report with top-evidence-match summaries followed by every candidate/target's detailed assessment, criterion tables, quotations, and source locators. |
+| Word (`.docx`) | An editable document with the same summary and evidence-review structure, native tables, headings, and page numbers. |
+| PowerPoint (`.pptx`) | An editable widescreen deck with summary comparisons, candidate overviews, and criterion/evidence continuation slides. |
+
+Summaries highlight the **top five scored candidates within each exact saved rubric** and include ties at the fifth-candidate cutoff, up to ten highlights. Additional tied candidates are explicitly counted, not given an artificial lower rank. All comparisons remain in the detailed report or CSV rows. Equal scores share competition ranks; different jobs/grades are never combined into a hiring ranking. Candidate details start on a new page or slide and continue when necessary instead of dropping evidence or shrinking text to fit.
+
+Export becomes available after at least one comparison completes, even if its overall score is withheld. **Partial reports** include unfinished, failed, and cancelled comparisons as explicit statuses, not zero scores. Report status is captured over a recorded interval; a comparison that finishes later is not silently added to that same export. Completed results must be retrieved and verified in full: an access, evidence, or generation failure stops the download rather than producing a deceptively partial file. Closing the dialog or leaving the current workspace cancels preparation.
+
+CSV criterion headers distinguish targets, saved versions, and duplicate criterion labels and include the criterion weight and 0-5 scale. A numeric zero remains zero; `Not assessed` and `N/A` remain distinct, and columns belonging to other targets are empty. An unavailable overall score has an empty numeric cell and a separate explanation. UTF-8 BOM, quoted multiline fields, and CRLF records support spreadsheet import. Untrusted text beginning with spreadsheet formula markers is prefixed with an apostrophe so it is not executed.
+
+Reports reuse the original saved scores, assessments, qualifications, and exact quotations; **exporting does not invoke AI or reassess candidates**. GS qualifications stay separate and unscored, and captured sections from HTML, Markdown, or Word are never labeled as printed PDF pages. Samples are explicitly fictional. Document summaries use labeled excerpts where needed; full detailed evidence is retained. Scores describe document evidence, not a person's intrinsic ability, hiring suitability, or official GS eligibility.
+
+Generation runs locally in a cancellable browser worker with lazily loaded document writers and bundled PDF fonts. No external conversion/viewer service receives the data, and no report archive or private browser-storage cache is created. PDF export reports unsupported font glyphs explicitly rather than silently altering names or quotations; editable Word/PowerPoint remain alternative formats. Bounded payload, file-size, page/slide, and generation limits fail visibly and may require exporting a narrower target. Downloaded files contain candidate information and leave the workspace's access-control boundary; keep them private and share only with authorized reviewers.
+
+Document/deck weight labels use readable display precision: `~` marks rounding, and a positive weight below 0.01% is labeled `<0.01%`. Saved weights and scores are unchanged; CSV criterion headers preserve the full saved weight.
 
 ### Private data, processing, and retention
 

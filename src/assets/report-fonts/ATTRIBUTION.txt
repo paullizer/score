@@ -1,0 +1,17 @@
+Noto Sans Regular and Noto Sans Bold
+Font metadata: Copyright 2015-2021 Google LLC. All Rights Reserved.
+Upstream license: Copyright 2018 The Noto Project Authors.
+Licensed under the SIL Open Font License, Version 1.1; see LICENSE-OFL.txt.
+These unmodified font binaries may be embedded in exported PDF documents.
+
+Official upstream: https://github.com/notofonts/noto-fonts
+Pinned revision: ffebf8c1ee449e544955a7e813c54f9b73848eac
+Upstream paths:
+  hinted/ttf/NotoSans/NotoSans-Regular.ttf
+  hinted/ttf/NotoSans/NotoSans-Bold.ttf
+
+Load the local assets as ArrayBuffers and pass
+{ fonts: { regular: ArrayBuffer, bold: ArrayBuffer } } to the report writer.
+No runtime font downloads or system/proprietary fonts are required.
+Noto Sans does not cover every writing system. Writers must check the actual
+embedded font's glyph coverage and reject unsupported text explicitly.

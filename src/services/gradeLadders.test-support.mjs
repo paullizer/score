@@ -7,6 +7,7 @@ import { pathToFileURL } from 'node:url'
 import { build } from 'esbuild'
 import { PDFDocument, StandardFonts } from 'pdf-lib'
 import { buildDocxPreviewTestWorker, docxPreviewBrowserPlugin } from './wordPreview.test-support.mjs'
+import { buildReportTestWorker, reportBrowserPlugin } from './analysisReports/browser.test-support.mjs'
 
 export const tenantId = '228db43d-371a-49d8-864e-fa202d181ea5'
 export const userId = '1d6312bd-3eaa-4586-8b74-e90eee126f78'
@@ -20,7 +21,7 @@ const nativeFetch = globalThis.fetch
 const clone = (value) => structuredClone(value)
 const hash = (value) => createHash('sha256').update(value).digest('hex')
 
-export async function buildGradeTestRuntime({ browser = false, serverExports = '' } = {}) {
+export async function buildGradeTestRuntime({ browser = false, productionBrowser = false, serverExports = '' } = {}) {
   const directory = resolve(`.grade-integration-${randomUUID()}`)
   await mkdir(directory)
   try {
@@ -41,13 +42,21 @@ export async function buildGradeTestRuntime({ browser = false, serverExports = '
       outfile: join(directory, `${name}.mjs`), bundle: true, packages: 'external', platform: 'node',
       format: 'esm', jsx: 'automatic', define: { 'import.meta.env.VITE_DEPLOYMENT_MODE': '"cloud"' }, logLevel: 'silent',
     })))
-    if (browser) {
+    if (browser && productionBrowser) {
+      const { build: buildVite } = await import('vite')
+      await buildVite({
+        configFile: resolve('vite.config.ts'),
+        define: { 'import.meta.env.VITE_DEPLOYMENT_MODE': '"cloud"' },
+        build: { outDir: directory, emptyOutDir: false },
+        logLevel: 'error',
+      })
+    } else if (browser) {
       await Promise.all([build({
         entryPoints: [join('src', 'main.tsx')], outfile: join(directory, 'browser.js'), bundle: true, platform: 'browser',
         format: 'esm', jsx: 'automatic', loader: { '.css': 'empty' },
-        plugins: [docxPreviewBrowserPlugin()],
+        plugins: [docxPreviewBrowserPlugin(), reportBrowserPlugin()],
         define: { 'import.meta.env.VITE_DEPLOYMENT_MODE': '"cloud"', 'process.env.NODE_ENV': '"development"' }, logLevel: 'silent',
-      }), buildDocxPreviewTestWorker(directory)])
+      }), buildDocxPreviewTestWorker(directory), buildReportTestWorker(directory)])
       const [{ default: postcss }, { default: tailwind }, { default: autoprefixer }] = await Promise.all([import('postcss'), import('tailwindcss'), import('autoprefixer')])
       const css = await postcss([tailwind(), autoprefixer()]).process(await readFile(join('src', 'styles', 'globals.css'), 'utf8'), { from: join('src', 'styles', 'globals.css') })
       await writeFile(join(directory, 'browser.css'), css.css)

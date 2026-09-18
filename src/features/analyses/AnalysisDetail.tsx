@@ -8,6 +8,7 @@ import { Avatar, Badge, Button, DemoNote, EmptyState, PageHeader, Score, Segment
 import { DocumentViewer } from '../../components/documents/DocumentViewer'
 import { analysisDataMode, sampleDataLink } from '../../app/real-data-mode'
 import { RealAnalysisDetail } from './RealAnalysisDetail'
+import { AnalysisReportExport } from './AnalysisReportExport'
 
 function ComparisonValue({ comparison }: { comparison: Comparison | undefined }) {
   if (!comparison) return <Badge tone="warning">Unavailable</Badge>
@@ -56,6 +57,7 @@ function RunView({ run }: { run: AnalysisRun }) {
     <Link className="back-link" to={sampleDataLink(selectedId ? `/analyses/${run.id}` : '/analyses', Boolean(cloud))}><ArrowLeft size={14} />{selectedId ? 'All comparisons' : 'Back to analyses'}</Link>
     <PageHeader eyebrow="EVIDENCE-LED REVIEW" title={run.name} description="A clear view of the match, and the passages behind it."
       actions={<>{working && <Button icon={X} onClick={() => cancelRun(run.id)}>Cancel pending</Button>}{needsRetry && !working && <Button icon={RotateCcw} onClick={() => retryRun(run.id)}>Retry unfinished</Button>}
+        <AnalysisReportExport source={{ kind: 'sample', run }} />
         <Button icon={Sparkles} onClick={() => navigate(sampleDataLink(`/analyses/new?from=${run.id}`, Boolean(cloud)))}>New run with these inputs</Button></>} />
     <div className="analysis-meta"><Badge tone="accent">Simulated scoring</Badge><Badge tone={status === 'Complete' ? 'success' : status === 'Needs attention' ? 'warning' : 'neutral'} dot>{status}</Badge><span>{run.resumes.length} {run.resumes.length === 1 ? 'resume' : 'resumes'}</span><span>{run.targets.length} separate {run.targets.length === 1 ? 'rubric' : 'rubrics'}</span><span>{dateLabel(run.createdAt)}</span><span className="ml-auto flex items-center gap-1.5"><ShieldCheck size={12} />Saved version snapshots</span></div>
     {working && <div className="run-progress panel" aria-live="polite"><div><span className="flex items-center gap-2"><LoaderCircle size={15} className="animate-spin" />Preparing evidence-backed sample results</span><span>{finished} / {run.comparisons.length}</span></div>
