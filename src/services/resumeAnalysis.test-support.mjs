@@ -412,6 +412,8 @@ export async function processAllAnalyses(fixture, stubs) {
     if (!pending) return
     await fixture.runtime.api.analysisWorker.runAnalysisWorker(stubs.analyses, { maxItems: 20 })
     fixture.advanceClock(120_000)
+    // In-memory work must yield so the HTTP fixture can service idle socket timers.
+    await new Promise(resolve => setImmediate(resolve))
   }
   assert.fail('Analysis processing did not reach a terminal state within its bounded integration fixture.')
 }

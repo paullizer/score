@@ -145,10 +145,10 @@ function azurePollingFor(f) {
   return { store: api.createAnalysisStoreFromContainer(container), queries, parentReads }
 }
 
-test('a durable 100-pair bootstrap is completed in 25-pair transactions before any model call', async () => {
+test('a durable 500-pair bootstrap is completed in 25-pair transactions before any model call', async () => {
   const f = fixture()
   f.analysis.store._beforeBatch(() => { throw new Error('Interrupted after durable run acceptance') })
-  await assert.rejects(createRun(f, 10, 10), /Interrupted/)
+  await assert.rejects(createRun(f, 125, 4), /Interrupted/)
   const accepted = [...f.analysis.store.values.values()][0]
   assert.equal(accepted.record.progress.initialized, 0)
   const mock = modelFor(f)
@@ -161,11 +161,12 @@ test('a durable 100-pair bootstrap is completed in 25-pair transactions before a
   assert.deepEqual(await runAnalysisWorker(mock.deps, { maxItems: 1 }), { claimed: 1, completed: 0 })
   const current = await f.analysis.store.get(f.workspaceId, accepted.record.id)
   assert.equal(current.record.status, 'queued')
-  assert.equal(current.record.progress.initialized, 100)
-  assert.equal(current.record.progress.queued, 100)
-  assert.deepEqual(f.analysis.store.batches.map(batch => batch.length), [26, 26, 26, 26])
-  assert.equal(new Set(comparisons(f, accepted.record.id).map(item => item.record.id)).size, 100)
-  assert.ok(claims.length >= 4)
+  assert.equal(current.record.progress.initialized, 500)
+  assert.equal(current.record.progress.queued, 500)
+  assert.deepEqual(f.analysis.store.batches.map(batch => batch.length), Array(20).fill(26))
+  assert.equal(new Set(comparisons(f, accepted.record.id).map(item => item.record.id)).size, 500)
+  assert.ok(claims.length >= 20)
+  assert.equal(current.record.attempts, 1)
   assert.ok(claims.every(record => record.lease.owner === mock.deps.owner && record.nextAttemptAt === undefined))
   assert.equal(current.record.lease, undefined)
   assert.equal(mock.calls.length, 0)
@@ -173,7 +174,7 @@ test('a durable 100-pair bootstrap is completed in 25-pair transactions before a
 
 test('partially initialized work survives a transient chunk failure and an expired initializer lease', async () => {
   const f = fixture()
-  const created = await createRun(f, 10, 10)
+  const created = await createRun(f, 125, 4)
   const mock = modelFor(f)
   f.analysis.store._beforeBatch(() => {
     f.analysis.store._beforeBatch(() => { throw new Error('Transient chunk outage') })
@@ -196,7 +197,7 @@ test('partially initialized work survives a transient chunk failure and an expir
   f.now = new Date(Date.parse(leased.lease.expiresAt) + 1).toISOString()
   await runAnalysisWorker(mock.deps, { maxItems: 1 })
   run = await f.analysis.store.get(f.workspaceId, created.run.id)
-  assert.equal(run.record.progress.initialized, 100)
+  assert.equal(run.record.progress.initialized, 500)
   assert.equal(run.record.attempts, 2)
   assert.equal(run.record.error, undefined)
   assert.equal(mock.calls.length, 0)

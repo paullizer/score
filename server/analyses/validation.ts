@@ -80,7 +80,7 @@ export const createAnalysisInputSchema = z.strictObject({
   targets: z.array(analysisTargetSelectionSchema).min(1).max(ANALYSIS_LIMITS.maxComparisons),
 }).superRefine((value, ctx) => {
   if (value.resumes.length * value.targets.length > ANALYSIS_LIMITS.maxComparisons) {
-    ctx.addIssue({ code: 'custom', message: 'An analysis run may contain at most 100 comparisons.' })
+    ctx.addIssue({ code: 'custom', message: `An analysis run may contain at most ${ANALYSIS_LIMITS.maxComparisons} comparisons.` })
   }
   if (!unique(value.resumes.map(item => item.resumeId))) {
     ctx.addIssue({ code: 'custom', path: ['resumes'], message: 'Resume selections must not repeat.' })
@@ -169,10 +169,11 @@ const entitySchema = z.discriminatedUnion('recordType', [runSchema, comparisonSc
 const manifestSchema = z.strictObject({
   schemaVersion: z.literal(1), dataKind: z.literal('real'), workspaceId: workspace, runId,
   createdAt: timestamp, createdBy: text(200), inputFingerprint: hash, request: createAnalysisInputSchema,
-  resumes: z.array(resumeReferenceSchema).min(1).max(100), targets: z.array(targetReferenceSchema).min(1).max(100),
+  resumes: z.array(resumeReferenceSchema).min(1).max(ANALYSIS_LIMITS.maxComparisons),
+  targets: z.array(targetReferenceSchema).min(1).max(ANALYSIS_LIMITS.maxComparisons),
   comparisons: z.array(z.strictObject({
     id: comparisonId, index: count, resumeSnapshotId: snapshotId, targetSnapshotId: snapshotId,
-  })).min(1).max(100),
+  })).min(1).max(ANALYSIS_LIMITS.maxComparisons),
 })
 
 export function analysisBytesHash(bytes: Uint8Array): string { return createHash('sha256').update(bytes).digest('hex') }
