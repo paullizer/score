@@ -129,7 +129,7 @@ after(async () => { globalThis.fetch = originalFetch; await rm(outputDirectory, 
 
 test('grade feature discovery is additive without changing the real-jobs client envelope', async () => {
   globalThis.fetch = async () => json({ realJobImports: true, limits: { maxPdfPages: 50 }, realGradeLadders: true, gradeLimits: { maxSources: 15 } })
-  assert.deepEqual(await jobClient.fetchJobProcessingFeatures(), { realJobImports: true, limits: { maxPdfPages: 50 } })
+  assert.deepEqual(await jobClient.fetchJobProcessingFeatures(), { realJobImports: true, markdownJobImports: false, limits: { maxPdfPages: 50 } })
   assert.deepEqual(await client.fetchGradeProcessingFeatures(), { realGradeLadders: true, gradeLimits: { maxSources: 15 } })
   globalThis.fetch = async () => json({ realJobImports: true })
   const disabled = await client.fetchGradeProcessingFeatures()

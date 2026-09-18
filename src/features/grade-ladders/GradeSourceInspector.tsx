@@ -3,6 +3,7 @@ import { Download, FileSearch, LoaderCircle } from 'lucide-react'
 import { useGradeLadders } from '../../app/grade-ladders-context'
 import type { Citation } from '../../domain/types'
 import type { FrozenReferenceSource, ReferenceDocument, ReferenceSourceRecord } from '../../domain/real-grades'
+import { documentPagination, type DocumentPagination } from '../../domain/source-files'
 import { DocumentViewer } from '../../components/documents/DocumentViewer'
 import { Badge, Button, EmptyState, ExternalSource, InlineError, Modal } from '../../components/ui'
 import { GradeIssueResolutions, GradeIssues } from './GradeShared'
@@ -15,9 +16,15 @@ export interface GradeSourceSelection {
   paragraphId?: string
 }
 
+function referencePagination(source: ReferenceSourceRecord | FrozenReferenceSource): DocumentPagination {
+  if ('originalContentType' in source && source.originalContentType) return documentPagination(source.originalContentType)
+  return source.origin === 'upload' || source.selectedPages.length > 0 ? 'pdf-pages' : 'captured-sections'
+}
+
 export function GradeSourceProvenance({ source }: { source: ReferenceSourceRecord | FrozenReferenceSource }) {
   const live = 'recordType' in source ? source : null
   const url = live ? live.finalUrl ?? live.requestedUrl : 'url' in source ? source.url : undefined
+  const pagination = referencePagination(source)
   return <div className="grade-provenance">
     <div className="flex flex-wrap gap-2"><Badge tone="accent">{sourcePurposeLabels[source.purpose]}</Badge><Badge>{source.origin === 'opm' ? 'Discovered OPM reference' : source.origin === 'seed-job' ? 'Automatically captured seed' : 'User supplied · not verified OPM authority'}</Badge><Badge tone={source.authorityStatus === 'current' ? 'neutral' : 'warning'}>{source.authorityStatus} authority / revision</Badge></div>
     <dl>
@@ -27,7 +34,7 @@ export function GradeSourceProvenance({ source }: { source: ReferenceSourceRecor
       <div><dt>Applicability</dt><dd>{source.coverage.state} · {source.coverage.explanation || 'Coverage has not been established.'}</dd></div>
       <div><dt>Series / grades / functions</dt><dd>{source.coverage.series.join(', ') || 'Unresolved series'} · {source.coverage.grades.map((grade) => `GS-${grade}`).join(', ') || 'No explicit grade coverage'} · {source.coverage.functions.join(', ') || 'No explicit functional coverage'}</dd></div>
       <div><dt>Intended section</dt><dd>{source.intendedSection || 'Whole reference / not specified'}</dd></div>
-      <div><dt>Extraction completeness</dt><dd>{source.completeness} · {source.selectedPages.length ? `Selected original pages ${source.selectedPages.join(', ')}` : 'Full document requested'} · {source.pageCount === undefined ? 'Page count pending' : `${source.pageCount} original pages`}</dd></div>
+      <div><dt>Extraction completeness</dt><dd>{source.completeness} · {source.selectedPages.length ? `Selected original pages ${source.selectedPages.join(', ')}` : 'Full document requested'} · {pagination === 'pdf-pages' ? source.pageCount === undefined ? 'Page count pending' : `${source.pageCount} original pages` : pagination === 'markdown-sections' ? 'Markdown sections, not PDF pages' : pagination === 'html-sections' ? 'Captured HTML sections, not PDF pages' : 'Captured sections, not PDF pages'}</dd></div>
       <div><dt>Captured content fingerprint</dt><dd><code>{source.sha256 || 'Capture pending — no verified hash yet'}</code></dd></div>
       {url && <div><dt>Source URL</dt><dd><ExternalSource url={url}>{url}</ExternalSource></dd></div>}
       {live && <>
@@ -102,8 +109,7 @@ export function GradeSourceInspector({ ladderId, selection, onClose }: { ladderI
       {!matches && <InlineError>The cited quotation or locator does not match this captured paragraph. Treat it as an unresolved citation; it must not support approval.</InlineError>}
       {highlighted && !paragraph && <InlineError>This passage is not in the selected extraction pages. Omitted pages were not examined.</InlineError>}
       <DocumentViewer document={loaded.document} highlightedId={highlighted} quote={matches ? citation?.quote : undefined}
-        pagination={'originalContentType' in loaded.source ? loaded.source.originalContentType === 'text/html' ? 'html-sections' : 'pdf-pages'
-          : loaded.source.origin === 'upload' || loaded.source.selectedPages.length > 0 ? 'pdf-pages' : 'captured-sections'} compact />
+        pagination={referencePagination(loaded.source)} compact />
       <details className="mt-5" open><summary className="cursor-pointer text-[13px] font-semibold">Provenance, applicability, and captured version</summary><GradeSourceProvenance source={loaded.source} /></details>
     </>}
   </Modal>

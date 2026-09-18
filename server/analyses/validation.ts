@@ -8,6 +8,9 @@ import {
 } from '../../src/domain/real-analyses'
 import type { GradeRubricVersionRecord, GradeSourceSetRecord } from '../../src/domain/real-grades'
 import type { RealResumeDocument } from '../../src/domain/real-resumes'
+import {
+  documentPagination, isSafeUploadedFilename, MAX_MARKDOWN_BYTES, originalFileExtension,
+} from '../../src/domain/source-files'
 import type { Citation, SourceDocument } from '../../src/domain/types'
 import { WORKSPACE_ID_PATTERN } from '../ids'
 import {
@@ -44,11 +47,15 @@ const runId = id('analysis-run')
 const comparisonId = id('analysis-comparison')
 const snapshotId = id('analysis-snapshot')
 const citations = z.array(citationSchema).max(60)
-const contentTypes = z.enum(['application/json', 'application/pdf', 'text/html'])
+const contentTypes = z.enum(['application/json', 'application/pdf', 'text/html', 'text/markdown'])
 const blobReferenceSchema = z.strictObject({
   blobName: z.string().max(700), contentType: contentTypes, sha256: hash,
   bytes: z.number().int().min(1).max(MAX_ANALYSIS_JSON_BYTES),
 })
+const originalReferenceSchema = blobReferenceSchema.extend({
+  contentType: z.enum(['application/pdf', 'text/html', 'text/markdown']),
+}).refine(value => value.contentType !== 'text/markdown' || value.bytes <= MAX_MARKDOWN_BYTES,
+  'Markdown originals exceed the supported size.')
 const jsonReferenceSchema = blobReferenceSchema.extend({ contentType: z.literal('application/json') })
 const documentReferenceSchema = jsonReferenceSchema.extend({ documentId: identifier, documentVersion: integer })
 
@@ -197,7 +204,7 @@ export function isSafeAnalysisBlobName(name: string): boolean {
   const parts = name.split('/')
   if (!WORKSPACE_ID_PATTERN.test(parts[0] ?? '') || !isAnalysisId(parts[1] ?? '', 'run')) return false
   if (parts.length === 3) return parts[2] === 'manifest.json'
-  if (parts.length === 4 && parts[2] === 'evidence') return /^[a-f0-9]{64}\.(?:json|pdf|html)$/.test(parts[3])
+  if (parts.length === 4 && parts[2] === 'evidence') return /^[a-f0-9]{64}\.(?:json|pdf|html|md)$/.test(parts[3])
   if (parts.length === 5 && parts[2] === 'snapshots' && isAnalysisId(parts[3], 'snapshot')) return /^[a-f0-9]{64}\.json$/.test(parts[4])
   return parts.length === 5 && parts[2] === 'results' && isAnalysisId(parts[3], 'comparison') &&
     new RegExp(`^${UUID}\\.json$`).test(parts[4])
@@ -313,6 +320,7 @@ const frozenBase = {
 }
 const resumeSourceSchema = z.discriminatedUnion('kind', [
   z.strictObject({ kind: z.literal('pdf'), displayName: text(4096), fileName: text(255) }),
+  z.strictObject({ kind: z.literal('markdown'), displayName: text(4096), fileName: text(255) }),
   z.strictObject({ kind: z.literal('url'), displayName: text(4096), url: z.string().url().max(4096) }),
 ])
 const resumeSnapshotSchema = z.strictObject({
@@ -325,12 +333,12 @@ const resumeSnapshotSchema = z.strictObject({
   }),
   source: resumeSourceSchema,
   capture: z.strictObject({
-    original: blobReferenceSchema.extend({ contentType: z.enum(['application/pdf', 'text/html']) }),
+    original: originalReferenceSchema,
     capturedAt: timestamp, finalUrl: z.string().url().max(4096).optional(), redirects: z.array(z.string().url().max(4096)).max(20),
   }),
   extraction: z.strictObject({
-    method: z.enum(['document-intelligence', 'html', 'browser']), version: text(200), extractedAt: timestamp,
-    pagination: z.enum(['pdf-pages', 'html-sections']), pageCount: z.number().int().min(1).max(50).nullable(),
+    method: z.enum(['document-intelligence', 'html', 'browser', 'markdown']), version: text(200), extractedAt: timestamp,
+    pagination: z.enum(['pdf-pages', 'html-sections', 'markdown-sections']), pageCount: z.number().int().min(1).max(50).nullable(),
     normalizedCharacters: z.number().int().min(1).max(180_000), document: documentReferenceSchema,
   }),
   profile: z.unknown(), document: z.unknown(),
@@ -359,14 +367,20 @@ export function parseFrozenResumeSnapshot(value: unknown): FrozenRealResumeSnaps
   if (source.kind === 'pdf') {
     assertAnalysis(isSafeResumeFilename(source.fileName) && source.displayName === source.fileName &&
       capture.original.contentType === 'application/pdf' && !capture.finalUrl && !capture.redirects.length, 'Invalid PDF source provenance.')
+  } else if (source.kind === 'markdown') {
+    assertAnalysis(isSafeUploadedFilename(source.fileName, 'markdown') && source.displayName === source.fileName &&
+      capture.original.contentType === 'text/markdown' && !capture.finalUrl && !capture.redirects.length, 'Invalid Markdown source provenance.')
   } else {
-    assertAnalysis(source.displayName === source.url && normalizeResumePublicUrl(source.url) === source.url && capture.finalUrl &&
+    assertAnalysis(capture.original.contentType !== 'text/markdown' &&
+      source.displayName === source.url && normalizeResumePublicUrl(source.url) === source.url && capture.finalUrl &&
       normalizeResumePublicUrl(capture.finalUrl) === capture.finalUrl, 'Invalid public source provenance.')
     for (const redirect of capture.redirects) assertAnalysis(normalizeResumePublicUrl(redirect) === redirect, 'Invalid source redirect.')
   }
   const pdf = capture.original.contentType === 'application/pdf'
-  assertAnalysis(pdf ? extraction.method === 'document-intelligence' && extraction.pagination === 'pdf-pages' && extraction.pageCount !== null
-    : ['html', 'browser'].includes(extraction.method) && extraction.pagination === 'html-sections' && extraction.pageCount === null,
+  const markdown = capture.original.contentType === 'text/markdown'
+  assertAnalysis(extraction.pagination === documentPagination(capture.original.contentType) &&
+    (pdf ? extraction.method === 'document-intelligence' && extraction.pageCount !== null
+      : (markdown ? extraction.method === 'markdown' : ['html', 'browser'].includes(extraction.method)) && extraction.pageCount === null),
   'Extraction does not match its captured media.')
   assertAnalysis(extraction.normalizedCharacters === document.paragraphs.reduce((sum, paragraph) => sum + paragraph.text.length + paragraph.heading.length, 0) &&
     (extraction.pageCount === null || document.paragraphs.every(paragraph => paragraph.page <= extraction.pageCount!)) &&
@@ -399,7 +413,7 @@ const targetSnapshotSchema = z.discriminatedUnion('kind', [
     ...frozenBase, kind: z.literal('job'), selection: analysisTargetSelectionSchema.options[0],
     summary: targetSummarySchema.options[0], requirementEvidence: z.array(requirementSchema).max(70),
     job: z.unknown(), rubric: z.unknown(), document: z.unknown(), source: z.unknown(),
-    original: blobReferenceSchema.extend({ contentType: z.enum(['application/pdf', 'text/html']) }),
+    original: originalReferenceSchema,
   }),
   z.strictObject({
     ...frozenBase, kind: z.literal('grade'), selection: analysisTargetSelectionSchema.options[1],
@@ -419,16 +433,21 @@ export function parseFrozenTargetSnapshot(value: unknown): FrozenRealAnalysisTar
     assertAnalysis(job && source && validateRealJobRecord({
       id: job.id, workspaceId: target.workspaceId, recordType: 'job', job, source,
       inputFingerprint: 'snapshot', createdBy: 'snapshot', updatedAt: target.frozenAt, attempts: 0, warnings: [],
-    }) && job.status === 'ready' && validateRealSourceDocument(document).length === 0 &&
-      rubric && validateRealRubric(rubric, document).length === 0, 'Invalid frozen job evidence.')
+    }) && job.status === 'ready' && validateRealSourceDocument(document, original.contentType).length === 0 &&
+      rubric && validateRealRubric(rubric, document, original.contentType).length === 0, 'Invalid frozen job evidence.')
     assertAnalysis(job.id === selection.jobId && job.documentId === selection.documentId && document.id === selection.documentId &&
       document.version === selection.documentVersion && rubric.id === selection.rubricId && rubric.version === selection.rubricVersion &&
       rubric.jobId === job.id && job.rubricId === rubric.id && analysisHash(rubric) === selection.rubricHash &&
       source.sha256 === original.sha256 && source.bytes === original.bytes &&
       source.originalContentType === original.contentType && original.blobName.startsWith(`${target.workspaceId}/`) &&
-      isSafeAnalysisBlobName(original.blobName), 'Frozen job selection or original mismatch.')
+      isSafeAnalysisBlobName(original.blobName) &&
+      original.blobName.endsWith(`/${original.sha256}.${originalFileExtension(original.contentType)}`),
+    'Frozen job selection or original mismatch.')
     assertAnalysis(target.summary.rubricId === rubric.id && target.summary.rubricVersion === rubric.version &&
       target.summary.criterionCount === rubric.criteria.length && target.summary.label === job.title, 'Job summary does not match the saved rubric.')
+    if (original.contentType === 'text/markdown') {
+      assertAnalysis(source.extractionMethod === 'markdown' && source.capturedAt, 'Invalid Markdown job provenance.')
+    }
   } else {
     const { version, approval, review, sourceSet, selection, summary } = target
     for (const [record, kind] of [[version, 'grade-version'], [approval, 'grade-approval'], [review, 'grade-review'], [sourceSet, 'grade-source-set']] as const) {

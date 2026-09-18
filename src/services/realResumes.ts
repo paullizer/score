@@ -6,6 +6,7 @@ import {
   type ResumeMutationResponse,
   type ResumeProcessingFeatures,
 } from '../domain/real-resumes'
+import { isSafeUploadedFilename, uploadedFileKind, type UploadedSourceKind } from '../domain/source-files'
 import { cloudJsonRequest } from './cloudWorkspace'
 
 const uuid = /^[\da-f]{8}-[\da-f]{4}-[\da-f]{4}-[\da-f]{4}-[\da-f]{12}$/i
@@ -32,7 +33,11 @@ function importHeaders(key: string, batchId: string, inputCount: number): Record
 
 export async function fetchResumeProcessingFeatures(signal?: AbortSignal): Promise<ResumeProcessingFeatures> {
   const features = await cloudJsonRequest<Partial<ResumeProcessingFeatures>>('/features', { method: 'GET', signal })
-  return { realResumeImports: features.realResumeImports === true, resumeLimits: features.resumeLimits ?? RESUME_IMPORT_LIMITS }
+  return {
+    realResumeImports: features.realResumeImports === true,
+    markdownResumeImports: features.realResumeImports === true && features.markdownResumeImports === true,
+    resumeLimits: features.resumeLimits ?? RESUME_IMPORT_LIMITS,
+  }
 }
 
 export async function listAllRealResumes(workspaceId: string, signal?: AbortSignal): Promise<RealResumeSummary[]> {
@@ -63,14 +68,43 @@ export async function getRealResume(workspaceId: string, resumeId: string, signa
   return detail
 }
 
-export async function importRealResumePdf(
+async function importRealResumeUpload(
+  workspaceId: string, file: File, kind: UploadedSourceKind, key: string, batchId: string, inputCount: number, signal?: AbortSignal,
+): Promise<RealResumeSummary> {
+  const label = kind === 'markdown' ? 'Markdown' : 'PDF'
+  if (uploadedFileKind(file) !== kind || !isSafeUploadedFilename(file.name, kind)) {
+    throw new Error(`Choose a ${label} file with a safe ${kind === 'markdown' ? '.md or .markdown' : '.pdf'} filename.`)
+  }
+  const maxBytes = kind === 'markdown' ? RESUME_IMPORT_LIMITS.maxMarkdownBytes : RESUME_IMPORT_LIMITS.maxPdfBytes
+  if (!file.size || file.size > maxBytes) throw new Error(`Choose a nonempty ${label} file no larger than ${maxBytes / 1024 / 1024} MiB.`)
+  const headers = {
+    ...importHeaders(key, batchId, inputCount),
+    'Content-Type': kind === 'markdown' ? 'text/markdown' : 'application/pdf',
+    'X-File-Name': encodeURIComponent(file.name),
+  }
+  const bytes = await file.arrayBuffer()
+  const result = await cloudJsonRequest<ResumeMutationResponse>(`${base(workspaceId)}/${kind}`, { method: 'POST', headers, body: bytes, signal })
+  return checked(result.resume, workspaceId)
+}
+
+export function importRealResumePdf(
   workspaceId: string, file: File, key: string, batchId: string, inputCount: number, signal?: AbortSignal,
 ): Promise<RealResumeSummary> {
-  const headers = { ...importHeaders(key, batchId, inputCount), 'Content-Type': 'application/pdf', 'X-File-Name': encodeURIComponent(file.name) }
-  if (!file.size || file.size > RESUME_IMPORT_LIMITS.maxPdfBytes) throw new Error('Choose a nonempty PDF no larger than 10 MiB.')
-  const bytes = await file.arrayBuffer()
-  const result = await cloudJsonRequest<ResumeMutationResponse>(`${base(workspaceId)}/pdf`, { method: 'POST', headers, body: bytes, signal })
-  return checked(result.resume, workspaceId)
+  return importRealResumeUpload(workspaceId, file, 'pdf', key, batchId, inputCount, signal)
+}
+
+export function importRealResumeMarkdown(
+  workspaceId: string, file: File, key: string, batchId: string, inputCount: number, signal?: AbortSignal,
+): Promise<RealResumeSummary> {
+  return importRealResumeUpload(workspaceId, file, 'markdown', key, batchId, inputCount, signal)
+}
+
+export async function importRealResumeFile(
+  workspaceId: string, file: File, key: string, batchId: string, inputCount: number, signal?: AbortSignal,
+): Promise<RealResumeSummary> {
+  const kind = uploadedFileKind(file)
+  if (!kind) throw new Error('Choose a PDF (.pdf) or Markdown (.md or .markdown) file. Other file types are not supported.')
+  return importRealResumeUpload(workspaceId, file, kind, key, batchId, inputCount, signal)
 }
 
 export async function importRealResumeUrl(

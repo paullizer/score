@@ -4,6 +4,7 @@ import type { TokenCredential } from '@azure/identity'
 import {
   ANALYSIS_LIMITS, analysisRunCanScore, type AnalysisEntity, type VersionedAnalysisEntity,
 } from '../../src/domain/real-analyses'
+import { MAX_MARKDOWN_BYTES } from '../../src/domain/source-files'
 import { WORKSPACE_ID_PATTERN } from '../ids'
 import { StoreConflictError } from '../store'
 import { fetchCosmosPage } from '../cosmos-query'
@@ -282,8 +283,10 @@ interface AnalysisBlobContainer {
     upload(...args: Parameters<BlockBlobClient['upload']>): Promise<Pick<Awaited<ReturnType<BlockBlobClient['upload']>>, 'etag'>>
   }
 }
-const mime = (name: string) => name.endsWith('.pdf') ? 'application/pdf' : name.endsWith('.html') ? 'text/html' : 'application/json'
-const maximum = (name: string) => name.endsWith('.pdf') ? 10 * 1024 * 1024 : name.endsWith('.html') ? MAX_ANALYSIS_ORIGINAL_BYTES : MAX_ANALYSIS_JSON_BYTES
+const mime = (name: string) => name.endsWith('.pdf') ? 'application/pdf' : name.endsWith('.html') ? 'text/html'
+  : name.endsWith('.md') ? 'text/markdown' : 'application/json'
+const maximum = (name: string) => name.endsWith('.pdf') ? 10 * 1024 * 1024 : name.endsWith('.md') ? MAX_MARKDOWN_BYTES
+  : name.endsWith('.html') ? MAX_ANALYSIS_ORIGINAL_BYTES : MAX_ANALYSIS_JSON_BYTES
 async function readBounded(stream: NodeJS.ReadableStream, length: number | undefined, max: number): Promise<Uint8Array> {
   if (length !== undefined && length > max) {
     if ('destroy' in stream && typeof stream.destroy === 'function') stream.destroy()

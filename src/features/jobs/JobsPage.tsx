@@ -3,6 +3,7 @@ import { Link, useNavigate, useParams } from 'react-router-dom'
 import { ArrowLeft, ArrowRight, ArrowUpRight, BarChart3, BriefcaseBusiness, Building2, ChevronRight, Download, FileText, Globe2, Layers3, Link2, LoaderCircle, MapPin, Plus, RotateCcw, ScanLine, ShieldCheck, Sparkles, X } from 'lucide-react'
 import { useWorkspace } from '../../app/workspace-context'
 import type { Citation, Criterion, SourceKind } from '../../domain/types'
+import { documentPagination } from '../../domain/source-files'
 import { dateLabel } from '../../domain/selectors'
 import { Badge, Button, DemoNote, EmptyState, ExternalSource, InlineError, PageHeader, SearchField, SegmentedControl, StatusBadge } from '../../components/ui'
 import { DocumentViewer } from '../../components/documents/DocumentViewer'
@@ -14,8 +15,8 @@ import { sampleDataLink } from '../../app/real-data-mode'
 import { realAnalysisLink } from '../analyses/realAnalysisUi'
 import type { RealAnalysisTargetSelection } from '../../domain/real-analyses'
 
-const sourceNames = { pdf: 'PDF document', url: 'Direct URL', website: 'Website' }
-const sourceIcons = { pdf: FileText, url: Link2, website: Globe2 }
+const sourceNames = { pdf: 'PDF document', markdown: 'Markdown document', url: 'Direct URL', website: 'Website' }
+const sourceIcons = { pdf: FileText, markdown: FileText, url: Link2, website: Globe2 }
 
 export function JobsPage() {
   const { workspace, cancelJob, retryJob, cloud } = useWorkspace()
@@ -67,7 +68,7 @@ export function JobsPage() {
       </div>
     </div>
     <section className="panel" aria-label="Job library">
-      {cloud && <div className="library-kind-switcher"><SegmentedControl label="Choose real jobs or samples" value={libraryKind} onChange={(value) => { setLibraryKind(value); selectJobs([]) }} options={[
+      {cloud && <div className="library-kind-switcher"><SegmentedControl label="Choose real jobs or samples" value={libraryKind} onChange={(value) => { setLibraryKind(value); selectJobs([]); if (value === 'samples' && source === 'markdown') setSource('all') }} options={[
         { value: 'real', label: 'Real jobs', count: workspace.jobs.filter((job) => job.dataKind === 'real').length },
         { value: 'samples', label: 'Samples', count: workspace.jobs.filter((job) => job.dataKind !== 'real').length },
       ]} /><span>{libraryKind === 'real' ? 'Private source imports and generated rubrics' : 'Fictional examples for the simulated preview'}</span></div>}
@@ -78,8 +79,8 @@ export function JobsPage() {
         <div className="toolbar"><SearchField value={query} onChange={setQuery} placeholder="Search jobs, organizations..." />
           <select aria-label="Filter by source" className="filter-select" value={source} onChange={(event) => {
             const value = event.target.value
-            if (value === 'all' || value === 'pdf' || value === 'url' || value === 'website') setSource(value)
-          }}><option value="all">All sources</option><option value="pdf">PDF files</option><option value="url">Direct URLs</option><option value="website">Websites</option></select>
+            if (value === 'all' || value === 'pdf' || value === 'markdown' || value === 'url' || value === 'website') setSource(value)
+          }}><option value="all">All sources</option><option value="pdf">PDF files</option>{libraryKind === 'real' && <option value="markdown">Markdown files</option>}<option value="url">Direct URLs</option><option value="website">Websites</option></select>
         </div>
       </div>
       {selectedJobs.length > 0 && <div className="selection-bar"><span><strong>{selectedJobs.length}</strong> {selectedJobs.length === 1 ? 'job' : 'jobs'} selected{selectedJobs.some((job) => !filtered.includes(job)) && ' (including hidden rows)'}</span>
@@ -115,7 +116,7 @@ export function JobsPage() {
         ? <EmptyState icon={LoaderCircle} title="Loading real jobs" description="Score is retrieving every page of server-owned job records for this workspace." />
         : libraryKind === 'real' && cloud && cloud.realJobs.phase !== 'ready'
           ? <EmptyState icon={BriefcaseBusiness} title="Real job imports are unavailable" description={cloud.realJobs.error ?? 'This deployment does not have real job processing enabled. Samples remain available in their separate view.'} action={<Button onClick={() => setLibraryKind('samples')}>View samples</Button>} />
-          : <EmptyState icon={BriefcaseBusiness} title={libraryJobs.length ? 'No jobs match these filters' : libraryKind === 'real' ? 'Import your first real job' : cloud ? 'Explore the sample jobs' : 'Your next great match starts here'} description={libraryJobs.length ? 'Try another search or choose All jobs to see the rest of your library.' : libraryKind === 'real' ? 'Upload an actual PDF or enter a direct posting URL. Score will create a durable queued job and source-grounded rubric.' : cloud ? 'Fictional examples remain available for the simulated workflow.' : 'Add a PDF, a job URL, or a collection of roles from a website.'}
+          : <EmptyState icon={BriefcaseBusiness} title={libraryJobs.length ? 'No jobs match these filters' : libraryKind === 'real' ? 'Import your first real job' : cloud ? 'Explore the sample jobs' : 'Your next great match starts here'} description={libraryJobs.length ? 'Try another search or choose All jobs to see the rest of your library.' : libraryKind === 'real' ? 'Upload an actual PDF or local Markdown file, or enter a direct posting URL. Score will create a durable queued job and source-grounded rubric.' : cloud ? 'Fictional examples remain available for the simulated workflow.' : 'Add a PDF, a job URL, or a collection of roles from a website.'}
             action={<Button onClick={() => { if (!libraryJobs.length && libraryKind === 'real') setImportOpen(true); else { setQuery(''); setFilter('all'); setSource('all') } }}>{libraryJobs.length ? 'Clear filters' : libraryKind === 'real' ? 'Import a real job' : 'Show all samples'}</Button>} />}
       <div className="table-bottom"><span>Showing {filtered.length} of {libraryJobs.length} {libraryKind === 'real' ? 'real' : 'sample'} jobs</span><label className="flex items-center gap-2">Sort by<select className="bg-transparent text-[10px] outline-offset-2" value={sort} onChange={(event) => setSort(event.target.value)} aria-label="Sort jobs"><option value="newest">Newest first</option><option value="title">Job title</option></select></label></div>
     </section>
@@ -196,7 +197,7 @@ export function JobDetail() {
     <div className="split-layout">
       <section className={`detail-panel ${pane !== 'document' ? 'mobile-pane-hidden' : ''}`} aria-label="Job description">
         <div className="section-heading"><div><h2>The role, in its own words</h2><p>Source context for every criterion</p></div><FileText size={17} className="text-muted" /></div>
-        {document ? <DocumentViewer document={document} highlightedId={highlighted?.id} quote={highlighted?.quote} pagination={real && source?.originalContentType === 'text/html' ? 'html-sections' : 'pdf-pages'} /> : real && (detail?.state === 'idle' || detail?.state === 'loading')
+        {document ? <DocumentViewer document={document} highlightedId={highlighted?.id} quote={highlighted?.quote} pagination={real ? documentPagination(source?.originalContentType) : 'pdf-pages'} /> : real && (detail?.state === 'idle' || detail?.state === 'loading')
           ? <EmptyState icon={LoaderCircle} title="Loading the parsed source" description="Score is retrieving the private source document and exact paragraph references." />
           : processing ? <EmptyState icon={LoaderCircle} title="Source processing is not complete" description="The worker is reading this source asynchronously. This page will refresh while the durable job remains queued." />
             : <EmptyState title="Source document unavailable" description={real ? 'The server has not returned a parsed source document. Review the job error or retry the import.' : 'This sample could not be opened. Reset the demo to restore the original document.'} />}

@@ -13,6 +13,7 @@ export { parseResumeEntity, validateRealResumeDocument, parseRealResumeProfile }
 export { parseAnalysisEntity } from './server/analyses/validation.ts'
 export * as resumeWorker from './worker/resumes/runtime.ts'
 export * as analysisWorker from './worker/analyses/runtime.ts'
+${options.serverExports ?? ''}
 `,
   })
 }

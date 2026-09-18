@@ -6,6 +6,8 @@ import {
   cancelRealJob,
   fetchJobProcessingFeatures,
   getRealJob,
+  importRealJobFile,
+  importRealJobMarkdown,
   importRealJobPdf,
   importRealJobUrl,
   listAllRealJobs,
@@ -14,6 +16,7 @@ import {
   saveRealJobRubric,
 } from '../services/realJobs'
 import type { Rubric } from '../domain/types'
+import { uploadedFileKind } from '../domain/source-files'
 import { WorkspaceContext, type CloudWorkspaceStatus, type WorkspaceContextValue } from './workspace-context'
 import { projectRealJobs } from './realJobsProjection'
 
@@ -107,7 +110,7 @@ export function RealJobsBridge({
       setFeatures(value)
       if (!value.realJobImports) {
         setPhase('unavailable')
-        setListError('Real PDF and direct URL imports are not available in this deployment.')
+        setListError('Real job imports are not available in this deployment.')
         return
       }
       void refresh()
@@ -187,6 +190,26 @@ export function RealJobsBridge({
     return summary
   }
 
+  function assertMarkdownAvailable() {
+    if (!features?.realJobImports || !features.markdownJobImports) {
+      throw new Error('Markdown job imports are not enabled in this deployment. PDF and direct URL imports are unchanged.')
+    }
+  }
+
+  async function importMarkdown(file: File, idempotencyKey: string, batchId?: string) {
+    assertMarkdownAvailable()
+    const summary = await importRealJobMarkdown(workspaceId, file, idempotencyKey, batchId)
+    if (aliveRef.current) upsertSummary(summary)
+    return summary
+  }
+
+  async function importFile(file: File, idempotencyKey: string, batchId?: string) {
+    if (uploadedFileKind(file) === 'markdown') assertMarkdownAvailable()
+    const summary = await importRealJobFile(workspaceId, file, idempotencyKey, batchId)
+    if (aliveRef.current) upsertSummary(summary)
+    return summary
+  }
+
   async function importUrl(url: string, idempotencyKey: string, batchId?: string) {
     const summary = await importRealJobUrl(workspaceId, url, idempotencyKey, batchId)
     if (aliveRef.current) upsertSummary(summary)
@@ -255,6 +278,8 @@ export function RealJobsBridge({
     ensureDetail,
     refresh,
     importPdf,
+    importMarkdown,
+    importFile,
     importUrl,
     originalUrl: (jobId) => realJobOriginalUrl(workspaceId, jobId),
   }

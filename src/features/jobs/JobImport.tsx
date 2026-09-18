@@ -2,6 +2,8 @@ import { useEffect, useRef, useState } from 'react'
 import { Check, ChevronLeft, ChevronRight, FileText, Globe2, Link2, LoaderCircle, RotateCcw, ScanSearch, UploadCloud } from 'lucide-react'
 import { useWorkspace } from '../../app/workspace-context'
 import type { ImportCandidate, SourceKind } from '../../domain/types'
+import { JOB_IMPORT_LIMITS } from '../../domain/real-jobs'
+import { isSafeUploadedFilename, uploadedFileKind } from '../../domain/source-files'
 import { JOB_FIXTURE_COUNT } from '../../data/fixtures'
 import { discoverJobs } from '../../services/mockWorkspace'
 import { Badge, Button, DemoNote, InlineError, Modal, SegmentedControl, StepLabel } from '../../components/ui'
@@ -15,6 +17,7 @@ type RealImportItem = {
   key: string
   label: string
   idempotencyKey: string
+  kind: 'pdf' | 'markdown' | 'url'
   file?: File
   url?: string
   state: 'pending' | 'uploading' | 'queued' | 'error'
@@ -26,7 +29,7 @@ function RealJobImport({ onClose }: { onClose: () => void }) {
   if (!cloud) throw new Error('Real job imports require a cloud workspace.')
   const realJobs = cloud.realJobs
   const limits = realJobs.features?.limits
-  const [mode, setMode] = useState<'pdf' | 'url'>('pdf')
+  const [mode, setMode] = useState<'files' | 'url'>('files')
   const [items, setItems] = useState<RealImportItem[]>([])
   const [urls, setUrls] = useState('')
   const [error, setError] = useState('')
@@ -35,23 +38,31 @@ function RealJobImport({ onClose }: { onClose: () => void }) {
   const active = items.some((item) => item.state === 'uploading')
   const queued = items.filter((item) => item.state === 'queued').length
   const failed = items.filter((item) => item.state === 'error').length
+  const unavailable = realJobs.phase !== 'ready' || !realJobs.features?.realJobImports
+  const markdownEnabled = realJobs.features?.markdownJobImports === true
 
   function chooseFiles(list: FileList | File[]) {
     const files = Array.from(list)
     if (!limits) { setError('Import limits are still loading. Try again in a moment.'); return }
-    if (!files.length) { setItems([]); setError('Choose at least one PDF.'); return }
-    if (files.length > limits.maxBatchFiles) { setItems([]); setError(`Choose no more than ${limits.maxBatchFiles} PDFs in one batch.`); return }
-    const invalidType = files.find((file) => file.type !== 'application/pdf' && !/\.pdf$/i.test(file.name))
-    if (invalidType) { setItems([]); setError(`${invalidType.name} is not a PDF. Choose PDF files only.`); return }
-    const tooLarge = files.find((file) => file.size > limits.maxPdfBytes)
-    if (tooLarge) { setItems([]); setError(`${tooLarge.name} exceeds the ${Math.floor(limits.maxPdfBytes / 1024 / 1024)} MB PDF limit.`); return }
-    const existing = files.find((file) => realJobs.summaries.some((summary) => summary.source.kind === 'pdf' && summary.source.displayName.toLocaleLowerCase() === file.name.toLocaleLowerCase()))
+    if (!files.length) { setItems([]); setError('Choose at least one PDF or Markdown file.'); return }
+    if (files.length > limits.maxBatchFiles) { setItems([]); setError(`Choose no more than ${limits.maxBatchFiles} PDF or Markdown files in one batch.`); return }
+    for (const file of files) {
+      const kind = uploadedFileKind(file)
+      if (!kind) { setItems([]); setError(`${file.name} is not supported. Choose PDF (.pdf) or Markdown (.md or .markdown) files.`); return }
+      if (kind === 'markdown' && !isSafeUploadedFilename(file.name, kind)) { setItems([]); setError(`${file.name} does not have a safe filename. Avoid reserved names, path separators, and control characters.`); return }
+      if (kind === 'markdown' && !markdownEnabled) { setItems([]); setError('Markdown job imports are not enabled in this deployment. You can still import PDFs and direct URLs.'); return }
+      if (!file.size) { setItems([]); setError(`${file.name} is empty. Choose a readable source file.`); return }
+      const maxBytes = kind === 'markdown' ? limits.maxMarkdownBytes ?? JOB_IMPORT_LIMITS.maxMarkdownBytes : limits.maxPdfBytes
+      if (file.size > maxBytes) { setItems([]); setError(`${file.name} exceeds the ${maxBytes / 1024 / 1024} MiB ${kind === 'markdown' ? 'Markdown' : 'PDF'} limit.`); return }
+    }
+    const existing = files.find((file) => realJobs.summaries.some((summary) => summary.source.kind === uploadedFileKind(file) && summary.source.displayName.toLocaleLowerCase() === file.name.toLocaleLowerCase()))
     if (existing) { setItems([]); setError(`${existing.name} is already represented by a real job in this workspace.`); return }
     const duplicate = files.find((file, index) => files.findIndex((candidate) => candidate.name.toLocaleLowerCase() === file.name.toLocaleLowerCase() && candidate.size === file.size) !== index)
-    if (duplicate) { setItems([]); setError(`Remove the duplicate PDF ${duplicate.name} before importing.`); return }
+    if (duplicate) { setItems([]); setError(`Remove the duplicate file ${duplicate.name} before importing.`); return }
     setItems(files.map((file) => ({
       key: `${file.name}:${file.size}:${file.lastModified}`,
       label: file.name,
+      kind: uploadedFileKind(file)!,
       file,
       idempotencyKey: crypto.randomUUID(),
       state: 'pending',
@@ -80,6 +91,7 @@ function RealJobImport({ onClose }: { onClose: () => void }) {
     setItems(normalized.map((url) => ({
       key: url,
       label: url,
+      kind: 'url',
       url,
       idempotencyKey: crypto.randomUUID(),
       state: 'pending',
@@ -90,10 +102,10 @@ function RealJobImport({ onClose }: { onClose: () => void }) {
   async function upload(item: RealImportItem) {
     setItems((current) => current.map((candidate) => candidate.key === item.key ? { ...candidate, state: 'uploading', error: undefined } : candidate))
     try {
-      if (item.file) await realJobs.importPdf(item.file, item.idempotencyKey, batchId)
+      if (item.file) await realJobs.importFile(item.file, item.idempotencyKey, batchId)
       else if (item.url) await realJobs.importUrl(item.url, item.idempotencyKey, batchId)
       else throw new Error('This import source is missing.')
-      setItems((current) => current.map((candidate) => candidate.key === item.key ? { ...candidate, state: 'queued', error: undefined } : candidate))
+      setItems((current) => current.map((candidate) => candidate.key === item.key ? { ...candidate, state: 'queued', file: undefined, error: undefined } : candidate))
     } catch (caught) {
       const message = caught instanceof Error ? caught.message : 'The source could not be queued.'
       setItems((current) => current.map((candidate) => candidate.key === item.key ? { ...candidate, state: 'error', error: message } : candidate))
@@ -111,25 +123,30 @@ function RealJobImport({ onClose }: { onClose: () => void }) {
     }
   }
 
-  const unavailable = realJobs.phase === 'unavailable' || realJobs.phase === 'error'
   return <Modal open onOpenChange={(open) => { if (!open) onClose() }} title="Import real job descriptions" description="Score privately reads each source and prepares a source-grounded rubric." drawer
     footer={<>
       <span className="mr-auto text-[11px] text-muted">{active ? 'Uploading sources…' : queued || failed ? `${queued} queued / ${failed} failed` : `${items.length} source${items.length === 1 ? '' : 's'} ready`}</span>
       {queued > 0 && failed === 0 && <Button onClick={onClose}>Done</Button>}
-      {failed > 0 && <Button icon={RotateCcw} disabled={active} onClick={() => void submit(items.filter((item) => item.state === 'error'))}>Retry failed</Button>}
+      {failed > 0 && <Button icon={RotateCcw} disabled={active || unavailable} onClick={() => void submit(items.filter((item) => item.state === 'error'))}>Retry failed</Button>}
       {queued === 0 && <Button variant="primary" icon={active ? LoaderCircle : UploadCloud} disabled={active || unavailable || !items.length} onClick={() => void submit()}>
         {active ? 'Uploading…' : `Import ${items.length || ''} ${items.length === 1 ? 'job' : 'jobs'}`}
       </Button>}
     </>}>
     {realJobs.phase === 'loading' && <div className="info-callout mb-5"><LoaderCircle size={18} className="animate-spin" /><div><strong>Checking import availability</strong><p>Score is loading this deployment's limits.</p></div></div>}
-    {unavailable && <div className="mb-5"><InlineError>{realJobs.error ?? 'Real job imports are unavailable in this deployment.'}</InlineError></div>}
-    <SegmentedControl value={mode} onChange={(value) => { setMode(value); setItems([]); setError('') }} label="Real job source" options={[{ value: 'pdf', label: 'PDF files' }, { value: 'url', label: 'Direct URLs' }]} />
+    {unavailable && realJobs.phase !== 'loading' && <div className="mb-5"><InlineError>{realJobs.error ?? 'Real job imports are unavailable in this deployment.'}</InlineError></div>}
+    {!unavailable && !markdownEnabled && <p className="mb-4 text-[11px] text-muted" role="status">Markdown imports are not enabled in this deployment. PDF and direct URL imports are available.</p>}
+    <SegmentedControl value={mode} onChange={(value) => { if (!active) { setMode(value); setItems([]); setError('') } }} label="Real job source" options={[{ value: 'files', label: 'PDF / Markdown files' }, { value: 'url', label: 'Direct URLs' }]} />
     <div className="my-6">
-      {mode === 'pdf' ? <>
-        <label className="drop-zone" onDragOver={(event) => event.preventDefault()} onDrop={(event) => { event.preventDefault(); chooseFiles(event.dataTransfer.files) }}>
-          <UploadCloud size={32} strokeWidth={1.4} /><strong>Drop job description PDFs here</strong>
-          <span>or browse files / up to {limits?.maxBatchFiles ?? 10} PDFs, {Math.floor((limits?.maxPdfBytes ?? 10 * 1024 * 1024) / 1024 / 1024)} MB and {limits?.maxPdfPages ?? 50} pages each</span>
-          <input type="file" multiple accept=".pdf,application/pdf" className="sr-only" aria-label="Choose real job PDF files" disabled={active || unavailable} onChange={(event) => { if (event.target.files) chooseFiles(event.target.files) }} />
+      {mode === 'files' ? <>
+        <label className="drop-zone" onDragOver={(event) => event.preventDefault()} onDrop={(event) => { event.preventDefault(); if (!active && !unavailable) chooseFiles(event.dataTransfer.files) }}>
+          <UploadCloud size={32} strokeWidth={1.4} /><strong>Drop job description PDFs or Markdown files here</strong>
+          <span>or browse files / up to {limits?.maxBatchFiles ?? 10} files. PDFs: {(limits?.maxPdfBytes ?? JOB_IMPORT_LIMITS.maxPdfBytes) / 1024 / 1024} MiB and {limits?.maxPdfPages ?? 50} pages each. Markdown (.md / .markdown): {(limits?.maxMarkdownBytes ?? JOB_IMPORT_LIMITS.maxMarkdownBytes) / 1024 / 1024} MiB each, no page limit.</span>
+          <span>Each source may contain up to {(limits?.maxSourceCharacters ?? JOB_IMPORT_LIMITS.maxSourceCharacters).toLocaleString()} normalized characters. Markdown is uploaded locally; links and images are not fetched.</span>
+          <input type="file" multiple accept=".pdf,.md,.markdown,application/pdf,text/markdown" className="sr-only" aria-label="Choose real job PDF or Markdown files" disabled={active || unavailable} onChange={(event) => {
+            const files = Array.from(event.currentTarget.files ?? [])
+            event.currentTarget.value = ''
+            if (files.length) chooseFiles(files)
+          }} />
         </label>
       </> : <label className="field">
         <span className="field-label flex items-center gap-2"><Link2 size={15} />Direct job posting URLs</span>
@@ -141,12 +158,13 @@ function RealJobImport({ onClose }: { onClose: () => void }) {
       </label>}
     </div>
     {items.length > 0 && <div className="import-items" aria-live="polite">{items.map((item) => <div className="import-item items-start" key={item.key}>
-      {item.file ? <FileText size={17} className="mt-0.5 text-muted" /> : <Link2 size={17} className="mt-0.5 text-muted" />}
+      {item.kind === 'url' ? <Link2 size={17} className="mt-0.5 text-muted" /> : <FileText size={17} className="mt-0.5 text-muted" />}
       <div><strong title={item.label}>{item.label}</strong>
         <p className={item.state === 'error' ? 'import-error-message' : ''}>{item.state === 'pending' ? 'Ready to upload' : item.state === 'uploading' ? 'Uploading actual source bytes…' : item.state === 'queued' ? 'Queued for private extraction and rubric generation' : item.error}</p>
       </div>
+      <Badge>{item.kind === 'markdown' ? 'Markdown' : item.kind === 'pdf' ? 'PDF' : 'URL'}</Badge>
       <Badge tone={item.state === 'error' ? 'danger' : item.state === 'queued' ? 'success' : 'neutral'} dot={item.state !== 'pending'}>{item.state}</Badge>
-      {item.state === 'error' && <Button size="sm" variant="ghost" icon={RotateCcw} aria-label={`Retry ${item.label}`} onClick={() => void submit([item])}>Retry</Button>}
+      {item.state === 'error' && <Button size="sm" variant="ghost" icon={RotateCcw} disabled={active || unavailable} aria-label={`Retry ${item.label}`} onClick={() => void submit([item])}>Retry</Button>}
     </div>)}</div>}
     <div className="info-callout mt-5"><FileText size={18} /><div><strong>Processing continues on the server</strong><p>Uploads become durable queued records individually. Extraction and rubric generation may take a minute to start; closing this panel or workspace does not cancel them.</p></div></div>
     <DemoNote>Real job sources are read and stored privately. Import real resumes separately, then manually choose ready inputs for real analysis. Only the Samples workflow uses simulated scoring.</DemoNote>

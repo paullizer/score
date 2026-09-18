@@ -9,8 +9,11 @@ import { JSDOM } from 'jsdom'
 import type { Browser, BrowserContext, Route } from 'playwright'
 import type { RealJobRecord, RealJobSource, VersionedRealJob } from '../src/domain/real-jobs'
 import { JOB_IMPORT_LIMITS } from '../src/domain/real-jobs'
+import { isOriginalContentType, originalFileExtension, type OriginalContentType } from '../src/domain/source-files'
 import type { Citation, Criterion, DocumentParagraph, Rubric, SourceDocument } from '../src/domain/types'
 import type { JobBlobStore, RealJobStore } from '../server/jobs/store'
+import { MarkdownInputError } from '../server/documents/markdown'
+import { extractMarkdownBlocks } from './markdown'
 
 const COGNITIVE_SCOPE = 'https://cognitiveservices.azure.com/.default'
 const DOCUMENT_API_VERSION = '2024-11-30'
@@ -361,6 +364,25 @@ export function createParagraphs(
     throw new WorkerError('empty-source', options.emptySourceMessage ?? 'The source did not contain readable job-posting text.', false, 'parsing')
   }
   return paragraphs
+}
+
+export function extractMarkdown(bytes: Uint8Array, options: ParagraphOptions = {}): {
+  title?: string
+  paragraphs: DocumentParagraph[]
+} {
+  try {
+    const extracted = extractMarkdownBlocks(bytes)
+    return {
+      title: extracted.title ? normalizeText(extracted.title) : undefined,
+      paragraphs: createParagraphs(extracted.blocks, {
+        defaultHeading: 'Markdown source', minimumTextLength: 1,
+        emptySourceMessage: 'The Markdown file did not contain readable source text.', ...options,
+      }),
+    }
+  } catch (error) {
+    if (error instanceof MarkdownInputError) throw new WorkerError(error.code, error.message, false, 'parsing', { cause: error })
+    throw error
+  }
 }
 
 function jobPostingJsonLd(document: Document): Record<string, unknown> | undefined {
@@ -1260,7 +1282,10 @@ function decodeDocument(bytes: Uint8Array): SourceDocument {
 }
 
 export function sourceBlobNames(record: RealJobRecord, contentType?: string): { original: string; extracted: string } {
-  const extension = contentType === 'application/pdf' || record.source.kind === 'pdf' ? 'pdf' : 'html'
+  const type = contentType ?? record.source.originalContentType ??
+    (record.source.kind === 'pdf' ? 'application/pdf' : record.source.kind === 'markdown' ? 'text/markdown' : 'text/html')
+  if (!isOriginalContentType(type)) throw new WorkerError('invalid-source-type', 'The original source has unsupported content metadata.', false, 'parsing')
+  const extension = originalFileExtension(type)
   return {
     original: `${record.workspaceId}/${record.id}/original.${extension}`,
     extracted: `${record.workspaceId}/${record.id}/source-document.json`,
@@ -1379,7 +1404,7 @@ export interface WorkerDependencies {
   blobs: JobBlobStore
   documentIntelligence: Omit<DocumentIntelligenceClientOptions, 'signal'>
   model: RubricModelOptions
-  validateRealRubric: (rubric: Rubric, document: SourceDocument) => string[]
+  validateRealRubric: (rubric: Rubric, document: SourceDocument, contentType?: OriginalContentType) => string[]
   browser?: BrowserRenderer
   safeFetchOptions?: Omit<SafeFetchOptions, 'signal'>
   clock?: Clock
@@ -1462,11 +1487,15 @@ async function saveOriginal(
   browser: BrowserRenderer | undefined,
   options: SafeFetchOptions,
   clock: Clock,
-): Promise<{ bytes: Uint8Array; contentType: 'application/pdf' | 'text/html'; source: RealJobSource }> {
+): Promise<{ bytes: Uint8Array; contentType: OriginalContentType; source: RealJobSource }> {
   if (record.source.originalBlobName) {
     const saved = await blobs.read(record.source.originalBlobName)
     if (!saved) throw new WorkerError('source-blob-missing', 'The saved original source is missing.', false, 'download')
-    const type = saved.contentType === 'application/pdf' ? 'application/pdf' : 'text/html'
+    const type = saved.contentType
+    if (!isOriginalContentType(type) ||
+      (record.source.kind === 'markdown') !== (type === 'text/markdown')) {
+      throw new WorkerError('invalid-source-type', 'The original source does not match its recorded upload type.', false, 'parsing')
+    }
     return {
       bytes: saved.bytes,
       contentType: type,
@@ -1476,12 +1505,12 @@ async function saveOriginal(
         sha256: record.source.sha256 ?? saved.sha256,
         bytes: record.source.bytes ?? saved.bytes.byteLength,
         capturedAt: record.source.capturedAt ?? clock.now().toISOString(),
-        extractionMethod: record.source.extractionMethod ?? (type === 'application/pdf' ? 'document-intelligence' : 'html'),
+        extractionMethod: record.source.extractionMethod ?? (type === 'application/pdf' ? 'document-intelligence' : type === 'text/markdown' ? 'markdown' : 'html'),
       },
     }
   }
-  if (record.source.kind === 'pdf') {
-    throw new WorkerError('source-blob-missing', 'The uploaded PDF source is missing.', false, 'download')
+  if (record.source.kind !== 'url') {
+    throw new WorkerError('source-blob-missing', 'The uploaded source file is missing.', false, 'download')
   }
   if (!record.source.url) throw new WorkerError('invalid-url', 'The job record has no source URL.', false, 'download')
   for (const candidateType of ['application/pdf', 'text/html'] as const) {
@@ -1606,6 +1635,10 @@ async function loadOrExtract(
       signal: controller.signal,
     })
     paragraphs = documentIntelligenceParagraphs(analysis)
+  } else if (original.contentType === 'text/markdown') {
+    const extracted = extractMarkdown(original.bytes, { defaultHeading: 'Job description' })
+    title = extracted.title ?? title
+    paragraphs = extracted.paragraphs
   } else {
     const html = Buffer.from(original.bytes).toString('utf8')
     const extracted = extractHtml(html, original.source.finalUrl ?? original.source.url ?? 'https://invalid.example')
@@ -1690,7 +1723,7 @@ export async function processClaimedJob(
     const generated = await generateGroundedRubric(
       artifact.document,
       dependencies.model,
-      dependencies.validateRealRubric,
+      (rubric, document) => dependencies.validateRealRubric(rubric, document, artifact.source.originalContentType),
       claimed.record.id,
       clock.now().toISOString(),
       controller.signal,

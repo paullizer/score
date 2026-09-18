@@ -23,6 +23,7 @@ import type {
   ResumeSourceCapture,
 } from './real-resumes'
 import type { Citation, Job, Rubric, SourceDocument } from './types'
+import type { OriginalContentType } from './source-files'
 
 export const ANALYSIS_LIMITS = {
   maxComparisons: 500,
@@ -147,7 +148,7 @@ export interface FrozenJobTargetSnapshot extends FrozenAnalysisTargetBase {
   document: RealJobDocument
   source: RealJobSource
   // Immutable original copied into analysis-sources.
-  original: ImmutableBlobReference & { contentType: 'application/pdf' | 'text/html' }
+  original: ImmutableBlobReference & { contentType: OriginalContentType }
 }
 
 export interface FrozenAnalysisReference {
