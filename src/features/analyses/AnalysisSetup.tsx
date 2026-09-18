@@ -4,6 +4,9 @@ import { ArrowLeft, ArrowRight, BriefcaseBusiness, Check, Layers3, ShieldCheck, 
 import { useWorkspace } from '../../app/workspace-context'
 import { latestRubrics } from '../../domain/selectors'
 import { Avatar, Badge, Button, DemoNote, EmptyState, InlineError, PageHeader, SearchField, SegmentedControl, StepLabel } from '../../components/ui'
+import { isEntityArchived, matchesArchiveFilter, type ArchiveFilter } from '../../domain/lifecycle'
+import { ArchivedBadge, ArchiveStateFilter, LifecycleBanner } from '../../components/lifecycle/LifecycleControls'
+import { useLifecycleAccess } from '../../components/lifecycle/useLifecycleAccess'
 import { analysisDataMode, sampleDataLink } from '../../app/real-data-mode'
 import { RealAnalysisSetup } from './RealAnalysisSetup'
 
@@ -41,23 +44,30 @@ function SampleAnalysisSetup() {
   const [failFirst, setFailFirst] = useState(false)
   const [error, setError] = useState('')
   const [starting, setStarting] = useState(false)
+  const [resumeArchiveFilter, setResumeArchiveFilter] = useState<ArchiveFilter>('default')
+  const [targetArchiveFilter, setTargetArchiveFilter] = useState<ArchiveFilter>('default')
+  const { canEdit } = useLifecycleAccess()
   const selectedRubrics = rubrics.filter((rubric) => targets.includes(rubric.id))
   const ready = (id: string) => {
     const rubric = rubrics.find((item) => item.id === id)
-    return rubric && rubric.dataKind !== 'real' && (rubric.kind === 'grade' || workspace.jobs.some((job) => job.rubricId === id && job.status === 'ready' && job.dataKind !== 'real'))
+    return canEdit && rubric && rubric.dataKind !== 'real' && !isEntityArchived(workspace, { kind: 'rubric', id: rubric.groupId }) &&
+      (rubric.kind === 'grade' || workspace.jobs.some((job) => job.rubricId === id && job.status === 'ready' && !job.rubricDeletedAt && job.dataKind !== 'real' && !isEntityArchived(workspace, { kind: 'job', id: job.id })))
   }
-  const invalidResumes = resumes.filter((id) => !workspace.resumes.some((resume) => resume.id === id))
+  const resumeReady = (id: string) => canEdit && workspace.resumes.some((resume) => resume.id === id) && !isEntityArchived(workspace, { kind: 'resume', id })
+  const invalidResumes = resumes.filter((id) => !resumeReady(id))
   const invalidTargets = targets.filter((id) => !ready(id))
   const realTargets = targets.filter((id) => id.startsWith('grade-version-') || workspace.rubrics.some((rubric) => rubric.id === id && rubric.dataKind === 'real'))
   const realPreselection = ['resumeSelections', 'targetSelections', 'selectionTransfer', 'selectionTransport', 'jobs', 'job', 'targets', 'ladder'].some((key) => params.has(key))
   const hasInvalid = invalidResumes.length > 0 || invalidTargets.length > 0 || realPreselection
-  const shownResumes = workspace.resumes.filter((resume) => `${resume.name} ${resume.role}`.toLowerCase().includes(resumeSearch.toLowerCase()))
-  const shownTargets = rubrics.filter((rubric) => rubric.kind === targetType && `${rubric.name} ${rubric.ladder ?? ''} ${rubric.grade ?? ''}`.toLowerCase().includes(targetSearch.toLowerCase()))
+  const shownResumes = workspace.resumes.filter((resume) => matchesArchiveFilter(isEntityArchived(workspace, { kind: 'resume', id: resume.id }), resumeSearch, resumeArchiveFilter) && `${resume.name} ${resume.role}`.toLowerCase().includes(resumeSearch.trim().toLowerCase()))
+  const eligibleResumes = shownResumes.filter((resume) => resumeReady(resume.id))
+  const shownTargets = rubrics.filter((rubric) => matchesArchiveFilter(isEntityArchived(workspace, { kind: 'rubric', id: rubric.groupId }), targetSearch, targetArchiveFilter) && rubric.kind === targetType && `${rubric.name} ${rubric.ladder ?? ''} ${rubric.grade ?? ''}`.toLowerCase().includes(targetSearch.trim().toLowerCase()))
   const jobCount = selectedRubrics.filter((rubric) => rubric.kind === 'job').length
   const gradeCount = selectedRubrics.filter((rubric) => rubric.kind === 'grade').length
   const comparisonCount = resumes.length * targets.length
   function toggle(value: string, selected: string[], set: (value: string[]) => void) { set(selected.includes(value) ? selected.filter((id) => id !== value) : [...selected, value]) }
   function run() {
+    if (!canEdit || hasInvalid || (previous && isEntityArchived(workspace, { kind: 'analysis', id: previous.id }))) { setError('Archived or unavailable inputs cannot start a new analysis. Choose active inputs in an active workspace.'); return }
     setStarting(true)
     setError('')
     try {
@@ -72,9 +82,11 @@ function SampleAnalysisSetup() {
   return <>
     <Link className="back-link" to={sampleDataLink('/analyses', Boolean(cloud))}><ArrowLeft size={14} />Back to analyses</Link>
     <PageHeader eyebrow="FROM CRITERIA TO CLARITY" title="Build an analysis" description="Choose who to compare, and what a great match means." />
+    <LifecycleBanner />
+    {previous && isEntityArchived(workspace, { kind: 'analysis', id: previous.id }) && <InlineError>This archived analysis is read-only. Unarchive it before creating a run from its selections, or choose active inputs in a fresh analysis.</InlineError>}
     {previous && <div className="info-callout mb-5"><Layers3 size={18} /><div><strong>A new run, not a rewrite.</strong><p>Selections from "{previous.name}" use the latest available rubric versions. The previous results stay exactly as they were.</p></div></div>}
     {params.get('from') && !previous && <div className="mb-5"><InlineError>The previous analysis is no longer available. Select fresh inputs below.</InlineError></div>}
-    {hasInvalid && <div className="mb-5"><InlineError>{realTargets.length || realPreselection ? 'Real inputs were directly requested. Real-only and mixed real/sample selections cannot use the demo scorer. No inputs will be silently skipped.' : 'Some requested inputs are missing, outdated, or not ready. They will not be silently skipped.'} <button className="ml-1 underline" onClick={() => {
+    {hasInvalid && <div className="mb-5"><InlineError>{realTargets.length || realPreselection ? 'Real inputs were directly requested. Real-only and mixed real/sample selections cannot use the demo scorer. No inputs will be silently skipped.' : 'Some requested inputs are archived, missing, outdated, or not ready. They will not be silently skipped.'} <button className="ml-1 underline" onClick={() => {
       if (realPreselection) navigate(sampleDataLink('/analyses/new', Boolean(cloud)))
       else { setResumes(resumes.filter((id) => !invalidResumes.includes(id))); setTargets(targets.filter((id) => !invalidTargets.includes(id))) }
     }}>Remove unavailable selections</button></InlineError></div>}
@@ -83,12 +95,13 @@ function SampleAnalysisSetup() {
         <section className="panel">
           <div className="section-heading"><div><StepLabel number={1} complete={resumes.length > 0}>Choose your resumes</StepLabel><p>One person exploring roles, or a whole applicant pool.</p></div><Badge tone={resumes.length ? 'accent' : 'neutral'}>{resumes.length} selected</Badge></div>
           <div className="flex flex-wrap items-center justify-between gap-3 border-b px-5 py-3"><SearchField value={resumeSearch} onChange={setResumeSearch} placeholder="Search people or experience..." />
-            <button className="text-link" onClick={() => {
-              const all = shownResumes.length > 0 && shownResumes.every((resume) => resumes.includes(resume.id))
-              setResumes(all ? resumes.filter((id) => !shownResumes.some((resume) => resume.id === id)) : [...new Set([...resumes, ...shownResumes.map((resume) => resume.id)])])
-            }}>{shownResumes.length > 0 && shownResumes.every((resume) => resumes.includes(resume.id)) ? 'Deselect visible' : 'Select visible'}</button></div>
+            <ArchiveStateFilter value={resumeArchiveFilter} onChange={setResumeArchiveFilter} label="Resume input archive state" />
+            <button className="text-link" disabled={!eligibleResumes.length} onClick={() => {
+              const all = eligibleResumes.length > 0 && eligibleResumes.every((resume) => resumes.includes(resume.id))
+              setResumes(all ? resumes.filter((id) => !eligibleResumes.some((resume) => resume.id === id)) : [...new Set([...resumes, ...eligibleResumes.map((resume) => resume.id)])])
+            }}>{eligibleResumes.length > 0 && eligibleResumes.every((resume) => resumes.includes(resume.id)) ? 'Deselect visible' : 'Select visible'}</button></div>
           <div className="builder-options">
-            {shownResumes.map((resume) => <label className="selection-card" key={resume.id}><input type="checkbox" checked={resumes.includes(resume.id)} onChange={() => toggle(resume.id, resumes, setResumes)} aria-label={`Include ${resume.name}`} /><Avatar initials={resume.initials} small /><div className="min-w-0"><strong className="block text-[12px] font-semibold">{resume.name}</strong><span className="mt-1 block text-[10px] text-muted">{resume.role}</span><span className="mt-1.5 block text-[9px] text-muted">{resume.experience} / fictional profile</span></div></label>)}
+            {shownResumes.map((resume) => <label className="selection-card" key={resume.id}><input type="checkbox" checked={resumes.includes(resume.id)} disabled={!resumeReady(resume.id)} onChange={() => toggle(resume.id, resumes, setResumes)} aria-label={`Include ${resume.name}`} /><Avatar initials={resume.initials} small /><div className="min-w-0"><strong className="block text-[12px] font-semibold">{resume.name}</strong><ArchivedBadge target={{ kind: 'resume', id: resume.id }} /><span className="mt-1 block text-[10px] text-muted">{resume.role}</span><span className="mt-1.5 block text-[9px] text-muted">{resume.experience} / fictional profile</span></div></label>)}
             {!shownResumes.length && <div className="col-span-full"><EmptyState title="No resumes to show" description="Adjust the search, or add sample resumes from the library." action={<Button onClick={() => navigate(sampleDataLink('/resumes', Boolean(cloud)))}>Open resumes</Button>} /></div>}
           </div>
         </section>
@@ -97,6 +110,7 @@ function SampleAnalysisSetup() {
           <div className="flex flex-wrap items-center justify-between gap-3 border-b px-5 py-3">
             <SegmentedControl label="Target type" value={targetType} onChange={setTargetType} options={[{ value: 'job', label: 'Job rubrics', count: jobCount }, { value: 'grade', label: 'GS / grade rubrics', count: gradeCount }]} />
             <SearchField value={targetSearch} onChange={setTargetSearch} placeholder="Find a rubric..." />
+            <ArchiveStateFilter value={targetArchiveFilter} onChange={setTargetArchiveFilter} label="Rubric input archive state" />
           </div>
           <div className="builder-options">
             {shownTargets.map((rubric) => {
@@ -106,12 +120,12 @@ function SampleAnalysisSetup() {
                 <input type="checkbox" disabled={!available} checked={targets.includes(rubric.id)} onChange={() => toggle(rubric.id, targets, setTargets)} aria-label={`Include ${rubric.name}`} />
                 <span className="target-symbol">{rubric.kind === 'job' ? <BriefcaseBusiness size={16} /> : <Layers3 size={16} />}</span>
                 <div className="min-w-0"><strong className="block text-[12px] font-semibold">{rubric.kind === 'job' ? job?.title ?? rubric.name : rubric.name}</strong><span className="mt-1 block text-[10px] text-muted">{rubric.kind === 'job' ? job?.organization : rubric.ladder}</span>
-                  <div className="mt-2 flex flex-wrap gap-1.5"><Badge>{rubric.grade ?? job?.grade ?? 'Job-specific'}</Badge><Badge>{rubric.criteria.length} criteria / v{rubric.version}</Badge>{rubric.dataKind === 'real' ? <Badge tone="warning">Demo scoring disabled</Badge> : !available && <Badge tone="warning">Not ready</Badge>}</div></div>
+                  <div className="mt-2 flex flex-wrap gap-1.5"><Badge>{rubric.grade ?? job?.grade ?? 'Job-specific'}</Badge><ArchivedBadge target={{ kind: 'rubric', id: rubric.groupId }} /><Badge>{rubric.criteria.length} criteria / v{rubric.version}</Badge>{rubric.dataKind === 'real' ? <Badge tone="warning">Demo scoring disabled</Badge> : !available && <Badge tone="warning">Not ready</Badge>}</div></div>
               </label>
             })}
             {!shownTargets.length && <div className="col-span-full"><EmptyState title="No matching rubrics" description="Try another search or view the other target type." /></div>}
           </div>
-          {targetType === 'grade' && <div className="border-t px-5 py-3"><DemoNote>Only fictional sample grade rubrics can be selected. Real source-grounded grades are disabled, including direct and mixed selections. Samples are not official OPM eligibility assessments.</DemoNote></div>}
+          {targetType === 'grade' && <div className="border-t px-5 py-3"><DemoNote>Only fictional sample grade rubrics can be selected here. Use Real analysis for ready real resumes and approved GS versions; real-only and mixed inputs cannot use the sample scorer. Samples are not official OPM eligibility assessments.</DemoNote></div>}
           {targetType === 'job' && shownTargets.some((rubric) => rubric.dataKind === 'real') && <div className="border-t px-5 py-3"><DemoNote>Real job rubrics are shown for transparency but cannot be selected. This analysis uses only fictional fixture scoring.</DemoNote></div>}
         </section>
       </div>
@@ -125,7 +139,7 @@ function SampleAnalysisSetup() {
           <p className="text-[11px] text-muted">Each criterion is scored from 0-5, with a weighted overall score out of 100. Different jobs and grades stay separate.</p>
           <details className="text-[10px] text-muted"><summary className="cursor-pointer">Demo scenario</summary><label className="check-label mt-3 text-[11px]"><input type="checkbox" checked={failFirst} onChange={(event) => setFailFirst(event.target.checked)} />Simulate one interrupted comparison</label></details>
           {error && <InlineError>{error}</InlineError>}
-          <Button variant="primary" icon={ArrowRight} className="w-full" disabled={!resumes.length || !targets.length || hasInvalid || starting} onClick={run}>{starting ? 'Starting...' : 'Run sample analysis'}</Button>
+          <Button variant="primary" icon={ArrowRight} className="w-full" disabled={!canEdit || !resumes.length || !targets.length || hasInvalid || starting || Boolean(previous && isEntityArchived(workspace, { kind: 'analysis', id: previous.id }))} onClick={run}>{starting ? 'Starting...' : 'Run sample analysis'}</Button>
           {(!resumes.length || !targets.length) && <p className="text-center text-[10px] text-muted">Select at least one resume and one rubric.</p>}
           <div className="flex items-start gap-2 text-[10px] text-muted"><ShieldCheck size={14} className="mt-0.5 shrink-0" /><p>Fictional content. Simulated scoring. {cloud ? 'Your selections are saved to this cloud workspace.' : 'Your selections stay on this device.'}</p></div>
         </div>

@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { Link, useSearchParams } from 'react-router-dom'
+import { Link, useNavigate, useSearchParams } from 'react-router-dom'
 import { ArrowLeft, ArrowUpRight, Layers3, LoaderCircle, RotateCcw, ShieldCheck, X } from 'lucide-react'
 import { useRealAnalyses } from '../../app/real-analyses-context'
 import type { RealAnalysisComparisonSummary, RealAnalysisRunSummary } from '../../domain/real-analyses'
@@ -13,6 +13,8 @@ import {
   distinctTargetLabels, realComparisonSortOptions, realComparisonTargetLabel, selectRealComparisons, targetScoreSortExplanation, type RealComparisonSortKey,
 } from './analysisTableBrowsing'
 import { RealComparisonReview } from './RealComparisonReview'
+import { ArchivedBadge, EntityLifecycleActions, LifecycleBanner } from '../../components/lifecycle/LifecycleControls'
+import { useLifecycleAccess } from '../../components/lifecycle/useLifecycleAccess'
 
 export function RealComparisonValue({ summary }: { summary: RealAnalysisComparisonSummary }) {
   const { comparison } = summary
@@ -26,6 +28,7 @@ export function RealComparisonValue({ summary }: { summary: RealAnalysisComparis
 
 export function RealComparisonActions({ summary }: { summary: RealAnalysisComparisonSummary }) {
   const api = useRealAnalyses()
+  const { canEdit } = useLifecycleAccess({ kind: 'analysis', id: summary.comparison.runId })
   const [error, setError] = useState('')
   const pair = summary.comparison
   const run = api?.summaries.find((item) => item.run.id === pair.runId)
@@ -34,15 +37,15 @@ export function RealComparisonActions({ summary }: { summary: RealAnalysisCompar
   const active = ['queued', 'running'].includes(pair.status)
   const canRetry = pair.status === 'cancelled' || pair.status === 'failed'
   async function act(action: 'retryComparison' | 'cancelComparison') {
-    if (!api || api.pending(pair.runId) || cancelling) return
+    if (!api || !canEdit || api.pending(pair.runId) || cancelling) return
     setError('')
     try { await api[action](pair.runId, pair.id, summary.etag) }
     catch (caught) { setError(caught instanceof Error ? caught.message : 'The comparison request could not be acknowledged.') }
   }
   return <div className="space-y-2"><div className="flex flex-wrap gap-2">
-    {active && <Button size="sm" variant="ghost" icon={X} disabled={!api?.canWrite || api.pending(pair.runId) || api.phase !== 'ready' || cancelling}
+    {active && <Button size="sm" variant="ghost" icon={X} disabled={!canEdit || !api?.canWrite || api.pending(pair.runId) || api.phase !== 'ready' || cancelling}
       aria-label={`Cancel comparison ${pair.index + 1}`} onClick={() => void act('cancelComparison')}>Cancel pair</Button>}
-    {canRetry && <Button size="sm" icon={RotateCcw} disabled={!api?.canWrite || api.pending(pair.runId) || api.phase !== 'ready' || cancelling}
+    {canRetry && <Button size="sm" icon={RotateCcw} disabled={!canEdit || !api?.canWrite || api.pending(pair.runId) || api.phase !== 'ready' || cancelling}
       title={cancelling ? 'Wait for the server to finish cancelling the run before retrying a saved pair.' : 'Explicitly retry this comparison with the same frozen inputs, even when automatic retries have stopped.'}
       aria-label={`Retry comparison ${pair.index + 1} with saved inputs`} onClick={() => void act('retryComparison')}>Retry saved pair</Button>}
   </div>{cancelling && <p className="text-[10px] text-muted">{paused ? 'Resume the paused run cancellation before retrying individual pairs.' : 'Run cancellation is still being finalized.'}</p>}{error && <InlineError>{error}</InlineError>}</div>
@@ -50,6 +53,7 @@ export function RealComparisonActions({ summary }: { summary: RealAnalysisCompar
 
 function RealRunActions({ summary }: { summary: RealAnalysisRunSummary }) {
   const api = useRealAnalyses()!
+  const { canEdit } = useLifecycleAccess({ kind: 'analysis', id: summary.run.id })
   const [error, setError] = useState('')
   const run = summary.run
   const cancelling = realAnalysisCancellationPending(summary)
@@ -57,7 +61,7 @@ function RealRunActions({ summary }: { summary: RealAnalysisRunSummary }) {
   const active = ['initializing', 'queued', 'running'].includes(run.status)
   const canRetry = run.progress.failed > 0 || run.progress.cancelled > 0 || ['failed', 'cancelled'].includes(run.status)
   async function act(action: 'retry' | 'cancel') {
-    if (api.pending(run.id) || (cancelling && (!paused || action !== 'retry'))) return
+    if (!canEdit || api.pending(run.id) || (cancelling && (!paused || action !== 'retry'))) return
     setError('')
     try {
       if (action === 'retry') await api.retry(run.id, {}, summary.etag)
@@ -65,10 +69,10 @@ function RealRunActions({ summary }: { summary: RealAnalysisRunSummary }) {
     } catch (caught) { setError(caught instanceof Error ? caught.message : 'This run request could not be acknowledged.') }
   }
   return <div className="space-y-2"><div className="flex flex-wrap gap-2">
-    {active && <Button icon={X} disabled={!api.canWrite || api.pending(run.id) || api.phase !== 'ready'} onClick={() => void act('cancel')}>Cancel unfinished</Button>}
-    {paused ? <Button icon={RotateCcw} disabled={!api.canWrite || api.pending(run.id) || api.phase !== 'ready'}
+    {active && <Button icon={X} disabled={!canEdit || !api.canWrite || api.pending(run.id) || api.phase !== 'ready'} onClick={() => void act('cancel')}>Cancel unfinished</Button>}
+    {paused ? <Button icon={RotateCcw} disabled={!canEdit || !api.canWrite || api.pending(run.id) || api.phase !== 'ready'}
       title="Resume only the saved cancellation cleanup. This does not restart scoring or change completed results."
-      onClick={() => void act('retry')}>Resume cancellation</Button> : canRetry && <Button icon={RotateCcw} disabled={!api.canWrite || api.pending(run.id) || api.phase !== 'ready' || cancelling}
+      onClick={() => void act('retry')}>Resume cancellation</Button> : canRetry && <Button icon={RotateCcw} disabled={!canEdit || !api.canWrite || api.pending(run.id) || api.phase !== 'ready' || cancelling}
       title={cancelling ? 'Cancellation must finish before a saved run can be retried.' : 'Explicitly retry failed or cancelled comparisons with their saved inputs. Completed results are unchanged.'}
       onClick={() => void act('retry')}>Retry failed / cancelled</Button>}
   </div>{cancelling && <p className="text-[11px] text-muted" role="status">{paused
@@ -83,6 +87,8 @@ export function RealAnalysisDetail({ id }: { id: string }) {
 
 function RealAnalysisView({ id }: { id: string }) {
   const api = useRealAnalyses()
+  const navigate = useNavigate()
+  const { canEdit, deleting, removed } = useLifecycleAccess({ kind: 'analysis', id })
   const [params, setParams] = useSearchParams()
   const [query, setQuery] = useState('')
   const [targetId, setTargetId] = useState('')
@@ -99,6 +105,7 @@ function RealAnalysisView({ id }: { id: string }) {
   }, [api?.phase, ensure, ensurePairs, entry?.state, id, pairs?.state])
   if (!api) return <EmptyState title="Real analyses require a cloud workspace" description="A real analysis cannot be read from sample storage." />
   const back = <Link className="back-link" to={selectedId ? `/analyses/${encodeURIComponent(id)}?data=real` : '/analyses?data=real'}><ArrowLeft size={14} aria-hidden="true" />{selectedId ? 'All saved comparisons' : 'Back to real analyses'}</Link>
+  if (deleting || (removed && entry?.state === 'ready')) return <>{back}<LifecycleBanner target={{ kind: 'analysis', id }} /><EmptyState title="Analysis cleanup or removal" description="Cached comparisons, snapshots, and downloads are no longer available. Retry the lifecycle operation above if permanent cleanup is incomplete." /></>
   if (api.phase === 'unavailable') return <>{back}<EmptyState title="Saved real analysis history is unavailable" description={api.error ?? 'The private history service is unavailable; no samples are substituted.'} action={<Button onClick={() => void api.refresh()}>Check service</Button>} /></>
   if (entry?.state !== 'ready') return <>{back}<EmptyState icon={entry?.state === 'error' || api.phase === 'error' ? Layers3 : LoaderCircle}
     title={entry?.state === 'error' || api.phase === 'error' ? 'This real analysis could not be opened' : 'Opening saved real analysis'}
@@ -128,10 +135,11 @@ function RealAnalysisView({ id }: { id: string }) {
   }
   return <>{back}
     <PageHeader eyebrow="REAL EVIDENCE · FROZEN INPUTS" title={run.name} description="Review each saved resume/target pair independently. Completion, coverage, and overall-score availability are separate."
-      actions={<><RealRunActions summary={summary} />{api.features?.realAnalyses
+      actions={<><EntityLifecycleActions target={{ kind: 'analysis', id }} name={run.name} onComplete={(action) => { if (action === 'delete') navigate('/analyses?data=real') }} /><RealRunActions summary={summary} />{canEdit && api.canWrite && api.features?.realAnalyses
         ? <Link className="button button-secondary button-md" {...realAnalysisLink({ from: id }, api.workspaceId)}><Layers3 size={15} aria-hidden="true" />New run with these inputs</Link>
-        : <Button icon={Layers3} disabled title={api.creationError ?? 'New-run readiness has not been confirmed.'}>New run with these inputs</Button>}</>} />
-    <div className="analysis-meta"><Badge tone="accent">Real evidence assessment</Badge><RealAnalysisStatus summary={summary} /><span>{detail.resumes.length} resumes</span><span>{detail.targets.length} separate targets</span><span>{dateLabel(run.createdAt)}</span><span className="flex items-center gap-1.5"><ShieldCheck size={13} aria-hidden="true" />Immutable snapshots</span></div>
+        : <Button icon={Layers3} disabled title={!canEdit ? 'Unarchive this analysis and its workspace before creating another run.' : api.creationError ?? 'New-run readiness has not been confirmed.'}>New run with these inputs</Button>}</>} />
+    <LifecycleBanner target={{ kind: 'analysis', id }} />
+    <div className="analysis-meta"><Badge tone="accent">Real evidence assessment</Badge><RealAnalysisStatus summary={summary} /><ArchivedBadge target={{ kind: 'analysis', id }} /><span>{detail.resumes.length} resumes</span><span>{detail.targets.length} separate targets</span><span>{dateLabel(run.createdAt)}</span><span className="flex items-center gap-1.5"><ShieldCheck size={13} aria-hidden="true" />Immutable snapshots</span></div>
     {(entry.error || api.error) && <div className="mb-5"><InlineError>{entry.error ?? api.error} The last acknowledged run is shown. <Button size="sm" onClick={() => { void api.refresh(); void api.ensureDetail(id, true) }}>Reload progress</Button></InlineError></div>}
     {!api.features?.realAnalyses && <p className="mb-5 text-[11px] text-muted">{api.creationError ?? 'Checking new-run readiness.'} This saved run and its frozen evidence are independent of new-run readiness.</p>}
     {run.error && <div className="mb-5"><InlineError>{run.error.code}: {run.error.message} Processing failures are not zero scores.</InlineError></div>}

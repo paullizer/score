@@ -19,10 +19,15 @@ import {
   extractedBlobName, isBlobInJobPrefix, originalBlobName, validateRealJobRecord,
   validateRealRubric, validateRealSourceDocument,
 } from '../jobs/validation'
-import { conflict, invalidRequest, notFound, unavailable } from '../errors'
+import { conflict, HttpError, invalidRequest, notFound, unavailable } from '../errors'
 import { StoreConflictError, StoreNotFoundError } from '../store'
 import { reconcileReferenceIssues } from '../../worker/references/issue-lifecycle'
-import type { GradeBlob, GradeBlobStore, GradeStore, GradeTransaction } from './store'
+import type { GradeBlob, GradeBlobStore, GradeStore, GradeTransaction, GradeTransactionOptions } from './store'
+import {
+  assertGradeWritable, GRADE_PREPARATION_RETENTION_MS, gradeIsLocked, gradeIsRemoved, guardedGradeBlobs, updateGradeControl,
+} from './guards'
+import { assertWorkspaceMutationLease } from '../lifecycle/lease'
+import { discardGradePreparation } from './lifecycle'
 import {
   addGradeUrlInputSchema, approveGradeInputSchema, blobInGrade, confirmGradeInputSchema,
   createGradeInputSchema, editGradeInputSchema, gradeActionInputSchema, gradeContentHash, gradeIssuesFor, gradeCoverageMatchesContext,
@@ -42,6 +47,12 @@ type Operations = Map<string, GradeTransaction>
 type CreateInput = z.infer<typeof createGradeInputSchema>
 type ConfirmInput = z.infer<typeof confirmGradeInputSchema>
 type ActionInput = z.infer<typeof gradeActionInputSchema>
+
+class RevokedGradeSeedError extends HttpError {
+  constructor(status: 404 | 409, message: string) {
+    super(status, status === 404 ? 'not_found' : 'conflict', message)
+  }
+}
 
 const digest = (bytes: Uint8Array) => createHash('sha256').update(bytes).digest('hex')
 const copy = <T>(value: T): T => structuredClone(value)
@@ -138,17 +149,29 @@ export class GradeService {
 
   constructor(grades: RealGradesDeps, jobs?: RealJobsDeps, now?: () => Date) {
     this.store = grades.store
-    this.blobs = grades.blobs
+    this.blobs = guardedGradeBlobs(grades.store, grades.blobs)
     this.jobs = jobs
     this.clock = now ?? (() => new Date())
   }
 
   private now(): string { return this.clock().toISOString() }
 
+  private async writable(workspaceId: string, ladderId?: string, grade?: number): Promise<void> {
+    try { await assertGradeWritable(this.store, workspaceId, ladderId, grade) } catch (error) {
+      if (error instanceof StoreConflictError) throw conflict(error.message)
+      throw error
+    }
+  }
+
   private async optional<K extends Kind>(workspaceId: string, id: string, kind: K, ladderId?: string): Promise<Stored<K> | undefined> {
     const value = await this.store.get(workspaceId, id)
     if (!value) return undefined
     const record = parseGradeEntity(value.record)
+    if (record.recordType === 'grade-ladder' && gradeIsRemoved(record.lifecycle)) throw notFound('This ladder has been removed.')
+    if (record.recordType === 'grade-ladder') {
+      const control = await this.store.getControl(workspaceId)
+      if (control && ['deleting', 'deleted'].includes(control.record.state)) throw notFound('This workspace has been removed.')
+    }
     if (record.workspaceId !== workspaceId || record.id !== id || record.recordType !== kind ||
       (ladderId !== undefined && (!('ladderId' in record) || record.ladderId !== ladderId))) {
       throw notFound('The requested grade record was not found.')
@@ -185,13 +208,18 @@ export class GradeService {
   private async active(workspaceId: string, ladderId: string): Promise<Stored<'grade-work'>[]> {
     const values = (await Promise.all(['queued', 'running'].map(status => this.all(workspaceId, ladderId, 'grade-work', status)))).flat()
     if (values.length > 65) throw conflict('Too many active stages. Let processing finish before changing this workflow.')
-    return values
+    const locked = new Set((await this.all(workspaceId, ladderId, 'grade-head'))
+      .filter(value => gradeIsLocked(value.record.lifecycle)).map(value => value.record.grade))
+    return values.filter(value => !locked.has(workGrade(value.record)!))
   }
 
-  private async commit(workspaceId: string, operations: Operations): Promise<void> {
+  private async commit(workspaceId: string, operations: Operations, options?: GradeTransactionOptions): Promise<void> {
     const batch = [...operations.values()]
     for (const operation of batch) parseGradeEntity(operation.record)
-    try { await this.store.transact(workspaceId, batch) } catch (error) {
+    try {
+      assertWorkspaceMutationLease(workspaceId)
+      await this.store.transact(workspaceId, batch, options)
+    } catch (error) {
       if (error instanceof StoreConflictError || error instanceof StoreNotFoundError) {
         throw conflict('The grade workflow changed before this operation could be saved. Reload and retry.')
       }
@@ -255,6 +283,7 @@ export class GradeService {
       if (generationWork(item.record) || (cancelDiscovery && item.record.input.kind === 'discover')) this.cancelWork(operations, item, timestamp)
     }
     for (const item of heads) {
+      if (gradeIsLocked(item.record.lifecycle)) continue
       const head = { ...item.record, status: 'draft' as const, updatedAt: timestamp }
       delete head.generationId
       delete head.latestReviewId
@@ -267,14 +296,36 @@ export class GradeService {
   }
 
   private async summary(value: Stored<'grade-ladder'>): Promise<GradeLadderSummary> {
+    if (value.record.lifecycle?.deletingAt) {
+      const ladder: GradeLadderRecord = {
+        ...value.record, sourceIds: [], issues: [], status: 'cancelled',
+        seedJobTitle: '', seedBlobName: '', createdBy: '', inputFingerprint: '',
+        context: { series: value.record.context.series, agency: '', agencyType: 'unknown',
+          supervision: 'unknown', functions: [], specialty: '', confirmed: false, answers: {} },
+      }
+      delete ladder.sourceSetId
+      delete ladder.generationId
+      delete ladder.discovery
+      return { ladder, etag: value.etag, levels: [], pending: true,
+        operation: { id: ladder.id, action: 'delete', status: 'pending', updatedAt: value.record.lifecycle.deletingAt } }
+    }
     const heads = await Promise.all(value.record.grades.map(grade =>
       this.get(value.record.workspaceId, gradeHeadId(value.record.id, grade), 'grade-head', value.record.id)))
-    return { ladder: value.record, etag: value.etag, levels: heads.map(value => ({ head: value.record, etag: value.etag })) }
+    return { ladder: value.record, etag: value.etag, levels: heads.map(value => ({
+      head: gradeIsRemoved(value.record.lifecycle) ? {
+        id: value.record.id, workspaceId: value.record.workspaceId, ladderId: value.record.ladderId,
+        recordType: 'grade-head', grade: value.record.grade, createdAt: value.record.createdAt,
+        updatedAt: value.record.updatedAt, status: 'draft', issues: [], lifecycle: value.record.lifecycle,
+      } : value.record, etag: value.etag,
+    })) }
   }
 
   async list(workspaceId: string, continuationToken?: string, limit = 50) {
+    const control = await this.store.getControl(workspaceId)
+    if (control && ['deleting', 'deleted'].includes(control.record.state)) return { ladders: [] }
     const page = await this.store.list(workspaceId, { recordType: 'grade-ladder', continuationToken, limit })
-    const ladders = await Promise.all(page.items.map(value => {
+    const ladders = await Promise.all(page.items.filter(value =>
+      value.record.recordType !== 'grade-ladder' || !value.record.lifecycle?.deletedAt).map(value => {
       const record = parseGradeEntity(value.record)
       if (record.recordType !== 'grade-ladder' || record.workspaceId !== workspaceId) throw unavailable('Invalid grade list ownership.')
       return this.summary({ record, etag: value.etag })
@@ -283,7 +334,17 @@ export class GradeService {
   }
 
   async detail(workspaceId: string, ladderId: string): Promise<GradeLadderDetail> {
-    const current = await this.get(workspaceId, ladderId, 'grade-ladder')
+    const control = await this.store.getControl(workspaceId)
+    if (control && ['deleting', 'deleted'].includes(control.record.state)) throw notFound('This workspace has been removed.')
+    const stored = await this.store.get(workspaceId, ladderId)
+    if (!stored) throw notFound('The requested grade ladder was not found.')
+    const record = parseGradeEntity(stored.record)
+    if (record.recordType !== 'grade-ladder' || record.id !== ladderId || record.workspaceId !== workspaceId ||
+      record.lifecycle?.deletedAt) throw notFound('The requested grade ladder was not found.')
+    const current: Stored<'grade-ladder'> = { record, etag: stored.etag }
+    if (record.lifecycle?.deletingAt) {
+      return { ...await this.summary(current), levels: [], sources: [], sourceSet: null, workItems: [] }
+    }
     const [base, sources, sourceSet, work] = await Promise.all([
       this.summary(current),
       Promise.all(current.record.sourceIds.map(id => this.get(workspaceId, id, 'grade-source', ladderId))),
@@ -307,7 +368,8 @@ export class GradeService {
         throw unavailable('The stored grade work has invalid ownership.')
       }
       return record
-    })
+    }).filter(record => !('grade' in record.input) ||
+      !base.levels.some(level => level.head.grade === workGrade(record) && gradeIsRemoved(level.head.lifecycle)))
     return { ...base, levels, sources: sources.map(source => source.record), sourceSet: sourceSet?.record ?? null, workItems }
   }
 
@@ -334,8 +396,30 @@ export class GradeService {
     return parsed
   }
 
+  private async creationSeed(workspaceId: string, input: CreateInput) {
+    if (!this.jobs) throw unavailable('Real job access is required to capture a new grade-ladder seed.')
+    const current = await this.jobs.store.get(workspaceId, input.jobId)
+    if (!current) throw new RevokedGradeSeedError(404, 'The requested seed job was not found.')
+    if (!validateRealJobRecord(current.record) || current.record.workspaceId !== workspaceId || current.record.id !== input.jobId) {
+      throw notFound('The requested seed job was not found.')
+    }
+    if (gradeIsRemoved(current.record.lifecycle) || gradeIsRemoved(current.record.rubricLifecycle) || current.record.job.rubricDeletedAt) {
+      throw new RevokedGradeSeedError(409, 'Removed seed jobs and rubrics cannot create grade ladders.')
+    }
+    if (gradeIsLocked(current.record.lifecycle) || gradeIsLocked(current.record.rubricLifecycle)) {
+      throw conflict('Archived seed jobs and rubrics cannot create grade ladders.')
+    }
+    if (current.record.job.status !== 'ready') throw conflict('Grade ladders require a ready real job.')
+    const versions = await this.jobs.store.listRubrics(workspaceId, input.jobId)
+    const rubric = versions.find(value => value.id === input.rubricId && value.version === input.rubricVersion)
+    if (!rubric) throw new RevokedGradeSeedError(404, 'The selected saved job rubric version was not found.')
+    if (rubric.jobId !== input.jobId) throw notFound('The selected saved job rubric version was not found.')
+    return { current, rubric }
+  }
+
   async create(workspaceId: string, key: string, input: CreateInput, actor: string): Promise<GradeLadderDetail> {
     const ladderId = `ladder-${key}`
+    await this.writable(workspaceId, ladderId)
     const fingerprint = gradeContentHash({ operation: 'create', input })
     const existing = await this.optional(workspaceId, ladderId, 'grade-ladder')
     if (existing) {
@@ -344,16 +428,45 @@ export class GradeService {
     }
     const initializationName = `${workspaceId}/${ladderId}/initialization.json`
     let initializationBlob = await this.blobs.read(initializationName)
+    const previousControl = await this.store.getControl(workspaceId, ladderId)
+    if ((initializationBlob && initializationSchema.parse(json(initializationBlob)).inputFingerprint !== fingerprint) ||
+      (previousControl?.record.preparation && previousControl.record.preparation.inputFingerprint !== fingerprint)) {
+      throw conflict('This idempotency key was used for different ladder input.')
+    }
+    let hasPreparation = Boolean(initializationBlob || previousControl?.record.preparation)
+    const liveSeed = async (captured?: GradeSeedSnapshot['rubric']) => {
+      try {
+        const live = await this.creationSeed(workspaceId, input)
+        if (captured && gradeContentHash(captured) !== gradeContentHash(live.rubric)) {
+          throw new RevokedGradeSeedError(409, 'The selected saved seed rubric no longer matches its immutable preparation. Use a new idempotency key.')
+        }
+        return live
+      } catch (error) {
+        if (hasPreparation && error instanceof RevokedGradeSeedError) {
+          try {
+            if (!await discardGradePreparation({ store: this.store, blobs: this.blobs }, workspaceId, ladderId, this.now())) {
+              throw unavailable('Unpublished seed uploads are still draining.')
+            }
+          } catch {
+            throw unavailable('The seed is no longer available. Unpublished ladder cleanup remains pending and will resume automatically.')
+          }
+        }
+        throw error
+      }
+    }
+    const { current, rubric } = await liveSeed()
+    await updateGradeControl(this.store, workspaceId, ladderId, control => {
+      if (control.preparation && control.preparation.inputFingerprint !== fingerprint) {
+        throw conflict('This idempotency key was used for different ladder input.')
+      }
+      return {
+        ...control,
+        preparation: control.preparation ?? { inputFingerprint: fingerprint, expiresAt: new Date(Date.now() + GRADE_PREPARATION_RETENTION_MS).toISOString() },
+      }
+    }, false)
+    hasPreparation = true
     if (!initializationBlob) {
       if (!this.jobs) throw unavailable('Real job access is required to capture a new grade-ladder seed.')
-      const current = await this.jobs.store.get(workspaceId, input.jobId)
-      if (!current || !validateRealJobRecord(current.record) || current.record.workspaceId !== workspaceId || current.record.id !== input.jobId) {
-        throw notFound('The requested seed job was not found.')
-      }
-      if (current.record.job.status !== 'ready') throw conflict('Grade ladders require a ready real job.')
-      const versions = await this.jobs.store.listRubrics(workspaceId, input.jobId)
-      const rubric = versions.find(value => value.id === input.rubricId && value.version === input.rubricVersion)
-      if (!rubric || rubric.jobId !== input.jobId) throw notFound('The selected saved job rubric version was not found.')
       const source = current.record.source
       if (!current.record.extractedBlobName || !source.originalBlobName || !source.originalContentType ||
         !isBlobInJobPrefix(current.record.extractedBlobName, workspaceId, input.jobId) ||
@@ -433,6 +546,7 @@ export class GradeService {
     const operations: Operations = new Map()
     for (const record of [ladder, source, this.work(ladder, { kind: 'discover' }, timestamp, key, fingerprint),
       ...input.grades.map(grade => this.head(ladder, grade, timestamp))]) creation(operations, record)
+    await liveSeed(seed.rubric)
     try { await this.commit(workspaceId, operations) } catch (error) {
       const published = await this.optional(workspaceId, ladderId, 'grade-ladder')
       if (!published || published.record.inputFingerprint !== fingerprint) throw error
@@ -441,6 +555,7 @@ export class GradeService {
   }
 
   async update(workspaceId: string, ladderId: string, input: z.infer<typeof updateGradeInputSchema>, etag: string) {
+    await this.writable(workspaceId, ladderId)
     const current = await this.get(workspaceId, ladderId, 'grade-ladder')
     requireMatch(current, etag)
     const ladder = { ...copy(current.record), ...copy(input), updatedAt: this.now() }
@@ -456,6 +571,7 @@ export class GradeService {
   }
 
   async discover(workspaceId: string, ladderId: string, key: string, actor: string, etag: string) {
+    await this.writable(workspaceId, ladderId)
     const current = await this.get(workspaceId, ladderId, 'grade-ladder')
     const receipt = await this.receipt(workspaceId, ladderId, key, 'discover', { etag }, actor)
     const existing = await this.optional(workspaceId, `grade-work-${key}`, 'grade-work', ladderId)
@@ -483,6 +599,7 @@ export class GradeService {
     input: { kind: 'pdf'; filename: string; bytes: Uint8Array; selectedPages: number[]; pageCount: number } |
       { kind: 'url'; url: string; selectedPages: number[] },
   ) {
+    await this.writable(workspaceId, ladderId)
     const current = await this.get(workspaceId, ladderId, 'grade-ladder')
     const fingerprintInput = input.kind === 'pdf'
       ? { kind: 'pdf', filename: input.filename, sha256: digest(input.bytes), selectedPages: input.selectedPages }
@@ -548,6 +665,7 @@ export class GradeService {
   }
 
   async selectPages(workspaceId: string, ladderId: string, sourceId: string, pages: number[], etag: string) {
+    await this.writable(workspaceId, ladderId)
     const [current, stored] = await Promise.all([
       this.get(workspaceId, ladderId, 'grade-ladder'), this.get(workspaceId, sourceId, 'grade-source', ladderId),
     ])
@@ -656,6 +774,7 @@ export class GradeService {
   }
 
   async confirm(workspaceId: string, ladderId: string, key: string, actor: string, input: ConfirmInput, etag: string) {
+    await this.writable(workspaceId, ladderId)
     const current = await this.get(workspaceId, ladderId, 'grade-ladder')
     const receipt = await this.receipt(workspaceId, ladderId, key, 'confirm', { input, etag }, actor)
     const existing = await this.optional(workspaceId, `source-set-${key}`, 'grade-source-set', ladderId)
@@ -736,6 +855,7 @@ export class GradeService {
     for (const work of pending) if (generationWork(work.record)) this.cancelWork(operations, work, ladder.updatedAt)
     const heads = await this.all(workspaceId, ladderId, 'grade-head')
     for (const currentHead of heads) {
+      if (gradeIsLocked(currentHead.record.lifecycle)) continue
       const head = { ...currentHead.record, status: 'draft' as const, updatedAt: ladder.updatedAt }
       delete head.generationId
       delete head.latestReviewId
@@ -753,6 +873,7 @@ export class GradeService {
   }
 
   async generate(workspaceId: string, ladderId: string, key: string, actor: string, etag: string) {
+    await this.writable(workspaceId, ladderId)
     const current = await this.get(workspaceId, ladderId, 'grade-ladder')
     const receipt = await this.receipt(workspaceId, ladderId, key, 'generate', { etag }, actor)
     const existing = await this.optional(workspaceId, `grade-work-${key}`, 'grade-work', ladderId)
@@ -767,22 +888,32 @@ export class GradeService {
     const timestamp = this.now()
     const ladder: GradeLadderRecord = { ...copy(current.record), generationId: key, status: 'generating', updatedAt: timestamp }
     const operations: Operations = new Map()
+    const reviveGrades: number[] = []
+    let eligibleGrades = 0
     for (const work of await this.active(workspaceId, ladderId)) {
       if (generationWork(work.record)) this.cancelWork(operations, work, timestamp)
     }
     for (const grade of ladder.grades) {
       const currentHead = await this.get(workspaceId, gradeHeadId(ladderId, grade), 'grade-head', ladderId)
+      if (currentHead.record.lifecycle?.archivedAt || currentHead.record.lifecycle?.deletingAt) continue
+      eligibleGrades++
       const head: GradeHeadRecord = {
         ...copy(currentHead.record), status: 'queued', generationId: key, sourceSetId: sourceSet.id,
         updatedAt: timestamp, issues: gradeIssuesFor(sourceSet.issues, grade),
       }
       delete head.latestReviewId
       delete head.error
+      if (head.lifecycle?.deletedAt) {
+        reviveGrades.push(grade)
+        head.lifecycle = { ...head.lifecycle }
+        delete head.lifecycle.deletedAt
+      }
       replacement(operations, currentHead, head)
     }
+    if (!eligibleGrades) throw conflict('Unarchive a grade rubric before starting a new generation.')
     creation(operations, this.work(ladder, { kind: 'plan-competencies', sourceSetId: sourceSet.id, generationId: key }, receipt.createdAt, key, receipt.fingerprint))
     replacement(operations, current, ladder)
-    try { await this.commit(workspaceId, operations) } catch (error) {
+    try { await this.commit(workspaceId, operations, { reviveGrades }) } catch (error) {
       const published = await this.optional(workspaceId, `grade-work-${key}`, 'grade-work', ladderId)
       if (published?.record.requestFingerprint !== receipt.fingerprint) throw error
     }
@@ -790,6 +921,7 @@ export class GradeService {
   }
 
   private async activeVersion(workspaceId: string, ladderId: string, grade: number, etag: string) {
+    await this.writable(workspaceId, ladderId, grade)
     const [ladder, head] = await Promise.all([
       this.get(workspaceId, ladderId, 'grade-ladder'), this.get(workspaceId, gradeHeadId(ladderId, grade), 'grade-head', ladderId),
     ])
@@ -909,7 +1041,8 @@ export class GradeService {
 
   async versions(workspaceId: string, ladderId: string, grade: number, continuationToken?: string, limit = 50) {
     await this.get(workspaceId, ladderId, 'grade-ladder')
-    await this.get(workspaceId, gradeHeadId(ladderId, grade), 'grade-head', ladderId)
+    const head = await this.get(workspaceId, gradeHeadId(ladderId, grade), 'grade-head', ladderId)
+    if (gradeIsRemoved(head.record.lifecycle)) return { versions: [] }
     const page = await this.store.list(workspaceId, { recordType: 'grade-version', ladderId, grade, continuationToken, limit })
     const versions = page.items.map(value => {
       const record = parseGradeEntity(value.record)
@@ -927,15 +1060,20 @@ export class GradeService {
   }
 
   async action(workspaceId: string, ladderId: string, input: ActionInput, action: 'cancel' | 'retry', etag: string) {
+    await this.writable(workspaceId, ladderId, input.grade)
     const current = await this.get(workspaceId, ladderId, 'grade-ladder')
     requireMatch(current, etag)
     if (input.grade !== undefined && !current.record.grades.includes(input.grade)) throw notFound('The requested grade is not in this ladder.')
     const timestamp = this.now()
     const work = await this.all(workspaceId, ladderId, 'grade-work')
     const explicit = input.workId ? await this.get(workspaceId, input.workId, 'grade-work', ladderId) : undefined
+    if (explicit && workGrade(explicit.record) !== undefined) await this.writable(workspaceId, ladderId, workGrade(explicit.record))
+    const lockedHeads = new Set((await this.all(workspaceId, ladderId, 'grade-head'))
+      .filter(value => gradeIsLocked(value.record.lifecycle)).map(value => value.record.grade))
     let targets = explicit ? [explicit] : work.filter(value =>
       this.workIsCurrent(value.record, current.record) && (input.grade === undefined || workGrade(value.record) === input.grade))
     targets = targets.filter(value => action === 'cancel' ? isActive(value.record) : ['failed', 'cancelled'].includes(value.record.status))
+    targets = targets.filter(value => !lockedHeads.has(workGrade(value.record)!))
     if (targets.length > 65) throw conflict('Too many stages for one action. Select an individual stage.')
     if (explicit && !targets.length) throw conflict(`The selected stage cannot be ${action === 'cancel' ? 'cancelled' : 'retried'}.`)
     if (action === 'retry') {
@@ -1019,6 +1157,7 @@ export class GradeService {
     if (input.grade !== undefined) affectedGrades.add(input.grade)
     const heads = await this.all(workspaceId, ladderId, 'grade-head')
     for (const value of heads) {
+      if (gradeIsLocked(value.record.lifecycle)) continue
       if (!affectedGrades.has(value.record.grade) && (input.workId || input.grade !== undefined ||
         !['queued', 'processing', 'error', 'cancelled'].includes(value.record.status))) continue
       if (!current.record.grades.includes(value.record.grade) || ['approved', 'ready-for-review'].includes(value.record.status)) continue

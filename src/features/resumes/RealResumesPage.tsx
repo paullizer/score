@@ -15,6 +15,10 @@ import { uploadFormatNames } from '../../services/documentUploads'
 import { realAnalysisLink, realResumeSelection } from '../analyses/realAnalysisUi'
 import { readyRealResume, resumeErrorMessage, resumeName, resumeWorkActive } from './resumeImportUi'
 import { RealAddResumesDialog } from './RealAddResumesDialog'
+import { useWorkspace } from '../../app/workspace-context'
+import { isEntityArchived, isEntityRemoved, matchesArchiveFilter, type ArchiveFilter } from '../../domain/lifecycle'
+import { ArchivedBadge, ArchiveStateFilter, EntityLifecycleActions, LifecycleBanner } from '../../components/lifecycle/LifecycleControls'
+import { useLifecycleAccess } from '../../components/lifecycle/useLifecycleAccess'
 
 type RealResumeSortKey = 'name' | 'source' | 'status' | 'added' | 'actions'
 const realResumeSortOptions: Record<RealResumeSortKey, TableSortOption<RealResumeSortKey>> = {
@@ -27,29 +31,32 @@ const realResumeSortOptions: Record<RealResumeSortKey, TableSortOption<RealResum
 const resumeStatusOrder = { error: 0, cancelled: 0, queued: 1, parsing: 1, profiling: 1, ready: 2 }
 
 export function RealResumeStatus({ summary }: { summary: RealResumeSummary }) {
+  if (summary.lifecycle?.deletingAt) return <Badge tone="warning">Deletion pending</Badge>
   const labels = { queued: 'Queued', parsing: 'Reading source', profiling: 'Extracting profile', ready: 'Ready', error: 'Could not process', cancelled: 'Cancelled' }
   return <Badge dot tone={summary.resume.status === 'ready' ? 'success' : summary.resume.status === 'error' ? 'danger' : 'neutral'}>{labels[summary.resume.status]}</Badge>
 }
 
 export function RealResumeActions({ summary }: { summary: RealResumeSummary }) {
   const api = useRealResumes()
+  const { canEdit } = useLifecycleAccess({ kind: 'resume', id: summary.resume.id })
   const [error, setError] = useState('')
   const busy = api?.pending(summary.resume.id)
   const active = resumeWorkActive(summary)
   const canRetry = summary.resume.status === 'cancelled' || summary.resume.status === 'error'
   async function act(kind: 'retry' | 'cancel') {
-    if (!api || busy) return
+    if (!api || busy || !canEdit) return
     setError('')
     try { await api[kind](summary.resume.id, summary.etag) }
     catch (caught) { setError(caught instanceof Error ? caught.message : 'This resume request could not be acknowledged.') }
   }
   return <div className="space-y-2">
     <div className="flex flex-wrap gap-2">
-      {active && <Button size="sm" icon={X} disabled={!api?.canWrite || busy || api.phase !== 'ready'} aria-label={`Cancel processing ${summary.source.displayName}`} onClick={() => void act('cancel')}>Cancel processing</Button>}
-      {canRetry && <Button size="sm" icon={RotateCcw} disabled={!api?.canWrite || busy || api.phase !== 'ready'}
+      {active && <Button size="sm" icon={X} disabled={!canEdit || !api?.canWrite || busy || api.phase !== 'ready'} aria-label={`Cancel processing ${summary.source.displayName}`} onClick={() => void act('cancel')}>Cancel processing</Button>}
+      {canRetry && <Button size="sm" icon={RotateCcw} disabled={!canEdit || !api?.canWrite || busy || api.phase !== 'ready'}
         title={summary.capture ? 'Retry processing the saved capture. Captured URLs are not fetched again.' : 'Explicitly retry this source. A URL must now be publicly accessible without sign-in.'}
         aria-label={`Retry processing ${summary.source.displayName}`} onClick={() => void act('retry')}>Retry processing</Button>}
     </div>
+    <EntityLifecycleActions target={{ kind: 'resume', id: summary.resume.id }} name={summary.resume.name ?? summary.source.displayName} />
     {error && <InlineError>{error}</InlineError>}
   </div>
 }
@@ -63,6 +70,8 @@ export function RealResumesPage({ id }: { id?: string }) {
 
 function RealResumesLibrary() {
   const api = useRealResumes()!
+  const { workspace } = useWorkspace()
+  const { canEdit } = useLifecycleAccess()
   const analyses = useRealAnalyses()
   const navigate = useNavigate()
   const [params, setParams] = useSearchParams()
@@ -70,8 +79,11 @@ function RealResumesLibrary() {
   const [sort, setSort] = useState<TableSort<RealResumeSortKey> | null>(null)
   const [selected, setSelected] = useState<RealAnalysisResumeSelection[]>([])
   const [adding, setAdding] = useState(false)
+  const [archiveFilter, setArchiveFilter] = useState<ArchiveFilter>('default')
   const query = search.trim().toLocaleLowerCase()
-  const visible = sortTableRows(api.summaries.filter((item) => [item.resume.name, item.resume.role, item.resume.location, item.resume.experience, item.resume.sourceLabel].join(' ').toLocaleLowerCase().includes(query)),
+  const selectable = (item: RealResumeSummary) => canEdit && readyRealResume(item) && !isEntityArchived(workspace, { kind: 'resume', id: item.resume.id }) && !isEntityRemoved(workspace, { kind: 'resume', id: item.resume.id })
+  const visible = sortTableRows(api.summaries.filter((item) => !item.lifecycle?.deletedAt && matchesArchiveFilter(isEntityArchived(workspace, { kind: 'resume', id: item.resume.id }), search, archiveFilter) &&
+    [item.resume.name, item.resume.role, item.resume.location, item.resume.experience, item.resume.sourceLabel].join(' ').toLocaleLowerCase().includes(query)),
     sort, (summary, key) => {
       switch (key) {
         case 'name': return summary.resume.name
@@ -80,7 +92,8 @@ function RealResumesLibrary() {
         case 'added': return Date.parse(summary.resume.createdAt)
       }
     })
-  const readyVisible = visible.filter(readyRealResume)
+  const readyVisible = visible.filter(selectable)
+  const invalidSelection = selected.some((choice) => !api.summaries.some((item) => item.resume.id === choice.resumeId && selectable(item)))
   const allVisibleSelected = readyVisible.length > 0 && readyVisible.every((item) => selected.some((choice) => choice.resumeId === item.resume.id))
   const hidden = selected.filter((choice) => !visible.some((item) => item.resume.id === choice.resumeId)).length
   const importsOpen = adding || params.get('imports') === 'open'
@@ -97,18 +110,20 @@ function RealResumesLibrary() {
 
   return <>
     <PageHeader eyebrow="REAL SOURCES, SEPARATE REVIEW" title="Resumes" description="Import actual documents, inspect the captured evidence, then manually select ready resumes for an analysis."
-      actions={<><Button icon={ArrowRight} disabled={!selected.length || !analyses?.canWrite || analyses.phase !== 'ready' || !analyses.features?.realAnalyses}
+      actions={<><Button icon={ArrowRight} disabled={!canEdit || !selected.length || invalidSelection || !analyses?.canWrite || analyses.phase !== 'ready' || !analyses.features?.realAnalyses}
         onClick={() => {
           const link = realAnalysisLink({ resumes: selected }, api.workspaceId)
           navigate(link.to, { state: link.state })
         }}>Build analysis{selected.length ? ` (${selected.length})` : ''}</Button>
-        <Button variant="primary" icon={Plus} disabled={!api.canWrite || api.phase !== 'ready'} onClick={() => setAdding(true)}>Add resumes</Button></>} />
+        <Button variant="primary" icon={Plus} disabled={!canEdit || !api.canWrite || api.phase !== 'ready'} onClick={() => setAdding(true)}>Add resumes</Button></>} />
+    {invalidSelection && <InlineError>A selected resume is archived, removed, or no longer ready. Clear it or explicitly choose active inputs; nothing will be silently skipped.</InlineError>}
     {api.error && <div className="mb-5"><InlineError>{api.error} <Button size="sm" onClick={() => void api.refresh()}>Retry resume service</Button></InlineError></div>}
     {!api.canWrite && <p className="mb-5 text-[12px] text-muted">Read-only workspace. You can inspect private resumes and sources; an owner or editor can import or analyze them.</p>}
     {analyses && (analyses.phase !== 'ready' || !analyses.features?.realAnalyses) && <p className="mb-5 text-[11px] text-muted">{analyses.creationError ?? analyses.error ?? 'Checking new analysis availability…'} Resume imports and saved analysis history have separate availability.</p>}
     <section className="panel" aria-label="Real resume library">
-      <div className="library-toolbar"><div className="flex items-center gap-2"><Users size={16} className="text-muted" aria-hidden="true" /><h2 className="text-[12px] font-semibold">Private real resumes</h2><Badge>{api.summaries.length}</Badge></div>
+      <div className="library-toolbar"><div className="flex items-center gap-2"><Users size={16} className="text-muted" aria-hidden="true" /><h2 className="text-[12px] font-semibold">Private real resumes</h2><Badge>{api.summaries.filter((item) => !isEntityArchived(workspace, { kind: 'resume', id: item.resume.id }) && !isEntityRemoved(workspace, { kind: 'resume', id: item.resume.id })).length}</Badge></div>
         <div className="toolbar"><SearchField value={search} onChange={setSearch} placeholder="Search stated names, roles, or sources…" label="Search real resumes" />
+          <ArchiveStateFilter value={archiveFilter} onChange={setArchiveFilter} label="Real resume archive state" />
           <TableSortSelect options={[realResumeSortOptions.name, realResumeSortOptions.source, realResumeSortOptions.status, realResumeSortOptions.added]}
             sort={sort?.key === 'actions' ? { ...sort, key: 'status' } : sort} onChange={setSort} label="Sort real resumes" />
           <Button size="sm" icon={RotateCcw} onClick={() => void api.refresh()}>Refresh</Button></div></div>
@@ -127,12 +142,13 @@ function RealResumesLibrary() {
           <SortableHeader option={realResumeSortOptions.actions} sort={sort} onChange={setSort} /></tr></thead>
         <tbody>{visible.map((summary) => {
           const checked = selected.some((item) => item.resumeId === summary.resume.id)
-          const ready = readyRealResume(summary)
+          const ready = selectable(summary)
           const message = resumeErrorMessage(summary)
           return <tr key={summary.resume.id} className={checked ? 'row-selected' : ''}>
             <td className="checkbox-cell"><input type="checkbox" checked={checked} disabled={!ready && !checked}
               aria-label={`Select ${resumeName(summary)} from ${summary.source.displayName}`} onChange={() => toggle(summary)} /></td>
             <td className="min-w-[180px]"><Link className="row-title" to={`/resumes/${encodeURIComponent(summary.resume.id)}?data=real`}>{resumeName(summary)}</Link>
+              <ArchivedBadge target={{ kind: 'resume', id: summary.resume.id }} />
               <p className="row-meta">{summary.resume.role ?? 'Role not stated'}</p><p className="row-meta">{summary.resume.location ?? 'Location not stated'} · {summary.resume.experience ?? 'Experience not stated'}</p></td>
             <td className="min-w-[230px] max-w-[440px]"><RealResumeStatus summary={summary} />
               <p className="mt-2 break-all text-[11px] text-muted">{summary.source.displayName}</p>
@@ -149,7 +165,7 @@ function RealResumesLibrary() {
         title={api.phase === 'loading' ? 'Loading private resumes' : api.phase === 'error' ? 'Resume service unavailable' : search ? 'No matching real resumes' : 'Import your first real resume'}
         description={api.phase === 'loading' ? 'Loading every page of authorized resume summaries.' : api.phase === 'error' ? 'No samples are substituted. Retry the service when available.'
           : search ? 'Try a stated name, role, or source label. Hidden selections are retained.' : `Choose actual ${uploadFormatNames(formats)} files or public HTML/PDF URLs. Inaccessible inputs get individual errors; successful imports remain available.`}
-        action={search ? <Button onClick={() => setSearch('')}>Clear search</Button> : <Button disabled={!api.canWrite || api.phase !== 'ready'} icon={Plus} onClick={() => setAdding(true)}>Add real resumes</Button>} />}
+        action={search || api.summaries.length ? <Button onClick={() => { setSearch(''); setArchiveFilter('all') }}>Show active and archived</Button> : <Button disabled={!canEdit || !api.canWrite || api.phase !== 'ready'} icon={Plus} onClick={() => setAdding(true)}>Add real resumes</Button>} />}
       <div className="table-bottom"><span>{visible.length} of {api.summaries.length} real sources</span><span>Private server records · no sample autosave</span></div>
     </section>
     <div className="info-callout mt-5"><ShieldCheck size={18} aria-hidden="true" /><div><strong>Evidence about a document, not a judgment about a person.</strong>
@@ -163,9 +179,11 @@ function RealResumeDetail({ id }: { id: string }) {
   const analyses = useRealAnalyses()
   const navigate = useNavigate()
   const entry = api.detail(id)
+  const { canEdit, deleting, removed } = useLifecycleAccess({ kind: 'resume', id })
   const ensure = api.ensureDetail
   useEffect(() => { if (api.features?.realResumeImports) void ensure(id) }, [api.features?.realResumeImports, ensure, entry.state, id])
   const back = <Link className="back-link" to="/resumes?data=real"><ArrowLeft size={14} aria-hidden="true" />Back to real resumes</Link>
+  if (deleting || (removed && entry.state === 'ready')) return <>{back}<LifecycleBanner target={{ kind: 'resume', id }} /><EmptyState title="Resume cleanup or removal" description="Only recovery metadata remains available. Cached documents and original downloads are hidden. Retry the lifecycle operation above if cleanup is incomplete." /></>
   if (entry.state !== 'ready') return <>{back}<EmptyState icon={entry.state === 'error' || api.phase === 'error' ? FileText : LoaderCircle}
     title={entry.state === 'error' || api.phase === 'error' ? 'This real resume could not be opened' : 'Opening private resume'}
     description={entry.state === 'error' ? entry.error : api.error ?? 'Loading the actual captured source and evidence-derived profile. No sample is substituted.'}
@@ -176,12 +194,13 @@ function RealResumeDetail({ id }: { id: string }) {
   const ready = readyRealResume(detail)
   return <>{back}
     <PageHeader eyebrow="REAL RESUME · PRIVATE SOURCE" title={resumeName(detail)} description={detail.resume.role ?? 'Role not stated in the captured source'}
-      actions={<><RealResumeActions summary={summary} /><Button variant="primary" icon={ArrowRight} disabled={!ready || !analyses?.canWrite || analyses.phase !== 'ready' || !analyses.features?.realAnalyses}
+      actions={<><RealResumeActions summary={summary} /><Button variant="primary" icon={ArrowRight} disabled={!canEdit || !ready || !analyses?.canWrite || analyses.phase !== 'ready' || !analyses.features?.realAnalyses}
         onClick={() => {
           const link = realAnalysisLink({ resumes: [realResumeSelection(detail)] }, api.workspaceId)
           navigate(link.to, { state: link.state })
         }}>Build analysis</Button></>} />
-    <div className="detail-metadata"><RealResumeStatus summary={summary} /><span>{detail.resume.location ?? 'Location not stated'}</span><span>{detail.resume.experience ?? 'Experience not stated'}</span><span>Added {dateLabel(detail.resume.createdAt)}</span></div>
+    <LifecycleBanner target={{ kind: 'resume', id }} />
+    <div className="detail-metadata"><RealResumeStatus summary={summary} /><ArchivedBadge target={{ kind: 'resume', id }} /><span>{detail.resume.location ?? 'Location not stated'}</span><span>{detail.resume.experience ?? 'Experience not stated'}</span><span>Added {dateLabel(detail.resume.createdAt)}</span></div>
     {(entry.error || api.error) && <div className="mb-5"><InlineError>{entry.error ?? api.error} The last acknowledged source is shown. <Button size="sm" onClick={() => void ensure(id, true)}>Reload source</Button></InlineError></div>}
     {message && <div className="mb-5"><InlineError>{message}{summary.error?.retryable === false && <p>Automatic retries are stopped for this error; you can still explicitly retry processing. {summary.capture
       ? 'The saved capture is preserved and will be reused, not fetched again. Import a new source separately if its content needs to change.'

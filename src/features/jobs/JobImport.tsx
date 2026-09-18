@@ -8,9 +8,13 @@ import { JOB_IMPORT_LIMITS } from '../../domain/real-jobs'
 import { JOB_FIXTURE_COUNT } from '../../data/fixtures'
 import { discoverJobs } from '../../services/mockWorkspace'
 import { Badge, Button, DemoNote, InlineError, Modal, SegmentedControl, StepLabel } from '../../components/ui'
+import { LifecycleBanner } from '../../components/lifecycle/LifecycleControls'
+import { useLifecycleAccess } from '../../components/lifecycle/useLifecycleAccess'
 
 export function JobImport({ onClose }: { onClose: () => void }) {
   const { cloud } = useWorkspace()
+  const { canEdit } = useLifecycleAccess()
+  if (!canEdit) return <Modal open onOpenChange={(open) => { if (!open) onClose() }} title="Imports are read-only" description="An active workspace and owner or editor access are required to import jobs." footer={<Button onClick={onClose}>Close</Button>}><LifecycleBanner /></Modal>
   return cloud ? <RealJobImport key={cloud.currentWorkspaceId} onClose={onClose} /> : <SampleJobImport onClose={onClose} />
 }
 

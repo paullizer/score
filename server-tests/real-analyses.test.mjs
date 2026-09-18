@@ -200,7 +200,7 @@ test('ready resume profile/source metadata must match real paragraphs and the im
   }
 })
 
-test('immutable winning manifest survives failed run publication and later edits without rereading mutable input libraries', async () => {
+test('unpublished winning manifests revalidate intake eligibility; accepted history never requires live sources', async () => {
   const f = fixture()
   const resume = await seedResume(f)
   const job = await seedJob(f)
@@ -212,6 +212,8 @@ test('immutable winning manifest survives failed run publication and later edits
   const manifestName = `${f.workspaceId}/analysis-run-${key}/manifest.json`
   const originalManifest = clone(f.analysis.blobs.values.get(manifestName))
   assert.ok(originalManifest)
+  const sources = [f.resumeValues, f.jobValues, f.rubricValues, f.resumes.blobs.values, f.jobs.blobs.values]
+    .map(values => ({ values, entries: clone([...values]) }))
   f.resumeValues.clear()
   f.jobValues.clear()
   f.rubricValues.clear()
@@ -219,6 +221,10 @@ test('immutable winning manifest survives failed run publication and later edits
   f.jobs.blobs.values.clear()
   f.now = LATER
   f.analysis.store._beforeCreate(undefined)
+  await assert.rejects(f.service.create(f.workspaceId, key, request, ACTOR), status(404))
+  assert.equal(f.analysis.store.values.size, 0, 'An unpublished manifest is not authorization to resurrect removed inputs.')
+  for (const source of sources) for (const [key, value] of source.entries) source.values.set(key, value)
+  f.jobValues.get(`${f.workspaceId}/${job.record.id}`).record.job.title = 'Renamed current job'
   const created = await f.service.create(f.workspaceId, key, request, ACTOR)
   assert.equal(created.run.createdAt, NOW)
   assert.equal(created.run.createdBy, ACTOR)
@@ -227,6 +233,8 @@ test('immutable winning manifest survives failed run publication and later edits
   const detail = await f.service.comparisonDetail(f.workspaceId, created.run.id, comparison.record.id)
   assert.deepEqual(detail.resumeSnapshot.document, resume.document)
   assert.deepEqual(detail.targetSnapshot.rubric, job.rubric)
+  assert.equal(detail.targetSnapshot.job.title, job.record.job.title)
+  for (const source of sources) source.values.clear()
   const repeated = await f.service.create(f.workspaceId, key, request, ACTOR)
   assert.equal(repeated.run.id, created.run.id)
   assert.equal(runComparisons(f, created.run.id).length, 1)

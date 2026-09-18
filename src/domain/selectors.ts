@@ -1,11 +1,12 @@
 import type { AnalysisRun, Rubric, Workspace } from './types'
+import { isEntityRemoved } from './lifecycle'
 
 export function latestRubrics(workspace: Workspace): Rubric[] {
   const latest = new Map<string, Rubric>()
   for (const rubric of workspace.rubrics) {
     if ((latest.get(rubric.groupId)?.version ?? 0) < rubric.version) latest.set(rubric.groupId, rubric)
   }
-  return [...latest.values()]
+  return [...latest.values()].filter((rubric) => !isEntityRemoved(workspace, { kind: 'rubric', id: rubric.groupId }))
 }
 
 export function runStatus(run: AnalysisRun): 'Running' | 'Complete' | 'Needs attention' | 'Cancelled' {

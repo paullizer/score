@@ -12,6 +12,7 @@ import { useGradeRequestKey } from './grade-request-hooks'
 
 export function GradeSourcesReview({ detail, onOpen, onDirtyChange }: { detail: GradeLadderDetail; onOpen: (selection: GradeSourceSelection) => void; onDirtyChange: (dirty: boolean) => void }) {
   const api = useGradeLadders()
+  const editable = api?.canEdit(detail.ladder.id) ?? false
   const [decisions, setDecisions] = useState(() => initialSourceDecisions(detail))
   const [dirty, setDirty] = useState(false)
   const [confirmed, setConfirmed] = useState(false)
@@ -28,7 +29,7 @@ export function GradeSourcesReview({ detail, onOpen, onDirtyChange }: { detail: 
   const budget = selectedSourceBudget(detail.sources, decisions)
   const stale = dirty && baseEtag.current !== detail.etag
   const discovering = detail.workItems.some((work) => work.input.kind === 'discover' && ['queued', 'running'].includes(work.status))
-  const busy = saving || api?.mutationPending || !api?.canWrite
+  const busy = saving || api?.mutationPending || !editable
   useEffect(() => { alive.current = true; return () => { alive.current = false } }, [])
   useEffect(() => { onDirtyChange(dirty); return () => onDirtyChange(false) }, [dirty, onDirtyChange])
   useEffect(() => {
@@ -50,7 +51,7 @@ export function GradeSourcesReview({ detail, onOpen, onDirtyChange }: { detail: 
   }
 
   async function freeze() {
-    if (!api || inFlight.current) return
+    if (!api || inFlight.current || !editable) return
     setError('')
     if (discovering) { setError('Wait for OPM discovery to finish, or cancel its durable work item before freezing sources.'); return }
     const selected = detail.sources.filter((source) => decisions.some((decision) => decision.sourceId === source.id && decision.selected))
@@ -120,6 +121,7 @@ export function GradeSourcesReview({ detail, onOpen, onDirtyChange }: { detail: 
 
 function GradeSourcePages({ detail, source, onClose }: { detail: GradeLadderDetail; source: ReferenceSourceRecord; onClose: () => void }) {
   const api = useGradeLadders()
+  const editable = api?.canEdit(detail.ladder.id) ?? false
   const [pages, setPages] = useState(source.selectedPages.join(', '))
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState('')
@@ -130,7 +132,7 @@ function GradeSourcePages({ detail, source, onClose }: { detail: GradeLadderDeta
   useEffect(() => { alive.current = true; return () => { alive.current = false } }, [])
   async function save(event: FormEvent) {
     event.preventDefault()
-    if (!api || inFlight.current || !api.canWrite) return
+    if (!api || inFlight.current || !editable) return
     let selectedPages: number[]
     try {
       selectedPages = parseSelectedPages(pages, api.features?.gradeLimits.maxPdfPages)
@@ -147,9 +149,9 @@ function GradeSourcePages({ detail, source, onClose }: { detail: GradeLadderDeta
   }
   const close = () => { void guard.close(onClose) }
   return <Modal open onOpenChange={(open) => { if (!open) close() }} title="Capture a new page selection" description={source.title}
-    footer={<><Button onClick={close}>Cancel</Button><Button form="grade-source-pages" type="submit" variant="primary" disabled={saving || !api?.canWrite}>{saving ? 'Saving…' : 'Capture new extraction version'}</Button></>}>
+    footer={<><Button onClick={close}>Cancel</Button><Button form="grade-source-pages" type="submit" variant="primary" disabled={saving || !editable}>{saving ? 'Saving…' : 'Capture new extraction version'}</Button></>}>
     <form id="grade-source-pages" onSubmit={save} className="space-y-4">
-      <label className="field"><span className="field-label">Original PDF page numbers / ranges</span><input className="input" value={pages} disabled={saving || !api?.canWrite} onChange={(event) => setPages(event.target.value)} placeholder="1-10, 18-28" /></label>
+      <label className="field"><span className="field-label">Original PDF page numbers / ranges</span><input className="input" value={pages} disabled={saving || !editable} onChange={(event) => setPages(event.target.value)} placeholder="1-10, 18-28" /></label>
       <p className="text-[11px] text-muted">Blank requests all pages within the 250-page per-PDF limit. Old source sets retain their exact original page selection and extraction version. Confirm the revised sources before generating new grades.</p>
       {error && <InlineError>{error}</InlineError>}
     </form>

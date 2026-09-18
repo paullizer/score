@@ -22,8 +22,10 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
       setStorageError(null)
       return 'saved'
     } catch (error) {
-      if (!(error instanceof DOMException)) throw error
-      setStorageError('Changes are not saved on this device. Browser storage may be unavailable or full. Free some space, then retry saving.')
+      if (!(error instanceof Error)) throw error
+      setStorageError(error instanceof DOMException
+        ? 'Changes are not saved on this device. Browser storage may be unavailable or full. Free some space, then retry saving.'
+        : `Changes are not saved on this device. ${error.message}`)
       console.warn('Score could not save the demo workspace.', error)
       return 'failed'
     }
@@ -57,6 +59,7 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
     workspace: engine.workspace, storageError, notice: engine.notice, clearNotice: engine.clearNotice, notify: engine.notify,
     addJobs: engine.addJobs, addResumes: engine.addResumes, cancelJob: engine.cancelJob, retryJob: engine.retryJob,
     saveRubric: engine.saveRubric, startAnalysis: engine.startAnalysis, cancelRun: engine.cancelRun, retryRun: engine.retryRun,
+    getLifecycleImpact: engine.getLifecycleImpact, changeLifecycle: engine.changeLifecycle,
     resetDemo: engine.resetDemo, retrySave: () => { engine.retryPersist() },
   }
   return <WorkspaceContext.Provider value={value}>{children}</WorkspaceContext.Provider>

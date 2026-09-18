@@ -11,6 +11,10 @@ export async function buildResumeAnalysisTestRuntime(options = {}) {
     serverExports: `
 export { parseResumeEntity, validateRealResumeDocument, parseRealResumeProfile } from './server/resumes/validation.ts'
 export { parseAnalysisEntity } from './server/analyses/validation.ts'
+export { resumeControlId, parseResumeControl, prepareResumeTransaction } from './server/resumes/guards.ts'
+export { analysisControlId, parseAnalysisControl, prepareAnalysisGuards } from './server/analyses/guards.ts'
+export { assertAnalysisReplacement, analysisWorkIsPending } from './server/analyses/azure-store.ts'
+export { analysisRunCanScore } from './src/domain/real-analyses.ts'
 export * as resumeWorker from './worker/resumes/runtime.ts'
 export * as analysisWorker from './worker/analyses/runtime.ts'
 ${options.serverExports ?? ''}
@@ -21,13 +25,18 @@ ${options.serverExports ?? ''}
 export function memoryRecords(api, parse, kind, { pageSize = 2 } = {}) {
   assert.equal(typeof parse, 'function', `The ${kind} record validator must be available.`)
   const values = new Map()
+  const controls = new Map()
   const transactions = []
   let counter = 0
   let nextFault
   const key = (workspaceId, id) => `${workspaceId}/${id}`
   const next = (record) => ({ record: clone(parse(record)), etag: `"${kind}-${++counter}"` })
+  const controlId = kind === 'resume' ? api.resumeControlId : api.analysisControlId
+  const parseControl = kind === 'resume' ? api.parseResumeControl : api.parseAnalysisControl
+  const prepare = kind === 'resume' ? api.prepareResumeTransaction : api.prepareAnalysisGuards
   const store = {
     values,
+    controls,
     transactions,
     failNextTransaction(error, afterCommit = false) { nextFault = { error, afterCommit } },
     async get(workspaceId, id) {
@@ -60,9 +69,10 @@ export function memoryRecords(api, parse, kind, { pageSize = 2 } = {}) {
       await store.transact(record.workspaceId, [{ kind: 'replace', record, etag }])
       return store.get(record.workspaceId, record.id)
     },
-    async transact(workspaceId, operations) {
-      assert.ok(operations.length > 0 && operations.length <= 100, 'Cosmos transaction operation limit.')
+    async transact(workspaceId, operations, options = {}) {
+      assert.ok((operations.length > 0 || options.controls?.length) && operations.length <= 100, 'Cosmos transaction operation limit.')
       assert.ok(Buffer.byteLength(JSON.stringify(operations)) <= 1_800_000, 'Cosmos transaction payload budget.')
+      const prepared = await prepare(store, workspaceId, operations, options)
       const ids = new Set()
       for (const operation of operations) {
         assert.equal(operation.record.workspaceId, workspaceId)
@@ -74,31 +84,96 @@ export function memoryRecords(api, parse, kind, { pageSize = 2 } = {}) {
         if (operation.kind === 'create' ? Boolean(current) : !current || current.etag !== operation.etag) {
           throw new api.StoreConflictError('Concurrent integration publication.')
         }
-        if (current?.record.recordType === 'analysis-comparison' && current.record.status === 'complete') {
+        if (operation.kind === 'delete') {
+          assert.ok(options.lifecycle, 'Only lifecycle cleanup can delete records.')
+          assert.deepEqual(operation.record, current.record)
+        } else if (kind === 'analysis' && current) api.assertAnalysisReplacement(current.record, operation.record)
+        if (operation.kind !== 'delete' && current?.record.recordType === 'analysis-comparison' && current.record.status === 'complete') {
           assert.deepEqual(operation.record, current.record, 'Completed comparison records are immutable.')
         }
+      }
+      for (const control of prepared) {
+        if (controls.get(key(workspaceId, control.record.id))?.etag !== control.etag) throw new api.StoreConflictError('Concurrent integration lifecycle control.')
+        parseControl(control.record)
       }
       const fault = nextFault
       nextFault = undefined
       if (fault && !fault.afterCommit) throw fault.error
-      for (const operation of operations) values.set(key(workspaceId, operation.record.id), next(operation.record))
-      transactions.push(clone(operations))
+      for (const control of prepared) controls.set(key(workspaceId, control.record.id), {
+        record: clone(parseControl(control.record)), etag: `"${kind}-control-${++counter}"`,
+      })
+      for (const operation of operations) {
+        if (operation.kind === 'delete') values.delete(key(workspaceId, operation.record.id))
+        else values.set(key(workspaceId, operation.record.id), next(operation.record))
+      }
+      if (operations.length) transactions.push(clone(operations))
       if (fault) throw fault.error
     },
     async listPending(now, limit) {
       return [...values.values()].filter(({ record }) => {
         if (record.nextAttemptAt && record.nextAttemptAt > now) return false
         if (record.lease && record.lease.expiresAt > now) return false
-        if (record.recordType === 'resume') return ['queued', 'parsing', 'profiling'].includes(record.resume.status)
-        if (record.recordType === 'analysis-run') {
-          return record.status === 'initializing' || Boolean(record.cancellation && !record.cancellation.completedAt)
+        const rootState = controls.get(key(record.workspaceId, controlId()))?.record.state ?? 'active'
+        if (record.recordType === 'resume') {
+          const own = controls.get(key(record.workspaceId, controlId(record.id)))?.record.state ?? 'active'
+          return rootState === 'active' && own === 'active' && !record.lifecycle?.archivedAt && !record.lifecycle?.deletingAt && !record.lifecycle?.deletedAt &&
+            ['queued', 'parsing', 'profiling'].includes(record.resume.status)
         }
-        return record.recordType === 'analysis-comparison' && ['queued', 'running'].includes(record.status)
+        if (record.recordType === 'resume-batch') return false
+        if (rootState !== 'active' && !(rootState === 'archived' && record.recordType === 'analysis-run' && record.cancellation)) return false
+        if (!api.analysisWorkIsPending(record, now)) return false
+        return record.recordType === 'analysis-run' || api.analysisRunCanScore(values.get(key(record.workspaceId, record.runId))?.record)
       }).sort((left, right) => left.record.createdAt.localeCompare(right.record.createdAt))
         .slice(0, limit).map(clone)
     },
+    async getControl(workspaceId, id) { return clone(controls.get(key(workspaceId, controlId(id)))) },
+    async listControls(workspaceId, token) {
+      const all = [...controls.values()].filter((item) => item.record.workspaceId === workspaceId)
+      const start = Number(token ?? 0), items = all.slice(start, start + pageSize).map(clone)
+      return { items, ...(start + items.length < all.length ? { continuationToken: String(start + items.length) } : {}) }
+    },
+    async pendingLifecycleWorkspaces(limit) {
+      return [...new Set([...controls.values()].filter(({ record }) => record.state === 'deleting' ||
+        (record.operation && record.operation.status !== 'complete')).map(({ record }) => record.workspaceId))].slice(0, limit)
+    },
   }
-  return { store, blobs: memoryBlobs() }
+  const blobs = memoryBlobs()
+  const page = (all, token) => {
+    const start = Number(token ?? 0), items = all.slice(start, start + pageSize)
+    return { items, ...(start + items.length < all.length ? { continuationToken: String(start + items.length) } : {}) }
+  }
+  blobs.putFenced = async (name, bytes, contentType, fence) => {
+    fence.signal?.throwIfAborted()
+    const writer = fence.writer ?? fence
+    assert.equal(name, writer.blobName)
+    assert.ok(name.startsWith(`${writer.workspaceId}/${writer.resumeId ?? writer.runId}/`))
+    assert.ok(Date.parse(writer.expiresAt) > Date.now())
+    await fence.assertActive()
+    const result = await blobs.putImmutable(name, bytes, contentType, fence)
+    await fence.assertActive()
+    return result
+  }
+  if (kind === 'resume') {
+    blobs.listFamilies = async (workspaceId, token) => {
+      const result = page([...new Set([...blobs.values.keys()].filter((name) => name.startsWith(`${workspaceId}/`)).map((name) => name.split('/')[1]))], token)
+      return { resumeIds: result.items, continuationToken: result.continuationToken }
+    }
+    blobs.listPage = async (workspaceId, resumeId, token) => {
+      const result = page([...blobs.values.keys()].filter((name) => name.startsWith(`${workspaceId}/${resumeId}/`)), token)
+      return { names: result.items, continuationToken: result.continuationToken }
+    }
+    blobs.delete = async (name) => { blobs.values.delete(name) }
+  } else {
+    blobs.list = async (workspaceId, runId, token) => page([...blobs.values].filter(([name]) =>
+      name.startsWith(`${workspaceId}/${runId ? `${runId}/` : ''}`)).map(([name, blob]) => ({ name, etag: blob.etag })), token)
+    blobs.delete = async (workspaceId, runId, name, etag) => {
+      assert.ok(name.startsWith(`${workspaceId}/${runId}/`))
+      const current = blobs.values.get(name)
+      if (current && current.etag !== etag) throw new api.StoreConflictError('A retained blob changed during cleanup.')
+      blobs.values.delete(name)
+    }
+  }
+  return { store, blobs }
 }
 
 export async function startResumeAnalysisFixture(runtime, options = {}) {

@@ -1,5 +1,5 @@
 import { CosmosClient, type Container, type JSONObject, type OperationInput, type SqlParameter } from '@azure/cosmos'
-import { BlobServiceClient, type BlockBlobClient } from '@azure/storage-blob'
+import { BlobServiceClient, type BlockBlobClient, type ContainerClient } from '@azure/storage-blob'
 import type { TokenCredential } from '@azure/identity'
 import { WORD_DOCUMENT_LIMITS, isWordContentType, storedDocumentContentType } from '../../src/domain/document-formats'
 import {
@@ -9,9 +9,16 @@ import { MAX_MARKDOWN_BYTES } from '../../src/domain/source-files'
 import { WORKSPACE_ID_PATTERN } from '../ids'
 import { StoreConflictError } from '../store'
 import { fetchCosmosPage } from '../cosmos-query'
-import type { AnalysisBlob, AnalysisBlobStore, AnalysisStore, RealAnalysesConfig } from './store'
+import { assertWorkspaceMutationLease } from '../lifecycle/lease'
+import type {
+  AnalysisBlob, AnalysisBlobStore, AnalysisStore, RealAnalysesConfig, AnalysisTransactionOptions, StoredAnalysisControl,
+} from './store'
 import {
-  analysisBytesHash, analysisCancellationNeedsRetry, analysisHash, assertAnalysis, isAnalysisId, isSafeAnalysisBlobName, MAX_ANALYSIS_JSON_BYTES,
+  ANALYSIS_BLOB_LEASE_SECONDS, ANALYSIS_BLOB_REQUEST_MILLISECONDS,
+  analysisControlId, analysisIsRemoved, assertAnalysisRunWritable, parseAnalysisControl, prepareAnalysisGuards,
+} from './guards'
+import {
+  analysisBlobInRun, analysisBytesHash, analysisCancellationNeedsRetry, analysisHash, assertAnalysis, isAnalysisId, isSafeAnalysisBlobName, MAX_ANALYSIS_JSON_BYTES,
   MAX_ANALYSIS_ORIGINAL_BYTES, MAX_ANALYSIS_TRANSACTION_BYTES, parseAnalysisEntity,
 } from './validation'
 
@@ -36,6 +43,17 @@ function decode(value: unknown, workspaceId?: string, id?: string): VersionedAna
   const record = parseAnalysisEntity(data)
   assertAnalysis(typeof tag === 'string' && tag && (workspaceId === undefined || record.workspaceId === workspaceId) &&
     (id === undefined || record.id === id), 'Stored ownership or ETag mismatch.')
+  return { record, etag: tag }
+}
+function decodeControl(value: unknown, workspaceId?: string, runId?: string): StoredAnalysisControl {
+  assertAnalysis(value && typeof value === 'object' && !Array.isArray(value), 'Stored control must be an object.')
+  const data = { ...value } as Record<string, unknown>
+  const tag = data._etag
+  for (const field of ['_etag', '_rid', '_self', '_attachments', '_ts']) delete data[field]
+  const record = parseAnalysisControl(data)
+  assertAnalysis(typeof tag === 'string' && tag &&
+    (workspaceId === undefined || record.workspaceId === workspaceId) &&
+    (runId === undefined || record.runId === runId), 'Stored analysis control ownership or ETag mismatch.')
   return { record, etag: tag }
 }
 
@@ -70,7 +88,8 @@ function checkReplacement(current: VersionedAnalysisEntity | undefined, record: 
 
 export function analysisWorkIsPending(record: AnalysisEntity, now: string): boolean {
   const eligible = record.recordType === 'analysis-run'
-    ? (record.status === 'initializing' || Boolean(record.cancellation && !record.cancellation.completedAt)) &&
+    ? !analysisIsRemoved(record.lifecycle) &&
+      ((!record.lifecycle?.archivedAt && record.status === 'initializing') || Boolean(record.cancellation && !record.cancellation.completedAt)) &&
       !analysisCancellationNeedsRetry(record)
     : record.status === 'queued' || record.status === 'running'
   return eligible && (!record.nextAttemptAt || record.nextAttemptAt <= now) && (!record.lease || record.lease.expiresAt <= now)
@@ -81,6 +100,30 @@ export function createAzureAnalysisStore(config: RealAnalysesConfig, credential:
   return createAnalysisStoreFromContainer(client.database(config.database).container(config.container))
 }
 export function createAnalysisStoreFromContainer(container: Pick<Container, 'item' | 'items'>): AnalysisStore {
+  async function batch(workspaceId: string, operations: OperationInput[], controls: NonNullable<AnalysisTransactionOptions['controls']>) {
+    const input: OperationInput[] = [
+      ...controls.map<OperationInput>(control => control.etag
+        ? { operationType: 'Replace', id: control.record.id, resourceBody: control.record as unknown as JSONObject, ifMatch: control.etag }
+        : { operationType: 'Create', resourceBody: control.record as unknown as JSONObject }),
+      ...operations,
+    ]
+    assertAnalysis(input.length <= ANALYSIS_LIMITS.initializationChunkSize + 3 &&
+      Buffer.byteLength(JSON.stringify(input)) <= MAX_ANALYSIS_TRANSACTION_BYTES, 'Analysis batch exceeds the Cosmos payload or operation budget.')
+    try {
+      assertWorkspaceMutationLease(workspaceId)
+      const response = await container.items.batch(input, workspaceId)
+      const results = response.result ?? []
+      if (results.length !== input.length || results.some(result => result.statusCode < 200 || result.statusCode >= 300) ||
+        (response.code !== undefined && (response.code < 200 || response.code >= 300))) {
+        const code = results.find(result => result.statusCode >= 400 && result.statusCode !== 424)?.statusCode ?? response.code
+        if ([404, 409, 412, 424].includes(code ?? 0)) throw new StoreConflictError('The analysis changed before guarded publication.')
+        throw new Error('Cosmos analysis transaction did not succeed.')
+      }
+    } catch (error) {
+      if ([404, 409, 412, 424].includes(status(error) ?? 0)) throw new StoreConflictError('The analysis changed before guarded publication.')
+      throw error
+    }
+  }
   const store: AnalysisStore = {
     async get(workspaceId, id) {
       scope(workspaceId, id)
@@ -127,15 +170,21 @@ export function createAnalysisStoreFromContainer(container: Pick<Container, 'ite
     async create<T extends AnalysisEntity>(value: T) {
       const record = parseAnalysisEntity(value)
       assertAnalysis(record.recordType === 'analysis-run', 'Comparisons must be created with a run publication fence.')
+      const controls = await prepareAnalysisGuards(store, record.workspaceId, [{ kind: 'create', record }])
+      const existing = await store.get(record.workspaceId, record.id)
+      if (existing) return { created: false, value: existing as VersionedAnalysisEntity<T> }
       try {
-        const response = await container.items.create(record)
-        assertAnalysis(response.resource, 'Cosmos did not return the created run.')
-        return { created: true, value: decode(response.resource, record.workspaceId, record.id) as VersionedAnalysisEntity<T> }
+        await batch(record.workspaceId, [{ operationType: 'Create', resourceBody: record as unknown as JSONObject }], controls)
+        const current = await store.get(record.workspaceId, record.id)
+        assertAnalysis(current, 'Cosmos did not return the created run.')
+        return { created: true, value: current as VersionedAnalysisEntity<T> }
       } catch (error) {
-        if (status(error) !== 409) throw error
-        const existing = await store.get(record.workspaceId, record.id)
-        assertAnalysis(existing, 'Conflicting run could not be read.')
-        return { created: false, value: existing as VersionedAnalysisEntity<T> }
+        if (!(error instanceof StoreConflictError)) throw error
+        const winner = await store.get(record.workspaceId, record.id)
+        if (!winner) throw error
+        assertAnalysis(winner.record.recordType === 'analysis-run', 'Conflicting run identity is invalid.')
+        assertAnalysisRunWritable(winner.record)
+        return { created: false, value: winner as VersionedAnalysisEntity<T> }
       }
     },
     async replace<T extends AnalysisEntity>(value: T, expected: string) {
@@ -147,38 +196,44 @@ export function createAnalysisStoreFromContainer(container: Pick<Container, 'ite
         analysisHash(current.record.progress) === analysisHash(record.progress) &&
         analysisHash(current.record.initialization) === analysisHash(record.initialization),
       'Run progress must change atomically with its comparisons.')
-      try {
-        const response = await container.item(record.id, record.workspaceId).replace(record, {
-          accessCondition: { type: 'IfMatch', condition: expected },
-        })
-        assertAnalysis(response.resource, 'Cosmos did not return the replaced run.')
-        return decode(response.resource, record.workspaceId, record.id) as VersionedAnalysisEntity<T>
-      } catch (error) {
-        if ([404, 409, 412].includes(status(error) ?? 0)) throw new StoreConflictError('The analysis changed.')
-        throw error
-      }
+      const controls = await prepareAnalysisGuards(store, record.workspaceId, [{ kind: 'replace', record, etag: expected }])
+      await batch(record.workspaceId, [{
+        operationType: 'Replace', id: record.id, resourceBody: record as unknown as JSONObject, ifMatch: expected,
+      }], controls)
+      const result = await store.get(record.workspaceId, record.id)
+      assertAnalysis(result, 'Cosmos did not return the replaced run.')
+      return result as VersionedAnalysisEntity<T>
     },
-    async transact(workspaceId, operations) {
+    async transact(workspaceId, operations, options = {}) {
       scope(workspaceId)
-      assertAnalysis(operations.length > 0 && operations.length <= ANALYSIS_LIMITS.initializationChunkSize + 1 &&
+      assertAnalysis((operations.length > 0 || options.controls?.length) && operations.length <= ANALYSIS_LIMITS.initializationChunkSize + 1 &&
         new Set(operations.map(item => item.record.id)).size === operations.length, 'Analysis transactions require at most 25 unique pairs and a run fence.')
       const validated = operations.map(operation => {
-        assertAnalysis(operation.kind === 'create' || operation.kind === 'replace', 'Unsupported transaction operation.')
+        assertAnalysis(operation.kind === 'create' || operation.kind === 'replace' ||
+          (options.lifecycle && operation.kind === 'delete'), 'Unsupported transaction operation.')
         const record = parseAnalysisEntity(operation.record)
         assertAnalysis(record.workspaceId === workspaceId, 'Transaction cannot cross workspace partitions.')
-        if (operation.kind === 'replace') etag(operation.etag)
+        if (operation.kind !== 'create') etag(operation.etag)
         return { ...operation, record }
       })
       assertAnalysis(Buffer.byteLength(JSON.stringify(validated)) <= MAX_ANALYSIS_TRANSACTION_BYTES, 'Analysis batch exceeds the Cosmos payload budget.')
+      if (!validated.length) {
+        const controls = await prepareAnalysisGuards(store, workspaceId, [], options)
+        await batch(workspaceId, [], controls)
+        return
+      }
       const run = validated.find(item => item.record.recordType === 'analysis-run')
-      assertAnalysis(run?.kind === 'replace' && validated.filter(item => item.record.recordType === 'analysis-run').length === 1 &&
+      assertAnalysis(run && (run.kind === 'replace' || (options.lifecycle && run.kind === 'delete' && validated.length === 1)) &&
+        validated.filter(item => item.record.recordType === 'analysis-run').length === 1 &&
         validated.every(item => item.record.recordType === 'analysis-run' || item.record.runId === run.record.id),
       'Every comparison transaction requires exactly one matching run ETag fence.')
       const previous = new Map<string, AnalysisEntity>()
       await Promise.all(validated.map(async operation => {
-        if (operation.kind === 'replace') {
+        if (operation.kind !== 'create') {
           const current = await store.get(workspaceId, operation.record.id)
           checkReplacement(current, operation.record, operation.etag)
+          if (operation.kind === 'delete') assertAnalysis(analysisHash(current!.record) === analysisHash(operation.record),
+            'Deletion requires the exact observed analysis record.')
           previous.set(operation.record.id, current!.record)
         }
       }))
@@ -188,6 +243,7 @@ export function createAnalysisStoreFromContainer(container: Pick<Container, 'ite
       const createdIndexes: number[] = []
       for (const operation of validated) {
         if (operation.record.recordType !== 'analysis-comparison') continue
+        if (operation.kind === 'delete') continue
         const next = operation.record
         const old = previous.get(next.id)
         if (old?.recordType === 'analysis-comparison') {
@@ -207,27 +263,78 @@ export function createAnalysisStoreFromContainer(container: Pick<Container, 'ite
       createdIndexes.sort((a, b) => a - b)
       assertAnalysis(createdIndexes.every((index, offset) => index === oldRun.progress.initialized + offset) &&
         analysisHash(progress) === analysisHash(run.record.progress), 'Run progress does not match its atomic comparison transitions.')
-      const batch: OperationInput[] = validated.map(operation => operation.kind === 'create'
-        ? { operationType: 'Create', resourceBody: operation.record as unknown as JSONObject }
-        : { operationType: 'Replace', id: operation.record.id, resourceBody: operation.record as unknown as JSONObject, ifMatch: operation.etag })
-      try {
-        const response = await container.items.batch(batch, workspaceId)
-        const results = response.result ?? []
-        if (results.length !== batch.length || results.some(result => result.statusCode < 200 || result.statusCode >= 300) ||
-          (response.code !== undefined && (response.code < 200 || response.code >= 300))) {
-          const code = results.find(result => result.statusCode >= 400 && result.statusCode !== 424)?.statusCode ?? response.code
-          if ([404, 409, 412, 424].includes(code ?? 0)) throw new StoreConflictError('The analysis changed before publication.')
-          throw new Error('Cosmos analysis transaction did not succeed.')
-        }
-      } catch (error) {
-        if ([404, 409, 412, 424].includes(status(error) ?? 0)) throw new StoreConflictError('The analysis changed before publication.')
-        throw error
+      if (validated.some(item => item.kind === 'delete')) assertAnalysis(validated.every(item =>
+        item.kind === 'delete' || (item.record.recordType === 'analysis-run' && item.kind === 'replace')),
+      'Deletion cannot mix comparison publication with cleanup.')
+      const controls = await prepareAnalysisGuards(store, workspaceId, validated, options)
+      if (run.kind === 'delete') {
+        assertAnalysis(controls.some(item => item.record.runId === run.record.id && item.record.state === 'deleted'),
+          'Run deletion requires a permanent tombstone.')
+        const runControl = controls.find(item => item.record.runId === run.record.id)!
+        assertAnalysis(!Object.values(runControl.record.writers ?? {}).some(writer => Date.parse(writer.expiresAt) > Date.now()),
+          'Analysis source writers have not drained.')
+        let token: string | undefined
+        const seen = new Set<string>()
+        do {
+          const page = await store.list(workspaceId, { recordType: 'analysis-comparison', runId: run.record.id, limit: 1, continuationToken: token })
+          assertAnalysis(!page.items.length, 'Run still owns comparisons.')
+          token = page.continuationToken
+          if (token) { assertAnalysis(!seen.has(token), 'Comparison cleanup pagination did not advance.'); seen.add(token) }
+        } while (token)
       }
+      const pending: OperationInput[] = validated.map(operation => operation.kind === 'create'
+        ? { operationType: 'Create', resourceBody: operation.record as unknown as JSONObject }
+        : operation.kind === 'delete' ? { operationType: 'Delete', id: operation.record.id, ifMatch: operation.etag }
+        : { operationType: 'Replace', id: operation.record.id, resourceBody: operation.record as unknown as JSONObject, ifMatch: operation.etag })
+      await batch(workspaceId, pending, controls)
+    },
+    async getControl(workspaceId, runId) {
+      scope(workspaceId, runId)
+      try {
+        const response = await container.item(analysisControlId(runId), workspaceId).read()
+        if (response.statusCode === 404 || !response.resource) return undefined
+        const value = decodeControl(response.resource, workspaceId, runId)
+        assertAnalysis(value.record.runId === runId, 'Analysis lifecycle scope mismatch.')
+        return value
+      } catch (error) { if (status(error) === 404) return undefined; throw error }
+    },
+    async listControls(workspaceId, continuationToken) {
+      scope(workspaceId)
+      assertAnalysis(continuationToken === undefined || (typeof continuationToken === 'string' &&
+        continuationToken.length > 0 && continuationToken.length <= 12 * 1024), 'Invalid lifecycle page token.')
+      const page = await fetchCosmosPage(container.items.query({
+        query: 'SELECT * FROM c WHERE c.workspaceId = @workspaceId AND c.recordType = @recordType',
+        parameters: [{ name: '@workspaceId', value: workspaceId }, { name: '@recordType', value: 'analysis-lifecycle' }],
+      }, { partitionKey: workspaceId, maxItemCount: 100, continuationToken }))
+      return { items: page.resources.map(value => decodeControl(value, workspaceId)),
+        ...(page.continuationToken ? { continuationToken: page.continuationToken } : {}) }
+    },
+    async pendingLifecycleWorkspaces(limit) {
+      assertAnalysis(Number.isInteger(limit) && limit > 0 && limit <= 100, 'Invalid lifecycle discovery limit.')
+      const workspaces = new Set<string>()
+      const seen = new Set<string>()
+      let continuationToken: string | undefined
+      do {
+        const page = await fetchCosmosPage(container.items.query({
+          query: `SELECT * FROM c WHERE c.recordType = @recordType AND
+            (c.state = 'deleting' OR (IS_DEFINED(c.operation) AND c.operation.status != 'complete'))`,
+          parameters: [{ name: '@recordType', value: 'analysis-lifecycle' }],
+        }, { maxItemCount: 100, continuationToken }))
+        for (const item of page.resources) {
+          const { record } = decodeControl(item)
+          if (record.state === 'deleting' || (record.operation && record.operation.status !== 'complete')) workspaces.add(record.workspaceId)
+          if (workspaces.size === limit) return [...workspaces]
+        }
+        continuationToken = page.continuationToken
+        if (continuationToken) { assertAnalysis(!seen.has(continuationToken), 'Lifecycle discovery did not advance.'); seen.add(continuationToken) }
+      } while (continuationToken)
+      return [...workspaces]
     },
     async listPending(now, limit) {
       assertAnalysis(Number.isFinite(Date.parse(now)) && Number.isInteger(limit) && limit > 0 && limit <= 100, 'Invalid pending work query.')
       const records: VersionedAnalysisEntity[] = []
       const parents = new Map<string, boolean>()
+      const workspaces = new Map<string, string>()
       // Initialize/cancel first; blocked children must not consume the ready-work limit.
       for (const recordType of ['analysis-run', 'analysis-comparison'] as const) {
         const eligible = recordType === 'analysis-run'
@@ -236,6 +343,8 @@ export function createAnalysisStoreFromContainer(container: Pick<Container, 'ite
           : "(c.status = 'queued' OR c.status = 'running')"
         const query = {
           query: `SELECT * FROM c WHERE c.recordType = @recordType AND ${eligible}
+            ${recordType === 'analysis-run' ? `AND NOT IS_DEFINED(c.lifecycle.deletingAt) AND NOT IS_DEFINED(c.lifecycle.deletedAt)
+              AND (NOT IS_DEFINED(c.lifecycle.archivedAt) OR IS_DEFINED(c.cancellation))` : ''}
             AND (NOT IS_DEFINED(c.nextAttemptAt) OR c.nextAttemptAt <= @now)
             AND (NOT IS_DEFINED(c.lease) OR c.lease.expiresAt <= @now)
             ORDER BY c.createdAt ASC`,
@@ -253,12 +362,18 @@ export function createAnalysisStoreFromContainer(container: Pick<Container, 'ite
             analysisWorkIsPending(item.record, now)), 'Pending query returned ineligible work.')
           for (const item of page) {
             const record = item.record
+            if (!workspaces.has(record.workspaceId)) {
+              workspaces.set(record.workspaceId, (await store.getControl(record.workspaceId))?.record.state ?? 'active')
+            }
+            const state = workspaces.get(record.workspaceId)
+            if (state !== 'active' && !(state === 'archived' && record.recordType === 'analysis-run' &&
+              record.cancellation && !record.cancellation.completedAt)) continue
             if (record.recordType === 'analysis-comparison') {
               const key = JSON.stringify([record.workspaceId, record.runId])
               if (!parents.has(key)) {
                 const parent = await store.get(record.workspaceId, record.runId)
-                assertAnalysis(parent?.record.recordType === 'analysis-run', 'Pending comparison has no valid parent run.')
-                parents.set(key, analysisRunCanScore(parent.record))
+                assertAnalysis(!parent || parent.record.recordType === 'analysis-run', 'Pending comparison has no valid parent run.')
+                parents.set(key, Boolean(parent && parent.record.recordType === 'analysis-run' && analysisRunCanScore(parent.record)))
               }
               if (!parents.get(key)) continue
             }
@@ -280,9 +395,13 @@ export function createAnalysisStoreFromContainer(container: Pick<Container, 'ite
 
 interface AnalysisBlobContainer {
   getBlockBlobClient(name: string): {
-    download(): Promise<Pick<Awaited<ReturnType<BlockBlobClient['download']>>, 'readableStreamBody' | 'contentType' | 'contentLength' | 'etag'>>
+    download(): Promise<Pick<Awaited<ReturnType<BlockBlobClient['download']>>, 'readableStreamBody' | 'contentType' | 'contentLength' | 'etag' | 'metadata'>>
     upload(...args: Parameters<BlockBlobClient['upload']>): Promise<Pick<Awaited<ReturnType<BlockBlobClient['upload']>>, 'etag'>>
+    getProperties?: BlockBlobClient['getProperties']
+    getBlobLeaseClient?: BlockBlobClient['getBlobLeaseClient']
+    deleteIfExists?: BlockBlobClient['deleteIfExists']
   }
+  listBlobsFlat?: ContainerClient['listBlobsFlat']
 }
 function mime(name: string): string {
   const contentType = storedDocumentContentType(name)
@@ -315,13 +434,20 @@ async function readBounded(stream: NodeJS.ReadableStream, length: number | undef
   return Buffer.concat(chunks, size)
 }
 export function createAzureAnalysisBlobStore(config: RealAnalysesConfig, credential: TokenCredential): AnalysisBlobStore {
-  return createAnalysisBlobStoreFromContainer(new BlobServiceClient(config.storageAccountUrl, credential).getContainerClient(config.blobContainer))
+  return createAnalysisBlobStoreFromContainer(new BlobServiceClient(config.storageAccountUrl, credential, {
+    retryOptions: { maxTries: 1, tryTimeoutInMs: ANALYSIS_BLOB_REQUEST_MILLISECONDS },
+  }).getContainerClient(config.blobContainer))
 }
 export function createAnalysisBlobStoreFromContainer(container: AnalysisBlobContainer): AnalysisBlobStore {
   async function read(name: string): Promise<AnalysisBlob | undefined> {
     assertAnalysis(isSafeAnalysisBlobName(name), 'Invalid analysis blob name.')
     try {
       const response = await container.getBlockBlobClient(name).download()
+      if (response.metadata?.scorepreparing === 'true') {
+        const stream = response.readableStreamBody
+        if (stream && 'destroy' in stream && typeof stream.destroy === 'function') stream.destroy()
+        return undefined
+      }
       assertAnalysis(response.readableStreamBody && response.etag && typeof response.contentType === 'string' &&
         response.contentType === mime(name), 'Invalid analysis blob content metadata.')
       const bytes = await readBounded(response.readableStreamBody, response.contentLength, maximum(name))
@@ -338,8 +464,9 @@ export function createAnalysisBlobStoreFromContainer(container: AnalysisBlobCont
         bytes.byteLength <= maximum(name), 'Invalid immutable analysis blob.')
       const body = Buffer.from(bytes)
       try {
+        assertWorkspaceMutationLease(name.split('/')[0])
         const response = await container.getBlockBlobClient(name).upload(body, body.byteLength, {
-          conditions: { ifNoneMatch: '*' }, blobHTTPHeaders: { blobContentType: contentType },
+          conditions: { ifNoneMatch: '*' }, blobHTTPHeaders: { blobContentType: contentType, blobCacheControl: 'private, no-store' },
         })
         assertAnalysis(response.etag, 'Blob upload returned no ETag.')
         return { created: true, blob: { bytes: body, contentType, sha256: analysisBytesHash(body), etag: response.etag } }
@@ -349,6 +476,94 @@ export function createAnalysisBlobStoreFromContainer(container: AnalysisBlobCont
         assertAnalysis(blob, 'Conflicting immutable blob could not be read.')
         return { created: false, blob }
       }
+    },
+    async putFenced(name, bytes, contentType, fence) {
+      assertAnalysis(analysisBlobInRun(name, fence.workspaceId, fence.runId) && fence.blobName === name &&
+        isAnalysisId(`analysis-run-${fence.id}`, 'run') && contentType === mime(name) &&
+        bytes.byteLength > 0 && bytes.byteLength <= maximum(name), 'Invalid fenced analysis blob.')
+      const client = container.getBlockBlobClient(name)
+      assertAnalysis(client.getBlobLeaseClient && client.getProperties, 'Analysis Blob lease fencing is unavailable.')
+      const assertTime = () => {
+        fence.signal?.throwIfAborted()
+        if (Date.parse(fence.expiresAt) - Date.now() <= ANALYSIS_BLOB_LEASE_SECONDS * 1000 + 5_000) {
+          throw new StoreConflictError('The analysis Blob writer reservation expired before upload.')
+        }
+      }
+      assertTime()
+      await fence.assertActive()
+      assertTime()
+      const timeout = AbortSignal.timeout(ANALYSIS_BLOB_REQUEST_MILLISECONDS)
+      const signal = fence.signal ? AbortSignal.any([timeout, fence.signal]) : timeout
+      try {
+        assertWorkspaceMutationLease(fence.workspaceId)
+        await client.upload(Buffer.alloc(0), 0, {
+          conditions: { ifNoneMatch: '*' }, metadata: { scorepreparing: 'true' },
+          blobHTTPHeaders: { blobContentType: 'application/octet-stream', blobCacheControl: 'private, no-store' }, abortSignal: signal,
+        })
+      } catch (error) {
+        if (![409, 412].includes(status(error) ?? 0)) throw error
+        const existing = await read(name)
+        if (existing) { await fence.assertActive(); return { created: false, blob: existing } }
+      }
+      assertTime()
+      const lease = client.getBlobLeaseClient(fence.id)
+      await lease.acquireLease(ANALYSIS_BLOB_LEASE_SECONDS, { abortSignal: signal })
+      try {
+        await fence.assertActive()
+        assertTime()
+        const properties = await client.getProperties({ abortSignal: signal })
+        if (properties.metadata?.scorepreparing !== 'true') {
+          const existing = await read(name)
+          assertAnalysis(existing, 'The immutable analysis source could not be read.')
+          await fence.assertActive()
+          return { created: false, blob: existing }
+        }
+        assertAnalysis(properties.etag, 'Analysis placeholder has no exact ETag.')
+        assertTime()
+        assertWorkspaceMutationLease(fence.workspaceId)
+        const body = Buffer.from(bytes)
+        const response = await client.upload(body, body.byteLength, {
+          conditions: { ifMatch: properties.etag, leaseId: lease.leaseId }, metadata: {},
+          blobHTTPHeaders: { blobContentType: contentType, blobCacheControl: 'private, no-store' }, abortSignal: signal,
+        })
+        assertAnalysis(response.etag, 'Blob upload returned no ETag.')
+        await fence.assertActive()
+        return { created: true, blob: { bytes: body, contentType, sha256: analysisBytesHash(body), etag: response.etag } }
+      } finally {
+        await lease.releaseLease({ abortSignal: AbortSignal.timeout(ANALYSIS_BLOB_REQUEST_MILLISECONDS) }).catch(() => undefined)
+      }
+    },
+    async list(workspaceId, runId, continuationToken) {
+      scope(workspaceId, runId)
+      assertAnalysis(runId === undefined || isAnalysisId(runId, 'run'), 'Invalid analysis blob list run.')
+      assertAnalysis(continuationToken === undefined || (typeof continuationToken === 'string' &&
+        continuationToken.length > 0 && continuationToken.length <= 16 * 1024), 'Invalid analysis Blob continuation token.')
+      assertAnalysis(container.listBlobsFlat, 'Analysis Blob enumeration is unavailable.')
+      const prefix = runId ? `${workspaceId}/${runId}/` : `${workspaceId}/`
+      const page = await container.listBlobsFlat({ prefix }).byPage({ maxPageSize: 100, continuationToken }).next()
+      if (page.done) return { items: [] }
+      const items = page.value.segment.blobItems.map(item => {
+        assertAnalysis(isSafeAnalysisBlobName(item.name) && item.name.startsWith(prefix) && item.properties.etag,
+          'Analysis Blob enumeration crossed its ownership or ETag boundary.')
+        etag(item.properties.etag)
+        return { name: item.name, etag: item.properties.etag }
+      })
+      return { items, ...(page.value.continuationToken ? { continuationToken: page.value.continuationToken } : {}) }
+    },
+    async delete(workspaceId, runId, name, expected) {
+      assertAnalysis(analysisBlobInRun(name, workspaceId, runId), 'Invalid analysis blob deletion scope.')
+      etag(expected)
+      const client = container.getBlockBlobClient(name)
+      assertAnalysis(client.getBlobLeaseClient && client.deleteIfExists, 'Analysis Blob deletion fencing is unavailable.')
+      assertWorkspaceMutationLease(workspaceId)
+      try {
+        await client.getBlobLeaseClient().breakLease(0, { abortSignal: AbortSignal.timeout(ANALYSIS_BLOB_REQUEST_MILLISECONDS) })
+      } catch (error) { if (![404, 409].includes(status(error) ?? 0)) throw error }
+      assertWorkspaceMutationLease(workspaceId)
+      await client.deleteIfExists({
+        conditions: { ifMatch: expected }, deleteSnapshots: 'include',
+        abortSignal: AbortSignal.timeout(ANALYSIS_BLOB_REQUEST_MILLISECONDS),
+      })
     },
   }
 }

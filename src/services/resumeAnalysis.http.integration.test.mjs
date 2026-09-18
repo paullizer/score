@@ -589,6 +589,89 @@ test('a failed comparison does not rewrite a completed pair, and explicit retry 
   } finally { await fixture.close() }
 })
 
+test('real lifecycle preserves frozen model evidence, blocks retained dependencies and never restarts restored work', async () => {
+  const fixture = await startResumeAnalysisFixture(runtime)
+  try {
+    const base = `/api/workspaces/${fixture.workspaceId}`
+    const job = await seedRealJob(fixture)
+    const bytes = Buffer.from(resumeParagraphs.map((item) => `## ${item.heading}\n\n${item.text}`).join('\n\n'))
+    const imported = await importResumeFile(fixture, new File([bytes], 'retained-profile.md'))
+    const stubs = processingStubs(fixture)
+    await processAllResumes(fixture, stubs)
+    const resumePath = `${base}/resumes/${imported.summary.resume.id}`
+    const resume = await jsonResponse(await fixture.request(resumePath))
+    const target = (await allPages(fixture, `${base}/analyses/targets`, 'targets'))
+      .find((item) => item.kind === 'job' && item.selection.jobId === job.job.id && item.selection.rubricVersion === job.rubric.version)
+    assert.ok(target)
+    const input = { name: 'Archive-safe real evidence', resumes: [resumeSelection(resume)], targets: [target.selection] }
+    const create = async () => (await jsonResponse(await fixture.request(`${base}/analyses`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json', 'Idempotency-Key': randomUUID() }, body: JSON.stringify(input),
+    }), [200, 202])).run
+    const change = async (path, action, extra = {}) => {
+      for (let attempt = 0; attempt < 10; attempt++) {
+        const current = await jsonResponse(await fixture.request(path))
+        const response = await fixture.request(`${path}/lifecycle`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json', 'If-Match': current.etag }, body: JSON.stringify({ action, ...extra }),
+        })
+        const result = await jsonResponse(response, [200, 202])
+        if (!result.operation || result.operation.status === 'complete') return result
+        assert.notEqual(result.deleted, true, 'Pending cleanup must never claim deletion completed.')
+      }
+      assert.fail('The bounded lifecycle operation did not finish after explicit, fresh-ETag retries.')
+    }
+    const created = await create()
+    const runPath = `${base}/analyses/${created.run.id}`
+    const before = await jsonResponse(await fixture.request(runPath))
+    const archivedResume = await change(resumePath, 'archive')
+    assert.ok(archivedResume.resume.lifecycle.archivedAt)
+    await change(`${base}/jobs/${job.job.id}`, 'archive', { scope: 'job' })
+    assert.equal((await allPages(fixture, `${base}/analyses/targets`, 'targets')).some((item) => item.kind === 'job' && item.selection.jobId === job.job.id), false)
+    await processAllAnalyses(fixture, stubs)
+    const finished = await jsonResponse(await fixture.request(runPath))
+    assert.equal(finished.run.status, 'complete', 'Archiving inputs does not cancel an already frozen real analysis.')
+    assert.deepEqual(finished.resumes, before.resumes)
+    assert.deepEqual(finished.targets, before.targets)
+    const pairs = await allPages(fixture, `${runPath}/comparisons`, 'comparisons')
+    const detailPath = `${runPath}/comparisons/${pairs[0].comparison.id}`
+    const evidence = await jsonResponse(await fixture.request(detailPath))
+    assert.equal(evidence.resumeSnapshot.extraction.pagination, 'markdown-sections')
+    assert.deepEqual(evidence.result.overall, { status: 'available', score: 60 })
+    assert.equal(stubs.modelCalls.filter((request) => request.response_format.json_schema.name === 'resume_rubric_assessment').length, 1)
+    const original = await fixture.request(`${resumePath}/original`)
+    assert.equal(original.status, 200, 'Archived inputs retain authorized read-only original downloads.')
+    assert.deepEqual(Buffer.from(await original.arrayBuffer()), bytes)
+    await change(runPath, 'archive')
+    assert.deepEqual(await jsonResponse(await fixture.request(detailPath)), evidence)
+    const impact = await jsonResponse(await fixture.request(`${resumePath}/lifecycle`))
+    assert.ok(impact.impact.blockers.some((item) => item.kind === 'analysis' && item.id === created.run.id))
+    const latestResume = await jsonResponse(await fixture.request(resumePath))
+    const blocked = await fixture.request(`${resumePath}/lifecycle`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json', 'If-Match': latestResume.etag }, body: JSON.stringify({ action: 'delete' }),
+    })
+    assert.equal(blocked.status, 409, await blocked.text())
+    await change(resumePath, 'unarchive')
+    await change(`${base}/jobs/${job.job.id}`, 'unarchive', { scope: 'job' })
+    await change(runPath, 'delete')
+    assert.equal((await fixture.request(detailPath)).status, 404)
+    const second = await create()
+    const secondPath = `${base}/analyses/${second.run.id}`
+    await change(secondPath, 'archive')
+    const cancelled = await jsonResponse(await fixture.request(secondPath))
+    assert.equal(cancelled.run.status, 'cancelled', 'Run archive cancels only its own unfinished work.')
+    const callsBeforeRestore = stubs.modelCalls.length
+    await change(secondPath, 'unarchive')
+    await processAllAnalyses(fixture, stubs)
+    assert.equal((await jsonResponse(await fixture.request(secondPath))).run.status, 'cancelled')
+    assert.equal(stubs.modelCalls.length, callsBeforeRestore, 'Restoring a run never queues automatic model scoring.')
+    assert.equal((await jsonResponse(await fixture.request(resumePath))).resume.status, 'ready')
+    await change(secondPath, 'delete')
+    await change(resumePath, 'delete')
+    assert.equal((await fixture.request(`${resumePath}/original`)).status, 404)
+    assert.equal((await allPages(fixture, `${base}/resumes`, 'resumes')).length, 0)
+    assert.equal(fixture.state.saves.length, 0, 'Real lifecycle never serializes real documents or runs into sample autosave.')
+  } finally { await fixture.close() }
+})
+
 test('cancelling an in-flight real run fences late assessment publication', async () => {
   const fixture = await startResumeAnalysisFixture(runtime)
   let release

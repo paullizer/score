@@ -4,6 +4,8 @@ import { useWorkspace } from '../../app/workspace-context'
 import { Badge, Button, DemoNote, InlineError, Modal } from '../../components/ui'
 import { RESUME_FIXTURE_COUNT } from '../../data/fixtures'
 import type { ImportCandidate } from '../../domain/types'
+import { LifecycleBanner } from '../../components/lifecycle/LifecycleControls'
+import { useLifecycleAccess } from '../../components/lifecycle/useLifecycleAccess'
 import { RealAddResumesDialog } from './RealAddResumesDialog'
 
 interface AddResumesDialogProps {
@@ -23,6 +25,7 @@ export function AddResumesDialog(props: AddResumesDialogProps) {
 
 function SampleAddResumesDialog({ open, onOpenChange, onAdded, onError }: AddResumesDialogProps) {
   const { addResumes, notify, cloud } = useWorkspace()
+  const { canEdit } = useLifecycleAccess()
   const [items, setItems] = useState<ImportCandidate[]>([])
   const [errors, setErrors] = useState<string[]>([])
   const [busy, setBusy] = useState(false)
@@ -40,7 +43,7 @@ function SampleAddResumesDialog({ open, onOpenChange, onAdded, onError }: AddRes
   }
 
   function selectNames(names: string[]) {
-    if (submitting.current) return
+    if (submitting.current || !canEdit) return
     const seen = new Set(items.map((item) => item.label.toLocaleLowerCase()))
     const problems: string[] = []
     const selected = names.map((name) => name.trim())
@@ -75,7 +78,7 @@ function SampleAddResumesDialog({ open, onOpenChange, onAdded, onError }: AddRes
   }
 
   async function importResumes() {
-    if (submitting.current) return
+    if (submitting.current || !canEdit) return
     if (!items.length) {
       setErrors(['Choose at least one PDF filename, or load the sample batch.'])
       return
@@ -86,6 +89,7 @@ function SampleAddResumesDialog({ open, onOpenChange, onAdded, onError }: AddRes
     onError('')
     try {
       const ids = await addResumes(items.map((item) => ({ ...item })))
+      if (!ids.length) throw new Error('Resume preparation stopped because the workspace changed or was archived. No profiles were added. Unarchive the workspace before explicitly retrying.')
       setItems([])
       onAdded(ids)
       onOpenChange(false)
@@ -113,12 +117,14 @@ function SampleAddResumesDialog({ open, onOpenChange, onAdded, onError }: AddRes
     description="Choose PDF filenames to try a batch import. Score creates fictional replacement profiles; your file contents are never accessed."
     footer={<>
       <Button onClick={() => changeOpen(false)}>{busy ? 'Close' : 'Cancel'}</Button>
-      <Button type="submit" form={formId} icon={busy ? Loader2 : Plus} variant="primary" disabled={busy || !items.length}>
+      <Button type="submit" form={formId} icon={busy ? Loader2 : Plus} variant="primary" disabled={busy || !canEdit || !items.length}>
         {busy ? 'Preparing samples…' : `Add ${items.length || ''} ${items.length === 1 ? 'sample resume' : 'sample resumes'}`.replace('  ', ' ')}
       </Button>
     </>}
   >
+    <LifecycleBanner />
     <form id={formId} onSubmit={submit} className="space-y-5" aria-busy={busy}>
+      <fieldset disabled={busy || !canEdit} className="space-y-5">
       {errors.length > 0 && <InlineError><ul className="space-y-1">{errors.map((message, index) => <li key={`${index}-${message}`}>{message}</li>)}</ul></InlineError>}
       <div className="rounded-xl border border-dashed bg-surface px-5 py-7 text-center">
         <Files size={28} className="mx-auto mb-3 text-accent" aria-hidden="true" />
@@ -170,6 +176,7 @@ function SampleAddResumesDialog({ open, onOpenChange, onAdded, onError }: AddRes
         <div><p className="text-[12px] font-medium">Preparing {items.length} fictional {items.length === 1 ? 'profile' : 'profiles'}…</p><p className="mt-1 text-[11px] text-muted">This is simulated progress, not PDF parsing. Preparation continues if you close this dialog.</p></div>
       </div>}
       <DemoNote>All imported profiles, document text, and later citations come from the demo fixtures—not from the selected PDFs. {cloud ? 'Sample profiles and filename labels are saved to this private cloud workspace; no PDF bytes are sent.' : 'Filename labels stay on this device.'}</DemoNote>
+      </fieldset>
     </form>
   </Modal>
 }

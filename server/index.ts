@@ -47,31 +47,42 @@ function main(): void {
   const credential = createCredential(config)
   const directory = createAzureDirectoryStore(config.cosmos, credential)
   const state = createAzureStateStore(config.storage, credential)
-  const jobs = config.realJobs
+  const jobStorage = config.realJobs ?? config.jobLifecycleStore
+  const gradeStorage = config.realGrades ?? config.gradeLifecycleStore
+  const jobs = jobStorage
     ? {
-        store: createAzureJobStore(config.realJobs, credential),
-        blobs: createAzureJobBlobStore(config.realJobs, credential),
+        store: createAzureJobStore(jobStorage, credential),
+        blobs: createAzureJobBlobStore(jobStorage, credential),
       }
     : undefined
-  const grades = config.realGrades
+  const grades = gradeStorage
     ? {
-        store: createAzureGradeStore(config.realGrades, credential),
-        blobs: createAzureGradeBlobStore(config.realGrades, credential),
+        store: createAzureGradeStore(gradeStorage, credential),
+        blobs: createAzureGradeBlobStore(gradeStorage, credential),
       }
     : undefined
-  const resumes = config.realResumes
+  const resumeStorage = config.realResumes ?? config.resumeLifecycleStore
+  const analysisStorage = config.realAnalyses ?? config.analysisLifecycleStore
+  const resumes = resumeStorage
     ? {
-        store: createAzureResumeStore(config.realResumes, credential),
-        blobs: createAzureResumeBlobStore(config.realResumes, credential),
+        store: createAzureResumeStore(resumeStorage, credential),
+        blobs: createAzureResumeBlobStore(resumeStorage, credential),
       }
     : undefined
-  const analyses = config.realAnalyses
+  const analyses = analysisStorage
     ? {
-        store: createAzureAnalysisStore(config.realAnalyses, credential),
-        blobs: createAzureAnalysisBlobStore(config.realAnalyses, credential),
+        store: createAzureAnalysisStore(analysisStorage, credential),
+        blobs: createAzureAnalysisBlobStore(analysisStorage, credential),
       }
     : undefined
   const app = createApp({ config, directory, state, jobs, grades, resumes, analyses })
+  const reconcile = app.locals.reconcileLifecycle as () => Promise<void>
+  const recoverLifecycle = () => { void reconcile().catch((error: unknown) => {
+    console.error('Lifecycle recovery is unavailable:', { name: error instanceof Error ? error.name : 'UnknownError' })
+  }) }
+  recoverLifecycle()
+  const lifecycleTimer = setInterval(recoverLifecycle, 60_000)
+  lifecycleTimer.unref()
 
   const port = readPort()
   const host = config.authMode === 'dev-header' ? '127.0.0.1' : '0.0.0.0'

@@ -2,6 +2,7 @@ import { RESUME_IMPORT_LIMITS, type RealResumeSummary } from '../../domain/real-
 import type { UploadFormat } from '../../domain/document-formats'
 import { isSafeUploadedFilename, uploadedFileKind, type UploadedSourceKind } from '../../domain/source-files'
 import { uploadFileByteLimit, uploadFormatNames, validateUploadFile } from '../../services/documentUploads'
+import { lifecycleIsRemoved } from '../../domain/lifecycle'
 
 export type RealResumeImportSource = { kind: UploadedSourceKind | 'unsupported'; file: File } | { kind: 'url'; url: string }
 
@@ -78,7 +79,9 @@ export function resumeWorkActive(summary: RealResumeSummary): boolean {
 
 export function readyRealResume(summary: RealResumeSummary): boolean {
   const ref = summary.documentRef
-  return summary.resume.dataKind === 'real' && summary.resume.status === 'ready' && Boolean(ref
+  return !summary.lifecycle?.archivedAt && !lifecycleIsRemoved(summary.lifecycle) &&
+    (!summary.lifecycleOperation || summary.lifecycleOperation.status === 'complete') &&
+    summary.resume.dataKind === 'real' && summary.resume.status === 'ready' && Boolean(ref
     && ref.documentId === summary.resume.documentId && ref.documentVersion === summary.resume.documentVersion && ref.sha256)
 }
 

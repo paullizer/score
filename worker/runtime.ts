@@ -11,6 +11,8 @@ import type { RealJobRecord, RealJobSource, VersionedRealJob } from '../src/doma
 import { JOB_IMPORT_LIMITS } from '../src/domain/real-jobs'
 import type { Citation, Criterion, DocumentParagraph, Rubric, SourceDocument } from '../src/domain/types'
 import type { JobBlobStore, RealJobStore } from '../server/jobs/store'
+import { isJobReadOnly, putJobBlob } from '../server/jobs/guards'
+import { validateRealSourceDocument } from '../server/jobs/validation'
 import {
   isOriginalContentType, isWordContentType, originalExtension, UPLOAD_CONTENT_TYPES,
   type OriginalContentType, type WordFormat,
@@ -1338,10 +1340,10 @@ function encodeDocument(document: SourceDocument): Uint8Array {
   return Buffer.from(JSON.stringify(document), 'utf8')
 }
 
-function decodeDocument(bytes: Uint8Array): SourceDocument {
+function decodeDocument(bytes: Uint8Array, contentType?: OriginalContentType): SourceDocument {
   try {
     const parsed = JSON.parse(Buffer.from(bytes).toString('utf8')) as SourceDocument
-    if (!parsed || parsed.kind !== 'job' || parsed.sample !== false || !Array.isArray(parsed.paragraphs) || parsed.paragraphs.length === 0) {
+    if (validateRealSourceDocument(parsed, contentType).length) {
       throw new Error('Invalid source document.')
     }
     return parsed
@@ -1425,7 +1427,9 @@ class LeaseController {
       throw abortError('Job processing was cancelled.')
     }
     const live = await this.store.get(this.workspaceId, this.jobId)
-    if (!live || live.record.job.status === 'cancelled' || live.record.lease?.owner !== this.owner) {
+    if (!live || isJobReadOnly(live.record) || live.record.job.status === 'cancelled' ||
+      live.record.lease?.owner !== this.owner || Date.parse(live.record.lease.expiresAt) <= this.clock.now().getTime() ||
+      (await this.store.getWorkspaceLifecycle(this.workspaceId)).state !== 'active') {
       this.markLost()
       throw abortError('The job was cancelled or its lease is no longer owned by this worker.')
     }
@@ -1494,6 +1498,7 @@ async function claimJob(
 ): Promise<VersionedRealJob | undefined> {
   const now = clock.now()
   const record = candidate.record
+  if (isJobReadOnly(record) || (await store.getWorkspaceLifecycle(record.workspaceId)).state !== 'active') return undefined
   if (['ready', 'cancelled', 'error'].includes(record.job.status)) return undefined
   if (record.nextAttemptAt && new Date(record.nextAttemptAt).getTime() > now.getTime()) return undefined
   if (record.lease && new Date(record.lease.expiresAt).getTime() > now.getTime()) return undefined
@@ -1556,6 +1561,8 @@ async function saveOriginal(
   browser: BrowserRenderer | undefined,
   options: SafeFetchOptions,
   clock: Clock,
+  store: RealJobStore,
+  owner: string,
 ): Promise<{ bytes: Uint8Array; contentType: OriginalContentType; source: RealJobSource }> {
   if (record.source.originalBlobName) {
     const saved = await blobs.read(record.source.originalBlobName)
@@ -1657,7 +1664,9 @@ async function saveOriginal(
   }
   const names = sourceBlobNames(record, type)
   const capturedAt = clock.now().toISOString()
-  const saved = await blobs.putImmutable(names.original, bytes, type)
+  const saved = await putJobBlob(store, blobs, record.workspaceId, record.id, names.original, bytes, type, {
+    owner, signal: options.signal,
+  })
   const source: RealJobSource = {
     ...record.source,
     finalUrl,
@@ -1681,7 +1690,7 @@ async function loadOrExtract(
   const cachedName = initial.extractedBlobName ?? names.extracted
   const cached = await dependencies.blobs.read(cachedName)
   if (cached) {
-    const document = decodeDocument(cached.bytes)
+    const document = decodeDocument(cached.bytes, initial.source.originalContentType)
     const expectedDocumentId = `document-${initial.id.replace(/^job-/, '')}`
     if (document.id !== expectedDocumentId) {
       throw new WorkerError('invalid-extraction-cache', 'The saved extraction does not belong to this job.', false, 'parsing')
@@ -1700,7 +1709,7 @@ async function loadOrExtract(
   const original = await saveOriginal(initial, dependencies.blobs, dependencies.browser, {
     ...dependencies.safeFetchOptions,
     signal: controller.signal,
-  }, dependencies.clock ?? systemClock)
+  }, dependencies.clock ?? systemClock, dependencies.store, controller.owner)
   await controller.update(record => ({
     ...record,
     source: original.source,
@@ -1742,8 +1751,12 @@ async function loadOrExtract(
       sample: false,
   }
   const documentBytes = encodeDocument(document)
-  const savedDocument = await dependencies.blobs.putImmutable(names.extracted, documentBytes, 'application/json')
-  const durableDocument = decodeDocument(savedDocument.blob.bytes)
+  await controller.check()
+  const savedDocument = await putJobBlob(
+    dependencies.store, dependencies.blobs, initial.workspaceId, initial.id,
+    names.extracted, documentBytes, 'application/json', { owner: controller.owner, signal: controller.signal },
+  )
+  const durableDocument = decodeDocument(savedDocument.blob.bytes, original.contentType)
   const expectedDocumentId = `document-${initial.id.replace(/^job-/, '')}`
   if (durableDocument.id !== expectedDocumentId) {
     throw new WorkerError('invalid-extraction-cache', 'The saved extraction does not belong to this job.', false, 'parsing')
@@ -1803,6 +1816,7 @@ export async function processClaimedJob(
   owner: string,
   deadlineAt?: number,
 ): Promise<void> {
+  if (!dependencies.store.getWorkspaceLifecycle) throw new Error('Job workspace lifecycle fencing is unavailable.')
   const clock = dependencies.clock ?? systemClock
   const controller = new LeaseController(dependencies.store, claimed.record.workspaceId, claimed.record.id, owner, clock)
   controller.start(deadlineAt)
@@ -1854,6 +1868,7 @@ export async function processClaimedJob(
 }
 
 export async function runWorker(dependencies: WorkerDependencies, options: RunWorkerOptions = {}): Promise<{ claimed: number; completed: number }> {
+  if (!dependencies.store.getWorkspaceLifecycle) throw new Error('Job workspace lifecycle fencing is unavailable.')
   const clock = dependencies.clock ?? systemClock
   const owner = dependencies.owner ?? `worker-${randomUUID()}`
   const deadline = clock.now().getTime() + (options.budgetMilliseconds ?? DEFAULT_RUN_BUDGET_MILLISECONDS)

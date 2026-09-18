@@ -211,7 +211,7 @@ The resume worker identity can access only its own records/sources, OCR, and the
 
 Actual resume/profile content can contain personal or sensitive information. PDF and DOCX bytes are processed by Azure Document Intelligence; Markdown and legacy DOC text extraction is local to the Node worker, but the extracted text still goes to Foundry. Resume text and selected rubric/source evidence are processed by Foundry for profiling, assessment, and grounding review. They reuse the existing **GPT-5 mini `job-rubric` deployment and US Data Zone Standard inference** described above, not a North Central US-only processing guarantee. Word previews add no external processing service. Do not import data without the appropriate authority and organizational review. Routine logs must not contain resume text, contact details, raw model responses, or personal source URLs.
 
-This release retains private immutable captures and results. **Reset samples does not delete real resumes, analyses, jobs, grade ladders, or their source/version history.** Resume replacement/editing, deletion, and retention administration are not provided by this release; operators must establish an appropriate retention/deletion process. Blob soft-delete retention also applies after operator deletion.
+This release retains private immutable captures and results until an authorized lifecycle deletion completes. **Reset samples does not delete real resumes, analyses, jobs, grade ladders, or their source/version history.** Real and sample libraries provide archive, unarchive, and confirmed deletion with dependency protection. Resume replacement/editing and infrastructure retention administration remain separate concerns. Existing Blob soft-delete retention also applies after application deletion.
 
 ## Deployment to Azure
 
@@ -311,7 +311,7 @@ This refreshes App Service's versionless Key Vault reference. `.azure\` and loca
 
 ### Cloud workspaces and future groups
 
-The cloud build uses `VITE_DEPLOYMENT_MODE=cloud`. It never falls back to local fixtures if authentication or cloud storage fails. Each user can create, rename, and switch between multiple personal workspaces. Cloud links include `/workspaces/<id>/` so a bookmark cannot silently resolve against a different selected workspace.
+The cloud build uses `VITE_DEPLOYMENT_MODE=cloud`. It never falls back to local fixtures if authentication or cloud storage fails. Each user can create, rename, switch, archive, unarchive, and delete personal workspaces. Cloud links include `/workspaces/<id>/` so a bookmark cannot silently resolve against a different selected workspace.
 
 Cosmos stores directory and membership documents together under the `/workspaceId` partition key. Legacy sample workspace state is stored in a private Blob rather than a single Cosmos item, avoiding Cosmos's per-item size limit. Sample saves require the current Blob ETag; metadata renames require the metadata ETag. Real job, grade, resume, and analysis mutations use separate versioned APIs and Cosmos ETags. Concurrent edits produce an explicit conflict instead of silently overwriting another session.
 
@@ -320,6 +320,29 @@ Initialization prepares state before atomically publishing directory metadata an
 Cloud mode keeps document state in memory, not browser local storage. Only theme and the last-selected workspace ID are remembered locally, with the latter scoped to tenant and user. Writes are queued and acknowledged before showing a saved state. Switching or signing out flushes pending changes and pauses browser-only demo simulations. Save failures retain the newest edits; conflict recovery is explicit.
 
 The data model reserves `group` workspaces and `owner`/`editor`/`viewer` memberships. Group creation, sharing administration, and Entra group resolution are deliberately not enabled yet. They must use these same server-side membership boundaries rather than client-side filters.
+
+### Archive, search, and permanent deletion
+
+Workspace, job, resume, rubric, ladder, and analysis controls distinguish **Archive** from **Delete**. Normal browsing shows active items; searching automatically includes archived matches with an **Archived** badge. The archive-state filter also lets you browse archived records without knowing their names. Workspace search is in the workspace picker; content searches remain within the selected workspace.
+
+Archived content is read-only and cannot be selected for new analyses or ladder seeds. Archiving cancels its unfinished work while retaining completed results. Unarchive never restarts cancelled processing. A workspace's contents, a job's rubrics, and a ladder's grade rubrics inherit their parent's archive state, without changing each child's own setting. Restoring a parent therefore does not restore children that were separately archived. Independent analyses and ladders that already captured a source are unchanged when that source is archived.
+
+Delete requires a confirmation describing the affected content. Existing analyses block deletion of their inputs, including references to older rubric versions and references from archived analyses. A ladder also protects its captured seed job and rubric until the ladder is deleted. The confirmation links to blocking records rather than deleting those dependencies implicitly. Lifecycle management remains available on archived records, so archived analyses can be deleted without making the workspace editable.
+
+| Delete target | Effect after dependencies have been removed |
+| --- | --- |
+| Workspace | Removes its owned content and private source artifacts. All analyses must be explicitly deleted first. |
+| Job | Removes its source and complete job-rubric history. |
+| Resume | Removes the profile and its otherwise unreferenced source document. |
+| Rubric | Removes the logical rubric's complete version history, not just its latest version. A job and its source remain readable with **No rubric**; a grade's parent ladder and shared evidence remain. |
+| Ladder | Removes its grade histories, approvals, reference captures, and processing artifacts, but not its independent seed job. |
+| Analysis | Removes the run, comparisons, and saved input/evidence snapshots. |
+
+Workspace lifecycle changes are owner-only. Owners and editors can manage individual items; viewers can search and inspect archived content. You may archive or delete the last active workspace: the workspace picker offers creation and restoration instead of automatically rebuilding deleted samples. Standalone browser mode remains a single local demo with lifecycle controls for its sample entities, not a separate local workspace directory.
+
+Cloud changes are version-checked and coordinated with saves, imports, and workers. An interrupted cleanup remains protected and reports its pending or failed state; retry finishes the same operation instead of restoring half-deleted data. Pending workspace deletions remain discoverable by their owner until finalization commits. Server recovery also resumes unfinished workspace operations and individual deletions after the browser closes. Minimal non-content deletion markers prevent old requests, saved tabs, and default initialization from bringing deleted identities back.
+
+**Permanent deletion is irreversible through Score, not a promise of immediate physical erasure from infrastructure backups.** The existing Azure Blob policy retains service-level soft-deleted blobs for seven days. This feature does not change that account-wide retention policy or touch shared knowledge content. Archive retains the original content and is the appropriate choice when it may be needed again.
 
 ### Foundry IQ boundary
 
@@ -357,6 +380,6 @@ Reloading during a simulation presents unfinished work as interrupted/cancelled 
 | `infra` | Bicep resource definitions |
 | `scripts` | Container build, deployment, identity, and knowledge-base configuration |
 
-Authenticated LinkedIn access, whole-site discovery and multi-page crawling, resume editing/deletion administration, group-workspace administration, and ATS integrations remain deferred. Direct job/profile URL rendering is not a general-purpose crawler. Real imports and assessments remain separate from sample simulations.
+Authenticated LinkedIn access, whole-site discovery and multi-page crawling, resume editing, infrastructure retention administration, group-workspace administration, and ATS integrations remain deferred. Direct job/profile URL rendering is not a general-purpose crawler. Real imports and assessments remain separate from sample simulations.
 
 When hosting the built `dist` directory, configure SPA fallback to `index.html` so direct links to job, rubric, and analysis routes work.

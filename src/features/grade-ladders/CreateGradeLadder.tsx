@@ -10,6 +10,8 @@ import { GradeContextFields } from './GradeContextFields'
 import { GradeDisclaimer } from './GradeShared'
 import { contextErrors, gradeLadderLink } from './gradeUi'
 import { useGradeRequestKey } from './grade-request-hooks'
+import { isEntityArchived } from '../../domain/lifecycle'
+import { LifecycleBanner } from '../../components/lifecycle/LifecycleControls'
 
 const blankContext: GradeContext = { series: '', agency: '', agencyType: 'unknown', supervision: 'unknown', functions: [], specialty: '', confirmed: false, answers: {} }
 
@@ -33,10 +35,11 @@ export function CreateGradeLadder() {
   const live = useRef(true)
   const guard = useGradeLeaveGuard(dirty, saving, 'Create grade ladder')
   const requestKey = useGradeRequestKey()
-  const jobs = workspace.jobs.filter((job) => job.dataKind === 'real' && job.status === 'ready')
+  const jobs = workspace.jobs.filter((job) => job.dataKind === 'real' && job.status === 'ready' && job.rubricId && !job.rubricDeletedAt &&
+    !isEntityArchived(workspace, { kind: 'job', id: job.id }) && workspace.rubrics.some((rubric) => rubric.id === job.rubricId && !isEntityArchived(workspace, { kind: 'rubric', id: rubric.groupId })))
   const job = jobs.find((item) => item.id === jobId)
   const detail = cloud?.realJobs.detail(jobId)
-  const selectedRubric = detail?.state === 'ready' ? (rubricId ? [...detail.value.rubricVersions].sort((a, b) => b.version - a.version).find((rubric) => rubric.id === rubricId && (!rubricVersion || rubric.version === rubricVersion)) : detail.value.rubric) : null
+  const selectedRubric = job && detail?.state === 'ready' ? (rubricId ? [...detail.value.rubricVersions].sort((a, b) => b.version - a.version).find((rubric) => rubric.id === rubricId && (!rubricVersion || rubric.version === rubricVersion) && !isEntityArchived(workspace, { kind: 'rubric', id: rubric.groupId })) : detail.value.rubric) : null
   const ensureJob = cloud?.realJobs.ensureDetail
 
   useEffect(() => { live.current = true; return () => { live.current = false } }, [])
@@ -51,7 +54,7 @@ export function CreateGradeLadder() {
 
   async function submit(event: FormEvent) {
     event.preventDefault()
-    if (submitted.current || !api) return
+    if (submitted.current || !api || !api.canWrite) return
     const errors = contextErrors(name, context, grades)
     if (!job || !selectedRubric || !seedConfirmed) errors.unshift('Select a ready real job and confirm its exact saved rubric version.')
     if (errors.length) { setError(errors.join(' ')); return }
@@ -79,20 +82,22 @@ export function CreateGradeLadder() {
   const close = () => { void guard.close(() => navigate('/rubrics?kind=grade&data=real', { replace: true })) }
   return <>
     <PageHeader eyebrow="PRIVATE GS GRADE LIBRARY" title="Create a grade ladder" description="Start from a saved real job, not a sample or an inferred occupational series." />
+    <LifecycleBanner />
     <GradeDisclaimer />
     <Modal open onOpenChange={(open) => { if (!open) close() }} title="Create grade ladder" description="Capture a seed job and saved rubric version. Automatic OPM discovery continues durably on the server." wide
-      footer={<><Button onClick={close}>Cancel</Button><Button variant="primary" type="submit" form="create-grade-ladder" icon={saving ? LoaderCircle : Layers3} disabled={disabled}>{saving ? 'Capturing seed…' : 'Create and discover sources'}</Button></>}>
+      footer={<><Button onClick={close}>Cancel</Button><Button variant="primary" type="submit" form="create-grade-ladder" icon={saving ? LoaderCircle : Layers3} disabled={disabled || !job || !selectedRubric}>{saving ? 'Capturing seed…' : 'Create and discover sources'}</Button></>}>
       {!api.canWrite && <InlineError>This workspace is read-only. An owner or editor can create a ladder.</InlineError>}
       {api.error && <InlineError>{api.error} <button className="underline" onClick={() => void api.refresh()}>Retry availability</button></InlineError>}
+      {jobId && !job && <InlineError>The requested seed is archived, missing, or has no active rubric. Choose an active, ready real job. Archived selections from old links are not accepted.</InlineError>}
       <form id="create-grade-ladder" onSubmit={submit} noValidate className="space-y-5">
         <fieldset disabled={disabled} className="space-y-4">
           <label className="field"><span className="field-label">Ready real job</span><select className="input" aria-label="Ready real job" value={jobId} required onChange={(event) => { setJobId(event.target.value); setRubricId(''); setRubricVersion(0); setSeedConfirmed(false); setDirty(true) }}>
             <option value="">Choose a ready real job</option>{jobs.map((item) => <option key={item.id} value={item.id}>{item.title} · {item.organization}</option>)}
-          </select><span className="field-hint">Samples and unfinished imports cannot seed a real grade ladder.</span></label>
+          </select><span className="field-hint">Archived jobs or rubrics, samples, and unfinished imports cannot seed a real grade ladder.</span></label>
           {!jobs.length && <p className="text-[12px] text-muted">{cloud?.realJobs.phase === 'loading' ? 'Loading real jobs…' : 'Import a real job and wait for its source-grounded rubric before starting.'}</p>}
           {jobId && detail?.state === 'error' && <InlineError>{detail.error}<button type="button" className="ml-2 underline" onClick={() => void ensureJob?.(jobId, true)}>Retry seed loading</button></InlineError>}
           {jobId && detail?.state !== 'ready' && detail?.state !== 'error' && <p role="status" className="text-[12px] text-muted">Loading the captured job source and saved rubric versions…</p>}
-          {detail?.state === 'ready' && <label className="field"><span className="field-label">Saved seed rubric version</span><select className="input" aria-label="Saved seed rubric version" value={selectedRubric ? `${selectedRubric.id}:${selectedRubric.version}` : ''} onChange={(event) => {
+          {job && detail?.state === 'ready' && <label className="field"><span className="field-label">Saved seed rubric version</span><select className="input" aria-label="Saved seed rubric version" value={selectedRubric ? `${selectedRubric.id}:${selectedRubric.version}` : ''} onChange={(event) => {
             const selected = detail.value.rubricVersions.find((rubric) => `${rubric.id}:${rubric.version}` === event.target.value)
             if (selected) { setRubricId(selected.id); setRubricVersion(selected.version) }
             setSeedConfirmed(false); setDirty(true)

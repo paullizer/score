@@ -8,6 +8,44 @@ let runtime
 before(async () => { runtime = await buildGradeTestRuntime() })
 after(async () => { globalThis.fetch = nativeFetch; await runtime?.close() })
 
+test('frontend workspace fakes enforce conditional metadata, idempotent cleanup, and exclusive mutation leases', async () => {
+  const fixture = await startGradeFixture(runtime)
+  try {
+    const { directory, state, workspaceId, api } = fixture
+    const original = await directory.getMetadata(workspaceId)
+    await assert.rejects(directory.replaceMetadata(original.metadata, '"stale"'), api.StoreConflictError)
+    const operation = { id: 'fixture-operation', action: 'archive', status: 'failed', updatedAt: fixture.now().toISOString() }
+    const updated = await directory.replaceMetadata({ ...original.metadata, lifecycleOperation: operation }, original.etag)
+    assert.notEqual(updated.etag, original.etag)
+    assert.deepEqual((await directory.listLifecycleOperations(1)).map((value) => value.metadata.lifecycleOperation), [operation])
+
+    const first = await state.acquireMutationLease(workspaceId)
+    await assert.rejects(state.acquireMutationLease(workspaceId), api.StoreConflictError)
+    await first.renew()
+    await first.release()
+    const second = await state.acquireMutationLease(workspaceId)
+    await assert.rejects(first.renew(), api.StoreConflictError)
+    await first.release()
+    await assert.rejects(state.acquireMutationLease(workspaceId), api.StoreConflictError, 'A stale release cannot unlock the next lease holder')
+    await second.renew()
+    await second.release()
+
+    const snapshot = await state.getState(workspaceId)
+    await assert.rejects(state.deleteState(workspaceId, '"stale"'), api.StoreConflictError)
+    await state.deleteState(workspaceId, snapshot.etag)
+    await state.deleteState(workspaceId, snapshot.etag)
+    assert.equal(await state.getState(workspaceId), undefined)
+    await directory.deleteMemberships(workspaceId)
+    const ownerId = api.membershipIdFor(original.metadata.ownerId)
+    assert.equal([...directory.memberships.values()].filter((membership) => membership.workspaceId === workspaceId).length, 1)
+    assert.ok(await directory.getMembership(workspaceId, ownerId), 'The owner can still discover and resume an unfinished deletion')
+    const deletedAt = fixture.now().toISOString()
+    await directory.replaceMetadata({ ...updated.metadata, deletedAt,
+      lifecycleOperation: { ...operation, action: 'delete', status: 'complete', updatedAt: deletedAt } }, updated.etag)
+    assert.equal([...directory.memberships.values()].some((membership) => membership.workspaceId === workspaceId), false)
+  } finally { await fixture.close() }
+})
+
 test('real API/client lifecycle captures exact seed versions, real PDFs, frozen citations, independent grades and immutable edits', async () => {
   const fixture = await startGradeFixture(runtime)
   let restoreFetch

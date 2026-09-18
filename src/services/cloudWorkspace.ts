@@ -1,5 +1,6 @@
 import type { Workspace } from '../domain/types'
 import type { CloudSession, CloudWorkspaceSnapshot, WorkspaceSummary } from '../domain/cloud'
+import type { LifecycleAction, LifecycleImpact, LifecycleOperation } from '../domain/lifecycle'
 
 /**
  * True when this build is deployed against the real Azure-hosted API (Docker/production build sets
@@ -48,6 +49,34 @@ export class CloudPreconditionError extends CloudApiError {
     super('precondition_required', message, 428)
     this.name = 'CloudPreconditionError'
   }
+}
+
+export class LifecycleOperationError extends Error {
+  readonly operation: LifecycleOperation
+  constructor(operation: LifecycleOperation) {
+    super(operation.error ?? (operation.status === 'failed'
+      ? 'The lifecycle operation did not finish. Retry to resume it; completed cleanup will not be repeated.'
+      : 'The lifecycle operation is still in progress. Refresh its status or retry to resume; it is not complete yet.'))
+    this.name = 'LifecycleOperationError'
+    this.operation = operation
+  }
+}
+
+export interface WorkspaceLifecycleResponse {
+  workspace?: WorkspaceSummary
+  deleted?: true
+  operation?: LifecycleOperation
+}
+
+export async function getWorkspaceLifecycleImpact(id: string, signal?: AbortSignal): Promise<LifecycleImpact> {
+  const result = await cloudJsonRequest<{ impact: LifecycleImpact }>(`/workspaces/${encodeURIComponent(id)}/lifecycle`, { signal })
+  return result.impact
+}
+
+export function changeWorkspaceLifecycle(id: string, action: LifecycleAction, etag: string): Promise<WorkspaceLifecycleResponse> {
+  return cloudLifecycleRequest<WorkspaceLifecycleResponse>(`/workspaces/${encodeURIComponent(id)}/lifecycle`, {
+    method: 'POST', headers: { 'If-Match': etag }, body: JSON.stringify({ action }),
+  }).then((result) => result.value)
 }
 
 const SCORE_REQUEST_HEADER = 'X-Score-Request'
@@ -106,7 +135,7 @@ async function unwrap<T>(response: Response): Promise<T> {
   return response.json() as Promise<T>
 }
 
-export function cloudJsonRequest<T>(path: string, init: RequestInit = {}): Promise<T> {
+function cloudRequest(path: string, init: RequestInit = {}): Promise<Response> {
   const headers = new Headers(init.headers)
   headers.set(SCORE_REQUEST_HEADER, 'workspace')
   if (init.body !== undefined && !headers.has('Content-Type')) headers.set('Content-Type', 'application/json')
@@ -117,7 +146,35 @@ export function cloudJsonRequest<T>(path: string, init: RequestInit = {}): Promi
     credentials: 'include',
     cache: 'no-store',
     headers,
-  }).then((response) => unwrap<T>(response))
+  })
+}
+
+export function cloudJsonRequest<T>(path: string, init: RequestInit = {}): Promise<T> {
+  return cloudRequest(path, init).then((response) => unwrap<T>(response))
+}
+
+export async function cloudLifecycleRequest<T>(path: string, init: RequestInit = {}): Promise<{ value: T; etag?: string }> {
+  const response = await cloudRequest(path, init)
+  const etag = response.headers.get('ETag') ?? undefined
+  if (response.status === 503 && !response.redirected && response.type !== 'opaqueredirect' && response.headers.get('content-type')?.toLowerCase().includes('application/json')) {
+    const body: unknown = await response.clone().json().catch(() => null)
+    if (body && typeof body === 'object' && 'operation' in body) {
+      const operation = body.operation
+      if (operation && typeof operation === 'object' && 'status' in operation && operation.status === 'failed' && 'id' in operation && typeof operation.id === 'string' &&
+        'action' in operation && ['archive', 'unarchive', 'delete'].includes(String(operation.action))) {
+        return { value: body as T, etag }
+      }
+    }
+  }
+  const value = await unwrap<T>(response)
+  if (response.status === 202) {
+    const operation = value && typeof value === 'object' && 'operation' in value ? value.operation : undefined
+    const pending = value && typeof value === 'object' && 'pending' in value && value.pending === true
+    if (!pending && (!operation || typeof operation !== 'object' || !('status' in operation) || !['pending', 'running', 'failed'].includes(String(operation.status)))) {
+      throw new CloudApiError('unavailable', 'The service has not acknowledged a completed lifecycle change or returned a recoverable operation. Refresh status before retrying.', 202)
+    }
+  }
+  return { value, etag }
 }
 
 export async function fetchSession(signal?: AbortSignal): Promise<CloudSession> {
@@ -201,5 +258,11 @@ export function writeLastWorkspaceId(tenantId: string, userId: string, workspace
   } catch (error) {
     if (!(error instanceof DOMException)) throw error
     console.warn('Score could not remember the workspace selection. Cloud content is unaffected.', error.name)
+  }
+}
+
+export function clearLastWorkspaceId(tenantId: string, userId: string): void {
+  try { localStorage.removeItem(lastWorkspaceKey(tenantId, userId)) } catch (error) {
+    if (!(error instanceof DOMException)) throw error
   }
 }

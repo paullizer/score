@@ -3,10 +3,12 @@ import { RESUME_IMPORT_LIMITS } from '../../src/domain/real-resumes'
 import { UPLOAD_CONTENT_TYPES, uploadFormatFromContentType, type UploadFormat } from '../../src/domain/document-formats'
 import { HttpError, invalidRequest, notFound, preconditionRequired, unavailable } from '../errors'
 import type { WorkspaceRepository } from '../repository'
+import type { LifecycleDependencies } from '../lifecycle/contracts'
 import { getPrincipal } from '../request-context'
 import { RealResumeService, type ResumeImportRequest } from './service'
 import type { RealResumesDeps } from './store'
 import { isResumeUuid, isSafeResumeFilename, isValidResumeId } from './validation'
+import { ResumeLifecycleService } from './lifecycle'
 
 export type { RealResumesDeps } from './store'
 
@@ -15,6 +17,7 @@ interface RealResumesRouterDeps {
   resumes?: RealResumesDeps
   now?: () => Date
   wordDocumentImports?: boolean
+  lifecycle?: LifecycleDependencies
 }
 
 function param(req: Request, name: string): string {
@@ -61,7 +64,7 @@ function filename(req: Request, kind: UploadFormat = 'pdf'): string {
 function etag(req: Request): string {
   const value = req.header('If-Match')
   if (!value) throw preconditionRequired('An If-Match header containing the current resume ETag is required.')
-  if (value.trim() !== value || value === '*' || value.startsWith('W/') || value.includes(',') || value.length > 1024) {
+  if (value.trim() !== value || value === '*' || value.startsWith('W/') || /[\r\n,]/.test(value) || value.length > 1024) {
     throw invalidRequest('If-Match must contain one exact resume ETag.')
   }
   return value
@@ -96,6 +99,7 @@ export function createRealResumesRouter(deps: RealResumesRouterDeps): Router {
   const router = express.Router()
   const base = '/workspaces/:workspaceId/resumes'
   const service = deps.resumes ? new RealResumeService(deps.resumes, deps.now) : undefined
+  const lifecycle = deps.resumes ? new ResumeLifecycleService(deps.resumes, deps.lifecycle, deps.now) : undefined
   const requireService = () => {
     if (!service) throw unavailable('Real resume imports are not enabled for this deployment.')
     return service
@@ -103,7 +107,8 @@ export function createRealResumesRouter(deps: RealResumesRouterDeps): Router {
   const authorize: RequestHandler = async (req, res, next) => {
     res.setHeader('Cache-Control', 'private, no-store')
     try {
-      await deps.repository.authorizeWorkspace(getPrincipal(req), param(req, 'workspaceId'), req.method === 'GET' || req.method === 'HEAD' ? 'read' : 'write')
+      await deps.repository.authorizeWorkspace(getPrincipal(req), param(req, 'workspaceId'),
+        req.method === 'GET' || req.method === 'HEAD' ? 'read' : req.path.endsWith('/lifecycle') ? 'manage' : 'write')
       requireService()
       next()
     } catch (error) { next(error) }
@@ -111,6 +116,8 @@ export function createRealResumesRouter(deps: RealResumesRouterDeps): Router {
   // The application mounts this router after its authentication and same-origin CSRF middleware.
   // Workspace authorization and header checks also precede the raw upload/body parsers below.
   router.use(base, authorize)
+  const mutate = (access: 'write' | 'manage', handler: (req: Request, res: Response) => Promise<void>): RequestHandler =>
+    (req, res) => deps.repository.withWorkspaceMutation(getPrincipal(req), param(req, 'workspaceId'), access, () => handler(req, res))
 
   router.get(base, async (req, res) => {
     const options = page(req)
@@ -130,6 +137,42 @@ export function createRealResumesRouter(deps: RealResumesRouterDeps): Router {
     res.setHeader('Referrer-Policy', 'no-referrer')
     res.send(Buffer.from(original.bytes))
   })
+  router.get(`${base}/:resumeId/lifecycle`, async (req, res) => {
+    requireService()
+    const impact = await lifecycle!.impact(param(req, 'workspaceId'), resumeId(req))
+    res.json({ impact })
+  })
+  router.post(`${base}/:resumeId/lifecycle`,
+    (req, _res, next) => {
+      try {
+        resumeId(req); etag(req)
+        if (!req.is('application/json')) throw invalidRequest('Content-Type must be application/json.')
+        next()
+      } catch (error) { next(error) }
+    },
+    express.json({ limit: '1kb', inflate: false }),
+    mutate('manage', async (req, res) => {
+      if (!req.body || typeof req.body !== 'object' || Array.isArray(req.body) ||
+        Object.keys(req.body).length !== 1 || !['archive', 'unarchive', 'delete'].includes(req.body.action)) {
+        throw invalidRequest('Resume lifecycle requests must contain only action: archive, unarchive, or delete.')
+      }
+      requireService()
+      const workspaceId = param(req, 'workspaceId')
+      const id = resumeId(req)
+      const result = await lifecycle!.change(workspaceId, id, req.body.action, etag(req))
+      if (result.deleted) { res.json({ deleted: true }); return }
+      if (result.pending) {
+        const resume = await requireService().detail(workspaceId, id).catch(() => undefined)
+        const currentEtag = resume?.etag ?? result.etag
+        if (currentEtag) res.setHeader('ETag', currentEtag)
+        res.status(202).json({ operation: result.operation, ...(currentEtag ? { etag: currentEtag } : {}), ...(resume ? { resume } : {}) })
+        return
+      }
+      const resume = await requireService().detail(workspaceId, id)
+      res.setHeader('ETag', resume.etag)
+      res.json({ resume })
+    }),
+  )
   for (const route of ['pdf', 'markdown', 'file'] as const) {
     const fileKind = (req: Request): UploadFormat => {
       const kind = route === 'file' ? uploadFormatFromContentType(req.header('Content-Type') ?? '') : route
@@ -165,7 +208,7 @@ export function createRealResumesRouter(deps: RealResumesRouterDeps): Router {
         type: route === 'file' ? Object.values(UPLOAD_CONTENT_TYPES) : UPLOAD_CONTENT_TYPES[route],
         limit: route === 'markdown' ? RESUME_IMPORT_LIMITS.maxMarkdownBytes : RESUME_IMPORT_LIMITS.maxFileBytes, inflate: false,
       }),
-      async (req: Request, res: Response) => {
+      mutate('write', async (req: Request, res: Response) => {
         const kind = fileKind(req)
         if (!Buffer.isBuffer(req.body)) throw invalidRequest('The request must contain raw document bytes.')
         const result = await requireService().importFile(
@@ -173,7 +216,7 @@ export function createRealResumesRouter(deps: RealResumesRouterDeps): Router {
         )
         res.setHeader('ETag', result.resume.etag)
         res.status(result.created ? 202 : 200).json({ resume: result.resume })
-      },
+      }),
       (error: unknown, _req: Request, _res: Response, next: NextFunction) => {
         if (typeof error === 'object' && error !== null && 'type' in error && error.type === 'entity.too.large') {
           next(new HttpError(413, 'invalid_request', 'Resume files may not exceed 10 MiB.'))
@@ -190,7 +233,7 @@ export function createRealResumesRouter(deps: RealResumesRouterDeps): Router {
       } catch (error) { next(error) }
     },
     express.json({ limit: '32kb', inflate: false }),
-    async (req, res) => {
+    mutate('write', async (req, res) => {
       if (!req.body || typeof req.body !== 'object' || Array.isArray(req.body) ||
         Object.keys(req.body).length !== 1 || !Object.hasOwn(req.body, 'url')) {
         throw invalidRequest('A URL import body must contain only a url field.')
@@ -198,7 +241,7 @@ export function createRealResumesRouter(deps: RealResumesRouterDeps): Router {
       const result = await requireService().importUrl(param(req, 'workspaceId'), importRequest(req), req.body.url)
       res.setHeader('ETag', result.resume.etag)
       res.status(result.created ? 202 : 200).json({ resume: result.resume })
-    },
+    }),
   )
   for (const action of ['retry', 'cancel'] as const) {
     router.post(`${base}/:resumeId/${action}`,
@@ -206,12 +249,12 @@ export function createRealResumesRouter(deps: RealResumesRouterDeps): Router {
         try { resumeId(req); etag(req); next() } catch (error) { next(error) }
       },
       express.raw({ type: () => true, limit: '1kb', inflate: false }),
-      async (req, res) => {
+      mutate('write', async (req, res) => {
         emptyBody(req.body)
         const value = await requireService()[action](param(req, 'workspaceId'), resumeId(req), etag(req))
         res.setHeader('ETag', value.etag)
         res.json({ resume: value })
-      },
+      }),
     )
   }
   return router

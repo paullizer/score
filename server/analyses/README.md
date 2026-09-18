@@ -43,6 +43,10 @@ same-origin/CSRF-protected `/api` router. It independently authorizes workspace
 membership and read/write roles and sets `Cache-Control: no-store`. Missing
 analysis dependencies fail closed; missing source dependencies do not prevent
 reading already frozen runs.
+Every HTTP mutation awaits `repository.withWorkspaceMutation` for its entire
+handler. Ordinary writes require an active workspace/run; lifecycle management
+uses `manage` and remains available on archived workspaces. Publication checks
+the workspace mutation lease again immediately before writing.
 `WORD_DOCUMENT_IMPORTS_ENABLED` gates new job/resume Word admissions, not analysis source
 schemas or historical reads. Upgraded validators must accept already-frozen Word evidence
 even while that flag is off. Real analysis creation still needs its existing configured
@@ -58,6 +62,8 @@ All paths below have prefix `/api/workspaces/:workspaceId/analyses`:
 | `GET /` | `RealAnalysesPage` |
 | `POST /` | HTTP 202, `{run: RealAnalysisRunSummary}` |
 | `GET /:runId` | Unwrapped `RealAnalysisRunDetail` |
+| `GET /:runId/lifecycle` | `{impact: LifecycleImpact}` |
+| `POST /:runId/lifecycle` with `{action: "archive" \| "unarchive" \| "delete"}` | `{analysis: RealAnalysisDetail}` or `{deleted: true}`; HTTP 202 `{operation, etag?, analysis?}` while incomplete |
 | `GET /:runId/comparisons` | `RealAnalysisComparisonsPage` |
 | `GET /:runId/comparisons/:comparisonId` | Unwrapped `RealAnalysisComparisonDetail` |
 | `GET /:runId/comparisons/:comparisonId/documents/:documentId?version=N` | `RealAnalysisDocumentResponse` |
@@ -80,11 +86,16 @@ For run/comparison cancellation and comparison retry, send an empty JSON object
 An undefined parsed body is not automatically considered empty: a declared
 nonzero entity or unparsed transfer-encoded body is rejected rather than ignored.
 Nonempty action bodies must use supported JSON and the exact action schema.
+Lifecycle actions always require the **run** ETag, never a comparison ETag.
+`RealAnalysisDetail` is an alias of the existing `RealAnalysisRunDetail`.
 
 ## Frozen evidence and recovery
 
 Discovery reads all authorized ready jobs and saved job rubric versions, plus
-grade heads with approval pointers. A grade's current draft is not its approval:
+grade heads with approval pointers. Archived/removing workspaces, resumes, jobs,
+logical job rubrics, ladders, grade heads, and approved grade seed jobs are not
+eligible for new work. Explicit scoring retries revalidate the exact selected
+sources under the workspace mutation lease. A grade's current draft is not its approval:
 the resolver loads the exact approved immutable version, approval, successful
 review, source set, seed, reference captures, and historical context. It checks
 content hashes, ownership, exact citations, grade support, and approval bindings.
@@ -134,10 +145,17 @@ Run IDs are `analysis-run-{idempotency-key}`. The deterministic immutable
 timestamp, snapshots, and deterministic pair identities. Competing or ambiguously
 acknowledged publication reuses the **winning manifest**, including its original
 timestamps and evidence; it does not resolve later source versions.
+Before an **unpublished** manifest is admitted as a run, its exact selections
+must still be eligible in the live libraries. A retained preparation is not
+permission to recreate deleted inputs. Revalidation never rewrites the winning
+manifest; historical inspection and already-admitted processing still use only
+the immutable captures.
 
 Initialization and cancellation use chunks of at most 25 pair writes plus one
 ETag-fenced run replacement, further reduced to stay below the transaction byte
-budget. Each cursor and its pair writes commit atomically. A cancelled partial run
+budget. Each publication transaction also includes same-partition workspace and
+run lifecycle control CAS operations (at most 28 Cosmos operations in total).
+Each cursor and its pair writes commit atomically. A cancelled partial run
 materializes its remaining pairs as cancelled, so none are stranded or scored.
 `listPending` includes recoverable initialization/cancellation and due or expired
 comparison work; ordinary terminal records are excluded. Run control work is
@@ -164,6 +182,70 @@ failed/cancelled comparisons and preserves successful original evidence. Bulk
 retry uses bounded transactions; a concurrent change can stop later chunks while
 retaining the already-retried subset. Reloading exposes the exact remaining work.
 
+## Library lifecycle and dependencies
+
+`library-lifecycle.ts` owns archive/delete administration. The existing
+`lifecycle.ts` still owns initialization, queue progress, and cancellation.
+Only mutable run records and run summary/detail envelopes carry lifecycle
+metadata. Archive never changes manifests, snapshots, comparison results,
+reviews, citations, or private original provenance.
+
+Archiving a run fences scoring immediately and cancels only that run's remaining
+work, materializing uninitialized comparisons as cancelled in the usual bounded
+chunks. Unarchive never clears cancellation or restarts work. Workspace archive
+cancels owned analysis work without individually archiving every run. Archiving
+an **input** resume/job/rubric/ladder does not cancel existing runs or invalidate
+their frozen evidence; the eligibility restriction applies to new intake and
+explicit scoring retries, not worker continuation or historical inspection.
+
+```ts
+createAnalysisLifecycleParticipant(analyses: RealAnalysesDeps): WorkspaceLifecycleParticipant
+realAnalysisDependencyBlockers(
+  analyses: RealAnalysesDeps, workspaceId: string, target: LifecycleTarget,
+): Promise<LifecycleBlocker[]>
+```
+
+The participant exposes `setState`, `cancel`, `purge`, `counts`,
+`pendingWorkspaces`, and `resume`. Counts include **every retained run**, including
+archived and cleanup-pending runs (`analyses`, `analysisComparisons`). Workspace
+deletion must combine these with sample-run blockers and must remain blocked
+until all runs are explicitly deleted. `purge` also enforces this rule; it is not
+an implicit analysis cascade. Run cleanup precedes resume/grade/job cleanup.
+
+Dependencies come from exact manifest/snapshot bindings, including source resume
+IDs, job IDs, stable logical rubric groups, historical rubric version IDs,
+`gradeHeadId(ladderId, grade)`, ladder IDs, and frozen GS seed jobs/rubrics. No
+mutable live-source lookup is needed. Unreadable dependency storage fails closed.
+Blocker links use `/analyses/<encodedId>?data=real`. A workspace target returns
+all retained real runs; an analysis target has no dependent-run blockers.
+
+Delete durably saves the dependency bindings before removing evidence, fences the
+run, and drains cancellation and Blob writers. It deletes comparisons and all
+owned snapshots/manifests/copied evidence/results using exact ETags and validated
+private prefixes. Cleanup follows empty continuation pages and restarts scans
+after deletes so shifting page offsets cannot skip artifacts. All phases are
+resumable. Until completion, list/detail responses retain recovery metadata but
+deleting runs expose no partial comparison or document evidence.
+
+Blob writers reserve a bounded slot in the same-partition run control. Azure
+content PUTs require an exact placeholder ETag and a finite Blob lease, with
+bounded requests and no automatic upload retries. Failed/ambiguous writers keep
+their reservations until the request/lease window has drained; cleanup then
+breaks leases and conditionally deletes. A late source/result PUT cannot recreate
+deleted content. A permanent minimal run control tombstone prevents old
+idempotency keys from recreating a run. Reconciliation preserves a terminal
+workspace `deleted` fence rather than downgrading it to `deleting`.
+
+Incomplete HTTP actions return 202 and a durable operation; reapers discover
+them through `pendingWorkspaces` and advance them with `resume` under the
+workspace mutation lease. Recovery respects live cancellation leases, backoff,
+and the existing three-attempt/non-retryable pause instead of automatically
+resetting worker budgets. Repeating the lifecycle action with the current run
+ETag explicitly resumes paused cleanup without restarting scoring. Already
+completed operations cannot cancel a later, explicitly retried comparison.
+Neither workers nor these analysis-store controls
+need new directory, legacy workspace, or live-source access.
+
 ## Worker-only shared helpers
 
 These exports are browser-free and require **only analysis stores**, not job,
@@ -179,7 +261,7 @@ From `lifecycle.ts`:
 ```ts
 advanceAnalysisRun(
   deps: RealAnalysesDeps, workspaceId: string, runId: string,
-  options?: { now?: () => Date; maxChunks?: number; leaseOwner?: string; expectedAttemptId?: string },
+  options?: { now?: () => Date; maxChunks?: number; leaseOwner?: string; expectedAttemptId?: string; lifecycle?: boolean },
 ): Promise<VersionedAnalysisEntity<RealAnalysisRunRecord>>
 // maxChunks defaults to 1 and is bounded to 1–4. Repeat through durable pending work.
 
@@ -195,6 +277,9 @@ loadAnalysisComparison(store, workspaceId, runId, comparisonId)
 ```
 
 Before claiming/scoring, require complete initialization and no cancellation.
+Also require active workspace/run lifecycle controls. Only lifecycle
+administration uses `lifecycle: true` to finish cancellation behind a deleting
+fence; ordinary scoring workers never process deleted runs.
 For claim, heartbeat, automatic retry, terminal failure, and result publication,
 write the comparison and the returned progress/state update in **one**
 `store.transact(workspaceId, [...])` with both observed ETags. An API cancellation
@@ -288,13 +373,13 @@ without withholding an otherwise fully assessable work score.
 Do not log raw documents, profiles, source URLs, model responses, or validation
 errors containing those values. These are retained private captures, not browser
 sample state; sample reset does not delete them. Failed pre-publication attempts
-can leave private immutable preparation blobs. Retention/deletion administration
-is a separate feature.
+can leave private immutable preparation blobs. Workspace cleanup enumerates
+those private families as well as published runs, retaining terminal fences.
 
 Focused validation (independently bundles its own entry point):
 
 ```powershell
-node --test server-tests\real-analyses.test.mjs server-tests\real-analyses-azure-store.test.mjs server-tests\real-analyses-model-boundary.test.mjs
+node --test server-tests\real-analyses.test.mjs server-tests\real-analyses-lifecycle.test.mjs server-tests\real-analyses-azure-store.test.mjs server-tests\real-analyses-model-boundary.test.mjs worker-tests\analysis-runtime.test.mjs
 npx tsc --project tsconfig.server.json --noEmit
 npx eslint server\analyses server-tests\real-analyses*.mjs --quiet
 ```

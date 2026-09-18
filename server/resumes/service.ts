@@ -11,9 +11,11 @@ import { decodeMarkdown, MarkdownInputError } from '../documents/markdown'
 import { conflict, HttpError, invalidRequest, notFound, unavailable } from '../errors'
 import { WORKSPACE_ID_PATTERN } from '../ids'
 import { StoreConflictError, StoreNotFoundError } from '../store'
+import { assertWorkspaceMutationLease } from '../lifecycle/lease'
 import { originalExtension, UPLOAD_CONTENT_TYPES, uploadFormatFromFilename, type UploadContentType, type UploadFormat } from '../../src/domain/document-formats'
 import { validateWordUpload } from '../documents/upload'
 import type { RealResumesDeps, ResumeBlob, ResumeTransaction } from './store'
+import { assertResumeWritable, prepareResumeImport, putResumeBlob, resumeIsRemoved } from './guards'
 import {
   isResumeUuid, isSafeResumeFilename, isValidResumeId, normalizeResumePublicUrl, parseRealResumeProfile,
   parseResumeCaptureManifest, parseResumeEntity, resumeBatchRecordId, resumeBlobReference, resumeCaptureBlobName,
@@ -83,6 +85,7 @@ function jsonReference(name: string, blob: ResumeBlob): ImmutableJsonBlobReferen
 function summary(value: VersionedResumeEntity<RealResumeRecord>): RealResumeSummary {
   const { record, etag } = value
   return {
+    ...(record.lifecycle ? { lifecycle: record.lifecycle } : {}),
     resume: record.resume, workspaceId: record.workspaceId, source: record.source, capture: record.capture ?? null,
     documentRef: record.extraction?.document ?? null, etag, updatedAt: record.updatedAt, attempts: record.attempts,
     retryCount: record.retryCount, ...(record.nextAttemptAt ? { nextAttemptAt: record.nextAttemptAt } : {}),
@@ -135,6 +138,36 @@ export class RealResumeService {
 
   private now(): string { return this.clock().toISOString() }
 
+  private async writable(workspaceId: string, id: string): Promise<void> {
+    try { await assertResumeWritable(this.store, workspaceId, id) } catch (error) {
+      if (error instanceof StoreConflictError) throw conflict(error.message)
+      throw error
+    }
+  }
+
+  private async publicSummary(value: VersionedResumeEntity<RealResumeRecord>): Promise<RealResumeSummary> {
+    const { record } = value
+    const [workspace, control] = await Promise.all([
+      this.store.getControl(record.workspaceId), this.store.getControl(record.workspaceId, record.id),
+    ])
+    const removed = resumeIsRemoved(record.lifecycle) ||
+      [workspace?.record.state, control?.record.state].some(state => state === 'deleting' || state === 'deleted')
+    const operation = control?.record.operation ?? workspace?.record.operation
+    const result = {
+      ...summary(value), ...(operation ? { lifecycleOperation: operation } : {}),
+      ...(removed ? {
+        lifecycle: { ...record.lifecycle, deletingAt: record.lifecycle?.deletingAt ?? control?.record.updatedAt ?? workspace!.record.updatedAt },
+        resume: { ...record.resume, name: null, role: null, location: null, experience: null },
+        capture: null, documentRef: null, warnings: [], duplicates: [],
+      } : {}),
+    }
+    if (removed) {
+      delete result.error
+      delete result.nextAttemptAt
+    }
+    return result
+  }
+
   private decode<K extends ResumeEntity['recordType']>(
     value: VersionedResumeEntity, workspaceId: string, kind: K, id?: string,
   ): VersionedResumeEntity<Extract<ResumeEntity, { recordType: K }>> {
@@ -174,6 +207,7 @@ export class RealResumeService {
   }
 
   private async accepted(receipt: ImportReceipt): Promise<VersionedResumeEntity<RealResumeRecord> | undefined> {
+    await this.writable(receipt.workspaceId, receipt.resumeId)
     const current = await this.optionalResume(receipt.workspaceId, receipt.resumeId)
     if (!current) return undefined
     if (current.record.inputFingerprint !== receipt.inputFingerprint) {
@@ -246,26 +280,36 @@ export class RealResumeService {
     }
     const page = await this.store.list(workspaceId, { recordType: 'resume', continuationToken, limit })
     const values = page.items.map(value => this.decode(value, workspaceId, 'resume'))
-    const duplicates = await this.duplicateWarnings(values.map(value => value.record))
+    const summaries = await Promise.all(values.map(value => this.publicSummary(value)))
+    const duplicates = await this.duplicateWarnings(values.filter((_value, index) => !resumeIsRemoved(summaries[index].lifecycle)).map(value => value.record))
     return {
-      resumes: values.map(value => ({ ...summary(value), duplicates: duplicates.get(value.record.id) ?? [] })),
+      resumes: summaries.map(value => ({ ...value, duplicates: duplicates.get(value.resume.id) ?? [] })),
       ...(page.continuationToken ? { continuationToken: page.continuationToken } : {}),
     }
   }
 
   async detail(workspaceId: string, resumeId: string): Promise<RealResumeDetail> {
     const current = await this.getResume(workspaceId, resumeId)
+    const metadata = await this.publicSummary(current)
+    if (resumeIsRemoved(metadata.lifecycle)) return { ...metadata, document: null, profile: null, extraction: null }
     const [document, , duplicates] = await Promise.all([
       this.document(current.record), this.capturedOriginal(current.record), this.duplicates(current.record),
     ])
     const profile = await this.profile(current.record, document)
-    return { ...summary(current), duplicates, document, profile, extraction: current.record.extraction ?? null }
+    const latest = await this.publicSummary(await this.getResume(workspaceId, resumeId))
+    if (resumeIsRemoved(latest.lifecycle)) return { ...latest, document: null, profile: null, extraction: null }
+    return { ...metadata, duplicates, document, profile, extraction: current.record.extraction ?? null }
   }
 
   async original(workspaceId: string, resumeId: string): Promise<{ bytes: Uint8Array; contentType: string; filename: string }> {
-    const { record } = await this.getResume(workspaceId, resumeId)
+    const current = await this.getResume(workspaceId, resumeId)
+    if (resumeIsRemoved((await this.publicSummary(current)).lifecycle)) throw notFound('This resume source is being deleted.')
+    const { record } = current
     const original = await this.capturedOriginal(record)
     if (!original) throw notFound('The original source has not been captured yet.')
+    if (resumeIsRemoved((await this.publicSummary(await this.getResume(workspaceId, resumeId))).lifecycle)) {
+      throw notFound('This resume source is being deleted.')
+    }
     const filename = record.source.kind !== 'url' ? record.source.fileName
       : `${record.id}.${originalExtension(record.capture!.original.contentType)}`
     return { bytes: original.bytes, contentType: original.contentType, filename }
@@ -297,6 +341,7 @@ export class RealResumeService {
       const page = await this.store.list(workspaceId, { recordType: 'resume', limit: 100, continuationToken })
       for (const value of page.items) {
         const other = this.decode(value, workspaceId, 'resume').record
+        if (resumeIsRemoved(other.lifecycle)) continue
         const matches = new Set([
           ...(other.capture ? byHash.get(other.capture.original.sha256) ?? [] : []),
           ...(other.source.kind === 'url' ? byUrl.get(other.source.url) ?? [] : []),
@@ -322,7 +367,7 @@ export class RealResumeService {
 
   private async receipt(candidate: ImportReceipt): Promise<ImportReceipt> {
     const name = resumeImportReceiptBlobName(candidate.workspaceId, candidate.resumeId)
-    const result = await this.blobs.putImmutable(name, Buffer.from(JSON.stringify(candidate)), 'application/json')
+    const result = await putResumeBlob(this.store, this.blobs, name, Buffer.from(JSON.stringify(candidate)), 'application/json')
     jsonReference(name, result.blob)
     let stored: z.infer<typeof receiptSchema>
     try { stored = receiptSchema.parse(parseJson(result.blob)) } catch { throw unavailable('The saved resume import receipt is invalid.') }
@@ -354,12 +399,17 @@ export class RealResumeService {
       ...input, schemaVersion: word ? 2 : 1, dataKind: 'real', workspaceId, resumeId: resumeIdForKey(input.idempotencyKey),
       createdAt: this.now(), source, inputFingerprint, ...(fileHash ? hashFields : {}),
     }
+    await this.writable(workspaceId, candidate.resumeId)
     const existing = await this.accepted(candidate)
     if (existing) return { created: false, resume: summary(existing) }
     const currentBatch = await this.batch(workspaceId, input.batchId)
     if (currentBatch) {
       this.checkBatch(currentBatch.record, input)
-      if (currentBatch.record.items.length >= input.inputCount) throw conflict('This import batch has already accepted its declared number of inputs. Start a new batch.')
+      if (currentBatch.record.items.length + (currentBatch.record.removedCount ?? 0) >= input.inputCount) throw conflict('This import batch has already accepted its declared number of inputs. Start a new batch.')
+    }
+    try { await prepareResumeImport(this.store, workspaceId, candidate.resumeId, inputFingerprint) } catch (error) {
+      if (error instanceof StoreConflictError) throw conflict(error.message)
+      throw error
     }
     const receipt = await this.receipt(candidate)
     const timestamp = [this.now(), receipt.createdAt].sort().at(-1)!
@@ -377,7 +427,7 @@ export class RealResumeService {
       if (source.kind === 'url') throw invalidRequest('URL inputs cannot contain uploaded bytes.')
       const contentType = UPLOAD_CONTENT_TYPES[source.kind]
       const name = resumeOriginalBlobName(workspaceId, record.id, source.kind)
-      const result = await this.blobs.putImmutable(name, file, contentType)
+      const result = await putResumeBlob(this.store, this.blobs, name, file, contentType)
       const original = resumeBlobReference(name, result.blob)
       const expectedHash = word ? receipt.fileSha256 : source.kind === 'markdown' ? receipt.markdownSha256 : receipt.pdfSha256
       if (original.sha256 !== expectedHash ||
@@ -389,7 +439,7 @@ export class RealResumeService {
         capture: { original: { ...original, contentType }, capturedAt: receipt.createdAt, redirects: [] },
       }
       const manifestName = resumeCaptureBlobName(workspaceId, record.id)
-      const captured = await this.blobs.putImmutable(manifestName, Buffer.from(JSON.stringify(manifest)), 'application/json')
+      const captured = await putResumeBlob(this.store, this.blobs, manifestName, Buffer.from(JSON.stringify(manifest)), 'application/json')
       const reference = jsonReference(manifestName, captured.blob)
       let saved: ResumeCaptureManifest
       try { saved = parseResumeCaptureManifest(parseJson(captured.blob)) } catch { throw unavailable('The saved resume capture manifest is invalid.') }
@@ -408,7 +458,7 @@ export class RealResumeService {
         if (batch.record.items.some(item => item.idempotencyKey === receipt.idempotencyKey)) {
           throw unavailable('An admitted resume item is missing its published record. Nothing has been replaced.')
         }
-        if (batch.record.items.length >= receipt.inputCount) throw conflict('This import batch has already accepted its declared number of inputs. Start a new batch.')
+        if (batch.record.items.length + (batch.record.removedCount ?? 0) >= receipt.inputCount) throw conflict('This import batch has already accepted its declared number of inputs. Start a new batch.')
       }
       const admittedAt = [this.now(), record.createdAt, batch?.record.updatedAt ?? ''].sort().at(-1)!
       const admission = {
@@ -429,6 +479,8 @@ export class RealResumeService {
         { kind: 'create', record: nextRecord },
       ]
       try {
+        await this.writable(workspaceId, record.id)
+        assertWorkspaceMutationLease(workspaceId)
         await this.store.transact(workspaceId, operations)
       } catch (error) {
         let confirmed: VersionedResumeEntity<RealResumeRecord> | undefined
@@ -450,6 +502,7 @@ export class RealResumeService {
     workspaceId: string, input: ResumeImportRequest, kind: UploadFormat, filename: string, bytes: Uint8Array,
   ): Promise<ResumeImportResult> {
     validateRequest(workspaceId, input)
+    await this.writable(workspaceId, resumeIdForKey(input.idempotencyKey))
     const label = kind === 'markdown' ? 'Markdown' : kind.toUpperCase()
     if (!isSafeResumeFilename(filename, kind)) throw invalidRequest(`X-File-Name must be a safe ${label} basename.`)
     if (!(bytes instanceof Uint8Array)) throw invalidRequest(`The request must contain raw ${label} bytes.`)
@@ -496,6 +549,7 @@ export class RealResumeService {
 
   private async replace(current: VersionedResumeEntity<RealResumeRecord>, record: RealResumeRecord): Promise<RealResumeSummary> {
     parseResumeEntity(record)
+    assertWorkspaceMutationLease(record.workspaceId)
     try { return summary(this.decode(await this.store.replace(record, current.etag), record.workspaceId, 'resume', record.id)) } catch (error) {
       if (error instanceof StoreConflictError || error instanceof StoreNotFoundError) throw conflict('This resume changed since you last loaded it. Reload before retrying the action.')
       throw error
@@ -505,9 +559,10 @@ export class RealResumeService {
   async retry(workspaceId: string, resumeId: string, expectedEtag: string): Promise<RealResumeSummary> {
     if (!validEtag(expectedEtag)) throw invalidRequest('If-Match must contain one exact resume ETag.')
     const current = await this.getResume(workspaceId, resumeId)
+    await this.writable(workspaceId, resumeId)
     if (current.etag !== expectedEtag) throw conflict('This resume changed since you last loaded it.')
     if (!['error', 'cancelled'].includes(current.record.resume.status)) throw conflict('Only failed or cancelled resumes can be retried.')
-    const timestamp = this.now()
+    const timestamp = [this.now(), current.record.updatedAt].sort().at(-1)!
     const record: RealResumeRecord = {
       ...current.record, resume: { ...current.record.resume, status: 'queued' }, updatedAt: timestamp,
       attempts: 0, retryCount: current.record.retryCount + 1, nextAttemptAt: timestamp,
@@ -523,10 +578,11 @@ export class RealResumeService {
   async cancel(workspaceId: string, resumeId: string, expectedEtag: string): Promise<RealResumeSummary> {
     if (!validEtag(expectedEtag)) throw invalidRequest('If-Match must contain one exact resume ETag.')
     const current = await this.getResume(workspaceId, resumeId)
+    await this.writable(workspaceId, resumeId)
     if (current.etag !== expectedEtag) throw conflict('This resume changed since you last loaded it.')
     if (current.record.resume.status === 'cancelled') return summary(current)
     if (!active.has(current.record.resume.status)) throw conflict('Only queued or processing resumes can be cancelled.')
-    const timestamp = this.now()
+    const timestamp = [this.now(), current.record.updatedAt].sort().at(-1)!
     const record: RealResumeRecord = {
       ...current.record, resume: { ...current.record.resume, status: 'cancelled' }, updatedAt: timestamp, cancelledAt: timestamp,
     }

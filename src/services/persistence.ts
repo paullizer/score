@@ -1,6 +1,7 @@
 import { createInitialWorkspace } from '../data/fixtures'
 import type { Workspace } from '../domain/types'
 import { recoverInterrupted, validateWorkspace, WorkspaceValidationError } from '../domain/workspace-validation'
+import { workspaceLifecycleTransitionErrors } from '../domain/lifecycle'
 
 export const WORKSPACE_STORAGE_KEY = 'score-demo-workspace-v1'
 
@@ -52,5 +53,20 @@ export function saveWorkspace(workspace: Workspace): void {
     if (!(error instanceof WorkspaceValidationError)) throw error
     throw new Error(`Cannot save invalid Score demo data: ${error.message}`)
   }
-  storage().setItem(WORKSPACE_STORAGE_KEY, JSON.stringify(validated))
+  const target = storage()
+  const serialized = target.getItem(WORKSPACE_STORAGE_KEY)
+  let previous: Workspace | undefined
+  if (serialized !== null) {
+    try {
+      previous = validateWorkspace(JSON.parse(serialized))
+    } catch (error) {
+      // An explicit recovery reset may replace unreadable data; valid states retain their tombstones.
+      if (!(error instanceof SyntaxError) && !(error instanceof WorkspaceValidationError)) throw error
+    }
+  }
+  if (previous) {
+    const errors = workspaceLifecycleTransitionErrors(previous, validated)
+    if (errors.length) throw new WorkspaceValidationError(errors[0])
+  }
+  target.setItem(WORKSPACE_STORAGE_KEY, JSON.stringify(validated))
 }

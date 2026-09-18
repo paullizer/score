@@ -25,6 +25,7 @@ await build({
     ].join('\n'),
   },
   outfile: bundle, bundle: true, platform: 'node', format: 'esm', packages: 'external', jsx: 'automatic', logLevel: 'silent',
+  define: { 'import.meta.env.VITE_DEPLOYMENT_MODE': '"cloud"' },
 })
 const ui = await import(pathToFileURL(bundle).href)
 after(async () => { await unlink(bundle) })
@@ -43,7 +44,8 @@ for (const format of ['docx', 'doc']) {
       for (const interactive of [true, false]) {
         const render = source => renderToStaticMarkup(createElement(StaticRouter, { location: '/' },
           createElement(ui.WorkspaceContext.Provider, {
-            value: { workspace: { jobs: [{ ...job.record.job, source }], documents: [job.document] }, saveRubric: async () => rubric.id },
+            value: { workspace: { schemaVersion: 1, jobs: [{ ...job.record.job, source }], documents: [job.document],
+              rubrics: [rubric], resumes: [], runs: [] }, saveRubric: async () => rubric.id },
           }, createElement(ui.RubricPanel, {
             rubric, readOnly: true, ...(interactive ? { onSelectCriterion: () => {} } : {}),
           })),

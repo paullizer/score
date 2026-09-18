@@ -7,6 +7,7 @@ import { pathToFileURL } from 'node:url'
 import { build } from 'esbuild'
 import React, { act } from 'react'
 import { JSDOM } from 'jsdom'
+import { frontendWorkspaceContext } from './frontend.test-support.mjs'
 
 const output = resolve(`.analysis-table-browsing-tests-${randomUUID()}`)
 const timestamp = '2026-09-18T12:00:00.000Z'
@@ -328,7 +329,7 @@ function app({ api = null, runs = [], cloud = true, path = '/analyses/run-one?da
   const value = { workspace, ...(cloud ? { cloud: { currentWorkspaceId: api?.workspaceId ?? workspaceId } } : {}),
     cancelRun: (id) => calls.push(['cancel-sample', id]), retryRun: (id) => calls.push(['retry-sample', id]) }
   return React.createElement(ui.MemoryRouter, { initialEntries: [path], future: { v7_startTransition: true, v7_relativeSplatPath: true } },
-    React.createElement(ui.WorkspaceContext.Provider, { value }, React.createElement(ui.RealAnalysesContext.Provider, { value: api },
+    React.createElement(ui.WorkspaceContext.Provider, { value: frontendWorkspaceContext(value, { analyses: api?.summaries }) }, React.createElement(ui.RealAnalysesContext.Provider, { value: api },
       React.createElement(Probe),
       directId ? React.createElement(ui.RealAnalysisDetail, { id: directId }) : React.createElement(ui.Routes, null,
         React.createElement(ui.Route, { path: '/analyses', element: React.createElement(ui.AnalysesPage) }),
@@ -610,7 +611,8 @@ test('the directly mounted real detail resets on a new id without relying on ext
   await render(app({ api, directId: 'run-one' }))
   await search('Candidate')
   await sortHeader('Saved resume')
-  await render(app({ api, directId: 'run-two' }))
+  const second = apiFor([pair(0, { runId: 'run-two' })], [target()], { summary: summary([], { id: 'run-two' }) })
+  await render(app({ api: second, directId: 'run-two' }))
   assert.equal(element('input[aria-label="Search comparisons"]').value, '')
   assert.equal(chosenSort(), 'Saved order')
 })

@@ -8,6 +8,7 @@ import { contextErrors } from './gradeUi'
 
 export function GradeContextEditor({ detail, onClose }: { detail: GradeLadderDetail; onClose: () => void }) {
   const api = useGradeLadders()
+  const editable = api?.canEdit(detail.ladder.id) ?? false
   const [name, setName] = useState(detail.ladder.name)
   const [context, setContext] = useState(() => structuredClone(detail.ladder.context))
   const [grades, setGrades] = useState([...detail.ladder.grades])
@@ -22,7 +23,7 @@ export function GradeContextEditor({ detail, onClose }: { detail: GradeLadderDet
   const close = () => { void guard.close(onClose) }
   async function submit(event: FormEvent) {
     event.preventDefault()
-    if (!api || inFlight.current || !api.canWrite) return
+    if (!api || inFlight.current || !editable) return
     const errors = contextErrors(name, context, grades)
     if (errors.length) { setError(errors.join(' ')); return }
     inFlight.current = true
@@ -35,9 +36,9 @@ export function GradeContextEditor({ detail, onClose }: { detail: GradeLadderDet
     finally { inFlight.current = false; if (alive.current) setSaving(false) }
   }
   return <Modal open onOpenChange={(open) => { if (!open) close() }} title="Update context or add GS grades" description="Previous grade versions, approvals, and their frozen evidence are immutable. New work needs reviewed sources for this context." wide
-    footer={<><Button onClick={close}>Cancel</Button><Button form="grade-context-edit" type="submit" variant="primary" disabled={saving || !api?.canWrite || !dirty}>{saving ? 'Saving…' : 'Save revised context'}</Button></>}>
+    footer={<><Button onClick={close}>Cancel</Button><Button form="grade-context-edit" type="submit" variant="primary" disabled={saving || !editable || !dirty}>{saving ? 'Saving…' : 'Save revised context'}</Button></>}>
     <form id="grade-context-edit" onSubmit={submit} noValidate className="space-y-5">
-      <GradeContextFields name={name} context={context} grades={grades} retainedGrades={detail.ladder.grades} onName={(value) => { setName(value); setDirty(true) }} onContext={(value) => { setContext(value); setDirty(true) }} onGrades={(value) => { setGrades(value); setDirty(true) }} disabled={saving || !api?.canWrite} />
+      <GradeContextFields name={name} context={context} grades={grades} retainedGrades={detail.ladder.grades} onName={(value) => { setName(value); setDirty(true) }} onContext={(value) => { setContext(value); setDirty(true) }} onGrades={(value) => { setGrades(value); setDirty(true) }} disabled={saving || !editable} />
       <p className="text-[11px] text-muted">Changing context or requested grades invalidates confirmation for new work. Rediscover applicable OPM references, review sources, and create a new generation; earlier approved versions stay inspectable.</p>
       {error && <InlineError>{error}</InlineError>}
     </form>

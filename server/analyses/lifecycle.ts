@@ -6,6 +6,8 @@ import { StoreConflictError } from '../store'
 import type { AnalysisStore, AnalysisTransaction, RealAnalysesDeps } from './store'
 import { assertComparisonManifestBinding, readAnalysisManifest } from './snapshots'
 import { analysisCancellationNeedsRetry, analysisHash, assertAnalysis, MAX_ANALYSIS_TRANSACTION_BYTES, parseAnalysisEntity } from './validation'
+import { analysisIsLocked, analysisIsRemoved } from './guards'
+import { assertWorkspaceMutationLease } from '../lifecycle/lease'
 
 export async function loadAnalysisRun(
   store: AnalysisStore, workspaceId: string, runId: string,
@@ -50,6 +52,8 @@ export function applyAnalysisComparisonTransition(
   'Comparison transition changed its input identity.')
   assertAnalysis(!previous || previous.status !== 'complete' || analysisHash(previous) === analysisHash(next), 'Completed evidence is immutable.')
   assertAnalysis(!run.cancellation || next.status === 'cancelled' || next.status === previous?.status, 'Cancellation fences late comparison publication.')
+  assertAnalysis(!analysisIsLocked(run.lifecycle) || next.status === 'cancelled' ||
+    (previous && analysisHash(previous) === analysisHash(next)), 'Archived or removed analyses cannot publish new scoring work.')
   assertAnalysis(run.progress.initialized === run.progress.total || !['running', 'complete'].includes(next.status),
     'Scoring must wait until initialization completes.')
   const updated = structuredClone(run)
@@ -121,6 +125,8 @@ export interface AdvanceAnalysisRunOptions {
   leaseOwner?: string
   // Owner labels can be reused; an older attempt must not adopt a newer claim.
   expectedAttemptId?: string
+  // Library cleanup can finish cancellation behind a deleting fence; scoring workers cannot.
+  lifecycle?: boolean
 }
 
 /** Bounded recovery uses only the analysis stores; it never resolves mutable source libraries. */
@@ -136,13 +142,17 @@ export async function advanceAnalysisRun(
   while (chunks < maxChunks) {
     const timestamp = (options.now ?? (() => new Date()))().toISOString()
     const run = current.record
+    if (analysisIsRemoved(run.lifecycle) && !options.lifecycle) return current
     if (options.expectedAttemptId !== undefined && run.attemptId !== options.expectedAttemptId) return current
     const cancelling = Boolean(run.cancellation && !run.cancellation.completedAt)
     if (run.status !== 'initializing' && !cancelling) return current
+    if (analysisIsLocked(run.lifecycle) && !cancelling) return current
     if (analysisCancellationNeedsRetry(run)) return current
     if ((run.nextAttemptAt && run.nextAttemptAt > timestamp) ||
       (run.lease && run.lease.expiresAt > timestamp && run.lease.owner !== options.leaseOwner)) return current
     const manifest = await readAnalysisManifest(deps.blobs, run)
+    const control = await deps.store.getControl(workspaceId, runId)
+    const overhead = Buffer.byteLength(JSON.stringify(control?.record ?? {})) + 4096
     const start = cancelling ? run.cancellation!.nextComparisonIndex : run.initialization.nextComparisonIndex
     const end = Math.min(start + ANALYSIS_LIMITS.initializationChunkSize, run.progress.total)
     let updated = structuredClone(run)
@@ -170,7 +180,7 @@ export async function advanceAnalysisRun(
         operation = { kind: 'create', record: comparison }
       }
       const operationBytes = operation ? Buffer.byteLength(JSON.stringify(operation)) : 0
-      if (bytes + operationBytes + Buffer.byteLength(JSON.stringify(candidate)) + 4096 > MAX_ANALYSIS_TRANSACTION_BYTES) break
+      if (bytes + operationBytes + Buffer.byteLength(JSON.stringify(candidate)) + overhead > MAX_ANALYSIS_TRANSACTION_BYTES) break
       updated = candidate
       if (operation) { parseAnalysisEntity(operation.record); operations.push(operation); bytes += operationBytes }
     }
@@ -195,7 +205,8 @@ export async function advanceAnalysisRun(
     parseAnalysisEntity(updated)
     operations.push({ kind: 'replace', record: updated, etag: current.etag })
     try {
-      await deps.store.transact(workspaceId, operations)
+      assertWorkspaceMutationLease(workspaceId)
+      await deps.store.transact(workspaceId, operations, { lifecycle: options.lifecycle })
       chunks++
     } catch (error) {
       const latest = await loadAnalysisRun(deps.store, workspaceId, runId)

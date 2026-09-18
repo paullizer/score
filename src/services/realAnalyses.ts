@@ -16,7 +16,8 @@ import {
   type RealComparisonMutationResponse,
   type RetryRealAnalysisInput,
 } from '../domain/real-analyses'
-import { cloudJsonRequest } from './cloudWorkspace'
+import { cloudJsonRequest, cloudLifecycleRequest } from './cloudWorkspace'
+import type { LifecycleAction, LifecycleImpact, LifecycleOperation } from '../domain/lifecycle'
 
 function base(workspaceId: string, runId?: string): string {
   const path = `/workspaces/${encodeURIComponent(workspaceId)}/analyses`
@@ -194,4 +195,28 @@ export function retryRealAnalysisComparison(workspaceId: string, runId: string, 
 
 export function cancelRealAnalysisComparison(workspaceId: string, runId: string, comparisonId: string, etag: string): Promise<RealAnalysisComparisonSummary> {
   return comparisonAction(workspaceId, runId, comparisonId, 'cancel', etag)
+}
+
+export interface RealAnalysisLifecycleResponse {
+  analysis?: RealAnalysisRunDetail
+  deleted?: true
+  operation?: LifecycleOperation
+  etag?: string
+}
+
+export async function getRealAnalysisLifecycleImpact(workspaceId: string, runId: string, signal?: AbortSignal): Promise<LifecycleImpact> {
+  const result = await cloudJsonRequest<{ impact: LifecycleImpact }>(`${base(workspaceId, runId)}/lifecycle`, { signal })
+  return result.impact
+}
+
+export async function changeRealAnalysisLifecycle(workspaceId: string, runId: string, action: LifecycleAction, etag: string): Promise<RealAnalysisLifecycleResponse> {
+  if (!etag) throw new Error('Reload the exact run version before changing its lifecycle.')
+  const result = await cloudLifecycleRequest<RealAnalysisLifecycleResponse>(`${base(workspaceId, runId)}/lifecycle`, {
+    method: 'POST', headers: { 'If-Match': etag }, body: JSON.stringify({ action }),
+  })
+  if (result.value.analysis) {
+    checkedRun(result.value.analysis, workspaceId)
+    if (result.value.analysis.run.id !== runId) throw new Error('The lifecycle response belongs to another analysis.')
+  }
+  return { ...result.value, etag: result.value.etag ?? result.etag }
 }

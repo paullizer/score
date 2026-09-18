@@ -9,6 +9,8 @@ import { rm } from 'node:fs/promises'
 import { build } from 'esbuild'
 import express from 'express'
 import { PDFDocument } from 'pdf-lib'
+import { docxFile, legacyDocFile } from './word-fixtures.mjs'
+import { installResumeLifecycleFake, installResumeBlobLifecycleFake } from './resume-lifecycle-fakes.mjs'
 
 const WORKSPACE = 'workspace-one'
 const OTHER_WORKSPACE = 'workspace-two'
@@ -20,12 +22,20 @@ const ORIGIN = 'https://resume-api.example.test'
 const NOW = '2026-09-18T02:30:00.000Z'
 const MAX_PDF = 10 * 1024 * 1024
 const MAX_MARKDOWN = 10 * 1024 * 1024
+const retainedAnalysis = { kind: 'analysis', id: 'retained-real-analysis-v1', name: 'Archived historical analysis',
+  href: '/analyses/retained-real-analysis-v1' }
+const noDependencies = { async impact() { return [] } }
 const clone = value => structuredClone(value)
-const output = join(process.cwd(), 'dist-server', `real-resumes-isolated-tests-${process.pid}.mjs`)
+const outputDirectory = join(process.cwd(), 'dist-server', `real-resumes-isolated-tests-${process.pid}`)
+const output = join(outputDirectory, 'runtime.mjs')
 let api
 let pdfBytes
 
 before(async () => {
+  await build({
+    entryPoints: ['server/documents/word-parser-worker.ts'], outfile: join(outputDirectory, 'word-parser.mjs'),
+    bundle: true, packages: 'external', platform: 'node', format: 'esm', target: 'node24', logLevel: 'silent',
+  })
   await build({
     stdin: {
       contents: [
@@ -33,6 +43,8 @@ before(async () => {
         "export * from './server/resumes/service';",
         "export * from './server/resumes/validation';",
         "export * from './server/resumes/azure-store';",
+        "export * from './server/resumes/guards';",
+        "export * from './server/resumes/lifecycle';",
         "export * from './server/errors';",
         "export * from './server/store';",
         "export * from './server/ids';",
@@ -46,7 +58,7 @@ before(async () => {
   api = await import(pathToFileURL(output).href)
   pdfBytes = await pdf(1)
 })
-after(async () => { await rm(output, { force: true }) })
+after(async () => { await rm(outputDirectory, { recursive: true, force: true }) })
 
 async function pdf(pages, title = 'Synthetic resume API test') {
   const document = await PDFDocument.create()
@@ -66,6 +78,22 @@ function fakeBlobContainer(events) {
     values,
     fail(callback) { failure = callback },
     override(callback) { override = callback },
+    listBlobsFlat({ prefix }) {
+      return {
+        byPage({ continuationToken, maxPageSize }) {
+          return {
+            async next() {
+              const names = [...values.keys()].filter(name => name.startsWith(prefix)).sort()
+              const offset = Number(continuationToken ?? 0)
+              return { done: false, value: {
+                segment: { blobItems: names.slice(offset, offset + maxPageSize).map(name => ({ name })) },
+                ...(offset + maxPageSize < names.length ? { continuationToken: String(offset + maxPageSize) } : {}),
+              } }
+            },
+          }
+        },
+      }
+    },
     getBlockBlobClient(name) {
       return {
         async download() {
@@ -73,26 +101,59 @@ function fakeBlobContainer(events) {
           if (!value) throw Object.assign(new Error('Missing blob'), { statusCode: 404 })
           const response = {
             readableStreamBody: Readable.from([Buffer.from(value.bytes)]),
-            contentLength: value.bytes.length, contentType: value.contentType, etag: value.etag,
+            contentLength: value.bytes.length, contentType: value.contentType, etag: value.etag, metadata: value.metadata,
           }
           return override ? override(response, name) : response
         },
         async upload(bytes, length, options) {
           assert.equal(length, bytes.byteLength)
-          assert.deepEqual(options.conditions, { ifNoneMatch: '*' })
-          if (values.has(name)) throw Object.assign(new Error('Already exists'), { statusCode: 412 })
+          options.abortSignal?.throwIfAborted()
+          const existing = values.get(name)
+          const lease = existing?.lease?.expiresAt > Date.now() ? existing.lease : undefined
+          if ((options.conditions?.ifNoneMatch === '*' && existing) ||
+            (options.conditions?.ifMatch && options.conditions.ifMatch !== existing?.etag) ||
+            (options.conditions?.leaseId && options.conditions.leaseId !== lease?.id) ||
+            (lease && options.conditions?.leaseId !== lease.id)) {
+            throw Object.assign(new Error('Blob write was fenced'), { statusCode: 412 })
+          }
           const blob = {
             bytes: Buffer.from(bytes), contentType: options.blobHTTPHeaders.blobContentType,
-            etag: `"blob-${++next}"`,
+            etag: `"blob-${++next}"`, metadata: options.metadata ?? {}, lease,
           }
-          if (failure) {
+          if (failure && bytes.length) {
             const callback = failure
             failure = undefined
             callback({ name, blob, values })
           }
           values.set(name, blob)
-          events.push({ kind: 'blob', name })
+          if (bytes.length) events.push({ kind: 'blob', name })
           return { etag: blob.etag }
+        },
+        async getProperties() {
+          const value = values.get(name)
+          if (!value) throw Object.assign(new Error('Missing blob'), { statusCode: 404 })
+          return { etag: value.etag, metadata: value.metadata }
+        },
+        getBlobLeaseClient(proposedId = randomUUID()) {
+          return {
+            leaseId: proposedId,
+            async acquireLease(seconds) {
+              const value = values.get(name)
+              if (!value) throw Object.assign(new Error('Missing blob'), { statusCode: 404 })
+              if (value.lease?.expiresAt > Date.now()) throw Object.assign(new Error('Blob leased'), { statusCode: 409 })
+              value.lease = { id: proposedId, expiresAt: Date.now() + seconds * 1000 }
+              return { leaseId: proposedId }
+            },
+            async releaseLease() {
+              const value = values.get(name)
+              if (value?.lease?.id === proposedId) delete value.lease
+            },
+          }
+        },
+        async deleteIfExists(options) {
+          assert.equal(options.deleteSnapshots, 'include')
+          if (values.get(name)?.lease?.expiresAt > Date.now()) throw Object.assign(new Error('Blob leased'), { statusCode: 412 })
+          return { succeeded: values.delete(name) }
         },
       }
     },
@@ -157,15 +218,22 @@ function fakeCosmosContainer(events, blobValues) {
         const parameter = name => spec.parameters.find(item => item.name === name)?.value
         const filtered = () => {
           const now = parameter('@now')
+          if (spec.query.includes('SELECT DISTINCT')) {
+            return [...new Set([...values.values()].filter(record => record.recordType === 'resume-lifecycle' &&
+              (record.state === 'deleting' || (record.operation && record.operation.status !== 'complete') ||
+                record.preparation?.expiresAt <= now)).map(record => record.workspaceId))]
+          }
           return [...values.values()].filter(record =>
             (!options?.partitionKey || record.workspaceId === options.partitionKey) &&
             record.recordType === parameter('@recordType') &&
             (!parameter('@batchId') || record.batchId === parameter('@batchId')) &&
             (!parameter('@status') || record.resume?.status === parameter('@status')) &&
             (!now || ((!record.nextAttemptAt || record.nextAttemptAt <= now) &&
+              !record.lifecycle?.archivedAt && !record.lifecycle?.deletingAt && !record.lifecycle?.deletedAt &&
               (record.resume?.status === 'queued' && !record.lease ||
                 ['parsing', 'profiling'].includes(record.resume?.status) && record.lease?.expiresAt <= now))))
-            .sort((a, b) => now ? a.createdAt.localeCompare(b.createdAt) : b.createdAt.localeCompare(a.createdAt))
+            .sort((a, b) => now ? a.createdAt.localeCompare(b.createdAt)
+              : spec.query.includes('ORDER BY c.id') ? a.id.localeCompare(b.id) : b.createdAt.localeCompare(a.createdAt))
         }
         return {
           async fetchNext() {
@@ -188,12 +256,13 @@ function fakeCosmosContainer(events, blobValues) {
         batches.push({ operations: clone(operations), workspaceId, options: clone(options) })
         assert.deepEqual(options, { contentResponseOnWriteEnabled: false })
         if (race) { const callback = race; race = undefined; callback() }
-        if (failBefore) { failBefore = false; throw new Error('Transient publication failure before commit') }
+        const content = operations.some(operation => operation.resourceBody?.recordType !== 'resume-lifecycle')
+        if (failBefore && content) { failBefore = false; throw new Error('Transient publication failure before commit') }
         if (responseOverride) return responseOverride(operations)
         const statuses = operations.map(operation => {
-          const current = values.get(key(workspaceId, operation.resourceBody.id))
+          const current = values.get(key(workspaceId, operation.id ?? operation.resourceBody.id))
           return operation.operationType === 'Create' ? current ? 409 : 201
-            : !current ? 404 : current._etag !== operation.ifMatch ? 412 : 200
+            : !current ? 404 : current._etag !== operation.ifMatch ? 412 : operation.operationType === 'Delete' ? 204 : 200
         })
         const failure = statuses.findIndex(code => code >= 400)
         if (failure !== -1) return {
@@ -201,7 +270,7 @@ function fakeCosmosContainer(events, blobValues) {
         }
         for (const operation of operations) {
           const record = operation.resourceBody
-          if (record.recordType === 'resume' && operation.operationType === 'Create' && blobValues) {
+          if (record?.recordType === 'resume' && operation.operationType === 'Create' && blobValues) {
             assert.ok(blobValues.has(api.resumeImportReceiptBlobName(workspaceId, record.id)), 'immutable receipt must precede queue publication')
             if (record.source.kind !== 'url') {
               assert.ok(blobValues.has(record.capture.original.blobName), 'original bytes must precede eligible work')
@@ -209,11 +278,15 @@ function fakeCosmosContainer(events, blobValues) {
             }
           }
         }
-        const result = operations.map((operation, index) => ({
-          statusCode: statuses[index], eTag: save(operation.resourceBody)._etag,
-        }))
-        events.push({ kind: 'transaction', ids: operations.map(operation => operation.resourceBody.id) })
-        if (failAfter) { failAfter = false; throw new Error('Successful publication response lost') }
+        const result = operations.map((operation, index) => {
+          if (operation.operationType === 'Delete') {
+            values.delete(key(workspaceId, operation.id))
+            return { statusCode: statuses[index] }
+          }
+          return { statusCode: statuses[index], eTag: save(operation.resourceBody)._etag }
+        })
+        if (content) events.push({ kind: 'transaction', ids: operations.map(operation => operation.id ?? operation.resourceBody.id) })
+        if (failAfter && content) { failAfter = false; throw new Error('Successful publication response lost') }
         return { code: 200, result }
       },
     },
@@ -268,7 +341,17 @@ async function fixture(options = {}) {
     },
     async getMembership(workspaceId, id) { return clone(memberships.get(`${workspaceId}/${id}`)) },
   }
-  const state = new Proxy({}, { get() { sampleCalls++; throw new Error('Real resume APIs must not touch sample persistence') } })
+  const leased = new Set()
+  const state = new Proxy({
+    async acquireMutationLease(workspaceId) {
+      while (leased.has(workspaceId)) await new Promise(resolve => setTimeout(resolve, 1))
+      leased.add(workspaceId)
+      return { async renew() { assert.ok(leased.has(workspaceId)) }, async release() { leased.delete(workspaceId) } }
+    },
+  }, { get(target, property) {
+    if (property in target) return target[property]
+    sampleCalls++; throw new Error('Real resume APIs must not touch sample persistence')
+  } })
   const now = () => new Date(clock)
   const repository = new api.WorkspaceRepository({ directory, state, now })
   const config = {
@@ -280,7 +363,8 @@ async function fixture(options = {}) {
   const router = express.Router()
   router.use((_req, res, next) => { res.setHeader('Cache-Control', 'no-store'); next() })
   router.use(api.createAuthMiddleware(config), api.createCsrfMiddleware(config))
-  router.use(api.createRealResumesRouter({ repository, resumes: options.disabled ? undefined : resumes.deps, now }))
+  router.use(api.createRealResumesRouter({ repository, resumes: options.disabled ? undefined : resumes.deps, now,
+    lifecycle: options.lifecycle, wordDocumentImports: options.wordDocumentImports }))
   app.use('/api', router)
   app.use((error, _req, res, _next) => {
     if (error instanceof api.HttpError) return res.status(error.status).json(api.toCloudApiError(error))
@@ -295,6 +379,7 @@ async function fixture(options = {}) {
   return {
     ...resumes, errors, now, base, service: new api.RealResumeService(resumes.deps, now),
     advance(value) { clock = value },
+    directory, memberships, state, repository,
     path(workspaceId = WORKSPACE) { return `${base}/${workspaceId}/resumes` },
     async close() { assert.equal(sampleCalls, 0); await new Promise(resolve => server.close(resolve)) },
   }
@@ -444,7 +529,8 @@ test('actual PDF bytes, receipts, and captures are durable before atomic admissi
     const replay = await bodyOf(await importPdf(server, { input: request, filename: 'Résumé candidate.pdf' }), 200)
     assert.equal(replay.resume.resume.id, accepted.resume.id)
     assert.equal(server.blobContainer.values.size, 3)
-    assert.equal(server.cosmos.values.size, 2)
+    assert.equal([...server.cosmos.values.values()].filter(value => value.recordType !== 'resume-lifecycle').length, 2)
+    assert.equal(server.cosmos.values.size, 4, 'workspace and resume fences accompany the two content records')
     const detailResponse = await fetch(`${server.path()}/${accepted.resume.id}`, { headers: headers({ write: false }) })
     const detail = await bodyOf(detailResponse, 200)
     assert.equal(detail.resume.id, accepted.resume.id, 'details are not wrapped in another resume field')
@@ -542,7 +628,7 @@ test('Markdown resume metadata, UTF-8, binary controls, empty inputs, compressed
     const oversized = await bodyOf(await importMarkdown(server, { bytes: Buffer.alloc(MAX_MARKDOWN + 1, 'x') }), 413)
     assert.match(oversized.error.message, /10 MiB/)
     assert.equal(server.blobContainer.values.size, 0)
-    assert.equal(server.cosmos.values.size, 0)
+    assert.equal([...server.cosmos.values.values()].filter(value => value.recordType !== 'resume-lifecycle').length, 0)
     const bytes = Buffer.alloc(MAX_MARKDOWN, 'x')
     const accepted = (await bodyOf(await importMarkdown(server, { bytes }), 202)).resume
     assert.equal(accepted.capture.original.bytes, MAX_MARKDOWN)
@@ -588,7 +674,8 @@ test('Markdown receipt replay survives failed publication and binds source bytes
     server.cosmos.failBefore()
     await bodyOf(await importMarkdown(server, { input: request }), 503)
     assert.equal(server.blobContainer.values.size, 3)
-    assert.equal(server.cosmos.values.size, 0)
+    assert.equal([...server.cosmos.values.values()].filter(value => value.recordType !== 'resume-lifecycle').length, 0)
+    assert.ok((await server.store.getControl(WORKSPACE, api.resumeIdForKey(request.idempotencyKey))).record.preparation)
     const winners = [...server.blobContainer.values.entries()].map(([name, blob]) => [name, Buffer.from(blob.bytes)])
     for (const options of [
       { filename: 'changed.md' }, { filename: 'resume.markdown' }, { bytes: Buffer.from('# Changed profile\n') },
@@ -877,8 +964,13 @@ test('concurrent admission accepts at most ten unique items and atomically binds
       assert.equal(saved.record.inputFingerprint, item.inputFingerprint)
       assert.equal(saved.record.batchId, batchId)
     }
-    assert.ok(server.cosmos.batches.every(batch => batch.operations.length === 2), 'admission and publication must be one Cosmos transaction')
-    assert.ok(server.cosmos.batches.some(batch => batch.operations[0].ifMatch), 'concurrent admission must condition the batch head')
+    const admissions = server.cosmos.batches.filter(batch => batch.operations.some(operation =>
+      operation.operationType === 'Create' && operation.resourceBody?.recordType === 'resume'))
+    assert.ok(admissions.every(batch => batch.operations.filter(operation => operation.resourceBody?.recordType !== 'resume-lifecycle').length === 2),
+      'admission and publication must be one Cosmos transaction')
+    assert.ok(admissions.every(batch => batch.operations.some(operation => operation.resourceBody?.id === api.resumeControlId()) &&
+      batch.operations.some(operation => operation.resourceBody?.resumeId)), 'every admission must condition both lifecycle fences')
+    assert.ok(admissions.some(batch => batch.operations[0].ifMatch), 'concurrent admission must condition the batch head')
     assert.equal((await server.store.list(WORKSPACE, { recordType: 'resume' })).items.length, 10)
   } finally { await server.close() }
 })
@@ -932,7 +1024,7 @@ test('lost and failed publication responses recover from immutable winning recei
     const request = input()
     server.cosmos.failBefore()
     await bodyOf(await importPdf(server, { input: request }), 503)
-    assert.equal(server.cosmos.values.size, 0)
+    assert.equal([...server.cosmos.values.values()].filter(value => value.recordType !== 'resume-lifecycle').length, 0)
     assert.equal(server.blobContainer.values.size, 3)
     const receipts = clone([...server.blobContainer.values.entries()])
     server.advance('2026-09-18T02:31:00.000Z')
@@ -1134,16 +1226,18 @@ test('Cosmos reads/writes validate records and exact ETags; single-write respons
   await store.transact(WORKSPACE, [
     { kind: 'replace', record: batch, etag: created.value.etag }, { kind: 'create', record },
   ])
-  assert.equal(cosmos.batches.length, 1)
+  assert.equal(cosmos.batches.length, 2)
   assert.equal(cosmos.replacements.length, 0)
-  assert.deepEqual(cosmos.batches[0].operations.map(operation => operation.operationType), ['Replace', 'Create'])
-  assert.equal(cosmos.batches[0].operations[0].ifMatch, created.value.etag)
-  assert.deepEqual(cosmos.batches[0].options, { contentResponseOnWriteEnabled: false })
+  assert.deepEqual(cosmos.batches[1].operations.filter(operation => operation.resourceBody?.recordType !== 'resume-lifecycle')
+    .map(operation => operation.operationType), ['Replace', 'Create'])
+  assert.equal(cosmos.batches[1].operations[0].ifMatch, created.value.etag)
+  assert.deepEqual(cosmos.batches[1].options, { contentResponseOnWriteEnabled: false })
   const current = await store.get(WORKSPACE, record.id)
   assert.ok(current.etag)
   assert.deepEqual(current.record, record)
   const updated = await store.replace({ ...record, warnings: ['Captured public sources may be incomplete.'] }, current.etag)
-  assert.deepEqual(cosmos.replacements[0].options, { accessCondition: { type: 'IfMatch', condition: current.etag } })
+  assert.equal(cosmos.batches.at(-1).operations[0].ifMatch, current.etag)
+  assert.equal(cosmos.batches.at(-1).operations.length, 3, 'replacement atomically conditions the workspace and resume fences')
   await assert.rejects(store.replace(record, current.etag), api.StoreConflictError)
   for (const etag of ['', '*', 'W/"weak"', '"one","two"', 'x'.repeat(1025)]) {
     await assert.rejects(store.replace(record, etag))
@@ -1500,4 +1594,419 @@ test('document/profile validation is strict, source-bounded, version-bound, and 
     assert.ok(api.validateResumeDocumentBinding({ ...ready.document, paragraphs: [{ ...ready.document.paragraphs[0], page: 51 }] }, ready.record).length)
     assert.ok(api.validateResumeDocumentBinding({ ...ready.document, paragraphs: [{ ...ready.document.paragraphs[0], text: 'Changed' }] }, ready.record).length)
   } finally { await server.close() }
+})
+
+test('real resume archive and restore retain completed evidence without mutating frozen profiles or analyses', async () => {
+  let dependencyCalls = 0
+  const frozenAnalysis = Object.freeze({ id: retainedAnalysis.id, sourceKind: 'real', archived: true, version: 1, status: 'running' })
+  const server = await fixture({ lifecycle: { async impact(workspaceId, target) {
+    dependencyCalls++
+    assert.equal(workspaceId, WORKSPACE)
+    assert.equal(target.kind, 'resume')
+    return [retainedAnalysis]
+  } } })
+  try {
+    const imported = (await bodyOf(await importPdf(server), 202)).resume
+    const ready = await profileResume(server, imported.resume.id)
+    const before = await server.service.detail(WORKSPACE, imported.resume.id)
+    const archived = (await bodyOf(await action(server, imported.resume.id, 'lifecycle', ready.etag, { action: 'archive' }), 200)).resume
+    assert.ok(archived.lifecycle.archivedAt)
+    assert.equal(archived.resume.status, 'ready')
+    assert.deepEqual(archived.document, before.document)
+    assert.deepEqual(archived.profile, before.profile)
+    assert.deepEqual(archived.capture, before.capture)
+    assert.equal(archived.profile.lifecycle, undefined)
+    assert.equal(archived.document.lifecycle, undefined)
+    assert.equal(dependencyCalls, 0, 'Archiving an input does not coordinate, cancel, or mutate independently frozen analyses')
+    assert.equal(frozenAnalysis.status, 'running')
+    await bodyOf(await action(server, imported.resume.id, 'retry', archived.etag), 409)
+    await bodyOf(await action(server, imported.resume.id, 'cancel', archived.etag), 409)
+    await bodyOf(await action(server, imported.resume.id, 'lifecycle', ready.etag, { action: 'unarchive' }), 409)
+    const impact = await bodyOf(await fetch(`${server.path()}/${imported.resume.id}/lifecycle`, { headers: headers({ write: false }) }), 200)
+    assert.deepEqual(impact.impact.blockers, [retainedAnalysis])
+    await bodyOf(await action(server, imported.resume.id, 'lifecycle', archived.etag, { action: 'delete' }), 409)
+    assert.equal(server.blobContainer.values.size, 5)
+    const restored = (await bodyOf(await action(server, imported.resume.id, 'lifecycle', archived.etag, { action: 'unarchive' }), 200)).resume
+    assert.equal(restored.lifecycle?.archivedAt, undefined)
+    assert.equal(restored.resume.status, 'ready')
+    assert.deepEqual(restored.profile, before.profile)
+    assert.equal(frozenAnalysis.status, 'running')
+  } finally { await server.close() }
+})
+
+test('archive cancels every file format and URL intake; restore never restarts processing or changes provenance', async () => {
+  const server = await fixture({ lifecycle: noDependencies, wordDocumentImports: true })
+  try {
+    const formats = [
+      ['pdf', 'application/pdf', pdfBytes],
+      ['markdown', 'text/markdown', Buffer.from('\ufeff# Alex Example\r\nEngineer.\r\n')],
+      ['docx', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', docxFile()],
+      ['doc', 'application/msword', legacyDocFile()],
+    ]
+    for (const [format, contentType, bytes] of formats) {
+      const request = input()
+      const filename = `resume.${format === 'markdown' ? 'markdown' : format}`
+      const response = await fetch(`${server.path()}/file`, {
+        method: 'POST', headers: headers({ 'content-type': contentType, 'x-file-name': encodeURIComponent(filename),
+          'idempotency-key': request.idempotencyKey, 'x-import-batch': request.batchId, 'x-import-count': '1' }), body: bytes,
+      })
+      const imported = (await bodyOf(response, 202)).resume
+      const id = imported.resume.id
+      const before = (await server.store.get(WORKSPACE, id)).record
+      const archived = (await bodyOf(await action(server, id, 'lifecycle', imported.etag, { action: 'archive' }), 200)).resume
+      assert.equal(archived.resume.status, 'cancelled')
+      assert.deepEqual(archived.capture, imported.capture)
+      await assert.rejects(server.service.importFile(WORKSPACE, request, filename, bytes, contentType), error => error.status === 409)
+      const restored = (await bodyOf(await action(server, id, 'lifecycle', archived.etag, { action: 'unarchive' }), 200)).resume
+      assert.equal(restored.resume.status, 'cancelled')
+      const original = await server.service.original(WORKSPACE, id)
+      assert.equal(original.contentType, contentType)
+      assert.deepEqual(Buffer.from(original.bytes), bytes)
+      assert.deepEqual((await server.store.get(WORKSPACE, id)).record.captureManifest, before.captureManifest)
+      const retried = (await bodyOf(await action(server, id, 'retry', restored.etag), 200)).resume
+      assert.equal(retried.resume.status, 'queued', 'Only an explicit retry may restart a restored intake')
+    }
+    const imported = (await bodyOf(await importUrl(server), 202)).resume
+    const id = imported.resume.id
+    const archived = (await bodyOf(await action(server, id, 'lifecycle', imported.etag, { action: 'archive' }), 200)).resume
+    assert.equal(archived.resume.status, 'cancelled')
+    assert.equal(archived.capture, null)
+    assert.equal(archived.document, null)
+    const restored = (await bodyOf(await action(server, id, 'lifecycle', archived.etag, { action: 'unarchive' }), 200)).resume
+    assert.equal(restored.resume.status, 'cancelled')
+    assert.equal(restored.profile, null)
+    assert.deepEqual(restored.source, imported.source)
+  } finally { await server.close() }
+})
+
+test('resume deletion fails closed without the dependency provider and lifecycle routes require exact authorized input', async () => {
+  const server = await fixture()
+  try {
+    const imported = (await bodyOf(await importUrl(server), 202)).resume
+    const id = imported.resume.id
+    await bodyOf(await action(server, id, 'lifecycle', imported.etag, { action: 'delete' }), 503)
+    assert.equal((await server.store.getControl(WORKSPACE, id)).record.state, 'active')
+    await bodyOf(await action(server, id, 'lifecycle', undefined, { action: 'archive' }), 428)
+    for (const etag of ['*', 'W/"weak"', '"one","two"']) {
+      await bodyOf(await action(server, id, 'lifecycle', etag, { action: 'archive' }), 400)
+    }
+    for (const body of [{ action: 'retry' }, { action: 'archive', profile: {} }, {}, []]) {
+      await bodyOf(await action(server, id, 'lifecycle', imported.etag, body), 400)
+    }
+    await bodyOf(await action(server, id, 'lifecycle', imported.etag, { action: 'archive' }, auth(VIEWER)), 403)
+    assert.equal((await server.store.get(WORKSPACE, id)).record.lifecycle, undefined)
+  } finally { await server.close() }
+})
+
+test('resume deletion purges only its namespace and batch references and permanently fences old keys and callbacks', async () => {
+  const server = await fixture({ lifecycle: noDependencies })
+  try {
+    const batchId = randomUUID()
+    const request = input({ batchId, inputCount: 2 })
+    const first = (await bodyOf(await importPdf(server, { input: request }), 202)).resume
+    const sibling = (await bodyOf(await importPdf(server, { input: { batchId, inputCount: 2 } }), 202)).resume
+    const id = first.resume.id
+    const stale = await profileResume(server, id)
+    const siblingBefore = await server.service.original(WORKSPACE, sibling.resume.id)
+    await bodyOf(await action(server, id, 'lifecycle', stale.etag, { action: 'delete' }), 200)
+    assert.equal(await server.store.get(WORKSPACE, id), undefined)
+    assert.equal([...server.blobContainer.values.keys()].some(name => name.startsWith(`${WORKSPACE}/${id}/`)), false)
+    assert.deepEqual(await server.service.original(WORKSPACE, sibling.resume.id), siblingBefore)
+    const batch = (await server.store.get(WORKSPACE, api.resumeBatchRecordId(batchId))).record
+    assert.deepEqual(batch.items.map(item => item.resumeId), [sibling.resume.id])
+    assert.equal(batch.removedCount, 1)
+    await bodyOf(await importPdf(server, { input: request }), 409)
+    await bodyOf(await importPdf(server, { input: { batchId, inputCount: 2 } }), 409)
+    await assert.rejects(server.store.replace(stale.record, stale.etag))
+    await assert.rejects(server.store.create(stale.record), api.StoreConflictError)
+    await assert.rejects(api.putResumeBlob(server.store, server.blobs,
+      api.resumeProfileBlobName(WORKSPACE, id), Buffer.from('{}'), 'application/json'), api.StoreConflictError)
+    const tombstone = (await server.store.getControl(WORKSPACE, id)).record
+    assert.deepEqual(Object.keys(tombstone).sort(), ['id', 'recordType', 'resumeId', 'state', 'updatedAt', 'workspaceId'])
+    assert.equal(tombstone.state, 'deleted')
+    assert.deepEqual((await server.service.list(WORKSPACE)).resumes.map(value => value.resume.id), [sibling.resume.id])
+  } finally { await server.close() }
+})
+
+test('partial delete returns 202 failed with a durable safe recovery row; the participant retries without exposing private evidence', async () => {
+  const server = await fixture({ lifecycle: noDependencies })
+  try {
+    const imported = (await bodyOf(await importPdf(server), 202)).resume
+    const id = imported.resume.id
+    const ready = await profileResume(server, id)
+    const remove = server.blobs.delete
+    let removed = 0
+    server.blobs.delete = async name => {
+      if (++removed > 1) throw new Error('Private storage diagnostic must never be in the response')
+      await remove(name)
+    }
+    const failed = await bodyOf(await action(server, id, 'lifecycle', ready.etag, { action: 'delete' }), 202)
+    assert.equal(failed.operation.status, 'failed')
+    assert.equal(failed.deleted, undefined)
+    assert.ok(failed.etag)
+    assert.ok(failed.resume.lifecycle.deletingAt)
+    assert.equal(failed.resume.document, null)
+    assert.equal(failed.resume.profile, null)
+    assert.equal(failed.resume.capture, null)
+    assert.equal(failed.resume.extraction, null)
+    assert.equal(failed.resume.resume.name, null)
+    assert.doesNotMatch(JSON.stringify(failed), /Private storage diagnostic|Alex Example|Ten years/)
+    assert.ok(await server.store.get(WORKSPACE, id), 'Keep the recovery row until every artifact has been removed')
+    assert.equal((await server.service.list(WORKSPACE)).resumes[0].lifecycleOperation.status, 'failed')
+    const impact = await bodyOf(await fetch(`${server.path()}/${id}/lifecycle`, { headers: headers({ write: false }) }), 200)
+    assert.equal(impact.impact.name, 'Resume pending deletion')
+    await bodyOf(await fetch(`${server.path()}/${id}/original`, { headers: headers({ write: false }) }), 404)
+    await bodyOf(await action(server, id, 'lifecycle', failed.etag, { action: 'unarchive' }), 409)
+    const participant = api.createResumeLifecycleParticipant(server.deps)
+    assert.deepEqual(await participant.pendingWorkspaces(20), [WORKSPACE])
+    server.blobs.delete = remove
+    await participant.resume(WORKSPACE, NOW)
+    assert.equal(await server.store.get(WORKSPACE, id), undefined)
+    assert.equal(server.blobContainer.values.size, 0)
+    assert.deepEqual(await participant.pendingWorkspaces(20), [])
+  } finally { await server.close() }
+})
+
+test('an interrupted archive is durably recovered and unarchive cannot leave queued work eligible', async () => {
+  const server = await fixture({ lifecycle: noDependencies })
+  try {
+    const imported = (await bodyOf(await importUrl(server), 202)).resume
+    const transact = server.store.transact
+    let stopped = false
+    server.store.transact = async (workspaceId, operations, options) => {
+      if (!stopped && operations.some(value => value.record.recordType === 'resume' && value.record.resume.status === 'cancelled')) {
+        stopped = true
+        throw new Error('Interrupted cancellation')
+      }
+      return transact(workspaceId, operations, options)
+    }
+    const failed = await bodyOf(await action(server, imported.resume.id, 'lifecycle', imported.etag, { action: 'archive' }), 202)
+    assert.equal(failed.operation.status, 'failed')
+    assert.ok(failed.resume.lifecycle.archivedAt)
+    assert.deepEqual(await server.store.listPending(NOW, 100), [])
+    const participant = api.createResumeLifecycleParticipant(server.deps)
+    assert.deepEqual(await participant.pendingWorkspaces(10), [WORKSPACE])
+    await participant.resume(WORKSPACE, NOW)
+    const restored = await server.service.detail(WORKSPACE, imported.resume.id)
+    assert.equal(restored.resume.status, 'cancelled')
+    assert.ok(restored.lifecycle.archivedAt)
+    assert.equal(restored.lifecycleOperation, undefined)
+    const unarchived = (await bodyOf(await action(server, imported.resume.id, 'lifecycle', restored.etag, { action: 'unarchive' }), 200)).resume
+    assert.equal(unarchived.resume.status, 'cancelled')
+    assert.deepEqual(await server.store.listPending(NOW, 100), [])
+  } finally { await server.close() }
+})
+
+test('workspace cleanup works with the route feature disabled and never downgrades a completed deletion fence', async () => {
+  const server = await fixture({ disabled: true })
+  try {
+    const request = input()
+    const imported = await server.service.importPdf(WORKSPACE, request, 'resume.pdf', pdfBytes)
+    await server.service.importUrl(WORKSPACE, input(), 'https://example.com/profile')
+    const participant = api.createResumeLifecycleParticipant(server.deps)
+    await assert.rejects(participant.cancel(WORKSPACE, NOW))
+    await assert.rejects(participant.purge(WORKSPACE, NOW))
+    assert.deepEqual(await participant.counts(WORKSPACE), { resumes: 2, resumeBatches: 2, sourceArtifacts: 4 })
+    await participant.setState(WORKSPACE, 'archived', NOW)
+    const blocked = await server.store.get(WORKSPACE, imported.resume.resume.id)
+    await assert.rejects(server.store.replace({ ...blocked.record, warnings: ['late worker'] }, blocked.etag), api.StoreConflictError)
+    await assert.rejects(server.service.importUrl(WORKSPACE, input(), 'https://example.com/new'), error => error.status === 409)
+    await participant.cancel(WORKSPACE, NOW)
+    assert.equal((await server.service.detail(WORKSPACE, imported.resume.resume.id)).resume.status, 'cancelled')
+    assert.equal(server.blobContainer.values.size, 4)
+    await participant.setState(WORKSPACE, 'active', NOW)
+    assert.deepEqual(await server.store.listPending(NOW, 100), [])
+    await participant.setState(WORKSPACE, 'deleting', NOW)
+    await participant.cancel(WORKSPACE, NOW)
+    await participant.purge(WORKSPACE, NOW)
+    await participant.setState(WORKSPACE, 'deleted', NOW)
+    await participant.setState(WORKSPACE, 'deleting', NOW)
+    await participant.purge(WORKSPACE, NOW)
+    assert.equal((await server.store.getControl(WORKSPACE)).record.state, 'deleted')
+    assert.equal(server.blobContainer.values.size, 0)
+    assert.ok([...server.cosmos.values.values()].every(value => value.recordType === 'resume-lifecycle'))
+    await assert.rejects(participant.setState(WORKSPACE, 'active', NOW), api.StoreConflictError)
+    await assert.rejects(server.service.importPdf(WORKSPACE, request, 'resume.pdf', pdfBytes), error => error.status === 409)
+  } finally { await server.close() }
+})
+
+test('expired unpublished imports are recovered; empty continuation pages and shifting Blob pages cannot skip cleanup', async () => {
+  const server = await fixture({ lifecycle: noDependencies })
+  try {
+    const request = input()
+    server.cosmos.failBefore()
+    await bodyOf(await importPdf(server, { input: request }), 503)
+    const id = api.resumeIdForKey(request.idempotencyKey)
+    await api.updateResumeControl(server.store, WORKSPACE, id, control => ({
+      ...control, preparation: { ...control.preparation, expiresAt: new Date(Date.now() - 1).toISOString() },
+    }))
+    const participant = api.createResumeLifecycleParticipant(server.deps)
+    assert.deepEqual(await participant.pendingWorkspaces(20), [WORKSPACE])
+    await participant.resume(WORKSPACE, NOW)
+    assert.equal(server.blobContainer.values.size, 0)
+    await bodyOf(await importPdf(server, { input: request }), 409)
+    const live = (await bodyOf(await importPdf(server), 202)).resume
+    for (let version = 1; version <= 125; version++) {
+      await server.blobs.putImmutable(api.resumeDocumentBlobName(WORKSPACE, live.resume.id, version), Buffer.from('{}'), 'application/json')
+    }
+    const emptyToken = 'empty-continuation'
+    const list = server.store.list
+    const listControls = server.store.listControls
+    const listBlobs = server.blobs.listPage
+    const listFamilies = server.blobs.listFamilies
+    server.store.list = async (workspaceId, options) => options.continuationToken === undefined
+      ? { items: [], continuationToken: emptyToken } : list(workspaceId, { ...options,
+        continuationToken: options.continuationToken === emptyToken ? undefined : options.continuationToken })
+    server.store.listControls = async (workspaceId, token) => token === undefined
+      ? { items: [], continuationToken: emptyToken } : listControls(workspaceId, token === emptyToken ? undefined : token)
+    server.blobs.listPage = async (workspaceId, resumeId, token) => token === undefined
+      ? { names: [], continuationToken: emptyToken } : listBlobs(workspaceId, resumeId, token === emptyToken ? undefined : token)
+    server.blobs.listFamilies = async (workspaceId, token) => token === undefined
+      ? { resumeIds: [], continuationToken: emptyToken } : listFamilies(workspaceId, token === emptyToken ? undefined : token)
+    await participant.setState(WORKSPACE, 'deleting', NOW)
+    await participant.cancel(WORKSPACE, NOW)
+    await participant.purge(WORKSPACE, NOW)
+    assert.equal(server.blobContainer.values.size, 0)
+    assert.ok([...server.cosmos.values.values()].every(value => value.recordType === 'resume-lifecycle'))
+  } finally { await server.close() }
+})
+
+test('a delayed finite-lease Blob writer cannot resurrect content after pending delete completes', async () => {
+  const server = await fixture({ lifecycle: noDependencies })
+  try {
+    const imported = (await bodyOf(await importUrl(server), 202)).resume
+    const id = imported.resume.id
+    const name = api.resumeProfileBlobName(WORKSPACE, id)
+    const client = server.blobContainer.getBlockBlobClient.bind(server.blobContainer)
+    let release, reached
+    const started = new Promise(resolve => { reached = resolve })
+    server.blobContainer.getBlockBlobClient = blobName => {
+      const current = client(blobName)
+      const upload = current.upload
+      return { ...current, async upload(bytes, size, options) {
+        if (blobName === name && bytes.length) {
+          reached()
+          await new Promise(resolve => { release = resolve })
+        }
+        return upload(bytes, size, options)
+      } }
+    }
+    const writing = api.putResumeBlob(server.store, server.blobs, name, Buffer.from('{"private":"late profile"}'), 'application/json')
+      .then(() => undefined, error => error)
+    await started
+    const current = await server.store.get(WORKSPACE, id)
+    const pending = await bodyOf(await action(server, id, 'lifecycle', current.etag, { action: 'delete' }), 202)
+    assert.equal(pending.operation.status, 'pending')
+    assert.equal(pending.resume.document, null)
+    assert.ok(await server.store.get(WORKSPACE, id))
+    await api.updateResumeControl(server.store, WORKSPACE, id, control => ({
+      ...control, writers: Object.fromEntries(Object.entries(control.writers).map(([writerId, value]) =>
+        [writerId, { ...value, expiresAt: new Date(Date.now() - 1).toISOString() }])),
+    }))
+    for (const value of server.blobContainer.values.values()) if (value.lease) value.lease.expiresAt = 0
+    await api.createResumeLifecycleParticipant(server.deps).resume(WORKSPACE, NOW)
+    release()
+    assert.ok(await writing)
+    assert.equal(await server.blobs.read(name), undefined)
+    assert.equal(server.blobContainer.values.size, 0)
+    assert.equal((await server.store.getControl(WORKSPACE, id)).record.state, 'deleted')
+  } finally { await server.close() }
+})
+
+test('all resume mutation routes reauthorize inside the finite workspace lease after body parsing', async () => {
+  const server = await fixture({ lifecycle: noDependencies })
+  try {
+    let archived = false
+    const getMetadata = server.directory.getMetadata
+    server.directory.getMetadata = async workspaceId => {
+      const stored = await getMetadata(workspaceId)
+      return archived && stored ? { ...stored, metadata: { ...stored.metadata, archivedAt: NOW } } : stored
+    }
+    const acquire = server.state.acquireMutationLease
+    server.state.acquireMutationLease = async workspaceId => {
+      const lease = await acquire(workspaceId)
+      archived = true
+      return lease
+    }
+    await bodyOf(await importPdf(server), 409)
+    assert.equal(server.blobContainer.values.size, 0)
+    assert.equal(server.cosmos.values.size, 0)
+    archived = false
+    server.state.acquireMutationLease = acquire
+    const imported = (await bodyOf(await importUrl(server), 202)).resume
+    archived = true
+    const archivedResume = (await bodyOf(await action(server, imported.resume.id, 'lifecycle', imported.etag, { action: 'archive' }), 200)).resume
+    assert.ok(archivedResume.lifecycle.archivedAt, 'Manage operations remain available in an archived workspace')
+    await bodyOf(await action(server, imported.resume.id, 'retry', archivedResume.etag), 409)
+  } finally { await server.close() }
+})
+
+test('shared integration fixture adapters enforce the same guards, cleanup, and tombstones as the Azure store', async () => {
+  const values = new Map()
+  const store = installResumeLifecycleFake({
+    values,
+    async list(workspaceId, options) {
+      return { items: clone([...values.values()].filter(value => value.record.workspaceId === workspaceId &&
+        value.record.recordType === options.recordType)) }
+    },
+  }, { StoreConflictError: api.StoreConflictError })
+  const blobValues = new Map()
+  const blobs = installResumeBlobLifecycleFake({
+    values: blobValues, async read(name) { return clone(blobValues.get(name)) },
+  })
+
+  test('workspace fence ETag changes atomically defeat resume publication even when the resume ETag did not change', async () => {
+    const server = await fixture()
+    try {
+      const imported = (await bodyOf(await importUrl(server), 202)).resume
+      const current = await server.store.get(WORKSPACE, imported.resume.id)
+      server.cosmos.race(() => {
+        const control = server.cosmos.values.get(server.cosmos.key(WORKSPACE, api.resumeControlId()))
+        server.cosmos.save({ ...control, state: 'archived', updatedAt: NOW })
+      })
+
+      test('lost successful archive and restore responses do not install a spurious recovery operation over later explicit retries', async () => {
+        const server = await fixture({ lifecycle: noDependencies })
+        try {
+          const imported = (await bodyOf(await importUrl(server), 202)).resume
+          const id = imported.resume.id
+          const transact = server.store.transact
+          server.store.transact = async (workspaceId, operations, options) => {
+            await transact(workspaceId, operations, options)
+            if (options?.controls?.some(value => value.record.resumeId === id && !value.record.operation) &&
+              operations.some(value => value.record.id === id)) throw new Error('Successful lifecycle response lost')
+          }
+          const archived = (await bodyOf(await action(server, id, 'lifecycle', imported.etag, { action: 'archive' }), 200)).resume
+          const restored = (await bodyOf(await action(server, id, 'lifecycle', archived.etag, { action: 'unarchive' }), 200)).resume
+          assert.equal(restored.resume.status, 'cancelled')
+          assert.equal(restored.lifecycleOperation, undefined)
+          const retry = (await bodyOf(await action(server, id, 'retry', restored.etag), 200)).resume
+          assert.equal(retry.resume.status, 'queued')
+          const participant = api.createResumeLifecycleParticipant(server.deps)
+          assert.deepEqual(await participant.pendingWorkspaces(20), [])
+          await participant.resume(WORKSPACE, NOW)
+          assert.equal((await server.service.detail(WORKSPACE, id)).resume.status, 'queued')
+        } finally { await server.close() }
+      })
+      await assert.rejects(server.store.replace({ ...current.record, warnings: ['Stale worker publication'] }, current.etag),
+        api.StoreConflictError)
+      assert.deepEqual(await server.store.get(WORKSPACE, imported.resume.id), current)
+      assert.deepEqual(await server.store.listPending(NOW, 100), [])
+    } finally { await server.close() }
+  })
+  const deps = { store, blobs }
+  const service = new api.RealResumeService(deps, () => new Date(NOW))
+  const request = input()
+  const imported = await service.importMarkdown(WORKSPACE, request, 'resume.md', Buffer.from('# Alex Example\nEngineer.\n'))
+  const id = imported.resume.resume.id
+  const lifecycle = new api.ResumeLifecycleService(deps, noDependencies, () => new Date(NOW))
+  await lifecycle.change(WORKSPACE, id, 'archive', imported.resume.etag)
+  const archived = await service.detail(WORKSPACE, id)
+  assert.equal(archived.resume.status, 'cancelled')
+  await assert.rejects(service.importMarkdown(WORKSPACE, request, 'resume.md', Buffer.from('# Alex Example\nEngineer.\n')), error => error.status === 409)
+  await lifecycle.change(WORKSPACE, id, 'delete', archived.etag)
+  assert.equal(blobValues.size, 0)
+  assert.equal(await store.get(WORKSPACE, id), undefined)
+  assert.equal((await store.getControl(WORKSPACE, id)).record.state, 'deleted')
+  assert.deepEqual(await store.listPending(NOW, 10), [])
 })

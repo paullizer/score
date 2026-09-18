@@ -7,6 +7,7 @@ import { pathToFileURL } from 'node:url'
 import { build } from 'esbuild'
 import React, { act } from 'react'
 import { JSDOM } from 'jsdom'
+import { frontendWorkspaceContext } from './frontend.test-support.mjs'
 
 const output = resolve(`.library-table-sorting-tests-${randomUUID()}`)
 const originalFetch = globalThis.fetch
@@ -152,7 +153,7 @@ async function renderPage(Page, { context = workspaceContext(), resumes = resume
   root ??= createRoot(document.getElementById('root'))
   await act(async () => root.render(React.createElement(ui.MemoryRouter, {
     initialEntries: [url], future: { v7_startTransition: true, v7_relativeSplatPath: true },
-  }, React.createElement(ui.WorkspaceContext.Provider, { value: context },
+  }, React.createElement(ui.WorkspaceContext.Provider, { value: frontendWorkspaceContext(context, { resumes: resumes.summaries, analyses: analyses.summaries }) },
     React.createElement(ui.RealResumesContext.Provider, { value: resumes },
       React.createElement(ui.RealAnalysesContext.Provider, { value: analyses }, React.createElement(React.Fragment, null,
         React.createElement(NavigationProbe), React.createElement(Page))))))))

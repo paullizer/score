@@ -17,7 +17,7 @@ await build({
   stdin: {
     resolveDir: root,
     contents: [
-      'service', 'routes', 'validation', 'snapshots', 'lifecycle', 'azure-store',
+      'service', 'routes', 'validation', 'snapshots', 'lifecycle', 'library-lifecycle', 'guards', 'azure-store',
     ].map(name => `export * from './server/analyses/${name}.ts';`).join('\n') +
       "\nexport * from './server/errors.ts'; export * from './server/store.ts';" +
       "\nexport * from './server/ids.ts'; export * from './server/middleware.ts';" +
@@ -57,7 +57,9 @@ export function blobs() {
   const values = new Map()
   const events = []
   let afterPut
-  return {
+  let beforeDelete
+  let beforeFencedPut
+  const store = {
     values, events,
     async read(name) { events.push(['read', name]); return clone(values.get(name)) },
     async putImmutable(name, bytes, contentType) {
@@ -69,11 +71,40 @@ export function blobs() {
       if (afterPut) await afterPut(name, blob)
       return { created: true, blob: clone(blob) }
     },
+    async putFenced(name, bytes, contentType, fence) {
+      await fence.assertActive()
+      if (beforeFencedPut) await beforeFencedPut(name, fence)
+      await fence.assertActive()
+      const value = await store.putImmutable(name, bytes, contentType)
+      await fence.assertActive()
+      return value
+    },
+    async list(workspaceId, runId, continuationToken) {
+      const prefix = runId ? `${workspaceId}/${runId}/` : `${workspaceId}/`
+      const all = [...values].filter(([name]) => name.startsWith(prefix)).map(([name, blob]) => ({ name, etag: blob.etag }))
+      const start = Number(continuationToken ?? 0)
+      const items = all.slice(start, start + 100)
+      return { items, ...(start + items.length < all.length ? { continuationToken: `${start + items.length}` } : {}) }
+    },
+    async delete(workspaceId, runId, name, etag) {
+      assert.ok(api.analysisBlobInRun(name, workspaceId, runId))
+      assert.ok(etag && etag !== '*')
+      if (beforeDelete) await beforeDelete(name)
+      const current = values.get(name)
+      if (!current) return
+      if (current.etag !== etag) throw new api.StoreConflictError('Blob ETag changed')
+      events.push(['delete', name, etag])
+      values.delete(name)
+    },
     _afterPut(callback) { afterPut = callback },
+    _beforeDelete(callback) { beforeDelete = callback },
+    _beforeFencedPut(callback) { beforeFencedPut = callback },
   }
+  return store
 }
 export function analysisStore() {
   const values = new Map()
+  const controls = new Map()
   const batches = []
   let counter = 0
   let beforeBatch
@@ -86,14 +117,27 @@ export function analysisStore() {
     values.set(key(record.workspaceId, record.id), value)
     return clone(value)
   }
+  const saveControls = prepared => {
+    for (const item of prepared) {
+      const old = controls.get(key(item.record.workspaceId, item.record.id))
+      if (old?.etag !== item.etag) throw new api.StoreConflictError('Analysis control changed')
+    }
+    for (const item of prepared) {
+      controls.set(key(item.record.workspaceId, item.record.id), {
+        record: clone(api.parseAnalysisControl(item.record)), etag: `"control-${++counter}"`,
+      })
+    }
+  }
   const store = {
-    values, batches, save,
+    values, controls, batches, save,
     async get(workspaceId, id) { return clone(values.get(key(workspaceId, id))) },
     async create(record) {
       if (beforeCreate) await beforeCreate(record)
       assert.equal(record.recordType, 'analysis-run')
+      const prepared = await api.prepareAnalysisGuards(store, record.workspaceId, [{ kind: 'create', record }])
       const old = values.get(key(record.workspaceId, record.id))
       if (old) return { created: false, value: clone(old) }
+      saveControls(prepared)
       const value = save(record)
       if (afterCreate) await afterCreate(record)
       return { created: true, value }
@@ -102,16 +146,21 @@ export function analysisStore() {
       const old = values.get(key(record.workspaceId, record.id))
       if (!old || old.etag !== etag) throw new api.StoreConflictError()
       api.assertAnalysisReplacement(old.record, record)
+      const prepared = await api.prepareAnalysisGuards(store, record.workspaceId, [{ kind: 'replace', record, etag }])
+      if (values.get(key(record.workspaceId, record.id))?.etag !== etag) throw new api.StoreConflictError()
+      saveControls(prepared)
       return save(record)
     },
-    async transact(workspaceId, operations) {
-      if (beforeBatch) { const callback = beforeBatch; beforeBatch = undefined; await callback(operations) }
-      assert.ok(operations.length > 0 && operations.length <= 26)
+    async transact(workspaceId, operations, options = {}) {
+      if (operations.length && beforeBatch) { const callback = beforeBatch; beforeBatch = undefined; await callback(operations) }
+      assert.ok((operations.length > 0 || options.controls?.length) && operations.length <= 26)
       assert.ok(Buffer.byteLength(JSON.stringify(operations)) <= api.MAX_ANALYSIS_TRANSACTION_BYTES)
       assert.equal(new Set(operations.map(item => item.record.id)).size, operations.length)
+      const prepared = await api.prepareAnalysisGuards(store, workspaceId, operations, options)
+      if (!operations.length) { saveControls(prepared); return }
       const runs = operations.filter(item => item.record.recordType === 'analysis-run')
       assert.equal(runs.length, 1)
-      assert.equal(runs[0].kind, 'replace')
+      assert.ok(runs[0].kind === 'replace' || (options.lifecycle && runs[0].kind === 'delete' && operations.length === 1))
       for (const operation of operations) {
         api.parseAnalysisEntity(operation.record)
         assert.equal(operation.record.workspaceId, workspaceId)
@@ -119,10 +168,14 @@ export function analysisStore() {
         const old = values.get(key(workspaceId, operation.record.id))
         if (operation.kind === 'create' ? old : !old || old.etag !== operation.etag) throw new api.StoreConflictError()
         if (old) api.assertAnalysisReplacement(old.record, operation.record)
+        if (operation.kind === 'delete') {
+          assert.ok(options.lifecycle)
+          assert.deepEqual(old.record, operation.record)
+        }
       }
       const progress = clone(values.get(key(workspaceId, runs[0].record.id)).record.progress)
       for (const operation of operations) {
-        if (operation.record.recordType !== 'analysis-comparison') continue
+        if (operation.record.recordType !== 'analysis-comparison' || operation.kind === 'delete') continue
         const previous = values.get(key(workspaceId, operation.record.id))?.record
         if (previous) {
           progress[previous.status]--
@@ -133,8 +186,12 @@ export function analysisStore() {
         if (next.status === 'complete') progress[next.resultSummary.overall.status === 'available' ? 'scored' : 'unscored']++
       }
       assert.deepEqual(runs[0].record.progress, progress)
+      saveControls(prepared)
       batches.push(clone(operations))
-      for (const operation of operations) save(operation.record)
+      for (const operation of operations) {
+        if (operation.kind === 'delete') values.delete(key(workspaceId, operation.record.id))
+        else save(operation.record)
+      }
       if (afterBatch) { const callback = afterBatch; afterBatch = undefined; await callback(operations) }
     },
     async list(workspaceId, options) {
@@ -150,6 +207,8 @@ export function analysisStore() {
     async listPending(now, limit) {
       return [...values.values()].filter(item => api.analysisWorkIsPending(item.record, now))
         .filter(({ record }) => {
+          const state = controls.get(key(record.workspaceId, api.analysisControlId()))?.record.state ?? 'active'
+          if (state !== 'active' && !(state === 'archived' && record.recordType === 'analysis-run' && record.cancellation)) return false
           if (record.recordType === 'analysis-run') return true
           const parent = values.get(key(record.workspaceId, record.runId))
           assert.equal(parent?.record.recordType, 'analysis-run')
@@ -157,6 +216,17 @@ export function analysisStore() {
         })
         .sort((a, b) => (a.record.recordType === 'analysis-run' ? 0 : 1) - (b.record.recordType === 'analysis-run' ? 0 : 1))
         .slice(0, limit).map(clone)
+    },
+    async getControl(workspaceId, runId) { return clone(controls.get(key(workspaceId, api.analysisControlId(runId)))) },
+    async listControls(workspaceId, token) {
+      const all = [...controls.values()].filter(value => value.record.workspaceId === workspaceId)
+      const start = Number(token ?? 0)
+      const items = clone(all.slice(start, start + 100))
+      return { items, ...(start + items.length < all.length ? { continuationToken: `${start + items.length}` } : {}) }
+    },
+    async pendingLifecycleWorkspaces(limit) {
+      return [...new Set([...controls.values()].filter(({ record }) => record.state === 'deleting' ||
+        (record.operation && record.operation.status !== 'complete')).map(value => value.record.workspaceId))].slice(0, limit)
     },
     _beforeBatch(callback) { beforeBatch = callback },
     _afterBatch(callback) { afterBatch = callback },
@@ -174,12 +244,16 @@ export function fixture(workspaceId = WORKSPACE) {
   const gradeValues = new Map()
   const resumes = {
     blobs: blobs(),
-    store: { async get(ws, id) { return clone(resumeValues.get(`${ws}/${id}`)) } },
+    store: {
+      async get(ws, id) { return clone(resumeValues.get(`${ws}/${id}`)) },
+      async getControl() { return undefined },
+    },
   }
   const jobs = {
     blobs: blobs(),
     store: {
       async get(ws, id) { return clone(jobValues.get(`${ws}/${id}`)) },
+      async getWorkspaceLifecycle() { return { state: 'active', updatedAt: NOW } },
       async list(ws, token) {
         const values = [...jobValues.values()].filter(item => item.record.workspaceId === ws)
         const start = Number(token ?? 0)
@@ -193,6 +267,7 @@ export function fixture(workspaceId = WORKSPACE) {
     blobs: blobs(),
     store: {
       async get(ws, id) { return clone(gradeValues.get(`${ws}/${id}`)) },
+      async getControl() { return undefined },
       async list(ws, options) {
         const records = [...gradeValues.values()].filter(item => item.record.workspaceId === ws &&
           item.record.recordType === options.recordType && (!options.ladderId || item.record.ladderId === options.ladderId))
@@ -425,12 +500,19 @@ export async function seedGrade(f, job, options = {}) {
   newer.contentHash = api.gradeVersionHash(newer)
   const head = { ...base, id: headId, recordType: 'grade-head', grade: 9, status: 'draft', sourceSetId: newerSet.id,
     generationId: 'unapproved-generation', latestVersionId: newerId, approvedVersionId: versionId, approvalId: approval.id, issues: [] }
-  for (const record of [sourceSet, version, review, approval, newerSet, newer, head]) {
+  const ladder = {
+    id: ladderId, workspaceId: f.workspaceId, recordType: 'grade-ladder', createdAt: NOW, updatedAt: NOW,
+    name: 'Approved engineering ladder', context, grades: [9], seedJobId: job.record.id,
+    seedRubricId: job.rubric.id, seedRubricVersion: job.rubric.version, seedJobTitle: job.record.job.title,
+    seedBlobName, sourceIds: [seedId, sourceId], sourceRevision: 2, status: 'draft', issues: [], createdBy: ACTOR,
+    inputFingerprint: 'a'.repeat(64),
+  }
+  for (const record of [sourceSet, version, review, approval, newerSet, newer, head, ladder]) {
     api.parseGradeEntity(record)
     f.gradeValues.set(`${f.workspaceId}/${record.id}`, { record: clone(record), etag: '"grade-frozen"' })
   }
   assert.deepEqual(api.validateGradeApproval(version, sourceSet, [seedDocument, reference]), [])
-  return { head, version, review, approval, sourceSet, newer, newerSet, reference, seed, selection: {
+  return { head, ladder, version, review, approval, sourceSet, newer, newerSet, reference, seed, selection: {
     kind: 'grade', ladderId, grade: 9, versionId, version: 1, versionHash: version.contentHash,
     approvalId: approval.id, reviewId: review.id, sourceSetId, sourceSetHash: sourceSet.contentHash,
   } }
@@ -515,11 +597,30 @@ export async function startHttp(f, enabled = true) {
   }))
   const directory = {
     async getMetadata(workspaceId) {
-      return workspaceId === f.workspaceId ? { metadata: { id: 'workspace', workspaceId, tenantId: TENANT }, etag: '"workspace"' } : undefined
+      return workspaceId === f.workspaceId ? {
+        metadata: { id: 'workspace', workspaceId, tenantId: TENANT, ...f.workspaceMetadata }, etag: '"workspace"',
+      } : undefined
     },
     async getMembership(workspaceId, id) { return workspaceId === f.workspaceId ? memberships.get(id) : undefined },
   }
-  const repository = new api.WorkspaceRepository({ directory, state: {}, now: () => new Date(f.now) })
+  let tail = Promise.resolve()
+  f.mutationLeases = { active: 0, acquired: 0 }
+  const state = {
+    async acquireMutationLease(workspaceId) {
+      assert.equal(workspaceId, f.workspaceId)
+      const previous = tail
+      let unlock
+      tail = new Promise(resolve => { unlock = resolve })
+      await previous
+      f.mutationLeases.active++
+      f.mutationLeases.acquired++
+      return {
+        async renew() { if (f.failMutationRenewal) throw new api.StoreConflictError('Mutation lease renewal failed') },
+        async release() { f.mutationLeases.active--; unlock() },
+      }
+    },
+  }
+  const repository = new api.WorkspaceRepository({ directory, state, now: () => new Date(f.now) })
   const config = { authMode: 'easyauth', tenantId: TENANT, allowedUserIds: new Set([OWNER, VIEWER, STRANGER]), appOrigin: ORIGIN }
   const app = express()
   app.use(express.json())

@@ -6,10 +6,13 @@ a separately requested analysis only after the resume worker publishes a validat
 
 ## HTTP integration
 
-Mount `createRealResumesRouter({ repository, resumes, now?, wordDocumentImports? })` under `/api`, **after** the existing
+Mount `createRealResumesRouter({ repository, resumes, now?, wordDocumentImports?, lifecycle? })` under `/api`, **after** the existing
 authentication and same-origin CSRF middleware. `resumes` is an optional `RealResumesDeps`
 (`store`, `blobs`); omission fails closed with HTTP 503. The router authorizes workspace
 read/write membership before its raw upload parser and returns private, `no-store` responses.
+Every mutation runs inside `repository.withWorkspaceMutation` after parsing, reauthorizes under the
+finite workspace lease, and asserts that lease before publication. Lifecycle mutations use `manage`
+access so an archived workspace can still be managed; ordinary intake/retry/cancel use `write`.
 Feature flags, dependency construction, and feature discovery belong to the application wiring.
 `wordDocumentImports` defaults to disabled and comes from `Config.wordDocumentImports` /
 `WORD_DOCUMENT_IMPORTS_ENABLED`. It gates new DOCX/DOC admissions only, not validation or reads
@@ -33,6 +36,8 @@ Paths below start with `/api/workspaces/:workspaceId`:
 | `POST /resumes/url` | JSON `{ "url": "https://…" }`, import headers | `{ resume: RealResumeSummary }` |
 | `POST /resumes/:resumeId/retry` | Exact `If-Match`; no body (empty JSON object also accepted) | `{ resume: RealResumeSummary }` |
 | `POST /resumes/:resumeId/cancel` | Exact `If-Match`; no body (empty JSON object also accepted) | `{ resume: RealResumeSummary }` |
+| `GET /resumes/:resumeId/lifecycle` | — | `{ impact: LifecycleImpact }` |
+| `POST /resumes/:resumeId/lifecycle` | Exact resume `If-Match`; JSON `{ "action": "archive" \| "unarchive" \| "delete" }` | Completed: `{ resume: RealResumeDetail }` or `{ deleted: true }`; incomplete: HTTP 202 `{ operation, etag?, resume? }` |
 
 All file/URL imports require UUID `Idempotency-Key`, UUID `X-Import-Batch`, and decimal `X-Import-Count`.
 Every item in a batch must declare the same count (1–10) and importing principal. Each item has
@@ -107,8 +112,10 @@ Receipts bind the exact uploaded bytes, including Markdown BOMs and line endings
 for changed bytes, filename, source kind, actor, or batch metadata is a conflict, not an overwrite.
 After an ambiguous response, retry the same item with the same key, body, and batch headers.
 Never overwrite or delete another attempt's winning blobs to compensate for a failed publication.
-Unpublished receipts/originals may remain after a failure or lost admission race; retention/deletion
-administration is outside this release. Resetting samples does not delete real resume data.
+Unpublished receipts/originals remain recoverable after a failed admission. A durable preparation
+control expires after 24 hours; the web-owned lifecycle reaper then removes that unpublished
+namespace, retains a permanent key tombstone, and never recreates it from a stale request.
+Resetting samples does not delete real resume data.
 
 Blob names are restricted to these exact names beneath `<workspaceId>/<resumeId>/`:
 
@@ -150,6 +157,64 @@ Azure factories:
 `importMarkdown(workspaceId, request, filename, bytes)` share file admission and immutable capture.
 `importUrl(workspaceId, request, url)` defers capture to the worker. All accept a `ResumeImportRequest` containing
 `idempotencyKey`, `batchId`, `inputCount`, and server-authenticated `createdBy`.
+
+## Archive, deletion, and workspace integration
+
+`createResumeLifecycleParticipant(resumes: RealResumesDeps): WorkspaceLifecycleParticipant` is
+exported from `server/resumes/lifecycle.ts`. Construct the stores whenever real resume storage
+is configured, even if route feature availability is disabled. Register the **analysis participant
+before resume/grade/job participants**; fence all stores with `setState` before calling cancellation
+or purge. A repeated `setState(..., 'deleting', ...)` against an already `deleted` store succeeds
+without weakening the fence.
+
+`ResumeLifecycleService(resumes, lifecycle?, now?)` implements individual `impact` and `change`.
+The router's optional `lifecycle: LifecycleDependencies` callback must return every retained real
+analysis referencing `{ kind: 'resume', id }`, including archived analyses and historical versions.
+Delete fails closed when the callback is unavailable or reports blockers. The initial check and
+fence run under the same workspace mutation lease as analysis creation. Once admitted, a durable
+delete operation can be resumed without the original HTTP request.
+
+Only the mutable `RealResumeRecord` and public summary/detail carry `lifecycle`; source documents,
+profiles, and frozen analysis snapshots do not. Archiving fences and cancels this intake's queued
+or leased work, preserves completed source/profile evidence, and never cancels independently
+frozen analyses. Restoring cannot restart cancelled work; an explicit retry is required. The
+workspace control independently gates all intakes, claims, heartbeats, retries, cancellation,
+and source/profile publication.
+
+Cosmos mutations condition both workspace and resume controls in the same transaction as content
+writes. `ResumeStore` implements `getControl`, `listControls`, `pendingLifecycleWorkspaces`, and
+`transact(..., { lifecycle?, controls? })`, including conditional deletion. Ordinary writes cannot
+modify lifecycle fields or bypass archived/deleting/deleted controls. Immutable capture, profile,
+citation, source-ownership, and retry-cycle checks remain in force during lifecycle transitions.
+
+Every intake/worker Blob publication uses `putResumeBlob` and `ResumeBlobStore.putFenced`. Writers
+reserve a bounded 180-second per-resume slot; Azure content PUTs also require an ETag and a
+nonrenewed 60-second Blob lease. Requests have a 60-second timeout and no automatic transport
+retries. Only a noncontent preparation placeholder may be created without that Blob lease.
+Ambiguous writers keep their reservations until they drain. Purge waits for live reservations,
+removes all originals/receipts/captures/extractions/profiles beneath the exact owned prefix,
+and requires an empty verification sweep. Empty continuation pages are followed, and sweeps
+restart after deletion shifts offsets. Sibling resumes and their Blob namespaces are untouched.
+
+Individual deletion removes batch item references but retains `removedCount`, so consumed
+admissions cannot reopen a declared batch. The final transaction removes the resume recovery row
+and retains a noncontent permanent `resume-lifecycle` tombstone. Workspace deletion additionally
+removes batch rows; the workspace tombstone prevents all old admissions. Stale idempotency keys,
+worker callbacks, and delayed leased content writes cannot recreate deleted content.
+
+Until deletion is complete, GET/list retain an ETag-bearing recovery summary and
+`lifecycleOperation` when available. Candidate display fields and capture/document/profile/
+extraction data are suppressed during deletion; original downloads are refused. Incomplete
+operations return 202 with explicit `pending` or `failed` status, never deletion success.
+`pendingWorkspaces(limit)` and `resume(workspaceId, timestamp)` feed the web-owned automatic
+reaper under its workspace lease; workers access only their own resume store.
+
+Shared integration fixtures can wrap their versioned resume record/Blob maps with
+`installResumeLifecycleFake(store, { values?, StoreConflictError })` and
+`installResumeBlobLifecycleFake(blobs)` from `server-tests/resume-lifecycle-fakes.mjs`.
+These use the production transaction guards; do not substitute permissive no-op lifecycle methods.
+
+## Evidence validation and worker publication
 
 Reusable validation exports:
 
@@ -200,7 +265,8 @@ Worker publication rules:
   a PDF with the existing PDF/OCR workflow for image-only or scan-heavy content.
 - Ready requires capture, manifest, extraction, profile, `completedAt`, and no lease, pending retry
   timestamp, or error. Profile metadata must match the saved profile. Completed records are
-  immutable. Error/cancelled records change only through a new explicit retry cycle.
+  immutable except for managed lifecycle metadata. Error/cancelled records change only through
+  a new explicit retry cycle or a managed lifecycle metadata transition.
 - Cancellation clears eligibility and the current attempt identity. Manual retry increments
   `retryCount`, resets automatic attempts to zero, clears terminal/lease/error fields, and keeps
   every saved source/profile reference. Stale workers cannot publish through the old ETag.
@@ -237,7 +303,9 @@ and rollout commands; these instructions do not imply any live environment has b
 
 ## Targeted validation
 
-Run `node --test server-tests\real-resumes.test.mjs`. The test builds its own isolated server
-module beneath `dist-server`, uses the actual router, authorization, service, validators, and
-Azure adapters with in-memory Cosmos/Blob transports, and removes its generated module afterward.
+Run `node --test server-tests\real-resumes.test.mjs worker-tests\resume-runtime.test.mjs`.
+The server test builds its own isolated server module and Word parser beneath `dist-server`,
+uses the actual router, authorization, service, validators, and Azure adapters with in-memory
+Cosmos/Blob transports, and removes its generated directory afterward. The worker tests use
+production guards for claims, heartbeat, publication, and lifecycle races.
 It needs no deployed cloud resources, model calls, browser login, or live candidate data.

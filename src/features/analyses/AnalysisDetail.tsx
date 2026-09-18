@@ -8,6 +8,8 @@ import { Avatar, Badge, Button, DemoNote, EmptyState, PageHeader, Score, SearchF
 import { SortableHeader, TableSortSelect } from '../../components/ui/TableSorting'
 import type { TableSort } from '../../domain/tableSorting'
 import { DocumentViewer } from '../../components/documents/DocumentViewer'
+import { ArchivedBadge, EntityLifecycleActions, LifecycleBanner } from '../../components/lifecycle/LifecycleControls'
+import { useLifecycleAccess } from '../../components/lifecycle/useLifecycleAccess'
 import { analysisDataMode, sampleDataLink } from '../../app/real-data-mode'
 import {
   distinctTargetLabels, matrixSortExplanation, sampleComparisonDefaultSort, sampleComparisonSortOptions, sampleComparisonTargetLabel,
@@ -39,6 +41,7 @@ export function AnalysisDetail() {
 
 function RunView({ run }: { run: AnalysisRun }) {
   const { cancelRun, retryRun, cloud } = useWorkspace()
+  const { canEdit } = useLifecycleAccess({ kind: 'analysis', id: run.id })
   const navigate = useNavigate()
   const [params, setParams] = useSearchParams()
   const [query, setQuery] = useState('')
@@ -67,8 +70,10 @@ function RunView({ run }: { run: AnalysisRun }) {
   return <>
     <Link className="back-link" to={sampleDataLink(selectedId ? `/analyses/${run.id}` : '/analyses', Boolean(cloud))}><ArrowLeft size={14} />{selectedId ? 'All comparisons' : 'Back to analyses'}</Link>
     <PageHeader eyebrow="EVIDENCE-LED REVIEW" title={run.name} description="A clear view of the match, and the passages behind it."
-      actions={<>{working && <Button icon={X} onClick={() => cancelRun(run.id)}>Cancel pending</Button>}{needsRetry && !working && <Button icon={RotateCcw} onClick={() => retryRun(run.id)}>Retry unfinished</Button>}
-        <Button icon={Sparkles} onClick={() => navigate(sampleDataLink(`/analyses/new?from=${run.id}`, Boolean(cloud)))}>New run with these inputs</Button></>} />
+      actions={<><EntityLifecycleActions target={{ kind: 'analysis', id: run.id }} name={run.name} onComplete={(action) => { if (action === 'delete') navigate(sampleDataLink('/analyses', Boolean(cloud))) }} />{working && <Button icon={X} disabled={!canEdit} onClick={() => cancelRun(run.id)}>Cancel pending</Button>}{needsRetry && !working && <Button icon={RotateCcw} disabled={!canEdit} onClick={() => retryRun(run.id)}>Retry unfinished</Button>}
+        <Button icon={Sparkles} disabled={!canEdit} onClick={() => navigate(sampleDataLink(`/analyses/new?from=${run.id}`, Boolean(cloud)))}>New run with these inputs</Button></>} />
+    <LifecycleBanner target={{ kind: 'analysis', id: run.id }} />
+    <ArchivedBadge target={{ kind: 'analysis', id: run.id }} />
     <div className="analysis-meta"><Badge tone="accent">Simulated scoring</Badge><Badge tone={status === 'Complete' ? 'success' : status === 'Needs attention' ? 'warning' : 'neutral'} dot>{status}</Badge><span>{run.resumes.length} {run.resumes.length === 1 ? 'resume' : 'resumes'}</span><span>{run.targets.length} separate {run.targets.length === 1 ? 'rubric' : 'rubrics'}</span><span>{dateLabel(run.createdAt)}</span><span className="ml-auto flex items-center gap-1.5"><ShieldCheck size={12} />Saved version snapshots</span></div>
     {working && <div className="run-progress panel" aria-live="polite"><div><span className="flex items-center gap-2"><LoaderCircle size={15} className="animate-spin" />Preparing evidence-backed sample results</span><span>{finished} / {run.comparisons.length}</span></div>
       <progress max={run.comparisons.length} value={finished} aria-label="Analysis progress" /><p>Every comparison is independent. Completed results are available below.</p></div>}
@@ -121,6 +126,7 @@ function RunView({ run }: { run: AnalysisRun }) {
 
 function ResultReview({ run, comparison }: { run: AnalysisRun; comparison: Comparison }) {
   const { retryRun } = useWorkspace()
+  const { canEdit } = useLifecycleAccess({ kind: 'analysis', id: run.id })
   const target = run.targets.find((item) => item.id === comparison.targetId)
   const snapshot = run.resumes.find((item) => item.resume.id === comparison.resumeId)
   const [expanded, setExpanded] = useState<string[]>(target ? [target.rubric.criteria[0]?.id].filter((id): id is string => Boolean(id)) : [])
@@ -132,7 +138,7 @@ function ResultReview({ run, comparison }: { run: AnalysisRun; comparison: Compa
   if (comparison.status !== 'complete') return <div className="panel"><EmptyState icon={comparison.status === 'running' ? LoaderCircle : ScanLine}
     title={comparison.status === 'failed' ? 'This comparison needs another try' : comparison.status === 'cancelled' ? 'No assessment was made' : 'The evidence is on its way'}
     description={comparison.error ?? 'This simulated comparison is still being prepared. A score will appear only when the assessment is complete.'}
-    action={(comparison.status === 'failed' || comparison.status === 'cancelled') && runStatus(run) !== 'Running' ? <Button icon={RotateCcw} onClick={() => retryRun(run.id)}>Retry unfinished comparisons</Button> : undefined} /></div>
+    action={(comparison.status === 'failed' || comparison.status === 'cancelled') && runStatus(run) !== 'Running' ? <Button icon={RotateCcw} disabled={!canEdit} onClick={() => retryRun(run.id)}>Retry unfinished comparisons</Button> : undefined} /></div>
   const selectedDocument = documentMode === 'job' ? target.document : snapshot.document
   const evidenceCount = comparison.criteria.reduce((sum, criterion) => sum + criterion.citations.length, 0)
   function showCitation(citation: Citation) {

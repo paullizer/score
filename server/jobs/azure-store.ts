@@ -1,18 +1,26 @@
-import { createHash } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { CosmosClient, ErrorResponse } from '@azure/cosmos'
-import type { Container, JSONObject } from '@azure/cosmos'
+import type { Container, JSONObject, OperationInput, OperationResponse } from '@azure/cosmos'
 import { BlobServiceClient, RestError } from '@azure/storage-blob'
-import type { BlockBlobClient } from '@azure/storage-blob'
+import type { BlockBlobClient, ContainerClient } from '@azure/storage-blob'
 import type { TokenCredential } from '@azure/identity'
 import { JOB_IMPORT_LIMITS } from '../../src/domain/real-jobs'
 import type { RealJobRecord, VersionedRealJob } from '../../src/domain/real-jobs'
 import type { Rubric } from '../../src/domain/types'
 import { UPLOAD_CONTENT_TYPES } from '../../src/domain/document-formats'
+import type { WorkspaceLifecycleControl } from '../lifecycle/contracts'
+import { assertWorkspaceMutationLease } from '../lifecycle/lease'
+import { isValidWorkspaceId } from '../ids'
 import { StoreConflictError } from '../store'
+import type { JobBlob, JobBlobStore, JobBlobWriter, JobBlobWriteFence, RealJobsConfig, RealJobStore } from './store'
+import { assertJobWritable, cancelJobWork, isJobReadOnly } from './guards'
 import { fetchCosmosPage } from '../cosmos-query'
-import type { JobBlob, JobBlobStore, RealJobsConfig, RealJobStore } from './store'
 import {
+  isBlobInJobPrefix,
+  isJobBlobInScope,
   isSafeJobBlobName,
+  isValidJobId,
+  jobBlobPrefix,
   jobBlobContentType,
   validateRealJobRecord,
   validateStoredRealRubric,
@@ -30,7 +38,28 @@ interface RubricVersionRecord {
   rubric: Rubric
 }
 
+interface WorkspaceGuard extends WorkspaceLifecycleControl {
+  id: 'job-workspace-lifecycle'
+  workspaceId: string
+  recordType: 'workspace-lifecycle'
+}
+
+interface JobTombstone {
+  id: string
+  workspaceId: string
+  recordType: 'job-tombstone'
+  deletedAt: string
+}
+
+interface BlobWriterRecord extends JobBlobWriter {
+  recordType: 'blob-writer'
+}
+
 const LIST_PAGE_SIZE = 50
+const GUARD_ID = 'job-workspace-lifecycle'
+const WRITER_MILLISECONDS = 120_000
+const BLOB_LEASE_SECONDS = 60
+const BLOB_REQUEST_MILLISECONDS = 30_000
 const MAX_HTML_BYTES = 24 * 1024 * 1024
 const MAX_DOCUMENT_BYTES = JOB_IMPORT_LIMITS.maxSourceCharacters * 8
 
@@ -102,17 +131,189 @@ function validateWriteRubric(record: RealJobRecord, rubric: Rubric): void {
 export function createAzureJobStore(config: RealJobsConfig, credential: TokenCredential): RealJobStore {
   const client = new CosmosClient({ endpoint: config.cosmosEndpoint, aadCredentials: credential })
   const container: Container = client.database(config.database).container(config.container)
+  return createJobStoreFromContainer(container)
+}
 
-  return {
-    async get(workspaceId, jobId) {
+export function createJobStoreFromContainer(container: Pick<Container, 'items' | 'item'>): RealJobStore {
+  async function read<T extends object>(workspaceId: string, id: string): Promise<CosmosDoc<T> | undefined> {
+    if (!isValidWorkspaceId(workspaceId)) throw new Error('Invalid job workspace.')
+    try {
+      const response = await container.item(id, workspaceId).read<CosmosDoc<T>>()
+      if (response.statusCode === 404 || !response.resource) return undefined
+      return response.resource
+    } catch (error) {
+      if (cosmosStatus(error) === 404) return undefined
+      throw error
+    }
+  }
+
+  async function rawJob(workspaceId: string, jobId: string) {
+    if (!isValidJobId(jobId)) throw new Error('Invalid job id.')
+    const value = await read<RealJobRecord | JobTombstone>(workspaceId, jobId)
+    if (value?.recordType === 'job-tombstone') {
+      if (value.id !== jobId || value.workspaceId !== workspaceId || !Number.isFinite(Date.parse(value.deletedAt))) {
+        throw new Error('Invalid job tombstone.')
+      }
+    }
+    return value
+  }
+
+  async function guard(workspaceId: string): Promise<{ record: WorkspaceGuard; etag: string }> {
+    let value = await read<WorkspaceGuard>(workspaceId, GUARD_ID)
+    if (!value) {
+      const initial: WorkspaceGuard = {
+        id: GUARD_ID, workspaceId, recordType: 'workspace-lifecycle',
+        state: 'active', updatedAt: new Date().toISOString(),
+      }
       try {
-        const response = await container.item(jobId, workspaceId).read<CosmosDoc<RealJobRecord>>()
-        if (response.statusCode === 404 || !response.resource) return undefined
-        return decodeJob(response.resource, workspaceId, jobId)
+        assertWorkspaceMutationLease(workspaceId)
+        value = (await container.items.create<CosmosDoc<WorkspaceGuard>>(initial)).resource
       } catch (error) {
-        if (cosmosStatus(error) === 404) return undefined
+        if (cosmosStatus(error) !== 409) throw error
+        value = await read<WorkspaceGuard>(workspaceId, GUARD_ID)
+      }
+    }
+    if (!value || value.id !== GUARD_ID || value.workspaceId !== workspaceId ||
+      value.recordType !== 'workspace-lifecycle' || typeof value._etag !== 'string' ||
+      !['active', 'archived', 'deleting', 'deleted'].includes(value.state) ||
+      !Number.isFinite(Date.parse(value.updatedAt))) throw new Error('Invalid job workspace lifecycle guard.')
+    return { record: omitCosmosFields(value), etag: value._etag }
+  }
+
+  async function guarded<T>(
+    workspaceId: string,
+    ordinary: boolean,
+    prepare: (control: WorkspaceGuard) => Promise<{
+      operations: OperationInput[]
+      result: (results: OperationResponse[]) => T
+      touch?: boolean
+    }>,
+  ): Promise<T> {
+    for (let attempt = 0; attempt < 8; attempt += 1) {
+      const current = await guard(workspaceId)
+      if (ordinary && current.record.state !== 'active') {
+        throw new StoreConflictError('This workspace is archived or removed.')
+      }
+      const pending = await prepare(current.record)
+      if (pending.operations.length === 0 && !pending.touch) return pending.result([])
+      const operations: OperationInput[] = [
+        { operationType: 'Replace', id: GUARD_ID, resourceBody: current.record as unknown as JSONObject, ifMatch: current.etag },
+        ...pending.operations,
+      ]
+      let response
+      try {
+        assertWorkspaceMutationLease(workspaceId)
+        response = await container.items.batch(operations, workspaceId)
+      } catch (error) {
+        if ([404, 409, 412, 424].includes(cosmosStatus(error) ?? 0)) {
+          throw new StoreConflictError('The job changed before its guarded write.')
+        }
         throw error
       }
+      const results = response.result ?? []
+      if (results[0]?.statusCode === 412) continue
+      if (results.length !== operations.length || results.some(result => result.statusCode < 200 || result.statusCode >= 300)) {
+        const status = results.find(result => result.statusCode >= 400 && result.statusCode !== 424)?.statusCode ?? response.code
+        if ([404, 409, 412, 424].includes(status ?? 0)) throw new StoreConflictError('The job or rubric changed before its guarded write.')
+        throw new Error(`Guarded job transaction failed (${status ?? 'unknown'}).`)
+      }
+      return pending.result(results.slice(1))
+    }
+    throw new StoreConflictError('The workspace changed during the job write. Retry with its current state.')
+  }
+
+  async function currentJob(workspaceId: string, jobId: string, expectedEtag?: string): Promise<VersionedRealJob> {
+    const value = await rawJob(workspaceId, jobId)
+    if (!value || value.recordType === 'job-tombstone') throw new StoreConflictError('The job has been removed.')
+    const current = decodeJob(value, workspaceId, jobId)
+    if (expectedEtag !== undefined && current.etag !== expectedEtag) throw new StoreConflictError('The job changed since it was last loaded.')
+    return current
+  }
+
+  function replacement(record: RealJobRecord, etag: string): OperationInput {
+    validateWriteRecord(record)
+    return { operationType: 'Replace', id: record.id, resourceBody: record as unknown as JSONObject, ifMatch: etag }
+  }
+
+  function written(record: RealJobRecord, results: OperationResponse[], index = 0): VersionedRealJob {
+    const etag = results[index]?.eTag
+    if (typeof etag !== 'string') throw new Error('Cosmos did not return the written job etag.')
+    return { record, etag }
+  }
+
+  function writerRecord(value: CosmosDoc<BlobWriterRecord>, workspaceId: string, jobId?: string): BlobWriterRecord {
+    if (value.recordType !== 'blob-writer' || value.workspaceId !== workspaceId ||
+      (jobId !== undefined && value.jobId !== jobId) || !/^job-blob-writer:[0-9a-f-]{36}$/.test(value.id) ||
+      !isBlobInJobPrefix(value.blobName, workspaceId, value.jobId) || !Number.isFinite(Date.parse(value.expiresAt)) ||
+      (value.owner !== undefined && (typeof value.owner !== 'string' || !value.owner))) {
+      throw new Error('Invalid job Blob writer reservation.')
+    }
+    return omitCosmosFields(value)
+  }
+
+  async function cleanupAllowed(workspaceId: string, jobId: string | undefined, control: WorkspaceGuard, rubricOnly = false) {
+    if (control.state === 'deleting' || control.state === 'deleted') return
+    if (jobId === undefined) throw new StoreConflictError('Workspace cleanup requires a deletion fence.')
+    const raw = await rawJob(workspaceId, jobId)
+    if (raw?.recordType === 'job-tombstone') return
+    if (!raw) throw new StoreConflictError('Job cleanup requires a deletion fence.')
+    const current = decodeJob(raw, workspaceId, jobId)
+    if (!current.record.lifecycle?.deletingAt &&
+      !(rubricOnly && current.record.rubricLifecycle?.deletingAt)) {
+      throw new StoreConflictError('Job cleanup requires a deletion fence.')
+    }
+  }
+
+  function recordsQuery(workspaceId: string, types: string[], jobId?: string, continuationToken?: string) {
+    return container.items.query<CosmosDoc<RubricVersionRecord | BlobWriterRecord | RealJobRecord>>({
+      query: `SELECT * FROM c WHERE ARRAY_CONTAINS(@types, c.recordType)
+        ${jobId === undefined ? '' : 'AND c.jobId = @jobId'} ORDER BY c.id ASC`,
+      parameters: [
+        { name: '@types', value: types },
+        ...(jobId === undefined ? [] : [{ name: '@jobId', value: jobId }]),
+      ],
+    }, { partitionKey: workspaceId, maxItemCount: LIST_PAGE_SIZE, continuationToken })
+  }
+
+  async function cleanupPage(workspaceId: string, types: string[], jobId?: string) {
+    let continuationToken: string | undefined
+    const tokens = new Set<string>()
+    for (;;) {
+      assertWorkspaceMutationLease(workspaceId)
+      const page = await fetchCosmosPage(recordsQuery(workspaceId, types, jobId, continuationToken))
+      const resources = page.resources
+      if (resources.length || !page.continuationToken) return resources
+      if (tokens.has(page.continuationToken)) throw new Error('Job cleanup pagination did not advance.')
+      tokens.add(page.continuationToken)
+      continuationToken = page.continuationToken
+    }
+  }
+
+  async function deleteRecords(workspaceId: string, types: string[], jobId?: string) {
+    for (;;) {
+      const removed = await guarded(workspaceId, false, async control => {
+        await cleanupAllowed(workspaceId, jobId, control, types.every(type => type === 'rubric-version'))
+        const resources = await cleanupPage(workspaceId, types, jobId)
+        for (const value of resources) {
+          if (value.recordType === 'rubric-version') decodeRubricRecord(value, workspaceId, jobId)
+          else if (value.recordType === 'blob-writer') {
+            const writer = writerRecord(value, workspaceId, jobId)
+            if (Date.parse(writer.expiresAt) > Date.now()) throw new StoreConflictError('Job Blob writers have not drained.')
+          } else throw new Error('Refusing to purge an unexpected job record.')
+        }
+        return {
+          operations: resources.map(value => ({ operationType: 'Delete' as const, id: value.id })),
+          result: () => resources.length,
+        }
+      })
+      if (removed === 0) return
+    }
+  }
+
+  const store: RealJobStore = {
+    async get(workspaceId, jobId) {
+      const value = await rawJob(workspaceId, jobId)
+      return value && value.recordType !== 'job-tombstone' ? decodeJob(value, workspaceId, jobId) : undefined
     },
 
     async list(workspaceId, continuationToken) {
@@ -133,52 +334,106 @@ export function createAzureJobStore(config: RealJobsConfig, credential: TokenCre
 
     async create(record) {
       validateWriteRecord(record)
-      try {
-        const response = await container.items.create<CosmosDoc<RealJobRecord>>(record)
-        if (!response.resource) throw new Error('Cosmos did not return the created job record.')
-        return { created: true, value: decodeJob(response.resource, record.workspaceId, record.id) }
-      } catch (error) {
-        if (cosmosStatus(error) !== 409) throw error
-        const existing = await this.get(record.workspaceId, record.id)
-        if (!existing) throw new Error('Cosmos reported a duplicate job record that could not be read.')
-        return { created: false, value: existing }
-      }
+      assertJobWritable(record)
+      return guarded<{ created: boolean; value: VersionedRealJob }>(record.workspaceId, true, async () => {
+        const existing = await rawJob(record.workspaceId, record.id)
+        if (existing?.recordType === 'job-tombstone') throw new StoreConflictError('This import idempotency key belongs to a deleted job.')
+        if (existing) {
+          const value = decodeJob(existing, record.workspaceId, record.id)
+          assertJobWritable(value.record)
+          return { operations: [], result: () => ({ created: false, value }) }
+        }
+        return {
+          operations: [{ operationType: 'Create', resourceBody: record as unknown as JSONObject }],
+          result: results => ({ created: true, value: written(record, results) }),
+        }
+      })
     },
 
     async replace(record, expectedEtag) {
       validateWriteRecord(record)
-      try {
-        const response = await container.item(record.id, record.workspaceId).replace<CosmosDoc<RealJobRecord>>(
-          record,
-          { accessCondition: { type: 'IfMatch', condition: expectedEtag } },
-        )
-        if (!response.resource) throw new Error('Cosmos did not return the replaced job record.')
-        return decodeJob(response.resource, record.workspaceId, record.id)
-      } catch (error) {
-        if ([404, 409, 412].includes(cosmosStatus(error) ?? 0)) {
-          throw new StoreConflictError('The job changed since it was last loaded.')
+      return guarded(record.workspaceId, true, async () => {
+        const current = await currentJob(record.workspaceId, record.id, expectedEtag)
+        assertJobWritable(current.record)
+        assertJobWritable(record)
+        if (JSON.stringify(record.lifecycle) !== JSON.stringify(current.record.lifecycle) ||
+          JSON.stringify(record.rubricLifecycle) !== JSON.stringify(current.record.rubricLifecycle) ||
+          record.job.rubricDeletedAt !== current.record.job.rubricDeletedAt) {
+          throw new StoreConflictError('Lifecycle metadata must be changed through lifecycle management.')
         }
-        throw error
-      }
+        return { operations: [replacement(record, expectedEtag)], result: results => written(record, results) }
+      })
     },
 
     async listPending(now, limit) {
       if (!Number.isInteger(limit) || limit < 1 || limit > 100) throw new Error('Pending job limit must be between 1 and 100.')
-      const response = await container.items.query<CosmosDoc<RealJobRecord>>({
-        query: `SELECT TOP @limit * FROM c
+      const result: VersionedRealJob[] = []
+      const controls = new Map<string, WorkspaceLifecycleControl>()
+      let continuationToken: string | undefined
+      const tokens = new Set<string>()
+      do {
+        const response = await fetchCosmosPage(container.items.query<CosmosDoc<RealJobRecord>>({
+          query: `SELECT * FROM c
           WHERE c.recordType = @recordType
           AND ARRAY_CONTAINS(@statuses, c.job.status)
+          AND NOT IS_DEFINED(c.lifecycle.archivedAt) AND NOT IS_DEFINED(c.lifecycle.deletingAt) AND NOT IS_DEFINED(c.lifecycle.deletedAt)
+          AND NOT IS_DEFINED(c.rubricLifecycle.archivedAt) AND NOT IS_DEFINED(c.rubricLifecycle.deletingAt) AND NOT IS_DEFINED(c.rubricLifecycle.deletedAt)
+          AND NOT IS_DEFINED(c.job.rubricDeletedAt)
           AND (NOT IS_DEFINED(c.nextAttemptAt) OR c.nextAttemptAt <= @now)
           AND (NOT IS_DEFINED(c.lease) OR c.lease.expiresAt <= @now)
           ORDER BY c.job.createdAt ASC`,
-        parameters: [
-          { name: '@limit', value: limit },
-          { name: '@recordType', value: 'job' },
-          { name: '@statuses', value: ['queued', 'parsing', 'generating'] },
-          { name: '@now', value: now },
-        ],
+          parameters: [
+            { name: '@recordType', value: 'job' },
+            { name: '@statuses', value: ['queued', 'parsing', 'generating'] },
+            { name: '@now', value: now },
+          ],
+        }, { maxItemCount: limit, continuationToken }))
+        for (const resource of response.resources) {
+          const value = decodeJob(resource)
+          let control = controls.get(value.record.workspaceId)
+          if (!control) {
+            control = await store.getWorkspaceLifecycle(value.record.workspaceId)
+            controls.set(value.record.workspaceId, control)
+          }
+          if (control.state === 'active' && !isJobReadOnly(value.record)) result.push(value)
+          if (result.length === limit) return result
+        }
+        continuationToken = response.continuationToken || undefined
+        if (continuationToken) {
+          if (tokens.has(continuationToken)) throw new Error('Pending job pagination did not advance.')
+          tokens.add(continuationToken)
+        }
+      } while (continuationToken)
+      return result
+    },
+
+    async pendingLifecycleWorkspaces(limit) {
+      if (!Number.isInteger(limit) || limit < 1 || limit > 100) throw new Error('Lifecycle workspace limit must be between 1 and 100.')
+      const response = await container.items.query<string>({
+        query: `SELECT DISTINCT TOP @limit VALUE c.workspaceId FROM c
+          WHERE c.recordType = @recordType
+          AND (IS_DEFINED(c.lifecycle.deletingAt) OR IS_DEFINED(c.rubricLifecycle.deletingAt))`,
+        parameters: [{ name: '@limit', value: limit }, { name: '@recordType', value: 'job' }],
       }).fetchAll()
-      return response.resources.map((resource) => decodeJob(resource))
+      const workspaceIds = [...new Set(response.resources)]
+      if (workspaceIds.length > limit || workspaceIds.some(id => typeof id !== 'string' || !isValidWorkspaceId(id))) {
+        throw new Error('Pending job cleanup returned invalid workspace scopes.')
+      }
+      return workspaceIds
+    },
+
+    async listLifecyclePending(workspaceId, continuationToken) {
+      if (!isValidWorkspaceId(workspaceId)) throw new Error('Invalid job workspace.')
+      const response = await fetchCosmosPage(container.items.query<CosmosDoc<RealJobRecord>>({
+        query: `SELECT * FROM c WHERE c.recordType = @recordType
+          AND (IS_DEFINED(c.lifecycle.deletingAt) OR IS_DEFINED(c.rubricLifecycle.deletingAt))
+          ORDER BY c.id ASC`,
+        parameters: [{ name: '@recordType', value: 'job' }],
+      }, { partitionKey: workspaceId, maxItemCount: LIST_PAGE_SIZE, continuationToken }))
+      return {
+        jobs: response.resources.map(raw => decodeJob(raw, workspaceId)),
+        ...(response.continuationToken ? { continuationToken: response.continuationToken } : {}),
+      }
     },
 
     async getRubric(workspaceId, rubricId) {
@@ -195,10 +450,17 @@ export function createAzureJobStore(config: RealJobsConfig, credential: TokenCre
         { partitionKey: workspaceId },
       ).fetchAll()
       const value = response.resources[0]
-      return value ? decodeRubricRecord(value, workspaceId, undefined, rubricId).rubric : undefined
+      if (!value) return undefined
+      const decoded = decodeRubricRecord(value, workspaceId, undefined, rubricId)
+      const owner = await store.get(workspaceId, decoded.jobId)
+      if (!owner || owner.record.lifecycle?.deletingAt || owner.record.lifecycle?.deletedAt ||
+        owner.record.rubricLifecycle?.deletingAt || owner.record.rubricLifecycle?.deletedAt) return undefined
+      return decoded.rubric
     },
 
     async listRubrics(workspaceId, jobId) {
+      const owner = await store.get(workspaceId, jobId)
+      if (!owner || owner.record.lifecycle?.deletedAt || owner.record.rubricLifecycle?.deletedAt) return []
       const response = await container.items.query<CosmosDoc<RubricVersionRecord>>(
         {
           query: `SELECT * FROM c
@@ -226,42 +488,245 @@ export function createAzureJobStore(config: RealJobsConfig, credential: TokenCre
         version: rubric.version,
         rubric,
       }
-      let response
-      try {
-        response = await container.items.batch(
-          [
+      return guarded(record.workspaceId, true, async () => {
+        const current = await currentJob(record.workspaceId, record.id, expectedEtag)
+        assertJobWritable(current.record)
+        assertJobWritable(record)
+        if (JSON.stringify(record.lifecycle) !== JSON.stringify(current.record.lifecycle) ||
+          JSON.stringify(record.rubricLifecycle) !== JSON.stringify(current.record.rubricLifecycle) ||
+          record.job.rubricDeletedAt !== current.record.job.rubricDeletedAt) {
+          throw new StoreConflictError('Publication cannot change lifecycle metadata.')
+        }
+        return {
+          operations: [
             { operationType: 'Create', resourceBody: rubricRecord as unknown as JSONObject },
-            { operationType: 'Replace', id: record.id, resourceBody: record as unknown as JSONObject, ifMatch: expectedEtag },
+            replacement(record, expectedEtag),
           ],
-          record.workspaceId,
-        )
+          result: results => written(record, results, 1),
+        }
+      })
+    },
+
+    async getWorkspaceLifecycle(workspaceId) {
+      const current = await guard(workspaceId)
+      return { state: current.record.state, updatedAt: current.record.updatedAt }
+    },
+
+    async setWorkspaceLifecycle(workspaceId, state, timestamp) {
+      await guarded(workspaceId, false, async current => {
+        if ((current.state === 'deleted' && state !== 'deleted') ||
+          (current.state === 'deleting' && !['deleting', 'deleted'].includes(state))) {
+          throw new StoreConflictError('A removed workspace cannot be restored.')
+        }
+        // The guard is already the first batch write; mutate that exact replacement.
+        current.state = state
+        current.updatedAt = timestamp
+        return {
+          operations: [],
+          touch: true,
+          result: () => undefined,
+        }
+      })
+    },
+
+    async cancelWorkspace(workspaceId, timestamp) {
+      const control = await store.getWorkspaceLifecycle(workspaceId)
+      if (control.state === 'active') throw new StoreConflictError('Workspace cancellation requires a lifecycle fence.')
+      let continuationToken: string | undefined
+      const tokens = new Set<string>()
+      do {
+        const page = await fetchCosmosPage(recordsQuery(workspaceId, ['job'], undefined, continuationToken))
+        for (const raw of page.resources) {
+          const value = decodeJob(raw as CosmosDoc<RealJobRecord>, workspaceId)
+          await guarded(workspaceId, false, async currentControl => {
+            if (currentControl.state === 'active') throw new StoreConflictError('Workspace cancellation lost its fence.')
+            const current = await currentJob(workspaceId, value.record.id)
+            const record = cancelJobWork(current.record, timestamp)
+            return { operations: [replacement(record, current.etag)], result: () => undefined }
+          })
+        }
+        continuationToken = page.continuationToken || undefined
+        if (continuationToken) {
+          if (tokens.has(continuationToken)) throw new Error('Job cancellation pagination did not advance.')
+          tokens.add(continuationToken)
+        }
+      } while (continuationToken)
+    },
+
+    async transitionLifecycle(workspaceId, jobId, expectedEtag, scope, action, timestamp) {
+      return guarded(workspaceId, false, async control => {
+        if (control.state === 'deleted' || (control.state === 'deleting' && action !== 'delete')) {
+          throw new StoreConflictError('This workspace is being removed.')
+        }
+        const current = await currentJob(workspaceId, jobId, expectedEtag)
+        const key = scope === 'job' ? 'lifecycle' : 'rubricLifecycle'
+        const metadata = current.record[key] ?? {}
+        if (metadata.deletedAt || (metadata.deletingAt && action !== 'delete') ||
+          (scope === 'rubric' && current.record.lifecycle?.deletingAt)) {
+          throw new StoreConflictError('A removed item cannot be restored or edited.')
+        }
+        if (action === 'delete' && metadata.deletingAt) return { operations: [], result: () => current }
+        const updated = { ...metadata, ...(scope === 'rubric' ? { parentKey: `job:${jobId}` } : {}) }
+        if (action === 'archive') updated.archivedAt = timestamp
+        else if (action === 'unarchive') delete updated.archivedAt
+        else updated.deletingAt = timestamp
+        const record: RealJobRecord = {
+          ...(action === 'unarchive' ? current.record : cancelJobWork(current.record, timestamp)),
+          [key]: updated,
+          updatedAt: timestamp,
+        }
+        return { operations: [replacement(record, current.etag)], result: results => written(record, results) }
+      })
+    },
+
+    async completeRubricDeletion(workspaceId, jobId, expectedEtag, timestamp) {
+      return guarded(workspaceId, false, async () => {
+        const current = await currentJob(workspaceId, jobId, expectedEtag)
+        if (!current.record.rubricLifecycle?.deletingAt) throw new StoreConflictError('Rubric deletion is not pending.')
+        const remaining = await cleanupPage(workspaceId, ['rubric-version'], jobId)
+        if (remaining.length) throw new StoreConflictError('Rubric cleanup has not completed.')
+        const record: RealJobRecord = {
+          ...cancelJobWork(current.record, timestamp),
+          job: { ...current.record.job, status: 'ready', rubricId: null, rubricDeletedAt: timestamp, error: undefined, errorStage: undefined },
+          error: undefined,
+          rubricLifecycle: { parentKey: `job:${jobId}`, deletedAt: timestamp },
+        }
+        return { operations: [replacement(record, current.etag)], result: results => written(record, results) }
+      })
+    },
+
+    async purgeRubrics(workspaceId, jobId) {
+      await deleteRecords(workspaceId, ['rubric-version'], jobId)
+    },
+
+    async purgeJobRecords(workspaceId, jobId, timestamp) {
+      await deleteRecords(workspaceId, ['rubric-version', 'blob-writer'], jobId)
+      await guarded(workspaceId, false, async control => {
+        await cleanupAllowed(workspaceId, jobId, control)
+        const remaining = await cleanupPage(workspaceId, ['rubric-version', 'blob-writer'], jobId)
+        if (remaining.length) throw new StoreConflictError('Job cleanup has not completed.')
+        const raw = await rawJob(workspaceId, jobId)
+        if (raw?.recordType === 'job-tombstone') return { operations: [], result: () => undefined }
+        const current = await currentJob(workspaceId, jobId)
+        const tombstone: JobTombstone = { id: jobId, workspaceId, recordType: 'job-tombstone', deletedAt: timestamp }
+        return {
+          operations: [{ operationType: 'Replace', id: jobId, resourceBody: tombstone as unknown as JSONObject, ifMatch: current.etag }],
+          result: () => undefined,
+        }
+      })
+    },
+
+    async purgeWorkspaceRecords(workspaceId, timestamp) {
+      await deleteRecords(workspaceId, ['rubric-version', 'blob-writer'])
+      for (;;) {
+        const removed = await guarded(workspaceId, false, async control => {
+          await cleanupAllowed(workspaceId, undefined, control)
+          const remaining = await cleanupPage(workspaceId, ['rubric-version', 'blob-writer'])
+          if (remaining.length) throw new StoreConflictError('Workspace job cleanup has not completed.')
+          const records = await cleanupPage(workspaceId, ['job'])
+          const operations: OperationInput[] = records.map(raw => {
+            const current = decodeJob(raw as CosmosDoc<RealJobRecord>, workspaceId)
+            const tombstone: JobTombstone = {
+              id: current.record.id, workspaceId, recordType: 'job-tombstone', deletedAt: timestamp,
+            }
+            return { operationType: 'Replace', id: tombstone.id, resourceBody: tombstone as unknown as JSONObject, ifMatch: current.etag }
+          })
+          return { operations, result: () => operations.length }
+        })
+        if (!removed) return
+      }
+    },
+
+    async beginBlobWrite(workspaceId, jobId, blobName, owner) {
+      if (!isBlobInJobPrefix(blobName, workspaceId, jobId)) throw new Error('Invalid job Blob writer scope.')
+      return guarded(workspaceId, true, async () => {
+        const raw = await rawJob(workspaceId, jobId)
+        if (raw?.recordType === 'job-tombstone') throw new StoreConflictError('This job has been removed.')
+        if (raw) {
+          const current = decodeJob(raw, workspaceId, jobId)
+          assertJobWritable(current.record)
+          if (owner && (current.record.lease?.owner !== owner || Date.parse(current.record.lease.expiresAt) <= Date.now())) {
+            throw new StoreConflictError('The source writer no longer owns this job.')
+          }
+        } else if (owner) throw new StoreConflictError('The source writer job has been removed.')
+        const writer: BlobWriterRecord = {
+          id: `job-blob-writer:${randomUUID()}`, workspaceId, jobId, blobName,
+          expiresAt: new Date(Date.now() + WRITER_MILLISECONDS).toISOString(), recordType: 'blob-writer',
+          ...(owner ? { owner } : {}),
+        }
+        return {
+          operations: [{ operationType: 'Create', resourceBody: writer as unknown as JSONObject }],
+          result: () => writer,
+        }
+      })
+    },
+
+    async assertBlobWrite(writer) {
+      const control = await store.getWorkspaceLifecycle(writer.workspaceId)
+      if (control.state !== 'active' || Date.parse(writer.expiresAt) <= Date.now()) {
+        throw new StoreConflictError('The job Blob writer has been fenced.')
+      }
+      const raw = await read<BlobWriterRecord>(writer.workspaceId, writer.id)
+      const stored = raw ? writerRecord(raw, writer.workspaceId, writer.jobId) : undefined
+      if (!stored || stored.blobName !== writer.blobName || stored.expiresAt !== writer.expiresAt ||
+        stored.owner !== writer.owner) {
+        throw new StoreConflictError('The job Blob writer reservation is no longer current.')
+      }
+      const job = await rawJob(writer.workspaceId, writer.jobId)
+      if (job?.recordType === 'job-tombstone') throw new StoreConflictError('The job has been removed.')
+      if (job) {
+        const current = decodeJob(job, writer.workspaceId, writer.jobId)
+        assertJobWritable(current.record)
+        if (writer.owner && (current.record.lease?.owner !== writer.owner ||
+          Date.parse(current.record.lease.expiresAt) <= Date.now())) {
+          throw new StoreConflictError('The source writer no longer owns this job.')
+        }
+      } else if (writer.owner) throw new StoreConflictError('The source writer job was removed.')
+    },
+
+    async finishBlobWrite(writer) {
+      const raw = await read<BlobWriterRecord>(writer.workspaceId, writer.id)
+      if (!raw) return
+      const stored = writerRecord(raw, writer.workspaceId, writer.jobId)
+      if (stored.blobName !== writer.blobName || stored.expiresAt !== writer.expiresAt) {
+        throw new Error('Refusing to release a different job Blob writer.')
+      }
+      try {
+        await container.item(writer.id, writer.workspaceId).delete()
       } catch (error) {
-        if ([404, 409, 412, 424].includes(cosmosStatus(error) ?? 0)) {
-          throw new StoreConflictError('The job or rubric version changed before publication.')
-        }
-        throw error
+        if (cosmosStatus(error) !== 404) throw error
       }
-      const results = response.result ?? []
-      if (results.length !== 2 || results.some((result) => result.statusCode < 200 || result.statusCode >= 300)) {
-        const status = results.find((result) => result.statusCode >= 400)?.statusCode ?? response.code
-        if ([404, 409, 412, 424].includes(status ?? 0)) {
-          throw new StoreConflictError('The job or rubric version changed before publication.')
+    },
+
+    async listBlobWriters(workspaceId, jobId) {
+      const writers: JobBlobWriter[] = []
+      let continuationToken: string | undefined
+      const tokens = new Set<string>()
+      do {
+        const page = await fetchCosmosPage(recordsQuery(workspaceId, ['blob-writer'], jobId, continuationToken))
+        for (const raw of page.resources) writers.push(writerRecord(raw as CosmosDoc<BlobWriterRecord>, workspaceId, jobId))
+        continuationToken = page.continuationToken || undefined
+        if (continuationToken) {
+          if (tokens.has(continuationToken)) throw new Error('Job Blob writer pagination did not advance.')
+          tokens.add(continuationToken)
         }
-        throw new Error(`Cosmos rubric publication did not succeed (batch status ${status ?? 'unknown'}).`)
-      }
-      const etag = results[1]?.eTag
-      if (typeof etag !== 'string') throw new Error('Cosmos did not return the published job etag.')
-      return { record, etag }
+      } while (continuationToken)
+      return writers
     },
   }
+  return store
 }
 
 interface JobBlobContainer {
   getBlockBlobClient(path: string): {
     download(): Promise<Pick<Awaited<ReturnType<BlockBlobClient['download']>>,
-      'readableStreamBody' | 'etag' | 'contentType' | 'contentLength'>>
+      'readableStreamBody' | 'etag' | 'contentType' | 'contentLength' | 'metadata'>>
     upload(...args: Parameters<BlockBlobClient['upload']>): Promise<Pick<Awaited<ReturnType<BlockBlobClient['upload']>>, 'etag'>>
+    getProperties?: BlockBlobClient['getProperties']
+    getBlobLeaseClient?: BlockBlobClient['getBlobLeaseClient']
+    deleteIfExists?: BlockBlobClient['deleteIfExists']
   }
+  listBlobsFlat?: ContainerClient['listBlobsFlat']
 }
 
 async function readBounded(
@@ -294,7 +759,9 @@ function hash(bytes: Uint8Array): string {
 }
 
 export function createAzureJobBlobStore(config: RealJobsConfig, credential: TokenCredential): JobBlobStore {
-  const service = new BlobServiceClient(config.storageAccountUrl, credential)
+  const service = new BlobServiceClient(config.storageAccountUrl, credential, {
+    retryOptions: { maxTries: 1, tryTimeoutInMs: BLOB_REQUEST_MILLISECONDS },
+  })
   return createJobBlobStoreFromContainer(service.getContainerClient(config.blobContainer))
 }
 
@@ -303,6 +770,7 @@ export function createJobBlobStoreFromContainer(container: JobBlobContainer): Jo
     if (!isSafeJobBlobName(blobName)) throw new Error('Invalid job blob name.')
     try {
       const response = await container.getBlockBlobClient(blobName).download()
+      if (response.metadata?.scorepreparing === 'true') return undefined
       if (!response.readableStreamBody) throw new Error('Blob download returned no content stream.')
       if (typeof response.etag !== 'string' || !response.etag.trim() || response.contentType !== jobBlobContentType(blobName)) {
         throw new Error('Blob download did not return required metadata.')
@@ -315,13 +783,69 @@ export function createJobBlobStoreFromContainer(container: JobBlobContainer): Jo
     }
   }
 
-  async function putImmutable(blobName: string, bytes: Uint8Array, contentType: string) {
+  async function putImmutable(blobName: string, bytes: Uint8Array, contentType: string, fence?: JobBlobWriteFence) {
     if (!isSafeJobBlobName(blobName)) throw new Error('Invalid job blob name.')
     if (!(bytes instanceof Uint8Array) || !bytes.byteLength || bytes.byteLength > maxBlobBytes(blobName)) {
       throw new Error('Job blob exceeds the supported size or is empty.')
     }
     if (contentType !== jobBlobContentType(blobName)) throw new Error('Unsupported job blob content type for its namespace.')
     const body = Buffer.from(bytes)
+    if (fence) {
+      const client = container.getBlockBlobClient(blobName)
+      if (!client.getBlobLeaseClient || !client.getProperties) throw new Error('Job Blob lease fencing is unavailable.')
+      if (fence.writer.blobName !== blobName ||
+        !isBlobInJobPrefix(blobName, fence.writer.workspaceId, fence.writer.jobId)) throw new Error('Invalid job Blob writer scope.')
+      const remaining = () => Date.parse(fence.writer.expiresAt) - Date.now()
+      const assertTime = () => {
+        if (remaining() <= BLOB_LEASE_SECONDS * 1000 + 5_000) {
+          throw new StoreConflictError('The job Blob writer reservation expired before upload.')
+        }
+      }
+      assertTime()
+      await fence.assertActive()
+      const timeout = AbortSignal.timeout(BLOB_REQUEST_MILLISECONDS)
+      const signal = fence.signal ? AbortSignal.any([timeout, fence.signal]) : timeout
+      try {
+        // The only unfenced create contains no source data. A finite lease fences the content PUT itself.
+        await client.upload(Buffer.alloc(0), 0, {
+          conditions: { ifNoneMatch: '*' },
+          metadata: { scorepreparing: 'true' },
+          blobHTTPHeaders: { blobContentType: 'application/octet-stream' },
+          abortSignal: signal,
+        })
+      } catch (error) {
+        if (![409, 412].includes(blobStatus(error) ?? 0)) throw error
+        const existing = await read(blobName)
+        if (existing) {
+          await fence.assertActive()
+          return { created: false, blob: existing }
+        }
+      }
+      assertTime()
+      const lease = client.getBlobLeaseClient(fence.writer.id.replace(/^job-blob-writer:/, ''))
+      await lease.acquireLease(BLOB_LEASE_SECONDS, { abortSignal: signal })
+      try {
+        await fence.assertActive()
+        assertTime()
+        const properties = await client.getProperties({ abortSignal: signal })
+        if (properties.metadata?.scorepreparing !== 'true') {
+          const existing = await read(blobName)
+          if (!existing) throw new Error('The immutable job source could not be read.')
+          return { created: false, blob: existing }
+        }
+        const response = await client.upload(body, body.byteLength, {
+          conditions: { ifMatch: properties.etag, leaseId: lease.leaseId },
+          metadata: {},
+          blobHTTPHeaders: { blobContentType: contentType, blobCacheControl: 'private, no-store' },
+          abortSignal: signal,
+        })
+        if (typeof response.etag !== 'string' || !response.etag.trim()) throw new Error('Blob upload did not return an etag.')
+        await fence.assertActive()
+        return { created: true, blob: { bytes: body, contentType, sha256: hash(body), etag: response.etag } }
+      } finally {
+        await lease.releaseLease({ abortSignal: AbortSignal.timeout(BLOB_REQUEST_MILLISECONDS) }).catch(() => undefined)
+      }
+    }
     try {
       const response = await container.getBlockBlobClient(blobName).upload(body, body.byteLength, {
         conditions: { ifNoneMatch: '*' },
@@ -340,5 +864,38 @@ export function createJobBlobStoreFromContainer(container: JobBlobContainer): Jo
     }
   }
 
-  return { read, putImmutable }
+  return {
+    read,
+    putImmutable,
+    async putFenced(blobName, bytes, contentType, fence) {
+      if (!fence?.writer || typeof fence.assertActive !== 'function') throw new Error('A job Blob write fence is required.')
+      return putImmutable(blobName, bytes, contentType, fence)
+    },
+    async list(workspaceId, jobId, continuationToken) {
+      const prefix = jobBlobPrefix(workspaceId, jobId)
+      if (!container.listBlobsFlat) throw new Error('Job Blob enumeration is unavailable.')
+      const pages = container.listBlobsFlat({ prefix }).byPage({ continuationToken, maxPageSize: LIST_PAGE_SIZE })
+      const page = await pages.next()
+      if (page.done) return { names: [] }
+      const names = page.value.segment.blobItems.map(item => item.name)
+      if (names.some(name => !isJobBlobInScope(name, workspaceId, jobId))) {
+        throw new Error('Job Blob enumeration returned an item outside its validated scope.')
+      }
+      return {
+        names,
+        ...(page.value.continuationToken ? { continuationToken: page.value.continuationToken } : {}),
+      }
+    },
+    async delete(workspaceId, jobId, blobName) {
+      if (!isJobBlobInScope(blobName, workspaceId, jobId)) throw new Error('Invalid job Blob deletion scope.')
+      const client = container.getBlockBlobClient(blobName)
+      if (!client.deleteIfExists || !client.getBlobLeaseClient) throw new Error('Job Blob deletion and fencing are unavailable.')
+      try {
+        await client.getBlobLeaseClient().breakLease(0, { abortSignal: AbortSignal.timeout(BLOB_REQUEST_MILLISECONDS) })
+      } catch (error) {
+        if (![404, 409].includes(blobStatus(error) ?? 0)) throw error
+      }
+      await client.deleteIfExists({ deleteSnapshots: 'include', abortSignal: AbortSignal.timeout(BLOB_REQUEST_MILLISECONDS) })
+    },
+  }
 }

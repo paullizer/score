@@ -2,6 +2,7 @@ import { JOB_IMPORT_LIMITS } from '../../src/domain/real-jobs'
 import type { RealJobRecord } from '../../src/domain/real-jobs'
 import { isSafeUploadedFilename } from '../../src/domain/source-files'
 import type { Citation, Rubric, SourceDocument } from '../../src/domain/types'
+import type { LifecycleMetadata } from '../../src/domain/lifecycle'
 import { isValidWorkspaceId } from '../ids'
 import {
   isOriginalContentType, isUploadFormat, originalExtension, storedDocumentContentType, UPLOAD_CONTENT_TYPES,
@@ -67,6 +68,28 @@ export function isSafeJobBlobName(value: string): boolean {
 
 export function isBlobInJobPrefix(value: string, workspaceId: string, jobId: string): boolean {
   return isSafeJobBlobName(value) && value.startsWith(`${workspaceId}/${jobId}/`)
+}
+
+export function jobBlobPrefix(workspaceId: string, jobId?: string): string {
+  if (!isValidWorkspaceId(workspaceId) || (jobId !== undefined && !isValidJobId(jobId))) {
+    throw new Error('Invalid job blob scope.')
+  }
+  return jobId === undefined ? `${workspaceId}/` : `${workspaceId}/${jobId}/`
+}
+
+export function isJobBlobInScope(value: string, workspaceId: string, jobId?: string): boolean {
+  const parts = value.split('/')
+  return value.startsWith(jobBlobPrefix(workspaceId, jobId)) && parts.length >= 3 &&
+    parts[0] === workspaceId && isValidJobId(parts[1]) &&
+    (jobId === undefined || parts[1] === jobId) &&
+    parts.slice(2).every(part => /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,254}$/.test(part))
+}
+
+function isLifecycle(value: unknown): value is LifecycleMetadata | undefined {
+  return value === undefined || (isRecord(value) &&
+    hasOnlyKeys(value, ['archivedAt', 'deletingAt', 'deletedAt', 'parentKey']) &&
+    ['archivedAt', 'deletingAt', 'deletedAt'].every(key => value[key] === undefined || isTimestamp(value[key])) &&
+    (value.parentKey === undefined || isNonBlank(value.parentKey)))
 }
 
 export function jobBlobContentType(name: string): OriginalContentType | 'application/json' {
@@ -237,12 +260,12 @@ export function validateStoredRealRubric(value: unknown): value is Rubric {
 export function validateRealJobRecord(value: unknown): value is RealJobRecord {
   if (!isRecord(value) || !hasOnlyKeys(value, [
     'id', 'workspaceId', 'recordType', 'job', 'source', 'inputFingerprint', 'createdBy', 'updatedAt', 'attempts',
-    'nextAttemptAt', 'lease', 'extractedBlobName', 'error', 'warnings',
+    'nextAttemptAt', 'lease', 'extractedBlobName', 'error', 'warnings', 'lifecycle', 'rubricLifecycle',
   ]) || value.recordType !== 'job' || typeof value.id !== 'string' || !isValidJobId(value.id) ||
     typeof value.workspaceId !== 'string' || !isValidWorkspaceId(value.workspaceId) || !isRecord(value.job) ||
     !hasOnlyKeys(value.job, [
       'id', 'title', 'organization', 'location', 'arrangement', 'employmentType', 'grade', 'series', 'source',
-      'sourceLabel', 'batchId', 'documentId', 'rubricId', 'status', 'errorStage', 'error', 'createdAt', 'dataKind',
+      'sourceLabel', 'batchId', 'documentId', 'rubricId', 'rubricDeletedAt', 'status', 'errorStage', 'error', 'createdAt', 'dataKind',
     ]) ||
     value.job.id !== value.id || value.job.dataKind !== 'real' || typeof value.job.documentId !== 'string' ||
     !isValidDocumentId(value.job.documentId) || !isRecord(value.source) ||
@@ -324,7 +347,11 @@ export function validateRealJobRecord(value: unknown): value is RealJobRecord {
     !['queued', 'parsing', 'generating', 'ready', 'error', 'cancelled'].includes(String(value.job.status))) {
     return false
   }
-  if (value.job.status === 'ready' && value.job.rubricId === null) return false
+  if (!isLifecycle(value.lifecycle) || !isLifecycle(value.rubricLifecycle)) return false
+  if (job.rubricDeletedAt !== undefined &&
+    (!isTimestamp(job.rubricDeletedAt) || job.rubricId !== null || !value.rubricLifecycle?.deletedAt)) return false
+  if (value.rubricLifecycle?.deletedAt && (!job.rubricDeletedAt || job.rubricId !== null)) return false
+  if (value.job.status === 'ready' && value.job.rubricId === null && !job.rubricDeletedAt) return false
   if (value.nextAttemptAt !== undefined && !isTimestamp(value.nextAttemptAt)) return false
   if (value.lease !== undefined && (!isRecord(value.lease) || !hasOnlyKeys(value.lease, ['owner', 'expiresAt']) ||
     !isNonBlank(value.lease.owner) || !isTimestamp(value.lease.expiresAt))) {
