@@ -8,6 +8,7 @@ import { JOB_IMPORT_LIMITS } from '../../src/domain/real-jobs'
 import type { RealJobRecord, VersionedRealJob } from '../../src/domain/real-jobs'
 import type { Rubric } from '../../src/domain/types'
 import { StoreConflictError } from '../store'
+import { fetchCosmosPage } from '../cosmos-query'
 import type { JobBlob, JobBlobStore, RealJobsConfig, RealJobStore } from './store'
 import {
   isSafeJobBlobName,
@@ -116,8 +117,8 @@ export function createAzureJobStore(config: RealJobsConfig, credential: TokenCre
         },
         { partitionKey: workspaceId, maxItemCount: LIST_PAGE_SIZE, continuationToken },
       )
-      const response = await iterator.fetchNext()
-      const jobs = (response.resources ?? []).map((resource) => decodeJob(resource, workspaceId))
+      const response = await fetchCosmosPage(iterator)
+      const jobs = response.resources.map((resource) => decodeJob(resource, workspaceId))
       return {
         jobs,
         ...(response.continuationToken ? { continuationToken: response.continuationToken } : {}),

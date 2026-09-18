@@ -7,6 +7,7 @@ import type { TokenCredential } from '@azure/identity'
 import { GRADE_LADDER_LIMITS, type GradeEntity, type GradeWorkRecord, type VersionedGradeEntity } from '../../src/domain/real-grades'
 import { WORKSPACE_ID_PATTERN } from '../ids'
 import { StoreConflictError, StoreNotFoundError } from '../store'
+import { fetchCosmosPage } from '../cosmos-query'
 import type { GradeBlob, GradeBlobStore, GradeStore, RealGradesConfig } from './store'
 import { gradeContentHash, isGradeId, isSafeGradeBlobName, MUTABLE_GRADE_TYPES, parseGradeEntity } from './validation'
 
@@ -115,9 +116,9 @@ export function createGradeStoreFromContainer(container: Pick<Container, 'item' 
           parameters.push({ name: `@${field}`, value: options[field] })
         }
       }
-      const response = await container.items.query({
+      const response = await fetchCosmosPage(container.items.query({
         query: `SELECT * FROM c WHERE ${filters.join(' AND ')} ORDER BY c.createdAt DESC`, parameters,
-      }, { partitionKey: workspaceId, maxItemCount: limit, continuationToken: options.continuationToken }).fetchNext()
+      }, { partitionKey: workspaceId, maxItemCount: limit, continuationToken: options.continuationToken }))
       const items = response.resources.map(value => decode(value, workspaceId))
       if (items.some(({ record }) => record.recordType !== options.recordType ||
         (options.ladderId !== undefined && (!('ladderId' in record) || record.ladderId !== options.ladderId)) ||

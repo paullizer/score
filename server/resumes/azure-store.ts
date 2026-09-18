@@ -6,6 +6,7 @@ import type { TokenCredential } from '@azure/identity'
 import type { RealResumeRecord, ResumeEntity, VersionedResumeEntity } from '../../src/domain/real-resumes'
 import { WORKSPACE_ID_PATTERN } from '../ids'
 import { StoreConflictError, StoreNotFoundError } from '../store'
+import { fetchCosmosPage } from '../cosmos-query'
 import type { RealResumesConfig, ResumeBlob, ResumeBlobStore, ResumeStore } from './store'
 import {
   REAL_RESUME_STATUSES, isResumeUuid, isSafeResumeBlobName, isValidResumeBatchRecordId, isValidResumeId,
@@ -147,9 +148,9 @@ export function createResumeStoreFromContainer(container: Pick<Container, 'item'
         filters.push('c.resume.status = @status')
         parameters.push({ name: '@status', value: options.status })
       }
-      const response = await container.items.query({
+      const response = await fetchCosmosPage(container.items.query({
         query: `SELECT * FROM c WHERE ${filters.join(' AND ')} ORDER BY c.createdAt DESC`, parameters,
-      }, { partitionKey: workspaceId, maxItemCount: limit, continuationToken: options.continuationToken }).fetchNext()
+      }, { partitionKey: workspaceId, maxItemCount: limit, continuationToken: options.continuationToken }))
       if (response.resources.length > limit) throw new Error('Resume query exceeded its requested page size.')
       const items = response.resources.map(value => decode(value, workspaceId))
       if (items.some(({ record }) => record.recordType !== options.recordType ||

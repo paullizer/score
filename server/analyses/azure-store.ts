@@ -6,6 +6,7 @@ import {
 } from '../../src/domain/real-analyses'
 import { WORKSPACE_ID_PATTERN } from '../ids'
 import { StoreConflictError } from '../store'
+import { fetchCosmosPage } from '../cosmos-query'
 import type { AnalysisBlob, AnalysisBlobStore, AnalysisStore, RealAnalysesConfig } from './store'
 import {
   analysisBytesHash, analysisCancellationNeedsRetry, analysisHash, assertAnalysis, isAnalysisId, isSafeAnalysisBlobName, MAX_ANALYSIS_JSON_BYTES,
@@ -108,10 +109,10 @@ export function createAnalysisStoreFromContainer(container: Pick<Container, 'ite
         filters.push(`c.${key} = @${key}`)
         parameters.push({ name: `@${key}`, value: options[key] })
       }
-      const response = await container.items.query({
+      const response = await fetchCosmosPage(container.items.query({
         query: `SELECT * FROM c WHERE ${filters.join(' AND ')} ORDER BY c.${options.recordType === 'analysis-comparison' ? 'index ASC' : 'createdAt DESC'}`,
         parameters,
-      }, { partitionKey: workspaceId, maxItemCount: limit, continuationToken: options.continuationToken }).fetchNext()
+      }, { partitionKey: workspaceId, maxItemCount: limit, continuationToken: options.continuationToken }))
       const items = response.resources.map(value => decode(value, workspaceId))
       assertAnalysis(items.length <= limit && items.every(({ record }) => record.recordType === options.recordType &&
         (options.runId === undefined || (record.recordType === 'analysis-comparison' && record.runId === options.runId)) &&
@@ -244,7 +245,7 @@ export function createAnalysisStoreFromContainer(container: Pick<Container, 'ite
         const seenTokens = new Set<string>()
         let continuationToken: string | undefined
         do {
-          const response = await container.items.query(query, { maxItemCount: 100, continuationToken }).fetchNext()
+          const response = await fetchCosmosPage(container.items.query(query, { maxItemCount: 100, continuationToken }))
           const page = response.resources.map(value => decode(value))
           assertAnalysis(page.length <= 100 && page.every(item => item.record.recordType === recordType &&
             analysisWorkIsPending(item.record, now)), 'Pending query returned ineligible work.')
