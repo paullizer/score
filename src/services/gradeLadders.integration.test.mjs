@@ -127,9 +127,15 @@ beforeEach(() => {
 
 after(async () => { globalThis.fetch = originalFetch; await rm(outputDirectory, { recursive: true, force: true }) })
 
-test('grade feature discovery is additive without changing the real-jobs client envelope', async () => {
+test('grade feature discovery stays separate from job Word-capability defaults', async () => {
   globalThis.fetch = async () => json({ realJobImports: true, limits: { maxPdfPages: 50 }, realGradeLadders: true, gradeLimits: { maxSources: 15 } })
-  assert.deepEqual(await jobClient.fetchJobProcessingFeatures(), { realJobImports: true, markdownJobImports: false, limits: { maxPdfPages: 50 } })
+  assert.deepEqual(await jobClient.fetchJobProcessingFeatures(), {
+    realJobImports: true, markdownJobImports: false, wordDocumentImports: false,
+    limits: {
+      maxFileBytes: 10 * 1024 * 1024, maxPdfBytes: 10 * 1024 * 1024, maxMarkdownBytes: 10 * 1024 * 1024, maxPdfPages: 50,
+      maxSourceCharacters: 180_000, maxBatchFiles: 10, maxUrlLength: 4096, maxCriteria: 20,
+    },
+  })
   assert.deepEqual(await client.fetchGradeProcessingFeatures(), { realGradeLadders: true, gradeLimits: { maxSources: 15 } })
   globalThis.fetch = async () => json({ realJobImports: true })
   const disabled = await client.fetchGradeProcessingFeatures()

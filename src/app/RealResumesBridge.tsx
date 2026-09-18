@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
 import type { RealResumeDetail, RealResumeSummary, ResumeProcessingFeatures } from '../domain/real-resumes'
+import { supportedUploadFormats } from '../domain/document-formats'
 import * as api from '../services/realResumes'
 import { CloudConflictError } from '../services/cloudWorkspace'
 import { appendResumeInputs, resumeWorkActive, type RealResumeImportBatch, type RealResumeImportSource } from '../features/resumes/resumeImportUi'
@@ -171,10 +172,12 @@ function RealResumesProvider({ workspaceId, children }: { workspaceId: string; c
 
   function stage(inputs: RealResumeImportSource[]) {
     assertWritable()
-    if (!inputs.length) throw new Error('Choose PDF or Markdown files, or enter at least one public URL, one per line.')
+    if (!inputs.length) throw new Error('Choose supported files or enter at least one public URL, one per line.')
     const id = currentBatchRef.current ?? newBatch()
     const batch = batchesRef.current.find((item) => item.id === id)!
-    const next = appendResumeInputs(batch, inputs, featuresRef.current?.resumeLimits, featuresRef.current?.markdownResumeImports === true)
+    const next = appendResumeInputs(batch, inputs, featuresRef.current?.resumeLimits, supportedUploadFormats({
+      markdownResumeImports: featuresRef.current?.markdownResumeImports, wordDocumentImports: featuresRef.current?.wordDocumentImports,
+    }))
     putBatches(batchesRef.current.map((item) => item.id === id ? next : item))
   }
 
@@ -203,11 +206,14 @@ function RealResumesProvider({ workspaceId, children }: { workspaceId: string; c
           if (item.source.kind === 'markdown' && !featuresRef.current?.markdownResumeImports) {
             throw new Error('Markdown resume imports are not enabled in this deployment. PDFs and public URLs are still supported.')
           }
+          if ((item.source.kind === 'docx' || item.source.kind === 'doc') && !featuresRef.current?.wordDocumentImports) {
+            throw new Error('Word document imports are not enabled in this deployment.')
+          }
           return api.importRealResumeFile(workspaceId, item.source.file, item.key, batchId, inputCount)
         })
         updateItem(batchId, item.key, {
           state: 'accepted', resumeId: summary.resume.id, error: undefined,
-          source: item.source.kind === 'pdf' || item.source.kind === 'markdown' ? { kind: item.source.kind, file: null } : item.source,
+          source: item.source.kind === 'url' || item.source.kind === 'unsupported' ? item.source : { kind: item.source.kind, file: null },
         })
       } catch (caught) {
         // A request can be accepted even when its response is lost. Retrying preserves both keys and bytes.

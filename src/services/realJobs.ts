@@ -6,8 +6,10 @@ import {
   type RealJobsPage,
   type RealJobSummary,
 } from '../domain/real-jobs'
-import { isSafeUploadedFilename, uploadedFileKind, type UploadedSourceKind } from '../domain/source-files'
+import { isSafeUploadedFilename, uploadedFileKind } from '../domain/source-files'
 import { cloudJsonRequest } from './cloudWorkspace'
+import { UPLOAD_CONTENT_TYPES, type UploadFormat } from '../domain/document-formats'
+import { requireUploadFile, uploadFileByteLimit } from './documentUploads'
 
 type RealJobWireSummary = RealJobSummary
 
@@ -29,7 +31,12 @@ export async function fetchJobProcessingFeatures(signal?: AbortSignal): Promise<
   return {
     realJobImports: features.realJobImports === true,
     markdownJobImports: features.realJobImports === true && features.markdownJobImports === true,
-    limits: features.limits ?? JOB_IMPORT_LIMITS,
+    wordDocumentImports: features.realJobImports === true && features.wordDocumentImports === true,
+    limits: {
+      ...JOB_IMPORT_LIMITS,
+      ...features.limits,
+      maxFileBytes: Math.min(features.limits?.maxFileBytes ?? JOB_IMPORT_LIMITS.maxFileBytes, JOB_IMPORT_LIMITS.maxFileBytes),
+    },
   }
 }
 
@@ -64,26 +71,31 @@ export async function getRealJob(workspaceId: string, jobId: string, signal?: Ab
 async function importRealJobUpload(
   workspaceId: string,
   file: File,
-  kind: UploadedSourceKind,
+  kind: UploadFormat,
   idempotencyKey: string,
   batchId?: string,
   signal?: AbortSignal,
 ): Promise<RealJobSummary> {
-  const label = kind === 'markdown' ? 'Markdown' : 'PDF'
-  // Job PDFs retain their legacy server-owned filename validation.
-  if (uploadedFileKind(file) !== kind || (kind === 'markdown' && !isSafeUploadedFilename(file.name, kind))) {
-    throw new Error(`Choose a ${label} file with a safe ${kind === 'markdown' ? '.md or .markdown' : '.pdf'} filename.`)
+  const label = kind === 'markdown' ? 'Markdown' : kind.toUpperCase()
+  const actualKind = uploadedFileKind(file)
+  // Only legacy job PDF calls leave malformed PDF basenames to the server.
+  if (actualKind !== kind && !(kind === 'pdf' && actualKind === undefined && file.type === 'application/pdf')) {
+    throw new Error(`${actualKind?.toUpperCase() ?? 'Unsupported'} uploads are not enabled for this method. Choose a ${label} file with a safe ${kind === 'markdown' ? '.md or .markdown' : `.${kind}`} filename.`)
   }
-  const maxBytes = kind === 'markdown' ? JOB_IMPORT_LIMITS.maxMarkdownBytes : JOB_IMPORT_LIMITS.maxPdfBytes
+  if (kind !== 'pdf' && !isSafeUploadedFilename(file.name, kind)) throw new Error(`Choose a ${label} file with a safe ${kind === 'markdown' ? '.md or .markdown' : `.${kind}`} filename.`)
+  const maxBytes = uploadFileByteLimit(kind, JOB_IMPORT_LIMITS)
   if (!file.size || file.size > maxBytes) throw new Error(`Choose a nonempty ${label} file no larger than ${maxBytes / 1024 / 1024} MiB.`)
+  if (kind === 'docx' || kind === 'doc') requireUploadFile(file, [kind])
   const headers = new Headers({
-    'Content-Type': kind === 'markdown' ? 'text/markdown' : 'application/pdf',
+    'Content-Type': UPLOAD_CONTENT_TYPES[kind],
     'X-File-Name': encodeURIComponent(file.name),
     'Idempotency-Key': idempotencyKey,
   })
   if (batchId) headers.set('X-Import-Batch', batchId)
+  signal?.throwIfAborted()
   const bytes = await file.arrayBuffer()
-  const response = await cloudJsonRequest<{ job: RealJobWireSummary }>(`${jobsPath(workspaceId)}/${kind}`, {
+  signal?.throwIfAborted()
+  const response = await cloudJsonRequest<{ job: RealJobWireSummary }>(`${jobsPath(workspaceId)}/${kind === 'pdf' || kind === 'markdown' ? kind : 'file'}`, {
     method: 'POST',
     headers,
     body: bytes,
@@ -107,8 +119,8 @@ export function importRealJobMarkdown(
 export async function importRealJobFile(
   workspaceId: string, file: File, idempotencyKey: string, batchId?: string, signal?: AbortSignal,
 ): Promise<RealJobSummary> {
-  const kind = uploadedFileKind(file)
-  if (!kind) throw new Error('Choose a PDF (.pdf) or Markdown (.md or .markdown) file. Other file types are not supported.')
+  const kind = uploadedFileKind(file) ?? (file.type === 'application/pdf' ? 'pdf' : undefined)
+  if (!kind) throw new Error('Choose a supported file: PDF, Markdown (.md or .markdown), DOCX or DOC. Other formats are not supported.')
   return importRealJobUpload(workspaceId, file, kind, idempotencyKey, batchId, signal)
 }
 

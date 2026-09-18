@@ -92,11 +92,14 @@ test('feature discovery keeps existing fields, authenticated privacy, and author
   assert.equal(features.realResumeImports, false)
   assert.equal(features.markdownResumeImports, false)
   assert.equal(features.realAnalyses, false)
+  assert.equal(features.wordDocumentImports, false)
+  assert.equal(features.limits.maxFileBytes, 10 * 1024 * 1024)
   assert.equal(features.limits.maxPdfBytes, 10 * 1024 * 1024)
   assert.equal(features.limits.maxMarkdownBytes, 10 * 1024 * 1024)
   assert.ok(features.gradeLimits)
   assert.deepEqual(features.resumeLimits, {
-    maxPdfBytes: 10 * 1024 * 1024, maxMarkdownBytes: 10 * 1024 * 1024, maxPdfPages: 50, maxSourceCharacters: 180_000,
+    maxFileBytes: 10 * 1024 * 1024, maxPdfBytes: 10 * 1024 * 1024, maxMarkdownBytes: 10 * 1024 * 1024,
+    maxPdfPages: 50, maxSourceCharacters: 180_000,
     maxBatchItems: 10, maxUrlLength: 4096, maxAutomaticAttempts: 3,
   })
   assert.deepEqual(features.analysisLimits, {
@@ -116,6 +119,7 @@ test('resume availability requires both explicit configuration and constructed d
     const features = await (await fetch(url, { headers: authHeaders() })).json()
     assert.equal(features.realResumeImports, expected)
     assert.equal(features.markdownResumeImports, expected)
+    assert.equal(features.wordDocumentImports, false)
     assert.equal(features.realAnalyses, false)
   }
 })

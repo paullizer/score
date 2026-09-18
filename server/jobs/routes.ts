@@ -3,8 +3,10 @@ import express, { type NextFunction, type Request, type RequestHandler, type Res
 import ipaddr from 'ipaddr.js'
 import type { RealJobDetail, RealJobRecord, RealJobSummary } from '../../src/domain/real-jobs'
 import { JOB_IMPORT_LIMITS } from '../../src/domain/real-jobs'
-import { isOriginalContentType, isSafeUploadedFilename, originalFileExtension, type UploadedSourceKind } from '../../src/domain/source-files'
+import { isOriginalContentType, isSafeUploadedFilename } from '../../src/domain/source-files'
 import type { Job, Rubric, SourceDocument } from '../../src/domain/types'
+import { originalExtension, UPLOAD_CONTENT_TYPES, uploadFormatFromContentType, type UploadFormat } from '../../src/domain/document-formats'
+import { validateWordUpload } from '../documents/upload'
 import type { AuthenticatedPrincipal } from '../auth'
 import { decodeMarkdown, MarkdownInputError } from '../documents/markdown'
 import { conflict, HttpError, invalidRequest, notFound, preconditionRequired, unavailable } from '../errors'
@@ -30,6 +32,7 @@ interface RealJobsRouterDeps {
   readonly repository: WorkspaceRepository
   readonly jobs?: RealJobsDeps
   readonly now?: () => Date
+  readonly wordDocumentImports?: boolean
 }
 
 interface AuthorizedRequest extends Request {
@@ -85,14 +88,14 @@ function hash(value: Uint8Array | string): string {
   return createHash('sha256').update(value).digest('hex')
 }
 
-function inputFingerprint(kind: UploadedSourceKind | 'url', values: readonly string[]): string {
+function inputFingerprint(kind: UploadFormat | 'url', values: readonly string[]): string {
   return hash([kind, ...values].join('\0'))
 }
 
-function decodeFilename(value: string | undefined, kind: UploadedSourceKind): string {
+function decodeFilename(value: string | undefined, kind: UploadFormat): string {
   if (!value) throw invalidRequest('X-File-Name is required.')
-  const label = kind === 'pdf' ? 'PDF' : 'Markdown'
-  if (kind === 'markdown' &&
+  const label = kind === 'markdown' ? 'Markdown' : kind.toUpperCase()
+  if (kind !== 'pdf' &&
     (value.length > MAX_FILENAME_LENGTH * 12 || !/^(?:[A-Za-z0-9_.!~*'()-]|%[0-9A-Fa-f]{2})+$/.test(value))) {
     throw invalidRequest(`X-File-Name must contain a percent-encoded safe ${label} basename.`)
   }
@@ -112,7 +115,7 @@ function decodeFilename(value: string | undefined, kind: UploadedSourceKind): st
       unsafeCharacter || !/\.pdf$/i.test(filename)) {
       throw invalidRequest('X-File-Name must be a safe PDF basename.')
     }
-  } else if (!isSafeUploadedFilename(filename, 'markdown')) throw invalidRequest('X-File-Name must be a safe Markdown basename.')
+  } else if (!isSafeUploadedFilename(filename, kind)) throw invalidRequest(`X-File-Name must be a safe ${label} basename.`)
   return filename
 }
 
@@ -164,7 +167,7 @@ function emptyJob(
   jobId: string,
   documentId: string,
   title: string,
-  source: UploadedSourceKind | 'url',
+  source: UploadFormat | 'url',
   sourceLabel: string,
   batchId: string | undefined,
   createdAt: string,
@@ -310,11 +313,14 @@ export function createRealJobsRouter(deps: RealJobsRouterDeps): Router {
     res.json(await detail(jobs, await jobs.store.get(pathParam(req, 'workspaceId'), jobParam(req))))
   }))
 
-  for (const kind of ['pdf', 'markdown'] as const) {
-    const contentType = kind === 'pdf' ? 'application/pdf' : 'text/markdown'
-    const label = kind === 'pdf' ? 'PDF' : 'Markdown'
+  for (const route of ['pdf', 'markdown', 'file'] as const) {
+    const fileKind = (req: Request): UploadFormat => {
+      const kind = route === 'file' ? uploadFormatFromContentType(req.header('Content-Type') ?? '') : route
+      if (!kind) throw invalidRequest('Content-Type must match a supported PDF, Markdown, DOCX, or DOC file.')
+      return kind
+    }
     router.post(
-      `${base}/${kind}`,
+      `${base}/${route}`,
       authorize(deps.repository, 'write'),
       available(deps.jobs),
       (req: Request, _res: Response, next: NextFunction) => {
@@ -324,6 +330,11 @@ export function createRealJobsRouter(deps: RealJobsRouterDeps): Router {
               throw invalidRequest(`${name} must be supplied only once.`)
             }
           }
+          const kind = fileKind(req)
+          const contentType = UPLOAD_CONTENT_TYPES[kind]
+          if ((kind === 'docx' || kind === 'doc') && !deps.wordDocumentImports) {
+            throw unavailable('Word document imports are not enabled for this deployment.')
+          }
           decodeFilename(req.header('X-File-Name'), kind)
           requireUuidHeader(req, 'Idempotency-Key')
           optionalUuid(req.header('X-Import-Batch'), 'X-Import-Batch')
@@ -331,16 +342,23 @@ export function createRealJobsRouter(deps: RealJobsRouterDeps): Router {
           if (kind === 'markdown' && !/^text\/markdown(?:\s*;\s*charset\s*=\s*(?:utf-8|"utf-8"))?\s*$/i.test(req.header('Content-Type') ?? '')) {
             throw invalidRequest('Content-Type must be text/markdown with no charset or charset=utf-8.')
           }
-          if (kind === 'markdown' && req.header('Content-Encoding') && req.header('Content-Encoding')?.toLowerCase() !== 'identity') {
+          if (kind !== 'pdf' && req.header('Content-Encoding') && req.header('Content-Encoding')?.toLowerCase() !== 'identity') {
+            const label = kind === 'markdown' ? 'Markdown' : kind.toUpperCase()
             throw invalidRequest(`Compressed ${label} uploads are not supported. Upload the original ${label} bytes.`)
           }
           next()
         } catch (error) { next(error) }
       },
-      express.raw({ type: contentType, limit: kind === 'pdf' ? JOB_IMPORT_LIMITS.maxPdfBytes : JOB_IMPORT_LIMITS.maxMarkdownBytes, inflate: kind === 'pdf' }),
+      express.raw({
+        type: route === 'file' ? Object.values(UPLOAD_CONTENT_TYPES) : UPLOAD_CONTENT_TYPES[route],
+        limit: route === 'markdown' ? JOB_IMPORT_LIMITS.maxMarkdownBytes : JOB_IMPORT_LIMITS.maxFileBytes,
+        inflate: route === 'pdf',
+      }),
       asyncHandler(async (req, res) => {
         const jobs = requireJobs(deps.jobs)
-        if (!Buffer.isBuffer(req.body)) throw invalidRequest(`The request must contain raw ${label} bytes.`)
+        const kind = fileKind(req)
+        const contentType = UPLOAD_CONTENT_TYPES[kind]
+        if (!Buffer.isBuffer(req.body)) throw invalidRequest('The request must contain raw document bytes.')
         const filename = decodeFilename(req.header('X-File-Name'), kind)
         const key = requireUuidHeader(req, 'Idempotency-Key')
         const batchId = optionalUuid(req.header('X-Import-Batch'), 'X-Import-Batch')
@@ -350,14 +368,14 @@ export function createRealJobsRouter(deps: RealJobsRouterDeps): Router {
           if (bytes.subarray(0, Math.min(bytes.byteLength, 1024)).indexOf(PDF_MAGIC) < 0) {
             throw invalidRequest('The uploaded file does not have a valid PDF header.')
           }
-        } else {
+        } else if (kind === 'markdown') {
           try { decodeMarkdown(bytes, JOB_IMPORT_LIMITS.maxMarkdownBytes) } catch (error) {
             if (error instanceof MarkdownInputError) {
               throw new HttpError(error.code === 'markdown-too-large' ? 413 : 400, 'invalid_request', error.message)
             }
             throw error
           }
-        }
+        } else await validateWordUpload(bytes, kind)
 
         const workspaceId = pathParam(req, 'workspaceId')
         const jobId = `job-${key}`
@@ -407,7 +425,7 @@ export function createRealJobsRouter(deps: RealJobsRouterDeps): Router {
       }),
       (error: unknown, _req: Request, _res: Response, next: NextFunction) => {
         if (typeof error === 'object' && error !== null && 'type' in error && error.type === 'entity.too.large') {
-          next(new HttpError(413, 'invalid_request', `${label} files may not exceed 10 MiB.`))
+          next(new HttpError(413, 'invalid_request', 'Uploaded files may not exceed 10 MiB.'))
         } else next(error)
       },
     )
@@ -559,8 +577,8 @@ export function createRealJobsRouter(deps: RealJobsRouterDeps): Router {
     const sourceHost = new URL(
       current.record.source.finalUrl ?? current.record.source.url ?? 'https://source.invalid',
     ).hostname
-    const filename = current.record.source.kind !== 'url' ? current.record.source.displayName
-      : `${sourceHost}.${originalFileExtension(expectedContentType)}`
+    const filename = current.record.source.kind !== 'url'
+      ? current.record.source.displayName : `${sourceHost}.${originalExtension(expectedContentType)}`
     res.setHeader('Content-Type', expectedContentType)
     res.setHeader('Content-Disposition', attachmentHeader(filename))
     res.setHeader('X-Content-Type-Options', 'nosniff')

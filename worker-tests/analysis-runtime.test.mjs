@@ -234,6 +234,52 @@ test('an actual cited assessment and independent review persist a result accepte
   assert.equal(run.record.progress.unscored, 0)
 })
 
+for (const format of ['docx', 'doc']) {
+  for (const targetKind of ['job', 'grade']) {
+    test(`${format.toUpperCase()} resume and ${targetKind} seed evidence score only from explicit frozen inputs with stable captured-section citations`, async () => {
+      const f = fixture()
+      const resume = await seedResume(f, 'Renée Example', randomUUID(), format)
+      const job = await seedJob(f, 'Engineering role', randomUUID(), format)
+      const target = targetKind === 'grade' ? await seedGrade(f, job) : job
+      const mock = modelFor(f)
+      assert.deepEqual(await runAnalysisWorker(mock.deps), { claimed: 0, completed: 0 })
+      assert.equal(mock.calls.length, 0, 'Imported Word inputs must not automatically score.')
+      const created = await f.service.create(f.workspaceId, randomUUID(), {
+        name: 'Explicit Word analysis', resumes: [resume.selection], targets: [target.selection],
+      }, ACTOR)
+      for (const values of [f.resumeValues, f.jobValues, f.rubricValues, f.gradeValues,
+        f.resumes.blobs.values, f.jobs.blobs.values, f.grades.blobs.values]) values.clear()
+      const outcome = await runAnalysisWorker(mock.deps)
+      assert.deepEqual(outcome, { claimed: 1, completed: 1 },
+        JSON.stringify(comparisons(f, created.run.id).map(value => value.record.error)))
+      assert.equal(mock.calls.length, 2)
+      assert.deepEqual(mock.calls[0].body.input.resume, resume.document)
+      const detail = await f.service.comparisonDetail(f.workspaceId, created.run.id, comparisons(f, created.run.id)[0].record.id)
+      assert.equal(detail.comparison.status, 'complete')
+      assert.equal(detail.resumeSnapshot.extraction.pagination, 'captured-sections')
+      assert.equal(detail.resumeSnapshot.extraction.pageCount, null)
+      assert.equal(detail.resumeSnapshot.extraction.method, format === 'doc' ? 'legacy-word' : 'document-intelligence')
+      const quote = detail.result.criteria.find(value => value.evidenceStatus === 'supported').citations[0]
+      assert.equal(quote.documentId, resume.document.id)
+      assert.equal(quote.documentVersion, resume.document.version)
+      assert.equal(quote.paragraphId, resume.document.paragraphs[0].id)
+      assert.equal(quote.page, 1)
+      assert.equal(quote.heading, resume.document.paragraphs[0].heading)
+      assert.equal(quote.quote, resume.document.paragraphs[0].text)
+      assert.equal(detail.result.humanReviewRequired, true)
+      assert.equal(detail.result.provenance.manifestSha256, created.run.manifest.sha256)
+      if (targetKind === 'grade') {
+        assert.deepEqual(detail.targetSnapshot.seed.document, job.document)
+        assert.equal(detail.targetSnapshot.seed.source.kind, format)
+        assert.equal(detail.targetSnapshot.sourceSet.sources.find(source => source.origin === 'seed-job').purpose, 'job-context')
+      } else {
+        assert.equal(detail.targetSnapshot.original.contentType, api.UPLOAD_CONTENT_TYPES[format])
+        assert.deepEqual(detail.result.criteria[0].requirementCitations, job.rubric.criteria[0].sourceCitations)
+      }
+    })
+  }
+}
+
 test('substantive ready resumes with every display metadata field unavailable are assessed without filename substitutions', async () => {
   const f = fixture()
   const resume = await seedResume(f)

@@ -1,7 +1,9 @@
 import type { Job, Rubric, SourceDocument } from './types'
-import { MAX_MARKDOWN_BYTES, type OriginalContentType } from './source-files'
+import type { OriginalContentType, UploadFormat, WordImportFeatures } from './document-formats'
+import { MAX_MARKDOWN_BYTES } from './source-files'
 
 export const JOB_IMPORT_LIMITS = {
+  maxFileBytes: 10 * 1024 * 1024,
   maxPdfBytes: 10 * 1024 * 1024,
   maxMarkdownBytes: MAX_MARKDOWN_BYTES,
   maxPdfPages: 50,
@@ -18,7 +20,7 @@ export interface JobImportError {
 }
 
 export interface RealJobSource {
-  kind: 'pdf' | 'markdown' | 'url'
+  kind: UploadFormat | 'url'
   displayName: string
   url?: string
   finalUrl?: string
@@ -27,7 +29,7 @@ export interface RealJobSource {
   sha256?: string
   bytes?: number
   capturedAt?: string
-  extractionMethod?: 'document-intelligence' | 'html' | 'browser' | 'markdown'
+  extractionMethod?: 'document-intelligence' | 'html' | 'browser' | 'markdown' | 'legacy-word'
 }
 
 export interface RealJobRecord {
@@ -73,7 +75,7 @@ export interface RealJobsPage {
   continuationToken?: string
 }
 
-export interface JobProcessingFeatures {
+export interface JobProcessingFeatures extends WordImportFeatures {
   realJobImports: boolean
   markdownJobImports: boolean
   limits: typeof JOB_IMPORT_LIMITS

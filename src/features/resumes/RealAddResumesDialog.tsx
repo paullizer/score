@@ -4,11 +4,13 @@ import { Link } from 'react-router-dom'
 import { useRealResumes } from '../../app/real-resumes-context'
 import { Badge, Button, EmptyState, InlineError, Modal, SegmentedControl } from '../../components/ui'
 import { RESUME_IMPORT_LIMITS } from '../../domain/real-resumes'
-import { resumeErrorMessage, resumeFileSource, resumeUrlLines, type RealResumeImportSource } from './resumeImportUi'
+import { supportedUploadFormats, uploadAccept } from '../../domain/document-formats'
+import { uploadFileByteLimit, uploadFormatNames, uploadPickerLabel } from '../../services/documentUploads'
+import { resumeErrorMessage, resumeFileInput, resumeUrlLines, type RealResumeImportSource } from './resumeImportUi'
 
 export function RealAddResumesDialog({ open, onOpenChange }: { open: boolean; onOpenChange: (open: boolean) => void }) {
   const api = useRealResumes()
-  const [mode, setMode] = useState<'files' | 'url'>('files')
+  const [mode, setMode] = useState<'file' | 'url'>('file')
   const [urls, setUrls] = useState('')
   const [error, setError] = useState('')
   const fileInput = useRef<HTMLInputElement>(null)
@@ -19,6 +21,10 @@ export function RealAddResumesDialog({ open, onOpenChange }: { open: boolean; on
   const accepted = items.filter((item) => item.state === 'accepted').length
   const valid = items.filter((item) => item.state === 'pending' || item.state === 'unconfirmed').length
   const limits = api?.features?.resumeLimits ?? RESUME_IMPORT_LIMITS
+  const formats = supportedUploadFormats({
+    markdownResumeImports: api?.features?.markdownResumeImports, wordDocumentImports: api?.features?.wordDocumentImports,
+  })
+  const wordEnabled = formats.includes('docx')
   const unavailable = !api || api.phase !== 'ready' || !api.canWrite
   const locked = batch?.inputCount !== null && batch?.inputCount !== undefined
   const markdownEnabled = api?.features?.markdownResumeImports === true
@@ -39,7 +45,7 @@ export function RealAddResumesDialog({ open, onOpenChange }: { open: boolean; on
   }
 
   return <Modal open={open} onOpenChange={onOpenChange} title="Add real resumes"
-    description="Upload actual PDF or Markdown bytes, or import publicly accessible resume/profile URLs. Each input is processed independently."
+    description={`Upload actual ${uploadPickerLabel(formats, ' or ')} files or import publicly accessible resume/profile URLs. Each input is processed independently.`}
     footer={<>
       <span className="mr-auto text-[11px] text-muted" role="status">{accepted} accepted / {items.length} inputs{uploading ? ' · Uploading — not yet accepted' : ''}</span>
       <Button onClick={() => onOpenChange(false)}>{uploading ? 'Close — keep uploading' : 'Close'}</Button>
@@ -51,32 +57,33 @@ export function RealAddResumesDialog({ open, onOpenChange }: { open: boolean; on
       {!api.canWrite && <div className="mb-4"><InlineError>This workspace is read-only. An owner or editor can import resumes.</InlineError></div>}
       {error && <div className="mb-4"><InlineError>{error}</InlineError></div>}
       <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
-        <SegmentedControl value={mode} onChange={setMode} label="Resume source type" options={[{ value: 'files', label: 'PDF / Markdown files' }, { value: 'url', label: 'Public URLs' }]} />
+        <SegmentedControl value={mode} onChange={setMode} label="Resume source type" options={[{ value: 'file', label: `${uploadPickerLabel(formats)} files` }, { value: 'url', label: 'Public URLs' }]} />
         <Badge>{items.length} / {limits.maxBatchItems} total inputs</Badge>
       </div>
-      <p className="mb-4 text-[11px] text-muted">PDFs, Markdown files, and URLs share one batch limit. Changing this tab keeps the entire batch. Importing does not start an analysis.</p>
-      {!unavailable && !markdownEnabled && <p className="mb-4 text-[11px] text-muted" role="status">Markdown imports are not enabled in this deployment. PDFs and public URLs remain available; Markdown inputs will be marked invalid and will not be sent.</p>}
-      {mode === 'files' ? <div className="drop-zone" onDragOver={(event) => event.preventDefault()} onDrop={(event) => {
+      <p className="mb-4 text-[11px] text-muted">Files and URLs share one batch limit. Changing this tab keeps the entire batch. Importing does not start an analysis.</p>
+      {!unavailable && !markdownEnabled && <p className="mb-4 text-[11px] text-muted" role="status">Markdown imports are not enabled in this deployment. Advertised file formats and public HTML/PDF URLs remain available; Markdown inputs will be marked invalid and will not be sent.</p>}
+      {mode === 'file' ? <div className="drop-zone" onDragOver={(event) => event.preventDefault()} onDrop={(event) => {
         event.preventDefault()
-        if (!unavailable && !locked && !uploading) stage(Array.from(event.dataTransfer.files, resumeFileSource))
+        if (!unavailable && !locked && !uploading) stage(Array.from(event.dataTransfer.files, resumeFileInput))
       }}>
-        <UploadCloud size={30} className="text-accent" aria-hidden="true" /><strong>Choose resume PDFs or Markdown files</strong>
-        <p id={hintId} className="text-[11px] text-muted">PDFs: up to {limits.maxPdfBytes / 1024 / 1024} MiB and {limits.maxPdfPages} pages each. Markdown (.md / .markdown): up to {(limits.maxMarkdownBytes ?? RESUME_IMPORT_LIMITS.maxMarkdownBytes) / 1024 / 1024} MiB each, no page limit. The server checks readability and the {(limits.maxSourceCharacters ?? RESUME_IMPORT_LIMITS.maxSourceCharacters).toLocaleString()} normalized-character limit per source. Different files may have the same filename.</p>
-        <input ref={fileInput} type="file" accept=".pdf,.md,.markdown,application/pdf,text/markdown" multiple className="sr-only" tabIndex={-1}
-          aria-label="Choose resume PDF or Markdown files" aria-describedby={hintId} disabled={unavailable || locked || uploading}
+        <UploadCloud size={30} className="text-accent" aria-hidden="true" /><strong>Choose resume {uploadPickerLabel(formats, ' or ')} files</strong>
+        <p id={hintId} className="text-[11px] text-muted">{formats.map((format) => `${uploadFormatNames([format])}: ${uploadFileByteLimit(format, limits) / 1024 / 1024} MiB`).join(' · ')}. PDFs only: {limits.maxPdfPages} printed pages. The server validates actual bytes, readability and the {(limits.maxSourceCharacters ?? RESUME_IMPORT_LIMITS.maxSourceCharacters).toLocaleString()} normalized-character limit. Different files may have the same filename.</p>
+        {wordEnabled && <p className="text-[11px] text-muted">DOC means Word 97–2003, not DOCM, RTF or templates. Word citations use captured sections, not printed pages. Embedded images are not extracted as evidence; use PDF/OCR for image-only resumes. Up to {limits.maxSourceCharacters.toLocaleString()} normalized characters per source.</p>}
+        <input ref={fileInput} type="file" accept={uploadAccept(formats)} multiple className="sr-only" tabIndex={-1}
+          aria-label={`Choose resume ${uploadPickerLabel(formats, ' or ')} files`} aria-describedby={hintId} disabled={unavailable || locked || uploading}
           onChange={(event) => {
             const files = Array.from(event.currentTarget.files ?? [])
             event.currentTarget.value = ''
-            if (files.length) stage(files.map(resumeFileSource))
+            if (files.length) stage(files.map(resumeFileInput))
           }} />
-        <Button icon={Plus} disabled={unavailable || locked || uploading} onClick={() => fileInput.current?.click()}>Choose files</Button>
-        <p className="text-[11px] text-muted">Markdown files are uploaded locally. Links and images in them are not fetched; evidence is shown as normalized text, not a rendered Markdown preview.</p>
+        <Button icon={Plus} disabled={unavailable || locked || uploading} onClick={() => fileInput.current?.click()}>{formats.length > 1 ? 'Choose files' : 'Choose PDFs'}</Button>
+        {markdownEnabled && <p className="text-[11px] text-muted">Markdown (.md / .markdown) has no printed-page limit. Files are uploaded locally. Links and images in them are not fetched; evidence is shown as normalized text, not a rendered Markdown preview.</p>}
       </div> : <div className="space-y-3">
         <label className="field"><span className="field-label">Public resume or profile URLs</span>
           <textarea className="input" rows={5} value={urls} disabled={unavailable || locked || uploading}
             onChange={(event) => setUrls(event.target.value)}
             placeholder={'https://example.org/resume.pdf\nhttps://www.linkedin.com/in/public-profile'} />
-          <span className="field-hint">One URL per line, at most {limits.maxUrlLength} characters each. Public LinkedIn profiles are supported only when accessible without sign-in.</span>
+          <span className="field-hint">One public HTML or PDF URL per line, at most {limits.maxUrlLength} characters each. Markdown and Word URLs are not supported. Public LinkedIn profiles are supported only when accessible without sign-in.</span>
         </label>
         <Button icon={Plus} disabled={unavailable || locked || uploading || !urls.trim()}
           onClick={() => stage(resumeUrlLines(urls).map((url) => ({ kind: 'url', url })))}>Add URLs to batch</Button>
@@ -91,7 +98,7 @@ export function RealAddResumesDialog({ open, onOpenChange }: { open: boolean; on
               {item.source.kind === 'url' ? <Link2 size={17} className="mt-1 shrink-0 text-muted" aria-hidden="true" /> : <FileText size={17} className="mt-1 shrink-0 text-muted" aria-hidden="true" />}
               <div className="min-w-0 flex-1">
                 <p className="break-all text-[11px] font-semibold">{index + 1}. {item.label}</p>
-                <p className="mt-1 text-[10px] text-muted">{item.state === 'pending' ? 'Ready to send — not accepted yet' : item.state === 'uploading' ? 'Sending source — server acceptance not confirmed yet'
+                <p className="mt-1 text-[10px] text-muted">{item.source.kind !== 'url' && `${item.source.kind.toUpperCase()} · `}{item.state === 'pending' ? 'Ready to send — not accepted yet' : item.state === 'uploading' ? 'Sending source — server acceptance not confirmed yet'
                   : item.state === 'accepted' ? `Accepted by the server · ${summary?.resume.status ?? 'processing status in library'}` : item.state === 'invalid' ? 'Invalid input — not sent' : 'Acceptance not confirmed — check the library or retry the unchanged request'}</p>
                 {item.error && <p className="mt-2 text-[11px] text-[var(--cp-danger)]" role="alert">{item.error}</p>}
                 {summary?.error && <p className="mt-2 text-[11px] text-[var(--cp-danger)]" role="alert">{resumeErrorMessage(summary)}</p>}
@@ -101,7 +108,7 @@ export function RealAddResumesDialog({ open, onOpenChange }: { open: boolean; on
                 {item.resumeId && <Link to={`/resumes/${encodeURIComponent(item.resumeId)}?data=real`} onClick={() => onOpenChange(false)} className="text-link mt-2 text-[11px]">Inspect accepted resume</Link>}
               </div>
               <div className="flex shrink-0 flex-col items-end gap-2">
-                <Badge>{item.source.kind === 'markdown' ? 'Markdown' : item.source.kind === 'pdf' ? 'PDF' : item.source.kind === 'url' ? 'URL' : 'Unsupported file'}</Badge>
+                <Badge>{item.source.kind === 'url' ? 'URL' : item.source.kind === 'unsupported' ? 'Unsupported file' : uploadFormatNames([item.source.kind])}</Badge>
                 <Badge tone={item.state === 'accepted' ? 'success' : ['invalid', 'unconfirmed'].includes(item.state) ? 'warning' : 'neutral'}>{item.state === 'accepted' ? <><Check size={11} />Accepted</> : item.state === 'unconfirmed' ? 'Not acknowledged' : item.state}</Badge>
                 {!locked && <Button size="sm" variant="ghost" icon={X} className="icon-button" aria-label={`Remove input ${index + 1}: ${item.label}`} onClick={() => api.removeItem(item.key)} />}
                 {item.state === 'unconfirmed' && <Button size="sm" icon={RotateCcw} disabled={unavailable || uploading} aria-label={`Retry input ${index + 1}: ${item.label}`} onClick={() => submit([item.key])}>Retry import</Button>}

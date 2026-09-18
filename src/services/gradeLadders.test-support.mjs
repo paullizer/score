@@ -6,6 +6,7 @@ import { join, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { build } from 'esbuild'
 import { PDFDocument, StandardFonts } from 'pdf-lib'
+import { buildDocxPreviewTestWorker, docxPreviewBrowserPlugin } from './wordPreview.test-support.mjs'
 
 export const tenantId = '228db43d-371a-49d8-864e-fa202d181ea5'
 export const userId = '1d6312bd-3eaa-4586-8b74-e90eee126f78'
@@ -28,6 +29,7 @@ export async function buildGradeTestRuntime({ browser = false, serverExports = '
       client: join('src', 'services', 'gradeLadders.ts'),
       jobs: join('src', 'services', 'realJobs.ts'),
       fixtures: join('src', 'data', 'fixtures.ts'),
+      'word-parser': join('server', 'documents', 'word-parser-worker.ts'),
     }
     await Promise.all(Object.entries(entries).map(([name, entry]) => build({
       ...(name === 'server' && serverExports ? {
@@ -40,11 +42,12 @@ export async function buildGradeTestRuntime({ browser = false, serverExports = '
       format: 'esm', jsx: 'automatic', define: { 'import.meta.env.VITE_DEPLOYMENT_MODE': '"cloud"' }, logLevel: 'silent',
     })))
     if (browser) {
-      await build({
+      await Promise.all([build({
         entryPoints: [join('src', 'main.tsx')], outfile: join(directory, 'browser.js'), bundle: true, platform: 'browser',
         format: 'esm', jsx: 'automatic', loader: { '.css': 'empty' },
+        plugins: [docxPreviewBrowserPlugin()],
         define: { 'import.meta.env.VITE_DEPLOYMENT_MODE': '"cloud"', 'process.env.NODE_ENV': '"development"' }, logLevel: 'silent',
-      })
+      }), buildDocxPreviewTestWorker(directory)])
       const [{ default: postcss }, { default: tailwind }, { default: autoprefixer }] = await Promise.all([import('postcss'), import('tailwindcss'), import('autoprefixer')])
       const css = await postcss([tailwind(), autoprefixer()]).process(await readFile(join('src', 'styles', 'globals.css'), 'utf8'), { from: join('src', 'styles', 'globals.css') })
       await writeFile(join(directory, 'browser.css'), css.css)

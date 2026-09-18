@@ -45,7 +45,7 @@ export { defaultPersonalWorkspaceId, isValidWorkspaceId, membershipIdFor, princi
 const currentDir = path.dirname(fileURLToPath(import.meta.url))
 const DEFAULT_DIST_DIR = path.join(currentDir, '..', 'dist')
 const MAX_JSON_BODY = '10mb'
-const RAW_SOURCE_UPLOAD_PATH = /^\/api\/workspaces\/[^/]+\/(?:jobs|resumes)\/(?:pdf|markdown)\/?$/i
+const RAW_SOURCE_UPLOAD_PATH = /^\/api\/workspaces\/[^/]+\/(?:jobs|resumes)\/(?:pdf|markdown|file)\/?$/i
 
 export interface AppDeps {
   readonly config: Config
@@ -110,6 +110,7 @@ export function createApp(deps: AppDeps): Express {
   const analyses = config.realAnalyses && deps.analyses?.store && deps.analyses.blobs
     ? deps.analyses : undefined
   const canCreateAnalyses = Boolean(analyses && resumes && (jobs || grades))
+  const wordDocumentImports = config.wordDocumentImports === true
 
   const app = express()
   app.disable('x-powered-by')
@@ -135,11 +136,12 @@ export function createApp(deps: AppDeps): Express {
       realGradeLadders: Boolean(grades), gradeLimits: GRADE_LADDER_LIMITS,
       realResumeImports: Boolean(resumes), markdownResumeImports: Boolean(resumes), resumeLimits: RESUME_IMPORT_LIMITS,
       realAnalyses: canCreateAnalyses, analysisLimits: ANALYSIS_LIMITS,
+      wordDocumentImports: wordDocumentImports && Boolean(jobs || resumes),
     })
   })
-  api.use(createRealJobsRouter({ repository, jobs, now: deps.now }))
+  api.use(createRealJobsRouter({ repository, jobs, now: deps.now, wordDocumentImports }))
   api.use(createRealGradesRouter({ repository, grades, jobs, now: deps.now }))
-  api.use(createRealResumesRouter({ repository, resumes, now: deps.now }))
+  api.use(createRealResumesRouter({ repository, resumes, now: deps.now, wordDocumentImports }))
   api.use(createRealAnalysesRouter({ repository, analyses, resumes, jobs, grades, now: deps.now }))
 
   api.get('/session', async (req, res) => {

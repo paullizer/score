@@ -205,6 +205,9 @@ export function RealJobsBridge({
 
   async function importFile(file: File, idempotencyKey: string, batchId?: string) {
     if (uploadedFileKind(file) === 'markdown') assertMarkdownAvailable()
+    if (['docx', 'doc'].includes(uploadedFileKind(file) ?? '') && (!features?.realJobImports || !features.wordDocumentImports)) {
+      throw new Error('Word document imports are not enabled in this deployment.')
+    }
     const summary = await importRealJobFile(workspaceId, file, idempotencyKey, batchId)
     if (aliveRef.current) upsertSummary(summary)
     return summary

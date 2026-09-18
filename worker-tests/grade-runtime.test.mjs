@@ -1,18 +1,20 @@
 import assert from 'node:assert/strict'
-import { createHash } from 'node:crypto'
-import { mkdtemp, rm } from 'node:fs/promises'
+import { createHash, randomUUID } from 'node:crypto'
+import { mkdir, unlink } from 'node:fs/promises'
 import path from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { after, before, test } from 'node:test'
 import { build } from 'esbuild'
 import { PDFDocument } from 'pdf-lib'
+import {
+  api as evidenceApi, fixture as evidenceFixture, evidenceOriginal, seedJob, seedGrade,
+} from '../server-tests/real-analyses.test-support.mjs'
 
 let runtime
 let StoreConflictError
-let buildDirectory
+const outfile = path.resolve('dist-worker', `grade-runtime-test-${process.pid}.mjs`)
 before(async () => {
-  buildDirectory = await mkdtemp(path.join(process.cwd(), 'node_modules', '.tmp', 'grade-runtime-'))
-  const outfile = path.join(buildDirectory, 'test-runtime.mjs')
+  await mkdir(path.dirname(outfile), { recursive: true })
   await build({
     stdin: {
       contents: "export * from './worker/grades/runtime'; export {StoreConflictError} from './server/store'; export {GradeModelError} from './worker/grades/model-errors';",
@@ -23,7 +25,7 @@ before(async () => {
   runtime = await import(pathToFileURL(outfile))
   StoreConflictError = runtime.StoreConflictError
 })
-after(async () => { if (buildDirectory) await rm(buildDirectory, { recursive: true, force: true }) })
+after(async () => { await unlink(outfile).catch(error => { if (error.code !== 'ENOENT') throw error }) })
 
 const wid = '694eb995-1199-4548-a216-50f6d303ec12'
 const lid = 'ladder-f2b18d43-b034-4f5d-8d43-6b7ac9801000'
@@ -424,6 +426,78 @@ test('competency planning atomically creates independent tasks for every selecte
   assert.equal(plans.length, 1)
   assert.equal(plans[0].model, 'model-from-response')
 })
+
+for (const format of ['docx', 'doc']) {
+  test(`${format.toUpperCase()} captured seeds are planned from frozen grade storage without Word extraction or live job access`, async () => {
+    const evidence = evidenceFixture(wid)
+    const job = await seedJob(evidence, 'Word engineering context', randomUUID(), format)
+    const approved = await seedGrade(evidence, job)
+    const f = fixture()
+    const ladder = {
+      ...f.ladder, id: approved.selection.ladderId, context: approved.sourceSet.context, grades: approved.sourceSet.grades,
+      seedJobId: job.record.id, seedRubricId: job.rubric.id, seedRubricVersion: job.rubric.version, seedJobTitle: job.record.job.title,
+      seedBlobName: approved.sourceSet.seedBlobName, sourceIds: approved.sourceSet.sources.map(source => source.sourceId),
+      sourceRevision: approved.sourceSet.revision, sourceSetId: approved.sourceSet.id,
+    }
+    const work = { ...f.work, ladderId: ladder.id,
+      input: { kind: 'plan-competencies', sourceSetId: approved.sourceSet.id, generationId } }
+    const heads = ladder.grades.map(grade => ({
+      ...base(`grade-head-${ladder.id.slice(7)}-${grade}`), recordType: 'grade-head', ladderId: ladder.id,
+      grade, generationId, sourceSetId: approved.sourceSet.id, status: 'queued', issues: [],
+    }))
+    const store = fakeStore([ladder, approved.sourceSet, work, ...heads])
+    let planned = false
+    evidence.grades.blobs.events.length = 0
+    evidence.jobValues.clear()
+    evidence.jobs.blobs.values.clear()
+    const deps = {
+      ...f.deps, store, blobs: evidence.grades.blobs, parseSeed: evidenceApi.parseGradeSeedSnapshot,
+      recordHash: record => record.recordType === 'grade-source-set'
+        ? evidenceApi.gradeSourceSetHash(record) : evidenceApi.gradeVersionHash(record),
+      fetchOriginal: async () => { assert.fail('Frozen seeds must never fetch a live source') },
+      extractReference: async () => { assert.fail('Frozen Word seeds must never enter the PDF/HTML reference parser') },
+      async planCompetencies(input) {
+        planned = true
+        assert.equal(input.seed.source.kind, format)
+        assert.equal(input.seed.source.extractionMethod, format === 'doc' ? 'legacy-word' : 'document-intelligence')
+        assert.deepEqual(input.seed.document, job.document)
+        const seedSource = input.sourceSet.sources.find(source => source.origin === 'seed-job')
+        assert.equal(seedSource.sha256, job.record.source.sha256)
+        assert.equal(seedSource.purpose, 'job-context')
+        assert.equal(seedSource.pageCount, 1)
+        assert.deepEqual(input.documents.find(document => document.id === seedSource.documentId).paragraphs, job.document.paragraphs)
+        return {
+          competencies: [{ id: 'engineering', label: 'Engineering', description: 'Evaluate engineering evidence.',
+            seedCriterionIds: [job.rubric.criteria[0].id], citations: job.rubric.criteria[0].sourceCitations }],
+          issues: [], model: 'test-model', promptVersion: 'test-plan',
+        }
+      },
+    }
+    assert.equal((await runtime.runGradeWorker(deps)).succeeded, 1)
+    assert.equal(planned, true)
+    assert.ok(evidence.grades.blobs.events.filter(([action]) => action === 'read').every(([, name]) => name.endsWith('.json')))
+    assert.equal(store.values().filter(record => record.recordType === 'grade-work' && record.input.kind === 'generate-grade').length, 1)
+  })
+
+  test(`${format.toUpperCase()} seed re-extraction fails before any source read and does not alter its immutable ready metadata`, async () => {
+    const f = fixture()
+    const original = evidenceOriginal(format)
+    const source = {
+      ...f.source, origin: 'seed-job', purpose: 'job-context', requestedUrl: undefined, status: 'ready',
+      authorityStatus: 'supplied', originalBlobName: `${wid}/${lid}/${sourceId}/original.${format}`,
+      originalContentType: evidenceApi.UPLOAD_CONTENT_TYPES[format], sha256: digest(original), bytes: original.byteLength,
+      documentBlobName: `${wid}/${lid}/${sourceId}/document-v1.json`, capturedAt: now,
+      completeness: 'complete', pageCount: 1, extractionMethod: 'seed-snapshot', extractionVersion: 'grade-seed-v1',
+    }
+    f.store.set(source)
+    f.deps.blobs.read = async () => { assert.fail('Seed re-extraction must stop before source blob access') }
+    f.deps.fetchOriginal = async () => { assert.fail('Seed re-extraction must not fetch sources') }
+    f.deps.extractReference = async () => { assert.fail('Seed re-extraction must not parse Word as HTML') }
+    assert.equal((await runtime.runGradeWorker(f.deps)).failed, 1)
+    assert.equal((await f.store.get(wid, workId)).record.error.code, 'seed-not-extractable')
+    assert.deepEqual((await f.store.get(wid, sourceId)).record, source)
+  })
+}
 
 test('cancelling one grade during shared planning does not strand the other grades', async () => {
   const f = fixture({ kind: 'plan-competencies', sourceSetId: setId, generationId })

@@ -7,6 +7,7 @@ import { pathToFileURL } from 'node:url'
 import { build } from 'esbuild'
 import React, { act } from 'react'
 import { JSDOM } from 'jsdom'
+import { docxFile, legacyDocFile } from '../../server-tests/word-fixtures.mjs'
 
 const outputDirectory = resolve(`.real-job-client-tests-${randomUUID()}`)
 const originalFetch = globalThis.fetch
@@ -99,6 +100,8 @@ before(async () => {
       export { GradeSourceInspector } from './src/features/grade-ladders/GradeSourceInspector';
       export { GradeLaddersContext } from './src/app/grade-ladders-context';
       export { JOB_IMPORT_LIMITS } from './src/domain/real-jobs';
+      export { supportedUploadFormats, uploadAccept } from './src/domain/document-formats';
+      export { uploadFileByteLimit } from './src/services/documentUploads';
       export { MemoryRouter, Routes, Route } from 'react-router-dom';
     ` },
     outfile: uiOutfile, bundle: true, packages: 'external', format: 'esm', platform: 'node', jsx: 'automatic',
@@ -146,6 +149,26 @@ test('Markdown job capability is opt-in and requires real job imports', async ()
   assert.equal((await client.fetchJobProcessingFeatures()).markdownJobImports, true)
 })
 
+test('job Markdown and Word capabilities stay independent, including the resume-only Markdown flag', async () => {
+  for (const [advertised, expected] of [
+    [{ realJobImports: true, markdownResumeImports: true }, ['pdf']],
+    [{ realJobImports: true, markdownResumeImports: true, wordDocumentImports: true }, ['pdf', 'docx', 'doc']],
+    [{ realJobImports: true, markdownJobImports: true }, ['pdf', 'markdown']],
+    [{ realJobImports: true, markdownJobImports: true, wordDocumentImports: true }, ['pdf', 'markdown', 'docx', 'doc']],
+    [{ realJobImports: false, markdownJobImports: true, wordDocumentImports: true }, ['pdf']],
+  ]) {
+    globalThis.fetch = async () => json(advertised)
+    const features = await client.fetchJobProcessingFeatures()
+    assert.deepEqual(ui.supportedUploadFormats(features), expected)
+    assert.equal(features.markdownResumeImports, undefined)
+  }
+  globalThis.fetch = async () => json({ realJobImports: true, markdownJobImports: true, wordDocumentImports: true,
+    limits: { maxFileBytes: 8, maxPdfBytes: 2, maxMarkdownBytes: 4 } })
+  const { limits } = await client.fetchJobProcessingFeatures()
+  assert.equal(limits.maxBatchFiles, 10)
+  assert.deepEqual(['pdf', 'markdown', 'docx', 'doc'].map((format) => ui.uploadFileByteLimit(format, limits)), [2, 4, 8, 8])
+})
+
 test('loads every jobs page with the fixed rubric summary field', async () => {
   const rubric = {
     id: 'rubric-2',
@@ -186,6 +209,7 @@ test('uploads actual PDF bytes with stable request metadata', async () => {
   await client.importRealJobPdf('workspace-1', file, 'stable-key', 'batch-key')
 
   assert.equal(requests.length, 1)
+  assert.equal(requests[0].url, '/api/workspaces/workspace-1/jobs/pdf')
   assert.equal(requests[0].init.method, 'POST')
   assert.equal(requests[0].init.headers.get('Content-Type'), 'application/pdf')
   assert.equal(requests[0].init.headers.get('X-File-Name'), 'role%20details.pdf')
@@ -193,6 +217,49 @@ test('uploads actual PDF bytes with stable request metadata', async () => {
   assert.equal(requests[0].init.headers.get('X-Import-Batch'), 'batch-key')
   assert.equal(requests[0].init.headers.get('X-Score-Request'), 'workspace')
   assert.deepEqual([...new Uint8Array(requests[0].init.body)], [37, 80, 68, 70])
+})
+
+test('Word capability is fail-closed and legacy byte limits remain compatible', async () => {
+  globalThis.fetch = async () => json({ realJobImports: true, limits: { maxPdfBytes: 9 * 1024 * 1024 } })
+  const old = await client.fetchJobProcessingFeatures()
+  assert.equal(old.wordDocumentImports, false)
+  assert.equal(old.limits.maxFileBytes, 10 * 1024 * 1024)
+  assert.equal(ui.uploadFileByteLimit('pdf', old.limits), 9 * 1024 * 1024)
+  assert.equal(old.limits.maxPdfPages, 50)
+  globalThis.fetch = async () => json({ realJobImports: true, wordDocumentImports: true })
+  assert.equal((await client.fetchJobProcessingFeatures()).wordDocumentImports, true)
+})
+
+test('generic job file uploads preserve Word bytes and retry keys while keeping PDF on its legacy endpoint', async () => {
+  globalThis.fetch = async (url, init) => { requests.push({ url, init }); return json({ job: summary('file-job', '2026-09-17T00:00:00.000Z') }, 202) }
+  const files = [
+    [new File([docxFile()], 'Rôle.DOCX'), 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', 'file'],
+    [new File([legacyDocFile()], 'Legacy.DOC', { type: 'application/octet-stream' }), 'application/msword', 'file'],
+    [new File(['%PDF-source'], 'Role.PDF'), 'application/pdf', 'pdf'],
+  ]
+  for (const [file, type, endpoint] of files) {
+    const key = randomUUID()
+    await client.importRealJobFile('workspace-one', file, key, 'unchanged-batch')
+    await client.importRealJobFile('workspace-one', file, key, 'unchanged-batch')
+    const pair = requests.slice(-2)
+    for (const request of pair) {
+      assert.equal(request.url, `/api/workspaces/workspace-one/jobs/${endpoint}`)
+      assert.equal(request.init.headers.get('Content-Type'), type)
+      assert.equal(request.init.headers.get('X-File-Name'), encodeURIComponent(file.name))
+      assert.equal(request.init.headers.get('Idempotency-Key'), key)
+      assert.equal(request.init.headers.get('X-Import-Batch'), 'unchanged-batch')
+      assert.equal(request.init.credentials, 'include')
+      assert.deepEqual(new Uint8Array(request.init.body), new Uint8Array(await file.arrayBuffer()))
+    }
+  }
+  const before = requests.length
+  await assert.rejects(client.importRealJobPdf('w', files[0][0], 'key'), /DOCX uploads are not enabled/)
+  await assert.rejects(client.importRealJobFile('w', new File(['x'], 'macro.docm'), 'key'), /Other formats/)
+  await assert.rejects(client.importRealJobFile('w', new File([docxFile()], 'docx', {
+    type: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  }), 'key'), /supported file/)
+  await assert.rejects(client.importRealJobFile('w', new File([], 'empty.docx'), 'key'), /empty/)
+  assert.equal(requests.length, before)
 })
 
 test('job PDF clients preserve legacy colon and reserved-basename acceptance without changing upload headers', async () => {
@@ -424,7 +491,7 @@ test('job picker and drop zone accept mixed PDF/Markdown files and retry the sam
   await mount(React.createElement(ui.JobImport, { onClose() {} }), value)
   const input = dom.window.document.querySelector('input[type="file"]')
   assert.equal(input.getAttribute('aria-label'), 'Choose real job PDF or Markdown files')
-  assert.match(input.accept, /\.pdf,.md,.markdown/)
+  for (const extension of ['.pdf', '.md', '.markdown']) assert.ok(input.accept.split(',').includes(extension))
   const files = [new File(['%PDF-source'], 'role.PDF'), new File(['# Duties\r\nExact bytes'], 'role.MD', { type: 'application/pdf' })]
   await chooseFiles(files)
   assert.equal(dom.window.document.querySelectorAll('.import-item').length, 2)
@@ -435,15 +502,48 @@ test('job picker and drop zone accept mixed PDF/Markdown files and retry the sam
   assert.equal(calls[1].file, files[1])
   assert.notEqual(calls[0].idempotencyKey, calls[1].idempotencyKey)
   assert.equal(calls[0].batchId, calls[1].batchId)
-  assert.match(dom.window.document.body.textContent, /1 queued \/ 1 failed/)
+  assert.match(dom.window.document.body.textContent, /1 queued \/ 1 unacknowledged/)
   await act(async () => {
     dom.window.document.querySelector('button[aria-label="Retry role.MD"]').click()
     await new Promise((resolve) => setTimeout(resolve, 0))
   })
   assert.equal(calls.length, 3)
   assert.deepEqual(calls[2], calls[1])
-  assert.match(dom.window.document.body.textContent, /2 queued \/ 0 failed/)
+  assert.match(dom.window.document.body.textContent, /2 queued \/ 0 unacknowledged/)
   assert.match(dom.window.document.querySelector('.import-items').textContent, /Markdown/)
+})
+
+test('job picker advertises Markdown and Word together without enabling either through the other flag', async () => {
+  const value = workspaceValue()
+  value.cloud.realJobs.features.wordDocumentImports = true
+  const calls = []
+  value.cloud.realJobs.importFile = async (file, key, batchId) => { calls.push({ file, key, batchId }); return summary(file.name, '2026-09-17T00:00:00.000Z') }
+  await mount(React.createElement(ui.JobImport, { onClose() {} }), value)
+  const input = dom.window.document.querySelector('input[type="file"]')
+  assert.equal(input.getAttribute('aria-label'), 'Choose real job PDF or Markdown or Word files')
+  for (const extension of ['.pdf', '.md', '.markdown', '.docx', '.doc']) assert.ok(input.accept.split(',').includes(extension))
+  const files = [
+    new File(['# Source'], 'role.MD', { type: 'application/pdf' }), new File([docxFile()], 'role.DOCX'),
+    new File([legacyDocFile()], 'role.DOC'), new File(['%PDF-source'], 'role.PDF'), new File(['invalid'], 'role.docm'),
+  ]
+  await chooseFiles(files, true)
+  assert.equal(dom.window.document.querySelectorAll('.import-item').length, 5)
+  await clickButton('Import 4 jobs')
+  assert.deepEqual(calls.map((call) => call.file), files.slice(0, 4))
+  assert.equal(new Set(calls.map((call) => call.batchId)).size, 1)
+  assert.equal(new Set(calls.map((call) => call.key)).size, 4)
+  assert.match(dom.window.document.body.textContent, /4 queued \/ 0 unacknowledged \/ 1 invalid/)
+
+  const isolated = workspaceValue()
+  isolated.cloud.currentWorkspaceId = 'workspace-two'
+  isolated.cloud.realJobs.features.markdownJobImports = false
+  isolated.cloud.realJobs.features.markdownResumeImports = true
+  isolated.cloud.realJobs.features.wordDocumentImports = true
+  await mount(React.createElement(ui.JobImport, { onClose() {} }), isolated)
+  const wordOnly = dom.window.document.querySelector('input[type="file"]')
+  assert.equal(wordOnly.getAttribute('aria-label'), 'Choose real job PDF or Word files')
+  assert.equal(wordOnly.accept.split(',').includes('.md'), false)
+  assert.equal(wordOnly.accept.split(',').includes('.docx'), true)
 })
 
 test('job picker accepts legacy PDF basenames while Markdown retains strict filename validation', async () => {
@@ -460,9 +560,11 @@ test('job picker accepts legacy PDF basenames while Markdown retains strict file
   assert.equal(dom.window.document.querySelector('[role="alert"]'), null)
   await clickButton('Import 3 jobs')
   assert.deepEqual(calls, files)
-  assert.match(dom.window.document.body.textContent, /3 queued \/ 0 failed/)
+  assert.match(dom.window.document.body.textContent, /3 queued \/ 0 unacknowledged/)
+  assert.equal(dom.window.document.querySelector('input[type="file"]').disabled, true)
+  await clickButton('Start another batch')
   await chooseFiles([new File(['# Source'], 'Role: engineer.md')], true)
-  assert.match(dom.window.document.querySelector('[role="alert"]').textContent, /does not have a safe filename/)
+  assert.match(dom.window.document.querySelector('[role="alert"]').textContent, /safe filename/)
   assert.equal(calls.length, 3)
 })
 
@@ -473,14 +575,15 @@ test('job UI rejects unknown or disabled Markdown files while keeping PDF and UR
   value.cloud.realJobs.importFile = async (file) => { calls.push(file); return summary('pdf', '2026-09-17T00:00:00.000Z') }
   await mount(React.createElement(ui.JobImport, { onClose() {} }), value)
   await chooseFiles([new File(['# Source'], 'role.txt', { type: 'text/markdown' })], true)
-  assert.match(dom.window.document.querySelector('[role="alert"]').textContent, /not supported/)
-  assert.equal(dom.window.document.querySelectorAll('.import-item').length, 0)
+  assert.match(dom.window.document.querySelector('[role="alert"]').textContent, /Other formats cannot be processed/)
+  assert.equal(dom.window.document.querySelectorAll('.import-item').length, 1, 'Invalid input is retained without discarding valid neighbors.')
   await chooseFiles([new File(['# Source'], 'role.MaRkDoWn')])
-  assert.match(dom.window.document.querySelector('[role="alert"]').textContent, /Markdown job imports are not enabled/)
+  assert.match(dom.window.document.querySelector('[role="alert"]').textContent, /Markdown uploads are not enabled/)
   assert.equal(calls.length, 0)
   await chooseFiles([new File(['%PDF-source'], 'role.pdf')])
   await clickButton('Import 1 job')
   assert.equal(calls.length, 1)
+  await clickButton('Start another batch')
   await clickButton('Direct URLs')
   assert.equal(dom.window.document.querySelector('textarea').disabled, false)
 })

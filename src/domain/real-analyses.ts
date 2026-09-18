@@ -11,6 +11,7 @@ import type {
   ReferenceDocument,
 } from './real-grades'
 import type { RealJobSource } from './real-jobs'
+import type { OriginalContentType } from './document-formats'
 import type {
   ImmutableBlobReference,
   ImmutableDocumentReference,
@@ -23,7 +24,6 @@ import type {
   ResumeSourceCapture,
 } from './real-resumes'
 import type { Citation, Job, Rubric, SourceDocument } from './types'
-import type { OriginalContentType } from './source-files'
 
 export const ANALYSIS_LIMITS = {
   maxComparisons: 500,

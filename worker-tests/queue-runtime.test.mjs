@@ -342,12 +342,13 @@ test('immutable extraction conflicts use the durable document for generation and
   }
   const originalName = `${workspaceId}/${jobId}/original.html`
   const extractedName = `${workspaceId}/${jobId}/source-document.json`
+  const originalBytes = Buffer.from(`<main><h1>Competing Role</h1><h2>Requirements</h2><p>${'Competing source requirement. '.repeat(30)}</p></main>`)
+  const originalHash = createHash('sha256').update(originalBytes).digest('hex')
   const blobs = {
     async read(name) {
       if (name === extractedName) return undefined
       if (name === originalName) {
-        const bytes = Buffer.from(`<main><h1>Competing Role</h1><h2>Requirements</h2><p>${'Competing source requirement. '.repeat(30)}</p></main>`)
-        return { bytes, contentType: 'text/html', sha256: 'original', etag: '"original"' }
+        return { bytes: originalBytes, contentType: 'text/html', sha256: originalHash, etag: '"original"' }
       }
       return undefined
     },
@@ -364,7 +365,10 @@ test('immutable extraction conflicts use the durable document for generation and
       }
     },
   }
-  const store = fakeStore(record({ extractedBlobName: undefined }))
+  const store = fakeStore(record({
+    extractedBlobName: undefined,
+    source: { ...record().source, sha256: originalHash, bytes: originalBytes.byteLength },
+  }))
   const durableResult = {
     ...modelResult,
     title: 'Durable Role',

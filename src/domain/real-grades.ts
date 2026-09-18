@@ -1,6 +1,6 @@
 import type { Citation, Criterion, DocumentParagraph, Job, Rubric, SourceDocument } from './types'
 import type { RealJobSource } from './real-jobs'
-import type { OriginalContentType } from './source-files'
+import type { OriginalContentType } from './document-formats'
 
 export const GRADE_LADDER_LIMITS = {
   maxSources: 15,

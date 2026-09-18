@@ -7,6 +7,7 @@ import type { TokenCredential } from '@azure/identity'
 import { JOB_IMPORT_LIMITS } from '../../src/domain/real-jobs'
 import type { RealJobRecord, VersionedRealJob } from '../../src/domain/real-jobs'
 import type { Rubric } from '../../src/domain/types'
+import { UPLOAD_CONTENT_TYPES } from '../../src/domain/document-formats'
 import { StoreConflictError } from '../store'
 import { fetchCosmosPage } from '../cosmos-query'
 import type { JobBlob, JobBlobStore, RealJobsConfig, RealJobStore } from './store'
@@ -36,6 +37,7 @@ const MAX_DOCUMENT_BYTES = JOB_IMPORT_LIMITS.maxSourceCharacters * 8
 function maxBlobBytes(blobName: string): number {
   switch (jobBlobContentType(blobName)) {
     case 'application/pdf': return JOB_IMPORT_LIMITS.maxPdfBytes
+    case UPLOAD_CONTENT_TYPES.docx: case UPLOAD_CONTENT_TYPES.doc: return JOB_IMPORT_LIMITS.maxFileBytes
     case 'text/markdown': return JOB_IMPORT_LIMITS.maxMarkdownBytes
     case 'text/html': return MAX_HTML_BYTES
     case 'application/json': return MAX_DOCUMENT_BYTES

@@ -6,8 +6,10 @@ import {
   type ResumeMutationResponse,
   type ResumeProcessingFeatures,
 } from '../domain/real-resumes'
-import { isSafeUploadedFilename, uploadedFileKind, type UploadedSourceKind } from '../domain/source-files'
+import { isSafeUploadedFilename, uploadedFileKind } from '../domain/source-files'
 import { cloudJsonRequest } from './cloudWorkspace'
+import { UPLOAD_CONTENT_TYPES, type UploadFormat } from '../domain/document-formats'
+import { requireUploadFile, uploadFileByteLimit } from './documentUploads'
 
 const uuid = /^[\da-f]{8}-[\da-f]{4}-[\da-f]{4}-[\da-f]{4}-[\da-f]{12}$/i
 
@@ -36,7 +38,12 @@ export async function fetchResumeProcessingFeatures(signal?: AbortSignal): Promi
   return {
     realResumeImports: features.realResumeImports === true,
     markdownResumeImports: features.realResumeImports === true && features.markdownResumeImports === true,
-    resumeLimits: features.resumeLimits ?? RESUME_IMPORT_LIMITS,
+    wordDocumentImports: features.realResumeImports === true && features.wordDocumentImports === true,
+    resumeLimits: {
+      ...RESUME_IMPORT_LIMITS,
+      ...features.resumeLimits,
+      maxFileBytes: Math.min(features.resumeLimits?.maxFileBytes ?? RESUME_IMPORT_LIMITS.maxFileBytes, RESUME_IMPORT_LIMITS.maxFileBytes),
+    },
   }
 }
 
@@ -69,21 +76,24 @@ export async function getRealResume(workspaceId: string, resumeId: string, signa
 }
 
 async function importRealResumeUpload(
-  workspaceId: string, file: File, kind: UploadedSourceKind, key: string, batchId: string, inputCount: number, signal?: AbortSignal,
+  workspaceId: string, file: File, kind: UploadFormat, key: string, batchId: string, inputCount: number, signal?: AbortSignal,
 ): Promise<RealResumeSummary> {
-  const label = kind === 'markdown' ? 'Markdown' : 'PDF'
+  const label = kind === 'markdown' ? 'Markdown' : kind.toUpperCase()
   if (uploadedFileKind(file) !== kind || !isSafeUploadedFilename(file.name, kind)) {
-    throw new Error(`Choose a ${label} file with a safe ${kind === 'markdown' ? '.md or .markdown' : '.pdf'} filename.`)
+    throw new Error(`${uploadedFileKind(file)?.toUpperCase() ?? 'Unsupported'} uploads are not enabled for this method. Choose a ${label} file with a safe ${kind === 'markdown' ? '.md or .markdown' : `.${kind}`} filename.`)
   }
-  const maxBytes = kind === 'markdown' ? RESUME_IMPORT_LIMITS.maxMarkdownBytes : RESUME_IMPORT_LIMITS.maxPdfBytes
+  const maxBytes = uploadFileByteLimit(kind, RESUME_IMPORT_LIMITS)
   if (!file.size || file.size > maxBytes) throw new Error(`Choose a nonempty ${label} file no larger than ${maxBytes / 1024 / 1024} MiB.`)
+  if (kind === 'docx' || kind === 'doc') requireUploadFile(file, [kind])
   const headers = {
     ...importHeaders(key, batchId, inputCount),
-    'Content-Type': kind === 'markdown' ? 'text/markdown' : 'application/pdf',
+    'Content-Type': UPLOAD_CONTENT_TYPES[kind],
     'X-File-Name': encodeURIComponent(file.name),
   }
+  signal?.throwIfAborted()
   const bytes = await file.arrayBuffer()
-  const result = await cloudJsonRequest<ResumeMutationResponse>(`${base(workspaceId)}/${kind}`, { method: 'POST', headers, body: bytes, signal })
+  signal?.throwIfAborted()
+  const result = await cloudJsonRequest<ResumeMutationResponse>(`${base(workspaceId)}/${kind === 'pdf' || kind === 'markdown' ? kind : 'file'}`, { method: 'POST', headers, body: bytes, signal })
   return checked(result.resume, workspaceId)
 }
 
@@ -103,7 +113,7 @@ export async function importRealResumeFile(
   workspaceId: string, file: File, key: string, batchId: string, inputCount: number, signal?: AbortSignal,
 ): Promise<RealResumeSummary> {
   const kind = uploadedFileKind(file)
-  if (!kind) throw new Error('Choose a PDF (.pdf) or Markdown (.md or .markdown) file. Other file types are not supported.')
+  if (!kind) throw new Error('Choose a supported file: PDF, Markdown (.md or .markdown), DOCX or DOC. Other file types are not supported.')
   return importRealResumeUpload(workspaceId, file, kind, key, batchId, inputCount, signal)
 }
 

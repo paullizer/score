@@ -4,7 +4,7 @@ import { Copy, FileSearch, Layers3, Pencil, ShieldCheck } from 'lucide-react'
 import { useWorkspace } from '../../app/workspace-context'
 import { Badge, Button, DemoNote, EmptyState, InlineError } from '../../components/ui'
 import type { Citation, Criterion, Rubric } from '../../domain/types'
-import { documentPagination } from '../../domain/source-files'
+import { documentPagination, isUploadFormat, UPLOAD_CONTENT_TYPES } from '../../domain/document-formats'
 import { RubricEditor } from './RubricEditor'
 
 const scoreLegend = [
@@ -29,9 +29,10 @@ export function RubricPanel({ rubric, onSelectCriterion, onVersionSaved, readOnl
   const duplicatingRef = useRef(false)
   const job = workspace.jobs.find((item) => item.id === rubric.jobId)
   const document = workspace.documents.find((item) => item.id === job?.documentId)
-  const pagination = job?.dataKind === 'real' ? documentPagination(cloud?.realJobs.source(job.id)?.originalContentType) : 'pdf-pages'
+  const pagination = job?.dataKind === 'real' ? documentPagination(cloud?.realJobs.source(job.id)?.originalContentType
+    ?? (isUploadFormat(job.source) ? UPLOAD_CONTENT_TYPES[job.source] : undefined)) : 'pdf-pages'
   const sourceLocation = (page: number) => pagination === 'pdf-pages' ? `p. ${page}`
-    : `${pagination === 'markdown-sections' ? 'Markdown ' : pagination === 'html-sections' ? 'HTML ' : ''}section ${page}`
+    : `${pagination === 'markdown-sections' ? 'Markdown' : pagination === 'html-sections' ? 'HTML' : 'Captured'} section ${page}`
   const realGrade = rubric.dataKind === 'real' && rubric.kind === 'grade'
   const viewer = Boolean(cloud && cloud.workspaces.find((item) => item.id === cloud.currentWorkspaceId)?.role === 'viewer')
   const editable = !realGrade && !(viewer && rubric.dataKind === 'real') && (rubric.kind === 'grade' || job?.status === 'ready') && (rubric.dataKind !== 'real' || Boolean(document))

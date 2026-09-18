@@ -1,5 +1,7 @@
 import { RESUME_IMPORT_LIMITS, type RealResumeSummary } from '../../domain/real-resumes'
+import type { UploadFormat } from '../../domain/document-formats'
 import { isSafeUploadedFilename, uploadedFileKind, type UploadedSourceKind } from '../../domain/source-files'
+import { uploadFileByteLimit, uploadFormatNames, validateUploadFile } from '../../services/documentUploads'
 
 export type RealResumeImportSource = { kind: UploadedSourceKind | 'unsupported'; file: File } | { kind: 'url'; url: string }
 
@@ -24,22 +26,26 @@ export interface RealResumeImportBatch {
   items: RealResumeImportItem[]
 }
 
-export function validateResumeInput(source: RealResumeImportSource, limits = RESUME_IMPORT_LIMITS, markdownEnabled = false): string | undefined {
+export function resumeFileInput(file: File): RealResumeImportSource {
+  return resumeFileSource(file)
+}
+
+export function validateResumeInput(source: RealResumeImportSource, limits = RESUME_IMPORT_LIMITS, formats: readonly UploadFormat[] | boolean = ['pdf']): string | undefined {
+  const available: readonly UploadFormat[] = typeof formats === 'boolean' ? formats ? ['pdf', 'markdown'] : ['pdf'] : formats
   if (source.kind !== 'url') {
-    if (source.kind === 'unsupported' || uploadedFileKind(source.file) !== source.kind) return 'Choose a PDF (.pdf) or Markdown (.md or .markdown) file. Other file types are not supported.'
-    const label = source.kind === 'markdown' ? 'Markdown' : 'PDF'
+    if (source.kind === 'unsupported' || uploadedFileKind(source.file) !== source.kind) return `Choose a supported file: ${uploadFormatNames(available)}. Other file types are not supported.`
+    const label = uploadFormatNames([source.kind])
     if (!isSafeUploadedFilename(source.file.name, source.kind)) return `Choose a ${label} file with a safe filename without reserved names, path separators, or control characters.`
-    if (source.kind === 'markdown' && !markdownEnabled) return 'Markdown resume imports are not enabled in this deployment. PDFs and public URLs are still supported.'
-    if (!source.file.size) return `This file is empty and could not be processed. Choose a readable ${label} file.`
-    const maxBytes = source.kind === 'markdown' ? limits.maxMarkdownBytes ?? RESUME_IMPORT_LIMITS.maxMarkdownBytes : limits.maxPdfBytes
-    if (source.file.size > maxBytes) return `This ${label} file exceeds ${maxBytes / 1024 / 1024} MiB and could not be processed. Choose a smaller file.`
-    return undefined
+    if (source.kind === 'markdown' && !available.includes('markdown')) return 'Markdown resume imports are not enabled in this deployment. PDFs and public URLs are still supported.'
+    return validateUploadFile(source.file, available, uploadFileByteLimit(source.kind, limits))
   }
   if (source.url.length > limits.maxUrlLength) return `This URL exceeds ${limits.maxUrlLength} characters and could not be processed.`
   if (!URL.canParse(source.url)) return 'Use a complete public http or https resume/profile URL.'
   const url = new URL(source.url)
   if (!['http:', 'https:'].includes(url.protocol)) return 'Only public http or https resume/profile URLs can be processed.'
   if (url.username || url.password) return 'URLs with embedded usernames or passwords cannot be processed. Supply a publicly accessible URL without credentials.'
+  if (/\.(docx?|docm|dotx?)$/i.test(url.pathname)) return 'Word URLs cannot be imported. Download the document and upload a supported file instead.'
+  if (/\.(md|markdown)$/i.test(url.pathname)) return 'Markdown URLs cannot be imported. Download the document and upload a Markdown file instead.'
   return undefined
 }
 
@@ -47,14 +53,14 @@ export function resumeUrlLines(text: string): string[] {
   return text.split(/\r?\n/).map((line) => line.trim()).filter(Boolean)
 }
 
-export function appendResumeInputs(batch: RealResumeImportBatch, inputs: RealResumeImportSource[], limits = RESUME_IMPORT_LIMITS, markdownEnabled = false): RealResumeImportBatch {
+export function appendResumeInputs(batch: RealResumeImportBatch, inputs: RealResumeImportSource[], limits = RESUME_IMPORT_LIMITS, formats: readonly UploadFormat[] | boolean = ['pdf']): RealResumeImportBatch {
   if (batch.inputCount !== null) throw new Error('This batch has already been submitted. Retry its unchanged items, or explicitly start another batch.')
   if (batch.items.length + inputs.length > limits.maxBatchItems) {
-    throw new Error(`A batch can contain at most ${limits.maxBatchItems} total PDFs, Markdown files, and URLs. Nothing was truncated; your existing selection is unchanged.`)
+    throw new Error(`A batch can contain at most ${limits.maxBatchItems} total files and URLs. Nothing was truncated; your existing selection is unchanged.`)
   }
   const existingUrls = new Set(batch.items.flatMap((item) => item.source.kind === 'url' ? [item.source.url] : []))
   const items = inputs.map((source): RealResumeImportItem => {
-    const error = validateResumeInput(source, limits, markdownEnabled)
+    const error = validateResumeInput(source, limits, formats)
     const repeated = source.kind === 'url' && existingUrls.has(source.url)
     if (source.kind === 'url') existingUrls.add(source.url)
     return {
@@ -83,6 +89,6 @@ export function resumeName(summary: RealResumeSummary): string {
 export function resumeErrorMessage(summary: RealResumeSummary): string | null {
   if (!summary.error) return null
   return summary.error.code === 'access-blocked'
-    ? 'This URL is not publicly accessible and could not be processed. Use a publicly accessible resume/profile URL, or upload a PDF or Markdown file you are authorized to use. Score cannot sign in or bypass site restrictions.'
+    ? 'This URL is not publicly accessible and could not be processed. Use a publicly accessible resume/profile URL, or upload a supported document you are authorized to use. Score cannot sign in or bypass site restrictions.'
     : summary.error.message
 }

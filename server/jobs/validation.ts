@@ -1,13 +1,17 @@
 import { JOB_IMPORT_LIMITS } from '../../src/domain/real-jobs'
 import type { RealJobRecord } from '../../src/domain/real-jobs'
-import { isOriginalContentType, isSafeUploadedFilename, type OriginalContentType } from '../../src/domain/source-files'
+import { isSafeUploadedFilename } from '../../src/domain/source-files'
 import type { Citation, Rubric, SourceDocument } from '../../src/domain/types'
 import { isValidWorkspaceId } from '../ids'
+import {
+  isOriginalContentType, isUploadFormat, originalExtension, storedDocumentContentType, UPLOAD_CONTENT_TYPES,
+  type OriginalContentType, type UploadFormat,
+} from '../../src/domain/document-formats'
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
 const JOB_ID_PATTERN = new RegExp(`^job-${UUID_PATTERN.source.slice(1, -1)}$`, 'i')
 const DOCUMENT_ID_PATTERN = new RegExp(`^document-${UUID_PATTERN.source.slice(1, -1)}$`, 'i')
-const SAFE_BLOB_FILE_PATTERN = /^(?:original\.(?:pdf|html|md)|source-document\.json)$/
+const SAFE_BLOB_FILE_PATTERN = /^(?:original\.(?:pdf|docx|doc|html|md)|source-document\.json)$/
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
@@ -40,15 +44,12 @@ export function isValidDocumentId(value: string): boolean {
 export function originalBlobName(
   workspaceId: string,
   jobId: string,
-  kindOrContentType: 'pdf' | 'markdown' | 'url' | OriginalContentType,
+  kindOrContentType: UploadFormat | 'url' | OriginalContentType,
 ): string {
-  let extension: string
-  switch (kindOrContentType) {
-    case 'pdf': case 'application/pdf': extension = 'pdf'; break
-    case 'url': case 'text/html': extension = 'html'; break
-    case 'markdown': case 'text/markdown': extension = 'md'; break
-    default: throw new Error('Invalid job original type.')
-  }
+  const contentType = isOriginalContentType(kindOrContentType) ? kindOrContentType
+    : kindOrContentType === 'url' ? 'text/html' : isUploadFormat(kindOrContentType) ? UPLOAD_CONTENT_TYPES[kindOrContentType] : undefined
+  if (!contentType) throw new Error('Invalid job original type.')
+  const extension = originalExtension(contentType)
   return `${workspaceId}/${jobId}/original.${extension}`
 }
 
@@ -70,13 +71,9 @@ export function isBlobInJobPrefix(value: string, workspaceId: string, jobId: str
 
 export function jobBlobContentType(name: string): OriginalContentType | 'application/json' {
   if (!isSafeJobBlobName(name)) throw new Error('Invalid job blob name.')
-  switch (name.split('/')[2]) {
-    case 'original.pdf': return 'application/pdf'
-    case 'original.html': return 'text/html'
-    case 'original.md': return 'text/markdown'
-    case 'source-document.json': return 'application/json'
-    default: throw new Error('Invalid job blob content type.')
-  }
+  const contentType = storedDocumentContentType(name)
+  if (!contentType) throw new Error('Invalid job blob content type.')
+  return contentType
 }
 
 export function validateRealSourceDocument(value: unknown, contentType?: OriginalContentType): string[] {
@@ -253,7 +250,7 @@ export function validateRealJobRecord(value: unknown): value is RealJobRecord {
       'kind', 'displayName', 'url', 'finalUrl', 'originalBlobName', 'originalContentType', 'sha256', 'bytes',
       'capturedAt', 'extractionMethod',
     ]) ||
-    !['pdf', 'markdown', 'url'].includes(String(value.source.kind)) || !isNonBlank(value.source.displayName) ||
+    (!isUploadFormat(value.source.kind) && value.source.kind !== 'url') || !isNonBlank(value.source.displayName) ||
     !isNonBlank(value.inputFingerprint) || !isNonBlank(value.createdBy) || !isTimestamp(value.updatedAt) ||
     !Number.isInteger(value.attempts) || Number(value.attempts) < 0 || !Array.isArray(value.warnings) ||
     !value.warnings.every((warning) => typeof warning === 'string')) {
@@ -261,7 +258,7 @@ export function validateRealJobRecord(value: unknown): value is RealJobRecord {
   }
   if (value.source.originalBlobName !== undefined) {
     if (typeof value.source.originalBlobName !== 'string' ||
-      typeof value.source.originalContentType !== 'string' || !isOriginalContentType(value.source.originalContentType) ||
+      !isOriginalContentType(value.source.originalContentType) ||
       !isBlobInJobPrefix(value.source.originalBlobName, value.workspaceId, value.id) ||
       value.source.originalBlobName !== originalBlobName(value.workspaceId, value.id, value.source.originalContentType)) {
       return false
@@ -272,15 +269,15 @@ export function validateRealJobRecord(value: unknown): value is RealJobRecord {
       value.extractedBlobName !== extractedBlobName(value.workspaceId, value.id))) {
     return false
   }
-  if ((value.source.kind === 'pdf' || value.source.kind === 'markdown') &&
-    (value.source.originalContentType !== (value.source.kind === 'pdf' ? 'application/pdf' : 'text/markdown') ||
-      value.source.originalBlobName === undefined || value.source.url !== undefined || value.source.finalUrl !== undefined)) {
-    return false
-  }
-  if (value.source.kind === 'markdown' &&
-    (!isSafeUploadedFilename(value.source.displayName, 'markdown') || typeof value.source.sha256 !== 'string' ||
-      !Number.isInteger(value.source.bytes) || Number(value.source.bytes) < 1 || Number(value.source.bytes) > JOB_IMPORT_LIMITS.maxMarkdownBytes)) {
-    return false
+  if (value.source.kind !== 'url') {
+    const format = value.source.kind
+    if (!isUploadFormat(format) || value.source.originalContentType !== UPLOAD_CONTENT_TYPES[format] ||
+      value.source.originalBlobName === undefined ||
+      value.source.url !== undefined || value.source.finalUrl !== undefined) return false
+    if (format !== 'pdf' && (!isSafeUploadedFilename(value.source.displayName, format) ||
+      typeof value.source.sha256 !== 'string' || !Number.isInteger(value.source.bytes) ||
+      Number(value.source.bytes) < 1 || Number(value.source.bytes) >
+        (format === 'markdown' ? JOB_IMPORT_LIMITS.maxMarkdownBytes : JOB_IMPORT_LIMITS.maxFileBytes))) return false
   }
   if (value.source.kind === 'url' &&
     (!isNonBlank(value.source.url) || (value.source.originalContentType !== undefined &&
@@ -308,7 +305,11 @@ export function validateRealJobRecord(value: unknown): value is RealJobRecord {
   if (value.source.extractionMethod !== undefined) {
     switch (value.source.originalContentType) {
       case 'application/pdf':
+      case UPLOAD_CONTENT_TYPES.docx:
         if (value.source.extractionMethod !== 'document-intelligence') return false
+        break
+      case UPLOAD_CONTENT_TYPES.doc:
+        if (value.source.extractionMethod !== 'legacy-word') return false
         break
       case 'text/html':
         if (!['html', 'browser'].includes(String(value.source.extractionMethod))) return false
