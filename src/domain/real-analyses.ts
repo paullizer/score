@@ -29,7 +29,7 @@ export const ANALYSIS_LIMITS = {
   maxComparisons: 500,
   initializationChunkSize: 25,
   maxAutomaticAttempts: 3,
-  maxOutputCorrections: 1,
+  maxOutputCorrections: 2,
 } as const
 
 export interface RealAnalysisResumeSelection {

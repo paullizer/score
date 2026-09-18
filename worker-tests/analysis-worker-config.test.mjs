@@ -41,7 +41,8 @@ test('analysis configuration requires only its dedicated stores, identity, and m
   assert.equal(result.localDevelopment, false)
   for (const key of ['rendererUrl', 'documentIntelligenceEndpoint', 'jobs', 'resumes', 'grades']) assert.equal(result[key], undefined)
   const deps = createAnalysisWorkerDependencies(result, { getToken: async () => ({ token: 'test-token', expiresOnTimestamp: 0 }) })
-  assert.deepEqual(Object.keys(deps).sort(), ['blobs', 'model', 'store'])
+  assert.deepEqual(Object.keys(deps).sort(), ['blobs', 'model', 'onEvent', 'store'])
+  assert.equal(typeof deps.onEvent, 'function')
   assert.equal(deps.model.endpoint, result.modelEndpoint)
 })
 

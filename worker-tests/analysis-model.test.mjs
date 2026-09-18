@@ -635,6 +635,153 @@ test('resume citation ownership, exact paragraph/quote binding, whitespace, dupl
   assert.throws(() => buildAnalysisResumeCitations([{ paragraphId: 'resume-p1', quote: 42 }], input), rejectsCode('invalid-citation'))
 })
 
+test('citation diagnostics classify each rejection without retaining source text or untrusted identities', () => {
+  const input = fixture()
+  input.resume.paragraphs[0].text = 'PRIVATE-SOURCE-SENTINEL uses  exact spacing.\nSecond line of evidence.'
+  const cases = [
+    ['invalid-shape', row => { row.citations[0].documentId = 'PRIVATE-MODEL-SENTINEL' }],
+    ['too-many-citations', row => { row.citations = Array.from({ length: 9 }, () => quote(input)) }],
+    ['unknown-paragraph', row => { row.citations[0].paragraphId = 'PRIVATE-MODEL-SENTINEL' }],
+    ['empty-quote', row => { row.citations[0].quote = ' \n ' }],
+    ['quote-too-long', row => { row.citations[0].quote = 'A'.repeat(ANALYSIS_MODEL_LIMITS.maxQuoteCharacters + 1) }],
+    ['quote-not-found', row => { row.citations[0].quote = 'PRIVATE-MODEL-SENTINEL secret@example' }],
+    ['whitespace-mismatch', row => { row.citations[0].quote = input.resume.paragraphs[0].text.replace(/\s+/g, ' ') }],
+    ['wrong-paragraph', row => { row.citations[0].quote = input.resume.paragraphs[1].text }],
+    ['duplicate-citation', row => { row.citations.push(quote(input)) }],
+  ]
+  for (const [reason, mutate] of cases) {
+    const value = assessment(input)
+    mutate(value.criteria[0])
+    assert.throws(() => validateAnalysisAssessment(value, input), error => {
+      rejectsCode('invalid-citation', { stage: 'assessment', correctable: true, retryable: false })(error)
+      const diagnostic = error.citationDiagnostics
+      assert.equal(diagnostic.findings.length, 1)
+      assert.equal(diagnostic.omittedFindings, 0)
+      const finding = diagnostic.findings[0]
+      assert.equal(finding.reason, reason)
+      assert.equal(finding.scope, 'criteria')
+      assert.equal(finding.rowIndex, 0)
+      assert.equal(finding.criterionId, input.rubric.criteria[0].id)
+      if (reason === 'unknown-paragraph') assert.equal(finding.paragraphId, undefined)
+      if (reason === 'wrong-paragraph') assert.equal(finding.matchingParagraphId, input.resume.paragraphs[1].id)
+      assert.doesNotMatch(JSON.stringify(error), /PRIVATE-|secret@example|Second line/)
+      assert.match(error.message, /^Assessment criterion 1/)
+      return true
+    })
+  }
+})
+
+test('citation findings cover criteria, qualifications and review issues and explicitly bound omitted findings', () => {
+  const grade = gradeFixture()
+  const value = assessment(grade)
+  value.criteria[0].citations[0].quote = 'PRIVATE-MODEL-SENTINEL'
+  value.qualifications[0].citations[0].quote = 'PRIVATE-MODEL-SENTINEL'
+  assert.throws(() => validateAnalysisAssessment(value, grade), error => {
+    assert.deepEqual(error.citationDiagnostics.findings.map(finding => [finding.scope, finding.rowIndex, finding.citationIndex]), [
+      ['criteria', 0, 0], ['qualifications', 0, 0],
+    ])
+    assert.equal(error.citationDiagnostics.findings[1].qualificationId, grade.qualifications[0].id)
+    assert.match(error.message, /2 citation problems/)
+    return true
+  })
+  const review = unsupportedReview(grade, {
+    criterionId: null, qualificationId: grade.qualifications[0].id,
+    citations: [{ paragraphId: grade.resume.paragraphs[3].id, quote: 'PRIVATE-MODEL-SENTINEL' }],
+  })
+  assert.throws(() => validateAnalysisGroundingReview(review, grade), error => {
+    rejectsCode('invalid-citation', { stage: 'grounding' })(error)
+    assert.equal(error.citationDiagnostics.findings[0].scope, 'issues')
+    assert.equal(error.citationDiagnostics.findings[0].qualificationId, grade.qualifications[0].id)
+    assert.equal(error.citationDiagnostics.findings[0].criterionId, undefined)
+    assert.match(error.message, /^Grounding review issue 1, citation 1/)
+    return true
+  })
+  for (const rows of [4, 5]) {
+    const input = fixture()
+    input.rubric.criteria = Array.from({ length: rows }, (_, index) => ({
+      ...input.rubric.criteria[0], id: `criterion-${index}`, weight: 100 / rows,
+    }))
+    input.requirementEvidence = input.rubric.criteria.map(row => ({ kind: 'criterion', criterionId: row.id, citations: row.sourceCitations }))
+    const many = assessment(input, Array(rows).fill(3))
+    for (const row of many.criteria) row.citations = Array.from({ length: 8 }, () => ({
+      paragraphId: input.resume.paragraphs[0].id, quote: 'PRIVATE-MODEL-SENTINEL',
+    }))
+    assert.throws(() => validateAnalysisAssessment(many, input), error => {
+      assert.equal(error.citationDiagnostics.findings.length, ANALYSIS_MODEL_LIMITS.maxCitationFindings)
+      assert.equal(error.citationDiagnostics.omittedFindings, rows * 8 - ANALYSIS_MODEL_LIMITS.maxCitationFindings)
+      assert.match(error.message, new RegExp(`${rows * 8} citation problems`))
+      assert.doesNotMatch(JSON.stringify(error), /PRIVATE-MODEL-SENTINEL/)
+      return true
+    })
+  }
+})
+
+test('targeted citation repair retains full input and shares two corrections across assessment and review', async () => {
+  const input = fixture()
+  input.resume.paragraphs[0].text = 'Resolved  calibration drift.\nDocumented the method and its limits.'
+  const invalid = assessment(input)
+  invalid.criteria[0].citations[0].quote = input.resume.paragraphs[0].text.replace(/\s+/g, ' ')
+  invalid.criteria[1].citations[0].paragraphId = input.resume.paragraphs[0].id
+  invalid.PRIVATE_SENTINEL = 'secret@example'
+  const review = unsupportedReview(input, {
+    citations: [{ paragraphId: input.resume.paragraphs[0].id, quote: 'PRIVATE-MODEL-SENTINEL' }],
+  })
+  const events = []
+  const mock = mockModel([invalid, assessment(input), review, supportedReview()])
+  const result = await assessResumeAgainstTarget(input, { ...mock.options, onEvent: event => events.push(event) })
+  assert.equal(mock.calls.length, 4)
+  assert.equal(result.correctionCount, 2)
+  assert.equal(result.groundingReviews.length, 1, 'An invalid review is not persisted as valid grounding evidence')
+  const requests = mock.calls.map(call => JSON.parse(call.request.messages[1].content))
+  for (const request of requests) assert.deepEqual(request.input, input)
+  const first = requests[1].correction
+  assert.equal(first.attempt, 1)
+  assert.equal(first.previousInvalidOutputOmitted, true)
+  assert.deepEqual(first.validation.citationDiagnostics.findings.map(finding => finding.reason), ['whitespace-mismatch', 'wrong-paragraph'])
+  assert.deepEqual(first.sourceParagraphs, input.resume.paragraphs.slice(0, 2).map(paragraph => ({ paragraphId: paragraph.id, text: paragraph.text })))
+  assert.equal(first.omittedSourceParagraphs, 0)
+  const second = requests[3].correction
+  assert.equal(second.attempt, 2)
+  assert.equal(second.validation.citationDiagnostics.findings[0].scope, 'issues')
+  assert.deepEqual(requests[2].assessment, requests[3].assessment, 'A review-format correction reviews the same validated assessment')
+  assert.doesNotMatch(JSON.stringify([first, second]), /PRIVATE[_-]|secret@example/)
+  assert.deepEqual(events.filter(event => event.event === 'validation-failed').map(event => [event.stage, event.correctionCount]),
+    [['assessment', 0], ['grounding', 1]])
+  assert.deepEqual(events.filter(event => event.event === 'correction').map(event => event.correctionCount), [1, 2])
+  assert.ok(events.filter(event => event.event === 'model-response').every(event => event.httpStatus === 200))
+  assert.doesNotMatch(JSON.stringify(events), /PRIVATE|secret@example|Resolved|calibration drift|Documented the method|test-token/)
+})
+
+test('supplemental repair sources are bounded without truncating frozen input or source paragraphs', async () => {
+  for (const paragraphLength of [0, ANALYSIS_MODEL_LIMITS.maxCorrectionSourceCharacters, ANALYSIS_MODEL_LIMITS.maxCorrectionSourceCharacters + 1]) {
+    const input = fixture()
+    const largeParagraph = paragraphLength > 0
+    if (largeParagraph) input.resume.paragraphs[0].text = 'A'.repeat(paragraphLength)
+    else input.resume.paragraphs = Array.from({ length: 12 }, (_, index) => ({
+      ...input.resume.paragraphs[index % 5], id: `resume-p${index + 1}`,
+    }))
+    const invalid = assessment(input)
+    if (largeParagraph) invalid.criteria[0].citations[0].quote = 'PRIVATE-MODEL-SENTINEL'
+    else invalid.criteria.forEach((row, index) => {
+      row.citations = input.resume.paragraphs.slice(index * 4, index * 4 + 4).map(paragraph => ({
+        paragraphId: paragraph.id, quote: 'PRIVATE-MODEL-SENTINEL',
+      }))
+    })
+    const repaired = assessment(input)
+    if (largeParagraph) repaired.criteria[0].citations[0].quote = input.resume.paragraphs[0].text.slice(0, 64)
+    const mock = mockModel([invalid, repaired, supportedReview()])
+    await assessResumeAgainstTarget(input, mock.options)
+    const request = JSON.parse(mock.calls[1].request.messages[1].content)
+    assert.deepEqual(request.input, input)
+    const omittedForSize = paragraphLength > ANALYSIS_MODEL_LIMITS.maxCorrectionSourceCharacters
+    assert.equal(request.correction.sourceParagraphs.length, largeParagraph ? Number(!omittedForSize) : ANALYSIS_MODEL_LIMITS.maxCorrectionSources)
+    assert.equal(request.correction.omittedSourceParagraphs, largeParagraph ? Number(omittedForSize) : 12 - ANALYSIS_MODEL_LIMITS.maxCorrectionSources)
+    for (const source of request.correction.sourceParagraphs) {
+      assert.equal(source.text, input.resume.paragraphs.find(paragraph => paragraph.id === source.paragraphId).text)
+    }
+  }
+})
+
 test('personal traits cannot be scored, while genuine professional work about protected topics is not rejected', () => {
   const input = fixture()
   input.rubric.criteria[0].label = 'Candidate age'
@@ -708,11 +855,12 @@ test('a real but semantically irrelevant quotation cannot publish without a supp
   invalidSupport.criteria[0].citations = [quote(input, 4)]
   // Exact string validation alone cannot decide whether the gardening passage supports calibration.
   assert.equal(validateAnalysisAssessment(invalidSupport, input).criteria[0].score, 4)
-  const mock = mockModel([invalidSupport, unsupportedReview(input), invalidSupport, unsupportedReview(input)])
+  const mock = mockModel([invalidSupport, unsupportedReview(input), invalidSupport, unsupportedReview(input), invalidSupport, unsupportedReview(input)])
   await assert.rejects(assessResumeAgainstTarget(input, mock.options), rejectsCode('grounding-failed', { stage: 'grounding', retryable: false }))
-  assert.equal(mock.calls.length, 4)
+  assert.equal(mock.calls.length, 6)
   assert.deepEqual(mock.calls.map(call => call.request.response_format.json_schema.name), [
     'resume_rubric_assessment', 'resume_rubric_grounding_review', 'resume_rubric_assessment', 'resume_rubric_grounding_review',
+    'resume_rubric_assessment', 'resume_rubric_grounding_review',
   ])
   const repair = JSON.parse(mock.calls[2].request.messages[1].content)
   assert.equal(repair.correction.attempt, 1)
@@ -742,7 +890,7 @@ test('one supported reassessment retains both actual reviews and binds each to t
   assert.equal('correction' in JSON.parse(mock.calls[3].request.messages[1].content), false, 'The second review is independent of the prior reviewer verdict')
 })
 
-test('invalid JSON gets only one safe correction and never echoes raw source or model PII into diagnostics', async () => {
+test('invalid JSON gets at most two safe corrections and never echoes raw source or model PII into diagnostics', async () => {
   const input = fixture()
   const mock = mockModel(['{"PRIVATE-SENTINEL":"secret@example', assessment(input), supportedReview()])
   const result = await assessResumeAgainstTarget(input, mock.options)
@@ -751,24 +899,25 @@ test('invalid JSON gets only one safe correction and never echoes raw source or 
   const correction = JSON.parse(mock.calls[1].request.messages[1].content).correction
   assert.equal(correction.previousInvalidOutputOmitted, true)
   assert.doesNotMatch(JSON.stringify(correction), /PRIVATE-SENTINEL|secret@example/)
-  const twice = mockModel(['PRIVATE-SENTINEL invalid json', 'PRIVATE-SENTINEL invalid json'])
-  await assert.rejects(assessResumeAgainstTarget(input, twice.options), rejectsCode('invalid-model-output', { stage: 'assessment' }))
-  assert.equal(twice.calls.length, 2)
+  const exhausted = mockModel(Array(3).fill('PRIVATE-SENTINEL invalid json'))
+  await assert.rejects(assessResumeAgainstTarget(input, exhausted.options), rejectsCode('invalid-model-output', { stage: 'assessment' }))
+  assert.equal(exhausted.calls.length, 3)
 })
 
-test('assessment schema repair and semantic review share one correction budget', async () => {
+test('assessment schema repair and semantic review share the same two-correction budget', async () => {
   const input = fixture()
   const invalid = assessment(input)
   invalid.criteria[0].score = 7
-  const mock = mockModel([invalid, assessment(input), unsupportedReview(input)])
+  const mock = mockModel([invalid, assessment(input), unsupportedReview(input), assessment(input), unsupportedReview(input)])
   await assert.rejects(assessResumeAgainstTarget(input, mock.options), rejectsCode('grounding-failed'))
-  assert.equal(mock.calls.length, 3)
-  const malformedReview = mockModel(['invalid-json', assessment(input), { outcome: 'supported', issues: [], PRIVATE_SENTINEL: 'secret@example' }])
+  assert.equal(mock.calls.length, 5)
+  const malformed = { outcome: 'supported', issues: [], PRIVATE_SENTINEL: 'secret@example' }
+  const malformedReview = mockModel(['invalid-json', assessment(input), malformed, malformed])
   await assert.rejects(assessResumeAgainstTarget(input, malformedReview.options), rejectsCode('invalid-model-output', { stage: 'grounding' }))
-  assert.equal(malformedReview.calls.length, 3)
+  assert.equal(malformedReview.calls.length, 4)
 })
 
-test('review formatting can consume the same single correction, but cannot turn semantic rejection into a retry loop', async () => {
+test('review formatting consumes the shared budget without turning semantic rejection into a retry loop', async () => {
   const input = fixture()
   const mock = mockModel([assessment(input), 'PRIVATE-SENTINEL invalid-json', supportedReview()])
   const result = await assessResumeAgainstTarget(input, mock.options)
@@ -776,14 +925,14 @@ test('review formatting can consume the same single correction, but cannot turn 
   assert.equal(mock.calls.length, 3)
   const correction = JSON.parse(mock.calls[2].request.messages[1].content).correction
   assert.doesNotMatch(JSON.stringify(correction), /PRIVATE-SENTINEL/)
-  const rejected = mockModel([assessment(input), 'PRIVATE-SENTINEL invalid-json', unsupportedReview(input)])
+  const rejected = mockModel([assessment(input), 'PRIVATE-SENTINEL invalid-json', unsupportedReview(input), assessment(input), unsupportedReview(input)])
   await assert.rejects(assessResumeAgainstTarget(input, rejected.options), rejectsCode('grounding-failed'))
-  assert.equal(rejected.calls.length, 3)
+  assert.equal(rejected.calls.length, 5)
   const invalidRepair = assessment(input)
   invalidRepair.criteria[0].criterionId = 'foreign'
-  const invalidAfterReview = mockModel([assessment(input), unsupportedReview(input), invalidRepair])
+  const invalidAfterReview = mockModel([assessment(input), unsupportedReview(input), invalidRepair, invalidRepair])
   await assert.rejects(assessResumeAgainstTarget(input, invalidAfterReview.options), rejectsCode('invalid-model-output'))
-  assert.equal(invalidAfterReview.calls.length, 3)
+  assert.equal(invalidAfterReview.calls.length, 4)
 })
 
 test('refusal, filtered and token-limited completions, tool requests, invalid envelope, and missing actual model identity never fabricate results', async () => {
@@ -860,6 +1009,46 @@ test('transport outages and token acquisition failures stay safe analysis-purpos
   assert.equal(result.assessmentProvenance.model, `${actualModel}-2`)
 })
 
+test('telemetry distinguishes a transport 429 from a subsequent HTTP 200 citation rejection', async () => {
+  const input = fixture()
+  const invalid = assessment(input)
+  invalid.criteria[0].citations[0].quote = 'PRIVATE-MODEL-SENTINEL'
+  const requestId = '12345678-1234-4234-8234-123456789abc'
+  const throttled = new Response('PRIVATE-UPSTREAM-SENTINEL', { status: 429, headers: { 'apim-request-id': requestId } })
+  const bad = response(invalid)
+  bad.headers.set('x-request-id', 'PRIVATE-HEADER-SENTINEL secret@example')
+  const events = []
+  const mock = mockModel([throttled, bad, assessment(input), supportedReview()])
+  const result = await assessResumeAgainstTarget(input, { ...mock.options, onEvent: event => events.push(event) })
+  assert.equal(result.correctionCount, 1)
+  assert.deepEqual(mock.sleeps, [500])
+  const responses = events.filter(event => event.event === 'model-response')
+  assert.deepEqual(responses.map(event => event.httpStatus), [429, 200, 200, 200])
+  assert.deepEqual(responses.map(event => event.transportAttempt), [1, 2, 1, 1])
+  assert.equal(responses[0].requestId, requestId)
+  assert.equal(responses[1].requestId, undefined)
+  assert.equal(responses[0].modelCallId, responses[1].modelCallId)
+  assert.notEqual(responses[1].modelCallId, responses[2].modelCallId)
+  const rejection = events.find(event => event.event === 'validation-failed')
+  assert.equal(rejection.code, 'invalid-citation')
+  assert.equal(rejection.modelCallId, responses[1].modelCallId)
+  assert.equal(rejection.correctionCount, 0)
+  assert.equal(events.filter(event => event.event === 'correction').length, 1)
+  assert.ok(responses.every(event => Number.isFinite(event.durationMilliseconds) && event.durationMilliseconds >= 0))
+  assert.doesNotMatch(JSON.stringify(events), /PRIVATE|secret@example|Resolved unusual|test-token/)
+
+  const exhaustedEvents = []
+  const exhausted = mockModel(() => new Response('PRIVATE-UPSTREAM-SENTINEL', { status: 429 }))
+  await assert.rejects(assessResumeAgainstTarget(input, {
+    ...exhausted.options, onEvent: event => exhaustedEvents.push(event),
+  }), rejectsCode('service-unavailable', { retryable: true }))
+  assert.equal(exhaustedEvents.filter(event => event.event === 'model-response').length, 2)
+  assert.equal(exhaustedEvents.filter(event => ['correction', 'validation-failed'].includes(event.event)).length, 0)
+  assert.equal(exhaustedEvents.at(-1).code, 'service-unavailable')
+  assert.equal(exhaustedEvents.at(-1).correctionCount, 0)
+  assert.doesNotMatch(JSON.stringify(exhaustedEvents), /PRIVATE/)
+})
+
 test('cancellation before, during, and after model operations prevents corrections, review, or late publication', async () => {
   const input = fixture()
   const before = new AbortController()
@@ -894,6 +1083,14 @@ test('cancellation before, during, and after model operations prevents correctio
   }
   await assert.rejects(assessResumeAgainstTarget(input, { ...token.options, signal: tokenAbort.signal }), rejectsCode('timeout', { cancelled: true }))
   assert.equal(token.calls.length, 0)
+
+  const correctionAbort = new AbortController()
+  const correcting = mockModel(['PRIVATE-SENTINEL invalid-json', 'PRIVATE-SENTINEL invalid-json'])
+  await assert.rejects(assessResumeAgainstTarget(input, {
+    ...correcting.options, signal: correctionAbort.signal,
+    onEvent: event => { if (event.event === 'correction' && event.correctionCount === 2) correctionAbort.abort() },
+  }), rejectsCode('timeout', { cancelled: true }))
+  assert.equal(correcting.calls.length, 2, 'Cancellation before the second repair prevents another model call')
 })
 
 test('snapshot bindings are mandatory and the captured model input cannot change while awaiting inference', async () => {

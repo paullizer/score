@@ -526,7 +526,7 @@ const resultSchema = analysisAssessmentOutputSchema.extend({
     attemptId: z.string().uuid(), manifestSha256: hash,
     resumeSnapshot: z.strictObject({ snapshotId, sha256: hash }), targetSnapshot: z.strictObject({ snapshotId, sha256: hash }),
     assessmentSha256: hash, assessment: modelProvenanceSchema,
-    groundingReviews: z.array(groundingReviewSchema).min(1).max(2),
+    groundingReviews: z.array(groundingReviewSchema).min(1).max(ANALYSIS_LIMITS.maxOutputCorrections + 1),
     correctionCount: z.number().int().min(0).max(ANALYSIS_LIMITS.maxOutputCorrections),
     calculationVersion: z.literal('weighted-0-100-v1'),
   }),

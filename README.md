@@ -133,7 +133,33 @@ If cancellation pauses after processing errors or exhausted automatic retries, c
 
 The assessment follows the saved criteria and 0-5 scoring anchors. Positive scores require exact citations from the correct frozen resume document. Absence of supporting evidence is an explicit evidence gap, not a claim about the person's ability. An unassessable positively weighted criterion withholds the overall score rather than becoming an invented zero or silently changing the weights. Source-supported GS not-applicable rows remain unscored and zero-weight. **GS qualifications remain separate and unscored for human review**, not official eligibility findings.
 
-Schema/coverage/citation checks and an independent grounding review precede publication; one bounded output correction is allowed. Weighted totals are calculated deterministically from validated criterion scores and unchanged rubric weights, not supplied by the model. Full-input context limits are reported as actionable limitations rather than silently dropping resume sections. Model identity, prompt/schema versions, grounding-review results, and frozen input identities/hashes are retained. Traceable quotations do not guarantee correct interpretation: humans must review the evidence and limitations. Different job or grade totals are not combined into a hiring ranking.
+Schema/coverage/citation checks and an independent grounding review precede publication; at most **two output corrections total per processing attempt** are shared across assessment validation, grounding-review validation, and semantic reassessment. Changing stages does not reset that budget. Weighted totals are calculated deterministically from validated criterion scores and unchanged rubric weights, not supplied by the model. Full-input context limits are reported as actionable limitations rather than silently dropping resume sections. Model identity, prompt/schema versions, grounding-review results, and frozen input identities/hashes are retained. Traceable quotations do not guarantee correct interpretation: humans must review the evidence and limitations. Different job or grade totals are not combined into a hiring ranking.
+
+### Analysis failure diagnostics and retries
+
+`invalid-citation` is a local evidence-validation failure, not an HTTP rate-limit response. Model-written quotations must be exact contiguous substrings of the specified frozen resume paragraph, preserving whitespace and punctuation; repeated citations within one list are also rejected. Shorter literal quotations are allowed, but rewritten text, normalized whitespace, or spliced passages are not. Errors identify the assessment or grounding-review stage and the affected row/citation. When deterministically identifiable, diagnostics distinguish whitespace changes and a quotation found in a different supplied paragraph; neither is silently accepted or reassigned.
+
+Correction requests receive bounded, citation-specific findings and supplemental copies of relevant trusted source paragraphs. The complete frozen input is still supplied unchanged, and omitted supplemental paragraphs/findings are counted explicitly. Raw invalid model output is not echoed back. A corrected assessment still needs a supported independent review before publication. Two semantic reassessments can produce up to three saved reviews and six logical model calls; the existing bounded transport retries remain separate. Once the correction budget is exhausted, invalid output fails that comparison without a score or an automatic validation-retry loop.
+
+Transient service failures retain their separate transport retries and up to three automatic processing attempts. **Retry saved pair** starts a fresh processing cycle against the same immutable inputs, so different model output can succeed without the resume changing. Completed comparisons are not replayed. `service-unavailable`, `timeout`, and citation/grounding failures remain distinct.
+
+The analysis worker writes structured JSON events with `component: "score-analysis"` to the existing `ContainerAppConsoleLogs` table. Events include model responses, validation failures, correction attempts, and comparison outcomes, correlated by workspace, run, comparison, processing-attempt, and model-call IDs. They record stage, deployment, actual response model when available, prompt/schema versions, correction and transport-attempt numbers, HTTP status, bounded request IDs, durations, and privacy-safe citation reason/location metadata. Raw resumes, quotations, model output, credentials, and arbitrary upstream error bodies are not logged. An HTTP 200 followed by `validation-failed` is therefore distinguishable from an HTTP 429 without retaining private content.
+
+For an authorized operator investigating a specific saved run:
+
+```kusto
+ContainerAppConsoleLogs
+| where TimeGenerated > ago(24h)
+| where JobName == "<analysis-worker-job-name>"
+| extend Event = parse_json(Log)
+| where Event.component == "score-analysis" and Event.runId == "<saved-run-id>"
+| project TimeGenerated, Event.event, Event.comparisonId, Event.attemptId,
+    Event.modelCallId, Event.stage, Event.httpStatus, Event.correctionCount,
+    Event.code, Event.outcome, Event.citationDiagnostics
+| order by TimeGenerated asc
+```
+
+Deploy and confirm readiness of API readers that accept two corrections and three grounding reviews **before** activating the updated analysis worker. The `azure.yaml` web deployment precedes its post-deploy worker update; preserve that compatibility order. After expanded provenance has been saved, any rollback must retain compatible readers rather than rejecting historical two-correction results. Deployment does not authorize automatic retries of an existing failed cohort.
 
 ### Private data, processing, and retention
 
