@@ -85,7 +85,8 @@ export function validateWorkerTemplate(env, existing, definition) {
   }
   const registries = existing.properties.configuration?.registries
   if (registries?.length !== 1 || registries[0].server !== required(env, 'AZURE_CONTAINER_REGISTRY_ENDPOINT') ||
-    registries[0].identity !== identityId || registries[0].username || registries[0].passwordSecretRef) {
+    typeof registries[0].identity !== 'string' || registries[0].identity.toLowerCase() !== identityId.toLowerCase() ||
+    registries[0].username || registries[0].passwordSecretRef) {
     throw new Error(`The ${containerName} must pull from the Score registry using its dedicated identity.`)
   }
   const defaultJobEntry = kind === 'job' && !container.command?.length && !container.args?.length
@@ -94,6 +95,26 @@ export function validateWorkerTemplate(env, existing, definition) {
     throw new Error(`The ${containerName} must use its ${entryPoint} entry point.`)
   }
   return { identityId, container }
+}
+
+export function validateRendererTemplate(renderer, workerIdentities = new Set(), workerEnvironments) {
+  const configuration = renderer.properties?.configuration
+  const identities = renderer.identity?.userAssignedIdentities ?? {}
+  const identityIds = Object.keys(identities)
+  const identityId = identityIds[0]
+  if (identityIds.length !== 1 || configuration?.ingress?.external !== false ||
+    !configuration.identitySettings?.some(setting => typeof setting.identity === 'string' &&
+      setting.identity.toLowerCase() === identityId.toLowerCase() && setting.lifecycle === 'None')) {
+    throw new Error('Renderer isolation is not active: internal ingress and a runtime-disabled pull-only identity are required.')
+  }
+  if (workerIdentities.has(identityId.toLowerCase()) ||
+    (workerEnvironments && (workerEnvironments.size !== 1 || typeof renderer.properties.environmentId !== 'string' ||
+      !workerEnvironments.has(renderer.properties.environmentId.toLowerCase())))) {
+    throw new Error('Workers must share the internal renderer environment, never its registry-pull identity.')
+  }
+  const clientId = identities[identityId].clientId
+  if (typeof clientId !== 'string') throw new Error('The registry pull identity client ID is unavailable.')
+  return { identityId, clientId }
 }
 
 export function validateFeatureSettings(settings, definition) {
@@ -275,35 +296,27 @@ async function main() {
       const { identityId } = validateWorkerTemplate(env, existing, definition)
       if (workerIdentities.has(identityId.toLowerCase())) throw new Error('Each scheduled worker must have an independent identity.')
       workerIdentities.add(identityId.toLowerCase())
-      workerEnvironments.add(existing.properties.environmentId)
+      workerEnvironments.add(existing.properties.environmentId.toLowerCase())
     }
     await validatePrivateServices(env, credential)
   }
   const rendererEndpoint = `https://management.azure.com${required(env, 'AZURE_JOB_RENDERER_ID')}?api-version=2025-07-01`
   const renderer = await request(credential, 'https://management.azure.com', rendererEndpoint)
   const renderConfiguration = renderer.properties.configuration
-  const pullIdentities = Object.keys(renderer.identity?.userAssignedIdentities ?? {})
-  if (pullIdentities.length !== 1 || renderConfiguration.ingress.external !== false ||
-    !renderConfiguration.identitySettings?.some(setting => setting.identity === pullIdentities[0] && setting.lifecycle === 'None')) {
-    throw new Error('Renderer isolation is not active: internal ingress and a runtime-disabled pull-only identity are required.')
-  }
-  if (workerIdentities.has(pullIdentities[0].toLowerCase()) ||
-    (mode === 'configure' && (workerEnvironments.size !== 1 || !workerEnvironments.has(renderer.properties.environmentId)))) {
-    throw new Error('Workers must share the internal renderer environment, never its registry-pull identity.')
-  }
-  const pullClientId = renderer.identity.userAssignedIdentities[pullIdentities[0]].clientId
-  if (typeof pullClientId !== 'string') throw new Error('The registry pull identity client ID is unavailable.')
+  const { identityId: pullIdentityId, clientId: pullClientId } = validateRendererTemplate(
+    renderer, workerIdentities, mode === 'configure' ? workerEnvironments : undefined,
+  )
   await request(credential, 'https://management.azure.com', rendererEndpoint, 'PUT', {
     location: renderer.location,
     tags: renderer.tags,
-    identity: { type: 'UserAssigned', userAssignedIdentities: { [pullIdentities[0]]: {} } },
+    identity: { type: 'UserAssigned', userAssignedIdentities: { [pullIdentityId]: {} } },
     properties: {
       environmentId: renderer.properties.environmentId,
       workloadProfileName: 'Consumption',
       configuration: {
         activeRevisionsMode: 'Single',
         registries: renderConfiguration.registries,
-        identitySettings: [{ identity: pullIdentities[0], lifecycle: 'None' }],
+        identitySettings: [{ identity: pullIdentityId, lifecycle: 'None' }],
         ingress: {
           external: false, targetPort: 8080, transport: 'auto', allowInsecure: false,
           traffic: [{ latestRevision: true, weight: 100 }],

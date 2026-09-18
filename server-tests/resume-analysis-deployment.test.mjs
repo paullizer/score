@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import test from 'node:test'
 import {
-  WORKER_DEFINITIONS, configureScheduledWorker, validateFeatureSettings, validateWorkerImage, validateWorkerTemplate,
+  WORKER_DEFINITIONS, configureScheduledWorker, validateFeatureSettings, validateRendererTemplate, validateWorkerImage, validateWorkerTemplate,
 } from '../scripts/azure-worker.mjs'
 
 const group = '/subscriptions/00000000-0000-4000-8000-000000000001/resourceGroups/score-test'
@@ -102,6 +102,45 @@ test('each worker keeps its own identity, entry point, stores, registry, and pro
       assert.throws(() => validateWorkerTemplate(env, value, definition))
     }
   }
+})
+
+test('Azure resource-ID casing does not change worker identity ownership', () => {
+  for (const definition of WORKER_DEFINITIONS) {
+    const value = template(definition)
+    const identity = Object.keys(value.identity.userAssignedIdentities)[0]
+    value.identity.userAssignedIdentities = { [identity.toLowerCase()]: value.identity.userAssignedIdentities[identity] }
+    validateWorkerTemplate(env, value, definition)
+    value.properties.configuration.registries[0].identity = identity.toUpperCase()
+    validateWorkerTemplate(env, value, definition)
+    value.properties.configuration.registries[0].identity = identity.replace('/score-test/', '/another-group/')
+    assert.throws(() => validateWorkerTemplate(env, value, definition), /dedicated identity/)
+  }
+})
+
+test('renderer isolation compares complete Azure IDs case-insensitively without accepting different identities', () => {
+  const identityId = `${group}/providers/Microsoft.ManagedIdentity/userAssignedIdentities/id-render-pull-test`
+  const environmentId = `${group}/providers/Microsoft.App/managedEnvironments/workers`
+  const renderer = {
+    identity: { type: 'UserAssigned', userAssignedIdentities: { [identityId.toLowerCase()]: { clientId: 'pull-client' } } },
+    properties: {
+      environmentId,
+      configuration: { ingress: { external: false }, identitySettings: [{ identity: identityId, lifecycle: 'None' }] },
+    },
+  }
+  assert.deepEqual(validateRendererTemplate(renderer, new Set(), new Set([environmentId.toLowerCase()])), {
+    identityId: identityId.toLowerCase(), clientId: 'pull-client',
+  })
+  const wrongIdentity = structuredClone(renderer)
+  wrongIdentity.properties.configuration.identitySettings[0].identity = identityId.replace('id-render-pull-test', 'id-other-pull-test')
+  assert.throws(() => validateRendererTemplate(wrongIdentity), /Renderer isolation/)
+  const enabledIdentity = structuredClone(renderer)
+  enabledIdentity.properties.configuration.identitySettings[0].lifecycle = 'All'
+  assert.throws(() => validateRendererTemplate(enabledIdentity), /Renderer isolation/)
+  const external = structuredClone(renderer)
+  external.properties.configuration.ingress.external = true
+  assert.throws(() => validateRendererTemplate(external), /Renderer isolation/)
+  assert.throws(() => validateRendererTemplate(renderer, new Set([identityId.toLowerCase()])), /never its registry-pull identity/)
+  assert.throws(() => validateRendererTemplate(renderer, new Set(), new Set([`${environmentId}-other`.toLowerCase()])), /share the internal renderer/)
 })
 
 test('API enablement requires separate provisioned stores but not enabled mutable input services', () => {
