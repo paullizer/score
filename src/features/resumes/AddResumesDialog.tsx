@@ -4,13 +4,24 @@ import { useWorkspace } from '../../app/workspace-context'
 import { Badge, Button, DemoNote, InlineError, Modal } from '../../components/ui'
 import { RESUME_FIXTURE_COUNT } from '../../data/fixtures'
 import type { ImportCandidate } from '../../domain/types'
+import { RealAddResumesDialog } from './RealAddResumesDialog'
 
-export function AddResumesDialog({ open, onOpenChange, onAdded, onError }: {
+interface AddResumesDialogProps {
   open: boolean
   onOpenChange: (open: boolean) => void
   onAdded: (ids: string[]) => void
   onError: (message: string) => void
-}) {
+  mode?: 'real' | 'samples'
+}
+
+export function AddResumesDialog(props: AddResumesDialogProps) {
+  const { cloud } = useWorkspace()
+  return props.mode === 'real' || (props.mode !== 'samples' && cloud)
+    ? <RealAddResumesDialog open={props.open} onOpenChange={props.onOpenChange} />
+    : <SampleAddResumesDialog {...props} />
+}
+
+function SampleAddResumesDialog({ open, onOpenChange, onAdded, onError }: AddResumesDialogProps) {
   const { addResumes, notify, cloud } = useWorkspace()
   const [items, setItems] = useState<ImportCandidate[]>([])
   const [errors, setErrors] = useState<string[]>([])

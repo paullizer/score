@@ -6,6 +6,8 @@ import type { AnalysisRun, Citation, Comparison } from '../../domain/types'
 import { dateLabel, runStatus } from '../../domain/selectors'
 import { Avatar, Badge, Button, DemoNote, EmptyState, PageHeader, Score, SegmentedControl } from '../../components/ui'
 import { DocumentViewer } from '../../components/documents/DocumentViewer'
+import { analysisDataMode, sampleDataLink } from '../../app/real-data-mode'
+import { RealAnalysisDetail } from './RealAnalysisDetail'
 
 function ComparisonValue({ comparison }: { comparison: Comparison | undefined }) {
   if (!comparison) return <Badge tone="warning">Unavailable</Badge>
@@ -17,16 +19,20 @@ function ComparisonValue({ comparison }: { comparison: Comparison | undefined })
 
 export function AnalysisDetail() {
   const { id } = useParams()
-  const { workspace } = useWorkspace()
+  const { workspace, cloud } = useWorkspace()
+  const [params] = useSearchParams()
   const navigate = useNavigate()
+  const mode = analysisDataMode(params, Boolean(cloud), workspace, id)
+  if (mode === 'invalid') return <EmptyState title="Unknown analysis mode" description="Choose real analyses or the explicitly fictional Samples history." action={<Button onClick={() => navigate('/analyses')}>Open analyses</Button>} />
+  if (mode === 'real' && id) return <RealAnalysisDetail id={id} />
   const run = workspace.runs.find((item) => item.id === id)
-  if (!run) return <EmptyState title="This analysis is no longer here" description="A demo reset may have replaced it. Open the analysis library to find your saved comparisons." action={<Button onClick={() => navigate('/analyses')}>Back to analyses</Button>} />
-  if (run.targets.some((target) => target.rubric.dataKind === 'real' || target.job?.dataKind === 'real')) return <EmptyState title="Real inputs cannot have demo scores" description="This run contains real job or GS grade inputs, possibly mixed with samples. Its simulated results are not shown or retried. Review real criteria in the rubric and grade libraries." action={<Button onClick={() => navigate('/rubrics?kind=grade&data=real')}>Open rubric library</Button>} />
+  if (!run) return <EmptyState title="This analysis is no longer here" description="A demo reset may have replaced it. Open the analysis library to find your saved comparisons." action={<Button onClick={() => navigate(sampleDataLink('/analyses', Boolean(cloud)))}>Back to analyses</Button>} />
+  if (run.targets.some((target) => target.rubric.dataKind === 'real' || target.job?.dataKind === 'real') || run.resumes.some((snapshot) => snapshot.resume.sample !== true || snapshot.document.sample !== true)) return <EmptyState title="Real inputs cannot have demo scores" description="This run contains real inputs, possibly mixed with samples. Its simulated results are not shown or retried. Use the separate real analysis workflow." action={<Button onClick={() => navigate('/analyses?data=real')}>Open real analyses</Button>} />
   return <RunView key={run.id} run={run} />
 }
 
 function RunView({ run }: { run: AnalysisRun }) {
-  const { cancelRun, retryRun } = useWorkspace()
+  const { cancelRun, retryRun, cloud } = useWorkspace()
   const navigate = useNavigate()
   const [params, setParams] = useSearchParams()
   const [sortTarget, setSortTarget] = useState(run.targets.length === 1 ? run.targets[0].id : '')
@@ -44,17 +50,17 @@ function RunView({ run }: { run: AnalysisRun }) {
     const bScore = run.comparisons.find((item) => item.resumeId === b.resume.id && item.targetId === sortTarget)?.score ?? -1
     return bScore - aScore
   })
-  function openResult(id: string) { setParams({ result: id }) }
+  function openResult(id: string) { const next = new URLSearchParams(params); next.set('result', id); if (cloud) next.set('data', 'samples'); setParams(next) }
 
   return <>
-    <Link className="back-link" to={selectedId ? `/analyses/${run.id}` : '/analyses'}><ArrowLeft size={14} />{selectedId ? 'All comparisons' : 'Back to analyses'}</Link>
+    <Link className="back-link" to={sampleDataLink(selectedId ? `/analyses/${run.id}` : '/analyses', Boolean(cloud))}><ArrowLeft size={14} />{selectedId ? 'All comparisons' : 'Back to analyses'}</Link>
     <PageHeader eyebrow="EVIDENCE-LED REVIEW" title={run.name} description="A clear view of the match, and the passages behind it."
       actions={<>{working && <Button icon={X} onClick={() => cancelRun(run.id)}>Cancel pending</Button>}{needsRetry && !working && <Button icon={RotateCcw} onClick={() => retryRun(run.id)}>Retry unfinished</Button>}
-        <Button icon={Sparkles} onClick={() => navigate(`/analyses/new?from=${run.id}`)}>New run with these inputs</Button></>} />
+        <Button icon={Sparkles} onClick={() => navigate(sampleDataLink(`/analyses/new?from=${run.id}`, Boolean(cloud)))}>New run with these inputs</Button></>} />
     <div className="analysis-meta"><Badge tone="accent">Simulated scoring</Badge><Badge tone={status === 'Complete' ? 'success' : status === 'Needs attention' ? 'warning' : 'neutral'} dot>{status}</Badge><span>{run.resumes.length} {run.resumes.length === 1 ? 'resume' : 'resumes'}</span><span>{run.targets.length} separate {run.targets.length === 1 ? 'rubric' : 'rubrics'}</span><span>{dateLabel(run.createdAt)}</span><span className="ml-auto flex items-center gap-1.5"><ShieldCheck size={12} />Saved version snapshots</span></div>
     {working && <div className="run-progress panel" aria-live="polite"><div><span className="flex items-center gap-2"><LoaderCircle size={15} className="animate-spin" />Preparing evidence-backed sample results</span><span>{finished} / {run.comparisons.length}</span></div>
       <progress max={run.comparisons.length} value={finished} aria-label="Analysis progress" /><p>Every comparison is independent. Completed results are available below.</p></div>}
-    {selectedId && !selected ? <EmptyState title="This result could not be found" description="Choose a comparison from this analysis instead." action={<Button onClick={() => setParams({})}>View all comparisons</Button>} />
+    {selectedId && !selected ? <EmptyState title="This result could not be found" description="Choose a comparison from this analysis instead." action={<Button onClick={() => setParams(cloud ? { data: 'samples' } : {})}>View all comparisons</Button>} />
       : selected ? <ResultReview key={selected.id} run={run} comparison={selected} />
         : <section className="panel">
           <div className="section-heading"><div><h2>{run.targets.length === 1 ? 'Applicant comparison' : run.resumes.length === 1 ? 'Your target comparisons' : 'The comparison workspace'}</h2><p>Separate scores. Consistent criteria. Select any result to see its evidence.</p></div>

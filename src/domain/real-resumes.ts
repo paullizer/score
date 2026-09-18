@@ -1,0 +1,242 @@
+import type { Citation, SourceDocument } from './types'
+
+export const RESUME_IMPORT_LIMITS = {
+  maxPdfBytes: 10 * 1024 * 1024,
+  maxPdfPages: 50,
+  maxSourceCharacters: 180_000,
+  maxBatchItems: 10,
+  maxUrlLength: 4096,
+  maxAutomaticAttempts: 3,
+} as const
+
+export interface ImmutableBlobReference {
+  blobName: string
+  contentType: string
+  sha256: string
+  bytes: number
+}
+
+export interface ImmutableJsonBlobReference extends ImmutableBlobReference {
+  contentType: 'application/json'
+}
+
+export interface ImmutableDocumentReference extends ImmutableJsonBlobReference {
+  documentId: string
+  documentVersion: number
+}
+
+export type RealResumeDocument = SourceDocument & { kind: 'resume'; sample: false }
+export type RealResumeStatus = 'queued' | 'parsing' | 'profiling' | 'ready' | 'error' | 'cancelled'
+
+export type ResumeProcessingErrorCode =
+  | 'access-blocked' | 'not-found' | 'network-error' | 'unsupported-content'
+  | 'unreadable-document' | 'pdf-too-large' | 'pdf-too-many-pages' | 'source-too-large'
+  | 'multiple-profiles' | 'not-a-profile' | 'invalid-profile' | 'invalid-source'
+  | 'invalid-model-output' | 'service-unavailable' | 'storage-error' | 'timeout' | 'internal-error'
+
+export interface ResumeProcessingError {
+  code: ResumeProcessingErrorCode
+  stage: 'download' | 'parsing' | 'profiling' | 'publication'
+  message: string
+  retryable: boolean
+}
+
+export type RealResumeSource =
+  | { kind: 'pdf'; displayName: string; fileName: string }
+  | { kind: 'url'; displayName: string; url: string }
+
+export interface ResumeSourceCapture {
+  original: ImmutableBlobReference & { contentType: 'application/pdf' | 'text/html' }
+  capturedAt: string
+  finalUrl?: string
+  redirects: string[]
+}
+
+export interface ResumeCaptureManifest {
+  schemaVersion: 1
+  dataKind: 'real'
+  workspaceId: string
+  resumeId: string
+  inputFingerprint: string
+  source: RealResumeSource
+  capture: ResumeSourceCapture
+}
+
+export interface ResumeExtractionProvenance {
+  method: 'document-intelligence' | 'html' | 'browser'
+  version: string
+  extractedAt: string
+  pagination: 'pdf-pages' | 'html-sections'
+  pageCount: number | null
+  normalizedCharacters: number
+  document: ImmutableDocumentReference
+}
+
+export type ResumeProfileField =
+  | { status: 'available'; value: string; citations: [Citation, ...Citation[]] }
+  | { status: 'unavailable'; value: null; citations: [] }
+
+export interface ResumeProfileProvenance {
+  model: string
+  promptVersion: string
+  schemaVersion: string
+  extractedAt: string
+}
+
+export interface RealResumeProfile {
+  schemaVersion: 1
+  dataKind: 'real'
+  workspaceId: string
+  resumeId: string
+  documentId: string
+  documentVersion: number
+  documentSha256: string
+  name: ResumeProfileField
+  role: ResumeProfileField
+  location: ResumeProfileField
+  experience: ResumeProfileField
+  provenance: ResumeProfileProvenance
+}
+
+// Display metadata is derived only from the profile; a filename is never a person's name.
+export interface RealResume {
+  id: string
+  dataKind: 'real'
+  name: string | null
+  role: string | null
+  location: string | null
+  experience: string | null
+  documentId: string
+  documentVersion: number
+  sourceLabel: string
+  batchId: string
+  status: RealResumeStatus
+  createdAt: string
+}
+
+export interface ResumeDuplicateWarning {
+  kind: 'exact-content' | 'same-source'
+  resumeId: string
+  message: string
+}
+
+export interface ResumeEntityBase {
+  id: string
+  workspaceId: string
+  dataKind: 'real'
+  createdAt: string
+  updatedAt: string
+}
+
+export interface RealResumeRecord extends ResumeEntityBase {
+  recordType: 'resume'
+  resume: RealResume
+  source: RealResumeSource
+  batchId: string
+  idempotencyKey: string
+  inputFingerprint: string
+  createdBy: string
+  capture?: ResumeSourceCapture
+  captureManifest?: ImmutableJsonBlobReference
+  extraction?: ResumeExtractionProvenance
+  profileBlob?: ImmutableJsonBlobReference
+  // Automatic attempts in the current retry cycle; manual retries increment retryCount.
+  attempts: number
+  retryCount: number
+  attemptId?: string
+  nextAttemptAt?: string
+  lease?: { owner: string; expiresAt: string; heartbeatAt: string }
+  completedAt?: string
+  cancelledAt?: string
+  error?: ResumeProcessingError
+  warnings: string[]
+  duplicates: ResumeDuplicateWarning[]
+}
+
+export interface ResumeBatchItem {
+  idempotencyKey: string
+  inputFingerprint: string
+  resumeId: string
+  acceptedAt: string
+}
+
+// Unique keys/IDs and the declared 1–10 input count are enforced in the admission transaction.
+export interface ResumeImportBatchRecord extends ResumeEntityBase {
+  recordType: 'resume-batch'
+  batchId: string
+  createdBy: string
+  inputCount: number
+  items: ResumeBatchItem[]
+}
+
+export type ResumeEntity = RealResumeRecord | ResumeImportBatchRecord
+
+export interface VersionedResumeEntity<T extends ResumeEntity = ResumeEntity> {
+  record: T
+  etag: string
+}
+
+export interface RealResumeSummary {
+  resume: RealResume
+  workspaceId: string
+  source: RealResumeSource
+  capture: ResumeSourceCapture | null
+  documentRef: ImmutableDocumentReference | null
+  etag: string
+  updatedAt: string
+  attempts: number
+  retryCount: number
+  nextAttemptAt?: string
+  error?: ResumeProcessingError
+  warnings: string[]
+  duplicates: ResumeDuplicateWarning[]
+}
+
+export interface RealResumeDetail extends RealResumeSummary {
+  document: RealResumeDocument | null
+  profile: RealResumeProfile | null
+  extraction: ResumeExtractionProvenance | null
+}
+
+export interface RealResumesPage {
+  resumes: RealResumeSummary[]
+  continuationToken?: string
+}
+
+export interface ResumeProcessingFeatures {
+  realResumeImports: boolean
+  resumeLimits: typeof RESUME_IMPORT_LIMITS
+}
+
+// Both import routes require UUID keys and the same declared count for every item in a batch.
+export interface ResumeImportHeaders {
+  'Idempotency-Key': string
+  'X-Import-Batch': string
+  'X-Import-Count': string
+}
+
+export interface ResumePdfImportHeaders extends ResumeImportHeaders {
+  'Content-Type': 'application/pdf'
+  // Percent-encoded safe basename, for display only.
+  'X-File-Name': string
+}
+
+export interface ImportResumeUrlInput {
+  url: string
+}
+
+export interface ResumeActionHeaders {
+  'If-Match': string
+}
+
+// GET details are unwrapped; import/retry/cancel POSTs return this wrapper.
+export interface ResumeMutationResponse {
+  resume: RealResumeSummary
+}
+
+export function resumeRecordIs<K extends ResumeEntity['recordType']>(
+  value: ResumeEntity,
+  recordType: K,
+): value is Extract<ResumeEntity, { recordType: K }> {
+  return value.recordType === recordType
+}

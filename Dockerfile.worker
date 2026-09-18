@@ -4,6 +4,7 @@ COPY package.json package-lock.json ./
 RUN npm ci --no-audit --no-fund
 COPY . .
 RUN npx tsc -p tsconfig.worker.json && npm run build:worker
+RUN node --input-type=module -e "import { accessSync } from 'node:fs'; for (const name of ['worker', 'grade-worker', 'resume-worker', 'analysis-worker', 'resume-runtime', 'analysis-runtime']) accessSync('dist-worker/' + name + '.mjs')"
 
 FROM node:24-bookworm-slim AS runtime
 WORKDIR /app

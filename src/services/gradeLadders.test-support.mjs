@@ -19,7 +19,7 @@ const nativeFetch = globalThis.fetch
 const clone = (value) => structuredClone(value)
 const hash = (value) => createHash('sha256').update(value).digest('hex')
 
-export async function buildGradeTestRuntime({ browser = false } = {}) {
+export async function buildGradeTestRuntime({ browser = false, serverExports = '' } = {}) {
   const directory = resolve(`.grade-integration-${randomUUID()}`)
   await mkdir(directory)
   try {
@@ -30,7 +30,13 @@ export async function buildGradeTestRuntime({ browser = false } = {}) {
       fixtures: join('src', 'data', 'fixtures.ts'),
     }
     await Promise.all(Object.entries(entries).map(([name, entry]) => build({
-      entryPoints: [entry], outfile: join(directory, `${name}.mjs`), bundle: true, packages: 'external', platform: 'node',
+      ...(name === 'server' && serverExports ? {
+        stdin: {
+          contents: `export * from './server/app.ts'\n${serverExports}`,
+          resolveDir: resolve('.'), sourcefile: 'integration-runtime.ts', loader: 'ts',
+        },
+      } : { entryPoints: [entry] }),
+      outfile: join(directory, `${name}.mjs`), bundle: true, packages: 'external', platform: 'node',
       format: 'esm', jsx: 'automatic', define: { 'import.meta.env.VITE_DEPLOYMENT_MODE': '"cloud"' }, logLevel: 'silent',
     })))
     if (browser) {
@@ -50,7 +56,7 @@ export async function buildGradeTestRuntime({ browser = false } = {}) {
   } catch (error) { await rm(directory, { recursive: true, force: true }); throw error }
 }
 
-function memoryBlobs() {
+export function memoryBlobs() {
   const values = new Map()
   return {
     values,
@@ -187,7 +193,7 @@ function memoryWorkspace(api) {
   return { directory, state }
 }
 
-export async function startGradeFixture(runtime, { injectAuth = false } = {}) {
+export async function startGradeFixture(runtime, { injectAuth = false, resumes, analyses, configOverrides = {} } = {}) {
   const { api } = runtime
   const grades = memoryGrades(api), jobs = memoryJobs(api), { directory, state } = memoryWorkspace(api)
   const server = createServer()
@@ -201,8 +207,9 @@ export async function startGradeFixture(runtime, { injectAuth = false } = {}) {
     cosmos: { endpoint: serviceConfig.cosmosEndpoint, database: 'score', container: 'workspaces' }, storage: { accountUrl: serviceConfig.storageAccountUrl, containerName: 'workspace-state' },
     realJobs: { ...serviceConfig, container: 'job-records', blobContainer: 'job-sources' },
     realGrades: { ...serviceConfig, container: 'grade-records', blobContainer: 'grade-sources' },
+    ...configOverrides,
   }
-  const app = api.createApp({ config, directory, state, jobs, grades, now, distDir: runtime.directory })
+  const app = api.createApp({ config, directory, state, jobs, grades, resumes, analyses, now, distDir: runtime.directory })
   const requests = []
   const pendingRequests = new Set()
   let holdNextMutation
@@ -240,7 +247,8 @@ export async function startGradeFixture(runtime, { injectAuth = false } = {}) {
   const session = await sessionResponse.json()
   const workspaceId = session.workspaces[0].id
   return {
-    runtime, origin, server, api, config, grades, jobs, directory, state, session, workspaceId, requests, now,
+    runtime, origin, server, api, config, grades, jobs, resumes, analyses, directory, state, session, workspaceId, requests, now,
+    advanceClock(milliseconds) { clock += milliseconds },
     request,
     installClientFetch() {
       const previous = globalThis.fetch

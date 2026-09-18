@@ -76,9 +76,25 @@ try {
   if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($gradeWorkerImage)) {
     Set-EnvironmentValue 'AZURE_GRADE_WORKER_CONTAINER_IMAGE' 'mcr.microsoft.com/k8se/quickstart-jobs:latest'
   }
+  $resumeWorkerImage = & azd env get-value AZURE_RESUME_WORKER_CONTAINER_IMAGE --environment $EnvironmentName 2>$null
+  if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($resumeWorkerImage)) {
+    Set-EnvironmentValue 'AZURE_RESUME_WORKER_CONTAINER_IMAGE' 'mcr.microsoft.com/k8se/quickstart-jobs:latest'
+  }
+  $analysisWorkerImage = & azd env get-value AZURE_ANALYSIS_WORKER_CONTAINER_IMAGE --environment $EnvironmentName 2>$null
+  if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($analysisWorkerImage)) {
+    Set-EnvironmentValue 'AZURE_ANALYSIS_WORKER_CONTAINER_IMAGE' 'mcr.microsoft.com/k8se/quickstart-jobs:latest'
+  }
   Write-Host "Deploying Score to $Location in subscription $SubscriptionId."
-  Write-Host "Allowed application user: $($user.userPrincipalName). Job imports are real; resume scoring remains simulated."
+  Write-Host "Allowed application user: $($user.userPrincipalName). Real resume imports and manual analyses require their independently verified workers."
   Write-Host 'Rubric model: GPT-5 mini, US Data Zone Standard, in the existing North Central US Foundry resource.'
+  if ($DeployOnly) {
+    foreach ($setting in @('AZURE_RESUME_WORKER_ID', 'AZURE_ANALYSIS_WORKER_ID')) {
+      $workerId = & azd env get-value $setting --environment $EnvironmentName 2>$null
+      if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($workerId)) {
+        throw 'Resume/analysis services have not been provisioned. Run this script with -ProvisionOnly before -DeployOnly.'
+      }
+    }
+  }
   if (!$DeployOnly) {
     foreach ($provider in @('Microsoft.Web', 'Microsoft.ContainerRegistry', 'Microsoft.DocumentDB', 'Microsoft.Storage', 'Microsoft.KeyVault', 'Microsoft.ManagedIdentity', 'Microsoft.CognitiveServices', 'Microsoft.Search', 'Microsoft.OperationalInsights', 'Microsoft.Insights', 'Microsoft.App')) {
       $state = (Invoke-Azure @('provider', 'show', '--subscription', $SubscriptionId, '--namespace', $provider, '--query', 'registrationState', '--output', 'tsv')).Trim()

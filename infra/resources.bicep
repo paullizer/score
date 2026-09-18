@@ -9,6 +9,8 @@ param containerImage string
 param workerImage string
 param rendererImage string
 param gradeWorkerImage string
+param resumeWorkerImage string
+param analysisWorkerImage string
 param appServiceSku string
 param searchSku string
 
@@ -269,6 +271,45 @@ module grades 'grades.bicep' = {
   }
 }
 
+module resumes 'private-processing.bicep' = {
+  name: 'score-resume-imports'
+  params: {
+    location: location
+    token: token
+    tags: tags
+    kind: 'resume'
+    cosmosAccountName: cosmos.name
+    storageAccountName: storage.name
+    registryName: registry.name
+    foundryAccountName: ai.outputs.accountName
+    modelDeploymentName: ingestion.outputs.modelDeploymentName
+    documentIntelligenceName: ingestion.outputs.documentIntelligenceName
+    environmentId: ingestion.outputs.environmentId
+    rendererUrl: ingestion.outputs.rendererUrl
+    rendererDeployed: ingestion.outputs.rendererIsDeployed
+    tenantId: tenantId
+    workerImage: resumeWorkerImage
+  }
+}
+
+module analyses 'private-processing.bicep' = {
+  name: 'score-resume-analyses'
+  params: {
+    location: location
+    token: token
+    tags: tags
+    kind: 'analysis'
+    cosmosAccountName: cosmos.name
+    storageAccountName: storage.name
+    registryName: registry.name
+    foundryAccountName: ai.outputs.accountName
+    modelDeploymentName: ingestion.outputs.modelDeploymentName
+    environmentId: ingestion.outputs.environmentId
+    tenantId: tenantId
+    workerImage: analysisWorkerImage
+  }
+}
+
 resource plan 'Microsoft.Web/serverfarms@2024-11-01' = {
   name: 'asp-score-${token}'
   location: location
@@ -338,6 +379,12 @@ resource appSettings 'Microsoft.Web/sites/config@2024-11-01' = {
     REAL_GRADE_LADDERS_ENABLED: grades.outputs.isDeployed ? 'true' : 'false'
     GRADE_RECORDS_CONTAINER: 'grade-records'
     GRADE_SOURCE_CONTAINER: 'grade-sources'
+    REAL_RESUME_IMPORTS_ENABLED: resumes.outputs.isDeployed ? 'true' : 'false'
+    RESUME_RECORDS_CONTAINER: 'resume-records'
+    RESUME_SOURCE_CONTAINER: 'resume-sources'
+    REAL_ANALYSES_ENABLED: analyses.outputs.isDeployed ? 'true' : 'false'
+    ANALYSIS_RECORDS_CONTAINER: 'analysis-records'
+    ANALYSIS_SOURCE_CONTAINER: 'analysis-sources'
     APP_ORIGIN: 'https://${web.properties.defaultHostName}'
     AZURE_AI_PROJECT_ENDPOINT: ai.outputs.projectEndpoint
     AZURE_AI_SEARCH_ENDPOINT: ai.outputs.searchEndpoint
@@ -446,3 +493,9 @@ output rendererUrl string = ingestion.outputs.rendererUrl
 output gradeWorkerName string = grades.outputs.workerName
 output gradeWorkerId string = grades.outputs.workerId
 output gradeWorkerPrincipalId string = grades.outputs.workerPrincipalId
+output resumeWorkerName string = resumes.outputs.workerName
+output resumeWorkerId string = resumes.outputs.workerId
+output resumeWorkerPrincipalId string = resumes.outputs.workerPrincipalId
+output analysisWorkerName string = analyses.outputs.workerName
+output analysisWorkerId string = analyses.outputs.workerId
+output analysisWorkerPrincipalId string = analyses.outputs.workerPrincipalId

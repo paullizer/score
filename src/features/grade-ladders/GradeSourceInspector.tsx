@@ -101,7 +101,9 @@ export function GradeSourceInspector({ ladderId, selection, onClose }: { ladderI
       {citation && <div className="mb-4"><span className="grade-field-kicker">Claim's exact quotation, not interpretation</span><blockquote className="source-quote">“{citation.quote}”</blockquote></div>}
       {!matches && <InlineError>The cited quotation or locator does not match this captured paragraph. Treat it as an unresolved citation; it must not support approval.</InlineError>}
       {highlighted && !paragraph && <InlineError>This passage is not in the selected extraction pages. Omitted pages were not examined.</InlineError>}
-      <DocumentViewer document={loaded.document} highlightedId={highlighted} quote={matches ? citation?.quote : undefined} compact />
+      <DocumentViewer document={loaded.document} highlightedId={highlighted} quote={matches ? citation?.quote : undefined}
+        pagination={'originalContentType' in loaded.source ? loaded.source.originalContentType === 'text/html' ? 'html-sections' : 'pdf-pages'
+          : loaded.source.origin === 'upload' || loaded.source.selectedPages.length > 0 ? 'pdf-pages' : 'captured-sections'} compact />
       <details className="mt-5" open><summary className="cursor-pointer text-[13px] font-semibold">Provenance, applicability, and captured version</summary><GradeSourceProvenance source={loaded.source} /></details>
     </>}
   </Modal>

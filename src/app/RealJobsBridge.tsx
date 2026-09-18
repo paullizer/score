@@ -240,7 +240,7 @@ export function RealJobsBridge({
 
   function startAnalysis(resumeIds: string[], rubricIds: string[], name?: string, failFirst?: boolean): string {
     if (rubricIds.some((id) => workspace.rubrics.find((rubric) => rubric.id === id)?.dataKind === 'real')) {
-      throw new Error('Real job rubrics cannot use the demo scorer. Resume scoring remains a simulated preview.')
+      throw new Error('Real job rubrics cannot use the demo scorer. Use the separate real analysis workflow with ready real resumes.')
     }
     return legacyValue.startAnalysis(resumeIds, rubricIds, name, failFirst)
   }
@@ -267,7 +267,7 @@ export function RealJobsBridge({
     startAnalysis,
     resetDemo: () => {
       legacyValue.resetDemo()
-      legacyValue.notify('Sample content was reset. Server-owned real jobs and rubric versions were not changed.')
+      legacyValue.notify('Sample content was reset. Server-owned real resumes, analyses, jobs, and rubric versions were not changed.')
     },
     cloud: { ...cloud, realJobs },
   }

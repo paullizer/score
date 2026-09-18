@@ -5,6 +5,8 @@ import { CloudWorkspaceProvider, type CloudWorkspaceProviderApi } from './CloudW
 import { App } from './App'
 import { RealJobsBridge } from './RealJobsBridge'
 import { RealGradeLaddersBridge } from './RealGradeLaddersBridge'
+import { RealResumesBridge } from './RealResumesBridge'
+import { RealAnalysesBridge } from './RealAnalysesBridge'
 import { GradeNavigationProtectionProvider, GradeRouterProtection } from './GradeNavigationProtection'
 import type { GradeLeaveProtectionApi } from './grade-navigation-context'
 import {
@@ -54,6 +56,7 @@ export function CloudApplication() {
   const gradeLeaveRef = useRef<GradeLeaveProtectionApi | null>(null)
   const aliveRef = useRef(true)
   const lastPathRef = useRef(window.location.pathname + window.location.search + window.location.hash)
+  const lastHistoryStateRef = useRef<unknown>(window.history.state)
 
   useEffect(() => {
     aliveRef.current = true
@@ -107,10 +110,11 @@ export function CloudApplication() {
       event.stopImmediatePropagation()
       const incoming = window.location.pathname + window.location.search + window.location.hash
       const outgoing = lastPathRef.current
+      const outgoingState = lastHistoryStateRef.current
       void (providerApiRef.current?.prepareToLeave() ?? Promise.resolve({ ok: true as const })).then((result) => {
         if (!aliveRef.current) return
         if (!result.ok) {
-          window.history.pushState(null, '', outgoing)
+          window.history.pushState(outgoingState, '', outgoing)
           window.dispatchEvent(new PopStateEvent('popstate', { state: window.history.state }))
           return
         }
@@ -229,19 +233,20 @@ export function CloudApplication() {
         onSignedOut={onSignedOut}
       >
     {(legacyValue, cloud) => <BrowserRouter key={workspaceId} basename={`/workspaces/${encodeURIComponent(workspaceId)}`}>
-      <GradeRouterProtection><RealJobsBridge workspaceId={workspaceId} legacyValue={legacyValue} cloud={cloud}><RealGradeLaddersBridge workspaceId={workspaceId}>
-        <TrackCloudPath pathRef={lastPathRef} basename={`/workspaces/${encodeURIComponent(workspaceId)}`} />
+      <GradeRouterProtection><RealJobsBridge workspaceId={workspaceId} legacyValue={legacyValue} cloud={cloud}><RealGradeLaddersBridge workspaceId={workspaceId}><RealResumesBridge workspaceId={workspaceId}><RealAnalysesBridge workspaceId={workspaceId}>
+        <TrackCloudPath pathRef={lastPathRef} stateRef={lastHistoryStateRef} basename={`/workspaces/${encodeURIComponent(workspaceId)}`} />
         <App />
-      </RealGradeLaddersBridge></RealJobsBridge></GradeRouterProtection>
+      </RealAnalysesBridge></RealResumesBridge></RealGradeLaddersBridge></RealJobsBridge></GradeRouterProtection>
     </BrowserRouter>}
   </CloudWorkspaceProvider></GradeNavigationProtectionProvider>
 }
 
-function TrackCloudPath({ pathRef, basename }: { pathRef: { current: string }; basename: string }) {
+function TrackCloudPath({ pathRef, stateRef, basename }: { pathRef: { current: string }; stateRef: { current: unknown }; basename: string }) {
   const location = useLocation()
   useEffect(() => {
     pathRef.current = basename + location.pathname + location.search + location.hash
-  }, [location, basename, pathRef])
+    stateRef.current = window.history.state
+  }, [location, basename, pathRef, stateRef])
   return null
 }
 
