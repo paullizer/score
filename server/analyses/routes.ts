@@ -9,7 +9,10 @@ import { isUuid } from '../jobs/validation'
 import type { RealAnalysesDeps } from './store'
 import { RealAnalysisService } from './service'
 import { AnalysisLibraryLifecycleService } from './library-lifecycle'
-import { analysisLifecycleInputSchema, createAnalysisInputSchema, emptyAnalysisInputSchema, isAnalysisId, retryAnalysisInputSchema } from './validation'
+import {
+  analysisLifecycleInputSchema, createAnalysisInputSchema, emptyAnalysisInputSchema,
+  isAnalysisId, reportComparisonIdsSchema, retryAnalysisInputSchema,
+} from './validation'
 
 export type { RealAnalysesDeps } from './store'
 export interface RealAnalysesRouterDeps {
@@ -131,6 +134,27 @@ export function createRealAnalysesRouter(deps: RealAnalysesRouterDeps): Router {
   router.get(`${base}/:runId/comparisons`, async (req, res) => {
     const options = page(req)
     res.json(await requireService().comparisons(param(req, 'workspaceId'), recordId(req, 'run'), options.continuationToken, options.limit))
+  })
+  router.get(`${base}/:runId/report-comparisons`, async (req, res) => {
+    query(req, ['comparisonId'])
+    body(emptyAnalysisInputSchema, actionBody(req))
+    const ids = req.query.comparisonId
+    const comparisonIds = body(reportComparisonIdsSchema, typeof ids === 'string' ? [ids] : ids)
+    const controller = new AbortController()
+    const abort = () => controller.abort()
+    req.once('aborted', abort)
+    res.once('close', abort)
+    try {
+      if (req.aborted) controller.abort()
+      const report = await requireService().reportComparisons(
+        param(req, 'workspaceId'), recordId(req, 'run'), comparisonIds, controller.signal,
+      )
+      controller.signal.throwIfAborted()
+      res.json(report)
+    } finally {
+      req.off('aborted', abort)
+      res.off('close', abort)
+    }
   })
   router.get(`${base}/:runId/comparisons/:comparisonId`, async (req, res) => {
     query(req, [])

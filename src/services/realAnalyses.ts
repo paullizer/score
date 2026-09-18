@@ -55,16 +55,47 @@ export async function fetchAnalysisProcessingFeatures(signal?: AbortSignal): Pro
   return { realAnalyses: result.realAnalyses === true, analysisLimits: result.analysisLimits ?? ANALYSIS_LIMITS }
 }
 
-async function collect<T>(path: string, field: 'runs' | 'targets' | 'comparisons', signal?: AbortSignal): Promise<T[]> {
+export interface RealAnalysisCollectionLimits {
+  maxItems: number
+  maxPages: number
+  maxBytes: number
+}
+
+async function collect<T>(
+  path: string, field: 'runs' | 'targets' | 'comparisons', signal?: AbortSignal, limits?: RealAnalysisCollectionLimits,
+): Promise<T[]> {
   const items: T[] = []
   const seen = new Set<string>()
+  const itemIds = new Set<string>()
+  let pages = 0
+  let bytes = 0
   let continuationToken: string | undefined
   do {
+    signal?.throwIfAborted()
+    if (limits && ++pages > limits.maxPages) throw new Error('The saved analysis inventory exceeds the page budget. Nothing was omitted; retry or narrow the report.')
     const query = continuationToken ? `?continuationToken=${encodeURIComponent(continuationToken)}` : ''
     const page = await cloudJsonRequest<RealAnalysesPage | RealAnalysisTargetsPage | RealAnalysisComparisonsPage>(`${path}${query}`, { method: 'GET', signal })
+    signal?.throwIfAborted()
     const values = field === 'runs' && 'runs' in page ? page.runs : field === 'targets' && 'targets' in page ? page.targets
       : field === 'comparisons' && 'comparisons' in page ? page.comparisons : null
     if (!Array.isArray(values)) throw new Error(`The analysis service returned an invalid ${field} page.`)
+    if (limits) {
+      bytes += new TextEncoder().encode(JSON.stringify(page)).byteLength
+      if (items.length + values.length > limits.maxItems || bytes > limits.maxBytes) {
+        throw new Error('The saved analysis inventory exceeds the report item or byte budget. Narrow the export; no comparisons were silently omitted.')
+      }
+      if (values.length > 100 ||
+        (page.continuationToken !== undefined && (typeof page.continuationToken !== 'string' ||
+          !page.continuationToken || page.continuationToken.length > 16 * 1024))) {
+        throw new Error('The analysis service returned a malformed inventory page.')
+      }
+      if (field === 'comparisons') for (const value of values as RealAnalysisComparisonSummary[]) {
+        const id = value?.comparison?.id
+        if (typeof id !== 'string' || !id) throw new Error('The analysis service returned an inventory comparison without an ID.')
+        if (itemIds.has(id)) throw new Error('The analysis service returned a repeated comparison ID or inventory page.')
+        itemIds.add(id)
+      }
+    }
     items.push(...values as T[])
     continuationToken = page.continuationToken
     if (continuationToken) {
@@ -101,8 +132,10 @@ export async function getRealAnalysis(workspaceId: string, runId: string, signal
   return detail
 }
 
-export async function listAllRealAnalysisComparisons(workspaceId: string, runId: string, signal?: AbortSignal): Promise<RealAnalysisComparisonSummary[]> {
-  return (await collect<RealAnalysisComparisonSummary>(pairs(workspaceId, runId), 'comparisons', signal))
+export async function listAllRealAnalysisComparisons(
+  workspaceId: string, runId: string, signal?: AbortSignal, limits?: RealAnalysisCollectionLimits,
+): Promise<RealAnalysisComparisonSummary[]> {
+  return (await collect<RealAnalysisComparisonSummary>(pairs(workspaceId, runId), 'comparisons', signal, limits))
     .map((value) => checkedComparison(value, workspaceId, runId))
 }
 

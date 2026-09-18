@@ -13,6 +13,7 @@ import {
   distinctTargetLabels, realComparisonSortOptions, realComparisonTargetLabel, selectRealComparisons, targetScoreSortExplanation, type RealComparisonSortKey,
 } from './analysisTableBrowsing'
 import { RealComparisonReview } from './RealComparisonReview'
+import { AnalysisReportExport } from './AnalysisReportExport'
 import { ArchivedBadge, EntityLifecycleActions, LifecycleBanner } from '../../components/lifecycle/LifecycleControls'
 import { useLifecycleAccess } from '../../components/lifecycle/useLifecycleAccess'
 
@@ -135,7 +136,10 @@ function RealAnalysisView({ id }: { id: string }) {
   }
   return <>{back}
     <PageHeader eyebrow="REAL EVIDENCE · FROZEN INPUTS" title={run.name} description="Review each saved resume/target pair independently. Completion, coverage, and overall-score availability are separate."
-      actions={<><EntityLifecycleActions target={{ kind: 'analysis', id }} name={run.name} onComplete={(action) => { if (action === 'delete') navigate('/analyses?data=real') }} /><RealRunActions summary={summary} />{canEdit && api.canWrite && api.features?.realAnalyses
+      actions={<><EntityLifecycleActions target={{ kind: 'analysis', id }} name={run.name} onComplete={(action) => { if (action === 'delete') navigate('/analyses?data=real') }} /><RealRunActions summary={summary} /><AnalysisReportExport source={{
+        kind: 'real', workspaceId: api.workspaceId, detail: { ...detail, ...summary },
+        comparisons: pairs?.state === 'ready' ? pairs.value : null, available: api.phase === 'ready',
+      }} />{canEdit && api.canWrite && api.features?.realAnalyses
         ? <Link className="button button-secondary button-md" {...realAnalysisLink({ from: id }, api.workspaceId)}><Layers3 size={15} aria-hidden="true" />New run with these inputs</Link>
         : <Button icon={Layers3} disabled title={!canEdit ? 'Unarchive this analysis and its workspace before creating another run.' : api.creationError ?? 'New-run readiness has not been confirmed.'}>New run with these inputs</Button>}</>} />
     <LifecycleBanner target={{ kind: 'analysis', id }} />

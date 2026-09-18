@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto'
 import { z } from 'zod'
+import { REPORT_LIMITS } from '../../src/domain/analysis-reports'
 import {
   ANALYSIS_LIMITS, type AnalysisEntity, type FrozenRealResumeSnapshot, type FrozenRealAnalysisTargetSnapshot,
   type FrozenRequirementEvidence, type RealAnalysisInitializationManifest, type RealAnalysisResult,
@@ -98,6 +99,7 @@ export const retryAnalysisInputSchema = z.strictObject({
   comparisonIds: z.array(comparisonId).min(1).max(ANALYSIS_LIMITS.maxComparisons).refine(unique).optional(),
 })
 export const emptyAnalysisInputSchema = z.strictObject({})
+export const reportComparisonIdsSchema = z.array(comparisonId).min(1).max(REPORT_LIMITS.batchComparisons).refine(unique)
 export const analysisLifecycleInputSchema = z.strictObject({ action: z.enum(['archive', 'unarchive', 'delete']) })
 
 const targetSummaryBase = {

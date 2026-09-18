@@ -16,6 +16,7 @@ import {
   selectSampleComparisons, type SampleComparisonSortKey,
 } from './analysisTableBrowsing'
 import { RealAnalysisDetail } from './RealAnalysisDetail'
+import { AnalysisReportExport } from './AnalysisReportExport'
 
 function ComparisonValue({ comparison }: { comparison: Comparison | undefined }) {
   if (!comparison) return <Badge tone="warning">Unavailable</Badge>
@@ -41,7 +42,7 @@ export function AnalysisDetail() {
 
 function RunView({ run }: { run: AnalysisRun }) {
   const { cancelRun, retryRun, cloud } = useWorkspace()
-  const { canEdit } = useLifecycleAccess({ kind: 'analysis', id: run.id })
+  const { canEdit, deleting, removed } = useLifecycleAccess({ kind: 'analysis', id: run.id })
   const navigate = useNavigate()
   const [params, setParams] = useSearchParams()
   const [query, setQuery] = useState('')
@@ -71,6 +72,7 @@ function RunView({ run }: { run: AnalysisRun }) {
     <Link className="back-link" to={sampleDataLink(selectedId ? `/analyses/${run.id}` : '/analyses', Boolean(cloud))}><ArrowLeft size={14} />{selectedId ? 'All comparisons' : 'Back to analyses'}</Link>
     <PageHeader eyebrow="EVIDENCE-LED REVIEW" title={run.name} description="A clear view of the match, and the passages behind it."
       actions={<><EntityLifecycleActions target={{ kind: 'analysis', id: run.id }} name={run.name} onComplete={(action) => { if (action === 'delete') navigate(sampleDataLink('/analyses', Boolean(cloud))) }} />{working && <Button icon={X} disabled={!canEdit} onClick={() => cancelRun(run.id)}>Cancel pending</Button>}{needsRetry && !working && <Button icon={RotateCcw} disabled={!canEdit} onClick={() => retryRun(run.id)}>Retry unfinished</Button>}
+        <AnalysisReportExport source={{ kind: 'sample', run, available: !deleting && !removed }} />
         <Button icon={Sparkles} disabled={!canEdit} onClick={() => navigate(sampleDataLink(`/analyses/new?from=${run.id}`, Boolean(cloud)))}>New run with these inputs</Button></>} />
     <LifecycleBanner target={{ kind: 'analysis', id: run.id }} />
     <ArchivedBadge target={{ kind: 'analysis', id: run.id }} />

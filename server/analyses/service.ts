@@ -16,6 +16,7 @@ import {
   analysisBytesHash, analysisCancellationNeedsRetry, analysisDeterministicId, analysisHash, analysisInputFingerprint,
   assertAnalysis, createAnalysisInputSchema, isAnalysisId, MAX_ANALYSIS_TRANSACTION_BYTES,
   parseAnalysisEntity, parseAnalysisInitializationManifest, retryAnalysisInputSchema,
+  reportComparisonIdsSchema,
 } from './validation'
 import {
   analysisBlobReference, assertComparisonManifestBinding, parseAnalysisJson, putAnalysisJson, readAnalysisBlob,
@@ -23,6 +24,7 @@ import {
 } from './snapshots'
 import { RealAnalysisTargets, resolveAnalysisResume, copyAnalysisTargetEvidence, type AnalysisSourceDeps } from './targets'
 import { analysisPageCursor, analysisPageToken, validateAnalysisPage } from './paging'
+import { readAnalysisReportComparisons } from './reports'
 import {
   advanceAnalysisRun, applyAnalysisComparisonTransition, cancelAnalysisComparisonRecord, loadAnalysisComparison,
   loadAnalysisRun, retryAnalysisComparisonRecord,
@@ -258,6 +260,17 @@ export class RealAnalysisService {
     const snapshots = await readAnalysisSnapshots(this.deps.blobs, run.record, comparison.record)
     const result = await readAnalysisResult(this.deps.blobs, run.record, comparison.record, snapshots)
     return { ...comparisonSummary(comparison), ...snapshots, result }
+  }
+  async reportComparisons(workspaceId: string, runId: string, comparisonIds: string[], signal?: AbortSignal) {
+    comparisonIds = input(reportComparisonIdsSchema, comparisonIds)
+    signal?.throwIfAborted()
+    const run = await this.run(workspaceId, runId)
+    const comparisons: RealAnalysisComparisonRecord[] = []
+    for (const id of comparisonIds) {
+      signal?.throwIfAborted()
+      comparisons.push((await this.comparison(workspaceId, runId, id)).record)
+    }
+    return readAnalysisReportComparisons(this.deps.blobs, run.record, comparisons, signal)
   }
   async document(workspaceId: string, runId: string, comparisonId: string, documentId: string, version: number): Promise<RealAnalysisDocumentResponse> {
     if (typeof documentId !== 'string' || !/^[a-zA-Z0-9][a-zA-Z0-9_.:-]{0,179}$/.test(documentId) ||
