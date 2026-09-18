@@ -5,6 +5,10 @@ import type {
 
 const WEIGHT_TOLERANCE = 0.000001
 
+function assertDemoRubric(rubric: Rubric): void {
+  if (rubric.dataKind === 'real') throw new Error('Real job and GS grade rubrics cannot use demo scoring, including mixed or directly preselected inputs.')
+}
+
 export function validateRubric(rubric: Rubric): string[] {
   const errors: string[] = []
   if (!rubric.name.trim()) errors.push('Give the rubric a name.')
@@ -69,6 +73,8 @@ export function assertResumeSnapshot(snapshot: ResumeSnapshot): void {
 }
 
 export function assertTargetSnapshot(target: AnalysisTarget): void {
+  assertDemoRubric(target.rubric)
+  if (target.job?.dataKind === 'real') throw new Error('Real jobs cannot be evaluated by the fixture scorer.')
   const errors = validateRubric(target.rubric)
   if (errors.length) throw new Error(`"${target.rubric.name}" is not ready: ${errors.join(' ')}`)
   if (target.id !== target.rubric.id || target.kind !== target.rubric.kind) {
@@ -121,6 +127,7 @@ export function snapshotAnalysisRun(
 ): AnalysisRun {
   assertSelection(resumeIds, 'resume')
   assertSelection(rubricIds, 'rubric target')
+  for (const rubric of workspace.rubrics.filter((item) => rubricIds.includes(item.id))) assertDemoRubric(rubric)
   const latest = new Map(latestRubrics(workspace).map((rubric) => [rubric.groupId, rubric.id]))
   const resumes = resumeIds.map((id): ResumeSnapshot => {
     const matches = workspace.resumes.filter((resume) => resume.id === id)
@@ -200,6 +207,7 @@ export function snapshotAnalysisRun(
 }
 
 export function weightedScore(rubric: Rubric, results: CriterionResult[]): number | null {
+  assertDemoRubric(rubric)
   const errors = validateRubric(rubric)
   if (errors.length) throw new Error(errors.join(' '))
   if (results.length !== rubric.criteria.length || new Set(results.map((result) => result.criterionId)).size !== results.length) {
@@ -247,6 +255,10 @@ function describeComparison(snapshot: ResumeSnapshot, target: AnalysisTarget, re
 }
 
 export function evaluateComparison(run: AnalysisRun, comparisonId: string): Comparison {
+  for (const target of run.targets) {
+    assertDemoRubric(target.rubric)
+    if (target.job?.dataKind === 'real') throw new Error('Mixed real and sample analysis runs cannot use fixture scoring.')
+  }
   const matches = run.comparisons.filter((comparison) => comparison.id === comparisonId)
   const comparison = matches[0]
   if (!comparison || matches.length !== 1) throw new Error(`Comparison "${comparisonId}" is missing or ambiguous in this run.`)

@@ -1,0 +1,15 @@
+FROM node:24-bookworm-slim AS build
+WORKDIR /app
+COPY package.json package-lock.json ./
+RUN npm ci --no-audit --no-fund
+COPY . .
+RUN npx tsc -p tsconfig.worker.json && npm run build:worker
+
+FROM node:24-bookworm-slim AS runtime
+WORKDIR /app
+ENV NODE_ENV=production
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev --no-audit --no-fund && npm cache clean --force
+COPY --from=build --chown=node:node /app/dist-worker ./dist-worker
+USER node
+CMD ["node", "dist-worker/worker.mjs"]

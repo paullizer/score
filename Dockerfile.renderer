@@ -1,0 +1,21 @@
+FROM node:24-bookworm-slim AS build
+WORKDIR /app
+COPY package.json package-lock.json ./
+RUN npm ci --no-audit --no-fund
+COPY . .
+RUN npx tsc -p tsconfig.renderer.json && npm run build:renderer
+
+FROM node:24-bookworm-slim AS runtime
+WORKDIR /app
+ENV NODE_ENV=production
+ENV PORT=8080
+ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev --no-audit --no-fund \
+    && npx playwright install --with-deps chromium \
+    && chmod -R a+rX /ms-playwright \
+    && npm cache clean --force
+COPY --from=build --chown=node:node /app/dist-renderer ./dist-renderer
+USER node
+EXPOSE 8080
+CMD ["node", "dist-renderer/renderer.mjs"]

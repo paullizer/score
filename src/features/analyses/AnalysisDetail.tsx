@@ -21,6 +21,7 @@ export function AnalysisDetail() {
   const navigate = useNavigate()
   const run = workspace.runs.find((item) => item.id === id)
   if (!run) return <EmptyState title="This analysis is no longer here" description="A demo reset may have replaced it. Open the analysis library to find your saved comparisons." action={<Button onClick={() => navigate('/analyses')}>Back to analyses</Button>} />
+  if (run.targets.some((target) => target.rubric.dataKind === 'real' || target.job?.dataKind === 'real')) return <EmptyState title="Real inputs cannot have demo scores" description="This run contains real job or GS grade inputs, possibly mixed with samples. Its simulated results are not shown or retried. Review real criteria in the rubric and grade libraries." action={<Button onClick={() => navigate('/rubrics?kind=grade&data=real')}>Open rubric library</Button>} />
   return <RunView key={run.id} run={run} />
 }
 
@@ -50,7 +51,7 @@ function RunView({ run }: { run: AnalysisRun }) {
     <PageHeader eyebrow="EVIDENCE-LED REVIEW" title={run.name} description="A clear view of the match, and the passages behind it."
       actions={<>{working && <Button icon={X} onClick={() => cancelRun(run.id)}>Cancel pending</Button>}{needsRetry && !working && <Button icon={RotateCcw} onClick={() => retryRun(run.id)}>Retry unfinished</Button>}
         <Button icon={Sparkles} onClick={() => navigate(`/analyses/new?from=${run.id}`)}>New run with these inputs</Button></>} />
-    <div className="analysis-meta"><Badge tone={status === 'Complete' ? 'success' : status === 'Needs attention' ? 'warning' : 'neutral'} dot>{status}</Badge><span>{run.resumes.length} {run.resumes.length === 1 ? 'resume' : 'resumes'}</span><span>{run.targets.length} separate {run.targets.length === 1 ? 'rubric' : 'rubrics'}</span><span>{dateLabel(run.createdAt)}</span><span className="ml-auto flex items-center gap-1.5"><ShieldCheck size={12} />Saved version snapshots</span></div>
+    <div className="analysis-meta"><Badge tone="accent">Simulated scoring</Badge><Badge tone={status === 'Complete' ? 'success' : status === 'Needs attention' ? 'warning' : 'neutral'} dot>{status}</Badge><span>{run.resumes.length} {run.resumes.length === 1 ? 'resume' : 'resumes'}</span><span>{run.targets.length} separate {run.targets.length === 1 ? 'rubric' : 'rubrics'}</span><span>{dateLabel(run.createdAt)}</span><span className="ml-auto flex items-center gap-1.5"><ShieldCheck size={12} />Saved version snapshots</span></div>
     {working && <div className="run-progress panel" aria-live="polite"><div><span className="flex items-center gap-2"><LoaderCircle size={15} className="animate-spin" />Preparing evidence-backed sample results</span><span>{finished} / {run.comparisons.length}</span></div>
       <progress max={run.comparisons.length} value={finished} aria-label="Analysis progress" /><p>Every comparison is independent. Completed results are available below.</p></div>}
     {selectedId && !selected ? <EmptyState title="This result could not be found" description="Choose a comparison from this analysis instead." action={<Button onClick={() => setParams({})}>View all comparisons</Button>} />

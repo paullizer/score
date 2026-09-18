@@ -1,0 +1,47 @@
+name: score
+metadata:
+  template: score@0.2.0
+infra:
+  provider: bicep
+  path: infra
+  module: main
+services:
+  web:
+    project: .
+    host: appservice
+    language: docker
+    docker:
+      path: Dockerfile
+      context: .
+      platform: linux/amd64
+      remoteBuild: true
+      registry: ${AZURE_CONTAINER_REGISTRY_ENDPOINT}
+      image: score
+hooks:
+  predeploy:
+    shell: pwsh
+    run: |
+      node scripts\azure-before-deploy.mjs
+      if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+  preprovision:
+    shell: pwsh
+    run: |
+      node scripts\azure-auth.mjs prepare
+      if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+  postprovision:
+    shell: pwsh
+    run: |
+      az acr config authentication-as-arm update --registry $env:AZURE_CONTAINER_REGISTRY_NAME --status enabled --subscription $env:AZURE_SUBSCRIPTION_ID --output none
+      if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      node scripts\azure-auth.mjs configure
+      if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      node scripts\azure-knowledge.mjs
+      if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+  postdeploy:
+    shell: pwsh
+    run: |
+      $ErrorActionPreference = 'Stop'
+      & .\scripts\deploy-worker.ps1
+      if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      node scripts\azure-finish.mjs
+      if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

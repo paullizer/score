@@ -11,7 +11,7 @@ export function AddResumesDialog({ open, onOpenChange, onAdded, onError }: {
   onAdded: (ids: string[]) => void
   onError: (message: string) => void
 }) {
-  const { addResumes, notify } = useWorkspace()
+  const { addResumes, notify, cloud } = useWorkspace()
   const [items, setItems] = useState<ImportCandidate[]>([])
   const [errors, setErrors] = useState<string[]>([])
   const [busy, setBusy] = useState(false)
@@ -112,7 +112,7 @@ export function AddResumesDialog({ open, onOpenChange, onAdded, onError }: {
       <div className="rounded-xl border border-dashed bg-surface px-5 py-7 text-center">
         <Files size={28} className="mx-auto mb-3 text-accent" aria-hidden="true" />
         <h3 className="text-[14px] font-semibold">A few resumes. One batch.</h3>
-        <p id={fileHintId} className="mx-auto mb-4 mt-2 max-w-sm text-[11px] text-muted">Select multiple PDFs. Only their names become local labels; the files themselves are not read, uploaded, or stored.</p>
+        <p id={fileHintId} className="mx-auto mb-4 mt-2 max-w-sm text-[11px] text-muted">Select multiple PDFs. Only their names become {cloud ? 'workspace' : 'local'} labels; the files themselves are not read, uploaded, or stored.</p>
         <input
           ref={fileInput}
           type="file"
@@ -158,7 +158,7 @@ export function AddResumesDialog({ open, onOpenChange, onAdded, onError }: {
         <Loader2 size={17} className="mt-0.5 shrink-0 motion-safe:animate-spin text-accent" aria-hidden="true" />
         <div><p className="text-[12px] font-medium">Preparing {items.length} fictional {items.length === 1 ? 'profile' : 'profiles'}…</p><p className="mt-1 text-[11px] text-muted">This is simulated progress, not PDF parsing. Preparation continues if you close this dialog.</p></div>
       </div>}
-      <DemoNote>All imported profiles, document text, and later citations come from the demo fixtures—not from the selected PDFs. Filename labels stay on this device.</DemoNote>
+      <DemoNote>All imported profiles, document text, and later citations come from the demo fixtures—not from the selected PDFs. {cloud ? 'Sample profiles and filename labels are saved to this private cloud workspace; no PDF bytes are sent.' : 'Filename labels stay on this device.'}</DemoNote>
     </form>
   </Modal>
 }

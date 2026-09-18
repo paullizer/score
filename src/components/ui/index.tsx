@@ -28,7 +28,7 @@ export function Badge({ children, tone = 'neutral', dot = false }: {
 }
 
 export function StatusBadge({ status }: { status: JobStatus }) {
-  const labels = { ready: 'Rubric ready', parsing: 'Reading sample', generating: 'Creating rubric', error: 'Needs attention', cancelled: 'Cancelled' }
+  const labels = { queued: 'Queued', ready: 'Rubric ready', parsing: 'Reading source', generating: 'Creating rubric', error: 'Needs attention', cancelled: 'Cancelled' }
   return <Badge tone={status === 'ready' ? 'success' : status === 'error' ? 'warning' : 'neutral'} dot>{labels[status]}</Badge>
 }
 
@@ -95,7 +95,7 @@ export function InlineError({ children }: { children: ReactNode }) {
   return <div className="inline-error" role="alert"><AlertCircle size={17} /><div>{children}</div></div>
 }
 
-export function DemoNote({ children = 'A working preview, with fictional documents and simulated results. No files or URLs are sent anywhere.' }: { children?: ReactNode }) {
+export function DemoNote({ children = 'A working preview with fictional documents and simulated results. Selected PDF contents are not read, and source URLs are not fetched.' }: { children?: ReactNode }) {
   return <div className="demo-note"><FlaskConical size={16} aria-hidden="true" /><span>{children}</span></div>
 }
 
@@ -122,5 +122,5 @@ export function StepLabel({ number, children, complete = false }: { number: numb
 export function ExternalSource({ url, children }: { url: string; children: ReactNode }) {
   const parsed = URL.canParse(url) ? new URL(url) : null
   if (!parsed || !['http:', 'https:'].includes(parsed.protocol)) return <span className="source-label">{children}</span>
-  return <a href={url} target="_blank" rel="noreferrer" className="text-link">{children}<ArrowUpRight size={13} /></a>
+  return <a href={url} target="_blank" rel="nofollow noopener noreferrer" className="text-link">{children}<ArrowUpRight size={13} /></a>
 }

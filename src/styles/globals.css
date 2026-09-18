@@ -90,6 +90,8 @@
   .mini-path span { @apply flex h-9 w-9 items-center justify-center rounded-[10px] border; background: var(--cp-panel); }
   .mini-path span:last-child { color: var(--cp-accent); border-color: var(--cp-accent-soft); }
   .library-toolbar { @apply flex flex-wrap items-center justify-between gap-3 border-b p-4; }
+  .library-kind-switcher { @apply flex flex-wrap items-center justify-between gap-3 border-b px-4 py-3; background: var(--cp-sheen); }
+  .library-kind-switcher > span { @apply text-[10px]; color: var(--cp-text-soft); }
   .segmented { @apply inline-flex flex-wrap gap-0.5 rounded-[10px] p-1; background: var(--cp-surface-soft); }
   .segmented button { @apply flex items-center gap-2 rounded-lg px-3 py-1.5 text-[11px] font-medium; color: var(--cp-text-muted); }
   .segmented button.is-active { background: var(--cp-surface); color: var(--cp-text); box-shadow: 0 1px 3px var(--cp-border); }
@@ -171,9 +173,14 @@
   .source-footer { @apply flex flex-wrap items-center justify-between gap-2 border-t px-5 py-3 text-[10px]; color: var(--cp-text-soft); }
   .source-footer .text-link { max-width: 100%; word-break: break-all; }
   .source-footer .text-link svg { flex-shrink: 0; }
+  .source-provenance { @apply flex flex-wrap items-center justify-between gap-3 border-t px-5 py-4; background: var(--cp-sheen); }
+  .source-provenance > div { @apply flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1 text-[10px]; color: var(--cp-text-soft); }
+  .source-provenance strong { color: var(--cp-text); }
+  .source-provenance code { font-family: Consolas, "Courier New", Courier, monospace; }
   .pane-switcher { @apply mb-4 hidden; }
   .criterion-card { @apply rounded-xl border p-4; background: var(--cp-surface); }
   .criterion-card + .criterion-card { @apply mt-3; }
+  .source-quote { @apply rounded-lg border-l-2 px-3 py-2 text-[10px] leading-5; color: var(--cp-text-muted); background: var(--cp-surface-soft); border-left-color: var(--cp-accent); }
   .rubric-card, .resume-card { @apply rounded-2xl border p-5; background: var(--cp-panel); transition: border-color 150ms, box-shadow 150ms; }
   .rubric-card:hover, .resume-card:hover { border-color: var(--cp-border-strong); box-shadow: 0 2px 5px var(--cp-border); }
   .metric-line { @apply flex items-center justify-between gap-3 text-[12px]; }
@@ -211,6 +218,7 @@
   .import-item > div { @apply min-w-0 flex-1; }
   .import-item strong { @apply block truncate text-[12px] font-medium; }
   .import-item p { @apply mt-1 truncate text-[10px]; color: var(--cp-text-soft); }
+  .import-item .import-error-message { white-space: normal; color: var(--cp-danger); }
   .step-label { @apply flex items-center gap-2 text-[11px] font-medium; color: var(--cp-text-muted); }
   .step-label > span { @apply flex h-5 w-5 items-center justify-center rounded-full border text-[9px]; background: var(--cp-surface); color: var(--cp-accent); }
   .check-label { @apply flex cursor-pointer items-center gap-2 text-[12px]; }
@@ -323,6 +331,165 @@
   .evidence-gap strong { @apply text-[11px] font-medium; }
   .evidence-gap p { @apply mt-1 text-[10px]; color: var(--cp-text-muted); }
   .score-legend { @apply flex flex-wrap gap-x-4 gap-y-2 border-t px-5 py-4 text-[8px]; color: var(--cp-text-soft); background: var(--cp-bg-elevated); }
+
+  /* Cloud workspace switcher, account panel, and save-status affordances */
+  .workspace-switcher-trigger { width: 100%; border: 1px solid transparent; text-align: left; transition: background 150ms, border-color 150ms; }
+  .workspace-switcher-trigger:hover, .workspace-switcher-trigger:focus-visible { background: var(--cp-surface-soft); border-color: var(--cp-border); }
+  .workspace-switcher-trigger > div { @apply min-w-0 flex-1; }
+  .workspace-switcher-trigger strong, .workspace-switcher-trigger span { @apply truncate; }
+  .workspace-switcher-caret { @apply ml-auto shrink-0; color: var(--cp-text-soft); }
+  .workspace-switcher-list { @apply space-y-2; }
+  .workspace-switcher-item { @apply flex items-center gap-2 rounded-xl border p-2.5; background: var(--cp-surface); }
+  .workspace-switcher-item.is-current { border-color: var(--cp-accent-soft); background: var(--cp-accent-soft); }
+  .workspace-switcher-name { @apply flex min-w-0 flex-1 items-center gap-2 rounded-lg px-2 py-1.5 text-left text-[12px] font-medium; color: var(--cp-text); }
+  .workspace-switcher-name:hover:not(:disabled) { color: var(--cp-accent); }
+  .workspace-switcher-name span { @apply truncate; }
+  .workspace-switcher-name-spacer { @apply inline-block h-3.5 w-3.5 shrink-0; }
+  .workspace-switcher-rename { @apply flex flex-1 items-center gap-2; }
+  .workspace-switcher-rename .input { @apply py-1.5; }
+  .workspace-switcher-create { @apply mt-4 flex items-center gap-2; }
+  .account-panel { @apply mb-4 flex items-center gap-2.5 border-t px-1 pt-4; }
+  .account-panel .avatar { color: var(--cp-accent); }
+  .cloud-loading-mark { @apply mx-auto mb-2 h-2.5 w-2.5 rounded-full; background: var(--cp-accent); }
+  .cloud-loading-card, .cloud-gate-card { text-align: center; }
+  .cloud-gate-brand { @apply mb-2 inline-flex items-center gap-2 text-[20px] font-semibold tracking-[-0.5px]; }
+  .cloud-gate-card h1 { @apply mb-1 text-xl font-semibold; }
+  .cloud-gate-card p { @apply mb-4; color: var(--cp-text-muted); }
+  .cloud-gate-card.is-error h1 { color: var(--cp-danger); }
+  .save-status.is-saving { color: var(--cp-text-muted); }
+  .save-status.is-saving > span { background: var(--cp-warning); }
+
+  .grade-disclaimer { @apply mb-5; }
+  .grade-library { @apply space-y-5 p-5; }
+  .grade-library-intro { @apply flex flex-wrap items-start justify-between gap-4; }
+  .grade-library-intro h2 { @apply text-[16px] font-semibold; }
+  .grade-library-intro p { @apply mt-2 max-w-xl text-[12px]; color: var(--cp-text-muted); }
+  .grade-family-grid { @apply grid gap-4 lg:grid-cols-2; }
+  .grade-family-card { @apply min-w-0 space-y-4 rounded-xl border p-5; background: var(--cp-surface); }
+  .grade-family-card h3 { @apply text-[17px] font-semibold; overflow-wrap: anywhere; }
+  .grade-family-card h3 a:hover { color: var(--cp-accent); }
+  .grade-family-card > p, .grade-family-seed { @apply text-[11px]; color: var(--cp-text-muted); }
+  .grade-family-levels { @apply space-y-3 border-y py-4; }
+  .grade-family-levels li { @apply flex flex-wrap items-center justify-between gap-2 text-[12px]; }
+  .grade-family-levels a { @apply font-semibold; color: var(--cp-accent); }
+  .grade-family-id { @apply block truncate font-mono text-[9px]; color: var(--cp-text-soft); }
+  .grade-context-fields { @apply min-w-0 space-y-5; }
+  .grade-form-grid { @apply grid gap-4 sm:grid-cols-2; }
+  .grade-form-grid .field + .field { margin-top: 0; }
+  .grade-checks { @apply flex flex-wrap gap-x-5 gap-y-3 text-[12px]; }
+  .grade-picker { @apply grid grid-cols-3 gap-2 sm:grid-cols-5; }
+  .grade-picker label { @apply flex min-h-10 items-center gap-2 rounded-lg border px-3 py-2 text-[12px]; background: var(--cp-surface); }
+  .grade-picker label.is-selected { color: var(--cp-accent); background: var(--cp-accent-soft); border-color: var(--cp-accent); }
+  .grade-context-confirm { @apply items-start rounded-xl border p-4 text-[12px]; background: var(--cp-surface-soft); }
+  .grade-seed-summary { @apply space-y-2 rounded-xl border p-4; background: var(--cp-surface-soft); }
+  .grade-seed-summary p { @apply text-[12px]; color: var(--cp-text-muted); }
+  .grade-workspace-toolbar { @apply my-5 flex flex-wrap items-center justify-between gap-3; }
+  .grade-discovery-context { @apply mb-5 flex flex-wrap items-center gap-3 rounded-xl border p-4 text-[11px]; background: var(--cp-surface-soft); }
+  .grade-discovery-context > span:last-child { color: var(--cp-text-muted); overflow-wrap: anywhere; }
+  .grade-operation-notice { @apply mb-5 rounded-xl border p-4 text-[12px]; color: var(--cp-accent); background: var(--cp-accent-soft); }
+  .grade-issues { @apply mb-5 min-w-0 rounded-xl border p-4; background: var(--cp-surface-soft); }
+  .grade-issues h3 { @apply mb-3 flex items-center gap-2 text-[12px] font-semibold; }
+  .grade-issues > ul { @apply space-y-3; }
+  .grade-issues li { @apply flex flex-wrap items-start gap-2 text-[11px]; }
+  .grade-issues li > div { @apply min-w-0 flex-1; min-width: 130px; }
+  .grade-issues li p { overflow-wrap: anywhere; }
+  .grade-source-budget { @apply flex flex-wrap justify-between gap-4 border-b px-5 py-4 text-[12px]; background: var(--cp-bg-elevated); }
+  .grade-source-budget small { @apply mt-1 block text-[10px]; color: var(--cp-text-soft); }
+  .grade-source-list { @apply space-y-4 p-5; }
+  .grade-source-card { @apply min-w-0 space-y-4 rounded-xl border p-4; background: var(--cp-surface); }
+  .grade-source-heading { @apply flex flex-wrap items-start justify-between gap-3; }
+  .grade-source-heading label { @apply min-w-0 flex-1 items-start; }
+  .grade-source-heading strong { @apply block text-[13px]; overflow-wrap: anywhere; }
+  .grade-source-heading small { @apply mt-1 block text-[10px]; color: var(--cp-text-soft); }
+  .grade-source-decision { @apply grid items-start gap-4 lg:grid-cols-[minmax(0,1fr)_minmax(0,1.5fr)]; }
+  .grade-source-decision .field + .field { margin-top: 0; }
+  .grade-frozen-summary { @apply flex items-start gap-3 border-b p-5 text-[12px]; color: var(--cp-accent); background: var(--cp-accent-soft); }
+  .grade-frozen-summary > div { min-width: 0; }
+  .grade-frozen-summary p { @apply mt-1 text-[11px]; }
+  .grade-frozen-summary code { @apply mt-2 block text-[9px]; overflow-wrap: anywhere; color: var(--cp-text-muted); }
+  .grade-freeze-actions { @apply space-y-4 border-t p-5; background: var(--cp-surface-soft); }
+  .grade-freeze-actions label { @apply items-start text-[12px]; }
+  .grade-provenance { @apply mt-4 min-w-0 space-y-4 text-[11px]; }
+  .grade-provenance dl { @apply space-y-3; }
+  .grade-provenance dt { @apply mb-1 text-[10px] font-medium; color: var(--cp-text-soft); }
+  .grade-provenance dd { @apply whitespace-pre-wrap; overflow-wrap: anywhere; }
+  .grade-provenance dd a { @apply inline-flex max-w-full text-[11px]; overflow-wrap: anywhere; }
+  .grade-provenance dd a svg { flex-shrink: 0; }
+  .grade-provenance li { @apply my-1; }
+  .grade-provenance code { @apply text-[10px]; overflow-wrap: anywhere; }
+  .reference-completeness { @apply border-b px-4 py-3 text-[10px]; color: var(--cp-text-muted); overflow-wrap: anywhere; }
+  .reference-locator { @apply mb-2 block text-[9px]; color: var(--cp-text-soft); }
+  .grade-snapshot-label { @apply mb-4 flex items-start gap-2 rounded-lg border p-3 text-[10px]; background: var(--cp-accent-soft); color: var(--cp-accent); overflow-wrap: anywhere; }
+  .grade-snapshot-label svg { flex-shrink: 0; }
+  .grade-field-kicker { @apply mb-2 block text-[9px] font-semibold uppercase tracking-wide; color: var(--cp-text-soft); }
+  .grade-citations { @apply mt-4 space-y-4; }
+  .grade-citations .text-link { @apply items-start text-left; white-space: normal; overflow-wrap: anywhere; }
+  .grade-citations .text-link svg { flex-shrink: 0; }
+  .grade-matrix-section { min-width: 0; }
+  .grade-matrix-scroll { @apply overflow-auto; max-width: 100%; max-height: 84vh; }
+  .grade-matrix { @apply w-full border-separate text-left; border-spacing: 0; }
+  .grade-matrix th, .grade-matrix td { @apply border-b border-r p-4 align-top; min-width: 290px; max-width: 370px; }
+  .grade-matrix thead th { background: var(--cp-surface); }
+  .grade-matrix .grade-row-label { @apply sticky left-0 text-[12px]; min-width: 170px; max-width: 220px; z-index: 1; background: var(--cp-bg-elevated); box-shadow: 1px 0 var(--cp-border); }
+  .grade-row-label code { @apply mt-3 block break-all text-[9px] font-normal; color: var(--cp-text-soft); }
+  .grade-row-label .badge { @apply mt-3; }
+  .grade-column-header { @apply space-y-3 font-normal; }
+  .grade-column-header h3 { @apply text-lg font-semibold; }
+  .grade-column-header p { @apply text-[11px]; color: var(--cp-text-muted); }
+  .grade-column-header > .button { @apply w-full; }
+  .grade-approval-reasons { @apply text-[10px]; color: var(--cp-text-muted); }
+  .grade-approval-reasons summary { @apply cursor-pointer text-left font-medium; }
+  .grade-approval-reasons ul { @apply mt-2 list-disc space-y-1 pl-4; }
+  .grade-criterion-cell { @apply min-w-0 space-y-4 text-[12px]; }
+  .grade-criterion-cell > div > strong { color: var(--cp-accent); }
+  .grade-criterion-cell > p { @apply whitespace-pre-line; overflow-wrap: anywhere; }
+  .grade-criterion-cell summary { @apply cursor-pointer text-[11px] font-medium; }
+  .grade-criterion-cell details p { @apply mt-2 whitespace-pre-line text-[11px]; color: var(--cp-text-muted); }
+  .grade-criterion-cell.is-gap { border-left: 2px solid var(--cp-warning); padding-left: 12px; }
+  .grade-interpretation { @apply rounded-lg border p-3; background: var(--cp-surface-soft); }
+  .grade-interpretation p { @apply whitespace-pre-line text-[11px]; color: var(--cp-text-muted); overflow-wrap: anywhere; }
+  .grade-empty-cell { @apply space-y-3 text-[11px]; color: var(--cp-text-muted); }
+  .grade-qualifications { @apply min-w-0 space-y-3 text-[11px]; }
+  .grade-qualifications h3 { @apply flex flex-wrap items-center gap-2 text-[13px] font-semibold; }
+  .grade-qualifications > p { color: var(--cp-text-muted); }
+  .grade-qualifications article { @apply space-y-3 border-t pt-4; }
+  .grade-qualifications article > p { @apply whitespace-pre-line; }
+  .grade-review-result { @apply space-y-3 text-[11px]; overflow-wrap: anywhere; }
+  .grade-review-result .grade-issues { @apply mb-0; }
+  .grade-mobile-tabs, .grade-mobile-panel { display: none; }
+  .grade-hash-label { @apply my-4 space-y-1 rounded-xl border p-4; background: var(--cp-surface-soft); }
+  .grade-hash-label > span { @apply block pt-2 text-[10px]; color: var(--cp-text-soft); }
+  .grade-hash-label code { @apply block text-[10px]; overflow-wrap: anywhere; }
+  .grade-history-layout { @apply grid items-start md:grid-cols-[210px_minmax(0,1fr)]; }
+  .grade-history-nav { @apply flex flex-col gap-2 border-r p-3; max-height: 75vh; overflow-y: auto; }
+  .grade-history-nav a { @apply flex flex-col items-start gap-2 rounded-lg border p-3 text-[12px]; background: var(--cp-surface); }
+  .grade-history-nav a[aria-current="page"] { color: var(--cp-accent); border-color: var(--cp-accent); background: var(--cp-accent-soft); }
+  .grade-history-nav a > span:not(.badge) { @apply text-[10px]; color: var(--cp-text-soft); }
+  .grade-history-content { @apply min-w-0 space-y-5 p-5; }
+  .grade-history-select { @apply max-w-xs; }
+  .grade-historical-context { @apply space-y-3 rounded-xl border p-4 text-[11px]; background: var(--cp-surface-soft); }
+  .grade-historical-context h4 { @apply text-[13px] font-semibold; }
+  .grade-historical-context li { @apply mt-3; }
+  .grade-historical-context li button { @apply text-left text-[11px]; }
+  .grade-historical-context li > span { @apply mt-1 block text-[10px]; color: var(--cp-text-soft); }
+  .grade-history-criterion { @apply space-y-3 rounded-xl border p-4; }
+  .grade-history-criterion > h4 { @apply text-[14px] font-semibold; }
+  .grade-editor-criterion { @apply min-w-0 space-y-4 rounded-xl border p-4; background: var(--cp-surface); }
+  .grade-editor-criterion legend { @apply max-w-full px-2 text-[12px] font-semibold; overflow-wrap: anywhere; }
+  .grade-editor-quotes { @apply space-y-3; }
+  .grade-editor-quotes li { @apply flex items-start gap-2 rounded-lg border p-3; background: var(--cp-surface-soft); }
+  .grade-editor-quotes li > div { @apply min-w-0 flex-1; }
+  .grade-editor-quotes blockquote { @apply whitespace-pre-line text-[11px]; overflow-wrap: anywhere; }
+  .grade-editor-quotes span { @apply mt-2 block text-[10px]; color: var(--cp-text-soft); }
+  .grade-editor-quotes + .button { @apply mt-3; }
+  .grade-work-items { @apply mt-5; }
+  .grade-work-list { max-height: 420px; overflow-y: auto; }
+  .grade-work-list article { @apply flex flex-wrap items-start justify-between gap-3 border-b px-5 py-4; }
+  .grade-work-list article > div:first-child { @apply min-w-0 flex-1; }
+  .grade-work-list strong { @apply block text-[11px] font-medium; overflow-wrap: anywhere; }
+  .grade-work-list article > div:first-child > span { @apply mt-1 block text-[10px]; color: var(--cp-text-soft); }
+  .grade-work-list p { @apply mt-2 text-[11px]; color: var(--cp-danger); }
+  .grade-processing-error { color: var(--cp-danger) !important; }
 }
 
 @keyframes fade-in { from { opacity: 0; } to { opacity: 1; } }
@@ -362,6 +529,15 @@
   .document-scroll { max-height: 72vh; }
   .evidence-layout { grid-template-columns: 1fr; }
   .evidence-panel { position: static; }
+  .grade-matrix-scroll { display: none; }
+  .grade-mobile-tabs { display: flex; overflow-x: auto; border-bottom: 1px solid var(--cp-border); padding: 12px; gap: 8px; }
+  .grade-mobile-tabs button { flex-shrink: 0; min-height: 50px; min-width: 90px; text-align: left; font-size: 13px; padding: 8px 12px; border: 1px solid var(--cp-border); border-radius: 10px; background: var(--cp-surface); }
+  .grade-mobile-tabs button span { display: block; font-size: 9px; margin-top: 4px; color: var(--cp-text-soft); }
+  .grade-mobile-tabs button[aria-selected="true"] { color: var(--cp-accent); background: var(--cp-accent-soft); border-color: var(--cp-accent); }
+  .grade-mobile-panel { display: block; padding: 20px; }
+  .grade-mobile-competency { border-top: 1px solid var(--cp-border); margin-top: 20px; padding-top: 20px; }
+  .grade-mobile-competency > h3 { font-weight: 600; margin-bottom: 12px; }
+  .grade-mobile-panel > .grade-qualifications, .grade-mobile-panel > .grade-review-result { margin-top: 24px; padding-top: 20px; border-top: 1px solid var(--cp-border); }
 }
 @media (max-width: 600px) {
   .main-content { padding: 24px 16px 16px; }
@@ -411,6 +587,15 @@
   .criterion-content { padding: 0 16px 20px; }
   .sort-target { width: 100%; }
   .sort-target select { max-width: 100%; flex: 1; }
+  .grade-library, .grade-source-list, .grade-freeze-actions, .grade-mobile-panel, .grade-history-content { padding: 16px; }
+  .grade-source-card { padding: 14px; }
+  .grade-history-nav { max-height: 200px; border-right: 0; border-bottom: 1px solid var(--cp-border); }
+  .grade-family-card .badge, .grade-source-card .badge, .grade-criterion-cell .badge { white-space: normal; }
+  .grade-context-fields .check-label { align-items: flex-start; }
+  .grade-work-list article { padding: 16px; }
+  .grade-hash-label { padding: 12px; }
+  .dialog-footer .button { white-space: normal; min-height: 40px; }
+  .grade-workspace-toolbar > .segmented { width: 100%; }
 }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation: none !important; transition: none !important; scroll-behavior: auto !important; }

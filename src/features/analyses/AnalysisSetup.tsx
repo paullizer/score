@@ -10,7 +10,7 @@ function ids(value: string | null): string[] {
 }
 
 export function AnalysisSetup() {
-  const { workspace, startAnalysis } = useWorkspace()
+  const { workspace, startAnalysis, cloud } = useWorkspace()
   const navigate = useNavigate()
   const [params] = useSearchParams()
   const rubrics = latestRubrics(workspace)
@@ -27,10 +27,11 @@ export function AnalysisSetup() {
   const selectedRubrics = rubrics.filter((rubric) => targets.includes(rubric.id))
   const ready = (id: string) => {
     const rubric = rubrics.find((item) => item.id === id)
-    return rubric && (rubric.kind === 'grade' || workspace.jobs.some((job) => job.rubricId === id && job.status === 'ready'))
+    return rubric && rubric.dataKind !== 'real' && (rubric.kind === 'grade' || workspace.jobs.some((job) => job.rubricId === id && job.status === 'ready' && job.dataKind !== 'real'))
   }
   const invalidResumes = resumes.filter((id) => !workspace.resumes.some((resume) => resume.id === id))
   const invalidTargets = targets.filter((id) => !ready(id))
+  const realTargets = targets.filter((id) => id.startsWith('grade-version-') || workspace.rubrics.some((rubric) => rubric.id === id && rubric.dataKind === 'real'))
   const hasInvalid = invalidResumes.length > 0 || invalidTargets.length > 0
   const shownResumes = workspace.resumes.filter((resume) => `${resume.name} ${resume.role}`.toLowerCase().includes(resumeSearch.toLowerCase()))
   const shownTargets = rubrics.filter((rubric) => rubric.kind === targetType && `${rubric.name} ${rubric.ladder ?? ''} ${rubric.grade ?? ''}`.toLowerCase().includes(targetSearch.toLowerCase()))
@@ -55,7 +56,7 @@ export function AnalysisSetup() {
     <PageHeader eyebrow="FROM CRITERIA TO CLARITY" title="Build an analysis" description="Choose who to compare, and what a great match means." />
     {previous && <div className="info-callout mb-5"><Layers3 size={18} /><div><strong>A new run, not a rewrite.</strong><p>Selections from "{previous.name}" use the latest available rubric versions. The previous results stay exactly as they were.</p></div></div>}
     {params.get('from') && !previous && <div className="mb-5"><InlineError>The previous analysis is no longer available. Select fresh inputs below.</InlineError></div>}
-    {hasInvalid && <div className="mb-5"><InlineError>Some requested inputs are missing, outdated, or not ready. They will not be silently skipped. <button className="ml-1 underline" onClick={() => { setResumes(resumes.filter((id) => !invalidResumes.includes(id))); setTargets(targets.filter((id) => !invalidTargets.includes(id))) }}>Remove unavailable selections</button></InlineError></div>}
+    {hasInvalid && <div className="mb-5"><InlineError>{realTargets.length ? 'Real job or GS grade rubrics were directly requested. Real-only and mixed real/sample selections cannot use the demo scorer. No inputs will be silently skipped.' : 'Some requested inputs are missing, outdated, or not ready. They will not be silently skipped.'} <button className="ml-1 underline" onClick={() => { setResumes(resumes.filter((id) => !invalidResumes.includes(id))); setTargets(targets.filter((id) => !invalidTargets.includes(id))) }}>Remove unavailable selections</button></InlineError></div>}
     <div className="analysis-builder">
       <div className="space-y-5">
         <section className="panel">
@@ -80,16 +81,17 @@ export function AnalysisSetup() {
             {shownTargets.map((rubric) => {
               const available = ready(rubric.id)
               const job = workspace.jobs.find((item) => item.id === rubric.jobId)
-              return <label className="selection-card" key={rubric.id} title={available ? undefined : 'Finish this job import before analysis.'}>
+              return <label className="selection-card" key={rubric.id} title={available ? undefined : rubric.dataKind === 'real' ? 'Real job and GS grade rubrics cannot use the fixture scorer.' : 'Finish this job import before analysis.'}>
                 <input type="checkbox" disabled={!available} checked={targets.includes(rubric.id)} onChange={() => toggle(rubric.id, targets, setTargets)} aria-label={`Include ${rubric.name}`} />
                 <span className="target-symbol">{rubric.kind === 'job' ? <BriefcaseBusiness size={16} /> : <Layers3 size={16} />}</span>
                 <div className="min-w-0"><strong className="block text-[12px] font-semibold">{rubric.kind === 'job' ? job?.title ?? rubric.name : rubric.name}</strong><span className="mt-1 block text-[10px] text-muted">{rubric.kind === 'job' ? job?.organization : rubric.ladder}</span>
-                  <div className="mt-2 flex flex-wrap gap-1.5"><Badge>{rubric.grade ?? job?.grade ?? 'Job-specific'}</Badge><Badge>{rubric.criteria.length} criteria / v{rubric.version}</Badge>{!available && <Badge tone="warning">Not ready</Badge>}</div></div>
+                  <div className="mt-2 flex flex-wrap gap-1.5"><Badge>{rubric.grade ?? job?.grade ?? 'Job-specific'}</Badge><Badge>{rubric.criteria.length} criteria / v{rubric.version}</Badge>{rubric.dataKind === 'real' ? <Badge tone="warning">Demo scoring disabled</Badge> : !available && <Badge tone="warning">Not ready</Badge>}</div></div>
               </label>
             })}
             {!shownTargets.length && <div className="col-span-full"><EmptyState title="No matching rubrics" description="Try another search or view the other target type." /></div>}
           </div>
-          {targetType === 'grade' && <div className="border-t px-5 py-3"><DemoNote>These are reusable illustrative grade rubrics, not official OPM eligibility assessments. No job selection is required.</DemoNote></div>}
+          {targetType === 'grade' && <div className="border-t px-5 py-3"><DemoNote>Only fictional sample grade rubrics can be selected. Real source-grounded grades are disabled, including direct and mixed selections. Samples are not official OPM eligibility assessments.</DemoNote></div>}
+          {targetType === 'job' && shownTargets.some((rubric) => rubric.dataKind === 'real') && <div className="border-t px-5 py-3"><DemoNote>Real job rubrics are shown for transparency but cannot be selected. This analysis uses only fictional fixture scoring.</DemoNote></div>}
         </section>
       </div>
       <aside className="analysis-summary panel" aria-label="Analysis summary">
@@ -104,7 +106,7 @@ export function AnalysisSetup() {
           {error && <InlineError>{error}</InlineError>}
           <Button variant="primary" icon={ArrowRight} className="w-full" disabled={!resumes.length || !targets.length || hasInvalid || starting} onClick={run}>{starting ? 'Starting...' : 'Run sample analysis'}</Button>
           {(!resumes.length || !targets.length) && <p className="text-center text-[10px] text-muted">Select at least one resume and one rubric.</p>}
-          <div className="flex items-start gap-2 text-[10px] text-muted"><ShieldCheck size={14} className="mt-0.5 shrink-0" /><p>Fictional content. Simulated scoring. Your selections stay on this device.</p></div>
+          <div className="flex items-start gap-2 text-[10px] text-muted"><ShieldCheck size={14} className="mt-0.5 shrink-0" /><p>Fictional content. Simulated scoring. {cloud ? 'Your selections are saved to this cloud workspace.' : 'Your selections stay on this device.'}</p></div>
         </div>
       </aside>
     </div>

@@ -1,6 +1,6 @@
 export type SourceKind = 'pdf' | 'url' | 'website'
 export type CriterionKey = 'technical' | 'delivery' | 'analysis' | 'communication' | 'leadership' | 'policy' | 'custom'
-export type JobStatus = 'parsing' | 'generating' | 'ready' | 'error' | 'cancelled'
+export type JobStatus = 'queued' | 'parsing' | 'generating' | 'ready' | 'error' | 'cancelled'
 export type ComparisonStatus = 'queued' | 'running' | 'complete' | 'failed' | 'cancelled'
 
 export interface DocumentParagraph {
@@ -16,7 +16,7 @@ export interface SourceDocument {
   kind: 'job' | 'resume'
   version: number
   paragraphs: DocumentParagraph[]
-  sample: true
+  sample: boolean
 }
 
 export interface Criterion {
@@ -27,6 +27,8 @@ export interface Criterion {
   weight: number
   guidance: string
   sourceParagraphId?: string
+  requirementType?: 'required' | 'preferred'
+  sourceCitations?: Citation[]
 }
 
 export interface Rubric {
@@ -41,6 +43,8 @@ export interface Rubric {
   version: number
   criteria: Criterion[]
   createdAt: string
+  dataKind?: 'real'
+  provenance?: { kind: 'generated' | 'edited'; model: string; promptVersion: string }
 }
 
 export interface Job {
@@ -58,9 +62,10 @@ export interface Job {
   documentId: string
   rubricId: string | null
   status: JobStatus
-  errorStage?: 'parsing' | 'rubric'
+  errorStage?: 'download' | 'parsing' | 'rubric'
   error?: string
   createdAt: string
+  dataKind?: 'real'
 }
 
 export interface Resume {

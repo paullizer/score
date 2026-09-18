@@ -1,0 +1,12 @@
+.git
+.azure
+.env
+.env.*
+node_modules
+dist
+dist-server
+dist-worker
+dist-renderer
+*.local
+*.log
+*.tsbuildinfo
