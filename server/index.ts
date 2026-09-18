@@ -7,6 +7,8 @@ import { createAzureStateStore } from './azure-state-store'
 import { ConfigError, loadConfig, type Config } from './config'
 import { createAzureJobBlobStore, createAzureJobStore } from './jobs/azure-store'
 import { createAzureGradeBlobStore, createAzureGradeStore } from './grades/azure-store'
+import { createAzureResumeBlobStore, createAzureResumeStore } from './resumes/azure-store'
+import { createAzureAnalysisBlobStore, createAzureAnalysisStore } from './analyses/azure-store'
 
 const DEFAULT_PORT = 8080
 
@@ -57,7 +59,19 @@ function main(): void {
         blobs: createAzureGradeBlobStore(config.realGrades, credential),
       }
     : undefined
-  const app = createApp({ config, directory, state, jobs, grades })
+  const resumes = config.realResumes
+    ? {
+        store: createAzureResumeStore(config.realResumes, credential),
+        blobs: createAzureResumeBlobStore(config.realResumes, credential),
+      }
+    : undefined
+  const analyses = config.realAnalyses
+    ? {
+        store: createAzureAnalysisStore(config.realAnalyses, credential),
+        blobs: createAzureAnalysisBlobStore(config.realAnalyses, credential),
+      }
+    : undefined
+  const app = createApp({ config, directory, state, jobs, grades, resumes, analyses })
 
   const port = readPort()
   const host = config.authMode === 'dev-header' ? '127.0.0.1' : '0.0.0.0'

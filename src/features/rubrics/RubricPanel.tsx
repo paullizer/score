@@ -173,7 +173,7 @@ export function RubricPanel({ rubric, onSelectCriterion, onVersionSaved, readOnl
         </ol>
         <p className="mt-3 text-[10px] text-muted">Criterion weights produce an overall score out of 100. “Not assessed” means no score was assigned, not a zero.</p>
       </section>
-      <DemoNote>{rubric.dataKind === 'real' ? 'Generated and reviewer-edited rubric versions are source-grounded. Real job scoring is disabled in this preview.' : 'Demo scoring is deterministic, not an AI prediction. Review the source evidence rather than treating a score as a hiring decision.'}</DemoNote>
+      <DemoNote>{rubric.dataKind === 'real' ? 'Generated and reviewer-edited rubric versions are source-grounded. Real analysis freezes the exact selected version and requires human review. The fixture scorer never receives this rubric.' : 'Demo scoring is deterministic, not an AI prediction. Review the source evidence rather than treating a score as a hiring decision.'}</DemoNote>
     </div>
 
     {editing && <RubricEditor

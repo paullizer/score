@@ -14,6 +14,8 @@ import { GradeMatrix } from './GradeMatrix'
 import { GradeVersionHistory } from './GradeVersionHistory'
 import { gradeApprovalBlockers, gradeWorkActive } from './gradeUi'
 import { useGradeRequestKey } from './grade-request-hooks'
+import { useRealAnalyses } from '../../app/real-analyses-context'
+import { ApprovedGradeAnalysis } from './ApprovedGradeAnalysis'
 
 export function GradeLadderPage({ ladderId: givenId }: { ladderId?: string }) {
   const { id } = useParams()
@@ -33,6 +35,10 @@ export function GradeLadderPage({ ladderId: givenId }: { ladderId?: string }) {
 
 function GradeLadderWorkspace({ detail, loadError }: { detail: GradeLadderDetail; loadError?: string }) {
   const api = useGradeLadders()!
+  const analyses = useRealAnalyses()
+  const refreshTargets = analyses?.refreshTargets
+  const targetStamp = detail.levels.map((level) => `${level.head.latestVersionId ?? ''}:${level.head.approvedVersionId ?? ''}`).join('|')
+  useEffect(() => { void refreshTargets?.() }, [refreshTargets, targetStamp])
   const [params, setParams] = useSearchParams()
   const [view, setView] = useState<'sources' | 'matrix' | 'history'>(() => params.get('version') ? 'history' : detail.levels.some((level) => level.version) ? 'matrix' : 'sources')
   const [grade, setGrade] = useState(Number(params.get('grade')) || detail.ladder.grades[0] || 1)
@@ -87,6 +93,7 @@ function GradeLadderWorkspace({ detail, loadError }: { detail: GradeLadderDetail
   function approve(level: GradeLevelDetail) {
     if (!level.version || !level.review || gradeApprovalBlockers(detail, level).length || sourceDirty) return Promise.reject(new Error('The latest grade version is not supported for approval.'))
     return run(() => api.approve(detail.ladder.id, level.head.grade, { versionId: level.version!.id, reviewId: level.review!.id }, level.etag), `GS-${level.head.grade} version ${level.version.version} was reviewer approved. Its captured evidence remains immutable.`)
+      .then(() => { void analyses?.refreshTargets() })
   }
   const generationBlocked = !api.canWrite ? 'Read-only workspace: an owner or editor can generate grades.' : sourceDirty ? 'Confirm or discard unsaved source decisions first.' : !detail.sourceSet || detail.sourceSet.id !== detail.ladder.sourceSetId ? 'Review sources and confirm a current frozen source set first.' : active ? 'Wait for current discovery, extraction, generation, or review to finish, or cancel that work.' : ''
 
@@ -100,6 +107,7 @@ function GradeLadderWorkspace({ detail, loadError }: { detail: GradeLadderDetail
     {detail.ladder.discovery && <div className="grade-discovery-context"><strong>{detail.ladder.discovery.seriesTitle || `Series ${detail.ladder.context.series}`}</strong><Badge tone={detail.ladder.discovery.seriesStatus === 'listed' ? 'neutral' : 'warning'}>{detail.ladder.discovery.seriesStatus} in discovered catalog</Badge><span>Catalog / adapter {detail.ladder.discovery.catalogVersion} · captured {detail.ladder.discovery.capturedAt}</span></div>}
     {generationBlocked && <p className="mb-4 text-[11px] text-muted">{generationBlocked}</p>}
     <GradeDisclaimer />
+    <div className="panel mb-5 px-5 pb-5"><ApprovedGradeAnalysis ladderId={detail.ladder.id} /></div>
     {!api.canWrite && <div className="info-callout mb-5"><p>This workspace is read-only. You can inspect captured evidence, grade drafts, and immutable history; only owners and editors can change or approve them.</p></div>}
     {loadError && <InlineError>{loadError} The last acknowledged detail is retained. <Button size="sm" onClick={() => void api.ensureDetail(detail.ladder.id, true)}>Reload from server</Button></InlineError>}
     {error && <div className="mb-5"><InlineError>{error}<p className="mt-1">A lost response does not prove the request failed. Reload the server state before changing an uncertain request; unchanged idempotent requests reuse their key.</p></InlineError></div>}

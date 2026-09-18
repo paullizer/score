@@ -4,6 +4,7 @@ import { useGradeLadders } from '../../app/grade-ladders-context'
 import { Badge, Button, EmptyState, InlineError } from '../../components/ui'
 import { gradeLadderLink } from './gradeUi'
 import { GradeDisclaimer, GradeStatus } from './GradeShared'
+import { ApprovedGradeAnalysis } from './ApprovedGradeAnalysis'
 
 export function GradeLadderLibrary({ search = '' }: { search?: string }) {
   const api = useGradeLadders()
@@ -25,6 +26,7 @@ export function GradeLadderLibrary({ search = '' }: { search?: string }) {
         <Link to={gradeLadderLink(ladder.id, head.grade)}>GS-{head.grade}</Link><GradeStatus status={head.status} />
       </li>)}</ul>
       <Link to={gradeLadderLink(ladder.id)} className="text-link">Open sources and grade matrix <ArrowRight size={14} aria-hidden="true" /></Link>
+      <ApprovedGradeAnalysis ladderId={ladder.id} />
       <span className="grade-family-id" title={ladder.id}>Family {ladder.id}</span>
     </article>)}</div>}
     {!visible.length && api.phase === 'ready' && <EmptyState icon={Layers3} title={search ? 'No matching real ladders' : 'Prepare your first real GS ladder'}

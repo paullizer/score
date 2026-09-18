@@ -9,6 +9,10 @@ import { DocumentViewer } from '../../components/documents/DocumentViewer'
 import { RubricPanel } from '../rubrics/RubricPanel'
 import { JobImport } from './JobImport'
 import { useGradeLadders } from '../../app/grade-ladders-context'
+import { useRealAnalyses } from '../../app/real-analyses-context'
+import { sampleDataLink } from '../../app/real-data-mode'
+import { realAnalysisLink } from '../analyses/realAnalysisUi'
+import type { RealAnalysisTargetSelection } from '../../domain/real-analyses'
 
 const sourceNames = { pdf: 'PDF document', url: 'Direct URL', website: 'Website' }
 const sourceIcons = { pdf: FileText, url: Link2, website: Globe2 }
@@ -16,11 +20,13 @@ const sourceIcons = { pdf: FileText, url: Link2, website: Globe2 }
 export function JobsPage() {
   const { workspace, cancelJob, retryJob, cloud } = useWorkspace()
   const navigate = useNavigate()
+  const analyses = useRealAnalyses()
   const [query, setQuery] = useState('')
   const [filter, setFilter] = useState<'all' | 'ready' | 'attention'>('all')
   const [source, setSource] = useState<'all' | SourceKind>('all')
   const [sort, setSort] = useState('newest')
   const [selected, setSelected] = useState<string[]>([])
+  const [selectedRealTargets, setSelectedRealTargets] = useState<Record<string, RealAnalysisTargetSelection>>({})
   const [importOpen, setImportOpen] = useState(false)
   const [libraryKind, setLibraryKind] = useState<'real' | 'samples'>(() => cloud ? 'real' : 'samples')
   const libraryJobs = workspace.jobs.filter((job) => libraryKind === 'real' ? job.dataKind === 'real' : job.dataKind !== 'real')
@@ -31,10 +37,25 @@ export function JobsPage() {
     return matchesQuery && (source === 'all' || job.source === source) &&
       (filter === 'all' || (filter === 'ready' ? job.status === 'ready' : job.status === 'error' || job.status === 'cancelled'))
   }).sort((a, b) => sort === 'title' ? a.title.localeCompare(b.title) : b.createdAt.localeCompare(a.createdAt))
-  const visibleReady = filtered.filter((job) => job.status === 'ready' && job.dataKind !== 'real').map((job) => job.id)
-  const selectedJobs = workspace.jobs.filter((job) => selected.includes(job.id) && job.dataKind !== 'real')
+  const realTargets = analyses?.targets.state === 'ready' && !analyses.targets.error ? analyses.targets.value : []
+  const canSelectReal = analyses?.canWrite && analyses.phase === 'ready' && analyses.features?.realAnalyses
+  const visibleReady = filtered.filter((job) => job.status === 'ready' && (job.dataKind !== 'real' || (canSelectReal && targetForJob(job.id)))).map((job) => job.id)
+  const selectedJobs = libraryJobs.filter((job) => selected.includes(job.id))
   const allVisible = visibleReady.length > 0 && visibleReady.every((id) => selected.includes(id))
-  function toggle(id: string) { setSelected((values) => values.includes(id) ? values.filter((value) => value !== id) : [...values, id]) }
+  function targetForJob(id: string) {
+    const job = workspace.jobs.find((item) => item.id === id)
+    const rubric = workspace.rubrics.find((item) => item.id === job?.rubricId)
+    return realTargets.find((target) => target.kind === 'job' && target.selection.jobId === id
+      && target.selection.rubricId === rubric?.id && target.selection.rubricVersion === rubric?.version)
+  }
+  function selectJobs(ids: string[]) {
+    setSelected(ids)
+    setSelectedRealTargets((current) => Object.fromEntries(ids.flatMap((id) => {
+      const selection = current[id] ?? targetForJob(id)?.selection
+      return selection ? [[id, selection]] : []
+    })))
+  }
+  function toggle(id: string) { selectJobs(selected.includes(id) ? selected.filter((value) => value !== id) : [...selected, id]) }
 
   return <>
     <PageHeader eyebrow="A CLEARER STARTING POINT" title="Your jobs" description="Bring the roles together. Define what a great match looks like."
@@ -42,11 +63,11 @@ export function JobsPage() {
     <div className="welcome-panel">
       <div className="flex items-center"><span className="welcome-symbol"><ScanLine size={25} strokeWidth={1.4} /></span><div><h2>Good matches start with clear criteria.</h2><p>Every job gets its own rubric. Every score leads back to evidence. Nothing important stays a black box.</p></div></div>
       <div className="welcome-action"><div className="mini-path" aria-hidden="true"><span><BriefcaseBusiness size={16} /></span><ChevronRight size={11} /><span><Layers3 size={16} /></span><ChevronRight size={11} /><span><BarChart3 size={16} /></span></div>
-        <Button size="sm" icon={ArrowUpRight} onClick={() => navigate(workspace.runs.length ? `/analyses/${workspace.runs[0].id}` : '/analyses/new')}>See it in action</Button>
+        <Button size="sm" icon={ArrowUpRight} onClick={() => navigate(cloud ? '/analyses?data=real' : workspace.runs.length ? `/analyses/${workspace.runs[0].id}` : '/analyses/new')}>{cloud ? 'Review analyses' : 'See it in action'}</Button>
       </div>
     </div>
     <section className="panel" aria-label="Job library">
-      {cloud && <div className="library-kind-switcher"><SegmentedControl label="Choose real jobs or samples" value={libraryKind} onChange={(value) => { setLibraryKind(value); setSelected([]) }} options={[
+      {cloud && <div className="library-kind-switcher"><SegmentedControl label="Choose real jobs or samples" value={libraryKind} onChange={(value) => { setLibraryKind(value); selectJobs([]) }} options={[
         { value: 'real', label: 'Real jobs', count: workspace.jobs.filter((job) => job.dataKind === 'real').length },
         { value: 'samples', label: 'Samples', count: workspace.jobs.filter((job) => job.dataKind !== 'real').length },
       ]} /><span>{libraryKind === 'real' ? 'Private source imports and generated rubrics' : 'Fictional examples for the simulated preview'}</span></div>}
@@ -62,19 +83,25 @@ export function JobsPage() {
         </div>
       </div>
       {selectedJobs.length > 0 && <div className="selection-bar"><span><strong>{selectedJobs.length}</strong> {selectedJobs.length === 1 ? 'job' : 'jobs'} selected{selectedJobs.some((job) => !filtered.includes(job)) && ' (including hidden rows)'}</span>
-        <div className="flex items-center gap-2"><Button variant="ghost" size="sm" onClick={() => setSelected([])}>Clear</Button><Button size="sm" variant="primary" icon={Sparkles} onClick={() => {
-          navigate(`/analyses/new?rubrics=${selectedJobs.map((job) => job.rubricId).filter(Boolean).join(',')}`)
+        <div className="flex items-center gap-2"><Button variant="ghost" size="sm" onClick={() => selectJobs([])}>Clear</Button><Button size="sm" variant="primary" icon={Sparkles}
+          disabled={selectedJobs.length !== selected.length || (libraryKind === 'real' && (!canSelectReal || selected.some((id) => !selectedRealTargets[id])))}
+          onClick={() => {
+          if (libraryKind === 'real') {
+            if (!analyses) return
+            const link = realAnalysisLink({ targets: selected.map((id) => selectedRealTargets[id]) }, analyses.workspaceId)
+            navigate(link.to, { state: link.state })
+          } else navigate(sampleDataLink(`/analyses/new?rubrics=${selectedJobs.map((job) => job.rubricId).join(',')}`, Boolean(cloud)))
         }}>Analyze selected</Button></div>
       </div>}
       {filtered.length ? <div className="table-wrap"><table className="data-table">
-        <thead><tr><th className="checkbox-cell"><input type="checkbox" aria-label="Select all visible ready jobs" checked={allVisible} disabled={!visibleReady.length} onChange={() => setSelected((values) => allVisible ? values.filter((id) => !visibleReady.includes(id)) : [...new Set([...values, ...visibleReady])])} /></th>
+        <thead><tr><th className="checkbox-cell"><input type="checkbox" aria-label="Select all visible ready jobs" checked={allVisible} disabled={!visibleReady.length} onChange={() => selectJobs(allVisible ? selected.filter((id) => !visibleReady.includes(id)) : [...new Set([...selected, ...visibleReady])])} /></th>
           <th>Job / organization</th><th className="mobile-hide">Source</th><th className="mobile-hide">Rubric</th><th className="mobile-hide">Added</th><th><span className="sr-only">Actions</span></th></tr></thead>
         <tbody>{filtered.map((job) => {
           const Icon = sourceIcons[job.source]
           const rubric = workspace.rubrics.find((item) => item.id === job.rubricId)
           const processing = job.status === 'queued' || job.status === 'parsing' || job.status === 'generating'
           return <tr key={job.id} className={selected.includes(job.id) ? 'row-selected' : ''}>
-            <td className="checkbox-cell"><input type="checkbox" aria-label={`Select ${job.title}`} disabled={job.status !== 'ready' || job.dataKind === 'real'} checked={selected.includes(job.id)} title={job.dataKind === 'real' ? 'Real jobs cannot use demo scoring.' : job.status === 'ready' ? 'Select for analysis' : 'The rubric must be ready before analysis'} onChange={() => toggle(job.id)} /></td>
+            <td className="checkbox-cell"><input type="checkbox" aria-label={`Select ${job.title}`} disabled={!visibleReady.includes(job.id) && !selected.includes(job.id)} checked={selected.includes(job.id)} title={job.dataKind === 'real' ? 'Select this exact saved real target for manual analysis with ready real resumes.' : job.status === 'ready' ? 'Select for sample analysis' : 'The rubric must be ready before analysis'} onChange={() => toggle(job.id)} /></td>
             <td><div className="job-cell"><span className="job-monogram"><Building2 size={19} strokeWidth={1.4} /></span><div><Link to={`/jobs/${job.id}`} className="row-title">{job.title}</Link><div className="row-meta">{job.organization}</div>{(job.grade || job.arrangement) && <div className="job-submeta">{[job.grade, job.arrangement].filter(Boolean).join(' / ')}</div>}<div className="job-mobile-status"><StatusBadge status={job.status} /><span className="source-type"><Icon size={12} />{sourceNames[job.source]}</span></div></div></div></td>
             <td className="mobile-hide"><span className="source-type"><Icon size={13} />{sourceNames[job.source]}</span><div className="row-meta">{job.dataKind === 'real' ? 'Private source' : job.batchId ? 'Batch import' : 'Sample source'}</div></td>
             <td className="mobile-hide"><StatusBadge status={job.status} /><div className="row-meta">{rubric ? `${rubric.criteria.length} criteria / v${rubric.version}` : job.status === 'error' ? `${job.errorStage === 'rubric' ? 'Rubric' : 'Document'} needs a retry` : processing ? job.dataKind === 'real' ? 'Server processing in progress' : 'Simulated import in progress' : job.status === 'queued' ? 'Waiting for a worker' : 'Not yet assessed'}</div></td>
@@ -92,7 +119,7 @@ export function JobsPage() {
             action={<Button onClick={() => { if (!libraryJobs.length && libraryKind === 'real') setImportOpen(true); else { setQuery(''); setFilter('all'); setSource('all') } }}>{libraryJobs.length ? 'Clear filters' : libraryKind === 'real' ? 'Import a real job' : 'Show all samples'}</Button>} />}
       <div className="table-bottom"><span>Showing {filtered.length} of {libraryJobs.length} {libraryKind === 'real' ? 'real' : 'sample'} jobs</span><label className="flex items-center gap-2">Sort by<select className="bg-transparent text-[10px] outline-offset-2" value={sort} onChange={(event) => setSort(event.target.value)} aria-label="Sort jobs"><option value="newest">Newest first</option><option value="title">Job title</option></select></label></div>
     </section>
-    <div className="library-note"><DemoNote>{libraryKind === 'real' ? 'Real PDF and URL content is privately read and stored. Resume import and scoring remain simulated.' : cloud ? 'Sample jobs and rubrics are fictional and remain separate from real imports.' : 'Example jobs and rubrics are fictional. Add a source to explore the import workflow.'}</DemoNote><Link className="text-link shrink-0 mobile-hide" to="/rubrics">How rubrics work <ArrowRight size={12} /></Link></div>
+    <div className="library-note"><DemoNote>{libraryKind === 'real' ? 'Real sources are private. Select ready real resumes in the separate analysis builder, review exact target versions, then explicitly run evidence assessment. Samples alone use simulated scoring.' : cloud ? 'Sample jobs and rubrics are fictional and remain separate from real imports.' : 'Example jobs and rubrics are fictional. Add a source to explore the import workflow.'}</DemoNote><Link className="text-link shrink-0 mobile-hide" to="/rubrics">How rubrics work <ArrowRight size={12} /></Link></div>
     {importOpen && <JobImport onClose={() => setImportOpen(false)} />}
   </>
 }
@@ -102,14 +129,20 @@ export function JobDetail() {
   const { workspace, retryJob, cancelJob, notify, cloud } = useWorkspace()
   const navigate = useNavigate()
   const gradeLadders = useGradeLadders()
+  const analyses = useRealAnalyses()
   const [highlighted, setHighlighted] = useState<{ id: string; quote?: string }>()
   const [pane, setPane] = useState<'document' | 'rubric'>('document')
   const job = workspace.jobs.find((item) => item.id === id)
   const real = job?.dataKind === 'real'
   const detail = real && id && cloud ? cloud.realJobs.detail(id) : undefined
+  const savedRubricVersion = workspace.rubrics.find((item) => item.id === job?.rubricId)?.version
+  const refreshTargets = analyses?.refreshTargets
   useEffect(() => {
     if (real && id && cloud) void cloud.realJobs.ensureDetail(id)
   }, [cloud, id, real])
+  useEffect(() => {
+    if (real && job?.status === 'ready') void refreshTargets?.()
+  }, [job?.id, job?.status, real, refreshTargets, savedRubricVersion])
   if (!job && cloud && id?.startsWith('job-') && cloud.realJobs.phase === 'loading') {
     return <EmptyState icon={LoaderCircle} title="Loading the real job" description="Retrieving this workspace's server-owned job records." />
   }
@@ -119,6 +152,8 @@ export function JobDetail() {
   if (!job) return <EmptyState title="This job is not in your workspace" description="Your other jobs are available in the library." action={<Button onClick={() => navigate('/jobs')}>Back to jobs</Button>} />
   const document = workspace.documents.find((item) => item.id === job.documentId)
   const rubric = workspace.rubrics.find((item) => item.id === job.rubricId)
+  const target = analyses?.targets.state === 'ready' ? analyses.targets.value.find((item) => item.kind === 'job' && item.selection.jobId === job.id && item.selection.rubricId === rubric?.id && item.selection.rubricVersion === rubric?.version) : undefined
+  const analysisReady = job.status === 'ready' && (!real || (target && analyses?.phase === 'ready' && analyses.canWrite && analyses.features?.realAnalyses && analyses.targets.state === 'ready' && !analyses.targets.error))
   const processing = job.status === 'queued' || job.status === 'parsing' || job.status === 'generating'
   const source = real && cloud ? cloud.realJobs.source(job.id) : undefined
   const summary = real && cloud ? cloud.realJobs.summaries.find((item) => item.job.id === job.id) : undefined
@@ -136,9 +171,18 @@ export function JobDetail() {
       actions={<>{real && <Button icon={Layers3} disabled={job.status !== 'ready' || !rubric || !gradeLadders?.canWrite || gradeLadders.phase !== 'ready'}
         title={!gradeLadders?.canWrite ? 'An owner or editor in a grade-enabled workspace can create a ladder.' : job.status !== 'ready' || !rubric ? 'Wait for the real job and saved rubric to be ready.' : gradeLadders.phase !== 'ready' ? 'Real grade processing is not currently available.' : 'Capture this real job and exact saved rubric version as a new grade family.'}
         onClick={() => navigate(`/grade-ladders/new?${new URLSearchParams({ job: job.id, rubric: rubric!.id, rubricVersion: String(rubric!.version) })}`)}>Create grade ladder</Button>}
-        <Button variant="primary" icon={Sparkles} disabled={job.status !== 'ready' || real} title={real ? 'Real job scoring is not enabled in this preview.' : undefined} onClick={() => navigate(`/analyses/new?rubrics=${job.rubricId}`)}>Analyze applicants</Button></>} />
+        <Button variant="primary" icon={Sparkles} disabled={!analysisReady} title={real ? 'Requires an eligible saved real target and write access to real analyses.' : undefined}
+          onClick={() => {
+            if (real) {
+              if (target && analyses) {
+                const link = realAnalysisLink({ targets: [target.selection] }, analyses.workspaceId)
+                navigate(link.to, { state: link.state })
+              }
+            }
+            else navigate(sampleDataLink(`/analyses/new?rubrics=${job.rubricId}`, Boolean(cloud)))
+          }}>Analyze applicants</Button></>} />
     <div className="detail-metadata">{job.location && <span><MapPin size={13} />{job.location}</span>}{(job.arrangement || job.employmentType) && <span><BriefcaseBusiness size={13} />{[job.arrangement, job.employmentType].filter(Boolean).join(' / ')}</span>}{job.grade && <Badge>{job.grade}</Badge>}{job.series && <Badge>Series {job.series}</Badge>}<StatusBadge status={job.status} /></div>
-    {real && <div className="info-callout mb-5"><ShieldCheck size={18} /><div><strong>Generated from the private source</strong><p>This job and rubric are server-owned. Demo scoring is disabled; review and edit the source-grounded criteria instead.</p></div></div>}
+    {real && <div className="info-callout mb-5"><ShieldCheck size={18} /><div><strong>Generated from the private source</strong><p>This job and rubric are server-owned. Analyze applicants opens a separate, manual real analysis with this exact saved version; fictional samples cannot be mixed in.</p></div></div>}
     {job.error && <div className="mb-5"><InlineError>
       <strong>{job.errorStage === 'rubric' ? 'The job is preserved; its rubric needs attention. ' : summary?.error?.code ? `${summary.error.code}: ` : ''}</strong>
       {job.error}
@@ -152,7 +196,7 @@ export function JobDetail() {
     <div className="split-layout">
       <section className={`detail-panel ${pane !== 'document' ? 'mobile-pane-hidden' : ''}`} aria-label="Job description">
         <div className="section-heading"><div><h2>The role, in its own words</h2><p>Source context for every criterion</p></div><FileText size={17} className="text-muted" /></div>
-        {document ? <DocumentViewer document={document} highlightedId={highlighted?.id} quote={highlighted?.quote} /> : real && (detail?.state === 'idle' || detail?.state === 'loading')
+        {document ? <DocumentViewer document={document} highlightedId={highlighted?.id} quote={highlighted?.quote} pagination={real && source?.originalContentType === 'text/html' ? 'html-sections' : 'pdf-pages'} /> : real && (detail?.state === 'idle' || detail?.state === 'loading')
           ? <EmptyState icon={LoaderCircle} title="Loading the parsed source" description="Score is retrieving the private source document and exact paragraph references." />
           : processing ? <EmptyState icon={LoaderCircle} title="Source processing is not complete" description="The worker is reading this source asynchronously. This page will refresh while the durable job remains queued." />
             : <EmptyState title="Source document unavailable" description={real ? 'The server has not returned a parsed source document. Review the job error or retry the import.' : 'This sample could not be opened. Reset the demo to restore the original document.'} />}
@@ -170,6 +214,6 @@ export function JobDetail() {
         </div>}
       </section>
     </div>
-    <div className="mt-5"><DemoNote>{real ? 'This rubric was generated from the displayed source. Select a citation to locate its exact paragraph. Demo scoring is disabled.' : 'The job text and criteria are illustrative. Select a rubric requirement to locate its source passage.'}</DemoNote></div>
+    <div className="mt-5"><DemoNote>{real ? 'This rubric was generated from the displayed source. Select a citation to locate its exact paragraph. Real analysis uses frozen sources and requires human review; the sample scorer never receives these inputs.' : 'The job text and criteria are illustrative. Select a rubric requirement to locate its source passage.'}</DemoNote></div>
   </>
 }

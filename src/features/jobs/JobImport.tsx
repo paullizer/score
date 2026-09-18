@@ -149,7 +149,7 @@ function RealJobImport({ onClose }: { onClose: () => void }) {
       {item.state === 'error' && <Button size="sm" variant="ghost" icon={RotateCcw} aria-label={`Retry ${item.label}`} onClick={() => void submit([item])}>Retry</Button>}
     </div>)}</div>}
     <div className="info-callout mt-5"><FileText size={18} /><div><strong>Processing continues on the server</strong><p>Uploads become durable queued records individually. Extraction and rubric generation may take a minute to start; closing this panel or workspace does not cancel them.</p></div></div>
-    <DemoNote>Resume imports and scoring are still simulated. Real job sources are read and stored privately for this workspace.</DemoNote>
+    <DemoNote>Real job sources are read and stored privately. Import real resumes separately, then manually choose ready inputs for real analysis. Only the Samples workflow uses simulated scoring.</DemoNote>
     {error && <div className="mt-5"><InlineError>{error}</InlineError></div>}
   </Modal>
 }

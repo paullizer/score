@@ -16,6 +16,8 @@ param containerImage string
 param workerImage string
 param rendererImage string
 param gradeWorkerImage string
+param resumeWorkerImage string
+param analysisWorkerImage string
 
 @allowed(['B1', 'B2', 'B3', 'S1'])
 param appServiceSku string = 'B1'
@@ -51,6 +53,8 @@ module resources 'resources.bicep' = {
     workerImage: workerImage
     rendererImage: rendererImage
     gradeWorkerImage: gradeWorkerImage
+    resumeWorkerImage: resumeWorkerImage
+    analysisWorkerImage: analysisWorkerImage
     appServiceSku: appServiceSku
     searchSku: searchSku
   }
@@ -89,3 +93,9 @@ output AZURE_JOB_RENDERER_URL string = resources.outputs.rendererUrl
 output AZURE_GRADE_WORKER_NAME string = resources.outputs.gradeWorkerName
 output AZURE_GRADE_WORKER_ID string = resources.outputs.gradeWorkerId
 output AZURE_GRADE_WORKER_PRINCIPAL_ID string = resources.outputs.gradeWorkerPrincipalId
+output AZURE_RESUME_WORKER_NAME string = resources.outputs.resumeWorkerName
+output AZURE_RESUME_WORKER_ID string = resources.outputs.resumeWorkerId
+output AZURE_RESUME_WORKER_PRINCIPAL_ID string = resources.outputs.resumeWorkerPrincipalId
+output AZURE_ANALYSIS_WORKER_NAME string = resources.outputs.analysisWorkerName
+output AZURE_ANALYSIS_WORKER_ID string = resources.outputs.analysisWorkerId
+output AZURE_ANALYSIS_WORKER_PRINCIPAL_ID string = resources.outputs.analysisWorkerPrincipalId
