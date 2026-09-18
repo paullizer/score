@@ -6,6 +6,8 @@ import {
   cancelRealJob,
   fetchJobProcessingFeatures,
   getRealJob,
+  importRealJobFile,
+  importRealJobMarkdown,
   importRealJobPdf,
   importRealJobUrl,
   listAllRealJobs,
@@ -16,8 +18,9 @@ import {
 } from '../services/realJobs'
 import type { Rubric } from '../domain/types'
 import { WorkspaceContext, type CloudWorkspaceStatus, type PendingLifecycleChange, type WorkspaceContextValue } from './workspace-context'
+import { uploadedFileKind } from '../domain/source-files'
 import { projectRealJobs } from './realJobsProjection'
-import { isEntityArchived, type LifecycleAction, type LifecycleTarget } from '../domain/lifecycle'
+import { isEntityArchived, isEntityRemoved, type LifecycleAction, type LifecycleTarget } from '../domain/lifecycle'
 
 const POLL_INTERVAL_MS = 2000
 const ACTIVE_STATUSES = new Set(['queued', 'parsing', 'generating'])
@@ -159,7 +162,7 @@ export function RealJobsBridge({
       setFeatures(value)
       if (!value.realJobImports) {
         setPhase('unavailable')
-        setListError('Real PDF and direct URL imports are not available in this deployment.')
+        setListError('Real job imports are not available in this deployment.')
         return
       }
       void refresh()
@@ -247,7 +250,7 @@ export function RealJobsBridge({
     const state = currentCloud.current
     const metadata = state.workspaces.find((item) => item.id === workspaceId)
     if (!metadata || metadata.role === 'viewer' || metadata.deletedAt) throw new Error('This workspace is read-only or unavailable.')
-    if (!lifecycle && (metadata.archivedAt || (metadata.lifecycleOperation && metadata.lifecycleOperation.status !== 'complete') || (target && isEntityArchived(workspace, target)))) {
+    if (!lifecycle && (metadata.archivedAt || (metadata.lifecycleOperation && metadata.lifecycleOperation.status !== 'complete') || (target && (isEntityArchived(workspace, target) || isEntityRemoved(workspace, target))))) {
       throw new Error('Archived content is read-only. Unarchive its parent and the item before editing or starting work.')
     }
   }
@@ -292,6 +295,25 @@ export function RealJobsBridge({
     return mutate(() => importRealJobUrl(workspaceId, url, idempotencyKey, batchId), remember)
   }
 
+  function assertMarkdownAvailable() {
+    if (!features?.realJobImports || !features.markdownJobImports) {
+      throw new Error('Markdown job imports are not enabled in this deployment. PDF and direct URL imports are unchanged.')
+    }
+  }
+
+  async function importMarkdown(file: File, idempotencyKey: string, batchId?: string) {
+    assertMarkdownAvailable()
+    return mutate(() => importRealJobMarkdown(workspaceId, file, idempotencyKey, batchId), remember)
+  }
+
+  async function importFile(file: File, idempotencyKey: string, batchId?: string) {
+    if (uploadedFileKind(file) === 'markdown') assertMarkdownAvailable()
+    if (['docx', 'doc'].includes(uploadedFileKind(file) ?? '') && (!features?.realJobImports || !features.wordDocumentImports)) {
+      throw new Error('Word document imports are not enabled in this deployment.')
+    }
+    return mutate(() => importRealJobFile(workspaceId, file, idempotencyKey, batchId), remember)
+  }
+
   async function cancelJob(id: string) {
     const job = workspace.jobs.find((item) => item.id === id)
     if (job?.dataKind !== 'real') return legacyValue.cancelJob(id)
@@ -322,10 +344,12 @@ export function RealJobsBridge({
     if (!jobId) throw new Error('This real rubric is missing its linked job.')
     const summary = summaries.find((item) => item.job.id === jobId)
     if (!summary) throw new Error('Refresh this job before saving its rubric.')
+    if (summary.job.rubricDeletedAt || summary.rubricLifecycle?.deletingAt || summary.rubricLifecycle?.deletedAt) throw new Error('This logical rubric was permanently removed or is awaiting cleanup. Saving an older draft cannot restore it.')
     try {
       const detail = await mutate(() => saveRealJobRubric(workspaceId, jobId, rubric, summary.etag), remember, { kind: 'rubric', id: rubric.groupId })
+      if (!detail.rubric || detail.job.rubricDeletedAt) throw new Error('The service did not acknowledge a current rubric. No older version was substituted.')
       legacyValue.notify(`${detail.rubric?.name ?? rubric.name} saved as reviewer-edited version ${detail.rubric?.version ?? rubric.version + 1}.`)
-      return detail.rubric?.id ?? detail.rubricVersions.at(-1)?.id ?? rubric.id
+      return detail.rubric.id
     } catch (error) {
       if (error instanceof CloudConflictError) {
         await Promise.all([refresh(), ensureDetail(jobId, true)])
@@ -337,7 +361,7 @@ export function RealJobsBridge({
 
   function startAnalysis(resumeIds: string[], rubricIds: string[], name?: string, failFirst?: boolean): string {
     if (rubricIds.some((id) => workspace.rubrics.find((rubric) => rubric.id === id)?.dataKind === 'real')) {
-      throw new Error('Real job rubrics cannot use the demo scorer. Resume scoring remains a simulated preview.')
+      throw new Error('Real job rubrics cannot use the demo scorer. Use the separate real analysis workflow with ready real resumes.')
     }
     return legacyValue.startAnalysis(resumeIds, rubricIds, name, failFirst)
   }
@@ -401,6 +425,8 @@ export function RealJobsBridge({
     ensureDetail,
     refresh,
     importPdf,
+    importMarkdown,
+    importFile,
     importUrl,
     originalUrl: (jobId) => realJobOriginalUrl(workspaceId, jobId),
   }
@@ -421,7 +447,7 @@ export function RealJobsBridge({
     lifecycleOperations: [...(legacyValue.lifecycleOperations ?? []), ...pendingLifecycle],
     resetDemo: () => {
       legacyValue.resetDemo()
-      legacyValue.notify('Sample content was reset. Server-owned real jobs and rubric versions were not changed.')
+      legacyValue.notify('Sample content was reset. Server-owned real resumes, analyses, jobs, and rubric versions were not changed.')
     },
     cloud: { ...cloud, realJobs },
   }

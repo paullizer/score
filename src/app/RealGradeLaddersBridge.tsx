@@ -435,7 +435,7 @@ export function RealGradeLaddersBridge({ workspaceId, children }: { workspaceId:
     },
     resetDemo: () => {
       parent.resetDemo()
-      parent.notify('Only samples were reset. Real jobs, grade ladders, sources, and all saved versions are unchanged.')
+      parent.notify('Only samples were reset. Real resumes, analyses, jobs, grade ladders, captured sources, and saved versions are unchanged.')
     },
   }}>{children}</WorkspaceContext.Provider></GradeLaddersContext.Provider>
 }

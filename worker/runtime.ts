@@ -13,6 +13,13 @@ import type { Citation, Criterion, DocumentParagraph, Rubric, SourceDocument } f
 import type { JobBlobStore, RealJobStore } from '../server/jobs/store'
 import { isJobReadOnly, putJobBlob } from '../server/jobs/guards'
 import { validateRealSourceDocument } from '../server/jobs/validation'
+import {
+  isOriginalContentType, isWordContentType, originalExtension, UPLOAD_CONTENT_TYPES,
+  type OriginalContentType, type WordFormat,
+} from '../src/domain/document-formats'
+import { hasOleSignature, hasZipSignature, parseWordFile, WordDocumentError } from '../server/documents/word'
+import { MarkdownInputError } from '../server/documents/markdown'
+import { extractMarkdownBlocks } from './markdown'
 
 const COGNITIVE_SCOPE = 'https://cognitiveservices.azure.com/.default'
 const DOCUMENT_API_VERSION = '2024-11-30'
@@ -27,6 +34,7 @@ const MAX_BROWSER_REQUESTS = 80
 const MAX_REDIRECTS = 5
 const REQUEST_TIMEOUT_MILLISECONDS = 30_000
 const AZURE_REQUEST_TIMEOUT_MILLISECONDS = 60_000
+const JOB_SECTION_HEADING = /^(?:responsibilities|duties|requirements|required qualifications|minimum qualifications|preferred qualifications|desired qualifications|qualifications|about the role|what you will do):?$/i
 
 export interface Clock {
   now(): Date
@@ -57,6 +65,8 @@ export interface SafeResponse {
   headers: Record<string, string>
   body: Uint8Array
   url: string
+  /** Followed redirect destinations, excluding the initial URL; absent when an adapter cannot report history. */
+  redirects?: string[]
 }
 
 export interface TransportRequest {
@@ -70,7 +80,7 @@ export interface TransportRequest {
   signal?: AbortSignal
 }
 
-export type PinnedTransport = (request: TransportRequest) => Promise<Omit<SafeResponse, 'url'>>
+export type PinnedTransport = (request: TransportRequest) => Promise<Omit<SafeResponse, 'url' | 'redirects'>>
 export type DnsResolver = (hostname: string) => Promise<string[]>
 
 export interface SafeFetchOptions {
@@ -250,6 +260,7 @@ export async function safeFetch(input: string, options: SafeFetchOptions = {}): 
   const maxRedirects = options.maxRedirects ?? MAX_REDIRECTS
   let remainingBytes = maxBytes
   let current = validatePublicUrl(input)
+  const redirects: string[] = []
   let method = options.method ?? 'GET'
   let body = options.body
   if (body && body.byteLength > maxBytes) {
@@ -281,11 +292,12 @@ export async function safeFetch(input: string, options: SafeFetchOptions = {}): 
     remainingBytes -= response.body.byteLength
     if (remainingBytes < 0) throw new WorkerError('source-too-large', `Remote responses exceed ${maxBytes} aggregate bytes.`, false, 'download')
     if ([301, 302, 303, 307, 308].includes(response.status)) {
-      if (options.followRedirects === false) return { ...response, url: current.href }
+      if (options.followRedirects === false) return { ...response, url: current.href, redirects }
       const location = headerValue(response.headers, 'location')
       if (!location) throw new WorkerError('invalid-redirect', 'The source returned a redirect without a destination.', false, 'download')
       if (redirect === maxRedirects) throw new WorkerError('too-many-redirects', 'The source exceeded the redirect limit.', false, 'download')
       current = validatePublicUrl(new URL(location, current).href)
+      redirects.push(current.href)
       if (method === 'POST' && [301, 302, 303].includes(response.status)) {
         method = 'GET'
         body = undefined
@@ -301,7 +313,7 @@ export async function safeFetch(input: string, options: SafeFetchOptions = {}): 
     if (response.status < 200 || response.status >= 300) {
       throw new WorkerError('source-fetch-failed', `The source returned HTTP ${response.status}.`, false, 'download')
     }
-    return { ...response, url: current.href }
+    return { ...response, url: current.href, redirects }
   }
   throw new WorkerError('too-many-redirects', 'The source exceeded the redirect limit.', false, 'download')
 }
@@ -316,19 +328,32 @@ export function normalizeText(value: string): string {
     .trim()
 }
 
-function meaningfulText(value: string): boolean {
+function meaningfulText(value: string, minimumLength = 2): boolean {
   const text = normalizeText(value)
-  return text.length >= 2 && /[\p{L}\p{N}]/u.test(text)
+  return text.length >= minimumLength && /[\p{L}\p{N}]/u.test(text)
 }
 
-function createParagraphs(blocks: Array<{ text: string; page?: number; heading?: string }>): DocumentParagraph[] {
+export interface ParagraphOptions {
+  defaultHeading?: string
+  maxPages?: number
+  maxCharacters?: number
+  minimumTextLength?: number
+  emptySourceMessage?: string
+}
+
+export function createParagraphs(
+  blocks: Array<{ text: string; page?: number; heading?: string }>,
+  options: ParagraphOptions = {},
+): DocumentParagraph[] {
   const paragraphs: DocumentParagraph[] = []
-  let heading = 'Job posting'
+  const maxPages = options.maxPages ?? JOB_IMPORT_LIMITS.maxPdfPages
+  const maxCharacters = options.maxCharacters ?? JOB_IMPORT_LIMITS.maxSourceCharacters
+  let heading = options.defaultHeading ?? 'Job posting'
   for (const block of blocks) {
     const text = normalizeText(block.text)
-    if (!meaningfulText(text)) continue
-    if ((block.page ?? 1) > JOB_IMPORT_LIMITS.maxPdfPages) {
-      throw new WorkerError('pdf-too-many-pages', `PDF exceeds the ${JOB_IMPORT_LIMITS.maxPdfPages}-page limit.`, false, 'parsing')
+    if (!meaningfulText(text, options.minimumTextLength)) continue
+    if ((block.page ?? 1) > maxPages) {
+      throw new WorkerError('pdf-too-many-pages', `PDF exceeds the ${maxPages}-page limit.`, false, 'parsing')
     }
     if (block.heading) heading = normalizeText(block.heading)
     paragraphs.push({
@@ -339,13 +364,32 @@ function createParagraphs(blocks: Array<{ text: string; page?: number; heading?:
     })
   }
   const characters = paragraphs.reduce((total, paragraph) => total + paragraph.text.length + paragraph.heading.length, 0)
-  if (characters > JOB_IMPORT_LIMITS.maxSourceCharacters) {
-    throw new WorkerError('source-too-long', `Extracted source exceeds ${JOB_IMPORT_LIMITS.maxSourceCharacters} characters.`, false, 'parsing')
+  if (characters > maxCharacters) {
+    throw new WorkerError('source-too-long', `Extracted source exceeds ${maxCharacters} characters.`, false, 'parsing')
   }
   if (paragraphs.length === 0) {
-    throw new WorkerError('empty-source', 'The source did not contain readable job-posting text.', false, 'parsing')
+    throw new WorkerError('empty-source', options.emptySourceMessage ?? 'The source did not contain readable job-posting text.', false, 'parsing')
   }
   return paragraphs
+}
+
+export function extractMarkdown(bytes: Uint8Array, options: ParagraphOptions = {}): {
+  title?: string
+  paragraphs: DocumentParagraph[]
+} {
+  try {
+    const extracted = extractMarkdownBlocks(bytes)
+    return {
+      title: extracted.title ? normalizeText(extracted.title) : undefined,
+      paragraphs: createParagraphs(extracted.blocks, {
+        defaultHeading: 'Markdown source', minimumTextLength: 1,
+        emptySourceMessage: 'The Markdown file did not contain readable source text.', ...options,
+      }),
+    }
+  } catch (error) {
+    if (error instanceof MarkdownInputError) throw new WorkerError(error.code, error.message, false, 'parsing', { cause: error })
+    throw error
+  }
 }
 
 function jobPostingJsonLd(document: Document): Record<string, unknown> | undefined {
@@ -444,42 +488,111 @@ export interface BrowserRenderer {
   render(url: string, options: SafeFetchOptions): Promise<{ html: string; finalUrl: string }>
 }
 
-export function createRemoteRenderer(endpoint: string, fetchImpl: typeof fetch = fetch): BrowserRenderer {
+export interface RemoteRendererOptions {
+  allowLocalHttp?: boolean
+}
+
+export function createRemoteRenderer(
+  endpoint: string,
+  fetchImpl: typeof fetch = fetch,
+  rendererOptions: RemoteRendererOptions = {},
+): BrowserRenderer {
   const base = new URL(endpoint)
-  if (base.protocol !== 'https:' || base.username || base.password || base.search || base.hash) {
+  const localHttp = rendererOptions.allowLocalHttp === true && base.protocol === 'http:' &&
+    ['127.0.0.1', '[::1]', 'localhost'].includes(base.hostname)
+  if ((!localHttp && base.protocol !== 'https:') || base.username || base.password || base.search || base.hash) {
     throw new Error('JOB_RENDERER_URL must be an HTTPS origin or base path without credentials, query, or fragment.')
+  }
+  const targetUrl = (input: string): string => {
+    const url = validatePublicUrl(input)
+    if (localHttp) {
+      const host = url.hostname.replace(/^\[|\]$/g, '').replace(/\.$/, '')
+      const address = ipaddr.isValid(host)
+      if (host === 'localhost' || /\.(?:localhost|local|internal|localdomain|home\.arpa)$/.test(host) ||
+        (address ? !isPublicAddress(host) : !host.includes('.'))) {
+        throw new WorkerError('invalid-url', 'The renderer target must be a public HTTP or HTTPS URL.', false, 'download')
+      }
+    }
+    return url.href
   }
   const renderUrl = new URL('render', base.href.endsWith('/') ? base.href : `${base.href}/`).href
   return {
     async render(url, options) {
-      const response = await timedFetch(fetchImpl, renderUrl, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json', 'x-score-worker': 'job-ingestion' },
-        body: JSON.stringify({ url: validatePublicUrl(url).href }),
-      }, options.signal, 'parsing')
-      if (response.status === 429 || response.status >= 500) {
-        throw new WorkerError('renderer-unavailable', `The secure renderer returned HTTP ${response.status}.`, true, 'download')
-      }
-      if (!response.ok) {
-        throw new WorkerError('browser-render-failed', `The secure renderer rejected the source with HTTP ${response.status}.`, false, 'download')
-      }
-      const bytes = new Uint8Array(await response.arrayBuffer())
-      if (bytes.byteLength > 2 * 1024 * 1024) {
-        throw new WorkerError('source-too-large', 'The rendered document exceeded its output limit.', false, 'download')
-      }
-      let payload: unknown
+      if (options.signal?.aborted) throw abortError('Source rendering was cancelled.')
+      const timeout = localHttp ? withTimeout(options.signal, AZURE_REQUEST_TIMEOUT_MILLISECONDS) : undefined
       try {
-        payload = JSON.parse(Buffer.from(bytes).toString('utf8'))
+        const response = await timedFetch(fetchImpl, renderUrl, {
+          method: 'POST',
+          ...(localHttp ? { redirect: 'error' as const } : {}),
+          headers: { 'content-type': 'application/json', 'x-score-worker': 'job-ingestion' },
+          body: JSON.stringify({ url: targetUrl(url) }),
+        }, timeout?.signal ?? options.signal, 'parsing')
+        if (response.status === 429 || response.status >= 500) {
+          throw new WorkerError('renderer-unavailable', `The secure renderer returned HTTP ${response.status}.`, true, 'download')
+        }
+        if (!response.ok) {
+          throw new WorkerError('browser-render-failed', `The secure renderer rejected the source with HTTP ${response.status}.`, false, 'download')
+        }
+        let bytes: Uint8Array
+        if (localHttp && response.body) {
+          const reader = response.body.getReader()
+          const chunks: Uint8Array[] = []
+          let length = 0
+          const cancel = () => { void reader.cancel().catch(() => {}) }
+          timeout?.signal.addEventListener('abort', cancel, { once: true })
+          try {
+            while (true) {
+              if (timeout?.signal.aborted) throw abortError('Source rendering was cancelled.')
+              const result = await reader.read()
+              if (timeout?.signal.aborted) throw abortError('Source rendering was cancelled.')
+              if (result.done) break
+              length += result.value.byteLength
+              if (length > 2 * 1024 * 1024) {
+                cancel()
+                throw new WorkerError('source-too-large', 'The rendered document exceeded its output limit.', false, 'download')
+              }
+              chunks.push(result.value)
+            }
+          } finally {
+            timeout?.signal.removeEventListener('abort', cancel)
+            reader.releaseLock()
+          }
+          bytes = Buffer.concat(chunks, length)
+        } else {
+          bytes = new Uint8Array(await response.arrayBuffer())
+        }
+        if (bytes.byteLength > 2 * 1024 * 1024) {
+          throw new WorkerError('source-too-large', 'The rendered document exceeded its output limit.', false, 'download')
+        }
+        let payload: unknown
+        try {
+          payload = JSON.parse(Buffer.from(bytes).toString('utf8'))
+        } catch (error) {
+          throw new WorkerError('renderer-invalid-response', 'The secure renderer returned invalid JSON.', true, 'download', { cause: error })
+        }
+        if (!payload || typeof payload !== 'object' ||
+          typeof (payload as { html?: unknown }).html !== 'string' ||
+          typeof (payload as { finalUrl?: unknown }).finalUrl !== 'string') {
+          throw new WorkerError('renderer-invalid-response', 'The secure renderer returned an invalid response.', true, 'download')
+        }
+        let finalUrl: string
+        try {
+          finalUrl = targetUrl((payload as { finalUrl: string }).finalUrl)
+        } catch (error) {
+          if (!localHttp) throw error
+          throw new WorkerError('renderer-invalid-response', 'The secure renderer returned an invalid public destination.', true, 'download')
+        }
+        return { html: (payload as { html: string }).html, finalUrl }
       } catch (error) {
-        throw new WorkerError('renderer-invalid-response', 'The secure renderer returned invalid JSON.', true, 'download', { cause: error })
+        if (options.signal?.aborted) throw abortError('Source rendering was cancelled.')
+        if (timeout?.signal.aborted) throw new WorkerError('renderer-unavailable', 'The secure renderer request timed out.', true, 'download')
+        if (localHttp && !(error instanceof WorkerError)) {
+          throw new WorkerError('renderer-invalid-response', 'The secure renderer response could not be read.', true, 'download')
+        }
+        throw error
+      } finally {
+        timeout?.dispose()
       }
-      if (!payload || typeof payload !== 'object' ||
-        typeof (payload as { html?: unknown }).html !== 'string' ||
-        typeof (payload as { finalUrl?: unknown }).finalUrl !== 'string') {
-        throw new WorkerError('renderer-invalid-response', 'The secure renderer returned an invalid response.', true, 'download')
-      }
-      const finalUrl = validatePublicUrl((payload as { finalUrl: string }).finalUrl).href
-      return { html: (payload as { html: string }).html, finalUrl }
     },
   }
 }
@@ -664,60 +777,113 @@ async function retryTransient<T>(operation: () => Promise<T>, clock: Clock, sign
   throw lastError
 }
 
-export function documentIntelligenceParagraphs(result: DocumentIntelligenceResult): DocumentParagraph[] {
+export interface DocumentIntelligenceParagraphOptions extends ParagraphOptions {
+  sectionHeadingPattern?: RegExp
+  requirePageNumbers?: boolean
+  capturedSections?: boolean
+}
+
+export function documentIntelligenceParagraphs(
+  result: DocumentIntelligenceResult,
+  options: DocumentIntelligenceParagraphOptions = {},
+): DocumentParagraph[] {
   const analyze = result.analyzeResult
   if (!analyze) throw new WorkerError('ocr-invalid-response', 'Document Intelligence returned no analysis result.', true, 'parsing')
-  const pages = analyze.pages?.length ?? 0
-  if (pages > JOB_IMPORT_LIMITS.maxPdfPages) {
-    throw new WorkerError('pdf-too-many-pages', `PDF exceeds the ${JOB_IMPORT_LIMITS.maxPdfPages}-page limit.`, false, 'parsing')
+  const maxPages = options.maxPages ?? JOB_IMPORT_LIMITS.maxPdfPages
+  const pages = options.capturedSections ? 0 : analyze.pages?.length ?? 0
+  if (pages > maxPages) {
+    throw new WorkerError('pdf-too-many-pages', `PDF exceeds the ${maxPages}-page limit.`, false, 'parsing')
   }
-  const blocks: Array<{ offset: number; text: string; page: number; heading?: string }> = []
-  let heading = 'Job posting'
+  const originalPages = (regions: Array<{ pageNumber?: number }> | undefined): number[] => {
+    const numbers = [...new Set((regions ?? []).map(region => region.pageNumber))]
+    if (numbers.some(page => page !== undefined && page > maxPages)) {
+      throw new WorkerError('pdf-too-many-pages', `PDF exceeds the ${maxPages}-page limit.`, false, 'parsing')
+    }
+    if (numbers.some(page => !Number.isInteger(page) || (page ?? 0) < 1)) {
+      throw new WorkerError('ocr-invalid-page', 'Extracted PDF text has an invalid original page number.', false, 'parsing')
+    }
+    return numbers as number[]
+  }
+  const declaredPages = options.requirePageNumbers ? originalPages(analyze.pages) : []
+  const singlePage = (numbers: number[]): number => {
+    if (numbers.length !== 1 || (declaredPages.length > 0 && !declaredPages.includes(numbers[0]))) {
+      throw new WorkerError('ocr-invalid-page', 'Extracted PDF text could not be assigned to one original page.', false, 'parsing')
+    }
+    return numbers[0]
+  }
+  const blocks: Array<{ offset: number; text: string; page: number; heading?: string; section?: boolean; table?: boolean }> = []
+  let heading = options.defaultHeading ?? 'Job posting'
+  const sectionHeadingPattern = options.sectionHeadingPattern ?? JOB_SECTION_HEADING
   for (const paragraph of analyze.paragraphs ?? []) {
     const text = normalizeText(paragraph.content ?? '')
-    if (!meaningfulText(text)) continue
+    if (!meaningfulText(text, options.minimumTextLength)) continue
     const role = paragraph.role
-    const sectionLabel = /^(?:responsibilities|duties|requirements|required qualifications|minimum qualifications|preferred qualifications|desired qualifications|qualifications|about the role|what you will do):?$/i.test(text)
-    if (role === 'title' || role === 'sectionHeading' || sectionLabel) heading = text
+    const section = role === 'title' || role === 'sectionHeading' || sectionHeadingPattern.test(text)
+    if (section) heading = text
     blocks.push({
       offset: paragraph.spans?.[0]?.offset ?? Number.MAX_SAFE_INTEGER,
       text,
-      page: paragraph.boundingRegions?.[0]?.pageNumber ?? 1,
+      page: options.capturedSections ? 1 : options.requirePageNumbers ? singlePage(originalPages(paragraph.boundingRegions)) : paragraph.boundingRegions?.[0]?.pageNumber ?? 1,
       heading: role === 'title' || role === 'sectionHeading' ? text : heading,
+      section,
     })
   }
   for (const table of analyze.tables ?? []) {
-    const rows = new Map<number, Map<number, string>>()
+    const tablePages = options.capturedSections ? [1] : options.requirePageNumbers ? originalPages(table.boundingRegions) : [table.boundingRegions?.[0]?.pageNumber ?? 1]
+    const groups = new Map<number, { rows: Map<number, Map<number, string>>; offset: number }>()
     for (const cell of table.cells ?? []) {
+      const cellPages = options.requirePageNumbers ? originalPages(cell.boundingRegions) : tablePages
+      const page = options.requirePageNumbers ? singlePage(cellPages.length ? cellPages : tablePages) : tablePages[0]
+      const group = groups.get(page) ?? { rows: new Map<number, Map<number, string>>(), offset: Number.MAX_SAFE_INTEGER }
       const row = cell.rowIndex ?? 0
       const column = cell.columnIndex ?? 0
-      const values = rows.get(row) ?? new Map<number, string>()
+      const values = group.rows.get(row) ?? new Map<number, string>()
       values.set(column, normalizeText(cell.content ?? ''))
-      rows.set(row, values)
+      group.rows.set(row, values)
+      group.offset = Math.min(group.offset, cell.spans?.[0]?.offset ?? table.spans?.[0]?.offset ?? Number.MAX_SAFE_INTEGER)
+      groups.set(page, group)
     }
-    const text = [...rows.entries()]
-      .sort(([left], [right]) => left - right)
-      .map(([, columns]) => [...columns.entries()].sort(([left], [right]) => left - right).map(([, value]) => value).join(' | '))
-      .filter(Boolean)
-      .join('\n')
-    if (text) {
-      blocks.push({
-        offset: table.spans?.[0]?.offset ?? Number.MAX_SAFE_INTEGER,
-        text,
-        page: table.boundingRegions?.[0]?.pageNumber ?? 1,
-        heading: `${heading} - table`,
-      })
+    for (const [page, group] of groups) {
+      const text = [...group.rows.entries()]
+        .sort(([left], [right]) => left - right)
+        .map(([, columns]) => [...columns.entries()].sort(([left], [right]) => left - right).map(([, value]) => value).join(' | '))
+        .filter(Boolean)
+        .join('\n')
+      if (text) {
+        blocks.push({
+          offset: options.requirePageNumbers ? group.offset : table.spans?.[0]?.offset ?? Number.MAX_SAFE_INTEGER,
+          text,
+          page,
+          heading: `${heading} - table`,
+          table: true,
+        })
+      }
     }
   }
-  blocks.sort((left, right) => left.offset - right.offset)
-  return createParagraphs(blocks)
+  blocks.sort((left, right) => (options.requirePageNumbers ? left.page - right.page : 0) || left.offset - right.offset)
+  if (options.requirePageNumbers) {
+    heading = options.defaultHeading ?? 'Job posting'
+    for (const block of blocks) {
+      if (block.section) heading = block.text
+      block.heading = block.table ? `${heading} - table` : heading
+    }
+  }
+  return createParagraphs(blocks, options)
 }
 
-export async function analyzePdf(bytes: Uint8Array, options: DocumentIntelligenceClientOptions): Promise<DocumentIntelligenceResult> {
+export interface PdfAnalysisOptions extends DocumentIntelligenceClientOptions {
+  /** Resume admission allows a complete %PDF- signature in the first 1,024 bytes; OCR still receives the unchanged file. */
+  allowPdfHeaderPrefix?: boolean
+}
+
+export async function analyzePdf(bytes: Uint8Array, options: PdfAnalysisOptions): Promise<DocumentIntelligenceResult> {
   if (bytes.byteLength > JOB_IMPORT_LIMITS.maxPdfBytes) {
     throw new WorkerError('pdf-too-large', `PDF exceeds the ${JOB_IMPORT_LIMITS.maxPdfBytes}-byte limit.`, false, 'parsing')
   }
-  if (Buffer.from(bytes.subarray(0, 5)).toString('ascii') !== '%PDF-') {
+  const hasHeader = options.allowPdfHeaderPrefix === true
+    ? Buffer.from(bytes.subarray(0, 1024)).includes(Buffer.from('%PDF-'))
+    : Buffer.from(bytes.subarray(0, 5)).toString('ascii') === '%PDF-'
+  if (!hasHeader) {
     throw new WorkerError('invalid-pdf', 'The source is not a valid PDF file.', false, 'parsing')
   }
   return pollPdfLayout(await submitPdfLayout(bytes, options), options)
@@ -735,6 +901,12 @@ function validatedOperationUrl(value: string, endpoint: string): string {
 }
 
 export async function submitPdfLayout(bytes: Uint8Array, options: DocumentIntelligenceClientOptions): Promise<string> {
+  return submitDocumentLayout(bytes, 'pdf', options)
+}
+
+async function submitDocumentLayout(
+  bytes: Uint8Array, format: 'pdf' | 'docx', options: DocumentIntelligenceClientOptions,
+): Promise<string> {
   if (options.signal?.aborted) throw abortError('Document extraction was cancelled.')
   const clock = options.clock ?? systemClock
   const fetchImpl = options.fetch ?? fetch
@@ -744,7 +916,7 @@ export async function submitPdfLayout(bytes: Uint8Array, options: DocumentIntell
     const value = await timedFetch(fetchImpl, `${endpoint}/documentintelligence/documentModels/prebuilt-layout:analyze?api-version=${DOCUMENT_API_VERSION}`, {
       method: 'POST',
       redirect: 'error',
-      headers: { authorization: `Bearer ${token}`, 'content-type': 'application/pdf' },
+      headers: { authorization: `Bearer ${token}`, 'content-type': UPLOAD_CONTENT_TYPES[format] },
       body: Buffer.from(bytes),
     }, options.signal, 'parsing')
     if ([429, 502, 503, 504].includes(value.status)) throw value
@@ -753,8 +925,9 @@ export async function submitPdfLayout(bytes: Uint8Array, options: DocumentIntell
   if (!response.ok) {
     const body = await response.text()
     const protectedPdf = /password|encrypted/i.test(body)
+    if (format === 'docx' && protectedPdf) throw new WordDocumentError('encrypted-word')
     throw new WorkerError(protectedPdf ? 'password-protected-pdf' : 'ocr-rejected',
-      protectedPdf ? 'Password-protected PDFs are not supported.' : `Document Intelligence rejected the PDF with HTTP ${response.status}.`,
+      protectedPdf ? 'Password-protected PDFs are not supported.' : `Document Intelligence rejected the ${format.toUpperCase()} with HTTP ${response.status}.`,
       response.status >= 500 || response.status === 429, 'parsing')
   }
   const operationLocation = response.headers.get('operation-location')
@@ -766,6 +939,12 @@ export async function pollPdfLayout(
   operationUrl: string,
   options: DocumentIntelligenceClientOptions,
   recoverableOperation = false,
+): Promise<DocumentIntelligenceResult> {
+  return pollDocumentLayout(operationUrl, options, recoverableOperation, 'pdf')
+}
+
+async function pollDocumentLayout(
+  operationUrl: string, options: DocumentIntelligenceClientOptions, recoverableOperation: boolean, format: 'pdf' | 'docx',
 ): Promise<DocumentIntelligenceResult> {
   const operationLocation = validatedOperationUrl(operationUrl, options.endpoint)
   const clock = options.clock ?? systemClock
@@ -788,11 +967,62 @@ export async function pollPdfLayout(
     if (result.status === 'failed') {
       const message = result.error?.message ?? 'Document Intelligence could not extract the PDF.'
       const protectedPdf = /password|encrypted/i.test(`${result.error?.code ?? ''} ${message}`)
+      if (format === 'docx') {
+        if (protectedPdf) throw new WordDocumentError('encrypted-word')
+        throw new WorkerError('ocr-failed', 'Document Intelligence could not extract the DOCX. Save a new DOCX or export a readable PDF.', false, 'parsing')
+      }
       throw new WorkerError(protectedPdf ? 'password-protected-pdf' : 'ocr-failed',
         protectedPdf ? 'Password-protected PDFs are not supported.' : message, false, 'parsing')
     }
   }
   throw new WorkerError('ocr-timeout', 'Document extraction exceeded its time limit.', true, 'parsing')
+}
+
+export const WORD_EXTRACTION_VERSION = 'score-word-extraction-v1'
+
+export function wordSourceWarnings(format: WordFormat): string[] {
+  return [
+    'Word evidence uses captured sections, not original page numbers. Text inside images is not extracted; upload a PDF for OCR if needed.',
+    ...(format === 'doc' ? ['Legacy DOC extraction preserves text, not the original document layout.'] : []),
+  ]
+}
+
+export async function extractWordDocument(
+  bytes: Uint8Array, format: WordFormat, options: DocumentIntelligenceClientOptions,
+  paragraphOptions: DocumentIntelligenceParagraphOptions = {},
+): Promise<{ paragraphs: DocumentParagraph[]; warnings: string[] }> {
+  try {
+    const parsed = await parseWordFile(bytes, format, options.signal)
+    const wordOptions = {
+      ...paragraphOptions,
+      minimumTextLength: 1,
+      capturedSections: true,
+      requirePageNumbers: false,
+      emptySourceMessage: 'The Word file contains no readable text. If the content is in images, export a PDF and use PDF/OCR import.',
+    }
+    let paragraphs: DocumentParagraph[]
+    if (format === 'docx') {
+      const analysis = await pollDocumentLayout(await submitDocumentLayout(bytes, 'docx', options), options, false, 'docx')
+      paragraphs = documentIntelligenceParagraphs(analysis, wordOptions)
+    } else {
+      const blocks: Array<{ text: string; page: number; heading: string }> = []
+      let heading = paragraphOptions.defaultHeading ?? 'Job posting'
+      const sectionHeadingPattern = paragraphOptions.sectionHeadingPattern ?? JOB_SECTION_HEADING
+      for (const section of parsed.sections) {
+        if (section.heading) heading = section.heading
+        for (const line of section.text.split(/\r?\n/)) {
+          const text = normalizeText(line)
+          if (!section.heading && sectionHeadingPattern.test(text)) heading = text
+          blocks.push({ text, page: 1, heading })
+        }
+      }
+      paragraphs = createParagraphs(blocks, wordOptions)
+    }
+    return { paragraphs, warnings: wordSourceWarnings(format) }
+  } catch (error) {
+    if (error instanceof WordDocumentError) throw new WorkerError(error.code, error.message, error.retryable, 'parsing')
+    throw error
+  }
 }
 
 export interface ModelCriterion {
@@ -915,6 +1145,7 @@ export interface StructuredModelRequest {
   system: string
   user: string
   maxCompletionTokens?: number
+  operation?: 'rubric' | 'resume' | 'analysis'
 }
 
 export async function invokeStructuredModel(
@@ -926,6 +1157,11 @@ export async function invokeStructuredModel(
   const fetchImpl = options.fetch ?? fetch
   const clock = options.clock ?? systemClock
   const endpoint = options.endpoint.replace(/\/+$/, '')
+  const context = {
+    rubric: { action: 'Rubric generation', result: 'a rubric', noun: 'rubric' },
+    resume: { action: 'Resume profiling', result: 'a resume profile', noun: 'resume profile' },
+    analysis: { action: 'Resume analysis', result: 'an analysis', noun: 'analysis' },
+  }[request.operation ?? 'rubric']
   const token = await options.getToken(COGNITIVE_SCOPE)
   const messages = [
     { role: 'system', content: request.system },
@@ -948,16 +1184,16 @@ export async function invokeStructuredModel(
     return value
   }, clock, signal, 2)
   if (!response.ok) {
-    throw new WorkerError('model-request-failed', `Rubric generation returned HTTP ${response.status}.`, response.status >= 500 || response.status === 429, 'rubric')
+    throw new WorkerError('model-request-failed', `${context.action} returned HTTP ${response.status}.`, response.status >= 500 || response.status === 429, 'rubric')
   }
   const payload = await response.json() as {
     model?: string
     choices?: Array<{ message?: { content?: string; refusal?: string } }>
   }
   const refusal = payload.choices?.[0]?.message?.refusal
-  if (refusal) throw new WorkerError('model-refused', 'The model could not produce a rubric for this source.', false, 'rubric')
+  if (refusal) throw new WorkerError('model-refused', `The model could not produce ${context.result} for this source.`, false, 'rubric')
   const content = payload.choices?.[0]?.message?.content
-  if (!content) throw new WorkerError('model-empty-response', 'The model returned no rubric.', true, 'rubric')
+  if (!content) throw new WorkerError('model-empty-response', `The model returned no ${context.noun}.`, true, 'rubric')
   return { content, model: payload.model || options.modelName }
 }
 
@@ -1104,10 +1340,10 @@ function encodeDocument(document: SourceDocument): Uint8Array {
   return Buffer.from(JSON.stringify(document), 'utf8')
 }
 
-function decodeDocument(bytes: Uint8Array): SourceDocument {
+function decodeDocument(bytes: Uint8Array, contentType?: OriginalContentType): SourceDocument {
   try {
     const parsed = JSON.parse(Buffer.from(bytes).toString('utf8')) as SourceDocument
-    if (validateRealSourceDocument(parsed).length) {
+    if (validateRealSourceDocument(parsed, contentType).length) {
       throw new Error('Invalid source document.')
     }
     return parsed
@@ -1117,7 +1353,10 @@ function decodeDocument(bytes: Uint8Array): SourceDocument {
 }
 
 export function sourceBlobNames(record: RealJobRecord, contentType?: string): { original: string; extracted: string } {
-  const extension = contentType === 'application/pdf' || record.source.kind === 'pdf' ? 'pdf' : 'html'
+  const type = contentType ?? record.source.originalContentType ??
+    (record.source.kind === 'url' ? 'text/html' : UPLOAD_CONTENT_TYPES[record.source.kind])
+  if (!isOriginalContentType(type)) throw new WorkerError('invalid-source-type', 'The saved source has an unsupported file type.', false, 'parsing')
+  const extension = originalExtension(type)
   return {
     original: `${record.workspaceId}/${record.id}/original.${extension}`,
     extracted: `${record.workspaceId}/${record.id}/source-document.json`,
@@ -1238,7 +1477,7 @@ export interface WorkerDependencies {
   blobs: JobBlobStore
   documentIntelligence: Omit<DocumentIntelligenceClientOptions, 'signal'>
   model: RubricModelOptions
-  validateRealRubric: (rubric: Rubric, document: SourceDocument) => string[]
+  validateRealRubric: (rubric: Rubric, document: SourceDocument, contentType?: OriginalContentType) => string[]
   browser?: BrowserRenderer
   safeFetchOptions?: Omit<SafeFetchOptions, 'signal'>
   clock?: Clock
@@ -1324,11 +1563,17 @@ async function saveOriginal(
   clock: Clock,
   store: RealJobStore,
   owner: string,
-): Promise<{ bytes: Uint8Array; contentType: 'application/pdf' | 'text/html'; source: RealJobSource }> {
+): Promise<{ bytes: Uint8Array; contentType: OriginalContentType; source: RealJobSource }> {
   if (record.source.originalBlobName) {
     const saved = await blobs.read(record.source.originalBlobName)
     if (!saved) throw new WorkerError('source-blob-missing', 'The saved original source is missing.', false, 'download')
-    const type = saved.contentType === 'application/pdf' ? 'application/pdf' : 'text/html'
+    const type = saved.contentType
+    if (!isOriginalContentType(type) || (record.source.originalContentType && record.source.originalContentType !== type) ||
+      (record.source.sha256 && sha256(saved.bytes) !== record.source.sha256) ||
+      (record.source.bytes !== undefined && record.source.bytes !== saved.bytes.byteLength) ||
+      (record.source.kind === 'url' ? !['application/pdf', 'text/html'].includes(type) : UPLOAD_CONTENT_TYPES[record.source.kind] !== type)) {
+      throw new WorkerError('invalid-source-type', 'The saved original does not match its captured type or content.', false, 'parsing')
+    }
     return {
       bytes: saved.bytes,
       contentType: type,
@@ -1338,12 +1583,13 @@ async function saveOriginal(
         sha256: record.source.sha256 ?? saved.sha256,
         bytes: record.source.bytes ?? saved.bytes.byteLength,
         capturedAt: record.source.capturedAt ?? clock.now().toISOString(),
-        extractionMethod: record.source.extractionMethod ?? (type === 'application/pdf' ? 'document-intelligence' : 'html'),
+        extractionMethod: record.source.extractionMethod ?? (type === UPLOAD_CONTENT_TYPES.doc ? 'legacy-word'
+          : type === 'text/markdown' ? 'markdown' : type === 'text/html' ? 'html' : 'document-intelligence'),
       },
     }
   }
-  if (record.source.kind === 'pdf') {
-    throw new WorkerError('source-blob-missing', 'The uploaded PDF source is missing.', false, 'download')
+  if (record.source.kind !== 'url') {
+    throw new WorkerError('source-blob-missing', 'The uploaded document source is missing.', false, 'download')
   }
   if (!record.source.url) throw new WorkerError('invalid-url', 'The job record has no source URL.', false, 'download')
   for (const candidateType of ['application/pdf', 'text/html'] as const) {
@@ -1373,6 +1619,12 @@ async function saveOriginal(
     2,
   )
   let bytes = fetched.body
+  if (isWordContentType(contentType(fetched)) || hasOleSignature(bytes) || hasZipSignature(bytes)) {
+    throw new WorkerError('unsupported-content', 'Word documents must be uploaded as files. Public URL imports support PDF or HTML job descriptions only.', false, 'download')
+  }
+  if (contentType(fetched) === 'text/markdown') {
+    throw new WorkerError('unsupported-content', 'Markdown documents must be uploaded as files. Public URL imports support PDF or HTML job descriptions only.', false, 'download')
+  }
   const type: 'application/pdf' | 'text/html' = contentType(fetched) === 'application/pdf' || looksLikePdf(bytes) ? 'application/pdf' : 'text/html'
   let finalUrl = fetched.url
   let extractionMethod: RealJobSource['extractionMethod'] = type === 'application/pdf' ? 'document-intelligence' : 'html'
@@ -1438,13 +1690,16 @@ async function loadOrExtract(
   const cachedName = initial.extractedBlobName ?? names.extracted
   const cached = await dependencies.blobs.read(cachedName)
   if (cached) {
-    const document = decodeDocument(cached.bytes)
+    const document = decodeDocument(cached.bytes, initial.source.originalContentType)
     const expectedDocumentId = `document-${initial.id.replace(/^job-/, '')}`
     if (document.id !== expectedDocumentId) {
       throw new WorkerError('invalid-extraction-cache', 'The saved extraction does not belong to this job.', false, 'parsing')
     }
     await controller.update(record => ({
       ...record,
+      warnings: isWordContentType(initial.source.originalContentType)
+        ? [...new Set([...record.warnings, ...wordSourceWarnings(initial.source.originalContentType === UPLOAD_CONTENT_TYPES.doc ? 'doc' : 'docx')])]
+        : record.warnings,
       extractedBlobName: cachedName,
       updatedAt: (dependencies.clock ?? systemClock).now().toISOString(),
       job: { ...record.job, documentId: document.id, status: 'generating' },
@@ -1464,12 +1719,23 @@ async function loadOrExtract(
 
   let title = initial.source.displayName || 'Imported job'
   let paragraphs: DocumentParagraph[]
+  let sourceWarnings: string[] = []
   if (original.contentType === 'application/pdf') {
     const analysis = await analyzePdf(original.bytes, {
       ...dependencies.documentIntelligence,
       signal: controller.signal,
     })
     paragraphs = documentIntelligenceParagraphs(analysis)
+  } else if (isWordContentType(original.contentType)) {
+    const extracted = await extractWordDocument(original.bytes, original.contentType === UPLOAD_CONTENT_TYPES.doc ? 'doc' : 'docx', {
+      ...dependencies.documentIntelligence, signal: controller.signal,
+    })
+    paragraphs = extracted.paragraphs
+    sourceWarnings = extracted.warnings
+  } else if (original.contentType === 'text/markdown') {
+    const extracted = extractMarkdown(original.bytes, { defaultHeading: 'Job description' })
+    title = extracted.title ?? title
+    paragraphs = extracted.paragraphs
   } else {
     const html = Buffer.from(original.bytes).toString('utf8')
     const extracted = extractHtml(html, original.source.finalUrl ?? original.source.url ?? 'https://invalid.example')
@@ -1490,7 +1756,7 @@ async function loadOrExtract(
     dependencies.store, dependencies.blobs, initial.workspaceId, initial.id,
     names.extracted, documentBytes, 'application/json', { owner: controller.owner, signal: controller.signal },
   )
-  const durableDocument = decodeDocument(savedDocument.blob.bytes)
+  const durableDocument = decodeDocument(savedDocument.blob.bytes, original.contentType)
   const expectedDocumentId = `document-${initial.id.replace(/^job-/, '')}`
   if (durableDocument.id !== expectedDocumentId) {
     throw new WorkerError('invalid-extraction-cache', 'The saved extraction does not belong to this job.', false, 'parsing')
@@ -1499,6 +1765,7 @@ async function loadOrExtract(
     ...record,
     source: original.source,
     extractedBlobName: names.extracted,
+    warnings: [...new Set([...record.warnings, ...sourceWarnings])],
     updatedAt: (dependencies.clock ?? systemClock).now().toISOString(),
     job: { ...record.job, documentId: durableDocument.id, status: 'generating' },
   }))
@@ -1559,7 +1826,7 @@ export async function processClaimedJob(
     const generated = await generateGroundedRubric(
       artifact.document,
       dependencies.model,
-      dependencies.validateRealRubric,
+      (rubric, document) => dependencies.validateRealRubric(rubric, document, artifact.source.originalContentType),
       claimed.record.id,
       clock.now().toISOString(),
       controller.signal,

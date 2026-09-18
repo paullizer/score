@@ -11,12 +11,24 @@ const headers = (extra = {}, oid = ALLOWED_OID) => ({
   ...authHeaders({ oid }), origin: APP_ORIGIN, 'x-score-request': 'workspace', 'content-type': 'application/json', ...extra,
 })
 
-async function fixture({ grades } = {}) {
+async function uploadInput(format) {
+  if (format === 'pdf') return { filename: 'Role.pdf', contentType: 'application/pdf', bytes: Buffer.from('%PDF-1.7\nrole source') }
+  if (format === 'markdown') return { filename: 'Role.markdown', contentType: 'text/markdown', bytes: Buffer.from('# Role\n\nExperience required.') }
+  const { docxFile, legacyDocFile } = await import('./word-fixtures.mjs')
+  return {
+    filename: `Role.${format}`,
+    contentType: format === 'docx' ? 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' : 'application/msword',
+    bytes: (format === 'docx' ? docxFile : legacyDocFile)('Role\nRequirements\nExperience required.'),
+  }
+}
+
+async function fixture({ grades, format = 'pdf', route = format === 'pdf' || format === 'markdown' ? format : 'file' } = {}) {
+  const upload = await uploadInput(format)
   const directory = createFakeDirectoryStore()
   const state = createFakeStateStore()
   const jobs = createFakeRealJobs()
   const app = createApp({
-    directory, state, jobs, grades, config: baseConfig({ realJobs: {} }), now: () => new Date(timestamp),
+    directory, state, jobs, grades, config: baseConfig({ realJobs: {}, wordDocumentImports: true }), now: () => new Date(timestamp),
   })
   const server = createServer(app)
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve))
@@ -25,15 +37,20 @@ async function fixture({ grades } = {}) {
   assert.equal(session.status, 200)
   const workspaceId = (await session.json()).workspaces[0].id
   const importKey = randomUUID()
-  const imported = await fetch(`${base}/workspaces/${workspaceId}/jobs/pdf`, {
-    method: 'POST', headers: headers({ 'content-type': 'application/pdf', 'x-file-name': 'Role.pdf', 'idempotency-key': importKey }),
-    body: Buffer.from('%PDF-1.7\nrole source'),
+  const replay = () => fetch(`${base}/workspaces/${workspaceId}/jobs/${route}`, {
+    method: 'POST', headers: headers({ 'content-type': upload.contentType, 'x-file-name': upload.filename, 'idempotency-key': importKey }),
+    body: upload.bytes,
   })
-  assert.equal(imported.status, 202)
+  const imported = await replay()
+  if (imported.status !== 202) {
+    const detail = await imported.text()
+    await new Promise(resolve => server.close(resolve))
+    assert.fail(`${format} import returned ${imported.status}: ${detail}`)
+  }
   const initial = (await imported.json()).job
   const jobId = initial.job.id
   return {
-    app, base, directory, state, jobs, workspaceId, jobId, importKey, initial,
+    app, base, directory, state, jobs, workspaceId, jobId, importKey, initial, upload, replay,
     async close() { await new Promise(resolve => server.close(resolve)) },
     async lifecycle(action, scope, etag, extra = {}) {
       return fetch(`${base}/workspaces/${workspaceId}/jobs/${jobId}/lifecycle`, {
@@ -140,7 +157,9 @@ test('job purge pages originals, extraction and preparation leftovers without cr
   try {
     const value = await ready(f, 4)
     for (let i = 0; i < 135; i += 1) {
-      await f.jobs.blobs.putImmutable(`${f.workspaceId}/${f.jobId}/preparation/part-${i}.json`, Buffer.from('{}'), 'application/json')
+      f.jobs.blobs._values.set(`${f.workspaceId}/${f.jobId}/preparation/part-${i}.json`, {
+        bytes: Buffer.from('{}'), contentType: 'application/json', etag: `"preparation-${i}"`,
+      })
     }
     const otherWorkspace = `${f.workspaceId}-other`
     const otherName = `${otherWorkspace}/${f.jobId}/original.pdf`
@@ -234,6 +253,18 @@ test('workspace archive fences future imports and preserves separately archived 
     assert.equal((await fetch(`${f.base}/workspaces/${f.workspaceId}/jobs/url`, {
       method: 'POST', headers: headers({ 'idempotency-key': randomUUID() }), body: JSON.stringify({ url: 'https://example.com/role' }),
     })).status, 409)
+    for (const [route, filename, contentType] of [
+      ['file', 'Role.pdf', 'application/pdf'],
+      ['markdown', 'Role.md', 'text/markdown'],
+      ['file', 'Role.md', 'text/markdown'],
+      ['file', 'Role.docx', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'],
+      ['file', 'Role.doc', 'application/msword'],
+    ]) {
+      assert.equal((await fetch(`${f.base}/workspaces/${f.workspaceId}/jobs/${route}`, {
+        method: 'POST', headers: headers({ 'content-type': contentType, 'x-file-name': filename, 'idempotency-key': randomUUID() }),
+        body: Buffer.from('invalid source must not reach a parser in an archived workspace'),
+      })).status, 409, `${filename} through /${route}`)
+    }
     const restored = await workspaceChange('unarchive', archivedWorkspace.workspace.etag)
     assert.equal(restored.status, 200)
     assert.equal((await f.jobs.store.get(f.workspaceId, f.jobId)).record.rubricLifecycle.archivedAt, timestamp)
@@ -364,10 +395,15 @@ test('every job mutator executes its complete handler under the appropriate work
         method: 'POST', headers: headers(),
       })).status, 200)
     }
-    assert.equal((await fetch(`${f.base}/workspaces/${f.workspaceId}/jobs/pdf`, {
-      method: 'POST', headers: headers({ 'content-type': 'application/pdf', 'x-file-name': 'Other.pdf', 'idempotency-key': randomUUID() }),
-      body: Buffer.from('%PDF-1.7\nother source'),
-    })).status, 202)
+    for (const [format, route] of [
+      ['pdf', 'pdf'], ['pdf', 'file'], ['markdown', 'markdown'], ['markdown', 'file'], ['docx', 'file'], ['doc', 'file'],
+    ]) {
+      const upload = await uploadInput(format)
+      assert.equal((await fetch(`${f.base}/workspaces/${f.workspaceId}/jobs/${route}`, {
+        method: 'POST', headers: headers({ 'content-type': upload.contentType, 'x-file-name': upload.filename, 'idempotency-key': randomUUID() }),
+        body: upload.bytes,
+      })).status, 202, `${format} through /${route}`)
+    }
     const rubric = (await f.jobs.store.listRubrics(f.workspaceId, f.jobId)).at(-1)
     const edited = await fetch(`${f.base}/workspaces/${f.workspaceId}/jobs/${f.jobId}/rubric`, {
       method: 'PUT', headers: headers({ 'if-match': readyJob.etag }),
@@ -376,14 +412,58 @@ test('every job mutator executes its complete handler under the appropriate work
     assert.equal(edited.status, 200)
     const etag = (await edited.json()).job.etag
     assert.equal((await f.lifecycle('archive', 'job', etag)).status, 200)
-    assert.deepEqual(calls, ['write', 'write', 'write', 'write', 'write', 'manage'])
-    assert.equal(released, 6)
+    assert.deepEqual(calls, [...Array(10).fill('write'), 'manage'])
+    assert.equal(released, 11)
     assert.equal(held, false)
   } finally {
     WorkspaceRepository.prototype.withWorkspaceMutation = originalMutation
     await f.close()
   }
 })
+
+for (const [format, route] of [
+  ['pdf', 'file'], ['markdown', 'markdown'], ['markdown', 'file'], ['docx', 'file'], ['doc', 'file'],
+]) {
+  test(`${format} through /${route} preserves lifecycle flags, original downloads, logical rubric deletion, and tombstone fencing`, async () => {
+    const f = await fixture({ format, route })
+    try {
+      assert.equal(f.initial.job.source, format)
+      assert.equal(f.initial.source.kind, format)
+      assert.equal(f.initial.source.originalContentType, f.upload.contentType)
+      const value = await ready(f, 3)
+      const rubricResponse = await f.lifecycle('archive', 'rubric', value.etag)
+      assert.equal(rubricResponse.status, 200)
+      const rubric = (await rubricResponse.json()).job
+      const archiveResponse = await f.lifecycle('archive', 'job', rubric.etag)
+      assert.equal(archiveResponse.status, 200)
+      const archived = (await archiveResponse.json()).job
+      assert.equal((await f.replay()).status, 409)
+      const original = await fetch(`${f.base}/workspaces/${f.workspaceId}/jobs/${f.jobId}/original`, { headers: authHeaders() })
+      assert.equal(original.status, 200)
+      assert.equal(original.headers.get('content-type'), f.upload.contentType)
+      assert.deepEqual(Buffer.from(await original.arrayBuffer()), f.upload.bytes)
+      const restoreResponse = await f.lifecycle('unarchive', 'job', archived.etag)
+      assert.equal(restoreResponse.status, 200)
+      const restored = (await restoreResponse.json()).job
+      assert.equal(restored.rubricLifecycle.archivedAt, timestamp)
+      assert.equal(restored.rubricLifecycle.parentKey, `job:${f.jobId}`)
+      const deletedRubricResponse = await f.lifecycle('delete', 'rubric', restored.etag)
+      assert.equal(deletedRubricResponse.status, 200)
+      const noRubric = (await deletedRubricResponse.json()).job
+      assert.equal(noRubric.job.status, 'ready')
+      assert.equal(noRubric.job.rubricId, null)
+      assert.equal(noRubric.job.rubricDeletedAt, timestamp)
+      assert.equal(noRubric.rubricLifecycle.deletedAt, timestamp)
+      assert.deepEqual(noRubric.rubricVersions, [])
+      assert.ok(noRubric.document)
+      assert.equal((await f.replay()).status, 409)
+      assert.equal((await f.lifecycle('delete', 'job', noRubric.etag)).status, 200)
+      assert.equal((await f.replay()).status, 409)
+      assert.equal(await f.jobs.store.get(f.workspaceId, f.jobId), undefined)
+      assert.deepEqual((await f.jobs.blobs.list(f.workspaceId, f.jobId)).names, [])
+    } finally { await f.close() }
+  })
+}
 
 test('job writes reauthorize after acquiring the workspace lease', async () => {
   const f = await fixture()

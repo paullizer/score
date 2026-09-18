@@ -48,10 +48,12 @@ or legacy-state permissions.
 Every mutating job handler runs entirely inside
 `repository.withWorkspaceMutation`: lifecycle requests use `manage`, other writes
 use `write`, and authorization is checked again after acquiring the durable
-workspace lease. The PDF parser runs after initial authorization but before this
-mutation lease. The lease is held until the handler promise settles, even if the
-HTTP client disconnects. Publication and cleanup boundaries also check the lease
-keeper; the same assertions are no-ops in worker contexts.
+workspace lease. Raw PDF, Markdown, and Word bodies are read only after initial
+authorization. File validation, Word parsing, and persistence all run under the
+mutation lease, including the `/file` upload endpoint. The lease is held until the
+handler promise settles, even if the HTTP client disconnects. Publication and
+cleanup boundaries also check the lease keeper; the same assertions are no-ops in
+worker contexts.
 
 All API/worker source writes use `putJobBlob`, which requires the Blob store's
 `putFenced` capability. A bounded Cosmos reservation is acquired before writing;
@@ -64,6 +66,12 @@ preallocation markers contain no source data and are never returned as documents
 The low-level immutable writer is retained for fixture/migration compatibility,
 not used by API requests or workers.
 
+Uploaded PDF, Markdown, DOCX, and DOC sources retain their format in both the job
+and source metadata. Each uses its canonical `original.pdf`, `original.md`,
+`original.docx`, or `original.doc` name and matching content type. URL imports stay
+URL sources with PDF or HTML captures. Archive, cleanup, and idempotency tombstones
+apply identically to every format; original downloads preserve the captured bytes.
+
 `createJobLifecycleParticipant(jobs)` implements the workspace coordinator's
 `setState`, `cancel`, `purge`, `counts`, `pendingWorkspaces`, and `resume` contract.
 The web reconciler discovers persisted job/rubric `deletingAt` markers across
@@ -74,11 +82,13 @@ from a worker or in-memory operation state. `JobCleanupPendingError`
 signals that its purge must be retried, not reported as complete. Workspace purge
 preserves only non-content lifecycle guards and job-id tombstones.
 
-Cosmos may return an empty page with a continuation token. Cleanup follows those
-tokens through exhaustion before clearing rubric pointers or publishing job
-tombstones; an empty page alone is not completion. Nonadvancing pagination fails
-closed. Re-running record cleanup against a tombstone also removes any residual
-owned records rather than skipping them.
+Cosmos may return progress-only responses before a data page, or an empty page
+with a continuation token. The bounded shared page reader handles progress
+responses for listing, polling, cancellation, writers, and recovery. Cleanup
+follows those tokens through exhaustion before clearing rubric pointers or
+publishing job tombstones; an empty page alone is not completion. Nonadvancing
+pagination fails closed. Re-running record cleanup against a tombstone also
+removes any residual owned records rather than skipping them.
 
 Permanent deletion means unavailable through Score. Existing Azure Blob
 soft-delete retention/backups still apply; this service does not alter the

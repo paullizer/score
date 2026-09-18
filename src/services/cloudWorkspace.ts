@@ -74,9 +74,9 @@ export async function getWorkspaceLifecycleImpact(id: string, signal?: AbortSign
 }
 
 export function changeWorkspaceLifecycle(id: string, action: LifecycleAction, etag: string): Promise<WorkspaceLifecycleResponse> {
-  return cloudJsonRequest(`/workspaces/${encodeURIComponent(id)}/lifecycle`, {
+  return cloudLifecycleRequest<WorkspaceLifecycleResponse>(`/workspaces/${encodeURIComponent(id)}/lifecycle`, {
     method: 'POST', headers: { 'If-Match': etag }, body: JSON.stringify({ action }),
-  })
+  }).then((result) => result.value)
 }
 
 const SCORE_REQUEST_HEADER = 'X-Score-Request'
@@ -166,7 +166,15 @@ export async function cloudLifecycleRequest<T>(path: string, init: RequestInit =
       }
     }
   }
-  return { value: await unwrap<T>(response), etag }
+  const value = await unwrap<T>(response)
+  if (response.status === 202) {
+    const operation = value && typeof value === 'object' && 'operation' in value ? value.operation : undefined
+    const pending = value && typeof value === 'object' && 'pending' in value && value.pending === true
+    if (!pending && (!operation || typeof operation !== 'object' || !('status' in operation) || !['pending', 'running', 'failed'].includes(String(operation.status)))) {
+      throw new CloudApiError('unavailable', 'The service has not acknowledged a completed lifecycle change or returned a recoverable operation. Refresh status before retrying.', 202)
+    }
+  }
+  return { value, etag }
 }
 
 export async function fetchSession(signal?: AbortSignal): Promise<CloudSession> {

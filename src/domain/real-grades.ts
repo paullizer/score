@@ -1,6 +1,7 @@
 import type { Citation, Criterion, DocumentParagraph, Job, Rubric, SourceDocument } from './types'
 import type { RealJobSource } from './real-jobs'
 import type { LifecycleMetadata, LifecycleOperation } from './lifecycle'
+import type { OriginalContentType } from './document-formats'
 
 export const GRADE_LADDER_LIMITS = {
   maxSources: 15,
@@ -171,7 +172,7 @@ export interface ReferenceSourceRecord extends GradeEntityBase {
   documentId: string
   documentVersion: number
   originalBlobName?: string
-  originalContentType?: 'application/pdf' | 'text/html'
+  originalContentType?: OriginalContentType
   documentBlobName?: string
   sha256?: string
   bytes?: number
@@ -221,6 +222,7 @@ export interface FrozenReferenceSource {
   documentVersion: number
   documentBlobName: string
   originalBlobName: string
+  originalContentType?: OriginalContentType
   sha256: string
   url?: string
   intendedSection?: string

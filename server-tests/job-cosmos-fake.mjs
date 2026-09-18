@@ -68,19 +68,26 @@ export function fakeJobCosmos() {
         return { resource: clone(write(doc)), statusCode: 201 }
       },
       query(spec, options) {
+        let continuationToken = options?.continuationToken
+        let fetchCount = 0
         return {
           async fetchAll() { return { resources: queryRows(spec, options).map(clone) } },
           async fetchNext() {
-            const readPage = (continuationToken = options?.continuationToken) => {
+            const readPage = (token = continuationToken) => {
               const rows = queryRows(spec, options)
-              const offset = Number(continuationToken ?? 0)
+              const offset = Number(token ?? 0)
               const size = options?.maxItemCount ?? 50
               return {
                 resources: rows.slice(offset, offset + size).map(clone),
                 ...(offset + size < rows.length ? { continuationToken: String(offset + size) } : {}),
               }
             }
-            return queryPage ? queryPage(spec, options ?? {}, readPage) : readPage()
+            const page = queryPage ? await queryPage(spec, { ...options, continuationToken }, readPage, fetchCount++) : readPage()
+            if (Array.isArray(page.resources) &&
+              !(page.resources.length === 0 && page.hasMoreResults === true && !page.continuationToken)) {
+              continuationToken = page.continuationToken
+            }
+            return page
           },
         }
       },

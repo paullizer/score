@@ -7,6 +7,7 @@ import { pathToFileURL } from 'node:url'
 import { build, stop } from 'esbuild'
 import { PDFDocument, StandardFonts } from 'pdf-lib'
 import { installGradeBlobLifecycleFake, installGradeLifecycleFake } from '../../server-tests/grade-lifecycle-fakes.mjs'
+import { buildDocxPreviewTestWorker, docxPreviewBrowserPlugin } from './wordPreview.test-support.mjs'
 
 export const tenantId = '228db43d-371a-49d8-864e-fa202d181ea5'
 export const userId = '1d6312bd-3eaa-4586-8b74-e90eee126f78'
@@ -20,7 +21,7 @@ const nativeFetch = globalThis.fetch
 const clone = (value) => structuredClone(value)
 const hash = (value) => createHash('sha256').update(value).digest('hex')
 
-export async function buildGradeTestRuntime({ browser = false } = {}) {
+export async function buildGradeTestRuntime({ browser = false, serverExports = '' } = {}) {
   const directory = resolve(`.grade-integration-${randomUUID()}`)
   await mkdir(directory)
   try {
@@ -29,9 +30,16 @@ export async function buildGradeTestRuntime({ browser = false } = {}) {
       client: join('src', 'services', 'gradeLadders.ts'),
       jobs: join('src', 'services', 'realJobs.ts'),
       fixtures: join('src', 'data', 'fixtures.ts'),
+      'word-parser': join('server', 'documents', 'word-parser-worker.ts'),
     }
     await Promise.all(Object.entries(entries).map(([name, entry]) => build({
-      entryPoints: [entry], outfile: join(directory, `${name}.mjs`), bundle: true, packages: 'external', platform: 'node',
+      ...(name === 'server' && serverExports ? {
+        stdin: {
+          contents: `export * from './server/app.ts'\n${serverExports}`,
+          resolveDir: resolve('.'), sourcefile: 'integration-runtime.ts', loader: 'ts',
+        },
+      } : { entryPoints: [entry] }),
+      outfile: join(directory, `${name}.mjs`), bundle: true, packages: 'external', platform: 'node',
       format: 'esm', jsx: 'automatic', define: { 'import.meta.env.VITE_DEPLOYMENT_MODE': '"cloud"' }, logLevel: 'silent',
     })))
     await build({
@@ -45,11 +53,12 @@ export async function buildGradeTestRuntime({ browser = false } = {}) {
       }],
     })
     if (browser) {
-      await build({
+      await Promise.all([build({
         entryPoints: [join('src', 'main.tsx')], outfile: join(directory, 'browser.js'), bundle: true, platform: 'browser',
         format: 'esm', jsx: 'automatic', loader: { '.css': 'empty' },
+        plugins: [docxPreviewBrowserPlugin()],
         define: { 'import.meta.env.VITE_DEPLOYMENT_MODE': '"cloud"', 'process.env.NODE_ENV': '"development"' }, logLevel: 'silent',
-      })
+      }), buildDocxPreviewTestWorker(directory)])
       const [{ default: postcss }, { default: tailwind }, { default: autoprefixer }] = await Promise.all([import('postcss'), import('tailwindcss'), import('autoprefixer')])
       const css = await postcss([tailwind(), autoprefixer()]).process(await readFile(join('src', 'styles', 'globals.css'), 'utf8'), { from: join('src', 'styles', 'globals.css') })
       await writeFile(join(directory, 'browser.css'), css.css)
@@ -69,7 +78,7 @@ export async function buildGradeTestRuntime({ browser = false } = {}) {
   }
 }
 
-function memoryBlobs() {
+export function memoryBlobs() {
   const values = new Map()
   return {
     values,
@@ -212,13 +221,13 @@ function memoryWorkspace(api) {
   return { directory, state }
 }
 
-export async function startGradeFixture(runtime, { injectAuth = false } = {}) {
+export async function startGradeFixture(runtime, { injectAuth = false, resumes, analyses, configOverrides = {} } = {}) {
   const { api } = runtime
   const grades = memoryGrades(api), jobs = memoryJobs(runtime.jobFakes), { directory, state } = memoryWorkspace(api)
   const server = createServer()
   await new Promise((resolve, reject) => { server.once('error', reject); server.listen(0, '127.0.0.1', resolve) })
   const origin = `http://127.0.0.1:${server.address().port}`
-  let clock = Date.parse('2026-09-17T19:00:00.000Z')
+  let clock = Math.max(Date.now(), Date.parse('2026-09-17T19:00:00.000Z'))
   const now = () => new Date(++clock)
   const serviceConfig = { cosmosEndpoint: 'https://test.documents.azure.com', database: 'score', storageAccountUrl: 'https://test.blob.core.windows.net' }
   const config = {
@@ -226,8 +235,9 @@ export async function startGradeFixture(runtime, { injectAuth = false } = {}) {
     cosmos: { endpoint: serviceConfig.cosmosEndpoint, database: 'score', container: 'workspaces' }, storage: { accountUrl: serviceConfig.storageAccountUrl, containerName: 'workspace-state' },
     realJobs: { ...serviceConfig, container: 'job-records', blobContainer: 'job-sources' },
     realGrades: { ...serviceConfig, container: 'grade-records', blobContainer: 'grade-sources' },
+    ...configOverrides,
   }
-  const app = api.createApp({ config, directory, state, jobs, grades, now, distDir: runtime.directory })
+  const app = api.createApp({ config, directory, state, jobs, grades, resumes, analyses, now, distDir: runtime.directory })
   const requests = []
   const pendingRequests = new Set()
   let holdNextMutation
@@ -269,7 +279,8 @@ export async function startGradeFixture(runtime, { injectAuth = false } = {}) {
   const session = await sessionResponse.json()
   const workspaceId = session.workspaces[0].id
   return {
-    runtime, origin, server, api, config, grades, jobs, directory, state, session, workspaceId, requests, now,
+    runtime, origin, server, api, config, grades, jobs, resumes, analyses, directory, state, session, workspaceId, requests, now,
+    advanceClock(milliseconds) { clock += milliseconds },
     request,
     installClientFetch() {
       const previous = globalThis.fetch

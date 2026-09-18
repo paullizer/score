@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { createHash } from 'node:crypto'
 import test from 'node:test'
 import { runWorker, sourceBlobNames } from '../dist-worker/runtime.mjs'
 
@@ -162,10 +163,10 @@ function fakeStore(initial, hooks = {}) {
   }
 }
 
-function fakeBlobs() {
+function fakeBlobs(sourceDocument = document) {
   const values = new Map([
     [`${workspaceId}/${jobId}/source-document.json`, {
-      bytes: Buffer.from(JSON.stringify(document)),
+      bytes: Buffer.from(JSON.stringify(sourceDocument)),
       contentType: 'application/json',
       sha256: 'doc-hash',
       etag: '"doc"',
@@ -215,12 +216,65 @@ function dependencies(store, blobs, fetchImpl) {
   }
 }
 
-function successfulModel() {
+function successfulModel(result = modelResult) {
   return new Response(JSON.stringify({
     model: 'gpt-5-mini-version',
-    choices: [{ message: { content: JSON.stringify(modelResult) } }],
+    choices: [{ message: { content: JSON.stringify(result) } }],
   }), { status: 200 })
 }
+
+test('Markdown job originals are extracted without OCR or public fetches and retained across retries', async () => {
+  const bytes = Buffer.from('# Platform Engineer\n\nTypeScript experience is required.')
+  const originalName = `${workspaceId}/${jobId}/original.md`
+  const values = new Map([[originalName, {
+    bytes, contentType: 'text/markdown', sha256: createHash('sha256').update(bytes).digest('hex'), etag: '"original"',
+  }]])
+  const initial = record({ extractedBlobName: undefined })
+  initial.job = { ...initial.job, source: 'markdown', sourceLabel: 'role.MARKDOWN', title: 'role.MARKDOWN' }
+  initial.source = {
+    kind: 'markdown', displayName: 'role.MARKDOWN', originalBlobName: originalName,
+    originalContentType: 'text/markdown', sha256: values.get(originalName).sha256, bytes: bytes.length,
+  }
+  const store = fakeStore(initial)
+  const writes = []
+  const blobs = {
+    async read(name) { return values.get(name) },
+    async putImmutable(name, body, contentType, fence) {
+      if (fence) await fence.assertActive()
+      writes.push(name)
+      if (values.has(name)) return { created: false, blob: values.get(name) }
+      const blob = { bytes: body, contentType, sha256: createHash('sha256').update(body).digest('hex'), etag: '"new"' }
+      values.set(name, blob)
+      return { created: true, blob }
+    },
+    async putFenced(name, body, contentType, fence) {
+      await fence.assertActive()
+      return this.putImmutable(name, body, contentType, fence)
+    },
+  }
+  let modelCalls = 0
+  const deps = dependencies(store, blobs, async () => {
+    modelCalls++
+    return modelCalls <= 4 ? new Response('', { status: 503 }) : successfulModel()
+  })
+  deps.safeFetchOptions = { resolver: async () => { throw new Error('Markdown must not resolve public hosts') } }
+  deps.browser = { render: async () => { throw new Error('Markdown must not render HTML') } }
+  assert.equal(sourceBlobNames(initial).original, originalName)
+  await runWorker(deps, { maxJobs: 1 })
+  assert.equal(store.state().job.status, 'queued')
+  const saved = await store.get()
+  await store.replace({ ...saved.record, nextAttemptAt: now }, saved.etag)
+  deps.model.fetch = async () => successfulModel({
+    ...modelResult, criteria: modelResult.criteria.map(criterion => ({ ...criterion, sourceParagraphId: 'p-0002' })),
+  })
+  await runWorker(deps, { maxJobs: 1 })
+  assert.equal(store.state().job.status, 'ready', JSON.stringify(store.state().error))
+  assert.equal(store.state().source.extractionMethod, 'markdown')
+  assert.equal(store.state().source.originalContentType, 'text/markdown')
+  assert.deepEqual(writes, [`${workspaceId}/${jobId}/source-document.json`])
+  assert.deepEqual(values.get(originalName).bytes, bytes)
+  assert.equal(store.published().criteria[0].sourceCitations[0].quote, 'TypeScript experience is required.')
+})
 
 test('worker claims, reuses cached extraction, and atomically publishes a ready job', async () => {
   const store = fakeStore(record())
@@ -234,6 +288,25 @@ test('worker claims, reuses cached extraction, and atomically publishes a ready 
   assert.equal(store.state().job.rubricId, `rubric-${jobId}`)
   assert.equal(store.published().criteria[0].sourceCitations[0].quote, 'TypeScript experience is required.')
 })
+
+for (const [kind, contentType] of [
+  ['pdf', 'application/pdf'], ['markdown', 'text/markdown'],
+  ['docx', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'], ['doc', 'application/msword'],
+  ['url', 'application/pdf'], ['url', 'text/html'],
+]) {
+  test(`job ${kind} publication validates PDF page limits using captured ${contentType} metadata`, async () => {
+    const initial = record()
+    initial.source = { ...initial.source, kind, originalContentType: contentType }
+    initial.job.source = kind
+    const store = fakeStore(initial)
+    const deps = dependencies(store, fakeBlobs(), async () => successfulModel())
+    const validatedTypes = []
+    deps.validateRealRubric = (_rubric, _document, type) => { validatedTypes.push(type); return [] }
+    await runWorker(deps, { maxJobs: 1 })
+    assert.equal(store.state().job.status, 'ready')
+    assert.deepEqual(validatedTypes, [contentType])
+  })
+}
 
 test('cancellation that removes the lease wins before model generation and publication', async () => {
   let replacements = 0
@@ -327,12 +400,13 @@ test('immutable extraction conflicts use the durable document for generation and
   }
   const originalName = `${workspaceId}/${jobId}/original.html`
   const extractedName = `${workspaceId}/${jobId}/source-document.json`
+  const originalBytes = Buffer.from(`<main><h1>Competing Role</h1><h2>Requirements</h2><p>${'Competing source requirement. '.repeat(30)}</p></main>`)
+  const originalHash = createHash('sha256').update(originalBytes).digest('hex')
   const blobs = {
     async read(name) {
       if (name === extractedName) return undefined
       if (name === originalName) {
-        const bytes = Buffer.from(`<main><h1>Competing Role</h1><h2>Requirements</h2><p>${'Competing source requirement. '.repeat(30)}</p></main>`)
-        return { bytes, contentType: 'text/html', sha256: 'original', etag: '"original"' }
+        return { bytes: originalBytes, contentType: 'text/html', sha256: originalHash, etag: '"original"' }
       }
       return undefined
     },
@@ -353,7 +427,10 @@ test('immutable extraction conflicts use the durable document for generation and
       return this.putImmutable(name)
     },
   }
-  const store = fakeStore(record({ extractedBlobName: undefined }))
+  const store = fakeStore(record({
+    extractedBlobName: undefined,
+    source: { ...record().source, sha256: originalHash, bytes: originalBytes.byteLength },
+  }))
   const durableResult = {
     ...modelResult,
     title: 'Durable Role',
@@ -429,21 +506,26 @@ test('run bounds the number of claimed jobs and uses coordinated blob names', as
   })
 })
 
-for (const scope of ['job', 'rubric', 'workspace']) {
-  test(`worker skips ${scope} archives before claiming or calling a model`, async () => {
-    const store = fakeStore(record(scope === 'workspace' ? {} : {
-      [scope === 'job' ? 'lifecycle' : 'rubricLifecycle']: { archivedAt: now },
-    }))
-    if (scope === 'workspace') store.setWorkspaceState('archived')
-    let calls = 0
-    const result = await runWorker(dependencies(store, fakeBlobs(), async () => {
-      calls += 1
-      return successfulModel()
-    }))
-    assert.deepEqual(result, { claimed: 0, completed: 0 })
-    assert.equal(calls, 0)
-    assert.equal(store.published(), undefined)
-  })
+for (const kind of ['url', 'pdf', 'markdown', 'docx', 'doc']) {
+  for (const scope of ['job', 'rubric', 'workspace']) {
+    test(`${kind} worker skips ${scope} archives before claiming or calling a model`, async () => {
+      const initial = record(scope === 'workspace' ? {} : {
+        [scope === 'job' ? 'lifecycle' : 'rubricLifecycle']: { archivedAt: now },
+      })
+      initial.job.source = kind
+      initial.source.kind = kind
+      const store = fakeStore(initial)
+      if (scope === 'workspace') store.setWorkspaceState('archived')
+      let calls = 0
+      const result = await runWorker(dependencies(store, fakeBlobs(), async () => {
+        calls += 1
+        return successfulModel()
+      }))
+      assert.deepEqual(result, { claimed: 0, completed: 0 })
+      assert.equal(calls, 0)
+      assert.equal(store.published(), undefined)
+    })
+  }
 }
 
 test('archiving during generation cancels a late result and restoring never restarts it', async () => {
@@ -494,3 +576,32 @@ test('worker explicitly rejects a store without lifecycle fencing', async () => 
   delete store.getWorkspaceLifecycle
   await assert.rejects(runWorker(dependencies(store, fakeBlobs(), async () => successfulModel())), /fencing is unavailable/)
 })
+
+for (const [kind, contentType] of [
+  ['pdf', 'application/pdf'], ['markdown', 'text/markdown'],
+  ['docx', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'], ['doc', 'application/msword'],
+]) {
+  test(`cached ${kind} extraction honors format-specific pagination before model generation`, async () => {
+    const initial = record()
+    initial.job.source = kind
+    initial.source = { ...initial.source, kind, originalContentType: contentType }
+    const store = fakeStore(initial)
+    const cached = { ...document, paragraphs: document.paragraphs.map(paragraph => ({ ...paragraph, page: 75 })) }
+    let calls = 0
+    await runWorker(dependencies(store, fakeBlobs(cached), async () => {
+      calls += 1
+      return successfulModel()
+    }))
+    if (kind === 'pdf') {
+      assert.equal(calls, 0)
+      assert.equal(store.state().error.code, 'invalid-extraction-cache')
+      assert.equal(store.published(), undefined)
+    } else {
+      assert.equal(calls, 1)
+      assert.equal(store.state().job.status, 'ready')
+      assert.equal(store.state().job.source, kind)
+      assert.equal(store.state().source.kind, kind)
+      assert.equal(store.published().criteria[0].sourceCitations[0].page, 75)
+    }
+  })
+}

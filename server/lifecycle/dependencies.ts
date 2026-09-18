@@ -6,15 +6,22 @@ import type { StateStore } from '../store'
 import { decodeWorkspace } from '../repository'
 import { unavailable } from '../errors'
 import type { LifecycleDependencies } from './contracts'
+import type { RealAnalysesDeps } from '../analyses/store'
+import { realAnalysisDependencyBlockers } from '../analyses/library-lifecycle'
 
 export function createLifecycleDependencies(
   state: StateStore,
   jobs?: RealJobsDeps,
   grades?: RealGradesDeps,
   requireGrades = false,
+  analyses?: RealAnalysesDeps,
+  requireAnalyses = false,
 ): LifecycleDependencies {
   return {
     async impact(workspaceId: string, target: LifecycleTarget): Promise<LifecycleBlocker[]> {
+      if (requireAnalyses && !analyses) {
+        throw unavailable('The analysis store is unavailable, so retained analysis dependencies could not be checked.')
+      }
       if (requireGrades && !grades && (target.kind === 'job' || target.kind === 'rubric')) {
         throw unavailable('The grade store is unavailable, so seed-ladder dependencies could not be checked.')
       }
@@ -68,6 +75,7 @@ export function createLifecycleDependencies(
           if (continuationToken) tokens.add(continuationToken)
         } while (continuationToken)
       }
+      if (analyses) blockers.push(...await realAnalysisDependencyBlockers(analyses, workspaceId, target))
       return blockers
     },
   }

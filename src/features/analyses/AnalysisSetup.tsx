@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { Link, useNavigate, useSearchParams } from 'react-router-dom'
+import { Link, useLocation, useNavigate, useSearchParams } from 'react-router-dom'
 import { ArrowLeft, ArrowRight, BriefcaseBusiness, Check, Layers3, ShieldCheck, Sparkles, Users } from 'lucide-react'
 import { useWorkspace } from '../../app/workspace-context'
 import { latestRubrics } from '../../domain/selectors'
@@ -7,12 +7,29 @@ import { Avatar, Badge, Button, DemoNote, EmptyState, InlineError, PageHeader, S
 import { isEntityArchived, matchesArchiveFilter, type ArchiveFilter } from '../../domain/lifecycle'
 import { ArchivedBadge, ArchiveStateFilter, LifecycleBanner } from '../../components/lifecycle/LifecycleControls'
 import { useLifecycleAccess } from '../../components/lifecycle/useLifecycleAccess'
+import { analysisDataMode, sampleDataLink } from '../../app/real-data-mode'
+import { RealAnalysisSetup } from './RealAnalysisSetup'
 
 function ids(value: string | null): string[] {
   return [...new Set((value ?? '').split(',').filter(Boolean))]
 }
 
 export function AnalysisSetup() {
+  const { workspace, cloud } = useWorkspace()
+  const [params] = useSearchParams()
+  const navigate = useNavigate()
+  const location = useLocation()
+  const mode = analysisDataMode(params, Boolean(cloud), workspace)
+  if (mode === 'invalid') return <EmptyState title="Unknown analysis mode" description="Choose real analysis or the explicitly fictional Samples workflow." action={<Button onClick={() => navigate('/analyses/new')}>Start a new selection</Button>} />
+  return <>
+    {cloud && <div className="library-kind-switcher mb-5 rounded-xl border"><SegmentedControl label="Choose real analysis or samples" value={mode}
+      onChange={(value) => navigate(`/analyses/new?data=${value}`)} options={[{ value: 'real', label: 'Real analysis' }, { value: 'samples', label: 'Samples' }]} />
+      <span>Real and sample inputs never mix. Changing this mode starts a separate selection.</span></div>}
+    {mode === 'real' ? <RealAnalysisSetup key={`${location.key}:${location.search}:${location.hash}`} /> : <SampleAnalysisSetup />}
+  </>
+}
+
+function SampleAnalysisSetup() {
   const { workspace, startAnalysis, cloud } = useWorkspace()
   const navigate = useNavigate()
   const [params] = useSearchParams()
@@ -40,7 +57,8 @@ export function AnalysisSetup() {
   const invalidResumes = resumes.filter((id) => !resumeReady(id))
   const invalidTargets = targets.filter((id) => !ready(id))
   const realTargets = targets.filter((id) => id.startsWith('grade-version-') || workspace.rubrics.some((rubric) => rubric.id === id && rubric.dataKind === 'real'))
-  const hasInvalid = invalidResumes.length > 0 || invalidTargets.length > 0
+  const realPreselection = ['resumeSelections', 'targetSelections', 'selectionTransfer', 'selectionTransport', 'jobs', 'job', 'targets', 'ladder'].some((key) => params.has(key))
+  const hasInvalid = invalidResumes.length > 0 || invalidTargets.length > 0 || realPreselection
   const shownResumes = workspace.resumes.filter((resume) => matchesArchiveFilter(isEntityArchived(workspace, { kind: 'resume', id: resume.id }), resumeSearch, resumeArchiveFilter) && `${resume.name} ${resume.role}`.toLowerCase().includes(resumeSearch.trim().toLowerCase()))
   const eligibleResumes = shownResumes.filter((resume) => resumeReady(resume.id))
   const shownTargets = rubrics.filter((rubric) => matchesArchiveFilter(isEntityArchived(workspace, { kind: 'rubric', id: rubric.groupId }), targetSearch, targetArchiveFilter) && rubric.kind === targetType && `${rubric.name} ${rubric.ladder ?? ''} ${rubric.grade ?? ''}`.toLowerCase().includes(targetSearch.trim().toLowerCase()))
@@ -54,7 +72,7 @@ export function AnalysisSetup() {
     setError('')
     try {
       const id = startAnalysis(resumes, targets, name.trim() || undefined, failFirst)
-      navigate(`/analyses/${id}`)
+      navigate(sampleDataLink(`/analyses/${id}`, Boolean(cloud)))
     } catch (caught) {
       if (!(caught instanceof Error)) throw caught
       setError(caught.message)
@@ -62,13 +80,16 @@ export function AnalysisSetup() {
     }
   }
   return <>
-    <Link className="back-link" to="/analyses"><ArrowLeft size={14} />Back to analyses</Link>
+    <Link className="back-link" to={sampleDataLink('/analyses', Boolean(cloud))}><ArrowLeft size={14} />Back to analyses</Link>
     <PageHeader eyebrow="FROM CRITERIA TO CLARITY" title="Build an analysis" description="Choose who to compare, and what a great match means." />
     <LifecycleBanner />
     {previous && isEntityArchived(workspace, { kind: 'analysis', id: previous.id }) && <InlineError>This archived analysis is read-only. Unarchive it before creating a run from its selections, or choose active inputs in a fresh analysis.</InlineError>}
     {previous && <div className="info-callout mb-5"><Layers3 size={18} /><div><strong>A new run, not a rewrite.</strong><p>Selections from "{previous.name}" use the latest available rubric versions. The previous results stay exactly as they were.</p></div></div>}
     {params.get('from') && !previous && <div className="mb-5"><InlineError>The previous analysis is no longer available. Select fresh inputs below.</InlineError></div>}
-    {hasInvalid && <div className="mb-5"><InlineError>{realTargets.length ? 'Real job or GS grade rubrics were directly requested. Real-only and mixed real/sample selections cannot use the demo scorer. No inputs will be silently skipped.' : 'Some requested inputs are archived, missing, outdated, or not ready. They will not be silently skipped.'} <button className="ml-1 underline" onClick={() => { setResumes(resumes.filter((id) => !invalidResumes.includes(id))); setTargets(targets.filter((id) => !invalidTargets.includes(id))) }}>Remove unavailable selections</button></InlineError></div>}
+    {hasInvalid && <div className="mb-5"><InlineError>{realTargets.length || realPreselection ? 'Real inputs were directly requested. Real-only and mixed real/sample selections cannot use the demo scorer. No inputs will be silently skipped.' : 'Some requested inputs are archived, missing, outdated, or not ready. They will not be silently skipped.'} <button className="ml-1 underline" onClick={() => {
+      if (realPreselection) navigate(sampleDataLink('/analyses/new', Boolean(cloud)))
+      else { setResumes(resumes.filter((id) => !invalidResumes.includes(id))); setTargets(targets.filter((id) => !invalidTargets.includes(id))) }
+    }}>Remove unavailable selections</button></InlineError></div>}
     <div className="analysis-builder">
       <div className="space-y-5">
         <section className="panel">
@@ -81,7 +102,7 @@ export function AnalysisSetup() {
             }}>{eligibleResumes.length > 0 && eligibleResumes.every((resume) => resumes.includes(resume.id)) ? 'Deselect visible' : 'Select visible'}</button></div>
           <div className="builder-options">
             {shownResumes.map((resume) => <label className="selection-card" key={resume.id}><input type="checkbox" checked={resumes.includes(resume.id)} disabled={!resumeReady(resume.id)} onChange={() => toggle(resume.id, resumes, setResumes)} aria-label={`Include ${resume.name}`} /><Avatar initials={resume.initials} small /><div className="min-w-0"><strong className="block text-[12px] font-semibold">{resume.name}</strong><ArchivedBadge target={{ kind: 'resume', id: resume.id }} /><span className="mt-1 block text-[10px] text-muted">{resume.role}</span><span className="mt-1.5 block text-[9px] text-muted">{resume.experience} / fictional profile</span></div></label>)}
-            {!shownResumes.length && <div className="col-span-full"><EmptyState title="No resumes to show" description="Adjust the search, or add sample resumes from the library." action={<Button onClick={() => navigate('/resumes')}>Open resumes</Button>} /></div>}
+            {!shownResumes.length && <div className="col-span-full"><EmptyState title="No resumes to show" description="Adjust the search, or add sample resumes from the library." action={<Button onClick={() => navigate(sampleDataLink('/resumes', Boolean(cloud)))}>Open resumes</Button>} /></div>}
           </div>
         </section>
         <section className="panel">
@@ -104,7 +125,7 @@ export function AnalysisSetup() {
             })}
             {!shownTargets.length && <div className="col-span-full"><EmptyState title="No matching rubrics" description="Try another search or view the other target type." /></div>}
           </div>
-          {targetType === 'grade' && <div className="border-t px-5 py-3"><DemoNote>Only fictional sample grade rubrics can be selected. Real source-grounded grades are disabled, including direct and mixed selections. Samples are not official OPM eligibility assessments.</DemoNote></div>}
+          {targetType === 'grade' && <div className="border-t px-5 py-3"><DemoNote>Only fictional sample grade rubrics can be selected here. Use Real analysis for ready real resumes and approved GS versions; real-only and mixed inputs cannot use the sample scorer. Samples are not official OPM eligibility assessments.</DemoNote></div>}
           {targetType === 'job' && shownTargets.some((rubric) => rubric.dataKind === 'real') && <div className="border-t px-5 py-3"><DemoNote>Real job rubrics are shown for transparency but cannot be selected. This analysis uses only fictional fixture scoring.</DemoNote></div>}
         </section>
       </div>

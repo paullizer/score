@@ -1,6 +1,7 @@
 import type { WorkspaceLifecycle } from './lifecycle'
+import type { UploadFormat } from './document-formats'
 
-export type SourceKind = 'pdf' | 'url' | 'website'
+export type SourceKind = UploadFormat | 'url' | 'website'
 export type CriterionKey = 'technical' | 'delivery' | 'analysis' | 'communication' | 'leadership' | 'policy' | 'custom'
 export type JobStatus = 'queued' | 'parsing' | 'generating' | 'ready' | 'error' | 'cancelled'
 export type ComparisonStatus = 'queued' | 'running' | 'complete' | 'failed' | 'cancelled'

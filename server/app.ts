@@ -10,14 +10,22 @@ import { mountStaticSpa } from './static'
 import type { Config } from './config'
 import { createRealJobsRouter, type RealJobsDeps } from './jobs/routes'
 import { createRealGradesRouter, type RealGradesDeps } from './grades/routes'
+import { createRealResumesRouter } from './resumes/routes'
+import { createRealAnalysesRouter } from './analyses/routes'
+import type { RealResumesDeps } from './resumes/store'
+import type { RealAnalysesDeps } from './analyses/store'
 import { JOB_IMPORT_LIMITS } from '../src/domain/real-jobs'
 import { GRADE_LADDER_LIMITS } from '../src/domain/real-grades'
+import { RESUME_IMPORT_LIMITS } from '../src/domain/real-resumes'
+import { ANALYSIS_LIMITS } from '../src/domain/real-analyses'
 import type { DirectoryStore, StateStore } from './store'
 import { createLifecycleDependencies } from './lifecycle/dependencies'
 import { WorkspaceLifecycleService } from './lifecycle/service'
 import type { WorkspaceLifecycleParticipant } from './lifecycle/contracts'
 import { createJobLifecycleParticipant } from './jobs/lifecycle'
 import { createGradeLifecycleParticipant } from './grades/lifecycle'
+import { createResumeLifecycleParticipant } from './resumes/lifecycle'
+import { createAnalysisLifecycleParticipant } from './analyses/library-lifecycle'
 export { WorkspaceRepository } from './repository'
 export { WorkspaceLifecycleService } from './lifecycle/service'
 export { createLifecycleDependencies } from './lifecycle/dependencies'
@@ -34,12 +42,23 @@ export {
   parseGradeEntity, validateReferenceDocument, validateGradeVersion, validateGradeApproval,
   gradeContentHash, gradeVersionHash, gradeSourceSetHash, gradeRecordHash, gradeIssuesFor, parseGradeSeedSnapshot,
 } from './grades/validation'
+export { createRealResumesRouter, createRealAnalysesRouter }
+export * from './resumes/azure-store'
+export * from './resumes/validation'
+export { RealResumeService } from './resumes/service'
+export * from './analyses/azure-store'
+export * from './analyses/validation'
+export * from './analyses/lifecycle'
+export * from './analyses/snapshots'
+export { RealAnalysisTargets } from './analyses/targets'
+export { RealAnalysisService } from './analyses/service'
 export { ConfigError, loadConfig } from './config'
 export { defaultPersonalWorkspaceId, isValidWorkspaceId, membershipIdFor, principalKeyFor } from './ids'
 
 const currentDir = path.dirname(fileURLToPath(import.meta.url))
 const DEFAULT_DIST_DIR = path.join(currentDir, '..', 'dist')
 const MAX_JSON_BODY = '10mb'
+const RAW_SOURCE_UPLOAD_PATH = /^\/api\/workspaces\/[^/]+\/(?:jobs|resumes)\/(?:pdf|markdown|file)\/?$/i
 
 export interface AppDeps {
   readonly config: Config
@@ -47,6 +66,8 @@ export interface AppDeps {
   readonly state: StateStore
   readonly jobs?: RealJobsDeps
   readonly grades?: RealGradesDeps
+  readonly resumes?: RealResumesDeps
+  readonly analyses?: RealAnalysesDeps
   /** Overridable so tests don't depend on a real build of dist/. */
   readonly distDir?: string
   /** Injectable clock for deterministic tests. */
@@ -101,18 +122,35 @@ export function createApp(deps: AppDeps): Express {
   const distDir = deps.distDir ?? DEFAULT_DIST_DIR
   const repository = new WorkspaceRepository({ directory, state, now: deps.now })
   const participants: WorkspaceLifecycleParticipant[] = []
+  if (deps.analyses) participants.push(createAnalysisLifecycleParticipant(deps.analyses))
+  else if (config.realAnalyses || config.analysisLifecycleStore) participants.push(unavailableParticipant('Analysis'))
+  if (deps.resumes) participants.push(createResumeLifecycleParticipant(deps.resumes))
+  else if (config.realResumes || config.resumeLifecycleStore) participants.push(unavailableParticipant('Resume'))
   if (deps.grades) participants.push(createGradeLifecycleParticipant(deps.grades))
   else if (config.realGrades || config.gradeLifecycleStore) participants.push(unavailableParticipant('Grade'))
   if (deps.jobs) participants.push(createJobLifecycleParticipant(deps.jobs))
   else if (config.realJobs || config.jobLifecycleStore) participants.push(unavailableParticipant('Job'))
-  const lifecycle = createLifecycleDependencies(state, deps.jobs, deps.grades, Boolean(config.realGrades || config.gradeLifecycleStore))
-  const workspaceLifecycle = new WorkspaceLifecycleService({ repository, directory, state, participants, now: deps.now })
+  const lifecycle = createLifecycleDependencies(state, deps.jobs, deps.grades, Boolean(config.realGrades || config.gradeLifecycleStore),
+    deps.analyses, Boolean(config.realAnalyses || config.analysisLifecycleStore))
+  const workspaceLifecycle = new WorkspaceLifecycleService({ repository, directory, state, participants, lifecycle, now: deps.now })
   const checkHealth = createHealthCheck({ directory, state })
+  const jobs = config.realJobs && deps.jobs?.store && deps.jobs.blobs ? deps.jobs : undefined
+  const grades = config.realGrades && deps.grades?.store && deps.grades.blobs ? deps.grades : undefined
+  const resumes = config.realResumes && deps.resumes?.store && deps.resumes.blobs ? deps.resumes : undefined
+  const analyses = config.realAnalyses && deps.analyses?.store && deps.analyses.blobs
+    ? deps.analyses : undefined
+  const canCreateAnalyses = Boolean(analyses && resumes && (jobs || grades))
+  const wordDocumentImports = config.wordDocumentImports === true
 
   const app = express()
   app.locals.reconcileLifecycle = () => workspaceLifecycle.reconcile()
   app.disable('x-powered-by')
-  app.use(express.json({ limit: MAX_JSON_BODY }))
+  const parseJson = express.json({ limit: MAX_JSON_BODY })
+  app.use((req, res, next) => {
+    // Even a mislabeled JSON upload must reach authorization before body parsing.
+    if (req.method === 'POST' && RAW_SOURCE_UPLOAD_PATH.test(req.path)) next()
+    else parseJson(req, res, next)
+  })
 
   app.get('/healthz', noStore, async (_req, res) => {
     const status = await checkHealth()
@@ -125,15 +163,17 @@ export function createApp(deps: AppDeps): Express {
   api.use(createCsrfMiddleware(config))
   api.get('/features', (_req, res) => {
     res.json({
-      realJobImports: Boolean(config.realJobs && deps.jobs), limits: JOB_IMPORT_LIMITS,
-      realGradeLadders: Boolean(config.realGrades && deps.grades), gradeLimits: GRADE_LADDER_LIMITS,
+      realJobImports: Boolean(jobs), markdownJobImports: Boolean(jobs), limits: JOB_IMPORT_LIMITS,
+      realGradeLadders: Boolean(grades), gradeLimits: GRADE_LADDER_LIMITS,
+      realResumeImports: Boolean(resumes), markdownResumeImports: Boolean(resumes), resumeLimits: RESUME_IMPORT_LIMITS,
+      realAnalyses: canCreateAnalyses, analysisLimits: ANALYSIS_LIMITS,
+      wordDocumentImports: wordDocumentImports && Boolean(jobs || resumes),
     })
   })
-  api.use(createRealJobsRouter({ repository, jobs: config.realJobs ? deps.jobs : undefined, lifecycle, now: deps.now }))
-  api.use(createRealGradesRouter({
-    repository, grades: config.realGrades ? deps.grades : undefined,
-    jobs: config.realJobs ? deps.jobs : undefined, lifecycle, now: deps.now,
-  }))
+  api.use(createRealJobsRouter({ repository, jobs, lifecycle, now: deps.now, wordDocumentImports }))
+  api.use(createRealGradesRouter({ repository, grades, jobs, lifecycle, now: deps.now }))
+  api.use(createRealResumesRouter({ repository, resumes, lifecycle, now: deps.now, wordDocumentImports }))
+  api.use(createRealAnalysesRouter({ repository, analyses, resumes, jobs, grades, now: deps.now }))
 
   api.get('/session', async (req, res) => {
     res.json(await repository.getSession(getPrincipal(req)))

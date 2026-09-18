@@ -306,3 +306,34 @@ test('individual cleanup is resumed under the workspace lease even without a wor
   assert.equal((await directory.getMetadata(workspace.id)).metadata.archivedAt, undefined)
   assert.ok(await state.getState(workspace.id))
 })
+
+test('real analyses block workspace deletion before any store is fenced or purged', async () => {
+  const directory = createFakeDirectoryStore(), state = createFakeStateStore()
+  const principal = { tenantId: TENANT_ID, oid: ALLOWED_OID, principalKey: principalKeyFor(TENANT_ID, ALLOWED_OID), name: 'Owner', email: 'owner@example.test' }
+  const repository = new WorkspaceRepository({ directory, state })
+  const workspace = (await repository.getSession(principal)).workspaces[0]
+  state._setRawContent(workspace.id, JSON.stringify(sampleWorkspaceBody()))
+  const untouched = async () => { assert.fail('A retained real analysis must block cleanup before mutation') }
+  const participant = {
+    setState: untouched, cancel: untouched, purge: untouched, resume: untouched,
+    async counts() { return { analyses: 1 } }, async pendingWorkspaces() { return [] },
+  }
+  const blockers = [{ kind: 'analysis', id: 'analysis-real-retained', name: 'Archived real analysis',
+    href: '/analyses/analysis-real-retained?data=real' }]
+  const service = new WorkspaceLifecycleService({
+    repository, directory, state, participants: [participant],
+    lifecycle: { async impact(id, target) {
+      assert.equal(id, workspace.id)
+      assert.deepEqual(target, { kind: 'workspace', id: workspace.id })
+      return blockers
+    } },
+  })
+  const preview = await service.impact(principal, workspace.id)
+  assert.equal(preview.impact.counts.analyses, 1)
+  assert.deepEqual(preview.impact.blockers, blockers)
+  await assert.rejects(service.change(principal, workspace.id, 'delete', workspace.etag), error => error.status === 409)
+  const missingDependencies = new WorkspaceLifecycleService({ repository, directory, state, participants: [participant] })
+  await assert.rejects(missingDependencies.change(principal, workspace.id, 'delete', workspace.etag), error => error.status === 503)
+  assert.equal((await directory.getMetadata(workspace.id)).etag, workspace.etag)
+  assert.ok(await state.getState(workspace.id))
+})

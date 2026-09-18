@@ -3,9 +3,13 @@ import express, { type NextFunction, type Request, type RequestHandler, type Res
 import ipaddr from 'ipaddr.js'
 import type { RealJobDetail, RealJobRecord, RealJobSummary, VersionedRealJob } from '../../src/domain/real-jobs'
 import { JOB_IMPORT_LIMITS } from '../../src/domain/real-jobs'
+import { isOriginalContentType, isSafeUploadedFilename } from '../../src/domain/source-files'
 import type { Job, Rubric, SourceDocument } from '../../src/domain/types'
+import { originalExtension, UPLOAD_CONTENT_TYPES, uploadFormatFromContentType, type UploadFormat } from '../../src/domain/document-formats'
+import { validateWordUpload } from '../documents/upload'
 import type { AuthenticatedPrincipal } from '../auth'
-import { conflict, invalidRequest, notFound, preconditionRequired, unavailable } from '../errors'
+import { decodeMarkdown, MarkdownInputError } from '../documents/markdown'
+import { conflict, HttpError, invalidRequest, notFound, preconditionRequired, unavailable } from '../errors'
 import { getPrincipal } from '../request-context'
 import type { WorkspaceRepository } from '../repository'
 import type { LifecycleDependencies } from '../lifecycle/contracts'
@@ -18,6 +22,7 @@ import {
   isValidJobId,
   isUuid,
   originalBlobName,
+  validateRealJobRecord,
   validateRealRubric,
   validateRealSourceDocument,
 } from './validation'
@@ -32,6 +37,7 @@ export interface RealJobsRouterDeps {
   readonly jobs?: RealJobsDeps
   readonly now?: () => Date
   readonly lifecycle?: LifecycleDependencies
+  readonly wordDocumentImports?: boolean
 }
 
 interface AuthorizedRequest extends Request {
@@ -87,26 +93,34 @@ function hash(value: Uint8Array | string): string {
   return createHash('sha256').update(value).digest('hex')
 }
 
-function inputFingerprint(kind: 'pdf' | 'url', values: readonly string[]): string {
+function inputFingerprint(kind: UploadFormat | 'url', values: readonly string[]): string {
   return hash([kind, ...values].join('\0'))
 }
 
-function decodeFilename(value: string | undefined): string {
+function decodeFilename(value: string | undefined, kind: UploadFormat): string {
   if (!value) throw invalidRequest('X-File-Name is required.')
+  const label = kind === 'markdown' ? 'Markdown' : kind.toUpperCase()
+  if (kind !== 'pdf' &&
+    (value.length > MAX_FILENAME_LENGTH * 12 || !/^(?:[A-Za-z0-9_.!~*'()-]|%[0-9A-Fa-f]{2})+$/.test(value))) {
+    throw invalidRequest(`X-File-Name must contain a percent-encoded safe ${label} basename.`)
+  }
   let filename: string
   try {
     filename = decodeURIComponent(value)
   } catch {
     throw invalidRequest('X-File-Name is not valid percent-encoding.')
   }
-  const unsafeCharacter = [...filename].some((character) => {
-    const code = character.charCodeAt(0)
-    return code < 32 || code === 127 || character === '/' || character === '\\'
-  })
-  if (!filename || filename.length > MAX_FILENAME_LENGTH || filename === '.' || filename === '..' ||
-    unsafeCharacter || !/\.pdf$/i.test(filename)) {
-    throw invalidRequest('X-File-Name must be a safe PDF basename.')
-  }
+  if (kind === 'pdf') {
+    // Existing PDF keys bind these legacy basenames; Markdown uses the stricter upload policy.
+    const unsafeCharacter = [...filename].some(character => {
+      const code = character.charCodeAt(0)
+      return code < 32 || code === 127 || character === '/' || character === '\\'
+    })
+    if (!filename || filename.length > MAX_FILENAME_LENGTH || filename === '.' || filename === '..' ||
+      unsafeCharacter || !/\.pdf$/i.test(filename)) {
+      throw invalidRequest('X-File-Name must be a safe PDF basename.')
+    }
+  } else if (!isSafeUploadedFilename(filename, kind)) throw invalidRequest(`X-File-Name must be a safe ${label} basename.`)
   return filename
 }
 
@@ -158,7 +172,7 @@ function emptyJob(
   jobId: string,
   documentId: string,
   title: string,
-  source: 'pdf' | 'url',
+  source: UploadFormat | 'url',
   sourceLabel: string,
   batchId: string | undefined,
   createdAt: string,
@@ -244,7 +258,7 @@ async function readDocument(blobs: JobBlobStore, record: RealJobRecord): Promise
   } catch {
     throw unavailable('The extracted job document could not be read.')
   }
-  const errors = validateRealSourceDocument(parsed)
+  const errors = validateRealSourceDocument(parsed, record.source.originalContentType)
   if (errors.length || (parsed as SourceDocument).id !== record.job.documentId) {
     throw unavailable('The extracted job document has an invalid stored shape.')
   }
@@ -304,7 +318,8 @@ function withoutJobError(job: Job & { dataKind: 'real' }): Job & { dataKind: 're
 
 function attachmentHeader(filename: string): string {
   const fallback = filename.replace(/[^\x20-\x7e]/g, '_').replace(/["\\]/g, '_') || 'source'
-  return `attachment; filename="${fallback}"; filename*=UTF-8''${encodeURIComponent(filename)}`
+  const encoded = encodeURIComponent(filename).replace(/['()*]/g, character => `%${character.charCodeAt(0).toString(16).toUpperCase()}`)
+  return `attachment; filename="${fallback}"; filename*=UTF-8''${encoded}`
 }
 
 type AsyncJobHandler = (req: Request, res: Response, next: NextFunction) => Promise<void>
@@ -417,72 +432,126 @@ export function createRealJobsRouter(deps: RealJobsRouterDeps): Router {
     }
   }))
 
-  router.post(
-    `${base}/pdf`,
-    authorize(deps.repository, 'write'),
-    available(deps.jobs),
-    express.raw({ type: 'application/pdf', limit: JOB_IMPORT_LIMITS.maxPdfBytes }),
-    mutation('write', async (req, res) => {
-      const jobs = requireJobs(deps.jobs)
-      if (!req.is('application/pdf') || !Buffer.isBuffer(req.body)) throw invalidRequest('Content-Type must be application/pdf.')
-      const filename = decodeFilename(req.header('x-file-name'))
-      const key = requireUuidHeader(req, 'Idempotency-Key')
-      const batchId = optionalUuid(req.header('x-import-batch'), 'X-Import-Batch')
-      const bytes = req.body as Buffer
-      if (bytes.byteLength === 0) throw invalidRequest('PDF body must not be empty.')
-      if (bytes.subarray(0, Math.min(bytes.byteLength, 1024)).indexOf(PDF_MAGIC) < 0) {
-        throw invalidRequest('The uploaded file does not have a valid PDF header.')
-      }
+  for (const route of ['pdf', 'markdown', 'file'] as const) {
+    const fileKind = (req: Request): UploadFormat => {
+      const kind = route === 'file' ? uploadFormatFromContentType(req.header('Content-Type') ?? '') : route
+      if (!kind) throw invalidRequest('Content-Type must match a supported PDF, Markdown, DOCX, or DOC file.')
+      return kind
+    }
+    router.post(
+      `${base}/${route}`,
+      authorize(deps.repository, 'write'),
+      available(deps.jobs),
+      (req: Request, _res: Response, next: NextFunction) => {
+        try {
+          for (const name of ['content-type', 'content-encoding', 'x-file-name', 'idempotency-key', 'x-import-batch']) {
+            if (req.rawHeaders.filter((header, index) => index % 2 === 0 && header.toLowerCase() === name).length > 1) {
+              throw invalidRequest(`${name} must be supplied only once.`)
+            }
+          }
+          const kind = fileKind(req)
+          const contentType = UPLOAD_CONTENT_TYPES[kind]
+          if ((kind === 'docx' || kind === 'doc') && !deps.wordDocumentImports) {
+            throw unavailable('Word document imports are not enabled for this deployment.')
+          }
+          decodeFilename(req.header('X-File-Name'), kind)
+          requireUuidHeader(req, 'Idempotency-Key')
+          optionalUuid(req.header('X-Import-Batch'), 'X-Import-Batch')
+          if (!req.is(contentType)) throw invalidRequest(`Content-Type must be ${contentType}.`)
+          if (kind === 'markdown' && !/^text\/markdown(?:\s*;\s*charset\s*=\s*(?:utf-8|"utf-8"))?\s*$/i.test(req.header('Content-Type') ?? '')) {
+            throw invalidRequest('Content-Type must be text/markdown with no charset or charset=utf-8.')
+          }
+          if (kind !== 'pdf' && req.header('Content-Encoding') && req.header('Content-Encoding')?.toLowerCase() !== 'identity') {
+            const label = kind === 'markdown' ? 'Markdown' : kind.toUpperCase()
+            throw invalidRequest(`Compressed ${label} uploads are not supported. Upload the original ${label} bytes.`)
+          }
+          next()
+        } catch (error) { next(error) }
+      },
+      express.raw({
+        type: route === 'file' ? Object.values(UPLOAD_CONTENT_TYPES) : UPLOAD_CONTENT_TYPES[route],
+        limit: route === 'markdown' ? JOB_IMPORT_LIMITS.maxMarkdownBytes : JOB_IMPORT_LIMITS.maxFileBytes,
+        inflate: route === 'pdf',
+      }),
+      mutation('write', async (req, res) => {
+        const jobs = requireJobs(deps.jobs)
+        const workspaceId = pathParam(req, 'workspaceId')
+        await requireMutableWorkspace(jobs.store, workspaceId)
+        const kind = fileKind(req)
+        const contentType = UPLOAD_CONTENT_TYPES[kind]
+        if (!Buffer.isBuffer(req.body)) throw invalidRequest('The request must contain raw document bytes.')
+        const filename = decodeFilename(req.header('X-File-Name'), kind)
+        const key = requireUuidHeader(req, 'Idempotency-Key')
+        const batchId = optionalUuid(req.header('X-Import-Batch'), 'X-Import-Batch')
+        const bytes = req.body as Buffer
+        if (kind === 'pdf') {
+          if (bytes.byteLength === 0) throw invalidRequest('PDF body must not be empty.')
+          if (bytes.subarray(0, Math.min(bytes.byteLength, 1024)).indexOf(PDF_MAGIC) < 0) {
+            throw invalidRequest('The uploaded file does not have a valid PDF header.')
+          }
+        } else if (kind === 'markdown') {
+          try { decodeMarkdown(bytes, JOB_IMPORT_LIMITS.maxMarkdownBytes) } catch (error) {
+            if (error instanceof MarkdownInputError) {
+              throw new HttpError(error.code === 'markdown-too-large' ? 413 : 400, 'invalid_request', error.message)
+            }
+            throw error
+          }
+        } else await validateWordUpload(bytes, kind)
 
-      const workspaceId = pathParam(req, 'workspaceId')
-      const jobId = `job-${key}`
-      const documentId = `document-${key}`
-      const blobName = originalBlobName(workspaceId, jobId, 'pdf')
-      const batch = batchId ?? ''
-      const fingerprint = inputFingerprint('pdf', [filename, batch, hash(bytes)])
-      await requireMutableWorkspace(jobs.store, workspaceId)
-      const existing = await jobs.store.get(workspaceId, jobId)
-      if (existing) {
-        assertJobWritable(existing.record)
-        if (existing.record.inputFingerprint !== fingerprint) throw conflict('This idempotency key was already used for different input.')
-        res.json({ job: await summary(jobs.store, existing) })
-        return
-      }
-      const sourceBlob = await putJobBlob(jobs.store, jobs.blobs, workspaceId, jobId, blobName, bytes, 'application/pdf')
-      if (sourceBlob.blob.sha256 !== hash(bytes) || sourceBlob.blob.contentType !== 'application/pdf') {
-        throw conflict('This idempotency key was already used for different input.')
-      }
+        const jobId = `job-${key}`
+        const documentId = `document-${key}`
+        const blobName = originalBlobName(workspaceId, jobId, kind)
+        const digest = hash(bytes)
+        const fingerprint = inputFingerprint(kind, [filename, batchId ?? '', digest])
+        const existing = await jobs.store.get(workspaceId, jobId)
+        if (existing) {
+          assertJobWritable(existing.record)
+          if (existing.record.inputFingerprint !== fingerprint) throw conflict('This idempotency key was already used for different input.')
+          res.status(200).json({ job: await summary(jobs.store, existing) })
+          return
+        }
+        const sourceBlob = await putJobBlob(jobs.store, jobs.blobs, workspaceId, jobId, blobName, bytes, contentType)
+        if (sourceBlob.blob.sha256 !== digest || sourceBlob.blob.contentType !== contentType ||
+          sourceBlob.blob.bytes.byteLength !== bytes.byteLength) {
+          throw conflict('This idempotency key was already used for different input.')
+        }
 
-      const timestamp = clock().toISOString()
-      const principal = (req as AuthorizedRequest).authorizedPrincipal
-      const record: RealJobRecord = {
-        id: jobId,
-        workspaceId,
-        recordType: 'job',
-        job: emptyJob(jobId, documentId, filename, 'pdf', filename, batchId, timestamp),
-        source: {
-          kind: 'pdf',
-          displayName: filename,
-          originalBlobName: blobName,
-          originalContentType: 'application/pdf',
-          sha256: sourceBlob.blob.sha256,
-          bytes: sourceBlob.blob.bytes.byteLength,
-        },
-        inputFingerprint: fingerprint,
-        createdBy: principal.principalKey,
-        updatedAt: timestamp,
-        attempts: 0,
-        nextAttemptAt: timestamp,
-        warnings: [],
-      }
-      assertWorkspaceMutationLease(workspaceId)
-      const created = await jobs.store.create(record)
-      if (!created.created && created.value.record.inputFingerprint !== fingerprint) {
-        throw conflict('This idempotency key was already used for different input.')
-      }
-      res.status(created.created ? 202 : 200).json({ job: await summary(jobs.store, created.value) })
-    }),
-  )
+        const timestamp = clock().toISOString()
+        const principal = (req as AuthorizedRequest).authorizedPrincipal
+        const record: RealJobRecord = {
+          id: jobId,
+          workspaceId,
+          recordType: 'job',
+          job: emptyJob(jobId, documentId, filename, kind, filename, batchId, timestamp),
+          source: {
+            kind,
+            displayName: filename,
+            originalBlobName: blobName,
+            originalContentType: contentType,
+            sha256: sourceBlob.blob.sha256,
+            bytes: sourceBlob.blob.bytes.byteLength,
+          },
+          inputFingerprint: fingerprint,
+          createdBy: principal.principalKey,
+          updatedAt: timestamp,
+          attempts: 0,
+          nextAttemptAt: timestamp,
+          warnings: [],
+        }
+        assertWorkspaceMutationLease(workspaceId)
+        const created = await jobs.store.create(record)
+        if (!created.created && created.value.record.inputFingerprint !== fingerprint) {
+          throw conflict('This idempotency key was already used for different input.')
+        }
+        res.status(created.created ? 202 : 200).json({ job: await summary(jobs.store, created.value) })
+      }),
+      (error: unknown, _req: Request, _res: Response, next: NextFunction) => {
+        if (typeof error === 'object' && error !== null && 'type' in error && error.type === 'entity.too.large') {
+          next(new HttpError(413, 'invalid_request', 'Uploaded files may not exceed 10 MiB.'))
+        } else next(error)
+      },
+    )
+  }
 
   router.post(`${base}/url`, authorize(deps.repository, 'write'), mutation('write', async (req, res) => {
     const jobs = requireJobs(deps.jobs)
@@ -605,7 +674,7 @@ export function createRealJobsRouter(deps: RealJobsRouterDeps): Router {
         promptVersion: latest.provenance?.promptVersion ?? '',
       },
     }
-    const errors = validateRealRubric(rubric, document)
+    const errors = validateRealRubric(rubric, document, current.record.source.originalContentType)
     if (errors.length) throw invalidRequest(errors.join(' '))
     const replacement: RealJobRecord = { ...current.record, updatedAt: timestamp }
     let updated
@@ -624,23 +693,28 @@ export function createRealJobsRouter(deps: RealJobsRouterDeps): Router {
     const current = await jobs.store.get(pathParam(req, 'workspaceId'), jobParam(req))
     if (!current) throw notFound('The requested job was not found.')
     if (current.record.lifecycle?.deletingAt || current.record.lifecycle?.deletedAt) throw notFound('This job source has been removed.')
+    if (!validateRealJobRecord(current.record)) throw unavailable('The original source has invalid stored metadata.')
     const blobName = current.record.source.originalBlobName
     if (!blobName) throw notFound('The original source is not available yet.')
     const blob = await jobs.blobs.read(blobName)
     if (!blob) throw notFound('The original source is not available.')
     const expectedContentType = current.record.source.originalContentType
-    if (!expectedContentType || blob.contentType !== expectedContentType) {
+    if (!expectedContentType || !isOriginalContentType(expectedContentType) || blob.contentType !== expectedContentType ||
+      (current.record.source.sha256 !== undefined && (blob.sha256 !== current.record.source.sha256 || hash(blob.bytes) !== current.record.source.sha256)) ||
+      (current.record.source.bytes !== undefined && blob.bytes.byteLength !== current.record.source.bytes)) {
       throw unavailable('The original source has invalid stored metadata.')
     }
     const sourceHost = new URL(
       current.record.source.finalUrl ?? current.record.source.url ?? 'https://source.invalid',
     ).hostname
-    const filename = expectedContentType === 'application/pdf'
-      ? current.record.source.kind === 'pdf' ? current.record.source.displayName : `${sourceHost}.pdf`
-      : `${sourceHost}.html`
+    const filename = current.record.source.kind !== 'url'
+      ? current.record.source.displayName : `${sourceHost}.${originalExtension(expectedContentType)}`
     res.setHeader('Content-Type', expectedContentType)
     res.setHeader('Content-Disposition', attachmentHeader(filename))
     res.setHeader('X-Content-Type-Options', 'nosniff')
+    res.setHeader('Content-Security-Policy', "sandbox; default-src 'none'; frame-ancestors 'none'")
+    res.setHeader('Referrer-Policy', 'no-referrer')
+    if (expectedContentType === 'text/markdown') res.setHeader('Cache-Control', 'private, no-store')
     res.send(Buffer.from(blob.bytes))
   }))
 

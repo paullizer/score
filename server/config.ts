@@ -1,6 +1,8 @@
 import { GUID_PATTERN } from './ids'
 import type { RealJobsConfig } from './jobs/store'
 import type { RealGradesConfig } from './grades/store'
+import type { RealResumesConfig } from './resumes/store'
+import type { RealAnalysesConfig } from './analyses/store'
 
 /**
  * Server configuration, loaded once from environment variables. Every default here is
@@ -31,6 +33,11 @@ export interface Config {
   readonly realGrades?: RealGradesConfig
   readonly jobLifecycleStore?: RealJobsConfig
   readonly gradeLifecycleStore?: RealGradesConfig
+  readonly resumeLifecycleStore?: RealResumesConfig
+  readonly analysisLifecycleStore?: RealAnalysesConfig
+  readonly realResumes?: RealResumesConfig
+  readonly realAnalyses?: RealAnalysesConfig
+  readonly wordDocumentImports: boolean
   readonly appOrigin: string
   readonly isProduction: boolean
   readonly isAppService: boolean
@@ -54,6 +61,23 @@ function required(env: NodeJS.ProcessEnv, name: string): string {
 function optional(env: NodeJS.ProcessEnv, name: string): string | undefined {
   const value = env[name]
   return typeof value === 'string' && value.trim().length > 0 ? value.trim() : undefined
+}
+
+function featureEnabled(env: NodeJS.ProcessEnv, name: string): boolean {
+  const value = optional(env, name)
+  if (value !== undefined && value !== 'true' && value !== 'false') {
+    throw new ConfigError(`${name} must be true or false.`)
+  }
+  return value === 'true'
+}
+
+function requireSeparateContainers(containers: readonly (readonly [string, string])[]): void {
+  const names = new Map<string, string>()
+  for (const [setting, name] of containers) {
+    const other = names.get(name)
+    if (other) throw new ConfigError(`${setting} must be separate from ${other}.`)
+    names.set(name, setting)
+  }
 }
 
 function requireGuid(env: NodeJS.ProcessEnv, name: string): string {
@@ -120,74 +144,60 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     accountUrl: requireUrl(env, 'STORAGE_ACCOUNT_URL'),
     containerName: optional(env, 'WORKSPACE_BLOB_CONTAINER') ?? 'workspace-state',
   }
-  const importsSetting = optional(env, 'REAL_JOB_IMPORTS_ENABLED')
-  if (importsSetting !== undefined && importsSetting !== 'true' && importsSetting !== 'false') {
-    throw new ConfigError('REAL_JOB_IMPORTS_ENABLED must be true or false.')
-  }
-  let realJobs: RealJobsConfig | undefined
-  if (importsSetting === 'true') {
-    const container = required(env, 'JOB_RECORDS_CONTAINER')
-    const blobContainer = required(env, 'JOB_SOURCE_CONTAINER')
-    if (container === cosmos.container) throw new ConfigError('JOB_RECORDS_CONTAINER must be separate from COSMOS_CONTAINER.')
-    if (blobContainer === storage.containerName) {
-      throw new ConfigError('JOB_SOURCE_CONTAINER must be separate from WORKSPACE_BLOB_CONTAINER.')
-    }
+  const jobsEnabled = featureEnabled(env, 'REAL_JOB_IMPORTS_ENABLED')
+  const gradesEnabled = featureEnabled(env, 'REAL_GRADE_LADDERS_ENABLED')
+  const resumesEnabled = featureEnabled(env, 'REAL_RESUME_IMPORTS_ENABLED')
+  const analysesEnabled = featureEnabled(env, 'REAL_ANALYSES_ENABLED')
+  const wordDocumentImports = featureEnabled(env, 'WORD_DOCUMENT_IMPORTS_ENABLED')
+  const jobRecords = jobsEnabled ? required(env, 'JOB_RECORDS_CONTAINER') : optional(env, 'JOB_RECORDS_CONTAINER') ?? 'job-records'
+  const jobSources = jobsEnabled ? required(env, 'JOB_SOURCE_CONTAINER') : optional(env, 'JOB_SOURCE_CONTAINER') ?? 'job-sources'
+  const gradeRecords = optional(env, 'GRADE_RECORDS_CONTAINER') ?? 'grade-records'
+  const gradeSources = optional(env, 'GRADE_SOURCE_CONTAINER') ?? 'grade-sources'
+  const resumeRecords = optional(env, 'RESUME_RECORDS_CONTAINER') ?? 'resume-records'
+  const resumeSources = optional(env, 'RESUME_SOURCE_CONTAINER') ?? 'resume-sources'
+  const analysisRecords = optional(env, 'ANALYSIS_RECORDS_CONTAINER') ?? 'analysis-records'
+  const analysisSources = optional(env, 'ANALYSIS_SOURCE_CONTAINER') ?? 'analysis-sources'
 
-    realJobs = {
-      cosmosEndpoint: cosmos.endpoint,
-      database: cosmos.database,
-      container,
-      storageAccountUrl: storage.accountUrl,
-      blobContainer,
-    }
+  // Reserve inactive stores too: enabling another feature must never expose an aliased store.
+  requireSeparateContainers([
+    ['COSMOS_CONTAINER', cosmos.container], ['JOB_RECORDS_CONTAINER', jobRecords],
+    ['GRADE_RECORDS_CONTAINER', gradeRecords], ['RESUME_RECORDS_CONTAINER', resumeRecords],
+    ['ANALYSIS_RECORDS_CONTAINER', analysisRecords],
+  ])
+  requireSeparateContainers([
+    ['WORKSPACE_BLOB_CONTAINER', storage.containerName], ['JOB_SOURCE_CONTAINER', jobSources],
+    ['GRADE_SOURCE_CONTAINER', gradeSources], ['RESUME_SOURCE_CONTAINER', resumeSources],
+    ['ANALYSIS_SOURCE_CONTAINER', analysisSources],
+  ])
+  const shared = {
+    cosmosEndpoint: cosmos.endpoint, database: cosmos.database, storageAccountUrl: storage.accountUrl,
   }
+  const realJobs: RealJobsConfig | undefined = jobsEnabled
+    ? { ...shared, container: jobRecords, blobContainer: jobSources } : undefined
+  const realGrades: RealGradesConfig | undefined = gradesEnabled
+    ? { ...shared, container: gradeRecords, blobContainer: gradeSources } : undefined
+  const realResumes: RealResumesConfig | undefined = resumesEnabled
+    ? { ...shared, container: resumeRecords, blobContainer: resumeSources } : undefined
+  const realAnalyses: RealAnalysesConfig | undefined = analysesEnabled
+    ? { ...shared, container: analysisRecords, blobContainer: analysisSources } : undefined
 
-  const gradesSetting = optional(env, 'REAL_GRADE_LADDERS_ENABLED')
-  if (gradesSetting !== undefined && gradesSetting !== 'true' && gradesSetting !== 'false') {
-    throw new ConfigError('REAL_GRADE_LADDERS_ENABLED must be true or false.')
-  }
-  let realGrades: RealGradesConfig | undefined
-  if (gradesSetting === 'true') {
-    const container = optional(env, 'GRADE_RECORDS_CONTAINER') ?? 'grade-records'
-    const blobContainer = optional(env, 'GRADE_SOURCE_CONTAINER') ?? 'grade-sources'
-    if (container === cosmos.container || container === (realJobs?.container ?? optional(env, 'JOB_RECORDS_CONTAINER') ?? 'job-records')) {
-      throw new ConfigError('GRADE_RECORDS_CONTAINER must be separate from workspace and job records.')
-    }
-    if (blobContainer === storage.containerName ||
-      blobContainer === (realJobs?.blobContainer ?? optional(env, 'JOB_SOURCE_CONTAINER') ?? 'job-sources')) {
-      throw new ConfigError('GRADE_SOURCE_CONTAINER must be separate from workspace and job sources.')
-    }
-    realGrades = {
-      cosmosEndpoint: cosmos.endpoint, database: cosmos.database, container,
-      storageAccountUrl: storage.accountUrl, blobContainer,
-    }
-  }
-
-  const jobRecords = optional(env, 'JOB_RECORDS_CONTAINER')
-  const jobSources = optional(env, 'JOB_SOURCE_CONTAINER')
-  if (Boolean(jobRecords) !== Boolean(jobSources)) {
+  const configuredJobRecords = optional(env, 'JOB_RECORDS_CONTAINER')
+  const configuredJobSources = optional(env, 'JOB_SOURCE_CONTAINER')
+  if (Boolean(configuredJobRecords) !== Boolean(configuredJobSources)) {
     throw new ConfigError('Both job storage containers must be configured so lifecycle cleanup cannot skip existing data.')
   }
-  const jobLifecycleStore = realJobs ?? (jobRecords && jobSources ? {
-    cosmosEndpoint: cosmos.endpoint, database: cosmos.database, container: jobRecords,
-    storageAccountUrl: storage.accountUrl, blobContainer: jobSources,
+  const jobLifecycleStore = realJobs ?? (configuredJobRecords && configuredJobSources ? {
+    ...shared, container: jobRecords, blobContainer: jobSources,
   } : undefined)
-  const gradeRecords = optional(env, 'GRADE_RECORDS_CONTAINER')
-  const gradeSources = optional(env, 'GRADE_SOURCE_CONTAINER')
-  const gradeLifecycleStore = realGrades ?? (gradeRecords || gradeSources ? {
-    cosmosEndpoint: cosmos.endpoint, database: cosmos.database, container: gradeRecords ?? 'grade-records',
-    storageAccountUrl: storage.accountUrl, blobContainer: gradeSources ?? 'grade-sources',
+  const gradeLifecycleStore = realGrades ?? (optional(env, 'GRADE_RECORDS_CONTAINER') || optional(env, 'GRADE_SOURCE_CONTAINER') ? {
+    ...shared, container: gradeRecords, blobContainer: gradeSources,
   } : undefined)
-  if (jobLifecycleStore && (jobLifecycleStore.container === cosmos.container ||
-    jobLifecycleStore.blobContainer === storage.containerName)) {
-    throw new ConfigError('Job lifecycle storage must be separate from workspace storage.')
-  }
-  if (gradeLifecycleStore && (gradeLifecycleStore.container === cosmos.container ||
-    gradeLifecycleStore.container === jobLifecycleStore?.container ||
-    gradeLifecycleStore.blobContainer === storage.containerName ||
-    gradeLifecycleStore.blobContainer === jobLifecycleStore?.blobContainer)) {
-    throw new ConfigError('Grade lifecycle storage must be separate from workspace and job storage.')
-  }
+  const resumeLifecycleStore = realResumes ?? (optional(env, 'RESUME_RECORDS_CONTAINER') || optional(env, 'RESUME_SOURCE_CONTAINER') ? {
+    ...shared, container: resumeRecords, blobContainer: resumeSources,
+  } : undefined)
+  const analysisLifecycleStore = realAnalyses ?? (optional(env, 'ANALYSIS_RECORDS_CONTAINER') || optional(env, 'ANALYSIS_SOURCE_CONTAINER') ? {
+    ...shared, container: analysisRecords, blobContainer: analysisSources,
+  } : undefined)
 
   return {
     authMode,
@@ -200,6 +210,11 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     realGrades,
     jobLifecycleStore,
     gradeLifecycleStore,
+    resumeLifecycleStore,
+    analysisLifecycleStore,
+    realResumes,
+    realAnalyses,
+    wordDocumentImports,
     appOrigin: requireHttpsOrigin(env, 'APP_ORIGIN'),
     isProduction,
     isAppService,

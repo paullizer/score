@@ -7,6 +7,7 @@ import { GradeDisclaimer, GradeStatus } from './GradeShared'
 import { useWorkspace } from '../../app/workspace-context'
 import { getEntityLifecycle, isEntityArchived, isEntityRemoved, matchesArchiveFilter, type ArchiveFilter } from '../../domain/lifecycle'
 import { ArchivedBadge, EntityLifecycleActions } from '../../components/lifecycle/LifecycleControls'
+import { ApprovedGradeAnalysis } from './ApprovedGradeAnalysis'
 
 export function GradeLadderLibrary({ search = '', archiveFilter = 'default' }: { search?: string; archiveFilter?: ArchiveFilter }) {
   const api = useGradeLadders()
@@ -36,6 +37,7 @@ export function GradeLadderLibrary({ search = '', archiveFilter = 'default' }: {
           restoreOnly={Boolean(head.lifecycle?.deletedAt)} />
       </li>)}</ul>
       <Link to={gradeLadderLink(ladder.id)} className="text-link">{getEntityLifecycle(workspace, { kind: 'ladder', id: ladder.id })?.deletingAt ? 'View cleanup status' : 'Open sources and grade matrix'} <ArrowRight size={14} aria-hidden="true" /></Link>
+      <ApprovedGradeAnalysis ladderId={ladder.id} />
       <span className="grade-family-id" title={ladder.id}>Family {ladder.id}</span>
       <EntityLifecycleActions target={{ kind: 'ladder', id: ladder.id }} name={ladder.name} />
     </article>)}</div>}

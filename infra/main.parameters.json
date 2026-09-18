@@ -12,6 +12,8 @@
     "containerImage": { "value": "${AZURE_CONTAINER_IMAGE}" },
     "workerImage": { "value": "${AZURE_WORKER_CONTAINER_IMAGE}" },
     "rendererImage": { "value": "${AZURE_JOB_RENDERER_IMAGE}" },
-    "gradeWorkerImage": { "value": "${AZURE_GRADE_WORKER_CONTAINER_IMAGE}" }
+    "gradeWorkerImage": { "value": "${AZURE_GRADE_WORKER_CONTAINER_IMAGE}" },
+    "resumeWorkerImage": { "value": "${AZURE_RESUME_WORKER_CONTAINER_IMAGE}" },
+    "analysisWorkerImage": { "value": "${AZURE_ANALYSIS_WORKER_CONTAINER_IMAGE}" }
   }
 }

@@ -11,23 +11,29 @@ import { ResumesPage } from '../features/resumes/ResumesPage'
 import { RubricsPage } from '../features/rubrics/RubricsPage'
 import { AnalysesPage, AnalysisSetup, AnalysisDetail } from '../features/analyses/AnalysesPage'
 import { latestRubrics } from '../domain/selectors'
+import { ANALYSIS_LIMITS } from '../domain/real-analyses'
 import { useGradeLadders } from './grade-ladders-context'
 import { CreateGradeLadder } from '../features/grade-ladders/CreateGradeLadder'
 import { GradeLadderPage } from '../features/grade-ladders/GradeLadderPage'
 import { isEntityArchived, isEntityRemoved } from '../domain/lifecycle'
 import { EntityLifecycleActions, LifecycleBanner, LifecycleDialogProvider, LifecycleOperationBanner } from '../components/lifecycle/LifecycleControls'
 import { useLifecycleAccess } from '../components/lifecycle/useLifecycleAccess'
+import { useRealResumes } from './real-resumes-context'
+import { useRealAnalyses } from './real-analyses-context'
+import { RealResumeImportActivity } from '../features/resumes/RealAddResumesDialog'
 
 function Navigation({ onNavigate }: { onNavigate?: () => void }) {
   const { workspace } = useWorkspace()
   const gradeLadders = useGradeLadders()
+  const realResumes = useRealResumes()
+  const realAnalyses = useRealAnalyses()
   const location = useLocation()
   const realGrades = gradeLadders?.summaries.reduce((count, family) => count + family.levels.filter((level) => level.head.latestVersionId && !isEntityRemoved(workspace, { kind: 'rubric', id: level.head.id }) && !isEntityArchived(workspace, { kind: 'rubric', id: level.head.id })).length, 0) ?? 0
   const items = [
     { to: '/jobs', label: 'Jobs', icon: BriefcaseBusiness, count: workspace.jobs.filter((job) => !isEntityArchived(workspace, { kind: 'job', id: job.id }) && !isEntityRemoved(workspace, { kind: 'job', id: job.id })).length },
-    { to: '/resumes', label: 'Resumes', icon: Files, count: workspace.resumes.filter((resume) => !isEntityArchived(workspace, { kind: 'resume', id: resume.id })).length },
+    { to: '/resumes', label: 'Resumes', icon: Files, count: [...workspace.resumes, ...(realResumes?.summaries.map((item) => item.resume) ?? [])].filter((resume) => !isEntityArchived(workspace, { kind: 'resume', id: resume.id }) && !isEntityRemoved(workspace, { kind: 'resume', id: resume.id })).length },
     { to: '/rubrics', label: 'Rubrics', icon: Layers3, count: latestRubrics(workspace).filter((rubric) => !(rubric.kind === 'grade' && rubric.dataKind === 'real') && !isEntityArchived(workspace, { kind: 'rubric', id: rubric.groupId })).length + realGrades },
-    { to: '/analyses', label: 'Analyses', icon: BarChart3, count: workspace.runs.filter((run) => !isEntityArchived(workspace, { kind: 'analysis', id: run.id })).length },
+    { to: '/analyses', label: 'Analyses', icon: BarChart3, count: [...workspace.runs, ...(realAnalyses?.summaries.map((item) => item.run) ?? [])].filter((run) => !isEntityArchived(workspace, { kind: 'analysis', id: run.id }) && !isEntityRemoved(workspace, { kind: 'analysis', id: run.id })).length },
   ]
   return <nav className="main-nav" aria-label="Main navigation">{items.map(({ to, label, icon: Icon, count }) =>
     <NavLink key={to} to={to} onClick={onNavigate} className={({ isActive }) => isActive || (to === '/rubrics' && location.pathname.startsWith('/grade-ladders')) ? 'nav-item is-active' : 'nav-item'}>
@@ -48,11 +54,14 @@ function AccountPanel({ cloud }: { cloud: NonNullable<ReturnType<typeof useWorks
 
 export function App() {
   const { workspace, storageError, retrySave, notice, clearNotice, resetDemo, cloud } = useWorkspace()
+  const realResumes = useRealResumes()
+  const realAnalyses = useRealAnalyses()
   const [showReset, setShowReset] = useState(false)
   const [showAbout, setShowAbout] = useState(false)
   const [mobileNav, setMobileNav] = useState(false)
   const navigate = useNavigate()
   const location = useLocation()
+  const newAnalysisMode = new URLSearchParams(location.search).get('data') === 'samples' ? 'samples' : 'real'
   const section = location.pathname.startsWith('/grade-ladders') ? 'rubrics' : location.pathname.split('/')[1] || 'jobs'
   const isDetail = location.pathname.split('/').filter(Boolean).length > 1
   const currentWorkspaceName = cloud?.workspaces.find((item) => item.id === cloud.currentWorkspaceId)?.name
@@ -91,14 +100,16 @@ export function App() {
         </div>
         <div className="topbar-actions">
           {cloud ? <CloudSaveIndicator cloud={cloud} /> : <span className={`save-status ${storageError ? 'is-error' : ''}`}><span />{storageError ? 'Changes not saved' : 'Saved on this device'}</span>}
-          <button className="demo-chip" onClick={() => setShowAbout(true)}><FlaskConical size={13} />{cloud ? 'Demo scoring / preview' : 'Demo workspace'}</button>
-          <Button variant="primary" size="sm" icon={Plus} disabled={!canEdit} onClick={() => navigate('/analyses/new')}>New analysis</Button>
+          <button className="demo-chip" onClick={() => setShowAbout(true)}><FlaskConical size={13} />{cloud ? 'Real & sample workflows' : 'Demo workspace'}</button>
+          <Button variant="primary" size="sm" icon={Plus} disabled={!canEdit || Boolean(cloud && newAnalysisMode === 'real' && (!realAnalyses?.canWrite || realAnalyses.phase !== 'ready' || !realAnalyses.features?.realAnalyses))}
+            onClick={() => navigate(cloud ? `/analyses/new?data=${newAnalysisMode}` : '/analyses/new')}>New analysis</Button>
         </div>
       </header>
       {cloud ? <CloudSaveBanner cloud={cloud} /> : storageError && <div className="storage-banner" role="alert"><span>{storageError}</span><Button size="sm" onClick={retrySave}>Retry saving</Button></div>}
       <main id="main-content" className="main-content">
         <LifecycleBanner />
         <LifecycleOperationBanner />
+        {cloud && <RealResumeImportActivity />}
         <Routes>
           <Route path="/" element={<Navigate to="/jobs" replace />} />
           <Route path="/jobs" element={<JobsPage />} />
@@ -115,8 +126,8 @@ export function App() {
           <Route path="*" element={<EmptyState title="This page is not in your workspace" description="Return to the jobs library to find your next review." action={<Button onClick={() => navigate('/jobs')}>Go to jobs</Button>} />} />
         </Routes>
         <footer className="workspace-footer">
-          <span><ShieldCheck size={13} />{cloud ? 'Real jobs and GS references are read and stored privately. Resume imports and scoring remain mock preview features.' : 'Private by design. This preview stays in your browser.'}</span>
-          <span>{workspace.jobs.filter((job) => !isEntityArchived(workspace, { kind: 'job', id: job.id }) && !isEntityRemoved(workspace, { kind: 'job', id: job.id })).length} active jobs / {workspace.resumes.filter((resume) => !isEntityArchived(workspace, { kind: 'resume', id: resume.id })).length} active resumes</span>
+          <span><ShieldCheck size={13} />{cloud ? 'Real sources and analyses are private server records. Samples stay fictional. A human makes the decision.' : 'Private by design. This preview stays in your browser.'}</span>
+          <span>{workspace.jobs.filter((job) => !isEntityArchived(workspace, { kind: 'job', id: job.id }) && !isEntityRemoved(workspace, { kind: 'job', id: job.id })).length} active jobs / {[...workspace.resumes, ...(realResumes?.summaries.map((item) => item.resume) ?? [])].filter((resume) => !isEntityArchived(workspace, { kind: 'resume', id: resume.id }) && !isEntityRemoved(workspace, { kind: 'resume', id: resume.id })).length} active resumes{cloud && ' · includes samples'}</span>
         </footer>
       </main>
     </div>
@@ -132,7 +143,7 @@ export function App() {
       description={cloud ? `Reset only the fictional preview content in ${currentWorkspaceName ?? 'this workspace'}?` : 'Reset your demo workspace?'}
       footer={<><Button onClick={() => setShowReset(false)}>Keep my workspace</Button><Button variant="danger" icon={RotateCcw} disabled={!canEdit} onClick={() => { resetDemo(); setShowReset(false); navigate('/jobs') }}>Reset {cloud ? 'samples' : 'demo'}</Button></>}>
       {cloud ? <>
-        <p>This resets only the legacy sample imports, rubric edits, and simulated analysis history in <strong>{currentWorkspaceName ?? 'this workspace'}</strong>. Server-owned real jobs, grade ladders, reference captures, approvals, and all their versions are not deleted or changed.</p>
+        <p>This resets only the legacy sample imports, rubric edits, and simulated analysis history in <strong>{currentWorkspaceName ?? 'this workspace'}</strong>. Server-owned real resumes, original captures, analyses and their frozen inputs/results, jobs, grade ladders, reference captures, approvals, and all their versions are not deleted or changed.</p>
         <p className="mt-4 text-muted">Your other workspaces are not affected.</p>
       </> : <>
         <p>This replaces demo imports, rubric edits, and analysis history with the original fictional examples. It cannot be undone.</p>
@@ -143,8 +154,8 @@ export function App() {
       footer={<Button variant="primary" onClick={() => setShowAbout(false)}>Back to the workspace</Button>}>
       <div className="about-illustration"><BriefcaseBusiness /><ChevronRight /><Layers3 /><ChevronRight /><BarChart3 /></div>
       <h3 className="mb-3 text-lg font-semibold">A job. A rubric. The evidence.</h3>
-      <p>{cloud ? 'Review real job descriptions and source-grounded GS grade ladders with frozen OPM and supporting references. Resume import, applicant scoring, and the Samples view remain fictional preview workflows. Grade approval is not official OPM classification or eligibility certification.' : 'Explore the complete review workflow with fictional jobs and resumes. Import files or URLs to simulate adding sample records, build a comparison, and follow each score back to its supporting passage.'}</p>
-      {cloud ? <div className="info-callout mt-5"><CircleHelp size={18} /><div><strong>Real job sources are processed privately.</strong><p>Uploaded job PDFs and direct posting URLs are read and stored in this cloud workspace so processing can resume on the server. Real jobs and rubric versions are separate from legacy sample autosave. Resume uploads and scoring still use fictional fixtures.</p></div></div>
+      <p>{cloud ? 'Import real resumes, inspect captured sources, then explicitly compare ready resumes against real jobs or exact approved GS versions. Real analyses use model-assisted evidence assessment and grounding review, with immutable snapshots and independent progress. Only the explicitly labeled Samples workflows are fictional. Scores are review aids, not hiring decisions or official GS eligibility determinations.' : 'Explore the complete review workflow with fictional jobs and resumes. Import files or URLs to simulate adding sample records, build a comparison, and follow each score back to its supporting passage.'}</p>
+      {cloud ? <div className="info-callout mt-5"><CircleHelp size={18} /><div><strong>Real sources are read, processed, and retained privately.</strong><p>Resume batches accept up to 10 total PDFs, local Markdown and Word files (when enabled), and public HTML/PDF URLs, including accessible LinkedIn profiles. Real job and resume files must be no larger than 10 MiB; the 50-page limit applies only to PDFs. Each source is limited to 180,000 normalized characters. Markdown uploads use .md or .markdown files; their links and images are not fetched, and evidence is shown as text rather than a rendered preview. Word uploads accept DOCX and Word 97–2003 DOC. Their citations use captured sections, not printed pages; the private DOCX formatted preview is approximate and extracted text remains authoritative. Nonpublic or blocked URLs cannot be processed; Score never signs in or bypasses access controls. Public profiles can be sparse. Each analysis is started manually and is limited to {realAnalyses?.features?.analysisLimits.maxComparisons ?? ANALYSIS_LIMITS.maxComparisons} independent comparisons.</p><p>Accepted imports and analysis work continue on the server after browser close. Larger analyses use the same processing rate and may take longer. Real documents, profiles, and results never enter sample autosave or browser local storage. Reset samples does not delete them. Disabled or unavailable real services never substitute fictional content.</p><p>Archive makes content read-only and stops unfinished work it owns, never independent saved analyses. Search includes archived records; restoring them does not restart processing. Permanent deletion requires confirmation and cannot remove an input retained by an analysis or seed ladder, including archived history.</p></div></div>
         : <div className="info-callout mt-5"><CircleHelp size={18} /><div><strong>Nothing is uploaded or evaluated by AI.</strong><p>Selected file contents are never read. URLs are not fetched. Scores and quotations come from synthetic fixtures, and GS examples are not official eligibility assessments.</p></div></div>}
       <div className="mt-5 flex flex-wrap gap-2"><Badge>{cloud ? 'Cloud workspace storage' : 'Local demo storage'}</Badge><Badge>Human review first</Badge><Badge>No automatic hiring decisions</Badge></div>
     </Modal>

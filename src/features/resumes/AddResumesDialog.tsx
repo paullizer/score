@@ -6,13 +6,24 @@ import { RESUME_FIXTURE_COUNT } from '../../data/fixtures'
 import type { ImportCandidate } from '../../domain/types'
 import { LifecycleBanner } from '../../components/lifecycle/LifecycleControls'
 import { useLifecycleAccess } from '../../components/lifecycle/useLifecycleAccess'
+import { RealAddResumesDialog } from './RealAddResumesDialog'
 
-export function AddResumesDialog({ open, onOpenChange, onAdded, onError }: {
+interface AddResumesDialogProps {
   open: boolean
   onOpenChange: (open: boolean) => void
   onAdded: (ids: string[]) => void
   onError: (message: string) => void
-}) {
+  mode?: 'real' | 'samples'
+}
+
+export function AddResumesDialog(props: AddResumesDialogProps) {
+  const { cloud } = useWorkspace()
+  return props.mode === 'real' || (props.mode !== 'samples' && cloud)
+    ? <RealAddResumesDialog open={props.open} onOpenChange={props.onOpenChange} />
+    : <SampleAddResumesDialog {...props} />
+}
+
+function SampleAddResumesDialog({ open, onOpenChange, onAdded, onError }: AddResumesDialogProps) {
   const { addResumes, notify, cloud } = useWorkspace()
   const { canEdit } = useLifecycleAccess()
   const [items, setItems] = useState<ImportCandidate[]>([])

@@ -28,6 +28,7 @@ export function fakeJobBlobContainer() {
       const etag = `"blob-${++counter}"`
       values.set(name, {
         bytes: Buffer.from(bytes), contentType: options.blobHTTPHeaders?.blobContentType,
+        cacheControl: options.blobHTTPHeaders?.blobCacheControl,
         metadata: options.metadata ?? {}, etag, lease,
       })
       return { etag }

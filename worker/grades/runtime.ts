@@ -771,7 +771,8 @@ async function recordFailure(deps: GradeWorkerDependencies, lease: GradeLease, e
     const operations: GradeTransaction[] = []
     if (work.input.kind === 'extract-source') {
       const value = await deps.store.get(work.workspaceId, work.input.sourceId)
-      if (value && gradeRecordIs(value.record, 'grade-source') && ladder.record.sourceIds.includes(value.record.id) &&
+      if (value && gradeRecordIs(value.record, 'grade-source') && value.record.origin !== 'seed-job' &&
+        ladder.record.sourceIds.includes(value.record.id) &&
         (work.input.documentVersion === undefined || work.input.documentVersion === value.record.documentVersion)) {
         operations.push({
           kind: 'replace', etag: value.etag,

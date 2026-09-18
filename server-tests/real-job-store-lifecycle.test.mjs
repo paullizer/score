@@ -43,8 +43,11 @@ async function ready(jobs) {
   return { value, rubric }
 }
 
-function injectEmptyCosmosPages(cosmos) {
-  cosmos.queryPages((_spec, options, readPage) => {
+function injectEmptyCosmosPages(cosmos, progress = false) {
+  cosmos.queryPages((_spec, options, readPage, fetchCount) => {
+    if (progress && fetchCount < 2) {
+      return { resources: fetchCount === 0 ? undefined : [], hasMoreResults: true }
+    }
     const token = options.continuationToken ?? '0'
     const empty = /^empty:(\d+):(\d+)$/.exec(token)
     const offset = empty?.[1] ?? token
@@ -420,4 +423,90 @@ test('participant terminal deletion retries stay fenced without downgrading the 
   assert.equal(await jobs.store.get(workspaceId, jobId), undefined)
   assert.deepEqual(await jobs.store.listRubrics(workspaceId, jobId), [])
   await assert.rejects(jobs.store.create(realJobRecord(workspaceId, `job-${randomUUID()}`)), /archived or removed/)
+})
+
+for (const [kind, extension, contentType] of [
+  ['pdf', 'pdf', 'application/pdf'],
+  ['markdown', 'md', 'text/markdown'],
+  ['docx', 'docx', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'],
+  ['doc', 'doc', 'application/msword'],
+]) {
+  test(`${kind} originals use guarded immutable writes, retain provenance through archive, and cannot replay after deletion`, async () => {
+    const { blob, jobs } = fixture()
+    const name = `${workspaceId}/${jobId}/original.${extension}`
+    const bytes = Buffer.from(`Captured ${kind} bytes`)
+    const saved = await putJobBlob(jobs.store, jobs.blobs, workspaceId, jobId, name, bytes, contentType)
+    assert.equal(blob.values.get(name).cacheControl, 'private, no-store')
+    const record = realJobRecord()
+    record.job = { ...record.job, source: kind, sourceLabel: `Role.${extension}` }
+    record.source = {
+      kind, displayName: `Role.${extension}`, originalBlobName: name, originalContentType: contentType,
+      sha256: saved.blob.sha256, bytes: bytes.length,
+    }
+    assert.ok(validateRealJobRecord(record))
+    const created = (await jobs.store.create(record)).value
+    const archived = await jobs.store.transitionLifecycle(workspaceId, jobId, created.etag, 'job', 'archive', timestamp)
+    assert.deepEqual(archived.record.source, record.source)
+    assert.deepEqual(Buffer.from((await jobs.blobs.read(name)).bytes), bytes)
+    await assert.rejects(putJobBlob(jobs.store, jobs.blobs, workspaceId, jobId, name, bytes, contentType), /archived or removed/)
+    await assert.rejects(jobs.store.create(record), /archived or removed/)
+    const restored = await jobs.store.transitionLifecycle(workspaceId, jobId, archived.etag, 'job', 'unarchive', timestamp)
+    assert.equal(restored.record.job.status, 'cancelled')
+    assert.deepEqual(await jobs.store.listPending('2099-01-01T00:00:00.000Z', 10), [])
+    const deleting = await jobs.store.transitionLifecycle(workspaceId, jobId, restored.etag, 'job', 'delete', timestamp)
+    await purgeJob(jobs, deleting, timestamp)
+    assert.equal(blob.values.size, 0)
+    await assert.rejects(jobs.store.replace(restored.record, restored.etag), /removed/)
+    await assert.rejects(jobs.store.create(record), /deleted job/)
+    await assert.rejects(putJobBlob(jobs.store, jobs.blobs, workspaceId, jobId, name, bytes, contentType), /removed/)
+    assert.equal(blob.values.size, 0)
+  })
+}
+
+test('progress-only Cosmos responses coexist with empty continuation pages in polling, cancellation, counts, recovery, and cleanup', async () => {
+  const { cosmos, jobs } = fixture()
+  const { value } = await ready(jobs)
+  for (let index = 0; index < 52; index += 1) await jobs.store.create(realJobRecord(workspaceId, `job-${randomUUID()}`))
+  const writer = await jobs.store.beginBlobWrite(workspaceId, jobId, `${workspaceId}/${jobId}/original.html`)
+  cosmos.records.get(`${workspaceId}/${writer.id}`).expiresAt = new Date(0).toISOString()
+  injectEmptyCosmosPages(cosmos, true)
+  assert.equal((await jobs.store.listPending('2099-01-01T00:00:00.000Z', 100)).length, 52)
+  assert.equal((await jobs.store.listBlobWriters(workspaceId, jobId)).length, 1)
+  const participant = createJobLifecycleParticipant(jobs)
+  assert.deepEqual(await participant.counts(workspaceId), { jobs: 53, rubrics: 1, rubricVersions: 1, sourceArtifacts: 0 })
+  await jobs.store.transitionLifecycle(workspaceId, jobId, value.etag, 'rubric', 'delete', timestamp)
+  await participant.resume(workspaceId, timestamp)
+  assert.equal((await jobs.store.get(workspaceId, jobId)).record.job.rubricDeletedAt, timestamp)
+  await participant.setState(workspaceId, 'deleting', timestamp)
+  await participant.cancel(workspaceId, timestamp)
+  assert.equal([...cosmos.records.values()].filter(record => record.recordType === 'job' && record.job.status === 'cancelled').length, 52)
+  await participant.purge(workspaceId, timestamp)
+  await participant.setState(workspaceId, 'deleted', timestamp)
+  assert.equal([...cosmos.records.values()].filter(record => record.recordType === 'job-tombstone').length, 53)
+  assert.equal([...cosmos.records.values()].some(record => ['job', 'rubric-version', 'blob-writer'].includes(record.recordType)), false)
+})
+
+test('malformed and endless Cosmos progress never become successful cleanup', async () => {
+  for (const [page, message] of [
+    [{ resources: null, hasMoreResults: false }, /invalid query page/],
+    [{ resources: undefined, hasMoreResults: true }, /progress-page limit/],
+  ]) {
+    const { cosmos, jobs } = fixture()
+    const { value } = await ready(jobs)
+    await jobs.store.transitionLifecycle(workspaceId, jobId, value.etag, 'job', 'delete', timestamp)
+    cosmos.queryPages(() => page)
+    await assert.rejects(jobs.store.purgeJobRecords(workspaceId, jobId, timestamp), message)
+    assert.equal(cosmos.records.get(`${workspaceId}/${jobId}`).recordType, 'job')
+    assert.equal([...cosmos.records.values()].filter(record => record.recordType === 'rubric-version').length, 1)
+  }
+})
+
+test('pending job, cancellation, and writer traversal fail closed on repeated continuation tokens', async () => {
+  const { cosmos, jobs } = fixture()
+  await jobs.store.create(realJobRecord())
+  cosmos.queryPages(() => ({ resources: [], continuationToken: 'stuck' }))
+  await assert.rejects(jobs.store.listPending(timestamp, 10), /pagination did not advance/)
+  await assert.rejects(jobs.store.listBlobWriters(workspaceId), /pagination did not advance/)
+  await jobs.store.setWorkspaceLifecycle(workspaceId, 'archived', timestamp)
+  await assert.rejects(jobs.store.cancelWorkspace(workspaceId, timestamp), /pagination did not advance/)
 })

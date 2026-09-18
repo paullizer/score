@@ -4,6 +4,7 @@ import { Copy, FileSearch, Layers3, Pencil, ShieldCheck } from 'lucide-react'
 import { useWorkspace } from '../../app/workspace-context'
 import { Badge, Button, DemoNote, EmptyState, InlineError } from '../../components/ui'
 import type { Citation, Criterion, Rubric } from '../../domain/types'
+import { documentPagination, isUploadFormat, UPLOAD_CONTENT_TYPES } from '../../domain/document-formats'
 import { RubricEditor } from './RubricEditor'
 import { ArchivedBadge, EntityLifecycleActions, LifecycleBanner } from '../../components/lifecycle/LifecycleControls'
 import { useLifecycleAccess } from '../../components/lifecycle/useLifecycleAccess'
@@ -31,6 +32,10 @@ export function RubricPanel({ rubric, onSelectCriterion, onVersionSaved, readOnl
   const { canEdit } = useLifecycleAccess({ kind: 'rubric', id: rubric.groupId })
   const job = workspace.jobs.find((item) => item.id === rubric.jobId)
   const document = workspace.documents.find((item) => item.id === job?.documentId)
+  const pagination = job?.dataKind === 'real' ? documentPagination(cloud?.realJobs.source(job.id)?.originalContentType
+    ?? (isUploadFormat(job.source) ? UPLOAD_CONTENT_TYPES[job.source] : undefined)) : 'pdf-pages'
+  const sourceLocation = (page: number) => pagination === 'pdf-pages' ? `p. ${page}`
+    : `${pagination === 'markdown-sections' ? 'Markdown' : pagination === 'html-sections' ? 'HTML' : 'Captured'} section ${page}`
   const realGrade = rubric.dataKind === 'real' && rubric.kind === 'grade'
   const viewer = Boolean(cloud && cloud.workspaces.find((item) => item.id === cloud.currentWorkspaceId)?.role === 'viewer')
   const editable = canEdit && !readOnly && !realGrade && !viewer && (rubric.kind === 'grade' || (job?.status === 'ready' && !job.rubricDeletedAt)) && (rubric.dataKind !== 'real' || Boolean(document))
@@ -141,10 +146,10 @@ export function RubricPanel({ rubric, onSelectCriterion, onVersionSaved, readOnl
                 {citationSource && (onSelectCriterion
                   ? <button type="button" className="link-button inline-flex items-start gap-1.5 text-[10px]" onClick={() => onSelectCriterion(criterion, citation)}>
                     <FileSearch size={13} className="mt-0.5 shrink-0" aria-hidden="true" />
-                    <span>View exact source · p. {citationSource.page} · {citationSource.heading}</span>
+                    <span>View exact source · {sourceLocation(citationSource.page)} · {citationSource.heading}</span>
                   </button>
                   : <Link to={`/jobs/${job.id}`} className="text-link text-[10px]">
-                    <FileSearch size={13} aria-hidden="true" />Job source · p. {citationSource.page} · {citationSource.heading}
+                    <FileSearch size={13} aria-hidden="true" />Job source · {sourceLocation(citationSource.page)} · {citationSource.heading}
                   </Link>)}
                 {!citationSource && <p className="text-[10px] text-muted">This cited source paragraph is unavailable.</p>}
               </div>
@@ -153,10 +158,10 @@ export function RubricPanel({ rubric, onSelectCriterion, onVersionSaved, readOnl
               {onSelectCriterion
                 ? <button type="button" className="link-button inline-flex items-start gap-1.5 text-[10px]" onClick={() => onSelectCriterion(criterion)}>
                   <FileSearch size={13} className="mt-0.5 shrink-0" aria-hidden="true" />
-                  <span>View source · p. {source.page} · {source.heading}</span>
+                  <span>View source · {sourceLocation(source.page)} · {source.heading}</span>
                 </button>
                 : <Link to={`/jobs/${job.id}`} className="text-link text-[10px]">
-                  <FileSearch size={13} aria-hidden="true" />Job source · p. {source.page} · {source.heading}
+                  <FileSearch size={13} aria-hidden="true" />Job source · {sourceLocation(source.page)} · {source.heading}
                 </Link>}
             </div>}
             {rubric.dataKind === 'real' && !citations.length && <div className="mt-3"><InlineError>This criterion has no exact source citation. Review the generated rubric before saving edits.</InlineError></div>}
@@ -179,7 +184,7 @@ export function RubricPanel({ rubric, onSelectCriterion, onVersionSaved, readOnl
         </ol>
         <p className="mt-3 text-[10px] text-muted">Criterion weights produce an overall score out of 100. “Not assessed” means no score was assigned, not a zero.</p>
       </section>
-      <DemoNote>{rubric.dataKind === 'real' ? 'Generated and reviewer-edited rubric versions are source-grounded. Real job scoring is disabled in this preview.' : 'Demo scoring is deterministic, not an AI prediction. Review the source evidence rather than treating a score as a hiring decision.'}</DemoNote>
+      <DemoNote>{rubric.dataKind === 'real' ? 'Generated and reviewer-edited rubric versions are source-grounded. Real analysis freezes the exact selected version and requires human review. The fixture scorer never receives this rubric.' : 'Demo scoring is deterministic, not an AI prediction. Review the source evidence rather than treating a score as a hiring decision.'}</DemoNote>
     </div>
 
     {editing && <RubricEditor

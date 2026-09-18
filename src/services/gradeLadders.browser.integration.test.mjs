@@ -385,7 +385,7 @@ test('draft-only source work keeps polling; reset and cold rubric or analysis li
     await visible(page.getByRole('heading', { name: seeded.first.version.rubric.name, exact: true }))
     const samples = runtime.fixtures.createInitialWorkspace()
     const sampleRubric = samples.rubrics.find((rubric) => rubric.kind === 'grade')
-    await page.goto(`${fixture.origin}/workspaces/${fixture.workspaceId}/analyses/new?${new URLSearchParams({ resumes: samples.resumes[0].id, rubrics: `${sampleRubric.id},${seeded.first.version.id}` })}`)
+    await page.goto(`${fixture.origin}/workspaces/${fixture.workspaceId}/analyses/new?${new URLSearchParams({ data: 'samples', resumes: samples.resumes[0].id, rubrics: `${sampleRubric.id},${seeded.first.version.id}` })}`)
     await visible(page.getByRole('heading', { name: 'Build an analysis', exact: true }))
     assert.equal(await page.getByRole('button', { name: 'Run sample analysis', exact: true }).isDisabled(), true)
     await visible(page.getByText(/Real-only and mixed real\/sample selections cannot use the demo scorer/))

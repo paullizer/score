@@ -9,6 +9,11 @@ import {
   type GradeContext, type GradeIssue,
 } from '../../src/domain/real-grades'
 import type { RealJobRecord } from '../../src/domain/real-jobs'
+import {
+  WORD_DOCUMENT_LIMITS, isOriginalContentType, isWordContentType, originalExtension, storedDocumentContentType,
+  type OriginalContentType,
+} from '../../src/domain/document-formats'
+import { isSafeUploadedFilename, MAX_MARKDOWN_BYTES } from '../../src/domain/source-files'
 import type { RealJobsDeps } from '../jobs/routes'
 import {
   extractedBlobName, isBlobInJobPrefix, originalBlobName, validateRealJobRecord,
@@ -67,7 +72,9 @@ const initializationSchema = z.strictObject({
 })
 
 function json(blob: GradeBlob): unknown {
-  if (blob.contentType !== 'application/json') throw unavailable('Captured grade data has invalid content metadata.')
+  if (blob.contentType !== 'application/json' || blob.sha256 !== digest(blob.bytes)) {
+    throw unavailable('Captured grade data has invalid content metadata.')
+  }
   try { return JSON.parse(Buffer.from(blob.bytes).toString('utf8')) } catch {
     throw unavailable('Captured grade data could not be read.')
   }
@@ -93,6 +100,8 @@ function frozen(source: ReferenceSourceRecord): FrozenReferenceSource {
     sourceId: source.id, title: source.title, origin: source.origin, purpose: source.purpose, publisher: source.publisher,
     documentId: source.documentId, documentVersion: source.documentVersion,
     documentBlobName: source.documentBlobName, originalBlobName: source.originalBlobName, sha256: source.sha256,
+    // Preserve legacy PDF/HTML snapshot shapes and hashes.
+    ...(source.originalContentType === 'text/markdown' ? { originalContentType: source.originalContentType } : {}),
     ...(source.finalUrl ?? source.requestedUrl ? { url: source.finalUrl ?? source.requestedUrl } : {}),
     ...(source.intendedSection !== undefined ? { intendedSection: source.intendedSection } : {}),
     ...(source.revision !== undefined ? { revision: source.revision } : {}),
@@ -371,7 +380,7 @@ export class GradeService {
       parsed.rubric.version !== input.rubricVersion ||
       parsed.job.status !== 'ready' || parsed.job.documentId !== parsed.document.id ||
       parsed.rubric.jobId !== parsed.job.id ||
-      parsed.source.originalBlobName !== `${workspaceId}/${ladderId}/source-${ladderId.slice(7)}/original.${parsed.source.originalContentType === 'application/pdf' ? 'pdf' : 'html'}`) {
+      parsed.source.originalBlobName !== `${workspaceId}/${ladderId}/source-${ladderId.slice(7)}/original.${originalExtension(parsed.source.originalContentType!)}`) {
       throw unavailable('The prepared seed has invalid ownership or version metadata.')
     }
     const check: RealJobRecord = {
@@ -380,8 +389,8 @@ export class GradeService {
       extractedBlobName: extractedBlobName(workspaceId, parsed.job.id), inputFingerprint: 'captured-seed',
       createdBy: 'seed-capture', updatedAt: parsed.capturedAt, attempts: 0, warnings: [],
     }
-    if (!validateRealJobRecord(check) || validateRealSourceDocument(parsed.document).length ||
-      validateRealRubric(parsed.rubric, parsed.document).length) {
+    if (!validateRealJobRecord(check) || validateRealSourceDocument(parsed.document, parsed.source.originalContentType).length ||
+      validateRealRubric(parsed.rubric, parsed.document, parsed.source.originalContentType).length) {
       throw unavailable('The prepared seed contains invalid job, rubric, or source data.')
     }
     return parsed
@@ -461,20 +470,31 @@ export class GradeService {
       const source = current.record.source
       if (!current.record.extractedBlobName || !source.originalBlobName || !source.originalContentType ||
         !isBlobInJobPrefix(current.record.extractedBlobName, workspaceId, input.jobId) ||
-        !isBlobInJobPrefix(source.originalBlobName, workspaceId, input.jobId)) {
+        !isBlobInJobPrefix(source.originalBlobName, workspaceId, input.jobId) ||
+        ((isWordContentType(source.originalContentType) || source.originalContentType === 'text/markdown') &&
+          (!source.sha256 || !source.bytes || !source.capturedAt || !source.extractionMethod ||
+            source.kind === 'url' || !isSafeUploadedFilename(source.displayName, source.kind)))) {
         throw conflict('The seed job does not have complete captured source evidence.')
       }
       const [documentBlob, original] = await Promise.all([
         this.jobs.blobs.read(current.record.extractedBlobName), this.jobs.blobs.read(source.originalBlobName),
       ])
-      if (!documentBlob || !original || original.contentType !== source.originalContentType ||
-        (source.sha256 && original.sha256 !== source.sha256)) throw unavailable('The seed job evidence is unavailable or has changed.')
+      if (!documentBlob || !original || original.contentType !== source.originalContentType || !original.bytes.byteLength ||
+        original.sha256 !== digest(original.bytes) || (source.sha256 && original.sha256 !== source.sha256) ||
+        (source.bytes !== undefined && original.bytes.byteLength !== source.bytes) ||
+        (isWordContentType(source.originalContentType) && original.bytes.byteLength > WORD_DOCUMENT_LIMITS.maxFileBytes) ||
+        (source.originalContentType === 'text/markdown' && original.bytes.byteLength > MAX_MARKDOWN_BYTES)) {
+        throw unavailable('The seed job evidence is unavailable or has changed.')
+      }
       const document = json(documentBlob) as GradeSeedSnapshot['document']
-      if (validateRealSourceDocument(document).length || document.id !== current.record.job.documentId ||
-        validateRealRubric(rubric, document).length) throw unavailable('The selected seed rubric or document has invalid stored evidence.')
-      const originalName = `${workspaceId}/${ladderId}/source-${key}/original.${source.originalContentType === 'application/pdf' ? 'pdf' : 'html'}`
+      if (validateRealSourceDocument(document, source.originalContentType).length || document.id !== current.record.job.documentId ||
+        validateRealRubric(rubric, document, source.originalContentType).length) {
+        throw unavailable('The selected seed rubric or document has invalid stored evidence.')
+      }
+      const originalName = `${workspaceId}/${ladderId}/source-${key}/original.${originalExtension(source.originalContentType)}`
       const captured = await this.blobs.putImmutable(originalName, original.bytes, original.contentType)
-      if (captured.blob.sha256 !== original.sha256 || captured.blob.contentType !== original.contentType) {
+      if (captured.blob.sha256 !== original.sha256 || digest(captured.blob.bytes) !== original.sha256 ||
+        captured.blob.bytes.byteLength !== original.bytes.byteLength || captured.blob.contentType !== original.contentType) {
         throw conflict('The prepared seed original differs from this request. Use a new idempotency key.')
       }
       const seed: GradeSeedSnapshot = {
@@ -720,9 +740,10 @@ export class GradeService {
     return this.readReference(workspaceId, ladderId, await this.resolveSource(workspaceId, ladderId, sourceId, sourceSetId))
   }
 
-  async original(workspaceId: string, ladderId: string, sourceId: string, sourceSetId?: string): Promise<GradeBlob> {
+  async original(workspaceId: string, ladderId: string, sourceId: string, sourceSetId?: string): Promise<GradeBlob & { contentType: OriginalContentType }> {
     let name: string | undefined
     let sha256: string | undefined
+    let bytes: number | undefined
     if (sourceSetId) {
       const source = await this.resolveSource(workspaceId, ladderId, sourceId, sourceSetId)
       name = source.originalBlobName
@@ -733,6 +754,7 @@ export class GradeService {
       const source = (await this.get(workspaceId, sourceId, 'grade-source', ladderId)).record
       name = source.originalBlobName
       sha256 = source.sha256
+      bytes = source.bytes
     }
     if (!name || !sha256) throw notFound('The original source has not been captured.')
     if (!blobInGrade(name, workspaceId, ladderId) || !name.startsWith(`${workspaceId}/${ladderId}/${sourceId}/`)) {
@@ -740,10 +762,15 @@ export class GradeService {
     }
     const blob = await this.blobs.read(name)
     if (!blob) throw notFound('The captured source original is unavailable.')
-    if (blob.sha256 !== sha256 || blob.contentType !== (name.endsWith('.pdf') ? 'application/pdf' : 'text/html')) {
+    const contentType = storedDocumentContentType(name)
+    if (!isOriginalContentType(contentType) || blob.sha256 !== sha256 || digest(blob.bytes) !== sha256 ||
+      blob.contentType !== contentType || !blob.bytes.byteLength || (bytes !== undefined && blob.bytes.byteLength !== bytes) ||
+      !name.endsWith(`/original.${originalExtension(contentType)}`) ||
+      (contentType === 'text/markdown' && blob.bytes.byteLength > MAX_MARKDOWN_BYTES) ||
+      (isWordContentType(contentType) && blob.bytes.byteLength > WORD_DOCUMENT_LIMITS.maxFileBytes)) {
       throw unavailable('The captured source original does not match its immutable metadata.')
     }
-    return blob
+    return { ...blob, contentType }
   }
 
   async confirm(workspaceId: string, ladderId: string, key: string, actor: string, input: ConfirmInput, etag: string) {

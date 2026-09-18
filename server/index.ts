@@ -7,6 +7,8 @@ import { createAzureStateStore } from './azure-state-store'
 import { ConfigError, loadConfig, type Config } from './config'
 import { createAzureJobBlobStore, createAzureJobStore } from './jobs/azure-store'
 import { createAzureGradeBlobStore, createAzureGradeStore } from './grades/azure-store'
+import { createAzureResumeBlobStore, createAzureResumeStore } from './resumes/azure-store'
+import { createAzureAnalysisBlobStore, createAzureAnalysisStore } from './analyses/azure-store'
 
 const DEFAULT_PORT = 8080
 
@@ -59,7 +61,21 @@ function main(): void {
         blobs: createAzureGradeBlobStore(gradeStorage, credential),
       }
     : undefined
-  const app = createApp({ config, directory, state, jobs, grades })
+  const resumeStorage = config.realResumes ?? config.resumeLifecycleStore
+  const analysisStorage = config.realAnalyses ?? config.analysisLifecycleStore
+  const resumes = resumeStorage
+    ? {
+        store: createAzureResumeStore(resumeStorage, credential),
+        blobs: createAzureResumeBlobStore(resumeStorage, credential),
+      }
+    : undefined
+  const analyses = analysisStorage
+    ? {
+        store: createAzureAnalysisStore(analysisStorage, credential),
+        blobs: createAzureAnalysisBlobStore(analysisStorage, credential),
+      }
+    : undefined
+  const app = createApp({ config, directory, state, jobs, grades, resumes, analyses })
   const reconcile = app.locals.reconcileLifecycle as () => Promise<void>
   const recoverLifecycle = () => { void reconcile().catch((error: unknown) => {
     console.error('Lifecycle recovery is unavailable:', { name: error instanceof Error ? error.name : 'UnknownError' })

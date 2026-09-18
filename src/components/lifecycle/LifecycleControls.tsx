@@ -48,7 +48,7 @@ export function LifecycleBanner({ target }: { target?: LifecycleTarget }) {
   if (canEdit) return null
   return <div className="lifecycle-banner" role="status"><LockKeyhole size={17} aria-hidden="true" /><div>
     <strong>{transitioning ? 'Lifecycle operation incomplete · read only' : deleting ? 'Deletion pending · read only' : removed ? 'Removed · read only' : archived ? 'Archived · read only' : syncing ? 'Refreshing saved content · read only' : 'Viewer access · read only'}</strong>
-    <p>{transitioning ? 'Changes and new processing are paused until the workspace operation finishes. Open My workspaces to check status or retry.'
+    <p>{transitioning ? 'Changes and new processing are paused until the lifecycle operation finishes. Use the recovery controls above, or My workspaces for a workspace operation, to check status or retry.'
       : deleting ? 'Cleanup has not completed. Retry the lifecycle operation above; ordinary changes and unarchive remain locked until it finishes.'
         : removed ? 'This item was removed or is no longer available. Any unsaved draft remains in this tab, but cannot restore a deleted record.'
       : archived ? `${inherited ? 'This item inherits its parent’s archive state. ' : ''}You can read retained content and manage its lifecycle, but cannot edit or start new processing. Unarchiving does not restart cancelled work.`

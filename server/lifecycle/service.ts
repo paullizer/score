@@ -7,7 +7,7 @@ import { conflict, forbidden, HttpError, invalidRequest, notFound, preconditionR
 import { isValidWorkspaceId } from '../ids'
 import { decodeWorkspace, toSummary, type WorkspaceRepository } from '../repository'
 import { StoreConflictError, type DirectoryStore, type StateStore, type StoredMetadata } from '../store'
-import type { WorkspaceLifecycleParticipant } from './contracts'
+import type { LifecycleDependencies, WorkspaceLifecycleParticipant } from './contracts'
 import { assertWorkspaceMutationLease, withWorkspaceMutationLease } from './lease'
 
 interface Dependencies {
@@ -15,6 +15,7 @@ interface Dependencies {
   directory: DirectoryStore
   state: StateStore
   participants: WorkspaceLifecycleParticipant[]
+  lifecycle?: LifecycleDependencies
   now?: () => Date
 }
 
@@ -64,11 +65,16 @@ export class WorkspaceLifecycleService {
     for (const participant of this.deps.participants) {
       for (const [kind, count] of Object.entries(await participant.counts(id))) counts[kind] = (counts[kind] ?? 0) + count
     }
+    if ((counts.analyses ?? 0) > workspace.runs.length && !this.deps.lifecycle) {
+      throw unavailable('Real analysis dependencies must be checked before managing this workspace.')
+    }
+    const target = { kind: 'workspace' as const, id }
+    const blockers = this.deps.lifecycle ? await this.deps.lifecycle.impact(id, target) :
+      workspace.runs.map(run => ({
+        kind: 'analysis' as const, id: run.id, name: run.name, href: `/analyses/${encodeURIComponent(run.id)}`,
+      }))
     return {
-      target: { kind: 'workspace', id }, name: stored.metadata.name, counts,
-      blockers: workspace.runs.map(run => ({
-        kind: 'analysis', id: run.id, name: run.name, href: `/analyses/${encodeURIComponent(run.id)}`,
-      })),
+      target, name: stored.metadata.name, counts, blockers,
     }
   }
 

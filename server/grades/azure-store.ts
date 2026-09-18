@@ -5,9 +5,12 @@ import { BlobServiceClient } from '@azure/storage-blob'
 import type { BlockBlobClient, ContainerClient } from '@azure/storage-blob'
 import type { TokenCredential } from '@azure/identity'
 import { GRADE_LADDER_LIMITS, type GradeEntity, type GradeWorkRecord, type VersionedGradeEntity } from '../../src/domain/real-grades'
+import { WORD_DOCUMENT_LIMITS, isWordContentType, storedDocumentContentType } from '../../src/domain/document-formats'
+import { MAX_MARKDOWN_BYTES } from '../../src/domain/source-files'
 import { WORKSPACE_ID_PATTERN } from '../ids'
 import { StoreConflictError, StoreNotFoundError } from '../store'
 import type { GradeBlob, GradeBlobStore, GradeStore, RealGradesConfig, StoredGradeControl } from './store'
+import { fetchCosmosPage } from '../cosmos-query'
 import { gradeContentHash, isGradeId, isSafeGradeBlobName, MUTABLE_GRADE_TYPES, parseGradeEntity } from './validation'
 import { gradeControlId, parseGradeControl, prepareGradeTransaction } from './guards'
 import { assertWorkspaceMutationLease } from '../lifecycle/lease'
@@ -133,10 +136,10 @@ export function createGradeStoreFromContainer(container: Pick<Container, 'item' 
     async listControls(workspaceId, continuationToken) {
       scope(workspaceId)
       paging(100, continuationToken)
-      const response = await container.items.query({
+      const response = await fetchCosmosPage(container.items.query({
         query: 'SELECT * FROM c WHERE c.workspaceId = @workspaceId AND c.recordType = @recordType ORDER BY c.id',
         parameters: [{ name: '@workspaceId', value: workspaceId }, { name: '@recordType', value: 'grade-lifecycle' }],
-      }, { partitionKey: workspaceId, maxItemCount: 100, continuationToken }).fetchNext()
+      }, { partitionKey: workspaceId, maxItemCount: 100, continuationToken }))
       return { items: response.resources.map(value => decodeControl(value, workspaceId)),
         ...(response.continuationToken ? { continuationToken: response.continuationToken } : {}) }
     },
@@ -156,9 +159,9 @@ export function createGradeStoreFromContainer(container: Pick<Container, 'item' 
         filters.push('(c.grade = @grade OR (c.recordType = \'grade-work\' AND c.input.grade = @grade))')
         parameters.push({ name: '@grade', value: options.grade })
       }
-      const response = await container.items.query({
+      const response = await fetchCosmosPage(container.items.query({
         query: `SELECT * FROM c WHERE ${filters.join(' AND ')} ORDER BY c.id`, parameters,
-      }, { partitionKey: workspaceId, maxItemCount: options.limit ?? 50, continuationToken: options.continuationToken }).fetchNext()
+      }, { partitionKey: workspaceId, maxItemCount: options.limit ?? 50, continuationToken: options.continuationToken }))
       const items = response.resources.map(value => decode(value, workspaceId))
       if (items.some(({ record }) =>
         (options.ladderId && record.id !== options.ladderId && (!('ladderId' in record) || record.ladderId !== options.ladderId)) ||
@@ -197,9 +200,9 @@ export function createGradeStoreFromContainer(container: Pick<Container, 'item' 
           parameters.push({ name: `@${field}`, value: options[field] })
         }
       }
-      const response = await container.items.query({
+      const response = await fetchCosmosPage(container.items.query({
         query: `SELECT * FROM c WHERE ${filters.join(' AND ')} ORDER BY c.createdAt DESC`, parameters,
-      }, { partitionKey: workspaceId, maxItemCount: limit, continuationToken: options.continuationToken }).fetchNext()
+      }, { partitionKey: workspaceId, maxItemCount: limit, continuationToken: options.continuationToken }))
       const items = response.resources.map(value => decode(value, workspaceId))
       if (items.some(({ record }) => record.recordType !== options.recordType ||
         (options.ladderId !== undefined && (!('ladderId' in record) || record.ladderId !== options.ladderId)) ||
@@ -327,13 +330,19 @@ interface GradeBlobContainer {
 }
 
 function blobLimit(name: string): number {
-  if (name.endsWith('.pdf')) return GRADE_LADDER_LIMITS.maxPdfBytes
-  if (name.endsWith('.html')) return 24 * 1024 * 1024
+  const contentType = storedDocumentContentType(name)
+  if (contentType === 'application/pdf') return GRADE_LADDER_LIMITS.maxPdfBytes
+  if (contentType === 'text/html') return 24 * 1024 * 1024
+  if (contentType === 'text/markdown') return MAX_MARKDOWN_BYTES
+  if (isWordContentType(contentType)) return WORD_DOCUMENT_LIMITS.maxFileBytes
+  if (contentType !== 'application/json') throw new Error('Unsupported grade blob content type.')
   return GRADE_LADDER_LIMITS.maxSourceCharacters * 8 + 4 * 1024 * 1024
 }
 
 function mime(name: string): string {
-  return name.endsWith('.pdf') ? 'application/pdf' : name.endsWith('.html') ? 'text/html' : 'application/json'
+  const contentType = storedDocumentContentType(name)
+  if (!contentType) throw new Error('Unsupported grade blob content type.')
+  return contentType
 }
 
 async function readBounded(stream: NodeJS.ReadableStream, length: number | undefined, maximum: number): Promise<Uint8Array> {
@@ -349,6 +358,7 @@ async function readBounded(stream: NodeJS.ReadableStream, length: number | undef
     if (size > maximum) throw new Error('Stored grade blob exceeds the supported size.')
     chunks.push(bytes)
   }
+  if (!size || (length !== undefined && size !== length)) throw new Error('Stored grade blob is empty or truncated.')
   return Buffer.concat(chunks, size)
 }
 
@@ -362,7 +372,7 @@ export function createGradeBlobStoreFromContainer(container: GradeBlobContainer)
     if (!isSafeGradeBlobName(name)) throw new Error('Invalid grade blob name.')
     try {
       const response = await container.getBlockBlobClient(name).download()
-      if (!response.readableStreamBody || !response.etag || response.contentType !== mime(name)) {
+      if (!response.readableStreamBody || !response.etag || typeof response.contentType !== 'string' || response.contentType !== mime(name)) {
         throw new Error('Grade blob has invalid stored content metadata.')
       }
       const bytes = await readBounded(response.readableStreamBody, response.contentLength, blobLimit(name))

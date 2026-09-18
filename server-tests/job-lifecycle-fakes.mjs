@@ -6,6 +6,30 @@ const clone = value => structuredClone(value)
 const keyFor = (workspaceId, jobId) => `${workspaceId}/${jobId}`
 const locked = value => Boolean(value?.archivedAt || value?.deletingAt || value?.deletedAt)
 const readOnly = record => locked(record.lifecycle) || locked(record.rubricLifecycle) || record.job.rubricDeletedAt
+const contentTypes = {
+  'original.pdf': 'application/pdf',
+  'original.md': 'text/markdown',
+  'original.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  'original.doc': 'application/msword',
+  'original.html': 'text/html',
+  'source-document.json': 'application/json',
+}
+
+function assertBlobScope(name, workspaceId, jobId) {
+  const parts = name.split('/')
+  assert.equal(parts.length, 3)
+  assert.ok(contentTypes[parts[2]], 'only canonical original/extraction files can be written')
+  if (workspaceId !== undefined) assert.equal(parts[0], workspaceId)
+  if (jobId !== undefined) assert.equal(parts[1], jobId)
+}
+
+function assertLifecycleUnchanged(record, current) {
+  if (JSON.stringify(record.lifecycle) !== JSON.stringify(current.lifecycle) ||
+    JSON.stringify(record.rubricLifecycle) !== JSON.stringify(current.rubricLifecycle) ||
+    record.job.rubricDeletedAt !== current.job.rubricDeletedAt) {
+    throw new StoreConflictError('Lifecycle metadata must be changed through lifecycle management.')
+  }
+}
 
 function cancel(record, timestamp) {
   return {
@@ -45,6 +69,7 @@ export function createFakeRealJobs() {
   }
   function assertCleanup(workspaceId, jobId, rubricOnly = false) {
     if (['deleting', 'deleted'].includes(control(workspaceId).state)) return
+    if (tombstones.has(keyFor(workspaceId, jobId))) return
     const value = current(workspaceId, jobId).record
     if (!value.lifecycle?.deletingAt && !(rubricOnly && value.rubricLifecycle?.deletingAt)) throw new StoreConflictError()
   }
@@ -68,7 +93,7 @@ export function createFakeRealJobs() {
         writable(record.workspaceId, existing.record)
         return { created: false, value: clone(existing) }
       }
-      assert.ok(record.source.kind !== 'pdf' || blobs.has(record.source.originalBlobName), 'source bytes must precede record publication')
+      assert.ok(record.source.kind === 'url' || blobs.has(record.source.originalBlobName), 'source bytes must precede record publication')
       const value = save(record)
       publicationEvents.push({ type: 'job', key })
       return { created: true, value }
@@ -81,11 +106,11 @@ export function createFakeRealJobs() {
         failNextReplace = false
         throw new StoreConflictError()
       }
-      assert.deepEqual(record.lifecycle, value.record.lifecycle)
-      assert.deepEqual(record.rubricLifecycle, value.record.rubricLifecycle)
+      assertLifecycleUnchanged(record, value.record)
       return save(record)
     },
     async listPending(now, limit) {
+      assert.ok(Number.isInteger(limit) && limit > 0 && limit <= 100)
       return [...records.values()].filter(({ record }) =>
         control(record.workspaceId).state === 'active' && !readOnly(record) &&
         ['queued', 'parsing', 'generating'].includes(record.job.status) &&
@@ -93,6 +118,7 @@ export function createFakeRealJobs() {
         .slice(0, limit).map(clone)
     },
     async pendingLifecycleWorkspaces(limit) {
+      assert.ok(Number.isInteger(limit) && limit > 0 && limit <= 100)
       return [...new Set([...records.values()].filter(({ record }) =>
         record.lifecycle?.deletingAt || record.rubricLifecycle?.deletingAt).map(({ record }) => record.workspaceId))].slice(0, limit)
     },
@@ -109,16 +135,20 @@ export function createFakeRealJobs() {
       return [...rubrics.entries()].filter(([key]) => key.startsWith(`${workspaceId}/`))
         .flatMap(([, values]) => values).filter(rubric => {
           const owner = records.get(keyFor(workspaceId, rubric.jobId))?.record
-          return rubric.id === rubricId && owner && !owner.rubricLifecycle?.deletingAt && !owner.rubricLifecycle?.deletedAt
+          return rubric.id === rubricId && owner && !owner.lifecycle?.deletingAt && !owner.lifecycle?.deletedAt &&
+            !owner.rubricLifecycle?.deletingAt && !owner.rubricLifecycle?.deletedAt
         }).sort((a, b) => b.version - a.version).map(clone)[0]
     },
     async listRubrics(workspaceId, jobId) {
+      const owner = records.get(keyFor(workspaceId, jobId))?.record
+      if (!owner || owner.lifecycle?.deletedAt || owner.rubricLifecycle?.deletedAt) return []
       return (rubrics.get(keyFor(workspaceId, jobId)) ?? []).slice().sort((a, b) => a.version - b.version).map(clone)
     },
     async publish(record, etag, rubric) {
       const value = current(record.workspaceId, record.id, etag)
       writable(record.workspaceId, value.record)
       writable(record.workspaceId, record)
+      assertLifecycleUnchanged(record, value.record)
       const key = keyFor(record.workspaceId, record.id)
       const versions = rubrics.get(key) ?? []
       if (versions.some(value => value.id === rubric.id && value.version === rubric.version)) throw new StoreConflictError()
@@ -137,10 +167,13 @@ export function createFakeRealJobs() {
       for (const value of records.values()) if (value.record.workspaceId === workspaceId) save(cancel(value.record, timestamp))
     },
     async transitionLifecycle(workspaceId, jobId, etag, scope, action, timestamp) {
+      const state = control(workspaceId).state
+      if (state === 'deleted' || (state === 'deleting' && action !== 'delete')) throw new StoreConflictError()
       const value = current(workspaceId, jobId, etag)
       const key = scope === 'job' ? 'lifecycle' : 'rubricLifecycle'
       const metadata = { ...value.record[key], ...(scope === 'rubric' ? { parentKey: `job:${jobId}` } : {}) }
-      if (metadata.deletedAt || (metadata.deletingAt && action !== 'delete')) throw new StoreConflictError()
+      if (metadata.deletedAt || (metadata.deletingAt && action !== 'delete') ||
+        (scope === 'rubric' && value.record.lifecycle?.deletingAt)) throw new StoreConflictError()
       if (metadata.deletingAt) return value
       if (action === 'archive') metadata.archivedAt = timestamp
       else if (action === 'unarchive') delete metadata.archivedAt
@@ -170,23 +203,32 @@ export function createFakeRealJobs() {
     },
     async purgeWorkspaceRecords(workspaceId) {
       if (!['deleting', 'deleted'].includes(control(workspaceId).state)) throw new StoreConflictError()
+      if ([...writers.values()].some(writer => writer.workspaceId === workspaceId && Date.parse(writer.expiresAt) > Date.now())) {
+        throw new StoreConflictError('Job Blob writers have not drained.')
+      }
       for (const value of [...records.values()]) if (value.record.workspaceId === workspaceId) await store.purgeJobRecords(workspaceId, value.record.id)
       for (const key of [...rubrics.keys()]) if (key.startsWith(`${workspaceId}/`)) rubrics.delete(key)
       for (const [id, writer] of writers) if (writer.workspaceId === workspaceId) writers.delete(id)
     },
     async beginBlobWrite(workspaceId, jobId, blobName, owner) {
+      assertBlobScope(blobName, workspaceId, jobId)
       const value = records.get(keyFor(workspaceId, jobId))
       writable(workspaceId, value?.record)
-      if (tombstones.has(keyFor(workspaceId, jobId)) || (owner && value?.record.lease?.owner !== owner)) throw new StoreConflictError()
+      if (tombstones.has(keyFor(workspaceId, jobId)) || (owner &&
+        (value?.record.lease?.owner !== owner || Date.parse(value.record.lease.expiresAt) <= Date.now()))) throw new StoreConflictError()
       const writer = { id: `job-blob-writer:${randomUUID()}`, workspaceId, jobId, blobName, owner, expiresAt: new Date(Date.now() + 120_000).toISOString() }
       writers.set(writer.id, clone(writer))
       return writer
     },
     async assertBlobWrite(writer) {
       const value = records.get(keyFor(writer.workspaceId, writer.jobId))
+      const stored = writers.get(writer.id)
       writable(writer.workspaceId, value?.record)
-      if (!writers.has(writer.id) || Date.parse(writer.expiresAt) <= Date.now() ||
-        tombstones.has(keyFor(writer.workspaceId, writer.jobId)) || (writer.owner && value?.record.lease?.owner !== writer.owner)) throw new StoreConflictError()
+      if (!stored || stored.workspaceId !== writer.workspaceId || stored.jobId !== writer.jobId ||
+        stored.blobName !== writer.blobName || stored.expiresAt !== writer.expiresAt || stored.owner !== writer.owner ||
+        Date.parse(writer.expiresAt) <= Date.now() || tombstones.has(keyFor(writer.workspaceId, writer.jobId)) ||
+        (writer.owner && (value?.record.lease?.owner !== writer.owner ||
+          Date.parse(value.record.lease.expiresAt) <= Date.now()))) throw new StoreConflictError()
     },
     async finishBlobWrite(writer) { writers.delete(writer.id) },
     async listBlobWriters(workspaceId, jobId) {
@@ -201,6 +243,11 @@ export function createFakeRealJobs() {
   const blobStore = {
     async read(name) { return blobs.has(name) ? clone(blobs.get(name)) : undefined },
     async putImmutable(name, bytes, contentType, fence) {
+      assertBlobScope(name)
+      assert.equal(contentType, contentTypes[name.split('/')[2]])
+      const maxBytes = contentType === 'text/html' ? 24 * 1024 * 1024
+        : contentType === 'application/json' ? 180_000 * 8 : 10 * 1024 * 1024
+      assert.ok(bytes instanceof Uint8Array && bytes.byteLength > 0 && bytes.byteLength <= maxBytes)
       if (fence) await fence.assertActive()
       const existing = blobs.get(name)
       if (existing) return { created: false, blob: clone(existing) }
@@ -211,6 +258,8 @@ export function createFakeRealJobs() {
       return { created: true, blob: clone(blob) }
     },
     async putFenced(name, bytes, contentType, fence) {
+      assertBlobScope(name, fence.writer.workspaceId, fence.writer.jobId)
+      assert.equal(name, fence.writer.blobName)
       await fence.assertActive()
       return this.putImmutable(name, bytes, contentType, fence)
     },

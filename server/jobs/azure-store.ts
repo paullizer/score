@@ -7,18 +7,21 @@ import type { TokenCredential } from '@azure/identity'
 import { JOB_IMPORT_LIMITS } from '../../src/domain/real-jobs'
 import type { RealJobRecord, VersionedRealJob } from '../../src/domain/real-jobs'
 import type { Rubric } from '../../src/domain/types'
+import { UPLOAD_CONTENT_TYPES } from '../../src/domain/document-formats'
 import type { WorkspaceLifecycleControl } from '../lifecycle/contracts'
 import { assertWorkspaceMutationLease } from '../lifecycle/lease'
 import { isValidWorkspaceId } from '../ids'
 import { StoreConflictError } from '../store'
 import type { JobBlob, JobBlobStore, JobBlobWriter, JobBlobWriteFence, RealJobsConfig, RealJobStore } from './store'
 import { assertJobWritable, cancelJobWork, isJobReadOnly } from './guards'
+import { fetchCosmosPage } from '../cosmos-query'
 import {
   isBlobInJobPrefix,
   isJobBlobInScope,
   isSafeJobBlobName,
   isValidJobId,
   jobBlobPrefix,
+  jobBlobContentType,
   validateRealJobRecord,
   validateStoredRealRubric,
 } from './validation'
@@ -61,9 +64,13 @@ const MAX_HTML_BYTES = 24 * 1024 * 1024
 const MAX_DOCUMENT_BYTES = JOB_IMPORT_LIMITS.maxSourceCharacters * 8
 
 function maxBlobBytes(blobName: string): number {
-  if (blobName.endsWith('/original.html')) return MAX_HTML_BYTES
-  if (blobName.endsWith('/source-document.json')) return MAX_DOCUMENT_BYTES
-  return JOB_IMPORT_LIMITS.maxPdfBytes
+  switch (jobBlobContentType(blobName)) {
+    case 'application/pdf': return JOB_IMPORT_LIMITS.maxPdfBytes
+    case UPLOAD_CONTENT_TYPES.docx: case UPLOAD_CONTENT_TYPES.doc: return JOB_IMPORT_LIMITS.maxFileBytes
+    case 'text/markdown': return JOB_IMPORT_LIMITS.maxMarkdownBytes
+    case 'text/html': return MAX_HTML_BYTES
+    case 'application/json': return MAX_DOCUMENT_BYTES
+  }
 }
 
 function cosmosStatus(error: unknown): number | undefined {
@@ -273,8 +280,8 @@ export function createJobStoreFromContainer(container: Pick<Container, 'items' |
     const tokens = new Set<string>()
     for (;;) {
       assertWorkspaceMutationLease(workspaceId)
-      const page = await recordsQuery(workspaceId, types, jobId, continuationToken).fetchNext()
-      const resources = page.resources ?? []
+      const page = await fetchCosmosPage(recordsQuery(workspaceId, types, jobId, continuationToken))
+      const resources = page.resources
       if (resources.length || !page.continuationToken) return resources
       if (tokens.has(page.continuationToken)) throw new Error('Job cleanup pagination did not advance.')
       tokens.add(page.continuationToken)
@@ -317,8 +324,8 @@ export function createJobStoreFromContainer(container: Pick<Container, 'items' |
         },
         { partitionKey: workspaceId, maxItemCount: LIST_PAGE_SIZE, continuationToken },
       )
-      const response = await iterator.fetchNext()
-      const jobs = (response.resources ?? []).map((resource) => decodeJob(resource, workspaceId))
+      const response = await fetchCosmosPage(iterator)
+      const jobs = response.resources.map((resource) => decodeJob(resource, workspaceId))
       return {
         jobs,
         ...(response.continuationToken ? { continuationToken: response.continuationToken } : {}),
@@ -363,8 +370,9 @@ export function createJobStoreFromContainer(container: Pick<Container, 'items' |
       const result: VersionedRealJob[] = []
       const controls = new Map<string, WorkspaceLifecycleControl>()
       let continuationToken: string | undefined
+      const tokens = new Set<string>()
       do {
-        const response = await container.items.query<CosmosDoc<RealJobRecord>>({
+        const response = await fetchCosmosPage(container.items.query<CosmosDoc<RealJobRecord>>({
           query: `SELECT * FROM c
           WHERE c.recordType = @recordType
           AND ARRAY_CONTAINS(@statuses, c.job.status)
@@ -379,7 +387,7 @@ export function createJobStoreFromContainer(container: Pick<Container, 'items' |
             { name: '@statuses', value: ['queued', 'parsing', 'generating'] },
             { name: '@now', value: now },
           ],
-        }, { maxItemCount: limit, continuationToken }).fetchNext()
+        }, { maxItemCount: limit, continuationToken }))
         for (const resource of response.resources) {
           const value = decodeJob(resource)
           let control = controls.get(value.record.workspaceId)
@@ -391,6 +399,10 @@ export function createJobStoreFromContainer(container: Pick<Container, 'items' |
           if (result.length === limit) return result
         }
         continuationToken = response.continuationToken || undefined
+        if (continuationToken) {
+          if (tokens.has(continuationToken)) throw new Error('Pending job pagination did not advance.')
+          tokens.add(continuationToken)
+        }
       } while (continuationToken)
       return result
     },
@@ -412,12 +424,12 @@ export function createJobStoreFromContainer(container: Pick<Container, 'items' |
 
     async listLifecyclePending(workspaceId, continuationToken) {
       if (!isValidWorkspaceId(workspaceId)) throw new Error('Invalid job workspace.')
-      const response = await container.items.query<CosmosDoc<RealJobRecord>>({
+      const response = await fetchCosmosPage(container.items.query<CosmosDoc<RealJobRecord>>({
         query: `SELECT * FROM c WHERE c.recordType = @recordType
           AND (IS_DEFINED(c.lifecycle.deletingAt) OR IS_DEFINED(c.rubricLifecycle.deletingAt))
           ORDER BY c.id ASC`,
         parameters: [{ name: '@recordType', value: 'job' }],
-      }, { partitionKey: workspaceId, maxItemCount: LIST_PAGE_SIZE, continuationToken }).fetchNext()
+      }, { partitionKey: workspaceId, maxItemCount: LIST_PAGE_SIZE, continuationToken }))
       return {
         jobs: response.resources.map(raw => decodeJob(raw, workspaceId)),
         ...(response.continuationToken ? { continuationToken: response.continuationToken } : {}),
@@ -521,9 +533,10 @@ export function createJobStoreFromContainer(container: Pick<Container, 'items' |
       const control = await store.getWorkspaceLifecycle(workspaceId)
       if (control.state === 'active') throw new StoreConflictError('Workspace cancellation requires a lifecycle fence.')
       let continuationToken: string | undefined
+      const tokens = new Set<string>()
       do {
-        const page = await recordsQuery(workspaceId, ['job'], undefined, continuationToken).fetchNext()
-        for (const raw of page.resources ?? []) {
+        const page = await fetchCosmosPage(recordsQuery(workspaceId, ['job'], undefined, continuationToken))
+        for (const raw of page.resources) {
           const value = decodeJob(raw as CosmosDoc<RealJobRecord>, workspaceId)
           await guarded(workspaceId, false, async currentControl => {
             if (currentControl.state === 'active') throw new StoreConflictError('Workspace cancellation lost its fence.')
@@ -533,6 +546,10 @@ export function createJobStoreFromContainer(container: Pick<Container, 'items' |
           })
         }
         continuationToken = page.continuationToken || undefined
+        if (continuationToken) {
+          if (tokens.has(continuationToken)) throw new Error('Job cancellation pagination did not advance.')
+          tokens.add(continuationToken)
+        }
       } while (continuationToken)
     },
 
@@ -684,10 +701,15 @@ export function createJobStoreFromContainer(container: Pick<Container, 'items' |
     async listBlobWriters(workspaceId, jobId) {
       const writers: JobBlobWriter[] = []
       let continuationToken: string | undefined
+      const tokens = new Set<string>()
       do {
-        const page = await recordsQuery(workspaceId, ['blob-writer'], jobId, continuationToken).fetchNext()
+        const page = await fetchCosmosPage(recordsQuery(workspaceId, ['blob-writer'], jobId, continuationToken))
         for (const raw of page.resources) writers.push(writerRecord(raw as CosmosDoc<BlobWriterRecord>, workspaceId, jobId))
         continuationToken = page.continuationToken || undefined
+        if (continuationToken) {
+          if (tokens.has(continuationToken)) throw new Error('Job Blob writer pagination did not advance.')
+          tokens.add(continuationToken)
+        }
       } while (continuationToken)
       return writers
     },
@@ -712,15 +734,23 @@ async function readBounded(
   declaredLength: number | undefined,
   maximumBytes: number,
 ): Promise<Uint8Array> {
-  if (declaredLength !== undefined && declaredLength > maximumBytes) throw new Error('Stored job blob exceeds the supported size.')
+  const destroy = () => { if ('destroy' in stream && typeof stream.destroy === 'function') stream.destroy() }
+  if (declaredLength !== undefined && (!Number.isInteger(declaredLength) || declaredLength < 1 || declaredLength > maximumBytes)) {
+    destroy()
+    throw new Error('Stored job blob exceeds the supported size or is empty.')
+  }
   const chunks: Buffer[] = []
   let length = 0
   for await (const chunk of stream) {
     const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)
     length += buffer.byteLength
-    if (length > maximumBytes) throw new Error('Stored job blob exceeds the supported size.')
+    if (length > maximumBytes) {
+      destroy()
+      throw new Error('Stored job blob exceeds the supported size.')
+    }
     chunks.push(buffer)
   }
+  if (!length || (declaredLength !== undefined && length !== declaredLength)) throw new Error('Stored job blob length is invalid.')
   return Buffer.concat(chunks, length)
 }
 
@@ -742,7 +772,7 @@ export function createJobBlobStoreFromContainer(container: JobBlobContainer): Jo
       const response = await container.getBlockBlobClient(blobName).download()
       if (response.metadata?.scorepreparing === 'true') return undefined
       if (!response.readableStreamBody) throw new Error('Blob download returned no content stream.')
-      if (typeof response.etag !== 'string' || typeof response.contentType !== 'string') {
+      if (typeof response.etag !== 'string' || !response.etag.trim() || response.contentType !== jobBlobContentType(blobName)) {
         throw new Error('Blob download did not return required metadata.')
       }
       const bytes = await readBounded(response.readableStreamBody, response.contentLength, maxBlobBytes(blobName))
@@ -755,8 +785,10 @@ export function createJobBlobStoreFromContainer(container: JobBlobContainer): Jo
 
   async function putImmutable(blobName: string, bytes: Uint8Array, contentType: string, fence?: JobBlobWriteFence) {
     if (!isSafeJobBlobName(blobName)) throw new Error('Invalid job blob name.')
-    if (bytes.byteLength > maxBlobBytes(blobName)) throw new Error('Job blob exceeds the supported size.')
-    if (!['application/pdf', 'text/html', 'application/json'].includes(contentType)) throw new Error('Unsupported job blob content type.')
+    if (!(bytes instanceof Uint8Array) || !bytes.byteLength || bytes.byteLength > maxBlobBytes(blobName)) {
+      throw new Error('Job blob exceeds the supported size or is empty.')
+    }
+    if (contentType !== jobBlobContentType(blobName)) throw new Error('Unsupported job blob content type for its namespace.')
     const body = Buffer.from(bytes)
     if (fence) {
       const client = container.getBlockBlobClient(blobName)
@@ -804,10 +836,10 @@ export function createJobBlobStoreFromContainer(container: JobBlobContainer): Jo
         const response = await client.upload(body, body.byteLength, {
           conditions: { ifMatch: properties.etag, leaseId: lease.leaseId },
           metadata: {},
-          blobHTTPHeaders: { blobContentType: contentType },
+          blobHTTPHeaders: { blobContentType: contentType, blobCacheControl: 'private, no-store' },
           abortSignal: signal,
         })
-        if (typeof response.etag !== 'string') throw new Error('Blob upload did not return an etag.')
+        if (typeof response.etag !== 'string' || !response.etag.trim()) throw new Error('Blob upload did not return an etag.')
         await fence.assertActive()
         return { created: true, blob: { bytes: body, contentType, sha256: hash(body), etag: response.etag } }
       } finally {
@@ -817,9 +849,9 @@ export function createJobBlobStoreFromContainer(container: JobBlobContainer): Jo
     try {
       const response = await container.getBlockBlobClient(blobName).upload(body, body.byteLength, {
         conditions: { ifNoneMatch: '*' },
-        blobHTTPHeaders: { blobContentType: contentType },
+        blobHTTPHeaders: { blobContentType: contentType, blobCacheControl: 'private, no-store' },
       })
-      if (typeof response.etag !== 'string') throw new Error('Blob upload did not return an etag.')
+      if (typeof response.etag !== 'string' || !response.etag.trim()) throw new Error('Blob upload did not return an etag.')
       return {
         created: true,
         blob: { bytes: body, contentType, sha256: hash(body), etag: response.etag },
