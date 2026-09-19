@@ -370,6 +370,40 @@ worker must perform semantic review; exact-string/schema checks alone do not
 establish support. Qualification limitations can make completion `limited`
 without withholding an otherwise fully assessable work score.
 
+### Source-selected model citations
+
+The analysis worker's transport contract uses only `{passageId: integer}` for
+criterion, qualification, and grounding-issue citations. Its versioned catalog
+is derived from the exact frozen resume: model-visible paragraphs retain their
+identity and order, with lossless bounded text passages instead of a second
+copy of the complete resume. Long paragraphs are split at safe boundaries
+without editing source characters; whitespace-only slices remain in context
+with null, non-selectable IDs. Evidence crossing paragraph boundaries requires
+separate selections.
+
+Trusted resolution copies the selected original paragraph slices, then runs the
+existing canonical literal-quotation validation. Unknown, malformed, oversized,
+or duplicate selections fail explicitly. Catalog/source binding failures are
+non-correctable integrity errors, not model requests to invent replacement
+evidence. Independent grounding still checks relevance and interpretation:
+selecting an existing passage does not by itself support a score.
+
+The model-facing prompt/schema versions change, but the persisted `Citation`,
+result schema version, canonical hashing, snapshot ownership, and API responses
+do not. Historical results retain their original quotes and provenance. Source
+viewers, highlighting, and report exports continue to read canonical citations;
+they do not need to understand passage IDs. The two-correction budget, separate
+transport retries, cancellation/publication fences, and unchanged completed
+results remain in force.
+
+Structured `evidence-catalog` logs record version, snapshot/document hashes and
+source counts, while `citations-resolved` counts canonical-valid citations.
+Neither event replaces semantic review. Selection findings include trusted
+locations and bounded counts, not invalid model-supplied identities or text.
+The root README contains a run-scoped Log Analytics query. Private snapshot
+inspection uses existing authorized reads, not new data-store permissions or
+public original-file links.
+
 Do not log raw documents, profiles, source URLs, model responses, or validation
 errors containing those values. These are retained private captures, not browser
 sample state; sample reset does not delete them. Failed pre-publication attempts
@@ -379,7 +413,7 @@ those private families as well as published runs, retaining terminal fences.
 Focused validation (independently bundles its own entry point):
 
 ```powershell
-node --test server-tests\real-analyses.test.mjs server-tests\real-analyses-lifecycle.test.mjs server-tests\real-analyses-azure-store.test.mjs server-tests\real-analyses-model-boundary.test.mjs worker-tests\analysis-runtime.test.mjs
+node --test server-tests\real-analyses.test.mjs server-tests\real-analyses-lifecycle.test.mjs server-tests\real-analyses-azure-store.test.mjs server-tests\real-analyses-model-boundary.test.mjs worker-tests\analysis-runtime.test.mjs worker-tests\analysis-evidence-passages.test.mjs
 npx tsc --project tsconfig.server.json --noEmit
 npx eslint server\analyses server-tests\real-analyses*.mjs --quiet
 ```

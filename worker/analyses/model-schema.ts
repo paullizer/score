@@ -21,8 +21,8 @@ export const ANALYSIS_MODEL_LIMITS = {
 } as const
 
 export const ANALYSIS_MODEL_SCHEMA_VERSIONS = {
-  assessment: 'score-analysis-assessment-v1',
-  grounding: 'score-analysis-grounding-v1',
+  assessment: 'score-analysis-assessment-v2',
+  grounding: 'score-analysis-grounding-v2',
 } as const
 
 const identifier = z.string().min(1).max(200).regex(/\S/)
@@ -110,6 +110,7 @@ export const assessmentInputSchema = z.strictObject({
   ])).max(ANALYSIS_MODEL_LIMITS.maxCriteria + ANALYSIS_MODEL_LIMITS.maxQualifications),
 })
 
+// Canonical quote validation is separate from the model-facing passage selections.
 const resumeQuote = z.strictObject({
   paragraphId: identifier,
   quote: nonblank(ANALYSIS_MODEL_LIMITS.maxQuoteCharacters),
@@ -186,6 +187,35 @@ function scopedQuotes(input: RealAnalysisAssessmentInput) {
   return z.array(resumeQuote.extend({
     paragraphId: z.enum(input.resume.paragraphs.map(value => value.id)),
   })).max(ANALYSIS_MODEL_LIMITS.maxCitations)
+}
+
+function passageSelections(passageCount: number) {
+  return z.array(z.strictObject({
+    passageId: z.number().int().min(1).max(passageCount),
+  })).max(ANALYSIS_MODEL_LIMITS.maxCitations)
+}
+
+export function assessmentSelectionSchemaForInput(input: RealAnalysisAssessmentInput, passageCount: number) {
+  const citations = passageSelections(passageCount)
+  return assessmentSchema.extend({
+    criteria: z.array(criterionResult.extend({
+      criterionId: z.enum(input.rubric.criteria.map(value => value.id)), citations,
+    })).length(input.rubric.criteria.length),
+    qualifications: z.array(qualificationResult.extend({
+      qualificationId: input.qualifications.length ? z.enum(input.qualifications.map(value => value.id)) : identifier,
+      citations,
+    })).length(input.qualifications.length),
+  })
+}
+
+export function groundingSelectionSchemaForInput(input: RealAnalysisAssessmentInput, passageCount: number) {
+  return groundingSchema.extend({
+    issues: z.array(groundingSchema.shape.issues.element.extend({
+      criterionId: z.enum(input.rubric.criteria.map(value => value.id)).nullable(),
+      qualificationId: input.qualifications.length ? z.enum(input.qualifications.map(value => value.id)).nullable() : z.null(),
+      citations: passageSelections(passageCount),
+    })).max(ANALYSIS_MODEL_LIMITS.maxReviewIssues),
+  })
 }
 
 export function analysisStructuredSchema(schema: z.ZodType): Record<string, unknown> {

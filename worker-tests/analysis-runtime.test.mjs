@@ -5,6 +5,7 @@ import path from 'node:path'
 import { after, test } from 'node:test'
 import { pathToFileURL } from 'node:url'
 import { build } from 'esbuild'
+import { assertLosslessResume, passageSelection } from './analysis-selection-test-support.mjs'
 import {
   api, fixture, seedResume, seedJob, seedGrade, createRun, finishInitialization,
   ACTOR, NOW, clone,
@@ -35,7 +36,7 @@ function clockFor(f) {
 }
 
 function modelAssessment(input, { limited = false } = {}) {
-  const quote = { paragraphId: input.resume.paragraphs[0].id, quote: input.resume.paragraphs[0].text }
+  const selected = passageSelection(input)
   return {
     criteria: input.rubric.criteria.map(criterion => criterion.support === 'not-applicable' ? {
       criterionId: criterion.id, evidenceStatus: 'not-applicable', score: null,
@@ -47,7 +48,7 @@ function modelAssessment(input, { limited = false } = {}) {
     } : {
       criterionId: criterion.id, evidenceStatus: 'supported', score: 3,
       rationale: 'The cited document describes independently evaluating engineering systems, matching the saved independent-work anchor.',
-      citations: [quote], limitation: null,
+      citations: [selected], limitation: null,
     }),
     qualifications: input.qualifications.map(qualification => ({
       qualificationId: qualification.id, evidenceStatus: 'not-assessed',
@@ -213,6 +214,8 @@ test('an actual cited assessment and independent review persist a result accepte
   f.resumes.blobs.values.clear()
   f.jobs.blobs.values.clear()
   const mock = modelFor(f)
+  const events = []
+  mock.deps.onEvent = event => events.push(event)
   const outcome = await runAnalysisWorker(mock.deps, { maxItems: 1 })
   assert.deepEqual(outcome, { claimed: 1, completed: 1 }, JSON.stringify(comparisons(f, created.run.id).map(item => item.record.error)))
   assert.deepEqual(mock.calls.map(call => call.kind), ['resume_rubric_assessment', 'resume_rubric_grounding_review'])
@@ -226,12 +229,35 @@ test('an actual cited assessment and independent review persist a result accepte
   assert.equal(detail.result.provenance.manifestSha256, created.run.manifest.sha256)
   assert.equal(detail.result.provenance.assessment.model, 'actual-analysis-model-1')
   assert.equal(detail.result.provenance.groundingReviews[0].provenance.model, 'actual-analysis-model-2')
+  assert.equal(detail.result.schemaVersion, 1)
+  assert.equal(detail.result.provenance.assessment.promptVersion, 'score-analysis-assessment-v3')
+  assert.equal(detail.result.provenance.assessment.schemaVersion, 'score-analysis-assessment-v2')
+  assert.equal(detail.result.provenance.groundingReviews[0].provenance.promptVersion, 'score-analysis-grounding-v3')
+  assert.equal(detail.result.provenance.groundingReviews[0].provenance.schemaVersion, 'score-analysis-grounding-v2')
+  assert.doesNotMatch(JSON.stringify(detail.result), /"passageId"/)
   assert.equal(detail.result.provenance.calculationVersion, 'weighted-0-100-v1')
   assert.equal(detail.comparison.result.sha256, api.analysisBytesHash(f.analysis.blobs.values.get(detail.comparison.result.blobName).bytes))
   const run = await f.analysis.store.get(f.workspaceId, created.run.id)
   assert.equal(run.record.status, 'complete')
   assert.equal(run.record.progress.scored, 1)
   assert.equal(run.record.progress.unscored, 0)
+  const catalogs = events.filter(event => event.event === 'evidence-catalog')
+  assert.equal(catalogs.length, 1)
+  const catalog = catalogs[0]
+  assert.equal(catalog.catalogVersion, 'score-analysis-passages-v1')
+  assert.equal(catalog.resumeDocumentSha256, api.analysisHash(detail.resumeSnapshot.document))
+  assert.equal(catalog.resumeSnapshotSha256, original.record.resume.blob.sha256)
+  assert.equal(catalog.targetSnapshotSha256, original.record.target.blob.sha256)
+  assert.equal(catalog.sourceCharacters, detail.resumeSnapshot.document.paragraphs.reduce((sum, paragraph) => sum + paragraph.text.length, 0))
+  assert.equal(catalog.paragraphCount, detail.resumeSnapshot.document.paragraphs.length)
+  for (const call of mock.calls) {
+    assert.equal(assertLosslessResume(call.body.input.resume, detail.resumeSnapshot.document), catalog.passageCount)
+  }
+  assert.ok(events.every(event => event.workspaceId === f.workspaceId && event.runId === created.run.id &&
+    event.comparisonId === original.record.id && event.attemptId === detail.comparison.attemptId))
+  assert.deepEqual(events.filter(event => event.event === 'citations-resolved').map(event => [event.stage, event.citationCount]),
+    [['assessment', 1], ['grounding', 0]])
+  assert.doesNotMatch(JSON.stringify(events), /"quote":|"text":|test-token|Evaluated engineering systems/)
 })
 
 for (const format of ['docx', 'doc']) {
@@ -253,7 +279,7 @@ for (const format of ['docx', 'doc']) {
       assert.deepEqual(outcome, { claimed: 1, completed: 1 },
         JSON.stringify(comparisons(f, created.run.id).map(value => value.record.error)))
       assert.equal(mock.calls.length, 2)
-      assert.deepEqual(mock.calls[0].body.input.resume, resume.document)
+      assertLosslessResume(mock.calls[0].body.input.resume, resume.document)
       const detail = await f.service.comparisonDetail(f.workspaceId, created.run.id, comparisons(f, created.run.id)[0].record.id)
       assert.equal(detail.comparison.status, 'complete')
       assert.equal(detail.resumeSnapshot.extraction.pagination, 'captured-sections')
@@ -302,7 +328,7 @@ test('substantive ready resumes with every display metadata field unavailable ar
   const mock = modelFor(f)
   const outcome = await runAnalysisWorker(mock.deps)
   assert.equal(mock.calls.length, 2)
-  assert.deepEqual(mock.calls[0].body.input.resume, resume.document)
+  assertLosslessResume(mock.calls[0].body.input.resume, resume.document)
   assert.deepEqual(outcome, { claimed: 1, completed: 1 })
   const detail = await f.service.comparisonDetail(f.workspaceId, created.run.id, comparisons(f, created.run.id)[0].record.id)
   for (const key of ['name', 'role', 'location', 'experience']) {
@@ -391,14 +417,15 @@ test('another comparison may change the parent ETag during publication without d
   assert.deepEqual([run.record.progress.complete, run.record.progress.cancelled, run.record.progress.failed], [1, 1, 0])
 })
 
-test('invalid model citations fail only that comparison and never produce a zero fallback', async () => {
+test('unknown passage selections exhaust only shared corrections, fail that comparison and never retry or manufacture a zero', async () => {
   const f = fixture()
   const created = await createRun(f, 1, 2)
   const invalidRubric = created.targets[0].selection.rubricId
   const mock = modelFor(f, ({ kind, body }) => {
     if (kind !== 'resume_rubric_assessment' || body.input.rubric.id !== invalidRubric) return
     const value = modelAssessment(body.input)
-    value.criteria[0].citations[0].quote = 'PRIVATE-MODEL-SENTINEL not in the document'
+    value.criteria[0].citations[0].passageId = 987654321
+    value.PRIVATE_SENTINEL = 'PRIVATE-MODEL-SENTINEL not in the document'
     return value
   })
   const events = []
@@ -409,25 +436,33 @@ test('invalid model citations fail only that comparison and never produce a zero
   assert.equal(failed.error.code, 'invalid-citation')
   assert.equal(failed.attempts, 1)
   assert.equal(failed.result, undefined)
-  assert.doesNotMatch(JSON.stringify(failed.error), /PRIVATE-MODEL-SENTINEL/)
+  assert.doesNotMatch(JSON.stringify(failed.error), /PRIVATE-MODEL-SENTINEL|987654321/)
   assert.equal(mock.calls.filter(call => call.kind === 'resume_rubric_assessment' && call.body.input.rubric.id === invalidRubric).length, 3)
   assert.match(failed.error.message, /Assessment criterion 1, citation 1/)
   assert.match(failed.error.message, /2-correction limit/)
+  assert.match(failed.error.message, /generated evidence is invalid; this does not mean resume data is missing/)
   assert.equal(failed.error.retryable, false)
   assert.equal(failed.nextAttemptAt, undefined)
   const failures = events.filter(event => event.comparisonId === failed.id)
   assert.ok(failures.every(event => event.workspaceId === f.workspaceId && event.runId === created.run.id && event.attemptId === failed.attemptId))
   assert.deepEqual(failures.filter(event => event.event === 'correction').map(event => event.correctionCount), [1, 2])
   assert.equal(failures.filter(event => event.event === 'validation-failed').length, 3)
+  assert.ok(failures.filter(event => event.event === 'validation-failed')
+    .every(event => event.citationDiagnostics.findings[0].reason === 'unknown-passage'))
+  assert.equal(failures.filter(event => event.event === 'evidence-catalog').length, 1)
+  assert.equal(failures.filter(event => event.event === 'citations-resolved').length, 0)
   assert.equal(failures.at(-1).event, 'comparison-outcome')
   assert.equal(failures.at(-1).outcome, 'failed')
   assert.equal(failures.at(-1).code, 'invalid-citation')
   assert.equal(failures.at(-1).correctionCount, 2)
   assert.equal(failures.at(-1).stage, 'assessment')
-  assert.doesNotMatch(JSON.stringify(events), /PRIVATE-MODEL-SENTINEL|test-token/)
+  assert.doesNotMatch(JSON.stringify(events), /PRIVATE-MODEL-SENTINEL|987654321|test-token/)
   assert.equal(complete.status, 'complete')
   assert.equal(complete.resultSummary.overall.score, 60)
   assert.equal(events.find(event => event.comparisonId === complete.id && event.event === 'comparison-outcome').outcome, 'complete')
+  const callCount = mock.calls.length
+  assert.deepEqual(await runAnalysisWorker(mock.deps, { maxItems: 2 }), { claimed: 0, completed: 0 })
+  assert.equal(mock.calls.length, callCount, 'Invalid model output must not trigger an automatic worker retry')
 })
 
 test('two semantic corrections publish three bound reviews and correlated completion without extra worker attempts', async () => {
@@ -445,7 +480,7 @@ test('two semantic corrections publish three bound reviews and correlated comple
       outcome: 'needs-correction',
       issues: [{
         code: 'unsupported-score', message: 'Compare the stated responsibility scope with the saved score anchors.',
-        criterionId: body.input.rubric.criteria[0].id, qualificationId: null, citations: [],
+        criterionId: body.input.rubric.criteria[0].id, qualificationId: null, citations: [passageSelection(body.input)],
       }],
     }
   })
@@ -462,6 +497,10 @@ test('two semantic corrections publish three bound reviews and correlated comple
   assert.equal(new Set(detail.result.provenance.groundingReviews.map(review => review.assessmentSha256)).size, 3)
   assert.equal(detail.result.provenance.groundingReviews.at(-1).assessmentSha256, detail.result.provenance.assessmentSha256)
   assert.equal(detail.result.overall.score, 60)
+  assert.equal(events.filter(event => event.event === 'evidence-catalog').length, 1)
+  assert.deepEqual(events.filter(event => event.event === 'citations-resolved').map(event => event.citationCount), [1, 1, 1, 1, 1, 0])
+  assert.ok(detail.result.provenance.groundingReviews.slice(0, 2).every(review =>
+    review.issues[0].citations[0].quote === detail.resumeSnapshot.document.paragraphs[0].text))
   assert.ok(events.every(event => event.comparisonId === saved.id && event.attemptId === saved.attemptId))
   assert.equal(events.at(-1).outcome, 'complete')
   assert.equal(events.at(-1).stage, 'publication')
@@ -527,7 +566,7 @@ test('missing snapshot retries stop after three attempts; manual retry uses orig
   assert.deepEqual(await f.analysis.store.get(f.workspaceId, second.record.id), completed)
   assert.deepEqual(f.analysis.blobs.values.get(completed.record.result.blobName), historical)
   const detail = await f.service.comparisonDetail(f.workspaceId, created.run.id, first.record.id)
-  assert.deepEqual(mock.calls.at(-2).body.input.resume, detail.resumeSnapshot.document)
+  assertLosslessResume(mock.calls.at(-2).body.input.resume, detail.resumeSnapshot.document)
 })
 
 test('worker finishes interrupted cancellation for both initializing and fully initialized 100-pair runs', async () => {
