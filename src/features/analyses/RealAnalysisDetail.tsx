@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react'
 import { Link, useNavigate, useSearchParams } from 'react-router-dom'
 import { ArrowLeft, ArrowUpRight, Layers3, LoaderCircle, RotateCcw, ShieldCheck, X } from 'lucide-react'
 import { useRealAnalyses } from '../../app/real-analyses-context'
+import { savedReviewView, type SavedReviewView } from '../../app/saved-review-navigation'
 import type { RealAnalysisComparisonSummary, RealAnalysisRunSummary } from '../../domain/real-analyses'
 import { dateLabel } from '../../domain/selectors'
 import { Badge, Button, EmptyState, InlineError, PageHeader, Score, SearchField } from '../../components/ui'
@@ -99,6 +100,7 @@ function RealAnalysisView({ id }: { id: string }) {
   const ensure = api?.ensureDetail
   const ensurePairs = api?.ensureComparisons
   const selectedId = params.get('result')
+  const sourceView = savedReviewView(params)
   useEffect(() => {
     if (api?.phase !== 'ready') return
     void ensure?.(id)
@@ -132,6 +134,7 @@ function RealAnalysisView({ id }: { id: string }) {
     const next = new URLSearchParams(params)
     next.set('data', 'real')
     next.set('result', pairId)
+    next.delete('view')
     setParams(next)
   }
   return <>{back}
@@ -153,7 +156,7 @@ function RealAnalysisView({ id }: { id: string }) {
       <p>{run.progress.scored} with a server-calculated score · {run.progress.unscored} completed without an overall score. Saved results are never overwritten when other pairs retry.</p>
       {realAnalysisCancellationPending(summary) && <p>Cancellation is progressing in bounded batches. This view keeps polling until the server confirms completion.</p>}
     </section>
-    {selectedId ? <SelectedRealComparison runId={id} comparisonId={selectedId} /> : <section className="panel mt-5" aria-label="Real comparisons">
+    {selectedId ? <SelectedRealComparison runId={id} comparisonId={selectedId} initialView={sourceView} /> : <section className="panel mt-5" aria-label="Real comparisons">
       <div className="section-heading"><div><h2>Separate comparisons, not a cross-job ranking</h2><p>Open a result for the complete criterion breakdown and exact source quotations.</p></div>
         <Button size="sm" icon={RotateCcw} onClick={() => { void api.ensureDetail(id, true); void api.ensureComparisons(id, true) }}>Refresh pairs</Button></div>
       <div className="library-toolbar">
@@ -193,7 +196,7 @@ function RealAnalysisView({ id }: { id: string }) {
   </>
 }
 
-function SelectedRealComparison({ runId, comparisonId }: { runId: string; comparisonId: string }) {
+function SelectedRealComparison({ runId, comparisonId, initialView }: { runId: string; comparisonId: string; initialView: SavedReviewView | null }) {
   const api = useRealAnalyses()!
   const entry = api.comparison(runId, comparisonId)
   const ensure = api.ensureComparison
@@ -203,6 +206,6 @@ function SelectedRealComparison({ runId, comparisonId }: { runId: string; compar
     description={entry.state === 'error' ? entry.error : 'Retrieving the immutable resume, target, and result. No live versions are substituted.'}
     action={<Button onClick={() => void ensure(runId, comparisonId, true)}>Retry saved comparison</Button>} /></section>
   return <div className="mt-5">{entry.error && <div className="mb-5"><InlineError>{entry.error} <Button size="sm" onClick={() => void ensure(runId, comparisonId, true)}>Reload saved comparison</Button></InlineError></div>}
-    <RealComparisonReview key={comparisonId} detail={entry.value} actions={<RealComparisonActions summary={entry.value} />} />
+    <RealComparisonReview key={`${comparisonId}:${initialView ?? 'review'}`} detail={entry.value} initialView={initialView} actions={<RealComparisonActions summary={entry.value} />} />
   </div>
 }

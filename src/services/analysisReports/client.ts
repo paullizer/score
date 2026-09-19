@@ -1,9 +1,10 @@
 import {
   REPORT_FORMATS, REPORT_LIMITS, type AnalysisReport, type AnalysisReportFormat,
-  type ReportFontData, type ReportWorkerRequest, type ReportWorkerResponse,
+  type ReportFontData, type ReportGenerationOptions, type ReportLinkContext, type ReportWorkerRequest, type ReportWorkerResponse,
 } from '../../domain/analysis-reports'
 import { assertReportResourceLimits } from './model'
 import { safeReportFilename } from './presentation'
+import { validatedReportLinkContext } from './links'
 
 const MAX_FONT_BYTES = 4 * 1024 * 1024
 
@@ -61,10 +62,11 @@ export function assertReportFile(bytes: ArrayBuffer, format: AnalysisReportForma
 export async function generateReportInWorker(
   report: AnalysisReport,
   format: AnalysisReportFormat,
-  options: { signal: AbortSignal; onProgress?: (message: string) => void },
+  options: { signal: AbortSignal; onProgress?: (message: string) => void; links?: ReportLinkContext },
 ): Promise<ArrayBuffer> {
   options.signal.throwIfAborted()
   assertReportResourceLimits(report)
+  const links = format === 'docx' ? options.links : validatedReportLinkContext(report, options)
   const lifetime = new AbortController()
   const signal = AbortSignal.any([options.signal, lifetime.signal])
   const timer = setTimeout(() => lifetime.abort(new DOMException('Report generation timed out', 'TimeoutError')), REPORT_LIMITS.maxGenerationMilliseconds)
@@ -75,7 +77,9 @@ export async function generateReportInWorker(
       fonts = await reportFonts(signal)
     }
     signal.throwIfAborted()
-    return await runWorker(report, format, signal, options.onProgress, fonts)
+    return await runWorker(report, format, signal, options.onProgress, {
+      ...(links ? { links } : {}), ...(fonts ? { fonts } : {}),
+    })
   } finally {
     clearTimeout(timer)
     lifetime.abort()
@@ -84,7 +88,7 @@ export async function generateReportInWorker(
 
 function runWorker(
   report: AnalysisReport, format: AnalysisReportFormat, signal: AbortSignal,
-  onProgress?: (message: string) => void, fonts?: ReportFontData,
+  onProgress?: (message: string) => void, options?: ReportGenerationOptions,
 ): Promise<ArrayBuffer> {
   return new Promise((resolve, reject) => {
     const requestId = crypto.randomUUID()
@@ -123,7 +127,8 @@ function runWorker(
         } else throw new Error('The report generator returned an invalid response.')
       } catch (error) { fail(error) }
     }
-    const request: ReportWorkerRequest = { type: 'generate', requestId, format, report, ...(fonts ? { options: { fonts } } : {}) }
+    const request: ReportWorkerRequest = { type: 'generate', requestId, format, report, ...(options ? { options } : {}) }
+    const fonts = options?.fonts
     try {
       signal.throwIfAborted()
       worker.postMessage(request, fonts ? [fonts.regular, fonts.bold] : [])
@@ -134,7 +139,7 @@ function runWorker(
 export function downloadAnalysisReport(bytes: ArrayBuffer, report: AnalysisReport, format: AnalysisReportFormat, signal: AbortSignal): string {
   signal.throwIfAborted()
   assertReportFile(bytes, format)
-  const filename = safeReportFilename(`${report.dataKind === 'sample' ? 'Sample - ' : ''}${report.run.name}${report.partial ? ' - partial' : ''}`, format)
+  const filename = safeReportFilename(`${report.dataKind === 'sample' ? 'Sample - ' : ''}${report.run.name}${format === 'docx' && report.partial ? ' - partial' : ''}`, format)
   const url = URL.createObjectURL(new Blob([bytes], { type: REPORT_FORMATS[format].mimeType }))
   const anchor = document.createElement('a')
   anchor.href = url

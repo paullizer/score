@@ -9,6 +9,7 @@ import { loadReportFoundation, realReportFixture } from './test-support.mjs'
 
 const output = resolve(`.csv-report-tests-${randomUUID()}`)
 let foundation, writer, model
+const options = { links: { origin: 'https://score.example', workspaceId: 'workspace-one' } }
 
 function parseCsv(bytes) {
   const text = Buffer.from(bytes).toString('utf8').replace(/^\uFEFF/, '')
@@ -53,39 +54,65 @@ before(async () => {
 })
 after(async () => { await foundation?.cleanup(); await rm(output, { recursive: true, force: true }) })
 
-test('CSV begins with name, job title and criterion columns and round-trips quoted Unicode assessments', () => {
+test('CSV uses the compact reader-facing schema and round-trips quoted Unicode source text', () => {
   const input = realReportFixture()
   input.comparisons[0].candidate.name = 'Zoë, "Jordan" Кириллица'
-  input.comparisons[0].summary = 'First saved paragraph, with "quotes".\r\nSecond saved paragraph: café Ω.'
+  input.comparisons[0].candidate.sourceLabel = 'Résumé, "original".pdf\r\nCaptured source: café Ω.'
+  input.comparisons[0].summary = 'Analyzed survey data with R and explained findings to project teams.'
+  input.comparisons[0].criteria[0].rationale = 'Built an R workflow to analyze survey responses.'
+  input.comparisons[0].criteria[1].rationale = 'Presented survey findings to three project teams.'
   const report = model.buildAnalysisReport(input)
-  const bytes = writer.generateCsvReport(report)
+  const original = JSON.stringify(report)
+  const bytes = writer.generateCsvReport(report, options)
   assert.deepEqual(Array.from(bytes.slice(0, 3)), [0xef, 0xbb, 0xbf])
   const result = records(bytes)
-  assert.deepEqual(result.headers.slice(0, 2), ['Candidate name', 'Job/grade title'])
-  assert.match(result.headers[2], /\[T1 C1\].*Duplicate criterion label.*50% weight; 0-5/)
-  assert.equal(result.headers[4], 'Overall score')
-  assert.equal(result.headers[5], 'Overall assessment')
+  assert.deepEqual(result.headers, [
+    'Candidate name', 'Job/grade', 'Overall score', 'Overall assessment', 'C1', 'C2',
+    'Analysis date', 'Source', 'Analysis link', 'Resume link', 'Job/grade link',
+  ])
   assert.equal(result.records[0]['Candidate name'], input.comparisons[0].candidate.name)
-  assert.equal(result.records[0]['Overall assessment'], input.comparisons[0].summary)
+  assert.equal(result.records[0].Source, input.comparisons[0].candidate.sourceLabel)
+  assert.match(result.records[0]['Overall assessment'], /survey/)
+  assert.ok(result.records[0]['Overall assessment'].length <= 300)
   assert.equal(result.records[0]['Overall score'], '92.75')
+  assert.equal(result.records[0]['Analysis date'], 'Sep 18, 2026')
   assert.equal(result.rows.length, input.comparisons.length)
-  assert.ok(result.records.every((row) => row['Human review notice'].includes('not hiring recommendations')))
+  assert.equal(JSON.stringify(report), original)
+  const analysis = new URL(result.records[0]['Analysis link'])
+  assert.equal(analysis.origin, options.links.origin)
+  assert.equal(analysis.pathname, '/workspaces/workspace-one/analyses/run-one')
+  assert.equal(analysis.searchParams.get('result'), 'comparison-0')
+  assert.equal(analysis.searchParams.get('data'), 'real')
+  assert.equal(new URL(result.records[0]['Resume link']).searchParams.get('view'), 'resume')
+  assert.equal(new URL(result.records[0]['Job/grade link']).searchParams.get('view'), 'target')
 })
 
-test('same-name criteria and targets stay distinct with exactly one row per comparison', () => {
-  const report = model.buildAnalysisReport(realReportFixture({ targetCount: 2 }))
-  const result = records(writer.generateCsvReport(report))
+test('different jobs reuse local criterion columns without merging targets or multiplying width', () => {
+  const input = realReportFixture({ targetCount: 2 })
+  const second = input.targets[1]
+  second.criteria[0].weight = 40
+  second.criteria[1].weight = 35
+  second.criteria.push({ ...second.criteria[0], id: 'criterion-2', weight: 25 })
+  for (const comparison of input.comparisons.filter(item => item.targetId === second.id)) {
+    comparison.criteria[0].weight = 40
+    comparison.criteria[1].weight = 35
+    comparison.criteria.push({ ...comparison.criteria[0], criterionId: 'criterion-2', weight: 25, score: 4 })
+    comparison.coverage.supported = 3
+    comparison.coverage.totalCriteria = 3
+  }
+  const report = model.buildAnalysisReport(input)
+  const result = records(writer.generateCsvReport(report, options))
   assert.equal(result.rows.length, 6)
-  assert.equal(new Set(result.records.map((row) => row['Comparison ID'])).size, 6)
-  const scores = result.rows.map((row) => row.slice(2, 6))
-  assert.deepEqual(scores[0], ['3', '3', '', ''])
-  assert.deepEqual(scores[3], ['', '', '3', '3'])
-  assert.deepEqual(result.records.map((row) => row['Evidence-match rank within target']), ['1', '2', '3', '1', '2', '3'])
-  assert.equal(new Set(result.headers.slice(2, 6)).size, 4)
+  assert.equal(new Set(result.records.map(row => row['Analysis link'])).size, 6)
+  assert.deepEqual(result.headers.filter(header => /^C\d+$/.test(header)), ['C1', 'C2', 'C3'])
+  assert.deepEqual(result.rows[0].slice(4, 7), ['3', '3', ''])
+  assert.deepEqual(result.rows[3].slice(4, 7), ['3', '3', '4'])
+  assert.notEqual(result.records[0]['Job/grade'], result.records[3]['Job/grade'])
+  assert.ok(result.records.every(row => !row['Job/grade'].includes('target-')))
 })
 
-test('CSV preserves zero, withheld, N/A and pending values without inventing scores', () => {
-  const input = realReportFixture({ scores: [0, null, 30], statuses: ['complete', 'complete', 'running'] })
+test('CSV includes completed results only and preserves zero, withheld, N/A and not assessed', () => {
+  const input = realReportFixture({ scores: [0, null, 30, 40], statuses: ['complete', 'complete', 'running', 'failed'] })
   for (const criterion of input.comparisons[0].criteria) {
     criterion.score = 0
     criterion.evidenceStatus = 'missing'
@@ -93,18 +120,15 @@ test('CSV preserves zero, withheld, N/A and pending values without inventing sco
   }
   input.comparisons[0].coverage.supported = 0
   input.comparisons[0].coverage.missing = 2
-  const result = records(writer.generateCsvReport(model.buildAnalysisReport(input)))
+  const result = records(writer.generateCsvReport(model.buildAnalysisReport(input), options))
+  assert.equal(result.records.length, 2)
   assert.equal(result.records[0]['Overall score'], '0')
-  assert.equal(result.rows[0][2], '0')
+  assert.equal(result.records[0].C1, '0')
   assert.equal(result.records[1]['Overall score'], '')
-  assert.equal(result.records[1]['Overall score availability'], 'withheld')
-  assert.match(result.records[1]['Overall score reason'], /not assessed/)
-  assert.equal(result.rows[1][2], 'Not assessed')
-  assert.equal(result.records[2]['Overall score'], '')
-  assert.equal(result.records[2]['Comparison status'], 'Running')
-  assert.equal(result.records[2]['Supported criteria'], '')
-  assert.equal(result.rows[2][2], 'Not assessed')
-  assert.ok(result.records.every((row) => row['Report status'] === 'Partial'))
+  assert.match(result.records[1]['Overall assessment'], /No overall score:.*not assessed/)
+  assert.equal(result.records[1].C1, 'Not assessed')
+  assert.ok(!result.headers.some(header => /status|availability|reason|partial|rank|cutoff|hash|\bID\b|coverage|notice/i.test(header)))
+  assert.ok(result.records.every(row => !['comparison-2', 'comparison-3'].includes(new URL(row['Analysis link']).searchParams.get('result'))))
 
   const grade = realReportFixture({ scores: [80], kind: 'grade' })
   grade.targets[0].criteria[0].weight = 0
@@ -113,36 +137,36 @@ test('CSV preserves zero, withheld, N/A and pending values without inventing sco
   grade.comparisons[0].criteria[1].weight = 100
   grade.comparisons[0].coverage.supported = 1
   grade.comparisons[0].coverage.notApplicable = 1
-  assert.equal(records(writer.generateCsvReport(model.buildAnalysisReport(grade))).rows[0][2], 'N/A')
+  assert.equal(records(writer.generateCsvReport(model.buildAnalysisReport(grade), options)).records[0].C1, 'N/A')
 })
 
 test('all untrusted spreadsheet formula prefixes are neutralized, including whitespace and control prefixes', () => {
   const names = ['=1+2', '+1+2', '-1+2', '@SUM(A1)', ' \t=1+2', '\r=1+2', '\n=1+2', '\uFEFF=1+2', '\u200F=1+2', '\u0001=1+2', '\tordinary', '＝1+2']
   const input = realReportFixture({ scores: names.map(() => 80) })
   input.comparisons.forEach((comparison, index) => { comparison.candidate.name = names[index]; comparison.summary = `=Summary "${index}",\ncell` })
-  input.run.name = '=run formula'
   input.targets[0].label = '+target formula'
-  const result = records(writer.generateCsvReport(model.buildAnalysisReport(input)))
+  input.comparisons.forEach((comparison, index) => { comparison.candidate.sourceLabel = names[index] })
+  const result = records(writer.generateCsvReport(model.buildAnalysisReport(input), options))
   for (const [index, record] of result.records.entries()) {
-    assert.equal(record['Candidate name'], `'${names[index]}`)
+    const displayName = model.readableCandidateName(input.comparisons[index].candidate)
+    assert.equal(record['Candidate name'], names[index] === '\tordinary' ? 'ordinary' : `'${displayName}`)
+    assert.equal(record.Source, `'${names[index]}`)
     assert.equal(record['Overall score'], '80')
-    assert.equal(record['Job/grade title'], "'+target formula")
-    assert.equal(record['Run name'], "'=run formula")
-    assert.equal(record['Overall assessment'], `'=Summary "${index}",\ncell`)
+    assert.equal(record['Job/grade'], "'+target formula")
+    assert.equal(record['Overall assessment'], `'=Summary "${index}", cell`)
   }
 })
 
-test('top-five cutoff ties share ranks and all 500 comparisons are exported', () => {
+test('all 500 completed comparisons are exported without ranking and tie metadata', () => {
   const report = model.buildAnalysisReport(realReportFixture({ scores: Array(500).fill(80) }))
-  const result = records(writer.generateCsvReport(report))
+  const result = records(writer.generateCsvReport(report, options))
   assert.equal(result.records.length, 500)
-  assert.equal(result.records.filter((row) => row['Highlighted evidence match'] === 'Yes').length, 10)
-  assert.ok(result.records.every((row) => row['Evidence-match rank within target'] === '1'))
-  assert.ok(result.records.every((row) => row['Additional candidates tied at cutoff'] === '490'))
-  assert.equal(new Set(result.records.map((row) => row['Comparison ID'])).size, 500)
+  assert.equal(result.headers.length, 11)
+  assert.ok(!result.headers.some(header => /rank|highlight|cutoff|ties/i.test(header)))
+  assert.equal(new Set(result.records.map(row => row['Analysis link'])).size, 500)
 })
 
-test('sample CSV is explicitly fictional and malformed row counts fail rather than download partial data', () => {
+test('sample CSV is explicitly fictional without a repeated metadata column', () => {
   const input = realReportFixture({ scores: [80] })
   input.dataKind = 'sample'
   delete input.workspaceId
@@ -154,9 +178,29 @@ test('sample CSV is explicitly fictional and malformed row counts fail rather th
     comparison.resultSha256 = null
   }
   const report = model.buildAnalysisReport(input)
-  assert.equal(records(writer.generateCsvReport(report)).records[0]['Report data'], 'Fictional sample')
+  const standalone = { links: { origin: 'http://localhost:5173' } }
+  const result = records(writer.generateCsvReport(report, standalone))
+  assert.equal(result.headers[0], 'Candidate name (fictional sample)')
+  assert.ok(!result.headers.includes('Report data'))
+  const link = new URL(result.records[0]['Analysis link'])
+  assert.equal(link.pathname, '/analyses/run-one')
+  assert.equal(link.searchParams.get('data'), 'samples')
+})
+
+test('inconsistent inventories and missing link context stop the CSV download', () => {
+  const report = model.buildAnalysisReport(realReportFixture({ scores: [80] }))
   report.counts.total++
-  assert.throws(() => writer.generateCsvReport(report), /rows do not match/)
+  assert.throws(() => writer.generateCsvReport(report, options), /rows do not match/)
+  report.counts.total--
+  report.counts.complete++
+  assert.throws(() => writer.generateCsvReport(report, options), /rows do not match/)
+  report.counts.complete--
+  report.groups[0].counts.complete++
+  assert.throws(() => writer.generateCsvReport(report, options), /rows do not match/)
+  report.groups[0].counts.complete--
+  assert.throws(() => writer.generateCsvReport(report), /link|origin/i)
+  report.groups[0].comparisons[0].criteria.pop()
+  assert.throws(() => writer.generateCsvReport(report, options), /criterion assessment is missing/)
 })
 
 test('CSV writer bundles for a browser without a filesystem or conversion service', async () => {
@@ -175,5 +219,7 @@ test('document weight labels remain readable without concealing approximation or
   const input = realReportFixture({ criterionCount: 3 })
   const report = model.buildAnalysisReport(input)
   assert.equal(report.groups[0].target.criteria[0].weight, 100 / 3)
-  assert.ok(records(writer.generateCsvReport(report)).headers[2].includes(`${100 / 3}%`))
+  const original = JSON.stringify(report)
+  assert.deepEqual(records(writer.generateCsvReport(report, options)).headers.slice(4, 7), ['C1', 'C2', 'C3'])
+  assert.equal(JSON.stringify(report), original)
 })
