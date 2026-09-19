@@ -5,6 +5,9 @@ import {
   type RealAnalysisGroundingReview, type RealAnalysisResultSummary,
 } from '../../src/domain/real-analyses'
 import {
+  ANALYSIS_REVIEW_ISSUE_CODES, type AnalysisAssessmentDiagnostic,
+} from '../../src/domain/analysis-diagnostics'
+import {
   invokeStructuredModel, systemClock, type Clock, type RubricModelOptions, type StructuredModelRequest,
 } from '../runtime'
 import {
@@ -77,6 +80,7 @@ export interface AnalysisAssessmentOptions {
   resumeSnapshotSha256: string
   targetSnapshotSha256: string
   onEvent?: AnalysisTelemetrySink
+  onDiagnostic?: (diagnostic: AnalysisAssessmentDiagnostic) => void
 }
 
 export interface AssessedResumeAgainstTarget {
@@ -124,13 +128,13 @@ function record(value: unknown): value is Record<string, unknown> {
 }
 
 async function boundedResponseJson(response: Response, signal: AbortSignal | undefined, stage: AnalysisModelStage): Promise<unknown> {
-  const tooLarge = () => new AnalysisModelError('context-limit', 'The analysis model response exceeded its bounded size; no partial result was used.', { stage })
+  const tooLarge = () => new AnalysisModelError('context-limit', 'The analysis model response exceeded its bounded size; no partial result was used.', { stage, reason: 'response-size' })
   const declaredBytes = Number(response.headers.get('content-length'))
   if (Number.isFinite(declaredBytes) && declaredBytes > ANALYSIS_MODEL_LIMITS.maxResponseBytes) {
     void response.body?.cancel().catch(() => {})
     throw tooLarge()
   }
-  if (!response.body) throw new AnalysisModelError('invalid-model-output', 'The analysis service returned an empty response.', { stage })
+  if (!response.body) throw new AnalysisModelError('invalid-model-output', 'The analysis service returned an empty response.', { stage, reason: 'invalid-envelope' })
   const reader = response.body.getReader()
   const chunks: Uint8Array[] = []
   let bytes = 0
@@ -145,7 +149,7 @@ async function boundedResponseJson(response: Response, signal: AbortSignal | und
     try {
       return JSON.parse(Buffer.concat(chunks).toString('utf8'))
     } catch {
-      throw new AnalysisModelError('invalid-model-output', 'The analysis service returned an invalid response envelope.', { stage })
+      throw new AnalysisModelError('invalid-model-output', 'The analysis service returned an invalid response envelope.', { stage, reason: 'invalid-envelope' })
     }
   } finally {
     void reader.cancel().catch(() => {})
@@ -155,26 +159,28 @@ async function boundedResponseJson(response: Response, signal: AbortSignal | und
 
 function responseEnvelope(value: unknown, stage: AnalysisModelStage): { content: string; model: string } {
   if (!record(value) || !Array.isArray(value.choices) || value.choices.length !== 1 || !record(value.choices[0])) {
-    throw new AnalysisModelError('invalid-model-output', 'The analysis service returned an invalid response envelope.', { stage })
+    throw new AnalysisModelError('invalid-model-output', 'The analysis service returned an invalid response envelope.', { stage, reason: 'invalid-envelope' })
   }
   const choice = value.choices[0]
   const message = choice.message
   if (choice.finish_reason === 'length') {
-    throw new AnalysisModelError('context-limit', 'The analysis model reached its completion-token limit; no truncated assessment or review was used.', { stage })
+    throw new AnalysisModelError('context-limit', 'The analysis model reached its completion-token limit; no truncated assessment or review was used.', { stage, reason: 'completion-token-limit' })
   }
   if (choice.finish_reason === 'content_filter' || record(message) && message.refusal) {
-    throw new AnalysisModelError('invalid-model-output', 'The analysis model declined this request; no assessment or review was substituted.', { stage })
+    throw new AnalysisModelError('invalid-model-output', 'The analysis model declined this request; no assessment or review was substituted.', {
+      stage, reason: choice.finish_reason === 'content_filter' ? 'content-filter' : 'model-refusal',
+    })
   }
   if (!record(message) || message.tool_calls || message.function_call ||
     choice.finish_reason !== undefined && choice.finish_reason !== 'stop' ||
     typeof message.content !== 'string' || !message.content.trim()) {
-    throw new AnalysisModelError('invalid-model-output', 'The analysis model did not return a complete structured response.', { stage })
+    throw new AnalysisModelError('invalid-model-output', 'The analysis model did not return a complete structured response.', { stage, reason: 'incomplete-response' })
   }
   if (message.content.length > ANALYSIS_MODEL_LIMITS.maxOutputCharacters) {
-    throw new AnalysisModelError('context-limit', 'The analysis model output exceeded its character limit; no partial output was used.', { stage })
+    throw new AnalysisModelError('context-limit', 'The analysis model output exceeded its character limit; no partial output was used.', { stage, reason: 'response-size' })
   }
   if (typeof value.model !== 'string' || !/^[a-zA-Z0-9][a-zA-Z0-9._:/-]{0,299}$/.test(value.model)) {
-    throw new AnalysisModelError('invalid-model-output', 'The analysis service did not identify the actual response model; configured names cannot substitute for provenance.', { stage })
+    throw new AnalysisModelError('invalid-model-output', 'The analysis service did not identify the actual response model; configured names cannot substitute for provenance.', { stage, reason: 'invalid-model-identity' })
   }
   return { content: message.content, model: value.model }
 }
@@ -202,9 +208,6 @@ async function invokeAnalysisModel(
 ): Promise<ModelCallResult> {
   checkCancelled(options.signal, stage)
   const inputCharacters = requestCharacters(request)
-  if (inputCharacters > ANALYSIS_MODEL_LIMITS.maxContextCharacters) {
-    throw new AnalysisModelError('context-limit', 'The complete analysis request exceeds the model context budget; no resume or requirement sections were omitted.', { stage })
-  }
   const startedAt = clock.now().toISOString()
   const callId = randomUUID()
   let transportAttempt = 0
@@ -213,8 +216,16 @@ async function invokeAnalysisModel(
     emitAnalysisTelemetry(options.onEvent, {
       timestamp, stage, modelCallId: callId, deployment: options.model.deployment,
       promptVersion: ANALYSIS_MODEL_PROMPT_VERSIONS[stage], schemaVersion: ANALYSIS_MODEL_SCHEMA_VERSIONS[stage],
+      inputCharacters, contextCharacterLimit: ANALYSIS_MODEL_LIMITS.maxContextCharacters,
+      completionTokenLimit: request.maxCompletionTokens,
       correctionCount, transportAttempt, durationMilliseconds: Math.max(0, Date.parse(timestamp) - Date.parse(startedAt)),
       ...event,
+    })
+  }
+  if (inputCharacters > ANALYSIS_MODEL_LIMITS.maxContextCharacters) {
+    emit({ event: 'model-failed', code: 'context-limit', reason: 'context-budget', retryable: false })
+    throw new AnalysisModelError('context-limit', 'The complete analysis request exceeds the model context budget; no resume or requirement sections were omitted.', {
+      stage, reason: 'context-budget',
     })
   }
   const fetchImpl = options.model.fetch ?? fetch
@@ -229,6 +240,7 @@ async function invokeAnalysisModel(
     transportAttempt += 1
     const requestStartedAt = clock.now().getTime()
     let response: Response | undefined
+    let finishReason: AnalysisTelemetryEvent['finishReason']
     try {
       response = await abortable(() => fetchImpl(url, init), signal ?? undefined, stage)
       if ([429, 502, 503, 504].includes(response.status)) return response
@@ -236,20 +248,31 @@ async function invokeAnalysisModel(
         if (!response.ok) {
           if (response.status === 400 || response.status === 413 || response.status === 422) {
             const payload = await boundedResponseJson(response, signal ?? undefined, stage)
-            const code = record(payload) && record(payload.error) ? payload.error.code : undefined
+            const upstreamError = record(payload) && record(payload.error) ? payload.error : undefined
+            const code = upstreamError?.code
             if (response.status === 413 || ['context_length_exceeded', 'context_window_exceeded', 'max_tokens_exceeded', 'token_limit_exceeded'].includes(String(code))) {
-              envelopeError = new AnalysisModelError('context-limit', 'The analysis service rejected the complete input or completion budget; no sections were truncated.', { stage })
+              envelopeError = new AnalysisModelError('context-limit', 'The analysis service rejected the complete input or completion budget; no sections were truncated.', { stage, reason: 'context-budget' })
+            } else if (code === 'content_filter' || code === 'ResponsibleAIPolicyViolation' ||
+              record(upstreamError?.innererror) && upstreamError.innererror.code === 'ResponsibleAIPolicyViolation') {
+              envelopeError = new AnalysisModelError('invalid-model-output',
+                'The analysis service content filter declined this request; no assessment or review was substituted.',
+                { stage, reason: 'content-filter' })
             }
           }
           return response
         }
-        const parsed = responseEnvelope(await boundedResponseJson(response, signal ?? undefined, stage), stage)
+        const payload = await boundedResponseJson(response, signal ?? undefined, stage)
+        if (record(payload) && Array.isArray(payload.choices) && record(payload.choices[0])) {
+          const value = payload.choices[0].finish_reason
+          finishReason = (['stop', 'length', 'content_filter', 'tool_calls', 'function_call'] as const).find(reason => reason === value)
+        }
+        const parsed = responseEnvelope(payload, stage)
         actualModel = parsed.model
         return Response.json({ model: parsed.model, choices: [{ message: { content: parsed.content } }] })
       } catch (error) {
         if (signal?.aborted) throw error
         envelopeError = error instanceof AnalysisModelError ? error :
-          new AnalysisModelError('invalid-model-output', 'The analysis service response could not be validated.', { stage })
+          new AnalysisModelError('invalid-model-output', 'The analysis service response could not be validated.', { stage, reason: 'invalid-envelope' })
         // A refusal prevents the shared transport from retrying this non-transient envelope failure.
         return Response.json({ choices: [{ message: { refusal: 'Analysis response validation failed.' } }] })
       }
@@ -259,7 +282,7 @@ async function invokeAnalysisModel(
         timestamp, durationMilliseconds: Math.max(0, Date.parse(timestamp) - requestStartedAt),
         event: response ? 'model-response' : 'model-transport-failed', httpStatus: response?.status,
         requestId: response ? analysisResponseRequestId(response.headers) : undefined, model: actualModel,
-        code: envelopeError?.code,
+        code: envelopeError?.code, reason: envelopeError?.reason, finishReason,
       })
     }
   }
@@ -271,7 +294,7 @@ async function invokeAnalysisModel(
     checkCancelled(options.signal, stage)
     if (envelopeError) throw envelopeError
     if (!actualModel || response.model !== actualModel) {
-      throw new AnalysisModelError('invalid-model-output', 'The analysis response model identity could not be verified.', { stage })
+      throw new AnalysisModelError('invalid-model-output', 'The analysis response model identity could not be verified.', { stage, reason: 'invalid-model-identity' })
     }
     return {
       content: response.content, callId,
@@ -284,7 +307,7 @@ async function invokeAnalysisModel(
     }
   } catch (error) {
     const failure = envelopeError ?? serviceError(error, stage)
-    emit({ event: 'model-failed', code: failure.code, retryable: failure.retryable, cancelled: Boolean(options.signal?.aborted || failure.cancelled) })
+    emit({ event: 'model-failed', code: failure.code, reason: failure.reason, retryable: failure.retryable, cancelled: Boolean(options.signal?.aborted || failure.cancelled) })
     checkCancelled(options.signal, stage)
     throw failure
   }
@@ -294,14 +317,15 @@ function parseModelJson(content: string, stage: AnalysisModelStage): unknown {
   try {
     return JSON.parse(content)
   } catch {
-    throw new AnalysisModelError('invalid-model-output', 'The analysis model output was not valid JSON.', { stage, correctable: true })
+    throw new AnalysisModelError('invalid-model-output', 'The analysis model output was not valid JSON.', { stage, correctable: true, reason: 'invalid-json' })
   }
 }
 
-function correctionDiagnostic(error: unknown): Pick<AnalysisModelError, 'code' | 'message' | 'citationDiagnostics'> | undefined {
+function correctionDiagnostic(error: unknown): Pick<AnalysisModelError, 'code' | 'message' | 'reason' | 'citationDiagnostics' | 'schemaDiagnostics'> | undefined {
   return error instanceof AnalysisModelError && error.correctable ? {
-    code: error.code, message: error.message,
+    code: error.code, message: error.message, reason: error.reason,
     ...(error.citationDiagnostics ? { citationDiagnostics: error.citationDiagnostics } : {}),
+    ...(error.schemaDiagnostics ? { schemaDiagnostics: error.schemaDiagnostics } : {}),
   } : undefined
 }
 
@@ -332,10 +356,13 @@ export async function assessResumeAgainstTarget(
   let correctionCount = 0
   let assessmentCorrection: Record<string, unknown> | undefined
   let reviewCorrection: Record<string, unknown> | undefined
-  let assessed: { assessment: RealAnalysisAssessmentOutput; provenance: AnalysisModelProvenance; hash: string } | undefined
+  let assessed: {
+    assessment: RealAnalysisAssessmentOutput; provenance: AnalysisModelProvenance; hash: string; callId: string; correctionCount: number
+  } | undefined
   const outputEvent = (
     response: ModelCallResult, stage: AnalysisModelStage, event: 'validation-failed' | 'correction' | 'citations-resolved',
-    details: Pick<AnalysisTelemetryEvent, 'code' | 'citationDiagnostics' | 'reviewIssueCount' | 'citationCount'>,
+    details: Pick<AnalysisTelemetryEvent,
+      'code' | 'reason' | 'citationDiagnostics' | 'schemaDiagnostics' | 'reviewIssueCount' | 'reviewIssues' | 'reviewOutcome' | 'citationCount'>,
   ) => emitAnalysisTelemetry(options.onEvent, {
     event, timestamp: clock.now().toISOString(), stage, modelCallId: response.callId,
     model: response.provenance.model, deployment: response.provenance.deployment,
@@ -344,17 +371,21 @@ export async function assessResumeAgainstTarget(
   })
   const repairValidation = (error: unknown, response: ModelCallResult, stage: AnalysisModelStage): Record<string, unknown> => {
     if (error instanceof AnalysisModelError) outputEvent(response, stage, 'validation-failed', {
-      code: error.code, citationDiagnostics: error.citationDiagnostics,
+      code: error.code, reason: error.reason, citationDiagnostics: error.citationDiagnostics, schemaDiagnostics: error.schemaDiagnostics,
     })
     const diagnostic = correctionDiagnostic(error)
     if (!diagnostic) throw error
     if (correctionCount >= ANALYSIS_LIMITS.maxOutputCorrections) {
       throw new AnalysisModelError(diagnostic.code,
         `${diagnostic.message} The ${ANALYSIS_LIMITS.maxOutputCorrections}-correction limit was reached; no result was published.`,
-        { stage, correctable: true, citationDiagnostics: diagnostic.citationDiagnostics })
+        { stage, correctable: true, reason: diagnostic.reason,
+          citationDiagnostics: diagnostic.citationDiagnostics, schemaDiagnostics: diagnostic.schemaDiagnostics })
     }
     correctionCount += 1
-    outputEvent(response, stage, 'correction', { code: diagnostic.code, citationDiagnostics: diagnostic.citationDiagnostics })
+    outputEvent(response, stage, 'correction', {
+      code: diagnostic.code, reason: diagnostic.reason,
+      citationDiagnostics: diagnostic.citationDiagnostics, schemaDiagnostics: diagnostic.schemaDiagnostics,
+    })
     return {
       attempt: correctionCount, validation: diagnostic, previousInvalidOutputOmitted: true,
       ...(diagnostic.citationDiagnostics ? analysisCitationRepairSources(diagnostic.citationDiagnostics, frozen, catalog) : {}),
@@ -374,7 +405,11 @@ export async function assessResumeAgainstTarget(
         outputEvent(response, 'assessment', 'citations-resolved', {
           citationCount: [...assessment.criteria, ...assessment.qualifications].reduce((sum, row) => sum + row.citations.length, 0),
         })
-        assessed = { assessment, provenance: response.provenance, hash: hashAnalysisAssessment(assessment) }
+        assessed = { assessment, provenance: response.provenance, hash: hashAnalysisAssessment(assessment), callId: response.callId, correctionCount }
+        options.onDiagnostic?.(structuredClone({
+          modelCallId: assessed.callId, correctionCount, assessmentSha256: assessed.hash,
+          assessment, provenance: response.provenance,
+        }))
       } catch (error) {
         assessmentCorrection = repairValidation(error, response, 'assessment')
         continue
@@ -400,13 +435,18 @@ export async function assessResumeAgainstTarget(
       continue
     }
     checkCancelled(options.signal, 'grounding')
-    groundingReviews.push({
+    const savedReview: RealAnalysisGroundingReview = {
       ...review, id: `analysis-grounding-${randomUUID()}`,
       assessmentSha256: assessed.hash,
       resumeSnapshotSha256: options.resumeSnapshotSha256,
       targetSnapshotSha256: options.targetSnapshotSha256,
       provenance: response.provenance,
-    })
+    }
+    groundingReviews.push(savedReview)
+    options.onDiagnostic?.(structuredClone({
+      modelCallId: assessed.callId, correctionCount: assessed.correctionCount, assessmentSha256: assessed.hash,
+      assessment: assessed.assessment, provenance: assessed.provenance, review: savedReview,
+    }))
     if (review.outcome === 'supported') {
       return {
         assessment: assessed.assessment,
@@ -415,14 +455,22 @@ export async function assessResumeAgainstTarget(
         assessmentSha256: assessed.hash,
       }
     }
-    outputEvent(response, 'grounding', 'validation-failed', { code: 'grounding-failed', reviewIssueCount: review.issues.length })
+    const reviewDiagnostics = {
+      code: 'grounding-failed' as const, reason: 'grounding-disagreement' as const,
+      reviewOutcome: review.outcome, reviewIssueCount: review.issues.length,
+      reviewIssues: review.issues.flatMap(issue => {
+        const code = ANALYSIS_REVIEW_ISSUE_CODES.find(code => code === issue.code)
+        return code ? [{ code, criterionId: issue.criterionId, qualificationId: issue.qualificationId }] : []
+      }),
+    }
+    outputEvent(response, 'grounding', 'validation-failed', reviewDiagnostics)
     if (correctionCount >= ANALYSIS_LIMITS.maxOutputCorrections) {
       throw new AnalysisModelError('grounding-failed',
         `Independent analysis review could not support this comparison after ${ANALYSIS_LIMITS.maxOutputCorrections} allowed corrections; no result was published.`,
-        { stage: 'grounding' })
+        { stage: 'grounding', reason: 'grounding-disagreement' })
     }
     correctionCount += 1
-    outputEvent(response, 'grounding', 'correction', { code: 'grounding-failed', reviewIssueCount: review.issues.length })
+    outputEvent(response, 'grounding', 'correction', reviewDiagnostics)
     assessmentCorrection = { attempt: correctionCount, previousAssessment: assessed.assessment, groundingReview: review }
     assessed = undefined
     reviewCorrection = undefined

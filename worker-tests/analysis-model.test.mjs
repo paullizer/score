@@ -211,7 +211,7 @@ function mockModel(values) {
   return { model, clock, calls, sleeps, options: { model, clock, resumeSnapshotSha256, targetSnapshotSha256 } }
 }
 
-function rejectsCode(code, { stage, retryable, correctable, cancelled } = {}) {
+function rejectsCode(code, { stage, retryable, correctable, cancelled, reason } = {}) {
   return error => {
     assert.ok(error instanceof AnalysisModelError)
     assert.equal(error.code, code)
@@ -219,6 +219,7 @@ function rejectsCode(code, { stage, retryable, correctable, cancelled } = {}) {
     if (retryable !== undefined) assert.equal(error.retryable, retryable)
     if (correctable !== undefined) assert.equal(error.correctable, correctable)
     if (cancelled !== undefined) assert.equal(error.cancelled, cancelled)
+    if (reason !== undefined) assert.equal(error.reason, reason)
     assert.doesNotMatch(error.message, /PRIVATE-SENTINEL|secret@example|Rubric generation|no rubric/)
     assert.equal(error.cause, undefined, 'Raw transport/model failures must not be retained as loggable causes')
     return true
@@ -1199,6 +1200,66 @@ test('one supported reassessment retains both actual reviews and binds each to t
   assert.equal('correction' in JSON.parse(mock.calls[3].request.messages[1].content), false, 'The second review is independent of the prior reviewer verdict')
 })
 
+test('private checkpoints retain rejected assessments and reviews without allowing the observer to change model evidence', async () => {
+  const input = fixture()
+  const rejected = selectedUnsupportedReview(input)
+  rejected.issues[0].message = 'PRIVATE-REVIEW-SENTINEL: The selected evidence does not support the saved scope.'
+  const output = selectedAssessment(input)
+  const mock = mockModel([output, rejected, output, rejected, output, rejected])
+  const checkpoints = []
+  const events = []
+  await assert.rejects(assessResumeAgainstTarget(input, {
+    ...mock.options,
+    onEvent: event => events.push(event),
+    onDiagnostic: diagnostic => {
+      checkpoints.push(structuredClone(diagnostic))
+      diagnostic.assessment.criteria[0].rationale = 'OBSERVER-MUTATION-SENTINEL'
+      if (diagnostic.review) diagnostic.review.issues[0].message = 'OBSERVER-MUTATION-SENTINEL'
+    },
+  }), rejectsCode('grounding-failed', { reason: 'grounding-disagreement' }))
+  assert.equal(checkpoints.length, 6)
+  assert.deepEqual(checkpoints.map(item => Boolean(item.review)), [false, true, false, true, false, true])
+  assert.deepEqual(checkpoints.map(item => item.correctionCount), [0, 0, 1, 1, 2, 2])
+  for (const checkpoint of checkpoints) {
+    assert.equal(checkpoint.assessmentSha256, hashAnalysisAssessment(checkpoint.assessment))
+    if (checkpoint.review) {
+      assert.equal(checkpoint.review.assessmentSha256, checkpoint.assessmentSha256)
+      assert.equal(checkpoint.review.resumeSnapshotSha256, resumeSnapshotSha256)
+      assert.match(checkpoint.review.issues[0].message, /PRIVATE-REVIEW-SENTINEL/)
+    }
+  }
+  assert.doesNotMatch(JSON.stringify(checkpoints), /OBSERVER-MUTATION-SENTINEL/)
+  assert.doesNotMatch(JSON.stringify(mock.calls), /OBSERVER-MUTATION-SENTINEL/)
+  assert.doesNotMatch(JSON.stringify(events), /PRIVATE-REVIEW-SENTINEL|OBSERVER-MUTATION-SENTINEL/)
+  assert.deepEqual(events.filter(event => event.event === 'validation-failed').map(event => event.reviewIssues[0]),
+    Array.from({ length: 3 }, () => ({
+      code: rejected.issues[0].code, criterionId: input.rubric.criteria[0].id, qualificationId: undefined,
+    })))
+})
+
+test('schema rejection retains safe field locations for correction and diagnosis without retaining invalid payloads', async () => {
+  const input = fixture()
+  const invalid = selectedAssessment(input)
+  invalid.criteria[0].score = 7
+  invalid['PRIVATE-FIELD-SENTINEL'] = 'PRIVATE-VALUE-SENTINEL'
+  const mock = mockModel([invalid, invalid, invalid])
+  const checkpoints = []
+  await assert.rejects(assessResumeAgainstTarget(input, {
+    ...mock.options, onDiagnostic: diagnostic => checkpoints.push(diagnostic),
+  }), error => {
+    assert.ok(rejectsCode('invalid-model-output', { reason: 'schema-mismatch' })(error))
+    assert.deepEqual(error.schemaDiagnostics.findings[0].path, ['criteria', 0, 'score'])
+    assert.doesNotMatch(JSON.stringify(error.schemaDiagnostics), /PRIVATE/)
+    return true
+  })
+  assert.equal(checkpoints.length, 0)
+  assert.equal(mock.calls.length, 3)
+  const correction = JSON.parse(mock.calls[1].request.messages[1].content).correction
+  assert.equal(correction.validation.reason, 'schema-mismatch')
+  assert.deepEqual(correction.validation.schemaDiagnostics.findings[0].path, ['criteria', 0, 'score'])
+  assert.doesNotMatch(JSON.stringify(correction), /PRIVATE/)
+})
+
 test('invalid JSON gets at most two safe corrections and never echoes raw source or model PII into diagnostics', async () => {
   const input = fixture()
   const mock = mockModel(['{"PRIVATE-SENTINEL":"secret@example', selectedAssessment(input), supportedReview()])
@@ -1251,18 +1312,18 @@ test('review formatting consumes the shared budget without turning semantic reje
 
 test('refusal, filtered and token-limited completions, tool requests, invalid envelope, and missing actual model identity never fabricate results', async () => {
   const input = fixture()
-  for (const [envelope, code] of [
-    [{ model: actualModel, choices: [{ finish_reason: 'stop', message: { refusal: 'PRIVATE-SENTINEL' } }] }, 'invalid-model-output'],
-    [{ model: actualModel, choices: [{ finish_reason: 'content_filter', message: { content: 'PRIVATE-SENTINEL' } }] }, 'invalid-model-output'],
-    [{ model: actualModel, choices: [{ finish_reason: 'length', message: { content: JSON.stringify(selectedAssessment(input)) } }] }, 'context-limit'],
-    [{ model: actualModel, choices: [{ finish_reason: 'tool_calls', message: { tool_calls: [{ name: 'fetch', url: 'https://secret@example' }] } }] }, 'invalid-model-output'],
-    [{ model: actualModel, choices: [] }, 'invalid-model-output'],
-    [{ model: actualModel, choices: [{ message: { content: '' } }] }, 'invalid-model-output'],
-    [{ choices: [{ message: { content: JSON.stringify(selectedAssessment(input)) } }] }, 'invalid-model-output'],
-    [{ model: '', choices: [{ message: { content: JSON.stringify(selectedAssessment(input)) } }] }, 'invalid-model-output'],
+  for (const [envelope, code, reason] of [
+    [{ model: actualModel, choices: [{ finish_reason: 'stop', message: { refusal: 'PRIVATE-SENTINEL' } }] }, 'invalid-model-output', 'model-refusal'],
+    [{ model: actualModel, choices: [{ finish_reason: 'content_filter', message: { content: 'PRIVATE-SENTINEL' } }] }, 'invalid-model-output', 'content-filter'],
+    [{ model: actualModel, choices: [{ finish_reason: 'length', message: { content: JSON.stringify(selectedAssessment(input)) } }] }, 'context-limit', 'completion-token-limit'],
+    [{ model: actualModel, choices: [{ finish_reason: 'tool_calls', message: { tool_calls: [{ name: 'fetch', url: 'https://secret@example' }] } }] }, 'invalid-model-output', 'incomplete-response'],
+    [{ model: actualModel, choices: [] }, 'invalid-model-output', 'invalid-envelope'],
+    [{ model: actualModel, choices: [{ message: { content: '' } }] }, 'invalid-model-output', 'incomplete-response'],
+    [{ choices: [{ message: { content: JSON.stringify(selectedAssessment(input)) } }] }, 'invalid-model-output', 'invalid-model-identity'],
+    [{ model: '', choices: [{ message: { content: JSON.stringify(selectedAssessment(input)) } }] }, 'invalid-model-output', 'invalid-model-identity'],
   ]) {
     const mock = mockModel([Response.json(envelope)])
-    await assert.rejects(assessResumeAgainstTarget(input, mock.options), rejectsCode(code, { retryable: false, correctable: false }))
+    await assert.rejects(assessResumeAgainstTarget(input, mock.options), rejectsCode(code, { reason, retryable: false, correctable: false }))
     assert.equal(mock.calls.length, 1)
   }
   const malformed = mockModel([new Response('PRIVATE-SENTINEL malformed envelope')])
@@ -1283,8 +1344,15 @@ test('source/context/completion bounds reject explicitly and never silently trun
   }))
   oversizedContext.requirementEvidence = oversizedContext.rubric.criteria.map(item => ({ kind: 'criterion', criterionId: item.id, citations: item.sourceCitations }))
   const context = mockModel([])
-  await assert.rejects(assessResumeAgainstTarget(oversizedContext, context.options), rejectsCode('context-limit'))
+  const events = []
+  await assert.rejects(assessResumeAgainstTarget(oversizedContext, {
+    ...context.options, onEvent: event => events.push(event),
+  }), rejectsCode('context-limit', { reason: 'context-budget' }))
   assert.equal(context.calls.length, 0)
+  assert.equal(events.at(-1).event, 'model-failed')
+  assert.equal(events.at(-1).reason, 'context-budget')
+  assert.ok(events.at(-1).inputCharacters > events.at(-1).contextCharacterLimit)
+  assert.equal(events.at(-1).completionTokenLimit, ANALYSIS_MODEL_LIMITS.assessmentCompletionTokens)
   for (const value of [
     response('A'.repeat(ANALYSIS_MODEL_LIMITS.maxOutputCharacters + 1)),
     new Response('A'.repeat(ANALYSIS_MODEL_LIMITS.maxResponseBytes + 1)),
@@ -1297,6 +1365,30 @@ test('source/context/completion bounds reject explicitly and never silently trun
   const rejectedContext = mockModel([Response.json({ error: { code: 'context_length_exceeded', message: 'PRIVATE-SENTINEL' } }, { status: 400 })])
   await assert.rejects(assessResumeAgainstTarget(fixture(), rejectedContext.options), rejectsCode('context-limit'))
   assert.equal(rejectedContext.calls.length, 1)
+})
+
+test('request-time content filtering is distinct from service outages without logging the provider error body', async () => {
+  const input = fixture()
+  for (const stage of ['assessment', 'grounding']) {
+    for (const upstream of [
+      { code: 'content_filter', message: 'PRIVATE-PROVIDER-SENTINEL' },
+      { code: 'BadRequest', message: 'PRIVATE-PROVIDER-SENTINEL', innererror: { code: 'ResponsibleAIPolicyViolation' } },
+    ]) {
+      const mock = mockModel([
+        ...(stage === 'grounding' ? [selectedAssessment(input)] : []),
+        Response.json({ error: upstream }, { status: 400 }),
+      ])
+      const events = []
+      const checkpoints = []
+      await assert.rejects(assessResumeAgainstTarget(input, {
+        ...mock.options, onEvent: event => events.push(event), onDiagnostic: checkpoint => checkpoints.push(checkpoint),
+      }), rejectsCode('invalid-model-output', { stage, reason: 'content-filter', retryable: false, correctable: false }))
+      assert.equal(mock.calls.length, stage === 'grounding' ? 2 : 1)
+      assert.equal(checkpoints.length, stage === 'grounding' ? 1 : 0)
+      assert.equal(events.find(event => event.httpStatus === 400).reason, 'content-filter')
+      assert.doesNotMatch(JSON.stringify(events), /PRIVATE-PROVIDER-SENTINEL|ResponsibleAIPolicyViolation|test-token/)
+    }
+  }
 })
 
 test('transport outages and token acquisition failures stay safe analysis-purpose errors and retain bounded transport retries', async () => {

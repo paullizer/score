@@ -9,7 +9,7 @@ import { Badge, Button, EmptyState, InlineError, PageHeader, Score, SearchField 
 import { SortableHeader, TableSortSelect } from '../../components/ui/TableSorting'
 import type { TableSort } from '../../domain/tableSorting'
 import { RealAnalysisStatus } from './RealAnalysesPage'
-import { realAnalysisCancellationPaused, realAnalysisCancellationPending, realAnalysisLink, targetIdentity, targetVersionLabel } from './realAnalysisUi'
+import { analysisDiagnosticNotice, analysisFailureStages, currentAnalysisDiagnostic, realAnalysisCancellationPaused, realAnalysisCancellationPending, realAnalysisLink, targetIdentity, targetVersionLabel } from './realAnalysisUi'
 import {
   distinctTargetLabels, realComparisonSortOptions, realComparisonTargetLabel, selectRealComparisons, targetScoreSortExplanation, type RealComparisonSortKey,
 } from './analysisTableBrowsing'
@@ -179,6 +179,9 @@ function RealAnalysisView({ id }: { id: string }) {
             <td className="min-w-[210px]"><strong className="block text-[12px]">{target.label}</strong><p className="row-meta">{target.sublabel}</p><div className="mt-2"><Badge>{targetVersionLabel(target.selection)}</Badge></div>
               {target.kind === 'grade' && target.newerDraftAvailable && <p className="row-meta">An unapproved newer draft was not used.</p>}</td>
             <td><RealComparisonValue summary={pair} />{comparison.error && <p className="mt-2 max-w-xs text-[11px] text-[var(--cp-danger)]">{comparison.error.code}: {comparison.error.message}</p>}
+              {comparison.error && <p className="row-meta">Stage: {analysisFailureStages[comparison.error.stage]}</p>}
+              {analysisDiagnosticNotice(comparison) && <p className="row-meta max-w-xs">{analysisDiagnosticNotice(comparison)}</p>}
+              {comparison.status === 'failed' && currentAnalysisDiagnostic(comparison) && <p className="row-meta max-w-xs">Open the saved pair for private validation reasons and the original sources.</p>}
               {comparison.nextAttemptAt && <p className="row-meta">Automatic retry {dateLabel(comparison.nextAttemptAt)}</p>}<p className="row-meta">Attempt {comparison.attempts} · manual retries {comparison.retryCount}</p></td>
             <td><div className="space-y-3"><div><Badge dot tone={comparison.status === 'complete' ? 'success' : ['failed', 'cancelled'].includes(comparison.status) ? 'warning' : 'neutral'}>
               {{ queued: 'Queued', running: 'Running', complete: 'Complete', failed: 'Failed', cancelled: 'Cancelled' }[comparison.status]}</Badge></div>

@@ -3,6 +3,7 @@ import type {
   AnalysisProcessingFeatures, CreateRealAnalysisInput, RealAnalysisComparisonDetail, RealAnalysisComparisonSummary,
   RealAnalysisDocumentResponse, RealAnalysisRunDetail, RealAnalysisRunSummary, RealAnalysisTargetSummary, RetryRealAnalysisInput,
 } from '../domain/real-analyses'
+import type { RealAnalysisDiagnosticsPage } from '../domain/analysis-diagnostics'
 import type { RealLoadState } from './real-request-scope'
 
 export interface RealAnalysesContextValue {
@@ -24,6 +25,7 @@ export interface RealAnalysesContextValue {
   comparison: (runId: string, comparisonId: string) => RealLoadState<RealAnalysisComparisonDetail>
   ensureComparison: (runId: string, comparisonId: string, force?: boolean) => Promise<void>
   document: (runId: string, comparisonId: string, documentId: string, version: number, signal?: AbortSignal) => Promise<RealAnalysisDocumentResponse['document']>
+  diagnostics: (runId: string, comparisonId: string, continuationToken?: string, signal?: AbortSignal) => Promise<RealAnalysisDiagnosticsPage>
   pending: (runId?: string) => boolean
   requestKey: (input: CreateRealAnalysisInput) => string
   create: (input: CreateRealAnalysisInput, key: string) => Promise<RealAnalysisRunSummary>

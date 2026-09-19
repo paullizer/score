@@ -1,37 +1,13 @@
 import type { RealAnalysisAssessmentInput } from '../../src/domain/real-analyses'
+import type {
+  AnalysisCitationDiagnostics, AnalysisCitationFinding, AnalysisCitationLocation, AnalysisCitationReason, AnalysisModelStage,
+} from '../../src/domain/analysis-diagnostics'
 import { ANALYSIS_MODEL_LIMITS } from './model-schema'
 import { createAnalysisPassageResolver, type AnalysisEvidenceCatalog } from './evidence-passages'
 
-export type AnalysisModelStage = 'assessment' | 'grounding'
-export type AnalysisCitationReason =
-  | 'invalid-shape' | 'too-many-citations' | 'unknown-paragraph' | 'empty-quote' | 'quote-too-long'
-  | 'quote-not-found' | 'whitespace-mismatch' | 'wrong-paragraph' | 'duplicate-citation'
-  | 'invalid-selection' | 'unknown-passage'
-
-export interface AnalysisCitationLocation {
-  scope: 'criteria' | 'qualifications' | 'issues' | 'citations'
-  rowIndex?: number
-  criterionId?: string
-  qualificationId?: string
-}
-
-export interface AnalysisCitationFinding extends AnalysisCitationLocation {
-  reason: AnalysisCitationReason
-  citationIndex?: number
-  paragraphId?: string
-  matchingParagraphId?: string
-  quoteLength?: number
-  paragraphLength?: number
-  passageId?: number
-  passageCount?: number
-  startOffset?: number
-  endOffset?: number
-}
-
-export interface AnalysisCitationDiagnostics {
-  findings: AnalysisCitationFinding[]
-  omittedFindings: number
-}
+export type {
+  AnalysisCitationDiagnostics, AnalysisCitationFinding, AnalysisCitationLocation, AnalysisCitationReason, AnalysisModelStage,
+} from '../../src/domain/analysis-diagnostics'
 
 function record(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value)

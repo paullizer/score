@@ -9,6 +9,7 @@ import React, { act } from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { JSDOM } from 'jsdom'
 import { frontendWorkspaceContext } from './frontend.test-support.mjs'
+import { diagnosticFixture, diagnosticReference, failedComparisonFixture, privateReviewReason } from './analysisDiagnostics.test-support.mjs'
 
 const output = resolve(`.real-analysis-client-tests-${randomUUID()}`)
 const originalFetch = globalThis.fetch
@@ -191,6 +192,49 @@ test('feature flags fail closed and every target/run/comparison page is consumed
     globalThis.fetch = async () => json({ [field]: [], continuationToken: 'repeat' })
     await assert.rejects(client[method](...args), /repeated continuation token/)
   }
+})
+
+test('private diagnostic GET is authorized, abortable, identity checked, and bounded to one attempt per page', async () => {
+  const diagnostic = diagnosticFixture(comparisonDetail())
+  globalThis.fetch = async (url, init) => { requests.push({ url, init }); return json({ attempts: [diagnostic], continuationToken: 'older / opaque' }) }
+  const page = await client.getRealAnalysisDiagnostics(workspaceId, 'run-one', 'comparison-one')
+  assert.deepEqual(page.attempts, [diagnostic])
+  assert.equal(requests.length, 1, 'history is not eagerly drained')
+  assert.equal(requests[0].url, `/api/workspaces/${workspaceId}/analyses/run-one/comparisons/comparison-one/diagnostics`)
+  assert.equal(requests[0].init.method, 'GET')
+  assert.equal(requests[0].init.credentials, 'include')
+  assert.equal(requests[0].init.cache, 'no-store')
+  assert.equal(requests[0].init.headers.get('X-Score-Request'), 'workspace')
+  globalThis.fetch = async (url, init) => { requests.push({ url, init }); return json({ attempts: [] }) }
+  await client.getRealAnalysisDiagnostics(workspaceId, 'run-one', 'comparison-one', page.continuationToken)
+  assert.equal(requests[1].url, `/api/workspaces/${workspaceId}/analyses/run-one/comparisons/comparison-one/diagnostics?continuationToken=older%20%2F%20opaque`)
+  assert.doesNotMatch(requests[1].url, /limit=|Private|assessment/)
+  for (const change of [{ workspaceId: 'foreign' }, { runId: 'foreign' }, { comparisonId: 'foreign' }, { dataKind: 'sample' }]) {
+    globalThis.fetch = async () => json({ attempts: [{ ...diagnostic, ...change }] })
+    await assert.rejects(client.getRealAnalysisDiagnostics(workspaceId, 'run-one', 'comparison-one'), /exact saved attempt/)
+  }
+  for (const bad of [{ attempts: [diagnostic, diagnostic] }, { attempts: [], continuationToken: 'next' }, { attempts: [diagnostic], continuationToken: 42 }]) {
+    globalThis.fetch = async () => json(bad)
+    await assert.rejects(client.getRealAnalysisDiagnostics(workspaceId, 'run-one', 'comparison-one'), /invalid history page/)
+  }
+  globalThis.fetch = async () => json({ attempts: [diagnostic], continuationToken: 'repeated' })
+  await assert.rejects(client.getRealAnalysisDiagnostics(workspaceId, 'run-one', 'comparison-one', 'repeated'), /repeated continuation token/)
+  const wrongReview = structuredClone(diagnostic)
+  wrongReview.assessments[0].review.assessmentSha256 = 'f'.repeat(64)
+  globalThis.fetch = async () => json({ attempts: [wrongReview] })
+  await assert.rejects(client.getRealAnalysisDiagnostics(workspaceId, 'run-one', 'comparison-one'), /invalid or unbounded/)
+  const excessive = { ...diagnostic, assessments: [...diagnostic.assessments, diagnostic.assessments[0]] }
+  globalThis.fetch = async () => json({ attempts: [excessive] })
+  await assert.rejects(client.getRealAnalysisDiagnostics(workspaceId, 'run-one', 'comparison-one'), /unbounded/)
+  const controller = new AbortController()
+  const late = deferred()
+  globalThis.fetch = async () => late.promise
+  const loading = client.getRealAnalysisDiagnostics(workspaceId, 'run-one', 'comparison-one', undefined, controller.signal)
+  controller.abort()
+  late.resolve(json({ attempts: [diagnostic] }))
+  await assert.rejects(loading, { name: 'AbortError' })
+  globalThis.fetch = async () => { assert.fail('An already aborted diagnostic request must not reach fetch.') }
+  await assert.rejects(client.getRealAnalysisDiagnostics(workspaceId, 'run-one', 'comparison-one', undefined, controller.signal), { name: 'AbortError' })
 })
 
 test('run creation sends typed exact selections only, preserves UUIDs, allows 500 and rejects 501 without truncation', async () => {
@@ -433,6 +477,198 @@ test('saved two-correction results display all three grounding reviews without r
   assert.match(html, /2 bounded corrections/)
   assert.match(html, /needs-correction.*needs-correction.*supported/)
   assert.match(html, />36<\/strong>/)
+})
+
+test('failure explanations distinguish request filtering and output limits without blaming a readable resume', () => {
+  assert.match(ui.analysisDiagnosticReasons['content-filter'], /request or model response/)
+  assert.match(ui.analysisDiagnosticReasons['completion-token-limit'], /output-token limit/)
+  const outputLimit = ui.analysisFailureExplanation({
+    code: 'context-limit', stage: 'grounding', retryable: false, message: 'The model reached its completion-token limit.',
+  })
+  assert.equal(outputLimit.title, 'Analysis exceeded a processing limit')
+  assert.match(outputLimit.explanation, /source or response/)
+  const refusal = ui.analysisFailureExplanation({
+    code: 'invalid-model-output', stage: 'assessment', retryable: false, message: 'The request was declined.',
+  })
+  assert.match(refusal.explanation, /did not return an acceptable assessment or review/)
+})
+
+test('failed, queued, running, and cancelled pairs retain frozen sources without completed result or score sections', () => {
+  for (const status of ['failed', 'queued', 'running', 'cancelled']) {
+    const detail = comparisonDetail('job')
+    detail.comparison.status = status
+    if (status === 'failed') detail.comparison.error = {
+      code: 'invalid-citation', stage: 'grounding', retryable: false, message: 'A generated quotation did not match the saved paragraph.',
+    }
+    const html = renderToStaticMarkup(React.createElement(ui.RealComparisonReview, { detail }))
+    assert.match(html, /Prepared accessible project documentation and tested engineering methods/)
+    assert.match(html, /Saved evidence source/)
+    assert.match(html, /Job description/)
+    assert.match(html, /Readable saved input is separate from AI validation/)
+    assert.doesNotMatch(html, /class="overall-score"|class="criterion-score"|class="result-overview|SERVER-CALCULATED EVIDENCE MATCH/)
+    if (status === 'failed') {
+      assert.match(html, /Details were not recorded for this attempt/)
+      assert.match(html, /Independent grounding review/)
+      assert.match(html, /same strict evidence checks/)
+    }
+  }
+})
+
+test('failed diagnostic review shows private exact reasons and IDs, not scores, while citations retain source ownership checks', async () => {
+  dom.window.localStorage.clear()
+  const saved = comparisonDetail()
+  const diagnostic = diagnosticFixture(saved)
+  const detail = failedComparisonFixture(saved, diagnostic)
+  const calls = []
+  const api = { ...baseApi, diagnostics: async (...args) => { calls.push(args); return { attempts: [diagnostic] } } }
+  const content = () => React.createElement(ui.RealAnalysesContext.Provider, { value: api }, React.createElement(ui.RealComparisonReview, { detail }))
+  await render(content())
+  await settle(() => dom.window.document.body.textContent.includes(privateReviewReason))
+  assert.equal(calls.length, 1)
+  const text = dom.window.document.body.textContent
+  for (const expected of ['Supported work (criterion-0)', 'Documented engineering qualifications (qualification-one)',
+    'fixture-call-fixture-failed-attempt-2', 'fixture-review-fixture-failed-attempt-2', 'fixture-assessment-v3', 'fixture-grounding-v3',
+    'fixture-analysis-diagnostics-v1', 'Unpublished assessment cycle 3', privateReviewReason, 'Recorded error for the current attempt']) {
+    assert.ok(text.includes(expected), `Diagnostic should show ${expected}`)
+  }
+  assert.equal(dom.window.document.querySelector('[aria-label="Private failure diagnostics"] b'), null, 'private model text is never interpreted as markup')
+  assert.equal(dom.window.document.querySelector('.overall-score, .criterion-score, .criterion-results'), null)
+  await act(async () => dom.window.document.querySelector('button[aria-label^="View resume evidence for unpublished review"]').click())
+  await settle(() => dom.window.document.querySelector('mark')?.textContent === saved.result.criteria[0].citations[0].quote)
+  diagnostic.assessments[2].review.issues[0].citations[0].documentId = 'job-document'
+  await render(content())
+  const citations = dom.window.document.querySelectorAll('button[aria-label^="View resume evidence for unpublished review"]')
+  await act(async () => citations[citations.length - 1].click())
+  await settle(() => dom.window.document.body.textContent.includes('does not belong to this comparison'))
+  assert.equal(dom.window.document.querySelector('mark'), null)
+  assert.equal(dom.window.localStorage.length, 0)
+  assert.doesNotMatch(dom.window.location.href, /Private|fixture-failed|continuation|grounding/)
+})
+
+test('failed GS comparisons expose approved requirements and authorize the exact frozen reference without inventing a result', async () => {
+  const detail = comparisonDetail()
+  detail.comparison.status = 'failed'
+  detail.result = null
+  const calls = []
+  const api = { ...baseApi, document: async (...args) => { calls.push(args); return referenceDocument() } }
+  await render(React.createElement(ui.RealAnalysesContext.Provider, { value: api }, React.createElement(ui.RealComparisonReview, { detail })))
+  await act(async () => [...dom.window.document.querySelectorAll('button')].find((item) => item.textContent === 'Grade requirements').click())
+  assert.match(dom.window.document.body.textContent, /exact approved requirements used for this assessment/)
+  assert.match(dom.window.document.body.textContent, /Documented engineering qualifications/)
+  assert.equal(calls.length, 0)
+  const select = dom.window.document.querySelector('select')
+  await act(async () => {
+    select.value = JSON.stringify(['saved-reference', 3])
+    select.dispatchEvent(new dom.window.Event('change', { bubbles: true }))
+  })
+  await settle(() => dom.window.document.body.textContent.includes('Original page 178 of 204'))
+  assert.deepEqual(calls[0].slice(0, 4), ['run-one', 'comparison-one', 'saved-reference', 3])
+  assert.ok(calls[0][4] instanceof AbortSignal)
+  assert.match(dom.window.document.body.textContent, /Apply engineering methods to documented projects/)
+  assert.equal(dom.window.document.querySelector('.overall-score, .criterion-score, .criterion-results'), null)
+})
+
+test('diagnostic history stays lazy after retry or success, loads one older attempt at a time, and rejects cursor cycles', async () => {
+  const saved = comparisonDetail('job')
+  const latest = diagnosticFixture(saved)
+  const older = diagnosticFixture(saved, 'older-attempt', 'fixture-assessment-v2')
+  const oldest = diagnosticFixture(saved, 'oldest-attempt')
+  latest.previous = diagnosticReference(older)
+  older.previous = diagnosticReference(oldest)
+  const detail = failedComparisonFixture(saved, latest)
+  detail.comparison.status = 'complete'
+  detail.comparison.attemptId = 'successful-attempt'
+  delete detail.comparison.error
+  detail.result = saved.result
+  const calls = []
+  const api = { ...baseApi, diagnostics: async (_run, _pair, cursor) => {
+    calls.push(cursor)
+    return cursor === undefined ? { attempts: [latest], continuationToken: 'cursor-one' }
+      : cursor === 'cursor-one' ? { attempts: [older], continuationToken: 'cursor-two' }
+        : { attempts: [oldest], continuationToken: 'cursor-one' }
+  } }
+  const content = () => React.createElement(ui.RealAnalysesContext.Provider, { value: api }, React.createElement(ui.RealComparisonReview, { detail }))
+  await render(content())
+  assert.equal(calls.length, 0)
+  await act(async () => [...dom.window.document.querySelectorAll('summary')].find((item) => item.textContent === 'Failure diagnostics and saved attempt history').click())
+  await settle(() => calls.length === 1 && dom.window.document.body.textContent.includes('Historical failure'))
+  assert.match(dom.window.document.querySelector('.overall-score').textContent, /36/)
+  assert.doesNotMatch(dom.window.document.body.textContent, /Recorded error for the current attempt/)
+  const clickOlder = async () => act(async () => [...dom.window.document.querySelectorAll('button')].find((item) => item.textContent === 'Load earlier saved attempt').click())
+  await clickOlder()
+  assert.deepEqual(calls, [undefined, 'cursor-one'])
+  assert.equal(dom.window.document.querySelectorAll('[aria-label^="Saved diagnostic attempt"]').length, 1)
+  assert.ok(dom.window.document.querySelector('[aria-label="Saved diagnostic attempt older-attempt"]'))
+  await clickOlder()
+  assert.match(dom.window.document.body.textContent, /repeated attempt or history cursor/)
+  assert.equal(dom.window.document.querySelector('[aria-label="Saved diagnostic attempt oldest-attempt"]'), null)
+  assert.ok([...dom.window.document.querySelectorAll('button')].some((item) => item.textContent === 'Retry diagnostics'))
+  detail.comparison.status = 'queued'
+  detail.comparison.attemptId = 'new-pending-attempt'
+  detail.comparison.retryCount++
+  detail.result = null
+  await render(content())
+  assert.equal(calls.length, 3, 'a retried comparison does not eagerly reload earlier private history')
+  assert.equal(dom.window.document.querySelector('[aria-label^="Saved diagnostic attempt"]'), null)
+  assert.equal(dom.window.document.querySelector('.overall-score'), null)
+})
+
+test('legacy and unavailable current attempts never borrow older reasons; diagnostic request failures offer recovery', async () => {
+  const saved = comparisonDetail('job')
+  const older = diagnosticFixture(saved, 'prior-attempt')
+  const detail = failedComparisonFixture(saved, older)
+  detail.comparison.attemptId = 'current-unrecorded-attempt'
+  let html = renderToStaticMarkup(React.createElement(ui.RealComparisonReview, { detail }))
+  assert.match(html, /Details were not recorded for this attempt/)
+  assert.doesNotMatch(html, /Recorded error for the current attempt/)
+  detail.comparison.diagnosticCapture = { attemptId: detail.comparison.attemptId, status: 'unavailable', pipelineVersion: 'fixture-current-pipeline' }
+  html = renderToStaticMarkup(React.createElement(ui.RealComparisonReview, { detail }))
+  assert.match(html, /Diagnostic details are unavailable for this attempt because they could not be saved/)
+  assert.match(html, /older saved diagnostic is not a substitute/)
+  assert.match(html, /fixture-current-pipeline/)
+  let calls = 0
+  const api = { ...baseApi, diagnostics: async () => {
+    if (++calls === 1) throw new Error('Controlled private-history request failure.')
+    return { attempts: [older] }
+  } }
+  await render(React.createElement(ui.RealAnalysesContext.Provider, { value: api }, React.createElement(ui.RealComparisonReview, { detail })))
+  assert.equal(calls, 0)
+  await act(async () => [...dom.window.document.querySelectorAll('summary')].find((item) => item.textContent === 'Failure diagnostics and saved attempt history').click())
+  await settle(() => dom.window.document.body.textContent.includes('Controlled private-history request failure'))
+  assert.doesNotMatch(dom.window.document.body.textContent, /No saved diagnostic history is available/)
+  await act(async () => [...dom.window.document.querySelectorAll('button')].find((item) => item.textContent === 'Retry diagnostics').click())
+  await settle(() => dom.window.document.body.textContent.includes(privateReviewReason))
+  assert.match(dom.window.document.body.textContent, /Historical failure/)
+  assert.doesNotMatch(dom.window.document.body.textContent, /Recorded error for the current attempt/)
+  assert.equal(calls, 2)
+})
+
+test('a diagnostic for different frozen snapshots is not displayed and stale comparison responses are discarded', async () => {
+  const saved = comparisonDetail('job')
+  const diagnostic = diagnosticFixture(saved)
+  const detail = failedComparisonFixture(saved, diagnostic)
+  const wrong = structuredClone(diagnostic)
+  wrong.resumeSnapshot.sha256 = 'f'.repeat(64)
+  const delayed = deferred()
+  let calls = 0
+  let signal
+  const api = { ...baseApi, diagnostics: async (_run, _pair, _cursor, abort) => {
+    signal = abort
+    if (++calls === 1) return { attempts: [wrong] }
+    return delayed.promise
+  } }
+  const content = () => React.createElement(ui.RealAnalysesContext.Provider, { value: api }, React.createElement(ui.RealComparisonReview, { detail }))
+  await render(content())
+  await settle(() => dom.window.document.body.textContent.includes('does not match this comparison'))
+  assert.equal(dom.window.document.querySelector('[aria-label^="Saved diagnostic attempt"]'), null)
+  await act(async () => [...dom.window.document.querySelectorAll('button')].find((item) => item.textContent === 'Retry diagnostics').click())
+  detail.comparison.attemptId = 'replacement-attempt'
+  delete detail.comparison.diagnosticCapture
+  await render(content())
+  assert.equal(signal.aborted, true)
+  await act(async () => { delayed.resolve({ attempts: [diagnostic] }); await delayed.promise })
+  assert.doesNotMatch(dom.window.document.body.textContent, /Private fixture review reason/)
+  assert.match(dom.window.document.body.textContent, /Details were not recorded for this attempt/)
 })
 
 async function render(element) {
@@ -904,4 +1140,75 @@ test('stale list responses cannot replace acknowledged run mutations; workspace 
   await settle(() => current?.phase === 'ready')
   assert.equal(current.summaries.length, 0)
   await assert.rejects(current.cancel('run-one', '"old"'), /read-only/)
+})
+
+test('diagnostic context cancels private reads on workspace changes or deletion and rejects concurrent history requests', async () => {
+  const diagnostic = diagnosticFixture(comparisonDetail('job'))
+  let delay = deferred()
+  let signal
+  let removed = false
+  let diagnosticReads = 0
+  globalThis.fetch = async (url, init) => {
+    if (url === '/api/features') return json({ realAnalyses: false })
+    if (url.includes('/other/')) return json({ runs: [] })
+    if (url.endsWith('/diagnostics')) { diagnosticReads++; signal = init.signal; return delay.promise }
+    return json({ runs: removed ? [] : [runSummary()] })
+  }
+  await render(bridge())
+  await settle(() => current?.phase === 'ready')
+  const caller = new AbortController()
+  const pending = current.diagnostics('run-one', 'comparison-one', undefined, caller.signal)
+  const cancelled = assert.rejects(pending, { name: 'AbortError' })
+  await assert.rejects(current.diagnostics('run-one', 'comparison-one'), /pending analysis request/)
+  assert.equal(diagnosticReads, 1)
+  caller.abort()
+  assert.equal(signal.aborted, true)
+  const first = delay
+  delay = deferred()
+  const replacement = current.diagnostics('run-one', 'comparison-one')
+  assert.equal(diagnosticReads, 2, 'a disposed history viewer releases its read slot immediately, including Strict Mode remounts')
+  first.resolve(json({ attempts: [diagnostic] }))
+  await cancelled
+  delay.resolve(json({ attempts: [diagnostic] }))
+  assert.equal((await replacement).attempts[0].attemptId, diagnostic.attemptId)
+
+  delay = deferred()
+  const switched = assert.rejects(current.diagnostics('run-one', 'comparison-one'), { name: 'AbortError' })
+  await render(bridge('other'))
+  await settle(() => current?.workspaceId === 'other' && current.phase === 'ready')
+  assert.equal(signal.aborted, true)
+  delay.resolve(json({ attempts: [diagnostic] }))
+  await switched
+  assert.equal(current.summaries.length, 0)
+
+  await render(bridge())
+  await settle(() => current?.workspaceId === workspaceId && current.phase === 'ready')
+  delay = deferred()
+  const deleted = assert.rejects(current.diagnostics('run-one', 'comparison-one'), { name: 'AbortError' })
+  removed = true
+  await act(async () => current.refresh())
+  assert.equal(signal.aborted, true)
+  delay.resolve(json({ attempts: [diagnostic] }))
+  await deleted
+  await assert.rejects(current.diagnostics('run-one', 'comparison-one'), /being deleted/)
+})
+
+test('diagnostic context rejects a stale input manifest and recovers a private request failure', async () => {
+  const diagnostic = diagnosticFixture(comparisonDetail('job'))
+  let mode = 'failure'
+  globalThis.fetch = async (url) => {
+    if (url === '/api/features') return json({ realAnalyses: false })
+    if (url.endsWith('/diagnostics')) {
+      if (mode === 'failure') return json({ error: { code: 'unavailable', message: 'Private diagnostic service temporarily unavailable.' } }, 503)
+      return json({ attempts: [{ ...diagnostic, ...(mode === 'stale' ? { manifestSha256: 'f'.repeat(64) } : {}) }] })
+    }
+    return json({ runs: [runSummary()] })
+  }
+  await render(bridge())
+  await settle(() => current?.phase === 'ready')
+  await assert.rejects(current.diagnostics('run-one', 'comparison-one'), /temporarily unavailable/)
+  mode = 'stale'
+  await assert.rejects(current.diagnostics('run-one', 'comparison-one'), /frozen input manifest/)
+  mode = 'ok'
+  assert.equal((await current.diagnostics('run-one', 'comparison-one')).attempts[0].attemptId, diagnostic.attemptId)
 })
