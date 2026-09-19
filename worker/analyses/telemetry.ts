@@ -2,7 +2,7 @@ import type { AnalysisProcessingError, AnalysisProcessingErrorCode } from '../..
 import type { AnalysisCitationDiagnostics } from './citation-diagnostics'
 
 export interface AnalysisTelemetryEvent {
-  event: 'model-response' | 'model-transport-failed' | 'model-failed' | 'validation-failed' | 'correction' | 'comparison-outcome'
+  event: 'evidence-catalog' | 'model-response' | 'model-transport-failed' | 'model-failed' | 'validation-failed' | 'correction' | 'citations-resolved' | 'comparison-outcome'
   timestamp: string
   stage: AnalysisProcessingError['stage']
   workspaceId?: string
@@ -24,6 +24,14 @@ export interface AnalysisTelemetryEvent {
   cancelled?: boolean
   citationDiagnostics?: AnalysisCitationDiagnostics
   reviewIssueCount?: number
+  citationCount?: number
+  catalogVersion?: string
+  resumeDocumentSha256?: string
+  resumeSnapshotSha256?: string
+  targetSnapshotSha256?: string
+  sourceCharacters?: number
+  paragraphCount?: number
+  passageCount?: number
   outcome?: 'complete' | 'failed' | 'queued' | 'abandoned'
 }
 
@@ -48,6 +56,10 @@ export function emitAnalysisTelemetry(sink: AnalysisTelemetrySink | undefined, e
     transportAttempt: event.transportAttempt, httpStatus: event.httpStatus, requestId: event.requestId,
     durationMilliseconds: event.durationMilliseconds, code: event.code, retryable: event.retryable,
     cancelled: event.cancelled, reviewIssueCount: event.reviewIssueCount, outcome: event.outcome,
+    citationCount: event.citationCount, catalogVersion: event.catalogVersion,
+    resumeDocumentSha256: event.resumeDocumentSha256, resumeSnapshotSha256: event.resumeSnapshotSha256,
+    targetSnapshotSha256: event.targetSnapshotSha256, sourceCharacters: event.sourceCharacters,
+    paragraphCount: event.paragraphCount, passageCount: event.passageCount,
     ...(event.citationDiagnostics ? {
       citationDiagnostics: {
         findings: event.citationDiagnostics.findings.map(finding => ({
@@ -55,6 +67,7 @@ export function emitAnalysisTelemetry(sink: AnalysisTelemetrySink | undefined, e
           criterionId: finding.criterionId, qualificationId: finding.qualificationId,
           citationIndex: finding.citationIndex, paragraphId: finding.paragraphId,
           matchingParagraphId: finding.matchingParagraphId, quoteLength: finding.quoteLength, paragraphLength: finding.paragraphLength,
+          passageId: finding.passageId, passageCount: finding.passageCount, startOffset: finding.startOffset, endOffset: finding.endOffset,
         })),
         omittedFindings: event.citationDiagnostics.omittedFindings,
       },

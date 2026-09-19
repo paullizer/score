@@ -10,12 +10,16 @@ import { RESUME_IMPORT_LIMITS } from '../../src/domain/real-resumes'
 import type { Citation } from '../../src/domain/types'
 import {
   assessmentInputSchema, assessmentSchemaForInput, groundingSchemaForInput,
+  assessmentSelectionSchemaForInput, groundingSelectionSchemaForInput,
   type ModelResumeQuote,
 } from './model-schema'
 import {
-  analysisOutputCitationDiagnostics, analysisResumeCitationDiagnostics, describeAnalysisCitationFailure,
+  analysisOutputCitationDiagnostics, analysisResumeCitationDiagnostics, analysisSelectionCitationDiagnostics, describeAnalysisCitationFailure,
   type AnalysisCitationDiagnostics, type AnalysisModelStage,
 } from './citation-diagnostics'
+import {
+  AnalysisEvidenceBindingError, createAnalysisPassageResolver, type AnalysisEvidenceCatalog,
+} from './evidence-passages'
 
 export type { AnalysisModelStage } from './citation-diagnostics'
 
@@ -130,7 +134,7 @@ export function validateAnalysisAssessmentInput(value: unknown): RealAnalysisAss
   return input
 }
 
-/** Only a paragraph ID and an untouched literal quote are accepted from either model. */
+/** Code-resolved quotations still require an exact paragraph and untouched literal text. */
 export function buildAnalysisResumeCitations(
   quotes: ModelResumeQuote[], input: RealAnalysisAssessmentInput, stage: AnalysisModelStage = 'assessment',
 ): Citation[] {
@@ -174,6 +178,54 @@ function personalTraitCriterion(label: string, description: string): boolean {
   const traits = 'age|race|racial background|ethnicity|religion|sex|gender|pregnancy|disability status|genetic information|marital status|national origin|sexual orientation|citizenship|veteran status'
   return new RegExp(`^(?:(?:applicant|candidate|personal)\\s+)?(?:${traits})(?:\\s+(?:preference|score|matching))?[.!]?\\s*$`, 'i').test(label.trim()) ||
     new RegExp(`\\b(?:score|rank|reward|prefer|evaluate|assess)(?:s|d|ing)?\\s+(?:(?:the|an?)\\s+)?(?:applicants?|candidates?)(?:['’]s?)?\\s+(?:${traits})\\b`, 'i').test(description)
+}
+
+function withPassageSelections<T>(
+  value: unknown, input: RealAnalysisAssessmentInput, catalog: AnalysisEvidenceCatalog, stage: AnalysisModelStage,
+  validate: (resolve: (passageId: number) => ModelResumeQuote) => T,
+): T {
+  try {
+    const diagnostics = analysisSelectionCitationDiagnostics(value, input, catalog, stage)
+    if (diagnostics) invalidCitations(diagnostics, stage)
+    return validate(createAnalysisPassageResolver(catalog, input.resume))
+  } catch (error) {
+    if (error instanceof AnalysisEvidenceBindingError) {
+      throw new AnalysisModelError('internal-error',
+        'The saved source-passage binding failed integrity validation. No generated evidence or score was published.', { stage })
+    }
+    throw error
+  }
+}
+
+export function validateAnalysisAssessmentSelections(
+  value: unknown, input: RealAnalysisAssessmentInput, catalog: AnalysisEvidenceCatalog,
+): RealAnalysisAssessmentOutput {
+  return withPassageSelections(value, input, catalog, 'assessment', resolve => {
+    const parsed = assessmentSelectionSchemaForInput(input, catalog.passages.length).safeParse(value)
+    if (!parsed.success) {
+      invalidOutput('The analysis model output does not match the exact bounded passage-selection schema or allowed identities.')
+    }
+    return validateAnalysisAssessment({
+      ...parsed.data,
+      criteria: parsed.data.criteria.map(row => ({ ...row, citations: row.citations.map(item => resolve(item.passageId)) })),
+      qualifications: parsed.data.qualifications.map(row => ({ ...row, citations: row.citations.map(item => resolve(item.passageId)) })),
+    }, input)
+  })
+}
+
+export function validateAnalysisGroundingSelections(
+  value: unknown, input: RealAnalysisAssessmentInput, catalog: AnalysisEvidenceCatalog,
+): RealAnalysisGroundingReviewOutput {
+  return withPassageSelections(value, input, catalog, 'grounding', resolve => {
+    const parsed = groundingSelectionSchemaForInput(input, catalog.passages.length).safeParse(value)
+    if (!parsed.success) {
+      invalidOutput('The analysis grounding review does not match its exact bounded passage-selection schema or allowed identities.', 'grounding')
+    }
+    return validateAnalysisGroundingReview({
+      ...parsed.data,
+      issues: parsed.data.issues.map(row => ({ ...row, citations: row.citations.map(item => resolve(item.passageId)) })),
+    }, input)
+  })
 }
 
 export function validateAnalysisAssessment(value: unknown, input: RealAnalysisAssessmentInput): RealAnalysisAssessmentOutput {

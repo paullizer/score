@@ -5,8 +5,9 @@ import path from 'node:path'
 import { after, test } from 'node:test'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { build } from 'esbuild'
+import { assertLosslessModelInput, passageSelection } from '../worker-tests/analysis-selection-test-support.mjs'
 import {
-  api, fixture, seedResume, seedJob, seedGrade, ACTOR, NOW, LATER, clone, citation,
+  api, fixture, seedResume, seedJob, seedGrade, createRun, publishResult, ACTOR, NOW, LATER, clone, citation,
 } from './real-analyses.test-support.mjs'
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
@@ -23,7 +24,7 @@ function response(value, name) {
 }
 
 function assessmentResponse(input, { scores = [4], unassessed = false, unassessedIds = [], limitedQualification = false } = {}) {
-  const paragraph = input.resume.paragraphs[0]
+  const selected = passageSelection(input)
   return {
     criteria: input.rubric.criteria.map((criterion, index) => {
       const base = { criterionId: criterion.id, rationale: 'The submitted document describes the engineering work at this saved anchor.' }
@@ -39,7 +40,7 @@ function assessmentResponse(input, { scores = [4], unassessed = false, unassesse
       const score = scores[index] ?? scores[0]
       return {
         ...base, evidenceStatus: score ? 'partial' : 'missing', score,
-        citations: score ? [{ paragraphId: paragraph.id, quote: paragraph.text }] : [], limitation: null,
+        citations: score ? [selected] : [], limitation: null,
       }
     }),
     qualifications: input.qualifications.map(qualification => ({
@@ -95,10 +96,10 @@ async function realModelPublication(f, resume, target, options = {}) {
         const request = JSON.parse(init.body)
         const payload = JSON.parse(request.messages.find(item => item.role === 'user').content)
         calls.push({ request, payload })
-        assert.deepEqual(payload.input, model.validateAnalysisAssessmentInput(input))
+        assertLosslessModelInput(payload.input, model.validateAnalysisAssessmentInput(input))
         if (!payload.assessment) {
           assessed++
-          return response(assessmentResponse(input, { ...options, ...(assessed <= corrections ? { scores: [assessed] } : {}) }),
+          return response(assessmentResponse(payload.input, { ...options, ...(assessed <= corrections ? { scores: [assessed] } : {}) }),
             'actual-boundary-assessor')
         }
         reviewed++
@@ -106,7 +107,7 @@ async function realModelPublication(f, resume, target, options = {}) {
           outcome: 'needs-correction', issues: [{
             code: 'unsupported-score', message: 'Review the cited scope against the saved score guidance.',
             criterionId: input.rubric.criteria[0].id, qualificationId: null,
-            citations: [{ paragraphId: input.resume.paragraphs[0].id, quote: input.resume.paragraphs[0].text }],
+            citations: [passageSelection(payload.input)],
           }],
         }, 'actual-boundary-reviewer')
         return response({ outcome: 'supported', issues: [] }, 'actual-boundary-reviewer')
@@ -148,6 +149,13 @@ async function realModelPublication(f, resume, target, options = {}) {
   ])
   const detail = await f.service.comparisonDetail(f.workspaceId, run.record.id, comparison.record.id)
   assert.deepEqual(detail.result, result)
+  assert.equal(result.schemaVersion, 1)
+  assert.equal(result.provenance.assessment.promptVersion, 'score-analysis-assessment-v3')
+  assert.equal(result.provenance.assessment.schemaVersion, 'score-analysis-assessment-v2')
+  assert.ok(result.provenance.groundingReviews.every(review =>
+    review.provenance.promptVersion === 'score-analysis-grounding-v3' &&
+    review.provenance.schemaVersion === 'score-analysis-grounding-v2'))
+  assert.doesNotMatch(JSON.stringify(result), /"passageId"|"passages"/)
   return { detail, result, calls, input, snapshots, run, comparison: complete }
 }
 
@@ -189,6 +197,48 @@ test('actual assessment and grounding output survives API publication/readback w
   f.resumes.blobs.values.clear()
   f.jobs.blobs.values.clear()
   assert.deepEqual((await f.service.comparisonDetail(f.workspaceId, published.run.record.id, published.comparison.id)).result, published.result)
+})
+
+test('historical literal-quote results remain API-readable and byte-identical alongside selection-model publications', async () => {
+  const f = fixture()
+  const oldRun = await createRun(f)
+  const oldComparison = [...f.analysis.store.values.values()].find(item =>
+    item.record.recordType === 'analysis-comparison' && item.record.runId === oldRun.run.id).record
+  const historical = await publishResult(f, oldRun.run.id, oldComparison.id)
+  const historicalBytes = clone(f.analysis.blobs.values.get(historical.reference.blobName).bytes)
+  assert.equal(historical.result.schemaVersion, 1)
+  assert.equal(historical.result.provenance.assessment.schemaVersion, '1')
+  assert.equal(historical.result.provenance.assessment.promptVersion, 'assessment-v1')
+
+  const modern = await realModelPublication(f, await seedResume(f), await seedJob(f))
+  assert.equal(modern.result.schemaVersion, historical.result.schemaVersion)
+  const citationFields = ['documentId', 'documentVersion', 'heading', 'page', 'paragraphId', 'quote']
+  for (const result of [historical.result, modern.result]) {
+    assert.deepEqual(api.parseAnalysisResult(result), result)
+    assert.deepEqual(Object.keys(result.criteria[0].citations[0]).sort(), citationFields)
+    assert.equal(typeof result.criteria[0].citations[0].quote, 'string')
+    assert.doesNotMatch(JSON.stringify(result), /"passageId"|"passages"/)
+  }
+  f.resumeValues.clear()
+  f.jobValues.clear()
+  f.rubricValues.clear()
+  f.resumes.blobs.values.clear()
+  f.jobs.blobs.values.clear()
+  const historicalDetail = await f.service.comparisonDetail(f.workspaceId, oldRun.run.id, oldComparison.id)
+  const modernDetail = await f.service.comparisonDetail(f.workspaceId, modern.run.record.id, modern.comparison.id)
+  assert.deepEqual(historicalDetail.result, historical.result)
+  assert.deepEqual(modernDetail.result, modern.result)
+  assert.deepEqual(f.analysis.blobs.values.get(historical.reference.blobName).bytes, historicalBytes)
+  assert.equal(api.analysisBytesHash(historicalBytes), historical.reference.sha256)
+  const historicalExcerpt = clone(historical.result)
+  historicalExcerpt.criteria[0].citations[0].quote = 'Evaluated engineering systems independently'
+  historicalExcerpt.provenance.assessmentSha256 = api.analysisAssessmentHash(historicalExcerpt)
+  historicalExcerpt.provenance.groundingReviews[0].assessmentSha256 = historicalExcerpt.provenance.assessmentSha256
+  assert.deepEqual(api.parseAnalysisResult(historicalExcerpt), historicalExcerpt)
+  const { criteria, qualifications, summary, limitations } = historicalExcerpt
+  assert.deepEqual(api.validateAnalysisAssessment(
+    { criteria, qualifications, summary, limitations }, historicalDetail.resumeSnapshot.document, historicalDetail.targetSnapshot,
+  ), [])
 })
 
 test('two corrections and three reviews survive publication/readback without widening provenance guarantees', async () => {
