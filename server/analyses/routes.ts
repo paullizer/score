@@ -11,7 +11,7 @@ import { RealAnalysisService } from './service'
 import { AnalysisLibraryLifecycleService } from './library-lifecycle'
 import {
   analysisLifecycleInputSchema, createAnalysisInputSchema, emptyAnalysisInputSchema,
-  isAnalysisId, reportComparisonIdsSchema, retryAnalysisInputSchema,
+  analysisNarrativeTargetIdSchema, generateAnalysisSummariesInputSchema, isAnalysisId, reportComparisonIdsSchema, retryAnalysisInputSchema,
 } from './validation'
 
 export type { RealAnalysesDeps } from './store'
@@ -83,7 +83,7 @@ export function createRealAnalysesRouter(deps: RealAnalysesRouterDeps): Router {
   const authorize: RequestHandler = async (req, res, next) => {
     res.setHeader('Cache-Control', 'no-store')
     try {
-      await deps.repository.authorizeWorkspace(getPrincipal(req), param(req, 'workspaceId'),
+      res.locals.analysisWorkspaceRole = await deps.repository.authorizeWorkspace(getPrincipal(req), param(req, 'workspaceId'),
         req.method === 'GET' ? 'read' : req.path.endsWith('/lifecycle') ? 'manage' : 'write')
       requireService()
       next()
@@ -135,6 +135,21 @@ export function createRealAnalysesRouter(deps: RealAnalysesRouterDeps): Router {
     const options = page(req)
     res.json(await requireService().comparisons(param(req, 'workspaceId'), recordId(req, 'run'), options.continuationToken, options.limit))
   })
+  router.get(`${base}/:runId/summaries`, async (req, res) => {
+    query(req, ['targetId'])
+    const targetId = req.query.targetId === undefined ? undefined : body(analysisNarrativeTargetIdSchema, req.query.targetId)
+    const summaries = await requireService().summaries(param(req, 'workspaceId'), recordId(req, 'run'), targetId)
+    if (res.locals.analysisWorkspaceRole === 'viewer') summaries.capabilities = { canGenerate: false, reason: 'read-only' }
+    res.setHeader('ETag', summaries.etag)
+    res.json(summaries)
+  })
+  router.post(`${base}/:runId/summaries`, mutate('write', async (req, res) => {
+    query(req, [])
+    const result = await requireService().generateSummaries(param(req, 'workspaceId'), recordId(req, 'run'),
+      body(generateAnalysisSummariesInputSchema, req.body), key(req), match(req), getPrincipal(req).principalKey)
+    res.setHeader('ETag', result.summaries.etag)
+    res.status(202).json(result)
+  }))
   router.get(`${base}/:runId/report-comparisons`, async (req, res) => {
     query(req, ['comparisonId'])
     body(emptyAnalysisInputSchema, actionBody(req))

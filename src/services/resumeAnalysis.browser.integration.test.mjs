@@ -417,10 +417,11 @@ async function seedBrowsingInputs(fixture) {
     onModelRequest(request) {
       if (request.response_format.json_schema.name !== 'resume_rubric_assessment') return
       const input = JSON.parse(request.messages[1].content).input
-      const profile = browsingProfiles.find((item) => item.name && input.resume.paragraphs.some((paragraph) => paragraph.text === item.name))
+      const passages = input.resume.paragraphs.flatMap((paragraph) => paragraph.passages ?? [])
+      const profile = browsingProfiles.find((item) => item.name && passages.some((passage) => passage.text.includes(item.name)))
         ?? browsingProfiles.at(-1)
-      const work = input.resume.paragraphs.find((paragraph) => paragraph.text.includes('Applied engineering methods'))
-      assert.ok(work)
+      const passage = passages.find((item) => item.text.includes('Applied engineering methods'))
+      assert.ok(passage?.passageId, 'The browsing fixture must select an exact frozen assessment passage.')
       assert.deepEqual(input.qualifications, [])
       const score = profile.score
       return modelResponse({
@@ -430,7 +431,7 @@ async function seedBrowsingInputs(fixture) {
           rationale: score === null ? 'The captured source does not establish the scope needed by this saved criterion.'
             : score === 0 ? 'No supporting evidence was assigned to this criterion in this controlled fixture.'
               : 'The quoted passage provides the controlled fixture evidence for this saved criterion.',
-          citations: score > 0 ? [{ paragraphId: work.paragraphId ?? work.id, quote: work.text }] : [],
+          citations: score > 0 ? [{ passageId: passage.passageId }] : [],
           limitation: score === null ? { code: 'not-assessable', message: 'The captured source scope requires human evidence review.' } : null,
         })),
         qualifications: [],

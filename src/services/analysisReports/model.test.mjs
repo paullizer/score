@@ -314,7 +314,11 @@ test('sample reports read frozen snapshots, preserve saved totals, and never syn
   assert.equal(report.counts.total, run.comparisons.length)
   assert.ok(report.notices.includes(api.REPORT_SAMPLE_NOTICE))
   assert.ok(report.notices.includes(api.REPORT_HUMAN_REVIEW_NOTICE))
-  assert.deepEqual(report.capture, { startedAt: REPORT_TEST_TIMESTAMP, completedAt: REPORT_TEST_TIMESTAMP })
+  assert.equal(report.capture.startedAt, REPORT_TEST_TIMESTAMP)
+  assert.equal(report.capture.completedAt, REPORT_TEST_TIMESTAMP)
+  assert.equal(report.capture.summaries.dataKind, 'sample')
+  assert.equal(report.capture.summaries.source, 'fixture')
+  assert.equal(report.capture.summaries.ready, true)
   assert.equal(report.generatedAt, REPORT_TEST_TIMESTAMP)
   for (const group of report.groups) {
     assert.equal(group.target.selection, null)
@@ -424,7 +428,8 @@ test('sample citations are verified against exact saved text, headings, position
   const saved = report.groups.flatMap(group => group.comparisons).find(item => item.id === entry.id)
   assert.equal(saved.criteria.find(item => item.criterionId === assessment.criterionId).citations[0].quote, excerpt)
   const serialized = JSON.stringify(report)
-  assert.ok(!serialized.includes('"paragraphs":'))
+  assert.ok(!serialized.includes('"document":'))
+  assert.ok(report.groups.every(group => group.target.narrative.paragraphs.every(paragraph => typeof paragraph === 'string')))
   assert.ok(!serialized.includes('This document is entirely synthetic and was written for the Score UI demonstration.'))
 })
 

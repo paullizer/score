@@ -18,9 +18,11 @@ import {
 } from '../../server/analyses/validation'
 import type { AnalysisBlobStore, AnalysisStore } from '../../server/analyses/store'
 import { analysisIsRemoved, fencedAnalysisBlobs } from '../../server/analyses/guards'
+import { prepareAnalysisNarrativeTransitions } from '../../server/analyses/narrative-scheduling'
 import { systemClock, type Clock, type RubricModelOptions } from '../runtime'
 import { AnalysisModelError, assessResumeAgainstTarget } from './model'
 import { emitAnalysisTelemetry, type AnalysisTelemetrySink } from './telemetry'
+import { runAnalysisNarrativeWork, type AnalysisNarrativeTelemetryEvent } from './narrative-runtime'
 
 const LEASE_MS = 90_000
 const HEARTBEAT_MS = 25_000
@@ -35,6 +37,7 @@ export interface AnalysisWorkerDependencies {
   clock?: Clock
   owner?: string
   onEvent?: AnalysisTelemetrySink
+  onNarrativeEvent?: (event: AnalysisNarrativeTelemetryEvent) => void
 }
 
 export interface AnalysisWorkerOptions {
@@ -231,6 +234,8 @@ class ComparisonLease {
         const timestamp = timeAfter(this.clock, comparison.record, run.record)
         const next = change(structuredClone(comparison.record), timestamp, run.record)
         const parent = applyAnalysisComparisonTransition(run.record, comparison.record, next, timestamp)
+        const narratives = await prepareAnalysisNarrativeTransitions(this.store, parent,
+          [{ previous: comparison.record, next }], timestamp)
         parseAnalysisEntity(next)
         parseAnalysisEntity(parent)
         if (!allowAborted) this.control.check()
@@ -238,6 +243,7 @@ class ComparisonLease {
           await this.store.transact(next.workspaceId, [
             { kind: 'replace', record: next, etag: comparison.etag },
             { kind: 'replace', record: parent, etag: run.etag },
+            ...narratives,
           ])
           return
         } catch (error) {
@@ -606,13 +612,15 @@ export async function runAnalysisWorker(
           if (!claimed) continue
           result.claimed++
           await processRun(deps, claimed, clock, deadline, options.signal, claimed.attemptLimitReached)
-        } else {
+        } else if (record.recordType === 'analysis-comparison') {
           const claimed = await claimComparison(deps, { record, etag: candidate.etag }, owner, clock, deadline, options.signal)
           if (!claimed) continue
           result.claimed++
           if (await processClaimedComparison(claimed, deps, {
             deadline, signal: options.signal, attemptLimitReached: claimed.attemptLimitReached,
           })) result.completed++
+        } else {
+          if (await runAnalysisNarrativeWork(deps, { record, etag: candidate.etag }, { deadline, signal: options.signal })) result.claimed++
         }
       } catch {
         // Store outages leave leased work recoverable; never log source text or SDK/model responses.

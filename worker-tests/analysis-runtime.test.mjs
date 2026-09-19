@@ -6,6 +6,7 @@ import { after, test } from 'node:test'
 import { pathToFileURL } from 'node:url'
 import { build } from 'esbuild'
 import { assertLosslessResume, passageSelection } from './analysis-selection-test-support.mjs'
+import { narrativeModelResponse } from '../server-tests/real-analysis-narratives.test-support.mjs'
 import {
   api, fixture, seedResume, seedJob, seedGrade, createRun, finishInitialization,
   ACTOR, NOW, clone,
@@ -68,7 +69,8 @@ function modelFor(f, handler) {
       const body = JSON.parse(request.messages[1].content)
       const kind = request.response_format.json_schema.name
       calls.push({ kind, body, request, signal: init.signal })
-      const override = await handler?.({ kind, body, request, signal: init.signal, call: calls.length })
+      const narrative = kind.startsWith('analysis_') ? narrativeModelResponse(kind, body) : undefined
+      const override = narrative ?? await handler?.({ kind, body, request, signal: init.signal, call: calls.length })
       if (override instanceof Response) return override
       const value = override ?? (kind === 'resume_rubric_assessment'
         ? modelAssessment(body.input) : { outcome: 'supported', issues: [] })
@@ -78,7 +80,7 @@ function modelFor(f, handler) {
       })
     },
   }
-  return { model, calls, deps: { ...f.analysis, model, clock: clockFor(f), owner: 'analysis-test-worker' } }
+  return { model, calls, deps: { ...f.analysis, model, clock: clockFor(f), owner: 'analysis-test-worker', onNarrativeEvent() {} } }
 }
 
 async function until(predicate, message = 'Expected asynchronous worker progress') {
@@ -121,7 +123,8 @@ function azurePollingFor(f) {
               record.error.retryable && record.attempts < parameters.get('@maxAttempts'))
           const eligible = recordType === 'analysis-run'
             ? record.status === 'initializing' || cancellation
-            : record.status === 'queued' || record.status === 'running'
+            : record.status === 'queued' || record.status === 'running' ||
+              recordType === 'analysis-target-narrative' && record.status === 'waiting'
           return eligible && (!record.nextAttemptAt || record.nextAttemptAt <= now) && (!record.lease || record.lease.expiresAt <= now)
         }).sort((a, b) => a.record.createdAt.localeCompare(b.record.createdAt))
           .map(item => ({ ...clone(item.record), _etag: item.etag }))
@@ -276,12 +279,13 @@ for (const format of ['docx', 'doc']) {
       for (const values of [f.resumeValues, f.jobValues, f.rubricValues, f.gradeValues,
         f.resumes.blobs.values, f.jobs.blobs.values, f.grades.blobs.values]) values.clear()
       const outcome = await runAnalysisWorker(mock.deps)
-      assert.deepEqual(outcome, { claimed: 1, completed: 1 },
+      assert.deepEqual(outcome, { claimed: 2, completed: 1 },
         JSON.stringify(comparisons(f, created.run.id).map(value => value.record.error)))
-      assert.equal(mock.calls.length, 2)
+      assert.equal(mock.calls.length, 4, 'Scoring and its independent candidate narrative each receive generation and review.')
       assertLosslessResume(mock.calls[0].body.input.resume, resume.document)
       const detail = await f.service.comparisonDetail(f.workspaceId, created.run.id, comparisons(f, created.run.id)[0].record.id)
       assert.equal(detail.comparison.status, 'complete')
+      assert.equal(detail.narrative.status, 'ready')
       assert.equal(detail.resumeSnapshot.extraction.pagination, 'captured-sections')
       assert.equal(detail.resumeSnapshot.extraction.pageCount, null)
       assert.equal(detail.resumeSnapshot.extraction.method, format === 'doc' ? 'legacy-word' : 'document-intelligence')
@@ -327,9 +331,9 @@ test('substantive ready resumes with every display metadata field unavailable ar
   }, ACTOR)
   const mock = modelFor(f)
   const outcome = await runAnalysisWorker(mock.deps)
-  assert.equal(mock.calls.length, 2)
+  assert.equal(mock.calls.length, 4)
   assertLosslessResume(mock.calls[0].body.input.resume, resume.document)
-  assert.deepEqual(outcome, { claimed: 1, completed: 1 })
+  assert.deepEqual(outcome, { claimed: 2, completed: 1 })
   const detail = await f.service.comparisonDetail(f.workspaceId, created.run.id, comparisons(f, created.run.id)[0].record.id)
   for (const key of ['name', 'role', 'location', 'experience']) {
     assert.equal(detail.resumeSnapshot.resume[key], null)
@@ -346,7 +350,7 @@ test('a valid limited assessment withholds the score without becoming a processi
   const f = fixture()
   const created = await createRun(f)
   const mock = modelFor(f, ({ kind, body }) => kind === 'resume_rubric_assessment' ? modelAssessment(body.input, { limited: true }) : undefined)
-  assert.deepEqual(await runAnalysisWorker(mock.deps), { claimed: 1, completed: 1 })
+  assert.deepEqual(await runAnalysisWorker(mock.deps), { claimed: 2, completed: 1 })
   const comparison = comparisons(f, created.run.id)[0]
   const detail = await f.service.comparisonDetail(f.workspaceId, created.run.id, comparison.record.id)
   assert.equal(detail.result.completion, 'limited')
@@ -367,7 +371,7 @@ test('approved GS exclusions and qualifications stay separate in frozen model in
   f.gradeValues.clear()
   f.grades.blobs.values.clear()
   const mock = modelFor(f)
-  assert.deepEqual(await runAnalysisWorker(mock.deps), { claimed: 1, completed: 1 })
+  assert.deepEqual(await runAnalysisWorker(mock.deps), { claimed: 2, completed: 1 })
   const detail = await f.service.comparisonDetail(f.workspaceId, created.run.id, comparisons(f, created.run.id)[0].record.id)
   const input = mock.calls[0].body.input
   assert.deepEqual(input.rubric, grade.version.rubric)
@@ -460,9 +464,11 @@ test('unknown passage selections exhaust only shared corrections, fail that comp
   assert.equal(complete.status, 'complete')
   assert.equal(complete.resultSummary.overall.score, 60)
   assert.equal(events.find(event => event.comparisonId === complete.id && event.event === 'comparison-outcome').outcome, 'complete')
-  const callCount = mock.calls.length
-  assert.deepEqual(await runAnalysisWorker(mock.deps, { maxItems: 2 }), { claimed: 0, completed: 0 })
-  assert.equal(mock.calls.length, callCount, 'Invalid model output must not trigger an automatic worker retry')
+  const scoringCalls = mock.calls.filter(call => !call.kind.startsWith('analysis_')).length
+  assert.deepEqual(await runAnalysisWorker(mock.deps, { maxItems: 2 }), { claimed: 2, completed: 0 })
+  assert.equal(mock.calls.filter(call => !call.kind.startsWith('analysis_')).length, scoringCalls,
+    'Independent summaries do not retry the invalid assessment.')
+  assert.equal((await api.readAnalysisSummaries(f.analysis, f.workspaceId, created.run.id)).counts.candidates.ready, 1)
 })
 
 test('two semantic corrections publish three bound reviews and correlated completion without extra worker attempts', async () => {
@@ -486,10 +492,11 @@ test('two semantic corrections publish three bound reviews and correlated comple
   })
   const events = []
   mock.deps.onEvent = event => events.push(event)
-  assert.deepEqual(await runAnalysisWorker(mock.deps), { claimed: 1, completed: 1 })
+  assert.deepEqual(await runAnalysisWorker(mock.deps), { claimed: 2, completed: 1 })
   const saved = comparisons(f, created.run.id)[0].record
   const detail = await f.service.comparisonDetail(f.workspaceId, created.run.id, saved.id)
-  assert.equal(mock.calls.length, 6)
+  assert.equal(mock.calls.filter(call => !call.kind.startsWith('analysis_')).length, 6)
+  assert.equal(mock.calls.filter(call => call.kind.startsWith('analysis_')).length, 2)
   assert.equal(saved.attempts, 1)
   assert.equal(saved.retryCount, 0)
   assert.equal(detail.result.provenance.correctionCount, 2)
@@ -540,7 +547,11 @@ test('missing snapshot retries stop after three attempts; manual retry uses orig
     assert.equal(failed.attempts, attempts)
     assert.equal(failed.result, undefined)
     assert.equal(failed.error.code, 'snapshot-unavailable')
-    assert.deepEqual(await runAnalysisWorker(mock.deps, { maxItems: 1 }), { claimed: 0, completed: 0 })
+    const summariesDue = (await f.analysis.store.listPending(f.now, 100)).filter(item => item.record.recordType.includes('narrative')).length
+    const scoringCalls = mock.calls.filter(call => !call.kind.startsWith('analysis_')).length
+    assert.deepEqual(await runAnalysisWorker(mock.deps, { maxItems: 1 }), { claimed: Math.min(1, summariesDue), completed: 0 })
+    assert.equal(mock.calls.filter(call => !call.kind.startsWith('analysis_')).length, scoringCalls,
+      'Independent summaries may progress while the assessment waits for its own bounded backoff.')
     if (attempts < 3) {
       assert.equal(failed.status, 'queued')
       assert.equal(Date.parse(failed.nextAttemptAt) - Date.parse(f.now), 30000 * 2 ** (attempts - 1))
@@ -680,7 +691,7 @@ test('an expired or foreign-owned attempt cannot start inference or resurrect it
   assert.equal(await processClaimedComparison(claimed, { ...mock.deps, owner: 'expired-owner' }), false)
   assert.equal(mock.calls.length, 0)
   assert.deepEqual(await f.analysis.store.get(f.workspaceId, queued.record.id), claimed)
-  assert.deepEqual(await runAnalysisWorker(mock.deps), { claimed: 1, completed: 1 })
+  assert.deepEqual(await runAnalysisWorker(mock.deps), { claimed: 2, completed: 1 })
   assert.equal(comparisons(f, created.run.id)[0].record.attempts, 2)
 })
 
@@ -766,9 +777,9 @@ test('ambiguous claim, immutable-result, and completion commits recover winning 
       if (name.includes('/results/')) { interrupted = true; throw new Error('PRIVATE-BLOB-RESPONSE-SENTINEL') }
     })
     const mock = modelFor(f)
-    assert.deepEqual(await runAnalysisWorker(mock.deps), { claimed: 1, completed: 1 }, lost)
+    assert.deepEqual(await runAnalysisWorker(mock.deps), { claimed: 2, completed: 1 }, lost)
     assert.equal(interrupted, true)
-    assert.equal(mock.calls.length, 2)
+    assert.equal(mock.calls.length, 4)
     const comparison = comparisons(f, created.run.id)[0]
     assert.equal(comparison.record.attempts, 1)
     assert.equal(comparison.record.error, undefined)
@@ -789,7 +800,7 @@ test('a winning immutable result is read and validated using its actual bytes, n
     return put(name, bytes, contentType)
   }
   const mock = modelFor(f)
-  assert.deepEqual(await runAnalysisWorker(mock.deps), { claimed: 1, completed: 1 })
+  assert.deepEqual(await runAnalysisWorker(mock.deps), { claimed: 2, completed: 1 })
   const comparison = comparisons(f, created.run.id)[0]
   const detail = await f.service.comparisonDetail(f.workspaceId, created.run.id, comparison.record.id)
   assert.equal(comparison.record.result.sha256, api.analysisBytesHash(f.analysis.blobs.values.get(comparison.record.result.blobName).bytes))
@@ -1199,7 +1210,9 @@ test('the default worker claim budget matches the two-item deployment default', 
   assert.deepEqual(await runAnalysisWorker(mock.deps), { claimed: 2, completed: 2 })
   assert.equal(comparisons(f, created.run.id).filter(item => item.record.status === 'queued').length, 1)
   assert.equal(mock.calls.length, 4)
-  assert.deepEqual(await runAnalysisWorker(mock.deps), { claimed: 1, completed: 1 })
+  assert.deepEqual(await runAnalysisWorker(mock.deps), { claimed: 2, completed: 1 })
+  assert.equal(mock.calls.filter(call => !call.kind.startsWith('analysis_')).length, 6)
+  assert.equal(mock.calls.filter(call => call.kind.startsWith('analysis_')).length, 2)
   assert.equal((await f.analysis.store.get(f.workspaceId, created.run.id)).record.status, 'complete')
 })
 

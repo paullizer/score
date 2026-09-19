@@ -293,6 +293,10 @@ test('report evidence stays frozen after all live source libraries change or dis
     assert.equal(target.id, records[comparison.index].target.summary.id)
     assert.equal(target.label, job.record.job.title)
     assert.deepEqual(target.selection, job.selection)
+    assert.deepEqual(target.presentation, {
+      title: job.record.job.title, organization: job.record.job.organization, description: job.rubric.description,
+      series: job.record.job.series, grade: job.record.job.grade, versionLabel: target.versionLabel,
+    })
   }
   assert.deepEqual([...f.analysis.store.values.values()], baseline)
 })
@@ -322,6 +326,14 @@ test('GS reports preserve approved context, exclusions, separate qualification i
   const target = report.targets[0], comparison = report.comparisons[0]
   assert.equal(target.id, grade.head.approvedVersionId === target.selection.versionId ? record.target.summary.id : 'wrong approved version')
   assert.deepEqual(target.selection, grade.selection)
+  assert.deepEqual(target.presentation, {
+    title: job.record.job.title, organization: grade.sourceSet.context.agency,
+    description: grade.version.rubric.description, series: grade.sourceSet.context.series,
+    grade: `GS-${grade.selection.grade}`, versionLabel: target.versionLabel,
+  })
+  assert.equal(target.label, record.target.summary.label)
+  assert.equal(target.sublabel, record.target.summary.sublabel)
+  assert.equal(detail.targetSnapshot.version.rubric.name, grade.version.rubric.name)
   assert.ok(target.facts.some(fact => fact.label === 'Agency' && fact.value === 'Historical agency'))
   assert.ok(target.facts.some(fact => fact.label.endsWith('— interpretation') && fact.value === grade.version.rubric.criteria[0].interpretation))
   assert.equal(comparison.overall.score, result.overall.score)
@@ -429,4 +441,61 @@ test('completed withheld scores are returned verbatim, not recalculated or subst
   assert.equal(report.comparisons[0].criteria[0].score, null)
   assert.deepEqual(report.comparisons[0].criteria[0].limitation, saved.result.criteria[0].limitation)
   assert.equal(report.comparisons[0].resultSha256, saved.reference.sha256)
+})
+
+test('frozen presentation uses actual separate title and organization fields, never rubric titles or heuristic dash splitting', async () => {
+  const f = fixture()
+  const title = 'Survey Statistician - Research Methods - Specialized Projects'
+  const jobs = [await seedJob(f, title), await seedJob(f, title)]
+  for (const [index, job] of jobs.entries()) {
+    job.record.job.organization = `Long Processing Center - Historical Organization ${index}`
+    job.record.job.grade = `GS-${11 + index}`
+    job.record.job.series = '1530'
+    job.rubric.name = `A distinct rubric name ${index}, not the primary job title`
+    job.rubric.description = `Full captured requirements for historical organization ${index}. Preserve this description without truncation.`
+    job.selection.rubricHash = api.analysisHash(job.rubric)
+  }
+  const run = await selectedRun(f, [await seedResume(f)], jobs)
+  const records = comparisons(f, run.id).map(value => value.record)
+  for (const record of records) await publishResult(f, run.id, record.id)
+  for (const values of [f.jobValues, f.rubricValues, f.jobs.blobs.values]) values.clear()
+  readOnly(f)
+  const report = await new api.RealAnalysisService(f.analysis).reportComparisons(f.workspaceId, run.id, records.map(record => record.id))
+  assert.equal(report.targets.length, 2)
+  assert.notEqual(report.targets[0].id, report.targets[1].id)
+  for (const [index, target] of report.targets.entries()) {
+    assert.equal(target.presentation.title, title)
+    assert.equal(target.presentation.organization, jobs[index].record.job.organization)
+    assert.equal(target.presentation.description, jobs[index].rubric.description)
+    assert.equal(target.presentation.series, '1530')
+    assert.equal(target.presentation.grade, jobs[index].record.job.grade)
+    assert.equal(target.label, records[index].target.summary.label)
+    assert.equal(target.sublabel, records[index].target.summary.sublabel)
+  }
+})
+
+test('grade headings use the frozen seed job title while approved grade/version and agency context stay separate', async () => {
+  const f = fixture()
+  const job = await seedJob(f, 'Seed job title - not the grade version name')
+  const grade = await seedGrade(f, job)
+  grade.sourceSet.context.agency = ''
+  grade.sourceSet.contentHash = api.gradeSourceSetHash(grade.sourceSet)
+  grade.selection.sourceSetHash = grade.sourceSet.contentHash
+  f.gradeValues.set(`${f.workspaceId}/${grade.sourceSet.id}`, { record: clone(grade.sourceSet), etag: '"frozen-no-agency"' })
+  const run = await selectedRun(f, [await seedResume(f)], [grade])
+  const [record] = comparisons(f, run.id).map(value => value.record)
+  await publishGradeResult(f, run.id, record.id)
+  for (const values of [f.gradeValues, f.grades.blobs.values, f.jobValues, f.jobs.blobs.values]) values.clear()
+  readOnly(f)
+  const report = await new api.RealAnalysisService(f.analysis).reportComparisons(f.workspaceId, run.id, [record.id])
+  const target = report.targets[0]
+  assert.equal(target.presentation.title, job.record.job.title)
+  assert.notEqual(target.presentation.title, grade.version.rubric.name)
+  assert.equal(target.label, record.target.summary.label)
+  assert.equal(target.sublabel, record.target.summary.sublabel)
+  assert.equal(target.presentation.organization, job.record.job.organization)
+  assert.equal(target.presentation.description, grade.version.rubric.description)
+  assert.equal(target.presentation.grade, 'GS-9')
+  assert.equal(target.presentation.versionLabel, 'Approved GS-9 · rubric v1')
+  assert.ok(!JSON.stringify(target.presentation).includes('draft'))
 })

@@ -120,16 +120,16 @@ test('worker errors are visible and cancellation terminates generation without d
   assert.equal(workers.length, before)
 })
 
-test('PDF font bytes come only from same-origin bundled assets and transfer into the worker', async () => {
+for (const format of ['pdf', 'docx']) test(`${format} font bytes come only from same-origin bundled assets and transfer into the worker`, async () => {
   const requests = []
   globalThis.fetch = async (url, options) => {
     requests.push({ url: String(url), options })
     return new Response(Uint8Array.of(0, 1, 0, 0, 1, 2, 3), { headers: { 'Content-Type': 'font/ttf' } })
   }
   behavior = (worker, request) => queueMicrotask(() => worker.onmessage({
-    data: { type: 'complete', requestId: request.requestId, bytes: pdfBytes() },
+    data: { type: 'complete', requestId: request.requestId, bytes: format === 'pdf' ? pdfBytes() : officeBytes() },
   }))
-  await api.generateReportInWorker(report, 'pdf', { signal: new AbortController().signal, links })
+  await api.generateReportInWorker(report, format, { signal: new AbortController().signal, links })
   assert.deepEqual(requests.map(({ url }) => url), [
     'https://score.test/src/assets/report-fonts/NotoSans-Regular.ttf',
     'https://score.test/src/assets/report-fonts/NotoSans-Bold.ttf',
@@ -140,14 +140,14 @@ test('PDF font bytes come only from same-origin bundled assets and transfer into
   assert.deepEqual(new Uint8Array(workers[0].request.options.fonts.regular), Uint8Array.of(0, 1, 0, 0, 1, 2, 3))
 })
 
-test('HTML, oversized, and failed font responses never start a PDF worker', async () => {
+for (const format of ['pdf', 'docx']) test(`HTML, oversized, and failed font responses never start a ${format} worker`, async () => {
   for (const response of [
     () => new Response('<html>Sign in</html>', { headers: { 'Content-Type': 'text/html' } }),
     () => new Response(new Uint8Array(4 * 1024 * 1024 + 1)),
     () => new Response('Unavailable', { status: 503 }),
   ]) {
     globalThis.fetch = async () => response()
-    await assert.rejects(api.generateReportInWorker(report, 'pdf', { signal: new AbortController().signal, links }), /font|TrueType/)
+    await assert.rejects(api.generateReportInWorker(report, format, { signal: new AbortController().signal, links }), /font|TrueType/)
   }
   assert.equal(workers.length, 0)
 })
@@ -179,7 +179,7 @@ test('download uses the expected MIME, safe filename and short-lived object URL 
 })
 
 test('concise exports require valid link context before font requests or worker startup', async () => {
-  for (const format of ['csv', 'pdf', 'pptx']) {
+  for (const format of ['csv', 'pdf', 'docx', 'pptx']) {
     await assert.rejects(api.generateReportInWorker(report, format, { signal: new AbortController().signal }), /trusted application origin/)
     await assert.rejects(api.generateReportInWorker(report, format, {
       signal: new AbortController().signal, links: { ...links, origin: 'https://score.test/private' },
@@ -192,19 +192,21 @@ test('concise exports require valid link context before font requests or worker 
   assert.equal(downloads.length, 0)
 })
 
-test('Word remains generatable without links and retains its partial filename', async () => {
+test('Word downloads use PDF-equivalent links, fonts and naming for settled partial results', async () => {
+  globalThis.fetch = async () => new Response(Uint8Array.of(0, 1, 0, 0, 1, 2, 3))
   behavior = (worker, request) => queueMicrotask(() => worker.onmessage({
     data: { type: 'complete', requestId: request.requestId, bytes: officeBytes() },
   }))
-  const bytes = await api.generateReportInWorker(report, 'docx', { signal: new AbortController().signal })
-  assert.equal(workers[0].request.options.links, undefined)
-  assert.deepEqual(workers[0].transfer, [])
+  const bytes = await api.generateReportInWorker(report, 'docx', { signal: new AbortController().signal, links })
+  assert.deepEqual(workers[0].request.options.links, links)
+  assert.equal(workers[0].transfer.length, 2)
   const filename = api.downloadAnalysisReport(bytes, { ...report, partial: true }, 'docx', new AbortController().signal)
-  assert.equal(filename, 'Saved evidence review - partial.docx')
+  assert.equal(filename, 'Saved evidence review.docx')
+  assert.equal(downloads[0].blob.type, 'application/vnd.openxmlformats-officedocument.wordprocessingml.document')
 })
 
-test('only concise formats omit the partial filename marker and sample filenames stay labeled', () => {
-  for (const format of ['csv', 'pdf', 'pptx']) {
+test('all formats omit the partial filename marker and sample filenames stay labeled', () => {
+  for (const format of ['csv', 'pdf', 'docx', 'pptx']) {
     const bytes = format === 'csv' ? csvBytes() : format === 'pdf' ? pdfBytes() : officeBytes()
     const filename = api.downloadAnalysisReport(bytes, { ...report, dataKind: 'sample', partial: true }, format, new AbortController().signal)
     assert.equal(filename, `Sample - Saved evidence review.${format}`)

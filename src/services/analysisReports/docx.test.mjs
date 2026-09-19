@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
-import { mkdir, rm } from 'node:fs/promises'
+import { mkdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { join, resolve } from 'node:path'
 import { after, before, test } from 'node:test'
 import { pathToFileURL } from 'node:url'
@@ -9,13 +9,18 @@ import { build } from 'esbuild'
 import { SaxesParser } from 'saxes'
 import yauzl from 'yauzl'
 import {
-  loadReportFoundation, realReportFixture, reportFixtureCitation, REPORT_TEST_TIMESTAMP,
+  loadReportFoundation, realReportFixture, reportFixtureCitation, REPORT_TEST_TIMESTAMP, withReportNarratives,
 } from './test-support.mjs'
+import {
+  fictionalPdfNavigationQaFixture, fictionalPdfQaFixture, fictionalSampleInput, readablePdfFixture, readPdf,
+} from './pdf-test-support.mjs'
 
-let foundation, writer, cleanup
+let foundation, writer, cleanup, options
 const output = resolve(`.analysis-report-docx-tests-${randomUUID()}`)
 const entry = `
   export { generateDocxReport } from './src/services/analysisReports/docx';
+  export { generatePdfReport } from './src/services/analysisReports/pdf';
+  export { reportReviewLinks } from './src/services/analysisReports/links';
   export { REPORT_LIMITS } from './src/domain/analysis-reports';
 `
 
@@ -30,6 +35,13 @@ before(async () => {
     platform: 'node', format: 'esm', logLevel: 'silent',
   })
   writer = await import(pathToFileURL(join(output, 'docx.mjs')).href)
+  const fonts = await Promise.all(['Regular', 'Bold'].map(weight =>
+    readFile(resolve('src', 'assets', 'report-fonts', `NotoSans-${weight}.ttf`))))
+  const buffers = fonts.map(bytes => bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength))
+  options = {
+    fonts: { regular: buffers[0], bold: buffers[1] },
+    links: { origin: 'https://score.example', workspaceId: 'workspace-one' },
+  }
 })
 
 after(async () => {
@@ -50,7 +62,8 @@ function unzip(bytes) {
           stream.on('error', reject)
           stream.on('data', chunk => chunks.push(chunk))
           stream.on('end', () => {
-            entries.set(entry.fileName, Buffer.concat(chunks).toString('utf8'))
+            const content = Buffer.concat(chunks)
+            entries.set(entry.fileName, /\.(xml|rels)$/.test(entry.fileName) ? content.toString('utf8') : content)
             zip.readEntry()
           })
         })
@@ -62,8 +75,7 @@ function unzip(bytes) {
 }
 
 function parseXml(xml, filename) {
-  const root = { name: '#document', attributes: {}, children: [] }
-  const stack = [root]
+  const root = { name: '#document', attributes: {}, children: [] }, stack = [root]
   const parser = new SaxesParser({ xmlns: true })
   parser.on('opentag', tag => {
     const node = {
@@ -89,41 +101,46 @@ function all(node, name) {
 
 function inlineText(node) {
   if (typeof node === 'string') return ''
+  if (node.name === 'w:pPr' || node.name === 'w:rPr') return ''
   if (node.name === 'w:t') return node.children.join('')
   if (node.name === 'w:tab') return '\t'
   if (node.name === 'w:br') return '\n'
   return node.children.map(inlineText).join('')
 }
 
-function textContent(node) {
-  return all(node, 'w:p').map(inlineText).join('\n')
-}
-
-function normalizeLines(value) {
-  return value.replace(/\r\n|\r/g, '\n')
-}
-
+const textContent = node => all(node, 'w:p').map(inlineText).join('\n')
+const normalizeLines = value => value.replace(/\r\n|[\r\u0085\u2028\u2029]/gu, '\n')
+const normalizedBody = value => value.replace(/Page\s*\d*/g, '').replace(/[\s\u2022]/gu, '')
 function containsText(node, expected) {
-  assert.ok(textContent(node).includes(normalizeLines(expected)), `Missing exact text: ${JSON.stringify(expected.slice(0, 150))}`)
+  assert.ok(textContent(node).includes(normalizeLines(expected)), `Missing exact text: ${JSON.stringify(expected.slice(0, 160))}`)
 }
 
-function reviewSections(document) {
-  const body = all(document, 'w:body')[0]
-  const sections = new Map()
-  let current
-  for (const node of body.children) {
-    const mark = all(node, 'w:bookmarkStart').find(bookmark => bookmark.attributes['w:name']?.startsWith('review_'))
-    if (mark) {
-      current = { name: '#review', attributes: {}, children: [] }
-      sections.set(mark.attributes['w:name'], current)
-    }
-    if (current) current.children.push(node)
+function documentSections(document, parts) {
+  const relationships = new Map(all(parts.get('word/_rels/document.xml.rels'), 'Relationship')
+    .map(node => [node.attributes.Id, node.attributes.Target]))
+  const result = []
+  let children = []
+  for (const node of all(document, 'w:body')[0].children) {
+    children.push(node)
+    const properties = all(node, 'w:sectPr')[0]
+    if (!properties) continue
+    const headerReference = all(properties, 'w:headerReference').find(node => node.attributes['w:type'] === 'default')
+    assert.ok(headerReference, 'Every section has its own identifying continuation header')
+    const header = parts.get(`word/${relationships.get(headerReference.attributes['r:id'])}`)
+    assert.ok(header)
+    result.push({ name: '#section', attributes: {}, children, header, properties })
+    children = []
   }
-  return sections
+  assert.equal(children.length, 0)
+  return result
 }
+const reviewSections = word => word.sections.filter(section => textContent(section.header).includes('Candidate review'))
+const glanceSections = word => word.sections.filter(section => textContent(section.header).includes('Candidates at a glance'))
 
-async function generate(report) {
-  const bytes = await writer.generateDocxReport(report)
+async function generate(report, generationOptions = options) {
+  const original = JSON.stringify(report)
+  const bytes = await writer.generateDocxReport(report, generationOptions)
+  assert.equal(JSON.stringify(report), original, 'Word must not mutate scores, source evidence, scope or saved narratives')
   assert.ok(bytes instanceof Uint8Array)
   assert.ok(bytes.length > 1000 && bytes.length <= writer.REPORT_LIMITS.maxOutputBytes)
   assert.equal(Buffer.from(bytes.slice(0, 2)).toString(), 'PK')
@@ -132,508 +149,396 @@ async function generate(report) {
     assert.ok(entries.has(filename), `Missing OOXML part ${filename}`)
   }
   const parts = new Map([...entries].filter(([name]) => /\.(xml|rels)$/.test(name)).map(([name, xml]) => [name, parseXml(xml, name)]))
-  return { bytes, entries, parts, document: parts.get('word/document.xml') }
+  const document = parts.get('word/document.xml')
+  return { bytes, entries, parts, document, sections: documentSections(document, parts) }
 }
+const reportFor = (input = readablePdfFixture(), buildOptions = {}) => foundation.buildAnalysisReport(input, buildOptions)
 
-function assertFullDetail(section, target, comparison) {
-  for (const expected of [
-    foundation.candidateName(comparison.candidate), comparison.candidate.id, comparison.id,
-    comparison.candidate.sourceLabel, comparison.candidate.documentId, target.id, target.label,
-    target.versionLabel, target.rubricId, foundation.overallScoreLabel(comparison.overall),
-  ]) containsText(section, expected)
-  for (const snapshot of [target.snapshot, comparison.candidate.snapshot]) {
-    if (snapshot) {
-      containsText(section, snapshot.snapshotId)
-      containsText(section, snapshot.sha256)
-    }
+test('Word and PDF emit the same completed report content, saved summaries, section order and source destinations', async () => {
+  const report = reportFor(readablePdfFixture({ scores: [90, null], targetCount: 2, criterionCount: 2 }))
+  const word = await generate(report)
+  const pdf = await readPdf(await writer.generatePdfReport(report, options))
+  assert.equal(normalizedBody(textContent(word.document)), normalizedBody(pdf.body),
+    'Only whitespace, native list markers and viewer-generated contents page numbers may differ')
+  assert.equal(word.sections.length, 2 + report.groups.length * 3)
+  for (const [index, group] of report.groups.entries()) {
+    const [opener, review, glance] = word.sections.slice(2 + index * 3, 5 + index * 3)
+    containsText(opener, group.target.presentation.title)
+    containsText(opener, group.target.presentation.organization)
+    for (const paragraph of group.target.narrative.paragraphs) containsText(opener, paragraph)
+    containsText(review, group.comparisons[0].narrative.text)
+    containsText(glance, 'Candidates at a glance')
+    for (const comparison of group.comparisons) containsText(glance, comparison.narrative.overview)
   }
-  for (const [key, value] of Object.entries(target.selection ?? {})) {
-    if (key !== 'kind' && typeof value === 'string') containsText(section, value)
+  const destinations = all(word.parts.get('word/_rels/document.xml.rels'), 'Relationship')
+    .filter(node => node.attributes.Type.endsWith('/hyperlink'))
+  assert.deepEqual(new Set(destinations.map(node => node.attributes.Target)), new Set(pdf.uriAnnotations.map(link => link.url)))
+  assert.ok(destinations.every(node => node.attributes.TargetMode === 'External'))
+  assert.doesNotMatch(textContent(word.document), /RAW-|Comparison ID|Run ID|SHA-256|Full saved overall assessment|\[excerpt\]/)
+  for (const part of word.parts.values()) {
+    for (const name of ['w:drawing', 'w:pict', 'w:documentProtection', 'w:txbxContent']) assert.equal(all(part, name).length, 0)
   }
-  if (comparison.candidate.documentSha256) containsText(section, comparison.candidate.documentSha256)
-  if (comparison.resultSha256) containsText(section, comparison.resultSha256)
-  if (comparison.status !== 'complete') return
-  containsText(section, comparison.summary)
-  for (const definition of target.criteria) {
-    for (const expected of [definition.id, definition.label, definition.description, definition.guidance]) containsText(section, expected)
-  }
-  for (const assessment of [...comparison.criteria, ...comparison.qualifications]) {
-    containsText(section, assessment.rationale)
-    for (const citation of [...assessment.citations, ...assessment.requirementCitations]) {
-      containsText(section, citation.quote)
-      containsText(section, citation.locator)
-    }
-    if (assessment.limitation) containsText(section, assessment.limitation.message)
-  }
-  for (const qualification of comparison.qualifications) {
-    containsText(section, qualification.text)
-    containsText(section, qualification.interpretation)
-  }
-  for (const value of comparison.limitations) containsText(section, value.message)
-  for (const fact of [...target.facts, ...comparison.provenance]) containsText(section, fact.value)
-}
-
-test('editable Word package preserves all candidates, counts, saved scores, and frozen detail', async () => {
-  const input = realReportFixture({ scores: [92.75, 87, 82, 75, 62, 43], targetCount: 2 })
-  input.comparisons[1].overall.score = 12
-  input.comparisons[3].overall.score = 99
-  input.comparisons[5].overall.score = 44
-  for (const item of input.comparisons) {
-    if (item.candidate.id === 'candidate-2') item.candidate.name = 'Candidate 1'
-    item.summary = `Complete saved assessment for ${item.id}. ${'Its original evidence is retained. '.repeat(16)}End of saved assessment ${item.id}.`
-  }
-  const report = foundation.buildAnalysisReport(input)
-  const before = JSON.stringify(report)
-  const { document, parts, entries } = await generate(report)
-  assert.equal(JSON.stringify(report), before)
-  containsText(document, '6 candidates · 12 comparisons · 2 exact targets')
-  for (const expected of [
-    report.run.id, report.run.name, report.run.createdAt, report.capture.startedAt, report.capture.completedAt,
-    report.generatedAt, report.workspaceId, foundation.REPORT_HUMAN_REVIEW_NOTICE, foundation.REPORT_CAPTURE_NOTICE,
-  ]) containsText(document, expected)
-  const sections = reviewSections(document)
-  assert.equal(sections.size, report.counts.total)
-  for (const group of report.groups) {
-    for (const comparison of group.comparisons) assertFullDetail(sections.get(`review_${comparison.index}`), group.target, comparison)
-  }
-  const tables = all(document, 'w:tbl')
-  for (let groupIndex = 0; groupIndex < report.groups.length; groupIndex++) {
-    const group = report.groups[groupIndex]
-    const rows = all(tables[groupIndex], 'w:tr').slice(1)
-    const highlighted = group.comparisons.filter(item => item.highlighted)
-    assert.equal(rows.length, group.highlightedComparisonIds.length)
-    assert.deepEqual(rows.map(row => all(row, 'w:tc').map(textContent)), highlighted.map(item => [
-      String(item.rank),
-      `${foundation.candidateName(item.candidate)}\n${item.candidate.role}\nCandidate ID: ${item.candidate.id}`,
-      foundation.overallScoreLabel(item.overall),
-    ]))
-  }
-  containsText(document, '[excerpt]')
-  for (const part of parts.values()) {
-    assert.equal(all(part, 'w:drawing').length, 0)
-    assert.equal(all(part, 'w:pict').length, 0)
-    assert.equal(all(part, 'w:documentProtection').length, 0)
-  }
-  assert.ok(![...entries.keys()].some(name => /(^word\/media\/|embeddings\/)/.test(name)))
+  assert.ok(![...word.entries.keys()].some(name => /(^word\/media\/|embeddings\/)/.test(name)), 'Pages must be editable, not screenshots')
 })
 
-test('summary ordering, ranks, highlight membership, and capped ties come from the shared model', async () => {
-  const report = foundation.buildAnalysisReport(realReportFixture({ scores: [100, 99, 98, 97, ...Array(12).fill(80), 70] }))
-  const group = report.groups[0]
-  const { document } = await generate(report)
-  containsText(document, foundation.highlightNotice(group))
-  containsText(document, '6 additional candidates tied at 80 / 100')
-  assert.equal(all(all(document, 'w:tbl')[0], 'w:tr').length, group.highlightedComparisonIds.length + 1)
-  assert.equal(reviewSections(document).size, 17)
-  assert.deepEqual(
-    all(all(document, 'w:tbl')[0], 'w:tr').slice(1).map(row => textContent(all(row, 'w:tc')[0])),
-    group.comparisons.filter(item => item.highlighted).map(item => String(item.rank)),
-  )
-  const direct = foundation.buildAnalysisReport(realReportFixture({ scores: [90, 80, 70] }))
-  const directGroup = direct.groups[0]
-  directGroup.comparisons.reverse()
-  directGroup.comparisons.forEach(item => { item.highlighted = item.id === 'comparison-2'; item.rank = 42 })
-  directGroup.highlightedComparisonIds = ['comparison-2']
-  directGroup.cutoffScore = 70
-  const { document: consumed } = await generate(direct)
-  const rows = all(all(consumed, 'w:tbl')[0], 'w:tr')
-  assert.equal(rows.length, 2)
-  containsText(rows[1], 'Candidate 2')
-  assert.equal(textContent(all(rows[1], 'w:tc')[0]), '42')
-  assert.deepEqual([...reviewSections(consumed).keys()], ['review_2', 'review_1', 'review_0'])
+test('duplicate target titles keep distinct native bookmarks, linked contents and live page references', async () => {
+  const input = readablePdfFixture({ scores: [90], targetCount: 3, criterionCount: 1 })
+  for (const target of input.targets) {
+    target.presentation.title = 'Survey Statistician'
+    target.label = 'LEGACY-COMPOSITE TITLE - OFFICE MUST NOT BE USED'
+  }
+  const word = await generate(reportFor(input))
+  const starts = all(word.document, 'w:bookmarkStart')
+  assert.equal(new Set(starts.map(node => node.attributes['w:id'])).size, starts.length, 'Numeric bookmark IDs must be unique, not only their names')
+  const names = starts.map(node => node.attributes['w:name'])
+  assert.equal(new Set(names).size, 4)
+  assert.ok(names.every(name => /^[A-Za-z][A-Za-z0-9_]{0,39}$/.test(name)))
+  const ends = all(word.document, 'w:bookmarkEnd').map(node => node.attributes['w:id'])
+  assert.deepEqual(new Set(starts.map(node => node.attributes['w:id'])), new Set(ends))
+  const contents = word.sections[1]
+  containsText(contents, 'Contents')
+  const contentsParagraphs = all(contents, 'w:p')
+  const firstEntry = contentsParagraphs.findIndex(node => inlineText(node).startsWith('Job analysis 1'))
+  assert.ok(firstEntry >= 0)
+  for (const paragraph of contentsParagraphs.slice(firstEntry).filter(node => inlineText(node).trim())) {
+    assert.ok(all(paragraph, 'w:keepLines').some(node => node.attributes['w:val'] !== 'false'),
+      'Contents titles and metadata should stay together rather than splitting an ordinary entry across pages')
+  }
+  for (const [index, target] of input.targets.entries()) {
+    containsText(contents, target.presentation.title)
+    containsText(contents, target.presentation.organization)
+    const opener = word.sections[2 + index * 3]
+    const destination = all(opener, 'w:bookmarkStart')[0].attributes['w:name']
+    const label = all(contents, 'w:hyperlink').find(node => inlineText(node) === `Job analysis ${index + 1}`)
+    assert.equal(label.attributes['w:anchor'], destination)
+    const title = all(contents, 'w:hyperlink').find(node => inlineText(node) === 'Survey Statistician' && node.attributes['w:anchor'] === destination)
+    assert.ok(title)
+    assert.ok(all(contents, 'w:instrText').some(node => node.children.join('').includes(`PAGEREF ${destination}`)))
+    assert.ok(all(opener, 'w:hyperlink').some(node => inlineText(node) === 'Return to contents' && node.attributes['w:anchor'] === names[0]))
+  }
+  for (const link of all(word.document, 'w:hyperlink').filter(node => node.attributes['w:anchor'])) {
+    assert.ok(names.includes(link.attributes['w:anchor']))
+  }
+  assert.doesNotMatch(textContent(word.document), /LEGACY-COMPOSITE/)
+  assert.equal(all(word.parts.get('word/settings.xml'), 'w:updateFields').length, 1)
 })
 
-test('zero, withheld, excluded, and unfinished states never become fictitious assessments', async () => {
-  const input = realReportFixture({
-    scores: [0, null, 10, 20, 30, 40], statuses: ['complete', 'complete', 'queued', 'running', 'failed', 'cancelled'],
+test('exact-target exports stay independent of active siblings and preserve exhaustive capture checks before filtering', async () => {
+  const base = readablePdfFixture({ scores: [90], targetCount: 2, criterionCount: 1 })
+  base.comparisons[1] = realReportFixture({ scores: [90], targetCount: 2, statuses: ['running'], criterionCount: 1 }).comparisons[1]
+  base.comparisons[1].candidate = structuredClone(base.comparisons[0].candidate)
+  const input = withReportNarratives(base)
+  assert.throws(() => reportFor(input), /ready narrative capture|still active|settled/i)
+  const targetId = input.targets[0].id
+  const report = reportFor(withReportNarratives(input, { targetId }), { targetId })
+  const word = await generate(report)
+  assert.equal(word.sections.length, 5)
+  containsText(word.document, input.targets[0].presentation.organization)
+  assert.ok(!textContent(word.document).includes(input.targets[1].presentation.organization))
+
+  const terminal = readablePdfFixture({ scores: [90], targetCount: 2, criterionCount: 1 })
+  terminal.comparisons[1] = realReportFixture({ scores: [90], targetCount: 2, statuses: ['failed'], criterionCount: 1 }).comparisons[1]
+  terminal.comparisons[1].candidate = structuredClone(terminal.comparisons[0].candidate)
+  const settled = reportFor(withReportNarratives(terminal))
+  assert.equal((await generate(settled)).sections.length, 5, 'Targets with no completed comparison are excluded from both report formats')
+  const damaged = structuredClone(settled)
+  damaged.capture.summaries.comparisons.pop()
+  await assert.rejects(writer.generateDocxReport(damaged, options), /capture|exhaustive|comparison/i)
+  for (const damage of [
+    report => { delete report.capture.summaries },
+    report => { report.capture.summaries.ready = false },
+    report => { delete report.groups[0].comparisons[0].narrative },
+    report => { delete report.groups[0].target.narrative },
+    report => { report.groups[0].comparisons[0].narrative.revision = 'outdated-revision' },
+  ]) {
+    const stale = structuredClone(report)
+    damage(stale)
+    await assert.rejects(writer.generateDocxReport(stale, options), /summary|summaries|narrative|publication/i)
+  }
+})
+
+test('featured reviews follow the supplied exact-target highlights, including capped ties, before every completed glance row', async () => {
+  const report = reportFor(readablePdfFixture({ scores: [100, 99, 98, 97, ...Array(12).fill(80), 70], criterionCount: 1 }))
+  const word = await generate(report)
+  assert.equal(reviewSections(word).length, 10)
+  const rows = all(all(glanceSections(word)[0], 'w:tbl')[0], 'w:tr').slice(1)
+  assert.equal(rows.length, 17)
+  assert.deepEqual(rows.map(row => textContent(all(row, 'w:tc')[0])), report.groups[0].comparisons.map(item => item.candidate.name))
+  assert.equal(textContent(word.sections.at(-1)).includes('Candidates at a glance'), true)
+  assert.doesNotMatch(textContent(word.document), /cutoff ties|competition rank/)
+  const direct = reportFor(readablePdfFixture({ scores: [90, 80, 70], criterionCount: 1 }))
+  direct.groups[0].highlightedComparisonIds = [direct.groups[0].comparisons[2].id]
+  const selected = await generate(direct)
+  assert.equal(reviewSections(selected).length, 1)
+  containsText(reviewSections(selected)[0], direct.groups[0].comparisons[2].candidate.name)
+})
+
+test('zero, withheld and failed/cancelled results have the same meaning as PDF, with no invented unfinished reviews', async () => {
+  const input = readablePdfFixture({
+    scores: [0, null, 10, 20], statuses: ['complete', 'complete', 'failed', 'cancelled'], criterionCount: 1,
   })
-  for (const assessment of input.comparisons[0].criteria) {
-    assessment.score = 0
-    assessment.evidenceStatus = 'missing'
-    assessment.citations = []
-  }
-  input.comparisons[0].coverage.supported = 0
-  input.comparisons[0].coverage.missing = 2
-  const report = foundation.buildAnalysisReport(input)
-  const { document, parts } = await generate(report)
-  containsText(document, foundation.reportStatusNotice(report.counts))
-  containsText(document, 'PARTIAL REPORT')
-  const sections = reviewSections(document)
-  const zero = sections.get('review_0')
-  containsText(zero, '0 / 100')
-  containsText(zero, '0 / 5')
-  containsText(zero, 'Missing evidence')
-  const withheld = sections.get('review_1')
-  containsText(withheld, 'Withheld — Weighted criteria were not assessed.')
-  containsText(withheld, 'unassessed-weighted-criteria')
-  containsText(withheld, 'Not assessed')
-  assert.ok(!all(withheld, 'w:p').some(node => /^(Overall score: )?0 \/ 100$/.test(inlineText(node))))
-  assert.ok(!textContent(withheld).includes('0 / 5'))
-  for (const comparison of report.groups[0].comparisons.filter(item => item.status !== 'complete')) {
-    const section = sections.get(`review_${comparison.index}`)
-    containsText(section, `Status: ${foundation.comparisonStatusLabel(comparison.status)}`)
-    containsText(section, 'No completed assessment was captured')
-    assert.equal(all(section, 'w:tbl').length, 0)
-    assert.ok(!textContent(section).includes('0 / 100'))
-    assert.ok(!textContent(section).includes('Full saved overall assessment'))
-    assert.ok(!textContent(section).includes('Saved rationale'))
-  }
-  containsText(sections.get('review_4'), input.comparisons[4].error.message)
-  containsText(sections.get('review_4'), 'Processing stage: assessment')
-  containsText(sections.get('review_4'), 'Retryable: Yes')
-  const header = [...parts].find(([name]) => /^word\/header\d+\.xml$/.test(name))[1]
-  containsText(header, 'PARTIAL REPORT')
-
-  const allWithheld = foundation.buildAnalysisReport(realReportFixture({ scores: [null, null] }))
-  const { document: noScores } = await generate(allWithheld)
-  containsText(noScores, 'No scored highlights are available')
-  assert.equal(all(noScores, 'w:tbl').length, 2)
-  assert.ok(!all(noScores, 'w:p').some(node => /^(Overall score: )?0 \/ 100$/.test(inlineText(node))))
+  const zero = input.comparisons[0]
+  Object.assign(zero.criteria[0], { score: 0, evidenceStatus: 'missing', citations: [] })
+  Object.assign(zero.coverage, { supported: 0, missing: 1 })
+  const report = reportFor(input), word = await generate(report)
+  containsText(word.document, 'Reporting on 2 of 4 candidates')
+  containsText(reviewSections(word)[0], 'Overall score: 0 / 100')
+  containsText(reviewSections(word)[0], '0 / 5')
+  containsText(reviewSections(word)[0], 'Missing evidence')
+  assert.equal(reviewSections(word).length, 1)
+  const rows = all(all(glanceSections(word)[0], 'w:tbl')[0], 'w:tr').slice(1)
+  assert.equal(rows.length, 2)
+  const withheld = rows.find(row => textContent(all(row, 'w:tc')[1]) === 'Withheld')
+  containsText(withheld, input.comparisons[1].overall.message)
+  assert.doesNotMatch(textContent(withheld), /0 \/ (5|100)/)
+  for (const excluded of input.comparisons.slice(2)) assert.ok(!textContent(word.document).includes(excluded.candidate.name))
+  const unscored = await generate(reportFor(readablePdfFixture({ scores: [null, null], criterionCount: 1 })))
+  assert.equal(reviewSections(unscored).length, 0)
+  assert.equal(all(unscored.document, 'w:tbl').length, 1)
+  assert.doesNotMatch(textContent(unscored.document), /Overall score: 0/)
 })
 
-test('GS qualification text, interpretation, evidence, and limitations remain separate and unscored', async () => {
-  const input = realReportFixture({ scores: [null], kind: 'grade', criterionCount: 5 })
-  const item = input.comparisons[0]
-  const weights = [30, 20, 40, 10, 0]
-  const statuses = ['supported', 'partial', 'missing', 'not-assessed', 'not-applicable']
-  item.criteria.forEach((criterion, index) => {
-    input.targets[0].criteria[index].weight = weights[index]
+test('GS qualification notes remain separate, native bullet lists and never numeric criterion scores', async () => {
+  const input = readablePdfFixture({ scores: [0], criterionCount: 3, kind: 'grade' })
+  const comparison = input.comparisons[0]
+  comparison.completion = 'limited'
+  comparison.criteria.forEach((criterion, index) => {
+    input.targets[0].criteria[index].weight = index ? 0 : 100
     Object.assign(criterion, {
-      weight: weights[index], evidenceStatus: statuses[index], score: [3, 2, 0, null, null][index],
-      citations: index < 2 ? [reportFixtureCitation(item.candidate.documentId)] : [],
-      limitation: index === 3 ? { code: 'frozen-gap', message: 'Saved assessment limitation; do not infer missing coverage.', criterionId: criterion.criterionId } : null,
+      weight: index ? 0 : 100, score: index ? null : 0, citations: [],
+      evidenceStatus: ['missing', 'not-assessed', 'not-applicable'][index],
+      limitation: index === 1 ? { code: 'source-incomplete', criterionId: criterion.criterionId, message: 'The submitted source omits the quantitative project details.' } : null,
     })
   })
-  item.coverage = {
-    totalCriteria: 5, supported: 1, partial: 1, missing: 1, notAssessed: 1, notApplicable: 1, assessedWeight: 90, totalWeight: 100,
-  }
-  item.qualifications = [{
-    qualificationId: 'gs-specialized-experience', text: 'Frozen GS qualification <specialized experience> & responsibility.',
-    interpretation: 'Saved interpretation.\nSeparately review one year of specialized experience.',
-    support: 'derived', evidenceStatus: 'partial', rationale: 'Exact saved GS rationale; this does not assign numeric points.',
-    citations: [reportFixtureCitation(item.candidate.documentId, { quote: 'GS resume quote — exact, not rewritten.' })],
-    requirementCitations: [reportFixtureCitation('gs-reference', { quote: 'Exact GS standard quotation.', pagination: 'pdf-pages', page: 178 })],
-    limitation: { code: 'human-review', message: 'Duration still requires qualified review.', qualificationId: 'gs-specialized-experience' },
+  comparison.coverage = { totalCriteria: 3, supported: 0, partial: 0, missing: 1, notAssessed: 1, notApplicable: 1, assessedWeight: 100, totalWeight: 100 }
+  comparison.qualifications = [{
+    qualificationId: 'qualification-one', text: 'One year of specialized experience at the next lower grade.',
+    interpretation: 'Review the duration and level separately from criterion scores.', support: 'gap', evidenceStatus: 'missing',
+    rationale: 'The resume does not establish a full year of specialized experience at the next lower grade.',
+    citations: [], requirementCitations: [reportFixtureCitation('grade-source', { quote: 'RAW-QUALIFICATION-QUOTE', pagination: 'markdown-sections' })],
+    limitation: { code: 'duration-unverified', message: 'Employment dates do not confirm the required duration.', qualificationId: 'qualification-one' },
   }]
-  item.limitations = [{ code: 'saved-overall-limit', message: 'Overall limitation stays in the saved report.', criterionId: 'criterion-3' }]
-  const report = foundation.buildAnalysisReport(input)
-  const { document } = await generate(report)
-  const section = reviewSections(document).get('review_0')
-  assertFullDetail(section, report.groups[0].target, report.groups[0].comparisons[0])
-  for (const expected of ['Not applicable (excluded)', '0%', '0 / 5', 'Assessed weight / total weight: 90 / 100', 'PDF page 178']) containsText(section, expected)
-  const content = textContent(section)
-  const qualification = content.slice(content.indexOf('GS qualifications — separate, unscored human review'))
-  assert.ok(qualification.includes(item.qualifications[0].text))
-  assert.ok(qualification.includes('Source support: derived'))
-  assert.ok(!/\b\d+ \/ (5|100)\b/.test(qualification), 'Qualification review must not introduce a numeric score')
-  for (const criterionTable of all(section, 'w:tbl')) {
-    assert.ok(!textContent(criterionTable).includes(item.qualifications[0].text))
-  }
+  const word = await generate(reportFor(input)), section = reviewSections(word)[0]
+  for (const value of ['0 / 5', 'Not assessed', 'N/A', 'GS qualification notes (unscored)', 'View grade requirements']) containsText(section, value)
+  const qualificationText = textContent(section).split('GS qualification notes (unscored)')[1]
+  assert.match(qualificationText, /specialized experience|Employment dates/)
+  assert.doesNotMatch(qualificationText, /\b\d+ \/ (5|100)\b|RAW-QUALIFICATION-QUOTE/)
+  assert.ok(all(section, 'w:numPr').length > 0)
+  assert.ok(all(word.parts.get('word/numbering.xml'), 'w:numFmt').some(node => node.attributes['w:val'] === 'bullet'))
+  assert.ok(!all(section, 'w:t').some(node => node.children.join('').startsWith('\u2022 ')))
 })
 
-test('Unicode, XML metacharacters, multiline quotations, tabs, and original source locators survive OOXML escaping', async () => {
-  const input = realReportFixture({ scores: [92.75] })
-  const comparison = input.comparisons[0]
-  comparison.candidate.name = 'Zoë <Sánchez> & "李" — Кириллица 😀'
-  comparison.summary = 'Résumé & <scope> "quoted".\r\nSecond saved line.\n\nFinal line with a\ttab.'
-  const quote = '  Exact <C++> & "SQL" résumé 😀\r\n\n\tSecond line: naïve Ω 李.\nTrailing spaces stay.  '
-  comparison.criteria[0].citations = [reportFixtureCitation(comparison.candidate.documentId, {
-    quote, sourceTitle: 'Résumé & <source>.docx', heading: '"Original" & immutable', pagination: 'captured-sections',
-  })]
-  comparison.criteria[0].requirementCitations = [
-    reportFixtureCitation('requirement-target-0', { quote: 'Frozen <required> & quoted.\nSecond source line.', pagination: 'markdown-sections' }),
-    reportFixtureCitation('requirement-target-0', { quote: 'Exact HTML capture.', pagination: 'html-sections' }),
-    reportFixtureCitation('requirement-target-0', { quote: 'Printed PDF passage.', pagination: 'pdf-pages', page: 178 }),
-  ]
-  input.targets[0].criteria[0].guidance = 'Frozen <guidance> & score anchors.\n0: No evidence.\n5: Sustained ownership.'
-  const report = foundation.buildAnalysisReport(input)
-  input.targets[0].criteria[0].guidance = 'Live guidance must never replace the frozen guidance.'
-  input.comparisons[0].criteria[0].citations[0].quote = 'Live replacement must not appear.'
-  const { document, entries } = await generate(report)
-  const section = reviewSections(document).get('review_0')
-  assertFullDetail(section, report.groups[0].target, report.groups[0].comparisons[0])
-  containsText(section, quote)
-  containsText(section, comparison.summary)
-  containsText(section, 'Captured source section 3 (not a printed page)')
-  containsText(section, 'Markdown section 3')
-  containsText(section, 'Captured HTML section 3')
-  containsText(section, 'PDF page 178')
-  assert.ok(!textContent(document).includes('Live replacement'))
-  assert.ok(!textContent(document).includes('Live guidance'))
-  assert.match(entries.get('word/document.xml'), /&lt;C\+\+&gt; &amp;/)
-  assert.ok(all(document, 'w:tab').length > 0)
-  assert.ok(all(document, 'w:t').some(node => node.attributes['xml:space'] === 'preserve' && node.children.join('').startsWith('  Exact')))
+test('Unicode, XML escaping, tabs and multiline saved prose remain intact and editable', async () => {
+  const input = readablePdfFixture({ criterionCount: 1 })
+  input.comparisons[0].candidate.name = 'Zoë <Sánchez> & "李" — Кириллица 😀'
+  input.targets[0].presentation.description = '  Exact <C++> & "SQL" résumé 😀\r\n\n\tSecond line: naïve Ω 李.\nTrailing spaces stay.  '
+  input.comparisons[0].narrative.text = 'Résumé & scope "quoted" is documented. A second saved statement explains the work. The final statement describes the remaining evidence gap.'
+  const report = reportFor(withReportNarratives(input))
+  const word = await generate(report)
+  containsText(word.document, input.comparisons[0].candidate.name)
+  containsText(word.document, input.targets[0].presentation.description)
+  containsText(word.document, input.comparisons[0].narrative.text)
+  assert.match(word.entries.get('word/document.xml'), /&lt;C\+\+&gt; &amp;/)
+  assert.ok(all(word.document, 'w:tab').length > 0)
+  assert.ok(all(word.document, 'w:t').some(node => node.attributes['xml:space'] === 'preserve' && node.children.join('').startsWith('  Exact')))
 })
 
-test('long full assessments and many criteria/citations flow without clipping or excerpting details', async () => {
-  const input = realReportFixture({ scores: [89], criterionCount: 20 })
-  const comparison = input.comparisons[0]
-  comparison.summary = `${'Full saved assessment line.\n'.repeat(300)}UNIQUE FULL ASSESSMENT END`
-  for (const [index, criterion] of comparison.criteria.entries()) {
-    criterion.rationale = `${index}: ${'Detailed saved rationale is not shortened. '.repeat(35)}END RATIONALE ${index}`
-    criterion.citations = Array.from({ length: 3 }, (_, citation) => reportFixtureCitation(comparison.candidate.documentId, {
-      paragraphId: `criterion-${index}-passage-${citation}`, quote: `${'Exact evidence text.\n'.repeat(45)}END QUOTE ${index}-${citation}`,
-    }))
-    criterion.requirementCitations[0].quote = `${'Full frozen requirement wording. '.repeat(30)}END REQUIREMENT ${index}`
-  }
-  const report = foundation.buildAnalysisReport(input)
-  const { document } = await generate(report)
-  const section = reviewSections(document).get('review_0')
-  assertFullDetail(section, report.groups[0].target, report.groups[0].comparisons[0])
-  assert.ok(!textContent(section).includes('[excerpt]'))
-  assert.equal(all(all(section, 'w:tbl')[0], 'w:tr').length, 21)
-  assert.equal(all(document, 'w:trHeight').length, 0)
-  assert.equal(all(document, 'w:txbxContent').length, 0)
+test('long identities, descriptions, overview paragraphs and every criterion flow without fixed-height or clipped text', async () => {
+  const input = readablePdfFixture({ scores: [92.7525], criterionCount: 100 })
+  input.targets[0].presentation.title = `Survey Statistician ${'Regional data analysis '.repeat(15)}FULL TITLE END`
+  input.targets[0].presentation.organization = `Office of ${'Technical assurance '.repeat(20)}FULL OFFICE END`
+  input.targets[0].presentation.description = `${'Saved role context.\n'.repeat(150)}FULL DESCRIPTION END`
+  input.targets[0].criteria[0].label = `${'Complete criterion wording '.repeat(140)}FULL CRITERION END`
+  input.comparisons[0].candidate.name = `Full Candidate ${'W'.repeat(150)}\nFULL NAME END`
+  const word = await generate(reportFor(input))
+  for (const value of Object.values(input.targets[0].presentation)) if (value) containsText(word.document, value)
+  const section = reviewSections(word)[0]
+  containsText(section, input.comparisons[0].candidate.name.replace(/\s+/g, ' '))
+  containsText(section.header, 'Candidate 1')
+  assert.doesNotMatch(textContent(section.header), /FULL NAME END|\u2026|\[excerpt\]/)
+  const rows = all(all(section, 'w:tbl')[0], 'w:tr')
+  assert.equal(rows.length, 101)
+  input.targets[0].criteria.forEach((criterion, index) => containsText(section, `C${index + 1} ${criterion.label}`))
+  for (const name of ['w:trHeight', 'w:txbxContent']) assert.equal(all(word.document, name).length, 0)
+  for (const row of rows.slice(1)) assert.ok(all(row, 'w:cantSplit').every(node => node.attributes['w:val'] === 'false'), 'Oversized rows must be able to continue on another page')
 })
 
-test('fractional weights fit readable cells with shared display labels, explicit approximation notes, and unchanged scores', async () => {
-  const report = foundation.buildAnalysisReport(realReportFixture({ scores: [92.7525], criterionCount: 3 }))
-  const before = JSON.stringify(report)
-  const { document } = await generate(report)
-  const section = reviewSections(document).get('review_0')
-  const scoreTable = all(section, 'w:tbl')[0]
-  const rows = all(scoreTable, 'w:tr').slice(1)
+test('fractional weights use the shared display labels without changing saved values', async () => {
+  const report = reportFor(readablePdfFixture({ scores: [92.7525], criterionCount: 3 }))
+  const word = await generate(report), review = reviewSections(word)[0]
+  const rows = all(all(review, 'w:tbl')[0], 'w:tr').slice(1)
   assert.deepEqual(rows.map(row => textContent(all(row, 'w:tc')[1])), Array(3).fill('~33.33%'))
-  assert.equal(all(scoreTable, 'w:gridCol')[1].attributes['w:w'], '1320')
-  containsText(section, 'Weight / requirement: ~33.33%')
-  containsText(section, '~ marks display-rounded criterion weights')
-  containsText(section, 'Saved scores and weight totals are unchanged.')
-  containsText(section, '92.7525 / 100')
-  assert.ok(!textContent(document).includes('33.333333333333336%'))
-  assert.equal(JSON.stringify(report), before)
-
-  const tiny = realReportFixture({ scores: [89], criterionCount: 3 })
-  const weights = [0, 50, 0.005]
-  tiny.targets[0].criteria.forEach((criterion, index) => { criterion.weight = weights[index] })
-  tiny.comparisons[0].criteria.forEach((criterion, index) => { criterion.weight = weights[index] })
-  tiny.comparisons[0].coverage.assessedWeight = 50.005
-  tiny.comparisons[0].coverage.totalWeight = 50.005
-  const tinyReport = foundation.buildAnalysisReport(tiny)
-  const { document: tinyDocument } = await generate(tinyReport)
-  const tinySection = reviewSections(tinyDocument).get('review_0')
-  assert.deepEqual(
-    all(all(tinySection, 'w:tbl')[0], 'w:tr').slice(1).map(row => textContent(all(row, 'w:tc')[1])),
-    ['0%', '50%', '<0.01%'],
-  )
-  containsText(tinySection, '<0.01% denotes a smaller nonzero weight')
-  const { document: exactDocument } = await generate(foundation.buildAnalysisReport(realReportFixture({ scores: [89] })))
-  assert.ok(!textContent(exactDocument).includes('~ marks display-rounded'))
+  containsText(review, '~ marks a weight rounded for display.')
+  containsText(review, '92.7525 / 100')
+  assert.doesNotMatch(textContent(word.document), /33\.333333333333336%/)
 })
 
-test('compact provenance retains every unique frozen identity and exact fact without duplicating selection fields', async () => {
-  for (const kind of ['job', 'grade']) {
-    const input = realReportFixture({ scores: [92.75], kind, criterionCount: 3 })
-    const target = input.targets[0]
-    const comparison = input.comparisons[0]
-    if (kind === 'job') {
-      target.selection.rubricHash = 'b'.repeat(64)
-      target.selection.documentSha256 = 'c'.repeat(64)
-      target.facts.push(
-        { label: 'Rubric SHA-256', value: target.selection.rubricHash },
-        { label: 'Requirement document SHA-256', value: target.selection.documentSha256 },
-      )
-    } else {
-      target.selection.versionHash = 'b'.repeat(64)
-      target.selection.sourceSetHash = 'c'.repeat(64)
-      target.facts.push(
-        { label: 'Grade version SHA-256', value: target.selection.versionHash },
-        { label: 'Approval ID', value: target.selection.approvalId },
-        { label: 'Grade grounding review ID', value: target.selection.reviewId },
-        { label: 'Frozen source set ID', value: target.selection.sourceSetId },
-        { label: 'Frozen source set SHA-256', value: target.selection.sourceSetHash },
-      )
-    }
-    target.snapshot.sha256 = 'd'.repeat(64)
-    comparison.candidate.documentSha256 = 'e'.repeat(64)
-    comparison.candidate.snapshot.sha256 = 'f'.repeat(64)
-    comparison.resultSha256 = '1'.repeat(64)
-    target.facts.push({ label: 'Exact audit note', value: 'Original <saved> provenance & detail.\nSecond line retains its exact words.' })
-    const report = foundation.buildAnalysisReport(input)
-    const { document } = await generate(report)
-    const section = reviewSections(document).get('review_0')
-    assertFullDetail(section, report.groups[0].target, report.groups[0].comparisons[0])
-    const compact = all(section, 'w:p').filter(node => all(node, 'w:pStyle').some(style => style.attributes['w:val'] === 'ReportProvenance'))
-    assert.ok(compact.length <= 16, 'Provenance should use concise labelled paragraphs, not label/value pairs and a raw selection dump')
-    for (const fact of [...target.facts, ...comparison.provenance]) {
-      assert.ok(compact.some(node => inlineText(node).includes(`${fact.label}: ${normalizeLines(fact.value)}`)))
-    }
-    const provenance = compact.map(inlineText).join('\n')
-    for (const hash of ['b'.repeat(64), 'c'.repeat(64)]) assert.equal(provenance.split(hash).length - 1, 1, 'Exact identity facts must not be duplicated by selection metadata')
-    assert.ok(!provenance.includes('rubricVersion:'))
-    assert.ok(!provenance.includes('kind:'))
-    assert.ok(!textContent(section).includes('Frozen target selection'))
+test('Word uses PDF-equivalent US Letter geometry, palette, outline headings, repeating headers and dual DXA table widths', async () => {
+  const word = await generate(reportFor(readablePdfFixture({ scores: [90], criterionCount: 2 })))
+  for (const section of word.sections) {
+    const size = all(section.properties, 'w:pgSz')[0].attributes
+    assert.equal(size['w:w'], '12240')
+    assert.equal(size['w:h'], '15840')
+    const margin = all(section.properties, 'w:pgMar')[0].attributes
+    for (const [side, value] of Object.entries({ top: 2140, bottom: 1320, left: 920, right: 920 })) assert.equal(Number(margin[`w:${side}`]), value)
+    containsText(section.header, 'Score')
+    assert.equal(all(section.header, 'w:p').length, 3)
+    const stops = all(section.header, 'w:tab').filter(node => node.attributes['w:val'])
+    assert.ok(stops.every(node => node.attributes['w:pos'] === (node.attributes['w:val'] === 'left' ? '0' : '10400')),
+      'Header tab stops are relative to the text margin even when shading extends to the page edges')
   }
-})
-
-test('page starts, US Letter geometry, readable built-in styles, repeating table headers, and dual DXA widths are explicit', async () => {
-  const report = foundation.buildAnalysisReport(realReportFixture({ targetCount: 2 }))
-  const { document, parts } = await generate(report)
-  const size = all(document, 'w:pgSz')[0].attributes
-  assert.equal(size['w:w'], '12240')
-  assert.equal(size['w:h'], '15840')
-  const margin = all(document, 'w:pgMar')[0].attributes
-  for (const side of ['top', 'bottom', 'left', 'right']) assert.equal(margin[`w:${side}`], '1440')
-  const sections = all(document, 'w:sectPr')
-  assert.equal(sections.length, report.counts.total + 1)
-  for (const section of sections.slice(1)) assert.equal(all(section, 'w:type')[0].attributes['w:val'], 'nextPage')
-  assert.ok(all(document, 'w:pgNumType').every(node => node.attributes['w:start'] === undefined), 'Page numbers must continue across candidate sections')
-  const pageStarts = all(document, 'w:p').filter(p => all(p, 'w:pageBreakBefore').some(mark => mark.attributes['w:val'] !== 'false'))
-  assert.equal(pageStarts.length, report.groups.length)
-  for (const start of pageStarts) {
-    assert.ok(inlineText(start).trim().length > 0, 'Page breaks must start real headings, not empty pages')
-    assert.equal(all(start, 'w:pStyle')[0].attributes['w:val'], 'Heading1')
-  }
-  for (const section of reviewSections(document).values()) {
-    assert.equal(all(section.children[0], 'w:pageBreakBefore').length, 0, 'Section page starts must not be doubled by paragraph page breaks')
-  }
-  for (const grid of all(document, 'w:tbl')) {
-    const width = all(grid, 'w:tblW')[0].attributes
-    assert.equal(width['w:type'], 'dxa')
-    assert.equal(width['w:w'], '9360')
-    assert.equal(all(grid, 'w:tblLayout')[0].attributes['w:type'], 'fixed')
-    const columns = all(grid, 'w:gridCol').map(node => Number(node.attributes['w:w']))
-    assert.equal(columns.reduce((sum, value) => sum + value, 0), 9360)
-    const rows = all(grid, 'w:tr')
+  for (const section of word.sections.slice(1)) assert.equal(all(section.properties, 'w:type')[0].attributes['w:val'], 'nextPage')
+  assert.ok(all(word.document, 'w:pgNumType').every(node => node.attributes['w:start'] === undefined))
+  assert.equal(all(word.document, 'w:pageBreakBefore').length, 0, 'Do not double section starts with paragraph page breaks')
+  for (const table of all(word.document, 'w:tbl')) {
+    assert.deepEqual(all(table, 'w:tblW')[0].attributes, { 'w:w': '10400', 'w:type': 'dxa' })
+    assert.equal(all(table, 'w:tblLayout')[0].attributes['w:type'], 'fixed')
+    const columns = all(table, 'w:gridCol').map(node => Number(node.attributes['w:w']))
+    assert.equal(columns.reduce((sum, value) => sum + value, 0), 10400)
+    const rows = all(table, 'w:tr')
     assert.equal(all(rows[0], 'w:tblHeader').length, 1)
-    assert.equal(all(grid, 'w:tblHeader').length, 1)
-    for (const row of rows) {
-      for (const [index, cell] of all(row, 'w:tc').entries()) {
-        const cellWidth = all(cell, 'w:tcW')[0].attributes
-        assert.equal(cellWidth['w:type'], 'dxa')
-        assert.equal(Number(cellWidth['w:w']), columns[index])
-        assert.ok(all(cell, 'w:tcMar').length > 0)
-      }
+    assert.equal(all(table, 'w:tblHeader').length, 1)
+    for (const row of rows) for (const [index, cell] of all(row, 'w:tc').entries()) {
+      assert.equal(Number(all(cell, 'w:tcW')[0].attributes['w:w']), columns[index])
+      assert.equal(all(cell, 'w:tcW')[0].attributes['w:type'], 'dxa')
+      assert.ok(all(cell, 'w:tcMar').length > 0)
     }
   }
-  const styleNodes = all(parts.get('word/styles.xml'), 'w:style')
-  assert.equal(new Set(styleNodes.map(node => node.attributes['w:styleId'])).size, styleNodes.length, 'Style IDs must be unique')
+  const styleNodes = all(word.parts.get('word/styles.xml'), 'w:style')
+  assert.equal(new Set(styleNodes.map(node => node.attributes['w:styleId'])).size, styleNodes.length)
   for (const level of [1, 2, 3]) {
     const style = styleNodes.find(node => node.attributes['w:styleId'] === `Heading${level}`)
-    assert.ok(style, `Built-in Heading${level} must be styled`)
     assert.equal(all(style, 'w:outlineLvl')[0].attributes['w:val'], String(level - 1))
-    assert.ok(all(style, 'w:keepNext').length > 0)
   }
-  for (const part of parts.values()) {
-    for (const fontSize of all(part, 'w:sz')) assert.ok(Number(fontSize.attributes['w:val']) >= 20, 'No text below 10 pt')
+  for (const fontSize of all(word.document, 'w:sz')) assert.ok(Number(fontSize.attributes['w:val']) >= 19)
+  assert.ok(all(word.document, 'w:color').some(node => node.attributes['w:val'] === 'B11F4B'))
+  assert.ok(all(word.document, 'w:shd').every(node => node.attributes['w:val'] === 'clear'))
+  for (const border of all(word.document, 'w:pBdr')) {
+    const order = ['w:top', 'w:left', 'w:bottom', 'w:right', 'w:between', 'w:bar']
+    const children = border.children.filter(node => typeof node !== 'string').map(node => order.indexOf(node.name))
+    assert.ok(children.every((value, index) => value >= 0 && (!index || children[index - 1] < value)),
+      'Paragraph borders must follow the OOXML schema order')
   }
-  const header = [...parts].find(([name]) => /^word\/header\d+\.xml$/.test(name))[1]
-  const footer = [...parts].find(([name]) => /^word\/footer\d+\.xml$/.test(name))[1]
-  containsText(header, 'SCORE')
-  containsText(footer, 'Human review required')
-  const instructions = all(footer, 'w:instrText').flatMap(node => node.children).join(' ')
-  assert.match(instructions, /\bPAGE\b/)
-  assert.match(instructions, /\bNUMPAGES\b/)
-  const bookmarks = new Set(all(document, 'w:bookmarkStart').map(mark => mark.attributes['w:name']))
-  for (const link of all(document, 'w:hyperlink')) assert.ok(bookmarks.has(link.attributes['w:anchor']))
+  const footer = [...word.parts].find(([name]) => /^word\/footer\d+\.xml$/.test(name))[1]
+  const fields = all(footer, 'w:instrText').flatMap(node => node.children).join(' ')
+  assert.match(fields, /\bPAGE\b/)
+  assert.match(fields, /\bNUMPAGES\b/)
+  assert.equal(all(word.document, 'w:footerReference').length, 1, 'Other sections inherit continuous pagination')
 })
 
-test('every candidate section has a bounded, readable continuation header identifying the candidate and target', async () => {
-  const input = realReportFixture({ scores: [90, 80], targetCount: 2 })
-  input.comparisons.filter(item => item.candidate.id === 'candidate-1').forEach(item => {
-    item.candidate.name = `Long candidate name ${'W'.repeat(80)}\nFull saved name ends here`
-  })
-  input.targets[1].label = `Long target ${'W'.repeat(80)}\nFull saved target ends here`
-  const report = foundation.buildAnalysisReport(input)
-  const { document, parts } = await generate(report)
-  const relationships = new Map(all(parts.get('word/_rels/document.xml.rels'), 'Relationship').map(node => [
-    node.attributes.Id, node.attributes.Target,
+test('both full local Noto Sans faces are embedded with valid relationships and lossless font bytes', async () => {
+  const word = await generate(reportFor(readablePdfFixture({ criterionCount: 1 })))
+  const fontTable = word.parts.get('word/fontTable.xml')
+  const family = all(fontTable, 'w:font').find(node => node.attributes['w:name'] === 'Noto Sans')
+  assert.ok(family)
+  const relationships = new Map(all(word.parts.get('word/_rels/fontTable.xml.rels'), 'Relationship').map(node => [node.attributes.Id, node.attributes]))
+  for (const [weight, element] of [['regular', 'w:embedRegular'], ['bold', 'w:embedBold']]) {
+    const embedded = all(family, element)[0].attributes
+    assert.match(embedded['w:fontKey'], /^\{[A-F0-9-]{36}\}$/)
+    const relationship = relationships.get(embedded['r:id'])
+    assert.ok(relationship.Type.endsWith('/font'))
+    assert.equal(relationship.TargetMode, undefined)
+    const data = Buffer.from(word.entries.get(`word/${relationship.Target}`))
+    const key = Buffer.from(embedded['w:fontKey'].replace(/[{}-]/g, ''), 'hex').reverse()
+    for (let index = 0; index < 32; index++) data[index] ^= key[index % 16]
+    assert.deepEqual(data, Buffer.from(options.fonts[weight]), 'Embedded fonts must survive browser-safe OOXML obfuscation exactly')
+  }
+  assert.ok(all(word.parts.get('word/styles.xml'), 'w:rFonts').some(node => node.attributes['w:ascii'] === 'Noto Sans'))
+})
+
+test('every one of 500 completed candidates remains in the editable glance table, without 500 featured reviews', async () => {
+  const report = reportFor(readablePdfFixture({ scores: Array.from({ length: 500 }, (_, index) => index % 101), criterionCount: 1 }))
+  const word = await generate(report)
+  containsText(word.document, 'Distinct reviewed candidates: 500')
+  containsText(word.document, 'Completed candidate-job reviews: 500')
+  assert.equal(reviewSections(word).length, report.groups[0].highlightedComparisonIds.length)
+  const rows = all(all(glanceSections(word)[0], 'w:tbl')[0], 'w:tr').slice(1)
+  assert.equal(rows.length, 500)
+  assert.deepEqual(rows.map(row => all(row, 'w:tc').slice(0, 2).map(textContent)), report.groups[0].comparisons.map(comparison => [
+    comparison.candidate.name, foundation.overallScoreLabel(comparison.overall),
   ]))
-  const sectionProperties = all(document, 'w:sectPr')
-  let sectionIndex = 1
-  for (const group of report.groups) {
-    for (const comparison of group.comparisons) {
-      const properties = sectionProperties[sectionIndex++]
-      const reference = all(properties, 'w:headerReference').find(node => node.attributes['w:type'] === 'default')
-      const header = parts.get(`word/${relationships.get(reference.attributes['r:id'])}`)
-      assert.ok(header, 'Each review needs its own default header for every continuation page')
-      const name = foundation.summaryExcerpt(foundation.candidateName(comparison.candidate).replace(/\s+/g, ' '), 36).text
-      const target = foundation.summaryExcerpt(group.target.label.replace(/\s+/g, ' '), 40).text
-      containsText(header, `Review ${comparison.index + 1}: ${name}`)
-      containsText(header, `Target: ${target}`)
-      containsText(header, 'SAVED ANALYSIS')
-      assert.equal(all(header, 'w:p').length, 3)
-      assert.ok(all(header, 'w:p').every(node => all(node, 'w:br').length === 0), 'Source newlines must not expand the running header')
-      const review = reviewSections(document).get(`review_${comparison.index}`)
-      containsText(review, foundation.candidateName(comparison.candidate))
-      containsText(review, group.target.label)
-    }
-  }
-  assert.equal(all(document, 'w:footerReference').length, 1, 'Candidate sections inherit the continuous report footer')
 })
 
-test('fictional sample notices and human-review guidance are visible in body and running header', async () => {
-  const run = foundation.createInitialWorkspace().runs[0]
-  const report = foundation.buildSampleAnalysisReport(run, { generatedAt: REPORT_TEST_TIMESTAMP })
-  const { document, parts } = await generate(report)
-  containsText(document, foundation.REPORT_SAMPLE_NOTICE)
-  containsText(document, foundation.REPORT_HUMAN_REVIEW_NOTICE)
-  containsText(document, foundation.reportTitle(report))
-  containsText(document, `${report.candidateCount} candidates`)
-  const header = [...parts].find(([name]) => /^word\/header\d+\.xml$/.test(name))[1]
-  containsText(header, 'FICTIONAL SAMPLE')
-  assert.equal(reviewSections(document).size, report.counts.total)
-  for (const group of report.groups) {
-    for (const comparison of group.comparisons) assertFullDetail(reviewSections(document).get(`review_${comparison.index}`), group.target, comparison)
-  }
+test('fictional sample identity remains explicit without real model provenance or network calls', async () => {
+  const report = foundation.buildSampleAnalysisReport(foundation.createInitialWorkspace().runs[0], { generatedAt: REPORT_TEST_TIMESTAMP })
+  const word = await generate(report, { fonts: options.fonts, links: { origin: options.links.origin } })
+  containsText(word.document, foundation.REPORT_SAMPLE_NOTICE)
+  containsText(word.document, foundation.REPORT_HUMAN_REVIEW_NOTICE)
+  for (const section of word.sections) containsText(section.header, 'FICTIONAL SAMPLE')
 })
 
-test('the 500-comparison report limit is supported without silently dropping candidates', async () => {
-  const report = foundation.buildAnalysisReport(realReportFixture({ scores: Array.from({ length: 500 }, (_, index) => index % 101), criterionCount: 1 }))
-  const { document } = await generate(report)
-  containsText(document, '500 candidates · 500 comparisons · 1 exact target')
-  const sections = reviewSections(document)
-  assert.equal(sections.size, 500)
-  for (const comparison of report.groups[0].comparisons) {
-    const section = sections.get(`review_${comparison.index}`)
-    containsText(section, `Candidate ID: ${comparison.candidate.id}`)
-    containsText(section, `Comparison ID: ${comparison.id}`)
-    containsText(section, foundation.overallScoreLabel(comparison.overall))
-  }
-})
-
-test('XML-invalid controls and lone surrogates are rejected explicitly rather than dropped or corrupting the ZIP', async () => {
+test('XML-invalid controls, including deliberately omitted evidence, fail visibly rather than corrupting the package', async () => {
   for (const invalid of ['\0', '\u0001', '\u000B', '\u000C', '\u001F', '\uFFFE', '\uFFFF', '\uD800', '\uDC00']) {
-    const report = foundation.buildAnalysisReport(realReportFixture({ scores: [90] }))
+    const report = reportFor()
     report.groups[0].comparisons[0].criteria[0].citations[0].quote += invalid
-    await assert.rejects(writer.generateDocxReport(report), /XML-invalid character \(U\+[0-9A-F]+\).*cannot be generated safely/)
-  }
-  const report = foundation.buildAnalysisReport(realReportFixture({ scores: [90] }))
-  report.groups[0].target.facts[0].value += '\u0002'
-  await assert.rejects(writer.generateDocxReport(report), /XML-invalid character/)
-})
-
-test('output byte limit rejects the actual complete package with an actionable message', async () => {
-  const report = foundation.buildAnalysisReport(realReportFixture({ scores: [90] }))
-  const originalLimit = writer.REPORT_LIMITS.maxOutputBytes
-  try {
-    writer.REPORT_LIMITS.maxOutputBytes = 100
-    await assert.rejects(writer.generateDocxReport(report), /Word report exceeds the output size limit.*Narrow the export.*no comparisons or evidence have been omitted/)
-  } finally {
-    writer.REPORT_LIMITS.maxOutputBytes = originalLimit
+    await assert.rejects(writer.generateDocxReport(report, options), /XML-invalid character \(U\+[0-9A-F]+\).*cannot be generated safely/)
   }
 })
 
-test('browser bundle emits a real readable DOCX Blob without Node globals, filesystem access, or conversion services', async () => {
+test('missing/corrupt fonts and unsafe or mismatched link contexts fail explicitly', async () => {
+  const report = reportFor()
+  await assert.rejects(writer.generateDocxReport(report, { links: options.links }), /locally bundled.*regular and bold/)
+  for (const bytes of [new ArrayBuffer(4), Uint8Array.of(0, 1, 0, 0).buffer, new ArrayBuffer(4 * 1024 * 1024 + 1)]) {
+    await assert.rejects(writer.generateDocxReport(report, { ...options, fonts: { ...options.fonts, regular: bytes } }), /local Word regular font/)
+  }
+  for (const links of [
+    undefined, { origin: 'file:///private/report.docx' }, { ...options.links, origin: 'https://score.example/private' },
+    { ...options.links, workspaceId: 'another-workspace' },
+  ]) await assert.rejects(writer.generateDocxReport(report, { ...options, links }), /origin|workspace|HTTP|link/i)
+})
+
+test('input, output, section and generation limits abort visibly without returning a partial document', async () => {
+  for (const [key, value, pattern] of [
+    ['maxOutputBytes', 100, /Word report exceeds the output size limit/],
+    ['maxPages', 1, /Word report exceeds the section\/page resource limit/],
+    ['maxGenerationMilliseconds', -1, /Word generation exceeded the report time limit/],
+  ]) {
+    const report = reportFor(), original = writer.REPORT_LIMITS[key]
+    try {
+      writer.REPORT_LIMITS[key] = value
+      await assert.rejects(writer.generateDocxReport(report, options), pattern)
+    } finally { writer.REPORT_LIMITS[key] = original }
+  }
+  const invalid = reportFor()
+  invalid.groups[0].target.presentation.description = 'x'.repeat(writer.REPORT_LIMITS.maxTextCharacters + 1)
+  await assert.rejects(writer.generateDocxReport(invalid, options), /presentation metadata is invalid/)
+  await assert.rejects(writer.generateDocxReport(foundation.buildAnalysisReport(realReportFixture()), options), /ready narrative capture/)
+})
+
+test('browser bundle emits genuine editable OOXML and embedded fonts without Node globals or network access', async () => {
   const bundle = await build({
-    stdin: { resolveDir: process.cwd(), loader: 'ts', contents: entry },
+    stdin: { resolveDir: process.cwd(), loader: 'ts', contents: "export { generateDocxReport } from './src/services/analysisReports/docx';" },
     bundle: true, write: false, platform: 'browser', format: 'iife', globalName: 'DocxReport',
     metafile: true, logLevel: 'silent',
   })
-  for (const output of Object.values(bundle.metafile.outputs)) {
-    assert.ok(!output.imports.some(item => item.external), 'Browser bundle must not need Node/external modules')
-  }
-  const sandbox = { Blob, TextEncoder, TextDecoder, setTimeout, clearTimeout, console }
+  for (const output of Object.values(bundle.metafile.outputs)) assert.ok(!output.imports.some(item => item.external))
+  const sandbox = { Blob, TextEncoder, TextDecoder, URL, URLSearchParams, setTimeout, clearTimeout, console }
   runInNewContext(`${bundle.outputFiles[0].text}\nglobalThis.reportWriter = DocxReport`, sandbox)
   assert.equal(sandbox.Buffer, undefined)
   assert.equal(sandbox.process, undefined)
-  const report = foundation.buildAnalysisReport(realReportFixture({ scores: [92.75] }))
-  const bytes = await sandbox.reportWriter.generateDocxReport(report)
-  const blob = new Blob([bytes], { type: foundation.REPORT_FORMATS.docx.mimeType })
-  assert.equal(blob.type, 'application/vnd.openxmlformats-officedocument.wordprocessingml.document')
-  assert.ok(blob.size > 1000)
-  const entries = await unzip(new Uint8Array(await blob.arrayBuffer()))
+  const bytes = await sandbox.reportWriter.generateDocxReport(reportFor(), options)
+  const entries = await unzip(bytes)
   for (const [name, xml] of entries) if (/\.(xml|rels)$/.test(name)) parseXml(xml, name)
-  const document = parseXml(entries.get('word/document.xml'), 'word/document.xml')
-  containsText(document, '92.75 / 100')
-  containsText(document, 'Candidate 0')
+  containsText(parseXml(entries.get('word/document.xml'), 'word/document.xml'), 'Alex Morgan')
+  assert.ok(entries.has('word/fonts/font1.odttf'))
+  assert.ok(entries.has('word/fonts/font2.odttf'))
+})
+
+test('matching fictional Word and PDF fixtures support native local layout review', async () => {
+  const fixtures = [
+    ['ordinary', fictionalPdfQaFixture()], ['long', fictionalPdfQaFixture('long')], ['large', fictionalPdfQaFixture('large')],
+    ['multi', fictionalPdfNavigationQaFixture()], ['long-metadata', fictionalPdfNavigationQaFixture('long-metadata')],
+  ]
+  for (const [name, input] of fixtures) {
+    const report = reportFor(fictionalSampleInput(input))
+    const generationOptions = { fonts: options.fonts, links: { origin: options.links.origin } }
+    const word = await generate(report, generationOptions)
+    containsText(word.document, foundation.REPORT_SAMPLE_NOTICE)
+    assert.equal(reviewSections(word).length, report.groups.reduce((sum, group) => sum + group.highlightedComparisonIds.length, 0))
+    if (process.env.REPORT_DOCX_QA_DIRECTORY) {
+      await mkdir(process.env.REPORT_DOCX_QA_DIRECTORY, { recursive: true })
+      await writeFile(join(process.env.REPORT_DOCX_QA_DIRECTORY, `score-word-${name}.docx`), word.bytes)
+      await writeFile(join(process.env.REPORT_DOCX_QA_DIRECTORY, `score-pdf-${name}.pdf`), await writer.generatePdfReport(report, generationOptions))
+    }
+  }
 })

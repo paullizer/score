@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { mkdir, rm } from 'node:fs/promises'
 import { join, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
@@ -18,6 +18,8 @@ export async function loadReportFoundation() {
         export * from './src/services/analysisReports/presentation';
         export * from './src/services/analysisReports/readable';
         export * from './src/services/analysisReports/sample';
+        export * from './src/services/analysisReports/narratives';
+        export * from './src/services/analysisReports/narrative-schemas';
         export { createInitialWorkspace, createFixtureWorkspace } from './src/data/fixtures';
         export { snapshotAnalysisRun, evaluateComparison } from './src/services/scoring';
       ` },
@@ -124,4 +126,117 @@ export function realReportFixture({
 
 export function realReportBatchFixture(input = realReportFixture()) {
   return { schemaVersion: 1, dataKind: 'real', workspaceId: input.workspaceId, runId: input.run.id, targets: input.targets, comparisons: input.comparisons }
+}
+
+const narrativeHash = value => createHash('sha256').update(JSON.stringify(value)).digest('hex')
+const narrativePin = narrative => narrative ? { revision: narrative.revision, inputFingerprint: narrative.inputFingerprint } : null
+
+// Test-only publications preserve supplied prose; application samples use sample.ts.
+export function withReportNarratives(input, { targetId = null } = {}) {
+  const value = structuredClone(input)
+  if (!['real', 'sample'].includes(value.dataKind) ||
+    [...value.targets, ...value.comparisons].some(item => item.dataKind !== value.dataKind ||
+      (item.narrative?.dataKind !== undefined && item.narrative.dataKind !== value.dataKind))) {
+    throw new Error('Narrative test fixtures must keep real and sample provenance separate.')
+  }
+  const fixtureId = `report-fixture-${narrativeHash(value.run.id)}`
+  const publicationMetadata = (kind, id, inputFingerprint) => value.dataKind === 'real'
+    ? { dataKind: 'real', generationId: `${kind}-generation-${id}`, inputFingerprint, publishedAt: REPORT_TEST_TIMESTAMP }
+    : { dataKind: 'sample', fixtureId, inputFingerprint: `fixture-${inputFingerprint}` }
+  const publicationRevision = publication => `${value.dataKind === 'sample' ? 'fixture-' : ''}${narrativeHash(publication)}`
+  for (const target of value.targets) {
+    target.presentation ??= {
+      title: target.label, organization: target.sublabel,
+      description: 'Captured analytical work requirements and the documented scope of delivery responsibilities.',
+      series: target.kind === 'grade' ? '0801' : '',
+      grade: target.selection?.kind === 'grade' ? `GS-${target.selection.grade}`
+        : target.facts.find(fact => fact.label === 'Illustrative grade')?.value ?? '',
+      versionLabel: target.versionLabel,
+    }
+  }
+  for (const comparison of value.comparisons) {
+    if (comparison.status !== 'complete') { delete comparison.narrative; continue }
+    const inputFingerprint = narrativeHash([comparison.id, comparison.targetId, comparison.candidate.snapshot, comparison.resultSha256])
+    const supplied = comparison.narrative
+    if (supplied && (typeof supplied.text !== 'string' || typeof supplied.overview !== 'string')) {
+      throw new Error('A supplied candidate fixture narrative needs both text and overview.')
+    }
+    const content = supplied ? { text: supplied.text, overview: supplied.overview } : comparison.overall.status === 'withheld' ? {
+      text: 'The saved evidence describes relevant work, but the record does not establish the full scope of the target requirements. Unassessed criteria leave material questions unresolved and prevent a supported overall conclusion. Reviewers should examine the original passages and qualification notes rather than infer undocumented experience.',
+      overview: 'Relevant work is documented, but unresolved requirements prevent a supported overall conclusion.',
+    } : {
+      text: 'The saved resume documents sustained responsibility for investigating operational problems and explaining the resulting findings. Those examples support the analytical and delivery requirements within the scope of the captured evidence. The record does not independently establish every qualification, so reviewers should examine the cited passages and separate limitations.',
+      overview: 'The record shows analytical work, but reviewers must verify its scope and unresolved requirements against the saved evidence.',
+    }
+    const publication = { ...publicationMetadata('candidate', comparison.id, inputFingerprint), ...content }
+    comparison.narrative = { ...publication, revision: publicationRevision(publication) }
+  }
+  for (const target of value.targets) {
+    const comparisons = value.comparisons.filter(comparison => comparison.targetId === target.id)
+    if (!comparisons.some(comparison => comparison.status === 'complete')) { delete target.narrative; continue }
+    const inputFingerprint = narrativeHash([target.id, target.snapshot, comparisons.map(comparison => [
+      comparison.id, comparison.status, comparison.resultSha256, narrativePin(comparison.narrative),
+    ])])
+    const supplied = target.narrative
+    if (supplied && (!Array.isArray(supplied.paragraphs) || supplied.paragraphs.some(paragraph => typeof paragraph !== 'string'))) {
+      throw new Error('A supplied target fixture narrative needs saved paragraphs.')
+    }
+    const publication = {
+      ...publicationMetadata('target', target.id, inputFingerprint),
+      paragraphs: supplied?.paragraphs ?? ['The reviewed records contain analytical and delivery examples, with differences in the depth of supporting evidence. Incomplete and unassessed requirements remain material limits to comparison, while any failed or cancelled reviews provide no candidate evidence.'],
+    }
+    target.narrative = { ...publication, revision: publicationRevision(publication) }
+  }
+  const comparisons = value.comparisons.filter(comparison => targetId === null || comparison.targetId === targetId).map(comparison => ({
+    comparisonId: comparison.id, targetId: comparison.targetId, status: comparison.status,
+    resultSha256: comparison.resultSha256, narrative: narrativePin(comparison.narrative),
+  }))
+  const targets = value.targets.filter(target => targetId === null || target.id === targetId)
+    .map(target => ({ targetId: target.id, narrative: narrativePin(target.narrative) }))
+  const capture = {
+    dataKind: 'real', ready: !comparisons.some(comparison => comparison.status === 'queued' || comparison.status === 'running'),
+    scope: { targetId }, comparisons, targets,
+  }
+  value.capture.summaries = value.dataKind === 'real' ? { ...capture, revision: narrativeHash(capture) } : {
+    dataKind: 'sample', source: 'fixture', fixtureId, ready: true, scope: { targetId },
+    revision: `fixture-${narrativeHash(capture)}`,
+  }
+  return value
+}
+
+export const withReadyReportNarratives = withReportNarratives
+
+export function reportSummariesFixture(input, options) {
+  if (input.dataKind !== 'real') throw new Error('Only a real-shaped test fixture can simulate the real summaries endpoint.')
+  const value = withReportNarratives(input, options)
+  const capture = value.capture.summaries
+  const baseState = {
+    waitingFor: null, attempts: 1, retryCount: 0, nextAttemptAt: null, updatedAt: REPORT_TEST_TIMESTAMP, error: null,
+  }
+  const state = publication => ({
+    ...baseState, status: publication ? 'ready' : 'not-required',
+    generationId: publication?.generationId ?? null, inputFingerprint: publication?.inputFingerprint ?? null,
+    published: publication ?? null,
+  })
+  const comparisons = capture.comparisons.map(pin => {
+    const comparison = value.comparisons.find(comparison => comparison.id === pin.comparisonId)
+    return { ...state(comparison.narrative), kind: 'candidate', comparisonId: pin.comparisonId, targetId: pin.targetId, comparisonStatus: pin.status }
+  })
+  const targets = capture.targets.map(pin => {
+    const target = value.targets.find(target => target.id === pin.targetId)
+    return { ...state(target.narrative), kind: 'target', targetId: target.id }
+  })
+  const counts = entries => {
+    const result = { total: entries.length, missing: 0, waiting: 0, queued: 0, running: 0, ready: 0, stale: 0, failed: 0, cancelled: 0, notRequired: 0 }
+    for (const entry of entries) result[entry.status === 'not-required' ? 'notRequired' : entry.status]++
+    return result
+  }
+  const scoring = { total: comparisons.length, initialized: comparisons.length, queued: 0, running: 0, complete: 0, failed: 0, cancelled: 0 }
+  for (const comparison of comparisons) scoring[comparison.comparisonStatus]++
+  return {
+    schemaVersion: 1, dataKind: 'real', workspaceId: value.workspaceId, runId: value.run.id,
+    scope: capture.scope, revision: capture.revision, etag: `"${capture.revision}"`, ready: capture.ready, capture,
+    scoring, counts: { candidates: counts(comparisons), targets: counts(targets) },
+    capabilities: { canGenerate: true, reason: null }, comparisons, targets,
+  }
 }

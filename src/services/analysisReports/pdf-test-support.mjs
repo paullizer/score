@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { decodePDFRawStream, PDFArray, PDFDict, PDFDocument, PDFName, PDFRawStream } from 'pdf-lib'
-import { realReportFixture, reportFixtureCitation } from './test-support.mjs'
+import { realReportFixture, reportFixtureCitation, withReportNarratives } from './test-support.mjs'
 
 const utf16Decoder = new TextDecoder('utf-16be')
 const streamDecoder = new TextDecoder()
@@ -12,7 +12,9 @@ export async function readPdf(bytes) {
   assert.equal(new TextDecoder().decode(bytes.slice(0, 5)), '%PDF-')
   const document = await PDFDocument.load(bytes)
   const fontCache = new Map()
-  const pages = document.getPages().map(page => {
+  const savedPages = document.getPages()
+  const pageIndices = new Map(savedPages.map((page, index) => [page.ref.toString(), index]))
+  const pages = savedPages.map(page => {
     const fonts = new Map()
     const resources = page.node.Resources().lookup(PDFName.of('Font'), PDFDict)
     for (const [key, reference] of resources.entries()) {
@@ -59,11 +61,22 @@ export async function readPdf(bytes) {
     const annotations = (page.node.Annots()?.asArray() ?? []).map(reference => {
       const annotation = document.context.lookup(reference, PDFDict)
       assert.equal(annotation.lookup(PDFName.of('Subtype')).toString(), '/Link')
+      const rect = annotation.lookup(PDFName.of('Rect'), PDFArray).asArray().map(value => value.asNumber())
+      if (annotation.has(PDFName.of('Dest'))) {
+        assert.equal(annotation.has(PDFName.of('A')), false, 'Native internal destinations must not become URI actions')
+        const destination = annotation.lookup(PDFName.of('Dest'), PDFArray).asArray()
+        const targetPageIndex = pageIndices.get(destination[0].toString())
+        assert.notEqual(targetPageIndex, undefined, 'Internal links must resolve to a final page in this PDF')
+        assert.equal(destination[1].toString(), '/XYZ')
+        assert.equal(destination[2].toString(), 'null')
+        assert.equal(destination[3].asNumber(), savedPages[targetPageIndex].getHeight())
+        assert.equal(destination[4].toString(), 'null')
+        return { kind: 'internal', targetPageIndex, rect }
+      }
       const action = annotation.lookup(PDFName.of('A'), PDFDict)
       assert.equal(action.lookup(PDFName.of('S')).toString(), '/URI')
       return {
-        url: action.lookup(PDFName.of('URI')).decodeText(),
-        rect: annotation.lookup(PDFName.of('Rect'), PDFArray).asArray().map(value => value.asNumber()),
+        kind: 'uri', url: action.lookup(PDFName.of('URI')).decodeText(), rect,
       }
     })
     return {
@@ -72,11 +85,17 @@ export async function readPdf(bytes) {
       rendered: items.map(item => item.rendered).join(''),
       body: items.filter(item => item.y > 60 && item.y < 704).map(item => item.source).join(''),
       section: items.find(item => item.y === 766)?.source ?? '',
+      primary: items.find(item => item.y === 734)?.source ?? '',
+      secondary: items.find(item => item.y === 718)?.source ?? '',
+      uriAnnotations: annotations.filter(annotation => annotation.kind === 'uri'),
+      internalAnnotations: annotations.filter(annotation => annotation.kind === 'internal'),
     }
   })
   return {
     document, pages, text: pages.map(page => page.text).join('\n'), body: pages.map(page => page.body).join(''),
     annotations: pages.flatMap(page => page.annotations),
+    uriAnnotations: pages.flatMap(page => page.uriAnnotations),
+    internalAnnotations: pages.flatMap(page => page.internalAnnotations),
   }
 }
 
@@ -84,13 +103,17 @@ export function reviewSections(pdf) {
   const sections = []
   for (const page of pdf.pages) {
     if (!page.section.endsWith('Candidate review')) continue
-    if (page.items.some(item => item.size === 20 && item.source.startsWith('Overall score:'))) sections.push({ pages: [] })
+    if (sections.at(-1)?.primary !== page.primary || sections.at(-1)?.secondary !== page.secondary) {
+      sections.push({ primary: page.primary, secondary: page.secondary, pages: [] })
+    }
     if (sections.length) sections.at(-1).pages.push(page)
   }
   return sections.map(section => ({ ...section, body: section.pages.map(page => page.body).join('') }))
 }
 
 export const overviewPages = pdf => pdf.pages.filter(page => page.section.endsWith('Candidates at a glance'))
+export const contentsPages = pdf => pdf.pages.filter(page => page.section.endsWith('Contents'))
+export const targetOpenerPages = pdf => pdf.pages.filter(page => page.body.includes('Return to contents'))
 
 export function assertNoClipping(pdf, fonts) {
   for (const page of pdf.pages) {
@@ -131,6 +154,17 @@ export function readablePdfFixture(options = {}) {
     target.label = target.kind === 'grade' ? 'General engineering · GS-9' : 'Engineering specialist'
     target.sublabel = `Example public works team ${index + 1}`
     target.facts = [{ label: 'Organization', value: `Example public works team ${index + 1}` }, { label: 'Series', value: '0801' }, { label: 'Grade', value: 'GS-9' }]
+    target.presentation = {
+      title: target.label, organization: target.sublabel,
+      description: 'The saved role covers engineering methods, quantitative analysis and delivery of documented public works projects.',
+      series: '0801', grade: 'GS-9', versionLabel: target.versionLabel,
+    }
+    if (input.comparisons.some(comparison => comparison.targetId === target.id && comparison.status === 'complete')) {
+      target.narrative = { paragraphs: [
+        'The completed reviews document engineering work on defined projects, with evidence of applied methods and technical communication. The scope and completeness of that evidence vary across the saved assessments.',
+        'Larger programme leadership and final decision ownership need closer source review where they are not documented. These observations concern the saved evidence for this exact target and do not establish suitability or official eligibility.',
+      ] }
+    }
     for (const [number, criterion] of target.criteria.entries()) {
       criterion.label = labels[number] ?? `Engineering evidence area ${number + 1}`
       criterion.description = `RAW-WORDING-${number}. Apply engineering methods to defined projects and communicate findings.`
@@ -146,6 +180,13 @@ export function readablePdfFixture(options = {}) {
     if (comparison.status !== 'complete') continue
     comparison.summary = `Led ${project} and independently checked engineering calculations. The submitted work includes concise technical reports for public works reviewers.`
     if (comparison.overall.status === 'withheld') comparison.summary = `The resume describes ${project}, but the available source could not establish the weighted requirements.`
+    comparison.narrative = comparison.overall.status === 'withheld' ? {
+      text: `The resume describes ${project}, but the available source is incomplete. The saved assessment cannot establish the weighted requirements from that material. The withheld result requires source verification rather than interpretation as a zero score.`,
+      overview: `The resume describes ${project}, but incomplete source evidence prevents an overall score.`,
+    } : {
+      text: `${comparison.summary} The record does not establish responsibility for larger programmes, which needs separate human verification.`,
+      overview: `Documented ${project} work includes engineering calculations and technical reporting, while larger programme responsibility remains unverified.`,
+    }
     comparison.criteria.forEach((criterion, number) => {
       const evidence = [
         `Applied engineering methods to ${project} and documented design assumptions.`,
@@ -172,18 +213,20 @@ export function readablePdfFixture(options = {}) {
       })]
     })
   }
-  return input
+  return withReportNarratives(input)
 }
 
 export function fictionalSampleInput(input) {
   const sample = structuredClone(input)
   sample.dataKind = 'sample'
   delete sample.workspaceId
+  delete sample.capture.summaries
   for (const target of sample.targets) {
     target.dataKind = 'sample'
     target.rubricId = target.id
     target.selection = null
     target.snapshot = null
+    if (target.narrative) target.narrative = { paragraphs: target.narrative.paragraphs }
   }
   for (const comparison of sample.comparisons) {
     comparison.dataKind = 'sample'
@@ -191,8 +234,9 @@ export function fictionalSampleInput(input) {
     comparison.candidate.snapshot = null
     comparison.resultSha256 = null
     comparison.qualifications = []
+    if (comparison.narrative) comparison.narrative = { text: comparison.narrative.text, overview: comparison.narrative.overview }
   }
-  return sample
+  return withReportNarratives(sample)
 }
 
 export function fictionalPdfQaFixture(kind = 'ordinary') {
@@ -208,12 +252,25 @@ export function fictionalPdfQaFixture(kind = 'ordinary') {
     { label: 'Functions', value: 'Survey design, statistical analysis and research delivery' },
     { label: 'Supervision', value: 'Small research team with external fieldwork partners' },
   ]
+  target.presentation = {
+    title: target.label, organization: target.sublabel,
+    description: 'The saved role concerns survey design, statistical analysis and delivery of research findings, with responsibility for a small research team and external fieldwork partners.',
+    series: '1530', grade: 'GS-12', versionLabel: target.versionLabel,
+  }
+  target.narrative = { paragraphs: [
+    'The completed review documents survey planning, statistical analysis and delivery of published research. Its strongest examples connect research methods with completed fieldwork and reproducible reporting.',
+    'Leadership evidence concerns mentoring analysts and coordinating a small research team. Broader programme ownership and budget authority remain unverified and require human inspection of the saved sources.',
+  ] }
   comparison.candidate.name = 'Alex Example'
   comparison.candidate.role = 'Survey methodologist'
   comparison.candidate.sourceLabel = large ? 'Alex-Example-research-portfolio.pdf' : 'Alex-Example-research-resume.pdf'
   comparison.summary = large
     ? 'Broad research-portfolio evidence covers survey planning, statistical analysis and delivered project work. Leadership examples mainly concern small teams rather than multi-team programme ownership.'
     : 'Strong survey design and statistical analysis, backed by delivered research projects. The resume documents small-team mentoring but gives fewer examples of leadership at a larger scale.'
+  comparison.narrative = {
+    text: `${comparison.summary} Responsibility for budgets and larger research programmes remains unverified in the saved evidence.`,
+    overview: 'Survey design and statistical analysis are supported by delivered research, while larger programme leadership remains unverified.',
+  }
   const ordinary = [
     ['Survey design', 40, 5, 'Designed household and business surveys, including sampling frames, field protocols and quality checks.'],
     ['Statistical analysis', 25, 4, 'Used R and Python to estimate survey results, assess non-response bias and report confidence intervals.'],
@@ -283,5 +340,27 @@ export function fictionalPdfQaFixture(kind = 'ordinary') {
     totalCriteria: target.criteria.length, supported: large ? 80 : 3, partial: large ? 20 : 1,
     missing: 0, notAssessed: 0, notApplicable: 0, assessedWeight: 100, totalWeight: 100,
   }
-  return input
+  return withReportNarratives(input)
+}
+
+export function fictionalPdfNavigationQaFixture(kind = 'multi') {
+  const long = kind === 'long-metadata'
+  const input = readablePdfFixture({ scores: [92, 84, 73, null], targetCount: 3, criterionCount: 4 })
+  for (const [index, target] of input.targets.entries()) {
+    target.presentation = {
+      title: long
+        ? `General Engineering Specialist - ${'Technical Assurance and Regional Public Infrastructure Research '.repeat(4)}${index + 1}`
+        : 'General Engineering Specialist',
+      organization: `${['Eastern', 'Western', 'Central'][index]} Public Works Research Office${long
+        ? `, ${'National Technical Processing and Evidence Review Center '.repeat(5)}Division ${index + 1}` : ''}`,
+      description: long
+        ? `Saved role context ${index + 1}.\n\n${'The role covers documented engineering methods, quantitative checks and coordination of public works research. '.repeat(90)}End of saved role context ${index + 1}.`
+        : 'The role covers documented engineering methods, quantitative checks and coordination of public works research.',
+      series: '0801', grade: `GS-${9 + index * 2}`, versionLabel: `Approved rubric v${index + 1}`,
+    }
+    target.label = 'Legacy composite label must not appear in the PDF'
+    target.sublabel = 'Legacy composite subtitle must not appear in the PDF'
+    target.versionLabel = target.presentation.versionLabel
+  }
+  return withReportNarratives(input)
 }

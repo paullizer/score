@@ -56,11 +56,12 @@ function targetFacts(target: FrozenRealAnalysisTargetSnapshot): ReportFact[] {
 
 function reportTarget(comparison: RealAnalysisComparisonRecord, target: FrozenRealAnalysisTargetSnapshot): RealReportTarget {
   const rubric = target.kind === 'job' ? target.rubric : target.version.rubric
+  const versionLabel = target.kind === 'grade' ? `Approved GS-${target.selection.grade} · rubric v${rubric.version}`
+    : `Rubric v${rubric.version} · source document v${target.document.version}`
   return {
     id: target.summary.id, dataKind: 'real', kind: target.kind,
     label: target.summary.label, sublabel: target.summary.sublabel,
-    versionLabel: target.kind === 'grade' ? `Approved GS-${target.selection.grade} · rubric v${rubric.version}`
-      : `Rubric v${rubric.version} · source document v${target.document.version}`,
+    versionLabel,
     rubricId: rubric.id, rubricVersion: rubric.version, selection: target.selection,
     snapshot: { snapshotId: comparison.target.snapshotId, sha256: comparison.target.blob.sha256 },
     criteria: rubric.criteria.map(criterion => ({
@@ -68,6 +69,15 @@ function reportTarget(comparison: RealAnalysisComparisonRecord, target: FrozenRe
       weight: criterion.weight, guidance: criterion.guidance, requirementType: criterion.requirementType ?? null,
     })),
     facts: targetFacts(target),
+    presentation: target.kind === 'job' ? {
+      title: target.job.title, organization: target.job.organization, description: target.rubric.description,
+      series: target.job.series, grade: target.job.grade, versionLabel,
+    } : {
+      title: target.seed.job.title,
+      organization: target.sourceSet.context.agency.trim() ? target.sourceSet.context.agency : target.seed.job.organization,
+      description: target.version.rubric.description, series: target.sourceSet.context.series,
+      grade: `GS-${target.selection.grade}`, versionLabel,
+    },
   }
 }
 

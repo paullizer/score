@@ -5,12 +5,14 @@ import {
 import type { Color, PDFDocument, PDFFont, PDFPage } from 'pdf-lib'
 import { REPORT_LIMITS } from '../../domain/analysis-reports'
 import { REPORT_PALETTE } from './presentation'
+import { DOCUMENT_REPORT_PAGE, DOCUMENT_REPORT_WIDTH, documentMetadataText } from './document-layout'
+import type {
+  DocumentContentsEntry, DocumentPageIdentity, DocumentReportLayout, DocumentReportLink,
+  DocumentTableCell, DocumentTextLink, DocumentTextStyle,
+} from './document-layout'
 
-export const PDF_REPORT_PAGE = {
-  width: 612, height: 792, margin: 46, bodyTop: 685, bodyBottom: 66,
-} as const
-
-export const PDF_REPORT_WIDTH = PDF_REPORT_PAGE.width - PDF_REPORT_PAGE.margin * 2
+export const PDF_REPORT_PAGE = DOCUMENT_REPORT_PAGE
+export const PDF_REPORT_WIDTH = DOCUMENT_REPORT_WIDTH
 
 function color(hex: string): Color {
   return rgb(parseInt(hex.slice(0, 2), 16) / 255, parseInt(hex.slice(2, 4), 16) / 255, parseInt(hex.slice(4, 6), 16) / 255)
@@ -30,39 +32,20 @@ export interface PdfReportFonts {
   bold: PDFFont
 }
 
-export interface PdfReportLink {
-  text: string
-  url: string
-}
-
-type TableCell = string | PdfReportLink
+export type PdfReportLink = DocumentReportLink
+type TableCell = DocumentTableCell
+type TextLink = DocumentTextLink
+type ContentsEntry = DocumentContentsEntry
 
 interface TextLine {
   text: string
   source: string
 }
 
-interface TextStyle {
-  size?: number
-  leading?: number
-  bold?: boolean
-  color?: Color
-  padding?: number
-  background?: Color
-  rule?: boolean
-  before?: number
-  after?: number
-  keepWithNext?: number
-  keepTailWithNext?: boolean
-  link?: string
-}
+type TextStyle = DocumentTextStyle<Color>
+type PageIdentity = DocumentPageIdentity
 
-interface PageIdentity {
-  section: string
-  primary: string
-  secondary: string
-}
-
+const PRIMARY_HEADER_SIZE = 9.5
 const segmenter = new Intl.Segmenter(undefined, { granularity: 'grapheme' })
 const printable = (text: string) => text.replace(/\t/g, '    ')
 
@@ -115,21 +98,8 @@ export function wrapPdfText(
   return lines
 }
 
-function compactHeader(text: string, measure: (text: string) => number): string {
-  const oneLine = text.replace(/[\r\n\t\u0085\u2028\u2029]+/gu, ' ')
-  if (measure(oneLine) <= PDF_REPORT_WIDTH) return oneLine
-  const graphemes = Array.from(segmenter.segment(oneLine), value => value.segment)
-  let low = 0
-  let high = graphemes.length
-  while (low < high) {
-    const middle = Math.ceil((low + high) / 2)
-    if (measure(`${graphemes.slice(0, middle).join('')}…`) <= PDF_REPORT_WIDTH) low = middle
-    else high = middle - 1
-  }
-  return `${graphemes.slice(0, low).join('')}…`
-}
-
-export class PdfReportLayout {
+export class PdfReportLayout implements DocumentReportLayout<Color> {
+  readonly colors = PDF_REPORT_COLORS
   private page!: PDFPage
   private y: number = PDF_REPORT_PAGE.bodyTop
   private identity!: PageIdentity
@@ -138,6 +108,9 @@ export class PdfReportLayout {
   private readonly fontKeys = new WeakMap<PDFPage, Map<PDFFont, PDFName>>()
   private readonly fontRuns = new Map<PDFFont, Map<string, { width: number; encoded?: PDFHexString }>>()
   private readonly checkedLinks = new Set<string>()
+  private readonly destinations = new Map<string, PDFPage>()
+  private readonly internalLinks: { page: PDFPage; destination: string; rect: number[] }[] = []
+  private readonly pageReferences: { page: PDFPage; destination: string; baseline: number }[] = []
 
   constructor(
     readonly document: PDFDocument,
@@ -173,8 +146,18 @@ export class PdfReportLayout {
   }
 
   startSection(identity: PageIdentity): void {
-    this.identity = identity
+    const primaryFits = !/[\r\n\t\u0085\u2028\u2029]/u.test(identity.primary) &&
+      this.measure(identity.primary, this.fonts.bold, PRIMARY_HEADER_SIZE) <= PDF_REPORT_WIDTH
+    this.identity = !primaryFits && identity.primaryFallback !== undefined
+      ? { ...identity, primary: identity.primaryFallback } : identity
     this.newPage()
+  }
+
+  markDestination(destination: string): void {
+    if (!destination || !this.page || this.destinations.has(destination)) {
+      throw new Error('PDF destinations must have unique identities and refer to an existing section opener.')
+    }
+    this.destinations.set(destination, this.page)
   }
 
   checkTime(): void {
@@ -195,15 +178,24 @@ export class PdfReportLayout {
     })
     this.drawText('Score', PDF_REPORT_PAGE.margin, 765, 13, this.fonts.bold, PDF_REPORT_COLORS.accent)
     const badge = [this.designation, this.identity.section].filter(Boolean).join(' · ')
+    for (const [text, font, size, width] of [
+      [badge, this.fonts.regular, 8.5, PDF_REPORT_WIDTH - 65],
+      [this.identity.primary, this.fonts.bold, PRIMARY_HEADER_SIZE, PDF_REPORT_WIDTH],
+      [this.identity.secondary, this.fonts.regular, 9, PDF_REPORT_WIDTH],
+    ] as const) {
+      if (/[\r\n\t\u0085\u2028\u2029]/u.test(text) || this.measure(text, font, size) > width) {
+        throw new Error('PDF running headers require short section labels. Full job and candidate identities must wrap in the page body.')
+      }
+    }
     this.drawText(badge, PDF_REPORT_PAGE.width - PDF_REPORT_PAGE.margin - this.measure(badge, this.fonts.regular, 8.5),
       766, 8.5, this.fonts.regular, PDF_REPORT_COLORS.muted)
     this.page.drawLine({
       start: { x: PDF_REPORT_PAGE.margin, y: 751 }, end: { x: PDF_REPORT_PAGE.width - PDF_REPORT_PAGE.margin, y: 751 },
       color: PDF_REPORT_COLORS.border, thickness: 0.6,
     })
-    this.drawText(compactHeader(this.identity.primary, value => this.measure(value, this.fonts.bold, 9.5)),
-      PDF_REPORT_PAGE.margin, 734, 9.5, this.fonts.bold, PDF_REPORT_COLORS.text)
-    this.drawText(compactHeader(this.identity.secondary, value => this.measure(value, this.fonts.regular, 9)),
+    this.drawText(this.identity.primary,
+      PDF_REPORT_PAGE.margin, 734, PRIMARY_HEADER_SIZE, this.fonts.bold, PDF_REPORT_COLORS.text)
+    this.drawText(this.identity.secondary,
       PDF_REPORT_PAGE.margin, 718, 9, this.fonts.regular, PDF_REPORT_COLORS.muted)
   }
 
@@ -211,34 +203,37 @@ export class PdfReportLayout {
     if (this.y - height < PDF_REPORT_PAGE.bodyBottom) this.newPage()
   }
 
-  private addLink(url: string, text: string, x: number, baseline: number, size: number, font: PDFFont): void {
-    if (!this.checkedLinks.has(url)) {
+  private addLink(link: TextLink, text: string, x: number, baseline: number, size: number, font: PDFFont): void {
+    if (typeof link === 'string' && !this.checkedLinks.has(link)) {
       let destination: URL
-      try { destination = new URL(url) } catch { throw new Error('A PDF report link must be an absolute application URL.') }
+      try { destination = new URL(link) } catch { throw new Error('A PDF report link must be an absolute application URL.') }
       if (!['http:', 'https:'].includes(destination.protocol) || destination.username || destination.password ||
-        Array.from(url).some(character => character.charCodeAt(0) <= 0x20 || character.charCodeAt(0) === 0x7f)) {
+        Array.from(link).some(character => character.charCodeAt(0) <= 0x20 || character.charCodeAt(0) === 0x7f)) {
         throw new Error('A PDF report link must use a safe HTTP or HTTPS application URL without credentials.')
       }
-      this.checkedLinks.add(url)
+      this.checkedLinks.add(link)
     }
     if (!text.trim()) return
     const width = this.measure(text, font, size)
     const ascent = font.heightAtSize(size, { descender: false })
     const descent = font.heightAtSize(size) - ascent
-    const annotation = this.document.context.obj({
-      Type: 'Annot', Subtype: 'Link',
-      Rect: [x, baseline - descent, x + width, baseline + ascent],
-      Border: [0, 0, 0],
-      A: { Type: 'Action', S: 'URI', URI: PDFString.of(url) },
-    })
-    this.page.node.addAnnot(this.document.context.register(annotation))
+    const rect = [x, baseline - descent, x + width, baseline + ascent]
+    if (typeof link === 'string') {
+      const annotation = this.document.context.obj({
+        Type: 'Annot', Subtype: 'Link', Rect: rect, Border: [0, 0, 0],
+        A: { Type: 'Action', S: 'URI', URI: PDFString.of(link) },
+      })
+      this.page.node.addAnnot(this.document.context.register(annotation))
+    } else {
+      this.internalLinks.push({ page: this.page, destination: link.destination, rect })
+    }
     this.page.drawLine({
       start: { x, y: baseline - 1.5 }, end: { x: x + width, y: baseline - 1.5 },
       color: PDF_REPORT_COLORS.accent, thickness: 0.4,
     })
   }
 
-  private drawText(text: string, x: number, baseline: number, size: number, font: PDFFont, fill: Color, source = text, link?: string): void {
+  private drawText(text: string, x: number, baseline: number, size: number, font: PDFFont, fill: Color, source = text, link?: TextLink): void {
     if (!text && !source) return
     for (const character of printable(text)) {
       const code = character.codePointAt(0)!
@@ -328,6 +323,31 @@ export class PdfReportLayout {
     this.paragraph(text, { bold: true, after: 4, keepWithNext: 30 })
   }
 
+  contentsEntry(entry: ContentsEntry): void {
+    const metadata = entry.metadata.join('\n')
+    const blocks = [
+      { text: entry.title, size: 13, leading: 19, bold: true, after: 4, link: { destination: entry.destination }, keepWithNext: 28 },
+      ...(entry.organization ? [{ text: entry.organization, size: 10.5, leading: 16, after: 4, keepWithNext: 14 }] : []),
+      ...(metadata ? [{ text: metadata, size: 9.5, leading: 14, after: 4, color: PDF_REPORT_COLORS.muted }] : []),
+      { text: entry.detail, size: 9.5, leading: 14, after: 16, color: PDF_REPORT_COLORS.muted },
+    ]
+    const height = 20 + blocks.reduce((sum, block) => sum +
+      this.wrap(block.text, 'bold' in block && block.bold ? this.fonts.bold : this.fonts.regular,
+        block.size, PDF_REPORT_WIDTH).length * block.leading + block.after, 0)
+    const bodyHeight = PDF_REPORT_PAGE.bodyTop - PDF_REPORT_PAGE.bodyBottom
+    this.ensureSpace(height <= bodyHeight ? height : 58)
+    const baseline = this.y - this.fonts.bold.heightAtSize(10, { descender: false })
+    if (this.measure(entry.label, this.fonts.bold, 10) +
+      this.measure(`Page ${REPORT_LIMITS.maxPages}`, this.fonts.regular, 10) + 24 > PDF_REPORT_WIDTH) {
+      throw new Error('PDF contents labels must leave space for their final page references.')
+    }
+    this.drawText(entry.label, PDF_REPORT_PAGE.margin, baseline, 10, this.fonts.bold,
+      PDF_REPORT_COLORS.accent, entry.label, { destination: entry.destination })
+    this.pageReferences.push({ page: this.page, destination: entry.destination, baseline })
+    this.y -= 20
+    for (const { text, ...style } of blocks) this.paragraph(text, style)
+  }
+
   callout(text: string, bold = false): void {
     this.paragraph(text, { bold, padding: 10, background: PDF_REPORT_COLORS.background, rule: true, after: 10 })
   }
@@ -391,23 +411,8 @@ export class PdfReportLayout {
   }
 
   metadata(entries: string[]): void {
-    const rows: string[] = []
-    let row = ''
-    const flush = () => { if (row) rows.push(row); row = '' }
-    for (const entry of entries) {
-      if (/[\r\n\u0085\u2028\u2029]/u.test(entry) || this.measure(entry, this.fonts.regular, 9.5) > PDF_REPORT_WIDTH) {
-        flush()
-        rows.push(entry)
-        continue
-      }
-      const combined = row ? `${row} · ${entry}` : entry
-      if (this.measure(combined, this.fonts.regular, 9.5) > PDF_REPORT_WIDTH) {
-        flush()
-        row = entry
-      } else row = combined
-    }
-    flush()
-    if (rows.length) this.paragraph(rows.join('\n'), { size: 9.5, leading: 14, after: 6 })
+    const text = documentMetadataText(entries, value => this.measure(value, this.fonts.regular, 9.5))
+    if (text) this.paragraph(text, { size: 9.5, leading: 14, after: 6 })
   }
 
   table(headers: string[], rows: TableCell[][], widths: number[]): void {
@@ -473,6 +478,27 @@ export class PdfReportLayout {
 
   finish(): void {
     const pages = this.document.getPages()
+    const pageNumbers = new Map(pages.map((page, index) => [page, index + 1]))
+    const destinationPage = (destination: string): PDFPage => {
+      const page = this.destinations.get(destination)
+      if (!page || !pageNumbers.has(page)) throw new Error('A PDF internal link has no final destination. No incomplete report was generated.')
+      return page
+    }
+    // Page references and native destinations resolve only after every flowing section is laid out.
+    for (const reference of this.pageReferences) {
+      const text = `Page ${pageNumbers.get(destinationPage(reference.destination))}`
+      this.page = reference.page
+      this.drawText(text, PDF_REPORT_PAGE.width - PDF_REPORT_PAGE.margin - this.measure(text, this.fonts.regular, 10),
+        reference.baseline, 10, this.fonts.regular, PDF_REPORT_COLORS.accent, text, { destination: reference.destination })
+    }
+    for (const link of this.internalLinks) {
+      const page = destinationPage(link.destination)
+      const annotation = this.document.context.obj({
+        Type: 'Annot', Subtype: 'Link', Rect: link.rect, Border: [0, 0, 0],
+        Dest: [page.ref, 'XYZ', null, page.getHeight(), null],
+      })
+      link.page.node.addAnnot(this.document.context.register(annotation))
+    }
     pages.forEach((page, index) => {
       this.page = page
       page.drawLine({

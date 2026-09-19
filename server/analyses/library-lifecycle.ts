@@ -178,6 +178,8 @@ async function startOperation(
   const now = timestampAfter(timestamp, current.record)
   const record = cancelled(current.record, now, actor)
   record.updatedAt = now
+  record.narrativeCancelledAt = now
+  if (action === 'delete') delete record.narrativeRequestId
   if (!parent && action === 'archive') record.lifecycle = { ...record.lifecycle, archivedAt: record.lifecycle?.archivedAt ?? now }
   if (action === 'delete') record.lifecycle = { ...record.lifecycle, deletingAt: record.lifecycle?.deletingAt ?? now }
   const next: AnalysisLifecycleControl = {
@@ -194,12 +196,15 @@ async function startOperation(
   return operation
 }
 
-async function purgeComparisons(analyses: RealAnalysesDeps, workspaceId: string, runId: string, timestamp: string): Promise<boolean> {
+async function purgeComparisons(
+  analyses: RealAnalysesDeps, workspaceId: string, runId: string, timestamp: string,
+  recordType: 'analysis-comparison' | 'analysis-candidate-narrative' | 'analysis-target-narrative' | 'analysis-narrative-request',
+): Promise<boolean> {
   let continuationToken: string | undefined
   const seen = new Set<string>()
   let chunks = 0
   while (chunks < MAINTENANCE_CHUNKS) {
-    const page = await analyses.store.list(workspaceId, { recordType: 'analysis-comparison', runId, limit: 25, continuationToken })
+    const page = await analyses.store.list(workspaceId, { recordType, runId, limit: 25, continuationToken })
     if (!page.items.length) {
       continuationToken = page.continuationToken
       pageToken(continuationToken, seen)
@@ -212,7 +217,7 @@ async function purgeComparisons(analyses: RealAnalysesDeps, workspaceId: string,
     const operations: AnalysisTransaction[] = []
     for (const value of page.items) {
       const record = parseAnalysisEntity(value.record)
-      assertAnalysis(record.recordType === 'analysis-comparison' && record.workspaceId === workspaceId && record.runId === runId &&
+      assertAnalysis(record.recordType === recordType && record.workspaceId === workspaceId && record.runId === runId &&
         value.etag, 'Analysis cleanup attempted to remove an unrelated comparison.')
       const operation: AnalysisTransaction = { kind: 'delete', record, etag: value.etag }
       const size = Buffer.byteLength(JSON.stringify(operation))
@@ -224,6 +229,7 @@ async function purgeComparisons(analyses: RealAnalysesDeps, workspaceId: string,
     operations.push({ kind: 'replace', record: { ...current.record, updatedAt: timestampAfter(timestamp, current.record) }, etag: current.etag })
     assertWorkspaceMutationLease(workspaceId)
     await analyses.store.transact(workspaceId, operations, { lifecycle: true })
+    if (operations.length === page.items.length + 1 && !page.continuationToken) return true
     // Deletion changes offsets. Start over, but never stop at an empty page that has a continuation.
     continuationToken = undefined
     seen.clear()
@@ -245,6 +251,8 @@ async function purgeBlobs(analyses: RealAnalysesDeps, workspaceId: string, runId
       assertWorkspaceMutationLease(workspaceId)
       await analyses.blobs.delete(workspaceId, runId, item.name, item.etag)
     }
+    // Writers are drained and new writes are fenced, so an exhausted page proves cleanup is complete.
+    if (!page.continuationToken) return true
     if (page.items.length) {
       continuationToken = undefined
       seen.clear()
@@ -252,7 +260,6 @@ async function purgeBlobs(analyses: RealAnalysesDeps, workspaceId: string, runId
     } else {
       continuationToken = page.continuationToken
       pageToken(continuationToken, seen)
-      if (!continuationToken) return true
     }
   }
   return false
@@ -279,7 +286,9 @@ async function finishOperation(analyses: RealAnalysesDeps, workspaceId: string, 
     if (needsCancellation(current.record)) return false
   }
   if (operation.action === 'delete') {
-    if (!await purgeComparisons(analyses, workspaceId, runId, timestamp)) return false
+    for (const type of ['analysis-candidate-narrative', 'analysis-target-narrative', 'analysis-narrative-request', 'analysis-comparison'] as const) {
+      if (!await purgeComparisons(analyses, workspaceId, runId, timestamp, type)) return false
+    }
     if (!await purgeBlobs(analyses, workspaceId, runId)) return false
     current = await managed(analyses, workspaceId, runId)
     control = await analyses.store.getControl(workspaceId, runId)
@@ -407,7 +416,7 @@ export function createAnalysisLifecycleParticipant(analyses: RealAnalysesDeps): 
     async cancel(workspaceId, timestamp) {
       let pending = false
       for (const current of await runs(analyses, workspaceId)) {
-        if (analysisIsRemoved(current.record.lifecycle) || !needsCancellation(current.record)) continue
+        if (analysisIsRemoved(current.record.lifecycle)) continue
         const previous = (await analyses.store.getControl(workspaceId, current.record.id))?.record.operation
         const operation = previous?.action === 'archive' && previous.status !== 'complete'
           ? previous : await startOperation(analyses, current, 'archive', timestamp, 'workspace-lifecycle', true)

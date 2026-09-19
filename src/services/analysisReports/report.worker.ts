@@ -2,6 +2,7 @@ import {
   REPORT_FORMATS, REPORT_LIMITS, type AnalysisReportWriter, type ReportWorkerRequest, type ReportWorkerResponse,
 } from '../../domain/analysis-reports'
 import { assertReportResourceLimits } from './model'
+import { requireReportNarratives } from './narratives'
 
 Object.defineProperty(globalThis, 'fetch', { value: () => Promise.reject(new Error('Network access is disabled during report generation.')) })
 Object.defineProperty(globalThis, 'XMLHttpRequest', { value: () => { throw new Error('Network access is disabled during report generation.') } })
@@ -15,6 +16,7 @@ self.addEventListener('message', (event: MessageEvent<ReportWorkerRequest>) => {
       throw new Error('The report generation request is invalid.')
     }
     assertReportResourceLimits(request.report)
+    if (request.format !== 'csv') requireReportNarratives(request.report)
     send({ type: 'progress', requestId: request.requestId, message: `Generating ${REPORT_FORMATS[request.format].label} from saved evidence` })
     let generate: AnalysisReportWriter
     switch (request.format) {

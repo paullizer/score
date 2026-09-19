@@ -7,6 +7,12 @@ import type {
 } from '../../domain/analysis-reports'
 import type { Citation } from '../../domain/types'
 import { buildReportNotices, citationLocator } from './presentation'
+import {
+  realCandidateNarrativeSchema, realNarrativeReportCaptureSchema, realTargetNarrativeSchema,
+  reportCandidateNarrativeSchema, reportNarrativeCaptureSchema,
+  reportTargetNarrativeSchema, reportTargetPresentationSchema,
+} from './narrative-schemas'
+import { requireReportNarratives } from './narratives'
 
 const id = z.string().min(1).max(1024).refine(value => value === value.trim(), 'Identity must not contain surrounding whitespace.')
 const text = z.string().max(REPORT_LIMITS.maxTextCharacters)
@@ -75,10 +81,13 @@ const targetShape = {
   snapshot: snapshot.nullable(),
   criteria: z.array(criterionDefinition).min(1).max(REPORT_LIMITS.maxCriteriaPerTarget),
   facts,
+  presentation: reportTargetPresentationSchema.optional(),
+  narrative: reportTargetNarrativeSchema.optional(),
 }
 
 function validateTarget(target: ReportTarget, context: z.RefinementCtx): void {
   unique(target.criteria.map(criterion => criterion.id), context, 'criterion IDs')
+  if (target.narrative && target.narrative.dataKind !== target.dataKind) issue(context, 'Target narrative provenance must match the report data kind.')
   if (target.dataKind === 'sample') {
     if (target.selection !== null || target.snapshot !== null) issue(context, 'Sample targets must not contain real snapshot or selection identities.')
     if (target.id !== target.rubricId) issue(context, 'A sample target must match its saved rubric ID.')
@@ -97,7 +106,7 @@ function validateTarget(target: ReportTarget, context: z.RefinementCtx): void {
 
 export const reportTargetSchema: z.ZodType<ReportTarget> = z.strictObject(targetShape).superRefine(validateTarget)
 const realTargetSchema = z.strictObject({
-  ...targetShape, dataKind: z.literal('real'), selection, snapshot,
+  ...targetShape, dataKind: z.literal('real'), selection, snapshot, narrative: realTargetNarrativeSchema.optional(),
 }).superRefine(validateTarget)
 
 const candidateShape = {
@@ -152,6 +161,7 @@ const comparisonShape = {
   id, index: z.number().int().min(0).max(REPORT_LIMITS.maxComparisons - 1),
   dataKind: z.enum(['real', 'sample']), targetId: id, candidate: candidateSchema, status,
   completion: z.enum(['assessed', 'limited']).nullable(), overall: overallSchema, summary: text.nullable(),
+  narrative: reportCandidateNarrativeSchema.optional(),
   coverage: coverageSchema.nullable(),
   criteria: z.array(criterionAssessmentSchema).max(REPORT_LIMITS.maxCriteriaPerTarget),
   qualifications: z.array(qualificationSchema).max(REPORT_LIMITS.maxQualificationsPerComparison),
@@ -163,6 +173,7 @@ const comparisonShape = {
 function validateComparison(comparison: ReportComparison, context: z.RefinementCtx): void {
   unique(comparison.criteria.map(criterion => criterion.criterionId), context, 'criterion assessments')
   unique(comparison.qualifications.map(qualification => qualification.qualificationId), context, 'qualification assessments')
+  if (comparison.narrative && comparison.narrative.dataKind !== comparison.dataKind) issue(context, 'Candidate narrative provenance must match the report data kind.')
   if (comparison.dataKind === 'sample') {
     if (comparison.candidate.snapshot || comparison.candidate.documentSha256 || comparison.resultSha256 || comparison.qualifications.length) {
       issue(context, 'Sample comparisons cannot contain real hashes, snapshots, or GS qualification assessments.')
@@ -173,7 +184,7 @@ function validateComparison(comparison: ReportComparison, context: z.RefinementC
   if (comparison.status !== 'complete') {
     if (comparison.overall.status !== 'unavailable' || comparison.completion !== null || comparison.summary !== null ||
       comparison.coverage !== null || comparison.criteria.length || comparison.qualifications.length || comparison.limitations.length ||
-      comparison.analyzedAt !== null || comparison.resultSha256 !== null) {
+      comparison.analyzedAt !== null || comparison.resultSha256 !== null || comparison.narrative !== undefined) {
       issue(context, 'An unfinished comparison must contain status only, not a score, assessment, or result identity.')
     }
     return
@@ -221,7 +232,7 @@ function validateComparison(comparison: ReportComparison, context: z.RefinementC
 
 export const reportComparisonSchema: z.ZodType<ReportComparison> = z.strictObject(comparisonShape).superRefine(validateComparison)
 const realComparisonSchema = z.strictObject({
-  ...comparisonShape, dataKind: z.literal('real'), candidate: realCandidateSchema,
+  ...comparisonShape, dataKind: z.literal('real'), candidate: realCandidateSchema, narrative: realCandidateNarrativeSchema.optional(),
 }).superRefine(validateComparison)
 
 function validateCollection(targets: ReportTarget[], comparisons: ReportComparison[], dataKind: ReportDataKind, context: z.RefinementCtx): void {
@@ -286,6 +297,7 @@ export const realReportBatchResponseSchema: z.ZodType<RealReportBatchResponse> =
   runId: id,
   targets: z.array(realTargetSchema).min(1).max(REPORT_LIMITS.batchComparisons),
   comparisons: z.array(realComparisonSchema).min(1).max(REPORT_LIMITS.batchComparisons),
+  summaries: realNarrativeReportCaptureSchema.optional(),
 }).superRefine((response, context) => {
   validateCollection(response.targets, response.comparisons, 'real', context)
   validateResources(response, REPORT_LIMITS.maxBatchBytes, context)
@@ -300,7 +312,7 @@ const reportInputSchema: z.ZodType<AnalysisReportInput> = z.strictObject({
   dataKind: z.enum(['real', 'sample']),
   workspaceId: id.optional(),
   run: z.strictObject({ id, name: label, createdAt: timestamp }),
-  capture: z.strictObject({ startedAt: timestamp, completedAt: timestamp }),
+  capture: z.strictObject({ startedAt: timestamp, completedAt: timestamp, summaries: reportNarrativeCaptureSchema.optional() }),
   generatedAt: timestamp,
   targets: z.array(reportTargetSchema).min(1).max(REPORT_LIMITS.maxTargets),
   comparisons: z.array(reportComparisonSchema).min(1).max(REPORT_LIMITS.maxComparisons),
@@ -398,5 +410,6 @@ export function buildAnalysisReport(input: AnalysisReportInput, options: Analysi
     groups: targets.map(target => buildGroup(target, comparisons.filter(comparison => comparison.targetId === target.id))),
   }
   assertReportResourceLimits(report)
+  if (report.capture.summaries !== undefined) requireReportNarratives(report)
   return report
 }
