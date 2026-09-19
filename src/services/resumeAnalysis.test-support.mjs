@@ -324,6 +324,13 @@ function quoteFor(paragraphs, text) {
   return paragraph ? { paragraphId: paragraph.paragraphId ?? paragraph.id, quote: paragraph.text } : undefined
 }
 
+export function analysisPassageFor(paragraphs, text) {
+  assert.ok(paragraphs.every((paragraph) => Array.isArray(paragraph.passages)), 'Analysis fixtures require the v3 source-owned passage catalog.')
+  const passage = paragraphs.flatMap((paragraph) => paragraph.passages)
+    .find((candidate) => Number.isSafeInteger(candidate.passageId) && candidate.passageId > 0 && candidate.text.includes(text))
+  return passage ? { passageId: passage.passageId } : undefined
+}
+
 function profileField(paragraphs, text) {
   const quote = quoteFor(paragraphs, text)
   return quote
@@ -375,8 +382,8 @@ export function processingStubs(fixture, { urlPages = new Map(), onModelRequest,
         }
       } else if (schema === 'resume_rubric_assessment') {
         const input = user.input
-        const work = quoteFor(input.resume.paragraphs, 'Applied engineering methods independently')
-        const education = quoteFor(input.resume.paragraphs, 'Bachelor of Engineering')
+        const work = analysisPassageFor(input.resume.paragraphs, 'Applied engineering methods independently')
+        const education = analysisPassageFor(input.resume.paragraphs, 'Bachelor of Engineering')
         assert.ok(work, 'The assessment fixture must quote actual independent engineering work.')
         output = {
           criteria: input.rubric.criteria.map((criterion) => criterion.support === 'not-applicable' ? {

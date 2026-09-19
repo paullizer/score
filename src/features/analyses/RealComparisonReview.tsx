@@ -8,7 +8,8 @@ import { documentPagination, type DocumentPagination } from '../../domain/docume
 import { gradeSourcePagination } from '../grade-ladders/gradeUi'
 import { Badge, Button, EmptyState, InlineError, Score, SegmentedControl } from '../../components/ui'
 import { DocumentViewer } from '../../components/documents/DocumentViewer'
-import { citationMatches, targetVersionLabel } from './realAnalysisUi'
+import { analysisFailureExplanation, analysisFailureStages, citationMatches, targetVersionLabel } from './realAnalysisUi'
+import { RealComparisonDiagnostics } from './RealComparisonDiagnostics'
 
 type EvidenceSelection = { kind: 'resume' | 'requirement'; citation: Citation; label: string }
 type SavedDocumentSelection = { kind: EvidenceSelection['kind']; documentId: string; documentVersion: number; label: string }
@@ -39,12 +40,28 @@ export function RealComparisonReview({ detail, actions, initialView }: {
   const [selected, setSelected] = useState<EvidenceSelection | null>(null)
   const [sourceView, setSourceView] = useState<SavedReviewView>(initialView ?? 'resume')
   const [pane, setPane] = useState<'criteria' | 'evidence'>(initialView ? 'evidence' : 'criteria')
+  const sourcePanel = useRef<HTMLElement>(null)
+  const complete = comparison.status === 'complete' && Boolean(result)
+  useEffect(() => {
+    if (!complete && selected) sourcePanel.current?.scrollIntoView({ block: 'start', behavior: 'smooth' })
+  }, [complete, selected])
   function showEvidence(selection: EvidenceSelection) {
     setSelected(selection)
     setSourceView(selection.kind === 'resume' ? 'resume' : 'target')
     setPane('evidence')
   }
-  if (comparison.status !== 'complete' || !result) return <section className="panel"><EmptyState
+  const sources = <>
+    <div className="section-heading"><div><h2>{selected ? 'Inspect the exact saved passage' : sourceView === 'resume' ? 'Full saved resume' : target.kind === 'grade' ? 'Saved approved grade requirements' : 'Full saved job description'}</h2><p>{selected ? `${selected.kind === 'resume' ? 'Resume evidence' : 'Requirement evidence'} · ${selected.label}` : 'Frozen inputs used for this comparison, not newer library records. Select a quotation to highlight an exact passage.'}</p></div><ScanLine size={17} className="text-accent" aria-hidden="true" /></div>
+    <div className="border-b px-4 py-3"><SegmentedControl label="Saved evidence source" value={sourceView}
+      onChange={(view) => { setSourceView(view); setSelected(null) }}
+      options={[{ value: 'resume', label: 'Resume evidence' }, { value: 'target', label: target.kind === 'grade' ? 'Grade requirements' : 'Job description' }]} /></div>
+    {selected && <div className="border-b p-3"><Button size="sm" onClick={() => { setSelected(null); setSourceView('resume') }}>View full saved resume</Button></div>}
+    {selected || sourceView === 'resume' ? <SavedEvidence detail={detail} selection={selected} /> : <SavedTargetEvidence detail={detail} />}
+  </>
+  const diagnostics = <RealComparisonDiagnostics detail={detail} renderCitations={(citations, label) =>
+    <EvidenceButtons citations={citations} kind="resume" label={label} onSelect={showEvidence} active={selected} />} />
+  const failure = comparison.error ? analysisFailureExplanation(comparison.error) : null
+  if (comparison.status !== 'complete' || !result) return <><section className="panel"><EmptyState
     icon={['queued', 'running'].includes(comparison.status) ? LoaderCircle : ScanLine}
     title={comparison.status === 'failed' ? 'This comparison could not be assessed' : comparison.status === 'cancelled' ? 'This comparison was cancelled'
       : comparison.status === 'complete' ? 'The saved result is unavailable' : 'The saved inputs are awaiting assessment'}
@@ -52,8 +69,23 @@ export function RealComparisonReview({ detail, actions, initialView }: {
       : 'No score exists yet. Independent server work uses the original frozen inputs; completed pairs in this run are unaffected.')}
     action={actions} />
     <div className="border-t p-5 text-[11px] text-muted">Saved resume: {resume.resume.name ?? 'Name not stated'} · document v{resume.document.version}<br />
-      Saved target: {target.summary.label} · {targetVersionLabel(target.selection)}</div>
+      Saved target: {target.summary.label} · {targetVersionLabel(target.selection)}
+      <p className="mt-2">Comparison state: {comparison.status} · processing attempt {comparison.attempts} · manual retries {comparison.retryCount}</p>
+      {comparison.attemptId && <p className="mt-1 break-all">Current attempt ID: {comparison.attemptId}</p>}
+      {(comparison.error || comparison.status === 'failed') && comparison.diagnosticCapture?.attemptId === comparison.attemptId && comparison.diagnosticCapture
+        && <p className="mt-1">Pipeline version: {comparison.diagnosticCapture.pipelineVersion}</p>}
+      {comparison.nextAttemptAt && <p className="mt-1">Next automatic attempt: {comparison.nextAttemptAt}</p>}
+    </div>
+    {failure && comparison.error && <div className="border-t p-5 text-[12px]">
+      <h3 className="font-semibold">{failure.title}</h3><p className="mt-2">{failure.explanation}</p>
+      <p className="mt-2 text-[11px] text-muted">Stage: {analysisFailureStages[comparison.error.stage]} ({comparison.error.stage}) · {comparison.error.code}</p>
+      <p className="mt-2"><strong>Next action: </strong>{failure.nextAction}</p>
+    </div>}
+    <p className="border-t p-5 text-[12px]">Readable saved input is separate from AI validation. Processing failures are not zero scores. Missing evidence can be documented as a gap in a completed assessment, but an unaccepted draft is not a result.</p>
   </section>
+    {diagnostics}
+    <section ref={sourcePanel} className="detail-panel evidence-panel mt-5" aria-label="Saved real source evidence">{sources}</section>
+  </>
 
   return <>
     <section className="result-overview panel">
@@ -125,15 +157,9 @@ export function RealComparisonReview({ detail, actions, initialView }: {
           {!target.version.qualifications.length && <p>No qualifications are captured for this version. Do not infer that none apply.</p>}
         </section>}
       </section>
-      <section className={`detail-panel evidence-panel ${pane !== 'evidence' ? 'mobile-pane-hidden' : ''}`} aria-label="Saved real source evidence">
-        <div className="section-heading"><div><h2>{selected ? 'Inspect the exact saved passage' : sourceView === 'resume' ? 'Full saved resume' : target.kind === 'grade' ? 'Saved approved grade requirements' : 'Full saved job description'}</h2><p>{selected ? `${selected.kind === 'resume' ? 'Resume evidence' : 'Requirement evidence'} · ${selected.label}` : 'Frozen inputs used for this comparison, not newer library records. Select a quotation to highlight an exact passage.'}</p></div><ScanLine size={17} className="text-accent" aria-hidden="true" /></div>
-        <div className="border-b px-4 py-3"><SegmentedControl label="Saved evidence source" value={sourceView}
-          onChange={(view) => { setSourceView(view); setSelected(null) }}
-          options={[{ value: 'resume', label: 'Resume evidence' }, { value: 'target', label: target.kind === 'grade' ? 'Grade requirements' : 'Job description' }]} /></div>
-        {selected && <div className="border-b p-3"><Button size="sm" onClick={() => { setSelected(null); setSourceView('resume') }}>View full saved resume</Button></div>}
-        {selected || sourceView === 'resume' ? <SavedEvidence detail={detail} selection={selected} /> : <SavedTargetEvidence detail={detail} />}
-      </section>
+      <section ref={sourcePanel} className={`detail-panel evidence-panel ${pane !== 'evidence' ? 'mobile-pane-hidden' : ''}`} aria-label="Saved real source evidence">{sources}</section>
     </div>
+    {diagnostics}
     <details className="panel mt-5 p-5 text-[11px]"><summary className="cursor-pointer text-[12px] font-semibold">Processing provenance and immutable identities</summary>
       <dl className="mt-4 space-y-3 break-words">
         <div><dt className="text-muted">Assessment model / deployment</dt><dd>{result.provenance.assessment.model} · {result.provenance.assessment.deployment}</dd></div>

@@ -3,8 +3,10 @@ import { after, before, test } from 'node:test'
 import { randomUUID } from 'node:crypto'
 import { chromium } from 'playwright'
 import { seededLadder, seedRealJob } from './gradeLadders.test-support.mjs'
+import { diagnosticFixture, diagnosticReference, failedComparisonFixture, privateReviewReason } from './analysisDiagnostics.test-support.mjs'
 import {
   allPages,
+  analysisPassageFor,
   buildResumeAnalysisTestRuntime,
   importResumePdf,
   jsonResponse,
@@ -417,9 +419,9 @@ async function seedBrowsingInputs(fixture) {
     onModelRequest(request) {
       if (request.response_format.json_schema.name !== 'resume_rubric_assessment') return
       const input = JSON.parse(request.messages[1].content).input
-      const profile = browsingProfiles.find((item) => item.name && input.resume.paragraphs.some((paragraph) => paragraph.text === item.name))
+      const profile = browsingProfiles.find((item) => item.name && input.resume.paragraphs.some((paragraph) => paragraph.passages.some((passage) => passage.text === item.name)))
         ?? browsingProfiles.at(-1)
-      const work = input.resume.paragraphs.find((paragraph) => paragraph.text.includes('Applied engineering methods'))
+      const work = analysisPassageFor(input.resume.paragraphs, 'Applied engineering methods')
       assert.ok(work)
       assert.deepEqual(input.qualifications, [])
       const score = profile.score
@@ -430,7 +432,7 @@ async function seedBrowsingInputs(fixture) {
           rationale: score === null ? 'The captured source does not establish the scope needed by this saved criterion.'
             : score === 0 ? 'No supporting evidence was assigned to this criterion in this controlled fixture.'
               : 'The quoted passage provides the controlled fixture evidence for this saved criterion.',
-          citations: score > 0 ? [{ paragraphId: work.paragraphId ?? work.id, quote: work.text }] : [],
+          citations: score > 0 ? [work] : [],
           limitation: score === null ? { code: 'not-assessable', message: 'The captured source scope requires human evidence review.' } : null,
         })),
         qualifications: [],
@@ -448,6 +450,165 @@ async function createBrowsingRun(fixture, resumes, targets, name) {
     body: JSON.stringify({ name, resumes: resumes.map(resumeSelection), targets: targets.map((target) => target.selection) }),
   }), [200, 202])).run
 }
+
+async function diagnosticBrowserScenario(fixture) {
+  await seedRealJob(fixture)
+  const imported = await importResumePdf(fixture, await resumePdf())
+  const stubs = processingStubs(fixture)
+  await processAllResumes(fixture, stubs)
+  const resume = await jsonResponse(await fixture.request(`/api/workspaces/${fixture.workspaceId}/resumes/${imported.summary.resume.id}`))
+  const targets = await allPages(fixture, `/api/workspaces/${fixture.workspaceId}/analyses/targets`, 'targets')
+  const created = await createBrowsingRun(fixture, [resume], [targets[0]], 'Private diagnostic fixture')
+  await processAllAnalyses(fixture, stubs)
+  const runPath = `/api/workspaces/${fixture.workspaceId}/analyses/${created.run.id}`
+  const [pair] = await allPages(fixture, `${runPath}/comparisons`, 'comparisons')
+  const pairPath = `${runPath}/comparisons/${pair.comparison.id}`
+  const accepted = await jsonResponse(await fixture.request(pairPath))
+  assert.ok(accepted.result, 'The browser fixture needs a normalized assessment from fictional sources.')
+  const diagnostic = diagnosticFixture(accepted)
+  return {
+    runPath, pairPath, accepted, diagnostic, detail: failedComparisonFixture(accepted, diagnostic),
+    run: await jsonResponse(await fixture.request(runPath)),
+    url: `${fixture.origin}/workspaces/${fixture.workspaceId}/analyses/${created.run.id}?data=real&result=${pair.comparison.id}`,
+  }
+}
+
+async function routeDiagnosticScenario(page, fixture, scenario, diagnostics) {
+  await page.route(`${fixture.origin}/api/workspaces/${fixture.workspaceId}/analyses**`, async (route) => {
+    const path = new URL(route.request().url()).pathname
+    if (path === `${scenario.pairPath}/diagnostics`) return diagnostics(route)
+    if (path === scenario.pairPath) return route.fulfill({ json: scenario.detail })
+    if (path === `${scenario.runPath}/comparisons`) return route.fulfill({ json: { comparisons: [{ etag: scenario.detail.etag, comparison: scenario.detail.comparison }] } })
+    if (path === scenario.runPath || path === `/api/workspaces/${fixture.workspaceId}/analyses`) {
+      const run = structuredClone(scenario.run)
+      const status = scenario.detail.comparison.status
+      run.run.status = status
+      run.run.progress = { total: 1, initialized: 1, queued: 0, running: 0, complete: 0, failed: 0, cancelled: 0, scored: 0, unscored: 0, [status]: 1 }
+      if (status === 'complete') run.run.progress.scored = 1
+      return route.fulfill({ json: path === scenario.runPath ? run : { runs: [run] } })
+    }
+    return route.continue()
+  })
+}
+
+test('browser failed diagnostics expose exact frozen sources, private review reasons, bounded history, and no draft scores', { timeout: 120_000 }, async (t) => {
+  const fixture = await startResumeAnalysisFixture(runtime, { injectAuth: true })
+  t.after(() => fixture.close())
+  const scenario = await diagnosticBrowserScenario(fixture)
+  const older = diagnosticFixture(scenario.accepted, 'fixture-older-attempt', 'fixture-assessment-v2')
+  scenario.diagnostic.previous = diagnosticReference(older)
+  scenario.detail = failedComparisonFixture(scenario.accepted, scenario.diagnostic)
+  let unavailable = true
+  const reads = []
+  const { context, page, errors } = await newPage()
+  try {
+    await routeDiagnosticScenario(page, fixture, scenario, (route) => {
+      const cursor = new URL(route.request().url()).searchParams.get('continuationToken')
+      reads.push(cursor)
+      return unavailable ? route.fulfill({ status: 503, json: { error: { code: 'unavailable', message: 'Private diagnostic fixture service is temporarily unavailable.' } } })
+        : route.fulfill({ json: cursor ? { attempts: [older] } : { attempts: [scenario.diagnostic], continuationToken: 'opaque older / fixture' } })
+    })
+    await page.goto(scenario.url)
+    await visible(page.getByRole('heading', { name: 'This comparison could not be assessed', exact: true }))
+    await visible(page.getByRole('button', { name: 'Retry diagnostics', exact: true }))
+    await visible(page.getByText(/Private diagnostic fixture service is temporarily unavailable/))
+    assert.equal(await page.getByText(/No saved diagnostic history is available/).count(), 0)
+    assert.ok(reads.every((cursor) => cursor === null), 'no earlier attempt is fetched automatically')
+    unavailable = false
+    await page.getByRole('button', { name: 'Retry diagnostics', exact: true }).click()
+    const review = await visible(page.getByRole('region', { name: 'Private review reasons for cycle 3', exact: true }))
+    await visible(review.getByText(privateReviewReason, { exact: true }))
+    const criterion = scenario.accepted.targetSnapshot.rubric.criteria[0]
+    await visible(review.getByRole('heading', { name: `${criterion.label} (${criterion.id})`, exact: true }))
+    await visible(review.getByText('Review ID: fixture-review-fixture-failed-attempt-2', { exact: true }))
+    assert.equal(await review.locator('b').count(), 0, 'authorized model explanations are rendered as text, not markup')
+    assert.equal(await page.locator('.overall-score, .criterion-score, .criterion-results').count(), 0)
+    assert.equal(await page.getByRole('button', { name: 'Retry comparison 1 with saved inputs', exact: true }).isEnabled(), true)
+    const source = page.getByRole('region', { name: 'Saved real source evidence', exact: true })
+    for (const paragraph of scenario.accepted.resumeSnapshot.document.paragraphs) await visible(source.getByText(paragraph.text, { exact: true }))
+    await page.setViewportSize({ width: 430, height: 900 })
+    await review.getByRole('button', { name: /^View resume evidence for unpublished review:/ }).first().click()
+    const citation = scenario.diagnostic.assessments[2].review.issues[0].citations[0]
+    await visible(source.locator('.document-paragraph.is-highlighted mark').filter({ hasText: citation.quote }))
+    await source.getByRole('button', { name: 'Job description', exact: true }).click()
+    for (const paragraph of scenario.accepted.targetSnapshot.document.paragraphs) await visible(source.getByText(paragraph.text, { exact: true }))
+    await source.getByRole('button', { name: 'Resume evidence', exact: true }).click()
+    await visible(source.getByText(resumeParagraphs[4].text, { exact: true }))
+    await page.getByRole('button', { name: 'Load earlier saved attempt', exact: true }).click()
+    await visible(page.getByRole('article', { name: 'Saved diagnostic attempt fixture-older-attempt', exact: true }))
+    assert.equal(await page.getByRole('article', { name: 'Saved diagnostic attempt fixture-failed-attempt', exact: true }).count(), 0)
+    assert.equal(reads.filter((cursor) => cursor === 'opaque older / fixture').length, 1)
+    await visible(page.getByText(/Historical failure.*current comparison failed/))
+
+    const accepted = structuredClone(scenario.accepted)
+    accepted.comparison.failureDiagnostic = diagnosticReference(scenario.diagnostic)
+    accepted.comparison.diagnosticCapture = scenario.detail.comparison.diagnosticCapture
+    accepted.comparison.attemptId = 'fixture-success-after-retry'
+    scenario.detail = accepted
+    const beforeReload = reads.length
+    await page.reload()
+    await visible(page.getByRole('heading', { name: 'Evidence-based assessment', exact: true }))
+    assert.equal(reads.length, beforeReload, 'successful comparisons keep failure history lazy')
+    assert.equal(await page.locator('.overall-score').count(), 1)
+    await page.getByText('Failure diagnostics and saved attempt history', { exact: true }).click()
+    await visible(page.getByText(/Historical failure.*current comparison complete/))
+    await visible(page.getByRole('region', { name: 'Private review reasons for cycle 3', exact: true }).getByText(privateReviewReason, { exact: true }))
+    assert.equal(await page.locator('.overall-score').count(), 1, 'historical drafts never add another score')
+    const storage = await page.evaluate(() => [...Object.values(localStorage), ...Object.values(sessionStorage)].join('\n'))
+    assert.doesNotMatch(storage, /Private fixture review reason|Private unpublished fixture|assessmentSha256|fixture-failed-attempt/)
+    assert.doesNotMatch(page.url(), /continuationToken|Private|fixture-failed-attempt|assessmentSha256/)
+    assert.deepEqual(errors, [])
+  } finally { await context.close() }
+})
+
+test('browser legacy and unavailable failures keep source access and discard late diagnostics after a workspace switch', { timeout: 120_000 }, async (t) => {
+  const fixture = await startResumeAnalysisFixture(runtime, { injectAuth: true })
+  t.after(() => fixture.close())
+  const scenario = await diagnosticBrowserScenario(fixture)
+  const legacy = structuredClone(scenario.detail)
+  delete legacy.comparison.failureDiagnostic
+  delete legacy.comparison.diagnosticCapture
+  delete legacy.comparison.attemptId
+  scenario.detail = legacy
+  const hold = deferred()
+  let diagnosticReads = 0
+  const { context, page, errors } = await newPage()
+  try {
+    await routeDiagnosticScenario(page, fixture, scenario, (route) => { diagnosticReads++; return route.continue() })
+    await page.goto(scenario.url)
+    await visible(page.getByText('Details were not recorded for this attempt.', { exact: true }))
+    const source = page.getByRole('region', { name: 'Saved real source evidence', exact: true })
+    await visible(source.getByText(resumeParagraphs[4].text, { exact: true }))
+    assert.equal(diagnosticReads, 0)
+    scenario.detail.comparison.attemptId = 'fixture-unavailable-attempt'
+    scenario.detail.comparison.diagnosticCapture = { attemptId: 'fixture-unavailable-attempt', status: 'unavailable', pipelineVersion: 'fixture-current-v3' }
+    scenario.detail.comparison.failureDiagnostic = diagnosticReference(scenario.diagnostic)
+    await page.reload()
+    await visible(page.getByText(/Diagnostic details are unavailable for this attempt because they could not be saved/))
+    assert.equal(diagnosticReads, 0, 'an older artifact is not automatically displayed as a newer failure')
+    await visible(source.getByText(resumeParagraphs[4].text, { exact: true }))
+
+    const created = await jsonResponse(await fixture.request('/api/workspaces', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: 'Empty diagnostic workspace' }),
+    }), [201])
+    fixture.staleRead(`${scenario.pairPath}/diagnostics`, { attempts: [scenario.diagnostic] }, hold.promise)
+    scenario.detail = failedComparisonFixture(scenario.accepted, scenario.diagnostic)
+    await page.reload()
+    await until(() => diagnosticReads > 0, 'The current failed comparison should request its private diagnostic.')
+    await visible(page.getByText('Loading one private saved attempt...', { exact: true }))
+    await page.locator('.workspace-switcher-trigger').first().click()
+    const switcher = await visible(page.getByRole('dialog', { name: 'My workspaces', exact: true }))
+    await switcher.getByRole('button', { name: 'Empty diagnostic workspace', exact: true }).click()
+    await page.waitForURL((url) => url.pathname.startsWith(`/workspaces/${created.workspace.id}/`))
+    hold.resolve()
+    await page.getByRole('link', { name: /^Resumes/ }).first().click()
+    await visible(page.getByRole('heading', { name: 'Import your first real resume', exact: true }))
+    assert.equal(await page.getByText(privateReviewReason, { exact: true }).count(), 0)
+    assert.equal(await page.getByText(resumeParagraphs[4].text, { exact: true }).count(), 0)
+    assert.equal(await page.getByRole('article', { name: /^Saved diagnostic attempt/ }).count(), 0)
+    assert.deepEqual(errors, [])
+  } finally { hold.resolve(); await context.close() }
+})
 
 test('browser comparison browsing searches every page, scopes score sorting, and preserves keyboard/mobile navigation', { timeout: 120_000 }, async (t) => {
   const fixture = await startResumeAnalysisFixture(runtime, { injectAuth: true, pageSize: 2 })

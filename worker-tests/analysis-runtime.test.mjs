@@ -443,6 +443,14 @@ test('unknown passage selections exhaust only shared corrections, fail that comp
   assert.match(failed.error.message, /generated evidence is invalid; this does not mean resume data is missing/)
   assert.equal(failed.error.retryable, false)
   assert.equal(failed.nextAttemptAt, undefined)
+  assert.equal(failed.diagnosticCapture.status, 'saved')
+  const history = await f.service.diagnostics(f.workspaceId, created.run.id, failed.id)
+  assert.equal(history.attempts.length, 1)
+  assert.equal(history.attempts[0].reason, 'citation-mismatch')
+  assert.equal(history.attempts[0].correctionCount, 2)
+  assert.equal(history.attempts[0].citationDiagnostics.findings[0].reason, 'unknown-passage')
+  assert.equal(history.attempts[0].assessments.length, 0)
+  assert.doesNotMatch(JSON.stringify(history), /PRIVATE-MODEL-SENTINEL|987654321|test-token/)
   const failures = events.filter(event => event.comparisonId === failed.id)
   assert.ok(failures.every(event => event.workspaceId === f.workspaceId && event.runId === created.run.id && event.attemptId === failed.attemptId))
   assert.deepEqual(failures.filter(event => event.event === 'correction').map(event => event.correctionCount), [1, 2])
@@ -505,6 +513,193 @@ test('two semantic corrections publish three bound reviews and correlated comple
   assert.equal(events.at(-1).outcome, 'complete')
   assert.equal(events.at(-1).stage, 'publication')
   assert.equal(events.at(-1).correctionCount, 2)
+})
+
+test('exhausted semantic review retains private reasons and exact assessment bindings across retries and eventual success', async () => {
+  const f = fixture()
+  const created = await createRun(f)
+  let reject = true
+  let reviews = 0
+  const mock = modelFor(f, ({ kind, body }) => {
+    if (reject && kind === 'resume_rubric_grounding_review') {
+      const issue = {
+        code: 'unsupported-score', message: 'PRIVATE-REVIEW-SENTINEL: The cited project scope does not support this saved anchor.',
+        criterionId: body.input.rubric.criteria[0].id, qualificationId: null, citations: [passageSelection(body.input)],
+      }
+      reviews += 1
+      return { outcome: 'needs-correction', issues: [
+        issue, ...(reviews % 3 === 2 ? [] : [{
+          ...issue, code: 'unsupported-rationale',
+          message: 'PRIVATE-REVIEW-SENTINEL: The stated rationale also exceeds the scope of the source.',
+        }]),
+      ] }
+    }
+  })
+  const events = []
+  mock.deps.onEvent = event => events.push(event)
+  await runAnalysisWorker(mock.deps)
+  let saved = comparisons(f, created.run.id)[0]
+  assert.equal(saved.record.status, 'failed')
+  assert.equal(saved.record.error.code, 'grounding-failed')
+  assert.equal(saved.record.diagnosticCapture.status, 'saved')
+  assert.equal(mock.calls.length, 6)
+  const firstReference = clone(saved.record.failureDiagnostic)
+  const firstBytes = clone(f.analysis.blobs.values.get(firstReference.blob.blobName))
+  let page = await f.service.diagnostics(f.workspaceId, created.run.id, saved.record.id)
+  const first = page.attempts[0]
+  assert.equal(first.attemptId, saved.record.attemptId)
+  assert.equal(first.reason, 'grounding-disagreement')
+  assert.equal(first.correctionCount, 2)
+  assert.equal(first.assessments.length, 3)
+  assert.deepEqual(first.assessments.map(item => item.review.issues.length), [2, 1, 2])
+  assert.equal(first.resumeSnapshot.sha256, saved.record.resume.blob.sha256)
+  assert.equal(first.targetSnapshot.sha256, saved.record.target.blob.sha256)
+  assert.ok(first.assessments.every(item => item.review.issues[0].message.includes('PRIVATE-REVIEW-SENTINEL') &&
+    item.assessmentSha256 === api.analysisAssessmentHash(item.assessment) &&
+    item.review.assessmentSha256 === item.assessmentSha256 &&
+    item.review.resumeSnapshotSha256 === first.resumeSnapshot.sha256))
+  assert.ok(first.assessments.every(item => item.review.issues[0].criterionId === item.assessment.criteria[0].criterionId))
+  assert.equal(page.continuationToken, undefined)
+  assert.doesNotMatch(JSON.stringify(events), /PRIVATE-REVIEW-SENTINEL|"quote":|"message":|test-token/)
+  assert.deepEqual(events.filter(event => event.event === 'validation-failed').map(event => event.reviewIssueCount), [2, 1, 2])
+  assert.ok(events.filter(event => event.code === 'grounding-failed' && event.event === 'validation-failed')
+    .every(event => event.reviewIssues[0].code === 'unsupported-score' &&
+      event.reviewIssues[0].criterionId === first.assessments[0].assessment.criteria[0].criterionId))
+  const failedReport = await f.service.reportComparisons(f.workspaceId, created.run.id, [saved.record.id])
+  assert.equal(failedReport.comparisons[0].overall.score ?? null, null)
+  assert.deepEqual(failedReport.comparisons[0].criteria, [])
+  assert.doesNotMatch(JSON.stringify(failedReport), /PRIVATE-REVIEW-SENTINEL|failureDiagnostic|diagnosticCapture/)
+
+  await f.service.comparisonAction(f.workspaceId, created.run.id, saved.record.id, 'retry', saved.etag)
+  assert.deepEqual(comparisons(f, created.run.id)[0].record.failureDiagnostic, firstReference)
+  await runAnalysisWorker(mock.deps)
+  saved = comparisons(f, created.run.id)[0]
+  assert.equal(saved.record.status, 'failed')
+  assert.notEqual(saved.record.attemptId, first.attemptId)
+  page = await f.service.diagnostics(f.workspaceId, created.run.id, saved.record.id)
+  assert.equal(page.attempts.length, 1)
+  assert.equal(page.attempts[0].retryCount, 1)
+  assert.deepEqual(page.attempts[0].previous, firstReference)
+  const older = await f.service.diagnostics(f.workspaceId, created.run.id, saved.record.id, page.continuationToken)
+  assert.deepEqual(older.attempts, [first])
+  assert.equal(older.continuationToken, undefined)
+  assert.deepEqual(f.analysis.blobs.values.get(firstReference.blob.blobName), firstBytes)
+
+  const lastReference = clone(saved.record.failureDiagnostic)
+  reject = false
+  await f.service.comparisonAction(f.workspaceId, created.run.id, saved.record.id, 'retry', saved.etag)
+  await runAnalysisWorker(mock.deps)
+  saved = comparisons(f, created.run.id)[0]
+  assert.equal(saved.record.status, 'complete')
+  assert.equal(saved.record.error, undefined)
+  assert.deepEqual(saved.record.failureDiagnostic, lastReference)
+  assert.equal((await f.service.diagnostics(f.workspaceId, created.run.id, saved.record.id)).attempts[0].error.code, 'grounding-failed')
+  assert.equal((await f.service.comparisonDetail(f.workspaceId, created.run.id, saved.record.id)).result.overall.score, 60)
+  const completedReport = await f.service.reportComparisons(f.workspaceId, created.run.id, [saved.record.id])
+  assert.equal(completedReport.comparisons[0].overall.score, 60)
+  assert.equal(completedReport.comparisons[0].resultSha256, saved.record.result.sha256)
+  assert.doesNotMatch(JSON.stringify(completedReport), /PRIVATE-REVIEW-SENTINEL|failureDiagnostic|diagnosticCapture/)
+})
+
+test('diagnostic write failures are explicit and do not mask the actual model failure or erase earlier history', async () => {
+  const f = fixture()
+  const created = await createRun(f)
+  const mock = modelFor(f, ({ kind, body }) => {
+    if (kind !== 'resume_rubric_assessment') return
+    const value = modelAssessment(body.input)
+    value.criteria[0].score = 7
+    return value
+  })
+  const events = []
+  mock.deps.onEvent = event => events.push(event)
+  await runAnalysisWorker(mock.deps)
+  let saved = comparisons(f, created.run.id)[0]
+  assert.equal(saved.record.diagnosticCapture.status, 'saved')
+  const previous = clone(saved.record.failureDiagnostic)
+  await f.service.comparisonAction(f.workspaceId, created.run.id, saved.record.id, 'retry', saved.etag)
+  const put = f.analysis.blobs.putImmutable.bind(f.analysis.blobs)
+  f.analysis.blobs.putImmutable = async (name, bytes, type) => {
+    if (name.includes('/diagnostics/')) throw new Error('PRIVATE-STORAGE-ERROR-SENTINEL')
+    return put(name, bytes, type)
+  }
+  await runAnalysisWorker(mock.deps)
+  saved = comparisons(f, created.run.id)[0]
+  assert.equal(saved.record.status, 'failed')
+  assert.equal(saved.record.error.code, 'invalid-model-output')
+  assert.equal(saved.record.diagnosticCapture.status, 'unavailable')
+  assert.equal(saved.record.diagnosticCapture.attemptId, saved.record.attemptId)
+  assert.deepEqual(saved.record.failureDiagnostic, previous)
+  assert.ok(events.some(event => event.event === 'diagnostic-write-failed' && event.code === 'storage-error'))
+  assert.doesNotMatch(JSON.stringify(events), /PRIVATE-STORAGE-ERROR-SENTINEL/)
+  const page = await f.service.diagnostics(f.workspaceId, created.run.id, saved.record.id)
+  assert.equal(page.attempts[0].attemptId, previous.attemptId)
+  assert.equal(page.attempts[0].reason, 'schema-mismatch')
+  assert.deepEqual(page.attempts[0].schemaDiagnostics.findings[0].path, ['criteria', 0, 'score'])
+})
+
+test('ambiguous diagnostic upload acknowledgments recover the exact immutable artifact without repeating model work', async () => {
+  const f = fixture()
+  const created = await createRun(f)
+  f.analysis.blobs._afterPut(name => {
+    if (name.includes('/diagnostics/')) throw new Error('PRIVATE-DIAGNOSTIC-ACK-SENTINEL')
+  })
+  const mock = modelFor(f, () => Response.json({
+    model: 'actual-model', choices: [{ finish_reason: 'length', message: { content: 'PRIVATE-TRUNCATED-SENTINEL' } }],
+  }))
+  await runAnalysisWorker(mock.deps)
+  const saved = comparisons(f, created.run.id)[0].record
+  assert.equal(saved.error.code, 'context-limit')
+  assert.equal(saved.diagnosticCapture.status, 'saved')
+  assert.equal(mock.calls.length, 1)
+  const page = await f.service.diagnostics(f.workspaceId, created.run.id, saved.id)
+  assert.equal(page.attempts[0].reason, 'completion-token-limit')
+  assert.equal(page.attempts[0].events.find(event => event.event === 'model-response').finishReason, 'length')
+  assert.doesNotMatch(JSON.stringify(page), /PRIVATE-DIAGNOSTIC-ACK-SENTINEL|PRIVATE-TRUNCATED-SENTINEL/)
+})
+
+test('cancellation during a diagnostic upload prevents publishing a history pointer or reviving the comparison', async () => {
+  const f = fixture()
+  const created = await createRun(f)
+  f.analysis.blobs._afterPut(async name => {
+    if (!name.includes('/diagnostics/')) return
+    const current = await f.analysis.store.get(f.workspaceId, created.run.id)
+    await f.service.cancel(f.workspaceId, created.run.id, ACTOR, current.etag)
+  })
+  const mock = modelFor(f, () => Response.json({
+    model: 'actual-model', choices: [{ finish_reason: 'stop', message: { refusal: 'PRIVATE-REFUSAL-SENTINEL' } }],
+  }))
+  await runAnalysisWorker(mock.deps)
+  const saved = comparisons(f, created.run.id)[0].record
+  assert.equal(saved.status, 'cancelled')
+  assert.equal(saved.failureDiagnostic, undefined)
+  assert.equal(saved.diagnosticCapture, undefined)
+  assert.equal(saved.result, undefined)
+  assert.deepEqual(await f.service.diagnostics(f.workspaceId, created.run.id, saved.id), { attempts: [] })
+})
+
+test('a takeover during diagnostic upload fences the old history reference while preserving the winning result', async () => {
+  const f = fixture()
+  const created = await createRun(f)
+  let replacement
+  let completed
+  f.analysis.blobs._afterPut(async name => {
+    if (!name.includes('/diagnostics/')) return
+    const old = comparisons(f, created.run.id)[0]
+    f.now = new Date(Date.parse(old.record.lease.expiresAt) + 1).toISOString()
+    replacement = modelFor(f)
+    await runAnalysisWorker(replacement.deps)
+    completed = comparisons(f, created.run.id)[0]
+  })
+  const obsolete = modelFor(f, () => Response.json({
+    model: 'actual-model', choices: [{ finish_reason: 'stop', message: { refusal: 'PRIVATE-REFUSAL-SENTINEL' } }],
+  }))
+  assert.deepEqual(await runAnalysisWorker(obsolete.deps), { claimed: 1, completed: 0 })
+  assert.equal(replacement.calls.length, 2)
+  assert.equal(completed.record.status, 'complete')
+  assert.equal(completed.record.failureDiagnostic, undefined)
+  assert.equal(completed.record.diagnosticCapture, undefined)
+  assert.deepEqual(comparisons(f, created.run.id)[0], completed)
+  assert.deepEqual(await f.service.diagnostics(f.workspaceId, created.run.id, completed.record.id), { attempts: [] })
 })
 
 test('corrupt snapshot bytes fail independently before inference', async () => {
@@ -1287,7 +1482,7 @@ test('a stale pending page cannot start scoring behind an archived workspace con
   assert.equal(mock.calls.length, 0)
 })
 
-test('deletion racing a leased result upload drains the writer, removes its orphan result, and fences old claimed attempts', async () => {
+for (const artifact of ['results', 'diagnostics']) test(`deletion racing a leased ${artifact} upload drains the writer, removes orphan content, and fences old claimed attempts`, async () => {
   const f = fixture()
   const created = await createRun(f)
   const pairId = comparisons(f, created.run.id)[0].record.id
@@ -1295,12 +1490,14 @@ test('deletion racing a leased result upload drains the writer, removes its orph
   let deletion
   let claimed
   f.analysis.blobs._afterPut(async name => {
-    if (!name.includes('/results/')) return
+    if (!name.includes(`/${artifact}/`)) return
     claimed = await f.analysis.store.get(f.workspaceId, pairId)
     const run = await f.analysis.store.get(f.workspaceId, created.run.id)
     deletion = await library.change(f.workspaceId, created.run.id, 'delete', run.etag, ACTOR)
   })
-  const mock = modelFor(f)
+  const mock = modelFor(f, artifact === 'diagnostics' ? () => Response.json({
+    model: 'actual-model', choices: [{ finish_reason: 'length', message: { content: 'PRIVATE-TRUNCATED-SENTINEL' } }],
+  }) : undefined)
   assert.deepEqual(await runAnalysisWorker(mock.deps, { maxItems: 1 }), { claimed: 1, completed: 0 })
   assert.equal(deletion.pending, true)
   assert.equal(deletion.operation.status, 'pending')

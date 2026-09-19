@@ -6,6 +6,7 @@ import type {
   AnalysisLimitation, AnalysisProcessingErrorCode, RealAnalysisAssessmentInput, RealAnalysisAssessmentOutput,
   RealAnalysisGroundingReviewOutput, RealAnalysisResultSummary, RealCriterionResult, RealQualificationAssessment,
 } from '../../src/domain/real-analyses'
+import type { AnalysisDiagnosticReason, AnalysisSchemaDiagnostics } from '../../src/domain/analysis-diagnostics'
 import { RESUME_IMPORT_LIMITS } from '../../src/domain/real-resumes'
 import type { Citation } from '../../src/domain/types'
 import {
@@ -20,6 +21,7 @@ import {
 import {
   AnalysisEvidenceBindingError, createAnalysisPassageResolver, type AnalysisEvidenceCatalog,
 } from './evidence-passages'
+import { analysisSchemaDiagnostics } from './diagnostics'
 
 export type { AnalysisModelStage } from './citation-diagnostics'
 
@@ -29,6 +31,8 @@ export interface AnalysisModelErrorOptions {
   correctable?: boolean
   cancelled?: boolean
   citationDiagnostics?: AnalysisCitationDiagnostics
+  schemaDiagnostics?: AnalysisSchemaDiagnostics
+  reason?: AnalysisDiagnosticReason
 }
 
 export class AnalysisModelError extends Error {
@@ -38,6 +42,8 @@ export class AnalysisModelError extends Error {
   readonly correctable: boolean
   readonly cancelled: boolean
   readonly citationDiagnostics?: AnalysisCitationDiagnostics
+  readonly schemaDiagnostics?: AnalysisSchemaDiagnostics
+  readonly reason?: AnalysisDiagnosticReason
 
   constructor(code: AnalysisProcessingErrorCode, message: string, options: AnalysisModelErrorOptions = {}) {
     super(message)
@@ -48,6 +54,8 @@ export class AnalysisModelError extends Error {
     this.correctable = options.correctable ?? false
     this.cancelled = options.cancelled ?? false
     this.citationDiagnostics = options.citationDiagnostics
+    this.schemaDiagnostics = options.schemaDiagnostics
+    this.reason = options.reason
   }
 }
 
@@ -55,16 +63,30 @@ export const ANALYSIS_WEIGHT_TOLERANCE = 0.000001
 export const ANALYSIS_CALCULATION_VERSION = 'weighted-0-100-v1' as const
 
 function invalidInput(message: string): never {
-  throw new AnalysisModelError('invalid-input', message)
+  throw new AnalysisModelError('invalid-input', message, { reason: 'input-contract' })
 }
 
-function invalidOutput(message: string, stage: AnalysisModelStage = 'assessment', citation = false): never {
-  throw new AnalysisModelError(citation ? 'invalid-citation' : 'invalid-model-output', message, { stage, correctable: true })
+function invalidOutput(
+  message: string, stage: AnalysisModelStage = 'assessment', citation = false,
+  reason: AnalysisDiagnosticReason = 'assessment-contract',
+): never {
+  throw new AnalysisModelError(citation ? 'invalid-citation' : 'invalid-model-output', message, {
+    stage, correctable: true, reason: citation ? 'citation-mismatch' : reason,
+  })
+}
+
+function invalidSchema(
+  message: string, issues: Parameters<typeof analysisSchemaDiagnostics>[0],
+  stage: AnalysisModelStage = 'assessment', citation = false,
+): never {
+  throw new AnalysisModelError(citation ? 'invalid-citation' : 'invalid-model-output', message, {
+    stage, correctable: true, reason: 'schema-mismatch', schemaDiagnostics: analysisSchemaDiagnostics(issues),
+  })
 }
 
 function invalidCitations(diagnostics: AnalysisCitationDiagnostics, stage: AnalysisModelStage): never {
   throw new AnalysisModelError('invalid-citation', describeAnalysisCitationFailure(diagnostics, stage), {
-    stage, correctable: true, citationDiagnostics: diagnostics,
+    stage, correctable: true, citationDiagnostics: diagnostics, reason: 'citation-mismatch',
   })
 }
 
@@ -98,7 +120,10 @@ function validateWeights(rubric: RealAnalysisAssessmentInput['rubric']): void {
 /** This boundary validates model inputs; authorization, approval, and snapshot hashes belong to the resolver. */
 export function validateAnalysisAssessmentInput(value: unknown): RealAnalysisAssessmentInput {
   const parsed = assessmentInputSchema.safeParse(value)
-  if (!parsed.success) invalidInput('Analysis requires a complete real resume, saved rubric, and bounded frozen requirement evidence.')
+  if (!parsed.success) throw new AnalysisModelError('invalid-input',
+    'Analysis requires a complete real resume, saved rubric, and bounded frozen requirement evidence.', {
+      reason: 'input-contract', schemaDiagnostics: analysisSchemaDiagnostics(parsed.error.issues),
+    })
   const input: RealAnalysisAssessmentInput = parsed.data
   if (!unique(input.resume.paragraphs.map(paragraph => paragraph.id)) ||
     !unique(input.qualifications.map(qualification => qualification.id)) ||
@@ -106,7 +131,9 @@ export function validateAnalysisAssessmentInput(value: unknown): RealAnalysisAss
     invalidInput('Analysis source paragraphs and qualifications need unique identities and a valid saved rubric version.')
   }
   if (input.resume.paragraphs.reduce((sum, paragraph) => sum + paragraph.text.length, 0) > RESUME_IMPORT_LIMITS.maxSourceCharacters) {
-    throw new AnalysisModelError('context-limit', 'The complete resume exceeds the supported analysis source limit; no sections were omitted.')
+    throw new AnalysisModelError('context-limit', 'The complete resume exceeds the supported analysis source limit; no sections were omitted.', {
+      reason: 'source-limit',
+    })
   }
   validateWeights(input.rubric)
   if (input.rubric.kind === 'job' && input.qualifications.length) {
@@ -170,7 +197,8 @@ function checkAssessmentLanguage(value: string): void {
     /\b(?:hire|reject|shortlist)\s+(?:this|the)\s+(?:candidate|applicant|person)\b/i.test(value) ||
     /\b(?:candidate|applicant|person|they|he|she)\s+(?:lacks?|cannot|can't|is unable|is incapable)\b/i.test(value) ||
     /\b(?:candidate|applicant|person|they|he|she)\s+(?:is|are|meets?)\s+(?:(?:officially|all|the|minimum)\s+)*(?:eligible|ineligible|qualified|unqualified|qualifications|eligibility)\b/i.test(value)) {
-    invalidOutput('Analysis must describe document evidence, not personal ability, a hiring recommendation, or official eligibility.')
+    invalidOutput('Analysis must describe document evidence, not personal ability, a hiring recommendation, or official eligibility.',
+      'assessment', false, 'policy-language')
   }
 }
 
@@ -203,7 +231,7 @@ export function validateAnalysisAssessmentSelections(
   return withPassageSelections(value, input, catalog, 'assessment', resolve => {
     const parsed = assessmentSelectionSchemaForInput(input, catalog.passages.length).safeParse(value)
     if (!parsed.success) {
-      invalidOutput('The analysis model output does not match the exact bounded passage-selection schema or allowed identities.')
+      invalidSchema('The analysis model output does not match the exact bounded passage-selection schema or allowed identities.', parsed.error.issues)
     }
     return validateAnalysisAssessment({
       ...parsed.data,
@@ -219,7 +247,8 @@ export function validateAnalysisGroundingSelections(
   return withPassageSelections(value, input, catalog, 'grounding', resolve => {
     const parsed = groundingSelectionSchemaForInput(input, catalog.passages.length).safeParse(value)
     if (!parsed.success) {
-      invalidOutput('The analysis grounding review does not match its exact bounded passage-selection schema or allowed identities.', 'grounding')
+      invalidSchema('The analysis grounding review does not match its exact bounded passage-selection schema or allowed identities.',
+        parsed.error.issues, 'grounding')
     }
     return validateAnalysisGroundingReview({
       ...parsed.data,
@@ -234,7 +263,8 @@ export function validateAnalysisAssessment(value: unknown, input: RealAnalysisAs
   const parsed = assessmentSchemaForInput(input).safeParse(value)
   if (!parsed.success) {
     const citation = parsed.error.issues.some(issue => issue.path.includes('citations'))
-    invalidOutput('The analysis model output does not match the exact bounded assessment schema or allowed identities.', 'assessment', citation)
+    invalidSchema('The analysis model output does not match the exact bounded assessment schema or allowed identities.',
+      parsed.error.issues, 'assessment', citation)
   }
   const result = parsed.data
   if (!unique(result.criteria.map(item => item.criterionId)) || !unique(result.qualifications.map(item => item.qualificationId))) {
@@ -368,7 +398,8 @@ export function validateAnalysisGroundingReview(
   const parsed = groundingSchemaForInput(input).safeParse(value)
   if (!parsed.success) {
     const citation = parsed.error.issues.some(issue => issue.path.includes('citations'))
-    invalidOutput('The analysis grounding review does not match its exact bounded schema or allowed identities.', 'grounding', citation)
+    invalidSchema('The analysis grounding review does not match its exact bounded schema or allowed identities.',
+      parsed.error.issues, 'grounding', citation)
   }
   const review = parsed.data
   if (review.outcome === 'supported' ? review.issues.length !== 0 : review.issues.length === 0) {

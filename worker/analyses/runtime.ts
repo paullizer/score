@@ -4,6 +4,11 @@ import {
   type RealAnalysisComparisonRecord, type RealAnalysisResult, type RealAnalysisResultSummary,
   type RealAnalysisRunRecord, type VersionedAnalysisEntity,
 } from '../../src/domain/real-analyses'
+import {
+  ANALYSIS_DIAGNOSTIC_LIMITS, ANALYSIS_PIPELINE_VERSION,
+  type AnalysisAssessmentDiagnostic, type AnalysisFailureDiagnostic, type AnalysisFailureDiagnosticReference,
+  type AnalysisTelemetryEvent,
+} from '../../src/domain/analysis-diagnostics'
 import type { ImmutableJsonBlobReference } from '../../src/domain/real-resumes'
 import { StoreConflictError } from '../../server/store'
 import {
@@ -14,7 +19,8 @@ import {
   readAnalysisResult, readAnalysisSnapshots, type AnalysisSnapshots,
 } from '../../server/analyses/snapshots'
 import {
-  analysisHash, analysisResultBlobName, assertAnalysisResultBinding, parseAnalysisEntity, parseAnalysisResult,
+  analysisDiagnosticBlobName, analysisHash, analysisResultBlobName, assertAnalysisFailureDiagnosticBinding,
+  assertAnalysisResultBinding, parseAnalysisEntity, parseAnalysisFailureDiagnostic, parseAnalysisResult,
 } from '../../server/analyses/validation'
 import type { AnalysisBlobStore, AnalysisStore } from '../../server/analyses/store'
 import { analysisIsRemoved, fencedAnalysisBlobs } from '../../server/analyses/guards'
@@ -341,6 +347,43 @@ async function storeResult(
   return { reference, result: winning }
 }
 
+async function storeFailureDiagnostic(
+  deps: AnalysisWorkerDependencies, lease: ComparisonLease, clock: Clock,
+  details: Pick<AnalysisFailureDiagnostic,
+    'error' | 'reason' | 'citationDiagnostics' | 'schemaDiagnostics' | 'events' | 'omittedEvents' | 'assessments' | 'correctionCount'>,
+  snapshots?: AnalysisSnapshots,
+): Promise<AnalysisFailureDiagnosticReference> {
+  const { run, comparison } = await lease.check()
+  const record = comparison.record
+  const createdAt = timeAfter(clock, run.record, record)
+  const diagnostic = parseAnalysisFailureDiagnostic({
+    ...details, schemaVersion: 1, dataKind: 'real', pipelineVersion: ANALYSIS_PIPELINE_VERSION,
+    workspaceId: record.workspaceId, runId: record.runId, comparisonId: record.id, attemptId: record.attemptId!,
+    createdAt, processingAttempt: record.attempts, retryCount: record.retryCount, manifestSha256: run.record.manifest.sha256,
+    resumeSnapshot: { snapshotId: record.resume.snapshotId, sha256: record.resume.blob.sha256 },
+    targetSnapshot: { snapshotId: record.target.snapshotId, sha256: record.target.blob.sha256 },
+    ...(record.failureDiagnostic ? { previous: record.failureDiagnostic } : {}),
+  } satisfies AnalysisFailureDiagnostic)
+  const pending = { ...record, updatedAt: createdAt }
+  assertAnalysisFailureDiagnosticBinding(diagnostic, run.record, pending, snapshots)
+  const name = analysisDiagnosticBlobName(record.workspaceId, record.runId, record.id, record.attemptId!)
+  const blobs = fencedAnalysisBlobs(deps, record.workspaceId, record.runId, lease.control.signal)
+  let reference: ImmutableJsonBlobReference
+  try {
+    reference = await lease.control.wait(() => putAnalysisJson(blobs, name, diagnostic))
+  } catch (error) {
+    lease.control.check()
+    const winning = await lease.control.wait(() => deps.blobs.read(name))
+    if (!winning || analysisHash(parseAnalysisJson(winning)) !== analysisHash(diagnostic)) throw error
+    reference = analysisBlobReference(name, winning)
+  }
+  const saved = parseAnalysisFailureDiagnostic(parseAnalysisJson(await lease.control.wait(() =>
+    readAnalysisBlob(deps.blobs, reference, record.workspaceId, record.runId))))
+  assertAnalysisFailureDiagnosticBinding(saved, run.record, pending, snapshots)
+  await lease.check()
+  return { attemptId: saved.attemptId, createdAt: saved.createdAt, blob: reference }
+}
+
 export async function processClaimedComparison(
   claimed: Comparison, deps: AnalysisWorkerDependencies,
   options: { deadline?: number; signal?: AbortSignal; attemptLimitReached?: boolean } = {},
@@ -352,29 +395,44 @@ export async function processClaimedComparison(
   const context = {
     workspaceId: claimed.record.workspaceId, runId: claimed.record.runId,
     comparisonId: claimed.record.id, attemptId: claimed.record.attemptId,
+    pipelineVersion: ANALYSIS_PIPELINE_VERSION,
   }
   let stage: Stage = 'assessment'
   let correctionCount = 0
+  const events: AnalysisTelemetryEvent[] = []
+  const assessments: AnalysisAssessmentDiagnostic[] = []
+  let omittedEvents = 0
   const onEvent: AnalysisTelemetrySink = event => {
     stage = event.stage
     correctionCount = event.correctionCount ?? correctionCount
-    emitAnalysisTelemetry(deps.onEvent, { ...event, ...context })
+    emitAnalysisTelemetry(safe => {
+      if (events.length < ANALYSIS_DIAGNOSTIC_LIMITS.maxEvents) events.push(structuredClone(safe))
+      else omittedEvents += 1
+      emitAnalysisTelemetry(deps.onEvent, safe)
+    }, { ...event, ...context })
   }
   const outcome = (status: 'complete' | 'failed' | 'queued' | 'abandoned', failure?: AnalysisProcessingError) => {
     const timestamp = clock.now().toISOString()
-    emitAnalysisTelemetry(deps.onEvent, {
+    onEvent({
       ...context, event: 'comparison-outcome', timestamp, stage: failure?.stage ?? stage, outcome: status,
       correctionCount, code: failure?.code, retryable: failure?.retryable,
       durationMilliseconds: Math.max(0, Date.parse(timestamp) - startedAt),
     })
   }
   let readingInputs = true
+  let captured: AnalysisSnapshots | undefined
   let published: ImmutableJsonBlobReference | undefined
+  onEvent({
+    event: 'comparison-started', timestamp: clock.now().toISOString(), stage,
+    resumeSnapshotSha256: claimed.record.resume.blob.sha256, targetSnapshotSha256: claimed.record.target.blob.sha256,
+    correctionCount,
+  })
   try {
     const { run, comparison } = await lease.check()
     if (options.attemptLimitReached) throw new AnalysisWorkFailure('timeout', stage,
       'Analysis stopped after three processing attempts. A manual retry preserves the original inputs.', true)
     const snapshots = await lease.control.wait(() => readAnalysisSnapshots(inputBlobs(deps.blobs, stage), run.record, comparison.record))
+    captured = snapshots
     readingInputs = false
     await lease.check()
     const target = snapshots.targetSnapshot
@@ -385,6 +443,16 @@ export async function processClaimedComparison(
       requirementEvidence: target.requirementEvidence,
     }, {
       model: deps.model, clock, signal: lease.control.signal, onEvent,
+      onDiagnostic(diagnostic) {
+        const index = assessments.findIndex(item => item.modelCallId === diagnostic.modelCallId)
+        if (index >= 0) assessments[index] = diagnostic
+        else {
+          if (assessments.length >= ANALYSIS_LIMITS.maxOutputCorrections + 1) {
+            throw new AnalysisModelError('internal-error', 'Analysis diagnostic capture exceeded the bounded correction history.')
+          }
+          assessments.push(diagnostic)
+        }
+      },
       resumeSnapshotSha256: comparison.record.resume.blob.sha256,
       targetSnapshotSha256: comparison.record.target.blob.sha256,
     })
@@ -423,6 +491,21 @@ export async function processClaimedComparison(
     }
     if (error instanceof LostAnalysisWork) { outcome('abandoned'); return false }
     const failure = failureFor(error, stage, readingInputs)
+    let diagnostic: AnalysisFailureDiagnosticReference | undefined
+    try {
+      diagnostic = await storeFailureDiagnostic(deps, lease, clock, {
+        error: failure, correctionCount, events, omittedEvents, assessments,
+        ...(error instanceof AnalysisModelError ? {
+          reason: error.reason, citationDiagnostics: error.citationDiagnostics, schemaDiagnostics: error.schemaDiagnostics,
+        } : {}),
+      }, captured)
+    } catch (diagnosticError) {
+      if (diagnosticError instanceof LostAnalysisWork) { outcome('abandoned'); return false }
+      onEvent({
+        event: 'diagnostic-write-failed', timestamp: clock.now().toISOString(), stage: failure.stage,
+        code: failureFor(diagnosticError, 'publication').code, cancelled: lease.control.signal.aborted,
+      })
+    }
     try {
       let status: 'queued' | 'failed' = 'failed'
       await lease.atomic((record, timestamp) => {
@@ -430,6 +513,8 @@ export async function processClaimedComparison(
         status = retry ? 'queued' : 'failed'
         const next: RealAnalysisComparisonRecord = {
           ...record, status, updatedAt: timestamp, error: failure,
+          ...(diagnostic ? { failureDiagnostic: diagnostic } : {}),
+          diagnosticCapture: { attemptId: record.attemptId!, status: diagnostic ? 'saved' : 'unavailable', pipelineVersion: ANALYSIS_PIPELINE_VERSION },
         }
         delete next.lease
         delete next.nextAttemptAt
