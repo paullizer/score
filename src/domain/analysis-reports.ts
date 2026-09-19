@@ -277,8 +277,14 @@ export interface ReportFontData {
   bold: ArrayBuffer
 }
 
+export interface ReportLinkContext {
+  origin: string
+  workspaceId?: string
+}
+
 export interface ReportGenerationOptions {
   fonts?: ReportFontData
+  links?: ReportLinkContext
 }
 
 export type AnalysisReportWriter = (report: AnalysisReport, options?: ReportGenerationOptions) => Uint8Array | Promise<Uint8Array>

@@ -16,6 +16,7 @@ export async function loadReportFoundation() {
         export * from './src/domain/analysis-reports';
         export * from './src/services/analysisReports/model';
         export * from './src/services/analysisReports/presentation';
+        export * from './src/services/analysisReports/readable';
         export * from './src/services/analysisReports/sample';
         export { createInitialWorkspace, createFixtureWorkspace } from './src/data/fixtures';
         export { snapshotAnalysisRun, evaluateComparison } from './src/services/scoring';

@@ -1,5 +1,5 @@
 import {
-  beginText, endText, PDFHexString, PDFName, PDFOperator, PDFOperatorNames, popGraphicsState, pushGraphicsState,
+  beginText, endText, PDFHexString, PDFName, PDFOperator, PDFOperatorNames, PDFString, popGraphicsState, pushGraphicsState,
   rgb, setFillingColor, setFontAndSize, setTextMatrix, showText,
 } from 'pdf-lib'
 import type { Color, PDFDocument, PDFFont, PDFPage } from 'pdf-lib'
@@ -30,6 +30,13 @@ export interface PdfReportFonts {
   bold: PDFFont
 }
 
+export interface PdfReportLink {
+  text: string
+  url: string
+}
+
+type TableCell = string | PdfReportLink
+
 interface TextLine {
   text: string
   source: string
@@ -47,6 +54,7 @@ interface TextStyle {
   after?: number
   keepWithNext?: number
   keepTailWithNext?: boolean
+  link?: string
 }
 
 interface PageIdentity {
@@ -129,6 +137,7 @@ export class PdfReportLayout {
   private readonly characters = new Map<PDFFont, Set<number>>()
   private readonly fontKeys = new WeakMap<PDFPage, Map<PDFFont, PDFName>>()
   private readonly fontRuns = new Map<PDFFont, Map<string, { width: number; encoded?: PDFHexString }>>()
+  private readonly checkedLinks = new Set<string>()
 
   constructor(
     readonly document: PDFDocument,
@@ -185,7 +194,7 @@ export class PdfReportLayout {
       x: 0, y: 704, width: PDF_REPORT_PAGE.width, height: 88, color: PDF_REPORT_COLORS.background,
     })
     this.drawText('Score', PDF_REPORT_PAGE.margin, 765, 13, this.fonts.bold, PDF_REPORT_COLORS.accent)
-    const badge = `${this.designation} · ${this.identity.section}`
+    const badge = [this.designation, this.identity.section].filter(Boolean).join(' · ')
     this.drawText(badge, PDF_REPORT_PAGE.width - PDF_REPORT_PAGE.margin - this.measure(badge, this.fonts.regular, 8.5),
       766, 8.5, this.fonts.regular, PDF_REPORT_COLORS.muted)
     this.page.drawLine({
@@ -202,12 +211,40 @@ export class PdfReportLayout {
     if (this.y - height < PDF_REPORT_PAGE.bodyBottom) this.newPage()
   }
 
-  private drawText(text: string, x: number, baseline: number, size: number, font: PDFFont, fill: Color, source = text): void {
+  private addLink(url: string, text: string, x: number, baseline: number, size: number, font: PDFFont): void {
+    if (!this.checkedLinks.has(url)) {
+      let destination: URL
+      try { destination = new URL(url) } catch { throw new Error('A PDF report link must be an absolute application URL.') }
+      if (!['http:', 'https:'].includes(destination.protocol) || destination.username || destination.password ||
+        Array.from(url).some(character => character.charCodeAt(0) <= 0x20 || character.charCodeAt(0) === 0x7f)) {
+        throw new Error('A PDF report link must use a safe HTTP or HTTPS application URL without credentials.')
+      }
+      this.checkedLinks.add(url)
+    }
+    if (!text.trim()) return
+    const width = this.measure(text, font, size)
+    const ascent = font.heightAtSize(size, { descender: false })
+    const descent = font.heightAtSize(size) - ascent
+    const annotation = this.document.context.obj({
+      Type: 'Annot', Subtype: 'Link',
+      Rect: [x, baseline - descent, x + width, baseline + ascent],
+      Border: [0, 0, 0],
+      A: { Type: 'Action', S: 'URI', URI: PDFString.of(url) },
+    })
+    this.page.node.addAnnot(this.document.context.register(annotation))
+    this.page.drawLine({
+      start: { x, y: baseline - 1.5 }, end: { x: x + width, y: baseline - 1.5 },
+      color: PDF_REPORT_COLORS.accent, thickness: 0.4,
+    })
+  }
+
+  private drawText(text: string, x: number, baseline: number, size: number, font: PDFFont, fill: Color, source = text, link?: string): void {
     if (!text && !source) return
     for (const character of printable(text)) {
       const code = character.codePointAt(0)!
-      if (!this.characters.get(font)!.has(code)) {
-        throw new Error(`The local PDF font cannot render U+${code.toString(16).toUpperCase().padStart(4, '0')}. Use another report format or a locally licensed font supporting this character; no source text was substituted.`)
+      if (!this.characters.get(font)!.has(code) || code < 32 || (code >= 0x7f && code < 0xa0) ||
+        (code >= 0xd800 && code <= 0xdfff)) {
+        throw new Error(`The local PDF font cannot render U+${code.toString(16).toUpperCase().padStart(4, '0')} in the displayed report. No source text was substituted or omitted. Use another report format or a locally licensed PDF font supporting this character.`)
       }
     }
     // ActualText retains source whitespace and combining sequences alongside embedded ToUnicode text.
@@ -225,6 +262,7 @@ export class PdfReportLayout {
       ]),
       showText(run.encoded), PDFOperator.of(PDFOperatorNames.EndMarkedContent), endText(), popGraphicsState(),
     )
+    if (link) this.addLink(link, text, x, baseline, size, font)
   }
 
   paragraph(text: string, style: TextStyle = {}): void {
@@ -273,7 +311,7 @@ export class PdfReportLayout {
       for (let index = 0; index < count; index++) {
         const line = lines[offset + index]
         this.drawText(line.text, PDF_REPORT_PAGE.margin + padding, this.y - padding - ascent - index * leading,
-          size, font, style.color ?? PDF_REPORT_COLORS.text, line.source)
+          size, font, style.color ?? (style.link ? PDF_REPORT_COLORS.accent : PDF_REPORT_COLORS.text), line.source, style.link)
       }
       this.y -= chunkHeight
       offset += count
@@ -292,6 +330,46 @@ export class PdfReportLayout {
 
   callout(text: string, bold = false): void {
     this.paragraph(text, { bold, padding: 10, background: PDF_REPORT_COLORS.background, rule: true, after: 10 })
+  }
+
+  links(links: readonly PdfReportLink[]): void {
+    const size = 10
+    const leading = 17
+    const gap = 24
+    const font = this.fonts.bold
+    const ascent = font.heightAtSize(size, { descender: false })
+    let x: number = PDF_REPORT_PAGE.margin
+    for (const link of links) {
+      const lines = this.wrap(link.text, font, size, PDF_REPORT_WIDTH)
+      for (const [index, line] of lines.entries()) {
+        const width = this.measure(line.text, font, size)
+        if (index || x + width > PDF_REPORT_PAGE.width - PDF_REPORT_PAGE.margin) {
+          this.y -= leading
+          x = PDF_REPORT_PAGE.margin
+        }
+        this.ensureSpace(leading)
+        this.drawText(line.text, x, this.y - ascent, size, font, PDF_REPORT_COLORS.accent, line.source, link.url)
+        x += width + gap
+      }
+    }
+    if (links.length) this.y -= leading + 9
+  }
+
+  explanation(label: string, text: string, source: string | null): void {
+    const bodyHeight = PDF_REPORT_PAGE.bodyTop - PDF_REPORT_PAGE.bodyBottom
+    const labelHeight = this.wrap(label, this.fonts.bold, 10, PDF_REPORT_WIDTH).length * 15
+    const textHeight = this.wrap(text, this.fonts.regular, 10, PDF_REPORT_WIDTH).length * 15
+    const sourceHeight = source ? this.wrap(source, this.fonts.regular, 9.5, PDF_REPORT_WIDTH).length * 14 : 0
+    const sourceReserve = sourceHeight <= bodyHeight - 30 ? sourceHeight : 28
+    const groupHeight = textHeight + (source ? 3 + sourceReserve : 0)
+    this.paragraph(label, {
+      size: 10, leading: 15, bold: true, before: 5, after: 4,
+      keepWithNext: labelHeight + 4 + groupHeight <= bodyHeight ? groupHeight : Math.min(textHeight, 30),
+    })
+    this.paragraph(text, {
+      size: 10, leading: 15, after: source ? 3 : 8, keepWithNext: sourceReserve, keepTailWithNext: true,
+    })
+    if (source) this.paragraph(source, { size: 9.5, leading: 14, color: PDF_REPORT_COLORS.muted, after: 8 })
   }
 
   citation(label: string, quote: string, locator: string): void {
@@ -332,16 +410,17 @@ export class PdfReportLayout {
     if (rows.length) this.paragraph(rows.join('\n'), { size: 9.5, leading: 14, after: 6 })
   }
 
-  table(headers: string[], rows: string[][], widths: number[]): void {
+  table(headers: string[], rows: TableCell[][], widths: number[]): void {
     if (!rows.length) return
-    if (headers.length !== widths.length || Math.abs(widths.reduce((sum, width) => sum + width, 0) - PDF_REPORT_WIDTH) > 0.01 ||
+    if (headers.length !== widths.length || widths.some(width => !Number.isFinite(width) || width <= 14) ||
+      Math.abs(widths.reduce((sum, width) => sum + width, 0) - PDF_REPORT_WIDTH) > 0.01 ||
       rows.some(row => row.length !== headers.length)) throw new Error('Invalid PDF report table layout.')
     const size = 9.5
     const leading = 14
     const padding = 7
     const headerLines = headers.map((header, index) => this.wrap(header, this.fonts.bold, size, widths[index] - padding * 2))
     const headerHeight = Math.max(...headerLines.map(lines => lines.length)) * leading + padding * 2
-    const drawCells = (cells: TextLine[][], offset: number, count: number, isHeader: boolean, shaded: boolean) => {
+    const drawCells = (cells: TextLine[][], offset: number, count: number, isHeader: boolean, shaded: boolean, links: (string | undefined)[] = []) => {
       const height = count * leading + padding * 2
       this.page.drawRectangle({
         x: PDF_REPORT_PAGE.margin, y: this.y - height, width: PDF_REPORT_WIDTH, height,
@@ -354,7 +433,7 @@ export class PdfReportLayout {
         for (let line = 0; line < count; line++) {
           const value = cells[cell][offset + line]
           if (value) this.drawText(value.text, x + padding, this.y - padding - ascent - line * leading,
-            size, font, isHeader ? PDF_REPORT_COLORS.paper : PDF_REPORT_COLORS.text, value.source)
+            size, font, isHeader ? PDF_REPORT_COLORS.paper : links[cell] ? PDF_REPORT_COLORS.accent : PDF_REPORT_COLORS.text, value.source, links[cell])
         }
         x += widths[cell]
       }
@@ -369,7 +448,9 @@ export class PdfReportLayout {
     this.ensureSpace(headerHeight + leading * 2 + padding * 2)
     drawHeader()
     rows.forEach((row, rowIndex) => {
-      const cells = row.map((value, index) => this.wrap(value, this.fonts.regular, size, widths[index] - padding * 2))
+      const cells = row.map((value, index) => this.wrap(typeof value === 'string' ? value : value.text,
+        this.fonts.regular, size, widths[index] - padding * 2))
+      const links = row.map(value => typeof value === 'string' ? undefined : value.url)
       const length = Math.max(...cells.map(lines => lines.length))
       const rowHeight = length * leading + padding * 2
       if (rowHeight <= PDF_REPORT_PAGE.bodyTop - PDF_REPORT_PAGE.bodyBottom - headerHeight &&
@@ -382,7 +463,7 @@ export class PdfReportLayout {
           continue
         }
         const count = Math.min(capacity, length - offset)
-        drawCells(cells, offset, count, false, rowIndex % 2 === 0)
+        drawCells(cells, offset, count, false, rowIndex % 2 === 0, links)
         offset += count
         if (offset < length) continueTable()
       }
@@ -398,11 +479,9 @@ export class PdfReportLayout {
         start: { x: PDF_REPORT_PAGE.margin, y: 53 }, end: { x: PDF_REPORT_PAGE.width - PDF_REPORT_PAGE.margin, y: 53 },
         color: PDF_REPORT_COLORS.border, thickness: 0.6,
       })
-      this.drawText(`${this.designation} · Evidence for human review`, PDF_REPORT_PAGE.margin, 39, 8.5, this.fonts.regular, PDF_REPORT_COLORS.muted)
       const pageNumber = `Page ${index + 1} of ${pages.length}`
       this.drawText(pageNumber, PDF_REPORT_PAGE.width - PDF_REPORT_PAGE.margin - this.measure(pageNumber, this.fonts.regular, 8.5),
         39, 8.5, this.fonts.regular, PDF_REPORT_COLORS.muted)
-      this.drawText('Not a hiring recommendation or official GS eligibility finding.', PDF_REPORT_PAGE.margin, 25, 8.5, this.fonts.regular, PDF_REPORT_COLORS.muted)
     })
     this.checkTime()
   }
