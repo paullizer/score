@@ -43,6 +43,33 @@ async function ready(jobs) {
   return { value, rubric }
 }
 
+test('job display names persist through the guarded adapter without changing canonical metadata or immutable rubric versions', async () => {
+  const { cosmos, jobs } = fixture()
+  const { value, rubric } = await ready(jobs)
+  const versions = await jobs.store.listRubrics(workspaceId, jobId)
+  const renamed = await jobs.store.replace({ ...value.record, displayName: 'Hiring group A' }, value.etag)
+  assert.equal(validateRealJobRecord(renamed.record), true)
+  assert.equal((await jobs.store.get(workspaceId, jobId)).record.displayName, 'Hiring group A')
+  assert.deepEqual(renamed.record.job, value.record.job)
+  assert.deepEqual(renamed.record.source, value.record.source)
+  assert.deepEqual(await jobs.store.listRubrics(workspaceId, jobId), versions)
+  assert.deepEqual(cosmos.batches.at(-1).map(operation => operation.resourceBody.recordType), ['workspace-lifecycle', 'job'])
+  assert.equal(cosmos.batches.at(-1).at(-1).ifMatch, value.etag)
+  await assert.rejects(jobs.store.replace({ ...value.record, displayName: 'Stale alias' }, value.etag), /changed/)
+  await assert.rejects(jobs.store.replace({
+    ...renamed.record, displayName: 'Mixed edit', job: { ...renamed.record.job, title: 'Replace original' },
+  }, renamed.etag), /Display-name edits/)
+  await assert.rejects(jobs.store.publish({
+    ...renamed.record, displayName: 'Worker must preserve alias',
+  }, renamed.etag, { ...rubric, version: 2 }), /display-name metadata/)
+  for (const displayName of ['', ' spaced ', 'x'.repeat(161), 'control\u007f', 1, null]) {
+    assert.equal(validateRealJobRecord({ ...value.record, displayName }), false)
+  }
+  assert.equal(validateRealJobRecord({ ...value.record, job: { ...value.record.job, displayName: 'Wrong nesting' } }), false)
+  const impact = await jobLifecycleImpact(jobs, renamed, 'job', { async impact() { return [] } })
+  assert.equal(impact.name, 'Hiring group A')
+})
+
 function injectEmptyCosmosPages(cosmos, progress = false) {
   cosmos.queryPages((_spec, options, readPage, fetchCount) => {
     if (progress && fetchCount < 2) {

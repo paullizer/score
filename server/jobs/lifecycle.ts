@@ -1,4 +1,5 @@
 import type { LifecycleImpact } from '../../src/domain/lifecycle'
+import { getDisplayName } from '../../src/domain/displayNames'
 import type { VersionedRealJob } from '../../src/domain/real-jobs'
 import type { LifecycleDependencies, WorkspaceLifecycleParticipant } from '../lifecycle/contracts'
 import { assertWorkspaceMutationLease } from '../lifecycle/lease'
@@ -61,7 +62,7 @@ export async function jobLifecycleImpact(
     : { kind: 'rubric', id: latest?.groupId ?? record.job.rubricId ?? `rubric-${record.id}` }
   return {
     target,
-    name: scope === 'job' ? record.job.title : latest?.name ?? `${record.job.title} rubric`,
+    name: scope === 'job' ? getDisplayName(record, record.job.title) : latest?.name ?? `${getDisplayName(record, record.job.title)} rubric`,
     counts: {
       ...(scope === 'job' ? { jobs: 1, sourceArtifacts: await sourceCount(jobs, record.workspaceId, record.id) } : {}),
       rubrics: versions.length ? 1 : 0,

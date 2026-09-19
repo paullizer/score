@@ -17,7 +17,7 @@ const key = '6b997c8d-331e-4149-a7fc-b93259efed42'
 const workspaceId = 'workspace-one'
 const hash = 'a'.repeat(64)
 const originals = new Map()
-let client, ui, dom, root, createRoot, requests, current
+let client, ui, dom, root, createRoot, requests, current, projected
 
 function json(body, status = 200) {
   return new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json' } })
@@ -151,7 +151,7 @@ before(async () => {
       export { RealAnalysesBridge } from './src/app/RealAnalysesBridge';
       export { RealAnalysesContext, useRealAnalyses } from './src/app/real-analyses-context';
       export { RealResumesContext } from './src/app/real-resumes-context';
-      export { WorkspaceContext } from './src/app/workspace-context';
+      export { WorkspaceContext, useWorkspace } from './src/app/workspace-context';
       export { RealAnalysisSetup } from './src/features/analyses/RealAnalysisSetup';
       export { RealResumesPage } from './src/features/resumes/RealResumesPage';
       export { RealComparisonReview } from './src/features/analyses/RealComparisonReview';
@@ -164,7 +164,7 @@ before(async () => {
   ])
   ;[client, ui] = await Promise.all(['client', 'ui'].map((name) => import(pathToFileURL(join(output, `${name}.mjs`)).href)))
 })
-beforeEach(() => { requests = []; current = null; dom.window.history.replaceState(null, '', '/') })
+beforeEach(() => { requests = []; current = null; projected = null; dom.window.history.replaceState(null, '', '/') })
 afterEach(async () => { if (root) { await act(async () => root.unmount()); root = null } })
 after(async () => {
   globalThis.fetch = originalFetch
@@ -742,13 +742,49 @@ test('manual run and pair retries stay available after automatic retries stop an
   }
 })
 
-function Probe() { current = ui.useRealAnalyses(); return React.createElement('span', null, current.phase) }
+function Probe() { current = ui.useRealAnalyses(); projected = ui.useWorkspace(); return React.createElement('span', null, current.phase) }
 const legacy = { schemaVersion: 1, jobs: [], resumes: [], rubrics: [], documents: [], runs: [] }
 function bridge(workspace = workspaceId, role = 'owner', show = true) {
   return router(React.createElement(ui.WorkspaceContext.Provider, { value: frontendWorkspaceContext({ workspace: legacy, cloud: { currentWorkspaceId: workspace, workspaces: [{ id: workspace, role }] } }) },
     React.createElement(ui.RealAnalysesBridge, { workspaceId: workspace }, show ? React.createElement(Probe) : null)))
 }
 function deferred() { let resolve; const promise = new Promise((done) => { resolve = done }); return { promise, resolve } }
+
+test('analysis rename uses captured concurrency without requiring new-run sources or changing manifest identity', async () => {
+  let run = runSummary()
+  const before = structuredClone(run.run)
+  const baseEtag = run.etag
+  let conflict = false
+  globalThis.fetch = async (url, init) => {
+    requests.push({ url, init })
+    if (url === '/api/features') return json({ realAnalyses: false, realResumeImports: false })
+    if (init.method === 'PATCH') {
+      if (conflict) return json({ error: { code: 'conflict', message: 'This title changed.' } }, 409)
+      assert.equal(init.headers.get('If-Match'), baseEtag)
+      run = { ...run, run: { ...run.run, displayName: JSON.parse(init.body).displayName }, etag: '"renamed"' }
+      return json({ run })
+    }
+    if (url.endsWith('/analyses')) return json({ runs: [run] })
+    if (url.endsWith('/analyses/run-one')) return json({ ...runDetail('grade'), ...run })
+    if (url.endsWith('/comparisons')) return json({ comparisons: [comparisonDetail()] })
+    throw new Error(`Unexpected live-source dependency request: ${url}`)
+  }
+  await render(bridge())
+  await settle(() => current?.phase === 'ready' && current.features !== null)
+  await act(async () => projected.renameEntity({ kind: 'analysis', id: 'run-one' }, 'Reviewer title', baseEtag))
+  assert.equal(current.summaries[0].run.displayName, 'Reviewer title')
+  assert.deepEqual({ ...run.run, displayName: undefined }, { ...before, displayName: undefined })
+  assert.deepEqual(legacy.runs, [])
+  assert.equal(current.features.realAnalyses, false)
+  conflict = true
+  await act(async () => {
+    await assert.rejects(projected.renameEntity({ kind: 'analysis', id: 'run-one' }, 'Conflicting edit', baseEtag), /Reload and review/)
+  })
+  const patches = requests.filter(request => request.init.method === 'PATCH')
+  assert.equal(patches.length, 2)
+  assert.deepEqual(patches.map(request => request.init.headers.get('If-Match')), [baseEtag, baseEtag])
+  assert.equal(current.summaries[0].run.displayName, 'Reviewer title')
+})
 
 test('existing-run retry and cancellation remain available without new-run source readiness', async () => {
   let run = runSummary('run-one', 'failed')

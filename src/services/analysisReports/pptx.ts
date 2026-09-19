@@ -7,7 +7,7 @@ import { assertReportResourceLimits } from './model'
 import {
   assertReportXmlText, buildComparisonDetailBlocks, candidateName, comparisonStatusLabel,
   criterionScoreLabel, evidenceStatusLabel, formatReportWeight, highlightNotice, overallScoreLabel, paginationLabel, REPORT_CAPTURE_NOTICE, REPORT_FONT_FAMILY,
-  REPORT_PALETTE, reportStatusNotice, reportTitle, summaryExcerpt,
+  REPORT_PALETTE, reportStatusNotice, reportTitle, summaryExcerpt, targetName,
 } from './presentation'
 import type { ReportTextBlock } from './presentation'
 import {
@@ -192,7 +192,8 @@ function highlightScore(slide: PptxGenJS.Slide, comparison: RankedReportComparis
 function highlights(deck: ReportDeck, group: ReportGroup, groupIndex: number): void {
   const reference = `Target ${groupIndex + 1}`
   flow(deck, 'Highest evidence matches', reference, [
-    { key: `target-${groupIndex}-label`, text: group.target.label, kind: 'heading' },
+    { key: `target-${groupIndex}-label`, text: targetName(group.target), kind: 'heading' },
+    ...(group.target.displayName ? [{ key: `target-${groupIndex}-source-label`, text: `Source target title: ${group.target.label}`, kind: 'paragraph' as const }] : []),
     { key: `target-${groupIndex}-identity`, text: `${group.target.sublabel}\n${group.target.versionLabel}\nTarget: ${group.target.id}\nRubric: ${group.target.rubricId} · version ${group.target.rubricVersion}` },
     { key: `target-${groupIndex}-status`, text: reportStatusNotice(group.counts) },
     { key: `target-${groupIndex}-highlight-notice`, text: highlightNotice(group) },

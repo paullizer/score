@@ -643,6 +643,44 @@ function JobsProbe() {
   return React.createElement('span', null, current.phase)
 }
 
+test('job rename projects acknowledged metadata and preserves ready source details outside sample persistence', async () => {
+  let record = markdownDetail()
+  const original = structuredClone(record)
+  const baseEtag = record.etag
+  let projected
+  function RenameProbe() { projected = ui.useWorkspace(); return null }
+  globalThis.fetch = async (url, init) => {
+    requests.push({ url, init })
+    if (url === '/api/features') return json({ realJobImports: true, markdownJobImports: true })
+    if (init.method === 'PATCH') {
+      assert.equal(init.headers.get('If-Match'), baseEtag)
+      record = { ...record, displayName: JSON.parse(init.body).displayName, etag: '"renamed"' }
+      return json({ job: { ...record, document: undefined, rubricVersions: undefined } })
+    }
+    if (url.endsWith('/jobs')) return json({ jobs: [{ ...record, document: undefined, rubricVersions: undefined }] })
+    if (url.endsWith(`/jobs/${record.job.id}`)) return json(record)
+    throw new Error(`Unexpected metadata dependency request: ${url}`)
+  }
+  const value = workspaceValue()
+  const { cloud, ...legacyValue } = value
+  await mount(React.createElement(ui.RealJobsBridge, { workspaceId: 'workspace-one', legacyValue, cloud },
+    React.createElement(RenameProbe)), value)
+  for (let index = 0; index < 30 && projected?.cloud.realJobs.phase !== 'ready'; index++) {
+    await act(async () => { await new Promise(resolve => setTimeout(resolve, 0)) })
+  }
+  assert.equal(projected.cloud.realJobs.phase, 'ready')
+  await act(async () => projected.cloud.realJobs.ensureDetail(record.job.id))
+  const document = projected.cloud.realJobs.detail(record.job.id).value.document
+  await act(async () => projected.renameEntity({ kind: 'job', id: record.job.id }, 'Hiring title', baseEtag))
+  assert.equal(projected.workspace.jobs[0].displayName, 'Hiring title')
+  assert.equal(projected.workspace.jobs[0].title, original.job.title)
+  assert.equal(projected.cloud.realJobs.detail(record.job.id).state, 'ready')
+  assert.equal(projected.cloud.realJobs.detail(record.job.id).value.document, document)
+  assert.deepEqual(record.job, original.job)
+  assert.deepEqual(legacyValue.workspace.jobs, [])
+  assert.equal(requests.filter(request => request.init.method === 'PATCH').length, 1)
+})
+
 test('job bridge fails closed for unadvertised Markdown without blocking PDF or URL APIs', async () => {
   globalThis.fetch = async (url, init) => {
     requests.push({ url, init })

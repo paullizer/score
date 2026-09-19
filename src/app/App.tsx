@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useRef, useState } from 'react'
 import { Link, NavLink, Navigate, Route, Routes, useLocation, useNavigate } from 'react-router-dom'
 import { ArrowUpRight, BarChart3, BriefcaseBusiness, Check, ChevronRight, CircleHelp, Files, FlaskConical, Layers3, LogOut, Menu, Plus, RotateCcw, ShieldCheck, X } from 'lucide-react'
 import { useWorkspace } from './workspace-context'
@@ -21,6 +21,9 @@ import { useLifecycleAccess } from '../components/lifecycle/useLifecycleAccess'
 import { useRealResumes } from './real-resumes-context'
 import { useRealAnalyses } from './real-analyses-context'
 import { RealResumeImportActivity } from '../features/resumes/RealAddResumesDialog'
+import { GradeNavigationProtectionProvider, GradeRouterProtection } from './GradeNavigationProtection'
+import { useGradeLeaveGuard, type GradeLeaveProtectionApi } from './grade-navigation-context'
+import { LibraryViewStateProvider } from './LibraryViewStateProvider'
 
 function Navigation({ onNavigate }: { onNavigate?: () => void }) {
   const { workspace } = useWorkspace()
@@ -53,6 +56,18 @@ function AccountPanel({ cloud }: { cloud: NonNullable<ReturnType<typeof useWorks
 }
 
 export function App() {
+  const { workspace, cloud } = useWorkspace()
+  const leaveRef = useRef<GradeLeaveProtectionApi | null>(null)
+  if (cloud) return <AppContent />
+  const workspaceId = workspace.lifecycle?.epoch ?? 'workspace'
+  return <LibraryViewStateProvider scopeKey={`local:${workspaceId}`}>
+    <GradeNavigationProtectionProvider workspaceId={workspaceId} routePrefix="/" apiRef={leaveRef}>
+      <GradeRouterProtection><AppContent /></GradeRouterProtection>
+    </GradeNavigationProtectionProvider>
+  </LibraryViewStateProvider>
+}
+
+function AppContent() {
   const { workspace, storageError, retrySave, notice, clearNotice, resetDemo, cloud } = useWorkspace()
   const realResumes = useRealResumes()
   const realAnalyses = useRealAnalyses()
@@ -66,13 +81,14 @@ export function App() {
   const isDetail = location.pathname.split('/').filter(Boolean).length > 1
   const currentWorkspaceName = cloud?.workspaces.find((item) => item.id === cloud.currentWorkspaceId)?.name
   const { canEdit } = useLifecycleAccess()
+  const leaveGuard = useGradeLeaveGuard(false, false, 'Workspace changes')
   const localRemoved = !cloud && isEntityRemoved(workspace, { kind: 'workspace', id: 'workspace' })
 
   if (localRemoved) return <main className="recovery-page"><div className="panel recovery-card">
     <h1>{storageError ? 'Workspace deletion is not saved' : 'Your local workspace was deleted'}</h1>
     <p>{storageError ? 'The change exists only in this tab. Keep it open and retry saving before leaving or creating another workspace.' : 'Its content was permanently removed. No samples are recreated automatically. You can explicitly create a fresh demo workspace.'}</p>
     {storageError && <><InlineError>{storageError}</InlineError><Button onClick={retrySave}>Retry saving deletion</Button></>}
-    <Button variant="primary" icon={Plus} disabled={Boolean(storageError)} onClick={() => { resetDemo(); navigate('/jobs') }}>Create demo workspace</Button>
+    <Button variant="primary" icon={Plus} disabled={Boolean(storageError)} onClick={() => { void leaveGuard.leave(() => { resetDemo(); navigate('/jobs') }) }}>Create demo workspace</Button>
   </div></main>
 
   return <LifecycleDialogProvider><div className="app-layout">
@@ -141,7 +157,7 @@ export function App() {
     <Modal open={showReset} onOpenChange={setShowReset}
       title={cloud ? 'Reset sample content?' : 'A fresh starting point'}
       description={cloud ? `Reset only the fictional preview content in ${currentWorkspaceName ?? 'this workspace'}?` : 'Reset your demo workspace?'}
-      footer={<><Button onClick={() => setShowReset(false)}>Keep my workspace</Button><Button variant="danger" icon={RotateCcw} disabled={!canEdit} onClick={() => { resetDemo(); setShowReset(false); navigate('/jobs') }}>Reset {cloud ? 'samples' : 'demo'}</Button></>}>
+      footer={<><Button onClick={() => setShowReset(false)}>Keep my workspace</Button><Button variant="danger" icon={RotateCcw} disabled={!canEdit} onClick={() => { void leaveGuard.leave(() => { resetDemo(); setShowReset(false); navigate('/jobs') }) }}>Reset {cloud ? 'samples' : 'demo'}</Button></>}>
       {cloud ? <>
         <p>This resets only the legacy sample imports, rubric edits, and simulated analysis history in <strong>{currentWorkspaceName ?? 'this workspace'}</strong>. Server-owned real resumes, original captures, analyses and their frozen inputs/results, jobs, grade ladders, reference captures, approvals, and all their versions are not deleted or changed.</p>
         <p className="mt-4 text-muted">Your other workspaces are not affected.</p>

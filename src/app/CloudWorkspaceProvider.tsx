@@ -304,7 +304,7 @@ export function CloudWorkspaceProvider({
 
   async function prepareToLeave(): Promise<Result> {
     if (leaveProtectionRef?.current && !await leaveProtectionRef.current.confirmLeave()) {
-      return { ok: false, reason: 'grade-protection', message: 'Leaving was stopped to preserve unsaved grade changes or an in-flight grade request.' }
+      return { ok: false, reason: 'grade-protection', message: 'Leaving was stopped to preserve unsaved changes or an in-flight request.' }
     }
     engineRef.current?.stopPendingOperations('This browser paused the demo operations while leaving the workspace. Completed results are kept; retry unfinished items later.')
     return flush()
@@ -545,6 +545,12 @@ function CloudWorkspaceReady({
   }
   const value: Omit<WorkspaceContextValue, 'cloud'> = {
     workspace, storageError: null, notice: engine.notice, clearNotice: engine.clearNotice, notify: engine.notify,
+    renameEntity: async (target, name) => {
+      assertWritable()
+      engine.renameEntity(target, name)
+      await flushSave()
+      engine.notify('Name saved. Source evidence and results are unchanged.')
+    },
     addJobs: (...args) => { assertWritable(); return engine.addJobs(...args) },
     addResumes: (...args) => { assertWritable(); return engine.addResumes(...args) },
     cancelJob: (id) => { assertWritable(); return engine.cancelJob(id) },

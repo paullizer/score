@@ -57,6 +57,7 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
 
   const value: WorkspaceContextValue = {
     workspace: engine.workspace, storageError, notice: engine.notice, clearNotice: engine.clearNotice, notify: engine.notify,
+    renameEntity: engine.renameEntity,
     addJobs: engine.addJobs, addResumes: engine.addResumes, cancelJob: engine.cancelJob, retryJob: engine.retryJob,
     saveRubric: engine.saveRubric, startAnalysis: engine.startAnalysis, cancelRun: engine.cancelRun, retryRun: engine.retryRun,
     getLifecycleImpact: engine.getLifecycleImpact, changeLifecycle: engine.changeLifecycle,

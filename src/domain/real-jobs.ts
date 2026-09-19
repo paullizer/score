@@ -37,6 +37,7 @@ export interface RealJobRecord {
   id: string
   workspaceId: string
   recordType: 'job'
+  displayName?: string
   job: Job & { dataKind: 'real' }
   source: RealJobSource
   inputFingerprint: string
@@ -58,6 +59,7 @@ export interface VersionedRealJob {
 }
 
 export interface RealJobSummary {
+  displayName?: string
   job: Job & { dataKind: 'real' }
   source: RealJobSource
   rubric: Rubric | null

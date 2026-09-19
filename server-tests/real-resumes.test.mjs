@@ -443,6 +443,105 @@ async function bodyOf(response, expectedStatus) {
   return body
 }
 
+test('resume metadata PATCH preserves ready profile/source bindings and requires strict names, exact ETags and write access', async () => {
+  const server = await fixture({ lifecycle: noDependencies })
+  try {
+    const initial = (await bodyOf(await importPdf(server, { filename: 'Not a person.pdf' }), 202)).resume
+    const ready = await profileResume(server, initial.resume.id)
+    const originals = clone(server.blobContainer.values)
+    const path = `${server.path()}/${initial.resume.id}/metadata`
+    const patch = (body = { displayName: 'Candidate A' }, extra = {}) => fetch(path, {
+      method: 'PATCH', headers: headers({ 'content-type': 'application/json', 'if-match': ready.etag, ...extra }),
+      body: JSON.stringify(body),
+    })
+    assert.equal((await fetch(path, { method: 'PATCH', headers: { 'content-type': 'application/json' }, body: '{}' })).status, 401)
+    for (const [extra, status] of [
+      [{ oid: VIEWER }, 403], [{ oid: OUTSIDER }, 404], [{ write: false }, 403],
+      [{ origin: 'https://foreign.example' }, 403], [{ 'if-match': '' }, 428],
+      [{ 'if-match': '*' }, 400], [{ 'if-match': `W/${ready.etag}` }, 400],
+      [{ 'if-match': `${ready.etag}, "other"` }, 400], [{ 'if-match': '"stale"' }, 409],
+    ]) await bodyOf(await patch(undefined, extra), status)
+    for (const body of [
+      {}, null, [], { displayName: 4 }, { displayName: '' }, { displayName: '  ' },
+      { displayName: 'x'.repeat(161) }, { displayName: '\tlabel' }, { displayName: 'control\u0085' },
+      { displayName: 'Name', name: 'Forged identity' }, { displayName: 'Name', resume: ready.record.resume },
+      { displayName: 'Name', profileBlob: ready.record.profileBlob }, { displayName: 'Name', status: 'queued' },
+    ]) await bodyOf(await patch(body), 400)
+    server.advance('2026-09-18T02:31:00.000Z')
+    const response = await patch({ displayName: `  ${'r'.repeat(160)}  ` })
+    const { resume } = await bodyOf(response, 200)
+    assert.equal(resume.displayName, 'r'.repeat(160))
+    assert.equal(response.headers.get('etag'), resume.etag)
+    assert.notEqual(resume.etag, ready.etag)
+    assert.deepEqual((await server.store.get(WORKSPACE, initial.resume.id)).record,
+      { ...ready.record, displayName: 'r'.repeat(160), updatedAt: server.now().toISOString() })
+    assert.deepEqual(clone(server.blobContainer.values), originals)
+    assert.deepEqual(resume.resume, ready.record.resume)
+    assert.equal(resume.resume.name, 'Alex Example')
+    assert.equal(resume.resume.sourceLabel, 'Not a person.pdf')
+    assert.equal(resume.resume.displayName, undefined)
+    const detail = await bodyOf(await fetch(path.replace(/\/metadata$/, ''), { headers: headers({ write: false }) }), 200)
+    assert.equal(detail.displayName, 'r'.repeat(160))
+    assert.deepEqual(detail.document, ready.document)
+    assert.deepEqual(detail.profile, ready.profile)
+    assert.equal((await server.service.list(WORKSPACE)).resumes[0].displayName, 'r'.repeat(160))
+    await bodyOf(await patch(), 409)
+    for (const change of [
+      record => { record.resume.name = 'Fictional person' },
+      record => { record.resume.sourceLabel = 'Replaced filename.pdf' },
+      record => { record.warnings = ['Changed evidence metadata'] },
+      record => { record.retryCount++ },
+    ]) {
+      const current = await server.store.get(WORKSPACE, initial.resume.id)
+      const record = { ...clone(current.record), displayName: 'Mixed edit' }
+      change(record)
+      await assert.rejects(server.store.replace(record, current.etag))
+    }
+    assert.equal((await new api.ResumeLifecycleService(server.deps, noDependencies, server.now)
+      .impact(WORKSPACE, initial.resume.id)).name, 'r'.repeat(160))
+    const archived = (await bodyOf(await action(server, initial.resume.id, 'lifecycle', resume.etag, { action: 'archive' }), 200)).resume
+    await bodyOf(await patch(undefined, { 'if-match': archived.etag }), 409)
+    const restored = (await bodyOf(await action(server, initial.resume.id, 'lifecycle', archived.etag, { action: 'unarchive' }), 200)).resume
+    await api.updateResumeControl(server.store, WORKSPACE, undefined,
+      control => ({ ...control, state: 'archived' }))
+    await bodyOf(await patch(undefined, { 'if-match': restored.etag }), 409)
+    await api.updateResumeControl(server.store, WORKSPACE, undefined,
+      control => ({ ...control, state: 'active' }))
+    await api.updateResumeControl(server.store, WORKSPACE, initial.resume.id,
+      control => ({ ...control, state: 'deleting' }))
+    await bodyOf(await patch(undefined, { 'if-match': restored.etag }), 409)
+    assert.deepEqual(server.errors, [])
+  } finally { await server.close() }
+})
+
+test('resume metadata changes remain cosmetic for null identities, failed and cancelled records, and persisted aliases validate strictly', async () => {
+  const server = await fixture()
+  try {
+    const imported = (await bodyOf(await importUrl(server), 202)).resume
+    const named = await server.service.updateMetadata(WORKSPACE, imported.resume.id, { displayName: 'Review this profile' }, imported.etag)
+    assert.equal(named.resume.name, null)
+    assert.equal(named.resume.sourceLabel, imported.resume.sourceLabel)
+    const cancelled = await server.service.cancel(WORKSPACE, imported.resume.id, named.etag)
+    assert.equal(cancelled.displayName, 'Review this profile')
+    const renamed = await server.service.updateMetadata(WORKSPACE, imported.resume.id, { displayName: 'Deferred profile' }, cancelled.etag)
+    assert.equal(renamed.resume.status, 'cancelled')
+    const retried = await server.service.retry(WORKSPACE, imported.resume.id, renamed.etag)
+    assert.equal(retried.displayName, 'Deferred profile')
+    let current = await server.store.get(WORKSPACE, imported.resume.id)
+    const failed = { ...current.record, resume: { ...current.record.resume, status: 'error' },
+      error: { code: 'service-unavailable', stage: 'profiling', message: 'Try again later.', retryable: true } }
+    delete failed.nextAttemptAt
+    current = await server.store.replace(failed, current.etag)
+    const failedAlias = await server.service.updateMetadata(WORKSPACE, imported.resume.id, { displayName: 'Still deferred' }, current.etag)
+    assert.equal(failedAlias.resume.status, 'error')
+    assert.deepEqual(failedAlias.error, failed.error)
+    for (const displayName of ['', ' spaced ', 'x'.repeat(161), 'line\nbreak', null, 1]) {
+      assert.throws(() => api.parseResumeEntity({ ...current.record, displayName }))
+    }
+    assert.equal(api.parseResumeEntity(current.record).displayName, 'Deferred profile')
+  } finally { await server.close() }
+})
+
 async function putJson(server, name, value) {
   const result = await server.blobs.putImmutable(name, Buffer.from(JSON.stringify(value)), 'application/json')
   return { ...api.resumeBlobReference(name, result.blob), contentType: 'application/json' }

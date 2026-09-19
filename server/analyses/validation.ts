@@ -20,7 +20,7 @@ import {
   citationSchema, gradeContextSchema, gradeIssuesFor,
   parseGradeEntity, parseGradeSeedSnapshot,
 } from '../grades/validation'
-import { validateRealJobRecord, validateRealRubric, validateRealSourceDocument } from '../jobs/validation'
+import { isNormalizedDisplayName, validateRealJobRecord, validateRealRubric, validateRealSourceDocument } from '../jobs/validation'
 import {
   isSafeResumeFilename, normalizeResumePublicUrl, parseRealResumeProfile, resumeOriginalBlobName,
   resumeDocumentBlobName, validateRealResumeDocument,
@@ -40,6 +40,7 @@ const UUID = '[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f
 const id = (prefix: string) => z.string().regex(new RegExp(`^${prefix}-${UUID}$`))
 const identifier = z.string().min(1).max(180).regex(/^[a-zA-Z0-9][a-zA-Z0-9_.:-]*$/)
 const text = (max: number) => z.string().max(max).refine(value => value.trim().length > 0)
+const displayName = z.string().refine(isNormalizedDisplayName, 'Invalid normalized display name.')
 const timestamp = z.iso.datetime({ precision: 3 })
 const hash = z.string().regex(/^[0-9a-f]{64}$/)
 const integer = z.number().int().min(1).max(1_000_000)
@@ -104,7 +105,7 @@ export const analysisLifecycleInputSchema = z.strictObject({ action: z.enum(['ar
 
 const targetSummaryBase = {
   id: identifier, workspaceId: workspace, dataKind: z.literal('real'),
-  label: text(500), sublabel: z.string().max(1500), rubricId: identifier, rubricVersion: integer,
+  label: text(500), displayName: displayName.optional(), sublabel: z.string().max(1500), rubricId: identifier, rubricVersion: integer,
   criterionCount: z.number().int().min(1).max(20),
 }
 const targetSummarySchema = z.discriminatedUnion('kind', [
@@ -116,7 +117,7 @@ const targetSummarySchema = z.discriminatedUnion('kind', [
 ])
 const resumeSummarySchema = z.strictObject({
   workspaceId: workspace, dataKind: z.literal('real'), selection: analysisResumeSelectionSchema,
-  name: text(2000).nullable(), role: text(2000).nullable(),
+  name: text(2000).nullable(), displayName: displayName.optional(), role: text(2000).nullable(),
   sourceLabel: text(4096), capturedAt: timestamp,
 })
 const resumeReferenceSchema = z.strictObject({ snapshotId, blob: jsonReferenceSchema, summary: resumeSummarySchema })
@@ -157,6 +158,7 @@ const resultSummarySchema = z.strictObject({
 })
 const runSchema = z.strictObject({
   ...base, id: runId, recordType: z.literal('analysis-run'), name: text(160), createdBy: text(200),
+  displayName: displayName.optional(),
   lifecycle: z.strictObject({
     archivedAt: timestamp.optional(), deletingAt: timestamp.optional(), deletedAt: timestamp.optional(),
     parentKey: text(250).optional(),
@@ -336,6 +338,7 @@ const resumeSourceSchema = z.discriminatedUnion('kind', [
 ])
 const resumeSnapshotSchema = z.strictObject({
   ...frozenBase, selection: analysisResumeSelectionSchema,
+  displayName: displayName.optional(),
   resume: z.strictObject({
     id: id('resume'), dataKind: z.literal('real'), name: text(2000).nullable(),
     role: text(2000).nullable(), location: text(2000).nullable(), experience: text(2000).nullable(),

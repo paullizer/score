@@ -68,7 +68,7 @@ export function WorkspaceSwitcher({ cloud, empty = false }: { cloud: WorkspaceDi
   const contents = <>
       {error && <div className="mb-4"><InlineError>{error}</InlineError></div>}
       <div className="toolbar mb-4"><SearchField value={query} onChange={setQuery} placeholder="Search workspaces…" label="Search workspaces" /><ArchiveStateFilter value={filter} onChange={setFilter} label="Workspace archive state" /></div>
-      <p className="mb-4 text-[11px] text-muted">Search includes archived workspaces. Open one to read its content; unarchive to resume editing. Cancelled work does not restart.</p>
+      <p className="mb-4 text-[11px] text-muted">Owners can use the pencil beside a workspace to rename it. Search includes archived workspaces. Open one to read its content; unarchive to resume editing. Cancelled work does not restart.</p>
       <ul className="workspace-switcher-list">
         {visible.map((item) => {
           const isCurrent = item.id === cloud.currentWorkspaceId

@@ -62,6 +62,7 @@ All paths below have prefix `/api/workspaces/:workspaceId/analyses`:
 | `GET /` | `RealAnalysesPage` |
 | `POST /` | HTTP 202, `{run: RealAnalysisRunSummary}` |
 | `GET /:runId` | Unwrapped `RealAnalysisRunDetail` |
+| `PATCH /:runId/metadata` with `{displayName: string}` | `{run: RealAnalysisRunSummary}` and ETag header |
 | `GET /:runId/lifecycle` | `{impact: LifecycleImpact}` |
 | `POST /:runId/lifecycle` with `{action: "archive" \| "unarchive" \| "delete"}` | `{analysis: RealAnalysisDetail}` or `{deleted: true}`; HTTP 202 `{operation, etag?, analysis?}` while incomplete |
 | `GET /:runId/comparisons` | `RealAnalysisComparisonsPage` |
@@ -88,6 +89,32 @@ nonzero entity or unparsed transfer-encoded body is rejected rather than ignored
 Nonempty action bodies must use supported JSON and the exact action schema.
 Lifecycle actions always require the **run** ETag, never a comparison ETag.
 `RealAnalysisDetail` is an alias of the existing `RealAnalysisRunDetail`.
+
+## Display names
+
+Metadata PATCH accepts only a JSON object with `displayName`, requires the exact
+current run `If-Match`, and rejects extra body/query fields. Names are trimmed,
+must contain 1–160 JavaScript string characters after trimming, and cannot
+contain control characters or line separators. Missing ETags return 428; wildcard,
+weak, or multiple ETags are invalid, and stale ETags return 409. Workspace
+membership, CSRF, mutation leases, and active workspace/run checks match other
+ordinary writes; archived or removing records cannot be renamed.
+
+The optional top-level `displayName` is a cosmetic override. A successful write
+changes only that field and `updatedAt`: it does not retry/cancel model work or
+rewrite progress, comparisons, results, citations, or evidence. The original
+`name` remains immutable and must still equal `manifest.request.name`.
+Existing analysis history can be renamed without live job/resume/grade services.
+
+New analyses capture optional source aliases in resume and target summaries.
+Frozen resume snapshots carry the captured alias separately from the canonical
+resume/profile; target snapshots keep it in `summary.displayName`, while
+`summary.label` remains the original job title or approved rubric name. Snapshot
+hashes and summary bindings include this metadata. Later source renames never
+update old comparisons, manifests, or reports, including records with no alias.
+Aliases are not supplied to assessment or grounding models. Worker initialization,
+leases, retries, progress, and conditional result publication preserve the latest
+run alias.
 
 ## Frozen evidence and recovery
 

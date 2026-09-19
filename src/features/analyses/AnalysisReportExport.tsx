@@ -5,6 +5,7 @@ import { REPORT_FORMATS, type AnalysisReport, type AnalysisReportFormat } from '
 import type { RealAnalysisComparisonSummary, RealAnalysisRunDetail } from '../../domain/real-analyses'
 import type { AnalysisRun } from '../../domain/types'
 import { Badge, Button, InlineError, Modal } from '../../components/ui'
+import { getDisplayName } from '../../domain/displayNames'
 
 type ReportSource =
   | { kind: 'sample'; run: AnalysisRun; available: boolean }
@@ -49,8 +50,8 @@ export function AnalysisReportExport({ source }: { source: ReportSource }) {
   }, [historyAvailable])
 
   const targets = source.kind === 'sample'
-    ? source.run.targets.map((target) => ({ id: target.id, label: `${target.label} / rubric v${target.rubric.version}` }))
-    : source.detail.targets.map((target) => ({ id: target.id, label: `${target.label} / rubric v${target.rubricVersion}` }))
+    ? source.run.targets.map((target) => ({ id: target.id, label: `${getDisplayName(target, target.label)} / rubric v${target.rubric.version}` }))
+    : source.detail.targets.map((target) => ({ id: target.id, label: `${getDisplayName(target, target.label)} / rubric v${target.rubricVersion}` }))
   const targetLabelCounts = new Map<string, number>()
   for (const target of targets) targetLabelCounts.set(target.label, (targetLabelCounts.get(target.label) ?? 0) + 1)
   const comparisons = source.kind === 'sample' ? source.run.comparisons.map((comparison) => ({ targetId: comparison.targetId, status: comparison.status }))

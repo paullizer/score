@@ -9,6 +9,7 @@ import { RealResumesBridge } from './RealResumesBridge'
 import { RealAnalysesBridge } from './RealAnalysesBridge'
 import { GradeNavigationProtectionProvider, GradeRouterProtection } from './GradeNavigationProtection'
 import type { GradeLeaveProtectionApi } from './grade-navigation-context'
+import { LibraryViewStateProvider } from './LibraryViewStateProvider'
 import {
   authLoginUrl, authLogoutUrl, CloudApiError, CloudAuthError, CloudConflictError,
   createWorkspace as createWorkspaceApi, fetchSession, listWorkspaces as listWorkspacesApi,
@@ -231,7 +232,7 @@ export function CloudApplication() {
   }
 
   async function leaveUnavailableWorkspace(): Promise<Result> {
-    if (gradeLeaveRef.current && !await gradeLeaveRef.current.confirmLeave()) return { ok: false, message: 'Leaving was stopped to preserve unsaved grade changes.' }
+    if (gradeLeaveRef.current && !await gradeLeaveRef.current.confirmLeave()) return { ok: false, message: 'Leaving was stopped to preserve unsaved changes or a pending request.' }
     await providerApiRef.current?.discardPendingChanges()
     if (sessionRef.current) clearLastWorkspaceId(sessionRef.current.user.tenantId, sessionRef.current.user.id)
     window.history.replaceState(null, '', '/')
@@ -336,8 +337,9 @@ export function CloudApplication() {
   const workspaceId = phase.workspaceId
   const activeSession = session
   if (!activeSession) throw new Error('The cloud session is missing after initialization.')
+  const viewScope = JSON.stringify([activeSession.user.tenantId, activeSession.user.id, workspaceId])
   // Keep pending saves above the router when browser history temporarily crosses its basename.
-  return <GradeNavigationProtectionProvider key={workspaceId} workspaceId={workspaceId} apiRef={gradeLeaveRef}><CloudWorkspaceProvider
+  return <LibraryViewStateProvider scopeKey={viewScope}><GradeNavigationProtectionProvider key={workspaceId} workspaceId={workspaceId} apiRef={gradeLeaveRef}><CloudWorkspaceProvider
         key={workspaceId}
         workspaceId={workspaceId}
         user={activeSession.user}
@@ -360,7 +362,7 @@ export function CloudApplication() {
         <App />
       </RealAnalysesBridge></RealResumesBridge></RealGradeLaddersBridge></RealJobsBridge></GradeRouterProtection>
     </BrowserRouter>}
-  </CloudWorkspaceProvider></GradeNavigationProtectionProvider>
+  </CloudWorkspaceProvider></GradeNavigationProtectionProvider></LibraryViewStateProvider>
 }
 
 function isActiveWorkspace(workspace: WorkspaceSummary): boolean {

@@ -199,6 +199,19 @@ function richMetadataInput() {
   return input
 }
 
+test('PDF: display headings and original source identities are both selectable', async () => {
+  const input = realReportFixture({ scores: [92.75] })
+  input.run.name = 'Renamed analysis'
+  input.targets[0].displayName = 'Custom target'
+  input.comparisons[0].candidate.displayName = 'Custom candidate'
+  const pdf = await generate(input)
+  for (const value of ['Renamed analysis', 'Custom target', 'Custom candidate',
+    `Source-stated name: ${input.comparisons[0].candidate.name}`, `Source target title: ${input.targets[0].label}`]) {
+    assert.ok(pdf.text.includes(value), `Missing label or source identity: ${value}`)
+  }
+  assertNoClipping(pdf)
+})
+
 test('PDF: a real, selectable US letter PDF includes saved context, Unicode fonts, evidence, provenance and page numbers', async () => {
   const pdf = await generate()
   assert.equal(pdf.document.getTitle(), foundation.reportTitle(pdf.report))

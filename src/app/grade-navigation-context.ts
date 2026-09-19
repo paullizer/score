@@ -23,6 +23,8 @@ export function useGradeLeaveGuard(dirty: boolean, pending: boolean, label: stri
   }, [dirty, id, label, pending, setBlocker])
   const release = useCallback(() => setBlocker?.(id, null), [id, setBlocker])
   const hold = useCallback(() => setBlocker?.(id, { dirty, pending: true, label }), [dirty, id, label, setBlocker])
+  // A synchronous failure may settle before React ever renders pending=true.
+  const settle = useCallback(() => setBlocker?.(id, dirty ? { dirty, pending: false, label } : null), [dirty, id, label, setBlocker])
   const close = useCallback(async (action: () => void) => {
     if (!context) action()
     else if (await context.confirmLeave([id])) context.runAuthorized(action, [id])
@@ -31,5 +33,5 @@ export function useGradeLeaveGuard(dirty: boolean, pending: boolean, label: stri
     if (!context) action()
     else if (await context.confirmLeave()) context.runAuthorized(action)
   }, [context])
-  return { release, close, leave, hold }
+  return { release, close, leave, hold, settle }
 }

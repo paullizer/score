@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto'
+import { isDeepStrictEqual } from 'node:util'
 import { CosmosClient, ErrorResponse } from '@azure/cosmos'
 import type { Container, JSONObject, OperationInput, OperationResponse } from '@azure/cosmos'
 import { BlobServiceClient, RestError } from '@azure/storage-blob'
@@ -361,6 +362,11 @@ export function createJobStoreFromContainer(container: Pick<Container, 'items' |
           record.job.rubricDeletedAt !== current.record.job.rubricDeletedAt) {
           throw new StoreConflictError('Lifecycle metadata must be changed through lifecycle management.')
         }
+        if (record.displayName !== current.record.displayName &&
+          !isDeepStrictEqual({ ...current.record, displayName: record.displayName, updatedAt: record.updatedAt }, record)) {
+          throw new StoreConflictError('Display-name edits cannot change job sources, evidence, or processing state.')
+        }
+        if (record.updatedAt < current.record.updatedAt) throw new StoreConflictError('Job update timestamps cannot move backwards.')
         return { operations: [replacement(record, expectedEtag)], result: results => written(record, results) }
       })
     },
@@ -494,8 +500,9 @@ export function createJobStoreFromContainer(container: Pick<Container, 'items' |
         assertJobWritable(record)
         if (JSON.stringify(record.lifecycle) !== JSON.stringify(current.record.lifecycle) ||
           JSON.stringify(record.rubricLifecycle) !== JSON.stringify(current.record.rubricLifecycle) ||
-          record.job.rubricDeletedAt !== current.record.job.rubricDeletedAt) {
-          throw new StoreConflictError('Publication cannot change lifecycle metadata.')
+          record.job.rubricDeletedAt !== current.record.job.rubricDeletedAt ||
+          record.displayName !== current.record.displayName) {
+          throw new StoreConflictError('Publication cannot change lifecycle or display-name metadata.')
         }
         return {
           operations: [

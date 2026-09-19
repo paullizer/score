@@ -53,6 +53,23 @@ before(async () => {
 })
 after(async () => { await foundation?.cleanup(); await rm(output, { recursive: true, force: true }) })
 
+test('custom labels get separate CSV columns without replacing source identity or saved scores', () => {
+  const input = realReportFixture({ scores: [92.75] })
+  input.run.name = 'Renamed analysis'
+  input.targets[0].displayName = 'Custom target'
+  input.comparisons[0].candidate.displayName = '=Custom label'
+  const result = records(writer.generateCsvReport(model.buildAnalysisReport(input)))
+  assert.deepEqual(result.headers.slice(-2), ['Candidate display label', 'Job/grade display title'])
+  const row = result.records[0]
+  assert.equal(row['Candidate name'], input.comparisons[0].candidate.name)
+  assert.equal(row['Job/grade title'], input.targets[0].label)
+  assert.equal(row['Candidate display label'], "'=Custom label")
+  assert.equal(row['Job/grade display title'], 'Custom target')
+  assert.equal(row['Run name'], 'Renamed analysis')
+  assert.equal(row['Overall score'], '92.75')
+  assert.ok(result.headers[2].includes('Custom target'))
+})
+
 test('CSV begins with name, job title and criterion columns and round-trips quoted Unicode assessments', () => {
   const input = realReportFixture()
   input.comparisons[0].candidate.name = 'Zoë, "Jordan" Кириллица'

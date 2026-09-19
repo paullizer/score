@@ -86,7 +86,8 @@ async function completedFixture({ comparisons = 2, partial = false } = {}) {
     else await processAllAnalyses(fixture, stubs)
     const runId = created.run.run.id
     const pairs = await allPages(fixture, `/api/workspaces/${fixture.workspaceId}/analyses/${runId}/comparisons`, 'comparisons')
-    assert.ok(pairs.some(({ comparison }) => comparison.status === 'complete'))
+    assert.ok(pairs.some(({ comparison }) => comparison.status === 'complete'),
+      JSON.stringify(pairs.map(({ comparison }) => ({ status: comparison.status, error: comparison.error }))))
     if (!partial) assert.ok(pairs.every(({ comparison }) => comparison.status === 'complete'))
     return { fixture, stubs, runId, pairs }
   } catch (error) { await fixture.close(); throw error }
@@ -101,6 +102,37 @@ before(async () => {
   }
 })
 after(async () => { await browser?.close(); await runtime?.close() })
+
+test('renaming a real analysis changes new report filenames without rescoring or replacing captured comparisons', { timeout: 90_000 }, async () => {
+  const { fixture, stubs, runId, pairs } = await completedFixture()
+  const { context, page, errors } = await newPage()
+  try {
+    const path = `/api/workspaces/${fixture.workspaceId}/analyses/${runId}`
+    const before = await jsonResponse(await fixture.request(path))
+    const modelsBefore = stubs.modelCalls.length
+    await page.goto(`${fixture.origin}/workspaces/${fixture.workspaceId}/analyses/${runId}?data=real`)
+    await page.getByRole('button', { name: 'Rename analysis: Grouped report review', exact: true }).click()
+    const editor = page.getByRole('dialog', { name: 'Edit analysis name', exact: true })
+    await editor.getByRole('textbox', { name: 'Analysis name', exact: true }).fill('Reviewer shortlist')
+    await editor.getByRole('button', { name: 'Save name', exact: true }).click()
+    await editor.waitFor({ state: 'hidden' })
+    await visible(page.getByRole('heading', { name: 'Reviewer shortlist', exact: true }))
+    await page.getByRole('button', { name: 'Export report', exact: true }).click()
+    const csv = await download(page, 'csv')
+    assert.equal(csv.filename, 'Reviewer shortlist.csv')
+    assert.match(csv.bytes.toString('utf8'), /"Reviewer shortlist"/)
+    const saved = await jsonResponse(await fixture.request(path))
+    assert.equal(saved.run.displayName, 'Reviewer shortlist')
+    assert.equal(saved.run.name, before.run.name)
+    assert.deepEqual(saved.run.manifest, before.run.manifest)
+    assert.deepEqual(await allPages(fixture, `${path}/comparisons`, 'comparisons'), pairs)
+    assert.equal(stubs.modelCalls.length, modelsBefore)
+    assert.deepEqual(errors, [])
+  } finally {
+    await context.close()
+    await fixture.close()
+  }
+})
 
 test('a read-only reviewer downloads genuine CSV, PDF, Word and PowerPoint files from archived frozen results without new AI calls', { timeout: 180_000 }, async () => {
   const { fixture, stubs, runId, pairs } = await completedFixture()

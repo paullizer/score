@@ -150,6 +150,29 @@ test('stale run ETags and every batch failure leave comparisons unpublished', as
   assert.equal((await store.get(f.workspaceId, run.id)).record.updatedAt, LATER)
 })
 
+test('analysis display metadata uses the normal Cosmos fences and permits no mixed evidence or processing changes', async () => {
+  const { f, initial, run, comparison } = await initializedPair()
+  const container = cosmos()
+  const store = api.createAnalysisStoreFromContainer(container)
+  const original = (await store.create(initial)).value
+  const service = new api.RealAnalysisService({ store, blobs: f.analysis.blobs }, {}, () => new Date(LATER))
+  const renamed = await service.updateMetadata(f.workspaceId, initial.id, { displayName: 'Saved alias' }, original.etag)
+  assert.deepEqual(renamed.run, { ...initial, displayName: 'Saved alias', updatedAt: LATER })
+  assert.deepEqual(container.batches.at(-1).map(item => item.resourceBody.recordType),
+    ['analysis-lifecycle', 'analysis-lifecycle', 'analysis-run'])
+  assert.equal(container.batches.at(-1).at(-1).ifMatch, original.etag)
+  await assert.rejects(service.updateMetadata(f.workspaceId, initial.id, { displayName: 'Stale alias' }, original.etag),
+    error => error.status === 409)
+  await assert.rejects(store.replace({ ...renamed.run, displayName: 'Mixed edit', attempts: 1 }, renamed.etag), /Display-name edits/)
+  await assert.rejects(store.replace({ ...renamed.run, name: 'Replace original' }, renamed.etag), /immutable/)
+  await store.transact(f.workspaceId, [
+    { kind: 'create', record: comparison },
+    { kind: 'replace', record: { ...run, displayName: 'Saved alias', updatedAt: LATER }, etag: renamed.etag },
+  ])
+  assert.equal((await store.get(f.workspaceId, initial.id)).record.displayName, 'Saved alias')
+  assert.equal((await store.get(f.workspaceId, initial.id)).record.progress.queued, 1)
+})
+
 test('100-pair initialization, full cancellation and full retry use the real adapter transaction invariants', async () => {
   const f = fixture()
   const created = await createRun(f, 10, 10)

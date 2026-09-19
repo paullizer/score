@@ -7,7 +7,7 @@ import type {
 } from '../../domain/analysis-reports'
 import {
   candidateName, comparisonStatusLabel, criterionScoreLabel, evidenceStatusLabel, formatReportWeight, highlightNotice,
-  overallScoreLabel, REPORT_FONT_FAMILY, REPORT_TITLE, reportStatusNotice, reportTitle, summaryExcerpt,
+  overallScoreLabel, REPORT_FONT_FAMILY, REPORT_TITLE, reportStatusNotice, reportTitle, summaryExcerpt, targetName,
 } from './presentation'
 import { PdfReportLayout, PDF_REPORT_COLORS } from './pdf-layout'
 import type { PdfReportFonts } from './pdf-layout'
@@ -53,7 +53,7 @@ function assertSupportedReportText(report: AnalysisReport, fonts: PdfReportFonts
 }
 
 function targetIdentity(target: ReportTarget): string {
-  return `Exact target ID: ${target.id}\n${target.kind === 'grade' ? 'Grade' : 'Job'} · ${target.sublabel}\n${target.versionLabel}\nRubric: ${target.rubricId} · version ${target.rubricVersion}`
+  return `${target.displayName ? `Source target title: ${target.label}\n` : ''}Exact target ID: ${target.id}\n${target.kind === 'grade' ? 'Grade' : 'Job'} · ${target.sublabel}\n${target.versionLabel}\nRubric: ${target.rubricId} · version ${target.rubricVersion}`
 }
 
 function reviewNumber(group: ReportGroup, comparison: ReportComparison, report: AnalysisReport): number {
@@ -103,11 +103,11 @@ function writeTargetSummary(layout: PdfReportLayout, report: AnalysisReport, gro
   const target = group.target
   layout.startSection({
     section: 'Target summary',
-    primary: `Target ${index + 1} of ${report.groups.length} · ${target.label}`,
+    primary: `Target ${index + 1} of ${report.groups.length} · ${targetName(target)}`,
     secondary: `${target.versionLabel} · ${target.id} · ${target.rubricId} v${target.rubricVersion}`,
   })
   if (index === 0) writeRunContext(layout, report)
-  layout.heading(`Target ${index + 1} · ${target.label}`, 17)
+  layout.heading(`Target ${index + 1} · ${targetName(target)}`, 17)
   layout.paragraph(targetIdentity(target), { size: 9.5, leading: 14, after: 8 })
   layout.paragraph(reportStatusNotice(group.counts), { size: 9.5, leading: 14, after: 7 })
   layout.heading('Highest evidence matches', 13)
@@ -237,12 +237,14 @@ function writeComparison(
   layout.startSection({
     section: 'Candidate review',
     primary: `Review ${number} of ${report.counts.total} · ${candidateName(comparison.candidate)}`,
-    secondary: `Target ${groupIndex + 1} · ${target.label} · ${target.versionLabel}`,
+    secondary: `Target ${groupIndex + 1} · ${targetName(target)} · ${target.versionLabel}`,
   })
   layout.paragraph(`CANDIDATE / TARGET REVIEW ${number}`, { size: 9.5, bold: true, color: PDF_REPORT_COLORS.accent })
   layout.paragraph(candidateName(comparison.candidate), { size: 22, leading: 31, bold: true, after: 6, keepWithNext: 30 })
-  layout.paragraph(target.label, { size: 13, bold: true, after: 4, keepWithNext: 28 })
+  layout.paragraph(targetName(target), { size: 13, bold: true, after: 4, keepWithNext: 28 })
   layout.metadata([
+    ...(comparison.candidate.displayName ? [`Source-stated name: ${comparison.candidate.name ?? 'Not stated'}`] : []),
+    ...(target.displayName ? [`Source target title: ${target.label}`] : []),
     `Role: ${comparison.candidate.role ?? 'Not recorded'}`,
     `${target.kind === 'grade' ? 'Grade' : 'Job'} · ${target.sublabel}`,
     `Exact target ID: ${target.id}`,

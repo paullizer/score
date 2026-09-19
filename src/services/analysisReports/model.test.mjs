@@ -14,6 +14,43 @@ after(async () => { await cleanup?.() })
 function sampleRun() { return api.createInitialWorkspace().runs[0] }
 function sampleOptions() { return { generatedAt: REPORT_TEST_TIMESTAMP } }
 
+test('sample report display names retain source names and leave all saved results unchanged', () => {
+  const run = sampleRun()
+  const original = structuredClone(run)
+  run.displayName = 'Reviewer analysis title'
+  run.targets[0].displayName = 'Reviewer target label'
+  run.resumes[0].resume.displayName = 'Reviewer resume label'
+  const report = api.buildSampleAnalysisReport(run, sampleOptions())
+  assert.equal(report.run.name, run.displayName)
+  const group = report.groups.find(item => item.target.id === run.targets[0].id)
+  assert.equal(group.target.label, original.targets[0].label)
+  assert.equal(api.targetName(group.target), 'Reviewer target label')
+  const comparison = group.comparisons.find(item => item.candidate.id === run.resumes[0].resume.id)
+  assert.equal(comparison.candidate.name, original.resumes[0].resume.name)
+  assert.equal(api.candidateName(comparison.candidate), 'Reviewer resume label')
+  const text = api.buildComparisonDetailBlocks(group.target, comparison).map(block => block.text).join('\n')
+  assert.ok(text.includes(`Source-stated name: ${original.resumes[0].resume.name}`))
+  assert.ok(text.includes(`Source target title: ${original.targets[0].label}`))
+  assert.deepEqual(run.comparisons, original.comparisons)
+  assert.deepEqual(comparison.criteria.map(item => item.score),
+    original.comparisons.find(item => item.id === comparison.id).criteria.map(item => item.score))
+})
+
+test('invalid display metadata produces structured validation failures rather than escaping safeParse', () => {
+  const input = realReportFixture({ scores: [80] })
+  for (const displayName of ['', '  ', ' surrounded ', 'line\nbreak', 'control\u0001', 'x'.repeat(161)]) {
+    const target = api.reportTargetSchema.safeParse({ ...input.targets[0], displayName })
+    assert.equal(target.success, false)
+    assert.equal(target.error.issues[0].path[0], 'displayName')
+    const comparison = api.reportComparisonSchema.safeParse({
+      ...input.comparisons[0], candidate: { ...input.comparisons[0].candidate, displayName },
+    })
+    assert.equal(comparison.success, false)
+    assert.deepEqual(comparison.error.issues[0].path, ['candidate', 'displayName'])
+  }
+  assert.equal(api.reportDisplayNameSchema.safeParse('x'.repeat(160)).success, true)
+})
+
 test('format metadata and resource limits are shared by all report consumers', () => {
   assert.equal(api.ANALYSIS_REPORT_SCHEMA_VERSION, 1)
   assert.deepEqual(Object.keys(api.REPORT_FORMATS), ['csv', 'pdf', 'docx', 'pptx'])

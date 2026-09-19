@@ -11,6 +11,7 @@ import type { LifecycleAction, LifecycleImpact, LifecycleOperation } from '../do
 import { isSafeUploadedFilename, uploadedFileKind } from '../domain/source-files'
 import { UPLOAD_CONTENT_TYPES, type UploadFormat } from '../domain/document-formats'
 import { requireUploadFile, uploadFileByteLimit } from './documentUploads'
+import { normalizeDisplayName } from '../domain/displayNames'
 
 type RealJobWireSummary = RealJobSummary
 
@@ -172,6 +173,20 @@ export async function saveRealJobRubric(
   )
   const detail = response.job
   return { ...normalizeSummary(detail), document: detail.document, rubricVersions: detail.rubricVersions }
+}
+
+export async function renameRealJob(workspaceId: string, jobId: string, name: string, etag: string): Promise<RealJobSummary> {
+  const displayName = normalizeDisplayName(name)
+  if (!etag) throw new Error('Reload the job before editing its display title.')
+  const response = await cloudJsonRequest<{ job: RealJobWireSummary }>(
+    `${jobsPath(workspaceId)}/${encodeURIComponent(jobId)}/metadata`,
+    { method: 'PATCH', headers: { 'If-Match': etag }, body: JSON.stringify({ displayName }) },
+  )
+  const summary = response.job
+  if (summary?.job?.id !== jobId || summary.job.dataKind !== 'real' || !summary.etag || summary.displayName !== displayName) {
+    throw new Error('The service did not acknowledge the requested job title. Reload before trying again.')
+  }
+  return normalizeSummary(summary)
 }
 
 export function realJobOriginalUrl(workspaceId: string, jobId: string): string {

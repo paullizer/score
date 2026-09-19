@@ -13,6 +13,7 @@ export function projectRealJobs(
     !lifecycleIsRemoved(byId.get(detail.job.id)?.lifecycle) && !lifecycleIsRemoved(detail.lifecycle))
   const realJobs = summaries.map((summary) => ({
     ...summary.job,
+    ...(summary.displayName === undefined ? {} : { displayName: summary.displayName }),
     dataKind: 'real' as const,
     error: summary.error?.message ?? summary.job.error,
   }))

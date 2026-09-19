@@ -632,7 +632,8 @@ export async function startHttp(f, enabled = true) {
   }))
   app.use('/api', router)
   app.use((error, _req, res, _next) => {
-    const safe = error instanceof api.HttpError ? error : api.unavailable()
+    const safe = error instanceof api.HttpError ? error
+      : error?.type === 'entity.parse.failed' ? api.invalidRequest('The request body is not valid JSON.') : api.unavailable()
     res.status(safe.status).json(api.toCloudApiError(safe))
   })
   const server = createServer(app)

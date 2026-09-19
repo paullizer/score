@@ -7,11 +7,16 @@ import type {
 } from '../../domain/analysis-reports'
 import type { Citation } from '../../domain/types'
 import { buildReportNotices, citationLocator } from './presentation'
+import { normalizeDisplayName } from '../../domain/displayNames'
 
 const id = z.string().min(1).max(1024).refine(value => value === value.trim(), 'Identity must not contain surrounding whitespace.')
 const text = z.string().max(REPORT_LIMITS.maxTextCharacters)
 const requiredText = text.refine(value => value.trim().length > 0, 'Saved text must not be empty.')
 const label = z.string().min(1).max(8192).refine(value => value.trim().length > 0, 'Label must not be empty.')
+export const reportDisplayNameSchema = z.string().refine((value) => {
+  try { return normalizeDisplayName(value) === value }
+  catch { return false }
+}, 'Saved display names must be normalized, nonempty, single-line text of at most 160 characters.')
 const timestamp = z.iso.datetime({ offset: true })
 const sha256 = z.string().regex(/^[a-f0-9]{64}$/i, 'Expected a SHA-256 identity.')
 const version = z.number().int().min(1)
@@ -67,6 +72,7 @@ const targetShape = {
   dataKind: z.enum(['real', 'sample']),
   kind: z.enum(['job', 'grade']),
   label,
+  displayName: reportDisplayNameSchema.optional(),
   sublabel: text,
   versionLabel: label,
   rubricId: id,
@@ -101,7 +107,7 @@ const realTargetSchema = z.strictObject({
 }).superRefine(validateTarget)
 
 const candidateShape = {
-  id, name: text.nullable(), role: text.nullable(), sourceLabel: label,
+  id, name: text.nullable(), displayName: reportDisplayNameSchema.optional(), role: text.nullable(), sourceLabel: label,
   documentId: id, documentVersion: version, documentSha256: sha256.nullable(), snapshot: snapshot.nullable(),
 }
 const candidateSchema = z.strictObject(candidateShape)

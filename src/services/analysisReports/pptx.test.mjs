@@ -182,6 +182,20 @@ function assertSlideGeometry(slides) {
   }
 }
 
+test('presentation display labels never replace original candidate or target identities', async () => {
+  const input = realReportFixture({ scores: [92.75] })
+  input.run.name = 'Renamed analysis'
+  input.targets[0].displayName = 'Custom target'
+  input.comparisons[0].candidate.displayName = 'Custom candidate'
+  const report = foundation.buildAnalysisReport(input)
+  const result = await inspectReport(report)
+  for (const value of ['Renamed analysis', 'Custom target', 'Custom candidate',
+    `Source-stated name: ${input.comparisons[0].candidate.name}`, `Source target title: ${input.targets[0].label}`]) {
+    assert.ok(result.text.includes(value), `Missing label or source identity: ${value}`)
+  }
+  assertAllSavedBlocks(report, result.slides)
+})
+
 test('real editable widescreen PPTX preserves every identity, saved block and source citation', async () => {
   const input = realReportFixture({
     scores: [92.75, 0, null, 10, 20, 30, 40], targetCount: 2,

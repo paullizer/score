@@ -2,11 +2,15 @@ import { z } from 'zod'
 import type { AnalysisRun, Job, Resume, Rubric, SourceDocument, Workspace } from './types'
 import { validateRubric, weightedScore } from '../services/scoring'
 import { isEntityArchived, isEntityRemoved } from './lifecycle'
+import { normalizeDisplayName } from './displayNames'
 
 // Pure Zod schema + cross-reference validation shared by the browser demo (src/services/persistence.ts)
 // and the cloud server (server/repository.ts). Nothing here touches storage, network, or the DOM.
 
 const text = z.string().refine((value) => value.trim().length > 0, 'Must not be blank')
+const displayName = z.string().refine((value) => {
+  try { return normalizeDisplayName(value) === value } catch { return false }
+}, 'Display name must be trimmed, nonempty, at most 160 characters, and contain no control characters')
 const positiveInteger = z.number().int().positive()
 const timestamp = z.iso.datetime({ offset: true })
 const criterionScore = z.number().finite().min(0).max(5)
@@ -46,6 +50,7 @@ const rubricSchema = z.strictObject({
 const jobSchema = z.strictObject({
   id: text,
   title: text,
+  displayName: displayName.optional(),
   organization: text,
   location: text,
   arrangement: text,
@@ -67,6 +72,7 @@ const evidenceSchema = z.strictObject({ score: criterionScore, paragraphId: text
 const resumeSchema = z.strictObject({
   id: text,
   name: text,
+  displayName: displayName.optional(),
   role: text,
   location: text,
   initials: text,
@@ -114,6 +120,7 @@ const targetSchema = z.strictObject({
   id: text,
   kind: z.enum(['job', 'grade']),
   label: text,
+  displayName: displayName.optional(),
   sublabel: text,
   rubric: rubricSchema,
   job: jobSchema.optional(),
@@ -122,6 +129,7 @@ const targetSchema = z.strictObject({
 const runSchema = z.strictObject({
   id: text,
   name: text,
+  displayName: displayName.optional(),
   createdAt: timestamp,
   targets: z.array(targetSchema).min(1),
   resumes: z.array(z.strictObject({ resume: resumeSchema, document: documentSchema })).min(1),

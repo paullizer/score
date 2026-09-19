@@ -105,6 +105,7 @@ export function RubricPanel({ rubric, onSelectCriterion, onVersionSaved, readOnl
           {duplicating ? 'Duplicating…' : 'Duplicate as new rubric'}
         </Button>}
       </div>}
+      {!readOnly && !realGrade && <p className="text-[11px] text-muted">Edit rubric includes the name and description. Even a name-only save creates a new version; saved analyses keep their original rubric.</p>}
       {!readOnly && !editable && <p className="text-[11px] text-muted">{realGrade ? 'Open the real grade family to edit a draft with its separate grounding-review and approval safeguards.' : viewer ? 'This workspace is read-only. An owner or editor can change real rubrics.' : 'Finish the linked job import and load its source before editing this rubric.'}</p>}
       {error && <InlineError>{error}</InlineError>}
       {!balanced && <InlineError>These criterion weights do not total 100%. {readOnly ? 'Open the current version to review the rubric.' : 'Edit the rubric to correct its weights before analysis.'}</InlineError>}

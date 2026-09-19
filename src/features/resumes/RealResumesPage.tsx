@@ -13,16 +13,18 @@ import { PrivateDocumentViewer } from '../../components/documents/PrivateDocumen
 import { UPLOAD_CONTENT_TYPES, supportedUploadFormats } from '../../domain/document-formats'
 import { uploadFormatNames } from '../../services/documentUploads'
 import { realAnalysisLink, realResumeSelection } from '../analyses/realAnalysisUi'
-import { readyRealResume, resumeErrorMessage, resumeName, resumeWorkActive } from './resumeImportUi'
+import { readyRealResume, resumeErrorMessage, resumeName, resumeStatedName, resumeWorkActive } from './resumeImportUi'
 import { RealAddResumesDialog } from './RealAddResumesDialog'
 import { useWorkspace } from '../../app/workspace-context'
+import { useLibraryViewState } from '../../app/library-view-state'
 import { isEntityArchived, isEntityRemoved, matchesArchiveFilter, type ArchiveFilter } from '../../domain/lifecycle'
 import { ArchivedBadge, ArchiveStateFilter, EntityLifecycleActions, LifecycleBanner } from '../../components/lifecycle/LifecycleControls'
 import { useLifecycleAccess } from '../../components/lifecycle/useLifecycleAccess'
+import { RenameEntityButton, RenameEntityProvider } from '../../components/ui/RenameEntityButton'
 
 type RealResumeSortKey = 'name' | 'source' | 'status' | 'added' | 'actions'
 const realResumeSortOptions: Record<RealResumeSortKey, TableSortOption<RealResumeSortKey>> = {
-  name: { key: 'name', label: 'Stated name', ascendingLabel: 'A–Z', descendingLabel: 'Z–A' },
+  name: { key: 'name', label: 'Resume label / stated name', ascendingLabel: 'A–Z', descendingLabel: 'Z–A' },
   source: { key: 'source', label: 'Source label', ascendingLabel: 'A–Z', descendingLabel: 'Z–A' },
   status: { key: 'status', label: 'Processing status', ascendingLabel: 'Needs attention first', descendingLabel: 'Complete first' },
   added: { key: 'added', label: 'Added date', ascendingLabel: 'Oldest first', descendingLabel: 'Newest first', initialDirection: 'desc' },
@@ -56,7 +58,9 @@ export function RealResumeActions({ summary }: { summary: RealResumeSummary }) {
         title={summary.capture ? 'Retry processing the saved capture. Captured URLs are not fetched again.' : 'Explicitly retry this source. A URL must now be publicly accessible without sign-in.'}
         aria-label={`Retry processing ${summary.source.displayName}`} onClick={() => void act('retry')}>Retry processing</Button>}
     </div>
-    <EntityLifecycleActions target={{ kind: 'resume', id: summary.resume.id }} name={summary.resume.name ?? summary.source.displayName} />
+    <div className="flex flex-wrap gap-2"><RenameEntityButton target={{ kind: 'resume', id: summary.resume.id }} name={resumeName(summary)} etag={summary.etag}
+      disabled={!api?.canWrite || api.phase !== 'ready' || !summary.etag || busy} />
+      <EntityLifecycleActions target={{ kind: 'resume', id: summary.resume.id }} name={resumeName(summary)} /></div>
     {error && <InlineError>{error}</InlineError>}
   </div>
 }
@@ -64,8 +68,13 @@ export function RealResumeActions({ summary }: { summary: RealResumeSummary }) {
 export function RealResumesPage({ id }: { id?: string }) {
   const api = useRealResumes()
   if (!api) return <EmptyState title="Real resumes require a cloud workspace" description="Standalone mode contains only fictional samples. No real files, documents, or analysis results enter sample storage." />
+  return <RenameEntityProvider key={`${api.workspaceId}:${id ?? 'library'}`}><RealResumesView id={id} /></RenameEntityProvider>
+}
+
+function RealResumesView({ id }: { id?: string }) {
+  const api = useRealResumes()!
   if (api.phase === 'unavailable') return <EmptyState title="Real resume imports are not enabled" description={api.error ?? 'No samples are substituted when real processing is unavailable.'} action={<Button onClick={() => void api.refresh()}>Check availability</Button>} />
-  return id ? <RealResumeDetail key={id} id={id} /> : <RealResumesLibrary key={api.workspaceId} />
+  return id ? <RealResumeDetail id={id} /> : <RealResumesLibrary />
 }
 
 function RealResumesLibrary() {
@@ -75,18 +84,18 @@ function RealResumesLibrary() {
   const analyses = useRealAnalyses()
   const navigate = useNavigate()
   const [params, setParams] = useSearchParams()
-  const [search, setSearch] = useState('')
-  const [sort, setSort] = useState<TableSort<RealResumeSortKey> | null>(null)
+  const [search, setSearch] = useLibraryViewState('resumes:real:query', '')
+  const [sort, setSort] = useLibraryViewState<TableSort<RealResumeSortKey> | null>('resumes:real:sort', null)
   const [selected, setSelected] = useState<RealAnalysisResumeSelection[]>([])
   const [adding, setAdding] = useState(false)
-  const [archiveFilter, setArchiveFilter] = useState<ArchiveFilter>('default')
+  const [archiveFilter, setArchiveFilter] = useLibraryViewState<ArchiveFilter>('resumes:real:archive', 'default')
   const query = search.trim().toLocaleLowerCase()
   const selectable = (item: RealResumeSummary) => canEdit && readyRealResume(item) && !isEntityArchived(workspace, { kind: 'resume', id: item.resume.id }) && !isEntityRemoved(workspace, { kind: 'resume', id: item.resume.id })
   const visible = sortTableRows(api.summaries.filter((item) => !item.lifecycle?.deletedAt && matchesArchiveFilter(isEntityArchived(workspace, { kind: 'resume', id: item.resume.id }), search, archiveFilter) &&
-    [item.resume.name, item.resume.role, item.resume.location, item.resume.experience, item.resume.sourceLabel].join(' ').toLocaleLowerCase().includes(query)),
+    [item.displayName, item.resume.name, item.resume.role, item.resume.location, item.resume.experience, item.resume.sourceLabel, item.source.displayName].join(' ').toLocaleLowerCase().includes(query)),
     sort, (summary, key) => {
       switch (key) {
-        case 'name': return summary.resume.name
+        case 'name': return summary.displayName ?? summary.resume.name
         case 'source': return summary.source.displayName
         case 'status': case 'actions': return resumeStatusOrder[summary.resume.status]
         case 'added': return Date.parse(summary.resume.createdAt)
@@ -122,7 +131,7 @@ function RealResumesLibrary() {
     {analyses && (analyses.phase !== 'ready' || !analyses.features?.realAnalyses) && <p className="mb-5 text-[11px] text-muted">{analyses.creationError ?? analyses.error ?? 'Checking new analysis availability…'} Resume imports and saved analysis history have separate availability.</p>}
     <section className="panel" aria-label="Real resume library">
       <div className="library-toolbar"><div className="flex items-center gap-2"><Users size={16} className="text-muted" aria-hidden="true" /><h2 className="text-[12px] font-semibold">Private real resumes</h2><Badge>{api.summaries.filter((item) => !isEntityArchived(workspace, { kind: 'resume', id: item.resume.id }) && !isEntityRemoved(workspace, { kind: 'resume', id: item.resume.id })).length}</Badge></div>
-        <div className="toolbar"><SearchField value={search} onChange={setSearch} placeholder="Search stated names, roles, or sources…" label="Search real resumes" />
+        <div className="toolbar"><SearchField value={search} onChange={setSearch} placeholder="Search labels, stated names, or sources…" label="Search real resumes" />
           <ArchiveStateFilter value={archiveFilter} onChange={setArchiveFilter} label="Real resume archive state" />
           <TableSortSelect options={[realResumeSortOptions.name, realResumeSortOptions.source, realResumeSortOptions.status, realResumeSortOptions.added]}
             sort={sort?.key === 'actions' ? { ...sort, key: 'status' } : sort} onChange={setSort} label="Sort real resumes" />
@@ -137,7 +146,7 @@ function RealResumesLibrary() {
       {visible.length ? <div className="table-wrap"><table className="data-table">
         <caption className="sr-only">Real resume processing status. Select ready sources for a separate manually started analysis.</caption>
         <thead><tr><th scope="col"><span className="sr-only">Select ready resume</span></th>
-          <SortableHeader option={realResumeSortOptions.name} sort={sort} onChange={setSort}>Stated profile</SortableHeader>
+          <SortableHeader option={realResumeSortOptions.name} sort={sort} onChange={setSort}>Resume / source profile</SortableHeader>
           <SortableHeader option={realResumeSortOptions.status} sort={sort} onChange={setSort}>Source / progress</SortableHeader>
           <SortableHeader option={realResumeSortOptions.actions} sort={sort} onChange={setSort} /></tr></thead>
         <tbody>{visible.map((summary) => {
@@ -149,6 +158,7 @@ function RealResumesLibrary() {
               aria-label={`Select ${resumeName(summary)} from ${summary.source.displayName}`} onChange={() => toggle(summary)} /></td>
             <td className="min-w-[180px]"><Link className="row-title" to={`/resumes/${encodeURIComponent(summary.resume.id)}?data=real`}>{resumeName(summary)}</Link>
               <ArchivedBadge target={{ kind: 'resume', id: summary.resume.id }} />
+              {summary.displayName && <p className="row-meta">Source name: {resumeStatedName(summary)}</p>}
               <p className="row-meta">{summary.resume.role ?? 'Role not stated'}</p><p className="row-meta">{summary.resume.location ?? 'Location not stated'} · {summary.resume.experience ?? 'Experience not stated'}</p></td>
             <td className="min-w-[230px] max-w-[440px]"><RealResumeStatus summary={summary} />
               <p className="mt-2 break-all text-[11px] text-muted">{summary.source.displayName}</p>
@@ -193,12 +203,13 @@ function RealResumeDetail({ id }: { id: string }) {
   const message = resumeErrorMessage(summary)
   const ready = readyRealResume(detail)
   return <>{back}
-    <PageHeader eyebrow="REAL RESUME · PRIVATE SOURCE" title={resumeName(detail)} description={detail.resume.role ?? 'Role not stated in the captured source'}
+    <PageHeader eyebrow="REAL RESUME · PRIVATE SOURCE" title={resumeName(summary)} description={detail.resume.role ?? 'Role not stated in the captured source'}
       actions={<><RealResumeActions summary={summary} /><Button variant="primary" icon={ArrowRight} disabled={!canEdit || !ready || !analyses?.canWrite || analyses.phase !== 'ready' || !analyses.features?.realAnalyses}
         onClick={() => {
           const link = realAnalysisLink({ resumes: [realResumeSelection(detail)] }, api.workspaceId)
           navigate(link.to, { state: link.state })
         }}>Build analysis</Button></>} />
+    {summary.displayName && <p className="mb-4 break-words text-[12px] text-muted">Source name: {resumeStatedName(summary)} · Original source: {summary.source.displayName}</p>}
     <LifecycleBanner target={{ kind: 'resume', id }} />
     <div className="detail-metadata"><RealResumeStatus summary={summary} /><ArchivedBadge target={{ kind: 'resume', id }} /><span>{detail.resume.location ?? 'Location not stated'}</span><span>{detail.resume.experience ?? 'Experience not stated'}</span><span>Added {dateLabel(detail.resume.createdAt)}</span></div>
     {(entry.error || api.error) && <div className="mb-5"><InlineError>{entry.error ?? api.error} The last acknowledged source is shown. <Button size="sm" onClick={() => void ensure(id, true)}>Reload source</Button></InlineError></div>}

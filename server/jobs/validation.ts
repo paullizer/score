@@ -3,6 +3,8 @@ import type { RealJobRecord } from '../../src/domain/real-jobs'
 import { isSafeUploadedFilename } from '../../src/domain/source-files'
 import type { Citation, Rubric, SourceDocument } from '../../src/domain/types'
 import type { LifecycleMetadata } from '../../src/domain/lifecycle'
+import { normalizeDisplayName } from '../../src/domain/displayNames'
+import { invalidRequest } from '../errors'
 import { isValidWorkspaceId } from '../ids'
 import {
   isOriginalContentType, isUploadFormat, originalExtension, storedDocumentContentType, UPLOAD_CONTENT_TYPES,
@@ -28,6 +30,21 @@ function isTimestamp(value: unknown): value is string {
 
 function hasOnlyKeys(value: Record<string, unknown>, keys: readonly string[]): boolean {
   return Object.keys(value).every((key) => keys.includes(key))
+}
+
+export function isNormalizedDisplayName(value: unknown): value is string {
+  if (typeof value !== 'string') return false
+  try { return normalizeDisplayName(value) === value } catch { return false }
+}
+
+export function parseDisplayNameMetadata(value: unknown): { displayName: string } {
+  if (!isRecord(value) || Object.keys(value).length !== 1 || !hasOnlyKeys(value, ['displayName']) ||
+    typeof value.displayName !== 'string') {
+    throw invalidRequest('Metadata requests must contain only a displayName string.')
+  }
+  try { return { displayName: normalizeDisplayName(value.displayName) } } catch (error) {
+    throw invalidRequest(error instanceof Error ? error.message : 'Display name is invalid.')
+  }
 }
 
 export function isUuid(value: string): boolean {
@@ -259,7 +276,7 @@ export function validateStoredRealRubric(value: unknown): value is Rubric {
 
 export function validateRealJobRecord(value: unknown): value is RealJobRecord {
   if (!isRecord(value) || !hasOnlyKeys(value, [
-    'id', 'workspaceId', 'recordType', 'job', 'source', 'inputFingerprint', 'createdBy', 'updatedAt', 'attempts',
+    'id', 'workspaceId', 'recordType', 'displayName', 'job', 'source', 'inputFingerprint', 'createdBy', 'updatedAt', 'attempts',
     'nextAttemptAt', 'lease', 'extractedBlobName', 'error', 'warnings', 'lifecycle', 'rubricLifecycle',
   ]) || value.recordType !== 'job' || typeof value.id !== 'string' || !isValidJobId(value.id) ||
     typeof value.workspaceId !== 'string' || !isValidWorkspaceId(value.workspaceId) || !isRecord(value.job) ||
@@ -279,6 +296,7 @@ export function validateRealJobRecord(value: unknown): value is RealJobRecord {
     !value.warnings.every((warning) => typeof warning === 'string')) {
     return false
   }
+  if (value.displayName !== undefined && !isNormalizedDisplayName(value.displayName)) return false
   if (value.source.originalBlobName !== undefined) {
     if (typeof value.source.originalBlobName !== 'string' ||
       !isOriginalContentType(value.source.originalContentType) ||

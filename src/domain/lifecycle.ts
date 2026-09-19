@@ -1,4 +1,5 @@
 import type { AnalysisRun, Job, Rubric, Workspace } from './types'
+import { getDisplayName } from './displayNames'
 
 export type LifecycleKind = 'workspace' | 'job' | 'resume' | 'rubric' | 'ladder' | 'analysis'
 export type LifecycleAction = 'archive' | 'unarchive' | 'delete'
@@ -199,9 +200,18 @@ function referencesTarget(run: AnalysisRun, target: LifecycleTarget, rubrics: Ru
 
 function targetName(workspace: Workspace, target: LifecycleTarget): string {
   if (target.kind === 'workspace') return 'Sample workspace'
-  if (target.kind === 'job') return workspace.jobs.find((job) => job.id === target.id)?.title ?? 'Job'
-  if (target.kind === 'resume') return workspace.resumes.find((resume) => resume.id === target.id)?.name ?? 'Resume'
-  if (target.kind === 'analysis') return workspace.runs.find((run) => run.id === target.id)?.name ?? 'Analysis'
+  if (target.kind === 'job') {
+    const job = workspace.jobs.find((item) => item.id === target.id)
+    return job ? getDisplayName(job, job.title) : 'Job'
+  }
+  if (target.kind === 'resume') {
+    const resume = workspace.resumes.find((item) => item.id === target.id)
+    return resume ? getDisplayName(resume, resume.name) : 'Resume'
+  }
+  if (target.kind === 'analysis') {
+    const run = workspace.runs.find((item) => item.id === target.id)
+    return run ? getDisplayName(run, run.name) : 'Analysis'
+  }
   const rubrics = ownedRubrics(workspace, target).sort((a, b) => b.version - a.version)
   return target.kind === 'ladder' ? rubrics[0]?.ladder ?? 'Grade ladder' : rubrics[0]?.name ?? 'Rubric'
 }
@@ -250,7 +260,7 @@ export function getSampleLifecycleImpact(workspace: Workspace, target: Lifecycle
   }
   const blockers: LifecycleBlocker[] = normalized.kind === 'analysis' ? [] : workspace.runs
     .filter((run) => referencesTarget(run, normalized, rubrics))
-    .map((run) => ({ kind: 'analysis', id: run.id, name: run.name, href: `/analyses/${encodeURIComponent(run.id)}` }))
+    .map((run) => ({ kind: 'analysis', id: run.id, name: getDisplayName(run, run.name), href: `/analyses/${encodeURIComponent(run.id)}` }))
   return { target: normalized, name: targetName(workspace, normalized), counts, blockers }
 }
 
@@ -405,7 +415,7 @@ function cancellationOnly(previous: AnalysisRun, next: AnalysisRun): boolean {
 
 function newAnalysisErrors(previous: Workspace, next: Workspace, run: AnalysisRun): string[] {
   const errors: string[] = []
-  const context = `New analysis "${run.name}"`
+  const context = `New analysis "${getDisplayName(run, run.name)}"`
   const eligible = (target: LifecycleTarget) => {
     const owner = parentKey(next, normalizeLifecycleTarget(next, target))
     if (!targetExists(next, normalizeLifecycleTarget(next, target)) || isEntityRemoved(previous, target) || isEntityRemoved(next, target)) {
@@ -528,27 +538,27 @@ export function workspaceLifecycleTransitionErrors(
     let permitted = job
     if (deletedRubric) {
       if (!candidate.rubricDeletedAt || candidate.rubricId !== null || next.rubrics.some((rubric) => rubric.jobId === job.id)) {
-        errors.push(`Deleting the rubric for "${job.title}" must remove every version and leave its source in the explicit No rubric state.`)
+        errors.push(`Deleting the rubric for "${getDisplayName(job, job.title)}" must remove every version and leave its source in the explicit No rubric state.`)
       }
       permitted = { ...permitted, rubricId: null, rubricDeletedAt: candidate.rubricDeletedAt, status: 'ready', error: undefined, errorStage: undefined }
     } else if (job.rubricDeletedAt !== candidate.rubricDeletedAt) {
-      errors.push(`The intentional rubric-removal marker for "${job.title}" cannot be changed without deleting its complete rubric group.`)
+      errors.push(`The intentional rubric-removal marker for "${getDisplayName(job, job.title)}" cannot be changed without deleting its complete rubric group.`)
     }
     if (locked({ kind: 'job', id: job.id })) {
       if (jobUnfinished(job) && candidate.status === 'cancelled' && !deletedRubric) {
         permitted = { ...permitted, status: 'cancelled', error: candidate.error, errorStage: candidate.errorStage }
       }
-      if (!sameValue(permitted, candidate)) errors.push(`Archived job "${job.title}" is read-only. Only cancelling unfinished work or deleting its rubric is allowed.`)
+      if (!sameValue(permitted, candidate)) errors.push(`Archived job "${getDisplayName(job, job.title)}" is read-only. Only cancelling unfinished work or deleting its rubric is allowed.`)
     }
     if ((isEntityArchived(next, { kind: 'job', id: job.id }) || next.rubrics.some((rubric) =>
       rubric.jobId === job.id && isEntityArchived(next, { kind: 'rubric', id: rubric.groupId }))) && jobUnfinished(candidate)) {
-      errors.push(`Archive must cancel unfinished processing for job "${job.title}". Unarchive does not restart it.`)
+      errors.push(`Archive must cancel unfinished processing for job "${getDisplayName(job, job.title)}". Unarchive does not restart it.`)
     }
   }
   for (const resume of previous.resumes) {
     const candidate = next.resumes.find((item) => item.id === resume.id)
     if (candidate && locked({ kind: 'resume', id: resume.id }) && !sameValue(resume, candidate)) {
-      errors.push(`Archived resume "${resume.name}" is read-only.`)
+      errors.push(`Archived resume "${getDisplayName(resume, resume.name)}" is read-only.`)
     }
   }
   for (const rubric of previous.rubrics) {
@@ -601,18 +611,18 @@ export function workspaceLifecycleTransitionErrors(
       continue
     }
     if (!sameValue(old.targets, run.targets) || !sameValue(old.resumes, run.resumes)) {
-      errors.push(`Analysis "${run.name}" must preserve its captured source snapshots. Create a new analysis to use other inputs.`)
+      errors.push(`Analysis "${getDisplayName(old, old.name)}" must preserve its captured source snapshots. Create a new analysis to use other inputs.`)
     }
     for (const comparison of old.comparisons.filter((item) => item.status === 'complete')) {
       if (!sameValue(comparison, run.comparisons.find((item) => item.id === comparison.id))) {
-        errors.push(`Analysis "${run.name}" must preserve its completed results.`)
+        errors.push(`Analysis "${getDisplayName(old, old.name)}" must preserve its completed results.`)
       }
     }
     if (locked({ kind: 'analysis', id: run.id }) && !cancellationOnly(old, run)) {
-      errors.push(`Archived analysis "${run.name}" is read-only. Only cancelling unfinished comparisons or deleting the analysis is allowed.`)
+      errors.push(`Archived analysis "${getDisplayName(old, old.name)}" is read-only. Only cancelling unfinished comparisons or deleting the analysis is allowed.`)
     }
     if (isEntityArchived(next, { kind: 'analysis', id: run.id }) && run.comparisons.some((item) => item.status === 'queued' || item.status === 'running')) {
-      errors.push(`Archive must cancel unfinished comparisons in "${run.name}". Unarchive does not restart them.`)
+      errors.push(`Archive must cancel unfinished comparisons in "${getDisplayName(old, old.name)}". Unarchive does not restart them.`)
     }
   }
   return [...new Set(errors)]

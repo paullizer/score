@@ -2,6 +2,7 @@ import { useState } from 'react'
 import { Link, useNavigate, useParams, useSearchParams } from 'react-router-dom'
 import { ArrowLeft, ArrowRight, BriefcaseBusiness, FileText, MapPin, Plus, Users, X } from 'lucide-react'
 import { useWorkspace } from '../../app/workspace-context'
+import { useLibraryViewState } from '../../app/library-view-state'
 import { DocumentViewer } from '../../components/documents/DocumentViewer'
 import { Avatar, Badge, Button, DemoNote, EmptyState, InlineError, PageHeader, SearchField, SegmentedControl } from '../../components/ui'
 import { SortableHeader, TableSortSelect, type TableSortOption } from '../../components/ui/TableSorting'
@@ -14,6 +15,8 @@ import { useLifecycleAccess } from '../../components/lifecycle/useLifecycleAcces
 import { RealResumesPage } from './RealResumesPage'
 import { useRealResumes } from '../../app/real-resumes-context'
 import { dataMode, sampleDataLink } from '../../app/real-data-mode'
+import { getDisplayName } from '../../domain/displayNames'
+import { RenameEntityButton, RenameEntityProvider } from '../../components/ui/RenameEntityButton'
 
 type ResumeSortKey = 'name' | 'location' | 'experience' | 'sourceLabel' | 'added'
 const resumeSortOptions: Record<ResumeSortKey, TableSortOption<ResumeSortKey>> = {
@@ -31,17 +34,17 @@ function analysisLink(ids: string[], cloud: boolean): string {
 function ResumesLibrary() {
   const { workspace, cloud } = useWorkspace()
   const navigate = useNavigate()
-  const [search, setSearch] = useState('')
-  const [sort, setSort] = useState<TableSort<ResumeSortKey> | null>(null)
+  const [search, setSearch] = useLibraryViewState('resumes:samples:query', '')
+  const [sort, setSort] = useLibraryViewState<TableSort<ResumeSortKey> | null>('resumes:samples:sort', null)
   const [selection, setSelection] = useState<string[]>([])
   const [adding, setAdding] = useState(false)
   const [importError, setImportError] = useState('')
-  const [archiveFilter, setArchiveFilter] = useState<ArchiveFilter>('default')
+  const [archiveFilter, setArchiveFilter] = useLibraryViewState<ArchiveFilter>('resumes:samples:archive', 'default')
   const { canEdit } = useLifecycleAccess()
   const query = search.trim().toLocaleLowerCase()
   const eligible = (id: string) => canEdit && !isEntityArchived(workspace, { kind: 'resume', id })
-  const visible = sortTableRows(workspace.resumes.filter((resume) => matchesArchiveFilter(isEntityArchived(workspace, { kind: 'resume', id: resume.id }), search, archiveFilter) && [resume.name, resume.role, resume.location, resume.experience, resume.sourceLabel].join(' ').toLocaleLowerCase().includes(query)),
-    sort, (resume, key) => key === 'added' ? Date.parse(resume.createdAt) : resume[key])
+  const visible = sortTableRows(workspace.resumes.filter((resume) => matchesArchiveFilter(isEntityArchived(workspace, { kind: 'resume', id: resume.id }), search, archiveFilter) && [resume.displayName, resume.name, resume.role, resume.location, resume.experience, resume.sourceLabel].join(' ').toLocaleLowerCase().includes(query)),
+    sort, (resume, key) => key === 'added' ? Date.parse(resume.createdAt) : key === 'name' ? getDisplayName(resume, resume.name) : resume[key])
   const scopedCount = workspace.resumes.filter((resume) => matchesArchiveFilter(isEntityArchived(workspace, { kind: 'resume', id: resume.id }), search, archiveFilter)).length
   const readyVisible = visible.filter((resume) => eligible(resume.id))
   const selected = workspace.resumes.filter((resume) => selection.includes(resume.id) && eligible(resume.id))
@@ -82,7 +85,7 @@ function ResumesLibrary() {
     <section className="panel">
       <div className="library-toolbar">
         <div className="flex items-center gap-2.5"><Users size={16} className="text-muted" aria-hidden="true" /><h2 className="text-[12px] font-semibold">Your resume library</h2><Badge>{workspace.resumes.filter((resume) => !isEntityArchived(workspace, { kind: 'resume', id: resume.id })).length}</Badge></div>
-        <div className="toolbar"><SearchField value={search} onChange={setSearch} placeholder="Search people, roles, or filenames…" label="Search resume library" />
+        <div className="toolbar"><SearchField value={search} onChange={setSearch} placeholder="Search labels, people, or filenames…" label="Search resume library" />
           <ArchiveStateFilter value={archiveFilter} onChange={setArchiveFilter} label="Resume archive state" />
           <TableSortSelect options={Object.values(resumeSortOptions)} sort={sort} onChange={setSort} label="Sort resumes" /></div>
       </div>
@@ -118,17 +121,17 @@ function ResumesLibrary() {
               <th scope="col"><span className="sr-only">View profile</span></th>
             </tr></thead>
             <tbody>{visible.map((resume) => <tr key={resume.id} className={selection.includes(resume.id) ? 'row-selected' : ''}>
-              <td className="checkbox-cell"><input type="checkbox" checked={eligible(resume.id) && selection.includes(resume.id)} disabled={!eligible(resume.id)} onChange={() => toggle(resume.id)} aria-label={`Select ${resume.name}`} /></td>
+              <td className="checkbox-cell"><input type="checkbox" checked={eligible(resume.id) && selection.includes(resume.id)} disabled={!eligible(resume.id)} onChange={() => toggle(resume.id)} aria-label={`Select ${getDisplayName(resume, resume.name)}`} /></td>
               <td>
                 <div className="flex min-w-[200px] items-center gap-3">
                   <Avatar initials={resume.initials} />
-                  <div className="min-w-0"><Link to={sampleDataLink(`/resumes/${resume.id}`, Boolean(cloud))} className="row-title">{resume.name}</Link> <ArchivedBadge target={{ kind: 'resume', id: resume.id }} /><p className="row-meta">{resume.role}</p></div>
+                  <div className="min-w-0"><Link to={sampleDataLink(`/resumes/${resume.id}`, Boolean(cloud))} className="row-title">{getDisplayName(resume, resume.name)}</Link> <ArchivedBadge target={{ kind: 'resume', id: resume.id }} />{resume.displayName && <p className="row-meta">Source name: {resume.name}</p>}<p className="row-meta">{resume.role}</p></div>
                 </div>
               </td>
               <td><span className="text-[11px] text-muted">{resume.location}</span></td>
               <td><span className="whitespace-nowrap text-[11px]">{resume.experience}</span></td>
               <td><div className="flex items-start gap-2 text-[11px] text-muted"><FileText size={14} className="mt-0.5 shrink-0" aria-hidden="true" /><div className="min-w-0 max-w-[210px]"><p className="break-words">{resume.sourceLabel}</p><p className="mt-1 text-[9px]">Fictional content · {dateLabel(resume.createdAt)}</p></div></div></td>
-              <td><div className="flex items-center gap-1"><Link to={sampleDataLink(`/resumes/${resume.id}`, Boolean(cloud))} className="inline-flex rounded-lg p-2 text-muted hover:bg-soft hover:text-accent" aria-label={`View ${resume.name}'s resume`}><ArrowRight size={16} aria-hidden="true" /></Link><EntityLifecycleActions target={{ kind: 'resume', id: resume.id }} name={resume.name} compact /></div></td>
+              <td><div className="flex flex-wrap items-center gap-1"><Link to={sampleDataLink(`/resumes/${resume.id}`, Boolean(cloud))} className="inline-flex rounded-lg p-2 text-muted hover:bg-soft hover:text-accent" aria-label={`View resume: ${getDisplayName(resume, resume.name)}`}><ArrowRight size={16} aria-hidden="true" /></Link><RenameEntityButton target={{ kind: 'resume', id: resume.id }} name={getDisplayName(resume, resume.name)} compact /><EntityLifecycleActions target={{ kind: 'resume', id: resume.id }} name={getDisplayName(resume, resume.name)} compact /></div></td>
             </tr>)}</tbody>
           </table>
         </div>
@@ -136,16 +139,16 @@ function ResumesLibrary() {
         <div className="space-y-3 p-4 md:hidden">
           {visible.map((resume) => <article className={`resume-card ${selection.includes(resume.id) ? 'border-accent bg-accent-soft' : ''}`} key={resume.id}>
             <div className="flex items-start gap-3">
-              <input type="checkbox" className="mt-3" checked={eligible(resume.id) && selection.includes(resume.id)} disabled={!eligible(resume.id)} onChange={() => toggle(resume.id)} aria-label={`Select ${resume.name}`} />
+              <input type="checkbox" className="mt-3" checked={eligible(resume.id) && selection.includes(resume.id)} disabled={!eligible(resume.id)} onChange={() => toggle(resume.id)} aria-label={`Select ${getDisplayName(resume, resume.name)}`} />
               <Avatar initials={resume.initials} />
-              <div className="min-w-0 flex-1"><h3><Link to={sampleDataLink(`/resumes/${resume.id}`, Boolean(cloud))} className="row-title text-[13px]">{resume.name}</Link></h3><ArchivedBadge target={{ kind: 'resume', id: resume.id }} /><p className="mt-1 text-[11px] text-muted">{resume.role}</p></div>
+              <div className="min-w-0 flex-1"><h3><Link to={sampleDataLink(`/resumes/${resume.id}`, Boolean(cloud))} className="row-title text-[13px]">{getDisplayName(resume, resume.name)}</Link></h3><ArchivedBadge target={{ kind: 'resume', id: resume.id }} />{resume.displayName && <p className="row-meta">Source name: {resume.name}</p>}<p className="mt-1 text-[11px] text-muted">{resume.role}</p></div>
             </div>
             <div className="mt-4 flex flex-wrap gap-x-4 gap-y-2 text-[10px] text-muted">
               <span className="inline-flex items-center gap-1.5"><MapPin size={12} aria-hidden="true" />{resume.location}</span>
               <span className="inline-flex items-center gap-1.5"><BriefcaseBusiness size={12} aria-hidden="true" />{resume.experience}</span>
             </div>
             <div className="mt-3 border-t pt-3"><p className="break-words text-[10px] text-muted">{resume.sourceLabel}</p><div className="mt-3 flex items-center justify-between gap-2"><Badge>Fictional profile</Badge><Link to={sampleDataLink(`/resumes/${resume.id}`, Boolean(cloud))} className="text-link text-[11px]">View resume <ArrowRight size={12} aria-hidden="true" /></Link></div></div>
-            <EntityLifecycleActions target={{ kind: 'resume', id: resume.id }} name={resume.name} />
+            <div className="mt-3 flex flex-wrap gap-2"><RenameEntityButton target={{ kind: 'resume', id: resume.id }} name={getDisplayName(resume, resume.name)} /><EntityLifecycleActions target={{ kind: 'resume', id: resume.id }} name={getDisplayName(resume, resume.name)} /></div>
           </article>)}
         </div>
       </> : <EmptyState
@@ -192,10 +195,11 @@ function ResumeDetail({ id }: { id: string }) {
     <Link className="back-link" to={sampleDataLink('/resumes', Boolean(cloud))}><ArrowLeft size={14} aria-hidden="true" />Back to resumes</Link>
     <PageHeader
       eyebrow="FICTIONAL CANDIDATE PROFILE"
-      title={resume.name}
+      title={getDisplayName(resume, resume.name)}
       description={resume.role}
-      actions={<><EntityLifecycleActions target={{ kind: 'resume', id }} name={resume.name} onComplete={(action) => { if (action === 'delete') navigate(sampleDataLink('/resumes', Boolean(cloud))) }} /><Button icon={ArrowRight} variant="primary" disabled={!available || !canEdit} onClick={() => navigate(analysisLink([resume.id], Boolean(cloud)))}>Match to jobs</Button></>}
+      actions={<><RenameEntityButton target={{ kind: 'resume', id }} name={getDisplayName(resume, resume.name)} /><EntityLifecycleActions target={{ kind: 'resume', id }} name={getDisplayName(resume, resume.name)} onComplete={(action) => { if (action === 'delete') navigate(sampleDataLink('/resumes', Boolean(cloud))) }} /><Button icon={ArrowRight} variant="primary" disabled={!available || !canEdit} onClick={() => navigate(analysisLink([resume.id], Boolean(cloud)))}>Match to jobs</Button></>}
     />
+    {resume.displayName && <p className="mb-4 break-words text-[12px] text-muted">Source name: {resume.name} · Original filename: {resume.sourceLabel}</p>}
     <LifecycleBanner target={{ kind: 'resume', id }} />
     <div className="detail-metadata">
       <Badge tone="accent">Fictional profile</Badge>
@@ -237,7 +241,7 @@ function ResumeDetail({ id }: { id: string }) {
               const status = runStatus(run)
               const comparisons = run.comparisons.filter((comparison) => comparison.resumeId === resume.id).length
               return <li key={run.id} className="p-4">
-                <Link to={sampleDataLink(`/analyses/${run.id}`, Boolean(cloud))} className="row-title inline-flex items-start gap-2"><span>{run.name}</span><ArrowRight size={13} className="mt-0.5 shrink-0" aria-hidden="true" /></Link>
+                <Link to={sampleDataLink(`/analyses/${run.id}`, Boolean(cloud))} className="row-title inline-flex items-start gap-2"><span>{getDisplayName(run, run.name)}</span><ArrowRight size={13} className="mt-0.5 shrink-0" aria-hidden="true" /></Link>
                 <div className="mt-2 flex flex-wrap items-center gap-2"><Badge tone={status === 'Needs attention' ? 'warning' : status === 'Complete' ? 'success' : 'neutral'} dot>{status}</Badge><span className="text-[10px] text-muted">{dateLabel(run.createdAt)}</span></div>
                 <p className="mt-2 text-[10px] text-muted">{comparisons} {comparisons === 1 ? 'comparison' : 'comparisons'} for this resume · saved input versions</p>
               </li>
@@ -261,6 +265,8 @@ export function ResumesPage() {
     {cloud && !id && <div className="library-kind-switcher mb-5 rounded-xl border"><SegmentedControl label="Choose real resumes or samples" value={mode}
       onChange={(value) => navigate(`/resumes?data=${value}`)} options={[{ value: 'real', label: 'Real resumes', count: real?.summaries.length ?? 0 }, { value: 'samples', label: 'Samples', count: workspace.resumes.length }]} />
       <span>{mode === 'real' ? 'Actual private sources · manual analysis' : 'Fictional profiles · filenames only · simulated scoring'}</span></div>}
-    {mode === 'real' ? <RealResumesPage id={id} /> : id ? <ResumeDetail key={id} id={id} /> : <ResumesLibrary key={cloud?.currentWorkspaceId ?? 'local'} />}
+    {mode === 'real' ? <RealResumesPage id={id} /> : <RenameEntityProvider key={`${cloud?.currentWorkspaceId ?? 'local'}:${id ?? 'library'}`}>
+      {id ? <ResumeDetail id={id} /> : <ResumesLibrary />}
+    </RenameEntityProvider>}
   </>
 }

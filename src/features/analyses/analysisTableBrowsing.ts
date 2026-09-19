@@ -4,6 +4,7 @@ import { runStatus } from '../../domain/selectors'
 import { matchesTableSearch, sortTableRows, type TableSort } from '../../domain/tableSorting'
 import type { AnalysisRun, AnalysisTarget, Comparison, ResumeSnapshot } from '../../domain/types'
 import { realAnalysisCancellationPaused, realAnalysisCancellationPending, targetIdentity, targetVersionLabel } from './realAnalysisUi'
+import { getDisplayName } from '../../domain/displayNames'
 
 export type AnalysisHistoryFilter = 'all' | 'complete' | 'attention'
 export type SampleAnalysisSortKey = 'name' | 'resumes' | 'targets' | 'status' | 'created'
@@ -67,10 +68,10 @@ export function realComparisonProcessingRank(summary: RealAnalysisComparisonSumm
 export function selectSampleAnalysisRuns(
   runs: readonly AnalysisRun[], query: string, filter: AnalysisHistoryFilter, sort: TableSort<SampleAnalysisSortKey> | null,
 ): AnalysisRun[] {
-  return sortTableRows(runs.filter((run) => matchesTableSearch(query, [run.name])
+  return sortTableRows(runs.filter((run) => matchesTableSearch(query, [getDisplayName(run, run.name)])
     && (filter === 'all' || (filter === 'complete' ? runStatus(run) === 'Complete' : runStatus(run) !== 'Complete'))), sort, (run, key) => {
     switch (key) {
-      case 'name': return run.name
+      case 'name': return getDisplayName(run, run.name)
       case 'resumes': return run.resumes.length
       case 'targets': return run.targets.length
       case 'status': return analysisProcessingRank(runStatus(run))
@@ -82,10 +83,10 @@ export function selectSampleAnalysisRuns(
 export function selectRealAnalysisRuns(
   runs: readonly RealAnalysisRunSummary[], query: string, filter: AnalysisHistoryFilter, sort: TableSort<RealAnalysisSortKey> | null,
 ): RealAnalysisRunSummary[] {
-  return sortTableRows(runs.filter((summary) => matchesTableSearch(query, [summary.run.name])
+  return sortTableRows(runs.filter((summary) => matchesTableSearch(query, [getDisplayName(summary.run, summary.run.name)])
     && (filter === 'all' || (filter === 'complete' ? summary.run.status === 'complete' : summary.run.status !== 'complete'))), sort, (summary, key) => {
     switch (key) {
-      case 'name': return summary.run.name
+      case 'name': return getDisplayName(summary.run, summary.run.name)
       case 'status': return realAnalysisProcessingRank(summary)
       case 'comparisons': return summary.run.progress.total
       case 'created': return Date.parse(summary.run.createdAt)
@@ -100,11 +101,11 @@ export interface ComparisonBrowsing<Key extends string> {
 }
 
 export function realComparisonTargetLabel(target: RealAnalysisTargetSummary): string {
-  return `${target.label} · ${target.sublabel} · ${targetVersionLabel(target.selection)}`
+  return `${getDisplayName(target, target.label)} · ${target.sublabel} · ${targetVersionLabel(target.selection)}`
 }
 
 export function sampleComparisonTargetLabel(target: AnalysisTarget): string {
-  return `${target.label} · ${target.sublabel} · ${target.kind === 'job' ? 'Job' : 'Grade'} rubric v${target.rubric.version}${target.document ? ` · source v${target.document.version}` : ''}`
+  return `${getDisplayName(target, target.label)} · ${target.sublabel} · ${target.kind === 'job' ? 'Job' : 'Grade'} rubric v${target.rubric.version}${target.document ? ` · source v${target.document.version}` : ''}`
 }
 
 export function distinctTargetLabels<T extends { id: string }>(targets: readonly T[], label: (target: T) => string): string[] {
@@ -126,13 +127,13 @@ export function selectRealComparisons(
     const resume = comparison.resume.summary
     const target = comparison.target.summary
     return (!browsing.targetId || targetIdentity(target.selection) === browsing.targetId)
-      && matchesTableSearch(browsing.query, [resume.name, resume.role, resume.sourceLabel, target.label, target.sublabel])
+      && matchesTableSearch(browsing.query, [resume.displayName, resume.name, resume.role, resume.sourceLabel, target.displayName, target.label, target.sublabel])
   })
   const rows = sortTableRows(matches, sort, (pair, key) => {
     const comparison = pair.comparison
     switch (key) {
-      case 'name': return comparison.resume.summary.name
-      case 'target': return comparison.target.summary.label.trim() ? realComparisonTargetLabel(comparison.target.summary) : null
+      case 'name': return comparison.resume.summary.displayName ?? comparison.resume.summary.name
+      case 'target': return getDisplayName(comparison.target.summary, comparison.target.summary.label).trim() ? realComparisonTargetLabel(comparison.target.summary) : null
       case 'status': return realComparisonProcessingRank(pair, run)
       case 'score': return comparison.status === 'complete' && comparison.resultSummary?.overall.status === 'available'
         ? comparison.resultSummary.overall.score : null
@@ -161,14 +162,14 @@ export function selectSampleComparisons(run: AnalysisRun, browsing: ComparisonBr
     comparisons.set(comparison.targetId, comparison)
     byResume.set(comparison.resumeId, comparisons)
   }
-  const targetMatches = matchesTableSearch(browsing.query, displayedTargets.flatMap((target) => [target.label, target.sublabel]))
+  const targetMatches = matchesTableSearch(browsing.query, displayedTargets.flatMap((target) => [target.displayName, target.label, target.sublabel]))
   const matches: SampleComparisonRow[] = run.resumes.filter(({ resume, document }) => targetMatches
-    || matchesTableSearch(browsing.query, [resume.name, resume.role, resume.sourceLabel, document.title]))
+    || matchesTableSearch(browsing.query, [resume.displayName, resume.name, resume.role, resume.sourceLabel, document.title]))
     .map((snapshot) => ({ snapshot, comparisons: byResume.get(snapshot.resume.id) ?? new Map<string, Comparison>() }))
   const rows = sortTableRows(matches, sort, (row, key) => {
     const comparison = selectedTarget ? row.comparisons.get(selectedTarget.id) : undefined
     switch (key) {
-      case 'name': return row.snapshot.resume.name
+      case 'name': return getDisplayName(row.snapshot.resume, row.snapshot.resume.name)
       case 'score': return comparison?.status === 'complete' ? comparison.score : null
       case 'coverage': return comparison?.status === 'complete' ? comparison.criteria.filter((criterion) => criterion.citations.length > 0).length : null
       case 'status': return analysisProcessingRank(comparison?.status)

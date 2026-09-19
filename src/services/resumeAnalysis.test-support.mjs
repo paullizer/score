@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
 import { PDFDocument, StandardFonts } from 'pdf-lib'
 import { buildGradeTestRuntime, memoryBlobs, startGradeFixture } from './gradeLadders.test-support.mjs'
+import { passageSelection } from '../../worker-tests/analysis-selection-test-support.mjs'
 
 const clone = (value) => structuredClone(value)
 
@@ -331,6 +332,13 @@ function profileField(paragraphs, text) {
     : { status: 'unavailable', value: null, citations: [] }
 }
 
+function analysisCitationFor(input, text) {
+  for (const [paragraphIndex, paragraph] of input.resume.paragraphs.entries()) {
+    const passageIndex = paragraph.passages.findIndex(passage => passage.text.includes(text))
+    if (passageIndex >= 0) return passageSelection(input, paragraphIndex, passageIndex)
+  }
+}
+
 export function processingStubs(fixture, { urlPages = new Map(), onModelRequest, ocrParagraphs = resumeParagraphs } = {}) {
   const modelCalls = []
   const sourceCalls = []
@@ -375,8 +383,8 @@ export function processingStubs(fixture, { urlPages = new Map(), onModelRequest,
         }
       } else if (schema === 'resume_rubric_assessment') {
         const input = user.input
-        const work = quoteFor(input.resume.paragraphs, 'Applied engineering methods independently')
-        const education = quoteFor(input.resume.paragraphs, 'Bachelor of Engineering')
+        const work = analysisCitationFor(input, 'Applied engineering methods independently')
+        const education = analysisCitationFor(input, 'Bachelor of Engineering')
         assert.ok(work, 'The assessment fixture must quote actual independent engineering work.')
         output = {
           criteria: input.rubric.criteria.map((criterion) => criterion.support === 'not-applicable' ? {

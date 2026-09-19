@@ -1,5 +1,5 @@
 import { REPORT_LIMITS, type AnalysisReport, type RankedReportComparison, type ReportGroup } from '../../domain/analysis-reports'
-import { candidateName, comparisonStatusLabel, evidenceStatusLabel, REPORT_HUMAN_REVIEW_NOTICE } from './presentation'
+import { candidateSourceName, comparisonStatusLabel, evidenceStatusLabel, REPORT_HUMAN_REVIEW_NOTICE, targetName } from './presentation'
 
 type Cell = string | number | null
 
@@ -33,10 +33,11 @@ function limitations(comparison: RankedReportComparison): string {
 }
 
 export function generateCsvReport(report: AnalysisReport): Uint8Array {
+  const displayLabels = report.groups.some(group => group.target.displayName || group.comparisons.some(comparison => comparison.candidate.displayName))
   const columns = report.groups.flatMap(({ target }, targetIndex) => target.criteria.map((criterion, criterionIndex) => ({
     targetId: target.id,
     criterionId: criterion.id,
-    header: `[T${targetIndex + 1} C${criterionIndex + 1}] ${target.label} | ${target.versionLabel} | ${criterion.label} [${criterion.id}] (${criterion.weight}% weight; 0-5)`,
+    header: `[T${targetIndex + 1} C${criterionIndex + 1}] ${targetName(target)} | ${target.versionLabel} | ${criterion.label} [${criterion.id}] (${criterion.weight}% weight; 0-5)`,
   })))
   const header: Cell[] = [
     'Candidate name', 'Job/grade title', ...columns.map((column) => column.header), 'Overall score', 'Overall assessment',
@@ -51,6 +52,7 @@ export function generateCsvReport(report: AnalysisReport): Uint8Array {
     'Resume document SHA-256', 'Resume snapshot ID', 'Target snapshot ID', 'Saved result SHA-256',
     'Run name', 'Run ID', 'Comparison ID', 'Analysis created at', 'Comparison assessed at',
     'Capture started at', 'Capture completed at', 'Report generated at', 'Report data', 'Report status', 'Human review notice',
+    ...(displayLabels ? ['Candidate display label', 'Job/grade display title'] : []),
   ]
   const encoder = new TextEncoder()
   const chunks: Uint8Array[] = [Uint8Array.of(0xef, 0xbb, 0xbf)]
@@ -77,7 +79,7 @@ export function generateCsvReport(report: AnalysisReport): Uint8Array {
       })
       const coverage = comparison.coverage
       append([
-        candidateName(comparison.candidate), target.label, ...scores,
+        candidateSourceName(comparison.candidate), target.label, ...scores,
         comparison.overall.score, comparison.summary,
         comparison.rank, comparison.highlighted ? 'Yes' : 'No', group.cutoffScore, group.additionalCutoffTies, comparisonStatusLabel(comparison.status),
         comparison.completion, comparison.overall.status, comparison.overall.status === 'available' ? null : comparison.overall.message,
@@ -97,6 +99,7 @@ export function generateCsvReport(report: AnalysisReport): Uint8Array {
         report.capture.startedAt, report.capture.completedAt, report.generatedAt,
         report.dataKind === 'sample' ? 'Fictional sample' : 'Real saved evidence', report.partial ? 'Partial' : 'Complete',
         REPORT_HUMAN_REVIEW_NOTICE,
+        ...(displayLabels ? [comparison.candidate.displayName ?? null, target.displayName ?? null] : []),
       ])
       rows++
     }
