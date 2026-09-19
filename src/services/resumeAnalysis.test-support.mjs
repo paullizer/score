@@ -325,6 +325,10 @@ function quoteFor(paragraphs, text) {
   return paragraph ? { paragraphId: paragraph.paragraphId ?? paragraph.id, quote: paragraph.text } : undefined
 }
 
+export function analysisPassageFor(paragraphs, text) {
+  return analysisCitationFor({ resume: { paragraphs } }, text)
+}
+
 function profileField(paragraphs, text) {
   const quote = quoteFor(paragraphs, text)
   return quote
@@ -333,8 +337,10 @@ function profileField(paragraphs, text) {
 }
 
 function analysisCitationFor(input, text) {
+  assert.ok(input.resume.paragraphs.every((paragraph) => Array.isArray(paragraph.passages)), 'Analysis fixtures require the v3 source-owned passage catalog.')
   for (const [paragraphIndex, paragraph] of input.resume.paragraphs.entries()) {
-    const passageIndex = paragraph.passages.findIndex(passage => passage.text.includes(text))
+    const passageIndex = paragraph.passages.findIndex(passage =>
+      Number.isSafeInteger(passage.passageId) && passage.passageId > 0 && passage.text.includes(text))
     if (passageIndex >= 0) return passageSelection(input, paragraphIndex, passageIndex)
   }
 }

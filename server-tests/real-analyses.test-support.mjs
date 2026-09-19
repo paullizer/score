@@ -17,11 +17,12 @@ await build({
   stdin: {
     resolveDir: root,
     contents: [
-      'service', 'routes', 'validation', 'snapshots', 'lifecycle', 'library-lifecycle', 'guards', 'azure-store',
+      'service', 'routes', 'validation', 'snapshots', 'diagnostics', 'paging', 'lifecycle', 'library-lifecycle', 'guards', 'azure-store',
     ].map(name => `export * from './server/analyses/${name}.ts';`).join('\n') +
       "\nexport * from './server/errors.ts'; export * from './server/store.ts';" +
       "\nexport * from './server/ids.ts'; export * from './server/middleware.ts';" +
       "\nexport { analysisRunCanScore } from './src/domain/real-analyses.ts';" +
+      "\nexport * from './src/domain/analysis-diagnostics.ts';" +
       "\nexport { WorkspaceRepository } from './server/repository.ts';" +
       "\nexport { parseGradeEntity, parseGradeSeedSnapshot, gradeContentHash, gradeVersionHash, gradeSourceSetHash, validateGradeApproval } from './server/grades/validation.ts';" +
       "\nexport { createGradeBlobStoreFromContainer } from './server/grades/azure-store.ts';" +

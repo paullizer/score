@@ -2,13 +2,14 @@ import { useEffect, useState } from 'react'
 import { Link, useNavigate, useSearchParams } from 'react-router-dom'
 import { ArrowLeft, ArrowUpRight, Layers3, LoaderCircle, RotateCcw, ShieldCheck, X } from 'lucide-react'
 import { useRealAnalyses } from '../../app/real-analyses-context'
+import { savedReviewView, type SavedReviewView } from '../../app/saved-review-navigation'
 import type { RealAnalysisComparisonSummary, RealAnalysisRunSummary } from '../../domain/real-analyses'
 import { dateLabel } from '../../domain/selectors'
 import { Badge, Button, EmptyState, InlineError, PageHeader, Score, SearchField } from '../../components/ui'
 import { SortableHeader, TableSortSelect } from '../../components/ui/TableSorting'
 import type { TableSort } from '../../domain/tableSorting'
 import { RealAnalysisStatus } from './RealAnalysesPage'
-import { realAnalysisCancellationPaused, realAnalysisCancellationPending, realAnalysisLink, targetIdentity, targetVersionLabel } from './realAnalysisUi'
+import { analysisDiagnosticNotice, analysisFailureStages, currentAnalysisDiagnostic, realAnalysisCancellationPaused, realAnalysisCancellationPending, realAnalysisLink, targetIdentity, targetVersionLabel } from './realAnalysisUi'
 import {
   distinctTargetLabels, realComparisonSortOptions, realComparisonTargetLabel, selectRealComparisons, targetScoreSortExplanation, type RealComparisonSortKey,
 } from './analysisTableBrowsing'
@@ -101,6 +102,7 @@ function RealAnalysisView({ id }: { id: string }) {
   const ensure = api?.ensureDetail
   const ensurePairs = api?.ensureComparisons
   const selectedId = params.get('result')
+  const sourceView = savedReviewView(params)
   useEffect(() => {
     if (api?.phase !== 'ready') return
     void ensure?.(id)
@@ -134,6 +136,7 @@ function RealAnalysisView({ id }: { id: string }) {
     const next = new URLSearchParams(params)
     next.set('data', 'real')
     next.set('result', pairId)
+    next.delete('view')
     setParams(next)
   }
   return <>{back}
@@ -155,7 +158,7 @@ function RealAnalysisView({ id }: { id: string }) {
       <p>{run.progress.scored} with a server-calculated score · {run.progress.unscored} completed without an overall score. Saved results are never overwritten when other pairs retry.</p>
       {realAnalysisCancellationPending(summary) && <p>Cancellation is progressing in bounded batches. This view keeps polling until the server confirms completion.</p>}
     </section>
-    {selectedId ? <SelectedRealComparison runId={id} comparisonId={selectedId} /> : <section className="panel mt-5" aria-label="Real comparisons">
+    {selectedId ? <SelectedRealComparison runId={id} comparisonId={selectedId} initialView={sourceView} /> : <section className="panel mt-5" aria-label="Real comparisons">
       <div className="section-heading"><div><h2>Separate comparisons, not a cross-job ranking</h2><p>Open a result for the complete criterion breakdown and exact source quotations.</p></div>
         <Button size="sm" icon={RotateCcw} onClick={() => { void api.ensureDetail(id, true); void api.ensureComparisons(id, true) }}>Refresh pairs</Button></div>
       <div className="library-toolbar">
@@ -179,6 +182,9 @@ function RealAnalysisView({ id }: { id: string }) {
             <td className="min-w-[210px]"><strong className="block text-[12px]">{getDisplayName(target, target.label)}</strong>{target.displayName && <p className="row-meta">Source title: {target.label}</p>}<p className="row-meta">{target.sublabel}</p><div className="mt-2"><Badge>{targetVersionLabel(target.selection)}</Badge></div>
               {target.kind === 'grade' && target.newerDraftAvailable && <p className="row-meta">An unapproved newer draft was not used.</p>}</td>
             <td><RealComparisonValue summary={pair} />{comparison.error && <p className="mt-2 max-w-xs text-[11px] text-[var(--cp-danger)]">{comparison.error.code}: {comparison.error.message}</p>}
+              {comparison.error && <p className="row-meta">Stage: {analysisFailureStages[comparison.error.stage]}</p>}
+              {analysisDiagnosticNotice(comparison) && <p className="row-meta max-w-xs">{analysisDiagnosticNotice(comparison)}</p>}
+              {comparison.status === 'failed' && currentAnalysisDiagnostic(comparison) && <p className="row-meta max-w-xs">Open the saved pair for private validation reasons and the original sources.</p>}
               {comparison.nextAttemptAt && <p className="row-meta">Automatic retry {dateLabel(comparison.nextAttemptAt)}</p>}<p className="row-meta">Attempt {comparison.attempts} · manual retries {comparison.retryCount}</p></td>
             <td><div className="space-y-3"><div><Badge dot tone={comparison.status === 'complete' ? 'success' : ['failed', 'cancelled'].includes(comparison.status) ? 'warning' : 'neutral'}>
               {{ queued: 'Queued', running: 'Running', complete: 'Complete', failed: 'Failed', cancelled: 'Cancelled' }[comparison.status]}</Badge></div>
@@ -196,7 +202,7 @@ function RealAnalysisView({ id }: { id: string }) {
   </>
 }
 
-function SelectedRealComparison({ runId, comparisonId }: { runId: string; comparisonId: string }) {
+function SelectedRealComparison({ runId, comparisonId, initialView }: { runId: string; comparisonId: string; initialView: SavedReviewView | null }) {
   const api = useRealAnalyses()!
   const entry = api.comparison(runId, comparisonId)
   const ensure = api.ensureComparison
@@ -206,6 +212,6 @@ function SelectedRealComparison({ runId, comparisonId }: { runId: string; compar
     description={entry.state === 'error' ? entry.error : 'Retrieving the immutable resume, target, and result. No live versions are substituted.'}
     action={<Button onClick={() => void ensure(runId, comparisonId, true)}>Retry saved comparison</Button>} /></section>
   return <div className="mt-5">{entry.error && <div className="mb-5"><InlineError>{entry.error} <Button size="sm" onClick={() => void ensure(runId, comparisonId, true)}>Reload saved comparison</Button></InlineError></div>}
-    <RealComparisonReview key={comparisonId} detail={entry.value} actions={<RealComparisonActions summary={entry.value} />} />
+    <RealComparisonReview key={`${comparisonId}:${initialView ?? 'review'}`} detail={entry.value} initialView={initialView} actions={<RealComparisonActions summary={entry.value} />} />
   </div>
 }

@@ -38,7 +38,7 @@ test('sample report display names retain source names and leave all saved result
 
 test('invalid display metadata produces structured validation failures rather than escaping safeParse', () => {
   const input = realReportFixture({ scores: [80] })
-  for (const displayName of ['', '  ', ' surrounded ', 'line\nbreak', 'control\u0001', 'x'.repeat(161)]) {
+  for (const displayName of [null, 42, '', '  ', ' surrounded ', 'line\nbreak', 'line\u2028break', 'control\u0001', 'x'.repeat(161), '😀'.repeat(81)]) {
     const target = api.reportTargetSchema.safeParse({ ...input.targets[0], displayName })
     assert.equal(target.success, false)
     assert.equal(target.error.issues[0].path[0], 'displayName')
@@ -49,6 +49,7 @@ test('invalid display metadata produces structured validation failures rather th
     assert.deepEqual(comparison.error.issues[0].path, ['candidate', 'displayName'])
   }
   assert.equal(api.reportDisplayNameSchema.safeParse('x'.repeat(160)).success, true)
+  assert.equal(api.reportDisplayNameSchema.safeParse('😀'.repeat(80)).success, true)
 })
 
 test('format metadata and resource limits are shared by all report consumers', () => {

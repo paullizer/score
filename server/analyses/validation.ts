@@ -2,6 +2,11 @@ import { createHash } from 'node:crypto'
 import { z } from 'zod'
 import { REPORT_LIMITS } from '../../src/domain/analysis-reports'
 import {
+  ANALYSIS_CITATION_REASONS, ANALYSIS_DIAGNOSTIC_FIELDS, ANALYSIS_DIAGNOSTIC_LIMITS,
+  ANALYSIS_DIAGNOSTIC_REASONS, ANALYSIS_REVIEW_ISSUE_CODES, ANALYSIS_SCHEMA_ISSUE_CODES, ANALYSIS_TELEMETRY_EVENTS,
+  type AnalysisFailureDiagnostic, type AnalysisFailureDiagnosticReference,
+} from '../../src/domain/analysis-diagnostics'
+import {
   ANALYSIS_LIMITS, type AnalysisEntity, type FrozenRealResumeSnapshot, type FrozenRealAnalysisTargetSnapshot,
   type FrozenRequirementEvidence, type RealAnalysisInitializationManifest, type RealAnalysisResult,
   type RealAnalysisResultSummary, type RealAnalysisAssessmentOutput,
@@ -64,6 +69,9 @@ const originalReferenceSchema = blobReferenceSchema.extend({
   .refine(value => !isWordContentType(value.contentType) || value.bytes <= WORD_DOCUMENT_LIMITS.maxFileBytes,
     'Word originals exceed the supported size.')
 const jsonReferenceSchema = blobReferenceSchema.extend({ contentType: z.literal('application/json') })
+export const analysisFailureDiagnosticReferenceSchema = z.strictObject({
+  attemptId: z.string().uuid(), createdAt: timestamp, blob: jsonReferenceSchema,
+})
 const documentReferenceSchema = jsonReferenceSchema.extend({ documentId: identifier, documentVersion: integer })
 
 export const analysisResumeSelectionSchema = z.strictObject({
@@ -178,6 +186,10 @@ const comparisonSchema = z.strictObject({
   resume: resumeReferenceSchema, target: targetReferenceSchema,
   result: jsonReferenceSchema.optional(), resultSummary: resultSummarySchema.optional(),
   completedAt: timestamp.optional(), cancelledAt: timestamp.optional(),
+  failureDiagnostic: analysisFailureDiagnosticReferenceSchema.optional(),
+  diagnosticCapture: z.strictObject({
+    attemptId: z.string().uuid(), status: z.enum(['saved', 'unavailable']), pipelineVersion: text(200),
+  }).optional(),
 })
 const entitySchema = z.discriminatedUnion('recordType', [runSchema, comparisonSchema])
 const manifestSchema = z.strictObject({
@@ -220,7 +232,7 @@ export function isSafeAnalysisBlobName(name: string): boolean {
   if (parts.length === 3) return parts[2] === 'manifest.json'
   if (parts.length === 4 && parts[2] === 'evidence') return /^[a-f0-9]{64}\.(?:json|pdf|md|docx|doc|html)$/.test(parts[3])
   if (parts.length === 5 && parts[2] === 'snapshots' && isAnalysisId(parts[3], 'snapshot')) return /^[a-f0-9]{64}\.json$/.test(parts[4])
-  return parts.length === 5 && parts[2] === 'results' && isAnalysisId(parts[3], 'comparison') &&
+  return parts.length === 5 && ['results', 'diagnostics'].includes(parts[2]) && isAnalysisId(parts[3], 'comparison') &&
     new RegExp(`^${UUID}\\.json$`).test(parts[4])
 }
 export function analysisBlobInRun(name: string, workspaceId: string, runId: string): boolean {
@@ -283,6 +295,15 @@ export function parseAnalysisEntity(value: unknown): AnalysisEntity {
       record.id === analysisDeterministicId('comparison', record.runId, record.index), 'Comparison identity mismatch.')
     snapshotReference(record.resume, record.workspaceId, record.runId)
     snapshotReference(record.target, record.workspaceId, record.runId)
+    if (record.failureDiagnostic) {
+      assertAnalysisFailureDiagnosticReference(record.failureDiagnostic, record.workspaceId, record.runId, record.id)
+      assertAnalysis(record.failureDiagnostic.createdAt >= record.createdAt && record.failureDiagnostic.createdAt <= record.updatedAt,
+        'Failure diagnostic timestamp is outside the comparison history.')
+    }
+    if (record.diagnosticCapture?.status === 'saved') {
+      assertAnalysis(record.failureDiagnostic?.attemptId === record.diagnosticCapture.attemptId,
+        'Saved diagnostic capture must identify its immutable artifact.')
+    }
     assertAnalysis(Boolean(record.result) === Boolean(record.resultSummary) &&
       (record.status === 'complete') === Boolean(record.result), 'Only completed comparisons can have results.')
     if (record.status === 'complete') {
@@ -327,6 +348,20 @@ export function analysisResultBlobName(workspaceId: string, runId: string, compa
   const name = `${workspaceId}/${runId}/results/${comparisonId}/${attemptId}.json`
   assertAnalysis(isSafeAnalysisBlobName(name), 'Invalid result publication identity.')
   return name
+}
+
+export function analysisDiagnosticBlobName(workspaceId: string, runId: string, comparisonId: string, attemptId: string): string {
+  const name = `${workspaceId}/${runId}/diagnostics/${comparisonId}/${attemptId}.json`
+  assertAnalysis(isSafeAnalysisBlobName(name), 'Invalid failure diagnostic identity.')
+  return name
+}
+
+export function assertAnalysisFailureDiagnosticReference(
+  reference: AnalysisFailureDiagnosticReference, workspaceId: string, runId: string, comparisonId: string,
+): void {
+  analysisFailureDiagnosticReferenceSchema.parse(reference)
+  assertAnalysis(reference.blob.blobName === analysisDiagnosticBlobName(workspaceId, runId, comparisonId, reference.attemptId),
+    'Failure diagnostic belongs to another comparison or attempt.')
 }
 
 const frozenBase = {
@@ -547,6 +582,131 @@ const groundingReviewSchema = z.strictObject({
   })).max(100),
   assessmentSha256: hash, resumeSnapshotSha256: hash, targetSnapshotSha256: hash, provenance: modelProvenanceSchema,
 })
+const diagnosticNumber = z.number().int().min(0).max(Number.MAX_SAFE_INTEGER)
+const citationDiagnosticsSchema = z.strictObject({
+  findings: z.array(z.strictObject({
+    reason: z.enum(ANALYSIS_CITATION_REASONS), scope: z.enum(['criteria', 'qualifications', 'issues', 'citations']),
+    rowIndex: diagnosticNumber.optional(), criterionId: identifier.optional(), qualificationId: identifier.optional(),
+    citationIndex: diagnosticNumber.optional(), paragraphId: identifier.optional(), matchingParagraphId: identifier.optional(),
+    quoteLength: diagnosticNumber.optional(), paragraphLength: diagnosticNumber.optional(),
+    passageId: diagnosticNumber.optional(), passageCount: diagnosticNumber.optional(),
+    startOffset: diagnosticNumber.optional(), endOffset: diagnosticNumber.optional(),
+  })).max(ANALYSIS_DIAGNOSTIC_LIMITS.maxFindings),
+  omittedFindings: diagnosticNumber,
+})
+const schemaDiagnosticsSchema = z.strictObject({
+  findings: z.array(z.strictObject({
+    code: z.enum(ANALYSIS_SCHEMA_ISSUE_CODES),
+    path: z.array(z.union([z.enum(ANALYSIS_DIAGNOSTIC_FIELDS), z.number().int().min(0).max(1_000_000)]))
+      .max(ANALYSIS_DIAGNOSTIC_LIMITS.maxPathSegments),
+  })).max(ANALYSIS_DIAGNOSTIC_LIMITS.maxFindings),
+  omittedFindings: diagnosticNumber,
+})
+const diagnosticEventSchema = z.strictObject({
+  event: z.enum(ANALYSIS_TELEMETRY_EVENTS), timestamp, stage: errorSchema.shape.stage,
+  workspaceId: workspace.optional(), runId: runId.optional(), comparisonId: comparisonId.optional(), attemptId: z.string().uuid().optional(),
+  modelCallId: z.string().uuid().optional(), pipelineVersion: text(200).optional(),
+  deployment: text(300).optional(), model: text(300).optional(), promptVersion: text(200).optional(), schemaVersion: text(200).optional(),
+  correctionCount: z.number().int().min(0).max(ANALYSIS_LIMITS.maxOutputCorrections).optional(),
+  transportAttempt: diagnosticNumber.optional(), httpStatus: z.number().int().min(100).max(599).optional(),
+  requestId: z.string().regex(/^(?:[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}|req_[a-zA-Z0-9]{16,64})$/i).optional(),
+  durationMilliseconds: diagnosticNumber.optional(), inputCharacters: diagnosticNumber.optional(),
+  contextCharacterLimit: diagnosticNumber.optional(), completionTokenLimit: diagnosticNumber.optional(),
+  finishReason: z.enum(['stop', 'length', 'content_filter', 'tool_calls', 'function_call']).optional(),
+  code: errorSchema.shape.code.optional(), reason: z.enum(ANALYSIS_DIAGNOSTIC_REASONS).optional(),
+  retryable: z.boolean().optional(), cancelled: z.boolean().optional(),
+  citationDiagnostics: citationDiagnosticsSchema.optional(), schemaDiagnostics: schemaDiagnosticsSchema.optional(),
+  reviewOutcome: groundingReviewSchema.shape.outcome.optional(),
+  reviewIssues: z.array(z.strictObject({
+    code: z.enum(ANALYSIS_REVIEW_ISSUE_CODES), criterionId: identifier.optional(), qualificationId: identifier.optional(),
+  })).max(64).optional(),
+  reviewIssueCount: diagnosticNumber.optional(), citationCount: diagnosticNumber.optional(), catalogVersion: text(200).optional(),
+  resumeDocumentSha256: hash.optional(), resumeSnapshotSha256: hash.optional(), targetSnapshotSha256: hash.optional(),
+  sourceCharacters: diagnosticNumber.optional(), paragraphCount: diagnosticNumber.optional(), passageCount: diagnosticNumber.optional(),
+  outcome: z.enum(['complete', 'failed', 'queued', 'abandoned']).optional(),
+})
+const failureDiagnosticSchema = z.strictObject({
+  schemaVersion: z.literal(1), dataKind: z.literal('real'), workspaceId: workspace, runId, comparisonId,
+  attemptId: z.string().uuid(), createdAt: timestamp, pipelineVersion: text(200), manifestSha256: hash,
+  resumeSnapshot: z.strictObject({ snapshotId, sha256: hash }), targetSnapshot: z.strictObject({ snapshotId, sha256: hash }),
+  processingAttempt: z.number().int().min(1).max(ANALYSIS_LIMITS.maxAutomaticAttempts),
+  retryCount: z.number().int().min(0).max(1_000_000),
+  correctionCount: z.number().int().min(0).max(ANALYSIS_LIMITS.maxOutputCorrections),
+  error: errorSchema, reason: z.enum(ANALYSIS_DIAGNOSTIC_REASONS).optional(),
+  citationDiagnostics: citationDiagnosticsSchema.optional(), schemaDiagnostics: schemaDiagnosticsSchema.optional(),
+  events: z.array(diagnosticEventSchema).max(ANALYSIS_DIAGNOSTIC_LIMITS.maxEvents), omittedEvents: diagnosticNumber,
+  assessments: z.array(z.strictObject({
+    modelCallId: z.string().uuid(), correctionCount: z.number().int().min(0).max(ANALYSIS_LIMITS.maxOutputCorrections),
+    assessmentSha256: hash, assessment: analysisAssessmentOutputSchema, provenance: modelProvenanceSchema,
+    review: groundingReviewSchema.extend({
+      issues: z.array(groundingReviewSchema.shape.issues.element.extend({ code: z.enum(ANALYSIS_REVIEW_ISSUE_CODES) })).max(64),
+    }).optional(),
+  })).max(ANALYSIS_LIMITS.maxOutputCorrections + 1),
+  previous: analysisFailureDiagnosticReferenceSchema.optional(),
+})
+
+export function parseAnalysisFailureDiagnostic(value: unknown): AnalysisFailureDiagnostic {
+  bounded(value)
+  const diagnostic = failureDiagnosticSchema.parse(value) as AnalysisFailureDiagnostic
+  assertAnalysis(unique(diagnostic.assessments.map(item => item.modelCallId)), 'Duplicate diagnostic assessment call.')
+  if (diagnostic.previous) {
+    assertAnalysisFailureDiagnosticReference(diagnostic.previous, diagnostic.workspaceId, diagnostic.runId, diagnostic.comparisonId)
+    assertAnalysis(diagnostic.previous.attemptId !== diagnostic.attemptId && diagnostic.previous.createdAt <= diagnostic.createdAt,
+      'Invalid previous failure diagnostic.')
+  }
+  for (const event of diagnostic.events) {
+    assertAnalysis(event.workspaceId === diagnostic.workspaceId && event.runId === diagnostic.runId &&
+      event.comparisonId === diagnostic.comparisonId && event.attemptId === diagnostic.attemptId &&
+      (event.correctionCount ?? 0) <= diagnostic.correctionCount &&
+      (!event.resumeSnapshotSha256 || event.resumeSnapshotSha256 === diagnostic.resumeSnapshot.sha256) &&
+      (!event.targetSnapshotSha256 || event.targetSnapshotSha256 === diagnostic.targetSnapshot.sha256),
+    'Diagnostic event ownership or snapshot mismatch.')
+  }
+  for (const item of diagnostic.assessments) {
+    assertAnalysis(item.assessmentSha256 === analysisAssessmentHash(item.assessment) &&
+      item.correctionCount <= diagnostic.correctionCount && item.provenance.completedAt >= item.provenance.startedAt,
+    'Diagnostic assessment hash or provenance mismatch.')
+    if (item.review) {
+      const review = item.review
+      assertAnalysis(review.assessmentSha256 === item.assessmentSha256 &&
+        review.resumeSnapshotSha256 === diagnostic.resumeSnapshot.sha256 &&
+        review.targetSnapshotSha256 === diagnostic.targetSnapshot.sha256 &&
+        review.provenance.completedAt >= review.provenance.startedAt &&
+        (review.outcome === 'supported' ? review.issues.length === 0 : review.issues.length > 0),
+      'Diagnostic review binding or outcome mismatch.')
+    }
+  }
+  return diagnostic
+}
+
+export function assertAnalysisFailureDiagnosticBinding(
+  diagnostic: AnalysisFailureDiagnostic, run: RealAnalysisRunRecord, comparison: RealAnalysisComparisonRecord,
+  snapshots?: { resumeSnapshot: FrozenRealResumeSnapshot; targetSnapshot: FrozenRealAnalysisTargetSnapshot },
+): void {
+  assertAnalysis(diagnostic.workspaceId === run.workspaceId && diagnostic.runId === run.id &&
+    diagnostic.comparisonId === comparison.id && comparison.workspaceId === run.workspaceId && comparison.runId === run.id &&
+    diagnostic.manifestSha256 === run.manifest.sha256 &&
+    diagnostic.resumeSnapshot.snapshotId === comparison.resume.snapshotId &&
+    diagnostic.resumeSnapshot.sha256 === comparison.resume.blob.sha256 &&
+    diagnostic.targetSnapshot.snapshotId === comparison.target.snapshotId &&
+    diagnostic.targetSnapshot.sha256 === comparison.target.blob.sha256 &&
+    diagnostic.createdAt >= comparison.createdAt && diagnostic.createdAt <= comparison.updatedAt,
+  'Failure diagnostic does not belong to these frozen comparison inputs.')
+  if (!diagnostic.assessments.length) return
+  assertAnalysis(snapshots, 'Diagnostic evidence requires its exact frozen sources.')
+  for (const item of diagnostic.assessments) {
+    assertAnalysis(validateAnalysisAssessment(item.assessment, snapshots.resumeSnapshot.document, snapshots.targetSnapshot).length === 0,
+      'Diagnostic assessment cites foreign evidence or requirements.')
+    for (const issue of item.review?.issues ?? []) {
+      assertAnalysis(!(issue.criterionId && issue.qualificationId) &&
+        (!issue.criterionId || item.assessment.criteria.some(row => row.criterionId === issue.criterionId)) &&
+        (!issue.qualificationId || item.assessment.qualifications.some(row => row.qualificationId === issue.qualificationId)) &&
+        issue.citations.every(citation => citationMatchesDocument(citation, snapshots.resumeSnapshot.document)),
+      'Diagnostic review cites foreign evidence or requirements.')
+    }
+  }
+}
+
 const resultSchema = analysisAssessmentOutputSchema.extend({
   schemaVersion: z.literal(1), dataKind: z.literal('real'), workspaceId: workspace, runId, comparisonId,
   createdAt: timestamp, humanReviewRequired: z.literal(true), ...resultSummarySchema.shape,

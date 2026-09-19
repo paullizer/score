@@ -70,7 +70,8 @@ function RealAnalysesProvider({ workspaceId, children }: { workspaceId: string; 
   }, [])
 
   const clearRunContent = useCallback((id: string) => {
-    scope.cancelReads((key) => key === `detail:${id}` || key === `pairs:${id}` || key.startsWith(`result:${id}/`) || key.startsWith(`document:${id}/`))
+    scope.cancelReads((key) => key === `detail:${id}` || key === `pairs:${id}` || key.startsWith(`result:${id}/`)
+      || key.startsWith(`document:${id}/`) || key.startsWith(`diagnostics:${id}/`))
     putDetail(id, { state: 'error', error: 'This analysis was removed or is awaiting permanent cleanup. Cached inputs and results are no longer available.' })
     const next = { ...comparisonsRef.current }; delete next[id]
     comparisonsRef.current = next; setComparisons(next)
@@ -190,6 +191,7 @@ function RealAnalysesProvider({ workspaceId, children }: { workspaceId: string; 
       if (!scope.current(ticket)) return
       if (!scope.canAccept(`pair:${key}`, ticket.sequence)) { superseded = true; return }
       if (caught instanceof CloudApiError && [403, 404].includes(caught.status)) {
+        scope.cancelReads((request) => request === `diagnostics:${key}`)
         pairSummaries.current.delete(key)
         putResult(key, { state: 'error', error: 'This saved comparison is no longer available. Cached source snapshots have been cleared.' })
         return
@@ -414,6 +416,24 @@ function RealAnalysesProvider({ workspaceId, children }: { workspaceId: string; 
         if (!scope.current(ticket) || !readableRun(runId) || signal?.aborted) throw new DOMException('The saved source request was cancelled.', 'AbortError')
         return document
       } finally { scope.finish(ticket) }
+    },
+    diagnostics: async (runId, comparisonId, continuationToken, signal) => {
+      signal?.throwIfAborted()
+      if (!historyAvailable.current || !readableRun(runId)) throw new Error('The private diagnostic service is unavailable or this analysis is being deleted.')
+      const ticket = scope.read(`diagnostics:${pairKey(runId, comparisonId)}`)
+      if (!ticket) throw new Error('Wait for the pending analysis request, then retry opening its private diagnostics.')
+      const cancel = () => { ticket.controller.abort(); scope.finish(ticket) }
+      signal?.addEventListener('abort', cancel, { once: true })
+      try {
+        const page = await api.getRealAnalysisDiagnostics(workspaceId, runId, comparisonId, continuationToken,
+          signal ? AbortSignal.any([signal, ticket.controller.signal]) : ticket.controller.signal)
+        if (!scope.current(ticket) || !readableRun(runId) || signal?.aborted) throw new DOMException('The private diagnostic request was cancelled.', 'AbortError')
+        const run = summariesRef.current.find((item) => item.run.id === runId)?.run
+        if (run && page.attempts.some((attempt) => attempt.manifestSha256 !== run.manifest.sha256)) {
+          throw new Error('The private diagnostic does not match this run’s frozen input manifest. Reload the saved comparison.')
+        }
+        return page
+      } finally { signal?.removeEventListener('abort', cancel); scope.finish(ticket) }
     },
   }
   function owns(target: LifecycleTarget) {

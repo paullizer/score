@@ -1,16 +1,19 @@
-import { useEffect, useRef, useState, type ReactNode } from 'react'
+import { useEffect, useId, useRef, useState, type ReactNode } from 'react'
 import { ArrowUpRight, ChevronDown, FileText, Layers3, LoaderCircle, Quote, ScanLine, ShieldCheck } from 'lucide-react'
 import { useRealAnalyses } from '../../app/real-analyses-context'
+import type { SavedReviewView } from '../../app/saved-review-navigation'
 import type { RealAnalysisComparisonDetail, RealAnalysisDocumentResponse, RealCriterionResult } from '../../domain/real-analyses'
 import type { Citation } from '../../domain/types'
 import { documentPagination, type DocumentPagination } from '../../domain/document-formats'
 import { gradeSourcePagination } from '../grade-ladders/gradeUi'
 import { Badge, Button, EmptyState, InlineError, Score, SegmentedControl } from '../../components/ui'
 import { DocumentViewer } from '../../components/documents/DocumentViewer'
-import { citationMatches, targetVersionLabel } from './realAnalysisUi'
 import { getDisplayName } from '../../domain/displayNames'
+import { analysisFailureExplanation, analysisFailureStages, citationMatches, targetVersionLabel } from './realAnalysisUi'
+import { RealComparisonDiagnostics } from './RealComparisonDiagnostics'
 
 type EvidenceSelection = { kind: 'resume' | 'requirement'; citation: Citation; label: string }
+type SavedDocumentSelection = { kind: EvidenceSelection['kind']; documentId: string; documentVersion: number; label: string }
 const evidenceLabels = { supported: 'Supported', partial: 'Partial support', missing: 'Missing evidence', 'not-assessed': 'Not assessed', 'not-applicable': 'Not applicable · unscored' }
 
 function EvidenceStatus({ status }: { status: RealCriterionResult['evidenceStatus'] }) {
@@ -29,16 +32,39 @@ function EvidenceButtons({ citations, kind, label, onSelect, active }: {
   </button>)}</div>
 }
 
-export function RealComparisonReview({ detail, actions }: { detail: RealAnalysisComparisonDetail; actions?: ReactNode }) {
+export function RealComparisonReview({ detail, actions, initialView }: {
+  detail: RealAnalysisComparisonDetail; actions?: ReactNode; initialView?: SavedReviewView | null
+}) {
   const { comparison, resumeSnapshot: resume, targetSnapshot: target, result } = detail
   const savedResume = comparison.resume.summary
   const resumeLabel = getDisplayName(savedResume, savedResume.name?.trim() || 'Name not stated')
   const rubric = target.kind === 'job' ? target.rubric : target.version.rubric
   const [expanded, setExpanded] = useState<string[]>(() => rubric.criteria[0] ? [rubric.criteria[0].id] : [])
   const [selected, setSelected] = useState<EvidenceSelection | null>(null)
-  const [pane, setPane] = useState<'criteria' | 'evidence'>('criteria')
-  function showEvidence(selection: EvidenceSelection) { setSelected(selection); setPane('evidence') }
-  if (comparison.status !== 'complete' || !result) return <section className="panel"><EmptyState
+  const [sourceView, setSourceView] = useState<SavedReviewView>(initialView ?? 'resume')
+  const [pane, setPane] = useState<'criteria' | 'evidence'>(initialView ? 'evidence' : 'criteria')
+  const sourcePanel = useRef<HTMLElement>(null)
+  const complete = comparison.status === 'complete' && Boolean(result)
+  useEffect(() => {
+    if (!complete && selected) sourcePanel.current?.scrollIntoView({ block: 'start', behavior: 'smooth' })
+  }, [complete, selected])
+  function showEvidence(selection: EvidenceSelection) {
+    setSelected(selection)
+    setSourceView(selection.kind === 'resume' ? 'resume' : 'target')
+    setPane('evidence')
+  }
+  const sources = <>
+    <div className="section-heading"><div><h2>{selected ? 'Inspect the exact saved passage' : sourceView === 'resume' ? 'Full saved resume' : target.kind === 'grade' ? 'Saved approved grade requirements' : 'Full saved job description'}</h2><p>{selected ? `${selected.kind === 'resume' ? 'Resume evidence' : 'Requirement evidence'} · ${selected.label}` : 'Frozen inputs used for this comparison, not newer library records. Select a quotation to highlight an exact passage.'}</p></div><ScanLine size={17} className="text-accent" aria-hidden="true" /></div>
+    <div className="border-b px-4 py-3"><SegmentedControl label="Saved evidence source" value={sourceView}
+      onChange={(view) => { setSourceView(view); setSelected(null) }}
+      options={[{ value: 'resume', label: 'Resume evidence' }, { value: 'target', label: target.kind === 'grade' ? 'Grade requirements' : 'Job description' }]} /></div>
+    {selected && <div className="border-b p-3"><Button size="sm" onClick={() => { setSelected(null); setSourceView('resume') }}>View full saved resume</Button></div>}
+    {selected || sourceView === 'resume' ? <SavedEvidence detail={detail} selection={selected} /> : <SavedTargetEvidence detail={detail} />}
+  </>
+  const diagnostics = <RealComparisonDiagnostics detail={detail} renderCitations={(citations, label) =>
+    <EvidenceButtons citations={citations} kind="resume" label={label} onSelect={showEvidence} active={selected} />} />
+  const failure = comparison.error ? analysisFailureExplanation(comparison.error) : null
+  if (comparison.status !== 'complete' || !result) return <><section className="panel"><EmptyState
     icon={['queued', 'running'].includes(comparison.status) ? LoaderCircle : ScanLine}
     title={comparison.status === 'failed' ? 'This comparison could not be assessed' : comparison.status === 'cancelled' ? 'This comparison was cancelled'
       : comparison.status === 'complete' ? 'The saved result is unavailable' : 'The saved inputs are awaiting assessment'}
@@ -48,8 +74,23 @@ export function RealComparisonReview({ detail, actions }: { detail: RealAnalysis
     <div className="border-t p-5 text-[11px] text-muted">Saved resume: {resumeLabel} · document v{resume.document.version}<br />
       {savedResume.displayName && <>Source name: {savedResume.name?.trim() || 'Name not stated'} · </>}{savedResume.sourceLabel}<br />
       Saved target: {getDisplayName(target.summary, target.summary.label)} · {targetVersionLabel(target.selection)}
-      {target.summary.displayName && <p>Source title: {target.summary.label}</p>}</div>
+      {target.summary.displayName && <><p>Source title: {target.summary.label}</p>{target.kind === 'job' && target.source?.displayName && <p>Original source: {target.source.displayName}</p>}</>}
+      <p className="mt-2">Comparison state: {comparison.status} · processing attempt {comparison.attempts} · manual retries {comparison.retryCount}</p>
+      {comparison.attemptId && <p className="mt-1 break-all">Current attempt ID: {comparison.attemptId}</p>}
+      {(comparison.error || comparison.status === 'failed') && comparison.diagnosticCapture?.attemptId === comparison.attemptId && comparison.diagnosticCapture
+        && <p className="mt-1">Pipeline version: {comparison.diagnosticCapture.pipelineVersion}</p>}
+      {comparison.nextAttemptAt && <p className="mt-1">Next automatic attempt: {comparison.nextAttemptAt}</p>}
+    </div>
+    {failure && comparison.error && <div className="border-t p-5 text-[12px]">
+      <h3 className="font-semibold">{failure.title}</h3><p className="mt-2">{failure.explanation}</p>
+      <p className="mt-2 text-[11px] text-muted">Stage: {analysisFailureStages[comparison.error.stage]} ({comparison.error.stage}) · {comparison.error.code}</p>
+      <p className="mt-2"><strong>Next action: </strong>{failure.nextAction}</p>
+    </div>}
+    <p className="border-t p-5 text-[12px]">Readable saved input is separate from AI validation. Processing failures are not zero scores. Missing evidence can be documented as a gap in a completed assessment, but an unaccepted draft is not a result.</p>
   </section>
+    {diagnostics}
+    <section ref={sourcePanel} className="detail-panel evidence-panel mt-5" aria-label="Saved real source evidence">{sources}</section>
+  </>
 
   return <>
     <section className="result-overview panel">
@@ -121,12 +162,9 @@ export function RealComparisonReview({ detail, actions }: { detail: RealAnalysis
           {!target.version.qualifications.length && <p>No qualifications are captured for this version. Do not infer that none apply.</p>}
         </section>}
       </section>
-      <section className={`detail-panel evidence-panel ${pane !== 'evidence' ? 'mobile-pane-hidden' : ''}`} aria-label="Saved real source evidence">
-        <div className="section-heading"><div><h2>Inspect the exact saved passage</h2><p>{selected ? `${selected.kind === 'resume' ? 'Resume evidence' : 'Requirement evidence'} · ${selected.label}` : 'Select a quotation to locate its saved document version.'}</p></div><ScanLine size={17} className="text-accent" aria-hidden="true" /></div>
-        {selected && <div className="border-b p-3"><Button size="sm" onClick={() => setSelected(null)}>View full saved resume</Button></div>}
-        <SavedEvidence detail={detail} selection={selected} />
-      </section>
+      <section ref={sourcePanel} className={`detail-panel evidence-panel ${pane !== 'evidence' ? 'mobile-pane-hidden' : ''}`} aria-label="Saved real source evidence">{sources}</section>
     </div>
+    {diagnostics}
     <details className="panel mt-5 p-5 text-[11px]"><summary className="cursor-pointer text-[12px] font-semibold">Processing provenance and immutable identities</summary>
       <dl className="mt-4 space-y-3 break-words">
         <div><dt className="text-muted">Assessment model / deployment</dt><dd>{result.provenance.assessment.model} · {result.provenance.assessment.deployment}</dd></div>
@@ -141,45 +179,94 @@ export function RealComparisonReview({ detail, actions }: { detail: RealAnalysis
   </>
 }
 
-function SavedEvidence({ detail, selection }: { detail: RealAnalysisComparisonDetail; selection: EvidenceSelection | null }) {
+function SavedTargetEvidence({ detail }: { detail: RealAnalysisComparisonDetail }) {
+  const target = detail.targetSnapshot
+  const sourceSelectId = useId()
+  const [documentKey, setDocumentKey] = useState('')
+  if (target.kind === 'job') return <SavedEvidence detail={detail} selection={{
+    kind: 'requirement', documentId: target.document.id, documentVersion: target.document.version, label: target.document.title,
+  }} />
+  const documents: SavedDocumentSelection[] = [
+    { kind: 'requirement', documentId: target.seed.document.id, documentVersion: target.seed.document.version, label: `Seed job context: ${target.seed.document.title}` },
+    ...target.references.map(({ source, document }) => ({
+      kind: 'requirement' as const, documentId: document.documentId, documentVersion: document.documentVersion, label: source.title,
+    })),
+  ]
+  const selection = documents.find((document) => JSON.stringify([document.documentId, document.documentVersion]) === documentKey)
+  return <>
+    <section className="space-y-4 border-b p-4 text-[12px]" aria-label="Saved approved grade requirements">
+      <div><h3 className="font-semibold">{target.summary.label} · approved version {target.version.version}</h3>
+        <p className="mt-1 whitespace-pre-line">{target.version.rubric.description}</p>
+        <p className="mt-1 text-muted">These are the exact approved requirements used for this assessment. The seed job is supporting context, not the whole grade standard.</p></div>
+      {target.version.rubric.criteria.map((criterion, index) => <article key={criterion.id}>
+        <h4 className="font-semibold">{index + 1}. {criterion.label} · {criterion.weight}% weight</h4>
+        <p className="mt-1 whitespace-pre-line">{criterion.description}</p>
+        <p className="mt-1 text-muted">{criterion.requirementType === 'required' ? 'Required' : criterion.requirementType === 'preferred' ? 'Preferred' : 'Requirement type not stated'} · {criterion.support === 'not-applicable' ? 'Not applicable · unscored' : criterion.support}</p>
+        {criterion.interpretation && <p className="mt-1 whitespace-pre-line"><strong>Saved interpretation, not quotation: </strong>{criterion.interpretation}</p>}
+        <p className="mt-1 whitespace-pre-line text-muted">{criterion.guidance}</p>
+      </article>)}
+      <div><h4 className="font-semibold">GS qualifications · separate and unscored</h4>
+        {target.version.qualifications.map((qualification) => <article className="mt-3" key={qualification.id}>
+          <p className="whitespace-pre-line">{qualification.text}</p>
+          {qualification.interpretation && <p className="mt-1 whitespace-pre-line text-muted">Saved interpretation, not quotation: {qualification.interpretation}</p>}
+        </article>)}
+        {!target.version.qualifications.length && <p className="mt-1 text-muted">No qualifications are captured for this version. Do not infer that none apply.</p>}
+      </div>
+    </section>
+    <div className="border-b p-4"><label htmlFor={sourceSelectId} className="mb-2 block text-[12px] font-semibold">Frozen grade source document</label>
+      <select id={sourceSelectId} className="filter-select mb-2 w-full" value={documentKey} onChange={(event) => setDocumentKey(event.target.value)}>
+        <option value="">Choose a saved source document</option>
+        {documents.map((document) => {
+          const key = JSON.stringify([document.documentId, document.documentVersion])
+          return <option key={key} value={key}>{document.label} · saved v{document.documentVersion}</option>
+        })}
+      </select>
+    <p className="text-[11px] text-muted">View the full captured document without inventing a quotation. Missing sources remain unavailable; current library versions are never substituted.</p></div>
+    {selection && <SavedEvidence detail={detail} selection={selection} />}
+  </>
+}
+
+function SavedEvidence({ detail, selection }: { detail: RealAnalysisComparisonDetail; selection: EvidenceSelection | SavedDocumentSelection | null }) {
   const api = useRealAnalyses()
   const service = useRef(api)
   service.current = api
   const [loaded, setLoaded] = useState<{ key: string; document: RealAnalysisDocumentResponse['document']; pagination: DocumentPagination } | null>(null)
   const [failure, setFailure] = useState<{ key: string; message: string } | null>(null)
   const [retry, setRetry] = useState(0)
-  const key = selection ? JSON.stringify([selection.kind, selection.citation]) : ''
+  const key = selection ? JSON.stringify(selection) : ''
   useEffect(() => {
     if (!selection) return
     const controller = new AbortController()
     setLoaded(null)
     setFailure(null)
     void (async () => {
-      const { citation, kind } = selection
+      const { kind } = selection
+      const reference = 'citation' in selection ? selection.citation : selection
       const resume = detail.resumeSnapshot
       const target = detail.targetSnapshot
       let document: RealAnalysisDocumentResponse['document']
       let pagination: DocumentPagination
       if (kind === 'resume') {
-        if (resume.document.id !== citation.documentId || resume.document.version !== citation.documentVersion) {
+        if (resume.document.id !== reference.documentId || resume.document.version !== reference.documentVersion) {
           throw new Error('This quotation does not belong to this comparison’s saved resume. No other applicant or requirement source can substitute for it.')
         }
         document = resume.document
         pagination = resume.extraction.pagination
-      } else if (target.kind === 'job' && target.document.id === citation.documentId && target.document.version === citation.documentVersion) {
+      } else if (target.kind === 'job' && target.document.id === reference.documentId && target.document.version === reference.documentVersion) {
         document = target.document
         pagination = documentPagination(target.original.contentType)
-      } else if (target.kind === 'grade' && target.seed.document.id === citation.documentId && target.seed.document.version === citation.documentVersion) {
+      } else if (target.kind === 'grade' && target.seed.document.id === reference.documentId && target.seed.document.version === reference.documentVersion) {
         document = target.seed.document
         pagination = documentPagination(target.seed.source.originalContentType)
       } else {
-        const reference = target.kind === 'grade' ? target.references.find((item) => item.document.documentId === citation.documentId && item.document.documentVersion === citation.documentVersion) : undefined
-        if (!reference) throw new Error('This requirement quotation is not part of this comparison’s frozen target sources.')
+        const source = target.kind === 'grade' ? target.references.find((item) => item.document.documentId === reference.documentId && item.document.documentVersion === reference.documentVersion) : undefined
+        if (!source) throw new Error('This requirement source is not part of this comparison’s frozen target sources.')
         if (!service.current) throw new Error('The private analysis document service is unavailable.')
-        document = await service.current.document(detail.comparison.runId, detail.comparison.id, citation.documentId, citation.documentVersion, controller.signal)
-        pagination = gradeSourcePagination(reference.source)
+        document = await service.current.document(detail.comparison.runId, detail.comparison.id, reference.documentId, reference.documentVersion, controller.signal)
+        pagination = gradeSourcePagination(source.source)
       }
-      if (!citationMatches(document, citation)) throw new Error('The quotation, paragraph, or version does not exactly match the saved source. Treat this evidence as unresolved; no alternate passage is highlighted.')
+      if (document.id !== reference.documentId || document.version !== reference.documentVersion) throw new Error('The returned document does not match the frozen source identity. No alternate version is shown.')
+      if ('citation' in selection && !citationMatches(document, selection.citation)) throw new Error('The quotation, paragraph, or version does not exactly match the saved source. Treat this evidence as unresolved; no alternate passage is highlighted.')
       if (!controller.signal.aborted) setLoaded({ key, document, pagination })
     })().catch((caught: unknown) => {
       if (!controller.signal.aborted) setFailure({ key, message: caught instanceof Error ? caught.message : 'The saved evidence could not be loaded.' })
@@ -190,10 +277,11 @@ function SavedEvidence({ detail, selection }: { detail: RealAnalysisComparisonDe
   const value = !selection ? { document: detail.resumeSnapshot.document, pagination: detail.resumeSnapshot.extraction.pagination }
     : loaded?.key === key ? loaded : null
   const error = failure?.key === key ? failure.message : null
+  const citation = selection && 'citation' in selection ? selection.citation : undefined
   return <>
     {error && <div className="p-4"><InlineError>{error} <Button size="sm" onClick={() => setRetry((value) => value + 1)}>Retry saved source</Button></InlineError></div>}
     {!value && !error && <EmptyState icon={LoaderCircle} title="Opening the exact saved evidence" description="Copied GS references use the authorized analysis-document endpoint. No live source or browser login is used." />}
-    {value && <><DocumentViewer document={value.document} highlightedId={selection?.citation.paragraphId} quote={selection?.citation.quote} pagination={value.pagination} compact />
+    {value && <><DocumentViewer document={value.document} highlightedId={citation?.paragraphId} quote={citation?.quote} pagination={value.pagination} compact />
       <div className="source-footer"><span>Frozen analysis document · v{value.document.version}</span><span className="break-all">{value.document.id}</span></div></>}
   </>
 }

@@ -81,6 +81,12 @@ export function assertAnalysisReplacement(previous: AnalysisEntity, next: Analys
     assertAnalysis(previous.runId === next.runId && previous.index === next.index &&
       analysisHash(previous.resume) === analysisHash(next.resume) && analysisHash(previous.target) === analysisHash(next.target),
     'Comparison frozen inputs are immutable.')
+    if (previous.failureDiagnostic) {
+      assertAnalysis(next.failureDiagnostic &&
+        (next.failureDiagnostic.attemptId !== previous.failureDiagnostic.attemptId ||
+          analysisHash(next.failureDiagnostic) === analysisHash(previous.failureDiagnostic)),
+      'Failure diagnostic history cannot be erased or an immutable attempt replaced.')
+    }
     assertAnalysis(previous.status !== 'complete' || analysisHash(previous) === analysisHash(next), 'Completed evidence cannot be retried, cancelled, or changed.')
   }
 }

@@ -11,6 +11,7 @@ import { DocumentViewer } from '../../components/documents/DocumentViewer'
 import { ArchivedBadge, EntityLifecycleActions, LifecycleBanner } from '../../components/lifecycle/LifecycleControls'
 import { useLifecycleAccess } from '../../components/lifecycle/useLifecycleAccess'
 import { analysisDataMode, sampleDataLink } from '../../app/real-data-mode'
+import { savedReviewView, type SavedReviewView } from '../../app/saved-review-navigation'
 import {
   distinctTargetLabels, matrixSortExplanation, sampleComparisonDefaultSort, sampleComparisonSortOptions, sampleComparisonTargetLabel,
   selectSampleComparisons, type SampleComparisonSortKey,
@@ -51,6 +52,7 @@ function RunView({ run }: { run: AnalysisRun }) {
   const [targetId, setTargetId] = useState('')
   const [sort, setSort] = useState<TableSort<SampleComparisonSortKey> | null>(() => sampleComparisonDefaultSort(run))
   const selectedId = params.get('result')
+  const sourceView = savedReviewView(params)
   const selected = run.comparisons.find((comparison) => comparison.id === selectedId)
   const status = runStatus(run)
   const working = status === 'Running'
@@ -68,7 +70,9 @@ function RunView({ run }: { run: AnalysisRun }) {
     setTargetId(next)
     if (!next && run.targets.length > 1 && sort?.key !== 'name') setSort(null)
   }
-  function openResult(id: string) { const next = new URLSearchParams(params); next.set('result', id); if (cloud) next.set('data', 'samples'); setParams(next) }
+  function openResult(id: string) { const next = new URLSearchParams(params); next.set('result', id); next.delete('view'); if (cloud) next.set('data', 'samples'); setParams(next) }
+  if (deleting || removed) return <><LifecycleBanner target={{ kind: 'analysis', id: run.id }} />
+    <EmptyState title="Analysis cleanup or removal" description="Saved comparisons and source documents are no longer available." /></>
 
   return <>
     <Link className="back-link" to={sampleDataLink(selectedId ? `/analyses/${run.id}` : '/analyses', Boolean(cloud))}><ArrowLeft size={14} />{selectedId ? 'All comparisons' : 'Back to analyses'}</Link>
@@ -82,7 +86,7 @@ function RunView({ run }: { run: AnalysisRun }) {
     {working && <div className="run-progress panel" aria-live="polite"><div><span className="flex items-center gap-2"><LoaderCircle size={15} className="animate-spin" />Preparing evidence-backed sample results</span><span>{finished} / {run.comparisons.length}</span></div>
       <progress max={run.comparisons.length} value={finished} aria-label="Analysis progress" /><p>Every comparison is independent. Completed results are available below.</p></div>}
     {selectedId && !selected ? <EmptyState title="This result could not be found" description="Choose a comparison from this analysis instead." action={<Button onClick={() => setParams(cloud ? { data: 'samples' } : {})}>View all comparisons</Button>} />
-      : selected ? <ResultReview key={selected.id} run={run} comparison={selected} />
+      : selected ? <ResultReview key={`${selected.id}:${sourceView ?? 'review'}`} run={run} comparison={selected} initialView={sourceView} />
         : <section className="panel">
           <div className="section-heading"><div><h2>{run.targets.length === 1 ? 'Applicant comparison' : run.resumes.length === 1 ? 'Your target comparisons' : 'The comparison workspace'}</h2><p>Separate scores. Consistent criteria. Select any result to see its evidence.</p></div></div>
           <div className="library-toolbar">
@@ -128,7 +132,7 @@ function RunView({ run }: { run: AnalysisRun }) {
   </>
 }
 
-function ResultReview({ run, comparison }: { run: AnalysisRun; comparison: Comparison }) {
+function ResultReview({ run, comparison, initialView }: { run: AnalysisRun; comparison: Comparison; initialView: SavedReviewView | null }) {
   const { retryRun } = useWorkspace()
   const { canEdit } = useLifecycleAccess({ kind: 'analysis', id: run.id })
   const target = run.targets.find((item) => item.id === comparison.targetId)
@@ -136,14 +140,14 @@ function ResultReview({ run, comparison }: { run: AnalysisRun; comparison: Compa
   const [expanded, setExpanded] = useState<string[]>(target ? [target.rubric.criteria[0]?.id].filter((id): id is string => Boolean(id)) : [])
   const [activeCitation, setActiveCitation] = useState<Citation>()
   const [jobParagraph, setJobParagraph] = useState<string>()
-  const [documentMode, setDocumentMode] = useState<'resume' | 'job'>('resume')
-  const [pane, setPane] = useState<'criteria' | 'evidence'>('criteria')
+  const [documentMode, setDocumentMode] = useState<SavedReviewView>(initialView ?? 'resume')
+  const [pane, setPane] = useState<'criteria' | 'evidence'>(initialView ? 'evidence' : 'criteria')
   if (!target || !snapshot) return <EmptyState title="The saved input is unavailable" description="This comparison cannot be reviewed because its source snapshot is missing." />
   if (comparison.status !== 'complete') return <div className="panel"><EmptyState icon={comparison.status === 'running' ? LoaderCircle : ScanLine}
     title={comparison.status === 'failed' ? 'This comparison needs another try' : comparison.status === 'cancelled' ? 'No assessment was made' : 'The evidence is on its way'}
     description={comparison.error ?? 'This simulated comparison is still being prepared. A score will appear only when the assessment is complete.'}
     action={(comparison.status === 'failed' || comparison.status === 'cancelled') && runStatus(run) !== 'Running' ? <Button icon={RotateCcw} disabled={!canEdit} onClick={() => retryRun(run.id)}>Retry unfinished comparisons</Button> : undefined} /></div>
-  const selectedDocument = documentMode === 'job' ? target.document : snapshot.document
+  const selectedDocument = documentMode === 'target' ? target.document : snapshot.document
   const evidenceCount = comparison.criteria.reduce((sum, criterion) => sum + criterion.citations.length, 0)
   function showCitation(citation: Citation) {
     setActiveCitation(citation)
@@ -178,18 +182,28 @@ function ResultReview({ run, comparison }: { run: AnalysisRun; comparison: Compa
                   <Quote size={15} /><span><q>{citation.quote}</q><small><FileText size={11} />Page {citation.page} / {citation.heading}<ArrowUpRight size={12} /></small></span>
                 </button>)}
               </div> : <div className="evidence-gap"><ScanLine size={17} /><div><strong>{result?.evidenceStatus === 'not-assessed' ? 'Not assessed in this demo' : 'No cited evidence'}</strong><p>{result?.evidenceStatus === 'not-assessed' ? 'Custom criteria need a real assessment service. An overall score is intentionally withheld.' : 'No supporting passage was located in this sample. That is an evidence gap, not a conclusion about the person.'}</p></div></div>}
-              <div className="criterion-bottom"><span>Weight: {criterion.weight}% of this rubric</span>{criterion.sourceParagraphId && target.document && <button className="text-link" onClick={() => { setJobParagraph(criterion.sourceParagraphId); setDocumentMode('job'); setPane('evidence') }}>View job requirement <ArrowUpRight size={11} /></button>}</div>
+              <div className="criterion-bottom"><span>Weight: {criterion.weight}% of this rubric</span>{criterion.sourceParagraphId && target.document && <button className="text-link" onClick={() => { setJobParagraph(criterion.sourceParagraphId); setDocumentMode('target'); setPane('evidence') }}>View job requirement <ArrowUpRight size={11} /></button>}</div>
             </div>}
           </div>
         })}</div>
         <div className="score-legend"><span>0 / no cited support</span><span>3 / substantive support</span><span>5 / strongest sample support</span></div>
       </section>
       <section className={`detail-panel evidence-panel ${pane !== 'evidence' ? 'mobile-pane-hidden' : ''}`} aria-label="Source evidence viewer">
-        <div className="section-heading"><div><h2>Go straight to the source</h2><p>{activeCitation && documentMode === 'resume' ? 'The selected supporting passage is highlighted.' : 'Select a quotation to locate the exact passage.'}</p></div><ScanLine size={17} className="text-accent" /></div>
+        <div className="section-heading"><div><h2>Go straight to the source</h2><p>{activeCitation && documentMode === 'resume' ? 'The selected supporting passage is highlighted.' : 'Viewing the saved source used for this comparison. Select a quotation to highlight an exact passage.'}</p></div><ScanLine size={17} className="text-accent" /></div>
         <div className="border-b px-4 py-3"><SegmentedControl label="Evidence source" value={documentMode} onChange={setDocumentMode}
-          options={target.document ? [{ value: 'resume', label: 'Resume evidence' }, { value: 'job', label: 'Job description' }] : [{ value: 'resume', label: 'Resume evidence' }]} /></div>
+          options={[{ value: 'resume', label: 'Resume evidence' }, { value: 'target', label: target.kind === 'grade' ? 'Grade requirements' : 'Job description' }]} /></div>
+        {documentMode === 'resume' && activeCitation && <div className="border-b p-3"><Button size="sm" onClick={() => setActiveCitation(undefined)}>View full saved resume</Button></div>}
+        {documentMode === 'target' && target.kind === 'grade' && <section className="space-y-4 border-b p-4 text-[12px]" aria-label="Saved sample grade requirements">
+          <div><h3 className="font-semibold">{target.label} · saved grade requirements</h3><p className="mt-1 text-muted">{target.rubric.description}</p>
+            <p className="mt-1 text-muted">Fictional sample rubric used for this comparison, not an approved GS standard.</p></div>
+          {target.rubric.criteria.map((criterion, index) => <article key={criterion.id}>
+            <h4 className="font-semibold">{index + 1}. {criterion.label} · {criterion.weight}% weight</h4>
+            <p className="mt-1 whitespace-pre-line">{criterion.description}</p><p className="mt-1 whitespace-pre-line text-muted">{criterion.guidance}</p>
+          </article>)}
+          {target.document && <p className="text-muted">The saved supporting source below is context, not the whole grade standard.</p>}
+        </section>}
         {selectedDocument ? <DocumentViewer document={selectedDocument} highlightedId={documentMode === 'resume' ? activeCitation?.paragraphId : jobParagraph} quote={documentMode === 'resume' ? activeCitation?.quote : undefined} compact />
-          : <EmptyState title="Source unavailable" description="This target has no associated source document." />}
+          : <EmptyState title="Source unavailable" description={target.kind === 'grade' ? 'No source document was captured for this sample grade. The saved rubric above is the available requirement record.' : 'This target has no associated source document.'} />}
         <div className="source-footer"><span>Original analysis snapshot</span><span>Document v{selectedDocument?.version ?? 'unavailable'}</span></div>
       </section>
     </div>

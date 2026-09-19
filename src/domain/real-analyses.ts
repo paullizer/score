@@ -25,6 +25,7 @@ import type {
 } from './real-resumes'
 import type { Citation, Job, Rubric, SourceDocument } from './types'
 import type { LifecycleMetadata, LifecycleOperation } from './lifecycle'
+import type { AnalysisDiagnosticCapture, AnalysisFailureDiagnosticReference } from './analysis-diagnostics'
 
 export const ANALYSIS_LIMITS = {
   maxComparisons: 500,
@@ -409,6 +410,8 @@ export interface RealAnalysisComparisonRecord extends AnalysisEntityBase, Analys
   resultSummary?: RealAnalysisResultSummary
   completedAt?: string
   cancelledAt?: string
+  failureDiagnostic?: AnalysisFailureDiagnosticReference
+  diagnosticCapture?: AnalysisDiagnosticCapture
 }
 
 export type AnalysisEntity = RealAnalysisRunRecord | RealAnalysisComparisonRecord

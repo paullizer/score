@@ -25,6 +25,7 @@ import {
 import { RealAnalysisTargets, resolveAnalysisResume, copyAnalysisTargetEvidence, type AnalysisSourceDeps } from './targets'
 import { analysisPageCursor, analysisPageToken, validateAnalysisPage } from './paging'
 import { readAnalysisReportComparisons } from './reports'
+import { readAnalysisFailureDiagnostics } from './diagnostics'
 import {
   advanceAnalysisRun, applyAnalysisComparisonTransition, cancelAnalysisComparisonRecord, loadAnalysisComparison,
   loadAnalysisRun, retryAnalysisComparisonRecord,
@@ -274,6 +275,12 @@ export class RealAnalysisService {
     const snapshots = await readAnalysisSnapshots(this.deps.blobs, run.record, comparison.record)
     const result = await readAnalysisResult(this.deps.blobs, run.record, comparison.record, snapshots)
     return { ...comparisonSummary(comparison), ...snapshots, result }
+  }
+  async diagnostics(workspaceId: string, runId: string, comparisonId: string, continuationToken?: string) {
+    const [run, comparison] = await Promise.all([this.run(workspaceId, runId), this.comparison(workspaceId, runId, comparisonId)])
+    const page = await readAnalysisFailureDiagnostics(this.deps.blobs, run.record, comparison.record, continuationToken)
+    await this.run(workspaceId, runId)
+    return page
   }
   async reportComparisons(workspaceId: string, runId: string, comparisonIds: string[], signal?: AbortSignal) {
     comparisonIds = input(reportComparisonIdsSchema, comparisonIds)

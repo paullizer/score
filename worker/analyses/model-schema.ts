@@ -1,5 +1,6 @@
 import { z } from 'zod'
 import type { RealAnalysisAssessmentInput } from '../../src/domain/real-analyses'
+import { ANALYSIS_DIAGNOSTIC_LIMITS, ANALYSIS_REVIEW_ISSUE_CODES } from '../../src/domain/analysis-diagnostics'
 
 export const ANALYSIS_MODEL_LIMITS = {
   maxContextCharacters: 240_000,
@@ -15,7 +16,7 @@ export const ANALYSIS_MODEL_LIMITS = {
   maxRationaleCharacters: 2_000,
   maxLimitationCharacters: 1_200,
   maxReviewIssues: 64,
-  maxCitationFindings: 32,
+  maxCitationFindings: ANALYSIS_DIAGNOSTIC_LIMITS.maxFindings,
   maxCorrectionSources: 8,
   maxCorrectionSourceCharacters: 8_000,
 } as const
@@ -143,11 +144,7 @@ export const assessmentSchema = z.strictObject({
 export const groundingSchema = z.strictObject({
   outcome: z.enum(['supported', 'needs-correction', 'unsupported']),
   issues: z.array(z.strictObject({
-    code: z.enum([
-      'unsupported-score', 'unsupported-rationale', 'irrelevant-evidence', 'omitted-evidence',
-      'unjustified-limitation', 'invalid-exclusion', 'qualification-judgment',
-      'prohibited-inference', 'insufficient-context',
-    ]),
+    code: z.enum(ANALYSIS_REVIEW_ISSUE_CODES),
     message: nonblank(ANALYSIS_MODEL_LIMITS.maxRationaleCharacters),
     criterionId: identifier.nullable(),
     qualificationId: identifier.nullable(),

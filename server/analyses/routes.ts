@@ -170,6 +170,16 @@ export function createRealAnalysesRouter(deps: RealAnalysesRouterDeps): Router {
     res.setHeader('ETag', detail.etag)
     res.json(detail)
   })
+  router.get(`${base}/:runId/comparisons/:comparisonId/diagnostics`, async (req, res) => {
+    query(req, ['continuationToken'])
+    const token = req.query.continuationToken
+    if (token !== undefined && (typeof token !== 'string' || !token || token.length > 16 * 1024)) {
+      throw invalidRequest('continuationToken must be a single valid diagnostic history token.')
+    }
+    res.json(await requireService().diagnostics(
+      param(req, 'workspaceId'), recordId(req, 'run'), recordId(req, 'comparison'), token,
+    ))
+  })
   router.get(`${base}/:runId/comparisons/:comparisonId/documents/:documentId`, async (req, res) => {
     query(req, ['version'])
     const version = req.query.version
