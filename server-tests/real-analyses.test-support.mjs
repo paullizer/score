@@ -17,12 +17,13 @@ await build({
   stdin: {
     resolveDir: root,
     contents: [
-      'service', 'routes', 'validation', 'snapshots', 'lifecycle', 'library-lifecycle', 'guards', 'azure-store',
+      'service', 'routes', 'validation', 'snapshots', 'diagnostics', 'paging', 'lifecycle', 'library-lifecycle', 'guards', 'azure-store',
       'narratives', 'narrative-records', 'narrative-artifacts', 'narrative-scheduling',
     ].map(name => `export * from './server/analyses/${name}.ts';`).join('\n') +
       "\nexport * from './server/errors.ts'; export * from './server/store.ts';" +
       "\nexport * from './server/ids.ts'; export * from './server/middleware.ts';" +
       "\nexport { analysisRunCanScore } from './src/domain/real-analyses.ts';" +
+      "\nexport * from './src/domain/analysis-diagnostics.ts';" +
       "\nexport { WorkspaceRepository } from './server/repository.ts';" +
       "\nexport { parseGradeEntity, parseGradeSeedSnapshot, gradeContentHash, gradeVersionHash, gradeSourceSetHash, validateGradeApproval } from './server/grades/validation.ts';" +
       "\nexport { createGradeBlobStoreFromContainer } from './server/grades/azure-store.ts';" +
@@ -646,7 +647,8 @@ export async function startHttp(f, enabled = true) {
   }))
   app.use('/api', router)
   app.use((error, _req, res, _next) => {
-    const safe = error instanceof api.HttpError ? error : api.unavailable()
+    const safe = error instanceof api.HttpError ? error
+      : error?.type === 'entity.parse.failed' ? api.invalidRequest('The request body is not valid JSON.') : api.unavailable()
     res.status(safe.status).json(api.toCloudApiError(safe))
   })
   const server = createServer(app)

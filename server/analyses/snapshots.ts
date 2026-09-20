@@ -123,6 +123,7 @@ function assertSnapshotSummaryBinding(
     analysisHash(resumeSnapshot.selection) === analysisHash(comparison.resume.summary.selection) &&
     analysisHash(targetSnapshot.summary) === analysisHash(comparison.target.summary) &&
     resumeSnapshot.resume.name === comparison.resume.summary.name && resumeSnapshot.resume.role === comparison.resume.summary.role &&
+    resumeSnapshot.displayName === comparison.resume.summary.displayName &&
     resumeSnapshot.resume.sourceLabel === comparison.resume.summary.sourceLabel &&
     resumeSnapshot.capture.capturedAt === comparison.resume.summary.capturedAt, 'Snapshot does not match its manifest summary.')
 }

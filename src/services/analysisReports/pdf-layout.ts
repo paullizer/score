@@ -375,16 +375,25 @@ export class PdfReportLayout implements DocumentReportLayout<Color> {
     if (links.length) this.y -= leading + 9
   }
 
-  explanation(label: string, text: string, source: string | null): void {
+  explanation(label: string, text: string, source: string | null, sectionHeading?: string): void {
     const bodyHeight = PDF_REPORT_PAGE.bodyTop - PDF_REPORT_PAGE.bodyBottom
     const labelHeight = this.wrap(label, this.fonts.bold, 10, PDF_REPORT_WIDTH).length * 15
     const textHeight = this.wrap(text, this.fonts.regular, 10, PDF_REPORT_WIDTH).length * 15
     const sourceHeight = source ? this.wrap(source, this.fonts.regular, 9.5, PDF_REPORT_WIDTH).length * 14 : 0
     const sourceReserve = sourceHeight <= bodyHeight - 30 ? sourceHeight : 28
     const groupHeight = textHeight + (source ? 3 + sourceReserve : 0)
+    const headingHeight = sectionHeading ? this.wrap(sectionHeading, this.fonts.bold, 16, PDF_REPORT_WIDTH).length * 24 + 16 : 0
+    const keepWithNext = headingHeight + (sectionHeading ? 5 : 0) + labelHeight + 4 + groupHeight <= bodyHeight
+      ? groupHeight : Math.min(textHeight, 30)
+    const keepTailWithNext = Boolean(sectionHeading && headingHeight + 5 + labelHeight + 4 + keepWithNext > bodyHeight)
+    if (sectionHeading) {
+      this.ensureSpace(Math.min(bodyHeight, headingHeight + 5 +
+        (keepTailWithNext ? Math.min(labelHeight, 30) : labelHeight) + 4 + keepWithNext))
+      this.heading(sectionHeading, 16)
+    }
     this.paragraph(label, {
       size: 10, leading: 15, bold: true, before: 5, after: 4,
-      keepWithNext: labelHeight + 4 + groupHeight <= bodyHeight ? groupHeight : Math.min(textHeight, 30),
+      keepWithNext, keepTailWithNext,
     })
     this.paragraph(text, {
       size: 10, leading: 15, after: source ? 3 : 8, keepWithNext: sourceReserve, keepTailWithNext: true,

@@ -7,6 +7,7 @@ import type {
 } from '../../domain/analysis-narratives'
 import type { RealAnalysisRunDetail, RealAnalysisTargetSummary } from '../../domain/real-analyses'
 import { dateLabel } from '../../domain/selectors'
+import { getDisplayName } from '../../domain/displayNames'
 import { Badge, Button, InlineError, Modal } from '../../components/ui'
 import { useLifecycleAccess } from '../../components/lifecycle/useLifecycleAccess'
 import { targetVersionLabel } from './realAnalysisUi'
@@ -110,7 +111,8 @@ export function ManageAnalysisSummaries({ detail, open, initialTargetId, onOpenC
     }
   }
 
-  const labels = detail.targets.map((target) => `${target.label} / ${targetVersionLabel(target.selection)}`)
+  const targetNames = new Map(detail.targets.map((target) => [target.id, getDisplayName(target, target.label)]))
+  const labels = detail.targets.map((target) => `${targetNames.get(target.id)} / ${targetVersionLabel(target.selection)}`)
   return <Modal open={open} onOpenChange={onOpenChange} title="Manage summaries"
     description="Update narrative text for this saved analysis, without rerunning scoring or changing frozen evidence."
     footer={<>
@@ -140,7 +142,7 @@ export function ManageAnalysisSummaries({ detail, open, initialTargetId, onOpenC
       </InlineError>}
       {summaries && [...summaries.comparisons, ...summaries.targets].some((item) => item.error) && <div className="space-y-3">
         {[...summaries.comparisons, ...summaries.targets].filter((item) => item.error).map((item) => <InlineError key={item.kind === 'candidate' ? item.comparisonId : item.targetId}>
-          {item.kind === 'candidate' ? `Candidate summary (${item.comparisonId})` : `Overview (${detail.targets.find((target) => target.id === item.targetId)?.label ?? item.targetId})`}: {item.error?.message}
+          {item.kind === 'candidate' ? `Candidate summary (${item.comparisonId})` : `Overview (${targetNames.get(item.targetId) ?? item.targetId})`}: {item.error?.message}
           {' '}Use Generate missing summaries to retry summary work, not scoring.
         </InlineError>)}
       </div>}
@@ -196,7 +198,8 @@ export function RealTargetNarrative({ runId, target }: { runId: string; target: 
   const error = entry?.state === 'error' || entry?.state === 'ready' ? entry.error : undefined
   return <section className="panel mt-5 space-y-3 p-5" aria-label="Saved job or grade overview">
     <h2 className="text-[15px] font-semibold">{target.kind === 'grade' ? 'Grade' : 'Job'} overview</h2>
-    <p className="text-[11px] text-muted">{target.label} · {targetVersionLabel(target.selection)}. This exact target only, across all its saved comparisons.</p>
+    <p className="text-[11px] text-muted">{getDisplayName(target, target.label)} · {targetVersionLabel(target.selection)}. This exact target only, across all its saved comparisons.</p>
+    {target.displayName !== undefined && <p className="text-[11px] text-muted">Source title: {target.label}</p>}
     {narrative ? <NarrativeContent narrative={narrative} loadError={error} /> : !error && <p className="text-[12px]" role="status">Loading saved overview...</p>}
     {error && <InlineError>{error}</InlineError>}
   </section>

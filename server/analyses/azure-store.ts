@@ -36,7 +36,7 @@ function scope(workspaceId: string, id?: string): void {
     (id === undefined || isAnalysisRecordId(id)), 'Invalid workspace or record identity.')
 }
 function etag(value: string): void {
-  assertAnalysis(typeof value === 'string' && value.trim() && value !== '*' && value.length <= 1024 &&
+  assertAnalysis(typeof value === 'string' && value && value.trim() === value && value !== '*' && !value.startsWith('W/') && value.length <= 1024 &&
     !/[,\r\n]/.test(value), 'An exact ETag is required.')
 }
 function decode(value: unknown, workspaceId?: string, id?: string): VersionedAnalysisEntity {
@@ -68,6 +68,10 @@ export function assertAnalysisReplacement(previous: AnalysisEntity, next: Analys
     for (const key of ['manifest', 'name', 'createdBy', 'idempotencyKey', 'inputFingerprint'] as const) {
       assertAnalysis(analysisHash(previous[key]) === analysisHash(next[key]), 'Accepted run inputs and manifest are immutable.')
     }
+    if (previous.displayName !== next.displayName) {
+      assertAnalysis(analysisHash({ ...previous, displayName: next.displayName, updatedAt: next.updatedAt }) === analysisHash(next),
+        'Display-name edits cannot change analysis inputs, evidence, lifecycle, or processing state.')
+    }
     assertAnalysis(previous.progress.total === next.progress.total &&
       next.initialization.nextComparisonIndex >= previous.initialization.nextComparisonIndex &&
       (!previous.initialization.completedAt || next.initialization.completedAt === previous.initialization.completedAt),
@@ -83,6 +87,12 @@ export function assertAnalysisReplacement(previous: AnalysisEntity, next: Analys
     assertAnalysis(previous.runId === next.runId && previous.index === next.index &&
       analysisHash(previous.resume) === analysisHash(next.resume) && analysisHash(previous.target) === analysisHash(next.target),
     'Comparison frozen inputs are immutable.')
+    if (previous.failureDiagnostic) {
+      assertAnalysis(next.failureDiagnostic &&
+        (next.failureDiagnostic.attemptId !== previous.failureDiagnostic.attemptId ||
+          analysisHash(next.failureDiagnostic) === analysisHash(previous.failureDiagnostic)),
+      'Failure diagnostic history cannot be erased or an immutable attempt replaced.')
+    }
     assertAnalysis(previous.status !== 'complete' || analysisHash(previous) === analysisHash(next), 'Completed evidence cannot be retried, cancelled, or changed.')
   } else if (previous.recordType === 'analysis-narrative-request' && next.recordType === 'analysis-narrative-request') {
     for (const key of ['runId', 'manifestSha256', 'requestId', 'requestedBy', 'mode', 'targetId', 'scopeRevision', 'plan', 'scheduled'] as const) {

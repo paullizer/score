@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react'
 import { Link, Navigate, useNavigate, useParams, useSearchParams } from 'react-router-dom'
 import { ArrowLeft, ArrowRight, BriefcaseBusiness, FileSearch, Layers3, LoaderCircle } from 'lucide-react'
 import { useWorkspace } from '../../app/workspace-context'
+import { useLibraryViewState } from '../../app/library-view-state'
 import { DocumentViewer } from '../../components/documents/DocumentViewer'
 import { Badge, Button, DemoNote, EmptyState, InlineError, Modal, PageHeader, SearchField, SegmentedControl } from '../../components/ui'
 import { dateLabel, latestRubrics } from '../../domain/selectors'
@@ -43,9 +44,9 @@ function RubricsLibrary() {
   const eligible = analyses?.canWrite && analyses.phase === 'ready' && analyses.features?.realAnalyses && analyses.targets.state === 'ready' && !analyses.targets.error ? analyses.targets.value : []
   const kind = params.get('kind') === 'grade' ? 'grade' : 'job'
   const libraryKind = cloud && params.get('data') !== 'samples' ? 'real' : 'samples'
-  const [search, setSearch] = useState('')
+  const [search, setSearch] = useLibraryViewState(`rubrics:${libraryKind}:query`, '')
   const [selection, setSelection] = useState<string[]>([])
-  const [archiveFilter, setArchiveFilter] = useState<ArchiveFilter>('default')
+  const [archiveFilter, setArchiveFilter] = useLibraryViewState<ArchiveFilter>(`rubrics:${libraryKind}:archive`, 'default')
   const { canEdit } = useLifecycleAccess()
   const [exactTargets, setExactTargets] = useState<Record<string, RealAnalysisTargetSelection>>({})
   const rubrics = latestRubrics(workspace).filter((rubric) => libraryKind === 'real' ? rubric.dataKind === 'real' : rubric.dataKind !== 'real')

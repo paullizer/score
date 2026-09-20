@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
-import { readFile } from 'node:fs/promises'
-import { resolve } from 'node:path'
+import { mkdir, readFile, writeFile } from 'node:fs/promises'
+import { join, resolve } from 'node:path'
 import { createContext, runInContext } from 'node:vm'
 import { after, before, test } from 'node:test'
 import { build } from 'esbuild'
@@ -77,6 +77,103 @@ function assertReadableGeometry(slides) {
   }
 }
 
+test('presentation display labels never replace original candidate or target identities', async () => {
+  const input = readablePptxFixture({ scores: [92.75, null], criterionCount: 6 })
+  input.run.name = 'Renamed analysis'
+  input.targets[0].displayName = 'Custom target'
+  input.targets[0].label = 'LEGACY-COMPOSITE TITLE - OFFICE MUST NOT BE USED'
+  input.comparisons[0].candidate.displayName = 'Custom candidate'
+  input.comparisons[1].candidate.displayName = 'Captured withheld candidate'
+  const report = foundation.buildAnalysisReport(input)
+  const original = JSON.stringify(report)
+  const result = await inspectReport(report)
+  for (const value of ['Renamed analysis', 'Custom target', 'Custom candidate',
+    `Source-stated name: ${input.comparisons[0].candidate.name}`, `Source target title: ${report.groups[0].target.presentation.title}`,
+    input.comparisons[0].candidate.sourceLabel]) {
+    assert.ok(result.text.includes(value), `Missing label or source identity: ${value}`)
+  }
+  assert.match(result.entries.get('docProps/core.xml').toString(), /Analysis evidence report — Renamed analysis/)
+  assert.equal(matchingShapes(result.slides, /^agenda-0-title$/)[0].text, 'Custom target')
+  const overview = matchingShapes(result.slides, /^overview-0-\d+$/)
+  assert.ok(overview.some(shape => shape.text.includes('Captured withheld candidate')))
+  assert.equal(matchingShapes(result.slides, /^review-0-0-overview-name$/)[0].text, 'Custom candidate')
+  assert.doesNotMatch(result.text, /LEGACY-COMPOSITE/)
+  assert.equal(JSON.stringify(report), original)
+  assertOverviewCoverage(report, result)
+  assertFeaturedContract(report, result)
+  assertTargetNavigationAndOrder(report, result)
+  assertReadableGeometry(result.slides)
+  assertNoAuditProse(result)
+})
+
+test('160-unit aliases and long source identities remain bounded and linked in single- and multiple-job decks', async () => {
+  for (const targetCount of [1, 2]) {
+    const input = readablePptxFixture({ scores: [92.75], criterionCount: 6, targetCount })
+    input.run.name = `${'Current analysis '.repeat(10).slice(0, 159)}Z`
+    input.targets.forEach(target => {
+      target.displayName = `${'Captured target '.repeat(10).slice(0, 159)}Z`
+      target.label = 'LEGACY-COMPOSITE TITLE - OFFICE MUST NOT BE USED'
+    })
+    input.comparisons.forEach(comparison => {
+      comparison.candidate.displayName = `${'Captured resume '.repeat(10).slice(0, 159)}Z`
+      comparison.candidate.name = 'Original source candidate name '.repeat(60).trimEnd()
+      comparison.candidate.sourceLabel = `${'Original resume filename '.repeat(60)}.pdf`
+    })
+    const report = foundation.buildAnalysisReport(input)
+    const original = JSON.stringify(report)
+    const result = await inspectReport(report)
+    assert.equal(JSON.stringify(report), original)
+    const title = result.slides[0].shapes.find(shape => shape.name === 'job-reference')
+    assert.equal(title.links[0].tooltip, input.run.name)
+    assert.equal(result.slides[0].relationships.get(title.links[0].id),
+      api.reportReviewLinks(report, report.groups[0].comparisons[0], PPTX_TEST_LINKS).analysis)
+    for (const [index, group] of report.groups.entries()) {
+      const links = api.reportReviewLinks(report, group.comparisons[0], PPTX_TEST_LINKS)
+      const sourceTitle = matchingShapes(result.slides, new RegExp(`^target-${index}-source-title-part-`))
+      assert.equal(sourceTitle.map(shape => shape.text).join(''), `Source target title: ${group.target.presentation.title}`)
+      const sourceName = matchingShapes(result.slides, new RegExp(`^review-${index}-0-metadata-2$`))[0]
+      assert.equal(sourceName.links[0].tooltip, `Source-stated name: ${group.comparisons[0].candidate.name}`)
+      const sourceFile = matchingShapes(result.slides, new RegExp(`^review-${index}-0-metadata-1$`))[0]
+      assert.equal(sourceFile.links[0].tooltip, `Source: ${group.comparisons[0].candidate.sourceLabel}`)
+      const opener = result.slides.find(slide => slide.shapes.some(shape => shape.name === `target-${index}-title`))
+      assert.equal(opener.shapes.find(shape => shape.name === `target-${index}-title`).text, group.target.displayName)
+      const sourceLink = opener.shapes.find(shape => shape.name === `target-${index}-source-link`)
+      assert.equal(opener.relationships.get(sourceLink.links[0].id), links.target)
+    }
+    assertOverviewCoverage(report, result)
+    assertFeaturedContract(report, result)
+    assertTargetNavigationAndOrder(report, result)
+    assert.doesNotMatch(result.text, /LEGACY-COMPOSITE/)
+    assertReadableGeometry(result.slides)
+    assertNoAuditProse(result)
+  }
+})
+
+test('fictional captured display labels support native local presentation review', async () => {
+  for (const kind of ['aliases', 'long-aliases']) {
+    const input = fictionalPptxFixture()
+    input.run.name = kind === 'aliases' ? 'Fictional research shortlisting review'
+      : `${'Fictional research analysis '.repeat(7).slice(0, 159)}Z`
+    input.targets[0].displayName = kind === 'aliases' ? 'Survey methods vacancy'
+      : `${'Captured survey research vacancy '.repeat(6).slice(0, 159)}Z`
+    input.comparisons.forEach((comparison, index) => {
+      comparison.candidate.displayName = kind === 'aliases' ? `Research applicant ${index + 1}`
+        : `${'Captured research applicant '.repeat(7).slice(0, 158)} ${index + 1}`
+    })
+    const report = foundation.buildAnalysisReport(input)
+    const bytes = await api.generatePptxReport(report, PPTX_SAMPLE_LINKS)
+    const result = await inspectPptx(bytes)
+    assertOverviewCoverage(report, result)
+    assertFeaturedContract(report, result)
+    assertTargetNavigationAndOrder(report, result)
+    assertReadableGeometry(result.slides)
+    if (process.env.REPORT_PPTX_QA_DIRECTORY) {
+      await mkdir(process.env.REPORT_PPTX_QA_DIRECTORY, { recursive: true })
+      await writeFile(join(process.env.REPORT_PPTX_QA_DIRECTORY, `score-pptx-${kind}.pptx`), bytes)
+    }
+  }
+})
+
 function assertOverviewCoverage(report, result, options = report.dataKind === 'sample' ? PPTX_SAMPLE_LINKS : PPTX_TEST_LINKS) {
   report.groups.forEach((group, groupIndex) => {
     const actual = []
@@ -105,7 +202,10 @@ function assertOverviewCoverage(report, result, options = report.dataKind === 's
       const analysis = actual[index].links.find(link => link.url === expectedLinks.analysis)
       assert.ok(analysis,
         'Overview retains supplied saved-score order and ties without reranking')
-      assert.equal(analysis.tooltip, api.readableCandidateName(comparison.candidate))
+      const name = api.readableCandidateName(comparison.candidate)
+      assert.equal(analysis.tooltip, comparison.candidate.displayName
+        ? `${name} · Source-stated name: ${comparison.candidate.name ?? 'Not stated'} · Source: ${comparison.candidate.sourceLabel}`
+        : name)
       if (actual[index].name !== api.readableCandidateName(comparison.candidate)) {
         const number = group.comparisons.indexOf(comparison) + 1
         assert.ok(actual[index].name.startsWith(`Candidate ${number}\n`), 'A candidate ordinal is a reference, not an invented person alias')
@@ -223,7 +323,7 @@ function assertTargetNavigationAndOrder(report, result) {
   report.groups.forEach((group, index) => {
     const entrySlide = result.slides.find(slide => slide.shapes.some(shape => shape.name === `agenda-${index}-title`))
     const entry = entrySlide.shapes.find(shape => shape.name === `agenda-${index}-title`)
-    assert.equal(entry.text, group.target.presentation.title)
+    assert.equal(entry.text, group.target.displayName ?? group.target.presentation.title)
     if (group.target.presentation.organization) {
       assert.equal(entrySlide.shapes.find(shape => shape.name === `agenda-${index}-organization`).text, group.target.presentation.organization)
     }
@@ -231,7 +331,7 @@ function assertTargetNavigationAndOrder(report, result) {
     const number = entrySlide.slideRelationships.get(entry.links[0].id)
     const opener = result.slides[number - 1]
     assert.ok(opener, 'Agenda targets an existing final slide')
-    assert.equal(opener.shapes.find(shape => shape.name === `target-${index}-title`).text, group.target.presentation.title,
+    assert.equal(opener.shapes.find(shape => shape.name === `target-${index}-title`).text, group.target.displayName ?? group.target.presentation.title,
       'Duplicate titles still link to the exact target, including final pagination')
     if (group.target.presentation.organization) {
       assert.equal(opener.shapes.find(shape => shape.name === `target-${index}-organization`).text, group.target.presentation.organization)

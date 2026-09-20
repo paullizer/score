@@ -2,7 +2,7 @@ import fontkit from '@pdf-lib/fontkit'
 import { PDFDocument } from 'pdf-lib'
 import { REPORT_LIMITS } from '../../domain/analysis-reports'
 import type { AnalysisReport, ReportGenerationOptions } from '../../domain/analysis-reports'
-import { REPORT_FONT_FAMILY, REPORT_TITLE } from './presentation'
+import { REPORT_FONT_FAMILY, reportTitle } from './presentation'
 import { assertReportResourceLimits } from './model'
 import { requireReportNarratives } from './narratives'
 import { writeDocumentReport } from './document-content'
@@ -30,7 +30,7 @@ export async function generatePdfReport(report: AnalysisReport, options?: Report
   requireReportNarratives(report)
   const document = await PDFDocument.create()
   const fonts = await embedReportFonts(document, options)
-  document.setTitle(REPORT_TITLE, { showInWindowTitleBar: true })
+  document.setTitle(reportTitle(report), { showInWindowTitleBar: true })
   document.setAuthor('Score')
   document.setSubject('Analysis evidence for human review')
   document.setCreator('Score')

@@ -3,6 +3,7 @@ import type { UploadFormat } from '../../domain/document-formats'
 import { isSafeUploadedFilename, uploadedFileKind, type UploadedSourceKind } from '../../domain/source-files'
 import { uploadFileByteLimit, uploadFormatNames, validateUploadFile } from '../../services/documentUploads'
 import { lifecycleIsRemoved } from '../../domain/lifecycle'
+import { getDisplayName } from '../../domain/displayNames'
 
 export type RealResumeImportSource = { kind: UploadedSourceKind | 'unsupported'; file: File } | { kind: 'url'; url: string }
 
@@ -86,6 +87,10 @@ export function readyRealResume(summary: RealResumeSummary): boolean {
 }
 
 export function resumeName(summary: RealResumeSummary): string {
+  return getDisplayName(summary, resumeStatedName(summary))
+}
+
+export function resumeStatedName(summary: RealResumeSummary): string {
   return summary.resume.name?.trim() || 'Name not stated'
 }
 

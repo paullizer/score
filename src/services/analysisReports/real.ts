@@ -5,10 +5,11 @@ import {
 import type { RealAnalysisNarrativeReportCapture, RealAnalysisSummariesResponse } from '../../domain/analysis-narratives'
 import { cloudJsonRequest } from '../cloudWorkspace'
 import { getRealAnalysis, getRealAnalysisSummaries, listAllRealAnalysisComparisons } from '../realAnalyses'
-import { assertReportResourceLimits, buildAnalysisReport, parseRealReportBatchResponse } from './model'
+import { assertReportResourceLimits, buildAnalysisReport, parseRealReportBatchResponse, reportDisplayNameSchema as displayName } from './model'
 import { realAnalysisSummariesResponseSchema } from './narrative-schemas'
 import { requireReportNarratives } from './narratives'
 import { unavailableOverallScore } from './presentation'
+import { getDisplayName } from '../../domain/displayNames'
 
 const id = z.string().min(1).max(1024).refine(value => value === value.trim())
 const text = z.string().max(REPORT_LIMITS.maxTextCharacters)
@@ -34,11 +35,11 @@ const targetSelection = z.discriminatedUnion('kind', [
 ])
 const resumeSummary = z.object({
   workspaceId: id, dataKind: z.literal('real'), selection: resumeSelection,
-  name: text.nullable(), role: text.nullable(), sourceLabel: label, capturedAt: timestamp,
+  name: text.nullable(), displayName: displayName.optional(), role: text.nullable(), sourceLabel: label, capturedAt: timestamp,
 })
 const targetSummary = z.object({
   id, workspaceId: id, dataKind: z.literal('real'), kind: z.enum(['job', 'grade']),
-  label, sublabel: text, rubricId: id, rubricVersion: version,
+  label, displayName: displayName.optional(), sublabel: text, rubricId: id, rubricVersion: version,
   criterionCount: z.number().int().min(1).max(REPORT_LIMITS.maxCriteriaPerTarget), selection: targetSelection,
 })
 const processingError = z.strictObject({ code: id, message: label, stage: label, retryable: z.boolean() })
@@ -64,7 +65,7 @@ const capturedComparison = z.object({
 const capturedRun = z.object({
   etag: id,
   run: z.object({
-    id, recordType: z.literal('analysis-run'), workspaceId: id, dataKind: z.literal('real'), name: label, createdAt: timestamp,
+    id, recordType: z.literal('analysis-run'), workspaceId: id, dataKind: z.literal('real'), name: label, displayName: displayName.optional(), createdAt: timestamp,
     status: z.enum(['initializing', 'queued', 'running', 'complete', 'partial', 'failed', 'cancelled']), manifest: blob,
     initialization: z.strictObject({ nextComparisonIndex: count, completedAt: timestamp.optional() }),
     progress: z.strictObject({
@@ -179,7 +180,7 @@ function validateInventory(
 function checkTarget(target: RealReportTarget, captured: CapturedComparison): void {
   const expected = captured.target
   requireSaved(target.id === expected.summary.id && target.kind === expected.summary.kind &&
-    target.label === expected.summary.label && target.sublabel === expected.summary.sublabel &&
+    target.label === expected.summary.label && target.displayName === expected.summary.displayName && target.sublabel === expected.summary.sublabel &&
     target.rubricId === expected.summary.rubricId && target.rubricVersion === expected.summary.rubricVersion &&
     target.criteria.length === expected.summary.criterionCount && same(target.selection, expected.summary.selection) &&
     target.snapshot.snapshotId === expected.snapshotId && target.snapshot.sha256 === expected.blob.sha256,
@@ -190,7 +191,7 @@ function capturedResult(comparison: RealReportComparison, captured: CapturedComp
   const { candidate } = comparison
   const expected = captured.resume
   requireSaved(comparison.id === captured.id && comparison.index === captured.index && comparison.targetId === captured.target.summary.id &&
-    candidate.id === expected.summary.selection.resumeId && candidate.name === expected.summary.name &&
+    candidate.id === expected.summary.selection.resumeId && candidate.name === expected.summary.name && candidate.displayName === expected.summary.displayName &&
     candidate.role === expected.summary.role && candidate.sourceLabel === expected.summary.sourceLabel &&
     candidate.documentId === expected.summary.selection.documentId && candidate.documentVersion === expected.summary.selection.documentVersion &&
     candidate.documentSha256 === expected.summary.selection.documentSha256 &&
@@ -407,7 +408,7 @@ export async function loadRealAnalysisReport(
     signal.throwIfAborted()
     requireSaved(comparisons.size === selected.length, 'Required report comparisons are missing.')
     const report = buildAnalysisReport({
-      dataKind: 'real', workspaceId, run: { id: detail.run.id, name: detail.run.name, createdAt: detail.run.createdAt },
+      dataKind: 'real', workspaceId, run: { id: detail.run.id, name: getDisplayName(detail.run, detail.run.name), createdAt: detail.run.createdAt },
       capture: { startedAt, completedAt, ...(summaries ? { summaries: summaries.capture } : {}) }, generatedAt: new Date().toISOString(),
       targets: detail.targets.filter(target => targets.has(target.id)).map(target => targets.get(target.id)!),
       comparisons: selected.map(comparison => comparisons.get(comparison.id)!),

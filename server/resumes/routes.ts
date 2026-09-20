@@ -128,6 +128,22 @@ export function createRealResumesRouter(deps: RealResumesRouterDeps): Router {
     res.setHeader('ETag', detail.etag)
     res.json(detail)
   })
+  router.patch(`${base}/:resumeId/metadata`,
+    (req, _res, next) => {
+      try {
+        resumeId(req); etag(req)
+        if (Object.keys(req.query).length) throw invalidRequest('Metadata requests do not accept query parameters.')
+        if (!req.is('application/json')) throw invalidRequest('Content-Type must be application/json.')
+        next()
+      } catch (error) { next(error) }
+    },
+    express.json({ limit: '4kb', inflate: false }),
+    mutate('write', async (req, res) => {
+      const resume = await requireService().updateMetadata(param(req, 'workspaceId'), resumeId(req), req.body, etag(req))
+      res.setHeader('ETag', resume.etag)
+      res.json({ resume })
+    }),
+  )
   router.get(`${base}/:resumeId/original`, async (req, res) => {
     const original = await requireService().original(param(req, 'workspaceId'), resumeId(req))
     res.setHeader('Content-Type', original.contentType)

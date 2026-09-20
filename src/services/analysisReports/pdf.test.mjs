@@ -122,10 +122,82 @@ function assertNoTechnicalMetadata(pdf) {
   }
 }
 
+test('PDF: display headings and original source identities are both selectable', async () => {
+  const input = readablePdfFixture({ scores: [92.75, null], criterionCount: 6 })
+  input.run.name = 'Renamed analysis'
+  input.targets[0].displayName = 'Custom target'
+  input.targets[0].label = 'LEGACY-COMPOSITE TITLE - OFFICE MUST NOT BE USED'
+  input.comparisons[0].candidate.displayName = 'Custom candidate'
+  input.comparisons[1].candidate.displayName = 'Captured withheld candidate'
+  const pdf = await generate(input)
+  assert.equal(pdf.document.getTitle(), foundation.reportTitle(pdf.report))
+  for (const value of ['Renamed analysis', 'Custom target', 'Custom candidate',
+    `Source-stated name: ${input.comparisons[0].candidate.name}`, `Source target title: ${input.targets[0].presentation.title}`,
+    input.comparisons[0].candidate.sourceLabel]) {
+    assert.ok(pdf.text.includes(value), `Missing label or source identity: ${value}`)
+  }
+  const overview = overviewText(pdf)
+  assert.ok(overview.includes('Custom candidate'))
+  assert.ok(overview.includes('Captured withheld candidate'))
+  const review = reviewSections(pdf)[0]
+  assert.ok(review.pages.length <= 2)
+  assert.ok(review.pages.every(page => page.items.some(item => item.y === 734 && item.source === 'Custom candidate')))
+  assert.ok(review.pages.every(page => page.items.some(item => item.y === 718 && item.source === 'Job analysis 1 · Featured candidate 1')))
+  assert.equal(review.pages.flatMap(page => page.annotations).length, 3)
+  assert.doesNotMatch(pdf.text, /LEGACY-COMPOSITE/)
+  assertContentsDestinations(pdf)
+  assertNoTechnicalMetadata(pdf)
+  assertNoClipping(pdf)
+})
+
+test('PDF: long captured aliases disambiguate exact targets and paginate without replacing original sources', async () => {
+  const input = readablePdfFixture({ scores: [92.75], targetCount: 2, criterionCount: 6 })
+  input.run.name = `${'Current analysis '.repeat(10).slice(0, 159)}Z`
+  input.targets.forEach(target => { target.displayName = `${'Captured target '.repeat(10).slice(0, 159)}Z` })
+  input.comparisons.forEach(comparison => {
+    comparison.candidate.displayName = `${'Captured resume '.repeat(10).slice(0, 159)}Z`
+    comparison.candidate.name = null
+  })
+  const pdf = await generate(input)
+  assert.equal(pdf.document.getTitle(), foundation.reportTitle(pdf.report))
+  assert.ok(pdf.body.includes(input.run.name))
+  const reviews = reviewSections(pdf)
+  assert.equal(reviews.length, 2)
+  pdf.report.groups.forEach((group, index) => {
+    const label = group.target.displayName
+    assert.ok(overviewText(pdf).includes(label))
+    assert.ok(reviews[index].body.includes(label))
+    assert.ok(reviews[index].body.includes('Source-stated name: Not stated'))
+    assert.ok(reviews[index].body.includes(`Source target title: ${group.target.presentation.title}`))
+    assert.ok(reviews[index].pages.every(page => page.secondary === `Job analysis ${index + 1} · Featured candidate 1`))
+    assert.ok(reviews[index].body.includes(group.comparisons[0].candidate.sourceLabel))
+    assert.ok(reviews[index].pages.length <= 3)
+    const links = writer.reportReviewLinks(pdf.report, group.comparisons[0], options)
+    for (const url of Object.values(links)) assert.ok(reviews[index].pages.some(page => page.annotations.some(link => link.url === url)))
+  })
+  assertContentsDestinations(pdf)
+  assertNoTechnicalMetadata(pdf)
+  assertNoClipping(pdf)
+})
+
+test('PDF: source-name disclosures never strand the explanation section heading above a page break', async () => {
+  const input = fictionalPdfQaFixture()
+  input.run.name = 'Fictional research shortlisting review'
+  input.targets[0].displayName = 'Survey methods vacancy'
+  input.comparisons[0].candidate.displayName = 'Research applicant A'
+  const pdf = await generate(fictionalSampleInput(input), { fonts: options.fonts, links: { origin: options.links.origin } })
+  const review = reviewSections(pdf)[0]
+  const headingPage = review.pages.find(page => page.items.some(item => item.source === 'Why these scores'))
+  assert.ok(headingPage)
+  assert.ok(headingPage.items.some(item => item.bold && item.size === 10 && /^C1(?: |$)/.test(item.source)),
+    'The explanation heading must share a page with the first criterion, not reserve only a fixed number of blank points.')
+  assertNoClipping(pdf)
+})
+
 test('PDF: concise searchable report includes job context, one caution, all criterion scores and page numbers', async context => {
   const input = readablePdfFixture()
   const pdf = await generate(input)
-  assert.equal(pdf.document.getTitle(), 'Analysis evidence report')
+  assert.equal(pdf.document.getTitle(), foundation.reportTitle(pdf.report))
   assert.equal(pdf.document.getAuthor(), 'Score')
   assert.equal(occurrences(pdf.body, 'Analysis evidence report'), 1)
   assert.equal(occurrences(pdf.body, foundation.REPORT_HUMAN_REVIEW_NOTICE), 1)
@@ -601,7 +673,7 @@ test('PDF: wrapped linked text and oversized table cells preserve Unicode, white
 
 test('PDF: metadata-rich records retain concise rationale, not audit text or unsupported omitted glyphs', async () => {
   const input = readablePdfFixture({ scores: [60, 60], criterionCount: 1 })
-  input.run.name = 'Internal processing audit 🚀'
+  input.run.name = 'Current analysis title'
   input.targets[0].facts.push({ label: 'Rubric SHA-256', value: 'b'.repeat(64) }, { label: 'Assessment deployment', value: '漢-hidden-deployment' })
   input.targets[0].criteria[0].guidance += ' 🚀 Guidance is not reader-facing.'
   for (const comparison of input.comparisons) {
@@ -613,7 +685,8 @@ test('PDF: metadata-rich records retain concise rationale, not audit text or uns
   const pdf = await generate(input)
   for (const section of reviewSections(pdf)) assert.ok(section.pages.length <= 2)
   assertNoTechnicalMetadata(pdf)
-  assert.doesNotMatch(pdf.text, /🚀|漢|audit only|Internal processing/)
+  assert.doesNotMatch(pdf.text, /🚀|漢|audit only/)
+  assert.ok(pdf.body.includes('Current analysis title'))
   assert.ok(pdf.body.includes('Applied engineering methods to flood-risk mapping'))
   assert.ok(pdf.body.includes('Applied engineering methods to bridge inspections'))
   assertNoClipping(pdf)
@@ -837,6 +910,13 @@ test('PDF: missing, corrupt and unsupported rendered fonts fail explicitly, neve
   const overview = structuredClone(report)
   overview.groups[0].target.narrative.paragraphs[0] = overview.groups[0].target.narrative.paragraphs[0].replace('completed', '漢')
   await assert.rejects(writer.generatePdfReport(overview, options), /U\+6F22.*No source text was substituted or omitted/)
+  for (const identity of ['analysis', 'candidate', 'target']) {
+    const copy = structuredClone(report)
+    if (identity === 'analysis') copy.run.name = 'Current analysis 🚀'
+    if (identity === 'candidate') copy.groups[0].comparisons[0].candidate.displayName = 'Captured candidate 🚀'
+    if (identity === 'target') copy.groups[0].target.displayName = 'Captured target 🚀'
+    await assert.rejects(writer.generatePdfReport(copy, options), /U\+1F680.*No source text was substituted or omitted/)
+  }
 })
 
 test('PDF: invalid application origins and unsafe layout links are rejected explicitly', async () => {

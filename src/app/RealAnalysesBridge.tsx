@@ -8,7 +8,8 @@ import type { RealAnalysisSummariesResponse } from '../domain/analysis-narrative
 import * as api from '../services/realAnalyses'
 import { CloudApiError, CloudConflictError, LifecycleOperationError } from '../services/cloudWorkspace'
 import { lifecycleIsRemoved, isEntityArchived, isEntityRemoved, type LifecycleAction, type LifecycleTarget } from '../domain/lifecycle'
-import { WorkspaceContext, useWorkspace, type PendingLifecycleChange } from './workspace-context'
+import { WorkspaceContext, useWorkspace, type PendingLifecycleChange, type RenameEntityTarget } from './workspace-context'
+import { getDisplayName } from '../domain/displayNames'
 import { useGradeLeaveGuard } from './grade-navigation-context'
 import { RealAnalysesContext, type RealAnalysesContextValue } from './real-analyses-context'
 import { RealRequestScope, realRequestError, type RealLoadState } from './real-request-scope'
@@ -84,7 +85,8 @@ function RealAnalysesProvider({ workspaceId, children }: { workspaceId: string; 
   const clearRunContent = useCallback((id: string) => {
     const removedScopes = new Set([...narrativeScopes.current].filter(([, item]) => item.runId === id).map(([key]) => key))
     scope.cancelReads((key) => key === `detail:${id}` || key === `pairs:${id}` || key.startsWith(`result:${id}/`) ||
-      key.startsWith(`document:${id}/`) || [...removedScopes].some((item) => key === `narratives:${item}`))
+      key.startsWith(`document:${id}/`) || key.startsWith(`diagnostics:${id}/`) ||
+      [...removedScopes].some((item) => key === `narratives:${item}`))
     putDetail(id, { state: 'error', error: 'This analysis was removed or is awaiting permanent cleanup. Cached inputs and results are no longer available.' })
     const next = { ...comparisonsRef.current }; delete next[id]
     comparisonsRef.current = next; setComparisons(next)
@@ -121,7 +123,7 @@ function RealAnalysesProvider({ workspaceId, children }: { workspaceId: string; 
 
   useEffect(() => {
     setPendingLifecycle(reconcileLifecycleOperations(pendingLifecycleRef.current, summaries.map((summary) =>
-      discoveredLifecycle({ kind: 'analysis', id: summary.run.id }, summary.run.name, summary.lifecycle ?? summary.run.lifecycle, summary.operation))))
+      discoveredLifecycle({ kind: 'analysis', id: summary.run.id }, getDisplayName(summary.run, summary.run.name), summary.lifecycle ?? summary.run.lifecycle, summary.operation))))
   }, [setPendingLifecycle, summaries])
 
   const readableRun = useCallback((id: string) => {
@@ -208,6 +210,7 @@ function RealAnalysesProvider({ workspaceId, children }: { workspaceId: string; 
       if (!scope.current(ticket)) return
       if (!scope.canAccept(`pair:${key}`, ticket.sequence)) { superseded = true; return }
       if (caught instanceof CloudApiError && [403, 404].includes(caught.status)) {
+        scope.cancelReads((request) => request === `diagnostics:${key}`)
         pairSummaries.current.delete(key)
         putResult(key, { state: 'error', error: 'This saved comparison is no longer available. Cached source snapshots have been cleared.' })
         return
@@ -413,13 +416,13 @@ function RealAnalysesProvider({ workspaceId, children }: { workspaceId: string; 
       await parentRef.current.cloud?.flushSave()
       assertRealLifecyclePermission(parentRef.current, workspaceId)
     } else {
-      if (!realWorkspaceWritable(parentRef.current, workspaceId)) throw new Error('This workspace is archived, read-only, or unavailable. An owner or editor must create, retry, or cancel analyses.')
+      if (!realWorkspaceWritable(parentRef.current, workspaceId)) throw new Error('This workspace is archived, read-only, or unavailable. An owner or editor must make changes to analyses.')
       if (!historyAvailable.current || phase !== 'ready') throw new Error('The saved analysis service is unavailable. Refresh before submitting.')
       if (runId) {
         const summary = summariesRef.current.find((item) => item.run.id === runId)
         const metadata = summary?.lifecycle ?? summary?.run.lifecycle
         if (!summary || metadata?.archivedAt || lifecycleIsRemoved(metadata) || pendingLifecycleRef.current.some((item) => item.target.id === runId)) {
-          throw new Error('This analysis is archived, removed, or has incomplete cleanup. Unarchive the run before starting new processing.')
+          throw new Error('This analysis is archived, removed, or has incomplete cleanup. Unarchive the run before editing it or starting new processing.')
         }
       }
     }
@@ -528,9 +531,34 @@ function RealAnalysesProvider({ workspaceId, children }: { workspaceId: string; 
         return document
       } finally { scope.finish(ticket) }
     },
+    diagnostics: async (runId, comparisonId, continuationToken, signal) => {
+      signal?.throwIfAborted()
+      if (!historyAvailable.current || !readableRun(runId)) throw new Error('The private diagnostic service is unavailable or this analysis is being deleted.')
+      const ticket = scope.read(`diagnostics:${pairKey(runId, comparisonId)}`)
+      if (!ticket) throw new Error('Wait for the pending analysis request, then retry opening its private diagnostics.')
+      const cancel = () => { ticket.controller.abort(); scope.finish(ticket) }
+      signal?.addEventListener('abort', cancel, { once: true })
+      try {
+        const page = await api.getRealAnalysisDiagnostics(workspaceId, runId, comparisonId, continuationToken,
+          signal ? AbortSignal.any([signal, ticket.controller.signal]) : ticket.controller.signal)
+        if (!scope.current(ticket) || !readableRun(runId) || signal?.aborted) throw new DOMException('The private diagnostic request was cancelled.', 'AbortError')
+        const run = summariesRef.current.find((item) => item.run.id === runId)?.run
+        if (run && page.attempts.some((attempt) => attempt.manifestSha256 !== run.manifest.sha256)) {
+          throw new Error('The private diagnostic does not match this run’s frozen input manifest. Reload the saved comparison.')
+        }
+        return page
+      } finally { signal?.removeEventListener('abort', cancel); scope.finish(ticket) }
+    },
   }
   function owns(target: LifecycleTarget) {
     return target.kind === 'analysis' && (knownIds.current.has(target.id) || pendingLifecycleRef.current.some((item) => item.target.id === target.id))
+  }
+
+  async function renameEntity(target: RenameEntityTarget, name: string, etag?: string) {
+    if (!owns(target)) return parentRef.current.renameEntity(target, name, etag)
+    if (!etag) throw new Error('Reload this analysis before editing its name.')
+    await mutate(target.id, () => api.renameRealAnalysis(workspaceId, target.id, name, etag), rememberRun)
+    parentRef.current.notify('Analysis name saved. Source evidence and results are unchanged.')
   }
 
   async function changeLifecycle(target: LifecycleTarget, action: LifecycleAction) {
@@ -548,7 +576,7 @@ function RealAnalysesProvider({ workspaceId, children }: { workspaceId: string; 
       if (response.operation && response.operation.status !== 'complete') {
         const summary = summariesRef.current.find((item) => item.run.id === target.id)
         setPendingLifecycle(reconcileLifecycleOperations(pendingLifecycleRef.current, [{
-          target, name: summary?.run.name ?? pending?.name ?? 'Real analysis', operation: response.operation,
+          target, name: summary ? getDisplayName(summary.run, summary.run.name) : pending?.name ?? 'Real analysis', operation: response.operation,
         }]))
         if (action === 'delete') clearRunContent(target.id)
       } else if (response.deleted) removeRun(target.id, sequence)
@@ -563,7 +591,7 @@ function RealAnalysesProvider({ workspaceId, children }: { workspaceId: string; 
     id: item.run.id, lifecycle: item.lifecycle ?? item.run.lifecycle,
   }))), [parent.workspace, summaries])
   const projected = {
-    ...parent, workspace, changeLifecycle,
+    ...parent, workspace, changeLifecycle, renameEntity,
     getLifecycleImpact: (target: LifecycleTarget) => owns(target) ? api.getRealAnalysisLifecycleImpact(workspaceId, target.id) : parentRef.current.getLifecycleImpact(target),
     lifecycleOperations: [...(parent.lifecycleOperations ?? []), ...pendingLifecycle],
   }

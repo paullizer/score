@@ -341,6 +341,66 @@ async function assertReady(run, id, workspace = WORKSPACE) {
   return { record, detail }
 }
 
+test('resume metadata edits preserve source identity and continue an owned publication after an ETag race without new attempts', async () => {
+  let run
+  let id
+  run = fixture({
+    async modelFetch(body) {
+      assert.doesNotMatch(JSON.stringify(body), /Initial alias|During profiling|Publication alias/)
+      const live = await run.store.get(WORKSPACE, id)
+      await run.service.updateMetadata(WORKSPACE, id, { displayName: 'During profiling' }, live.etag)
+      return modelResponse(body)
+    },
+  })
+  id = await run.url()
+  const imported = await run.store.get(WORKSPACE, id)
+  await run.service.updateMetadata(WORKSPACE, id, { displayName: 'Initial alias' }, imported.etag)
+  const replace = run.store.replace.bind(run.store)
+  let raced = false
+  run.store.replace = async (record, etag) => {
+    if (!raced && record.resume.status === 'ready') {
+      raced = true
+      const live = await run.store.get(WORKSPACE, id)
+      await run.service.updateMetadata(WORKSPACE, id, { displayName: 'Publication alias' }, live.etag)
+    }
+    return replace(record, etag)
+  }
+  assert.deepEqual(await runResumeWorker(run.deps, { maxItems: 1 }), { claimed: 1, completed: 1 })
+  const { record, detail } = await assertReady(run, id)
+  assert.equal(raced, true)
+  assert.equal(record.displayName, 'Publication alias')
+  assert.equal(detail.displayName, 'Publication alias')
+  assert.equal(record.resume.name, NAME)
+  assert.equal(record.resume.sourceLabel, imported.record.resume.sourceLabel)
+  assert.deepEqual(record.source, imported.record.source)
+  assert.equal(record.attempts, 1)
+  assert.equal(record.retryCount, 0)
+  assert.equal(run.requests.model.length, 1)
+})
+
+test('resume metadata edits after an ambiguously acknowledged ready publication preserve both the saved alias and successful result', async () => {
+  const run = fixture()
+  const id = await run.url()
+  const replace = run.store.replace.bind(run.store)
+  let renamed = false
+  run.store.replace = async (record, etag) => {
+    const saved = await replace(record, etag)
+    if (!renamed && record.resume.status === 'ready') {
+      renamed = true
+      await run.service.updateMetadata(WORKSPACE, id, { displayName: 'Confirmed after publication' }, saved.etag)
+      throw new Error('The ready publication response was lost.')
+    }
+    return saved
+  }
+  assert.deepEqual(await runResumeWorker(run.deps, { maxItems: 1 }), { claimed: 1, completed: 1 })
+  const { record } = await assertReady(run, id)
+  assert.equal(record.displayName, 'Confirmed after publication')
+  assert.equal(record.resume.name, NAME)
+  assert.equal(record.attempts, 1)
+  assert.equal(record.error, undefined)
+  assert.equal(run.requests.model.length, 1)
+})
+
 test('Markdown resume originals produce grounded metadata and section citations without OCR or public requests', async () => {
   const bytes = Buffer.from(`\ufeff# ${NAME}\r\n\r\n${ROLE}\r\n\r\nSeattle, Washington\r\n\r\n## Experience\r\n\r\n${EXPERIENCE}\r\n`)
   const run = fixture({ browser: { render: async () => { throw new Error('Markdown must not render HTML') } } })
@@ -402,11 +462,17 @@ test('actual uploaded PDF bytes take OCR and grounded profile paths; API validat
   const bytes = await pdf()
   const run = fixture()
   const id = await run.upload(bytes, 'Filename is not a person.pdf')
+  const imported = await run.store.get(WORKSPACE, id)
+  const displayName = 'DISPLAY_ALIAS_IS_NOT_RESUME_EVIDENCE'
+  await run.service.updateMetadata(WORKSPACE, id, { displayName }, imported.etag)
   assert.equal((await run.record(id)).resume.name, null)
   assert.deepEqual(await runResumeWorker(run.deps), { claimed: 1, completed: 1 })
   const { record, detail } = await assertReady(run, id)
+  assert.equal(detail.displayName, displayName)
   assert.equal(detail.resume.name, NAME)
   assert.equal(detail.resume.role, ROLE)
+  assert.equal(detail.document.title, 'Filename is not a person.pdf')
+  assert.deepEqual(record.source, imported.record.source)
   assert.equal(record.capture.finalUrl, undefined)
   assert.deepEqual(record.capture.redirects, [])
   assert.equal(record.extraction.method, 'document-intelligence')
@@ -419,6 +485,10 @@ test('actual uploaded PDF bytes take OCR and grounded profile paths; API validat
   assert.equal(run.requests.model.length, 1)
   assert.ok(run.requests.tokens.every(scope => scope === 'https://cognitiveservices.azure.com/.default'))
   assert.equal(run.requests.model[0].body.messages[1].content.includes('Filename is not a person'), false)
+  assert.equal(JSON.stringify(run.requests.model[0].body).includes(displayName), false)
+  assert.deepEqual(JSON.parse(run.requests.model[0].body.messages[1].content), {
+    source: { paragraphs: detail.document.paragraphs.map(paragraph => ({ paragraphId: paragraph.id, text: paragraph.text })) },
+  })
   assert.equal(run.requests.model[0].body.response_format.json_schema.name, 'resume_profile')
   assert.equal(detail.profile.provenance.model, 'gpt-5-mini-controlled-build')
   assert.deepEqual(await runResumeWorker(run.deps), { claimed: 0, completed: 0 })
@@ -1500,10 +1570,13 @@ test('three transient automatic attempts back off, stop, and allow only an expli
   let healthy = false
   const run = fixture({ transport: async () => healthy ? http() : http('private-marker', 503) })
   const id = await run.url()
+  const imported = await run.store.get(WORKSPACE, id)
+  await run.service.updateMetadata(WORKSPACE, id, { displayName: 'Keep across all retries' }, imported.etag)
   for (let attempt = 1; attempt <= 3; attempt++) {
     assert.deepEqual(await runResumeWorker(run.deps), { claimed: 1, completed: 0 })
     const record = await run.record(id)
     assert.equal(record.attempts, attempt)
+    assert.equal(record.displayName, 'Keep across all retries')
     assert.equal(record.error.code, 'service-unavailable')
     assert.equal(record.error.retryable, true)
     assert.deepEqual(await runResumeWorker(run.deps), { claimed: 0, completed: 0 })
@@ -1524,6 +1597,7 @@ test('three transient automatic attempts back off, stop, and allow only an expli
   const { record } = await assertReady(run, id)
   assert.equal(record.attempts, 1)
   assert.equal(record.retryCount, 1)
+  assert.equal(record.displayName, 'Keep across all retries')
 })
 
 test('execution budget aborts uncooperative model work and fences late completion', async () => {

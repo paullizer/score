@@ -1,6 +1,7 @@
 import type {
   AnalysisReport, RankedReportComparison, ReportGenerationOptions, ReportGroup, ReportTargetPresentation,
 } from '../../domain/analysis-reports'
+import { getDisplayName } from '../../domain/displayNames'
 import {
   evidenceStatusLabel, overallScoreLabel, REPORT_HUMAN_REVIEW_NOTICE,
   REPORT_SAMPLE_NOTICE, REPORT_TITLE,
@@ -29,6 +30,7 @@ interface TargetSection {
 function writeIntroduction<Color>(layout: DocumentReportLayout<Color>, report: AnalysisReport, sections: TargetSection[]): void {
   layout.startSection({ section: 'Introduction', primary: REPORT_TITLE, secondary: 'Saved analysis scope' })
   layout.paragraph(REPORT_TITLE, { size: 23, bold: true, leading: 32, after: 8, headingLevel: 1 })
+  layout.paragraph(report.run.name, { size: 13, leading: 18, bold: true, after: 8 })
   if (report.dataKind === 'sample') {
     layout.paragraph(REPORT_SAMPLE_NOTICE, { size: 9.5, leading: 14, bold: true, color: layout.colors.accent, after: 7 })
   }
@@ -61,13 +63,19 @@ function targetMetadata(presentation: ReportTargetPresentation): string[] {
   ].filter(Boolean)
 }
 
-function writeTargetIdentity<Color>(layout: DocumentReportLayout<Color>, presentation: ReportTargetPresentation, size: number): void {
-  layout.paragraph(presentation.title, {
+function writeTargetIdentity<Color>(layout: DocumentReportLayout<Color>, section: TargetSection, size: number): void {
+  const { group, presentation } = section
+  layout.paragraph(getDisplayName(group.target, presentation.title), {
     size, leading: Math.ceil(size * 1.4), bold: true, after: 5, keepWithNext: 28,
     ...(size === 20 ? { headingLevel: 1 } : {}),
   })
   if (presentation.organization) {
     layout.paragraph(presentation.organization, { size: 11, leading: 16, after: 6, keepWithNext: 28 })
+  }
+  if (group.target.displayName !== undefined) {
+    layout.paragraph(`Source target title: ${presentation.title}`, {
+      size: 9.5, leading: 14, color: layout.colors.muted, after: 7,
+    })
   }
   layout.metadata(targetMetadata(presentation))
 }
@@ -81,7 +89,7 @@ function writeContents<Color>(layout: DocumentReportLayout<Color>, sections: Tar
   for (const section of sections) {
     const count = section.group.comparisons.filter(comparison => comparison.status === 'complete').length
     layout.contentsEntry({
-      label: section.label, title: section.presentation.title, organization: section.presentation.organization,
+      label: section.label, title: getDisplayName(section.group.target, section.presentation.title), organization: section.presentation.organization,
       metadata: targetMetadata(section.presentation),
       detail: `${count} completed ${count === 1 ? 'comparison' : 'comparisons'}`,
       destination: section.destination,
@@ -97,7 +105,7 @@ function writeTargetOverview<Color>(
   layout.markDestination(section.destination)
   layout.paragraph('Return to contents', { size: 9.5, leading: 14, after: 12, link: { destination: CONTENTS_DESTINATION } })
   layout.label(section.label)
-  writeTargetIdentity(layout, presentation, 20)
+  writeTargetIdentity(layout, section, 20)
   const comparison = group.comparisons.find(comparison => comparison.status === 'complete')
   if (!comparison) throw new Error('A document target section requires a completed comparison.')
   layout.links([{
@@ -119,9 +127,9 @@ function writeTargetOverview<Color>(
 function writeCandidatesAtAGlance<Color>(
   layout: DocumentReportLayout<Color>, report: AnalysisReport, section: TargetSection, options?: ReportGenerationOptions,
 ): void {
-  const { group, presentation } = section
+  const { group } = section
   layout.startSection({ section: 'Candidates at a glance', primary: section.label, secondary: 'All completed comparisons' })
-  writeTargetIdentity(layout, presentation, 17)
+  writeTargetIdentity(layout, section, 17)
   layout.heading('Candidates at a glance', 14)
   const completed = group.comparisons.filter(comparison => comparison.status === 'complete')
   layout.table(
@@ -160,14 +168,13 @@ function writeScorecard<Color>(layout: DocumentReportLayout<Color>, criteria: Re
   if (criteria.some(criterion => criterion.weightLabel.startsWith('~'))) {
     layout.paragraph('~ marks a weight rounded for display.', { size: 9.5, leading: 14, color: layout.colors.muted, after: 7 })
   }
-  layout.heading('Why these scores', 16)
-  for (const criterion of criteria) {
+  for (const [index, criterion] of criteria.entries()) {
     const state = criterion.evidenceStatus === 'partial' || criterion.evidenceStatus === 'missing'
       ? ` · ${evidenceStatusLabel(criterion.evidenceStatus)}` : ''
     const limitation = criterion.limitation && !criterion.explanation.includes(criterion.limitation) ? criterion.limitation : null
     const rationale = [criterion.explanation, limitation].filter(Boolean).join(' ')
     layout.explanation(`C${criterion.number} ${criterion.label} (${criterion.scoreLabel})${state}`, rationale,
-      criterion.sourceLabel ? `Source: ${criterion.sourceLabel}` : null)
+      criterion.sourceLabel ? `Source: ${criterion.sourceLabel}` : null, index === 0 ? 'Why these scores' : undefined)
   }
 }
 
@@ -175,7 +182,7 @@ function writeComparison<Color>(
   layout: DocumentReportLayout<Color>, report: AnalysisReport, section: TargetSection,
   comparison: RankedReportComparison, index: number, options?: ReportGenerationOptions,
 ): void {
-  const { group, presentation } = section
+  const { group } = section
   const name = readableCandidateName(comparison.candidate)
   const links = reportReviewLinks(report, comparison, options)
   const summary = candidateNarrativeText(comparison)
@@ -186,7 +193,12 @@ function writeComparison<Color>(
     secondary: `${section.label} · Featured candidate ${index + 1}`,
   })
   layout.paragraph(name, { size: 22, leading: 31, bold: true, after: 6, keepWithNext: 30, headingLevel: 2 })
-  writeTargetIdentity(layout, presentation, 12)
+  writeTargetIdentity(layout, section, 12)
+  if (comparison.candidate.displayName !== undefined) {
+    layout.paragraph(`Source-stated name: ${comparison.candidate.name ?? 'Not stated'}`, {
+      size: 9.5, leading: 14, color: layout.colors.muted, after: 7,
+    })
+  }
   layout.paragraph([
     comparison.candidate.role?.trim() ? compactReportText(comparison.candidate.role, 180) : null,
     compactReportText(comparison.candidate.sourceLabel, 200),

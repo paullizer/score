@@ -17,7 +17,7 @@ const key = '2d2a2db7-b3aa-4383-a6e1-90aab16992aa'
 const batchId = 'b7971149-c541-4fb5-a096-a40ecf8c2ed5'
 const timestamp = '2026-09-17T18:00:00.000Z'
 const hash = 'a'.repeat(64)
-let client, ui, createRoot, dom, root, current, requests
+let client, ui, createRoot, dom, root, current, requests, projected
 const originals = new Map()
 
 function json(body, status = 200) {
@@ -87,7 +87,7 @@ before(async () => {
     build({ stdin: { resolveDir: process.cwd(), loader: 'tsx', contents: `
       export * from './src/features/resumes/resumeImportUi';
       export { RealRequestScope } from './src/app/real-request-scope';
-      export { WorkspaceContext } from './src/app/workspace-context';
+      export { WorkspaceContext, useWorkspace } from './src/app/workspace-context';
       export { RealResumesBridge } from './src/app/RealResumesBridge';
       export { RealResumesContext, useRealResumes } from './src/app/real-resumes-context';
       export { DocumentViewer } from './src/components/documents/DocumentViewer';
@@ -105,7 +105,7 @@ before(async () => {
   ;[client, ui] = await Promise.all(['client', 'ui'].map((name) => import(pathToFileURL(join(output, `${name}.mjs`)).href)))
 })
 
-beforeEach(() => { requests = []; current = null })
+beforeEach(() => { requests = []; current = null; projected = null })
 afterEach(async () => {
   if (root) {
     await act(async () => root.unmount())
@@ -480,7 +480,7 @@ function markdownComparison(kind) {
   const criterion = { id: 'criterion-one', label: 'Documentation', weight: 100, description: 'Document engineering work.', guidance: 'Assess exact source evidence.', requirementType: 'required' }
   const rubric = { version: 2, criteria: [criterion] }
   const target = {
-    kind, summary: { label: 'Saved requirements', sublabel: 'Exact Markdown source' },
+    kind, summary: { id: `target-${kind}`, label: 'Saved requirements', sublabel: 'Exact Markdown source' },
     selection: kind === 'job' ? { kind, rubricVersion: 2, documentVersion: 3 } : { kind, grade: 9, version: 2 },
     requirementEvidence: [{ kind: 'criterion', criterionId: criterion.id, citations: [requirementCitation] }],
     ...(kind === 'job' ? { rubric, document: jobDocument, original: { contentType: 'text/markdown' } }
@@ -488,7 +488,9 @@ function markdownComparison(kind) {
         sourceSet: { id: 'frozen-set' }, seed: { document: jobDocument, source: { kind: 'markdown', originalContentType: 'text/markdown' } }, references: [] }),
   }
   return {
-    comparison: { id: `comparison-${kind}`, runId: 'run-one', status: 'complete' },
+    comparison: { id: `comparison-${kind}`, runId: 'run-one', status: 'complete',
+      resume: { summary: { name: saved.resume.name, role: saved.resume.role, sourceLabel: saved.resume.sourceLabel } },
+      target: { summary: target.summary } },
     resumeSnapshot: { resume: saved.resume, document: saved.document, extraction: saved.extraction },
     targetSnapshot: target,
     result: {
@@ -622,7 +624,7 @@ test('request scope fences stale reads and workspace lifetimes without cancellin
   assert.equal(scope.mutationCurrent(first), false)
 })
 
-function Probe() { current = ui.useRealResumes(); return React.createElement('span', null, current.phase) }
+function Probe() { current = ui.useRealResumes(); projected = ui.useWorkspace(); return React.createElement('span', null, current.phase) }
 const sample = { schemaVersion: 1, jobs: [], resumes: [], rubrics: [], documents: [], runs: [] }
 function tree(workspaceId, showProbe = true, role = 'owner', showDialog = false) {
   return React.createElement(ui.MemoryRouter, { future: { v7_startTransition: true, v7_relativeSplatPath: true } },
@@ -641,6 +643,37 @@ async function settle(predicate) {
   for (let index = 0; index < 30 && !predicate(); index++) await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)) })
   assert.equal(Boolean(predicate()), true, 'Expected asynchronous UI state was reached')
 }
+
+test('resume rename retains ready source details and never promotes a custom label to stated identity', async () => {
+  let record = detail()
+  const before = structuredClone(record)
+  const baseEtag = record.etag
+  globalThis.fetch = async (url, init) => {
+    requests.push({ url, init })
+    if (url === '/api/features') return json({ realResumeImports: true })
+    if (init.method === 'PATCH') {
+      assert.equal(init.headers.get('If-Match'), baseEtag)
+      record = { ...record, displayName: JSON.parse(init.body).displayName, etag: '"renamed"' }
+      return json({ resume: { ...record, document: undefined, profile: undefined, extraction: undefined } })
+    }
+    if (url.endsWith('/resumes')) return json({ resumes: [{ ...record, document: undefined, profile: undefined, extraction: undefined }] })
+    if (url.endsWith('/resumes/resume-one')) return json(record)
+    throw new Error(`Unexpected metadata dependency request: ${url}`)
+  }
+  await mount()
+  await settle(() => current?.phase === 'ready')
+  await act(async () => current.ensureDetail('resume-one'))
+  const document = current.detail('resume-one').value.document
+  await act(async () => projected.renameEntity({ kind: 'resume', id: 'resume-one' }, 'Reviewer label', baseEtag))
+  assert.equal(current.summaries[0].displayName, 'Reviewer label')
+  assert.equal(current.summaries[0].resume.name, null)
+  assert.equal(current.detail('resume-one').state, 'ready')
+  assert.equal(current.detail('resume-one').value.document, document)
+  assert.deepEqual(record.resume, before.resume)
+  assert.deepEqual(record.profile, before.profile)
+  assert.deepEqual(sample.resumes, [])
+  assert.equal(requests.filter(request => request.init.method === 'PATCH').length, 1)
+})
 
 test('provider retains independent accepted/unconfirmed uploads after dialog unmount and retries exact keys', async () => {
   const secondUpload = deferred()

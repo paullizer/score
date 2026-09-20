@@ -75,5 +75,5 @@ export interface DocumentReportLayout<Color> {
   links(links: readonly DocumentReportLink[]): void
   contentsEntry(entry: DocumentContentsEntry): void
   table(headers: string[], rows: DocumentTableCell[][], widths: number[]): void
-  explanation(label: string, text: string, source: string | null): void
+  explanation(label: string, text: string, source: string | null, sectionHeading?: string): void
 }

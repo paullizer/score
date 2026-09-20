@@ -26,6 +26,7 @@ import type {
 import type { Citation, Job, Rubric, SourceDocument } from './types'
 import type { LifecycleMetadata, LifecycleOperation } from './lifecycle'
 import type { RealAnalysisCandidateNarrativeSummary, RealAnalysisNarrativeRecord } from './analysis-narratives'
+import type { AnalysisDiagnosticCapture, AnalysisFailureDiagnosticReference } from './analysis-diagnostics'
 
 export type {
   RealAnalysisCandidateNarrativeRecord,
@@ -78,6 +79,7 @@ export interface RealAnalysisTargetSummaryBase {
   workspaceId: string
   dataKind: 'real'
   label: string
+  displayName?: string
   sublabel: string
   rubricId: string
   rubricVersion: number
@@ -110,6 +112,7 @@ export interface RealAnalysisResumeSummary {
   dataKind: 'real'
   selection: RealAnalysisResumeSelection
   name: string | null
+  displayName?: string
   role: string | null
   sourceLabel: string
   capturedAt: string
@@ -121,6 +124,7 @@ export interface FrozenRealResumeSnapshot {
   workspaceId: string
   dataKind: 'real'
   frozenAt: string
+  displayName?: string
   selection: RealAnalysisResumeSelection
   resume: RealResume & { status: 'ready' }
   source: RealResumeSource
@@ -264,6 +268,7 @@ export interface RealAnalysisRunRecord extends AnalysisEntityBase, AnalysisWorkS
   recordType: 'analysis-run'
   lifecycle?: LifecycleMetadata
   name: string
+  displayName?: string
   createdBy: string
   idempotencyKey: string
   inputFingerprint: string
@@ -415,6 +420,8 @@ export interface RealAnalysisComparisonRecord extends AnalysisEntityBase, Analys
   resultSummary?: RealAnalysisResultSummary
   completedAt?: string
   cancelledAt?: string
+  failureDiagnostic?: AnalysisFailureDiagnosticReference
+  diagnosticCapture?: AnalysisDiagnosticCapture
 }
 
 export interface RealAnalysisNarrativeRequestRecord extends AnalysisEntityBase, AnalysisWorkState {
@@ -511,7 +518,7 @@ export interface RetryRealAnalysisInput {
   comparisonIds?: string[]
 }
 
-// GET details are unwrapped; POST actions return a versioned summary in these wrappers.
+// GET details are unwrapped; mutations return a versioned summary in these wrappers.
 export interface RealAnalysisMutationResponse {
   run: RealAnalysisRunSummary
 }

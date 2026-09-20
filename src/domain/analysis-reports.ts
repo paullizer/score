@@ -101,6 +101,7 @@ export interface ReportTarget {
   dataKind: ReportDataKind
   kind: 'job' | 'grade'
   label: string
+  displayName?: string
   sublabel: string
   versionLabel: string
   rubricId: string
@@ -123,6 +124,7 @@ export interface RealReportTarget extends ReportTarget {
 export interface ReportCandidate {
   id: string
   name: string | null
+  displayName?: string
   role: string | null
   sourceLabel: string
   documentId: string

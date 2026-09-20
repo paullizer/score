@@ -7,7 +7,7 @@ import {
   type VersionedAnalysisEntity, type AnalysisResumeSnapshotReference, type AnalysisTargetSnapshotReference,
 } from '../../src/domain/real-analyses'
 import { conflict, invalidRequest, notFound, preconditionRequired } from '../errors'
-import { isUuid } from '../jobs/validation'
+import { isUuid, parseDisplayNameMetadata } from '../jobs/validation'
 import { WORKSPACE_ID_PATTERN } from '../ids'
 import { StoreConflictError, StoreNotFoundError } from '../store'
 import { assertWorkspaceMutationLease } from '../lifecycle/lease'
@@ -28,6 +28,7 @@ import { readAnalysisReportComparisons } from './reports'
 import { generateAnalysisSummaries, readAnalysisNarrativeInventory, readAnalysisSummaries } from './narratives'
 import type { GenerateRealAnalysisSummariesInput } from '../../src/domain/analysis-narratives'
 import { prepareAnalysisNarrativeTransitions } from './narrative-scheduling'
+import { readAnalysisFailureDiagnostics } from './diagnostics'
 import {
   advanceAnalysisRun, applyAnalysisComparisonTransition, cancelAnalysisComparisonRecord, loadAnalysisComparison,
   loadAnalysisRun, retryAnalysisComparisonRecord,
@@ -51,7 +52,8 @@ function requireScope(workspaceId: string, id?: string, kind: 'run' | 'compariso
 }
 function requireMatch(actual: string, expected: string): void {
   if (!expected) throw preconditionRequired('An If-Match header with the current analysis record ETag is required.')
-  if (typeof expected !== 'string' || expected === '*' || expected.length > 1024 || /[,\r\n]/.test(expected)) throw invalidRequest('If-Match must contain one exact ETag.')
+  if (typeof expected !== 'string' || expected.trim() !== expected || expected === '*' || expected.startsWith('W/') ||
+    expected.length > 1024 || /[,\r\n]/.test(expected)) throw invalidRequest('If-Match must contain one exact ETag.')
   if (actual !== expected) throw conflict('This analysis record changed. Reload before retrying the action.')
 }
 function changeError(error: unknown): never {
@@ -150,6 +152,7 @@ export class RealAnalysisService {
         resumes.push({
           snapshotId, blob: reference, summary: {
             workspaceId, dataKind: 'real', selection, name: snapshot.resume.name, role: snapshot.resume.role,
+            ...(snapshot.displayName !== undefined ? { displayName: snapshot.displayName } : {}),
             sourceLabel: snapshot.resume.sourceLabel, capturedAt: snapshot.capture.capturedAt,
           },
         })
@@ -250,6 +253,18 @@ export class RealAnalysisService {
     const manifest = await readAnalysisManifest(this.deps.blobs, value.record)
     return { ...summary, resumes: manifest.resumes.map(item => item.summary), targets: manifest.targets.map(item => item.summary) }
   }
+  async updateMetadata(workspaceId: string, runId: string, request: unknown, expected: string): Promise<RealAnalysisRunSummary> {
+    const { displayName } = parseDisplayNameMetadata(request)
+    const current = await this.run(workspaceId, runId)
+    await this.writable(workspaceId, current.record)
+    requireMatch(current.etag, expected)
+    const record: RealAnalysisRunRecord = {
+      ...current.record, displayName, updatedAt: [this.now(), current.record.updatedAt].sort().at(-1)!,
+    }
+    parseAnalysisEntity(record)
+    assertWorkspaceMutationLease(workspaceId)
+    try { return runSummary(await this.deps.store.replace(record, expected)) } catch (error) { changeError(error) }
+  }
   async comparisons(workspaceId: string, runId: string, continuationToken?: string, limit = 50): Promise<RealAnalysisComparisonsPage> {
     const run = await this.run(workspaceId, runId)
     validateAnalysisPage(limit, continuationToken)
@@ -279,6 +294,12 @@ export class RealAnalysisService {
   }
   generateSummaries(workspaceId: string, runId: string, input: GenerateRealAnalysisSummariesInput, requestId: string, expected: string, actor: string) {
     return generateAnalysisSummaries(this.deps, workspaceId, runId, input, requestId, expected, actor, this.clock)
+  }
+  async diagnostics(workspaceId: string, runId: string, comparisonId: string, continuationToken?: string) {
+    const [run, comparison] = await Promise.all([this.run(workspaceId, runId), this.comparison(workspaceId, runId, comparisonId)])
+    const page = await readAnalysisFailureDiagnostics(this.deps.blobs, run.record, comparison.record, continuationToken)
+    await this.run(workspaceId, runId)
+    return page
   }
   async reportComparisons(workspaceId: string, runId: string, comparisonIds: string[], signal?: AbortSignal) {
     comparisonIds = input(reportComparisonIdsSchema, comparisonIds)

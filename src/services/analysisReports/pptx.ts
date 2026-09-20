@@ -5,13 +5,14 @@ import type {
 } from '../../domain/analysis-reports'
 import { reportReviewLinks, validatedReportLinkContext } from './links'
 import { assertReportResourceLimits } from './model'
+import { getDisplayName } from '../../domain/displayNames'
 import {
   candidateNarrativeOverview, candidateNarrativeText, reportTargetPresentation,
   requireReportNarratives, targetNarrativeParagraphs,
 } from './narratives'
 import {
   assertXmlText, criterionScoreLabel, evidenceStatusLabel, formatReportWeight, overallScoreLabel,
-  REPORT_FONT_FAMILY, REPORT_PALETTE, REPORT_TITLE,
+  REPORT_FONT_FAMILY, REPORT_PALETTE, REPORT_TITLE, reportTitle,
 } from './presentation'
 import { readableAnalysisDate, readableCandidateName, readableCompletionNotice, selectKeyCriteria } from './readable'
 import type { ReadableCriterion } from './readable'
@@ -101,7 +102,9 @@ class ReportDeck {
     this.presentation.layout = 'LAYOUT_WIDE'
     this.presentation.author = 'Score'
     this.presentation.subject = 'Analysis evidence for human review'
-    this.presentation.title = REPORT_TITLE
+    const title = reportTitle(report)
+    assertXmlText(title)
+    this.presentation.title = title
     this.presentation.company = 'Score'
     this.presentation.theme = { headFontFace: REPORT_FONT_FAMILY, bodyFontFace: REPORT_FONT_FAMILY }
   }
@@ -171,6 +174,13 @@ function coverGraphic(slide: PptxGenJS.Slide, x: number, y: number, index: numbe
 function opening(deck: ReportDeck): void {
   const completed = deck.report.groups.flatMap(group => group.comparisons).filter(item => item.status === 'complete')
   const slide = deck.slide(REPORT_TITLE)
+  const name = deck.report.run.name
+  text(slide, fits(name, 6.5, 0.3, 11) ? name : 'View analysis title', {
+    x: 2.25, y: 0.615, w: 6.5, h: 0.3,
+  }, 11, {
+    color: C.muted, objectName: 'job-reference',
+    hyperlink: hyperlink(deck.links(deck.report.groups[0].comparisons[0]).analysis, name),
+  })
   text(slide, 'Saved evidence for an informed review.', { x: 0.6, y: 2.08, w: BODY_WIDTH, h: 0.5 }, 20, {
     color: C.muted, objectName: 'cover-introduction',
   })
@@ -201,6 +211,7 @@ interface AgendaEntry {
   group: ReportGroup
   index: number
   presentation: ReportTargetPresentation
+  title: string
   metadata: string
   height: number
   titleHeight: number
@@ -236,8 +247,9 @@ function reserveAgenda(deck: ReportDeck): AgendaPage[] {
   }
   deck.report.groups.forEach((group, index) => {
     const presentation = reportTargetPresentation(group.target)
+    const title = getDisplayName(group.target, presentation.title)
     const metadata = `${targetMetadata(presentation)} · ${group.counts.complete} reviewed`
-    const titleHeight = height(presentation.title, width, 20)
+    const titleHeight = height(title, width, 20)
     const organizationHeight = presentation.organization ? height(presentation.organization, width, 14) : 0
     const metadataHeight = height(metadata, width, 14)
     const entryHeight = 0.24 + titleHeight + (organizationHeight ? organizationHeight + 0.07 : 0) + metadataHeight + 0.1
@@ -246,7 +258,7 @@ function reserveAgenda(deck: ReportDeck): AgendaPage[] {
     }
     if (entries.length && used + 0.22 + entryHeight > capacity) flush()
     if (entries.length) used += 0.22
-    entries.push({ group, index, presentation, metadata, height: entryHeight, titleHeight, organizationHeight, metadataHeight })
+    entries.push({ group, index, presentation, title, metadata, height: entryHeight, titleHeight, organizationHeight, metadataHeight })
     used += entryHeight
   })
   flush()
@@ -270,7 +282,7 @@ function finishAgenda(deck: ReportDeck, pages: AgendaPage[], destinations: Reado
       })
       const x = 1.4, width = BODY_WIDTH - 1.38
       let rowY = y + 0.12
-      text(page.slide, entry.presentation.title, { x, y: rowY, w: width, h: entry.titleHeight }, 20, {
+      text(page.slide, entry.title, { x, y: rowY, w: width, h: entry.titleHeight }, 20, {
         bold: true, color: C.accent, hyperlink: internalLink(destination), objectName: `${name}-title`,
       })
       rowY += entry.titleHeight + 0.07
@@ -311,11 +323,12 @@ function targetLinks(
 
 function jobIntroduction(deck: ReportDeck, group: ReportGroup, index: number, contentsSlide: number): number {
   const presentation = reportTargetPresentation(group.target)
+  const title = getDisplayName(group.target, presentation.title)
   const key = `target-${index}`
   const reference = sectionReference(group, index)
   const slide = deck.slide('', `${reference} · About the ${group.target.kind}`)
   const destination = deck.slideCount
-  const titleHeight = height(presentation.title, BODY_WIDTH, 30)
+  const titleHeight = height(title, BODY_WIDTH, 30)
   const organizationHeight = presentation.organization ? height(presentation.organization, BODY_WIDTH, 20) : 0
   const metadata = targetMetadata(presentation)
   const metadataHeight = height(metadata, BODY_WIDTH, 14)
@@ -323,7 +336,7 @@ function jobIntroduction(deck: ReportDeck, group: ReportGroup, index: number, co
   if (identityBottom > CONTENT_BOTTOM) {
     throw new Error(`PowerPoint job identity cannot fit its full title and organization at a readable size. ${LIMIT_MESSAGE}`)
   }
-  text(slide, presentation.title, { x: 0.6, y: 1.12, w: BODY_WIDTH, h: titleHeight }, 30, {
+  text(slide, title, { x: 0.6, y: 1.12, w: BODY_WIDTH, h: titleHeight }, 30, {
     bold: true, objectName: `${key}-title`,
   })
   let y = 1.12 + titleHeight + 0.18
@@ -338,6 +351,9 @@ function jobIntroduction(deck: ReportDeck, group: ReportGroup, index: number, co
   })
   targetLinks(slide, deck, group, key, contentsSlide)
   const blocks: PptxFlowBlock[] = [
+    ...(group.target.displayName !== undefined ? [{
+      key: `${key}-source-title`, text: `Source target title: ${presentation.title}`, section: 'Job context',
+    }] : []),
     { key: `${key}-context-heading`, text: 'Job context', kind: 'heading', fontSize: 20, section: 'Job context' },
     { key: `${key}-description`,
       text: keepPptxParagraphEndWordsTogether(presentation.description, BODY_WIDTH, PPTX_LAYOUT.bodyFontSize), section: 'Job context' },
@@ -430,20 +446,28 @@ function resumeDocumentReference(comparison: ReportComparison): string {
   return `Resume v${comparison.candidate.documentVersion}`
 }
 
+function candidateTooltip(comparison: ReportComparison): string {
+  const name = readableCandidateName(comparison.candidate)
+  return comparison.candidate.displayName !== undefined
+    ? `${name} · Source-stated name: ${comparison.candidate.name ?? 'Not stated'} · Source: ${comparison.candidate.sourceLabel}`
+    : name
+}
+
 function overviewCandidateCell(
   comparison: ReportComparison, number: number, links: ReviewLinks, width: number, overviewSlide?: number,
 ): DeckCell {
   const name = readableCandidateName(comparison.candidate)
-  if (fits(name, width, 1.1, TABLE_FONT)) return { text: name, url: links.analysis, tooltip: name }
+  const tooltip = candidateTooltip(comparison)
+  if (fits(name, width, 1.1, TABLE_FONT)) return { text: name, url: links.analysis, tooltip }
   const label = `Candidate ${number}`
   const source = fits(`${label}\n${comparison.candidate.sourceLabel}\nView analysis`, width, 1.4, TABLE_FONT)
     ? comparison.candidate.sourceLabel : resumeDocumentReference(comparison)
   return {
     text: `${label}\n${source}\nView analysis`,
     runs: [
-      { text: `${label}\n`, options: { color: C.accent, hyperlink: overviewSlide ? internalLink(overviewSlide) : hyperlink(links.analysis, name) } },
+      { text: `${label}\n`, options: { color: C.accent, hyperlink: overviewSlide ? internalLink(overviewSlide) : hyperlink(links.analysis, tooltip) } },
       { text: `${source}\n`, options: { color: C.accent, hyperlink: hyperlink(links.resume, comparison.candidate.sourceLabel) } },
-      { text: 'View analysis', options: { color: C.accent, hyperlink: hyperlink(links.analysis, name) } },
+      { text: 'View analysis', options: { color: C.accent, hyperlink: hyperlink(links.analysis, tooltip) } },
     ],
   }
 }
@@ -636,7 +660,7 @@ function candidateLinks(
   slide: PptxGenJS.Slide, group: ReportGroup, comparison: ReportComparison, links: ReviewLinks, key: string, fullDetails: boolean,
 ): void {
   const items = [
-    { label: 'View analysis', url: links.analysis, x: 0.6, w: 2.1, tooltip: readableCandidateName(comparison.candidate) },
+    { label: 'View analysis', url: links.analysis, x: 0.6, w: 2.1, tooltip: candidateTooltip(comparison) },
     { label: 'View resume', url: links.resume, x: 2.9, w: 2.0,
       tooltip: [comparison.candidate.sourceLabel, comparison.candidate.role].filter(Boolean).join('\n') },
     { label: group.target.kind === 'grade' ? 'View grade requirements' : 'View job', url: links.target, x: 5.1, w: 3.3 },
@@ -654,6 +678,8 @@ interface CandidateLayout {
   roleHeight: number
   source: string
   sourceHeight: number
+  sourceName: string | null
+  sourceNameHeight: number
   summaryY: number
   narrativeFont: number
   separateNarrative: boolean
@@ -663,19 +689,23 @@ function candidateLayout(comparison: ReportComparison): CandidateLayout {
   const name = readableCandidateName(comparison.candidate)
   const role = comparison.candidate.role ? `Role: ${comparison.candidate.role}` : 'Role not recorded'
   const source = `Source: ${comparison.candidate.sourceLabel}`
+  const sourceName = comparison.candidate.displayName !== undefined ? `Source-stated name: ${comparison.candidate.name ?? 'Not stated'}` : null
   const metadataWidth = 8.55
   const roleLabel = fits(role, metadataWidth, 0.62, 15) ? role : 'View recorded role'
   const sourceLabel = fits(source, metadataWidth, 0.57, 14) ? source : `Source: ${resumeDocumentReference(comparison)}`
+  const sourceNameLabel = sourceName === null ? null : fits(sourceName, metadataWidth, 0.57, 14) ? sourceName : 'View source-stated name'
   const roleHeight = height(roleLabel, metadataWidth, 15), sourceHeight = height(sourceLabel, metadataWidth, 14)
+  const sourceNameHeight = sourceNameLabel === null ? 0 : height(sourceNameLabel, metadataWidth, 14)
   const narrative = candidateNarrativeText(comparison)
   for (const nameFont of [32, 28, 24, 22]) {
     const nameHeight = height(name, metadataWidth, nameFont)
     if (nameHeight > 1.45) continue
-    const summaryY = Math.max(3.02, 1.12 + nameHeight + 0.12 + roleHeight + 0.08 + sourceHeight + 0.28)
+    const summaryY = Math.max(3.02, 1.12 + nameHeight + 0.12 + roleHeight + 0.08 + sourceHeight +
+      (sourceNameHeight ? sourceNameHeight + 0.08 : 0) + 0.28)
     for (const narrativeFont of [16, 14]) {
       if (fits(narrative, BODY_WIDTH - 0.4, CONTENT_BOTTOM - summaryY - 0.71, narrativeFont)) {
         return { nameFont, nameHeight, role: roleLabel, roleHeight, source: sourceLabel, sourceHeight,
-          summaryY, narrativeFont, separateNarrative: false }
+          sourceName: sourceNameLabel, sourceNameHeight, summaryY, narrativeFont, separateNarrative: false }
       }
     }
   }
@@ -685,7 +715,8 @@ function candidateLayout(comparison: ReportComparison): CandidateLayout {
     throw new Error(`PowerPoint cannot preserve the full candidate name and saved assessment at readable sizes within three slides. ${LIMIT_MESSAGE}`)
   }
   return { nameFont, nameHeight: height(name, BODY_WIDTH, nameFont), role: roleLabel, roleHeight,
-    source: sourceLabel, sourceHeight, summaryY: 0, narrativeFont, separateNarrative: true }
+    source: sourceLabel, sourceHeight, sourceName: sourceNameLabel, sourceNameHeight,
+    summaryY: 0, narrativeFont, separateNarrative: true }
 }
 
 function scorePanel(slide: PptxGenJS.Slide, comparison: ReportComparison, key: string, wide = false): void {
@@ -725,8 +756,12 @@ function candidateOverview(
     { index: 0, value: layout.role, full: comparison.candidate.role ? `Role: ${comparison.candidate.role}` : 'Role not recorded',
       h: layout.roleHeight, font: 15, url: links.analysis },
     { index: 1, value: layout.source, full: `Source: ${comparison.candidate.sourceLabel}`, h: layout.sourceHeight, font: 14, url: links.resume },
+    ...(layout.sourceName === null ? [] : [{
+      index: 2, value: layout.sourceName, full: `Source-stated name: ${comparison.candidate.name ?? 'Not stated'}`,
+      h: layout.sourceNameHeight, font: 14, url: links.resume,
+    }]),
   ]
-  for (const item of layout.separateNarrative ? [metadata[1], metadata[0]] : metadata) {
+  for (const item of layout.separateNarrative ? [...metadata.slice(2), metadata[1], metadata[0]] : metadata) {
     if (layout.separateNarrative && y + item.h > 5.25) continue
     text(slide, item.value, { x: 0.6, y, w: 8.55, h: item.h }, item.font, {
       color: C.muted, objectName: `${key}-metadata-${item.index}`,

@@ -36,7 +36,8 @@ function recordId(req: Request, kind: 'run' | 'comparison'): string {
 function match(req: Request): string {
   const value = req.header('If-Match')
   if (!value) throw preconditionRequired('An If-Match header containing the current record ETag is required.')
-  if (value === '*' || value.length > 1024 || /[,\r\n]/.test(value)) throw invalidRequest('If-Match must contain one exact ETag.')
+  if (value.trim() !== value || value === '*' || value.startsWith('W/') ||
+    value.length > 1024 || /[,\r\n]/.test(value)) throw invalidRequest('If-Match must contain one exact ETag.')
   return value
 }
 function key(req: Request): string {
@@ -114,6 +115,13 @@ export function createRealAnalysesRouter(deps: RealAnalysesRouterDeps): Router {
     res.setHeader('ETag', detail.etag)
     res.json(detail)
   })
+  router.patch(`${base}/:runId/metadata`, mutate('write', async (req, res) => {
+    query(req, [])
+    if (!req.is('application/json')) throw invalidRequest('Content-Type must be application/json.')
+    const run = await requireService().updateMetadata(param(req, 'workspaceId'), recordId(req, 'run'), req.body, match(req))
+    res.setHeader('ETag', run.etag)
+    res.json({ run })
+  }))
   router.get(`${base}/:runId/lifecycle`, async (req, res) => {
     query(req, [])
     requireService()
@@ -176,6 +184,16 @@ export function createRealAnalysesRouter(deps: RealAnalysesRouterDeps): Router {
     const detail = await requireService().comparisonDetail(param(req, 'workspaceId'), recordId(req, 'run'), recordId(req, 'comparison'))
     res.setHeader('ETag', detail.etag)
     res.json(detail)
+  })
+  router.get(`${base}/:runId/comparisons/:comparisonId/diagnostics`, async (req, res) => {
+    query(req, ['continuationToken'])
+    const token = req.query.continuationToken
+    if (token !== undefined && (typeof token !== 'string' || !token || token.length > 16 * 1024)) {
+      throw invalidRequest('continuationToken must be a single valid diagnostic history token.')
+    }
+    res.json(await requireService().diagnostics(
+      param(req, 'workspaceId'), recordId(req, 'run'), recordId(req, 'comparison'), token,
+    ))
   })
   router.get(`${base}/:runId/comparisons/:comparisonId/documents/:documentId`, async (req, res) => {
     query(req, ['version'])

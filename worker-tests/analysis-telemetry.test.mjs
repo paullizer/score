@@ -5,6 +5,7 @@ import { loadWorker } from './shared-model-loader.mjs'
 const { analysisResponseRequestId, emitAnalysisTelemetry, logAnalysisTelemetry } = await loadWorker('../worker/analyses/telemetry.ts')
 const { createAnalysisEvidenceCatalog } = await loadWorker('../worker/analyses/evidence-passages.ts')
 const { analysisSelectionCitationDiagnostics } = await loadWorker('../worker/analyses/citation-diagnostics.ts')
+const { analysisSchemaDiagnostics } = await loadWorker('../worker/analyses/diagnostics.ts')
 
 function event() {
   return {
@@ -143,6 +144,54 @@ test('only bounded request ID formats are retained from upstream headers', () =>
   for (const value of ['PRIVATE-SENTINEL', 'secret@example', `req_${'a'.repeat(100)}`, '../private']) {
     assert.equal(analysisResponseRequestId(new Headers({ 'x-request-id': value })), undefined)
   }
+})
+
+test('semantic review telemetry retains only allowed reason codes and saved scopes, never reviewer prose or drafts', t => {
+  const lines = []
+  t.mock.method(console, 'log', line => lines.push(line))
+  logAnalysisTelemetry({
+    event: 'validation-failed', timestamp: '2026-09-19T12:00:00.000Z', stage: 'grounding',
+    code: 'grounding-failed', reason: 'grounding-disagreement', reviewOutcome: 'needs-correction',
+    reviewIssueCount: 2,
+    reviewIssues: [
+      { code: 'unsupported-score', criterionId: 'saved-criterion', message: 'PRIVATE-REVIEW-SENTINEL', citations: [{ quote: 'PRIVATE-QUOTE-SENTINEL' }] },
+      { code: 'PRIVATE-UNTRUSTED-CODE', message: 'PRIVATE-REVIEW-SENTINEL' },
+    ],
+    assessments: [{ rationale: 'PRIVATE-ASSESSMENT-SENTINEL' }],
+    review: { issues: [{ message: 'PRIVATE-REVIEW-SENTINEL' }] },
+  })
+  const logged = JSON.parse(lines[0])
+  assert.deepEqual(logged.reviewIssues, [{ code: 'unsupported-score', criterionId: 'saved-criterion' }])
+  assert.equal(logged.reviewIssueCount, 2)
+  assert.equal(logged.reason, 'grounding-disagreement')
+  assert.doesNotMatch(lines[0], /PRIVATE|assessments|"review":|"message":|"quote":/)
+})
+
+test('schema findings expose bounded field locations without raw parser messages, values or arbitrary keys', t => {
+  const findings = analysisSchemaDiagnostics(Array.from({ length: 40 }, () => ({
+    code: 'invalid_value', path: ['criteria', 2, 'score'],
+    message: 'PRIVATE-PARSER-SENTINEL', values: ['PRIVATE-VALUE-SENTINEL'],
+  })))
+  assert.equal(findings.findings.length, 32)
+  assert.equal(findings.omittedFindings, 8)
+  assert.deepEqual(findings.findings[0], { code: 'invalid_value', path: ['criteria', 2, 'score'] })
+  const lines = []
+  t.mock.method(console, 'log', line => lines.push(line))
+  logAnalysisTelemetry({
+    event: 'validation-failed', timestamp: '2026-09-19T12:00:00.000Z', stage: 'assessment',
+    reason: 'schema-mismatch',
+    schemaDiagnostics: {
+      findings: [{
+        code: 'PRIVATE-CODE-SENTINEL', path: ['criteria', 0, 'PRIVATE-FIELD-SENTINEL'],
+        message: 'PRIVATE-PARSER-SENTINEL', values: ['PRIVATE-VALUE-SENTINEL'],
+      }],
+      omittedFindings: 0,
+    },
+  })
+  assert.deepEqual(JSON.parse(lines[0]).schemaDiagnostics.findings, [{
+    code: 'custom', path: ['criteria', 0, 'unknown-field'],
+  }])
+  assert.doesNotMatch(lines[0], /PRIVATE|"message":|"values":/)
 })
 
 test('a failed diagnostic sink is reported without exposing its exception or changing assessment behavior', t => {

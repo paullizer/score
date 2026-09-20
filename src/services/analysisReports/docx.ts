@@ -10,7 +10,7 @@ import type { IContext, IParagraphOptions, IRunOptions, IStylesOptions, IXmlable
 import { REPORT_LIMITS } from '../../domain/analysis-reports'
 import type { AnalysisReport, ReportGenerationOptions } from '../../domain/analysis-reports'
 import {
-  assertReportXmlText, REPORT_FONT_FAMILY, REPORT_HUMAN_REVIEW_NOTICE, REPORT_PALETTE, REPORT_TITLE,
+  assertReportXmlText, REPORT_FONT_FAMILY, REPORT_HUMAN_REVIEW_NOTICE, REPORT_PALETTE, reportTitle,
 } from './presentation'
 import { assertReportResourceLimits } from './model'
 import { requireReportNarratives } from './narratives'
@@ -307,7 +307,8 @@ class WordReportLayout implements DocumentReportLayout<string> {
     }))
   }
 
-  explanation(label: string, value: string, source: string | null): void {
+  explanation(label: string, value: string, source: string | null, sectionHeading?: string): void {
+    if (sectionHeading) this.heading(sectionHeading, 16)
     this.paragraph(label, { size: 10, leading: 15, bold: true, before: 5, after: 4, keepWithNext: 30 })
     this.paragraph(value, { size: 10, leading: 15, after: source ? 3 : 8, ...(source ? { keepWithNext: 14 } : {}) })
     if (source) this.paragraph(source, { size: 9.5, leading: 14, color: palette.muted, after: 8 })
@@ -364,7 +365,7 @@ class WordReportLayout implements DocumentReportLayout<string> {
       children: [new TextRun({ children: ['Page ', PageNumber.CURRENT, ' of ', PageNumber.TOTAL_PAGES], size: 17, color: palette.muted })],
     })] })
     const document = new Document({
-      creator: 'Score', lastModifiedBy: 'Score', title: REPORT_TITLE,
+      creator: 'Score', lastModifiedBy: 'Score', title: reportTitle(this.report),
       subject: 'Analysis evidence for human review', description: REPORT_HUMAN_REVIEW_NOTICE,
       styles, features: { updateFields: true }, fonts: this.fonts.embedded,
       numbering: { config: [{ reference: 'review-notes', levels: [{

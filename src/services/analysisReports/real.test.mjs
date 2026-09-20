@@ -139,6 +139,18 @@ function regenerate(body) {
   return body
 }
 
+function addDisplayLabels(f) {
+  f.detail.run.displayName = 'Renamed saved run'
+  for (const target of f.detail.targets) target.displayName = `Display ${target.id}`
+  for (const resume of f.detail.resumes) resume.displayName = `Display ${resume.selection.resumeId}`
+  for (const { comparison } of f.inventory) {
+    comparison.resume.summary.displayName = `Display ${comparison.resume.summary.selection.resumeId}`
+    comparison.target.summary.displayName = `Display ${comparison.target.summary.id}`
+  }
+  for (const target of f.report.targets) target.displayName = `Display ${target.id}`
+  for (const comparison of f.report.comparisons) comparison.candidate.displayName = `Display ${comparison.candidate.id}`
+}
+
 before(async () => {
   await mkdir(output)
   await build({
@@ -160,6 +172,36 @@ after(async () => {
     else delete globalThis[name]
   }
   await rm(output, { recursive: true, force: true })
+})
+
+test('real exports use the current run title and exact captured labels without replacing source identities', async () => {
+  const f = fixture()
+  addDisplayLabels(f)
+  serve(f)
+  const report = await load(f)
+  assert.equal(report.run.name, 'Renamed saved run')
+  for (const group of report.groups) {
+    const original = f.report.targets.find(target => target.id === group.target.id)
+    assert.equal(group.target.displayName, original.displayName)
+    assert.equal(group.target.label, original.label)
+    for (const comparison of group.comparisons) {
+      const source = f.report.comparisons.find(item => item.id === comparison.id)
+      assert.equal(comparison.candidate.displayName, source.candidate.displayName)
+      assert.equal(comparison.candidate.name, source.candidate.name)
+      assert.deepEqual(comparison.overall, source.overall)
+    }
+  }
+})
+
+test('real exports reject display labels that differ from the captured analysis summaries', async () => {
+  const f = fixture()
+  addDisplayLabels(f)
+  serve(f, { report: ids => {
+    const payload = batch(f, ids)
+    payload.comparisons[0].candidate.displayName = 'Different live label'
+    return json(payload)
+  } })
+  await assert.rejects(load(f), /candidate differs from the captured/)
 })
 
 test('500 comparisons consume the complete inventory and bounded concurrent 25-ID batches, without new-run feature gates or persistence', async () => {

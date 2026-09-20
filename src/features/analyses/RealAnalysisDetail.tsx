@@ -9,7 +9,7 @@ import { Badge, Button, EmptyState, InlineError, PageHeader, Score, SearchField 
 import { SortableHeader, TableSortSelect } from '../../components/ui/TableSorting'
 import type { TableSort } from '../../domain/tableSorting'
 import { RealAnalysisStatus } from './RealAnalysesPage'
-import { realAnalysisCancellationPaused, realAnalysisCancellationPending, realAnalysisLink, targetIdentity, targetVersionLabel } from './realAnalysisUi'
+import { analysisDiagnosticNotice, analysisFailureStages, currentAnalysisDiagnostic, realAnalysisCancellationPaused, realAnalysisCancellationPending, realAnalysisLink, targetIdentity, targetVersionLabel } from './realAnalysisUi'
 import {
   distinctTargetLabels, realComparisonSortOptions, realComparisonTargetLabel, selectRealComparisons, targetScoreSortExplanation, type RealComparisonSortKey,
 } from './analysisTableBrowsing'
@@ -18,6 +18,8 @@ import { AnalysisReportExport } from './AnalysisReportExport'
 import { ManageAnalysisSummaries, RealTargetNarrative } from './AnalysisSummaries'
 import { ArchivedBadge, EntityLifecycleActions, LifecycleBanner } from '../../components/lifecycle/LifecycleControls'
 import { useLifecycleAccess } from '../../components/lifecycle/useLifecycleAccess'
+import { getDisplayName } from '../../domain/displayNames'
+import { RenameEntityButton, RenameEntityProvider } from '../../components/ui/RenameEntityButton'
 
 export function RealComparisonValue({ summary }: { summary: RealAnalysisComparisonSummary }) {
   const { comparison } = summary
@@ -85,7 +87,7 @@ function RealRunActions({ summary }: { summary: RealAnalysisRunSummary }) {
 
 export function RealAnalysisDetail({ id }: { id: string }) {
   const api = useRealAnalyses()
-  return <RealAnalysisView key={`${api?.workspaceId ?? 'unavailable'}:${id}`} id={id} />
+  return <RenameEntityProvider key={`${api?.workspaceId ?? 'unavailable'}:${id}`}><RealAnalysisView id={id} /></RenameEntityProvider>
 }
 
 function RealAnalysisView({ id }: { id: string }) {
@@ -150,8 +152,8 @@ function RealAnalysisView({ id }: { id: string }) {
     setParams(next)
   }
   return <>{back}
-    <PageHeader eyebrow="REAL EVIDENCE · FROZEN INPUTS" title={run.name} description="Review each saved resume/target pair independently. Completion, coverage, and overall-score availability are separate."
-      actions={<><EntityLifecycleActions target={{ kind: 'analysis', id }} name={run.name} onComplete={(action) => { if (action === 'delete') navigate('/analyses?data=real') }} /><RealRunActions summary={summary} />
+    <PageHeader eyebrow="REAL EVIDENCE · FROZEN INPUTS" title={getDisplayName(run, run.name)} description="Review each saved resume/target pair independently. Completion, coverage, and overall-score availability are separate."
+      actions={<><RenameEntityButton target={{ kind: 'analysis', id }} name={getDisplayName(run, run.name)} etag={summary.etag} disabled={!api.canWrite || api.phase !== 'ready' || !summary.etag || api.pending(id)} /><EntityLifecycleActions target={{ kind: 'analysis', id }} name={getDisplayName(run, run.name)} onComplete={(action) => { if (action === 'delete') navigate('/analyses?data=real') }} /><RealRunActions summary={summary} />
         <Button ref={summaryTrigger} onClick={() => setSummaryScope({ targetId: viewedTarget?.id })}>Manage summaries</Button><AnalysisReportExport source={{
         kind: 'real', workspaceId: api.workspaceId, detail: { ...detail, ...summary },
         comparisons: pairs?.state === 'ready' ? pairs.value : null, available: api.phase === 'ready',
@@ -188,15 +190,19 @@ function RealAnalysisView({ id }: { id: string }) {
           const comparison = pair.comparison
           const resume = comparison.resume.summary
           const target = comparison.target.summary
-          return <tr key={comparison.id}><td className="min-w-[180px]"><button className="row-title text-left" onClick={() => openPair(comparison.id)}>{resume.name ?? 'Name not stated'}</button>
+          return <tr key={comparison.id}><td className="min-w-[180px]"><button className="row-title text-left" onClick={() => openPair(comparison.id)}>{getDisplayName(resume, resume.name?.trim() || 'Name not stated')}</button>
+            {resume.displayName && <p className="row-meta">Source name: {resume.name?.trim() || 'Name not stated'}</p>}
             <p className="row-meta">{resume.role ?? 'Role not stated'}</p><p className="row-meta break-all">{resume.sourceLabel}</p><p className="row-meta">Document v{resume.selection.documentVersion}</p></td>
-            <td className="min-w-[210px]"><strong className="block text-[12px]">{target.label}</strong><p className="row-meta">{target.sublabel}</p><div className="mt-2"><Badge>{targetVersionLabel(target.selection)}</Badge></div>
+            <td className="min-w-[210px]"><strong className="block text-[12px]">{getDisplayName(target, target.label)}</strong>{target.displayName && <p className="row-meta">Source title: {target.label}</p>}<p className="row-meta">{target.sublabel}</p><div className="mt-2"><Badge>{targetVersionLabel(target.selection)}</Badge></div>
               {target.kind === 'grade' && target.newerDraftAvailable && <p className="row-meta">An unapproved newer draft was not used.</p>}</td>
             <td><RealComparisonValue summary={pair} />{comparison.error && <p className="mt-2 max-w-xs text-[11px] text-[var(--cp-danger)]">{comparison.error.code}: {comparison.error.message}</p>}
+              {comparison.error && <p className="row-meta">Stage: {analysisFailureStages[comparison.error.stage]}</p>}
+              {analysisDiagnosticNotice(comparison) && <p className="row-meta max-w-xs">{analysisDiagnosticNotice(comparison)}</p>}
+              {comparison.status === 'failed' && currentAnalysisDiagnostic(comparison) && <p className="row-meta max-w-xs">Open the saved pair for private validation reasons and the original sources.</p>}
               {comparison.nextAttemptAt && <p className="row-meta">Automatic retry {dateLabel(comparison.nextAttemptAt)}</p>}<p className="row-meta">Attempt {comparison.attempts} · manual retries {comparison.retryCount}</p></td>
             <td><div className="space-y-3"><div><Badge dot tone={comparison.status === 'complete' ? 'success' : ['failed', 'cancelled'].includes(comparison.status) ? 'warning' : 'neutral'}>
               {{ queued: 'Queued', running: 'Running', complete: 'Complete', failed: 'Failed', cancelled: 'Cancelled' }[comparison.status]}</Badge></div>
-              <Button size="sm" variant="ghost" icon={ArrowUpRight} aria-label={`Review comparison ${comparison.index + 1}: ${resume.name ?? 'Name not stated'} against ${target.label}`}
+              <Button size="sm" variant="ghost" icon={ArrowUpRight} aria-label={`Review comparison ${comparison.index + 1}: ${getDisplayName(resume, resume.name?.trim() || 'Name not stated')} against ${getDisplayName(target, target.label)}`}
               onClick={() => openPair(comparison.id)}>Review saved pair</Button><RealComparisonActions summary={pair} /></div></td>
           </tr>
         })}</tbody>

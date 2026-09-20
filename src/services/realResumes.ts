@@ -11,6 +11,7 @@ import { cloudJsonRequest, cloudLifecycleRequest } from './cloudWorkspace'
 import type { LifecycleAction, LifecycleImpact, LifecycleOperation } from '../domain/lifecycle'
 import { UPLOAD_CONTENT_TYPES, type UploadFormat } from '../domain/document-formats'
 import { requireUploadFile, uploadFileByteLimit } from './documentUploads'
+import { normalizeDisplayName } from '../domain/displayNames'
 
 const uuid = /^[\da-f]{8}-[\da-f]{4}-[\da-f]{4}-[\da-f]{4}-[\da-f]{12}$/i
 
@@ -141,6 +142,17 @@ export function retryRealResume(workspaceId: string, resumeId: string, etag: str
 
 export function cancelRealResume(workspaceId: string, resumeId: string, etag: string): Promise<RealResumeSummary> {
   return action(workspaceId, resumeId, 'cancel', etag)
+}
+
+export async function renameRealResume(workspaceId: string, resumeId: string, name: string, etag: string): Promise<RealResumeSummary> {
+  const displayName = normalizeDisplayName(name)
+  if (!etag) throw new Error('Reload the resume before editing its display label.')
+  const result = await cloudJsonRequest<ResumeMutationResponse>(`${base(workspaceId, resumeId)}/metadata`, {
+    method: 'PATCH', headers: { 'If-Match': etag }, body: JSON.stringify({ displayName }),
+  })
+  const summary = checked(result.resume, workspaceId)
+  if (summary.resume.id !== resumeId || summary.displayName !== displayName) throw new Error('The service did not acknowledge the requested resume label. Reload before trying again.')
+  return summary
 }
 
 export function realResumeOriginalUrl(workspaceId: string, resumeId: string): string {

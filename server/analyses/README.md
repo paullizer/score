@@ -62,10 +62,12 @@ All paths below have prefix `/api/workspaces/:workspaceId/analyses`:
 | `GET /` | `RealAnalysesPage` |
 | `POST /` | HTTP 202, `{run: RealAnalysisRunSummary}` |
 | `GET /:runId` | Unwrapped `RealAnalysisRunDetail` |
+| `PATCH /:runId/metadata` with `{displayName: string}` | `{run: RealAnalysisRunSummary}` and ETag header |
 | `GET /:runId/lifecycle` | `{impact: LifecycleImpact}` |
 | `POST /:runId/lifecycle` with `{action: "archive" \| "unarchive" \| "delete"}` | `{analysis: RealAnalysisDetail}` or `{deleted: true}`; HTTP 202 `{operation, etag?, analysis?}` while incomplete |
 | `GET /:runId/comparisons` | `RealAnalysisComparisonsPage` |
 | `GET /:runId/comparisons/:comparisonId` | Unwrapped `RealAnalysisComparisonDetail` |
+| `GET /:runId/comparisons/:comparisonId/diagnostics?continuationToken=...` | `RealAnalysisDiagnosticsPage`; at most one private failed-attempt artifact per page |
 | `GET /:runId/comparisons/:comparisonId/documents/:documentId?version=N` | `RealAnalysisDocumentResponse` |
 | `GET /:runId/summaries` with optional `targetId` query | `RealAnalysisSummariesResponse`, including selected-scope ETag, status, published narratives, and report capture pins |
 | `POST /:runId/summaries` with `{mode: "missing" \| "all", targetId?}` | `RealAnalysisSummariesMutationResponse` with durable request ID, scheduled counts, and summary state |
@@ -84,6 +86,10 @@ only IDs/versions in the comparison; callers cannot supply blob names.
 If independently imported sources reuse the same document ID/version, document
 lookup returns HTTP 409 rather than selecting a different source by array order.
 Comparison detail retains both originals for source-kind-aware inline inspection.
+Diagnostic history accepts only its optional continuation token, not `limit` or
+caller-supplied blob paths. Tokens and artifact references are bound to the exact
+workspace, run, and comparison. Viewer roles may read the same private evidence
+as other workspace members; outsiders and unauthenticated callers cannot.
 A GS seed and its verified normalized reference remain one captured source.
 For run/comparison cancellation and comparison retry, send an empty JSON object
 `{}` or a genuinely bodyless request. Bodyless run retry is equivalent to `{}`.
@@ -169,6 +175,40 @@ before enabling workers that write narrative records. Historical source/results
 remain unchanged, and older analyses are not backfilled by reading them. Retain
 compatible readers on rollback once narrative history exists; no additional
 storage resource or broader worker identity grant is required.
+
+## Display names
+
+Metadata PATCH accepts only a JSON object with `displayName`, requires the exact
+current run `If-Match`, and rejects extra body/query fields. Names are trimmed,
+must contain 1–160 JavaScript string characters after trimming, and cannot
+contain control characters or line separators. Missing ETags return 428; wildcard,
+weak, or multiple ETags are invalid, and stale ETags return 409. Workspace
+membership, CSRF, mutation leases, and active workspace/run checks match other
+ordinary writes; archived or removing records cannot be renamed.
+
+The optional top-level `displayName` is a cosmetic override. A successful write
+changes only that field and `updatedAt`: it does not retry/cancel model work or
+rewrite progress, comparisons, results, citations, private failure diagnostics,
+or evidence. The original
+`name` remains immutable and must still equal `manifest.request.name`.
+Existing analysis history can be renamed without live job/resume/grade services.
+
+New analyses capture optional source aliases in resume and target summaries.
+Frozen resume snapshots carry the captured alias separately from the canonical
+resume/profile; target snapshots keep it in `summary.displayName`, while
+`summary.label` remains the original job title or approved rubric name. Snapshot
+hashes and summary bindings include this metadata. Later source renames never
+update old comparisons, manifests, or reports, including records with no alias.
+Aliases are not supplied to assessment or grounding models. Worker initialization,
+leases, retries, progress, and conditional result publication preserve the latest
+run alias.
+
+Saved-summary selectors use captured target aliases without changing exact-target
+scope or regenerating evidence. PDF, Word, and PowerPoint carry the current run
+title and captured candidate/target aliases while retaining source-stated candidate
+names and the canonical frozen job title, separately from the organization.
+Aliases do not restore legacy combined job/organization headings or replace saved
+narrative text. PDF and Word continue to share the same report content.
 
 ## Frozen evidence and recovery
 
@@ -263,6 +303,45 @@ failed/cancelled comparisons and preserves successful original evidence. Bulk
 retry uses bounded transactions; a concurrent change can stop later chunks while
 retaining the already-retried subset. Reloading exposes the exact remaining work.
 
+### Private failed-attempt diagnostics
+
+`src/domain/analysis-diagnostics.ts` defines the versioned artifact contract and
+the privacy-safe telemetry vocabulary. Each failed worker attempt can save
+`workspace/run/diagnostics/comparison/attempt-uuid.json` through the existing
+lifecycle-fenced immutable Blob writer. Artifacts bind the attempt, manifest,
+resume and target snapshot hashes, pipeline version, error category and stage,
+correction/processing counts, safe schema/citation findings, and at most 64 safe
+events. They retain up to three validated assessment checkpoints with their
+actual independent reviews, assessment hashes, source hashes, and model-call
+provenance. Invalid raw model output and arbitrary validation messages are never
+stored. Reviewer prose and canonical citations stay in the private artifact,
+not operational logs or inline Cosmos records.
+
+An optional `failureDiagnostic` field holds only the newest immutable reference;
+each artifact's optional `previous` reference links the prior captured attempt.
+The optional `diagnosticCapture` field distinguishes `saved` from `unavailable`
+for a particular attempt. A write/read-back failure preserves the original
+processing error and any older diagnostic head, and emits the safe
+`diagnostic-write-failed` event. Ambiguous successful uploads reuse verified
+winning bytes instead of repeating inference. Cancellation or ownership loss
+cannot publish a late reference. Retry and subsequent completion preserve the
+history without changing frozen inputs or completed result scores.
+
+`readAnalysisFailureDiagnostics` in `diagnostics.ts` verifies the reference, stored
+byte digest and length, scoped identities, source bindings, assessment hashes,
+review scopes, and canonical citations before returning one artifact. History
+is never embedded in comparison-list responses. Deleting/deleted runs cannot
+expose it. Legacy records without a diagnostic reference return empty history:
+absence means details were not captured, not that a resume was empty or that a
+missing skill caused the failure. Private drafts do not qualify as completed
+results, limited assessments, or report scores.
+
+Deploy compatible API/UI readers before workers that write these optional
+fields. Any rollback must retain diagnostic-compatible readers, including the
+worker's record parser. The existing two-correction budget, strict validation,
+independent review, completion semantics, and source permissions are unchanged.
+Production deployment and controlled retries need separate operational approval.
+
 ## Library lifecycle and dependencies
 
 `library-lifecycle.ts` owns archive/delete administration. The existing
@@ -302,7 +381,7 @@ all retained real runs; an analysis target has no dependent-run blockers.
 
 Delete durably saves the dependency bindings before removing evidence, fences the
 run, and drains cancellation and Blob writers. It deletes comparisons and all
-owned snapshots/manifests/copied evidence/results using exact ETags and validated
+owned snapshots/manifests/copied evidence/results/diagnostics using exact ETags and validated
 private prefixes. Cleanup follows empty continuation pages and restarts scans
 after deletes so shifting page offsets cannot skip artifacts. All phases are
 resumable. Until completion, list/detail responses retain recovery metadata but
@@ -422,6 +501,9 @@ analysisHash(value: unknown): string // Canonical content hash, including assess
 analysisAssessmentHash(assessment: RealAnalysisAssessmentOutput): string
 analysisBytesHash(bytes: Uint8Array): string // Actual stored Blob byte digest.
 analysisResultBlobName(workspaceId, runId, comparisonId, attemptId): string
+analysisDiagnosticBlobName(workspaceId, runId, comparisonId, attemptId): string
+parseAnalysisFailureDiagnostic(value: unknown): AnalysisFailureDiagnostic
+assertAnalysisFailureDiagnosticBinding(diagnostic, run, comparison, snapshots?): void
 ```
 
 Results are stored at `workspace/run/results/comparison/attempt-uuid.json`.
@@ -494,7 +576,7 @@ those private families as well as published runs, retaining terminal fences.
 Focused validation (independently bundles its own entry point):
 
 ```powershell
-node --test server-tests\real-analyses.test.mjs server-tests\real-analyses-lifecycle.test.mjs server-tests\real-analyses-azure-store.test.mjs server-tests\real-analyses-model-boundary.test.mjs worker-tests\analysis-runtime.test.mjs worker-tests\analysis-evidence-passages.test.mjs
+node --test server-tests\real-analyses.test.mjs server-tests\real-analyses-lifecycle.test.mjs server-tests\real-analyses-azure-store.test.mjs server-tests\real-analyses-model-boundary.test.mjs server-tests\analysis-diagnostics.test.mjs worker-tests\analysis-runtime.test.mjs worker-tests\analysis-evidence-passages.test.mjs worker-tests\analysis-telemetry.test.mjs
 npx tsc --project tsconfig.server.json --noEmit
 npx eslint server\analyses server-tests\real-analyses*.mjs --quiet
 ```

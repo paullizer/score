@@ -2,7 +2,7 @@ import type {
   AnalysisReport, ReportCandidate, ReportComparison, ReportEvidenceStatus, ReportGroup,
   ReportStatusCounts, ReportTarget,
 } from '../../domain/analysis-reports'
-import { criterionScoreLabel, formatReportWeight } from './presentation'
+import { criterionScoreLabel, formatReportWeight, targetName } from './presentation'
 
 const graphemeSegmenter = new Intl.Segmenter('en', { granularity: 'grapheme' })
 const sentenceSegmenter = new Intl.Segmenter('en', { granularity: 'sentence' })
@@ -75,17 +75,31 @@ function conciseEvidence(value: string, maxCharacters: number, maxSentences = 2)
   return selected.join(' ')
 }
 
-export function readableCandidateName(candidate: ReportCandidate): string {
+export function readableCandidateSourceName(candidate: ReportCandidate): string {
   return candidate.name?.trim() ? plain(candidate.name) : plain(candidate.sourceLabel) || 'Name not recorded'
 }
 
-export function readableTargetLabel(report: AnalysisReport, group: ReportGroup): string {
-  const label = plain(group.target.label)
-  const matches = report.groups.filter(item => plain(item.target.label).toLocaleLowerCase('en') === label.toLocaleLowerCase('en'))
+export function readableCandidateName(candidate: ReportCandidate): string {
+  return candidate.displayName === undefined ? readableCandidateSourceName(candidate) : plain(candidate.displayName)
+}
+
+function disambiguatedTargetLabel(
+  report: AnalysisReport, group: ReportGroup, name: (target: ReportTarget) => string,
+): string {
+  const label = plain(name(group.target))
+  const matches = report.groups.filter(item => plain(name(item.target)).toLocaleLowerCase('en') === label.toLocaleLowerCase('en'))
   if (matches.length < 2) return label
   const sublabel = plain(group.target.sublabel)
   if (sublabel && matches.filter(item => plain(item.target.sublabel) === sublabel).length === 1) return `${label} - ${sublabel}`
   return `${label} (${group.target.kind === 'grade' ? 'Grade' : 'Job'} ${matches.findIndex(item => item.target.id === group.target.id) + 1})`
+}
+
+export function readableTargetLabel(report: AnalysisReport, group: ReportGroup): string {
+  return disambiguatedTargetLabel(report, group, targetName)
+}
+
+export function readableTargetSourceLabel(report: AnalysisReport, group: ReportGroup): string {
+  return disambiguatedTargetLabel(report, group, target => target.label)
 }
 
 export function readableJobFacts(target: ReportTarget, maxFacts = 4): string[] {

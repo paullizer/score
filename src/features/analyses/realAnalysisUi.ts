@@ -1,6 +1,8 @@
 import type {
-  RealAnalysisResumeSelection, RealAnalysisRunDetail, RealAnalysisRunSummary, RealAnalysisTargetSelection, RealAnalysisTargetSummary,
+  AnalysisProcessingError, RealAnalysisComparisonRecord, RealAnalysisResumeSelection,
+  RealAnalysisRunDetail, RealAnalysisRunSummary, RealAnalysisTargetSelection, RealAnalysisTargetSummary,
 } from '../../domain/real-analyses'
+import type { AnalysisDiagnosticReason } from '../../domain/analysis-diagnostics'
 import type { RealResumeSummary } from '../../domain/real-resumes'
 import { analysisCancellationNeedsRetry } from '../../domain/real-analyses'
 import type { Citation, SourceDocument, Workspace } from '../../domain/types'
@@ -8,6 +10,7 @@ import type { ReferenceDocument } from '../../domain/real-grades'
 import { gradeHeadId } from '../../domain/real-grades'
 import { isEntityArchived, isEntityRemoved, type LifecycleTarget } from '../../domain/lifecycle'
 import { readyRealResume, resumeName } from '../resumes/resumeImportUi'
+import { getDisplayName } from '../../domain/displayNames'
 
 export interface SelectedRealResume {
   id: string
@@ -22,6 +25,106 @@ export interface SelectedRealTarget {
   selection: RealAnalysisTargetSelection | null
   summary?: RealAnalysisTargetSummary
   issue?: string
+}
+
+export const analysisFailureStages: Record<AnalysisProcessingError['stage'], string> = {
+  initialization: 'Preparing frozen inputs',
+  assessment: 'Draft assessment validation',
+  grounding: 'Independent grounding review',
+  publication: 'Publishing the result',
+}
+
+export const analysisDiagnosticReasons: Record<AnalysisDiagnosticReason, string> = {
+  'input-contract': 'The saved input did not satisfy the processing contract.',
+  'source-limit': 'A saved source exceeded the processing size limit.',
+  'context-budget': 'The complete input exceeded the model context budget; it was not silently truncated.',
+  'response-size': 'The model response exceeded the allowed response size.',
+  'completion-token-limit': 'The model reached its output-token limit before completing the response.',
+  'model-refusal': 'The model declined to produce the requested response.',
+  'content-filter': 'The request or model response was stopped by a content filter.',
+  'invalid-envelope': 'The service response did not contain the required model-response structure.',
+  'incomplete-response': 'The model did not finish the required response.',
+  'invalid-model-identity': 'The returned model identity could not be validated.',
+  'invalid-json': 'The model response was not valid structured JSON.',
+  'schema-mismatch': 'The model response did not satisfy the required schema.',
+  'citation-mismatch': 'An evidence reference could not be resolved exactly against the frozen source.',
+  'assessment-contract': 'The draft did not satisfy the assessment rules.',
+  'policy-language': 'The draft included a judgment that the assessment policy does not permit.',
+  'grounding-disagreement': 'The independent review did not substantiate the draft assessment.',
+}
+
+export function analysisFailureExplanation(error: AnalysisProcessingError): { title: string; explanation: string; nextAction: string } {
+  switch (error.code) {
+    case 'invalid-citation': return {
+      title: 'AI evidence references did not validate',
+      explanation: 'A generated quotation or passage reference did not match the frozen source exactly. Readable source text is not proof that the AI draft passed validation.',
+      nextAction: 'Inspect the saved sources and any recorded citation or review reasons. An explicit saved-pair retry must pass the same strict evidence checks.',
+    }
+    case 'grounding-failed': return {
+      title: 'AI review did not accept the draft assessment',
+      explanation: 'The independent grounding review could not substantiate the draft. This is a processing failure, not a finding that the person lacks a skill.',
+      nextAction: 'Compare the private review reasons with the exact saved resume and requirements. Retry the saved pair only after reviewing the failure; changing inputs requires a new analysis.',
+    }
+    case 'invalid-model-output': return {
+      title: 'The AI response did not satisfy the assessment rules',
+      explanation: 'The model did not return an acceptable assessment or review. Required response, evidence, and policy checks must pass before a result can be published.',
+      nextAction: 'Inspect the recorded validation reason and source text. An explicit saved-pair retry uses unchanged inputs and must pass all checks.',
+    }
+    case 'context-limit': return {
+      title: 'Analysis exceeded a processing limit',
+      explanation: 'The source or response could not be processed within the allowed budget. No partial response is presented as a completed assessment.',
+      nextAction: 'Review the recorded limit and frozen sources. If the input must change, prepare a new analysis rather than expecting a retry to change the saved input.',
+    }
+    case 'invalid-input':
+    case 'stale-input':
+    case 'snapshot-invalid':
+    case 'snapshot-unavailable': return {
+      title: 'The frozen input could not be validated or opened',
+      explanation: 'Processing could not verify all required saved inputs. Available source viewers below do not substitute a live document for a missing or invalid snapshot.',
+      nextAction: 'Reload the saved comparison and inspect the available sources. Ask a workspace administrator to investigate snapshot availability before retrying; use a new analysis for changed inputs.',
+    }
+    case 'service-unavailable':
+    case 'timeout': return {
+      title: error.code === 'timeout' ? 'Processing did not finish in time' : 'A processing service was unavailable',
+      explanation: 'The service could not finish this attempt. A transport or availability failure says nothing about the evidence match.',
+      nextAction: 'Check the saved retry state. If automatic work has stopped, an explicit saved-pair retry can try again when the service is available.',
+    }
+    case 'storage-error': return {
+      title: 'Processing could not save or retrieve required data',
+      explanation: 'A storage operation failed. Even a readable draft is not a published assessment or a score.',
+      nextAction: 'Reload the saved state and have a workspace administrator check storage availability before explicitly retrying the saved pair.',
+    }
+    case 'internal-error': return {
+      title: 'An unexpected processing error stopped this attempt',
+      explanation: 'The attempt did not produce an accepted result. No candidate judgment can be inferred from this error.',
+      nextAction: 'Inspect the saved stage and attempt ID, and ask a workspace administrator to investigate before retrying.',
+    }
+  }
+}
+
+export function currentAnalysisDiagnostic(comparison: RealAnalysisComparisonRecord): boolean {
+  return Boolean((comparison.error || comparison.status === 'failed') && comparison.attemptId
+    && comparison.failureDiagnostic?.attemptId === comparison.attemptId)
+}
+
+export function analysisDiagnosticNotice(comparison: RealAnalysisComparisonRecord): string | null {
+  const currentCapture = (comparison.error || comparison.status === 'failed') && comparison.attemptId
+    && comparison.diagnosticCapture?.attemptId === comparison.attemptId
+    ? comparison.diagnosticCapture : undefined
+  if (currentCapture?.status === 'unavailable') {
+    return 'Diagnostic details are unavailable for this attempt because they could not be saved. The processing failure is unchanged; an older saved diagnostic is not a substitute.'
+  }
+  if (currentCapture?.status === 'saved' && !currentAnalysisDiagnostic(comparison)) {
+    return 'The saved diagnostic reference for this attempt is unavailable. Reload the saved comparison to review its details.'
+  }
+  if ((comparison.error || comparison.status === 'failed') && !currentAnalysisDiagnostic(comparison)) {
+    return `Details were not recorded for this attempt.${comparison.diagnosticCapture?.status === 'unavailable'
+      ? ' Diagnostic details could not be saved for an earlier attempt either.' : ''}`
+  }
+  if (comparison.diagnosticCapture?.status === 'unavailable') {
+    return 'Diagnostic details could not be saved for an earlier attempt. This does not change the current comparison state.'
+  }
+  return null
 }
 
 export function realAnalysisCancellationPending(summary: RealAnalysisRunSummary): boolean {
@@ -243,8 +346,8 @@ export function initialRealSelections(
   const exactResumes = parseSelections(params.get('resumeSelections'), isRealResumeSelection, 'resume', errors)
   const exactTargets = parseSelections(params.get('targetSelections'), isRealTargetSelection, 'target', errors)
   if (previous) {
-    chosenResumes.push(...previous.resumes.map((item) => ({ id: item.selection.resumeId, label: item.name || 'Name not stated', selection: item.selection })))
-    chosenTargets.push(...previous.targets.map((item) => ({ id: targetIdentity(item.selection), label: item.label, selection: item.selection, summary: item })))
+    chosenResumes.push(...previous.resumes.map((item) => ({ id: item.selection.resumeId, label: getDisplayName(item, item.name?.trim() || 'Name not stated'), selection: item.selection })))
+    chosenTargets.push(...previous.targets.map((item) => ({ id: targetIdentity(item.selection), label: getDisplayName(item, item.label), selection: item.selection, summary: item })))
     if (['resumes', 'rubrics', 'jobs', 'job', 'targets', 'ladder', 'resumeSelections', 'targetSelections'].some((key) => params.has(key))) {
       errors.push('This link combines a previous run with additional inputs. Start a new selection or use only the saved run inputs; nothing will be silently ignored.')
     }
@@ -261,14 +364,14 @@ export function initialRealSelections(
     }
     for (const selection of exactTargets) {
       const current = targets.find((item) => targetIdentity(item.selection) === targetIdentity(selection))
-      chosenTargets.push({ id: targetIdentity(selection), label: current?.label ?? 'Requested target', selection, summary: current })
+      chosenTargets.push({ id: targetIdentity(selection), label: current ? getDisplayName(current, current.label) : 'Requested target', selection, summary: current })
     }
     function choose(matches: RealAnalysisTargetSummary[], requested: string) {
       if (matches.length !== 1) {
         chosenTargets.push({ id: `requested:${requested}`, label: requested, selection: null, issue: `${requested} is missing, ambiguous, a sample, or not an eligible real target. An exact saved job or approved GS version is required.` })
       } else {
         const current = matches[0]
-        chosenTargets.push({ id: targetIdentity(current.selection), label: current.label, selection: current.selection, summary: current })
+        chosenTargets.push({ id: targetIdentity(current.selection), label: getDisplayName(current, current.label), selection: current.selection, summary: current })
       }
     }
     for (const id of ids(params.get('targets'))) choose(targets.filter((target) => target.id === id), `Target ${id}`)
@@ -284,7 +387,7 @@ export function initialRealSelections(
       const matches = targets.filter((target) => target.kind === 'grade' && target.selection.ladderId === params.get('ladder')
         && (!params.has('grade') || String(target.selection.grade) === params.get('grade'))
         && (!params.has('version') || target.selection.versionId === params.get('version') || String(target.selection.version) === params.get('version')))
-      if (matches.length) for (const target of matches) choose([target], target.label)
+      if (matches.length) for (const target of matches) choose([target], getDisplayName(target, target.label))
       else choose([], `Approved GS target in ladder ${params.get('ladder')}`)
     }
   }

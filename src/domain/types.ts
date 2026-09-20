@@ -53,6 +53,7 @@ export interface Rubric {
 export interface Job {
   id: string
   title: string
+  displayName?: string
   organization: string
   location: string
   arrangement: string
@@ -75,6 +76,7 @@ export interface Job {
 export interface Resume {
   id: string
   name: string
+  displayName?: string
   role: string
   location: string
   initials: string
@@ -107,6 +109,7 @@ export interface AnalysisTarget {
   id: string
   kind: 'job' | 'grade'
   label: string
+  displayName?: string
   sublabel: string
   rubric: Rubric
   job?: Job
@@ -132,6 +135,7 @@ export interface Comparison {
 export interface AnalysisRun {
   id: string
   name: string
+  displayName?: string
   createdAt: string
   targets: AnalysisTarget[]
   resumes: ResumeSnapshot[]

@@ -1,6 +1,7 @@
 import { z } from 'zod'
 import {
   ANALYSIS_LIMITS,
+  type AnalysisModelProvenance,
   type AnalysisProcessingFeatures,
   type CreateRealAnalysisInput,
   type RealAnalysesPage,
@@ -22,8 +23,14 @@ import {
   type GenerateRealAnalysisSummariesInput, type RealAnalysisSummariesMutationResponse,
   type RealAnalysisSummariesQuery, type RealAnalysisSummariesResponse,
 } from '../domain/analysis-narratives'
+import {
+  ANALYSIS_DIAGNOSTIC_LIMITS, ANALYSIS_DIAGNOSTIC_REASONS,
+  type AnalysisFailureDiagnostic, type RealAnalysisDiagnosticsPage,
+} from '../domain/analysis-diagnostics'
+import type { Citation } from '../domain/types'
 import { cloudJsonRequest, cloudLifecycleRequest } from './cloudWorkspace'
 import type { LifecycleAction, LifecycleImpact, LifecycleOperation } from '../domain/lifecycle'
+import { normalizeDisplayName } from '../domain/displayNames'
 
 function base(workspaceId: string, runId?: string): string {
   const path = `/workspaces/${encodeURIComponent(workspaceId)}/analyses`
@@ -302,6 +309,95 @@ export async function getRealAnalysisDocument(workspaceId: string, runId: string
   return result.document
 }
 
+function diagnosticText(value: unknown): value is string { return typeof value === 'string' && value.length > 0 }
+function diagnosticCount(value: unknown): value is number { return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 }
+function diagnosticHash(value: unknown): boolean { return typeof value === 'string' && /^[\da-f]{64}$/i.test(value) }
+function diagnosticCursor(value: unknown): value is string { return diagnosticText(value) && value.length <= 16 * 1024 }
+
+function diagnosticProvenance(value: AnalysisModelProvenance): boolean {
+  return Boolean(value && diagnosticText(value.model) && diagnosticText(value.deployment) && diagnosticText(value.promptVersion)
+    && diagnosticText(value.schemaVersion) && diagnosticText(value.startedAt) && diagnosticText(value.completedAt)
+    && diagnosticCount(value.inputCharacters))
+}
+
+function diagnosticCitations(values: Citation[]): boolean {
+  return Array.isArray(values) && values.every((value) => value && diagnosticText(value.documentId)
+    && diagnosticCount(value.documentVersion) && value.documentVersion > 0 && diagnosticText(value.paragraphId)
+    && diagnosticCount(value.page) && value.page > 0 && typeof value.heading === 'string' && diagnosticText(value.quote))
+}
+
+function checkedDiagnostic(value: AnalysisFailureDiagnostic, workspaceId: string, runId: string, comparisonId: string) {
+  if (!value || value.schemaVersion !== 1 || value.dataKind !== 'real' || value.workspaceId !== workspaceId
+    || value.runId !== runId || value.comparisonId !== comparisonId || !diagnosticText(value.attemptId)
+    || !diagnosticText(value.createdAt) || !diagnosticText(value.pipelineVersion) || !diagnosticHash(value.manifestSha256)
+    || !diagnosticText(value.resumeSnapshot?.snapshotId) || !diagnosticHash(value.resumeSnapshot?.sha256)
+    || !diagnosticText(value.targetSnapshot?.snapshotId) || !diagnosticHash(value.targetSnapshot?.sha256)) {
+    throw new Error('The diagnostic service did not return an exact saved attempt for this workspace, run, and comparison.')
+  }
+  if (!diagnosticCount(value.processingAttempt) || value.processingAttempt < 1 || !diagnosticCount(value.retryCount)
+    || !diagnosticCount(value.correctionCount) || value.correctionCount > ANALYSIS_LIMITS.maxOutputCorrections
+    || !value.error || !['initialization', 'assessment', 'grounding', 'publication'].includes(value.error.stage)
+    || !['invalid-input', 'stale-input', 'snapshot-unavailable', 'snapshot-invalid', 'context-limit', 'invalid-model-output',
+      'invalid-citation', 'grounding-failed', 'service-unavailable', 'storage-error', 'timeout', 'internal-error'].includes(value.error.code)
+    || !diagnosticText(value.error.message) || typeof value.error.retryable !== 'boolean'
+    || (value.reason !== undefined && !ANALYSIS_DIAGNOSTIC_REASONS.includes(value.reason))
+    || !Array.isArray(value.events) || value.events.length > ANALYSIS_DIAGNOSTIC_LIMITS.maxEvents || !diagnosticCount(value.omittedEvents)
+    || !Array.isArray(value.assessments) || value.assessments.length > ANALYSIS_LIMITS.maxOutputCorrections + 1
+    || value.assessments.some((cycle) => !cycle || !diagnosticText(cycle.modelCallId) || !diagnosticHash(cycle.assessmentSha256)
+      || !diagnosticCount(cycle.correctionCount) || cycle.correctionCount > value.correctionCount || !diagnosticProvenance(cycle.provenance)
+      || !cycle.assessment || typeof cycle.assessment.summary !== 'string'
+      || !Array.isArray(cycle.assessment.criteria) || !Array.isArray(cycle.assessment.qualifications)
+      || !Array.isArray(cycle.assessment.limitations) || cycle.assessment.limitations.some((item) => !item || !diagnosticText(item.message))
+      || cycle.assessment.criteria.some((item) => !item || !diagnosticText(item.criterionId) || !diagnosticText(item.rationale))
+      || cycle.assessment.qualifications.some((item) => !item || !diagnosticText(item.qualificationId) || !diagnosticText(item.rationale))
+      || (cycle.review !== undefined && (!cycle.review || !diagnosticText(cycle.review.id) || !diagnosticProvenance(cycle.review.provenance)
+        || cycle.review.assessmentSha256 !== cycle.assessmentSha256 || cycle.review.resumeSnapshotSha256 !== value.resumeSnapshot.sha256
+        || cycle.review.targetSnapshotSha256 !== value.targetSnapshot.sha256
+        || !['supported', 'needs-correction', 'unsupported'].includes(cycle.review.outcome)
+        || !Array.isArray(cycle.review.issues)
+        || cycle.review.issues.some((issue) => !issue || !diagnosticText(issue.code) || !diagnosticText(issue.message)
+          || (issue.criterionId !== undefined && !diagnosticText(issue.criterionId))
+          || (issue.qualificationId !== undefined && !diagnosticText(issue.qualificationId))
+          || !diagnosticCitations(issue.citations)))))) {
+    throw new Error('The diagnostic service returned an invalid or unbounded saved diagnostic. No draft was shown.')
+  }
+  const citations = value.citationDiagnostics
+  const schema = value.schemaDiagnostics
+  if ((citations && (!Array.isArray(citations.findings) || citations.findings.length > ANALYSIS_DIAGNOSTIC_LIMITS.maxFindings
+    || !diagnosticCount(citations.omittedFindings) || citations.findings.some((finding) => !finding || !diagnosticText(finding.reason)
+      || (finding.criterionId !== undefined && !diagnosticText(finding.criterionId))
+      || (finding.qualificationId !== undefined && !diagnosticText(finding.qualificationId))
+      || (finding.paragraphId !== undefined && !diagnosticText(finding.paragraphId))
+      || (finding.passageId !== undefined && !diagnosticCount(finding.passageId))
+      || (finding.citationIndex !== undefined && !diagnosticCount(finding.citationIndex)))))
+    || (schema && (!Array.isArray(schema.findings) || schema.findings.length > ANALYSIS_DIAGNOSTIC_LIMITS.maxFindings
+      || !diagnosticCount(schema.omittedFindings) || schema.findings.some((finding) => !finding || !diagnosticText(finding.code)
+        || !Array.isArray(finding.path) || finding.path.length > ANALYSIS_DIAGNOSTIC_LIMITS.maxPathSegments
+        || finding.path.some((segment) => !diagnosticText(segment) && !diagnosticCount(segment)))))) {
+    throw new Error('The diagnostic service returned malformed validation findings. No diagnostic was shown.')
+  }
+}
+
+export async function getRealAnalysisDiagnostics(
+  workspaceId: string, runId: string, comparisonId: string, continuationToken?: string, signal?: AbortSignal,
+): Promise<RealAnalysisDiagnosticsPage> {
+  signal?.throwIfAborted()
+  if (![workspaceId, runId, comparisonId].every(diagnosticText)) throw new Error('An exact workspace, run, and comparison are required to open private diagnostics.')
+  if (continuationToken !== undefined && !diagnosticCursor(continuationToken)) throw new Error('The saved diagnostic continuation is invalid. Reopen the latest attempt.')
+  const query = continuationToken === undefined ? '' : `?continuationToken=${encodeURIComponent(continuationToken)}`
+  const page = await cloudJsonRequest<RealAnalysisDiagnosticsPage>(`${pairs(workspaceId, runId, comparisonId)}/diagnostics${query}`, { method: 'GET', signal })
+  signal?.throwIfAborted()
+  if (!page || !Array.isArray(page.attempts) || page.attempts.length > 1
+    || (page.continuationToken !== undefined && (!diagnosticCursor(page.continuationToken) || page.attempts.length !== 1))) {
+    throw new Error('The diagnostic service returned an invalid history page. Only one saved attempt may be loaded at a time.')
+  }
+  if (page.continuationToken !== undefined && page.continuationToken === continuationToken) {
+    throw new Error('The diagnostic service returned a repeated continuation token. Reopen the latest attempt.')
+  }
+  for (const attempt of page.attempts) checkedDiagnostic(attempt, workspaceId, runId, comparisonId)
+  return page
+}
+
 export async function createRealAnalysis(workspaceId: string, input: CreateRealAnalysisInput, key: string): Promise<RealAnalysisRunSummary> {
   if (!/^[\da-f]{8}-[\da-f]{4}-[\da-f]{4}-[\da-f]{4}-[\da-f]{12}$/i.test(key)) throw new Error('A stable UUID idempotency key is required for an analysis.')
   if (!input.resumes.length || !input.targets.length) throw new Error('Select at least one ready real resume and one eligible real target.')
@@ -345,6 +441,17 @@ export async function retryRealAnalysis(workspaceId: string, runId: string, inpu
     method: 'POST', headers: concurrency(etag), body: JSON.stringify(input),
   })
   return checkedRun(result.run, workspaceId)
+}
+
+export async function renameRealAnalysis(workspaceId: string, runId: string, name: string, etag: string): Promise<RealAnalysisRunSummary> {
+  const displayName = normalizeDisplayName(name)
+  if (!etag) throw new Error('Reload the analysis before editing its name.')
+  const result = await cloudJsonRequest<RealAnalysisMutationResponse>(`${base(workspaceId, runId)}/metadata`, {
+    method: 'PATCH', headers: concurrency(etag), body: JSON.stringify({ displayName }),
+  })
+  const summary = checkedRun(result.run, workspaceId)
+  if (summary.run.id !== runId || summary.run.displayName !== displayName) throw new Error('The service did not acknowledge the requested analysis name. Reload before trying again.')
+  return summary
 }
 
 export async function cancelRealAnalysis(workspaceId: string, runId: string, etag: string): Promise<RealAnalysisRunSummary> {

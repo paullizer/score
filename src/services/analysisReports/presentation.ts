@@ -5,6 +5,7 @@ import type {
   ReportGroup, ReportOverallScore, ReportStatusCounts, ReportTarget,
 } from '../../domain/analysis-reports'
 import type { DocumentPagination } from '../../domain/document-formats'
+import { getDisplayName } from '../../domain/displayNames'
 
 export const REPORT_TITLE = 'Analysis evidence report'
 export const REPORT_HUMAN_REVIEW_NOTICE = 'Highest evidence matches are not hiring recommendations or official GS eligibility findings. A qualified reviewer must inspect the evidence and limitations.'
@@ -58,8 +59,16 @@ export function unavailableOverallScore(status: Exclude<ReportComparisonStatus, 
   return { status: 'unavailable', score: null, reason: 'not-complete', message: `${comparisonStatusLabel(status)}; no completed assessment was captured.` }
 }
 
-export function candidateName(candidate: ReportCandidate): string {
+export function candidateSourceName(candidate: ReportCandidate): string {
   return candidate.name?.trim() ? candidate.name : `Unnamed candidate (${candidate.id})`
+}
+
+export function candidateName(candidate: ReportCandidate): string {
+  return getDisplayName(candidate, candidateSourceName(candidate))
+}
+
+export function targetName(target: ReportTarget): string {
+  return getDisplayName(target, target.label)
 }
 
 export function paginationLabel(pagination: DocumentPagination, page: number): string {
@@ -149,7 +158,9 @@ export function buildComparisonDetailBlocks(target: ReportTarget, comparison: Re
   const cite = (label: string, citations: ReportCitation[]) => {
     for (const citation of citations) add(`${label}: “${citation.quote}”\n${citation.locator}`, 'citation')
   }
-  add(`${candidateName(comparison.candidate)} — ${target.label}`, 'heading')
+  add(`${candidateName(comparison.candidate)} — ${targetName(target)}`, 'heading')
+  if (comparison.candidate.displayName) add(`Source-stated name: ${comparison.candidate.name ?? 'Not stated'}`)
+  if (target.displayName) add(`Source target title: ${target.label}`)
   add(`Candidate ID: ${comparison.candidate.id}\nRole: ${comparison.candidate.role ?? 'Not recorded'}\nComparison ID: ${comparison.id}`)
   add(`Target: ${target.id}\n${target.kind === 'grade' ? 'Grade' : 'Job'} · ${target.sublabel}\n${target.versionLabel}\nRubric: ${target.rubricId} · version ${target.rubricVersion}`)
   add(`Resume: ${comparison.candidate.sourceLabel}\nDocument: ${comparison.candidate.documentId} · version ${comparison.candidate.documentVersion}`)

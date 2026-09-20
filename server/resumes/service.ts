@@ -12,6 +12,7 @@ import { conflict, HttpError, invalidRequest, notFound, unavailable } from '../e
 import { WORKSPACE_ID_PATTERN } from '../ids'
 import { StoreConflictError, StoreNotFoundError } from '../store'
 import { assertWorkspaceMutationLease } from '../lifecycle/lease'
+import { parseDisplayNameMetadata } from '../jobs/validation'
 import { originalExtension, UPLOAD_CONTENT_TYPES, uploadFormatFromFilename, type UploadContentType, type UploadFormat } from '../../src/domain/document-formats'
 import { validateWordUpload } from '../documents/upload'
 import type { RealResumesDeps, ResumeBlob, ResumeTransaction } from './store'
@@ -85,6 +86,7 @@ function jsonReference(name: string, blob: ResumeBlob): ImmutableJsonBlobReferen
 function summary(value: VersionedResumeEntity<RealResumeRecord>): RealResumeSummary {
   const { record, etag } = value
   return {
+    ...(record.displayName !== undefined ? { displayName: record.displayName } : {}),
     ...(record.lifecycle ? { lifecycle: record.lifecycle } : {}),
     resume: record.resume, workspaceId: record.workspaceId, source: record.source, capture: record.capture ?? null,
     documentRef: record.extraction?.document ?? null, etag, updatedAt: record.updatedAt, attempts: record.attempts,
@@ -162,6 +164,7 @@ export class RealResumeService {
       } : {}),
     }
     if (removed) {
+      delete result.displayName
       delete result.error
       delete result.nextAttemptAt
     }
@@ -554,6 +557,17 @@ export class RealResumeService {
       if (error instanceof StoreConflictError || error instanceof StoreNotFoundError) throw conflict('This resume changed since you last loaded it. Reload before retrying the action.')
       throw error
     }
+  }
+
+  async updateMetadata(workspaceId: string, resumeId: string, request: unknown, expectedEtag: string): Promise<RealResumeSummary> {
+    const { displayName } = parseDisplayNameMetadata(request)
+    if (!validEtag(expectedEtag)) throw invalidRequest('If-Match must contain one exact resume ETag.')
+    const current = await this.getResume(workspaceId, resumeId)
+    await this.writable(workspaceId, resumeId)
+    if (current.etag !== expectedEtag) throw conflict('This resume changed since you last loaded it.')
+    return this.replace(current, {
+      ...current.record, displayName, updatedAt: [this.now(), current.record.updatedAt].sort().at(-1)!,
+    })
   }
 
   async retry(workspaceId: string, resumeId: string, expectedEtag: string): Promise<RealResumeSummary> {

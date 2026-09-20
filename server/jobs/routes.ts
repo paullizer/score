@@ -22,6 +22,7 @@ import {
   isValidJobId,
   isUuid,
   originalBlobName,
+  parseDisplayNameMetadata,
   validateRealJobRecord,
   validateRealRubric,
   validateRealSourceDocument,
@@ -205,7 +206,7 @@ function requireJobs(jobs: RealJobsDeps | undefined): RealJobsDeps {
 function requireEtag(req: Request): string {
   const etag = req.header('if-match')
   if (!etag) throw preconditionRequired()
-  if (etag === '*' || etag.startsWith('W/') || etag.includes(',')) {
+  if (etag.trim() !== etag || etag === '*' || etag.startsWith('W/') || /[,\r\n]/.test(etag) || etag.length > 1024) {
     throw invalidRequest('If-Match must be exactly the current job etag.')
   }
   return etag
@@ -225,6 +226,7 @@ async function requireMutableWorkspace(store: RealJobStore, workspaceId: string)
 
 function summaryMetadata(value: VersionedRealJob, rubric: Rubric | null = null): RealJobSummary {
   return {
+    ...(value.record.displayName !== undefined ? { displayName: value.record.displayName } : {}),
     job: value.record.job,
     source: value.record.source,
     rubric,
@@ -354,6 +356,35 @@ export function createRealJobsRouter(deps: RealJobsRouterDeps): Router {
     const jobs = requireJobs(deps.jobs)
     res.json(await detail(jobs, await jobs.store.get(pathParam(req, 'workspaceId'), jobParam(req))))
   }))
+
+  router.patch(`${base}/:jobId/metadata`, authorize(deps.repository, 'write'), available(deps.jobs),
+    (req, _res, next) => {
+      try {
+        jobParam(req); requireEtag(req)
+        if (Object.keys(req.query).length) throw invalidRequest('Metadata requests do not accept query parameters.')
+        if (!req.is('application/json')) throw invalidRequest('Content-Type must be application/json.')
+        next()
+      } catch (error) { next(error) }
+    },
+    express.json({ limit: '4kb', inflate: false }),
+    mutation('write', async (req, res) => {
+      const { displayName } = parseDisplayNameMetadata(req.body)
+      const jobs = requireJobs(deps.jobs)
+      const workspaceId = pathParam(req, 'workspaceId')
+      const current = await jobs.store.get(workspaceId, jobParam(req))
+      if (!current) throw notFound('The requested job was not found.')
+      await requireMutableWorkspace(jobs.store, workspaceId)
+      assertJobWritable(current.record)
+      const expected = requireEtag(req)
+      if (current.etag !== expected) throw conflict('This job changed since you last loaded it.')
+      const record: RealJobRecord = {
+        ...current.record, displayName, updatedAt: [clock().toISOString(), current.record.updatedAt].sort().at(-1)!,
+      }
+      const job = await summary(jobs.store, await replaceOrConflict(jobs.store, record, expected))
+      res.setHeader('ETag', job.etag)
+      res.json({ job })
+    }),
+  )
 
   router.get(`${base}/:jobId/lifecycle`, authorize(deps.repository, 'manage'), asyncHandler(async (req, res) => {
     const jobs = requireJobs(deps.jobs)

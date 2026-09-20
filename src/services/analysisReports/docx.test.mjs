@@ -181,6 +181,27 @@ test('Word and PDF emit the same completed report content, saved summaries, sect
   assert.ok(![...word.entries.keys()].some(name => /(^word\/media\/|embeddings\/)/.test(name)), 'Pages must be editable, not screenshots')
 })
 
+test('Word and PDF display labels retain canonical source identities and identical report content', async () => {
+  const input = readablePdfFixture({ scores: [92.75], criterionCount: 2 })
+  input.run.name = 'Renamed analysis'
+  input.targets[0].displayName = 'Custom target'
+  input.targets[0].label = 'LEGACY-COMPOSITE TITLE - OFFICE MUST NOT BE USED'
+  input.comparisons[0].candidate.displayName = 'Custom candidate'
+  const report = foundation.buildAnalysisReport(input)
+  const word = await generate(report)
+  const pdf = await readPdf(await writer.generatePdfReport(report, options))
+  assert.equal(normalizedBody(textContent(word.document)), normalizedBody(pdf.body))
+  const title = all(word.parts.get('docProps/core.xml'), 'dc:title')[0].children.join('')
+  assert.equal(title, foundation.reportTitle(report))
+  for (const value of ['Renamed analysis', 'Custom target', 'Custom candidate',
+    `Source-stated name: ${input.comparisons[0].candidate.name}`,
+    `Source target title: ${input.targets[0].presentation.title}`, input.targets[0].presentation.organization]) {
+    containsText(word.document, value)
+  }
+  assert.doesNotMatch(textContent(word.document), /LEGACY-COMPOSITE/)
+  containsText(reviewSections(word)[0], input.comparisons[0].narrative.text)
+})
+
 test('duplicate target titles keep distinct native bookmarks, linked contents and live page references', async () => {
   const input = readablePdfFixture({ scores: [90], targetCount: 3, criterionCount: 1 })
   for (const target of input.targets) {
@@ -525,9 +546,19 @@ test('browser bundle emits genuine editable OOXML and embedded fonts without Nod
 })
 
 test('matching fictional Word and PDF fixtures support native local layout review', async () => {
+  const aliases = fictionalPdfQaFixture()
+  aliases.run.name = 'Fictional research shortlisting review'
+  aliases.targets[0].displayName = 'Survey methods vacancy'
+  aliases.comparisons[0].candidate.displayName = 'Research applicant A'
+  const longAliases = fictionalPdfQaFixture()
+  longAliases.run.name = `${'Fictional research analysis '.repeat(7).slice(0, 159)}Z`
+  longAliases.targets[0].displayName = `${'Captured survey research vacancy '.repeat(6).slice(0, 159)}Z`
+  longAliases.comparisons[0].candidate.displayName = `${'Captured research applicant '.repeat(7).slice(0, 159)}Z`
+  longAliases.comparisons[0].candidate.name = null
   const fixtures = [
     ['ordinary', fictionalPdfQaFixture()], ['long', fictionalPdfQaFixture('long')], ['large', fictionalPdfQaFixture('large')],
     ['multi', fictionalPdfNavigationQaFixture()], ['long-metadata', fictionalPdfNavigationQaFixture('long-metadata')],
+    ['aliases', aliases], ['long-aliases', longAliases],
   ]
   for (const [name, input] of fixtures) {
     const report = reportFor(fictionalSampleInput(input))
@@ -535,6 +566,15 @@ test('matching fictional Word and PDF fixtures support native local layout revie
     const word = await generate(report, generationOptions)
     containsText(word.document, foundation.REPORT_SAMPLE_NOTICE)
     assert.equal(reviewSections(word).length, report.groups.reduce((sum, group) => sum + group.highlightedComparisonIds.length, 0))
+    if (input.targets[0].displayName !== undefined) {
+      for (const text of [input.run.name, input.targets[0].displayName, input.comparisons[0].candidate.displayName,
+        `Source-stated name: ${input.comparisons[0].candidate.name ?? 'Not stated'}`,
+        `Source target title: ${input.targets[0].presentation.title}`]) containsText(word.document, text)
+      const pdf = await readPdf(await writer.generatePdfReport(report, generationOptions))
+      const content = text => normalizedBody(text).replaceAll('CriterionWeightScore', '').replaceAll('NameScoreAssessmenthighlights', '')
+      assert.equal(content(textContent(word.document)), content(pdf.body),
+        'PDF repeats table headers at physical page breaks; Word stores one native repeating header row.')
+    }
     if (process.env.REPORT_DOCX_QA_DIRECTORY) {
       await mkdir(process.env.REPORT_DOCX_QA_DIRECTORY, { recursive: true })
       await writeFile(join(process.env.REPORT_DOCX_QA_DIRECTORY, `score-word-${name}.docx`), word.bytes)

@@ -202,7 +202,7 @@ export function fencedAnalysisBlobs(
         if (Date.parse(expiresAt) <= Date.now() || workspace?.record.state !== 'active' || control?.record.state !== 'active' ||
           writer?.blobName !== name || writer.expiresAt !== expiresAt) denied()
         if (run?.record.recordType === 'analysis-run') assertAnalysisRunWritable(run.record)
-        if (name.includes('/results/')) {
+        if (name.includes('/results/') || name.includes('/diagnostics/')) {
           if (run?.record.recordType !== 'analysis-run' || !analysisRunCanScore(run.record)) denied()
           const parts = name.split('/')
           const comparison = await deps.store.get(workspaceId, parts[3])

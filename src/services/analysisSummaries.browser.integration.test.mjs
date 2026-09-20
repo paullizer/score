@@ -260,6 +260,29 @@ test('summary management uses explicit saved-run or exact-grade scope, not table
   assert.deepEqual(errors, [])
 })
 
+test('captured target display names stay consistent across summary management and the saved overview', async (t) => {
+  const { page, fixture, state } = await setup(t)
+  const target = fixture.targets[0]
+  target.displayName = 'Captured research vacancy'
+  await page.reload()
+  await visible(page.getByRole('heading', { name: 'Saved narrative review', exact: true }))
+  const selector = page.getByLabel('Comparison target', { exact: true })
+  const value = await selector.getByRole('option', { name: /Captured research vacancy/ }).getAttribute('value')
+  assert.ok(value)
+  await selector.selectOption(value)
+  const overview = await visible(page.getByRole('region', { name: 'Saved job or grade overview', exact: true }))
+  await visible(overview.getByText(/^Captured research vacancy/))
+  await visible(overview.getByText(`Source title: ${target.label}`, { exact: true }))
+  const dialog = await openManager(page)
+  assert.equal(await dialog.getByLabel('Summary scope', { exact: true }).inputValue(), target.id)
+  assert.equal(await dialog.getByRole('option', { name: /Captured research vacancy/ }).count(), 1)
+  const before = JSON.stringify(fixture.details)
+  await dialog.getByRole('button', { name: 'Generate missing summaries', exact: true }).click()
+  await visible(dialog.getByText(/^Summary request acknowledged:/))
+  assert.deepEqual(posts(state).map(request => request.body), [{ mode: 'missing', targetId: target.id }])
+  assert.equal(JSON.stringify(fixture.details), before)
+})
+
 test('regenerate all confirms separately, prevents duplicate submits, and keeps request key and original summary ETag after ambiguity', async (t) => {
   const { page, state, errors } = await setup(t, { summaryOptions: { candidateStatus: 'ready', targetStatus: 'ready' } })
   const dialog = await openManager(page)
