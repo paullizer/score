@@ -16,7 +16,8 @@ import type {
 } from './store'
 import {
   ANALYSIS_BLOB_LEASE_SECONDS, ANALYSIS_BLOB_REQUEST_MILLISECONDS,
-  analysisControlId, analysisIsRemoved, assertAnalysisRunWritable, parseAnalysisControl, prepareAnalysisGuards,
+  analysisControlId, analysisIsRemoved, assertAnalysisRunWritable, isAuthorizedManualSummaryPublication,
+  parseAnalysisControl, prepareAnalysisGuards,
 } from './guards'
 import {
   analysisNarrativeCanWork, analysisNarrativeRequestCanAdvance, analysisNarrativeRequestCancelled, candidateNarrativeBinding,
@@ -111,6 +112,11 @@ export function assertAnalysisReplacement(previous: AnalysisEntity, next: Analys
         previous.inputFingerprint === next.inputFingerprint && analysisHash(previous.resumeSnapshot) === analysisHash(next.resumeSnapshot),
       'Narrative frozen comparison identity is immutable.')
     }
+    if (previous.history) {
+      assertAnalysis(next.history && (next.history.id !== previous.history.id ||
+        analysisHash(next.history) === analysisHash(previous.history)),
+      'Summary history cannot be erased or an immutable checkpoint replaced.')
+    }
     if (previous.generationId === next.generationId) {
       assertAnalysis(previous.requestId === next.requestId && previous.requestedAt === next.requestedAt &&
         previous.requestedBy === next.requestedBy && previous.reason === next.reason &&
@@ -121,9 +127,15 @@ export function assertAnalysisReplacement(previous: AnalysisEntity, next: Analys
         'Published narrative generations are immutable.')
       assertAnalysis(!['failed', 'cancelled'].includes(previous.status) || next.status === previous.status,
         'Stopped narrative generations require a fresh explicit or dependent generation.')
+      assertAnalysis(!previous.summaryRound || (next.summaryRound ?? 0) >= previous.summaryRound,
+        'A summary generation cannot reset its durable round budget.')
     } else {
       assertAnalysis(next.requestedAt >= previous.requestedAt && next.attempts === 0 && !next.lease &&
-        ['waiting', 'queued', 'cancelled'].includes(next.status), 'New narrative generations must start unclaimed.')
+        (['waiting', 'queued', 'cancelled'].includes(next.status) ||
+          next.status === 'ready' && isAuthorizedManualSummaryPublication(previous, next)),
+      'New narrative generations must start unclaimed or have exact manual publication authorization.')
+      assertAnalysis(analysisHash(next.history ?? null) === analysisHash(previous.history ?? null),
+        'A new summary generation must retain its predecessor history.')
     }
     assertAnalysis(analysisHash(previous.published ?? null) === analysisHash(next.published ?? null) ||
       next.status === 'ready' && next.published?.generationId === next.generationId,

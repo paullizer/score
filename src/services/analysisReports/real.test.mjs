@@ -6,7 +6,7 @@ import { pathToFileURL } from 'node:url'
 import { after, afterEach, before, beforeEach, test } from 'node:test'
 import { setTimeout as delay } from 'node:timers/promises'
 import { build } from 'esbuild'
-import { realReportFixture, reportSummariesFixture, withReportNarratives, REPORT_TEST_HASH, REPORT_TEST_TIMESTAMP } from './test-support.mjs'
+import { realReportFixture, reportSummariesFixture, version2ReportFixture, withReportNarratives, REPORT_TEST_HASH, REPORT_TEST_TIMESTAMP } from './test-support.mjs'
 
 const output = resolve(`.analysis-report-real-tests-${randomUUID()}`)
 const originalFetch = globalThis.fetch
@@ -531,6 +531,34 @@ test('ready narrative capture pins the exhaustive scope, attaches exact saved pr
   assert.ok(report.capture.startedAt <= report.capture.completedAt && report.capture.completedAt <= report.generatedAt)
   await assertRealAnalysisReportNarrativesCurrent(f.report.workspaceId, f.report.run.id, report)
   assert.equal(summaryRequests().length, 3)
+})
+
+test('real report reads preserve v2 manual approval and full text while revision fences still reject changed disclosures', async () => {
+  const f = narrativeFixture({ scores: [92.75, null] })
+  const supplied = version2ReportFixture({ long: true })
+  f.report.comparisons.forEach((comparison, index) => { comparison.narrative = supplied.comparisons[index].narrative })
+  f.report.targets[0].narrative = supplied.targets[0].narrative
+  // Fixture publication identities must bind the generated inventory IDs, not the source fixture IDs.
+  const stamped = withReportNarratives(f.report)
+  f.report.comparisons = stamped.comparisons
+  f.report.targets = stamped.targets
+  serve(f)
+  const report = await load(f, { requireSummaries: true })
+  const group = report.groups[0]
+  assert.equal(group.target.narrative.summaryVersion, 2)
+  assert.deepEqual(group.target.narrative.approval, supplied.targets[0].narrative.approval)
+  for (const [index, comparison] of group.comparisons.entries()) {
+    assert.equal(comparison.narrative.text, supplied.comparisons[index].narrative.text)
+    assert.deepEqual(comparison.narrative.approval, supplied.comparisons[index].narrative.approval)
+  }
+  await assertRealAnalysisReportNarrativesCurrent(f.report.workspaceId, f.report.run.id, report)
+  serve(f, { summaries: body => {
+    body.comparisons[0].published.approval.issues[0].message = 'Different reviewer finding'
+    return json(body)
+  } })
+  await assert.rejects(assertRealAnalysisReportNarrativesCurrent(f.report.workspaceId, f.report.run.id, report),
+    /changed generation|saved publication/)
+  assert.ok(requests.every(({ init }) => init.method === 'GET'))
 })
 
 test('legacy default and explicit false never read summaries even when generation is unavailable', async () => {

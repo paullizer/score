@@ -9,6 +9,7 @@ import {
   reportCandidateNarrativeSchema, reportNarrativeCaptureSchema, reportTargetNarrativeSchema,
   reportTargetPresentationSchema,
 } from './narrative-schemas'
+import { summaryIssueDisclosures } from '../../domain/analysis-summary-history'
 
 function requireSaved(condition: unknown, message: string): asserts condition {
   if (!condition) throw new Error(`${message} No PDF, Word, or PowerPoint report was produced. Reload the analysis, open Manage summaries, and retry when the selected summaries are ready.`)
@@ -37,6 +38,14 @@ export function candidateNarrativeOverview(comparison: ReportComparison): string
 
 export function targetNarrativeParagraphs(target: ReportTarget): string[] {
   return targetNarrative(target).paragraphs
+}
+
+export function candidateNarrativeDisclosures(comparison: ReportComparison): string[] {
+  return summaryIssueDisclosures(candidateNarrative(comparison))
+}
+
+export function targetNarrativeDisclosures(target: ReportTarget): string[] {
+  return summaryIssueDisclosures(targetNarrative(target))
 }
 
 export function reportTargetPresentation(target: ReportTarget): ReportTargetPresentation {

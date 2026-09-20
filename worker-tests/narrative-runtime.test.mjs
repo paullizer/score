@@ -5,6 +5,7 @@ import { api, fixture, createRun, publishResult, ACTOR, clone } from '../server-
 import {
   drainNarrativeRequest, narrativeRuntime, narrativeWorker, runComparisons, settleNarratives,
 } from '../server-tests/real-analysis-narratives.test-support.mjs'
+import { loadWorker } from './shared-model-loader.mjs'
 
 const { runAnalysisWorker, processClaimedNarrative } = await narrativeRuntime()
 async function summaries(f, runId, targetId) { return api.readAnalysisSummaries(f.analysis, f.workspaceId, runId, targetId) }
@@ -40,7 +41,7 @@ test('new completion atomically queues independent narrative work and target pub
   assert.equal(ready.ready, true, JSON.stringify(ready))
   const targetCall = mock.calls.find(call => call.kind === 'analysis_target_narrative')
   assert.equal(targetCall.body.source.records.length, 2)
-  assert.deepEqual(new Set(targetCall.body.source.records.map(pair => pair.comparisonId)), new Set(before.map(pair => pair.record.id)))
+  assert.deepEqual(new Set(targetCall.body.source.records.flatMap(pair => pair.members)), new Set(before.map(pair => pair.record.id)))
   assert.ok(mock.calls.every(call => call.kind.startsWith('analysis_')), 'Summary-only inference never invokes scoring.')
   assert.deepEqual(runComparisons(f, created.run.id), before)
   for (const [name, blob] of oldBlobs) assert.deepEqual(f.analysis.blobs.values.get(name), blob)
@@ -212,12 +213,111 @@ test('a settled partial/cancelled 500-comparison scope includes every status wit
   assert.equal(ready.counts.candidates.notRequired, 498)
   assert.equal(ready.capture.comparisons.length, 500)
   const generation = mock.calls.find(call => call.kind === 'analysis_target_narrative')
-  assert.deepEqual(generation.body.source.members, Array.from({ length: 500 }, (_, index) => index + 1))
+  assert.deepEqual(generation.body.source.records.flatMap(unit => unit.members), scoring.map(pair => pair.record.id).sort())
+  const supplied = new Map(mock.calls.flatMap(call => call.body.source?.records ?? [])
+    .filter(unit => unit.analysis.comparisonId).map(unit => [unit.analysis.comparisonId, unit.analysis]))
+  assert.equal([...supplied.values()].filter(analysis => analysis.status === 'cancelled').length, 498)
+  assert.equal([...supplied.values()].filter(analysis => analysis.criteria).length, 2)
   assert.ok(mock.calls.every(call => call.kind.startsWith('analysis_')))
   assert.deepEqual(runComparisons(f, created.run.id), scoring)
   assert.ok(f.analysis.store.batches.every(batch => batch.length <= 26 && Buffer.byteLength(JSON.stringify(batch)) <= api.MAX_ANALYSIS_TRANSACTION_BYTES))
   run = await f.analysis.store.get(f.workspaceId, created.run.id)
   assert.equal(run.record.status, 'cancelled')
+})
+
+test('three failed factual rounds retain history and manual approval unblocks the overview without changing scoring', async () => {
+  const { readSummaryGeneration } = await loadWorker('../server/analyses/summary-history.ts')
+  const f = fixture()
+  const created = await createRun(f)
+  const pair = runComparisons(f, created.run.id)[0]
+  await publishResult(f, created.run.id, pair.record.id)
+  const scored = clone(runComparisons(f, created.run.id))
+  let drafts = 0
+  const mock = narrativeWorker(f, ({ kind }) => {
+    if (kind === 'analysis_candidate_narrative') return {
+      text: `Saved candidate draft number ${++drafts} requires factual correction.`,
+      overview: 'The saved analysis needs careful interpretation.',
+    }
+    if (kind === 'analysis_narrative_grounding_review') return {
+      outcome: 'needs-correction',
+      issues: [{ code: 'unsupported-claim', message: 'The draft overstates the supplied analysis.', field: 'text', paragraphIndex: null }],
+    }
+  })
+  const failed = await settleNarratives(f, created.run.id, mock)
+  assert.equal(drafts, 3)
+  assert.equal(failed.comparisons[0].status, 'failed')
+  assert.equal(failed.comparisons[0].summaryRound, 3)
+  assert.equal(failed.comparisons[0].hasHistory, true)
+  const record = (await f.analysis.store.get(f.workspaceId, api.analysisNarrativeId('candidate', created.run.id, pair.record.id))).record
+  const saved = await readSummaryGeneration(f.analysis, record)
+  const reviewed = saved.steps.filter(step => step.scopeId === 'final' && step.phase === 'reviewed')
+  assert.equal(reviewed.length, 3)
+  assert.equal(new Set(reviewed.map(step => step.outputSha256)).size, 3)
+  assert.ok(reviewed.every(step => step.review.issues.length === 1 && step.draft.text))
+  assert.deepEqual(runComparisons(f, created.run.id), scored)
+  assert.doesNotMatch(JSON.stringify(mock.events), /overstates the supplied|Saved candidate draft|fake-private-token/)
+  const page = await api.readAnalysisSummaryHistory(f.analysis, f.workspaceId, created.run.id,
+    { kind: 'candidate', subjectId: pair.record.id })
+  const selected = reviewed.find(step => step.round === 1)
+  await api.publishAnalysisSummaryDraft(f.analysis, f.workspaceId, created.run.id,
+    { kind: 'candidate', subjectId: pair.record.id },
+    { generationId: record.generationId, round: selected.round, outputSha256: selected.outputSha256 },
+    randomUUID(), page.etag, ACTOR, () => new Date(f.now))
+  const remaining = narrativeWorker(f)
+  const ready = await settleNarratives(f, created.run.id, remaining)
+  assert.equal(ready.ready, true)
+  assert.equal(ready.comparisons[0].published.text, selected.draft.text)
+  assert.equal(ready.comparisons[0].published.approval.kind, 'manual')
+  assert.equal(ready.comparisons[0].published.approval.reviewOutcome, 'needs-correction')
+  assert.ok(remaining.calls.every(call => call.kind !== 'analysis_candidate_narrative'))
+  assert.doesNotMatch(JSON.stringify(remaining.calls.map(call => call.body.source)), /Saved candidate draft|overstates the supplied/)
+  assert.deepEqual(runComparisons(f, created.run.id), scored)
+})
+
+test('automatic retry resumes a persisted draft after a transient review failure without another generation', async () => {
+  const f = fixture()
+  const created = await createRun(f)
+  const pair = runComparisons(f, created.run.id)[0]
+  await publishResult(f, created.run.id, pair.record.id)
+  const first = narrativeWorker(f, ({ kind }) =>
+    kind === 'analysis_narrative_grounding_review' ? new Response('PRIVATE-UPSTREAM', { status: 503 }) : undefined)
+  await runAnalysisWorker(first.deps, { maxItems: 1 })
+  const pending = await summaries(f, created.run.id)
+  assert.equal(pending.comparisons[0].status, 'queued')
+  assert.equal(pending.comparisons[0].summaryRound, 1)
+  assert.equal(pending.comparisons[0].hasHistory, true)
+  assert.equal(first.calls.filter(call => call.kind === 'analysis_candidate_narrative').length, 1)
+  f.now = new Date(Date.parse(f.now) + 60_000).toISOString()
+  const resumed = narrativeWorker(f)
+  const ready = await settleNarratives(f, created.run.id, resumed)
+  assert.equal(ready.ready, true)
+  assert.equal(resumed.calls.filter(call => call.kind === 'analysis_candidate_narrative').length, 0)
+  assert.equal(ready.comparisons[0].summaryRound, 1)
+})
+
+test('a failed draft checkpoint reports history-write-failed and stops before review or publication', async () => {
+  const f = fixture()
+  const created = await createRun(f)
+  const pair = runComparisons(f, created.run.id)[0]
+  await publishResult(f, created.run.id, pair.record.id)
+  const scored = clone(runComparisons(f, created.run.id))
+  const put = f.analysis.blobs.putFenced
+  f.analysis.blobs.putFenced = async function (name, bytes, ...args) {
+    if (name.includes('/narrative-history/') && JSON.parse(bytes.toString()).phase === 'generated') {
+      throw new Error('PRIVATE-HISTORY-STORAGE')
+    }
+    return put.call(this, name, bytes, ...args)
+  }
+  const mock = narrativeWorker(f)
+  await runAnalysisWorker(mock.deps, { maxItems: 1 })
+  const state = await summaries(f, created.run.id)
+  assert.equal(state.comparisons[0].status, 'queued')
+  assert.equal(state.comparisons[0].error.diagnostic.reason, 'history-write-failed')
+  assert.equal(state.comparisons[0].published, null)
+  assert.equal(mock.calls.length, 1)
+  assert.equal(mock.calls[0].kind, 'analysis_candidate_narrative')
+  assert.deepEqual(runComparisons(f, created.run.id), scored)
+  assert.doesNotMatch(JSON.stringify(mock.events), /PRIVATE-HISTORY-STORAGE/)
 })
 
 test('summary-only cancellation fences in-flight and projected generations at a fixed clock without cancelling completed scoring', async () => {

@@ -3,6 +3,9 @@ import { z } from 'zod'
 import { REPORT_LIMITS } from '../../src/domain/analysis-reports'
 import type { RealAnalysisNarrativeRecord } from '../../src/domain/analysis-narratives'
 import {
+  SUMMARY_LIMITS, summaryDiagnosticSchema, summaryHistoryReferenceSchema, type AnalysisSummaryHistoryReference,
+} from '../../src/domain/analysis-summary-history'
+import {
   ANALYSIS_CITATION_REASONS, ANALYSIS_DIAGNOSTIC_FIELDS, ANALYSIS_DIAGNOSTIC_LIMITS,
   ANALYSIS_DIAGNOSTIC_REASONS, ANALYSIS_REVIEW_ISSUE_CODES, ANALYSIS_SCHEMA_ISSUE_CODES, ANALYSIS_TELEMETRY_EVENTS,
   type AnalysisFailureDiagnostic, type AnalysisFailureDiagnosticReference,
@@ -212,10 +215,12 @@ const narrativeBase = {
   reason: z.enum(['missing', 'all', 'comparison-completed', 'comparison-changed']),
   inputFingerprint: hash.nullable(), waitingFor: z.enum(['scoring', 'candidate-narratives']).optional(),
   published: narrativePublicationSchema.optional(),
+  history: summaryHistoryReferenceSchema.optional(),
+  summaryRound: z.number().int().min(1).max(SUMMARY_LIMITS.rounds).optional(),
   error: z.strictObject({
     code: z.enum([...errorSchema.shape.code.options, 'dependency-failed']),
     stage: z.enum(['dependencies', 'candidate-generation', 'target-generation', 'grounding', 'publication']),
-    message: text(2000), retryable: z.boolean(),
+    message: text(2000), retryable: z.boolean(), diagnostic: summaryDiagnosticSchema.optional(),
   }).optional(),
 }
 const candidateNarrativeSchema = z.strictObject({
@@ -286,6 +291,28 @@ export function analysisNarrativeRequestBlobName(workspaceId: string, runId: str
   assertAnalysis(isSafeAnalysisBlobName(name), 'Invalid narrative request identity.')
   return name
 }
+export function analysisSummaryHistoryBlobName(
+  workspaceId: string, runId: string, kind: 'candidate' | 'target', subjectId: string,
+  generationId: string, attemptId: string, entryId: string,
+): string {
+  const name = `${workspaceId}/${runId}/narrative-history/${kind}/${subjectId}/${generationId}/${attemptId}/${entryId}.json`
+  assertAnalysis(isSafeAnalysisBlobName(name), 'Invalid summary checkpoint identity.')
+  return name
+}
+export function analysisSummaryActionBlobName(workspaceId: string, runId: string, requestId: string): string {
+  const name = `${workspaceId}/${runId}/narrative-actions/${requestId}.json`
+  assertAnalysis(isSafeAnalysisBlobName(name), 'Invalid summary action identity.')
+  return name
+}
+export function assertAnalysisSummaryHistoryReference(
+  reference: AnalysisSummaryHistoryReference, workspaceId: string, runId: string, kind: 'candidate' | 'target', subjectId: string,
+): void {
+  summaryHistoryReferenceSchema.parse(reference)
+  const parts = reference.blob.blobName.split('/')
+  assertAnalysis(reference.blob.blobName === analysisSummaryHistoryBlobName(
+    workspaceId, runId, kind, subjectId, reference.generationId, parts[6], reference.id,
+  ), 'Summary history belongs to another subject, generation, or checkpoint.')
+}
 export function analysisDeterministicId(kind: 'comparison' | 'snapshot', run: string, key: string | number): string {
   const hex = analysisHash({ kind, run, key }).slice(0, 32).split('')
   hex[12] = '5'
@@ -299,6 +326,12 @@ export function isSafeAnalysisBlobName(name: string): boolean {
   if (parts.length === 3) return parts[2] === 'manifest.json'
   if (parts.length === 4 && parts[2] === 'evidence') return /^[a-f0-9]{64}\.(?:json|pdf|md|docx|doc|html)$/.test(parts[3])
   if (parts.length === 5 && parts[2] === 'snapshots' && isAnalysisId(parts[3], 'snapshot')) return /^[a-f0-9]{64}\.json$/.test(parts[4])
+  if (parts[2] === 'narrative-actions') return parts.length === 4 && new RegExp(`^${UUID}\\.json$`).test(parts[3])
+  if (parts[2] === 'narrative-history') return parts.length === 8 &&
+    (parts[3] === 'candidate' ? isAnalysisId(parts[4], 'comparison')
+      : parts[3] === 'target' && analysisNarrativeTargetIdSchema.safeParse(parts[4]).success) &&
+    new RegExp(`^${UUID}$`).test(parts[5]) && new RegExp(`^${UUID}$`).test(parts[6]) &&
+    new RegExp(`^${UUID}\\.json$`).test(parts[7])
   if (parts[2] === 'narratives') {
     if (parts.length === 5 && parts[3] === 'requests') return new RegExp(`^${UUID}\\.json$`).test(parts[4])
     return parts.length === 7 &&
@@ -432,6 +465,11 @@ function validateNarrativeRecord(record: RealAnalysisNarrativeRecord): void {
       publication.blob.blobName === analysisNarrativeBlobName(record.workspaceId, record.runId, kind, subject,
         publication.generationId, parts[6]?.replace(/\.json$/, '')),
     'Narrative publication ownership or revision mismatch.')
+  }
+  if (record.history) {
+    assertAnalysisSummaryHistoryReference(record.history, record.workspaceId, record.runId, kind, subject)
+    assertAnalysis(record.history.createdAt >= record.createdAt && record.history.createdAt <= record.updatedAt,
+      'Summary checkpoint time is outside its work record history.')
   }
   if (record.status === 'ready') assertAnalysis(record.published && record.inputFingerprint && record.attemptId &&
     record.published.generationId === record.generationId && record.published.inputFingerprint === record.inputFingerprint &&

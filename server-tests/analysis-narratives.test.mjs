@@ -185,6 +185,15 @@ test('persisted synthesis provenance binds every review to its exact input/outpu
   const target = await f.analysis.store.get(f.workspaceId, api.analysisNarrativeId('target', created.run.id, ready.targets[0].targetId))
   const artifact = await api.readAnalysisNarrativePublication(f.analysis.blobs, target.record)
   assert.equal(artifact.kind, 'target')
+  // Keep exercising the immutable v1 reader after new workers begin publishing v2 summaries.
+  artifact.schemaVersion = 1
+  delete artifact.approval
+  delete artifact.history
+  artifact.paragraphs = ['The saved analysis records engineering evidence for human review.']
+  artifact.claims = [{ id: 'legacy-claim', location: { field: 'paragraphs', paragraphIndex: 0, sentenceIndex: 0 },
+    references: [{ kind: 'coverage', comparisonId: artifact.binding.comparisons[0].comparisonId }] }]
+  artifact.provenance.outputSha256 = api.analysisHash({ paragraphs: artifact.paragraphs, claims: artifact.claims })
+  artifact.provenance.groundingReviews = [{ ...artifact.provenance.groundingReviews.at(-1), outputSha256: artifact.provenance.outputSha256 }]
   const finalReview = artifact.provenance.groundingReviews.at(-1)
   const steps = [1, 2].map(index => ({
     comparisonIds: artifact.binding.comparisons.map(pair => pair.comparisonId),

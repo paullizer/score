@@ -104,6 +104,7 @@ export function newCandidateNarrative(
     ...request, generationId: narrativeGenerationId(request.requestId, id), status: 'queued',
     inputFingerprint: analysisHash(binding), attempts: 0, retryCount: previous ? previous.retryCount + 1 : 0,
     nextAttemptAt: request.requestedAt, ...(previous?.published ? { published: previous.published } : {}),
+    ...(previous?.history ? { history: previous.history } : {}),
   }
 }
 
@@ -122,5 +123,6 @@ export function newTargetNarrative(
     status: 'waiting', inputFingerprint: null, waitingFor: 'scoring', attempts: 0,
     retryCount: previous ? previous.retryCount + 1 : 0, nextAttemptAt: request.requestedAt,
     ...(previous?.published ? { published: previous.published } : {}),
+    ...(previous?.history ? { history: previous.history } : {}),
   }
 }

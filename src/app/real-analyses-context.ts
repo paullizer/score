@@ -8,10 +8,14 @@ import type { RealLoadState } from './real-request-scope'
 import type {
   GenerateRealAnalysisSummariesInput, RealAnalysisSummariesMutationResponse, RealAnalysisSummariesResponse,
 } from '../domain/analysis-narratives'
+import type {
+  AnalysisSummaryHistoryPage, AnalysisSummarySubject, PublishSummaryDraftInput,
+} from '../domain/analysis-summary-history'
 
 export interface RealAnalysesContextValue {
   workspaceId: string
   canWrite: boolean
+  canReviewSummaries: boolean
   // Historical access comes from the owned analysis API, not the new-run feature flag.
   phase: 'loading' | 'ready' | 'unavailable' | 'error'
   features: AnalysisProcessingFeatures | null
@@ -30,6 +34,9 @@ export interface RealAnalysesContextValue {
   narratives: (runId: string, targetId?: string) => RealLoadState<RealAnalysisSummariesResponse>
   ensureNarratives: (runId: string, targetId?: string, force?: boolean) => Promise<void>
   generateSummaries: (runId: string, input: GenerateRealAnalysisSummariesInput, etag: string) => Promise<RealAnalysisSummariesMutationResponse>
+  summaryHistory: (runId: string, subject: AnalysisSummarySubject, cursor?: string, signal?: AbortSignal) => Promise<AnalysisSummaryHistoryPage>
+  publishSummaryDraft: (runId: string, subject: AnalysisSummarySubject, input: PublishSummaryDraftInput, etag: string) => Promise<RealAnalysisSummariesResponse>
+  retrySummary: (runId: string, subject: AnalysisSummarySubject, etag: string) => Promise<RealAnalysisSummariesResponse>
   document: (runId: string, comparisonId: string, documentId: string, version: number, signal?: AbortSignal) => Promise<RealAnalysisDocumentResponse['document']>
   diagnostics: (runId: string, comparisonId: string, continuationToken?: string, signal?: AbortSignal) => Promise<RealAnalysisDiagnosticsPage>
   pending: (runId?: string) => boolean

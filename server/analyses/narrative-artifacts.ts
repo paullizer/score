@@ -8,10 +8,15 @@ import {
   candidateNarrativeOutputSchema, narrativeGroundingReviewOutputSchema, narrativeSentences, targetNarrativeOutputSchema,
   validateCandidateNarrativeOutput, validateNarrativeProse, validateTargetNarrativeOutput,
 } from '../../src/domain/analysis-narrative-validation'
+import {
+  SUMMARY_LIMITS, summaryApprovalSchema, summaryCandidateContentSchema, summaryDraftCharacters,
+  summaryHistoryReferenceSchema, summaryIssueMatchesDraft, summaryIssueSchema, summaryTargetContentSchema,
+} from '../../src/domain/analysis-summary-history'
 import type { AnalysisBlobStore } from './store'
 import { parseAnalysisJson, readAnalysisBlob } from './snapshots'
 import {
-  analysisHash, analysisNarrativeBlobName, analysisNarrativeTargetIdSchema, assertAnalysis, isAnalysisId, MAX_ANALYSIS_JSON_BYTES,
+  analysisHash, analysisNarrativeBlobName, analysisNarrativeTargetIdSchema, assertAnalysis, assertAnalysisSummaryHistoryReference,
+  isAnalysisId, MAX_ANALYSIS_JSON_BYTES,
 } from './validation'
 import { WORKSPACE_ID_PATTERN } from '../ids'
 
@@ -66,14 +71,80 @@ const artifactBase = {
   generationId: z.string().uuid(), requestId: z.string().uuid(), inputFingerprint: hash,
   humanReviewRequired: z.literal(true), provenance, previousPublication: publication.optional(),
 }
-const artifactSchema = z.discriminatedUnion('kind', [
+const legacyArtifactSchema = z.discriminatedUnion('kind', [
   z.strictObject({ ...artifactBase, kind: z.literal('candidate'), binding: candidateBinding, ...candidateNarrativeOutputSchema.shape }),
   z.strictObject({ ...artifactBase, kind: z.literal('target'), binding: targetBinding, ...targetNarrativeOutputSchema.shape }),
 ])
+const summaryProvenance = provenance.extend({
+  groundingReviews: z.array(z.strictObject({
+    id: z.string().uuid(), inputFingerprint: hash, outputSha256: hash, provenance: modelProvenance,
+    outcome: z.enum(['supported', 'needs-correction', 'unsupported']),
+    issues: z.array(z.strictObject({
+      code: summaryIssueSchema.shape.code, message: summaryIssueSchema.shape.message, references: z.array(z.never()).max(0),
+    })).max(SUMMARY_LIMITS.issues),
+  })).max((ANALYSIS_NARRATIVE_LIMITS.maxComparisons * 2 + 1) * SUMMARY_LIMITS.rounds),
+  correctionCount: z.number().int().min(0).max(SUMMARY_LIMITS.rounds - 1),
+})
+const summaryBase = {
+  ...artifactBase, schemaVersion: z.literal(2), claims: z.array(z.never()).max(0),
+  provenance: summaryProvenance, approval: summaryApprovalSchema, history: summaryHistoryReferenceSchema,
+}
+const summaryArtifactSchema = z.discriminatedUnion('kind', [
+  z.strictObject({ ...summaryBase, kind: z.literal('candidate'), binding: candidateBinding, ...summaryCandidateContentSchema.shape }),
+  z.strictObject({ ...summaryBase, kind: z.literal('target'), binding: targetBinding, ...summaryTargetContentSchema.shape }),
+])
+
+function validateSummaryArtifact(artifact: RealAnalysisNarrativeArtifact): void {
+  const draft = artifact.kind === 'candidate'
+    ? { kind: artifact.kind, text: artifact.text, overview: artifact.overview }
+    : { kind: artifact.kind, paragraphs: artifact.paragraphs }
+  assertAnalysis(summaryDraftCharacters(draft) <= SUMMARY_LIMITS.totalCharacters &&
+    artifact.inputFingerprint === analysisHash(artifact.binding) && artifact.provenance.outputSha256 === analysisHash(draft),
+  'Summary content or frozen input hash mismatch.')
+  const reviewKey = (item: { inputFingerprint: string; outputSha256: string }) => `${item.inputFingerprint}:${item.outputSha256}`
+  const synthesis = artifact.provenance.synthesis ?? []
+  const synthesisPairs = new Set(synthesis.map(reviewKey))
+  const reviews = artifact.provenance.groundingReviews
+  const reviewedPairs = new Set(reviews.map(reviewKey))
+  const comparisonIds = new Set(artifact.kind === 'candidate' ? [artifact.binding.comparisonId]
+    : artifact.binding.comparisons.map(pair => pair.comparisonId))
+  const timeValid = (value: typeof artifact.provenance.generation) =>
+    value.startedAt <= value.completedAt && value.completedAt <= artifact.createdAt
+  assertAnalysis(timeValid(artifact.provenance.generation) && reviews.every(review =>
+    timeValid(review.provenance) &&
+    (review.outcome === 'supported' ? review.issues.length === 0 : review.issues.length > 0) &&
+    (review.inputFingerprint === artifact.inputFingerprint || synthesisPairs.has(reviewKey(review)))) &&
+    synthesis.every(step => timeValid(step.provenance) && reviewedPairs.has(reviewKey(step)) &&
+      new Set(step.comparisonIds).size === step.comparisonIds.length && step.comparisonIds.every(id => comparisonIds.has(id))) &&
+    (artifact.kind !== 'target' || comparisonIds.size === artifact.binding.comparisons.length),
+  'Summary review or synthesis provenance does not bind its saved input.')
+  const final = reviews.at(-1)
+  const exact = final?.inputFingerprint === artifact.inputFingerprint && final.outputSha256 === artifact.provenance.outputSha256
+  const approval = artifact.approval!
+  if (approval.kind === 'automatic') {
+    assertAnalysis(exact && final?.outcome === 'supported' && final.issues.length === 0,
+      'Automatic summary approval requires a supported review of this exact output and input.')
+  } else {
+    assertAnalysis(approval.approvedAt === artifact.createdAt && approval.issues.every(issue => summaryIssueMatchesDraft(issue, draft)) &&
+      (approval.reviewOutcome === 'not-reviewed' ? reviews.length === 0 && approval.issues.length === 0
+        : exact && approval.reviewOutcome === final?.outcome &&
+          analysisHash(approval.issues.map(issue => ({ code: issue.code, message: issue.message }))) ===
+          analysisHash(final.issues.map(issue => ({ code: issue.code, message: issue.message })))),
+    'Manual summary approval must retain the actual review outcome and known issues.')
+  }
+  assertAnalysisSummaryHistoryReference(artifact.history!, artifact.binding.workspaceId, artifact.binding.runId,
+    artifact.kind, artifact.kind === 'candidate' ? artifact.binding.comparisonId : artifact.binding.targetId)
+  assertAnalysis(artifact.history!.createdAt <= artifact.createdAt, 'Summary history cannot postdate its publication.')
+}
 
 export function parseAnalysisNarrativeArtifact(value: unknown): RealAnalysisNarrativeArtifact {
   assertAnalysis(Buffer.byteLength(JSON.stringify(value)) <= MAX_ANALYSIS_JSON_BYTES, 'Narrative artifact exceeds its byte budget.')
-  const artifact = artifactSchema.parse(value) as RealAnalysisNarrativeArtifact
+  const version = value && typeof value === 'object' && 'schemaVersion' in value ? value.schemaVersion : undefined
+  const artifact = (version === 2 ? summaryArtifactSchema : legacyArtifactSchema).parse(value) as RealAnalysisNarrativeArtifact
+  if (artifact.schemaVersion === 2) {
+    validateSummaryArtifact(artifact)
+    return artifact
+  }
   const output = artifact.kind === 'candidate'
     ? { text: artifact.text, overview: artifact.overview, claims: artifact.claims }
     : { paragraphs: artifact.paragraphs, claims: artifact.claims }
@@ -125,6 +196,11 @@ export function validateAnalysisNarrativeArtifactInput(
   parseAnalysisNarrativeArtifact(artifact)
   assertAnalysis(analysisHash(artifact.binding) === analysisHash(input.binding) && artifact.inputFingerprint === input.inputFingerprint,
     'Narrative artifact is not bound to the claimed model input.')
+  if (artifact.schemaVersion === 2) {
+    assertAnalysis(artifact.kind === 'candidate' ? 'source' in input : 'candidates' in input,
+      'Summary input and output kinds do not match.')
+    return
+  }
   if (artifact.kind === 'candidate' && 'source' in input) {
     validateCandidateNarrativeOutput({ text: artifact.text, overview: artifact.overview, claims: artifact.claims }, input)
   } else if (artifact.kind === 'target' && 'candidates' in input) {

@@ -3,7 +3,7 @@ import { after, before, test } from 'node:test'
 import { runInNewContext } from 'node:vm'
 import { build } from 'esbuild'
 import {
-  loadReportFoundation, realReportFixture, reportSummariesFixture, withReadyReportNarratives, withReportNarratives, REPORT_TEST_TIMESTAMP,
+  loadReportFoundation, realReportFixture, reportSummariesFixture, version2ReportFixture, withReadyReportNarratives, withReportNarratives, REPORT_TEST_TIMESTAMP,
 } from './test-support.mjs'
 
 let api, cleanup
@@ -43,6 +43,66 @@ test('narrative helpers return complete saved fields verbatim and preserve legac
     }
   }
   assert.equal(JSON.stringify(input), original)
+})
+
+test('v2 report readers preserve full flexible prose and manual approval without V1 sentence, numeric or small character gates', () => {
+  for (const manual of [false, true]) for (const long of [false, true]) {
+    const input = version2ReportFixture({ manual, long })
+    const original = JSON.stringify(input)
+    const report = api.buildAnalysisReport(input)
+    api.requireReportNarratives(report)
+    const group = report.groups[0]
+    assert.deepEqual(group.target.narrative, input.targets[0].narrative)
+    assert.deepEqual(api.targetNarrativeParagraphs(group.target), input.targets[0].narrative.paragraphs)
+    for (const comparison of group.comparisons) {
+      const source = input.comparisons.find(item => item.id === comparison.id)
+      assert.deepEqual(comparison.narrative, source.narrative)
+      assert.equal(api.candidateNarrativeText(comparison), source.narrative.text)
+      assert.equal(api.candidateNarrativeOverview(comparison), source.narrative.overview)
+      assert.deepEqual(comparison.overall, source.overall)
+      assert.equal(comparison.narrative.approval.kind, manual ? 'manual' : 'automatic')
+      const disclosures = api.candidateNarrativeDisclosures(comparison)
+      assert.equal(disclosures.length, manual ? 2 : 0)
+      if (manual) {
+        assert.equal(disclosures[0], 'Manually approved summary. Automated review: needs-correction.')
+        assert.equal(disclosures[1], `Known issue: ${source.narrative.approval.issues[0].message}`)
+      }
+    }
+    const response = reportSummariesFixture(input)
+    response.comparisons[0].hasHistory = true
+    response.comparisons[0].summaryRound = 3
+    const parsed = api.realAnalysisSummariesResponseSchema.parse(response)
+    assert.deepEqual(parsed.comparisons[0].published.approval, input.comparisons[0].narrative.approval)
+    assert.equal(parsed.comparisons[0].hasHistory, true)
+    assert.equal(parsed.comparisons[0].summaryRound, 3)
+    assert.equal(JSON.stringify(input), original)
+  }
+})
+
+test('v2 approval is explicit and bounded while unready, foreign, or unpinned manual publications remain ineligible', () => {
+  for (const mutate of [
+    input => { delete input.comparisons[0].narrative.approval },
+    input => { delete input.comparisons[0].narrative.summaryVersion },
+    input => { input.comparisons[0].narrative.summaryVersion = 3 },
+    input => { input.comparisons[0].narrative.text = ' ' },
+    input => { input.comparisons[0].narrative.overview = 'x'.repeat(4_001) },
+    input => { input.targets[0].narrative.paragraphs = [] },
+    input => { input.targets[0].narrative.paragraphs = Array(7).fill('x'.repeat(16_000)) },
+    input => { input.comparisons[0].narrative.approval.reviewOutcome = 'passed-manually' },
+    input => { input.comparisons[0].narrative.approval.issues[0].field = 'criteria' },
+    input => { input.comparisons[0].narrative.approval.secretDraft = 'must not be stripped and hidden' },
+    input => { input.capture.summaries.ready = false },
+    input => { input.comparisons[0].narrative.revision = 'b'.repeat(64) },
+    input => { input.targets[0].narrative.inputFingerprint = 'b'.repeat(64) },
+  ]) {
+    const input = version2ReportFixture()
+    mutate(input)
+    assert.throws(() => api.buildAnalysisReport(input), undefined, mutate.toString())
+  }
+  const legacy = withReportNarratives(realReportFixture())
+  const before = JSON.stringify(legacy)
+  api.requireReportNarratives(api.buildAnalysisReport(legacy))
+  assert.equal(JSON.stringify(legacy), before, 'Reading V1 never rewrites or rehashes saved fixtures.')
 })
 
 test('canonical titles and organizations are separate, preserve dashes in full, and never merge identical-title targets', () => {

@@ -25,12 +25,16 @@ import {
 import {
   analysisBlobReference, createAnalysisSnapshotReader, parseAnalysisJson, putAnalysisJson, readAnalysisBlob,
 } from '../../server/analyses/snapshots'
+import { readSummaryGeneration, SummaryHistoryCaptureError, writeSummaryCheckpoint } from '../../server/analyses/summary-history'
+import type { AnalysisSummaryStep } from '../../src/domain/analysis-summary-history'
 import type { AnalysisTransaction } from '../../server/analyses/store'
 import {
   analysisHash, analysisNarrativeBlobName, analysisNarrativeId, assertAnalysis, MAX_ANALYSIS_TRANSACTION_BYTES, parseAnalysisEntity,
 } from '../../server/analyses/validation'
 import { systemClock, type Clock } from '../runtime'
-import { generateCandidateNarrative, generateTargetNarrative, NarrativeModelError } from './narrative-model'
+import { NarrativeModelError } from './narrative-model'
+import { generateCandidateSummary, generateTargetSummary } from './summary-model'
+import { emitSummaryTelemetry, logSummaryTelemetry, type SummaryTelemetryEvent } from './summary-telemetry'
 import type { AnalysisWorkerDependencies } from './runtime'
 
 const LEASE_MS = 90_000
@@ -42,20 +46,7 @@ type Narrative = VersionedAnalysisEntity<RealAnalysisNarrativeRecord>
 type Run = VersionedAnalysisEntity<RealAnalysisRunRecord>
 type Stage = AnalysisNarrativeProcessingError['stage']
 
-export interface AnalysisNarrativeTelemetryEvent {
-  event: 'narrative-outcome'
-  workspaceId: string
-  runId: string
-  targetId: string
-  comparisonId?: string
-  generationId: string
-  attemptId?: string
-  stage: Stage
-  outcome: 'ready' | 'failed' | 'queued' | 'abandoned'
-  code?: AnalysisNarrativeProcessingError['code']
-  retryable?: boolean
-  durationMilliseconds: number
-}
+export type AnalysisNarrativeTelemetryEvent = SummaryTelemetryEvent
 
 class LostNarrativeWork extends Error {
   constructor() { super('This narrative generation or attempt is no longer owned by the worker.') }
@@ -73,8 +64,11 @@ async function workspaceActive(deps: AnalysisWorkerDependencies, workspaceId: st
   return ((await deps.store.getControl(workspaceId))?.record.state ?? 'active') === 'active'
 }
 function failureFor(error: unknown, stage: Stage, inputs: boolean): AnalysisNarrativeProcessingError {
-  if (error instanceof NarrativeWorkFailure) return error.failure
-  if (error instanceof NarrativeModelError) return { code: error.code, stage: error.stage, message: error.message, retryable: error.retryable }
+  if (error instanceof NarrativeWorkFailure || error instanceof SummaryHistoryCaptureError) return error.failure
+  if (error instanceof NarrativeModelError) return {
+    code: error.code, stage: error.stage, message: error.message, retryable: error.retryable,
+    ...(error.diagnostic ? { diagnostic: error.diagnostic } : {}),
+  }
   if (error instanceof AnalysisNarrativeValidationError) return { code: error.code, stage, message: error.message, retryable: false }
   if (inputs && error instanceof HttpError && error.code === 'invalid_request') return {
     code: 'context-limit', stage, retryable: false,
@@ -268,6 +262,7 @@ async function targetInput(
     candidates.push({
       binding: pair.binding, result, narrative: {
         dataKind: 'real', ...narrativePublicationVersion(pair.narrative.published), text: artifact.text, overview: artifact.overview,
+        ...(artifact.schemaVersion === 2 ? { summaryVersion: 2 as const, approval: artifact.approval } : {}),
       },
     })
   }
@@ -339,9 +334,21 @@ async function reconcileTarget(
       { kind: 'replace', record: next, etag: current.etag },
       { kind: 'replace', record: { ...inventory.run.record, updatedAt: timestamp }, etag: inventory.run.etag },
     )
-    try { await deps.store.transact(record.workspaceId, operations); return { worked: true, ready } } catch (error) {
+    const dependencyOutcome = () => {
+      if (next.status !== 'failed') return
+      emitSummaryTelemetry(deps.onNarrativeEvent ?? logSummaryTelemetry, {
+        event: 'narrative-outcome', timestamp, workspaceId: record.workspaceId, runId: record.runId,
+        targetId: record.targetId, generationId: next.generationId, stage: 'dependencies', outcome: 'failed',
+        code: 'dependency-failed', retryable: false,
+      })
+    }
+    try {
+      await deps.store.transact(record.workspaceId, operations)
+      dependencyOutcome()
+      return { worked: true, ready }
+    } catch (error) {
       const latest = await loadAnalysisNarrative(deps.store, record.workspaceId, record.id)
-      if (latest && analysisHash(latest.record) === analysisHash(next)) return { worked: true, ready }
+      if (latest && analysisHash(latest.record) === analysisHash(next)) { dependencyOutcome(); return { worked: true, ready } }
       if (!isConflict(error)) throw error
     }
   }
@@ -406,19 +413,30 @@ export async function processClaimedNarrative(
   let stage: Stage = claimed.record.recordType === 'analysis-candidate-narrative' ? 'candidate-generation' : 'target-generation'
   let inputs = true
   let reference: ImmutableJsonBlobReference | undefined
+  let round = claimed.record.summaryRound
+  const onEvent = (event: SummaryTelemetryEvent) => {
+    stage = event.stage
+    if (event.scopeId === 'final' && event.round !== undefined) round = event.round
+    const record = claimed.record
+    emitSummaryTelemetry(deps.onNarrativeEvent ?? logSummaryTelemetry, {
+      ...event, workspaceId: record.workspaceId, runId: record.runId, targetId: record.targetId,
+      ...(record.recordType === 'analysis-candidate-narrative' ? { comparisonId: record.comparisonId } : {}),
+      generationId: record.generationId, attemptId: record.attemptId,
+    })
+  }
   const emit = (outcome: AnalysisNarrativeTelemetryEvent['outcome'], failure?: AnalysisNarrativeProcessingError) => {
     const record = claimed.record
     const event: AnalysisNarrativeTelemetryEvent = {
-      event: 'narrative-outcome', workspaceId: record.workspaceId, runId: record.runId, targetId: record.targetId,
+      event: 'narrative-outcome', timestamp: clock.now().toISOString(),
+      workspaceId: record.workspaceId, runId: record.runId, targetId: record.targetId,
       ...(record.recordType === 'analysis-candidate-narrative' ? { comparisonId: record.comparisonId } : {}),
       generationId: record.generationId, attemptId: record.attemptId, stage: failure?.stage ?? stage, outcome,
       ...(failure ? { code: failure.code, retryable: failure.retryable } : {}),
+      round, reason: failure?.diagnostic?.reason, modelCallId: failure?.diagnostic?.modelCallId,
+      reviewIssueCount: failure?.diagnostic?.issueCount,
       durationMilliseconds: Math.max(0, clock.now().getTime() - started),
     }
-    try {
-      if (deps.onNarrativeEvent) deps.onNarrativeEvent(event)
-      else console.log(JSON.stringify({ component: 'score-analysis-narrative', ...event }))
-    } catch { console.error('Analysis narrative telemetry failed:', { code: 'analysis-narrative-telemetry-failed' }) }
+    onEvent(event)
   }
   try {
     const { run, narrative } = await lease.check()
@@ -434,15 +452,35 @@ export async function processClaimedNarrative(
     if (input.inputFingerprint !== narrative.record.inputFingerprint) throw new LostNarrativeWork()
     inputs = false
     await lease.check()
-    const modelOptions = { model: deps.model, clock, signal: lease.control.signal, attemptId: narrative.record.attemptId! }
+    onEvent({ event: 'narrative-started', timestamp: clock.now().toISOString(), stage, round })
+    const resume = await lease.control.wait(() => readSummaryGeneration(deps, narrative.record))
+    const modelOptions = {
+      model: deps.model, clock, signal: lease.control.signal, attemptId: narrative.record.attemptId!,
+      ...resume, onEvent,
+      async onCheckpoint(step: AnalysisSummaryStep) {
+        const current = await lease.check()
+        const history = await lease.control.wait(() => writeSummaryCheckpoint(deps, current.narrative.record, step, {
+          createdAt: narrativeTimestamp(current.run.record, clock.now().toISOString()),
+          signal: lease.control.signal, assertActive: () => lease.check(),
+        }))
+        await lease.atomic((record, timestamp) => {
+          if (record.history?.id !== current.narrative.record.history?.id) throw new LostNarrativeWork()
+          return {
+            ...record, updatedAt: timestamp, history,
+            ...(step.scopeId === 'final' ? { summaryRound: step.round } : {}),
+          }
+        })
+      },
+    }
     const generated = 'source' in input
-      ? await lease.control.wait(() => generateCandidateNarrative(input, modelOptions))
-      : await lease.control.wait(() => generateTargetNarrative(input, modelOptions))
+      ? await lease.control.wait(() => generateCandidateSummary(input, modelOptions))
+      : await lease.control.wait(() => generateTargetSummary(input, modelOptions))
     stage = 'publication'
     const current = await lease.check()
     const artifact = parseAnalysisNarrativeArtifact({
-      schemaVersion: 1, dataKind: 'real', kind: input.binding.kind, binding: input.binding,
+      schemaVersion: 2, dataKind: 'real', kind: input.binding.kind, binding: input.binding,
       ...generated.output, provenance: generated.provenance, inputFingerprint: input.inputFingerprint,
+      approval: { kind: 'automatic' }, history: current.narrative.record.history,
       createdAt: narrativeTimestamp(current.run.record, clock.now().toISOString()), humanReviewRequired: true,
       generationId: narrative.record.generationId, requestId: narrative.record.requestId,
       ...(narrative.record.published ? { previousPublication: narrative.record.published } : {}),

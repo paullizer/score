@@ -9,7 +9,7 @@ import { build } from 'esbuild'
 import fontkit from '@pdf-lib/fontkit'
 import { PDFDocument } from 'pdf-lib'
 import {
-  loadReportFoundation, realReportFixture, reportFixtureCitation, REPORT_TEST_TIMESTAMP, withReportNarratives,
+  loadReportFoundation, realReportFixture, reportFixtureCitation, REPORT_TEST_TIMESTAMP, version2ReportFixture, withReportNarratives,
 } from './test-support.mjs'
 import {
   assertNoClipping as checkClipping, contentsPages, fictionalPdfNavigationQaFixture, fictionalPdfQaFixture, fictionalSampleInput,
@@ -76,6 +76,29 @@ async function savePdfQaArtifact(name, input) {
 const assertNoClipping = pdf => checkClipping(pdf, measurementFonts)
 const occurrences = (text, phrase) => text.split(phrase).length - 1
 const overviewText = pdf => overviewPages(pdf).map(page => page.body).join('')
+
+test('PDF preserves long v2 summaries and manual known issues through full-text and overview-table pagination', async () => {
+  const pdf = await generate(version2ReportFixture({ long: true }))
+  const group = pdf.report.groups[0]
+  const candidate = group.comparisons[0]
+  const review = reviewSections(pdf)[0]
+  assert.ok(review.pages.length > 1)
+  assert.ok(review.body.includes(candidate.narrative.text))
+  assert.ok(review.body.includes('Manually approved summary. Automated review: needs-correction.'))
+  assert.ok(review.body.includes(`Known issue: ${candidate.narrative.approval.issues[0].message}`))
+  const targetText = pdf.pages.filter(page => page.section.endsWith('Target overview')).map(page => page.body).join('')
+  for (const paragraph of group.target.narrative.paragraphs) assert.ok(targetText.includes(paragraph))
+  assert.ok(targetText.includes(`Known issue: ${group.target.narrative.approval.issues[0].message}`))
+  const glance = overviewPages(pdf)
+  assert.ok(glance.length > 1)
+  const highlights = glance.flatMap(page => page.items.filter(item => !item.bold && item.x > 260 && item.y > 66 && item.y < 685))
+    .map(item => item.source).join('')
+  for (const comparison of group.comparisons) {
+    assert.ok(highlights.includes(comparison.narrative.overview), 'No long overview is clipped, including an unfeatured/withheld review.')
+    assert.ok(highlights.includes(`Known issue: ${comparison.narrative.approval.issues[0].message}`))
+  }
+  assertNoClipping(pdf)
+})
 
 function assertContentsDestinations(pdf) {
   const contents = contentsPages(pdf)

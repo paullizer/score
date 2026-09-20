@@ -9,6 +9,9 @@ import type {
   RealAnalysisResult,
 } from './real-analyses'
 import type { ImmutableJsonBlobReference } from './real-resumes'
+import type {
+  AnalysisSummaryApproval, AnalysisSummaryDiagnostic, AnalysisSummaryHistoryReference, AnalysisSummaryPublicationMetadata,
+} from './analysis-summary-history'
 
 export const ANALYSIS_NARRATIVE_SCHEMA_VERSION = 1 as const
 
@@ -64,14 +67,14 @@ export interface AnalysisNarrativePublishedVersion extends AnalysisNarrativeRevi
   publishedAt: string
 }
 
-export interface AnalysisCandidateNarrativeContent {
+export interface AnalysisCandidateNarrativeContent extends AnalysisSummaryPublicationMetadata {
   // Three or four complete sentences; scores remain in the unchanged scoring result.
   text: string
   // One complete sentence generated and independently reviewed together with text.
   overview: string
 }
 
-export interface AnalysisTargetNarrativeContent {
+export interface AnalysisTargetNarrativeContent extends AnalysisSummaryPublicationMetadata {
   paragraphs: string[]
 }
 
@@ -219,8 +222,8 @@ export interface AnalysisNarrativeProvenance {
   attemptId: string
   outputSha256: string
   generation: AnalysisModelProvenance
-  // At least one independent review; the last must support this exact output and input fingerprint.
-  groundingReviews: [AnalysisNarrativeGroundingReview, ...AnalysisNarrativeGroundingReview[]]
+  // Automated publication requires exact-output support; v2 manual approval retains the original verdict.
+  groundingReviews: AnalysisNarrativeGroundingReview[]
   correctionCount: number
   synthesis?: AnalysisNarrativeSynthesisStep[]
 }
@@ -231,7 +234,7 @@ export interface AnalysisNarrativePublicationReference extends AnalysisNarrative
 }
 
 export interface AnalysisNarrativeArtifactBase {
-  schemaVersion: typeof ANALYSIS_NARRATIVE_SCHEMA_VERSION
+  schemaVersion: typeof ANALYSIS_NARRATIVE_SCHEMA_VERSION | 2
   dataKind: 'real'
   createdAt: string
   generationId: string
@@ -241,6 +244,8 @@ export interface AnalysisNarrativeArtifactBase {
   provenance: AnalysisNarrativeProvenance
   // Older immutable versions remain reachable without an unbounded history array in a work record.
   previousPublication?: AnalysisNarrativePublicationReference
+  approval?: AnalysisSummaryApproval
+  history?: AnalysisSummaryHistoryReference
 }
 
 export interface RealAnalysisCandidateNarrativeArtifact extends AnalysisNarrativeArtifactBase, AnalysisCandidateNarrativeModelOutput {
@@ -261,6 +266,7 @@ export interface AnalysisNarrativeProcessingError {
   // Safe, actionable text only; exclude source excerpts, private URLs and raw model responses.
   message: string
   retryable: boolean
+  diagnostic?: AnalysisSummaryDiagnostic
 }
 
 export interface AnalysisNarrativeWorkState extends Omit<AnalysisWorkState, 'error'> {
@@ -285,6 +291,8 @@ export interface AnalysisNarrativeRecordBase extends AnalysisEntityBase, Analysi
   waitingFor?: AnalysisNarrativeWaitReason
   // Retain during regeneration, failure and cancellation; it does not make a pending generation ready.
   published?: AnalysisNarrativePublicationReference
+  history?: AnalysisSummaryHistoryReference
+  summaryRound?: number
 }
 
 export interface RealAnalysisCandidateNarrativeRecord extends AnalysisNarrativeRecordBase {
@@ -321,6 +329,8 @@ export interface AnalysisNarrativeSummaryBase extends AnalysisNarrativeCurrentSt
   nextAttemptAt: string | null
   updatedAt: string | null
   error: AnalysisNarrativeProcessingError | null
+  summaryRound?: number
+  hasHistory?: boolean
 }
 
 export interface RealAnalysisCandidateNarrativeSummary extends AnalysisNarrativeSummaryBase {

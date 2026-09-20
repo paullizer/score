@@ -7,8 +7,8 @@ import { reportReviewLinks, validatedReportLinkContext } from './links'
 import { assertReportResourceLimits } from './model'
 import { getDisplayName } from '../../domain/displayNames'
 import {
-  candidateNarrativeOverview, candidateNarrativeText, reportTargetPresentation,
-  requireReportNarratives, targetNarrativeParagraphs,
+  candidateNarrativeDisclosures, candidateNarrativeOverview, candidateNarrativeText, reportTargetPresentation,
+  requireReportNarratives, targetNarrativeDisclosures, targetNarrativeParagraphs,
 } from './narratives'
 import {
   assertXmlText, criterionScoreLabel, evidenceStatusLabel, formatReportWeight, overallScoreLabel,
@@ -17,7 +17,7 @@ import {
 import { readableAnalysisDate, readableCandidateName, readableCompletionNotice, selectKeyCriteria } from './readable'
 import type { ReadableCriterion } from './readable'
 import {
-  assertPptxBox, keepPptxParagraphEndWordsTogether, measurePptxText, paginatePptxBlocks, PPTX_LAYOUT,
+  assertPptxBox, keepPptxParagraphEndWordsTogether, measurePptxText, paginatePptxBlocks, PPTX_LAYOUT, takePptxText,
 } from './pptx-layout'
 import type { PptxBox, PptxFlowBlock } from './pptx-layout'
 
@@ -57,6 +57,11 @@ function height(value: string, width: number, fontSize: number): number {
 
 function fits(value: string, width: number, available: number, fontSize: number): boolean {
   return height(value, width, fontSize) <= available + 0.000001
+}
+
+function summaryLeading(fontSize: number): PptxGenJS.TextPropsOptions {
+  // Percentage leading varies with a viewer's font metrics; point leading matches the paginator.
+  return { lineSpacingMultiple: undefined, lineSpacing: fontSize * PPTX_LAYOUT.lineHeight }
 }
 
 function text(
@@ -350,6 +355,8 @@ function jobIntroduction(deck: ReportDeck, group: ReportGroup, index: number, co
     color: C.muted, objectName: `${key}-metadata`,
   })
   targetLinks(slide, deck, group, key, contentsSlide)
+  const manual = group.target.narrative?.approval?.kind === 'manual'
+  const overviewSection = manual ? 'Manually approved overview' : 'Analysis overview'
   const blocks: PptxFlowBlock[] = [
     ...(group.target.displayName !== undefined ? [{
       key: `${key}-source-title`, text: `Source target title: ${presentation.title}`, section: 'Job context',
@@ -357,10 +364,17 @@ function jobIntroduction(deck: ReportDeck, group: ReportGroup, index: number, co
     { key: `${key}-context-heading`, text: 'Job context', kind: 'heading', fontSize: 20, section: 'Job context' },
     { key: `${key}-description`,
       text: keepPptxParagraphEndWordsTogether(presentation.description, BODY_WIDTH, PPTX_LAYOUT.bodyFontSize), section: 'Job context' },
-    { key: `${key}-overview-heading`, text: 'Analysis overview', kind: 'heading', fontSize: 20, section: 'Analysis overview' },
+    { key: `${key}-overview-heading`, text: overviewSection, kind: 'heading', fontSize: 20, section: overviewSection },
+    ...(group.comparisons.some(item => item.status === 'complete')
+      ? targetNarrativeDisclosures(group.target).map((disclosure, disclosureIndex) => ({
+        key: `${key}-disclosure-${disclosureIndex}`, text: disclosure, section: overviewSection,
+      })) : []),
+    ...(manual ? [{
+      key: `${key}-summary-text-heading`, text: 'Saved overview text', kind: 'heading' as const, fontSize: 20, section: overviewSection,
+    }] : []),
     ...(group.comparisons.some(item => item.status === 'complete')
       ? targetNarrativeParagraphs(group.target).map((paragraph, paragraphIndex) => ({
-        key: `${key}-narrative-${paragraphIndex}`, text: paragraph, section: 'Analysis overview',
+        key: `${key}-narrative-${paragraphIndex}`, text: paragraph, section: overviewSection,
       }))
       : [{ key: `${key}-unassessed`, text: 'No completed assessments are available for this job or grade.', section: 'Analysis overview' }]),
   ]
@@ -391,6 +405,7 @@ function jobIntroduction(deck: ReportDeck, group: ReportGroup, index: number, co
         x: 0.6, y: (first ? bodyY : PPTX_LAYOUT.bodyY) + fragment.y - offset, w: BODY_WIDTH, h: fragment.height,
       }, fragment.fontSize, {
         bold: fragment.kind === 'heading', objectName: `${fragment.key}-part-${pageIndex}-${fragmentIndex}`,
+        ...(group.target.narrative?.summaryVersion === 2 ? summaryLeading(fragment.fontSize) : {}),
       })
     }
   })
@@ -476,17 +491,23 @@ function overview(deck: ReportDeck, group: ReportGroup, groupIndex: number, cand
   const widths = [2.75, 2.35, BODY_WIDTH - 5.1]
   const y = PPTX_LAYOUT.bodyY, capacity = CONTENT_BOTTOM - y
   let rows: DeckCell[][] = [], heights: number[] = [], page = 0
+  let continued = false, manualContinuation = false
   const flush = () => {
-    const slide = deck.slide('Candidates at a glance', sectionReference(group, groupIndex))
+    const slide = deck.slide(`Candidates at a glance${continued ? ' (continued)' : ''}`, sectionReference(group, groupIndex))
     if (rows.length) table(slide, ['Name', 'Score', 'Assessment overview'], rows, widths, uniformRowHeights(heights), y, `overview-${groupIndex}-${page}`)
     else text(slide, 'No completed assessments are available for this job yet.', {
       x: 0.6, y, w: BODY_WIDTH, h: 0.8,
     }, 18, { objectName: 'empty-overview' })
-    text(slide, 'Use candidate links for the overview, saved analysis, or resume.', { x: 0.6, y: LINKS_Y, w: 11.4, h: 0.35 }, 14, {
+    const notice = manualContinuation ? `Manually approved summary and known issues${continued ? ' (continued)' : ''}; saved scores are unchanged.`
+      : continued ? 'Continued overview for the same saved candidate and score. Use the candidate link for details.'
+        : 'Use candidate links for the overview, saved analysis, or resume.'
+    text(slide, notice, { x: 0.6, y: LINKS_Y, w: 11.4, h: 0.35 }, 14, {
       color: C.muted, objectName: 'overview-link-note',
     })
     rows = []
     heights = []
+    continued = false
+    manualContinuation = false
     page++
   }
   for (const [index, comparison] of group.comparisons.entries()) {
@@ -495,10 +516,26 @@ function overview(deck: ReportDeck, group: ReportGroup, groupIndex: number, cand
       overviewCandidateCell(comparison, index + 1, deck.links(comparison), widths[0] - TABLE_PADDING_X * 2,
         candidateOverviews.get(comparison.id)),
       { text: comparison.overall.status === 'available' ? overallScoreLabel(comparison.overall) : 'Withheld' },
-      { text: candidateNarrativeOverview(comparison) },
+      { text: [...candidateNarrativeDisclosures(comparison), candidateNarrativeOverview(comparison)].join('\n\n') },
     ]
     const rowHeight = tableRowHeight(row, widths)
-    if (HEADER_HEIGHT + rowHeight > capacity) throw new Error(`PowerPoint overview row exceeds its readable layout budget. ${LIMIT_MESSAGE}`)
+    if (HEADER_HEIGHT + rowHeight > capacity) {
+      if (rows.length) flush()
+      let remaining = row[2].text
+      let part = 0
+      do {
+        const fragment = takePptxText(remaining, widths[2] - TABLE_PADDING_X * 2,
+          capacity - HEADER_HEIGHT - TABLE_PADDING_Y * 2, TABLE_FONT)
+        const continuedRow = [row[0], row[1], { text: fragment.text }]
+        rows.push(continuedRow)
+        heights.push(tableRowHeight(continuedRow, widths))
+        continued = part++ > 0
+        manualContinuation = comparison.narrative?.approval?.kind === 'manual'
+        flush()
+        remaining = fragment.rest
+      } while (remaining)
+      continue
+    }
     if (rows.length && HEADER_HEIGHT + (rows.length + 1) * Math.max(rowHeight, ...heights) > capacity) flush()
     rows.push(row)
     heights.push(rowHeight)
@@ -685,6 +722,10 @@ interface CandidateLayout {
   separateNarrative: boolean
 }
 
+function candidateSummaryText(comparison: ReportComparison): string {
+  return [...candidateNarrativeDisclosures(comparison), candidateNarrativeText(comparison)].join('\n\n')
+}
+
 function candidateLayout(comparison: ReportComparison): CandidateLayout {
   const name = readableCandidateName(comparison.candidate)
   const role = comparison.candidate.role ? `Role: ${comparison.candidate.role}` : 'Role not recorded'
@@ -696,7 +737,7 @@ function candidateLayout(comparison: ReportComparison): CandidateLayout {
   const sourceNameLabel = sourceName === null ? null : fits(sourceName, metadataWidth, 0.57, 14) ? sourceName : 'View source-stated name'
   const roleHeight = height(roleLabel, metadataWidth, 15), sourceHeight = height(sourceLabel, metadataWidth, 14)
   const sourceNameHeight = sourceNameLabel === null ? 0 : height(sourceNameLabel, metadataWidth, 14)
-  const narrative = candidateNarrativeText(comparison)
+  const narrative = candidateSummaryText(comparison)
   for (const nameFont of [32, 28, 24, 22]) {
     const nameHeight = height(name, metadataWidth, nameFont)
     if (nameHeight > 1.45) continue
@@ -710,7 +751,8 @@ function candidateLayout(comparison: ReportComparison): CandidateLayout {
     }
   }
   const nameFont = [30, 26, 22, 20].find(size => fits(name, BODY_WIDTH, 3.62, size))
-  const narrativeFont = [16, 14].find(size => fits(narrative, BODY_WIDTH, CONTENT_BOTTOM - 1.82, size))
+  const narrativeFont = comparison.narrative?.summaryVersion === 2 ? 16
+    : [16, 14].find(size => fits(narrative, BODY_WIDTH, CONTENT_BOTTOM - 1.82, size))
   if (!nameFont || !narrativeFont) {
     throw new Error(`PowerPoint cannot preserve the full candidate name and saved assessment at readable sizes within three slides. ${LIMIT_MESSAGE}`)
   }
@@ -770,17 +812,20 @@ function candidateOverview(
     y += item.h + 0.08
   }
   scorePanel(slide, comparison, key, layout.separateNarrative)
+  const overview = [...candidateNarrativeDisclosures(comparison), candidateNarrativeOverview(comparison)].join('\n\n')
   if (!layout.separateNarrative) {
     rectangle(slide, { x: 0.6, y: layout.summaryY, w: BODY_WIDTH, h: CONTENT_BOTTOM - layout.summaryY }, C.paper, `${key}-summary-panel`)
     text(slide, 'Assessment summary', { x: 0.8, y: layout.summaryY + 0.16, w: BODY_WIDTH - 0.4, h: 0.43 }, 18, {
       bold: true, objectName: `${key}-summary-heading`,
     })
-    text(slide, candidateNarrativeText(comparison), {
+    text(slide, candidateSummaryText(comparison), {
       x: 0.8, y: layout.summaryY + 0.66, w: BODY_WIDTH - 0.4, h: CONTENT_BOTTOM - layout.summaryY - 0.71,
-    }, layout.narrativeFont, { objectName: `${key}-summary` })
-  } else if (fits(candidateNarrativeOverview(comparison), BODY_WIDTH, 5.21 - y, 16)) {
-    text(slide, candidateNarrativeOverview(comparison), { x: 0.6, y: y + 0.12, w: BODY_WIDTH, h: 5.33 - y }, 16, {
-      objectName: `${key}-identity-overview`,
+    }, layout.narrativeFont, {
+      objectName: `${key}-summary`, ...(comparison.narrative?.summaryVersion === 2 ? summaryLeading(layout.narrativeFont) : {}),
+    })
+  } else if (fits(overview, BODY_WIDTH, 5.21 - y, 16)) {
+    text(slide, overview, { x: 0.6, y: y + 0.12, w: BODY_WIDTH, h: 5.33 - y }, 16, {
+      objectName: `${key}-identity-overview`, ...(comparison.narrative?.summaryVersion === 2 ? summaryLeading(16) : {}),
     })
   }
   candidateLinks(slide, group, comparison, links, key, plan.fullDetails)
@@ -887,7 +932,29 @@ function featuredReview(deck: ReportDeck, group: ReportGroup, comparison: Report
   const layout = candidateLayout(comparison)
   const plan = reviewPlan(group, comparison, links, layout.separateNarrative)
   candidateOverview(deck, group, comparison, links, plan, layout, key, reference)
-  if (layout.separateNarrative) {
+  if (layout.separateNarrative && comparison.narrative?.summaryVersion === 2) {
+    const manual = comparison.narrative.approval?.kind === 'manual'
+    const blocks: PptxFlowBlock[] = [
+      ...candidateNarrativeDisclosures(comparison).map((disclosure, index) => ({ key: `${key}-disclosure-${index}`, text: disclosure })),
+      ...(manual ? [{ key: `${key}-summary-text-heading`, text: 'Saved summary text', kind: 'heading' as const, fontSize: 20 }] : []),
+      { key: `${key}-summary`, text: candidateNarrativeText(comparison) },
+    ]
+    const pages = paginatePptxBlocks(blocks, BODY_WIDTH, CONTENT_BOTTOM - 1.82)
+    pages.forEach((page, pageIndex) => {
+      const slide = deck.slide('', reference)
+      text(slide, `${manual ? 'Manually approved summary' : 'Assessment summary'}${pageIndex ? ' (continued)' : ''}`, { x: 0.6, y: 1.12, w: 7.8, h: 0.45 }, 20, {
+        bold: true, objectName: `${key}-assessment-name-${pageIndex}`,
+      })
+      candidateOverviewLink(slide, before + 1, `${key}-assessment-${pageIndex}`, 1.18)
+      for (const [fragmentIndex, fragment] of page.fragments.entries()) {
+        text(slide, fragment.text, { x: 0.6, y: 1.82 + fragment.y, w: BODY_WIDTH, h: fragment.height }, fragment.fontSize, {
+          bold: fragment.kind === 'heading', objectName: `${fragment.key}-part-${pageIndex}-${fragmentIndex}`,
+          ...summaryLeading(fragment.fontSize),
+        })
+      }
+      candidateLinks(slide, group, comparison, links, key, plan.fullDetails)
+    })
+  } else if (layout.separateNarrative) {
     const slide = deck.slide('', reference)
     text(slide, 'Assessment summary', { x: 0.6, y: 1.12, w: 3.65, h: 0.45 }, 20, {
       bold: true, objectName: `${key}-assessment-name`,
@@ -904,7 +971,9 @@ function featuredReview(deck: ReportDeck, group: ReportGroup, comparison: Report
   }
   scorecard(deck, group, comparison, links, plan, key, reference, index + 1, before + 1)
   if (!layout.separateNarrative) explanationSlide(deck, group, comparison, links, plan, key, reference, index + 1, before + 1)
-  if (deck.slideCount - before > 3) throw new Error('PowerPoint candidate reviews must not exceed three slides.')
+  if (comparison.narrative?.summaryVersion !== 2 && deck.slideCount - before > 3) {
+    throw new Error('Legacy PowerPoint candidate reviews must not exceed three slides.')
+  }
   return before + 1
 }
 

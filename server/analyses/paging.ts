@@ -5,12 +5,13 @@ import { isAnalysisId } from './validation'
 
 const tokenSchema = z.strictObject({
   version: z.literal(1), workspaceId: z.string().regex(WORKSPACE_ID_PATTERN),
-  kind: z.enum(['targets', 'runs', 'comparisons', 'diagnostics']),
+  kind: z.enum(['targets', 'runs', 'comparisons', 'diagnostics', 'summary-history']),
   runId: z.string().refine(value => isAnalysisId(value, 'run')).optional(),
   comparisonId: z.string().refine(value => isAnalysisId(value, 'comparison')).optional(),
+  summaryKind: z.enum(['candidate', 'target']).optional(), subjectId: z.string().min(1).max(200).optional(),
   cursor: z.string().min(1).max(12 * 1024),
 })
-type Scope = Pick<z.infer<typeof tokenSchema>, 'workspaceId' | 'kind' | 'runId' | 'comparisonId'>
+type Scope = Pick<z.infer<typeof tokenSchema>, 'workspaceId' | 'kind' | 'runId' | 'comparisonId' | 'summaryKind' | 'subjectId'>
 
 export function validateAnalysisPage(limit = 50, continuationToken?: string): void {
   if (!Number.isInteger(limit) || limit < 1 || limit > 100) throw invalidRequest('limit must be an integer between 1 and 100.')
@@ -29,7 +30,7 @@ export function analysisPageCursor(scope: Scope, token?: string): string | undef
   try {
     const value = tokenSchema.parse(JSON.parse(Buffer.from(token, 'base64url').toString('utf8')))
     if (value.workspaceId !== scope.workspaceId || value.kind !== scope.kind || value.runId !== scope.runId ||
-      value.comparisonId !== scope.comparisonId) throw new Error('scope')
+      value.comparisonId !== scope.comparisonId || value.summaryKind !== scope.summaryKind || value.subjectId !== scope.subjectId) throw new Error('scope')
     return value.cursor
   } catch { throw invalidRequest('This analysis page token is invalid or belongs to another list.') }
 }

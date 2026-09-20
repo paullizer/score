@@ -168,7 +168,10 @@ export function withReportNarratives(input, { targetId = null } = {}) {
       text: 'The saved resume documents sustained responsibility for investigating operational problems and explaining the resulting findings. Those examples support the analytical and delivery requirements within the scope of the captured evidence. The record does not independently establish every qualification, so reviewers should examine the cited passages and separate limitations.',
       overview: 'The record shows analytical work, but reviewers must verify its scope and unresolved requirements against the saved evidence.',
     }
-    const publication = { ...publicationMetadata('candidate', comparison.id, inputFingerprint), ...content }
+    const publication = { ...publicationMetadata('candidate', comparison.id, inputFingerprint), ...content,
+      ...(supplied?.summaryVersion === undefined ? {} : { summaryVersion: supplied.summaryVersion }),
+      ...(supplied?.approval === undefined ? {} : { approval: structuredClone(supplied.approval) }),
+    }
     comparison.narrative = { ...publication, revision: publicationRevision(publication) }
   }
   for (const target of value.targets) {
@@ -184,6 +187,8 @@ export function withReportNarratives(input, { targetId = null } = {}) {
     const publication = {
       ...publicationMetadata('target', target.id, inputFingerprint),
       paragraphs: supplied?.paragraphs ?? ['The reviewed records contain analytical and delivery examples, with differences in the depth of supporting evidence. Incomplete and unassessed requirements remain material limits to comparison, while any failed or cancelled reviews provide no candidate evidence.'],
+      ...(supplied?.summaryVersion === undefined ? {} : { summaryVersion: supplied.summaryVersion }),
+      ...(supplied?.approval === undefined ? {} : { approval: structuredClone(supplied.approval) }),
     }
     target.narrative = { ...publication, revision: publicationRevision(publication) }
   }
@@ -205,6 +210,30 @@ export function withReportNarratives(input, { targetId = null } = {}) {
 }
 
 export const withReadyReportNarratives = withReportNarratives
+
+export function version2ReportFixture({ long = false, manual = true } = {}) {
+  const input = realReportFixture({ scores: [92.75, null] })
+  const approval = (subject, field, paragraphIndex) => manual ? {
+    kind: 'manual', approvedAt: REPORT_TEST_TIMESTAMP, approvedBy: 'workspace-editor', reviewOutcome: 'needs-correction',
+    issues: [{
+      code: 'unsupported-claim', message: `${subject}: independent national responsibility was not established.${long
+        ? ` ${'The supplied assessment records narrower scope and should be checked by a human reviewer. '.repeat(15)}` : ''}`,
+      field, paragraphIndex,
+    }],
+  } : { kind: 'automatic' }
+  for (const comparison of input.comparisons) comparison.narrative = {
+    summaryVersion: 2, approval: approval(comparison.id, 'text', null),
+    text: `The saved assessment mentions 1,000 samples as 1000, 12.0 as 12, and a rated 480-volt system${long
+      ? `, ${'within the documented engineering scope, '.repeat(65)}without changing the assessment` : ''}. Its original score and limits are unchanged.`,
+    overview: `Saved overview for ${comparison.id}: ${long ? 'Documented methods and limited context; '.repeat(65) : 'two sentences are allowed. The recorded limits remain.'}`,
+  }
+  input.targets[0].narrative = {
+    summaryVersion: 2, approval: approval(input.targets[0].id, 'paragraphs', 0),
+    paragraphs: Array.from({ length: long ? 4 : 1 }, (_, index) =>
+      `Saved target paragraph ${index + 1} covers the supplied assessments${long ? `, ${'retaining recorded strengths and limits, '.repeat(30)}without a new assessment` : ''}. It preserves the scores and frozen evidence.`),
+  }
+  return withReportNarratives(input)
+}
 
 export function reportSummariesFixture(input, options) {
   if (input.dataKind !== 'real') throw new Error('Only a real-shaped test fixture can simulate the real summaries endpoint.')

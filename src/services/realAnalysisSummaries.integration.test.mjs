@@ -5,7 +5,7 @@ import { mkdir, rm } from 'node:fs/promises'
 import { join, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { build } from 'esbuild'
-import { analysisSummaryFixture, summaryResponse, summaryRunId, summaryWorkspaceId } from './analysisSummaries.test-support.mjs'
+import { analysisSummaryFixture, summaryHistoryFixture, summaryResponse, summaryRunId, summaryTimestamp, summaryWorkspaceId } from './analysisSummaries.test-support.mjs'
 
 const output = resolve(`.summary-service-tests-${randomUUID()}`)
 const originalFetch = globalThis.fetch
@@ -147,4 +147,96 @@ test('unacknowledged request IDs, foreign mutation scope and aborted reads fail 
   const controller = new AbortController()
   globalThis.fetch = async () => { controller.abort(); return json(value) }
   await assert.rejects(client.getRealAnalysisSummaries(summaryWorkspaceId, summaryRunId, {}, controller.signal), { name: 'AbortError' })
+})
+
+test('v2 summaries preserve manual approval, long two-sentence numerical prose and private-history progress metadata', async () => {
+  const history = summaryHistoryFixture(fixture)
+  const approval = { kind: 'manual', approvedAt: summaryTimestamp, approvedBy: 'workspace-editor',
+    reviewOutcome: 'needs-correction', issues: history.entries[0].review.issues }
+  const text = `The Ph.D. engineer's saved assessment records 1,000 as 1000, 12.0 as 12, 60/100, and a rated 480-volt system, ${'with documented applied methods, '.repeat(50)}without rescoring. Its limits remain recorded.`
+  const value = summaryResponse(fixture, { candidateStatus: 'ready', targetStatus: 'ready',
+    text, paragraphs: Array(5).fill(text), summaryVersion: 2, approval, hasHistory: true, summaryRound: 3 })
+  globalThis.fetch = async () => json(value)
+  const result = await client.getRealAnalysisSummaries(summaryWorkspaceId, summaryRunId)
+  assert.equal(result.comparisons[0].published.text, text)
+  assert.deepEqual(result.comparisons[0].published.approval, approval)
+  assert.equal(result.comparisons[0].published.summaryVersion, 2)
+  assert.deepEqual(result.targets[0].published.paragraphs, Array(5).fill(text))
+  assert.equal(result.comparisons[0].hasHistory, true)
+  assert.equal(result.comparisons[0].summaryRound, 3)
+  const failure = summaryResponse(fixture, { candidateStatus: 'failed', states: { 'comparison-1': {
+    diagnostic: { reason: 'factual-review', round: 3, modelCallId: randomUUID(), issueCount: 1 },
+  } } })
+  globalThis.fetch = async () => json(failure)
+  assert.deepEqual((await client.getRealAnalysisSummaries(summaryWorkspaceId, summaryRunId)).comparisons[0].error.diagnostic,
+    failure.comparisons[0].error.diagnostic)
+  for (const edit of [
+    item => { delete item.summaryVersion },
+    item => { delete item.approval },
+    item => { item.summaryVersion = 3 },
+    item => { item.text = ' ' },
+    item => { item.text = 'x'.repeat(16_001) },
+    item => { item.approval.issues[0].field = 'foreign' },
+  ]) {
+    const invalid = structuredClone(value)
+    edit(invalid.comparisons[0].published)
+    globalThis.fetch = async () => json(invalid)
+    await assert.rejects(client.getRealAnalysisSummaries(summaryWorkspaceId, summaryRunId), /invalid saved-summary envelope/)
+  }
+})
+
+test('private summary history GET validates subject identity and keeps complete draft/review checkpoints', async () => {
+  const history = summaryHistoryFixture(fixture)
+  const subject = { kind: 'candidate', subjectId: 'comparison-1' }
+  const requests = []
+  globalThis.fetch = async (url, init) => { requests.push({ url, init }); return json(history) }
+  const read = await client.getRealAnalysisSummaryHistory(summaryWorkspaceId, summaryRunId, subject, 'opaque+scoped/cursor')
+  assert.deepEqual(read, history)
+  assert.equal(requests[0].url, `/api/workspaces/${summaryWorkspaceId}/analyses/${summaryRunId}/summaries/candidate/comparison-1/history?continuationToken=opaque%2Bscoped%2Fcursor`)
+  assert.equal(requests[0].init.method, 'GET')
+  assert.equal(requests[0].init.cache, 'no-store')
+  assert.equal(requests[0].init.body, undefined)
+  for (const edit of [
+    page => { page.workspaceId = 'foreign' },
+    page => { page.subjectId = 'comparison-2' },
+    page => { page.entries[0].kind = 'target' },
+    page => { page.entries[0].runId = 'foreign' },
+    page => { page.entries[0].draft.kind = 'reduction' },
+    page => { page.entries[0].review.outputSha256 = 'f'.repeat(64) },
+    page => { page.entries.push(page.entries[0]) },
+    page => { page.continuationToken = 'same' },
+  ]) {
+    const invalid = structuredClone(history)
+    edit(invalid)
+    globalThis.fetch = async () => json(invalid)
+    await assert.rejects(client.getRealAnalysisSummaryHistory(summaryWorkspaceId, summaryRunId, subject, 'same'), /private (?:summary )?history/)
+  }
+  const controller = new AbortController()
+  globalThis.fetch = async () => { controller.abort(); return json(history) }
+  await assert.rejects(client.getRealAnalysisSummaryHistory(summaryWorkspaceId, summaryRunId, subject, undefined, controller.signal), { name: 'AbortError' })
+})
+
+test('manual publication and single-summary retry send exact immutable selection, original ETag and stable UUID only', async () => {
+  const history = summaryHistoryFixture(fixture)
+  const draft = history.entries[0]
+  const subject = { kind: history.kind, subjectId: history.subjectId }
+  const input = { generationId: draft.generationId, round: draft.round, outputSha256: draft.outputSha256 }
+  const summaries = summaryResponse(fixture, { targetId: draft.targetId })
+  const requests = []
+  globalThis.fetch = async (url, init) => { requests.push({ url, init }); return json({ summaries }) }
+  const key = randomUUID()
+  for (let replay = 0; replay < 2; replay++) {
+    await client.publishRealAnalysisSummaryDraft(summaryWorkspaceId, summaryRunId, subject, input, history.etag, key, draft.targetId)
+  }
+  await client.retryRealAnalysisSummary(summaryWorkspaceId, summaryRunId, subject, history.etag, key, draft.targetId)
+  assert.deepEqual(requests.map(item => JSON.parse(item.init.body)), [input, input, {}])
+  assert.ok(requests.every(item => item.init.headers.get('If-Match') === history.etag &&
+    item.init.headers.get('Idempotency-Key') === key && item.init.method === 'POST'))
+  assert.deepEqual(requests.map(item => item.url.split('/').slice(-4).join('/')), [
+    'summaries/candidate/comparison-1/publish', 'summaries/candidate/comparison-1/publish', 'summaries/candidate/comparison-1/retry',
+  ])
+  globalThis.fetch = async () => json({ summaries: summaryResponse(fixture) })
+  await assert.rejects(client.retryRealAnalysisSummary(summaryWorkspaceId, summaryRunId, subject, history.etag, key, draft.targetId), /mismatched/)
+  globalThis.fetch = async () => json({ summaries: { ...summaries, workspaceId: 'foreign' } })
+  await assert.rejects(client.publishRealAnalysisSummaryDraft(summaryWorkspaceId, summaryRunId, subject, input, history.etag, key, draft.targetId), /mismatched/)
 })
