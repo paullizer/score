@@ -10,6 +10,11 @@ export interface PendingLifecycleChange {
   operation: LifecycleOperation
 }
 
+export interface RenameEntityTarget {
+  kind: 'analysis' | 'job' | 'resume'
+  id: string
+}
+
 /** Cloud-only save status for the currently open workspace's document state. */
 export type CloudSaveState = 'saving' | 'saved' | 'error' | 'conflict'
 export type RealJobDetailLoadState =
@@ -64,6 +69,7 @@ export interface WorkspaceContextValue {
   notice: string | null
   clearNotice: () => void
   notify: (message: string) => void
+  renameEntity: (target: RenameEntityTarget, displayName: string, etag?: string) => void | Promise<void>
   addJobs: (items: ImportCandidate[], source: SourceKind, fail?: 'parsing' | 'rubric') => string[]
   addResumes: (items: ImportCandidate[]) => Promise<string[]>
   cancelJob: (id: string) => void | Promise<void>

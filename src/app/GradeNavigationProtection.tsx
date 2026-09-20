@@ -8,8 +8,9 @@ function snapshot(): HistorySnapshot {
   return { url: window.location.pathname + window.location.search + window.location.hash, state: window.history.state }
 }
 
-export function GradeNavigationProtectionProvider({ workspaceId, apiRef, children }: {
+export function GradeNavigationProtectionProvider({ workspaceId, routePrefix = `/workspaces/${encodeURIComponent(workspaceId)}`, apiRef, children }: {
   workspaceId: string
+  routePrefix?: string
   apiRef: { current: GradeLeaveProtectionApi | null }
   children: ReactNode
 }) {
@@ -78,9 +79,9 @@ export function GradeNavigationProtectionProvider({ workspaceId, apiRef, childre
         return
       }
       if (allowPop.current) { allowPop.current = false; return }
-      const prefix = `/workspaces/${encodeURIComponent(workspaceId)}/`
+      const prefix = routePrefix.endsWith('/') ? routePrefix : `${routePrefix}/`
       // Cross-workspace navigation is held by CloudApplication before its persistent provider leaves.
-      if (!window.location.pathname.startsWith(prefix) || !blockers.current.size) return
+      if (!(window.location.pathname === routePrefix || window.location.pathname.startsWith(prefix)) || !blockers.current.size) return
       event.stopImmediatePropagation()
       if (popPending.current) return
       popPending.current = true
@@ -108,7 +109,7 @@ export function GradeNavigationProtectionProvider({ workspaceId, apiRef, childre
       window.removeEventListener('beforeunload', warn)
       window.removeEventListener('popstate', onPop, { capture: true })
     }
-  }, [confirmLeave, workspaceId])
+  }, [confirmLeave, routePrefix])
 
   const value = useMemo(() => ({ confirmLeave, setBlocker, recordLocation, releaseForLeave, runAuthorized }), [confirmLeave, setBlocker, recordLocation, releaseForLeave, runAuthorized])
   const pending = visibleBlockers.some((blocker) => blocker.pending)
@@ -116,14 +117,14 @@ export function GradeNavigationProtectionProvider({ workspaceId, apiRef, childre
   return <GradeNavigationContext.Provider value={value}>
     {children}
     <Modal open={open} onOpenChange={(next) => { if (!next) resolveDecision(false) }}
-      title={pending ? 'Wait for the grade request' : dirty ? 'Leave unsaved grade changes?' : 'Continue leaving?'}
+      title={pending ? 'Request in progress' : dirty ? 'Unsaved changes' : 'Continue leaving?'}
       description={pending
-        ? 'The request may already be accepted by the server. Keep this workspace open until the response is known.'
-        : 'Only saved server versions are durable. Unsaved edits in this tab will be discarded if you leave.'}
+        ? 'Keep this workspace open until the request outcome is known. It may already have been accepted.'
+        : 'Unsaved edits in this tab will be discarded if you leave. Stay here to continue editing.'}
       footer={<><Button variant="primary" onClick={() => resolveDecision(false)}>Stay here</Button>
         <Button variant={dirty ? 'danger' : 'secondary'} disabled={pending} onClick={() => resolveDecision(true)}>{dirty ? 'Discard unsaved changes and leave' : 'Continue'}</Button></>}>
-      <ul className="list-disc space-y-2 pl-5 text-[12px]">{visibleBlockers.map((blocker, index) => <li key={index}>{blocker.label}{blocker.pending ? ' · awaiting the server' : ' · unsaved'}</li>)}</ul>
-      <p className="mt-4 text-[11px] text-muted">Accepted background discovery, extraction, and generation continue on the server after their request is acknowledged. This protection never cancels that work.</p>
+      <ul className="list-disc space-y-2 pl-5 text-[12px]">{visibleBlockers.map((blocker, index) => <li key={index}>{blocker.label}{blocker.pending ? ' · awaiting acknowledgement' : ' · unsaved'}</li>)}</ul>
+      <p className="mt-4 text-[11px] text-muted">Already accepted background work continues on the server after you leave. This protection never cancels that work.</p>
     </Modal>
   </GradeNavigationContext.Provider>
 }

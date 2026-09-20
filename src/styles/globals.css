@@ -62,11 +62,12 @@
   .save-status.is-error > span { background: var(--cp-danger); }
   .demo-chip { @apply inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-[10px]; color: var(--cp-text-muted); background: var(--cp-surface); }
   .main-content { @apply mx-auto w-full max-w-[1600px] px-9 pb-4 pt-9; }
-  .page-heading { @apply mb-7 flex items-end justify-between gap-5; }
+  .page-heading { @apply mb-7 flex flex-wrap items-end justify-between gap-5; }
+  .page-heading > div:first-child { min-width: 0; max-width: 100%; }
   .eyebrow { @apply mb-2.5 text-[9px] font-semibold uppercase tracking-[0.16em]; color: var(--cp-text-soft); }
-  .page-heading h1 { @apply text-[31px] font-semibold tracking-[-1px]; }
+  .page-heading h1 { @apply text-[31px] font-semibold tracking-[-1px]; overflow-wrap: anywhere; }
   .page-heading p { @apply mt-2 text-[13px]; color: var(--cp-text-muted); }
-  .heading-actions { @apply flex shrink-0 flex-wrap items-center gap-2; }
+  .heading-actions { @apply flex shrink-0 flex-wrap items-center gap-2; max-width: 100%; }
   .button { @apply inline-flex shrink-0 items-center justify-center gap-2 rounded-[10px] border font-medium; transition: background 150ms, border-color 150ms, transform 150ms; white-space: nowrap; }
   .button-md { @apply px-4 py-2.5 text-[12px]; min-height: 39px; }
   .button-sm { @apply px-3 py-2 text-[11px]; min-height: 32px; }
@@ -138,7 +139,7 @@
   .data-table .checkbox-cell { @apply w-10 pr-0; }
   .job-cell { @apply flex min-w-[240px] items-center gap-3; }
   .job-monogram { @apply flex h-10 w-10 shrink-0 items-center justify-center rounded-xl border text-[11px] font-semibold; background: var(--cp-surface-soft); color: var(--cp-text-muted); }
-  .row-title { @apply text-[12px] font-semibold; }
+  .row-title { @apply text-[12px] font-semibold; overflow-wrap: anywhere; }
   .row-title:hover { color: var(--cp-accent); }
   .row-meta { @apply mt-1 text-[10px]; color: var(--cp-text-soft); }
   .job-submeta { @apply mt-1.5 flex items-center gap-1.5 text-[10px]; color: var(--cp-text-muted); }
@@ -317,6 +318,7 @@
   .matrix-cell .score-bar { width: 100%; margin-top: -4px; }
   .result-overview { @apply mb-5 grid grid-cols-[1fr_1.1fr_auto]; }
   .result-identity { @apply flex items-start gap-3 p-6; }
+  .result-identity > div, .result-target { min-width: 0; overflow-wrap: anywhere; }
   .result-identity .eyebrow, .result-target .eyebrow, .overall-score .eyebrow { @apply mb-2 text-[8px]; }
   .result-identity h2 { @apply text-[17px] font-semibold tracking-[-0.4px]; }
   .result-identity p { @apply mt-1 text-[11px]; color: var(--cp-text-muted); }

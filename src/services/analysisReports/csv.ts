@@ -1,7 +1,7 @@
 import { REPORT_LIMITS, type AnalysisReport, type ReportGenerationOptions } from '../../domain/analysis-reports'
 import { reportReviewLinks } from './links'
 import { assertReportResourceLimits } from './model'
-import { assessmentSummary, readableAnalysisDate, readableCandidateName, readableTargetLabel } from './readable'
+import { assessmentSummary, readableAnalysisDate, readableCandidateSourceName, readableTargetSourceLabel } from './readable'
 
 type Cell = string | number | null
 
@@ -18,12 +18,14 @@ function csvCell(value: Cell): string {
 export function generateCsvReport(report: AnalysisReport, options?: ReportGenerationOptions): Uint8Array {
   assertReportResourceLimits(report)
   const startedAt = Date.now()
+  const displayLabels = report.groups.some(group => group.target.displayName || group.comparisons.some(comparison => comparison.candidate.displayName))
   const criterionCount = Math.max(0, ...report.groups.map(group => group.target.criteria.length))
   const header: Cell[] = [
     report.dataKind === 'sample' ? 'Candidate name (fictional sample)' : 'Candidate name',
     'Job/grade', 'Overall score', 'Overall assessment',
     ...Array.from({ length: criterionCount }, (_, index) => `C${index + 1}`),
     'Analysis date', 'Source', 'Analysis link', 'Resume link', 'Job/grade link',
+    ...(displayLabels ? ['Candidate display label', 'Job/grade display title'] : []),
   ]
   const encoder = new TextEncoder()
   const chunks: Uint8Array[] = [Uint8Array.of(0xef, 0xbb, 0xbf)]
@@ -44,7 +46,7 @@ export function generateCsvReport(report: AnalysisReport, options?: ReportGenera
   let comparisons = 0
   for (const group of report.groups) {
     const { target } = group
-    const targetLabel = readableTargetLabel(report, group)
+    const targetLabel = readableTargetSourceLabel(report, group)
     let completed = 0
     for (const comparison of group.comparisons) {
       comparisons++
@@ -59,10 +61,11 @@ export function generateCsvReport(report: AnalysisReport, options?: ReportGenera
       })
       const links = reportReviewLinks(report, comparison, options)
       append([
-        readableCandidateName(comparison.candidate), targetLabel, comparison.overall.score,
+        readableCandidateSourceName(comparison.candidate), targetLabel, comparison.overall.score,
         assessmentSummary(target, comparison, 300), ...scores,
         readableAnalysisDate(comparison.analyzedAt), comparison.candidate.sourceLabel,
         links.analysis, links.resume, links.target,
+        ...(displayLabels ? [comparison.candidate.displayName ?? null, target.displayName ?? null] : []),
       ])
       rows++
       completed++

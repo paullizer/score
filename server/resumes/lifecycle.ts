@@ -1,4 +1,5 @@
 import type { LifecycleAction, LifecycleImpact, LifecycleMetadata, LifecycleOperation } from '../../src/domain/lifecycle'
+import { getDisplayName } from '../../src/domain/displayNames'
 import type { RealResumeRecord, ResumeEntity, VersionedResumeEntity } from '../../src/domain/real-resumes'
 import { conflict, notFound, unavailable } from '../errors'
 import type { LifecycleDependencies, WorkspaceLifecycleParticipant } from '../lifecycle/contracts'
@@ -280,7 +281,7 @@ export class ResumeLifecycleService {
     const removed = resumeIsRemoved(record.lifecycle) ||
       (workspace !== undefined && ['deleting', 'deleted'].includes(workspace.record.state))
     return {
-      target, name: removed ? 'Resume pending deletion' : record.resume.name ?? record.source.displayName,
+      target, name: removed ? 'Resume pending deletion' : getDisplayName(record, record.resume.name ?? record.source.displayName),
       counts: { resumes: 1, originals: record.capture ? 1 : 0, documents: record.extraction ? 1 : 0, profiles: record.profileBlob ? 1 : 0 },
       blockers: this.dependencies ? await this.dependencies.impact(workspaceId, target) : [],
     }

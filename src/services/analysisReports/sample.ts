@@ -5,8 +5,9 @@ import type {
 } from '../../domain/analysis-reports'
 import type { AnalysisRun, AnalysisTarget, Citation, Criterion, SourceDocument } from '../../domain/types'
 import { assertResumeSnapshot, assertTargetSnapshot } from '../scoring'
-import { assertReportResourceLimits, buildAnalysisReport, createReportCitation } from './model'
+import { assertReportResourceLimits, buildAnalysisReport, createReportCitation, reportDisplayNameSchema as displayName } from './model'
 import { unavailableOverallScore } from './presentation'
+import { getDisplayName } from '../../domain/displayNames'
 
 const id = z.string().min(1).max(1024)
 const text = z.string().max(REPORT_LIMITS.maxTextCharacters)
@@ -28,16 +29,16 @@ const criterionSchema = z.strictObject({
   sourceCitations: z.array(sourceCitation).max(REPORT_LIMITS.maxCitationsPerAssessment).optional(),
 })
 const jobSchema = z.strictObject({
-  id, title: nonempty, organization: text, location: text, arrangement: text, employmentType: text, grade: text, series: text,
+  id, title: nonempty, displayName: displayName.optional(), organization: text, location: text, arrangement: text, employmentType: text, grade: text, series: text,
   source: z.enum(['pdf', 'markdown', 'docx', 'doc', 'url', 'website']), sourceLabel: nonempty, batchId: id.optional(),
   documentId: id, rubricId: id.nullable(), status: z.enum(['queued', 'parsing', 'generating', 'ready', 'error', 'cancelled']),
   errorStage: z.enum(['download', 'parsing', 'rubric']).optional(), error: text.optional(), createdAt: timestamp,
   dataKind: z.never().optional(),
 })
 const sampleRunSchema: z.ZodType<AnalysisRun> = z.strictObject({
-  id, name: nonempty, createdAt: timestamp,
+  id, name: nonempty, displayName: displayName.optional(), createdAt: timestamp,
   targets: z.array(z.strictObject({
-    id, kind: z.enum(['job', 'grade']), label: nonempty, sublabel: text,
+    id, kind: z.enum(['job', 'grade']), label: nonempty, displayName: displayName.optional(), sublabel: text,
     rubric: z.strictObject({
       id, groupId: id, kind: z.enum(['job', 'grade']), jobId: id.optional(), ladder: text.optional(), grade: text.optional(),
       name: nonempty, description: nonempty, version, criteria: z.array(criterionSchema).min(1).max(REPORT_LIMITS.maxCriteriaPerTarget),
@@ -47,7 +48,7 @@ const sampleRunSchema: z.ZodType<AnalysisRun> = z.strictObject({
   })).min(1).max(REPORT_LIMITS.maxTargets),
   resumes: z.array(z.strictObject({
     resume: z.strictObject({
-      id, name: nonempty, role: text, location: text, initials: text, experience: text, documentId: id,
+      id, name: nonempty, displayName: displayName.optional(), role: text, location: text, initials: text, experience: text, documentId: id,
       sourceLabel: nonempty, createdAt: timestamp, sample: z.literal(true),
       evidence: z.partialRecord(key, z.strictObject({ score, paragraphId: id })),
     }),
@@ -130,6 +131,7 @@ export function buildSampleAnalysisReport(run: AnalysisRun, options: SampleAnaly
   ]))
   const targets: ReportTarget[] = saved.targets.map(target => ({
     id: target.id, dataKind: 'sample', kind: target.kind, label: target.label, sublabel: target.sublabel,
+    ...(target.displayName === undefined ? {} : { displayName: target.displayName }),
     versionLabel: `Saved ${target.kind === 'grade' ? 'illustrative grade' : 'job'} rubric v${target.rubric.version}`,
     rubricId: target.rubric.id, rubricVersion: target.rubric.version, selection: null, snapshot: null,
     criteria: target.rubric.criteria.map(criterion => ({
@@ -149,6 +151,7 @@ export function buildSampleAnalysisReport(run: AnalysisRun, options: SampleAnaly
       id: comparison.id, index, dataKind: 'sample', targetId: target.id,
       candidate: {
         id: resume.resume.id, name: resume.resume.name, role: resume.resume.role, sourceLabel: resume.resume.sourceLabel,
+        ...(resume.resume.displayName === undefined ? {} : { displayName: resume.resume.displayName }),
         documentId: resume.document.id, documentVersion: resume.document.version, documentSha256: null, snapshot: null,
       },
       status: comparison.status,
@@ -187,7 +190,7 @@ export function buildSampleAnalysisReport(run: AnalysisRun, options: SampleAnaly
   const generatedAt = parsedOptions.generatedAt ?? new Date().toISOString()
   return buildAnalysisReport({
     dataKind: 'sample',
-    run: { id: saved.id, name: saved.name, createdAt: saved.createdAt },
+    run: { id: saved.id, name: getDisplayName(saved, saved.name), createdAt: saved.createdAt },
     capture: parsedOptions.capture ?? { startedAt: generatedAt, completedAt: generatedAt },
     generatedAt,
     targets,

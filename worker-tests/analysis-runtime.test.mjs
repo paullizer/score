@@ -146,6 +146,66 @@ function azurePollingFor(f) {
   return { store: api.createAnalysisStoreFromContainer(container), queries, parentReads }
 }
 
+test('analysis metadata edits survive initializer leases and progress publication without changing the accepted manifest name', async () => {
+  const f = fixture()
+  const created = await createRun(f, 6, 5)
+  assert.equal(created.run.status, 'initializing')
+  const renamed = await f.service.updateMetadata(f.workspaceId, created.run.id, { displayName: 'Initialization alias' }, created.etag)
+  const mock = modelFor(f)
+  assert.deepEqual(await runAnalysisWorker(mock.deps, { maxItems: 1 }), { claimed: 1, completed: 0 })
+  const current = await f.analysis.store.get(f.workspaceId, created.run.id)
+  assert.equal(current.record.displayName, 'Initialization alias')
+  assert.equal(current.record.name, renamed.run.name)
+  assert.equal(current.record.progress.initialized, 30)
+  assert.equal(current.record.status, 'queued')
+  assert.deepEqual(current.record.manifest, created.run.manifest)
+  assert.equal((await api.readAnalysisManifest(f.analysis.blobs, current.record)).request.name, created.run.name)
+  assert.equal(mock.calls.length, 0)
+})
+
+test('analysis metadata edits and captured labels stay out of model input and survive a result-publication ETag conflict', async () => {
+  const f = fixture()
+  const resume = await seedResume(f)
+  const job = await seedJob(f)
+  f.resumeValues.set(`${f.workspaceId}/${resume.record.id}`, { record: { ...resume.record, displayName: 'Captured resume alias' }, etag: '"resume-name"' })
+  f.jobValues.set(`${f.workspaceId}/${job.record.id}`, { record: { ...job.record, displayName: 'Captured target alias' }, etag: '"job-name"' })
+  const created = await f.service.create(f.workspaceId, randomUUID(), {
+    name: 'Accepted analysis name', resumes: [resume.selection], targets: [job.selection],
+  }, ACTOR)
+  const original = comparisons(f, created.run.id)[0]
+  let raced = false
+  const mock = modelFor(f, async ({ kind, request }) => {
+    assert.doesNotMatch(JSON.stringify(request), /Captured resume alias|Captured target alias|Assessment alias|Publication alias/)
+    if (kind === 'resume_rubric_assessment') {
+      const run = await f.analysis.store.get(f.workspaceId, created.run.id)
+      await f.service.updateMetadata(f.workspaceId, created.run.id, { displayName: 'Assessment alias' }, run.etag)
+    } else {
+      f.analysis.store._beforeBatch(async operations => {
+        assert.ok(operations.some(item => item.record.recordType === 'analysis-comparison' && item.record.status === 'complete'))
+        raced = true
+        const run = await f.analysis.store.get(f.workspaceId, created.run.id)
+        await f.service.updateMetadata(f.workspaceId, created.run.id, { displayName: 'Publication alias' }, run.etag)
+      })
+    }
+  })
+  assert.deepEqual(await runAnalysisWorker(mock.deps, { maxItems: 1 }), { claimed: 1, completed: 1 })
+  const current = await f.analysis.store.get(f.workspaceId, created.run.id)
+  assert.equal(raced, true)
+  assert.equal(current.record.displayName, 'Publication alias')
+  assert.equal(current.record.name, created.run.name)
+  assert.equal(current.record.status, 'complete')
+  assert.deepEqual(current.record.manifest, created.run.manifest)
+  const completed = await f.service.comparisonDetail(f.workspaceId, created.run.id, original.record.id)
+  assert.equal(completed.comparison.attempts, 1)
+  assert.equal(completed.comparison.retryCount, 0)
+  assert.equal(completed.resumeSnapshot.displayName, 'Captured resume alias')
+  assert.equal(completed.targetSnapshot.summary.displayName, 'Captured target alias')
+  assert.deepEqual(completed.resumeSnapshot.resume, resume.record.resume)
+  assert.equal(completed.result.provenance.manifestSha256, created.run.manifest.sha256)
+  assert.deepEqual(completed.result.overall, { status: 'available', score: 60 })
+  assert.equal(mock.calls.length, 2)
+})
+
 test('a durable 500-pair bootstrap is completed in 25-pair transactions before any model call', async () => {
   const f = fixture()
   f.analysis.store._beforeBatch(() => { throw new Error('Interrupted after durable run acceptance') })

@@ -116,7 +116,7 @@ function fakeStore(initial, hooks = {}) {
     async publish(value, etag, rubric) {
       if (hooks.publish) await hooks.publish()
       assertWritable()
-      if (etag !== `"${version}"`) throw new Error('publish conflict')
+      if (etag !== `"${version}"`) throw Object.assign(new Error('publish conflict'), { name: 'StoreConflictError' })
       current = structuredClone(value)
       published = structuredClone(rubric)
       version += 1
@@ -141,6 +141,10 @@ function fakeStore(initial, hooks = {}) {
     },
     async finishBlobWrite(writer) { writers.delete(writer.id) },
     setWorkspaceState(value) { workspaceState = value },
+    setDisplayName(value) {
+      current = { ...current, displayName: value }
+      version += 1
+    },
     setLifecycle(scope, metadata) {
       current[scope === 'job' ? 'lifecycle' : 'rubricLifecycle'] = metadata
       if (locked(metadata)) {
@@ -222,6 +226,57 @@ function successfulModel(result = modelResult) {
     choices: [{ message: { content: JSON.stringify(result) } }],
   }), { status: 200 })
 }
+
+test('job metadata edits during processing and conditional publication preserve aliases without retrying model work', async () => {
+  let updateRaced = false
+  let publicationRaced = false
+  const initial = record({ displayName: 'Before processing' })
+  const store = fakeStore(initial, {
+    replace(value) {
+      if (!updateRaced && value.job.status === 'generating') {
+        updateRaced = true
+        store.setDisplayName('While generating')
+      }
+    },
+    publish() {
+      if (!publicationRaced) {
+        publicationRaced = true
+        store.setDisplayName('While publishing')
+      }
+    },
+  })
+  let calls = 0
+  const deps = dependencies(store, fakeBlobs(), async (_url, init) => {
+    calls++
+    assert.doesNotMatch(init.body, /Before processing|While generating|While publishing|During model/)
+    store.setDisplayName('During model')
+    return successfulModel()
+  })
+  assert.deepEqual(await runWorker(deps, { maxJobs: 1 }), { claimed: 1, completed: 1 })
+  assert.equal(updateRaced, true)
+  assert.equal(publicationRaced, true)
+  assert.equal(calls, 1)
+  assert.equal(store.state().displayName, 'While publishing')
+  assert.equal(store.state().job.title, modelResult.title)
+  assert.equal(store.state().job.status, 'ready')
+  assert.equal(store.state().job.displayName, undefined)
+  assert.equal(store.state().attempts, 1)
+  assert.equal(store.state().error, undefined)
+  assert.equal(store.state().lease, undefined)
+  assert.deepEqual(store.state().source, initial.source)
+  assert.equal(store.published().name, `${modelResult.title} rubric`)
+})
+
+test('job metadata timestamps ahead of the worker clock do not prevent claims or move backwards during processing', async () => {
+  const updatedAt = '2026-09-17T12:00:01.000Z'
+  const store = fakeStore(record({ displayName: 'Recent alias', updatedAt }), {
+    replace(value) { assert.ok(value.updatedAt >= updatedAt) },
+  })
+  await runWorker(dependencies(store, fakeBlobs(), async () => successfulModel()), { maxJobs: 1 })
+  assert.equal(store.state().job.status, 'ready')
+  assert.equal(store.state().updatedAt, updatedAt)
+  assert.equal(store.state().displayName, 'Recent alias')
+})
 
 test('Markdown job originals are extracted without OCR or public fetches and retained across retries', async () => {
   const bytes = Buffer.from('# Platform Engineer\n\nTypeScript experience is required.')
@@ -352,18 +407,20 @@ test('claim races are skipped while unexpected store failures surface', async ()
 })
 
 test('transient model failures defer work with backoff and stop automatically after attempt three', async () => {
-  const retrying = fakeStore(record())
+  const retrying = fakeStore(record({ displayName: 'Keep while retrying' }))
   await runWorker(dependencies(retrying, fakeBlobs(), async () => new Response('', { status: 503 })), { maxJobs: 1 })
   assert.equal(retrying.state().job.status, 'queued')
   assert.equal(retrying.state().error.retryable, true)
   assert.equal(retrying.state().nextAttemptAt, '2026-09-17T12:00:15.000Z')
   assert.equal(retrying.state().lease, undefined)
+  assert.equal(retrying.state().displayName, 'Keep while retrying')
 
-  const exhausted = fakeStore(record({ attempts: 2 }))
+  const exhausted = fakeStore(record({ attempts: 2, displayName: 'Keep after attempts' }))
   await runWorker(dependencies(exhausted, fakeBlobs(), async () => new Response('', { status: 503 })), { maxJobs: 1 })
   assert.equal(exhausted.state().job.status, 'error')
   assert.match(exhausted.state().job.error, /retry limit reached/)
   assert.equal(exhausted.state().attempts, 3)
+  assert.equal(exhausted.state().displayName, 'Keep after attempts')
 })
 
 test('expired crashed claims remain recoverable and a crashed third claim becomes terminal', async () => {
@@ -462,6 +519,30 @@ test('run deadline aborts generation and durably defers the claimed job', async 
   assert.equal(store.state().job.status, 'queued')
   assert.equal(store.state().error.code, 'run-budget-exhausted')
   assert.equal(store.state().lease, undefined)
+})
+
+test('a deadline reached during publication ownership reads still fences the write and preserves the latest alias', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+  const store = fakeStore(record({ displayName: 'Before model' }))
+  const getWorkspaceLifecycle = store.getWorkspaceLifecycle.bind(store)
+  let generated = false
+  let checks = 0
+  store.getWorkspaceLifecycle = async () => {
+    const control = await getWorkspaceLifecycle()
+    if (generated && ++checks === 2) t.mock.timers.tick(10)
+    return control
+  }
+  await runWorker(dependencies(store, fakeBlobs(), async () => {
+    generated = true
+    store.setDisplayName('Latest alias before deadline')
+    return successfulModel()
+  }), { maxJobs: 1, budgetMilliseconds: 10 })
+  assert.equal(store.state().job.status, 'queued')
+  assert.equal(store.state().error.code, 'run-budget-exhausted')
+  assert.equal(store.state().displayName, 'Latest alias before deadline')
+  assert.equal(store.state().lease, undefined)
+  assert.equal(store.state().attempts, 1)
+  assert.equal(store.published(), undefined)
 })
 
 test('direct URL PDFs over the storage limit fail permanently before immutable writes', async () => {

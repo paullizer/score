@@ -54,6 +54,48 @@ before(async () => {
 })
 after(async () => { await foundation?.cleanup(); await rm(output, { recursive: true, force: true }) })
 
+test('custom labels get separate CSV columns without replacing source identity or saved scores', () => {
+  const input = realReportFixture({ scores: [92.75] })
+  input.run.name = 'Renamed analysis'
+  input.targets[0].displayName = 'Custom target'
+  input.comparisons[0].candidate.displayName = '=Custom label'
+  const report = model.buildAnalysisReport(input)
+  const original = JSON.stringify(report)
+  const result = records(writer.generateCsvReport(report, options))
+  assert.equal(result.headers.length, 13)
+  assert.deepEqual(result.headers.slice(-2), ['Candidate display label', 'Job/grade display title'])
+  const row = result.records[0]
+  assert.equal(row['Candidate name'], input.comparisons[0].candidate.name)
+  assert.equal(row['Job/grade'], input.targets[0].label)
+  assert.equal(row['Candidate display label'], "'=Custom label")
+  assert.equal(row['Job/grade display title'], 'Custom target')
+  assert.equal(row.Source, input.comparisons[0].candidate.sourceLabel)
+  assert.equal(row['Overall score'], '92.75')
+  assert.deepEqual([row.C1, row.C2], ['3', '3'])
+  assert.equal(new URL(row['Analysis link']).searchParams.get('result'), 'comparison-0')
+  assert.equal(model.safeReportFilename(report.run.name, 'csv'), 'Renamed analysis.csv')
+  assert.equal(JSON.stringify(report), original)
+})
+
+test('mixed captured aliases append only two columns and leave canonical target disambiguation unchanged', () => {
+  const input = realReportFixture({ scores: [80, 70], targetCount: 2 })
+  input.targets[0].displayName = '+Reviewer target'
+  for (const comparison of input.comparisons.filter(item => item.candidate.id === 'candidate-0')) {
+    comparison.candidate.name = null
+    comparison.candidate.displayName = 'Captured resume label'
+  }
+  const result = records(writer.generateCsvReport(model.buildAnalysisReport(input), options))
+  assert.equal(result.headers.length, 13)
+  assert.equal(result.records[0]['Candidate name'], input.comparisons[0].candidate.sourceLabel)
+  assert.equal(result.records[0]['Candidate display label'], 'Captured resume label')
+  assert.equal(result.records[1]['Candidate display label'], '')
+  assert.equal(result.records[0]['Job/grade display title'], "'+Reviewer target")
+  assert.equal(result.records[2]['Job/grade display title'], '')
+  assert.equal(result.records[0]['Job/grade'], `${input.targets[0].label} (Job 1)`)
+  assert.equal(result.records[2]['Job/grade'], `${input.targets[1].label} (Job 2)`)
+  assert.ok(!result.headers.some(header => /rank|cutoff|hash|\bID\b|coverage|notice/i.test(header)))
+})
+
 test('CSV uses the compact reader-facing schema and round-trips quoted Unicode source text', () => {
   const input = realReportFixture()
   input.comparisons[0].candidate.name = 'Zoë, "Jordan" Кириллица'

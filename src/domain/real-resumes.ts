@@ -103,7 +103,7 @@ export interface RealResumeProfile {
   provenance: ResumeProfileProvenance
 }
 
-// Display metadata is derived only from the profile; a filename is never a person's name.
+// Source identity is derived only from the profile; a filename or display alias is never a person's name.
 export interface RealResume {
   id: string
   dataKind: 'real'
@@ -135,6 +135,7 @@ export interface ResumeEntityBase {
 
 export interface RealResumeRecord extends ResumeEntityBase {
   recordType: 'resume'
+  displayName?: string
   lifecycle?: LifecycleMetadata
   resume: RealResume
   source: RealResumeSource
@@ -185,6 +186,7 @@ export interface VersionedResumeEntity<T extends ResumeEntity = ResumeEntity> {
 }
 
 export interface RealResumeSummary {
+  displayName?: string
   lifecycle?: LifecycleMetadata
   lifecycleOperation?: LifecycleOperation
   resume: RealResume
@@ -250,7 +252,7 @@ export interface ResumeActionHeaders {
   'If-Match': string
 }
 
-// GET details are unwrapped; import/retry/cancel POSTs return this wrapper.
+// GET details are unwrapped; mutations return this wrapper.
 export interface ResumeMutationResponse {
   resume: RealResumeSummary
 }

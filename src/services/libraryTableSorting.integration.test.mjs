@@ -466,7 +466,7 @@ test('sample resume selections survive sorting and empty search in both layouts,
   await choose('Sort resumes', 'Candidate name: A–Z')
   const mobile = [...document.querySelectorAll('.resume-card')].find((item) => idFromLink(item.querySelector('a.row-title')) === 's-z')
   assert.equal(mobile.querySelector('input[type="checkbox"]').checked, true)
-  assert.equal(row('s-z').querySelector('a[aria-label="View Zoe 10\'s resume"]').getAttribute('href'), '/resumes/s-z?data=samples')
+  assert.equal(row('s-z').querySelector('a[aria-label="View resume: Zoe 10"]').getAttribute('href'), '/resumes/s-z?data=samples')
   await search('  ADA 2  ')
   order(['s-a2', 's-tie'], true)
   assert.match(document.querySelector('[role="status"]').textContent, /1 selected · 1 hidden by search/)
@@ -495,12 +495,12 @@ test('real resume headers and selector sort nullable names, displayed source lab
   order(initial)
   assert.equal(selectedOption('Sort real resumes'), 'Default order')
   assert.equal(document.querySelectorAll('th[aria-sort]').length, 0)
-  await sortHeader('Stated profile')
+  await sortHeader('Resume / source profile')
   order(['r-a2', 'r-tie', 'r-a10', 'r-queue', 'r-cancel', 'r-parse', 'r-z', 'r-null', 'r-blank'])
-  activeHeader('Stated profile', 'ascending')
-  await sortHeader('Stated profile')
+  activeHeader('Resume / source profile', 'ascending')
+  await sortHeader('Resume / source profile')
   order(['r-z', 'r-parse', 'r-cancel', 'r-queue', 'r-a10', 'r-a2', 'r-tie', 'r-null', 'r-blank'])
-  activeHeader('Stated profile', 'descending')
+  activeHeader('Resume / source profile', 'descending')
   assert.equal(row('r-null').querySelector('a.row-title').textContent, 'Name not stated')
   assert.equal(row('r-blank').querySelector('a.row-title').textContent, 'Name not stated')
   for (const heading of ['Source / progress', 'Status / actions']) {
@@ -519,8 +519,8 @@ test('real resume headers and selector sort nullable names, displayed source lab
   await choose('Sort real resumes', 'Processing status: Complete first')
   order(completeResumes)
   const choices = [
-    ['Stated name: A–Z', ['r-a2', 'r-tie', 'r-a10', 'r-queue', 'r-cancel', 'r-parse', 'r-z', 'r-null', 'r-blank']],
-    ['Stated name: Z–A', ['r-z', 'r-parse', 'r-cancel', 'r-queue', 'r-a10', 'r-a2', 'r-tie', 'r-null', 'r-blank']],
+    ['Resume label / stated name: A–Z', ['r-a2', 'r-tie', 'r-a10', 'r-queue', 'r-cancel', 'r-parse', 'r-z', 'r-null', 'r-blank']],
+    ['Resume label / stated name: Z–A', ['r-z', 'r-parse', 'r-cancel', 'r-queue', 'r-a10', 'r-a2', 'r-tie', 'r-null', 'r-blank']],
     ['Source label: A–Z', ['r-queue', 'r-a2', 'r-null', 'r-a10', 'r-tie', 'r-z', 'r-cancel', 'r-parse', 'r-blank']],
     ['Source label: Z–A', ['r-parse', 'r-cancel', 'r-z', 'r-a10', 'r-tie', 'r-null', 'r-a2', 'r-queue', 'r-blank']],
     ['Added date: Oldest first', ['r-blank', 'r-tie', 'r-parse', 'r-queue', 'r-cancel', 'r-null', 'r-a10', 'r-a2', 'r-z']],
@@ -611,7 +611,7 @@ test('sorted real resume actions retain exact IDs and ETags, and pending/read-on
   assert.equal(row('r-null').querySelector('a.text-link').getAttribute('href'), '/resumes/r-null?data=real')
   await renderPage(ui.RealResumesPage, { resumes: { ...resumes, pending: (id) => id === 'r-null' }, url: '/resumes?data=real' })
   assert.equal(button('Retry processing', row('r-null')).disabled, true)
-  await choose('Sort real resumes', 'Stated name: A–Z')
+  await choose('Sort real resumes', 'Resume label / stated name: A–Z')
   assert.equal(button('Retry processing', row('r-null')).disabled, true)
   await renderPage(ui.RealResumesPage, { resumes: { ...resumes, canWrite: false }, analyses: analysesApi([], { canWrite: false }), url: '/resumes?data=real' })
   assert.equal(button('Add resumes').disabled, true)
@@ -636,7 +636,7 @@ test('resume workspace and real/sample switches reset both browsing and selectio
   const resumes = resumesApi()
   await renderPage(ui.ResumesPage, { context, resumes, url: '/resumes?data=real' })
   await click(checkbox('r-z'))
-  await choose('Sort real resumes', 'Stated name: Z–A')
+  await choose('Sort real resumes', 'Resume label / stated name: Z–A')
   await search('Zoe')
   await segment('Choose real resumes or samples', 'Samples')
   order(context.workspace.resumes.map((item) => item.id), true)
@@ -657,7 +657,7 @@ test('resume workspace and real/sample switches reset both browsing and selectio
   assert.equal(button('Build analysis').disabled, true)
   await click(checkbox('r-z'))
   await search('Zoe')
-  await choose('Sort real resumes', 'Stated name: A–Z')
+  await choose('Sort real resumes', 'Resume label / stated name: A–Z')
   const switched = { ...context, cloud: { ...context.cloud, currentWorkspaceId: 'workspace-two' } }
   await renderPage(ui.ResumesPage, { context: switched, resumes: { ...resumes, workspaceId: 'workspace-two' }, url: '/resumes?data=real' })
   assert.equal(document.querySelector('input[type="search"]').value, '')

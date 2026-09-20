@@ -8,6 +8,7 @@ import { documentPagination, type DocumentPagination } from '../../domain/docume
 import { gradeSourcePagination } from '../grade-ladders/gradeUi'
 import { Badge, Button, EmptyState, InlineError, Score, SegmentedControl } from '../../components/ui'
 import { DocumentViewer } from '../../components/documents/DocumentViewer'
+import { getDisplayName } from '../../domain/displayNames'
 import { analysisFailureExplanation, analysisFailureStages, citationMatches, targetVersionLabel } from './realAnalysisUi'
 import { RealComparisonDiagnostics } from './RealComparisonDiagnostics'
 
@@ -35,6 +36,8 @@ export function RealComparisonReview({ detail, actions, initialView }: {
   detail: RealAnalysisComparisonDetail; actions?: ReactNode; initialView?: SavedReviewView | null
 }) {
   const { comparison, resumeSnapshot: resume, targetSnapshot: target, result } = detail
+  const savedResume = comparison.resume.summary
+  const resumeLabel = getDisplayName(savedResume, savedResume.name?.trim() || 'Name not stated')
   const rubric = target.kind === 'job' ? target.rubric : target.version.rubric
   const [expanded, setExpanded] = useState<string[]>(() => rubric.criteria[0] ? [rubric.criteria[0].id] : [])
   const [selected, setSelected] = useState<EvidenceSelection | null>(null)
@@ -68,8 +71,10 @@ export function RealComparisonReview({ detail, actions, initialView }: {
     description={comparison.error?.message ?? (comparison.status === 'complete' ? 'No result payload was returned. No score is invented; reload the saved comparison.'
       : 'No score exists yet. Independent server work uses the original frozen inputs; completed pairs in this run are unaffected.')}
     action={actions} />
-    <div className="border-t p-5 text-[11px] text-muted">Saved resume: {resume.resume.name ?? 'Name not stated'} · document v{resume.document.version}<br />
-      Saved target: {target.summary.label} · {targetVersionLabel(target.selection)}
+    <div className="border-t p-5 text-[11px] text-muted">Saved resume: {resumeLabel} · document v{resume.document.version}<br />
+      {savedResume.displayName && <>Source name: {savedResume.name?.trim() || 'Name not stated'} · </>}{savedResume.sourceLabel}<br />
+      Saved target: {getDisplayName(target.summary, target.summary.label)} · {targetVersionLabel(target.selection)}
+      {target.summary.displayName && <><p>Source title: {target.summary.label}</p>{target.kind === 'job' && target.source?.displayName && <p>Original source: {target.source.displayName}</p>}</>}
       <p className="mt-2">Comparison state: {comparison.status} · processing attempt {comparison.attempts} · manual retries {comparison.retryCount}</p>
       {comparison.attemptId && <p className="mt-1 break-all">Current attempt ID: {comparison.attemptId}</p>}
       {(comparison.error || comparison.status === 'failed') && comparison.diagnosticCapture?.attemptId === comparison.attemptId && comparison.diagnosticCapture
@@ -89,8 +94,8 @@ export function RealComparisonReview({ detail, actions, initialView }: {
 
   return <>
     <section className="result-overview panel">
-      <div className="result-identity"><span className="target-symbol"><FileText size={18} aria-hidden="true" /></span><div><div className="eyebrow">SAVED REAL RESUME</div><h2>{resume.resume.name ?? 'Name not stated'}</h2><p>{resume.resume.role ?? 'Role not stated'}</p><p className="break-all text-[10px] text-muted">{resume.resume.sourceLabel}</p></div></div>
-      <div className="result-target"><div className="eyebrow">{target.kind === 'grade' ? 'EXACT APPROVED GS VERSION' : 'EXACT SAVED JOB RUBRIC'}</div><h3>{target.summary.label}</h3><p>{target.summary.sublabel}</p>
+      <div className="result-identity"><span className="target-symbol"><FileText size={18} aria-hidden="true" /></span><div><div className="eyebrow">SAVED REAL RESUME</div><h2>{resumeLabel}</h2>{savedResume.displayName && <p>Source name: {savedResume.name?.trim() || 'Name not stated'}</p>}<p>{savedResume.role ?? 'Role not stated'}</p><p className="break-all text-[10px] text-muted">{savedResume.sourceLabel}</p></div></div>
+      <div className="result-target"><div className="eyebrow">{target.kind === 'grade' ? 'EXACT APPROVED GS VERSION' : 'EXACT SAVED JOB RUBRIC'}</div><h3>{getDisplayName(target.summary, target.summary.label)}</h3>{target.summary.displayName && <><p>Source title: {target.summary.label}</p>{target.kind === 'job' && target.source?.displayName && <p>Original source: {target.source.displayName}</p>}</>}<p>{target.summary.sublabel}</p>
         <div className="mt-2 flex flex-wrap gap-1.5"><Badge>{targetVersionLabel(target.selection)}</Badge><Badge tone={result.completion === 'limited' ? 'warning' : 'success'}>{result.completion === 'limited' ? 'Complete · limited assessment' : 'Complete · assessed'}</Badge></div>
       </div>
       <div className="overall-score"><div className="eyebrow">SERVER-CALCULATED EVIDENCE MATCH</div>

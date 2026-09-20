@@ -12,12 +12,14 @@ import {
   importRealJobUrl,
   listAllRealJobs,
   realJobOriginalUrl,
+  renameRealJob,
   retryRealJob,
   saveRealJobRubric,
   getRealJobLifecycleImpact, changeRealJobLifecycle,
 } from '../services/realJobs'
 import type { Rubric } from '../domain/types'
-import { WorkspaceContext, type CloudWorkspaceStatus, type PendingLifecycleChange, type WorkspaceContextValue } from './workspace-context'
+import { WorkspaceContext, type CloudWorkspaceStatus, type PendingLifecycleChange, type RenameEntityTarget, type WorkspaceContextValue } from './workspace-context'
+import { getDisplayName } from '../domain/displayNames'
 import { uploadedFileKind } from '../domain/source-files'
 import { projectRealJobs } from './realJobsProjection'
 import { isEntityArchived, isEntityRemoved, type LifecycleAction, type LifecycleTarget } from '../domain/lifecycle'
@@ -92,7 +94,7 @@ export function RealJobsBridge({
         next.push({
           jobId: summary.job.id, scope,
           target: { kind: scope, id: scope === 'job' ? summary.job.id : summary.rubric?.groupId ?? summary.job.rubricId ?? `rubric-${summary.job.id}` },
-          name: scope === 'job' ? summary.job.title : summary.rubric?.name ?? `${summary.job.title} rubric`,
+          name: scope === 'job' ? getDisplayName(summary, summary.job.title) : summary.rubric?.name ?? `${getDisplayName(summary, summary.job.title)} rubric`,
           operation: { id: `${scope}-delete:${summary.job.id}`, action: 'delete', status: 'pending', updatedAt: metadata.deletingAt },
         })
       }
@@ -359,6 +361,30 @@ export function RealJobsBridge({
     }
   }
 
+  async function renameEntity(target: RenameEntityTarget, name: string, etag?: string) {
+    if (target.kind !== 'job' || !workspace.jobs.some((job) => job.id === target.id && job.dataKind === 'real')) {
+      return legacyValue.renameEntity(target, name, etag)
+    }
+    if (!etag) throw new Error('Reload this job before editing its display title.')
+    if (phase !== 'ready') throw new Error('The job service is unavailable. Refresh it before editing the title.')
+    try {
+      await mutate(() => renameRealJob(workspaceId, target.id, name, etag), (summary, stamp) => {
+        if (!upsertSummary(summary, stamp)) return
+        setDetails((current) => {
+          const cached = current[target.id]
+          if (cached?.state === 'ready' && cached.value.etag === etag) {
+            return { ...current, [target.id]: { state: 'ready', value: { ...cached.value, ...summary } } }
+          }
+          const next = { ...current }; delete next[target.id]; return next
+        })
+      }, target)
+      legacyValue.notify('Job display title saved. The original job and rubric are unchanged.')
+    } catch (error) {
+      if (error instanceof CloudConflictError) throw new Error('This job changed. Reload its current title before trying again; your edit has not overwritten it.')
+      throw error
+    }
+  }
+
   function startAnalysis(resumeIds: string[], rubricIds: string[], name?: string, failFirst?: boolean): string {
     if (rubricIds.some((id) => workspace.rubrics.find((rubric) => rubric.id === id)?.dataKind === 'real')) {
       throw new Error('Real job rubrics cannot use the demo scorer. Use the separate real analysis workflow with ready real resumes.')
@@ -405,7 +431,7 @@ export function RealJobsBridge({
     if (result.operation && result.operation.status !== 'complete') {
       setPendingLifecycle((current) => [...current.filter((item) => !(item.jobId === currentSummary.job.id && item.scope === scope)), {
         target, jobId: currentSummary.job.id, scope,
-        name: pending?.name ?? (scope === 'job' ? currentSummary.job.title : currentSummary.rubric?.name ?? `${currentSummary.job.title} rubric`),
+        name: pending?.name ?? (scope === 'job' ? getDisplayName(currentSummary, currentSummary.job.title) : currentSummary.rubric?.name ?? `${getDisplayName(currentSummary, currentSummary.job.title)} rubric`),
         operation: result.operation!,
       }])
       throw new LifecycleOperationError(result.operation)
@@ -436,6 +462,7 @@ export function RealJobsBridge({
     cancelJob,
     retryJob,
     saveRubric,
+    renameEntity,
     startAnalysis,
     getLifecycleImpact: (target) => {
       const pending = pendingLifecycleRef.current.find((item) => item.target.kind === target.kind && item.target.id === target.id)

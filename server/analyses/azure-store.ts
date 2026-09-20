@@ -32,7 +32,7 @@ function scope(workspaceId: string, id?: string): void {
     (id === undefined || isAnalysisId(id, 'run') || isAnalysisId(id, 'comparison')), 'Invalid workspace or record identity.')
 }
 function etag(value: string): void {
-  assertAnalysis(typeof value === 'string' && value.trim() && value !== '*' && value.length <= 1024 &&
+  assertAnalysis(typeof value === 'string' && value && value.trim() === value && value !== '*' && !value.startsWith('W/') && value.length <= 1024 &&
     !/[,\r\n]/.test(value), 'An exact ETag is required.')
 }
 function decode(value: unknown, workspaceId?: string, id?: string): VersionedAnalysisEntity {
@@ -63,6 +63,10 @@ export function assertAnalysisReplacement(previous: AnalysisEntity, next: Analys
   if (previous.recordType === 'analysis-run' && next.recordType === 'analysis-run') {
     for (const key of ['manifest', 'name', 'createdBy', 'idempotencyKey', 'inputFingerprint'] as const) {
       assertAnalysis(analysisHash(previous[key]) === analysisHash(next[key]), 'Accepted run inputs and manifest are immutable.')
+    }
+    if (previous.displayName !== next.displayName) {
+      assertAnalysis(analysisHash({ ...previous, displayName: next.displayName, updatedAt: next.updatedAt }) === analysisHash(next),
+        'Display-name edits cannot change analysis inputs, evidence, lifecycle, or processing state.')
     }
     assertAnalysis(previous.progress.total === next.progress.total &&
       next.initialization.nextComparisonIndex >= previous.initialization.nextComparisonIndex &&

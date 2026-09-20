@@ -74,6 +74,75 @@ function assertReadableGeometry(slides) {
   }
 }
 
+test('presentation display labels never replace original candidate or target identities', async () => {
+  const input = readablePptxFixture({ scores: [92.75, null], criterionCount: 6 })
+  input.run.name = 'Renamed analysis'
+  input.targets[0].displayName = 'Custom target'
+  input.comparisons[0].candidate.displayName = 'Custom candidate'
+  input.comparisons[1].candidate.displayName = 'Captured withheld candidate'
+  const report = foundation.buildAnalysisReport(input)
+  const original = JSON.stringify(report)
+  const result = await inspectReport(report)
+  for (const value of ['Renamed analysis', 'Custom target', 'Custom candidate',
+    `Source-stated name: ${input.comparisons[0].candidate.name}`, `Source target title: ${input.targets[0].label}`,
+    input.comparisons[0].candidate.sourceLabel]) {
+    assert.ok(result.text.includes(value), `Missing label or source identity: ${value}`)
+  }
+  assert.match(result.entries.get('docProps/core.xml').toString(), /Analysis evidence report — Renamed analysis/)
+  assert.match(result.slides[0].text, /Custom target/)
+  const overview = matchingShapes(result.slides, /^overview-0-\d+$/)
+  assert.ok(overview.some(shape => shape.text.includes('Captured withheld candidate')))
+  assert.ok(matchingShapes(result.slides, /^review-0-0-(overview|scorecard|explanations)-name$/).every(shape => shape.text === 'Custom candidate'))
+  assert.equal(JSON.stringify(report), original)
+  assertOverviewCoverage(report, result)
+  assertFeaturedContract(report, result)
+  assertReadableGeometry(result.slides)
+  assertNoAuditProse(result)
+})
+
+test('160-unit aliases and long source identities remain bounded and linked in single- and multiple-job decks', async () => {
+  for (const targetCount of [1, 2]) {
+    const input = readablePptxFixture({ scores: [92.75], criterionCount: 6, targetCount })
+    input.run.name = `${'Current analysis '.repeat(10).slice(0, 159)}Z`
+    input.targets.forEach(target => {
+      target.displayName = `${'Captured target '.repeat(10).slice(0, 159)}Z`
+      target.label = 'Original source target title '.repeat(100).trimEnd()
+    })
+    input.comparisons.forEach(comparison => {
+      comparison.candidate.displayName = `${'Captured resume '.repeat(10).slice(0, 159)}Z`
+      comparison.candidate.name = 'Original source candidate name '.repeat(60).trimEnd()
+      comparison.candidate.sourceLabel = `${'Original resume filename '.repeat(60)}.pdf`
+    })
+    const report = foundation.buildAnalysisReport(input)
+    const original = JSON.stringify(report)
+    const result = await inspectReport(report)
+    assert.equal(JSON.stringify(report), original)
+    assert.equal(result.slides.length, targetCount === 1 ? 5 : 11)
+    const title = result.slides[0].shapes.find(shape => shape.name === 'job-reference')
+    assert.equal(title.links[0].tooltip, input.run.name)
+    assert.equal(result.slides[0].relationships.get(title.links[0].id),
+      api.reportReviewLinks(report, report.groups[0].comparisons[0], PPTX_TEST_LINKS).analysis)
+    for (const [index, group] of report.groups.entries()) {
+      const links = api.reportReviewLinks(report, group.comparisons[0], PPTX_TEST_LINKS)
+      const sourceTitle = result.slides.flatMap(slide => slide.shapes
+        .filter(shape => shape.name === 'source-target-title' && slide.relationships.get(shape.links[0]?.id) === links.target))
+      assert.equal(sourceTitle.length, 1)
+      assert.equal(sourceTitle[0].links[0].tooltip, `Source target title: ${group.target.label}`)
+      const sourceName = matchingShapes(result.slides, new RegExp(`^review-${index}-0-metadata-2$`))[0]
+      assert.equal(sourceName.links[0].tooltip, `Source-stated name: ${group.comparisons[0].candidate.name}`)
+      const sourceFile = matchingShapes(result.slides, new RegExp(`^review-${index}-0-metadata-1$`))[0]
+      assert.equal(sourceFile.links[0].tooltip, `Source: ${group.comparisons[0].candidate.sourceLabel}`)
+      const references = result.slides.flatMap(slide => slide.shapes.filter(shape =>
+        shape.name === 'job-reference' && shape.links[0]?.tooltip === api.readableTargetLabel(report, group)))
+      assert.ok(references.length >= 4, 'Compacted job aliases keep the full captured, disambiguated label')
+    }
+    assertOverviewCoverage(report, result)
+    assertFeaturedContract(report, result)
+    assertReadableGeometry(result.slides)
+    assertNoAuditProse(result)
+  }
+})
+
 function assertOverviewCoverage(report, result, options = report.dataKind === 'sample' ? PPTX_SAMPLE_LINKS : PPTX_TEST_LINKS) {
   report.groups.forEach((group, groupIndex) => {
     const actual = []
@@ -97,7 +166,10 @@ function assertOverviewCoverage(report, result, options = report.dataKind === 's
     complete.forEach((comparison, index) => {
       assert.equal(actual[index].analysis, api.reportReviewLinks(report, comparison, options).analysis,
         'Overview retains supplied saved-score order and ties without reranking')
-      assert.equal(actual[index].tooltip, api.readableCandidateName(comparison.candidate))
+      const name = api.readableCandidateName(comparison.candidate)
+      assert.equal(actual[index].tooltip, comparison.candidate.displayName
+        ? `${name} · Source-stated name: ${comparison.candidate.name ?? 'Not stated'} · Source: ${comparison.candidate.sourceLabel}`
+        : name)
       assert.equal(actual[index].score, comparison.overall.status === 'available' ? `${comparison.overall.score} / 100` : 'Withheld')
       assert.ok(actual[index].highlights.length > 10)
     })

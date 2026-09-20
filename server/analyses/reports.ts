@@ -59,6 +59,7 @@ function reportTarget(comparison: RealAnalysisComparisonRecord, target: FrozenRe
   return {
     id: target.summary.id, dataKind: 'real', kind: target.kind,
     label: target.summary.label, sublabel: target.summary.sublabel,
+    ...(target.summary.displayName !== undefined ? { displayName: target.summary.displayName } : {}),
     versionLabel: target.kind === 'grade' ? `Approved GS-${target.selection.grade} · rubric v${rubric.version}`
       : `Rubric v${rubric.version} · source document v${target.document.version}`,
     rubricId: rubric.id, rubricVersion: rubric.version, selection: target.selection,
@@ -124,6 +125,7 @@ function reportComparison(
     id: comparison.id, index: comparison.index, dataKind: 'real', targetId: target.summary.id,
     candidate: {
       id: resume.selection.resumeId, name: resume.resume.name, role: resume.resume.role,
+      ...(resume.displayName !== undefined ? { displayName: resume.displayName } : {}),
       sourceLabel: resume.resume.sourceLabel, documentId: resume.document.id, documentVersion: resume.document.version,
       documentSha256: resume.selection.documentSha256,
       snapshot: { snapshotId: comparison.resume.snapshotId, sha256: comparison.resume.blob.sha256 },

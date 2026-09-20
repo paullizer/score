@@ -6,7 +6,7 @@ import type {
 import { reportReviewLinks, validatedReportLinkContext } from './links'
 import { assertReportResourceLimits } from './model'
 import {
-  assertXmlText, overallScoreLabel, REPORT_FONT_FAMILY, REPORT_PALETTE, REPORT_TITLE,
+  assertXmlText, overallScoreLabel, REPORT_FONT_FAMILY, REPORT_PALETTE, REPORT_TITLE, reportTitle,
 } from './presentation'
 import {
   assessmentHighlights, assessmentIntroduction, assessmentSummary, compactReportText, criterionReviews, qualificationNotes,
@@ -89,7 +89,9 @@ class ReportDeck {
     this.presentation.layout = 'LAYOUT_WIDE'
     this.presentation.author = 'Score'
     this.presentation.subject = 'Analysis evidence for human review'
-    this.presentation.title = REPORT_TITLE
+    const title = reportTitle(report)
+    assertXmlText(title)
+    this.presentation.title = title
     this.presentation.company = 'Score'
     this.presentation.theme = { headFontFace: REPORT_FONT_FAMILY, bodyFontFace: REPORT_FONT_FAMILY }
   }
@@ -101,7 +103,7 @@ class ReportDeck {
   }
 
   slide(
-    title: string, reference = '', options: { titleWidth?: number; titleLink?: string; name?: string } = {},
+    title: string, reference = '', options: { titleWidth?: number; titleLink?: string; referenceLink?: string; name?: string } = {},
   ): PptxGenJS.Slide {
     this.checkBudget()
     if (this.slideCount >= Math.min(REPORT_LIMITS.maxSlides, REPORT_LIMITS.maxPages)) {
@@ -114,9 +116,13 @@ class ReportDeck {
     text(slide, 'SCORE', { x: 0.76, y: 0.615, w: 1.04, h: 0.32 }, 12, {
       bold: true, color: C.paper, objectName: 'brand',
     })
-    text(slide, compactToBox(reference, 6.5, 0.3, 11, 'Analysis evidence'), {
+    const displayedReference = compactToBox(reference, 6.5, 0.3, 11, 'Analysis evidence')
+    text(slide, displayedReference, {
       x: 2.25, y: 0.615, w: 6.5, h: 0.3,
-    }, 11, { color: C.muted, objectName: 'job-reference' })
+    }, 11, {
+      color: C.muted, objectName: 'job-reference',
+      ...(options.referenceLink && displayedReference !== reference ? { hyperlink: hyperlink(options.referenceLink, reference) } : {}),
+    })
     if (this.report.dataKind === 'sample') {
       text(slide, 'FICTIONAL SAMPLE', { x: 9.0, y: 0.615, w: PPTX_LAYOUT.width - 9.6, h: 0.32 }, 11, {
         bold: true, align: 'right', color: C.accent, objectName: 'report-designation',
@@ -153,19 +159,31 @@ function jobFacts(slide: PptxGenJS.Slide, group: ReportGroup, y: number): void {
   })
 }
 
+function sourceTargetTitle(slide: PptxGenJS.Slide, group: ReportGroup, url: string, y: number): void {
+  if (!group.target.displayName) return
+  const value = `Source target title: ${group.target.label}`
+  const displayed = compactToBox(value, BODY_WIDTH, 0.35, 14, 'View source target title')
+  text(slide, displayed, { x: 0.6, y, w: BODY_WIDTH, h: 0.35 }, 14, {
+    color: C.muted, objectName: 'source-target-title',
+    ...(displayed !== value ? { hyperlink: hyperlink(url, value) } : {}),
+  })
+}
+
 function opening(deck: ReportDeck): void {
   const report = deck.report
   const single = report.groups.length === 1 ? report.groups[0] : undefined
-  const slide = deck.slide(REPORT_TITLE)
+  const slide = deck.slide(REPORT_TITLE, report.run.name, { referenceLink: deck.links(report.groups[0].comparisons[0]).analysis })
   const jobLabel = single ? readableTargetLabel(report, single) : `${report.groups.length} jobs and grades`
   const targetLink = single ? deck.links(single.comparisons[0]).target : undefined
-  const displayedJob = compactToBox(jobLabel, BODY_WIDTH, 0.98, 24, 'Job requirements')
+  const jobHeight = single?.target.displayName ? 0.6 : 0.98
+  const displayedJob = compactToBox(jobLabel, BODY_WIDTH, jobHeight, 24, 'Job requirements')
   text(slide, displayedJob, {
-    x: 0.6, y: 2.08, w: BODY_WIDTH, h: 0.98,
+    x: 0.6, y: 2.08, w: BODY_WIDTH, h: jobHeight,
   }, 24, {
     bold: true, underline: { style: 'none' }, objectName: 'opening-job',
     ...(targetLink && displayedJob !== jobLabel ? { hyperlink: hyperlink(targetLink, jobLabel) } : {}),
   })
+  if (single) sourceTargetTitle(slide, single, targetLink!, 2.75)
   const latestAnalysis = report.groups.flatMap(group => group.comparisons)
     .map(comparison => comparison.analyzedAt).filter((date): date is string => date !== null).sort().at(-1) ?? null
   text(slide, `Analysis date: ${readableAnalysisDate(latestAnalysis) || 'Not recorded'}`, {
@@ -186,7 +204,7 @@ function opening(deck: ReportDeck): void {
 function jobIntroduction(deck: ReportDeck, group: ReportGroup): void {
   const label = readableTargetLabel(deck.report, group)
   const links = deck.links(group.comparisons[0])
-  const slide = deck.slide(group.target.kind === 'grade' ? 'About the grade' : 'About the job', label)
+  const slide = deck.slide(group.target.kind === 'grade' ? 'About the grade' : 'About the job', label, { referenceLink: links.target })
   const displayedLabel = compactToBox(label, BODY_WIDTH, 1.2, 28, 'Job requirements')
   text(slide, displayedLabel, {
     x: 0.6, y: 2.14, w: BODY_WIDTH, h: 1.2,
@@ -194,7 +212,8 @@ function jobIntroduction(deck: ReportDeck, group: ReportGroup): void {
     bold: true, objectName: 'target-label',
     ...(displayedLabel !== label ? { hyperlink: hyperlink(links.target, label) } : {}),
   })
-  jobFacts(slide, group, 3.75)
+  sourceTargetTitle(slide, group, links.target, 3.5)
+  jobFacts(slide, group, group.target.displayName ? 4.05 : 3.75)
   linkText(slide, group.target.kind === 'grade' ? 'View grade requirements' : 'View job', links.target, {
     x: 0.6, y: LINKS_Y, w: 3.3, h: 0.35,
   }, 'target-link')
@@ -246,7 +265,7 @@ function overview(deck: ReportDeck, group: ReportGroup, groupIndex: number): voi
   let used = HEADER_HEIGHT
   let page = 0
   const flush = () => {
-    const slide = deck.slide('Candidates at a glance', label)
+    const slide = deck.slide('Candidates at a glance', label, { referenceLink: deck.links(group.comparisons[0]).target })
     if (rows.length) table(slide, ['Name', 'Score', 'Assessment highlights'], rows, widths, heights, y, `overview-${groupIndex}-${page}`)
     else text(slide, 'No completed assessments are available for this job yet.', {
       x: 0.6, y, w: BODY_WIDTH, h: 0.8,
@@ -263,11 +282,14 @@ function overview(deck: ReportDeck, group: ReportGroup, groupIndex: number): voi
     if (comparison.status !== 'complete') continue
     const name = readableCandidateName(comparison.candidate)
     const links = deck.links(comparison)
+    const tooltip = comparison.candidate.displayName
+      ? `${name} · Source-stated name: ${comparison.candidate.name ?? 'Not stated'} · Source: ${comparison.candidate.sourceLabel}`
+      : name
     const highlights = assessmentHighlights(group.target, comparison, 180)
     const row = [
       {
         text: compactToBox(name, widths[0] - TABLE_PADDING_X * 2, 0.65, TABLE_FONT, 'View candidate name'),
-        url: links.analysis, tooltip: name,
+        url: links.analysis, tooltip,
       },
       { text: comparison.overall.status === 'available' ? overallScoreLabel(comparison.overall) : 'Withheld' },
       { text: highlights },
@@ -387,17 +409,21 @@ function candidateOverview(
 ): void {
   const name = readableCandidateName(comparison.candidate)
   const slide = deck.slide(name, readableTargetLabel(deck.report, group), {
-    titleWidth: 8.55, titleLink: links.analysis, name: `${key}-overview-name`,
+    titleWidth: 8.55, titleLink: links.analysis, referenceLink: links.target, name: `${key}-overview-name`,
   })
   const metadataWidth = 8.55
+  const alias = comparison.candidate.displayName !== undefined
+  const metadataHeight = alias ? 0.34 : 0.39
+  const metadataFont = alias ? 14 : 15
   for (const [index, item] of [
     { value: comparison.candidate.role ? `Role: ${comparison.candidate.role}` : 'Role not recorded', url: links.analysis },
     { value: `Source: ${comparison.candidate.sourceLabel}`, url: links.resume },
+    ...(alias ? [{ value: `Source-stated name: ${comparison.candidate.name ?? 'Not stated'}`, url: links.resume }] : []),
   ].entries()) {
-    const displayed = compactToBox(item.value, metadataWidth, 0.39, 15, index ? 'View resume source' : 'View recorded role')
+    const displayed = compactToBox(item.value, metadataWidth, metadataHeight, metadataFont, index ? 'View resume source' : 'View recorded role')
     text(slide, displayed, {
-      x: 0.6, y: 2.0 + index * 0.46, w: metadataWidth, h: 0.39,
-    }, 15, {
+      x: 0.6, y: 2.0 + index * (alias ? 0.36 : 0.46), w: metadataWidth, h: metadataHeight,
+    }, metadataFont, {
       color: C.muted, objectName: `${key}-metadata-${index}`,
       ...(displayed !== item.value ? { hyperlink: hyperlink(item.url, item.value) } : {}),
     })
@@ -457,7 +483,7 @@ function scorecard(
   deck: ReportDeck, group: ReportGroup, comparison: ReportComparison, links: ReviewLinks, plan: ReviewPlan, key: string,
 ): void {
   const slide = deck.slide(readableCandidateName(comparison.candidate), readableTargetLabel(deck.report, group), {
-    titleLink: links.analysis, name: `${key}-scorecard-name`,
+    titleLink: links.analysis, referenceLink: links.target, name: `${key}-scorecard-name`,
   })
   text(slide, plan.keyCriteria ? 'Scorecard · Key criteria' : 'Scorecard', {
     x: 0.6, y: 2.05, w: BODY_WIDTH, h: 0.45,
@@ -476,7 +502,7 @@ function explanationSlide(
   deck: ReportDeck, group: ReportGroup, comparison: ReportComparison, links: ReviewLinks, plan: ReviewPlan, key: string,
 ): void {
   const slide = deck.slide(readableCandidateName(comparison.candidate), readableTargetLabel(deck.report, group), {
-    titleLink: links.analysis, name: `${key}-explanations-name`,
+    titleLink: links.analysis, referenceLink: links.target, name: `${key}-explanations-name`,
   })
   text(slide, plan.keyCriteria ? 'Why these scores · Key criteria' : 'Why these scores', {
     x: 0.6, y: 2.05, w: 7.7, h: 0.45,

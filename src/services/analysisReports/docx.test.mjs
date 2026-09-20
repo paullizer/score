@@ -173,6 +173,20 @@ function assertFullDetail(section, target, comparison) {
   for (const fact of [...target.facts, ...comparison.provenance]) containsText(section, fact.value)
 }
 
+test('Word headings use display labels while full detail retains source identities', async () => {
+  const input = realReportFixture({ scores: [92.75] })
+  input.run.name = 'Renamed analysis'
+  input.targets[0].displayName = 'Custom target'
+  input.comparisons[0].candidate.displayName = 'Custom candidate'
+  const report = foundation.buildAnalysisReport(input)
+  const { document } = await generate(report)
+  for (const value of ['Renamed analysis', 'Custom target', 'Custom candidate',
+    `Source-stated name: ${input.comparisons[0].candidate.name}`, `Source target title: ${input.targets[0].label}`]) {
+    containsText(document, value)
+  }
+  assertFullDetail(reviewSections(document).get('review_0'), report.groups[0].target, report.groups[0].comparisons[0])
+})
+
 test('editable Word package preserves all candidates, counts, saved scores, and frozen detail', async () => {
   const input = realReportFixture({ scores: [92.75, 87, 82, 75, 62, 43], targetCount: 2 })
   input.comparisons[1].overall.score = 12

@@ -112,6 +112,7 @@ export class RealAnalysisTargets {
       if (selection && analysisHash(selection) !== analysisHash(exact)) throw conflict('The selected job rubric or source hash is stale. Refresh targets and choose an exact version.')
       const summary: RealJobTargetSummary = {
         kind: 'job', id: analysisTargetSummaryId(exact), workspaceId, dataKind: 'real', selection: exact,
+        ...(job.displayName !== undefined ? { displayName: job.displayName } : {}),
         label: job.job.title, sublabel: `${job.job.organization}${job.job.organization ? ' · ' : ''}${rubric.name} · v${rubric.version}`,
         rubricId: rubric.id, rubricVersion: rubric.version, criterionCount: rubric.criteria.length,
       }
@@ -317,6 +318,7 @@ export async function resolveAnalysisResume(
   )))
   return parseFrozenResumeSnapshot({
     schemaVersion: 1, snapshotId, workspaceId, dataKind: 'real', frozenAt, selection,
+    ...(record.displayName !== undefined ? { displayName: record.displayName } : {}),
     resume: record.resume, source: record.source, capture: record.capture, extraction: record.extraction, profile, document,
   })
 }

@@ -261,7 +261,7 @@ test('default cloud resume mode combines archive search, sorting, Word evidence 
   const filter = document.querySelector('select[aria-label="Real resume archive state"]')
   await act(async () => { filter.value = 'all'; filter.dispatchEvent(new dom.window.Event('change', { bubbles: true })) })
   await search('Search real resumes', '')
-  const header = document.querySelector('thead th button[aria-label^="Sort Stated name"]')
+  const header = document.querySelector('thead th button[aria-label^="Sort Resume label / stated name"]')
   await act(async () => header.click())
   assert.deepEqual([...document.querySelectorAll('tbody a.row-title')].map((item) => item.textContent), ['Ada 10', 'Zeta 2'])
   await navigate('/resumes/resume-word?data=real')

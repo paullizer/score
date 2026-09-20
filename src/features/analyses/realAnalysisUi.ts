@@ -10,6 +10,7 @@ import type { ReferenceDocument } from '../../domain/real-grades'
 import { gradeHeadId } from '../../domain/real-grades'
 import { isEntityArchived, isEntityRemoved, type LifecycleTarget } from '../../domain/lifecycle'
 import { readyRealResume, resumeName } from '../resumes/resumeImportUi'
+import { getDisplayName } from '../../domain/displayNames'
 
 export interface SelectedRealResume {
   id: string
@@ -345,8 +346,8 @@ export function initialRealSelections(
   const exactResumes = parseSelections(params.get('resumeSelections'), isRealResumeSelection, 'resume', errors)
   const exactTargets = parseSelections(params.get('targetSelections'), isRealTargetSelection, 'target', errors)
   if (previous) {
-    chosenResumes.push(...previous.resumes.map((item) => ({ id: item.selection.resumeId, label: item.name || 'Name not stated', selection: item.selection })))
-    chosenTargets.push(...previous.targets.map((item) => ({ id: targetIdentity(item.selection), label: item.label, selection: item.selection, summary: item })))
+    chosenResumes.push(...previous.resumes.map((item) => ({ id: item.selection.resumeId, label: getDisplayName(item, item.name?.trim() || 'Name not stated'), selection: item.selection })))
+    chosenTargets.push(...previous.targets.map((item) => ({ id: targetIdentity(item.selection), label: getDisplayName(item, item.label), selection: item.selection, summary: item })))
     if (['resumes', 'rubrics', 'jobs', 'job', 'targets', 'ladder', 'resumeSelections', 'targetSelections'].some((key) => params.has(key))) {
       errors.push('This link combines a previous run with additional inputs. Start a new selection or use only the saved run inputs; nothing will be silently ignored.')
     }
@@ -363,14 +364,14 @@ export function initialRealSelections(
     }
     for (const selection of exactTargets) {
       const current = targets.find((item) => targetIdentity(item.selection) === targetIdentity(selection))
-      chosenTargets.push({ id: targetIdentity(selection), label: current?.label ?? 'Requested target', selection, summary: current })
+      chosenTargets.push({ id: targetIdentity(selection), label: current ? getDisplayName(current, current.label) : 'Requested target', selection, summary: current })
     }
     function choose(matches: RealAnalysisTargetSummary[], requested: string) {
       if (matches.length !== 1) {
         chosenTargets.push({ id: `requested:${requested}`, label: requested, selection: null, issue: `${requested} is missing, ambiguous, a sample, or not an eligible real target. An exact saved job or approved GS version is required.` })
       } else {
         const current = matches[0]
-        chosenTargets.push({ id: targetIdentity(current.selection), label: current.label, selection: current.selection, summary: current })
+        chosenTargets.push({ id: targetIdentity(current.selection), label: getDisplayName(current, current.label), selection: current.selection, summary: current })
       }
     }
     for (const id of ids(params.get('targets'))) choose(targets.filter((target) => target.id === id), `Target ${id}`)
@@ -386,7 +387,7 @@ export function initialRealSelections(
       const matches = targets.filter((target) => target.kind === 'grade' && target.selection.ladderId === params.get('ladder')
         && (!params.has('grade') || String(target.selection.grade) === params.get('grade'))
         && (!params.has('version') || target.selection.versionId === params.get('version') || String(target.selection.version) === params.get('version')))
-      if (matches.length) for (const target of matches) choose([target], target.label)
+      if (matches.length) for (const target of matches) choose([target], getDisplayName(target, target.label))
       else choose([], `Approved GS target in ladder ${params.get('ladder')}`)
     }
   }

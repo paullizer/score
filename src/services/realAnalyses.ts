@@ -24,6 +24,7 @@ import {
 import type { Citation } from '../domain/types'
 import { cloudJsonRequest, cloudLifecycleRequest } from './cloudWorkspace'
 import type { LifecycleAction, LifecycleImpact, LifecycleOperation } from '../domain/lifecycle'
+import { normalizeDisplayName } from '../domain/displayNames'
 
 function base(workspaceId: string, runId?: string): string {
   const path = `/workspaces/${encodeURIComponent(workspaceId)}/analyses`
@@ -303,6 +304,17 @@ export async function retryRealAnalysis(workspaceId: string, runId: string, inpu
     method: 'POST', headers: concurrency(etag), body: JSON.stringify(input),
   })
   return checkedRun(result.run, workspaceId)
+}
+
+export async function renameRealAnalysis(workspaceId: string, runId: string, name: string, etag: string): Promise<RealAnalysisRunSummary> {
+  const displayName = normalizeDisplayName(name)
+  if (!etag) throw new Error('Reload the analysis before editing its name.')
+  const result = await cloudJsonRequest<RealAnalysisMutationResponse>(`${base(workspaceId, runId)}/metadata`, {
+    method: 'PATCH', headers: concurrency(etag), body: JSON.stringify({ displayName }),
+  })
+  const summary = checkedRun(result.run, workspaceId)
+  if (summary.run.id !== runId || summary.run.displayName !== displayName) throw new Error('The service did not acknowledge the requested analysis name. Reload before trying again.')
+  return summary
 }
 
 export async function cancelRealAnalysis(workspaceId: string, runId: string, etag: string): Promise<RealAnalysisRunSummary> {

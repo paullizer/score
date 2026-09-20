@@ -36,7 +36,7 @@ export function PageHeader({ eyebrow, title, description, actions }: {
   eyebrow?: string; title: string; description: string; actions?: ReactNode
 }) {
   return <div className="page-heading">
-    <div>{eyebrow && <div className="eyebrow">{eyebrow}</div>}<h1>{title}</h1><p>{description}</p></div>
+    <div>{eyebrow && <div className="eyebrow">{eyebrow}</div>}<h1 tabIndex={-1}>{title}</h1><p>{description}</p></div>
     {actions && <div className="heading-actions">{actions}</div>}
   </div>
 }
@@ -60,23 +60,30 @@ export function SegmentedControl<T extends string>({ value, onChange, options, l
   </div>
 }
 
-export function Modal({ open, onOpenChange, title, description, children, footer, wide = false, drawer = false }: {
+export function Modal({ open, onOpenChange, title, description, children, footer, wide = false, drawer = false, dismissDisabled = false, onOpenAutoFocus, onCloseAutoFocus }: {
   open: boolean; onOpenChange: (open: boolean) => void; title: string; description: string
   children: ReactNode; footer?: ReactNode; wide?: boolean; drawer?: boolean
+  dismissDisabled?: boolean; onOpenAutoFocus?: (event: Event) => void; onCloseAutoFocus?: (event: Event) => void
 }) {
   const returnFocus = useRef<HTMLElement | null>(null)
-  return <Dialog.Root open={open} onOpenChange={onOpenChange}>
+  return <Dialog.Root open={open} onOpenChange={(next) => { if (next || !dismissDisabled) onOpenChange(next) }}>
     <Dialog.Portal><Dialog.Overlay className="dialog-overlay" />
       <Dialog.Content className={`dialog-content ${wide ? 'dialog-wide' : ''} ${drawer ? 'dialog-drawer' : ''}`}
-        onOpenAutoFocus={() => { returnFocus.current = document.activeElement instanceof HTMLElement ? document.activeElement : null }}
+        onEscapeKeyDown={(event) => { if (dismissDisabled) event.preventDefault() }}
+        onInteractOutside={(event) => { if (dismissDisabled) event.preventDefault() }}
+        onOpenAutoFocus={(event) => {
+          returnFocus.current = document.activeElement instanceof HTMLElement ? document.activeElement : null
+          onOpenAutoFocus?.(event)
+        }}
         onCloseAutoFocus={(event) => {
+          if (onCloseAutoFocus) { onCloseAutoFocus(event); return }
           if (returnFocus.current?.isConnected) {
             event.preventDefault()
             returnFocus.current.focus()
           }
         }}>
         <div className="dialog-header"><div><Dialog.Title>{title}</Dialog.Title><Dialog.Description>{description}</Dialog.Description></div>
-          <Dialog.Close asChild><Button variant="ghost" size="sm" className="icon-button" aria-label="Close dialog" icon={X} /></Dialog.Close>
+          <Dialog.Close asChild><Button variant="ghost" size="sm" className="icon-button" aria-label="Close dialog" icon={X} disabled={dismissDisabled} /></Dialog.Close>
         </div>
         <div className="dialog-body">{children}</div>
         {footer && <div className="dialog-footer">{footer}</div>}

@@ -5,7 +5,8 @@ import * as api from '../services/realResumes'
 import { CloudApiError, CloudConflictError, LifecycleOperationError } from '../services/cloudWorkspace'
 import { lifecycleIsRemoved, type LifecycleAction, type LifecycleTarget } from '../domain/lifecycle'
 import { appendResumeInputs, resumeWorkActive, type RealResumeImportBatch, type RealResumeImportSource } from '../features/resumes/resumeImportUi'
-import { WorkspaceContext, useWorkspace, type PendingLifecycleChange } from './workspace-context'
+import { WorkspaceContext, useWorkspace, type PendingLifecycleChange, type RenameEntityTarget } from './workspace-context'
+import { getDisplayName } from '../domain/displayNames'
 import { useGradeLeaveGuard } from './grade-navigation-context'
 import { RealResumesContext, type RealResumesContextValue } from './real-resumes-context'
 import { RealRequestScope, realRequestError, type RealLoadState } from './real-request-scope'
@@ -70,7 +71,7 @@ function RealResumesProvider({ workspaceId, children }: { workspaceId: string; c
 
   useEffect(() => {
     setPendingLifecycle(reconcileLifecycleOperations(pendingLifecycleRef.current, summaries.map((summary) =>
-      discoveredLifecycle({ kind: 'resume', id: summary.resume.id }, summary.resume.name ?? summary.source.displayName, summary.lifecycle, summary.lifecycleOperation))))
+      discoveredLifecycle({ kind: 'resume', id: summary.resume.id }, getDisplayName(summary, summary.resume.name ?? summary.source.displayName), summary.lifecycle, summary.lifecycleOperation))))
   }, [setPendingLifecycle, summaries])
 
   const ensureDetail = useCallback(async function loadDetail(id: string, force = false): Promise<void> {
@@ -297,6 +298,18 @@ function RealResumesProvider({ workspaceId, children }: { workspaceId: string; c
     return target.kind === 'resume' && (knownIds.current.has(target.id) || pendingLifecycleRef.current.some((item) => item.target.id === target.id))
   }
 
+  async function renameEntity(target: RenameEntityTarget, name: string, etag?: string) {
+    if (!owns(target)) return parentRef.current.renameEntity(target, name, etag)
+    if (!etag) throw new Error('Reload this resume before editing its display label.')
+    await mutate(`resume:${target.id}`, () => api.renameRealResume(workspaceId, target.id, name, etag), (summary, sequence) => {
+      const cached = detailsRef.current[target.id]
+      if (remember(summary, sequence) && cached?.state === 'ready' && cached.value.etag === etag) {
+        putDetail(target.id, { state: 'ready', value: { ...cached.value, ...summary } })
+      }
+    }, false, target.id)
+    parentRef.current.notify('Resume label saved. The stated name and original source are unchanged.')
+  }
+
   async function changeLifecycle(target: LifecycleTarget, action: LifecycleAction) {
     if (!owns(target)) return parentRef.current.changeLifecycle(target, action)
     const pending = pendingLifecycleRef.current.find((item) => item.target.id === target.id)
@@ -312,7 +325,7 @@ function RealResumesProvider({ workspaceId, children }: { workspaceId: string; c
       if (response.operation && response.operation.status !== 'complete') {
         const summary = summariesRef.current.find((item) => item.resume.id === target.id)
         setPendingLifecycle(reconcileLifecycleOperations(pendingLifecycleRef.current, [{
-          target, name: summary?.resume.name ?? summary?.source.displayName ?? pending?.name ?? 'Real resume', operation: response.operation,
+          target, name: summary ? getDisplayName(summary, summary.resume.name ?? summary.source.displayName) : pending?.name ?? 'Real resume', operation: response.operation,
         }]))
         if (action === 'delete') putDetail(target.id, { state: 'error', error: 'Deletion is still incomplete. Retry the lifecycle operation; cached source content has been cleared.' })
       } else if (response.deleted) removeResume(target.id, sequence)
@@ -327,7 +340,7 @@ function RealResumesProvider({ workspaceId, children }: { workspaceId: string; c
     id: item.resume.id, lifecycle: item.lifecycle,
   }))), [parent.workspace, summaries])
   const projected = {
-    ...parent, workspace, changeLifecycle,
+    ...parent, workspace, changeLifecycle, renameEntity,
     getLifecycleImpact: (target: LifecycleTarget) => owns(target) ? api.getRealResumeLifecycleImpact(workspaceId, target.id) : parentRef.current.getLifecycleImpact(target),
     lifecycleOperations: [...(parent.lifecycleOperations ?? []), ...pendingLifecycle],
   }

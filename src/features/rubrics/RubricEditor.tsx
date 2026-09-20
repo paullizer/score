@@ -1,6 +1,7 @@
 import { useId, useRef, useState, type FormEvent } from 'react'
 import { Plus, Save, Trash2 } from 'lucide-react'
 import { useWorkspace } from '../../app/workspace-context'
+import { useGradeLeaveGuard } from '../../app/grade-navigation-context'
 import { Badge, Button, DemoNote, InlineError, Modal } from '../../components/ui'
 import type { Criterion, Rubric } from '../../domain/types'
 import { validateRubric } from '../../services/mockWorkspace'
@@ -15,9 +16,11 @@ export function RubricEditor({ rubric, onClose, onSaved }: {
   const { workspace, saveRubric, cloud } = useWorkspace()
   const { canEdit } = useLifecycleAccess({ kind: 'rubric', id: rubric.groupId })
   const [draft, setDraft] = useState<Rubric>(() => structuredClone(rubric))
+  const [initialDraft] = useState(() => JSON.stringify(rubric))
   const [attempted, setAttempted] = useState(false)
   const [error, setError] = useState('')
   const [saving, setSaving] = useState(false)
+  const guard = useGradeLeaveGuard(JSON.stringify(draft) !== initialDraft, saving, `Rubric: ${rubric.name}`)
   const submitting = useRef(false)
   const feedback = useRef<HTMLDivElement>(null)
   const formId = useId()
@@ -44,6 +47,7 @@ export function RubricEditor({ rubric, onClose, onSaved }: {
   const errors = [...validateRubric(draft), ...realErrors]
   const total = draft.criteria.reduce((sum, criterion) => sum + criterion.weight, 0)
   const balanced = Number.isFinite(total) && Math.abs(total - 100) <= 0.000001
+  const close = () => { void guard.close(onClose) }
 
   function updateCriterion(id: string, patch: Partial<Criterion>) {
     setDraft((value) => ({
@@ -83,6 +87,7 @@ export function RubricEditor({ rubric, onClose, onSaved }: {
       return
     }
     submitting.current = true
+    guard.hold()
     setSaving(true)
     try {
       const id = await saveRubric({
@@ -101,10 +106,11 @@ export function RubricEditor({ rubric, onClose, onSaved }: {
           } : {}),
         })),
       })
+      guard.release()
       onSaved(id)
     } catch (caught) {
-      if (!(caught instanceof Error)) throw caught
-      setError(caught.message)
+      guard.settle()
+      setError(caught instanceof Error ? caught.message : 'The rubric could not be saved. Your edits are still here; try again.')
       submitting.current = false
       setSaving(false)
       requestAnimationFrame(() => feedback.current?.focus())
@@ -113,13 +119,13 @@ export function RubricEditor({ rubric, onClose, onSaved }: {
 
   return <Modal
     open
-    onOpenChange={(open) => { if (!open && !submitting.current) onClose() }}
+    onOpenChange={(open) => { if (!open) close() }}
     title="Edit rubric"
     description={`Save a new version of this rubric. Version ${rubric.version} and its existing analysis results will not change.`}
     wide
     footer={<>
       <span className="mr-auto text-[11px] text-muted">Weights must total 100%.</span>
-      <Button onClick={onClose} disabled={saving}>Cancel</Button>
+      <Button onClick={close} disabled={saving}>Cancel</Button>
       <Button type="submit" form={formId} icon={Save} variant="primary" disabled={saving || !canEdit}>
         {saving ? 'Saving…' : `Save version ${rubric.version + 1}`}
       </Button>

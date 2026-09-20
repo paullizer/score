@@ -114,6 +114,11 @@ export function checkResumeReplacement(
     return
   }
   if (resumeIsLocked(previous.lifecycle) || !same(previous.lifecycle ?? {}, record.lifecycle ?? {})) denied()
+  const metadataOnly = same({ ...previous, displayName: record.displayName, updatedAt: record.updatedAt }, record)
+  if (metadataOnly) return
+  if (previous.displayName !== record.displayName) {
+    throw new Error('Display-name edits cannot change resume sources, profile, evidence, lifecycle, or processing state.')
+  }
   if (previous.idempotencyKey !== record.idempotencyKey || previous.inputFingerprint !== record.inputFingerprint ||
     !same(previous.source, record.source) || previous.resume.documentId !== record.resume.documentId ||
     previous.resume.documentVersion !== record.resume.documentVersion) throw new Error('Captured resume input is immutable.')

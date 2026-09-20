@@ -187,6 +187,42 @@ test('job facts and display names do not expose administrative identity fallback
   assert.ok(!first.includes('target-0'))
 })
 
+test('readable labels use captured aliases while source names, filenames and saved evidence stay separate', () => {
+  const input = realReportFixture({ scores: [80], targetCount: 2 })
+  input.targets[0].displayName = 'Captured job label'
+  input.targets[1].displayName = 'Another captured label'
+  for (const comparison of input.comparisons) comparison.candidate.displayName = 'Captured resume label'
+  const report = api.buildAnalysisReport(input)
+  const original = JSON.stringify(report)
+  const group = report.groups[0]
+  const candidate = group.comparisons[0].candidate
+  assert.equal(api.readableCandidateName(candidate), 'Captured resume label')
+  assert.equal(api.readableCandidateSourceName(candidate), candidate.name)
+  assert.equal(api.readableCandidateName({ ...candidate, name: null }), 'Captured resume label')
+  assert.equal(api.readableCandidateSourceName({ ...candidate, name: null }), candidate.sourceLabel)
+  assert.equal(api.readableCandidateName({ ...candidate, displayName: undefined, name: null }), candidate.sourceLabel)
+  assert.equal(api.readableTargetLabel(report, group), 'Captured job label')
+  assert.equal(api.readableTargetLabel(report, report.groups[1]), 'Another captured label')
+  assert.equal(api.readableTargetSourceLabel(report, group), `${group.target.label} (Job 1)`)
+  assert.equal(api.readableTargetSourceLabel(report, report.groups[1]), `${group.target.label} (Job 2)`)
+  assert.equal(api.criterionReviews(group.target, group.comparisons[0])[0].sourceLabel, `${candidate.sourceLabel}, section 3`)
+  assert.equal(JSON.stringify(report), original)
+})
+
+test('target disambiguation compares the visible captured labels, including alias/source-label collisions', () => {
+  const input = realReportFixture({ scores: [80], targetCount: 3 })
+  input.targets[0].displayName = 'Shared title'
+  input.targets[1].displayName = 'Shared title'
+  input.targets[2].label = 'Shared title'
+  const report = api.buildAnalysisReport(input)
+  assert.deepEqual(report.groups.map(group => api.readableTargetLabel(report, group)),
+    ['Shared title (Job 1)', 'Shared title (Job 2)', 'Shared title (Job 3)'])
+  report.groups[0].target.sublabel = 'Distinct saved scope'
+  assert.equal(api.readableTargetLabel(report, report.groups[0]), 'Shared title - Distinct saved scope')
+  assert.equal(report.groups.length, 3)
+  assert.equal(report.counts.total, 3)
+})
+
 test('bounded display text respects grapheme boundaries and visibly marks shortening', () => {
   assert.equal(api.compactReportText('  Two  short\nsentences. ', 40), 'Two short sentences.')
   const result = api.compactReportText('Repeated e\u0301vidence '.repeat(100), 80)

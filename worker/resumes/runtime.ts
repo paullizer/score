@@ -33,6 +33,7 @@ import { MARKDOWN_EXTRACTION_VERSION } from '../markdown'
 
 const LEASE_MILLISECONDS = 90_000
 const HEARTBEAT_MILLISECONDS = 25_000
+const WRITE_ATTEMPTS = 8
 const RUN_BUDGET_MILLISECONDS = 660_000
 const MAX_HTTP_BYTES = 12 * 1024 * 1024
 const EXTRACTION_VERSION = 'score-resume-extraction-v1'
@@ -311,29 +312,34 @@ class ResumeLease {
     allowAborted = false,
   ): Promise<VersionedResumeEntity<RealResumeRecord>> {
     return this.exclusive(async () => {
-      const live = await this.owned(allowAborted)
-      const next = mutate(live.record)
-      parseResumeEntity(next)
-      this.checkSignal(allowAborted)
-      const saved = (value: VersionedResumeEntity): VersionedResumeEntity<RealResumeRecord> => {
-        const decoded = decodeRecord(value)
-        if (!same(decoded.record, next)) throw failure('storage-error')
-        if (decoded.record.resume.status === 'ready') {
-          this.published = true
-          if (this.heartbeat) clearInterval(this.heartbeat)
-          if (this.deadlineTimer) clearTimeout(this.deadlineTimer)
+      for (let attempt = 0; attempt < WRITE_ATTEMPTS; attempt++) {
+        const live = await this.owned(allowAborted)
+        const next = mutate(live.record)
+        parseResumeEntity(next)
+        this.checkSignal(allowAborted)
+        const matches = (record: RealResumeRecord) => record.updatedAt >= next.updatedAt &&
+          same(record, { ...next, displayName: record.displayName, updatedAt: record.updatedAt })
+        const saved = (value: VersionedResumeEntity): VersionedResumeEntity<RealResumeRecord> => {
+          const decoded = decodeRecord(value)
+          if (!matches(decoded.record)) throw failure('storage-error')
+          if (decoded.record.resume.status === 'ready') {
+            this.published = true
+            if (this.heartbeat) clearInterval(this.heartbeat)
+            if (this.deadlineTimer) clearTimeout(this.deadlineTimer)
+          }
+          return decoded
         }
-        return decoded
+        try {
+          return saved(await this.dependencies.store.replace(next, live.etag))
+        } catch (error) {
+          // Confirm an uncertain publication even if a name edit followed the successful write.
+          const current = await this.dependencies.store.get(next.workspaceId, next.id).catch(() => undefined)
+          if (current?.record.recordType === 'resume' && matches(current.record)) return saved(current)
+          if (!conflict(error)) throw failure('storage-error', true)
+          // Re-read the same owned attempt; metadata-only edits must not consume a processing retry.
+        }
       }
-      try {
-        return saved(await this.dependencies.store.replace(next, live.etag))
-      } catch (error) {
-        if (conflict(error)) return this.markLost()
-        // A lost response may follow a successful conditional write, including publication.
-        const current = await this.dependencies.store.get(next.workspaceId, next.id).catch(() => undefined)
-        if (current && same(current.record, next)) return saved(current)
-        throw failure('storage-error', true)
-      }
+      throw failure('storage-error', true)
     })
   }
 

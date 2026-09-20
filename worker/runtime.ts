@@ -26,6 +26,7 @@ const DOCUMENT_API_VERSION = '2024-11-30'
 const PROMPT_VERSION = 'score-job-rubric-v2'
 const LEASE_MILLISECONDS = 90_000
 const HEARTBEAT_MILLISECONDS = 25_000
+const WRITE_ATTEMPTS = 8
 const DEFAULT_RUN_BUDGET_MILLISECONDS = 11 * 60_000
 const DEFAULT_MAX_JOBS = 4
 const MAX_HTTP_BYTES = 12 * 1024 * 1024
@@ -1383,13 +1384,13 @@ class LeaseController {
 
   start(deadlineAt?: number): void {
     this.timer = setInterval(() => {
-      void this.exclusive(async () => {
-        const live = await this.getOwned()
-        await this.store.replace({
-          ...live.record,
-          updatedAt: this.clock.now().toISOString(),
-          lease: { owner: this.owner, expiresAt: new Date(this.clock.now().getTime() + LEASE_MILLISECONDS).toISOString() },
-        }, live.etag)
+      void this.update(record => {
+        const time = Math.max(this.clock.now().getTime(), Date.parse(record.updatedAt))
+        return {
+          ...record,
+          updatedAt: new Date(time).toISOString(),
+          lease: { owner: this.owner, expiresAt: new Date(time + LEASE_MILLISECONDS).toISOString() },
+        }
       }).catch(() => {
         if (!this.signal.aborted) this.markLost()
       })
@@ -1441,27 +1442,40 @@ class LeaseController {
   }
 
   async update(mutate: (record: RealJobRecord) => RealJobRecord): Promise<VersionedRealJob> {
-    return this.exclusive(async () => {
-      const live = await this.getOwned()
-      return this.store.replace(mutate(live.record), live.etag)
-    })
+    return this.write(mutate)
   }
 
   async updateAfterAbort(mutate: (record: RealJobRecord) => RealJobRecord): Promise<VersionedRealJob> {
-    return this.exclusive(async () => {
-      const live = await this.getOwned(true)
-      return this.store.replace(mutate(live.record), live.etag)
-    })
+    return this.write(mutate, undefined, true)
   }
 
   async publish(rubric: Rubric, mutate: (record: RealJobRecord) => RealJobRecord): Promise<VersionedRealJob> {
+    return this.write(mutate, rubric)
+  }
+
+  private async write(
+    mutate: (record: RealJobRecord) => RealJobRecord, rubric?: Rubric, allowAborted = false,
+  ): Promise<VersionedRealJob> {
     return this.exclusive(async () => {
-      const live = await this.getOwned()
-      if (this.signal.aborted) {
-        if (this.signal.reason instanceof WorkerError) throw this.signal.reason
-        throw abortError('Job publication was cancelled.')
+      for (let attempt = 0; attempt < WRITE_ATTEMPTS; attempt++) {
+        const live = await this.getOwned(allowAborted)
+        if (!allowAborted && this.signal.aborted) {
+          if (this.signal.reason instanceof WorkerError) throw this.signal.reason
+          throw abortError('Job processing was cancelled.')
+        }
+        const next = mutate(live.record)
+        next.updatedAt = [live.record.updatedAt, next.updatedAt].sort().at(-1)!
+        try {
+          return rubric ? await this.store.publish(next, live.etag, rubric) : await this.store.replace(next, live.etag)
+        } catch (error) {
+          const status = error && typeof error === 'object'
+            ? Number((error as { statusCode?: unknown; code?: unknown }).statusCode ?? (error as { code?: unknown }).code) : 0
+          const conflict = error instanceof Error && ['StoreConflictError', 'StoreNotFoundError'].includes(error.name)
+          if (!conflict && ![404, 409, 412].includes(status)) throw error
+          // A display-name edit changes the ETag, not this worker's lease or captured evidence.
+        }
       }
-      return this.store.publish(mutate(live.record), live.etag, rubric)
+      throw new WorkerError('storage-conflict', 'The job changed too often to save processing progress. Please retry.', true, 'rubric')
     })
   }
 
@@ -1498,6 +1512,7 @@ async function claimJob(
 ): Promise<VersionedRealJob | undefined> {
   const now = clock.now()
   const record = candidate.record
+  const updatedAt = [record.updatedAt, now.toISOString()].sort().at(-1)!
   if (isJobReadOnly(record) || (await store.getWorkspaceLifecycle(record.workspaceId)).state !== 'active') return undefined
   if (['ready', 'cancelled', 'error'].includes(record.job.status)) return undefined
   if (record.nextAttemptAt && new Date(record.nextAttemptAt).getTime() > now.getTime()) return undefined
@@ -1508,7 +1523,7 @@ async function claimJob(
         ...record,
         lease: undefined,
         nextAttemptAt: undefined,
-        updatedAt: now.toISOString(),
+        updatedAt,
         error: {
           code: 'attempt-limit-reached',
           message: 'The worker stopped after three automatic attempts.',
@@ -1533,7 +1548,7 @@ async function claimJob(
       attempts: record.attempts + 1,
       nextAttemptAt: leaseExpiresAt,
       error: undefined,
-      updatedAt: now.toISOString(),
+      updatedAt,
       lease: { owner, expiresAt: leaseExpiresAt },
       job: { ...record.job, status: 'parsing', error: undefined, errorStage: undefined },
     }, candidate.etag)

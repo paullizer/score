@@ -37,6 +37,30 @@ Reload its current job ETag and repeat the same delete action to resume. Neither
 response means permanent deletion completed. Unavailable capabilities/dependency
 checks before a durable deletion fence still return HTTP 503.
 
+## Display names
+
+`PATCH /api/workspaces/:workspaceId/jobs/:jobId/metadata` accepts exactly
+`{ "displayName": "New label" }` as JSON, with the current job `If-Match` ETag.
+It returns `{ job: RealJobSummary }` and the replacement ETag header. Names are
+trimmed, must be 1–160 JavaScript string characters after trimming, and reject
+control characters and line separators. Unknown body/query fields, weak,
+wildcard, and multiple ETags are rejected. Missing ETags return 428 and stale
+ETags return 409.
+
+The optional alias lives on the real record and summary/detail wrapper, never
+inside canonical `job` metadata. Only `displayName` and `updatedAt` change.
+Extracted titles, filenames/URLs, fingerprints, source bytes, documents, and
+immutable rubric versions remain unchanged. Renaming does not run or retry
+extraction/generation and never sends the alias to the model. Future analyses
+capture an alias separately; existing analysis snapshots retain their original
+captured labels or legacy fallback.
+
+Renames require owner/editor write access, normal CSRF protection, and the
+workspace mutation lease. Existing workspace/job/rubric archive and removal
+restrictions still apply. Workers preserve the latest alias when updating
+progress or publishing a rubric and retry bounded ETag contention only while
+they still own the active attempt; cancellation or lease loss still fences them.
+
 ## Storage and worker fencing
 
 Every normal Cosmos create, replacement/claim, and rubric publication includes an

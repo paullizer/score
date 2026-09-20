@@ -11,7 +11,8 @@ import type { CreateRealAnalysisInput, RealAnalysisRunDetail, RealAnalysisTarget
 import type { RealResumeSummary } from '../../domain/real-resumes'
 import { ANALYSIS_LIMITS } from '../../domain/real-analyses'
 import { Badge, Button, EmptyState, InlineError, PageHeader, SearchField, SegmentedControl, StepLabel } from '../../components/ui'
-import { readyRealResume, resumeName } from '../resumes/resumeImportUi'
+import { readyRealResume, resumeName, resumeStatedName } from '../resumes/resumeImportUi'
+import { DISPLAY_NAME_MAX_LENGTH, defaultAnalysisName, getDisplayName, normalizeDisplayName } from '../../domain/displayNames'
 import {
   currentRealTarget, initialRealSelections, newerSavedJobTarget, realResumeSelection, resumeSelectionIssue, targetIdentity, targetSelectionIssue,
   resolveRealAnalysisNavigation, targetVersionLabel, realTargetAvailable, realTargetArchived, realTargetRemoved, type SelectedRealResume, type SelectedRealTarget,
@@ -75,10 +76,10 @@ function RealAnalysisBuilder({ previous, params, fragment, transferred }: {
   const activeTargets = currentTargets.filter((target) => realTargetAvailable(workspace, target.selection))
   const shownResumes = resumeApi.summaries.filter((item) => !item.lifecycle?.deletedAt &&
     matchesArchiveFilter(isEntityArchived(workspace, { kind: 'resume', id: item.resume.id }), resumeSearch, resumeArchiveFilter) &&
-    [item.resume.name, item.resume.role, item.resume.sourceLabel].join(' ').toLocaleLowerCase().includes(resumeSearch.trim().toLocaleLowerCase()))
+    [item.displayName, item.resume.name, item.resume.role, item.resume.sourceLabel, item.source.displayName].join(' ').toLocaleLowerCase().includes(resumeSearch.trim().toLocaleLowerCase()))
   const shownTargets = currentTargets.filter((target) => !realTargetRemoved(workspace, target.selection) &&
     matchesArchiveFilter(realTargetArchived(workspace, target.selection), targetSearch, targetArchiveFilter) &&
-    target.kind === targetType && `${target.label} ${target.sublabel}`.toLocaleLowerCase().includes(targetSearch.trim().toLocaleLowerCase()))
+    target.kind === targetType && `${getDisplayName(target, target.label)} ${target.label} ${target.sublabel}`.toLocaleLowerCase().includes(targetSearch.trim().toLocaleLowerCase()))
   const count = draft.resumes.length * draft.targets.length
   const limit = api.features?.analysisLimits.maxComparisons ?? ANALYSIS_LIMITS.maxComparisons
   const duplicateInputs = new Set(draft.resumes.map((item) => item.id)).size !== draft.resumes.length || new Set(draft.targets.map((item) => item.id)).size !== draft.targets.length
@@ -89,6 +90,7 @@ function RealAnalysisBuilder({ previous, params, fragment, transferred }: {
   const locked = starting || Boolean(attempt)
   const jobs = draft.targets.filter((target) => target.selection?.kind === 'job').length
   const grades = draft.targets.filter((target) => target.selection?.kind === 'grade').length
+  const suggestedName = defaultAnalysisName(draft.resumes.length, draft.targets.map((target) => target.label))
 
   function selectResume(summary: RealResumeSummary, replace = false) {
     if (locked || !canEdit || !api.canWrite || !resumeReady(summary)) return
@@ -100,7 +102,7 @@ function RealAnalysisBuilder({ previous, params, fragment, transferred }: {
 
   function selectTarget(target: RealAnalysisTargetSummary, replaceId?: string) {
     if (locked || !canEdit || !api.canWrite || !realTargetAvailable(workspace, target.selection)) return
-    const choice: SelectedRealTarget = { id: targetIdentity(target.selection), label: target.label, selection: target.selection, summary: target }
+    const choice: SelectedRealTarget = { id: targetIdentity(target.selection), label: getDisplayName(target, target.label), selection: target.selection, summary: target }
     setDraft((current) => ({ ...current, targets: replaceId
       ? current.targets.map((item) => item.id === replaceId ? choice : item)
       : current.targets.some((item) => item.id === choice.id) ? current.targets.filter((item) => item.id !== choice.id) : [...current.targets, choice] }))
@@ -112,12 +114,15 @@ function RealAnalysisBuilder({ previous, params, fragment, transferred }: {
     let request = attempt
     if (!request) {
       if (invalid || !draft.resumes.length || !draft.targets.length || count > limit) { setError('Review every selected input and the comparison limit before submitting. Nothing will be skipped.'); return }
+      let acceptedName: string
+      try { acceptedName = name.trim() ? normalizeDisplayName(name) : suggestedName }
+      catch (caught) { setError(caught instanceof Error ? caught.message : 'Enter a valid analysis name.'); return }
       const input: CreateRealAnalysisInput = {
-        name: name.trim() || 'Resume evidence review',
+        name: acceptedName,
         resumes: draft.resumes.map((item) => { if (!item.selection) throw new Error('Missing exact resume selection.'); return item.selection }),
         targets: draft.targets.map((item) => { if (!item.selection) throw new Error('Missing exact target selection.'); return item.selection }),
       }
-      request = { input, key: api.requestKey(input) }
+      request = { input: structuredClone(input), key: api.requestKey(input) }
       setAttempt(request)
     }
     inFlight.current = true
@@ -142,7 +147,7 @@ function RealAnalysisBuilder({ previous, params, fragment, transferred }: {
     {transferred && <div className="info-callout mb-5"><Layers3 size={18} aria-hidden="true" /><div><strong>All exact selections were transferred with this navigation.</strong>
       <p>The URL stays short; this history entry carries only IDs, versions, and hashes. A copied URL without that state cannot restore the selection. After you manually create a run, its saved-run link can be reopened normally.</p></div></div>}
     {previous && <div className="info-callout mb-5"><Layers3 size={18} aria-hidden="true" /><div><strong>A new run, with reviewable selections.</strong>
-      <p>These are the saved inputs of “{previous.run.name}”, not silently updated versions. Eligible historical job rubrics stay selected; newer saved versions are identified separately below. Changed or unavailable inputs require explicit review. Retry on the old run always reuses its original snapshots.</p></div></div>}
+      <p>These are the saved inputs of “{getDisplayName(previous.run, previous.run.name)}”, not silently updated versions. Eligible historical job rubrics stay selected; newer saved versions are identified separately below. Changed or unavailable inputs require explicit review. Retry on the old run always reuses its original snapshots.</p></div></div>}
     {unavailable && <div className="mb-5"><InlineError>{api.creationError ?? api.error ?? resumeApi.error ?? (api.targets.state === 'error' || api.targets.state === 'ready' ? api.targets.error : undefined) ?? 'Input availability is not confirmed. Refresh before submitting.'} Your selection has been kept.</InlineError></div>}
     {!api.canWrite && <div className="info-callout mb-5"><p>This workspace is read-only. Only an owner or editor can run, retry, or cancel an analysis.</p></div>}
     {(draft.errors.length > 0 || duplicateInputs) && <div className="mb-5"><InlineError>{draft.errors.map((message) => <p key={message}>{message}</p>)}
@@ -151,7 +156,7 @@ function RealAnalysisBuilder({ previous, params, fragment, transferred }: {
     <div className="analysis-builder">
       <div className="space-y-5">
         <section className="panel"><div className="section-heading"><div><StepLabel number={1} complete={draft.resumes.length > 0}>Choose ready real resumes</StepLabel><p>Missing profile metadata is not replaced by filenames.</p></div><Badge>{draft.resumes.length} selected</Badge></div>
-          <div className="library-toolbar"><SearchField value={resumeSearch} onChange={setResumeSearch} placeholder="Search stated names, roles, or sources…" label="Search analysis resumes" />
+          <div className="library-toolbar"><SearchField value={resumeSearch} onChange={setResumeSearch} placeholder="Search labels, stated names, or sources…" label="Search analysis resumes" />
             <ArchiveStateFilter value={resumeArchiveFilter} onChange={setResumeArchiveFilter} label="Real resume input archive state" />
             <Button size="sm" variant="ghost" disabled={locked || !canEdit || !api.canWrite || !shownResumes.some(resumeReady)} onClick={() => {
               const visible = shownResumes.filter(resumeReady)
@@ -166,7 +171,8 @@ function RealAnalysisBuilder({ previous, params, fragment, transferred }: {
             {shownResumes.map((summary) => <label className="selection-card" key={summary.resume.id}>
               <input type="checkbox" checked={draft.resumes.some((item) => item.id === summary.resume.id)} disabled={locked || !canEdit || !api.canWrite || !resumeReady(summary)}
                 aria-label={`Include ${resumeName(summary)} from ${summary.source.displayName}`} onChange={() => selectResume(summary)} />
-              <Users size={17} className="shrink-0 text-muted" aria-hidden="true" /><div className="min-w-0"><strong className="block text-[12px]">{resumeName(summary)}</strong>
+              <Users size={17} className="shrink-0 text-muted" aria-hidden="true" /><div className="min-w-0"><strong className="block break-words text-[12px]">{resumeName(summary)}</strong>
+                {summary.displayName && <span className="row-meta block">Source name: {resumeStatedName(summary)}</span>}
                 <span className="row-meta block">{summary.resume.role ?? 'Role not stated'}</span><span className="row-meta block break-all">{summary.source.displayName}</span>
                 <div className="mt-2"><Badge tone={resumeReady(summary) ? 'success' : 'warning'}>{summary.resume.status}{summary.documentRef ? ` · document v${summary.documentRef.documentVersion}` : ''}</Badge><ArchivedBadge target={{ kind: 'resume', id: summary.resume.id }} /></div></div>
             </label>)}
@@ -182,9 +188,9 @@ function RealAnalysisBuilder({ previous, params, fragment, transferred }: {
             <ArchiveStateFilter value={targetArchiveFilter} onChange={setTargetArchiveFilter} label="Real target input archive state" /></div>
           <div className="builder-options">{shownTargets.map((target) => <label className="selection-card" key={target.id}>
             <input type="checkbox" checked={draft.targets.some((item) => item.id === targetIdentity(target.selection))} disabled={locked || !canEdit || !api.canWrite || !realTargetAvailable(workspace, target.selection)}
-              aria-label={`Include ${target.label}, ${targetVersionLabel(target.selection)}`} onChange={() => selectTarget(target)} />
+              aria-label={`Include ${getDisplayName(target, target.label)}, ${targetVersionLabel(target.selection)}`} onChange={() => selectTarget(target)} />
             <span className="target-symbol">{target.kind === 'job' ? <BriefcaseBusiness size={16} aria-hidden="true" /> : <Layers3 size={16} aria-hidden="true" />}</span>
-            <div className="min-w-0"><strong className="block text-[12px]">{target.label}</strong><span className="row-meta block">{target.sublabel}</span>
+            <div className="min-w-0"><strong className="block break-words text-[12px]">{getDisplayName(target, target.label)}</strong>{target.displayName && <span className="row-meta block">Source title: {target.label}</span>}<span className="row-meta block">{target.sublabel}</span>
               <div className="mt-2 flex flex-wrap gap-1.5"><Badge>{targetVersionLabel(target.selection)}</Badge><Badge>{target.criterionCount} criteria</Badge>
                 {realTargetArchived(workspace, target.selection) && <Badge tone="warning">Archived · read only</Badge>}
                 {target.kind === 'grade' && target.newerDraftAvailable && <Badge tone="warning">Newer draft exists · not selected</Badge>}</div>
@@ -233,8 +239,9 @@ function RealAnalysisBuilder({ previous, params, fragment, transferred }: {
       <aside className="analysis-summary panel" aria-label="Real analysis summary">
         <div className="section-heading"><StepLabel number={3}>Review, then run</StepLabel></div>
         <div className="space-y-5 p-5">
-          <label className="field"><span className="field-label">Analysis name (optional)</span><input className="input" value={name} maxLength={160} disabled={locked || !canEdit || !api.canWrite}
-            onChange={(event) => setName(event.target.value)} placeholder="Resume evidence review" /></label>
+          <label className="field"><span className="field-label">Analysis name (optional)</span><input className="input" value={name} maxLength={DISPLAY_NAME_MAX_LENGTH} disabled={locked || !canEdit || !api.canWrite}
+            onChange={(event) => setName(event.target.value)} placeholder={attempt?.input.name ?? suggestedName} /></label>
+          <p className="break-words text-[11px] text-muted">{attempt ? `This submission keeps the name “${attempt.input.name}”, the same inputs, and the same request key on retry.` : `Leave blank to use “${suggestedName}”. Your own name will not change when selections change.`}</p>
           <div className="space-y-3 border-y py-4"><div className="metric-line"><span>Real resumes</span><strong>{draft.resumes.length}</strong></div><div className="metric-line"><span>Job rubrics</span><strong>{jobs}</strong></div><div className="metric-line"><span>Approved GS versions</span><strong>{grades}</strong></div></div>
           <div className="comparison-count" aria-live="polite"><strong>{count}</strong><span>individual comparisons<small>Maximum {limit}. No truncation.</small></span></div>
           {count > limit && <InlineError>{count} comparisons exceeds the {limit}-comparison limit. Remove resumes or targets explicitly before running.</InlineError>}

@@ -18,7 +18,7 @@ const key = '6b997c8d-331e-4149-a7fc-b93259efed42'
 const workspaceId = 'workspace-one'
 const hash = 'a'.repeat(64)
 const originals = new Map()
-let client, ui, dom, root, createRoot, requests, current
+let client, ui, dom, root, createRoot, requests, current, projected
 
 function json(body, status = 200) {
   return new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json' } })
@@ -152,7 +152,7 @@ before(async () => {
       export { RealAnalysesBridge } from './src/app/RealAnalysesBridge';
       export { RealAnalysesContext, useRealAnalyses } from './src/app/real-analyses-context';
       export { RealResumesContext } from './src/app/real-resumes-context';
-      export { WorkspaceContext } from './src/app/workspace-context';
+      export { WorkspaceContext, useWorkspace } from './src/app/workspace-context';
       export { RealAnalysisSetup } from './src/features/analyses/RealAnalysisSetup';
       export { RealResumesPage } from './src/features/resumes/RealResumesPage';
       export { RealComparisonReview } from './src/features/analyses/RealComparisonReview';
@@ -165,7 +165,7 @@ before(async () => {
   ])
   ;[client, ui] = await Promise.all(['client', 'ui'].map((name) => import(pathToFileURL(join(output, `${name}.mjs`)).href)))
 })
-beforeEach(() => { requests = []; current = null; dom.window.history.replaceState(null, '', '/') })
+beforeEach(() => { requests = []; current = null; projected = null; dom.window.history.replaceState(null, '', '/') })
 afterEach(async () => { if (root) { await act(async () => root.unmount()); root = null } })
 after(async () => {
   globalThis.fetch = originalFetch
@@ -514,9 +514,54 @@ test('failed, queued, running, and cancelled pairs retain frozen sources without
   }
 })
 
+test('saved review navigation retains captured aliases and original identities after live library renames in every state', async () => {
+  const saved = comparisonDetail('job')
+  saved.comparison.resume.summary.name = 'Jordan Example'
+  saved.comparison.resume.summary.displayName = 'Captured candidate alias'
+  saved.resumeSnapshot.resume.name = 'Jordan Example'
+  saved.targetSnapshot.summary.displayName = 'Captured job alias'
+  const liveResume = resumeSummary()
+  Object.assign(liveResume.resume, { name: 'Jordan Example', displayName: 'Later candidate alias' })
+  const liveTarget = { ...saved.targetSnapshot.summary, displayName: 'Later job alias' }
+  const liveJob = { ...saved.targetSnapshot.job, displayName: liveTarget.displayName }
+  const workspace = frontendWorkspaceContext({
+    workspace: { schemaVersion: 1, jobs: [liveJob], resumes: [liveResume.resume], rubrics: [], documents: [], runs: [] },
+    cloud: { currentWorkspaceId: workspaceId, realJobs: { summaries: [{ workspaceId, job: liveJob }] } },
+  }, { resumes: [liveResume] })
+  for (const state of ['complete', 'failed', 'queued', 'running', 'cancelled', 'missing-result']) {
+    const detail = structuredClone(saved)
+    detail.comparison.status = state === 'missing-result' ? 'complete' : state
+    if (state !== 'complete') detail.result = null
+    if (state === 'failed') detail.comparison.error = {
+      code: 'invalid-citation', stage: 'grounding', retryable: false, message: 'A generated quotation did not match the saved paragraph.',
+    }
+    const unchanged = JSON.stringify(detail)
+    await render(React.createElement(ui.WorkspaceContext.Provider, { value: workspace },
+      React.createElement(ui.RealResumesContext.Provider, { value: { ...baseResumes, summaries: [liveResume] } },
+        React.createElement(ui.RealAnalysesContext.Provider, { value: { ...baseApi, targets: [liveTarget] } },
+          React.createElement(ui.RealComparisonReview, { key: state, detail, initialView: 'target' })))))
+    const source = () => dom.window.document.querySelector('[aria-label="Saved real source evidence"]')
+    await settle(() => source()?.textContent.includes('Document engineering projects.'))
+    const text = dom.window.document.body.textContent
+    for (const expected of ['Captured candidate alias', 'Source name: Jordan Example', 'resume.pdf',
+      'Captured job alias', 'Source title: Saved engineering role', 'Original source: Captured job']) {
+      assert.ok(text.includes(expected), `${state} review should retain ${expected}`)
+    }
+    assert.doesNotMatch(text, /Later candidate alias|Later job alias/)
+    assert.equal(source().querySelector('mark'), null, 'opening the saved target does not invent a citation')
+    await act(async () => [...source().querySelectorAll('button')].find((button) => button.textContent === 'Resume evidence').click())
+    await settle(() => source()?.textContent.includes('Prepared accessible project documentation and tested engineering methods.'))
+    assert.equal(source().querySelector('mark'), null)
+    assert.equal(JSON.stringify(detail), unchanged, 'display labels and source navigation never rewrite frozen model evidence')
+  }
+})
+
 test('failed diagnostic review shows private exact reasons and IDs, not scores, while citations retain source ownership checks', async () => {
   dom.window.localStorage.clear()
   const saved = comparisonDetail()
+  saved.comparison.resume.summary.name = 'Jordan Example'
+  saved.comparison.resume.summary.displayName = 'Captured candidate alias'
+  saved.resumeSnapshot.resume.name = 'Jordan Example'
   const diagnostic = diagnosticFixture(saved)
   const detail = failedComparisonFixture(saved, diagnostic)
   const calls = []
@@ -526,7 +571,8 @@ test('failed diagnostic review shows private exact reasons and IDs, not scores, 
   await settle(() => dom.window.document.body.textContent.includes(privateReviewReason))
   assert.equal(calls.length, 1)
   const text = dom.window.document.body.textContent
-  for (const expected of ['Supported work (criterion-0)', 'Documented engineering qualifications (qualification-one)',
+  for (const expected of ['Captured candidate alias', 'Source name: Jordan Example', 'resume.pdf',
+    'Supported work (criterion-0)', 'Documented engineering qualifications (qualification-one)',
     'fixture-call-fixture-failed-attempt-2', 'fixture-review-fixture-failed-attempt-2', 'fixture-assessment-v3', 'fixture-grounding-v3',
     'fixture-analysis-diagnostics-v1', 'Unpublished assessment cycle 3', privateReviewReason, 'Recorded error for the current attempt']) {
     assert.ok(text.includes(expected), `Diagnostic should show ${expected}`)
@@ -570,6 +616,8 @@ test('failed GS comparisons expose approved requirements and authorize the exact
 
 test('diagnostic history stays lazy after retry or success, loads one older attempt at a time, and rejects cursor cycles', async () => {
   const saved = comparisonDetail('job')
+  saved.comparison.resume.summary.displayName = 'Captured candidate alias'
+  saved.targetSnapshot.summary.displayName = 'Captured job alias'
   const latest = diagnosticFixture(saved)
   const older = diagnosticFixture(saved, 'older-attempt', 'fixture-assessment-v2')
   const oldest = diagnosticFixture(saved, 'oldest-attempt')
@@ -593,6 +641,9 @@ test('diagnostic history stays lazy after retry or success, loads one older atte
   await act(async () => [...dom.window.document.querySelectorAll('summary')].find((item) => item.textContent === 'Failure diagnostics and saved attempt history').click())
   await settle(() => calls.length === 1 && dom.window.document.body.textContent.includes('Historical failure'))
   assert.match(dom.window.document.querySelector('.overall-score').textContent, /36/)
+  assert.match(dom.window.document.querySelector('.result-identity').textContent, /Captured candidate alias.*Source name: Name not stated/)
+  assert.match(dom.window.document.querySelector('.result-target').textContent, /Captured job alias.*Source title: Saved engineering role.*Original source: Captured job/)
+  assert.doesNotMatch(dom.window.document.querySelector('.result-overview').textContent, /Private fixture review reason|Private unpublished fixture/)
   assert.doesNotMatch(dom.window.document.body.textContent, /Recorded error for the current attempt/)
   const clickOlder = async () => act(async () => [...dom.window.document.querySelectorAll('button')].find((item) => item.textContent === 'Load earlier saved attempt').click())
   await clickOlder()
@@ -978,13 +1029,49 @@ test('manual run and pair retries stay available after automatic retries stop an
   }
 })
 
-function Probe() { current = ui.useRealAnalyses(); return React.createElement('span', null, current.phase) }
+function Probe() { current = ui.useRealAnalyses(); projected = ui.useWorkspace(); return React.createElement('span', null, current.phase) }
 const legacy = { schemaVersion: 1, jobs: [], resumes: [], rubrics: [], documents: [], runs: [] }
 function bridge(workspace = workspaceId, role = 'owner', show = true) {
   return router(React.createElement(ui.WorkspaceContext.Provider, { value: frontendWorkspaceContext({ workspace: legacy, cloud: { currentWorkspaceId: workspace, workspaces: [{ id: workspace, role }] } }) },
     React.createElement(ui.RealAnalysesBridge, { workspaceId: workspace }, show ? React.createElement(Probe) : null)))
 }
 function deferred() { let resolve; const promise = new Promise((done) => { resolve = done }); return { promise, resolve } }
+
+test('analysis rename uses captured concurrency without requiring new-run sources or changing manifest identity', async () => {
+  let run = runSummary()
+  const before = structuredClone(run.run)
+  const baseEtag = run.etag
+  let conflict = false
+  globalThis.fetch = async (url, init) => {
+    requests.push({ url, init })
+    if (url === '/api/features') return json({ realAnalyses: false, realResumeImports: false })
+    if (init.method === 'PATCH') {
+      if (conflict) return json({ error: { code: 'conflict', message: 'This title changed.' } }, 409)
+      assert.equal(init.headers.get('If-Match'), baseEtag)
+      run = { ...run, run: { ...run.run, displayName: JSON.parse(init.body).displayName }, etag: '"renamed"' }
+      return json({ run })
+    }
+    if (url.endsWith('/analyses')) return json({ runs: [run] })
+    if (url.endsWith('/analyses/run-one')) return json({ ...runDetail('grade'), ...run })
+    if (url.endsWith('/comparisons')) return json({ comparisons: [comparisonDetail()] })
+    throw new Error(`Unexpected live-source dependency request: ${url}`)
+  }
+  await render(bridge())
+  await settle(() => current?.phase === 'ready' && current.features !== null)
+  await act(async () => projected.renameEntity({ kind: 'analysis', id: 'run-one' }, 'Reviewer title', baseEtag))
+  assert.equal(current.summaries[0].run.displayName, 'Reviewer title')
+  assert.deepEqual({ ...run.run, displayName: undefined }, { ...before, displayName: undefined })
+  assert.deepEqual(legacy.runs, [])
+  assert.equal(current.features.realAnalyses, false)
+  conflict = true
+  await act(async () => {
+    await assert.rejects(projected.renameEntity({ kind: 'analysis', id: 'run-one' }, 'Conflicting edit', baseEtag), /Reload and review/)
+  })
+  const patches = requests.filter(request => request.init.method === 'PATCH')
+  assert.equal(patches.length, 2)
+  assert.deepEqual(patches.map(request => request.init.headers.get('If-Match')), [baseEtag, baseEtag])
+  assert.equal(current.summaries[0].run.displayName, 'Reviewer title')
+})
 
 test('existing-run retry and cancellation remain available without new-run source readiness', async () => {
   let run = runSummary('run-one', 'failed')

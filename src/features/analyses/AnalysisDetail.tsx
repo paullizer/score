@@ -18,6 +18,8 @@ import {
 } from './analysisTableBrowsing'
 import { RealAnalysisDetail } from './RealAnalysisDetail'
 import { AnalysisReportExport } from './AnalysisReportExport'
+import { getDisplayName } from '../../domain/displayNames'
+import { RenameEntityButton, RenameEntityProvider } from '../../components/ui/RenameEntityButton'
 
 function ComparisonValue({ comparison }: { comparison: Comparison | undefined }) {
   if (!comparison) return <Badge tone="warning">Unavailable</Badge>
@@ -38,7 +40,7 @@ export function AnalysisDetail() {
   const run = workspace.runs.find((item) => item.id === id)
   if (!run) return <EmptyState title="This analysis is no longer here" description="A demo reset may have replaced it. Open the analysis library to find your saved comparisons." action={<Button onClick={() => navigate(sampleDataLink('/analyses', Boolean(cloud)))}>Back to analyses</Button>} />
   if (run.targets.some((target) => target.rubric.dataKind === 'real' || target.job?.dataKind === 'real') || run.resumes.some((snapshot) => snapshot.resume.sample !== true || snapshot.document.sample !== true)) return <EmptyState title="Real inputs cannot have demo scores" description="This run contains real inputs, possibly mixed with samples. Its simulated results are not shown or retried. Use the separate real analysis workflow." action={<Button onClick={() => navigate('/analyses?data=real')}>Open real analyses</Button>} />
-  return <RunView key={`${cloud?.currentWorkspaceId ?? 'standalone'}:${run.id}`} run={run} />
+  return <RenameEntityProvider key={`${cloud?.currentWorkspaceId ?? 'standalone'}:${run.id}`}><RunView run={run} /></RenameEntityProvider>
 }
 
 function RunView({ run }: { run: AnalysisRun }) {
@@ -74,8 +76,8 @@ function RunView({ run }: { run: AnalysisRun }) {
 
   return <>
     <Link className="back-link" to={sampleDataLink(selectedId ? `/analyses/${run.id}` : '/analyses', Boolean(cloud))}><ArrowLeft size={14} />{selectedId ? 'All comparisons' : 'Back to analyses'}</Link>
-    <PageHeader eyebrow="EVIDENCE-LED REVIEW" title={run.name} description="A clear view of the match, and the passages behind it."
-      actions={<><EntityLifecycleActions target={{ kind: 'analysis', id: run.id }} name={run.name} onComplete={(action) => { if (action === 'delete') navigate(sampleDataLink('/analyses', Boolean(cloud))) }} />{working && <Button icon={X} disabled={!canEdit} onClick={() => cancelRun(run.id)}>Cancel pending</Button>}{needsRetry && !working && <Button icon={RotateCcw} disabled={!canEdit} onClick={() => retryRun(run.id)}>Retry unfinished</Button>}
+    <PageHeader eyebrow="EVIDENCE-LED REVIEW" title={getDisplayName(run, run.name)} description="A clear view of the match, and the passages behind it."
+      actions={<><RenameEntityButton target={{ kind: 'analysis', id: run.id }} name={getDisplayName(run, run.name)} /><EntityLifecycleActions target={{ kind: 'analysis', id: run.id }} name={getDisplayName(run, run.name)} onComplete={(action) => { if (action === 'delete') navigate(sampleDataLink('/analyses', Boolean(cloud))) }} />{working && <Button icon={X} disabled={!canEdit} onClick={() => cancelRun(run.id)}>Cancel pending</Button>}{needsRetry && !working && <Button icon={RotateCcw} disabled={!canEdit} onClick={() => retryRun(run.id)}>Retry unfinished</Button>}
         <AnalysisReportExport source={{ kind: 'sample', run, available: !deleting && !removed }} />
         <Button icon={Sparkles} disabled={!canEdit} onClick={() => navigate(sampleDataLink(`/analyses/new?from=${run.id}`, Boolean(cloud)))}>New run with these inputs</Button></>} />
     <LifecycleBanner target={{ kind: 'analysis', id: run.id }} />
@@ -104,7 +106,7 @@ function RunView({ run }: { run: AnalysisRun }) {
             <tbody>{browsing.rows.map(({ snapshot: { resume }, comparisons }) => {
               const comparison = comparisons.get(browsing.selectedTarget!.id)
               const supported = comparison?.criteria.filter((criterion) => criterion.citations.length > 0).length ?? 0
-              return <tr key={resume.id}><td><div className="flex min-w-[220px] items-center gap-3"><Avatar initials={resume.initials} /><div><button className="row-title text-left" onClick={() => comparison && openResult(comparison.id)} disabled={!comparison}>{resume.name}</button><p className="row-meta">{resume.role}</p><p className="row-meta">{resume.sourceLabel}</p></div></div></td>
+              return <tr key={resume.id}><td><div className="flex min-w-[220px] items-center gap-3"><Avatar initials={resume.initials} /><div><button className="row-title text-left" onClick={() => comparison && openResult(comparison.id)} disabled={!comparison}>{getDisplayName(resume, resume.name)}</button>{resume.displayName && <p className="row-meta">Source name: {resume.name}</p>}<p className="row-meta">{resume.role}</p><p className="row-meta">{resume.sourceLabel}</p></div></div></td>
                 <td><ComparisonValue comparison={comparison} />{comparison?.score !== null && comparison?.score !== undefined && <div className="score-bar"><span style={{ width: `${comparison.score}%` }} /></div>}</td>
                 <td><span className="text-[11px] text-muted">{comparison?.status === 'complete' ? `${supported} of ${browsing.selectedTarget!.rubric.criteria.length} criteria with citations` : 'Evidence not assessed yet'}</span></td>
                 <td><div className="space-y-2"><div><Badge dot tone={comparison?.status === 'complete' ? 'success' : !comparison || ['failed', 'cancelled'].includes(comparison.status) ? 'warning' : 'neutral'}>
@@ -113,11 +115,11 @@ function RunView({ run }: { run: AnalysisRun }) {
             })}</tbody>
           </table></div> : <div className="table-wrap"><table className="data-table matrix-table">
             <thead><tr><SortableHeader className="matrix-person" option={sortOptions[0]} sort={browsing.sort} onChange={changeSort}>Resume / target</SortableHeader>
-              {browsing.displayedTargets.map((target) => <th scope="col" key={target.id}><Badge tone={target.kind === 'grade' ? 'accent' : 'neutral'}>{target.kind === 'job' ? 'Job rubric' : 'Grade rubric'}</Badge><strong>{target.label}</strong><span>{target.sublabel}</span><span>Rubric v{target.rubric.version}</span></th>)}</tr></thead>
-            <tbody>{browsing.rows.map(({ snapshot: { resume }, comparisons }) => <tr key={resume.id}><td className="matrix-person"><div className="flex items-center gap-3"><Avatar initials={resume.initials} small /><div><strong className="block text-[12px] font-semibold">{resume.name}</strong><span className="row-meta block">{resume.role}</span></div></div></td>
+              {browsing.displayedTargets.map((target) => <th scope="col" key={target.id}><Badge tone={target.kind === 'grade' ? 'accent' : 'neutral'}>{target.kind === 'job' ? 'Job rubric' : 'Grade rubric'}</Badge><strong>{getDisplayName(target, target.label)}</strong>{target.displayName && <span>Source title: {target.label}</span>}<span>{target.sublabel}</span><span>Rubric v{target.rubric.version}</span></th>)}</tr></thead>
+            <tbody>{browsing.rows.map(({ snapshot: { resume }, comparisons }) => <tr key={resume.id}><td className="matrix-person"><div className="flex items-center gap-3"><Avatar initials={resume.initials} small /><div><strong className="block text-[12px] font-semibold">{getDisplayName(resume, resume.name)}</strong>{resume.displayName && <span className="row-meta block">Source name: {resume.name}</span>}<span className="row-meta block">{resume.role}</span><span className="row-meta block">{resume.sourceLabel}</span></div></div></td>
               {browsing.displayedTargets.map((target) => {
                 const comparison = comparisons.get(target.id)
-                return <td key={target.id}>{comparison ? <button className="matrix-cell" onClick={() => openResult(comparison.id)} aria-label={`Review ${resume.name} against ${target.label}`}>
+                return <td key={target.id}>{comparison ? <button className="matrix-cell" onClick={() => openResult(comparison.id)} aria-label={`Review ${getDisplayName(resume, resume.name)} against ${getDisplayName(target, target.label)}`}>
                   <ComparisonValue comparison={comparison} /><ArrowUpRight size={13} />
                   {comparison.score !== null && <div className="score-bar"><span style={{ width: `${comparison.score}%` }} /></div>}
                 </button> : <Badge tone="warning">Unavailable</Badge>}</td>
@@ -154,8 +156,8 @@ function ResultReview({ run, comparison, initialView }: { run: AnalysisRun; comp
   }
   return <>
     <section className="result-overview panel">
-      <div className="result-identity"><Avatar initials={snapshot.resume.initials} /><div><div className="eyebrow">RESUME</div><h2>{snapshot.resume.name}</h2><p>{snapshot.resume.role}</p></div></div>
-      <div className="result-target"><div className="eyebrow">{target.kind === 'grade' ? 'GRADE-LEVEL RUBRIC' : 'JOB RUBRIC'}</div><h3>{target.label}</h3><p>{target.sublabel}</p><div className="mt-2 flex flex-wrap gap-1.5"><Badge>Rubric v{target.rubric.version}</Badge><Badge>{evidenceCount} citations</Badge></div></div>
+      <div className="result-identity"><Avatar initials={snapshot.resume.initials} /><div><div className="eyebrow">RESUME</div><h2>{getDisplayName(snapshot.resume, snapshot.resume.name)}</h2>{snapshot.resume.displayName && <p>Source name: {snapshot.resume.name}</p>}<p>{snapshot.resume.role}</p><p>{snapshot.resume.sourceLabel}</p></div></div>
+      <div className="result-target"><div className="eyebrow">{target.kind === 'grade' ? 'GRADE-LEVEL RUBRIC' : 'JOB RUBRIC'}</div><h3>{getDisplayName(target, target.label)}</h3>{target.displayName && <><p>Source title: {target.label}</p>{target.job && <p>Original source: {target.job.sourceLabel}</p>}</>}<p>{target.sublabel}</p><div className="mt-2 flex flex-wrap gap-1.5"><Badge>Rubric v{target.rubric.version}</Badge><Badge>{evidenceCount} citations</Badge></div></div>
       <div className="overall-score"><div className="eyebrow">OVERALL EVIDENCE MATCH</div><Score value={comparison.score} large /><span>Weighted criterion scores</span></div>
       <div className="result-summary"><Sparkles size={16} /><div><h3>Why this score</h3><p>{comparison.summary}</p></div></div>
     </section>

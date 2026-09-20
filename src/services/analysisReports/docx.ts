@@ -13,7 +13,7 @@ import {
   assertReportXmlText, candidateName, comparisonStatusLabel, criterionScoreLabel,
   evidenceStatusLabel, formatReportWeight, highlightNotice, overallScoreLabel, REPORT_CAPTURE_NOTICE,
   REPORT_HUMAN_REVIEW_NOTICE, REPORT_PALETTE, REPORT_SAMPLE_NOTICE, reportStatusNotice,
-  reportTitle, summaryExcerpt,
+  reportTitle, summaryExcerpt, targetName,
 } from './presentation'
 
 const PAGE_WIDTH = 12240
@@ -222,8 +222,9 @@ function targetSummary(group: ReportGroup): Content[] {
   const highlightedIds = new Set(group.highlightedComparisonIds)
   const highlighted = group.comparisons.filter(comparison => comparison.highlighted && highlightedIds.has(comparison.id))
   const content: Content[] = [
-    heading(`Highest evidence matches — ${target.label}`, 1, true),
-    field(target.kind === 'grade' ? 'Grade' : 'Job', target.sublabel || target.label, true),
+    heading(`Highest evidence matches — ${targetName(target)}`, 1, true),
+    field(target.kind === 'grade' ? 'Grade' : 'Job', target.sublabel || targetName(target), true),
+    ...(target.displayName ? [field('Source target title', target.label, true)] : []),
     field('Saved target version', target.versionLabel, true),
     field('Exact target', target.id, true),
     field('Rubric', `${target.rubricId} · version ${target.rubricVersion}`, true),
@@ -371,10 +372,12 @@ function comparisonReview(group: ReportGroup, comparison: RankedReportComparison
       heading: HeadingLevel.HEADING_1, widowControl: true,
       children: [new Bookmark({
         id: bookmarkId(comparison),
-        children: runs(`${candidateName(comparison.candidate)} — ${target.label}`),
+        children: runs(`${candidateName(comparison.candidate)} — ${targetName(target)}`),
       })],
     }),
     field('Candidate ID', comparison.candidate.id, true),
+    ...(comparison.candidate.displayName ? [field('Source-stated name', comparison.candidate.name ?? 'Not stated', true)] : []),
+    ...(target.displayName ? [field('Source target title', target.label, true)] : []),
     field('Role', comparison.candidate.role ?? 'Not recorded', true),
     field('Comparison ID', comparison.id, true),
     field('Exact target', `${target.id} · ${target.kind === 'grade' ? 'Grade' : 'Job'} · ${target.sublabel}`, true),
@@ -435,7 +438,7 @@ function header(report: AnalysisReport, context?: { target: ReportTarget; compar
       { style: 'ReportMetadata', spacing: { after: 20, line: 240 } },
     ),
     paragraph(
-      `Target: ${summaryExcerpt(context.target.label.replace(/\s+/g, ' '), 40).text}`,
+      `Target: ${summaryExcerpt(targetName(context.target).replace(/\s+/g, ' '), 40).text}`,
       { style: 'ReportMetadata', spacing: { after: 40, line: 240 }, border },
     ),
   ] : []

@@ -1,5 +1,6 @@
 import { latestRubrics } from '../domain/selectors'
 import { assertEntityWritable } from '../domain/lifecycle'
+import { defaultAnalysisName, getDisplayName, normalizeDisplayName } from '../domain/displayNames'
 import type {
   AnalysisRun, AnalysisTarget, Citation, Comparison, CriterionResult, ResumeSnapshot, Rubric, SourceDocument, Workspace,
 } from '../domain/types'
@@ -175,6 +176,7 @@ export function snapshotAnalysisRun(
         id: rubric.id,
         kind: 'job',
         label: job.title,
+        ...(job.displayName === undefined ? {} : { displayName: job.displayName }),
         sublabel: `${job.organization} · ${job.grade}`,
         rubric,
         job,
@@ -204,7 +206,7 @@ export function snapshotAnalysisRun(
   }
   return structuredClone({
     id: identity.id,
-    name: name?.trim() || `${resumes.length} ${resumes.length === 1 ? 'resume' : 'resumes'} · ${targets.length === 1 ? targets[0].label : `${targets.length} separate targets`}`,
+    name: name?.trim() ? normalizeDisplayName(name) : defaultAnalysisName(resumes.length, targets.map((target) => getDisplayName(target, target.label))),
     createdAt: identity.createdAt,
     targets,
     resumes,

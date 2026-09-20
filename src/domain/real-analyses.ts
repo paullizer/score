@@ -72,6 +72,7 @@ export interface RealAnalysisTargetSummaryBase {
   workspaceId: string
   dataKind: 'real'
   label: string
+  displayName?: string
   sublabel: string
   rubricId: string
   rubricVersion: number
@@ -104,6 +105,7 @@ export interface RealAnalysisResumeSummary {
   dataKind: 'real'
   selection: RealAnalysisResumeSelection
   name: string | null
+  displayName?: string
   role: string | null
   sourceLabel: string
   capturedAt: string
@@ -115,6 +117,7 @@ export interface FrozenRealResumeSnapshot {
   workspaceId: string
   dataKind: 'real'
   frozenAt: string
+  displayName?: string
   selection: RealAnalysisResumeSelection
   resume: RealResume & { status: 'ready' }
   source: RealResumeSource
@@ -258,6 +261,7 @@ export interface RealAnalysisRunRecord extends AnalysisEntityBase, AnalysisWorkS
   recordType: 'analysis-run'
   lifecycle?: LifecycleMetadata
   name: string
+  displayName?: string
   createdBy: string
   idempotencyKey: string
   inputFingerprint: string
@@ -484,7 +488,7 @@ export interface RetryRealAnalysisInput {
   comparisonIds?: string[]
 }
 
-// GET details are unwrapped; POST actions return a versioned summary in these wrappers.
+// GET details are unwrapped; mutations return a versioned summary in these wrappers.
 export interface RealAnalysisMutationResponse {
   run: RealAnalysisRunSummary
 }

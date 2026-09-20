@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto'
 import { gradeHeadId } from '../../src/domain/real-grades'
+import { getDisplayName } from '../../src/domain/displayNames'
 import type { LifecycleAction, LifecycleBlocker, LifecycleImpact, LifecycleOperation, LifecycleTarget } from '../../src/domain/lifecycle'
 import type { RealAnalysisDetail, RealAnalysisRunRecord, VersionedAnalysisEntity } from '../../src/domain/real-analyses'
 import type { WorkspaceLifecycleParticipant } from '../lifecycle/contracts'
@@ -122,7 +123,7 @@ export async function realAnalysisDependencyBlockers(
     for (const { record } of await runs(analyses, workspaceId)) {
       if (target.kind !== 'workspace' && !(await dependencyTargets(analyses, record))
         .some(value => value.kind === target.kind && value.id === target.id)) continue
-      blockers.push({ kind: 'analysis', id: record.id, name: record.name, href: `/analyses/${encodeURIComponent(record.id)}?data=real` })
+      blockers.push({ kind: 'analysis', id: record.id, name: getDisplayName(record, record.name), href: `/analyses/${encodeURIComponent(record.id)}?data=real` })
     }
     return blockers
   } catch {
@@ -341,7 +342,7 @@ export class AnalysisLibraryLifecycleService {
   async impact(workspaceId: string, runId: string): Promise<LifecycleImpact> {
     const run = await managed(this.analyses, workspaceId, runId)
     return {
-      target: { kind: 'analysis', id: runId }, name: run.record.name,
+      target: { kind: 'analysis', id: runId }, name: getDisplayName(run.record, run.record.name),
       counts: { analyses: 1, analysisComparisons: run.record.progress.total,
         completedResults: run.record.progress.complete }, blockers: [],
     }

@@ -102,6 +102,111 @@ async function stored(page) {
   return page.evaluate((key) => JSON.parse(localStorage.getItem(key)), storageKey)
 }
 
+async function renameItem(page, kind, currentName, nextName) {
+  await page.getByRole('button', { name: `Rename ${kind}: ${currentName}`, exact: true }).first().click()
+  const fields = { job: 'Job display title', resume: 'Resume label', analysis: 'Analysis name' }
+  const dialog = page.getByRole('dialog', { name: `Edit ${fields[kind].toLowerCase()}`, exact: true })
+  const input = dialog.getByRole('textbox', { name: fields[kind], exact: true })
+  assert.equal(await input.getAttribute('maxlength'), '160')
+  await input.fill(nextName)
+  await input.press('Enter')
+  await dialog.waitFor({ state: 'hidden' })
+}
+
+test('editable display names persist without rewriting evidence and library context survives detail navigation', { timeout: 90000 }, async t => {
+  const workspace = domain.createInitialWorkspace()
+  const job = workspace.jobs[0], resume = workspace.resumes[0], run = workspace.runs[0]
+  job.displayName = 'Original reviewer job label'
+  const page = await pageFor(t, workspace)
+  await page.goto(`${localServer.origin}/jobs`)
+  const jobSearch = page.getByRole('searchbox', { name: 'Search jobs, organizations...' })
+  const jobSort = page.getByRole('combobox', { name: /^Sort/ })
+  await jobSearch.fill(job.displayName)
+  await jobSort.selectOption('0:desc')
+  await renameItem(page, 'job', job.displayName, 'Hiring display title')
+  assert.equal(await page.getByRole('link', { name: 'Hiring display title', exact: true }).count(), 0, 'The renamed row can leave its old-label filter without unmounting the save dialog early')
+  assert.equal(await jobSearch.inputValue(), job.displayName)
+  await jobSearch.fill('Hiring display title')
+  await page.getByRole('link', { name: 'Hiring display title', exact: true }).click()
+  await page.getByRole('heading', { name: 'Hiring display title', exact: true }).waitFor()
+  await page.goBack()
+  assert.equal(await jobSearch.inputValue(), 'Hiring display title')
+  assert.equal(await jobSort.inputValue(), '0:desc')
+
+  await page.locator('.sidebar').getByRole('link', { name: /Resumes/ }).click()
+  await renameItem(page, 'resume', resume.name, 'Reviewed resume A')
+  const resumeSearch = page.getByRole('searchbox', { name: 'Search resume library' })
+  await resumeSearch.fill('Reviewed resume A')
+  await page.getByRole('combobox', { name: 'Sort resumes', exact: true }).selectOption('0:desc')
+  await page.getByRole('checkbox', { name: 'Select Reviewed resume A', exact: true }).check()
+  await page.getByRole('link', { name: 'Reviewed resume A', exact: true }).click()
+  await page.getByRole('heading', { name: 'Reviewed resume A', exact: true }).waitFor()
+  await page.goBack()
+  assert.equal(await resumeSearch.inputValue(), 'Reviewed resume A')
+  assert.equal(await page.getByRole('combobox', { name: 'Sort resumes', exact: true }).inputValue(), '0:desc')
+  assert.equal(await page.getByRole('checkbox', { name: 'Select Reviewed resume A', exact: true }).isChecked(), false, 'Remembering browsing does not retain selected records')
+
+  await page.locator('.sidebar').getByRole('link', { name: /Analyses/ }).click()
+  await renameItem(page, 'analysis', run.name, 'Reviewed shortlist')
+  const analysisSearch = page.getByRole('searchbox', { name: 'Find an analysis...' })
+  await analysisSearch.fill('Reviewed shortlist')
+  await page.getByRole('combobox', { name: 'Sort analyses', exact: true }).selectOption('0:desc')
+  await page.getByRole('link', { name: 'Reviewed shortlist', exact: true }).click()
+  await page.getByRole('heading', { name: 'Reviewed shortlist', exact: true }).waitFor()
+  await page.goBack()
+  assert.equal(await analysisSearch.inputValue(), 'Reviewed shortlist')
+  assert.equal(await page.getByRole('combobox', { name: 'Sort analyses', exact: true }).inputValue(), '0:desc')
+
+  const saved = await stored(page)
+  assert.equal(saved.jobs.find(item => item.id === job.id).displayName, 'Hiring display title')
+  assert.equal(saved.jobs.find(item => item.id === job.id).title, job.title)
+  assert.equal(saved.resumes.find(item => item.id === resume.id).displayName, 'Reviewed resume A')
+  assert.equal(saved.resumes.find(item => item.id === resume.id).name, resume.name)
+  const savedRun = saved.runs.find(item => item.id === run.id)
+  assert.equal(savedRun.displayName, 'Reviewed shortlist')
+  assert.equal(savedRun.name, run.name)
+  assert.deepEqual(savedRun.targets, run.targets)
+  assert.deepEqual(savedRun.resumes, run.resumes)
+  assert.deepEqual(savedRun.comparisons, run.comparisons)
+  assert.deepEqual(saved.documents, workspace.documents)
+  await page.reload()
+  assert.equal(await analysisSearch.inputValue(), '')
+  assert.equal(await page.getByRole('combobox', { name: 'Sort analyses', exact: true }).inputValue(), '')
+  await page.getByRole('link', { name: 'Reviewed shortlist', exact: true }).click()
+  await page.setViewportSize({ width: 390, height: 844 })
+  const longName = `Review ${'X'.repeat(153)}`
+  await renameItem(page, 'analysis', 'Reviewed shortlist', longName)
+  await page.getByRole('heading', { name: longName, exact: true }).waitFor()
+  assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 1), true, 'Long edited titles must not overflow a narrow viewport')
+})
+
+test('a failed local name save retains the draft and still allows an explicit discard', { timeout: 60000 }, async t => {
+  const workspace = domain.createInitialWorkspace(), run = workspace.runs[0]
+  const page = await pageFor(t, workspace)
+  await page.goto(`${localServer.origin}/analyses`)
+  await page.getByRole('button', { name: `Rename analysis: ${run.name}`, exact: true }).click()
+  const editor = page.getByRole('dialog', { name: 'Edit analysis name', exact: true })
+  await editor.getByRole('textbox', { name: 'Analysis name', exact: true }).fill('Keep my unsaved name')
+  await page.evaluate(key => {
+    const original = Storage.prototype.setItem
+    Storage.prototype.setItem = function (name, value) {
+      if (name === key) throw new DOMException('Controlled test quota failure', 'QuotaExceededError')
+      return original.call(this, name, value)
+    }
+  }, storageKey)
+  await editor.getByRole('button', { name: 'Save name', exact: true }).click()
+  await editor.getByText(/The name could not be saved/).waitFor()
+  assert.equal(await editor.getByRole('textbox', { name: 'Analysis name', exact: true }).inputValue(), 'Keep my unsaved name')
+  await editor.getByRole('button', { name: 'Cancel', exact: true }).click()
+  const protection = page.getByRole('dialog', { name: 'Unsaved changes', exact: true })
+  await protection.getByRole('button', { name: 'Stay here', exact: true }).click()
+  assert.equal(await editor.getByRole('textbox', { name: 'Analysis name', exact: true }).inputValue(), 'Keep my unsaved name')
+  await editor.getByRole('button', { name: 'Cancel', exact: true }).click()
+  await protection.getByRole('button', { name: 'Discard unsaved changes and leave', exact: true }).click()
+  await editor.waitFor({ state: 'hidden' })
+  assert.equal((await stored(page)).runs[0].displayName, undefined)
+})
+
 test('sample jobs, logical rubrics, resumes, and ladder families have complete lifecycle controls', { timeout: 90000 }, async (t) => {
   const workspace = domain.createInitialWorkspace(); workspace.runs = []
   const job = workspace.jobs[0], resume = workspace.resumes[0]
@@ -206,7 +311,8 @@ test('search can discover archived analysis inputs but bulk selection and old pr
   await page.getByRole('searchbox', { name: 'Search people or experience...' }).fill(resume.name)
   assert.equal(await page.getByRole('checkbox', { name: `Include ${resume.name}`, exact: true }).isDisabled(), true)
   await page.getByRole('searchbox', { name: 'Find a rubric...' }).fill(rubric.name)
-  assert.equal(await page.getByRole('checkbox', { name: `Include ${rubric.name}`, exact: true }).isDisabled(), true)
+  const jobTitle = workspace.jobs.find((job) => job.id === rubric.jobId).title
+  assert.equal(await page.getByRole('checkbox', { name: `Include ${jobTitle}`, exact: true }).isDisabled(), true)
   await page.getByRole('button', { name: 'Remove unavailable selections' }).click()
   assert.equal(await page.getByRole('button', { name: 'Select visible', exact: true }).isDisabled(), true)
   assert.equal((await stored(page)).runs.length, workspace.runs.length)
@@ -496,6 +602,36 @@ test('archived cloud deep links are readable for viewers but never selected auto
   assert.equal(fixture.mutations.length, 0)
 })
 
+test('sample name acknowledgement keeps its editor open through cloud failures and retries', { timeout: 60000 }, async t => {
+  const workspace = domain.createInitialWorkspace(), run = workspace.runs[0]
+  const fixture = cloudFixture(workspace, [workspaceSummary()])
+  const page = await pageFor(t)
+  await fixture.install(page)
+  await page.goto(`${cloudServer.origin}/workspaces/workspace-one/analyses?data=samples`)
+  const saving = deferred()
+  t.after(() => saving.resolve())
+  fixture.beforeSave = () => saving.promise
+  fixture.saveFailures = [503]
+  await page.getByRole('button', { name: `Rename analysis: ${run.name}`, exact: true }).click()
+  const editor = page.getByRole('dialog', { name: 'Edit analysis name', exact: true })
+  await editor.getByRole('textbox', { name: 'Analysis name', exact: true }).fill('Cloud display name')
+  await editor.getByRole('button', { name: 'Save name', exact: true }).click()
+  await until(() => Promise.resolve(fixture.mutations.some(item => item.method === 'PUT')), 'The name save must wait for cloud acknowledgement')
+  assert.equal(await editor.getByRole('button', { name: 'Cancel', exact: true }).isDisabled(), true)
+  assert.equal(fixture.workspace.runs[0].displayName, undefined)
+  saving.resolve()
+  await editor.getByText(/Injected save failure/).waitFor()
+  assert.equal(await editor.getByRole('textbox', { name: 'Analysis name', exact: true }).inputValue(), 'Cloud display name')
+  fixture.beforeSave = null
+  await editor.getByRole('button', { name: 'Save name', exact: true }).click()
+  await editor.waitFor({ state: 'hidden' })
+  assert.equal(fixture.workspace.runs[0].displayName, 'Cloud display name')
+  assert.equal(fixture.workspace.runs[0].name, run.name)
+  assert.deepEqual(fixture.workspace.runs[0].comparisons, run.comparisons)
+  assert.equal(fixture.saves.length, 1)
+  assert.equal(fixture.mutations.filter(item => item.method === 'PUT').length, 2)
+})
+
 test('cloud sample deletion keeps its confirmation until the save is acknowledged and retries without deleting twice', { timeout: 60000 }, async (t) => {
   const sample = domain.createInitialWorkspace(); sample.runs = []
   const fixture = cloudFixture(sample, [workspaceSummary()])
@@ -647,7 +783,7 @@ test('cross-tab workspace lifecycle refresh preserves unsaved grade drafts and t
   assert.equal(await editor.getByRole('textbox', { name: 'Grade rubric name', exact: true }).inputValue(), 'Keep this unsaved draft')
   assert.equal(await editor.getByRole('button', { name: 'Save draft and request review', exact: true }).isDisabled(), true)
   await editor.getByRole('button', { name: 'Close draft', exact: true }).click()
-  const protection = page.getByRole('dialog', { name: 'Leave unsaved grade changes?', exact: true })
+  const protection = page.getByRole('dialog', { name: 'Unsaved changes', exact: true })
   await protection.getByRole('button', { name: 'Stay here', exact: true }).click()
   assert.equal(await editor.getByRole('textbox', { name: 'Grade rubric name', exact: true }).inputValue(), 'Keep this unsaved draft')
   assert.equal(fixture.saves.length, 0)

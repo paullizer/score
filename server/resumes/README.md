@@ -12,7 +12,7 @@ authentication and same-origin CSRF middleware. `resumes` is an optional `RealRe
 read/write membership before its raw upload parser and returns private, `no-store` responses.
 Every mutation runs inside `repository.withWorkspaceMutation` after parsing, reauthorizes under the
 finite workspace lease, and asserts that lease before publication. Lifecycle mutations use `manage`
-access so an archived workspace can still be managed; ordinary intake/retry/cancel use `write`.
+access so an archived workspace can still be managed; ordinary intake/metadata/retry/cancel use `write`.
 Feature flags, dependency construction, and feature discovery belong to the application wiring.
 `wordDocumentImports` defaults to disabled and comes from `Config.wordDocumentImports` /
 `WORD_DOCUMENT_IMPORTS_ENABLED`. It gates new DOCX/DOC admissions only, not validation or reads
@@ -29,6 +29,7 @@ Paths below start with `/api/workspaces/:workspaceId`:
 | --- | --- | --- |
 | `GET /resumes` | Optional `continuationToken`, `limit` (1–100; default 50) | `RealResumesPage` |
 | `GET /resumes/:resumeId` | — | Unwrapped `RealResumeDetail`, with ETag |
+| `PATCH /resumes/:resumeId/metadata` | Exact `If-Match`; JSON `{ "displayName": "New label" }` | `{ resume: RealResumeSummary }`, with ETag |
 | `GET /resumes/:resumeId/original` | — | Private original bytes as an attachment |
 | `POST /resumes/file` | Raw canonical PDF/Markdown/DOCX/DOC bytes, import headers, percent-encoded `X-File-Name` | `{ resume: RealResumeSummary }` |
 | `POST /resumes/pdf` | Existing strict raw `application/pdf` alias, same import headers and `X-File-Name` | `{ resume: RealResumeSummary }` |
@@ -45,6 +46,28 @@ its own idempotency key. PDF, Markdown, DOCX, DOC, and URL items share that batc
 accepted item returns 202; a confirmed replay returns 200.
 The write responses include the current ETag. Retry/cancel do not accept source text, profiles,
 processing status, or other client-owned overrides.
+
+Metadata PATCH accepts only `displayName`; extra body/query fields are invalid.
+Names are trimmed, must contain 1–160 JavaScript string characters after trimming,
+and cannot contain control characters or line separators. Missing ETags return
+428; weak, wildcard, or multiple ETags are invalid, and stale ETags return 409.
+The endpoint requires normal write membership and CSRF protection and is fenced
+by the workspace mutation lease plus workspace/resume archive/removal controls.
+
+The optional `displayName` is on the real record and summary/detail wrapper, not
+the canonical resume. Only that alias and `updatedAt` change. Source-stated
+`resume.name`, imported `sourceLabel`, profiles, documents, captures, originals,
+hashes, processing state, and attempt counters are untouched. In particular,
+a filename or user alias never becomes the person's name. Completed, failed,
+and cancelled records can be renamed when otherwise writable. Old records need
+no migration and use their original presentation fallback.
+
+Future analyses capture the alias in frozen resume metadata and its manifest
+summary; later renames do not rewrite historical comparisons or reports.
+Profiling/scoring inputs never include the alias. An owned worker retries bounded
+conditional-write contention against fresh records, preserving concurrent
+renames without consuming another model attempt. It still stops on cancellation,
+archive/removal, or lease loss.
 
 Uploaded PDF, Markdown, DOCX, and genuine Word 97–2003 DOC files are limited to **10 MiB each**.
 The **50-page limit is PDF-only**. The service parses actual PDF structure before publication,
@@ -151,7 +174,9 @@ Azure factories:
   expose the same adapters for isolated tests.
 
 `RealResumeService(resumes, now?)` exposes `list`, `detail`, `original`, `importFile`, `importPdf`,
-`importMarkdown`, `importUrl`, `retry`, and `cancel`.
+`importMarkdown`, `importUrl`, `updateMetadata`, `retry`, and `cancel`.
+`updateMetadata(workspaceId, resumeId, { displayName }, expectedEtag)` changes only
+display metadata and does not need to read source blobs or profiles.
 `importFile(workspaceId, request, filename, bytes, contentType: UploadContentType)`,
 `importPdf(workspaceId, request, filename, bytes)`, and
 `importMarkdown(workspaceId, request, filename, bytes)` share file admission and immutable capture.

@@ -9,7 +9,7 @@ export function frontendWorkspaceContext(value = {}, { resumes = [], analyses = 
     storageError: null, notice: null, clearNotice: noop, notify: noop,
     addJobs: unused, addResumes: unused, cancelJob: unused, retryJob: unused, saveRubric: unused,
     startAnalysis: unused, cancelRun: unused, retryRun: unused, resetDemo: unused, retrySave: noop,
-    getLifecycleImpact: unused, changeLifecycle: unused, lifecycleOperations: [],
+    getLifecycleImpact: unused, changeLifecycle: unused, renameEntity: unused, lifecycleOperations: [],
     ...value,
     workspace: {
       ...workspace,

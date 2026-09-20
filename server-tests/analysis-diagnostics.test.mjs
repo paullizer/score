@@ -72,6 +72,30 @@ test('diagnostic history is immutable, paginated one attempt at a time and prese
   assert.throws(() => api.assertAnalysisReplacement(latest.record, changed), /immutable attempt replaced/)
 })
 
+test('renaming a failed analysis preserves private diagnostics and frozen inputs', async () => {
+  const f = fixture()
+  const created = await createRun(f)
+  const [pair] = comparisons(f, created.run.id)
+  const diagnostic = await saveFailure(f, created.run.id, pair.record.id)
+  const run = await f.analysis.store.get(f.workspaceId, created.run.id)
+  const failed = clone(await f.analysis.store.get(f.workspaceId, pair.record.id))
+  const savedDetail = await f.service.comparisonDetail(f.workspaceId, created.run.id, pair.record.id)
+  const savedBlobs = clone(f.analysis.blobs.values)
+  f.now = new Date(Date.parse(f.now) + 1000).toISOString()
+
+  const renamed = await f.service.updateMetadata(f.workspaceId, created.run.id, {
+    displayName: 'Review failed assessment',
+  }, run.etag)
+
+  assert.deepEqual(renamed.run, { ...run.record, displayName: 'Review failed assessment', updatedAt: f.now })
+  assert.notEqual(renamed.etag, run.etag)
+  assert.equal((await api.readAnalysisManifest(f.analysis.blobs, renamed.run)).request.name, created.run.name)
+  assert.deepEqual(await f.service.diagnostics(f.workspaceId, created.run.id, pair.record.id), { attempts: [diagnostic] })
+  assert.deepEqual(await f.service.comparisonDetail(f.workspaceId, created.run.id, pair.record.id), savedDetail)
+  assert.deepEqual(await f.analysis.store.get(f.workspaceId, pair.record.id), failed)
+  assert.deepEqual(f.analysis.blobs.values, savedBlobs)
+})
+
 test('diagnostic routes require workspace read authorization and reject raw paths and foreign history cursors', async t => {
   const f = fixture()
   const created = await createRun(f, 1, 2)

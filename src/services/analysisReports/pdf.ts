@@ -6,7 +6,7 @@ import type {
 } from '../../domain/analysis-reports'
 import {
   evidenceStatusLabel, overallScoreLabel, REPORT_FONT_FAMILY, REPORT_HUMAN_REVIEW_NOTICE,
-  REPORT_SAMPLE_NOTICE, REPORT_TITLE,
+  REPORT_SAMPLE_NOTICE, REPORT_TITLE, reportTitle,
 } from './presentation'
 import {
   assessmentHighlights, assessmentSummary, compactReportText, criterionReviews, qualificationNotes,
@@ -36,6 +36,7 @@ async function embedReportFonts(document: PDFDocument, options?: ReportGeneratio
 
 function writeIntroduction(layout: PdfReportLayout, report: AnalysisReport): void {
   layout.paragraph(REPORT_TITLE, { size: 23, bold: true, leading: 32, after: 8 })
+  layout.paragraph(compactReportText(report.run.name, 180), { size: 13, leading: 18, bold: true, after: 8 })
   if (report.dataKind === 'sample') {
     layout.paragraph(REPORT_SAMPLE_NOTICE, { size: 9.5, leading: 14, bold: true, color: PDF_REPORT_COLORS.accent, after: 7 })
   }
@@ -58,6 +59,10 @@ function writeTargetOverview(
   layout.startSection({ section: 'Candidates at a glance', primary: targetLabel, secondary: group.target.kind === 'grade' ? 'Grade requirements' : 'Job overview' })
   if (!index) writeIntroduction(layout, report)
   layout.heading(targetLabel, 17)
+  if (group.target.displayName) {
+    layout.paragraph(`Source target title: ${compactReportText(group.target.label, 200)}`,
+      { size: 9.5, leading: 14, color: PDF_REPORT_COLORS.muted, after: 7 })
+  }
   const facts = readableJobFacts(group.target, 4)
   if (facts.length) {
     layout.label(group.target.kind === 'grade' ? 'About the grade' : 'About the job')
@@ -125,6 +130,13 @@ function writeComparison(
   layout.startSection({ section: 'Candidate review', primary: name, secondary: target })
   layout.paragraph(name, { size: 22, leading: 31, bold: true, after: 6, keepWithNext: 30 })
   layout.paragraph(target, { size: 12, leading: 17, bold: true, after: 5, keepWithNext: 28 })
+  const sourceNames = [
+    ...(comparison.candidate.displayName ? [`Source-stated name: ${compactReportText(comparison.candidate.name ?? 'Not stated', 180)}`] : []),
+    ...(group.target.displayName ? [`Source target title: ${compactReportText(group.target.label, 200)}`] : []),
+  ]
+  if (sourceNames.length) {
+    layout.paragraph(sourceNames.join('\n'), { size: 9.5, leading: 14, color: PDF_REPORT_COLORS.muted, after: 7 })
+  }
   layout.paragraph([
     comparison.candidate.role?.trim() ? compactReportText(comparison.candidate.role, 180) : null,
     compactReportText(comparison.candidate.sourceLabel, 200),
@@ -160,7 +172,7 @@ export async function generatePdfReport(report: AnalysisReport, options?: Report
   const document = await PDFDocument.create()
   const fonts = await embedReportFonts(document, options)
   validatedReportLinkContext(report, options)
-  document.setTitle(REPORT_TITLE, { showInWindowTitleBar: true })
+  document.setTitle(reportTitle(report), { showInWindowTitleBar: true })
   document.setAuthor('Score')
   document.setSubject('Analysis evidence for human review')
   document.setCreator('Score')

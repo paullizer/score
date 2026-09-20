@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
 import { PDFDocument, StandardFonts } from 'pdf-lib'
 import { buildGradeTestRuntime, memoryBlobs, startGradeFixture } from './gradeLadders.test-support.mjs'
+import { passageSelection } from '../../worker-tests/analysis-selection-test-support.mjs'
 
 const clone = (value) => structuredClone(value)
 
@@ -325,10 +326,7 @@ function quoteFor(paragraphs, text) {
 }
 
 export function analysisPassageFor(paragraphs, text) {
-  assert.ok(paragraphs.every((paragraph) => Array.isArray(paragraph.passages)), 'Analysis fixtures require the v3 source-owned passage catalog.')
-  const passage = paragraphs.flatMap((paragraph) => paragraph.passages)
-    .find((candidate) => Number.isSafeInteger(candidate.passageId) && candidate.passageId > 0 && candidate.text.includes(text))
-  return passage ? { passageId: passage.passageId } : undefined
+  return analysisCitationFor({ resume: { paragraphs } }, text)
 }
 
 function profileField(paragraphs, text) {
@@ -336,6 +334,15 @@ function profileField(paragraphs, text) {
   return quote
     ? { status: 'available', value: text, citations: [quote] }
     : { status: 'unavailable', value: null, citations: [] }
+}
+
+function analysisCitationFor(input, text) {
+  assert.ok(input.resume.paragraphs.every((paragraph) => Array.isArray(paragraph.passages)), 'Analysis fixtures require the v3 source-owned passage catalog.')
+  for (const [paragraphIndex, paragraph] of input.resume.paragraphs.entries()) {
+    const passageIndex = paragraph.passages.findIndex(passage =>
+      Number.isSafeInteger(passage.passageId) && passage.passageId > 0 && passage.text.includes(text))
+    if (passageIndex >= 0) return passageSelection(input, paragraphIndex, passageIndex)
+  }
 }
 
 export function processingStubs(fixture, { urlPages = new Map(), onModelRequest, ocrParagraphs = resumeParagraphs } = {}) {
@@ -382,8 +389,8 @@ export function processingStubs(fixture, { urlPages = new Map(), onModelRequest,
         }
       } else if (schema === 'resume_rubric_assessment') {
         const input = user.input
-        const work = analysisPassageFor(input.resume.paragraphs, 'Applied engineering methods independently')
-        const education = analysisPassageFor(input.resume.paragraphs, 'Bachelor of Engineering')
+        const work = analysisCitationFor(input, 'Applied engineering methods independently')
+        const education = analysisCitationFor(input, 'Bachelor of Engineering')
         assert.ok(work, 'The assessment fixture must quote actual independent engineering work.')
         output = {
           criteria: input.rubric.criteria.map((criterion) => criterion.support === 'not-applicable' ? {

@@ -7,6 +7,8 @@ import {
 } from '../domain/lifecycle'
 import { createAnalysisRun, createJobImport, createResumeImport, evaluateComparison, validateRubric } from '../services/mockWorkspace'
 import { validateWorkspace } from '../domain/workspace-validation'
+import { normalizeDisplayName } from '../domain/displayNames'
+import type { RenameEntityTarget } from './workspace-context'
 
 export type PersistenceResult = 'saved' | 'queued' | 'failed'
 
@@ -15,6 +17,7 @@ export interface WorkspaceEngine {
   notice: string | null
   clearNotice: () => void
   notify: (message: string) => void
+  renameEntity: (target: RenameEntityTarget, displayName: string) => void
   addJobs: (items: ImportCandidate[], source: SourceKind, fail?: 'parsing' | 'rubric') => string[]
   addResumes: (items: ImportCandidate[]) => Promise<string[]>
   cancelJob: (id: string) => void
@@ -286,6 +289,26 @@ export function useWorkspaceEngine(initialWorkspace: Workspace | null, persist: 
     }
   }
 
+  function renameEntity(target: RenameEntityTarget, name: string) {
+    const displayName = normalizeDisplayName(name)
+    const state = writable(target)
+    const item = target.kind === 'analysis' ? state.runs.find((run) => run.id === target.id)
+      : target.kind === 'job' ? state.jobs.find((job) => job.id === target.id)
+        : state.resumes.find((resume) => resume.id === target.id)
+    if (!item) throw new Error('This item is no longer available. Reopen it from the library before renaming it.')
+    if ('dataKind' in item && item.dataKind === 'real') throw new Error('Real records must use their server-owned metadata operation.')
+    const saved = update((current) => {
+      if (target.kind === 'analysis') return { ...current, runs: current.runs.map((run) => run.id === target.id ? { ...run, displayName } : run) }
+      if (target.kind === 'job') return { ...current, jobs: current.jobs.map((job) => job.id === target.id ? { ...job, displayName } : job) }
+      return { ...current, resumes: current.resumes.map((resume) => resume.id === target.id ? { ...resume, displayName } : resume) }
+    })
+    if (saved === 'failed') {
+      setNotice('The new name is only in this tab. Retry saving before leaving.')
+      throw new Error('The name could not be saved on this device. Your edit is still in this tab; retry saving.')
+    }
+    setNotice(saved === 'queued' ? 'Name updated. Waiting for cloud save.' : 'Name saved. Source evidence and results are unchanged.')
+  }
+
   function startAnalysis(resumeIds: string[], rubricIds: string[], name?: string, failFirst = false): string {
     const run = createAnalysisRun(writable(), resumeIds, rubricIds, name)
     update((state) => ({ ...state, runs: [run, ...state.runs] }))
@@ -419,7 +442,7 @@ export function useWorkspaceEngine(initialWorkspace: Workspace | null, persist: 
 
   return {
     workspace, notice, clearNotice: () => setNotice(null), notify: setNotice,
-    addJobs, addResumes, cancelJob, retryJob, saveRubric, startAnalysis, cancelRun, retryRun,
+    addJobs, addResumes, cancelJob, retryJob, saveRubric, startAnalysis, cancelRun, retryRun, renameEntity,
     getLifecycleImpact, changeLifecycle, resetDemo, stopPendingOperations, setExternalArchive, replaceWorkspace,
     retryPersist: () => current.current ? persist(current.current) : 'failed',
   }

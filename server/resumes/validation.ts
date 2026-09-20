@@ -9,6 +9,7 @@ import {
 import { isSafeUploadedFilename } from '../../src/domain/source-files'
 import { invalidRequest } from '../errors'
 import { WORKSPACE_ID_PATTERN } from '../ids'
+import { isNormalizedDisplayName } from '../jobs/validation'
 import type { ResumeBlob } from './store'
 import {
   DOCUMENT_BLOB_CONTENT_TYPES, ORIGINAL_CONTENT_TYPES, UPLOAD_CONTENT_TYPES, UPLOAD_FORMATS,
@@ -226,6 +227,7 @@ const duplicate = z.strictObject({
 const base = { workspaceId, dataKind: z.literal('real'), createdAt: timestamp, updatedAt: timestamp }
 const resumeRecord = z.strictObject({
   ...base, id: resumeId, recordType: z.literal('resume'),
+  displayName: z.string().refine(isNormalizedDisplayName, 'Invalid normalized display name.').optional(),
   lifecycle: z.strictObject({
     archivedAt: timestamp.optional(), deletingAt: timestamp.optional(), deletedAt: timestamp.optional(),
     parentKey: z.string().min(1).max(400).optional(),

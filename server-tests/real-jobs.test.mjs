@@ -110,6 +110,71 @@ async function importUrl(server, workspaceId, url, options = {}) {
   })
 }
 
+test('job metadata PATCH validates strict aliases, authorization and exact ETags without changing source or worker state', async () => {
+  const server = await startRealJobsServer()
+  try {
+    const workspace = await bootstrap(server)
+    const imported = (await (await importPdf(server, workspace.id)).json()).job
+    const initial = await server.jobs.store.get(workspace.id, imported.job.id)
+    const leased = await server.jobs.store.replace({
+      ...initial.record, attempts: 1, lease: { owner: 'worker', expiresAt: '2026-09-17T15:00:00.000Z' },
+      job: { ...initial.record.job, status: 'parsing' },
+    }, initial.etag)
+    const path = `${server.baseUrl}/api/workspaces/${workspace.id}/jobs/${imported.job.id}/metadata`
+    const patch = (body = { displayName: 'Custom title' }, extra = {}) => fetch(path, {
+      method: 'PATCH', headers: writeHeaders(ALLOWED_OID, { 'content-type': 'application/json', 'if-match': leased.etag, ...extra }),
+      body: JSON.stringify(body),
+    })
+    assert.equal((await fetch(path, { method: 'PATCH', headers: { 'content-type': 'application/json' }, body: '{}' })).status, 401)
+    assert.equal((await patch(undefined, { ...authHeaders({ oid: OTHER_ALLOWED_OID }) })).status, 404)
+    server.directory._addMembership(workspace.id, membershipFor(workspace.id, { oid: OTHER_ALLOWED_OID, role: 'viewer' }))
+    assert.equal((await patch(undefined, { ...authHeaders({ oid: OTHER_ALLOWED_OID }) })).status, 403)
+    for (const [headers, status] of [
+      [{ origin: 'https://foreign.example' }, 403], [{ 'x-score-request': '' }, 403],
+      [{ 'if-match': '' }, 428], [{ 'if-match': '*' }, 400], [{ 'if-match': `W/${leased.etag}` }, 400],
+      [{ 'if-match': `${leased.etag}, "other"` }, 400], [{ 'if-match': '"stale"' }, 409],
+    ]) assert.equal((await patch(undefined, headers)).status, status)
+    for (const body of [
+      {}, null, [], { displayName: 1 }, { displayName: '' }, { displayName: '   ' },
+      { displayName: 'x'.repeat(161) }, { displayName: 'control\u0000' }, { displayName: 'line\nbreak' },
+      { displayName: 'Name', title: 'Replace extracted title' }, { displayName: 'Name', source: imported.source },
+      { displayName: 'Name', job: imported.job }, { displayName: 'Name', status: 'ready' },
+    ]) assert.equal((await patch(body)).status, 400, JSON.stringify(body))
+    const response = await patch({ displayName: ` ${'j'.repeat(160)} ` })
+    assert.equal(response.status, 200, await response.clone().text())
+    const { job } = await response.json()
+    assert.equal(response.headers.get('etag'), job.etag)
+    assert.equal(job.displayName, 'j'.repeat(160))
+    assert.notEqual(job.etag, leased.etag)
+    assert.deepEqual((await server.jobs.store.get(workspace.id, imported.job.id)).record,
+      { ...leased.record, displayName: 'j'.repeat(160) })
+    assert.deepEqual(job.job, leased.record.job)
+    assert.deepEqual(job.source, imported.source)
+    assert.equal((await patch()).status, 409)
+    const detail = await (await fetch(path.replace(/\/metadata$/, ''), { headers: authHeaders() })).json()
+    assert.equal(detail.displayName, 'j'.repeat(160))
+    assert.equal(detail.job.displayName, undefined)
+    const listed = await (await fetch(`${server.baseUrl}/api/workspaces/${workspace.id}/jobs`, { headers: authHeaders() })).json()
+    assert.equal(listed.jobs[0].displayName, 'j'.repeat(160))
+    const original = await fetch(path.replace(/\/metadata$/, '/original'), { headers: authHeaders() })
+    assert.equal(original.status, 200)
+    assert.match(original.headers.get('content-disposition'), /Principal Engineer/)
+    assert.deepEqual(Buffer.from(await original.arrayBuffer()), Buffer.from('%PDF-1.7\nreal job source\n', 'ascii'))
+
+    server.jobs.store._failNextReplace()
+    assert.equal((await patch({ displayName: 'Lost race' }, { 'if-match': job.etag })).status, 409)
+    assert.equal((await server.jobs.store.get(workspace.id, imported.job.id)).record.displayName, 'j'.repeat(160))
+    const archived = await server.jobs.store.transitionLifecycle(workspace.id, imported.job.id, job.etag, 'job', 'archive', leased.record.updatedAt)
+    assert.equal((await patch(undefined, { 'if-match': archived.etag })).status, 409)
+    const restored = await server.jobs.store.transitionLifecycle(workspace.id, imported.job.id, archived.etag, 'job', 'unarchive', leased.record.updatedAt)
+    await server.jobs.store.setWorkspaceLifecycle(workspace.id, 'archived', leased.record.updatedAt)
+    assert.equal((await patch(undefined, { 'if-match': restored.etag })).status, 409)
+    await server.jobs.store.setWorkspaceLifecycle(workspace.id, 'active', leased.record.updatedAt)
+    const deleting = await server.jobs.store.transitionLifecycle(workspace.id, imported.job.id, restored.etag, 'job', 'delete', leased.record.updatedAt)
+    assert.equal((await patch(undefined, { 'if-match': deleting.etag })).status, 409)
+  } finally { await server.close() }
+})
+
 test('features are authenticated and remain disabled when job dependencies are absent', async () => {
   const server = await startTestServer()
   try {
