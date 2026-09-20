@@ -3,6 +3,7 @@ import { Readable } from 'node:stream'
 import test from 'node:test'
 import { randomUUID } from 'node:crypto'
 import { api, fixture, createRun, publishResult, NOW, LATER, ACTOR, clone } from './real-analyses.test-support.mjs'
+import { narrativeRuntime, narrativeWorker } from './real-analysis-narratives.test-support.mjs'
 
 function cosmos() {
   const values = new Map()
@@ -101,6 +102,161 @@ async function initializedPair() {
   return { f, run: created.run, comparison, initial }
 }
 
+function backedFixture(original) {
+  const container = cosmos()
+  for (const value of [...original.analysis.store.values.values(), ...original.analysis.store.controls.values()]) container.save(value.record)
+  const store = api.createAnalysisStoreFromContainer(container)
+  const f = { ...original, analysis: { ...original.analysis, store } }
+  f.service = new api.RealAnalysisService(f.analysis, f, () => new Date(f.now))
+  return { f, store, container }
+}
+
+test('Cosmos publishes automatic sidecars and selected refreshes with exact root/control CAS while completed comparisons remain immutable', async () => {
+  const original = fixture()
+  const created = await createRun(original, 2, 2)
+  const pairIds = [...original.analysis.store.values.values()].filter(value => value.record.recordType === 'analysis-comparison').map(value => value.record.id)
+  const { f, store, container } = backedFixture(original)
+  for (const id of pairIds) await publishResult(f, created.run.id, id)
+  const frozen = await Promise.all(pairIds.map(id => store.get(f.workspaceId, id)))
+  const pending = await store.listPending(f.now, 100)
+  assert.equal(pending.filter(item => item.record.recordType === 'analysis-candidate-narrative').length, 4)
+  assert.equal(pending.filter(item => item.record.recordType === 'analysis-target-narrative').length, 2)
+  const { runAnalysisWorker } = await narrativeRuntime()
+  const mock = narrativeWorker(f)
+  assert.deepEqual(await runAnalysisWorker(mock.deps, { maxItems: 100 }), { claimed: 6, completed: 0 })
+  const ready = await api.readAnalysisSummaries(f.analysis, f.workspaceId, created.run.id)
+  assert.equal(ready.ready, true, JSON.stringify(ready))
+  const [targetId, independentId] = ready.targets.map(item => item.targetId)
+  const before = await api.readAnalysisSummaries(f.analysis, f.workspaceId, created.run.id, targetId)
+  const independent = await api.readAnalysisSummaries(f.analysis, f.workspaceId, created.run.id, independentId)
+  const key = randomUUID()
+  const refresh = await f.service.generateSummaries(f.workspaceId, created.run.id, { mode: 'all', targetId }, key, before.etag, ACTOR)
+  assert.deepEqual(refresh.scheduled, { candidates: 2, targets: 1 })
+  assert.deepEqual((await store.listPending(f.now, 100)).map(item => item.record.recordType), ['analysis-narrative-request'])
+  const current = await store.get(f.workspaceId, created.run.id)
+  const unfenced = { ...current.record }
+  delete unfenced.narrativeRequestId
+  await assert.rejects(store.replace(unfenced, current.etag), /atomically/)
+  await assert.rejects(store.transact(f.workspaceId, [{ kind: 'replace', record: unfenced, etag: current.etag }]), /cannot be discarded/)
+  assert.deepEqual(await runAnalysisWorker(mock.deps, { maxItems: 100 }), { claimed: 4, completed: 0 })
+  const after = await api.readAnalysisSummaries(f.analysis, f.workspaceId, created.run.id, targetId)
+  assert.equal(after.ready, true)
+  assert.notEqual(after.revision, before.revision)
+  assert.deepEqual((await api.readAnalysisSummaries(f.analysis, f.workspaceId, created.run.id, independentId)).capture, independent.capture)
+  const replay = await f.service.generateSummaries(f.workspaceId, created.run.id, { mode: 'all', targetId }, key, before.etag, ACTOR)
+  assert.equal(replay.summaries.revision, after.revision)
+  assert.deepEqual(await Promise.all(pairIds.map(id => store.get(f.workspaceId, id))), frozen)
+  assert.ok(container.batches.every(batch => batch.length <= 28 && Buffer.byteLength(JSON.stringify(batch)) <= api.MAX_ANALYSIS_TRANSACTION_BYTES))
+})
+
+test('Cosmos binds every candidate and target to the exact completed result, frozen target, manifest, workspace, and cancellation watermark', async () => {
+  const original = fixture()
+  const created = await createRun(original)
+  const pairId = [...original.analysis.store.values.values()].find(value => value.record.recordType === 'analysis-comparison').record.id
+  await publishResult(original, created.run.id, pairId, false, { scheduleNarratives: false })
+  const { f, store, container } = backedFixture(original)
+  const run = await store.get(f.workspaceId, created.run.id), pair = await store.get(f.workspaceId, pairId)
+  const request = { requestId: randomUUID(), requestedAt: f.now, requestedBy: ACTOR, reason: 'missing' }
+  const candidate = api.newCandidateNarrative(run.record, pair.record, request)
+  const write = record => store.transact(f.workspaceId, [
+    { kind: 'create', record }, { kind: 'replace', record: run.record, etag: run.etag },
+  ])
+  for (const bindingChange of [
+    { resultSha256: 'a'.repeat(64) },
+    { targetId: `target-${'a'.repeat(48)}` },
+    { resumeSnapshot: { ...candidate.resumeSnapshot, sha256: 'a'.repeat(64) } },
+    { manifestSha256: 'a'.repeat(64) },
+    { comparisonId: `analysis-comparison-${randomUUID()}` },
+  ]) {
+    const binding = { ...api.candidateNarrativeBinding(run.record, pair.record), ...bindingChange }
+    await assert.rejects(write({
+      ...candidate, ...bindingChange, id: api.analysisNarrativeId('candidate', created.run.id, binding.comparisonId),
+      inputFingerprint: api.analysisHash(binding),
+    }), /binding|manifest|completed comparison/)
+  }
+  await assert.rejects(write({ ...candidate, updatedAt: LATER }), /cancellation fence/)
+  await assert.rejects(write({
+    ...candidate, workspaceId: 'workspace-neighbor',
+    inputFingerprint: api.analysisHash({ ...api.candidateNarrativeBinding(run.record, pair.record), workspaceId: 'workspace-neighbor' }),
+  }), /workspace partitions/)
+  const target = api.newTargetNarrative(run.record, {
+    ...pair.record.target, blob: { ...pair.record.target.blob, sha256: 'a'.repeat(64) },
+  }, request)
+  await assert.rejects(write(target), /matching frozen comparison target/)
+  assert.equal(await store.get('workspace-neighbor', candidate.id), undefined)
+  assert.deepEqual((await store.list('workspace-neighbor', { recordType: 'analysis-candidate-narrative', runId: created.run.id })).items, [])
+  const workspaceControl = await store.getControl(f.workspaceId)
+  container._race(() => {
+    container.save({ ...workspaceControl.record, state: 'archived' })
+  })
+  await assert.rejects(write(candidate), api.StoreConflictError)
+  assert.equal(await store.get(f.workspaceId, candidate.id), undefined)
+  assert.deepEqual(await store.get(f.workspaceId, pairId), pair)
+})
+
+test('Cosmos retains cancelled generations through a partial multi-chunk coordinator and never replays the cancelled request over a newer generation', async () => {
+  const original = fixture()
+  const created = await createRun(original, 50)
+  while ((await original.analysis.store.get(original.workspaceId, created.run.id)).record.progress.initialized < 50) {
+    await api.advanceAnalysisRun(original.analysis, original.workspaceId, created.run.id, { now: () => new Date(original.now), maxChunks: 4 })
+  }
+  const pairIds = [...original.analysis.store.values.values()].filter(value => value.record.recordType === 'analysis-comparison').map(value => value.record.id)
+  for (const id of pairIds) await publishResult(original, created.run.id, id, false, { scheduleNarratives: false })
+  const { f, store, container } = backedFixture(original)
+  const frozen = await Promise.all(pairIds.map(id => store.get(f.workspaceId, id)))
+  const initial = await api.readAnalysisSummaries(f.analysis, f.workspaceId, created.run.id)
+  const key = randomUUID()
+  const accepted = await f.service.generateSummaries(f.workspaceId, created.run.id, { mode: 'all' }, key, initial.etag, ACTOR)
+  await api.advanceAnalysisNarrativeRequest(f.analysis, f.workspaceId, created.run.id, key, () => new Date(f.now))
+  const id = api.analysisNarrativeId('request', created.run.id, key)
+  assert.equal((await store.get(f.workspaceId, id)).record.nextIndex, 24)
+  assert.equal(container.batches.at(-1).length, 28)
+  const run = await store.get(f.workspaceId, created.run.id)
+  await f.service.cancel(f.workspaceId, created.run.id, ACTOR, run.etag)
+  const stopped = await api.readAnalysisSummaries(f.analysis, f.workspaceId, created.run.id)
+  assert.equal(stopped.counts.candidates.cancelled, 50)
+  assert.equal(stopped.counts.targets.cancelled, 1)
+  const { runAnalysisWorker } = await narrativeRuntime()
+  const mock = narrativeWorker(f)
+  assert.deepEqual(await runAnalysisWorker(mock.deps, { maxItems: 1 }), { claimed: 1, completed: 0 })
+  assert.equal(mock.calls.length, 0)
+  assert.equal((await store.get(f.workspaceId, id)).record.status, 'cancelled')
+  const after = await api.readAnalysisSummaries(f.analysis, f.workspaceId, created.run.id)
+  assert.equal(after.revision, stopped.revision)
+  const next = await f.service.generateSummaries(f.workspaceId, created.run.id, { mode: 'missing' }, randomUUID(), after.etag, ACTOR)
+  assert.deepEqual(next.scheduled, accepted.scheduled)
+  const replay = await f.service.generateSummaries(f.workspaceId, created.run.id, { mode: 'all' }, key, initial.etag, ACTOR)
+  assert.equal(replay.summaries.revision, next.summaries.revision)
+  assert.deepEqual(await Promise.all(pairIds.map(pairId => store.get(f.workspaceId, pairId))), frozen)
+  assert.ok(container.batches.every(batch => batch.length <= 28 && Buffer.byteLength(JSON.stringify(batch)) <= api.MAX_ANALYSIS_TRANSACTION_BYTES))
+})
+
+test('Cosmos can finish cancelled refresh metadata behind archived workspace/run controls without model work or resurrecting old text', async () => {
+  const original = fixture()
+  const created = await createRun(original)
+  const pairId = [...original.analysis.store.values.values()].find(value => value.record.recordType === 'analysis-comparison').record.id
+  const { f, store } = backedFixture(original)
+  await publishResult(f, created.run.id, pairId)
+  const { runAnalysisWorker } = await narrativeRuntime()
+  await runAnalysisWorker(narrativeWorker(f).deps, { maxItems: 100 })
+  const before = await api.readAnalysisSummaries(f.analysis, f.workspaceId, created.run.id)
+  assert.equal(before.ready, true)
+  await f.service.generateSummaries(f.workspaceId, created.run.id, { mode: 'all' }, randomUUID(), before.etag, ACTOR)
+  const run = await store.get(f.workspaceId, created.run.id)
+  await new api.AnalysisLibraryLifecycleService(f.analysis, () => new Date(f.now)).change(f.workspaceId, created.run.id, 'archive', run.etag, ACTOR)
+  await api.createAnalysisLifecycleParticipant(f.analysis).setState(f.workspaceId, 'archived', f.now)
+  const stopped = await api.readAnalysisSummaries(f.analysis, f.workspaceId, created.run.id)
+  const mock = narrativeWorker(f)
+  assert.deepEqual(await runAnalysisWorker(mock.deps, { maxItems: 100 }), { claimed: 1, completed: 0 })
+  assert.equal(mock.calls.length, 0)
+  const after = await api.readAnalysisSummaries(f.analysis, f.workspaceId, created.run.id)
+  assert.equal(after.revision, stopped.revision)
+  assert.equal(after.ready, false)
+  assert.equal(after.comparisons[0].status, 'cancelled')
+  assert.deepEqual(after.comparisons[0].published, before.comparisons[0].published)
+  assert.deepEqual(after.targets[0].published, before.targets[0].published)
+})
+
 test('Cosmos initialization is a single bounded transaction with the SDK ifMatch run fence, not sequential writes', async () => {
   const { f, initial, run, comparison } = await initializedPair()
   const container = cosmos()
@@ -195,7 +351,7 @@ test('100-pair initialization, full cancellation and full retry use the real ada
   const retried = await service.retry(f.workspaceId, initial.id, {}, cancelled.etag)
   assert.equal(retried.run.progress.queued, 100)
   assert.equal(retried.run.progress.cancelled, 0)
-  assert.equal(container.batches.length, 13)
+  assert.equal(container.batches.length, 18, 'Retry reserves child slots for dependent target invalidation.')
   assert.ok(container.batches.every(batch => batch.length <= 28))
 })
 
@@ -451,7 +607,9 @@ test('Cosmos archive/delete uses exact child/run/control ETags and a permanent m
   assert.equal((await store.getControl(f.workspaceId, created.run.id)).record.state, 'deleted')
   await assert.rejects(store.create(created.run), api.StoreConflictError)
   const deletes = container.batches.flat().filter(item => item.operationType === 'Delete')
-  assert.equal(deletes.length, 3)
+  assert.equal(deletes.length, 5, 'Both completed-result narrative sidecars are purged with the scoring records.')
+  assert.equal(deletes.filter(item => item.id.startsWith('analysis-candidate-narrative:')).length, 1)
+  assert.equal(deletes.filter(item => item.id.startsWith('analysis-target-narrative:')).length, 1)
   assert.ok(deletes.every(item => typeof item.ifMatch === 'string' && item.ifMatch !== '*'))
   assert.equal(deletes.find(item => item.id === pair.record.id).ifMatch, before.get(`${f.workspaceId}/${pair.record.id}`))
   assert.ok(container.batches.every(batch => batch[0].resourceBody.id === api.analysisControlId() &&

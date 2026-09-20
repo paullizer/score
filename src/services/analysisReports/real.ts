@@ -2,9 +2,12 @@ import { z } from 'zod'
 import {
   REPORT_LIMITS, type AnalysisReport, type RealReportComparison, type RealReportTarget,
 } from '../../domain/analysis-reports'
+import type { RealAnalysisNarrativeReportCapture, RealAnalysisSummariesResponse } from '../../domain/analysis-narratives'
 import { cloudJsonRequest } from '../cloudWorkspace'
-import { getRealAnalysis, listAllRealAnalysisComparisons } from '../realAnalyses'
+import { getRealAnalysis, getRealAnalysisSummaries, listAllRealAnalysisComparisons } from '../realAnalyses'
 import { assertReportResourceLimits, buildAnalysisReport, parseRealReportBatchResponse, reportDisplayNameSchema as displayName } from './model'
+import { realAnalysisSummariesResponseSchema } from './narrative-schemas'
+import { requireReportNarratives } from './narratives'
 import { unavailableOverallScore } from './presentation'
 import { getDisplayName } from '../../domain/displayNames'
 
@@ -91,7 +94,9 @@ function unique(values: (string | number)[], description: string): void {
   requireSaved(new Set(values).size === values.length, `The captured inventory has duplicate ${description}.`)
 }
 
-function validateInventory(detail: CapturedRun, inventory: CapturedComparison[], workspaceId: string, runId: string): void {
+function validateInventory(
+  detail: CapturedRun, inventory: CapturedComparison[], workspaceId: string, runId: string, readyTargetId?: string,
+): void {
   const { run, resumes, targets } = detail
   const total = resumes.length * targets.length
   const p = run.progress
@@ -107,7 +112,8 @@ function validateInventory(detail: CapturedRun, inventory: CapturedComparison[],
     (run.status !== 'running' || p.running > 0) &&
     (run.status !== 'partial' || (p.complete > 0 && p.complete < p.total && p.queued + p.running === 0)),
   'The captured run status and its saved progress disagree.')
-  requireSaved(inventory.length === total && p.initialized === total && run.initialization.completedAt,
+  requireSaved(inventory.length <= total && (readyTargetId !== undefined ||
+    (inventory.length === total && p.initialized === total && run.initialization.completedAt)),
     'The captured comparison inventory is incomplete. Wait for initialization to finish.')
   unique(resumes.map(resume => resume.selection.resumeId), 'resume selections')
   unique(targets.map(target => target.id), 'target IDs')
@@ -198,20 +204,106 @@ function capturedResult(comparison: RealReportComparison, captured: CapturedComp
     return comparison
   }
   // Later completions/retries are not part of this export's captured status inventory.
-  return {
+  const normalized: RealReportComparison = {
     ...comparison, status: captured.status, completion: null, overall: unavailableOverallScore(captured.status),
     summary: null, coverage: null, criteria: [], qualifications: [], limitations: [], error: captured.error ?? null,
     analyzedAt: null, resultSha256: null, provenance: [],
   }
+  delete normalized.narrative
+  return normalized
+}
+
+async function readReadySummaries(
+  workspaceId: string, runId: string, targetId: string | null, signal: AbortSignal, onBytes?: (bytes: number) => void,
+): Promise<RealAnalysisSummariesResponse> {
+  signal.throwIfAborted()
+  const raw = await getRealAnalysisSummaries(workspaceId, runId, targetId === null ? {} : { targetId }, signal)
+  signal.throwIfAborted()
+  assertReportResourceLimits(raw)
+  onBytes?.(new TextEncoder().encode(JSON.stringify(raw)).byteLength)
+  const parsed = realAnalysisSummariesResponseSchema.safeParse(raw)
+  requireSaved(parsed.success,
+    'The saved summary response has invalid prose or inconsistent scope, readiness, generation, result, or revision pins. Open Manage summaries to review its state.')
+  const summaries = parsed.data
+  requireSaved(summaries.workspaceId === workspaceId && summaries.runId === runId && summaries.scope.targetId === targetId,
+    'The saved summaries belong to a different workspace, analysis, or exact target.')
+  requireSaved(summaries.capabilities.reason !== 'deleting' && summaries.capabilities.reason !== 'cancelling',
+    'The selected analysis is being deleted or cancelled.')
+  requireSaved(summaries.ready,
+    'PDF, Word, and PowerPoint require current, ready candidate summaries and target overviews. Selected scoring or summaries are missing, outdated, failed, or still in progress; open Manage summaries and retry when ready.')
+  return summaries
+}
+
+function sameCapture(left: RealAnalysisNarrativeReportCapture, right: RealAnalysisNarrativeReportCapture): boolean {
+  const ordered = (capture: RealAnalysisNarrativeReportCapture) => ({
+    ...capture,
+    targets: [...capture.targets].sort((a, b) => a.targetId.localeCompare(b.targetId)),
+    comparisons: [...capture.comparisons].sort((a, b) => a.comparisonId.localeCompare(b.comparisonId)),
+  })
+  return same(ordered(left), ordered(right))
+}
+
+function validateSummaryInventory(
+  summaries: RealAnalysisSummariesResponse, detail: CapturedRun, selected: CapturedComparison[],
+): void {
+  const targetIds = new Set(detail.targets.filter(target => summaries.scope.targetId === null || target.id === summaries.scope.targetId)
+    .map(target => target.id))
+  const pins = new Map(summaries.capture.comparisons.map(pin => [pin.comparisonId, pin]))
+  requireSaved(summaries.capture.targets.length === targetIds.size &&
+    summaries.capture.targets.every(pin => targetIds.has(pin.targetId)) &&
+    pins.size === selected.length && selected.length === detail.resumes.length * targetIds.size,
+  'The authoritative summary pins omit or add targets or comparisons from the exact saved manifest scope.')
+  for (const comparison of selected) {
+    const pin = pins.get(comparison.id)
+    requireSaved(pin && pin.targetId === comparison.target.summary.id && pin.status === comparison.status &&
+      pin.resultSha256 === (comparison.result?.sha256 ?? null),
+    'A comparison status or immutable result hash changed after the ready summary preflight.')
+  }
+}
+
+async function recheckNarratives(
+  workspaceId: string, runId: string, report: AnalysisReport, signal: AbortSignal, onBytes?: (bytes: number) => void,
+): Promise<void> {
+  requireReportNarratives(report)
+  const capture = report.capture.summaries
+  requireSaved(report.dataKind === 'real' && report.workspaceId === workspaceId && report.run.id === runId && capture?.dataKind === 'real',
+    'The narrative report belongs to a different workspace or saved analysis.')
+  const current = await readReadySummaries(workspaceId, runId, report.scope.targetId, signal, onBytes)
+  requireSaved(sameCapture(capture, current.capture),
+    'The selected summaries, generations, scoring statuses, or result set changed during report preparation.')
+  const targets = new Map(current.targets.map(target => [target.targetId, target]))
+  const comparisons = new Map(current.comparisons.map(comparison => [comparison.comparisonId, comparison]))
+  for (const group of report.groups) {
+    requireSaved(same(group.target.narrative ?? null, targets.get(group.target.id)?.published ?? null),
+      'The selected target overview changed generation or no longer matches its saved publication.')
+    for (const comparison of group.comparisons) {
+      requireSaved(same(comparison.narrative ?? null, comparisons.get(comparison.id)?.published ?? null),
+        'A candidate summary changed generation or no longer matches its saved publication.')
+    }
+  }
+  signal.throwIfAborted()
+}
+
+/** Reauthorize and check the exact selected narrative revision immediately before document/deck download. */
+export async function assertRealAnalysisReportNarrativesCurrent(
+  workspaceId: string, runId: string, report: AnalysisReport, signal?: AbortSignal,
+): Promise<void> {
+  id.parse(workspaceId)
+  id.parse(runId)
+  const bounded = AbortSignal.any([AbortSignal.timeout(REPORT_LIMITS.maxGenerationMilliseconds), ...(signal ? [signal] : [])])
+  bounded.throwIfAborted()
+  assertReportResourceLimits(report)
+  await recheckNarratives(workspaceId, runId, report, bounded)
 }
 
 export async function loadRealAnalysisReport(
   workspaceId: string, runId: string,
-  options: { targetId?: string; signal?: AbortSignal; onProgress?: (completed: number, total: number) => void } = {},
+  options: { targetId?: string; requireSummaries?: boolean; signal?: AbortSignal; onProgress?: (completed: number, total: number) => void } = {},
 ): Promise<AnalysisReport> {
   id.parse(workspaceId)
   id.parse(runId)
   if (options.targetId !== undefined) id.parse(options.targetId)
+  if (options.requireSummaries !== undefined) z.boolean().parse(options.requireSummaries)
   const cancellation = new AbortController()
   const signal = AbortSignal.any([
     cancellation.signal, AbortSignal.timeout(REPORT_LIMITS.maxGenerationMilliseconds),
@@ -220,6 +312,15 @@ export async function loadRealAnalysisReport(
   signal.throwIfAborted()
   const startedAt = new Date().toISOString()
   try {
+    let receivedBytes = 0
+    const accountBytes = (bytes: number) => {
+      receivedBytes += bytes
+      if (receivedBytes > REPORT_LIMITS.maxInputBytes) {
+        throw new Error('The report responses exceed the input byte budget. Narrow the export to one exact job/grade target; no comparisons, summaries, or evidence were omitted.')
+      }
+    }
+    const summaries = options.requireSummaries
+      ? await readReadySummaries(workspaceId, runId, options.targetId ?? null, signal, accountBytes) : undefined
     const rawDetail = await getRealAnalysis(workspaceId, runId, signal)
     signal.throwIfAborted()
     assertReportResourceLimits(rawDetail)
@@ -229,11 +330,12 @@ export async function loadRealAnalysisReport(
     })).map(value => capturedComparison.parse(value.comparison))
     signal.throwIfAborted()
     const completedAt = new Date().toISOString()
-    validateInventory(detail, inventory, workspaceId, runId)
+    validateInventory(detail, inventory, workspaceId, runId, summaries ? options.targetId : undefined)
     if (options.targetId !== undefined) requireSaved(detail.targets.some(target => target.id === options.targetId),
       'The selected exact target is not in this saved analysis.')
     const selected = inventory.filter(comparison => options.targetId === undefined || comparison.target.summary.id === options.targetId)
       .sort((left, right) => left.index - right.index)
+    if (summaries) validateSummaryInventory(summaries, detail, selected)
     if (!selected.some(comparison => comparison.status === 'complete')) {
       throw new Error('At least one comparison in the selected scope must be complete before exporting. Completed results with withheld scores are eligible.')
     }
@@ -246,8 +348,9 @@ export async function loadRealAnalysisReport(
     }
     let nextBatch = 0
     let loaded = 0
-    let inputBytes = 0
-    let receivedBytes = 0
+    let inputBytes = summaries ? new TextEncoder().encode(JSON.stringify(summaries.capture)).byteLength : 0
+    const candidateNarratives = new Map(summaries?.comparisons.map(comparison => [comparison.comparisonId, comparison.published]))
+    const targetNarratives = new Map(summaries?.targets.map(target => [target.targetId, target.published]))
     const load = async () => {
       while (nextBatch < batches.length) {
         signal.throwIfAborted()
@@ -259,22 +362,33 @@ export async function loadRealAnalysisReport(
         )
         signal.throwIfAborted()
         const response = parseRealReportBatchResponse(payload)
-        receivedBytes += new TextEncoder().encode(JSON.stringify(payload)).byteLength
-        if (receivedBytes > REPORT_LIMITS.maxInputBytes) {
-          throw new Error('The report responses exceed the input byte budget. Narrow the export to one exact job/grade target; no comparisons or evidence were omitted.')
-        }
+        accountBytes(new TextEncoder().encode(JSON.stringify(payload)).byteLength)
         requireSaved(response.workspaceId === workspaceId && response.runId === runId && response.comparisons.length === batch.length,
           'A report batch belongs to a different workspace/run or is missing requested comparisons.')
+        if (summaries && response.summaries) requireSaved(sameCapture(summaries.capture, response.summaries),
+          'A report batch carries different summary revisions or selected-scope pins.')
         const requested = new Map(batch.map(comparison => [comparison.id, comparison]))
         const batchTargets = new Map(response.targets.map(target => [target.id, target]))
         for (const comparison of response.comparisons) {
           const captured = requested.get(comparison.id)
-          const target = batchTargets.get(comparison.targetId)
+          let target = batchTargets.get(comparison.targetId)
           requireSaved(captured && target && !comparisons.has(comparison.id), 'A report batch returned duplicate, missing, or unrequested comparisons.')
           checkTarget(target, captured)
+          let normalized = capturedResult(comparison, captured)
+          if (summaries) {
+            requireSaved(comparison.status === captured.status && comparison.resultSha256 === (captured.result?.sha256 ?? null),
+              'A selected comparison status or result hash changed between report batches.')
+            const candidateNarrative = candidateNarratives.get(comparison.id)
+            const targetNarrative = targetNarratives.get(target.id)
+            requireSaved(comparison.narrative === undefined || same(comparison.narrative, candidateNarrative),
+              'A report batch contains a candidate narrative from a different generation.')
+            requireSaved(target.narrative === undefined || same(target.narrative, targetNarrative),
+              'A report batch contains a target overview from a different generation.')
+            if (candidateNarrative) normalized = { ...normalized, narrative: candidateNarrative }
+            if (targetNarrative) target = { ...target, narrative: targetNarrative }
+          }
           const previous = targets.get(target.id)
           requireSaved(!previous || same(previous, target), 'A frozen report target changed between batches.')
-          const normalized = capturedResult(comparison, captured)
           if (!previous) {
             targets.set(target.id, target)
             inputBytes += new TextEncoder().encode(JSON.stringify(target)).byteLength
@@ -295,10 +409,15 @@ export async function loadRealAnalysisReport(
     requireSaved(comparisons.size === selected.length, 'Required report comparisons are missing.')
     const report = buildAnalysisReport({
       dataKind: 'real', workspaceId, run: { id: detail.run.id, name: getDisplayName(detail.run, detail.run.name), createdAt: detail.run.createdAt },
-      capture: { startedAt, completedAt }, generatedAt: new Date().toISOString(),
+      capture: { startedAt, completedAt, ...(summaries ? { summaries: summaries.capture } : {}) }, generatedAt: new Date().toISOString(),
       targets: detail.targets.filter(target => targets.has(target.id)).map(target => targets.get(target.id)!),
       comparisons: selected.map(comparison => comparisons.get(comparison.id)!),
     }, { targetId: options.targetId })
+    if (summaries) {
+      await recheckNarratives(workspaceId, runId, report, signal, accountBytes)
+      report.capture.completedAt = new Date().toISOString()
+      report.generatedAt = report.capture.completedAt
+    }
     signal.throwIfAborted()
     return report
   } catch (error) {

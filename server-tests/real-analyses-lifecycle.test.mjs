@@ -4,6 +4,7 @@ import test from 'node:test'
 import {
   api, fixture, createRun, seedJob, seedResume, seedGrade, publishResult, startHttp, ACTOR, NOW, LATER, clone, sha,
 } from './real-analyses.test-support.mjs'
+import { settleNarratives } from './real-analysis-narratives.test-support.mjs'
 
 const lifecycle = f => new api.AnalysisLibraryLifecycleService(f.analysis, () => new Date(f.now))
 const participant = f => api.createAnalysisLifecycleParticipant(f.analysis)
@@ -43,6 +44,40 @@ test('permanent deletion of an uninitialized 500-pair run resumes every cancella
   assert.equal(deleted.filter(item => item.record.recordType === 'analysis-run').length, 1)
   assert.ok(f.analysis.store.batches.every(batch => batch.length <= 26 &&
     Buffer.byteLength(JSON.stringify(batch)) <= api.MAX_ANALYSIS_TRANSACTION_BYTES))
+})
+
+test('the last budgeted cleanup page completes small deletions without an unnecessary pending response', async () => {
+  for (const boundary of ['records', 'blobs']) {
+    const f = fixture()
+    const created = await createRun(f, boundary === 'records' ? 8 : 1)
+    let pages = 0
+    if (boundary === 'records') {
+      const list = f.analysis.store.list.bind(f.analysis.store)
+      f.analysis.store.list = async (workspaceId, options) => {
+        const page = await list(workspaceId, options.recordType === 'analysis-comparison' ? { ...options, limit: 2 } : options)
+        if (options.recordType === 'analysis-comparison' && page.items.length) pages++
+        return page
+      }
+    } else {
+      await publishResult(f, created.run.id, comparisons(f, created.run.id)[0].record.id)
+      assert.equal((await settleNarratives(f, created.run.id)).ready, true)
+      assert.ok(f.analysis.blobs.values.size >= 4)
+      const list = f.analysis.blobs.list.bind(f.analysis.blobs)
+      f.analysis.blobs.list = async (...args) => {
+        const page = await list(...args)
+        if (!page.items.length || ++pages === 4) return page
+        return { items: page.items.slice(0, 1), continuationToken: '1' }
+      }
+    }
+    assert.deepEqual(await change(f, created.run.id, 'delete'), { deleted: true }, boundary)
+    assert.equal(pages, 4, boundary)
+    assert.equal(await current(f, created.run.id), undefined)
+    assert.equal(f.analysis.store.values.size, 0)
+    assert.equal(f.analysis.blobs.values.size, 0)
+    assert.equal((await f.analysis.store.getControl(f.workspaceId, created.run.id)).record.state, 'deleted')
+    assert.ok(f.analysis.store.batches.every(batch => batch.length <= 26 &&
+      Buffer.byteLength(JSON.stringify(batch)) <= api.MAX_ANALYSIS_TRANSACTION_BYTES))
+  }
 })
 
 test('ambiguous lifecycle fence and final tombstone commits are reconciled without losing recovery or reviving work', async () => {
@@ -211,7 +246,9 @@ test('archive preserves completed comparisons, model reviews, original bytes and
   assert.equal(result.analysis.run.progress.cancelled, 2)
   assert.deepEqual(comparisons(f, run.run.id)[0], completed)
   assert.deepEqual([...f.analysis.blobs.values], evidence)
-  assert.deepEqual(await f.service.comparisonDetail(f.workspaceId, run.run.id, first.record.id), detail)
+  const archivedDetail = await f.service.comparisonDetail(f.workspaceId, run.run.id, first.record.id)
+  assert.equal(archivedDetail.narrative.status, 'cancelled', 'Archive fences pending sidecar work, not the immutable result.')
+  assert.deepEqual({ ...archivedDetail, narrative: undefined }, { ...detail, narrative: undefined })
   assert.deepEqual((await f.service.document(f.workspaceId, run.run.id, first.record.id,
     detail.resumeSnapshot.document.id, detail.resumeSnapshot.document.version)).document, detail.resumeSnapshot.document)
   await change(f, run.run.id, 'unarchive')

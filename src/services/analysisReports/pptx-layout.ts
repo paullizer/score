@@ -74,6 +74,7 @@ const LATIN_ADVANCES: Readonly<Record<string, number>> = Object.fromEntries((
 export function pptxGlyphWidth(character: string, fontSize: number): number {
   if (/[\r\n\u2028\u2029]/u.test(character)) return 0
   if (character === '\t') return Math.max(72, fontSize * 4)
+  if (character === '\u00a0') return fontSize * LATIN_ADVANCES[' ']
   if (/\p{Mark}/u.test(character)) return fontSize * 0.15
   if (LATIN_ADVANCES[character] !== undefined) return fontSize * LATIN_ADVANCES[character]
   if (character === '–') return fontSize * 0.65
@@ -113,7 +114,7 @@ export function measurePptxLines(text: string, width: number, fontSize: number):
     }
     lineWidth += advance
     cursor += character.length
-    if (/\s/u.test(character) || /[-/]/u.test(character)) {
+    if ((character !== '\u00a0' && /\s/u.test(character)) || /[-/]/u.test(character)) {
       breakAt = cursor
       breakWidth = lineWidth
     }
@@ -131,6 +132,22 @@ export function measurePptxText(text: string, width: number, fontSize: number): 
   return { lines, height: pptxTextHeight(lines.length, fontSize) }
 }
 
+export function keepPptxParagraphEndWordsTogether(text: string, width: number, fontSize: number): string {
+  validTextDimensions(width, fontSize)
+  return text.replace(/(\S+)( +)(\S+)([\t ]*)(?=\r\n?|\n|\u2028|\u2029|$)/gu,
+    (original, first: string, spaces: string, last: string, trailing: string) => {
+      if (/[.!?\u3002\uff01\uff1f]["'\u2019\u201d)\]]*$/u.test(first)) return original
+      const pair = `${first}${spaces.replace(/ /g, '\u00a0')}${last}`
+      return measurePptxLines(pair, width, fontSize).length === 1 ? pair + trailing : original
+    })
+}
+
+const sentenceSegmenter = new Intl.Segmenter('en', { granularity: 'sentence' })
+
+function firstSentence(text: string): string {
+  return sentenceSegmenter.segment(text)[Symbol.iterator]().next().value?.segment ?? ''
+}
+
 export function takePptxText(text: string, width: number, maxHeight: number, fontSize: number): {
   text: string
   rest: string
@@ -140,19 +157,29 @@ export function takePptxText(text: string, width: number, maxHeight: number, fon
   if (measured.height <= maxHeight + 0.000001) return { text, rest: '', height: measured.height }
   const capacity = Math.floor((maxHeight - PPTX_LAYOUT.textSafety + 0.000001) * 72 / (fontSize * PPTX_LAYOUT.lineHeight))
   if (capacity < 1) throw new Error('PowerPoint text has no room for a readable line.')
+  const sentenceEnds = Array.from(sentenceSegmenter.segment(text), sentence => sentence.index + sentence.segment.length)
   let count = Math.min(capacity, measured.lines.length)
   while (count > 0) {
     let end = measured.lines[count - 1].end
     const paragraphBreaks = [...text.slice(0, end).matchAll(/(?:\r?\n[\t ]*){2,}/g)]
     const boundary = paragraphBreaks.at(-1)
     const paragraphEnd = boundary ? boundary.index! + boundary[0].length : 0
-    // Keep ordinary paragraphs intact; split genuinely long paragraphs with at least two
-    // lines on the following slide instead of stranding their final few words.
+    let sentenceEnd = 0
+    for (const position of sentenceEnds) {
+      if (position > end) break
+      sentenceEnd = position
+    }
+    let semanticBoundary = false
     if (paragraphEnd > 0 && paragraphEnd < end &&
       measurePptxText(text.slice(0, paragraphEnd), width, fontSize).height >= maxHeight * 0.6) {
       end = paragraphEnd
+      semanticBoundary = true
+    } else if (sentenceEnd > 0) {
+      end = sentenceEnd
+      semanticBoundary = true
     }
-    if (count > 2 && text.slice(end).trim() &&
+    // Only genuinely oversized sentences need line-level splitting and widow protection.
+    if (!semanticBoundary && count > 2 && text.slice(end).trim() &&
       measurePptxText(text.slice(end).trimEnd(), width, fontSize).lines.length < 2) {
       count--
       continue
@@ -197,9 +224,22 @@ export function paginatePptxBlocks(
       const following = blocks[blockIndex + 1]
       const followingFont = following?.fontSize ?? PPTX_LAYOUT.bodyFontSize
       const headingReserve = kind === 'heading' && following ?
-        Math.min(measurePptxText(following.text, textWidth, followingFont).height, pptxTextHeight(3, followingFont)) + 0.1 : 0
+        Math.max(
+          Math.min(measurePptxText(following.text, textWidth, followingFont).height, pptxTextHeight(3, followingFont)),
+          Math.min(measurePptxText(firstSentence(following.text), textWidth, followingFont).height, continuedHeight - measured.height - 0.1),
+        ) + 0.1 : 0
       const wholeHeight = measured.height + padding * 2 + contextHeight
+      const firstSentenceHeight = measurePptxText(firstSentence(remaining), textWidth, fontSize).height + padding * 2 + contextHeight
+      const canMoveParagraph = kind !== 'heading' && page.fragments.at(-1)?.kind !== 'heading' &&
+        ((wholeHeight <= continuedHeight && available < wholeHeight) ||
+          (firstSentenceHeight <= continuedHeight && available < firstSentenceHeight))
+      if (kind === 'heading' && !page.fragments.length && page.capacity < continuedHeight &&
+        available < wholeHeight + headingReserve && wholeHeight + headingReserve <= continuedHeight + 0.000001) {
+        nextPage()
+        continue
+      }
       if (page.fragments.length && (available < Math.min(wholeHeight, minimum) ||
+        canMoveParagraph ||
         (kind === 'citation' && wholeHeight <= page.capacity && available < wholeHeight) ||
         (measured.lines.length <= 3 && wholeHeight <= page.capacity && available < wholeHeight) ||
         (kind === 'heading' && wholeHeight <= page.capacity && available < wholeHeight + headingReserve))) {

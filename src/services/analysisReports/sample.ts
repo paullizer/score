@@ -7,6 +7,8 @@ import type { AnalysisRun, AnalysisTarget, Citation, Criterion, SourceDocument }
 import { assertResumeSnapshot, assertTargetSnapshot } from '../scoring'
 import { assertReportResourceLimits, buildAnalysisReport, createReportCitation, reportDisplayNameSchema as displayName } from './model'
 import { unavailableOverallScore } from './presentation'
+import { sampleCandidateNarrative, sampleNarrativeCapture, sampleReportFixtureId, sampleTargetNarrative } from './sample-narratives'
+import { reportNarrativeCaptureSchema } from './narrative-schemas'
 import { getDisplayName } from '../../domain/displayNames'
 
 const id = z.string().min(1).max(1024)
@@ -139,6 +141,14 @@ export function buildSampleAnalysisReport(run: AnalysisRun, options: SampleAnaly
       guidance: criterion.guidance, requirementType: criterion.requirementType ?? null,
     })),
     facts: targetFacts(target),
+    presentation: {
+      title: target.job?.title ?? target.rubric.name,
+      organization: target.job?.organization ?? '',
+      description: target.rubric.description,
+      series: target.job?.series ?? '',
+      grade: target.job?.grade ?? target.rubric.grade ?? '',
+      versionLabel: `Saved ${target.kind === 'grade' ? 'illustrative grade' : 'job'} rubric v${target.rubric.version}`,
+    },
   }))
   const comparisons: ReportComparison[] = saved.comparisons.map((comparison, index) => {
     const resume = resumesById.get(comparison.resumeId)
@@ -185,13 +195,30 @@ export function buildSampleAnalysisReport(run: AnalysisRun, options: SampleAnaly
   })
   const parsedOptions = z.strictObject({
     targetId: id.optional(), generatedAt: timestamp.optional(),
-    capture: z.strictObject({ startedAt: timestamp, completedAt: timestamp }).optional(),
+    capture: z.strictObject({ startedAt: timestamp, completedAt: timestamp, summaries: reportNarrativeCaptureSchema.optional() }).optional(),
   }).parse(options)
   const generatedAt = parsedOptions.generatedAt ?? new Date().toISOString()
+  const fixtureId = sampleReportFixtureId(saved.id)
+  for (const target of targets) {
+    const selected = comparisons.filter(comparison => comparison.targetId === target.id)
+    for (const comparison of selected) {
+      if (comparison.status === 'complete') comparison.narrative = sampleCandidateNarrative(fixtureId, target, comparison)
+    }
+    if (selected.some(comparison => comparison.status === 'complete')) target.narrative = sampleTargetNarrative(fixtureId, target, selected)
+  }
+  const summaries = sampleNarrativeCapture(fixtureId, targets, comparisons, parsedOptions.targetId ?? null)
+  const previous = parsedOptions.capture?.summaries
+  if (previous && (previous.dataKind !== 'sample' || previous.fixtureId !== fixtureId ||
+    previous.revision !== summaries.revision || previous.scope.targetId !== summaries.scope.targetId)) {
+    throw new Error('The sample summary capture does not match this frozen fixture run and selected target scope.')
+  }
   return buildAnalysisReport({
     dataKind: 'sample',
     run: { id: saved.id, name: getDisplayName(saved, saved.name), createdAt: saved.createdAt },
-    capture: parsedOptions.capture ?? { startedAt: generatedAt, completedAt: generatedAt },
+    capture: {
+      ...(parsedOptions.capture ?? { startedAt: generatedAt, completedAt: generatedAt }),
+      summaries,
+    },
     generatedAt,
     targets,
     comparisons,

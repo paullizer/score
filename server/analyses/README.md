@@ -69,12 +69,16 @@ All paths below have prefix `/api/workspaces/:workspaceId/analyses`:
 | `GET /:runId/comparisons/:comparisonId` | Unwrapped `RealAnalysisComparisonDetail` |
 | `GET /:runId/comparisons/:comparisonId/diagnostics?continuationToken=...` | `RealAnalysisDiagnosticsPage`; at most one private failed-attempt artifact per page |
 | `GET /:runId/comparisons/:comparisonId/documents/:documentId?version=N` | `RealAnalysisDocumentResponse` |
+| `GET /:runId/summaries` with optional `targetId` query | `RealAnalysisSummariesResponse`, including selected-scope ETag, status, published narratives, and report capture pins |
+| `POST /:runId/summaries` with `{mode: "missing" \| "all", targetId?}` | `RealAnalysisSummariesMutationResponse` with durable request ID, scheduled counts, and summary state |
 | `POST /:runId/retry` with `{comparisonIds?}` | `{run: RealAnalysisRunSummary}` |
 | `POST /:runId/cancel` with `{}` | `{run: RealAnalysisRunSummary}` |
 | `POST /:runId/comparisons/:comparisonId/retry` or `/cancel` with `{}` | `{comparison: RealAnalysisComparisonSummary}` |
 
-Creation requires a UUID `Idempotency-Key`. Actions require one exact `If-Match`
-ETag for the run or comparison being acted upon. Lists support `limit` (1–100,
+Creation requires a UUID `Idempotency-Key`. Scoring/lifecycle actions require one exact `If-Match`
+ETag for the run or comparison being acted upon. Summary generation uses a stable UUID
+`Idempotency-Key` and the **selected summary scope's ETag**, not a run or comparison
+ETag. Lists support `limit` (1–100,
 default 50) and opaque `continuationToken` values bound to the workspace/list/run.
 Unknown body/query fields, duplicate selections, stale hashes, foreign IDs,
 sample/mixed input, and unsupported types are rejected. Document access resolves
@@ -94,6 +98,83 @@ nonzero entity or unparsed transfer-encoded body is rejected rather than ignored
 Nonempty action bodies must use supported JSON and the exact action schema.
 Lifecycle actions always require the **run** ETag, never a comparison ETag.
 `RealAnalysisDetail` is an alias of the existing `RealAnalysisRunDetail`.
+
+## Saved narrative summaries
+
+Narratives are versioned sidecars, not modifications to completed comparison
+records or their immutable results. The original `result.summary` participates in
+the assessment hash and independent review; it must never be replaced by a
+summary refresh. Candidate and target work records live in `analysis-records`;
+immutable narrative artifacts live under the owning run in `analysis-sources`.
+Public summary DTOs expose text, state, safe provenance/revision identifiers, and
+capture pins, not private blob names.
+
+Each candidate narrative binds the exact completed result, resume/target snapshots,
+and manifest hashes. Each target narrative binds the exhaustive exact-target
+comparison set, including statuses, result hashes, and candidate narrative
+generations/publication revisions. Lease heartbeats and unrelated target work do
+not invalidate a selected scope's revision. A published prior version can remain
+readable during replacement, but queued/running/failed replacement work does not
+become ready merely because old text exists.
+
+GET is read-only: opening old history or exporting a report never schedules model
+work. POST accepts only the current run or one exact saved target, not labels or
+arbitrary comparison subsets. `missing` reuses current candidates, retries missing
+or failed narratives, and refreshes missing/outdated dependent target overviews.
+`all` requests a fresh generation of all required summaries in scope without
+rescoring. Request replay must not start another generation or supersede a newer
+accepted request after an ambiguous response.
+
+New completed scoring results durably schedule candidate summaries and coalesce
+the affected target overview. Target synthesis waits until selected scoring has
+settled and every completed comparison has a current candidate narrative. A
+scoring retry invalidates the affected overview immediately; a later completion
+refreshes it without regenerating unchanged candidates. Failed/cancelled
+comparisons contribute processing-status facts, not invented evidence or zero
+scores. A target with no completed comparisons needs no narrative.
+
+Generation uses only the frozen analysis stores and the configured analysis
+model, so it does not require live source discovery/import services. The
+`analysisSummaryGeneration` feature is separate from new-run `realAnalyses`
+readiness. Normal workspace write authorization, mutation leases, exact
+concurrency, CSRF protection, and `no-store` responses still apply. Authorized
+viewers can read ready narratives; writable, non-archived runs are required for
+generation. A settled partial/cancelled run may explicitly summarize its completed
+results without restarting scoring.
+
+Summary claims are checked against the saved assessment with independent
+grounding review and bounded correction attempts. Output has explicit prose
+length limits, and large target cohorts use bounded exhaustive synthesis rather
+than selecting only the first page or featured candidates. Failures are actionable
+summary errors, not successful count-based fallbacks or failed scoring results.
+Model provenance and output/input bindings remain attached to the immutable
+artifact. Routine logs exclude narrative text, source passages, private URLs, and
+raw model responses.
+
+Worker claims, heartbeats, retries, and publication use independent narrative
+attempt/generation fences in addition to current run/workspace lifecycle
+controls. Cancellation, archive, and deletion prevent late publication. Cleanup
+includes narrative records, versions, and request artifacts; late Blob writers
+must not recreate deleted content. New sidecar writes count toward the same
+transaction operation/byte limits as scoring and initialization.
+
+PDF, Word, and PowerPoint require current summaries for their complete selected scope.
+Summary responses include authoritative report-capture pins; clients verify exact
+comparison/result/narrative identities during collection and recheck the selected
+revision before download. A stale or missing narrative aborts these exports
+rather than mixing generations or generating prose on demand. CSV retains its
+existing contract and remains independent of narrative readiness. PDF and Word
+share one content pipeline, including the same selected scope, saved narratives,
+featured reviews, completed-candidate overview, and authenticated source links.
+Client polling must continue after scoring is terminal and follow summary
+revisions, because regenerating a narrative never changes a completed
+comparison's ETag.
+
+Deploy compatible schema readers, lifecycle handlers, API, and report clients
+before enabling workers that write narrative records. Historical source/results
+remain unchanged, and older analyses are not backfilled by reading them. Retain
+compatible readers on rollback once narrative history exists; no additional
+storage resource or broader worker identity grant is required.
 
 ## Display names
 
@@ -121,6 +202,13 @@ update old comparisons, manifests, or reports, including records with no alias.
 Aliases are not supplied to assessment or grounding models. Worker initialization,
 leases, retries, progress, and conditional result publication preserve the latest
 run alias.
+
+Saved-summary selectors use captured target aliases without changing exact-target
+scope or regenerating evidence. PDF, Word, and PowerPoint carry the current run
+title and captured candidate/target aliases while retaining source-stated candidate
+names and the canonical frozen job title, separately from the organization.
+Aliases do not restore legacy combined job/organization headings or replace saved
+narrative text. PDF and Word continue to share the same report content.
 
 ## Frozen evidence and recovery
 

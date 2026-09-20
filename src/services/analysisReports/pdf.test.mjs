@@ -8,9 +8,12 @@ import { pathToFileURL } from 'node:url'
 import { build } from 'esbuild'
 import fontkit from '@pdf-lib/fontkit'
 import { PDFDocument } from 'pdf-lib'
-import { loadReportFoundation, reportFixtureCitation, REPORT_TEST_TIMESTAMP } from './test-support.mjs'
 import {
-  assertNoClipping as checkClipping, fictionalPdfQaFixture, fictionalSampleInput, overviewPages, readablePdfFixture, readPdf, reviewSections,
+  loadReportFoundation, realReportFixture, reportFixtureCitation, REPORT_TEST_TIMESTAMP, withReportNarratives,
+} from './test-support.mjs'
+import {
+  assertNoClipping as checkClipping, contentsPages, fictionalPdfNavigationQaFixture, fictionalPdfQaFixture, fictionalSampleInput,
+  overviewPages, readablePdfFixture, readPdf, reviewSections, targetOpenerPages,
 } from './pdf-test-support.mjs'
 
 let foundation, cleanup, writer, output, options, measurementFonts
@@ -47,9 +50,9 @@ after(async () => {
   if (output) await rm(output, { recursive: true, force: true })
 })
 
-async function generate(input = readablePdfFixture(), generationOptions = options) {
+async function generate(input = readablePdfFixture(), generationOptions = options, buildOptions = {}) {
   const source = JSON.stringify(input)
-  const report = foundation.buildAnalysisReport(input)
+  const report = foundation.buildAnalysisReport(input, buildOptions)
   const saved = JSON.stringify(report)
   const started = Date.now()
   const bytes = await writer.generatePdfReport(report, generationOptions)
@@ -74,11 +77,41 @@ const assertNoClipping = pdf => checkClipping(pdf, measurementFonts)
 const occurrences = (text, phrase) => text.split(phrase).length - 1
 const overviewText = pdf => overviewPages(pdf).map(page => page.body).join('')
 
+function assertContentsDestinations(pdf) {
+  const contents = contentsPages(pdf)
+  const openers = targetOpenerPages(pdf)
+  const groups = pdf.report.groups.filter(group => group.comparisons.some(comparison => comparison.status === 'complete'))
+  assert.equal(openers.length, groups.length)
+  assert.ok(contents.length)
+  assert.equal(pdf.pages[0].section.replace('FICTIONAL SAMPLE · ', ''), 'Introduction')
+  assert.equal(pdf.pages[1], contents[0])
+  assert.ok(contents.every(page => pdf.pages.indexOf(page) < pdf.pages.indexOf(openers[0])))
+  for (const [index, group] of groups.entries()) {
+    const opener = openers[index]
+    const label = `${group.target.kind === 'grade' ? 'Grade' : 'Job'} analysis ${index + 1}`
+    const targetPageIndex = pdf.pages.indexOf(opener)
+    assert.equal(opener.primary, label)
+    const page = contents.find(page => page.items.some(item => item.source === label))
+    assert.ok(page, `Missing contents entry ${label}`)
+    const item = page.items.find(item => item.source === label)
+    const link = page.internalAnnotations.find(annotation =>
+      Math.abs(annotation.rect[0] - item.x) < 0.01 && item.y >= annotation.rect[1] && item.y <= annotation.rect[3])
+    assert.equal(link?.targetPageIndex, targetPageIndex, `Contents entry ${label} must resolve to its final exact-target opener`)
+    assert.ok(page.items.some(value => value.source === `Page ${targetPageIndex + 1}` && value.y === item.y),
+      'Visible page references must be finalized after contents and target pagination')
+    assert.ok(contents.flatMap(page => page.internalAnnotations).some(link => link.targetPageIndex === targetPageIndex))
+    assert.equal(opener.internalAnnotations.length, 1)
+    assert.equal(opener.internalAnnotations[0].targetPageIndex, pdf.pages.indexOf(contents[0]))
+    assert.ok(opener.body.includes('Return to contents'))
+  }
+  assert.ok(pdf.uriAnnotations.every(link => new URL(link.url).origin === options.links.origin))
+}
+
 function assertNoTechnicalMetadata(pdf) {
   assert.doesNotMatch(pdf.text, /Run ID:|Workspace ID:|Exact target ID:|Candidate ID:|Comparison ID:|Criterion ID:|SHA-256|Capture interval:|Saved provenance|Review \d|Partial report|cutoff|competition rank|Assessment model|Output correction count|RAW-GUIDANCE-|RAW-WORDING-|RAW-RESUME-QUOTE-|RAW-REQUIREMENT-QUOTE-/i)
   assert.ok(pdf.pages.every(page => !page.section.includes('PARTIAL')))
   for (const group of pdf.report.groups) {
-    for (const value of [group.target.id, group.target.rubricId, group.target.versionLabel, group.target.snapshot?.sha256]) {
+    for (const value of [group.target.id, group.target.rubricId, group.target.snapshot?.sha256]) {
       if (value) assert.ok(!pdf.text.includes(value), `Technical metadata was displayed: ${value}`)
     }
     for (const comparison of group.comparisons) {
@@ -93,12 +126,13 @@ test('PDF: display headings and original source identities are both selectable',
   const input = readablePdfFixture({ scores: [92.75, null], criterionCount: 6 })
   input.run.name = 'Renamed analysis'
   input.targets[0].displayName = 'Custom target'
+  input.targets[0].label = 'LEGACY-COMPOSITE TITLE - OFFICE MUST NOT BE USED'
   input.comparisons[0].candidate.displayName = 'Custom candidate'
   input.comparisons[1].candidate.displayName = 'Captured withheld candidate'
   const pdf = await generate(input)
   assert.equal(pdf.document.getTitle(), foundation.reportTitle(pdf.report))
   for (const value of ['Renamed analysis', 'Custom target', 'Custom candidate',
-    `Source-stated name: ${input.comparisons[0].candidate.name}`, `Source target title: ${input.targets[0].label}`,
+    `Source-stated name: ${input.comparisons[0].candidate.name}`, `Source target title: ${input.targets[0].presentation.title}`,
     input.comparisons[0].candidate.sourceLabel]) {
     assert.ok(pdf.text.includes(value), `Missing label or source identity: ${value}`)
   }
@@ -108,8 +142,10 @@ test('PDF: display headings and original source identities are both selectable',
   const review = reviewSections(pdf)[0]
   assert.ok(review.pages.length <= 2)
   assert.ok(review.pages.every(page => page.items.some(item => item.y === 734 && item.source === 'Custom candidate')))
-  assert.ok(review.pages.every(page => page.items.some(item => item.y === 718 && item.source === 'Custom target')))
+  assert.ok(review.pages.every(page => page.items.some(item => item.y === 718 && item.source === 'Job analysis 1 · Featured candidate 1')))
   assert.equal(review.pages.flatMap(page => page.annotations).length, 3)
+  assert.doesNotMatch(pdf.text, /LEGACY-COMPOSITE/)
+  assertContentsDestinations(pdf)
   assertNoTechnicalMetadata(pdf)
   assertNoClipping(pdf)
 })
@@ -128,17 +164,33 @@ test('PDF: long captured aliases disambiguate exact targets and paginate without
   const reviews = reviewSections(pdf)
   assert.equal(reviews.length, 2)
   pdf.report.groups.forEach((group, index) => {
-    const label = foundation.readableTargetLabel(pdf.report, group)
+    const label = group.target.displayName
     assert.ok(overviewText(pdf).includes(label))
     assert.ok(reviews[index].body.includes(label))
     assert.ok(reviews[index].body.includes('Source-stated name: Not stated'))
-    assert.ok(reviews[index].body.includes(`Source target title: ${group.target.label}`))
+    assert.ok(reviews[index].body.includes(`Source target title: ${group.target.presentation.title}`))
+    assert.ok(reviews[index].pages.every(page => page.secondary === `Job analysis ${index + 1} · Featured candidate 1`))
     assert.ok(reviews[index].body.includes(group.comparisons[0].candidate.sourceLabel))
     assert.ok(reviews[index].pages.length <= 3)
     const links = writer.reportReviewLinks(pdf.report, group.comparisons[0], options)
     for (const url of Object.values(links)) assert.ok(reviews[index].pages.some(page => page.annotations.some(link => link.url === url)))
   })
+  assertContentsDestinations(pdf)
   assertNoTechnicalMetadata(pdf)
+  assertNoClipping(pdf)
+})
+
+test('PDF: source-name disclosures never strand the explanation section heading above a page break', async () => {
+  const input = fictionalPdfQaFixture()
+  input.run.name = 'Fictional research shortlisting review'
+  input.targets[0].displayName = 'Survey methods vacancy'
+  input.comparisons[0].candidate.displayName = 'Research applicant A'
+  const pdf = await generate(fictionalSampleInput(input), { fonts: options.fonts, links: { origin: options.links.origin } })
+  const review = reviewSections(pdf)[0]
+  const headingPage = review.pages.find(page => page.items.some(item => item.source === 'Why these scores'))
+  assert.ok(headingPage)
+  assert.ok(headingPage.items.some(item => item.bold && item.size === 10 && /^C1(?: |$)/.test(item.source)),
+    'The explanation heading must share a page with the first criterion, not reserve only a fixed number of blank points.')
   assertNoClipping(pdf)
 })
 
@@ -150,6 +202,9 @@ test('PDF: concise searchable report includes job context, one caution, all crit
   assert.equal(occurrences(pdf.body, 'Analysis evidence report'), 1)
   assert.equal(occurrences(pdf.body, foundation.REPORT_HUMAN_REVIEW_NOTICE), 1)
   assert.equal(occurrences(pdf.body, 'Analysis date:'), 1)
+  assert.ok(pdf.pages[0].body.includes('Distinct reviewed candidates: 1'))
+  assert.ok(pdf.pages[0].body.includes('Job targets: 1'))
+  assert.ok(pdf.pages[0].body.includes('Completed candidate-job reviews: 1'))
   assert.ok(pdf.body.includes('2026'))
   for (const expected of [
     'Reporting on 1 of 1 candidate', 'About the job', 'Engineering specialist', 'Example public works team',
@@ -161,6 +216,10 @@ test('PDF: concise searchable report includes job context, one caution, all crit
   const section = reviewSections(pdf)[0]
   assert.equal(reviewSections(pdf).length, 1)
   assert.ok(section.pages.length <= 2, `An ordinary six-criterion review used ${section.pages.length} pages`)
+  for (const page of section.pages) {
+    assert.equal(page.primary, 'Alex Morgan')
+    assert.equal(page.secondary, 'Job analysis 1 · Featured candidate 1')
+  }
   for (const [index, definition] of input.targets[0].criteria.entries()) {
     assert.ok(section.body.includes(`C${index + 1} ${definition.label}`))
     assert.ok(section.body.includes(`C${index + 1} ${definition.label} (3 / 5)`))
@@ -173,6 +232,7 @@ test('PDF: concise searchable report includes job context, one caution, all crit
     assert.equal(page.items.filter(item => item.y < 60).length, 1, 'Footers should contain page numbers, not repeated cautions')
   })
   assertNoTechnicalMetadata(pdf)
+  assertContentsDestinations(pdf)
   assertNoClipping(pdf)
   await savePdfQaArtifact('score-pdf-fictional-ordinary-v2.pdf', fictionalPdfQaFixture())
   context.diagnostic(`${pdf.pages.length} pages total; ${section.pages.length} pages for the ordinary featured review`)
@@ -198,7 +258,7 @@ test('PDF: overview names and featured links have actual same-origin URI annotat
       assert.ok(annotations.some(link => Math.abs(link.rect[0] - item.x) < 0.01 && item.y >= link.rect[1] && item.y <= link.rect[3]))
     }
   }
-  assert.ok(pdf.annotations.every(link => new URL(link.url).origin === options.links.origin))
+  assertContentsDestinations(pdf)
   assertNoClipping(pdf)
 })
 
@@ -214,7 +274,16 @@ test('PDF: fictional QA fixtures have consistent stored totals and distinct subs
     assert.ok(comparison.criteria.every(criterion => criterion.citations.length && criterion.rationale.length > 60))
     assert.doesNotMatch(comparison.summary, /Full saved overall assessment|flood-risk/)
     foundation.buildAnalysisReport(input)
-    foundation.buildAnalysisReport(fictionalSampleInput(input))
+    const sample = fictionalSampleInput(input)
+    assert.deepEqual(sample.comparisons.map(comparison => comparison.summary), input.comparisons.map(comparison => comparison.summary))
+    assert.equal(sample.capture.summaries.source, 'fixture')
+    for (const narrative of [...sample.targets, ...sample.comparisons].map(value => value.narrative).filter(Boolean)) {
+      assert.equal(narrative.dataKind, 'sample')
+      assert.match(narrative.revision, /^fixture-/)
+      assert.equal('generationId' in narrative, false)
+      assert.equal('publishedAt' in narrative, false)
+    }
+    foundation.buildAnalysisReport(sample)
   }
 })
 
@@ -239,16 +308,18 @@ test('PDF: an independent local reader extracts meaningful Unicode text', async 
   assertNoClipping(pdf)
 })
 
-test('PDF: every exact target has its own completed-only overview before featured candidate reviews', async () => {
-  const input = readablePdfFixture({ scores: [92, 81, 0, null, 60], statuses: ['complete', 'complete', 'complete', 'complete', 'queued'], targetCount: 2, criterionCount: 1 })
+test('PDF: each exact target keeps its context, featured reviews and all-completed table contiguous in that order', async () => {
+  const input = readablePdfFixture({ scores: [92, 81, 0, null, 60], statuses: ['complete', 'complete', 'complete', 'complete', 'cancelled'], targetCount: 2, criterionCount: 1 })
   input.comparisons[1].overall.score = 5
   input.comparisons[3].overall.score = 99
   input.comparisons[5].overall.score = 40
   const pdf = await generate(input)
   const overviews = overviewPages(pdf)
   assert.equal(occurrences(overviewText(pdf), 'Candidates at a glance'), 2)
-  assert.ok(overviewText(pdf).includes('candidate-job reviews'))
-  assert.ok(overviews.every(page => pdf.pages.indexOf(page) < pdf.pages.findIndex(item => item.section.endsWith('Candidate review'))))
+  assert.ok(pdf.pages[0].body.includes('Reporting on 8 of 10 candidate-job reviews'))
+  assert.ok(pdf.pages[0].body.includes('Distinct reviewed candidates: 4'))
+  assert.ok(pdf.pages[0].body.includes('Job targets: 2'))
+  assert.ok(pdf.pages[0].body.includes('Completed candidate-job reviews: 8'))
   assert.equal(overviews.flatMap(page => page.annotations).length, 8)
   const labels = new Set(overviews.map(page => page.items.find(item => item.y === 734)?.source))
   assert.equal(labels.size, 2, 'Same-label exact targets need readable disambiguation, not merged overview rows')
@@ -256,15 +327,204 @@ test('PDF: every exact target has its own completed-only overview before feature
   const featured = pdf.report.groups.flatMap(group => group.highlightedComparisonIds.map(id => ({ group, comparison: group.comparisons.find(item => item.id === id) })))
   assert.equal(sections.length, featured.length)
   sections.forEach((section, index) => {
-    const { comparison } = featured[index]
+    const { comparison, group } = featured[index]
     assert.ok(section.body.includes(comparison.candidate.name))
     for (const page of section.pages) {
-      assert.ok(page.items.some(item => item.y === 734 && item.source === comparison.candidate.name))
-      assert.ok(page.items.some(item => item.y === 718 && item.source.includes('Engineering specialist')))
+      assert.equal(page.primary, comparison.candidate.name)
+      assert.ok(page.secondary.startsWith(`Job analysis ${pdf.report.groups.indexOf(group) + 1} · Featured candidate `))
     }
   })
+  for (const [index] of pdf.report.groups.entries()) {
+    const label = `Job analysis ${index + 1}`
+    const opener = targetOpenerPages(pdf)[index]
+    const reviews = pdf.pages.filter(page => page.secondary.startsWith(`${label} · Featured candidate `))
+    const glance = overviews.filter(page => page.primary === label)
+    assert.ok(pdf.pages.indexOf(opener) < pdf.pages.indexOf(reviews[0]))
+    assert.ok(pdf.pages.indexOf(reviews.at(-1)) < pdf.pages.indexOf(glance[0]))
+    if (index + 1 < pdf.report.groups.length) {
+      assert.ok(pdf.pages.indexOf(glance.at(-1)) < pdf.pages.indexOf(targetOpenerPages(pdf)[index + 1]))
+    }
+  }
+  assertContentsDestinations(pdf)
   assertNoTechnicalMetadata(pdf)
   assertNoClipping(pdf)
+})
+
+test('PDF: full canonical title, separate organization and exact saved paragraphs survive wrapping without legacy synthesis', async () => {
+  const input = readablePdfFixture({ criterionCount: 1 })
+  const target = input.targets[0]
+  const comparison = input.comparisons[0]
+  target.label = 'LEGACY combined title and agency must not appear'
+  target.sublabel = 'LEGACY fallback subtitle must not appear'
+  target.presentation = {
+    title: 'Survey Statistician - Research Methods, Data Quality and Longitudinal Programme Evaluation',
+    organization: 'Department of Public Research - National Survey Processing and Statistical Evidence Review Center, Regional Operations Directorate',
+    description: `DESCRIPTION-START\n\n${'The saved role includes survey planning, reproducible quantitative checks, research documentation and coordination of fieldwork partners. '.repeat(100)}\nDESCRIPTION-END`,
+    series: '1530', grade: 'GS-12', versionLabel: 'Approved rubric v7',
+  }
+  target.narrative.paragraphs = [
+    'The saved reviews document completed research and quantitative work. Their strongest examples connect methods with delivered reports and reproducible checks.',
+    'Leadership examples concern small teams and defined workstreams. Broader programme and budget responsibility remain unverified in the available records.',
+    'These observations describe this exact saved target rather than a cross-job ranking. Human reviewers need to inspect source completeness and the separate qualification requirements.',
+  ]
+  comparison.narrative.text = 'The resume documents survey design and reproducible statistical analysis. Completed research reports connect those methods with delivered public-facing findings. Leadership examples concern mentoring analysts rather than ownership of a large programme. Budget authority remains unverified and requires human source review.'
+  comparison.narrative.overview = 'Survey design and reproducible analysis are supported by completed research, while larger programme leadership remains unverified.'
+  comparison.summary = 'LEGACY-COUNT-SUMMARY: Criterion evidence: 1 supported. The document evidence-match total is 92.75/100.'
+  const pdf = await generate(input)
+  const contents = contentsPages(pdf).map(page => page.body).join('')
+  const context = pdf.pages.filter(page => page.section.endsWith('Target overview')).map(page => page.body).join('')
+  const review = reviewSections(pdf)[0]
+  for (const text of [target.presentation.title, target.presentation.organization, 'Series: 1530', 'Grade: GS-12', 'Approved rubric v7']) {
+    assert.ok(contents.includes(text), `Contents lost frozen identity ${text}`)
+    assert.ok(context.includes(text), `Opener lost frozen identity ${text}`)
+    assert.ok(review.body.includes(text), `Candidate review lost frozen identity ${text}`)
+    assert.ok(overviewText(pdf).includes(text), `At-a-glance section lost frozen identity ${text}`)
+  }
+  assert.ok(context.includes(target.presentation.description), 'The full saved description must flow across pages without summarization')
+  assert.ok(pdf.pages.filter(page => page.section.endsWith('Target overview')).length > 2)
+  for (const paragraph of target.narrative.paragraphs) assert.ok(context.includes(paragraph))
+  assert.ok(review.body.includes(comparison.narrative.text))
+  assert.ok(overviewText(pdf).includes(comparison.narrative.overview))
+  assert.doesNotMatch(pdf.body, /LEGACY|\.{3}|\u2026/)
+  assert.ok(contentsPages(pdf).flatMap(page => page.items).some(item => item.size === 13 && item.source.startsWith('Survey Statistician')))
+  assert.ok(contentsPages(pdf).flatMap(page => page.items).some(item => item.size === 10.5 && item.source.startsWith('Department of Public Research')))
+  assertContentsDestinations(pdf)
+  assertNoClipping(pdf)
+})
+
+test('PDF: duplicate Survey Statistician office labels never expand legacy sublabels into canonical titles', async () => {
+  const input = readablePdfFixture({ scores: [80], targetCount: 3, criterionCount: 1 })
+  const organizations = [
+    'Department of Public Research - National Survey Processing and Statistical Evidence Review Center, Eastern Operations',
+    'Department of Public Research - National Survey Processing and Statistical Evidence Review Center, Western Operations',
+    'Department of Public Research - National Survey Processing and Statistical Evidence Review Center, Eastern Operations',
+  ]
+  input.targets.forEach((target, index) => {
+    target.label = 'Survey Statistician'
+    target.sublabel = `${organizations[index]} · Survey methods rubric · approved version ${index + 1}`
+    target.presentation = {
+      ...target.presentation,
+      title: target.label, organization: organizations[index], series: '1530',
+      grade: index === 1 ? 'GS-12' : 'GS-11', versionLabel: `Approved rubric v${index + 1}`,
+    }
+  })
+  const report = foundation.buildAnalysisReport(input)
+  const legacyLabels = report.groups.map(group => {
+    const label = `${group.target.label} - ${group.target.sublabel}`
+    assert.equal(foundation.readableTargetLabel(report, group), label, 'Legacy CSV label expansion remains unchanged')
+    return label
+  })
+  const pdf = await generate(input)
+  for (const label of legacyLabels) assert.ok(!pdf.body.includes(label), 'A legacy organization/rubric sublabel must not become a PDF title')
+  assert.equal(contentsPages(pdf).flatMap(page => page.items)
+    .filter(item => item.source === 'Survey Statistician' && item.size === 13 && item.bold).length, 3)
+  for (const [index, target] of input.targets.entries()) {
+    const label = `Job analysis ${index + 1}`
+    const surfaces = [
+      pdf.pages.filter(page => page.primary === label && page.section.endsWith('Target overview')),
+      pdf.pages.filter(page => page.secondary.startsWith(`${label} · Featured candidate `)),
+      overviewPages(pdf).filter(page => page.primary === label),
+    ]
+    for (const pages of surfaces) {
+      const items = pages.flatMap(page => page.items.filter(item => item.y > 60 && item.y < 704))
+      assert.equal(items.filter(item => item.source === target.presentation.title && item.bold).length, 1)
+      assert.equal(items.filter(item => item.size === 11 && !item.bold).map(item => item.source).join(''), target.presentation.organization)
+      const body = pages.map(page => page.body).join('')
+      assert.ok(body.includes(`Grade: ${target.presentation.grade}`))
+      assert.ok(body.includes(target.presentation.versionLabel))
+      assert.ok(!body.includes(target.sublabel))
+    }
+  }
+  assertContentsDestinations(pdf)
+  assertNoClipping(pdf)
+})
+
+test('PDF: paginated contents resolves duplicate title, organization and grade/version destinations after long descriptions and scorecards', async () => {
+  const input = readablePdfFixture({ scores: [80], targetCount: 14, criterionCount: 1, kind: 'grade' })
+  const dense = readablePdfFixture({ scores: [80], criterionCount: 100, kind: 'grade' })
+  input.targets[0].criteria = dense.targets[0].criteria
+  input.comparisons[0].criteria = dense.comparisons[0].criteria
+  input.comparisons[0].coverage = dense.comparisons[0].coverage
+  for (const [index, target] of input.targets.entries()) {
+    target.presentation = {
+      title: index === 0 ? `LONG-TITLE-START ${'Advanced Quantitative Research and Engineering Methods '.repeat(24)} LONG-TITLE-END`
+        : 'General engineering - Research methods',
+      organization: index === 0 ? `LONG-ORGANIZATION-START ${'National Technical Processing and Evidence Review Center '.repeat(28)} LONG-ORGANIZATION-END`
+        : `Department of Public Research, ${index % 2 ? 'Eastern' : 'Western'} Processing Center`,
+      description: index === 0
+        ? `ROLE-START ${'The frozen requirements cover documented engineering methods and independently reviewed quantitative research. '.repeat(150)} ROLE-END`
+        : 'The exact saved grade concerns engineering methods and independently reviewed quantitative research.',
+      series: '0801', grade: 'GS-9', versionLabel: `Approved grade version ${index + 1}`,
+    }
+  }
+  const pdf = await generate(input)
+  assert.ok(pdf.pages[0].body.includes('Jobs / grades: 14'))
+  assert.ok(contentsPages(pdf).length > 3, 'Contents must paginate by measured wrapped entry height')
+  assert.ok(reviewSections(pdf)[0].pages.length > 5)
+  assert.ok(pdf.pages.filter(page => page.section.endsWith('Target overview') && page.primary === 'Grade analysis 1').length > 5)
+  assertContentsDestinations(pdf)
+  const contents = contentsPages(pdf).flatMap(page => page.items.filter(item =>
+    item.y > 60 && item.y < 704 && !/^Page \d+$/u.test(item.source))).map(item => item.source).join('')
+  assert.ok(contents.includes(input.targets[0].presentation.title))
+  assert.ok(contents.includes(input.targets[0].presentation.organization))
+  const openers = targetOpenerPages(pdf)
+  assert.equal(new Set(openers.map(page => pdf.pages.indexOf(page))).size, 14)
+  for (const [index, opener] of openers.entries()) {
+    const targetContext = pdf.pages.filter(page => page.primary === opener.primary && page.section.endsWith('Target overview'))
+      .map(page => page.body).join('')
+    assert.ok(targetContext.includes(input.targets[index].presentation.versionLabel))
+  }
+  assertNoClipping(pdf)
+})
+
+test('PDF: contents includes only completed target groups and exact-target exports retain their own native destinations', async () => {
+  const input = readablePdfFixture({ scores: [80], targetCount: 3, criterionCount: 1 })
+  const failed = realReportFixture({ scores: [80], targetCount: 3, criterionCount: 1, statuses: ['failed'] })
+  failed.comparisons[1].candidate = structuredClone(input.comparisons[1].candidate)
+  input.comparisons[1] = failed.comparisons[1]
+  delete input.targets[1].narrative
+  const pdf = await generate(withReportNarratives(input))
+  assertContentsDestinations(pdf)
+  assert.equal(targetOpenerPages(pdf).length, 2)
+  assert.ok(pdf.pages[0].body.includes('Distinct reviewed candidates: 1'))
+  assert.ok(pdf.pages[0].body.includes('Job targets: 2'))
+  assert.ok(pdf.pages[0].body.includes('Completed candidate-job reviews: 2'))
+  assert.ok(pdf.pages[0].body.includes('1 could not be assessed'))
+  assert.ok(!contentsPages(pdf).map(page => page.body).join('').includes(input.targets[1].presentation.organization))
+
+  const selected = structuredClone(input)
+  const targetId = input.targets[2].id
+  selected.targets = selected.targets.filter(target => target.id === targetId)
+  selected.comparisons = selected.comparisons.filter(comparison => comparison.targetId === targetId)
+  const single = await generate(withReportNarratives(selected, { targetId }), options, { targetId })
+  assertContentsDestinations(single)
+  assert.equal(targetOpenerPages(single).length, 1)
+  assert.ok(targetOpenerPages(single)[0].body.includes(input.targets[2].presentation.organization))
+  assert.ok(single.pages[0].body.includes('Completed candidate-job reviews: 1'))
+  assertNoClipping(pdf)
+  assertNoClipping(single)
+})
+
+test('PDF: absent, stale or inconsistent saved summaries fail closed before filtering the original capture', async () => {
+  const input = readablePdfFixture({ scores: [80, null, 70], statuses: ['complete', 'complete', 'failed'], criterionCount: 1 })
+  const report = foundation.buildAnalysisReport(input)
+  for (const invalidate of [
+    report => { delete report.capture.summaries },
+    report => { report.capture.summaries.ready = false },
+    report => { delete report.groups[0].target.narrative },
+    report => { delete report.groups[0].comparisons[0].narrative },
+    report => { delete report.groups[0].target.presentation },
+    report => { report.groups[0].comparisons[0].narrative.inputFingerprint = 'f'.repeat(64) },
+    report => { report.groups[0].target.narrative.revision = 'e'.repeat(64) },
+    report => { report.capture.summaries.comparisons = report.capture.summaries.comparisons.filter(pin => pin.status === 'complete') },
+    report => { report.capture.summaries.comparisons.find(pin => pin.status === 'failed').status = 'cancelled' },
+    report => { report.groups[0].comparisons[0].resultSha256 = 'b'.repeat(64) },
+    report => { report.capture.summaries.scope.targetId = report.groups[0].target.id },
+  ]) {
+    const invalid = structuredClone(report)
+    invalidate(invalid)
+    await assert.rejects(writer.generatePdfReport(invalid, options), /saved|narrative|summar|capture|presentation|metadata/i)
+  }
 })
 
 test('PDF: capped ties stay equal in all-completed overview; only supplied highlights get individual reviews', async () => {
@@ -288,9 +548,9 @@ test('PDF: capped ties stay equal in all-completed overview; only supplied highl
 })
 
 test('PDF: zero, completed withheld scores and actual unfinished reasons remain distinct', async () => {
-  const input = readablePdfFixture({
+  const input = fictionalSampleInput(readablePdfFixture({
     scores: [0, null, 40, 30, 20, 10], statuses: ['complete', 'complete', 'queued', 'running', 'failed', 'cancelled'], criterionCount: 1,
-  })
+  }))
   const comparison = input.comparisons[0]
   comparison.criteria[0].score = 0
   comparison.criteria[0].evidenceStatus = 'missing'
@@ -346,9 +606,37 @@ test('PDF: duplicate or unnamed candidates have readable labels and distinct sav
   input.comparisons[2].candidate.name = null
   const pdf = await generate(input)
   assert.equal(occurrences(overviewText(pdf), 'Jordan Example'), 2)
+  assert.equal(reviewSections(pdf).length, 3, 'Repeated display names still need distinct numbered review headers')
+  assert.equal(new Set(reviewSections(pdf).map(section => section.secondary)).size, 3)
   const destinations = overviewPages(pdf).flatMap(page => page.annotations.map(link => link.url))
   assert.equal(new Set(destinations).size, 3)
   assert.ok(!pdf.text.includes('candidate-2'), 'Unnamed fallbacks must not disclose raw candidate IDs')
+  assertNoClipping(pdf)
+})
+
+test('PDF: running headers retain full names at the measured width boundary and use numbered fallbacks without shrinking', async () => {
+  const font = measurementFonts.bold
+  const characterWidth = font.layout('W').glyphs[0].advanceWidth * 9.5 / font.unitsPerEm
+  const fittingName = 'W'.repeat(Math.floor(520 / characterWidth))
+  const overflowingName = `${fittingName}W`
+  const longName = `LONG-CANDIDATE-START-${'W'.repeat(1200)}-LONG-CANDIDATE-END`
+  const names = [fittingName, overflowingName, longName]
+  const input = readablePdfFixture({ scores: [90, 80, 70], criterionCount: 1 })
+  input.comparisons.forEach((comparison, index) => { comparison.candidate.name = names[index] })
+  const pdf = await generate(input)
+  const reviews = reviewSections(pdf)
+  assert.equal(reviews.length, names.length)
+  assert.ok(reviews[2].pages.length > 1, 'The pathological name must exercise continuation headers')
+  for (const [index, section] of reviews.entries()) {
+    assert.ok(section.body.includes(names[index]), 'The full candidate identity must remain in the review body')
+    for (const page of section.pages) {
+      assert.equal(page.primary, index === 0 ? fittingName : `Candidate ${index + 1}`)
+      assert.equal(page.secondary, `Job analysis 1 · Featured candidate ${index + 1}`)
+      assert.equal(page.items.find(item => item.y === 734)?.size, 9.5)
+      assert.doesNotMatch(page.primary, /\.{3}|\u2026/)
+    }
+  }
+  assertContentsDestinations(pdf)
   assertNoClipping(pdf)
 })
 
@@ -360,7 +648,9 @@ test('PDF: wrapped linked text and oversized table cells preserve Unicode, white
     bold: await document.embedFont(options.fonts.bold, { subset: true, features: { liga: false, clig: false } }),
   }
   const layout = new writer.PdfReportLayout(document, fonts, '')
-  layout.startSection({ section: 'Candidate review', primary: `José Zoë — ${'Ω'.repeat(180)}`, secondary: `Engineering specialist ${'W'.repeat(180)}` })
+  layout.startSection({ section: 'Candidate review', primary: 'Job analysis 1 · Featured candidate 1', secondary: 'Scorecard and supporting evidence' })
+  layout.paragraph(`José Zoë — ${'Ω'.repeat(180)}`, { bold: true, size: 20, leading: 28 })
+  layout.paragraph(`Engineering specialist ${'W'.repeat(180)}`, { bold: true, size: 12, leading: 17 })
   const linked = `First line with exact  spaces.\r\nSecond\tline with A\u0301 and résumé.\nLONG-START-${'W'.repeat(2200)}-LONG-END`
   const destination = 'https://score.example/analyses/saved-review'
   layout.paragraph(linked, { link: destination })
@@ -377,7 +667,7 @@ test('PDF: wrapped linked text and oversized table cells preserve Unicode, white
   assert.ok(pdf.annotations.length > 100)
   assert.ok(pdf.annotations.every(link => [destination, tableDestination].includes(link.url)))
   assert.ok(pdf.pages.filter(page => page.body.includes('Assessment highlights')).length > 1)
-  assert.ok(pdf.pages.every(page => page.items.some(item => item.y === 734 && item.source.startsWith('José Zoë'))))
+  assert.ok(pdf.pages.every(page => page.primary === 'Job analysis 1 · Featured candidate 1'))
   assertNoClipping(pdf)
 })
 
@@ -521,13 +811,32 @@ test('PDF: a truly large scorecard paginates every criterion and rationale with 
     for (const header of ['Criterion', 'Weight', 'Score']) assert.ok(page.body.includes(header))
   }
   for (const page of section.pages) {
-    assert.ok(page.items.some(item => item.y === 734 && item.source === 'Alex Morgan'))
-    assert.ok(page.items.some(item => item.y === 718 && item.source.includes('Engineering specialist')))
+    assert.equal(page.primary, 'Alex Morgan')
+    assert.equal(page.secondary, 'Job analysis 1 · Featured candidate 1')
   }
   assertNoTechnicalMetadata(pdf)
   assertNoClipping(pdf)
   await savePdfQaArtifact('score-pdf-fictional-large-scorecard-v2.pdf', fictionalPdfQaFixture('large'))
   context.diagnostic(`${section.pages.length} pages for all 100 criteria and their rationales`)
+})
+
+test('PDF: an extreme criterion label flows through scorecard rows and explanation pages without losing its original text', async () => {
+  const input = readablePdfFixture({ criterionCount: 1 })
+  const phrase = 'Documented quantitative methods and independently reviewed evidence. '
+  input.targets[0].criteria[0].label = `CRITERION-START ${phrase.repeat(110)}CRITERION-END`
+  const pdf = await generate(input)
+  const section = reviewSections(pdf)[0]
+  assert.ok(section.pages.length > 5)
+  assert.equal(occurrences(section.body, 'CRITERION-START'), 2)
+  assert.equal(occurrences(section.body, 'CRITERION-END'), 2)
+  const items = section.pages.flatMap(page => page.items.filter(item => item.y > 60 && item.y < 704))
+  const tableCriterion = items.filter(item => item.x === 53 && item.size === 9.5 && !item.bold).map(item => item.source).join('')
+  const explanationLabel = items.filter(item => item.x === 46 && item.size === 10 && item.bold).map(item => item.source).join('')
+  assert.equal(tableCriterion, `C1 ${input.targets[0].criteria[0].label}`)
+  assert.equal(explanationLabel.slice(explanationLabel.indexOf('C1 CRITERION-START')), `C1 ${input.targets[0].criteria[0].label} (3 / 5)`)
+  assert.ok(section.body.includes(input.comparisons[0].criteria[0].rationale))
+  assertContentsDestinations(pdf)
+  assertNoClipping(pdf)
 })
 
 test('PDF: zero, not assessed and N/A remain separate, with short material unscored GS notes and grade links', async () => {
@@ -590,6 +899,17 @@ test('PDF: missing, corrupt and unsupported rendered fonts fail explicitly, neve
       return true
     })
   }
+  for (const field of ['title', 'organization', 'description']) {
+    const copy = structuredClone(report)
+    copy.groups[0].target.presentation[field] += ' 漢'
+    await assert.rejects(writer.generatePdfReport(copy, options), /U\+6F22.*No source text was substituted or omitted/)
+  }
+  const candidate = structuredClone(report)
+  candidate.groups[0].comparisons[0].narrative.text = candidate.groups[0].comparisons[0].narrative.text.replace('Led', '漢')
+  await assert.rejects(writer.generatePdfReport(candidate, options), /U\+6F22.*No source text was substituted or omitted/)
+  const overview = structuredClone(report)
+  overview.groups[0].target.narrative.paragraphs[0] = overview.groups[0].target.narrative.paragraphs[0].replace('completed', '漢')
+  await assert.rejects(writer.generatePdfReport(overview, options), /U\+6F22.*No source text was substituted or omitted/)
   for (const identity of ['analysis', 'candidate', 'target']) {
     const copy = structuredClone(report)
     if (identity === 'analysis') copy.run.name = 'Current analysis 🚀'
@@ -611,6 +931,21 @@ test('PDF: invalid application origins and unsafe layout links are rejected expl
   const layout = new writer.PdfReportLayout(document, { regular: font, bold: font }, '')
   layout.startSection({ section: 'Link QA', primary: 'Saved candidate', secondary: 'Engineering specialist' })
   assert.throws(() => layout.paragraph('Unsafe link', { link: 'javascript:alert(1)' }), /safe HTTP or HTTPS/)
+})
+
+test('PDF: missing or duplicate internal destinations and overlong running headers fail explicitly', async () => {
+  const document = await PDFDocument.create()
+  document.registerFontkit(fontkit)
+  const font = await document.embedFont(options.fonts.regular, { subset: true })
+  const layout = new writer.PdfReportLayout(document, { regular: font, bold: font }, '')
+  layout.startSection({ section: 'Contents', primary: 'Included target sections', secondary: 'Navigation within this report' })
+  layout.markDestination('contents')
+  assert.throws(() => layout.markDestination('contents'), /unique identities/)
+  layout.paragraph('Open a missing target', { link: { destination: 'missing-target' } })
+  assert.throws(() => layout.finish(), /internal link has no final destination/)
+  assert.throws(() => layout.startSection({
+    section: 'Target overview', primary: 'Unbounded running identity '.repeat(100), secondary: 'Job analysis 1',
+  }), /running headers require short section labels/)
 })
 
 test('PDF: full source validation is not bypassed for deliberately omitted quote or provenance content', () => {
@@ -656,8 +991,22 @@ test('PDF: every one of 500 completed candidates remains in the overview, withou
   assert.ok(pdf.pages.length <= writer.REPORT_LIMITS.maxPages)
   assert.ok(pdf.bytes.byteLength <= writer.REPORT_LIMITS.maxOutputBytes)
   assertNoTechnicalMetadata(pdf)
+  assertContentsDestinations(pdf)
   assertNoClipping(pdf)
   context.diagnostic(`${pdf.pages.length} pages; ${pdf.bytes.byteLength} bytes; generation ${pdf.generationMilliseconds} ms; inspection ${pdf.inspectionMilliseconds} ms`)
+})
+
+test('PDF: fictional multi-job and long-metadata fixtures expose local visual QA generation hooks', async () => {
+  for (const kind of ['multi', 'long-metadata']) {
+    const input = fictionalPdfNavigationQaFixture(kind)
+    const pdf = await generate(input)
+    assertContentsDestinations(pdf)
+    assert.equal(targetOpenerPages(pdf).length, 3)
+    assert.equal(overviewPages(pdf).flatMap(page => page.uriAnnotations).length, 12)
+    assert.doesNotMatch(pdf.body, /Legacy composite|\.{3}|\u2026/)
+    assertNoClipping(pdf)
+    await savePdfQaArtifact(`score-pdf-fictional-${kind}-v3.pdf`, input)
+  }
 })
 
 test('PDF: writer bundles for the browser without Node filesystem access, font fetches or conversion services', async () => {

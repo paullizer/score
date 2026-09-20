@@ -25,6 +25,9 @@ import {
 import { RealAnalysisTargets, resolveAnalysisResume, copyAnalysisTargetEvidence, type AnalysisSourceDeps } from './targets'
 import { analysisPageCursor, analysisPageToken, validateAnalysisPage } from './paging'
 import { readAnalysisReportComparisons } from './reports'
+import { generateAnalysisSummaries, readAnalysisNarrativeInventory, readAnalysisSummaries } from './narratives'
+import type { GenerateRealAnalysisSummariesInput } from '../../src/domain/analysis-narratives'
+import { prepareAnalysisNarrativeTransitions } from './narrative-scheduling'
 import { readAnalysisFailureDiagnostics } from './diagnostics'
 import {
   advanceAnalysisRun, applyAnalysisComparisonTransition, cancelAnalysisComparisonRecord, loadAnalysisComparison,
@@ -102,6 +105,15 @@ export class RealAnalysisService {
     return value
   }
   private async commit(workspaceId: string, operations: AnalysisTransaction[]): Promise<void> {
+    const parent = operations.find(operation => operation.record.recordType === 'analysis-run')?.record
+    assertAnalysis(parent?.recordType === 'analysis-run', 'Analysis action needs its run fence.')
+    const transitions = []
+    for (const operation of operations) if (operation.record.recordType === 'analysis-comparison' && operation.kind === 'replace') {
+      const old = await loadAnalysisComparison(this.deps.store, workspaceId, parent.id, operation.record.id)
+      if (!old || old.etag !== operation.etag) throw conflict('The comparison changed before this action could be saved. Reload and retry.')
+      transitions.push({ previous: old.record, next: operation.record })
+    }
+    operations.push(...await prepareAnalysisNarrativeTransitions(this.deps.store, parent, transitions, parent.updatedAt))
     operations.forEach(operation => parseAnalysisEntity(operation.record))
     assertWorkspaceMutationLease(workspaceId)
     try { await this.deps.store.transact(workspaceId, operations) } catch (error) { changeError(error) }
@@ -274,7 +286,14 @@ export class RealAnalysisService {
     const [run, comparison] = await Promise.all([this.run(workspaceId, runId), this.comparison(workspaceId, runId, comparisonId)])
     const snapshots = await readAnalysisSnapshots(this.deps.blobs, run.record, comparison.record)
     const result = await readAnalysisResult(this.deps.blobs, run.record, comparison.record, snapshots)
-    return { ...comparisonSummary(comparison), ...snapshots, result }
+    const summaries = await readAnalysisSummaries(this.deps, workspaceId, runId, comparison.record.target.summary.id)
+    return { ...comparisonSummary(comparison), ...snapshots, result, narrative: summaries.comparisons.find(item => item.comparisonId === comparisonId) }
+  }
+  summaries(workspaceId: string, runId: string, targetId?: string) {
+    return readAnalysisSummaries(this.deps, workspaceId, runId, targetId)
+  }
+  generateSummaries(workspaceId: string, runId: string, input: GenerateRealAnalysisSummariesInput, requestId: string, expected: string, actor: string) {
+    return generateAnalysisSummaries(this.deps, workspaceId, runId, input, requestId, expected, actor, this.clock)
   }
   async diagnostics(workspaceId: string, runId: string, comparisonId: string, continuationToken?: string) {
     const [run, comparison] = await Promise.all([this.run(workspaceId, runId), this.comparison(workspaceId, runId, comparisonId)])
@@ -321,13 +340,22 @@ export class RealAnalysisService {
     await this.writable(workspaceId, current.record)
     requireMatch(current.etag, expected)
     if (!actor.trim() || actor.length > 200) throw invalidRequest('An authenticated cancellation actor is required.')
+    const p = current.record.progress
+    if (p.initialized === p.total && p.queued + p.running === 0) {
+      const inventory = await readAnalysisNarrativeInventory(this.deps, workspaceId, runId)
+      const active = [...inventory.comparisons, ...inventory.targets].some(item => ['waiting', 'queued', 'running'].includes(item.state.status))
+      if (!active) throw conflict('This run has no active comparisons or summaries to cancel. Completed results are immutable.')
+      const timestamp = new Date(Math.max(Date.parse(this.now()), Date.parse(current.record.updatedAt))).toISOString()
+      const updated = { ...current.record, updatedAt: timestamp, narrativeCancelledAt: timestamp }
+      assertWorkspaceMutationLease(workspaceId)
+      try { return runSummary(await this.deps.store.replace(updated, expected)) } catch (error) { changeError(error) }
+    }
     if (!current.record.cancellation) {
-      const p = current.record.progress
-      if (p.initialized === p.total && p.queued + p.running === 0) throw conflict('This run has no active comparisons to cancel. Completed results are immutable.')
-      const timestamp = this.now()
+      const timestamp = new Date(Math.max(Date.parse(this.now()), Date.parse(current.record.updatedAt))).toISOString()
       const updated: RealAnalysisRunRecord = {
         ...structuredClone(current.record), updatedAt: timestamp, status: 'cancelled', attempts: 0,
         cancellation: { requestedAt: timestamp, requestedBy: actor, nextComparisonIndex: 0 },
+        narrativeCancelledAt: timestamp,
       }
       delete updated.lease
       delete updated.attemptId
@@ -345,7 +373,7 @@ export class RealAnalysisService {
     let current = await this.run(workspaceId, runId)
     await this.writable(workspaceId, current.record)
     requireMatch(current.etag, expected)
-    const timestamp = this.now()
+    const timestamp = new Date(Math.max(Date.parse(this.now()), Date.parse(current.record.updatedAt))).toISOString()
     if (current.record.cancellation && !current.record.cancellation.completedAt) {
       if (request.comparisonIds || !analysisCancellationNeedsRetry(current.record) ||
         (current.record.lease && current.record.lease.expiresAt > timestamp)) {
@@ -402,6 +430,7 @@ export class RealAnalysisService {
     }, runId)
     let offset = 0
     while (offset < selected.length) {
+      const batchTimestamp = new Date(Math.max(Date.parse(timestamp), Date.parse(current.record.updatedAt))).toISOString()
       let updated = structuredClone(current.record)
       if (updated.cancellation && !updated.cancellation.completedAt) throw conflict('A new cancellation prevented this retry.')
       delete updated.cancellation
@@ -410,13 +439,13 @@ export class RealAnalysisService {
       if (offset === 0) { updated.retryCount++; updated.attempts = 0 }
       const operations: AnalysisTransaction[] = []
       let bytes = 0
-      while (offset < selected.length && operations.length < ANALYSIS_LIMITS.initializationChunkSize) {
+      while (offset < selected.length && operations.length < Math.floor(ANALYSIS_LIMITS.initializationChunkSize / 2)) {
         const previous = selected[offset]
-        const next = retryAnalysisComparisonRecord(previous.record, timestamp)
+        const next = retryAnalysisComparisonRecord(previous.record, batchTimestamp)
         const operation: AnalysisTransaction = { kind: 'replace', record: next, etag: previous.etag }
         const size = Buffer.byteLength(JSON.stringify(operation))
-        if (bytes + size + Buffer.byteLength(JSON.stringify(updated)) + 4096 > MAX_ANALYSIS_TRANSACTION_BYTES) break
-        updated = applyAnalysisComparisonTransition(updated, previous.record, next, timestamp)
+        if (bytes + size + Buffer.byteLength(JSON.stringify(updated)) + 64 * 1024 > MAX_ANALYSIS_TRANSACTION_BYTES) break
+        updated = applyAnalysisComparisonTransition(updated, previous.record, next, batchTimestamp)
         operations.push(operation)
         bytes += size
         offset++
@@ -440,7 +469,7 @@ export class RealAnalysisService {
     requireMatch(comparison.etag, expected)
     const manifest = await readAnalysisManifest(this.deps.blobs, run.record)
     assertComparisonManifestBinding(manifest, comparison.record)
-    const timestamp = this.now()
+    const timestamp = new Date(Math.max(Date.parse(this.now()), Date.parse(run.record.updatedAt), Date.parse(comparison.record.updatedAt))).toISOString()
     let parent = structuredClone(run.record)
     let updated: RealAnalysisComparisonRecord
     if (action === 'retry') {

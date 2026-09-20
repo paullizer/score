@@ -295,10 +295,10 @@
   .run-progress { @apply mb-5 px-5 py-4; }
   .run-progress > div { @apply mb-3 flex justify-between gap-3 text-[12px]; }
   .run-progress p { @apply mt-2 text-[10px]; color: var(--cp-text-soft); }
-  .run-progress progress { @apply block h-1.5 w-full overflow-hidden rounded-full; appearance: none; }
-  .run-progress progress::-webkit-progress-bar { background: var(--cp-surface-soft); border-radius: 10px; }
-  .run-progress progress::-webkit-progress-value { background: var(--cp-accent); border-radius: 10px; transition: width 300ms; }
-  .run-progress progress::-moz-progress-bar { background: var(--cp-accent); }
+  .run-progress progress, .summary-progress { @apply block h-1.5 w-full overflow-hidden rounded-full; appearance: none; }
+  .run-progress progress::-webkit-progress-bar, .summary-progress::-webkit-progress-bar { background: var(--cp-surface-soft); border-radius: 10px; }
+  .run-progress progress::-webkit-progress-value, .summary-progress::-webkit-progress-value { background: var(--cp-accent); border-radius: 10px; transition: width 300ms; }
+  .run-progress progress::-moz-progress-bar, .summary-progress::-moz-progress-bar { background: var(--cp-accent); }
   .sort-target { @apply flex min-w-0 items-center gap-2 text-[10px]; color: var(--cp-text-muted); }
   .sort-target select { max-width: 205px; }
   .comparison-state { @apply inline-flex items-center gap-1.5 text-[11px]; color: var(--cp-text-soft); }

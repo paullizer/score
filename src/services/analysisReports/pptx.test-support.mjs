@@ -1,12 +1,12 @@
 import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
-import { mkdir, rm } from 'node:fs/promises'
+import { mkdir, rm, writeFile } from 'node:fs/promises'
 import { join, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { build } from 'esbuild'
 import { fromBuffer } from 'yauzl'
 import { SaxesParser } from 'saxes'
-import { realReportFixture, reportFixtureCitation } from './test-support.mjs'
+import { loadReportFoundation, realReportFixture, reportFixtureCitation, withReportNarratives } from './test-support.mjs'
 
 export const PPTX_TEST_LINKS = { links: { origin: 'https://score.example', workspaceId: 'workspace-one' } }
 export const PPTX_SAMPLE_LINKS = { links: { origin: 'https://score.example' } }
@@ -20,6 +20,7 @@ export async function loadPptxTestApi() {
         export * from './src/services/analysisReports/pptx';
         export * from './src/services/analysisReports/pptx-layout';
         export * from './src/services/analysisReports/readable';
+        export * from './src/services/analysisReports/narratives';
         export * from './src/services/analysisReports/links';
         export { REPORT_LIMITS } from './src/domain/analysis-reports';
       ` },
@@ -93,7 +94,7 @@ export function inspectSlideXml(xml) {
       cell?.fonts.push(size)
     }
     if (tag.name === 'a:hlinkClick' && shape) {
-      const link = { id: tag.attributes['r:id'], tooltip: tag.attributes.tooltip ?? '' }
+      const link = { id: tag.attributes['r:id'], tooltip: tag.attributes.tooltip ?? '', action: tag.attributes.action ?? '' }
       shape.links.push(link)
       cell?.links.push(link)
     }
@@ -126,16 +127,22 @@ export function inspectSlideXml(xml) {
 }
 
 function relationships(xml) {
-  const result = new Map()
+  const external = new Map(), internal = new Map()
   const parser = new SaxesParser()
   parser.on('opentag', tag => {
     if (tag.name === 'Relationship' && tag.attributes.Type.endsWith('/hyperlink')) {
       assert.equal(tag.attributes.TargetMode, 'External')
-      result.set(tag.attributes.Id, tag.attributes.Target)
+      external.set(tag.attributes.Id, tag.attributes.Target)
+    }
+    if (tag.name === 'Relationship' && tag.attributes.Type.endsWith('/slide')) {
+      assert.ok(!tag.attributes.TargetMode || tag.attributes.TargetMode === 'Internal')
+      const number = tag.attributes.Target.match(/(?:^|\/)slide(\d+)\.xml$/)?.[1]
+      assert.ok(number, 'Native slide relationships point to actual slide XML')
+      internal.set(tag.attributes.Id, Number(number))
     }
   })
   parser.write(xml).close()
-  return result
+  return { external, internal }
 }
 
 export async function inspectPptx(bytes) {
@@ -151,9 +158,10 @@ export async function inspectPptx(bytes) {
     .map(([name, contents]) => {
       const xml = contents.toString('utf8')
       const relName = name.replace('slides/', 'slides/_rels/') + '.rels'
+      const links = relationships(entries.get(relName)?.toString('utf8') ?? '<Relationships/>')
       return {
         name, xml, ...inspectSlideXml(xml),
-        relationships: relationships(entries.get(relName)?.toString('utf8') ?? '<Relationships/>'),
+        relationships: links.external, slideRelationships: links.internal,
       }
     })
   return { bytes, entries, slides, text: slides.map(slide => slide.text).join('\n') }
@@ -191,6 +199,14 @@ export function readablePptxFixture(options = {}) {
       { label: 'Employment type', value: 'Full time' },
       { label: 'Functions', value: 'Survey design and statistical research' },
     ]
+    target.presentation = {
+      title: target.kind === 'grade' ? 'Research specialist' : 'Research analyst',
+      organization: 'Example Research Office',
+      description: 'Design surveys and conduct statistical research for public programs. Document reproducible methods, communicate findings, and coordinate delivery with research colleagues.',
+      series: target.kind === 'grade' ? '1530' : '',
+      grade: target.kind === 'grade' ? 'GS-9' : '',
+      versionLabel: target.versionLabel,
+    }
     target.criteria.forEach((criterion, index) => {
       criterion.label = `${labels[index % labels.length]}${index >= labels.length ? ` ${Math.floor(index / labels.length) + 1}` : ''}`
       criterion.description = `Review documented ${labels[index % labels.length].toLowerCase()}.`
@@ -254,7 +270,48 @@ export function longPptxFixture(criterionCount = 20) {
     citations: [], requirementCitations: [],
     limitation: { code: 'duration-not-established', message: 'Duration of specialized experience needs verification.' },
   }))
+  comparison.narrative = {
+    text: longPptxNarrative(),
+    overview: 'The record documents survey design, but sustained leadership and the duration of specialized experience need verification.',
+  }
   return input
+}
+
+export function longPptxNarrative() {
+  const sentences = [
+    'The resume documents survey design, analytical review, and reproducible methods used across national research programs, with specific examples of decisions that improved the clarity of collected evidence and made the resulting findings easier for colleagues to examine.',
+    'The recorded work connects technical research to operational delivery through documented sampling plans, reviewable analysis scripts, and explanations prepared for stakeholders who needed to understand both the practical implications and the limits of the findings.',
+    'The evidence does not establish sustained leadership of large multidisciplinary teams or the duration of specialized experience required for this grade, so those qualifications still need separate human verification against the full saved source record and the exact requirements.',
+  ]
+  return sentences.join(' ')
+}
+
+// Prepare format-specific prose before the shared fixture helper publishes and pins it.
+export function readyPptxFixture(input, options = {}) {
+  const value = structuredClone(input)
+  for (const comparison of value.comparisons) {
+    if (comparison.status !== 'complete') continue
+    const index = Number(comparison.candidate.id.split('-').at(-1))
+    comparison.narrative ??= comparison.overall.status === 'withheld' ? {
+      text: 'No overall score is available because the saved record leaves weighted requirements unassessed. The submission does not establish enough detail about research ownership and delivery to support a complete assessment. Reviewers should verify the missing context in the original resume and the separate qualification notes.',
+      overview: 'No overall score is available because the record leaves material research requirements unassessed.',
+    } : index % 2 ? {
+      text: 'The record documents repeatable statistical reporting pipelines and clear briefings for operational audiences. Those examples connect analytical methods to useful program reporting and show coordinated work with research colleagues. Wider team leadership and ownership of a complete research program are less clearly established in the submitted evidence.',
+      overview: 'Statistical reporting is well documented, but wider team leadership and full-program ownership remain less clearly established.',
+    } : {
+      text: 'The record documents national survey design and the validation of sampling plans across several research settings. Those examples connect statistical analysis to reliable delivery and reproducible methods that other researchers can review. Department-wide team leadership is not established by the submitted evidence and needs separate verification.',
+      overview: 'Survey design and analytical delivery are documented, but department-wide leadership still needs verification.',
+    }
+  }
+  for (const target of value.targets) {
+    if (!value.comparisons.some(comparison => comparison.targetId === target.id && comparison.status === 'complete')) continue
+    target.narrative ??= {
+      paragraphs: [
+        'The reviewed records show practical survey and statistical research experience, with differences in the depth of documented program ownership. Stronger examples connect analytical methods to reproducible delivery and clear communication, while leadership and specialized qualifications still require careful human review.',
+      ],
+    }
+  }
+  return withReportNarratives(value, options)
 }
 
 export function fictionalPptxFixture(kind = 'normal') {
@@ -368,4 +425,65 @@ export function fictionalPptxFixture(kind = 'normal') {
     comparison.qualifications = []
   }
   return input
+}
+
+export function powerpointLayoutFixture(kind = 'single-long') {
+  if (!['single-long', 'multi-long', 'long-candidate', 'dense'].includes(kind)) {
+    throw new Error(`Unknown PowerPoint layout fixture: ${kind}`)
+  }
+  if (kind === 'long-candidate' || kind === 'dense') {
+    return readyPptxFixture(fictionalPptxFixture(kind === 'dense' ? 'large' : 'long'))
+  }
+  const input = fictionalPptxFixture()
+  const originalTarget = structuredClone(input.targets[0])
+  const originals = kind === 'multi-long' ? input.comparisons.slice(0, 1) : input.comparisons
+  const title = 'Survey Statistician - National Survey Design, Longitudinal Methods, and Integrated Statistical Research Operations'
+  const organization = 'United States Department of Commerce / Census Bureau / National Processing Center for Survey Operations, Longitudinal Research, and Statistical Methods'
+  const context = [
+    'The frozen job overview describes responsibility for longitudinal survey design, national sampling plans, and statistical research methods used across public programs.',
+    'The work includes documented analytical review, reproducible methods, collaboration with research teams, and clear explanations of uncertainty for operational stakeholders.',
+    'The organization expects careful stewardship of captured evidence and a reviewable record of the decisions made during survey development and program delivery.',
+  ].join(' ')
+  input.targets = Array.from({ length: kind === 'multi-long' ? 2 : 1 }, (_, index) => ({
+    ...structuredClone(originalTarget), id: `target-${index}`, rubricId: `target-${index}`,
+    rubricVersion: index + 1, versionLabel: `Saved illustrative rubric v${index + 1}`,
+    presentation: {
+      title, organization, series: '1530', grade: index ? 'GS-13' : 'GS-12',
+      versionLabel: `Saved illustrative rubric v${index + 1}`,
+      description: `${context}\n\n${context}\n\nThe final frozen context sentence must remain visible after pagination.`,
+    },
+    narrative: {
+      paragraphs: [
+        'The reviewed fictional records document survey design, analytical methods, and practical research delivery. The strongest examples connect sampling decisions to reproducible analysis and explain how the findings were communicated to research colleagues.',
+        'The evidence differs in the depth of program ownership and the scale of documented leadership. Reviewers should distinguish small-team coordination from department-wide responsibilities, and verify qualifications in the exact saved source record rather than infer additional experience.',
+      ],
+    },
+  }))
+  input.comparisons = input.targets.flatMap((target, targetIndex) => originals.map((comparison, candidateIndex) => ({
+    ...structuredClone(comparison), id: `comparison-${targetIndex * originals.length + candidateIndex}`,
+    index: targetIndex * originals.length + candidateIndex, targetId: target.id,
+  })))
+  return readyPptxFixture(input)
+}
+
+export async function writePowerpointLayoutExamples(directory, kinds = ['single-long', 'multi-long']) {
+  if (!Array.isArray(kinds) || !kinds.length || kinds.length > 4 || new Set(kinds).size !== kinds.length) {
+    throw new Error('Choose between one and four distinct PowerPoint fixture variants.')
+  }
+  const inputs = kinds.map(kind => ({ kind, input: powerpointLayoutFixture(kind) }))
+  const [foundation, pptx] = await Promise.all([loadReportFoundation(), loadPptxTestApi()])
+  try {
+    await mkdir(directory, { recursive: true })
+    const files = []
+    for (const { kind, input } of inputs) {
+      const report = foundation.api.buildAnalysisReport(input)
+      const bytes = await pptx.api.generatePptxReport(report, PPTX_SAMPLE_LINKS)
+      const path = join(directory, `powerpoint-layout-${kind}.pptx`)
+      await writeFile(path, bytes)
+      files.push({ path, slides: (await inspectPptx(bytes)).slides.length })
+    }
+    return files
+  } finally {
+    await Promise.all([foundation.cleanup(), pptx.cleanup()])
+  }
 }

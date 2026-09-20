@@ -18,6 +18,7 @@ await build({
     resolveDir: root,
     contents: [
       'service', 'routes', 'validation', 'snapshots', 'diagnostics', 'paging', 'lifecycle', 'library-lifecycle', 'guards', 'azure-store',
+      'narratives', 'narrative-records', 'narrative-artifacts', 'narrative-scheduling',
     ].map(name => `export * from './server/analyses/${name}.ts';`).join('\n') +
       "\nexport * from './server/errors.ts'; export * from './server/store.ts';" +
       "\nexport * from './server/ids.ts'; export * from './server/middleware.ts';" +
@@ -165,7 +166,10 @@ export function analysisStore() {
       for (const operation of operations) {
         api.parseAnalysisEntity(operation.record)
         assert.equal(operation.record.workspaceId, workspaceId)
-        if (operation.record.recordType === 'analysis-comparison') assert.equal(operation.record.runId, runs[0].record.id)
+        if (operation.record.recordType !== 'analysis-run') assert.equal(operation.record.runId, runs[0].record.id)
+        if (operation.kind !== 'delete' && operation.record.recordType.includes('narrative')) {
+          assert.ok(operation.record.updatedAt <= runs[0].record.updatedAt, 'The parent timestamp fences every narrative generation.')
+        }
         const old = values.get(key(workspaceId, operation.record.id))
         if (operation.kind === 'create' ? old : !old || old.etag !== operation.etag) throw new api.StoreConflictError()
         if (old) api.assertAnalysisReplacement(old.record, operation.record)
@@ -209,13 +213,19 @@ export function analysisStore() {
       return [...values.values()].filter(item => api.analysisWorkIsPending(item.record, now))
         .filter(({ record }) => {
           const state = controls.get(key(record.workspaceId, api.analysisControlId()))?.record.state ?? 'active'
-          if (state !== 'active' && !(state === 'archived' && record.recordType === 'analysis-run' && record.cancellation)) return false
+          if (state !== 'active' && !(state === 'archived' &&
+            (record.recordType === 'analysis-run' && record.cancellation || record.recordType === 'analysis-narrative-request'))) return false
           if (record.recordType === 'analysis-run') return true
           const parent = values.get(key(record.workspaceId, record.runId))
           assert.equal(parent?.record.recordType, 'analysis-run')
-          return api.analysisRunCanScore(parent.record)
+          return record.recordType === 'analysis-comparison' ? api.analysisRunCanScore(parent.record)
+            : record.recordType === 'analysis-narrative-request'
+              ? api.analysisNarrativeRequestCanAdvance(parent.record, record) &&
+                (state !== 'archived' || api.analysisNarrativeRequestCancelled(parent.record, record))
+              : api.analysisNarrativeCanWork(parent.record, record) && !parent.record.narrativeRequestId
         })
-        .sort((a, b) => (a.record.recordType === 'analysis-run' ? 0 : 1) - (b.record.recordType === 'analysis-run' ? 0 : 1))
+        .sort((a, b) => ['analysis-run', 'analysis-comparison', 'analysis-narrative-request', 'analysis-candidate-narrative', 'analysis-target-narrative'].indexOf(a.record.recordType) -
+          ['analysis-run', 'analysis-comparison', 'analysis-narrative-request', 'analysis-candidate-narrative', 'analysis-target-narrative'].indexOf(b.record.recordType))
         .slice(0, limit).map(clone)
     },
     async getControl(workspaceId, runId) { return clone(controls.get(key(workspaceId, api.analysisControlId(runId)))) },
@@ -532,16 +542,17 @@ export async function createRun(f, resumeCount = 1, targetCount = 1) {
 export async function finishInitialization(f, id) {
   return api.advanceAnalysisRun(f.analysis, f.workspaceId, id, { now: () => new Date(f.now), maxChunks: 4 })
 }
-export async function publishResult(f, runId, comparisonId, withheld = false) {
+export async function publishResult(f, runId, comparisonId, withheld = false, { scheduleNarratives = true } = {}) {
   let run = await f.analysis.store.get(f.workspaceId, runId)
   let comparison = await f.analysis.store.get(f.workspaceId, comparisonId)
+  const timestamp = new Date(Math.max(Date.parse(f.now), Date.parse(run.record.updatedAt), Date.parse(comparison.record.updatedAt))).toISOString()
   const attemptId = randomUUID()
-  const running = { ...comparison.record, status: 'running', attempts: 1, attemptId, updatedAt: f.now,
-    lease: { owner: 'test-worker', heartbeatAt: f.now, expiresAt: LATER } }
+  const running = { ...comparison.record, status: 'running', attempts: 1, attemptId, updatedAt: timestamp,
+    lease: { owner: 'test-worker', heartbeatAt: timestamp, expiresAt: LATER } }
   delete running.nextAttemptAt
   await f.analysis.store.transact(f.workspaceId, [
     { kind: 'replace', record: running, etag: comparison.etag },
-    { kind: 'replace', record: api.applyAnalysisComparisonTransition(run.record, comparison.record, running, f.now), etag: run.etag },
+    { kind: 'replace', record: api.applyAnalysisComparisonTransition(run.record, comparison.record, running, timestamp), etag: run.etag },
   ])
   run = await f.analysis.store.get(f.workspaceId, runId)
   comparison = await f.analysis.store.get(f.workspaceId, comparisonId)
@@ -559,10 +570,10 @@ export async function publishResult(f, runId, comparisonId, withheld = false) {
   const assessment = { criteria, qualifications: [], summary: 'Evidence in the submitted document, for human review only.', limitations: [] }
   const assessmentSha256 = api.analysisHash(assessment)
   const model = { model: 'test-assessor', deployment: 'test-deployment', promptVersion: 'assessment-v1', schemaVersion: '1',
-    startedAt: f.now, completedAt: f.now, inputCharacters: 1000 }
+    startedAt: timestamp, completedAt: timestamp, inputCharacters: 1000 }
   const result = api.parseAnalysisResult({
     ...assessment, ...api.calculateAnalysisSummary(criteria), schemaVersion: 1, dataKind: 'real', workspaceId: f.workspaceId,
-    runId, comparisonId, createdAt: f.now, humanReviewRequired: true, provenance: {
+    runId, comparisonId, createdAt: timestamp, humanReviewRequired: true, provenance: {
       attemptId, manifestSha256: run.record.manifest.sha256, assessmentSha256, assessment: model,
       resumeSnapshot: { snapshotId: comparison.record.resume.snapshotId, sha256: comparison.record.resume.blob.sha256 },
       targetSnapshot: { snapshotId: comparison.record.target.snapshotId, sha256: comparison.record.target.blob.sha256 },
@@ -575,12 +586,15 @@ export async function publishResult(f, runId, comparisonId, withheld = false) {
     },
   })
   const reference = await api.putAnalysisJson(f.analysis.blobs, `${f.workspaceId}/${runId}/results/${comparisonId}/${attemptId}.json`, result)
-  const completed = { ...comparison.record, status: 'complete', completedAt: f.now, result: reference,
+  const completed = { ...comparison.record, status: 'complete', completedAt: timestamp, result: reference,
     resultSummary: { completion: result.completion, overall: result.overall, coverage: result.coverage } }
   delete completed.lease
+  const parent = api.applyAnalysisComparisonTransition(run.record, comparison.record, completed, timestamp)
   await f.analysis.store.transact(f.workspaceId, [
     { kind: 'replace', record: completed, etag: comparison.etag },
-    { kind: 'replace', record: api.applyAnalysisComparisonTransition(run.record, comparison.record, completed, f.now), etag: run.etag },
+    { kind: 'replace', record: parent, etag: run.etag },
+    ...(scheduleNarratives ? await api.prepareAnalysisNarrativeTransitions(f.analysis.store, parent,
+      [{ previous: comparison.record, next: completed }], timestamp) : []),
   ])
   return { result, completed, reference }
 }

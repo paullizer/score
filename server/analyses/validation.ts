@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto'
 import { z } from 'zod'
 import { REPORT_LIMITS } from '../../src/domain/analysis-reports'
+import type { RealAnalysisNarrativeRecord } from '../../src/domain/analysis-narratives'
 import {
   ANALYSIS_CITATION_REASONS, ANALYSIS_DIAGNOSTIC_FIELDS, ANALYSIS_DIAGNOSTIC_LIMITS,
   ANALYSIS_DIAGNOSTIC_REASONS, ANALYSIS_REVIEW_ISSUE_CODES, ANALYSIS_SCHEMA_ISSUE_CODES, ANALYSIS_TELEMETRY_EVENTS,
@@ -55,6 +56,7 @@ const unique = <T>(values: T[]) => new Set(values).size === values.length
 const runId = id('analysis-run')
 const comparisonId = id('analysis-comparison')
 const snapshotId = id('analysis-snapshot')
+export const analysisNarrativeTargetIdSchema = z.string().regex(/^target-[a-f0-9]{48}$/)
 const citations = z.array(citationSchema).max(60)
 const originalContentTypes = z.enum(ORIGINAL_CONTENT_TYPES)
 const contentTypes = z.enum(DOCUMENT_BLOB_CONTENT_TYPES)
@@ -108,6 +110,9 @@ export const retryAnalysisInputSchema = z.strictObject({
   comparisonIds: z.array(comparisonId).min(1).max(ANALYSIS_LIMITS.maxComparisons).refine(unique).optional(),
 })
 export const emptyAnalysisInputSchema = z.strictObject({})
+export const generateAnalysisSummariesInputSchema = z.strictObject({
+  mode: z.enum(['missing', 'all']), targetId: analysisNarrativeTargetIdSchema.optional(),
+})
 export const reportComparisonIdsSchema = z.array(comparisonId).min(1).max(REPORT_LIMITS.batchComparisons).refine(unique)
 export const analysisLifecycleInputSchema = z.strictObject({ action: z.enum(['archive', 'unarchive', 'delete']) })
 
@@ -179,6 +184,8 @@ const runSchema = z.strictObject({
   cancellation: z.strictObject({
     requestedAt: timestamp, requestedBy: text(200), nextComparisonIndex: count, completedAt: timestamp.optional(),
   }).optional(),
+  narrativeRequestId: z.string().uuid().optional(),
+  narrativeCancelledAt: timestamp.optional(),
 })
 const comparisonSchema = z.strictObject({
   ...base, id: comparisonId, recordType: z.literal('analysis-comparison'), runId, index: count,
@@ -191,7 +198,44 @@ const comparisonSchema = z.strictObject({
     attemptId: z.string().uuid(), status: z.enum(['saved', 'unavailable']), pipelineVersion: text(200),
   }).optional(),
 })
-const entitySchema = z.discriminatedUnion('recordType', [runSchema, comparisonSchema])
+const narrativeIdentity = z.strictObject({ snapshotId, sha256: hash })
+const narrativePublicationSchema = z.strictObject({
+  revision: hash, inputFingerprint: hash, generationId: z.string().uuid(), publishedAt: timestamp,
+  blob: jsonReferenceSchema,
+})
+const narrativeBase = {
+  ...base, schemaVersion: z.literal(1), runId, manifestSha256: hash, targetId: analysisNarrativeTargetIdSchema,
+  targetSnapshot: narrativeIdentity,
+  status: z.enum(['waiting', 'queued', 'running', 'ready', 'failed', 'cancelled']),
+  generationId: z.string().uuid(), requestId: z.string().uuid(), requestedAt: timestamp,
+  requestedBy: text(200).nullable(),
+  reason: z.enum(['missing', 'all', 'comparison-completed', 'comparison-changed']),
+  inputFingerprint: hash.nullable(), waitingFor: z.enum(['scoring', 'candidate-narratives']).optional(),
+  published: narrativePublicationSchema.optional(),
+  error: z.strictObject({
+    code: z.enum([...errorSchema.shape.code.options, 'dependency-failed']),
+    stage: z.enum(['dependencies', 'candidate-generation', 'target-generation', 'grounding', 'publication']),
+    message: text(2000), retryable: z.boolean(),
+  }).optional(),
+}
+const candidateNarrativeSchema = z.strictObject({
+  ...narrativeBase, id: z.string(), recordType: z.literal('analysis-candidate-narrative'),
+  comparisonId, resumeSnapshot: narrativeIdentity, resultSha256: hash, inputFingerprint: hash,
+})
+const targetNarrativeSchema = z.strictObject({
+  ...narrativeBase, id: z.string(), recordType: z.literal('analysis-target-narrative'),
+})
+const narrativeRequestSchema = z.strictObject({
+  ...base, id: z.string(), recordType: z.literal('analysis-narrative-request'), runId, manifestSha256: hash,
+  requestId: z.string().uuid(), requestedBy: text(200), mode: z.enum(['missing', 'all']),
+  targetId: analysisNarrativeTargetIdSchema.nullable(), scopeRevision: hash, plan: jsonReferenceSchema,
+  status: z.enum(['queued', 'complete', 'cancelled']),
+  nextIndex: z.number().int().min(0).max(ANALYSIS_LIMITS.maxComparisons * 2),
+  scheduled: z.strictObject({ candidates: count, targets: count }),
+})
+const entitySchema = z.discriminatedUnion('recordType', [
+  runSchema, comparisonSchema, candidateNarrativeSchema, targetNarrativeSchema, narrativeRequestSchema,
+])
 const manifestSchema = z.strictObject({
   schemaVersion: z.literal(1), dataKind: z.literal('real'), workspaceId: workspace, runId,
   createdAt: timestamp, createdBy: text(200), inputFingerprint: hash, request: createAnalysisInputSchema,
@@ -219,6 +263,29 @@ export function parseAnalysisTargetSummary(value: unknown) {
 export function isAnalysisId(value: string, kind: 'run' | 'comparison' | 'snapshot'): boolean {
   return new RegExp(`^analysis-${kind}-${UUID}$`).test(value)
 }
+export function analysisNarrativeId(kind: 'candidate' | 'target' | 'request', runId: string, subjectId: string): string {
+  return `analysis-${kind === 'request' ? 'narrative-request' : `${kind}-narrative`}:${runId}:${subjectId}`
+}
+export function isAnalysisRecordId(value: string): boolean {
+  if (isAnalysisId(value, 'run') || isAnalysisId(value, 'comparison')) return true
+  const [kind, run, subject, extra] = value.split(':')
+  if (extra !== undefined || !isAnalysisId(run ?? '', 'run')) return false
+  return kind === 'analysis-candidate-narrative' ? isAnalysisId(subject ?? '', 'comparison')
+    : kind === 'analysis-target-narrative' ? analysisNarrativeTargetIdSchema.safeParse(subject).success
+      : kind === 'analysis-narrative-request' && new RegExp(`^${UUID}$`).test(subject ?? '')
+}
+export function analysisNarrativeBlobName(
+  workspaceId: string, runId: string, kind: 'candidate' | 'target', subjectId: string, generationId: string, attemptId: string,
+): string {
+  const name = `${workspaceId}/${runId}/narratives/${kind}/${subjectId}/${generationId}/${attemptId}.json`
+  assertAnalysis(isSafeAnalysisBlobName(name), 'Invalid narrative publication identity.')
+  return name
+}
+export function analysisNarrativeRequestBlobName(workspaceId: string, runId: string, requestId: string): string {
+  const name = `${workspaceId}/${runId}/narratives/requests/${requestId}.json`
+  assertAnalysis(isSafeAnalysisBlobName(name), 'Invalid narrative request identity.')
+  return name
+}
 export function analysisDeterministicId(kind: 'comparison' | 'snapshot', run: string, key: string | number): string {
   const hex = analysisHash({ kind, run, key }).slice(0, 32).split('')
   hex[12] = '5'
@@ -232,6 +299,13 @@ export function isSafeAnalysisBlobName(name: string): boolean {
   if (parts.length === 3) return parts[2] === 'manifest.json'
   if (parts.length === 4 && parts[2] === 'evidence') return /^[a-f0-9]{64}\.(?:json|pdf|md|docx|doc|html)$/.test(parts[3])
   if (parts.length === 5 && parts[2] === 'snapshots' && isAnalysisId(parts[3], 'snapshot')) return /^[a-f0-9]{64}\.json$/.test(parts[4])
+  if (parts[2] === 'narratives') {
+    if (parts.length === 5 && parts[3] === 'requests') return new RegExp(`^${UUID}\\.json$`).test(parts[4])
+    return parts.length === 7 &&
+      (parts[3] === 'candidate' ? isAnalysisId(parts[4], 'comparison')
+        : parts[3] === 'target' && analysisNarrativeTargetIdSchema.safeParse(parts[4]).success) &&
+      new RegExp(`^${UUID}$`).test(parts[5]) && new RegExp(`^${UUID}\\.json$`).test(parts[6])
+  }
   return parts.length === 5 && ['results', 'diagnostics'].includes(parts[2]) && isAnalysisId(parts[3], 'comparison') &&
     new RegExp(`^${UUID}\\.json$`).test(parts[4])
 }
@@ -290,7 +364,9 @@ export function parseAnalysisEntity(value: unknown): AnalysisEntity {
       if (record.cancellation.completedAt) assertAnalysis(record.cancellation.nextComparisonIndex === p.total &&
         p.queued + p.running === 0 && record.completedAt, 'Cancellation is unfinished.')
     }
-  } else {
+    if (record.narrativeCancelledAt) assertAnalysis(record.narrativeCancelledAt <= record.updatedAt,
+      'Narrative cancellation fence is ahead of the run.')
+  } else if (record.recordType === 'analysis-comparison') {
     assertAnalysis(record.index < ANALYSIS_LIMITS.maxComparisons &&
       record.id === analysisDeterministicId('comparison', record.runId, record.index), 'Comparison identity mismatch.')
     snapshotReference(record.resume, record.workspaceId, record.runId)
@@ -315,8 +391,52 @@ export function parseAnalysisEntity(value: unknown): AnalysisEntity {
     if (record.status === 'cancelled') assertAnalysis(record.cancelledAt && !record.lease && !record.nextAttemptAt,
       'Cancelled comparisons must release work.')
     if (record.status === 'failed') assertAnalysis(record.error && !record.lease && !record.nextAttemptAt, 'Failed comparison must retain a terminal error.')
+  } else if (record.recordType === 'analysis-narrative-request') {
+    assertAnalysis(record.id === analysisNarrativeId('request', record.runId, record.requestId) &&
+      record.plan.blobName === analysisNarrativeRequestBlobName(record.workspaceId, record.runId, record.requestId),
+    'Narrative request identity mismatch.')
+    const total = record.scheduled.candidates + record.scheduled.targets
+    assertAnalysis(record.nextIndex <= total && (record.status === 'queued' ? record.nextIndex < total : record.nextIndex === total) &&
+      !record.lease && !record.attemptId && record.attempts === 0 && record.retryCount === 0 && !record.error && !record.nextAttemptAt,
+    'Invalid bounded narrative scheduling cursor.')
+  } else {
+    validateNarrativeRecord(record)
   }
   return record
+}
+
+function validateNarrativeRecord(record: RealAnalysisNarrativeRecord): void {
+  const kind = record.recordType === 'analysis-candidate-narrative' ? 'candidate' : 'target'
+  const subject = record.recordType === 'analysis-candidate-narrative' ? record.comparisonId : record.targetId
+  assertAnalysis(record.id === analysisNarrativeId(kind, record.runId, subject) &&
+    record.requestedAt >= record.createdAt && record.requestedAt <= record.updatedAt, 'Narrative identity or request time mismatch.')
+  if (kind === 'candidate') assertAnalysis(record.status !== 'waiting' && !record.waitingFor, 'Candidate work cannot wait on other narratives.')
+  if (record.recordType === 'analysis-candidate-narrative') assertAnalysis(record.inputFingerprint === analysisHash({
+    kind: 'candidate', workspaceId: record.workspaceId, runId: record.runId, manifestSha256: record.manifestSha256,
+    targetId: record.targetId, targetSnapshot: record.targetSnapshot, comparisonId: record.comparisonId,
+    resumeSnapshot: record.resumeSnapshot, resultSha256: record.resultSha256,
+  }), 'Candidate narrative fingerprint does not bind its saved input identities.')
+  if (record.status === 'waiting') assertAnalysis(record.inputFingerprint === null && record.waitingFor && !record.lease,
+    'Waiting target work must identify its prerequisites.')
+  else assertAnalysis(!record.waitingFor, 'Only waiting targets have prerequisite state.')
+  if (record.status === 'running') assertAnalysis(record.attemptId && record.attempts > 0 && record.lease &&
+    record.inputFingerprint && !record.nextAttemptAt && !record.error, 'Running narrative work requires a fingerprint and lease.')
+  else assertAnalysis(!record.lease, 'Only running narratives retain a lease.')
+  if (record.status === 'queued') assertAnalysis(record.inputFingerprint && record.nextAttemptAt, 'Queued narrative work requires exact inputs and a due time.')
+  if (record.status === 'failed') assertAnalysis(record.error && !record.nextAttemptAt, 'Failed narrative work requires a safe terminal error.')
+  if (record.status === 'cancelled') assertAnalysis(!record.nextAttemptAt, 'Cancelled narrative work cannot remain scheduled.')
+  if (record.published) {
+    const publication = record.published
+    const parts = publication.blob.blobName.split('/')
+    assertAnalysis(publication.revision === publication.blob.sha256 && publication.publishedAt <= record.updatedAt &&
+      publication.blob.blobName === analysisNarrativeBlobName(record.workspaceId, record.runId, kind, subject,
+        publication.generationId, parts[6]?.replace(/\.json$/, '')),
+    'Narrative publication ownership or revision mismatch.')
+  }
+  if (record.status === 'ready') assertAnalysis(record.published && record.inputFingerprint && record.attemptId &&
+    record.published.generationId === record.generationId && record.published.inputFingerprint === record.inputFingerprint &&
+    record.published.blob.blobName === analysisNarrativeBlobName(record.workspaceId, record.runId, kind, subject, record.generationId, record.attemptId) &&
+    !record.nextAttemptAt && !record.error, 'Ready narratives require the current published generation.')
 }
 
 export function parseAnalysisInitializationManifest(value: unknown): RealAnalysisInitializationManifest {

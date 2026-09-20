@@ -167,6 +167,7 @@ export function createApp(deps: AppDeps): Express {
       realGradeLadders: Boolean(grades), gradeLimits: GRADE_LADDER_LIMITS,
       realResumeImports: Boolean(resumes), markdownResumeImports: Boolean(resumes), resumeLimits: RESUME_IMPORT_LIMITS,
       realAnalyses: canCreateAnalyses, analysisLimits: ANALYSIS_LIMITS,
+      analysisSummaryGeneration: Boolean(analyses),
       wordDocumentImports: wordDocumentImports && Boolean(jobs || resumes),
     })
   })

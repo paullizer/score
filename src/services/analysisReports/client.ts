@@ -66,14 +66,14 @@ export async function generateReportInWorker(
 ): Promise<ArrayBuffer> {
   options.signal.throwIfAborted()
   assertReportResourceLimits(report)
-  const links = format === 'docx' ? options.links : validatedReportLinkContext(report, options)
+  const links = validatedReportLinkContext(report, options)
   const lifetime = new AbortController()
   const signal = AbortSignal.any([options.signal, lifetime.signal])
   const timer = setTimeout(() => lifetime.abort(new DOMException('Report generation timed out', 'TimeoutError')), REPORT_LIMITS.maxGenerationMilliseconds)
   try {
     let fonts: ReportFontData | undefined
-    if (format === 'pdf') {
-      options.onProgress?.('Loading locally bundled PDF fonts')
+    if (format === 'pdf' || format === 'docx') {
+      options.onProgress?.('Loading locally bundled document fonts')
       fonts = await reportFonts(signal)
     }
     signal.throwIfAborted()
@@ -139,7 +139,7 @@ function runWorker(
 export function downloadAnalysisReport(bytes: ArrayBuffer, report: AnalysisReport, format: AnalysisReportFormat, signal: AbortSignal): string {
   signal.throwIfAborted()
   assertReportFile(bytes, format)
-  const filename = safeReportFilename(`${report.dataKind === 'sample' ? 'Sample - ' : ''}${report.run.name}${format === 'docx' && report.partial ? ' - partial' : ''}`, format)
+  const filename = safeReportFilename(`${report.dataKind === 'sample' ? 'Sample - ' : ''}${report.run.name}`, format)
   const url = URL.createObjectURL(new Blob([bytes], { type: REPORT_FORMATS[format].mimeType }))
   const anchor = document.createElement('a')
   anchor.href = url

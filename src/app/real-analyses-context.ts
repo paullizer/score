@@ -5,6 +5,9 @@ import type {
 } from '../domain/real-analyses'
 import type { RealAnalysisDiagnosticsPage } from '../domain/analysis-diagnostics'
 import type { RealLoadState } from './real-request-scope'
+import type {
+  GenerateRealAnalysisSummariesInput, RealAnalysisSummariesMutationResponse, RealAnalysisSummariesResponse,
+} from '../domain/analysis-narratives'
 
 export interface RealAnalysesContextValue {
   workspaceId: string
@@ -24,6 +27,9 @@ export interface RealAnalysesContextValue {
   ensureComparisons: (id: string, force?: boolean) => Promise<void>
   comparison: (runId: string, comparisonId: string) => RealLoadState<RealAnalysisComparisonDetail>
   ensureComparison: (runId: string, comparisonId: string, force?: boolean) => Promise<void>
+  narratives: (runId: string, targetId?: string) => RealLoadState<RealAnalysisSummariesResponse>
+  ensureNarratives: (runId: string, targetId?: string, force?: boolean) => Promise<void>
+  generateSummaries: (runId: string, input: GenerateRealAnalysisSummariesInput, etag: string) => Promise<RealAnalysisSummariesMutationResponse>
   document: (runId: string, comparisonId: string, documentId: string, version: number, signal?: AbortSignal) => Promise<RealAnalysisDocumentResponse['document']>
   diagnostics: (runId: string, comparisonId: string, continuationToken?: string, signal?: AbortSignal) => Promise<RealAnalysisDiagnosticsPage>
   pending: (runId?: string) => boolean

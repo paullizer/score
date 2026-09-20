@@ -419,10 +419,10 @@ async function seedBrowsingInputs(fixture) {
     onModelRequest(request) {
       if (request.response_format.json_schema.name !== 'resume_rubric_assessment') return
       const input = JSON.parse(request.messages[1].content).input
+      const work = analysisPassageFor(input.resume.paragraphs, 'Applied engineering methods')
+      assert.ok(work, 'The browsing fixture must select an exact frozen assessment passage.')
       const profile = browsingProfiles.find((item) => item.name && input.resume.paragraphs.some((paragraph) => paragraph.passages.some((passage) => passage.text === item.name)))
         ?? browsingProfiles.at(-1)
-      const work = analysisPassageFor(input.resume.paragraphs, 'Applied engineering methods')
-      assert.ok(work)
       assert.deepEqual(input.qualifications, [])
       const score = profile.score
       return modelResponse({

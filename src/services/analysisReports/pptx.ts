@@ -1,34 +1,38 @@
 import PptxGenJS from 'pptxgenjs'
 import { REPORT_LIMITS } from '../../domain/analysis-reports'
 import type {
-  AnalysisReport, ReportComparison, ReportGenerationOptions, ReportGroup,
+  AnalysisReport, ReportComparison, ReportGenerationOptions, ReportGroup, ReportTargetPresentation,
 } from '../../domain/analysis-reports'
 import { reportReviewLinks, validatedReportLinkContext } from './links'
 import { assertReportResourceLimits } from './model'
+import { getDisplayName } from '../../domain/displayNames'
 import {
-  assertXmlText, overallScoreLabel, REPORT_FONT_FAMILY, REPORT_PALETTE, REPORT_TITLE, reportTitle,
+  candidateNarrativeOverview, candidateNarrativeText, reportTargetPresentation,
+  requireReportNarratives, targetNarrativeParagraphs,
+} from './narratives'
+import {
+  assertXmlText, criterionScoreLabel, evidenceStatusLabel, formatReportWeight, overallScoreLabel,
+  REPORT_FONT_FAMILY, REPORT_PALETTE, REPORT_TITLE, reportTitle,
 } from './presentation'
-import {
-  assessmentHighlights, assessmentIntroduction, assessmentSummary, compactReportText, criterionReviews, qualificationNotes,
-  readableAnalysisDate, readableCandidateName, readableCompletionNotice, readableJobFacts,
-  readableTargetLabel, selectKeyCriteria,
-} from './readable'
+import { readableAnalysisDate, readableCandidateName, readableCompletionNotice, selectKeyCriteria } from './readable'
 import type { ReadableCriterion } from './readable'
-import { assertPptxBox, measurePptxText, PPTX_LAYOUT } from './pptx-layout'
-import type { PptxBox } from './pptx-layout'
+import {
+  assertPptxBox, keepPptxParagraphEndWordsTogether, measurePptxText, paginatePptxBlocks, PPTX_LAYOUT,
+} from './pptx-layout'
+import type { PptxBox, PptxFlowBlock } from './pptx-layout'
 
 const C = REPORT_PALETTE
 const BODY_WIDTH = PPTX_LAYOUT.width - 2 * PPTX_LAYOUT.margin
-const CONTENT_BOTTOM = 6.22
-const LINKS_Y = 6.43
+const CONTENT_BOTTOM = PPTX_LAYOUT.bodyBottom
+const LINKS_Y = 6.55
 const TABLE_FONT = PPTX_LAYOUT.tableFontSize
 const TABLE_PADDING_X = 0.14
 const TABLE_PADDING_Y = 0.05
 const HEADER_HEIGHT = 0.46
 const REVIEW_TABLE_Y = 2.58
-const EXPLANATION_Y = 2.58
 const COLUMN_GAP = 0.36
 const EXPLANATION_WIDTH = (BODY_WIDTH - COLUMN_GAP) / 2
+const EXPLANATION_TEXT_GAP = 0.04
 const HUMAN_REVIEW = 'Human review required. Evidence matches are not hiring decisions or official GS eligibility findings.'
 const LIMIT_MESSAGE = 'Narrow the export to one exact job/grade target; the export was not generated.'
 const WEIGHT_NOTICE = 'Weights: ~ rounded to two decimals; <0.01% is a positive weight below 0.01%.'
@@ -42,6 +46,19 @@ function hyperlink(url: string, tooltip?: string): PptxGenJS.HyperlinkProps {
   return { url, ...(tooltip ? { tooltip } : {}) }
 }
 
+function internalLink(slide: number): PptxGenJS.HyperlinkProps {
+  if (!Number.isInteger(slide) || slide < 1) throw new Error('PowerPoint navigation has no valid destination.')
+  return { slide }
+}
+
+function height(value: string, width: number, fontSize: number): number {
+  return measurePptxText(value, width, fontSize).height
+}
+
+function fits(value: string, width: number, available: number, fontSize: number): boolean {
+  return height(value, width, fontSize) <= available + 0.000001
+}
+
 function text(
   slide: PptxGenJS.Slide, value: TextValue, box: PptxBox, fontSize = 16,
   options: PptxGenJS.TextPropsOptions = {},
@@ -49,8 +66,9 @@ function text(
   const plain = typeof value === 'string' ? value : value.map(run => run.text).join('')
   assertXmlText(plain)
   assertPptxBox(box)
-  const height = measurePptxText(plain, box.w, fontSize).height
-  if (height > box.h + 0.00001) throw new Error(`PowerPoint text exceeds its readable layout budget. ${LIMIT_MESSAGE}`)
+  if (!fits(plain, box.w, box.h, fontSize)) {
+    throw new Error(`PowerPoint text exceeds its readable layout budget. ${LIMIT_MESSAGE}`)
+  }
   slide.addText(value, {
     ...box, fontFace: REPORT_FONT_FAMILY, fontSize, color: C.text, margin: 0, lang: 'en-US',
     breakLine: false, paraSpaceAfter: 0, paraSpaceBefore: 0, lineSpacingMultiple: PPTX_LAYOUT.lineHeight,
@@ -63,27 +81,22 @@ function rectangle(slide: PptxGenJS.Slide, box: PptxBox, color: string, name: st
   slide.addShape('rect', { ...box, objectName: name, fill: { color }, line: { color, width: 0 } })
 }
 
-function compactToBox(value: string, width: number, height: number, fontSize: number, fallback: string): string {
-  if (measurePptxText(value, width, fontSize).height <= height + 0.000001) return value
-  let limit = Math.min(Array.from(value).length, 480)
-  while (limit >= 16) {
-    const candidate = compactReportText(value, limit)
-    if (measurePptxText(candidate, width, fontSize).height <= height + 0.000001) return candidate
-    limit = Math.floor(limit * 0.82)
-  }
-  return fallback
+function linkText(
+  slide: PptxGenJS.Slide, label: string, url: string, box: PptxBox, name: string, tooltip?: string,
+): void {
+  text(slide, label, box, 14, {
+    color: C.accent, underline: { style: 'sng' }, hyperlink: hyperlink(url, tooltip), objectName: name,
+  })
 }
 
-function linkText(slide: PptxGenJS.Slide, label: string, url: string, box: PptxBox, name: string): void {
-  text(slide, label, box, 14, {
-    color: C.accent, underline: { style: 'sng' }, hyperlink: hyperlink(url), objectName: name,
-  })
+function sectionReference(group: ReportGroup, groupIndex: number): string {
+  return `Section ${groupIndex + 1} · ${group.target.kind === 'grade' ? 'Grade' : 'Job'} analysis`
 }
 
 class ReportDeck {
   readonly presentation = new PptxGenJS()
   private readonly startedAt = Date.now()
-  private slideCount = 0
+  slideCount = 0
 
   constructor(readonly report: AnalysisReport, readonly options?: ReportGenerationOptions) {
     this.presentation.layout = 'LAYOUT_WIDE'
@@ -102,9 +115,7 @@ class ReportDeck {
     }
   }
 
-  slide(
-    title: string, reference = '', options: { titleWidth?: number; titleLink?: string; referenceLink?: string; name?: string } = {},
-  ): PptxGenJS.Slide {
+  slide(title: string, reference = '', name = 'slide-title', fontSize = 36): PptxGenJS.Slide {
     this.checkBudget()
     if (this.slideCount >= Math.min(REPORT_LIMITS.maxSlides, REPORT_LIMITS.maxPages)) {
       throw new Error(`PowerPoint exceeds the slide/page limit. ${LIMIT_MESSAGE}`)
@@ -116,27 +127,18 @@ class ReportDeck {
     text(slide, 'SCORE', { x: 0.76, y: 0.615, w: 1.04, h: 0.32 }, 12, {
       bold: true, color: C.paper, objectName: 'brand',
     })
-    const displayedReference = compactToBox(reference, 6.5, 0.3, 11, 'Analysis evidence')
-    text(slide, displayedReference, {
-      x: 2.25, y: 0.615, w: 6.5, h: 0.3,
-    }, 11, {
+    if (reference) text(slide, reference, { x: 2.25, y: 0.615, w: 6.5, h: 0.3 }, 11, {
       color: C.muted, objectName: 'job-reference',
-      ...(options.referenceLink && displayedReference !== reference ? { hyperlink: hyperlink(options.referenceLink, reference) } : {}),
     })
     if (this.report.dataKind === 'sample') {
       text(slide, 'FICTIONAL SAMPLE', { x: 9.0, y: 0.615, w: PPTX_LAYOUT.width - 9.6, h: 0.32 }, 11, {
         bold: true, align: 'right', color: C.accent, objectName: 'report-designation',
       })
     }
-    const titleWidth = options.titleWidth ?? BODY_WIDTH
-    const displayedTitle = compactToBox(title, titleWidth, 0.8, 36, 'Candidate review')
-    text(slide, displayedTitle, {
-      x: 0.6, y: 1.12, w: titleWidth, h: 0.8,
-    }, 36, {
-      bold: true, underline: { style: 'none' }, objectName: options.name ?? 'slide-title',
-      ...(options.titleLink && displayedTitle !== title ? { hyperlink: hyperlink(options.titleLink, title) } : {}),
+    if (title) text(slide, title, { x: 0.6, y: 1.12, w: BODY_WIDTH, h: height(title, BODY_WIDTH, fontSize) }, fontSize, {
+      bold: true, objectName: name,
     })
-    text(slide, `${this.slideCount}`, { x: 12.21, y: 6.45, w: 0.52, h: 0.3 }, 11, {
+    text(slide, `${this.slideCount}`, { x: 12.21, y: 6.6, w: 0.52, h: 0.3 }, 11, {
       color: C.muted, align: 'right', objectName: 'slide-number',
     })
     return slide
@@ -147,100 +149,285 @@ class ReportDeck {
   }
 }
 
-function jobFacts(slide: PptxGenJS.Slide, group: ReportGroup, y: number): void {
-  const width = (BODY_WIDTH - COLUMN_GAP) / 2
-  readableJobFacts(group.target, 4).forEach((fact, index) => {
-    const x = 0.6 + (index % 2) * (width + COLUMN_GAP)
-    const rowY = y + Math.floor(index / 2) * 0.72
-    rectangle(slide, { x, y: rowY, w: width, h: 0.62 }, C.paper, `job-fact-${index}-panel`)
-    text(slide, compactToBox(fact, width - 0.32, 0.5, 14, 'See the job requirements for details.'), {
-      x: x + 0.16, y: rowY + 0.065, w: width - 0.32, h: 0.5,
-    }, 14, { objectName: `job-fact-${index}` })
-  })
-}
-
-function sourceTargetTitle(slide: PptxGenJS.Slide, group: ReportGroup, url: string, y: number): void {
-  if (!group.target.displayName) return
-  const value = `Source target title: ${group.target.label}`
-  const displayed = compactToBox(value, BODY_WIDTH, 0.35, 14, 'View source target title')
-  text(slide, displayed, { x: 0.6, y, w: BODY_WIDTH, h: 0.35 }, 14, {
-    color: C.muted, objectName: 'source-target-title',
-    ...(displayed !== value ? { hyperlink: hyperlink(url, value) } : {}),
-  })
+function coverGraphic(slide: PptxGenJS.Slide, x: number, y: number, index: number): void {
+  if (index === 0) {
+    for (let person = 0; person < 3; person++) {
+      const box = { x: x + person * 0.24, y, w: 0.17, h: 0.17 }
+      assertPptxBox(box)
+      slide.addShape('ellipse', { ...box, fill: { color: C.accent }, line: { color: C.accent, width: 0 },
+        objectName: `cover-people-${person}-head` })
+      rectangle(slide, { ...box, y: y + 0.22, h: 0.24 }, C.accent, `cover-people-${person}-body`)
+    }
+  } else if (index === 1) {
+    for (let card = 0; card < 3; card++) {
+      rectangle(slide, { x: x + card * 0.12, y: y + card * 0.1, w: 0.46, h: 0.32 },
+        card === 1 ? C.border : C.accent, `cover-analyses-${card}`)
+    }
+  } else {
+    for (let bar = 0; bar < 3; bar++) {
+      rectangle(slide, { x: x + bar * 0.24, y: y + (2 - bar) * 0.12, w: 0.16, h: 0.22 + bar * 0.12 },
+        C.accent, `cover-comparisons-${bar}`)
+    }
+  }
 }
 
 function opening(deck: ReportDeck): void {
-  const report = deck.report
-  const single = report.groups.length === 1 ? report.groups[0] : undefined
-  const slide = deck.slide(REPORT_TITLE, report.run.name, { referenceLink: deck.links(report.groups[0].comparisons[0]).analysis })
-  const jobLabel = single ? readableTargetLabel(report, single) : `${report.groups.length} jobs and grades`
-  const targetLink = single ? deck.links(single.comparisons[0]).target : undefined
-  const jobHeight = single?.target.displayName ? 0.6 : 0.98
-  const displayedJob = compactToBox(jobLabel, BODY_WIDTH, jobHeight, 24, 'Job requirements')
-  text(slide, displayedJob, {
-    x: 0.6, y: 2.08, w: BODY_WIDTH, h: jobHeight,
-  }, 24, {
-    bold: true, underline: { style: 'none' }, objectName: 'opening-job',
-    ...(targetLink && displayedJob !== jobLabel ? { hyperlink: hyperlink(targetLink, jobLabel) } : {}),
+  const completed = deck.report.groups.flatMap(group => group.comparisons).filter(item => item.status === 'complete')
+  const slide = deck.slide(REPORT_TITLE)
+  const name = deck.report.run.name
+  text(slide, fits(name, 6.5, 0.3, 11) ? name : 'View analysis title', {
+    x: 2.25, y: 0.615, w: 6.5, h: 0.3,
+  }, 11, {
+    color: C.muted, objectName: 'job-reference',
+    hyperlink: hyperlink(deck.links(deck.report.groups[0].comparisons[0]).analysis, name),
   })
-  if (single) sourceTargetTitle(slide, single, targetLink!, 2.75)
-  const latestAnalysis = report.groups.flatMap(group => group.comparisons)
-    .map(comparison => comparison.analyzedAt).filter((date): date is string => date !== null).sort().at(-1) ?? null
-  text(slide, `Analysis date: ${readableAnalysisDate(latestAnalysis) || 'Not recorded'}`, {
-    x: 0.6, y: 3.15, w: BODY_WIDTH, h: 0.4,
+  text(slide, 'Saved evidence for an informed review.', { x: 0.6, y: 2.08, w: BODY_WIDTH, h: 0.5 }, 20, {
+    color: C.muted, objectName: 'cover-introduction',
+  })
+  const cards = [
+    { count: new Set(completed.map(item => item.candidate.id)).size, label: 'Distinct reviewed\ncandidates', name: 'candidates' },
+    { count: deck.report.groups.length, label: 'Jobs / grades\nExact saved targets', name: 'targets' },
+    { count: completed.length, label: 'Completed candidate-job\ncomparisons', name: 'comparisons' },
+  ]
+  const width = (BODY_WIDTH - COLUMN_GAP * 2) / 3
+  cards.forEach((card, index) => {
+    const x = 0.6 + index * (width + COLUMN_GAP)
+    rectangle(slide, { x, y: 2.9, w: width, h: 2.88 }, C.paper, `cover-${card.name}-card`)
+    coverGraphic(slide, x + width - 0.95, 3.15, index)
+    text(slide, `${card.count}`, { x: x + 0.24, y: 3.65, w: width - 0.48, h: 1.14 }, 60, {
+      color: C.accent, bold: true, objectName: `cover-${card.name}-count`,
+    })
+    text(slide, card.label, { x: x + 0.24, y: 4.98, w: width - 0.48, h: 0.68 }, 16, {
+      objectName: `cover-${card.name}-label`,
+    })
+  })
+  const latest = completed.map(item => item.analyzedAt).filter((date): date is string => date !== null).sort().at(-1) ?? null
+  text(slide, `Analysis date: ${readableAnalysisDate(latest) || 'Not recorded'}`, {
+    x: 0.6, y: 6.13, w: BODY_WIDTH, h: 0.35,
   }, 14, { color: C.muted, objectName: 'analysis-date' })
-  text(slide, readableCompletionNotice(report.counts, report.groups.length > 1), {
-    x: 0.6, y: 3.67, w: BODY_WIDTH, h: 0.78,
-  }, 18, { objectName: 'completion-notice' })
-  if (single) jobFacts(slide, single, 4.6)
-  else text(slide, 'Each job has its own candidate overview and evidence reviews.', {
-    x: 0.6, y: 4.7, w: BODY_WIDTH, h: 0.8,
-  }, 20, { objectName: 'grouped-introduction' })
-  text(slide, HUMAN_REVIEW, { x: 0.6, y: 6.12, w: 11.4, h: 0.6 }, 14, {
-    color: C.muted, objectName: 'human-review-notice',
+}
+
+interface AgendaEntry {
+  group: ReportGroup
+  index: number
+  presentation: ReportTargetPresentation
+  title: string
+  metadata: string
+  height: number
+  titleHeight: number
+  organizationHeight: number
+  metadataHeight: number
+}
+
+interface AgendaPage {
+  slide: PptxGenJS.Slide
+  number: number
+  entries: AgendaEntry[]
+}
+
+function targetMetadata(presentation: ReportTargetPresentation): string {
+  return [
+    presentation.series ? `Series: ${presentation.series}` : '',
+    presentation.grade ? `Grade: ${presentation.grade}` : '',
+    presentation.versionLabel,
+  ].filter(Boolean).join(' · ')
+}
+
+function reserveAgenda(deck: ReportDeck): AgendaPage[] {
+  const width = BODY_WIDTH - 1.38
+  const pages: AgendaPage[] = []
+  let entries: AgendaEntry[] = [], used = 0
+  const capacity = 3.48
+  const flush = () => {
+    if (!entries.length) return
+    const slide = deck.slide('', 'Saved analysis')
+    pages.push({ slide, number: deck.slideCount, entries })
+    entries = []
+    used = 0
+  }
+  deck.report.groups.forEach((group, index) => {
+    const presentation = reportTargetPresentation(group.target)
+    const title = getDisplayName(group.target, presentation.title)
+    const metadata = `${targetMetadata(presentation)} · ${group.counts.complete} reviewed`
+    const titleHeight = height(title, width, 20)
+    const organizationHeight = presentation.organization ? height(presentation.organization, width, 14) : 0
+    const metadataHeight = height(metadata, width, 14)
+    const entryHeight = 0.24 + titleHeight + (organizationHeight ? organizationHeight + 0.07 : 0) + metadataHeight + 0.1
+    if (entryHeight > capacity) {
+      throw new Error(`PowerPoint contents cannot fit the full job title, organization, and version at a readable size. ${LIMIT_MESSAGE}`)
+    }
+    if (entries.length && used + 0.22 + entryHeight > capacity) flush()
+    if (entries.length) used += 0.22
+    entries.push({ group, index, presentation, title, metadata, height: entryHeight, titleHeight, organizationHeight, metadataHeight })
+    used += entryHeight
+  })
+  flush()
+  return pages
+}
+
+function finishAgenda(deck: ReportDeck, pages: AgendaPage[], destinations: ReadonlyMap<string, number>): void {
+  for (const [pageIndex, page] of pages.entries()) {
+    const title = pages.length > 1 ? `Contents · ${pageIndex + 1} of ${pages.length}` : 'Contents'
+    text(page.slide, title, { x: 0.6, y: 1.12, w: BODY_WIDTH, h: height(title, BODY_WIDTH, 36) }, 36, {
+      bold: true, objectName: 'slide-title',
+    })
+    let y = PPTX_LAYOUT.bodyY
+    for (const entry of page.entries) {
+      const destination = destinations.get(entry.group.target.id)
+      if (destination === undefined) throw new Error('PowerPoint contents is missing an exact target destination.')
+      const name = `agenda-${entry.index}`
+      rectangle(page.slide, { x: 0.6, y, w: BODY_WIDTH, h: entry.height }, C.paper, `${name}-panel`)
+      text(page.slide, `${entry.index + 1}`, { x: 0.76, y: y + 0.14, w: 0.5, h: 0.48 }, 20, {
+        bold: true, color: C.accent, objectName: `${name}-number`,
+      })
+      const x = 1.4, width = BODY_WIDTH - 1.38
+      let rowY = y + 0.12
+      text(page.slide, entry.title, { x, y: rowY, w: width, h: entry.titleHeight }, 20, {
+        bold: true, color: C.accent, hyperlink: internalLink(destination), objectName: `${name}-title`,
+      })
+      rowY += entry.titleHeight + 0.07
+      if (entry.organizationHeight) {
+        text(page.slide, entry.presentation.organization, { x, y: rowY, w: width, h: entry.organizationHeight }, 14, {
+          objectName: `${name}-organization`,
+        })
+        rowY += entry.organizationHeight + 0.07
+      }
+      text(page.slide, entry.metadata, { x, y: rowY, w: width, h: entry.metadataHeight }, 14, {
+        color: C.muted, objectName: `${name}-metadata`,
+      })
+      y += entry.height + 0.22
+    }
+    if (pageIndex === 0) {
+      const notice = readableCompletionNotice(deck.report.counts, deck.report.groups.length > 1)
+      text(page.slide, notice, { x: 0.6, y: 5.73, w: BODY_WIDTH, h: 0.6 }, 14, { objectName: 'completion-notice' })
+      text(page.slide, HUMAN_REVIEW, { x: 0.6, y: 6.38, w: 11.4, h: 0.58 }, 14, {
+        color: C.muted, objectName: 'human-review-notice',
+      })
+    } else {
+      text(page.slide, 'Select a job title to open its exact saved analysis section.', {
+        x: 0.6, y: LINKS_Y, w: 11.4, h: 0.35,
+      }, 14, { color: C.muted, objectName: 'agenda-navigation-note' })
+    }
+  }
+}
+
+function targetLinks(
+  slide: PptxGenJS.Slide, deck: ReportDeck, group: ReportGroup, key: string, contentsSlide: number,
+): void {
+  linkText(slide, group.target.kind === 'grade' ? 'View grade requirements' : 'View job',
+    deck.links(group.comparisons[0]).target, { x: 0.6, y: LINKS_Y, w: 3.4, h: 0.35 }, `${key}-source-link`)
+  text(slide, 'Return to contents', { x: 9.0, y: LINKS_Y, w: 3.1, h: 0.35 }, 14, {
+    color: C.accent, underline: { style: 'sng' }, hyperlink: internalLink(contentsSlide), objectName: `${key}-contents-link`,
   })
 }
 
-function jobIntroduction(deck: ReportDeck, group: ReportGroup): void {
-  const label = readableTargetLabel(deck.report, group)
-  const links = deck.links(group.comparisons[0])
-  const slide = deck.slide(group.target.kind === 'grade' ? 'About the grade' : 'About the job', label, { referenceLink: links.target })
-  const displayedLabel = compactToBox(label, BODY_WIDTH, 1.2, 28, 'Job requirements')
-  text(slide, displayedLabel, {
-    x: 0.6, y: 2.14, w: BODY_WIDTH, h: 1.2,
-  }, 28, {
-    bold: true, objectName: 'target-label',
-    ...(displayedLabel !== label ? { hyperlink: hyperlink(links.target, label) } : {}),
+function jobIntroduction(deck: ReportDeck, group: ReportGroup, index: number, contentsSlide: number): number {
+  const presentation = reportTargetPresentation(group.target)
+  const title = getDisplayName(group.target, presentation.title)
+  const key = `target-${index}`
+  const reference = sectionReference(group, index)
+  const slide = deck.slide('', `${reference} · About the ${group.target.kind}`)
+  const destination = deck.slideCount
+  const titleHeight = height(title, BODY_WIDTH, 30)
+  const organizationHeight = presentation.organization ? height(presentation.organization, BODY_WIDTH, 20) : 0
+  const metadata = targetMetadata(presentation)
+  const metadataHeight = height(metadata, BODY_WIDTH, 14)
+  const identityBottom = 1.12 + titleHeight + 0.18 + (organizationHeight ? organizationHeight + 0.18 : 0) + metadataHeight
+  if (identityBottom > CONTENT_BOTTOM) {
+    throw new Error(`PowerPoint job identity cannot fit its full title and organization at a readable size. ${LIMIT_MESSAGE}`)
+  }
+  text(slide, title, { x: 0.6, y: 1.12, w: BODY_WIDTH, h: titleHeight }, 30, {
+    bold: true, objectName: `${key}-title`,
   })
-  sourceTargetTitle(slide, group, links.target, 3.5)
-  jobFacts(slide, group, group.target.displayName ? 4.05 : 3.75)
-  linkText(slide, group.target.kind === 'grade' ? 'View grade requirements' : 'View job', links.target, {
-    x: 0.6, y: LINKS_Y, w: 3.3, h: 0.35,
-  }, 'target-link')
+  let y = 1.12 + titleHeight + 0.18
+  if (organizationHeight) {
+    text(slide, presentation.organization, { x: 0.6, y, w: BODY_WIDTH, h: organizationHeight }, 20, {
+      color: C.muted, objectName: `${key}-organization`,
+    })
+    y += organizationHeight + 0.18
+  }
+  text(slide, metadata, { x: 0.6, y, w: BODY_WIDTH, h: metadataHeight }, 14, {
+    color: C.muted, objectName: `${key}-metadata`,
+  })
+  targetLinks(slide, deck, group, key, contentsSlide)
+  const blocks: PptxFlowBlock[] = [
+    ...(group.target.displayName !== undefined ? [{
+      key: `${key}-source-title`, text: `Source target title: ${presentation.title}`, section: 'Job context',
+    }] : []),
+    { key: `${key}-context-heading`, text: 'Job context', kind: 'heading', fontSize: 20, section: 'Job context' },
+    { key: `${key}-description`,
+      text: keepPptxParagraphEndWordsTogether(presentation.description, BODY_WIDTH, PPTX_LAYOUT.bodyFontSize), section: 'Job context' },
+    { key: `${key}-overview-heading`, text: 'Analysis overview', kind: 'heading', fontSize: 20, section: 'Analysis overview' },
+    ...(group.comparisons.some(item => item.status === 'complete')
+      ? targetNarrativeParagraphs(group.target).map((paragraph, paragraphIndex) => ({
+        key: `${key}-narrative-${paragraphIndex}`, text: paragraph, section: 'Analysis overview',
+      }))
+      : [{ key: `${key}-unassessed`, text: 'No completed assessments are available for this job or grade.', section: 'Analysis overview' }]),
+  ]
+  const bodyY = identityBottom + 0.28
+  const onOpener = CONTENT_BOTTOM - bodyY >= 1.25
+  const pages = paginatePptxBlocks(blocks, BODY_WIDTH, onOpener ? CONTENT_BOTTOM - bodyY : CONTENT_BOTTOM - PPTX_LAYOUT.bodyY, {
+    continuationHeight: CONTENT_BOTTOM - PPTX_LAYOUT.bodyY,
+  })
+  const startedSections = new Set<string>()
+  pages.forEach((page, pageIndex) => {
+    deck.checkBudget()
+    const first = onOpener && pageIndex === 0 && page.capacity <= CONTENT_BOTTOM - bodyY + 0.000001
+    const section = page.fragments[0].section ?? 'About the analysis'
+    const continued = startedSections.has(section) || page.fragments[0].continued
+    const current = first ? slide : deck.slide(`${section}${continued ? ' (continued)' : ''}`, reference)
+    if (!first) targetLinks(current, deck, group, `${key}-context-${pageIndex}`, contentsSlide)
+    if (pages[pageIndex + 1]?.fragments[0].continued) {
+      text(current, 'Continues on next slide', { x: 4.3, y: LINKS_Y, w: 4.4, h: 0.35 }, 14, {
+        color: C.muted, objectName: `${key}-context-${pageIndex}-continuation-note`,
+      })
+    }
+    const omitHeading = !first && page.fragments[0].kind === 'heading' && page.fragments[0].text === section
+    const offset = omitHeading ? page.fragments[1]?.y ?? 0 : 0
+    for (const [fragmentIndex, fragment] of page.fragments.entries()) {
+      if (fragment.section) startedSections.add(fragment.section)
+      if (omitHeading && fragmentIndex === 0) continue
+      text(current, fragment.text, {
+        x: 0.6, y: (first ? bodyY : PPTX_LAYOUT.bodyY) + fragment.y - offset, w: BODY_WIDTH, h: fragment.height,
+      }, fragment.fontSize, {
+        bold: fragment.kind === 'heading', objectName: `${fragment.key}-part-${pageIndex}-${fragmentIndex}`,
+      })
+    }
+  })
+  return destination
 }
 
 interface DeckCell {
   text: string
   url?: string
   tooltip?: string
+  runs?: PptxGenJS.TextProps[]
 }
 
 function tableRowHeight(cells: readonly DeckCell[], widths: readonly number[]): number {
   return Math.max(...cells.map((cell, index) =>
-    measurePptxText(cell.text, widths[index] - TABLE_PADDING_X * 2, TABLE_FONT).height)) + TABLE_PADDING_Y * 2
+    height(cell.text, widths[index] - TABLE_PADDING_X * 2, TABLE_FONT))) + TABLE_PADDING_Y * 2
+}
+
+function uniformRowHeights(heights: readonly number[]): number[] {
+  const maximum = Math.max(...heights)
+  return heights.map(() => maximum)
 }
 
 function table(
   slide: PptxGenJS.Slide, headers: readonly string[], rows: readonly DeckCell[][],
   widths: number[], heights: number[], y: number, name: string,
 ): void {
-  const box = { x: 0.6, y, w: BODY_WIDTH, h: HEADER_HEIGHT + heights.reduce((sum, height) => sum + height, 0) }
+  const box = { x: 0.6, y, w: BODY_WIDTH, h: HEADER_HEIGHT + heights.reduce((sum, value) => sum + value, 0) }
   assertPptxBox(box)
   const tableRows: PptxGenJS.TableRow[] = [headers.map(value => ({ text: value })), ...rows].map((row, rowIndex) =>
     row.map((cell: DeckCell) => {
       assertXmlText(cell.text)
+      if (cell.runs && cell.runs.map(run => run.text).join('') !== cell.text) {
+        throw new Error('PowerPoint table links must preserve the complete measured cell text.')
+      }
       return {
-        text: cell.url ? [{ text: cell.text, options: { color: C.accent, hyperlink: hyperlink(cell.url, cell.tooltip) } }] : cell.text,
+        text: cell.runs ?? (cell.url ? [{ text: cell.text, options: { color: C.accent, hyperlink: hyperlink(cell.url, cell.tooltip) } }] : cell.text),
         options: {
           bold: rowIndex === 0, color: rowIndex === 0 ? C.paper : cell.url ? C.accent : C.text,
           fill: { color: rowIndex === 0 ? C.text : rowIndex % 2 ? C.paper : C.background },
@@ -255,312 +442,497 @@ function table(
   })
 }
 
-function overview(deck: ReportDeck, group: ReportGroup, groupIndex: number): void {
+function resumeDocumentReference(comparison: ReportComparison): string {
+  return `Resume v${comparison.candidate.documentVersion}`
+}
+
+function candidateTooltip(comparison: ReportComparison): string {
+  const name = readableCandidateName(comparison.candidate)
+  return comparison.candidate.displayName !== undefined
+    ? `${name} · Source-stated name: ${comparison.candidate.name ?? 'Not stated'} · Source: ${comparison.candidate.sourceLabel}`
+    : name
+}
+
+function overviewCandidateCell(
+  comparison: ReportComparison, number: number, links: ReviewLinks, width: number, overviewSlide?: number,
+): DeckCell {
+  const name = readableCandidateName(comparison.candidate)
+  const tooltip = candidateTooltip(comparison)
+  if (fits(name, width, 1.1, TABLE_FONT)) return { text: name, url: links.analysis, tooltip }
+  const label = `Candidate ${number}`
+  const source = fits(`${label}\n${comparison.candidate.sourceLabel}\nView analysis`, width, 1.4, TABLE_FONT)
+    ? comparison.candidate.sourceLabel : resumeDocumentReference(comparison)
+  return {
+    text: `${label}\n${source}\nView analysis`,
+    runs: [
+      { text: `${label}\n`, options: { color: C.accent, hyperlink: overviewSlide ? internalLink(overviewSlide) : hyperlink(links.analysis, tooltip) } },
+      { text: `${source}\n`, options: { color: C.accent, hyperlink: hyperlink(links.resume, comparison.candidate.sourceLabel) } },
+      { text: 'View analysis', options: { color: C.accent, hyperlink: hyperlink(links.analysis, tooltip) } },
+    ],
+  }
+}
+
+function overview(deck: ReportDeck, group: ReportGroup, groupIndex: number, candidateOverviews: ReadonlyMap<string, number>): void {
   const widths = [2.75, 2.35, BODY_WIDTH - 5.1]
-  const y = PPTX_LAYOUT.bodyY
-  const capacity = CONTENT_BOTTOM - y
-  const label = readableTargetLabel(deck.report, group)
-  let rows: DeckCell[][] = []
-  let heights: number[] = []
-  let used = HEADER_HEIGHT
-  let page = 0
+  const y = PPTX_LAYOUT.bodyY, capacity = CONTENT_BOTTOM - y
+  let rows: DeckCell[][] = [], heights: number[] = [], page = 0
   const flush = () => {
-    const slide = deck.slide('Candidates at a glance', label, { referenceLink: deck.links(group.comparisons[0]).target })
-    if (rows.length) table(slide, ['Name', 'Score', 'Assessment highlights'], rows, widths, heights, y, `overview-${groupIndex}-${page}`)
+    const slide = deck.slide('Candidates at a glance', sectionReference(group, groupIndex))
+    if (rows.length) table(slide, ['Name', 'Score', 'Assessment overview'], rows, widths, uniformRowHeights(heights), y, `overview-${groupIndex}-${page}`)
     else text(slide, 'No completed assessments are available for this job yet.', {
       x: 0.6, y, w: BODY_WIDTH, h: 0.8,
     }, 18, { objectName: 'empty-overview' })
-    text(slide, 'Select a name to view the full analysis.', { x: 0.6, y: LINKS_Y, w: 9.5, h: 0.35 }, 14, {
+    text(slide, 'Use candidate links for the overview, saved analysis, or resume.', { x: 0.6, y: LINKS_Y, w: 11.4, h: 0.35 }, 14, {
       color: C.muted, objectName: 'overview-link-note',
     })
     rows = []
     heights = []
-    used = HEADER_HEIGHT
     page++
   }
-  for (const comparison of group.comparisons) {
+  for (const [index, comparison] of group.comparisons.entries()) {
     if (comparison.status !== 'complete') continue
-    const name = readableCandidateName(comparison.candidate)
-    const links = deck.links(comparison)
-    const tooltip = comparison.candidate.displayName
-      ? `${name} · Source-stated name: ${comparison.candidate.name ?? 'Not stated'} · Source: ${comparison.candidate.sourceLabel}`
-      : name
-    const highlights = assessmentHighlights(group.target, comparison, 180)
     const row = [
-      {
-        text: compactToBox(name, widths[0] - TABLE_PADDING_X * 2, 0.65, TABLE_FONT, 'View candidate name'),
-        url: links.analysis, tooltip,
-      },
+      overviewCandidateCell(comparison, index + 1, deck.links(comparison), widths[0] - TABLE_PADDING_X * 2,
+        candidateOverviews.get(comparison.id)),
       { text: comparison.overall.status === 'available' ? overallScoreLabel(comparison.overall) : 'Withheld' },
-      { text: highlights },
+      { text: candidateNarrativeOverview(comparison) },
     ]
-    const height = tableRowHeight(row, widths)
-    if (HEADER_HEIGHT + height > capacity) throw new Error(`PowerPoint overview row exceeds its readable layout budget. ${LIMIT_MESSAGE}`)
-    if (rows.length && used + height > capacity) flush()
+    const rowHeight = tableRowHeight(row, widths)
+    if (HEADER_HEIGHT + rowHeight > capacity) throw new Error(`PowerPoint overview row exceeds its readable layout budget. ${LIMIT_MESSAGE}`)
+    if (rows.length && HEADER_HEIGHT + (rows.length + 1) * Math.max(rowHeight, ...heights) > capacity) flush()
     rows.push(row)
-    heights.push(height)
-    used += height
+    heights.push(rowHeight)
   }
   if (rows.length || !page) flush()
+}
+
+function savedCriteria(group: ReportGroup, comparison: ReportComparison): ReadableCriterion[] {
+  const assessments = new Map(comparison.criteria.map(criterion => [criterion.criterionId, criterion]))
+  return group.target.criteria.map((definition, index) => {
+    const assessment = assessments.get(definition.id)
+    if (!assessment) throw new Error('A completed PowerPoint review is missing a saved criterion.')
+    const limitation = assessment.limitation?.message ?? null
+    return {
+      id: definition.id, number: index + 1, label: definition.label, weight: assessment.weight,
+      weightLabel: formatReportWeight(assessment.weight), score: assessment.score,
+      scoreLabel: assessment.evidenceStatus === 'not-applicable' ? 'N/A' : criterionScoreLabel(assessment),
+      evidenceStatus: assessment.evidenceStatus, required: definition.requirementType === 'required',
+      sourceLabel: null, limitation,
+      explanation: assessment.rationale + (limitation && !assessment.rationale.includes(limitation) ? `\n${limitation}` : ''),
+    }
+  })
+}
+
+interface WarningPlan {
+  heading: string
+  text: string
+  height: number
+  deferred: boolean
+}
+
+function reviewWarnings(comparison: ReportComparison): WarningPlan {
+  const severity = { 'not-assessed': 3, missing: 2, partial: 1, supported: 0 }
+  const concerns = comparison.qualifications.map((qualification, index) => ({ qualification, index }))
+    .filter(({ qualification }) => qualification.evidenceStatus !== 'supported' || qualification.limitation)
+    .sort((a, b) => severity[b.qualification.evidenceStatus] - severity[a.qualification.evidenceStatus] || a.index - b.index)
+  let deferred = concerns.length > 2
+  const width = BODY_WIDTH - 0.4
+  const notes = concerns.slice(0, 2).map(({ qualification, index }) => {
+    const message = qualification.limitation?.message ?? qualification.rationale
+    const full = `${qualification.text}: ${message}`
+    if (fits(full, width, 0.6, 14)) return full
+    deferred = true
+    const referenced = `Qualification ${index + 1}: ${message}`
+    if (fits(referenced, width, 0.6, 14)) return referenced
+    return `Qualification ${index + 1}: ${evidenceStatusLabel(qualification.evidenceStatus)}. View the full qualification review.`
+  })
+  if (!concerns.length && comparison.limitations.length) {
+    const message = comparison.limitations[0].message
+    if (fits(message, width, 0.9, 14)) notes.push(message)
+    else { notes.push('An assessment limitation requires review in the full saved analysis.'); deferred = true }
+    deferred ||= comparison.limitations.length > 1
+  }
+  if (deferred) notes.push('Further details are available in the full analysis.')
+  const value = notes.join('\n')
+  return {
+    heading: concerns.length ? 'Unscored qualification caveats' : 'Assessment limitations',
+    text: value, height: value ? height(value, width, 14) + 0.64 : 0, deferred,
+  }
 }
 
 interface Explanation {
   criterion: ReadableCriterion
   label: string
-  value: string
+  body: string
+  headingHeight: number
+  bodyHeight: number
   height: number
+  deferred: boolean
 }
 
 interface ReviewPlan {
   criteria: ReadableCriterion[]
   keyCriteria: boolean
   rows: DeckCell[][]
+  widths: number[]
   rowHeights: number[]
   explanations: Explanation[]
   split: number
-  notes: string[]
-  notesHeight: number
+  warnings: WarningPlan
+  fullDetails: boolean
+  combined: boolean
 }
 
 const CRITERION_WIDTHS = [8.03, 1.6, BODY_WIDTH - 9.63]
+const COMBINED_WIDTHS = [3.6, 1.3, 1.8, BODY_WIDTH - 6.7]
 
-function reviewPlan(group: ReportGroup, comparison: ReportComparison, links: ReviewLinks): ReviewPlan {
-  const all = criterionReviews(group.target, comparison, 150)
-  const notes = qualificationNotes(comparison, 2, 150)
-  const notesHeight = notes.length ? measurePptxText(notes.join('\n'), BODY_WIDTH - 0.4, 14).height + 0.66 : 0
-  const available = CONTENT_BOTTOM - EXPLANATION_Y - (notesHeight ? notesHeight + 0.2 : 0)
-  for (let count = Math.min(8, all.length); count >= 1; count--) {
-    const criteria = count === all.length ? all : selectKeyCriteria(all, count)
-    const rows = criteria.map(criterion => {
-      const fullLabel = `C${criterion.number} · ${criterion.label}`
-      const label = compactToBox(fullLabel, CRITERION_WIDTHS[0] - TABLE_PADDING_X * 2, 0.65, 14,
-        `C${criterion.number} · View criterion`)
-      return [{
-        text: label, ...(label !== fullLabel ? { url: links.analysis, tooltip: fullLabel } : {}),
-      }, { text: criterion.weightLabel }, { text: criterion.scoreLabel }]
-    })
-    const rowHeights = rows.map(row => tableRowHeight(row, CRITERION_WIDTHS))
-    const weightNoteHeight = criteria.some(criterion => /^[~<]/.test(criterion.weightLabel)) ? 0.44 : 0
-    if (HEADER_HEIGHT + rowHeights.reduce((sum, height) => sum + height, 0) > CONTENT_BOTTOM - REVIEW_TABLE_Y - weightNoteHeight) continue
-    const explanations = criteria.map(criterion => {
-      const label = criterionHeading(criterion, EXPLANATION_WIDTH)
-      const value = `${label} — ${criterion.explanation}`
-      return { criterion, label, value, height: measurePptxText(value, EXPLANATION_WIDTH, 14).height + 0.06 }
-    })
-    const height = (values: Explanation[]) => values.reduce((sum, value) => sum + value.height, 0) + Math.max(0, values.length - 1) * 0.22
-    let split = 1
-    let best = Infinity
-    for (let cut = 1; cut <= explanations.length; cut++) {
-      const maximum = Math.max(height(explanations.slice(0, cut)), height(explanations.slice(cut)))
-      if (maximum < best) { best = maximum; split = cut }
-    }
-    if (best <= available) return { criteria, keyCriteria: count < all.length, rows, rowHeights, explanations, split, notes, notesHeight }
+function explanation(criterion: ReadableCriterion, width: number, available: number): Explanation {
+  const fullLabel = `C${criterion.number} · ${criterion.label} · ${criterion.scoreLabel}`
+  const shortLabel = `C${criterion.number} · ${criterion.scoreLabel} · ${evidenceStatusLabel(criterion.evidenceStatus)}`
+  const label = fits(fullLabel, width, Math.min(1.05, available / 2), 14) ? fullLabel : shortLabel
+  const headingHeight = height(label, width, 14)
+  const bodyBudget = available - headingHeight - EXPLANATION_TEXT_GAP
+  let body = criterion.explanation
+  let deferred = label !== fullLabel
+  if (!fits(body, width, bodyBudget, 14)) {
+    body = criterion.limitation && fits(`${criterion.limitation}\nView the full saved explanation.`, width, bodyBudget, 14)
+      ? `${criterion.limitation}\nView the full saved explanation.`
+      : 'View the full saved explanation.'
+    deferred = true
   }
-  throw new Error(`PowerPoint scorecard cannot fit a readable criterion and qualification summary. ${LIMIT_MESSAGE}`)
+  const bodyHeight = height(body, width, 14)
+  return { criterion, label, body, headingHeight, bodyHeight, height: headingHeight + EXPLANATION_TEXT_GAP + bodyHeight, deferred }
+}
+
+function explanationRows(explanations: readonly Explanation[], split: number): number[] {
+  const left = explanations.slice(0, split), right = explanations.slice(split)
+  return Array.from({ length: Math.max(left.length, right.length) }, (_, index) =>
+    Math.max(left[index]?.height ?? 0, right[index]?.height ?? 0))
+}
+
+function reviewPlan(group: ReportGroup, comparison: ReportComparison, links: ReviewLinks, combined: boolean): ReviewPlan {
+  const all = savedCriteria(group, comparison)
+  const warnings = reviewWarnings(comparison)
+  const available = CONTENT_BOTTOM - REVIEW_TABLE_Y - (warnings.height ? warnings.height + 0.24 : 0)
+  const widths = combined ? COMBINED_WIDTHS : CRITERION_WIDTHS
+  for (let count = Math.min(combined ? 4 : 8, all.length); count >= 1; count--) {
+    const criteria = selectKeyCriteria(all, count)
+    const explanations = criteria.map(criterion => explanation(criterion, EXPLANATION_WIDTH, Math.min(2.25, available)))
+    const rows = criteria.map((criterion, index) => {
+      const fullLabel = `C${criterion.number} · ${criterion.label}`
+      const label = fits(fullLabel, widths[0] - TABLE_PADDING_X * 2, combined ? 1.3 : 1.05, 14)
+        ? fullLabel : `C${criterion.number} · View full criterion`
+      const row: DeckCell[] = [
+        { text: label, ...(label !== fullLabel ? { url: links.analysis, tooltip: fullLabel } : {}) },
+        { text: criterion.weightLabel }, { text: criterion.scoreLabel },
+      ]
+      if (combined) {
+        const full = criterion.explanation
+        const value = fits(full, widths[3] - TABLE_PADDING_X * 2, Math.max(0.6, available - HEADER_HEIGHT), 14)
+          ? full : `${evidenceStatusLabel(criterion.evidenceStatus)}. View the full saved explanation.`
+        row.push({ text: value, ...(value !== full ? { url: links.analysis } : {}) })
+      }
+      if (row[0].url) explanations[index].deferred = true
+      return row
+    })
+    const measuredHeights = rows.map(row => tableRowHeight(row, widths))
+    const rowHeights = combined ? uniformRowHeights(measuredHeights) : measuredHeights
+    const weightNoteHeight = criteria.some(criterion => /^[~<]/.test(criterion.weightLabel)) ? 0.42 : 0
+    const tableAvailable = (combined ? available : CONTENT_BOTTOM - REVIEW_TABLE_Y) - weightNoteHeight
+    if (HEADER_HEIGHT + rowHeights.reduce((sum, value) => sum + value, 0) > tableAvailable) continue
+    let split = 1, best = Infinity
+    for (let cut = 1; cut <= explanations.length; cut++) {
+      const rowHeights = explanationRows(explanations, cut)
+      const alignedHeight = rowHeights.reduce((sum, value) => sum + value, 0) + Math.max(0, rowHeights.length - 1) * 0.22
+      if (alignedHeight < best) { best = alignedHeight; split = cut }
+    }
+    if (!combined && best > available) continue
+    return {
+      criteria, keyCriteria: count < all.length, rows, widths: [...widths], rowHeights, explanations, split, warnings, combined,
+      fullDetails: count < all.length || warnings.deferred || rows.some(row => row.some(cell => cell.url)) ||
+        (!combined && explanations.some(item => item.deferred)),
+    }
+  }
+  throw new Error(`PowerPoint cannot fit a readable key criterion and its qualification warnings within three candidate slides. ${LIMIT_MESSAGE}`)
 }
 
 function candidateLinks(
-  slide: PptxGenJS.Slide, group: ReportGroup, links: ReviewLinks, key: string, includeFullScorecard: boolean,
+  slide: PptxGenJS.Slide, group: ReportGroup, comparison: ReportComparison, links: ReviewLinks, key: string, fullDetails: boolean,
 ): void {
   const items = [
-    { label: 'View analysis', url: links.analysis, x: 0.6, w: 2.1 },
-    { label: 'View resume', url: links.resume, x: 2.9, w: 2.0 },
+    { label: 'View analysis', url: links.analysis, x: 0.6, w: 2.1, tooltip: candidateTooltip(comparison) },
+    { label: 'View resume', url: links.resume, x: 2.9, w: 2.0,
+      tooltip: [comparison.candidate.sourceLabel, comparison.candidate.role].filter(Boolean).join('\n') },
     { label: group.target.kind === 'grade' ? 'View grade requirements' : 'View job', url: links.target, x: 5.1, w: 3.3 },
-    ...(includeFullScorecard ? [{ label: 'View full scorecard', url: links.analysis, x: 9.0, w: 3.1 }] : []),
+    ...(fullDetails ? [{ label: 'View full scorecard', url: links.analysis, x: 9.0, w: 3.1 }] : []),
   ]
   items.forEach((item, index) => linkText(slide, item.label, item.url, {
     x: item.x, y: LINKS_Y, w: item.w, h: 0.35,
-  }, `${key}-link-${index}`))
+  }, `${key}-link-${index}`, item.tooltip))
 }
 
-function criterionHeading(criterion: ReadableCriterion, width: number): string {
-  const title = (label: string) => `C${criterion.number} · ${label} · ${criterion.scoreLabel}`
-  const full = title(criterion.label)
-  if (measurePptxText(full, width, 14).height <= 0.35) return full
-  for (let budget = 64; budget >= 16; budget = Math.floor(budget * 0.8)) {
-    const compact = title(compactReportText(criterion.label, budget))
-    if (measurePptxText(compact, width, 14).height <= 0.35) return compact
-  }
-  return `C${criterion.number} · ${criterion.scoreLabel}`
+interface CandidateLayout {
+  nameFont: number
+  nameHeight: number
+  role: string
+  roleHeight: number
+  source: string
+  sourceHeight: number
+  sourceName: string | null
+  sourceNameHeight: number
+  summaryY: number
+  narrativeFont: number
+  separateNarrative: boolean
 }
 
-function needsFullScorecard(plan: ReviewPlan): boolean {
-  return plan.keyCriteria || plan.rows.some(row => row[0].url)
-    || plan.criteria.some(criterion => /(?:\.{3}|…)$/u.test(criterion.explanation))
-}
-
-function overviewExplanations(
-  group: ReportGroup, comparison: ReportComparison, selected: readonly ReadableCriterion[], width: number,
-): Map<string, string> {
-  const explanations = new Map(selected.map(criterion => [criterion.id, criterion.explanation]))
-  for (const budget of [88, 72, 56, 48]) {
-    const remaining = selected.filter(criterion => measurePptxText(explanations.get(criterion.id)!, width, 14).height > 0.6)
-    if (!remaining.length) break
-    const reviews = new Map(criterionReviews(group.target, comparison, budget).map(criterion => [criterion.id, criterion]))
-    for (const criterion of remaining) explanations.set(criterion.id, reviews.get(criterion.id)!.explanation)
-  }
-  return new Map([...explanations].map(([id, explanation]) => [
-    id, compactToBox(explanation, width, 0.6, 14, 'View the full analysis for the recorded evidence.'),
-  ]))
-}
-
-function candidateOverview(
-  deck: ReportDeck, group: ReportGroup, comparison: ReportComparison, links: ReviewLinks, plan: ReviewPlan, key: string,
-): void {
+function candidateLayout(comparison: ReportComparison): CandidateLayout {
   const name = readableCandidateName(comparison.candidate)
-  const slide = deck.slide(name, readableTargetLabel(deck.report, group), {
-    titleWidth: 8.55, titleLink: links.analysis, referenceLink: links.target, name: `${key}-overview-name`,
-  })
+  const role = comparison.candidate.role ? `Role: ${comparison.candidate.role}` : 'Role not recorded'
+  const source = `Source: ${comparison.candidate.sourceLabel}`
+  const sourceName = comparison.candidate.displayName !== undefined ? `Source-stated name: ${comparison.candidate.name ?? 'Not stated'}` : null
   const metadataWidth = 8.55
-  const alias = comparison.candidate.displayName !== undefined
-  const metadataHeight = alias ? 0.34 : 0.39
-  const metadataFont = alias ? 14 : 15
-  for (const [index, item] of [
-    { value: comparison.candidate.role ? `Role: ${comparison.candidate.role}` : 'Role not recorded', url: links.analysis },
-    { value: `Source: ${comparison.candidate.sourceLabel}`, url: links.resume },
-    ...(alias ? [{ value: `Source-stated name: ${comparison.candidate.name ?? 'Not stated'}`, url: links.resume }] : []),
-  ].entries()) {
-    const displayed = compactToBox(item.value, metadataWidth, metadataHeight, metadataFont, index ? 'View resume source' : 'View recorded role')
-    text(slide, displayed, {
-      x: 0.6, y: 2.0 + index * (alias ? 0.36 : 0.46), w: metadataWidth, h: metadataHeight,
-    }, metadataFont, {
-      color: C.muted, objectName: `${key}-metadata-${index}`,
-      ...(displayed !== item.value ? { hyperlink: hyperlink(item.url, item.value) } : {}),
-    })
+  const roleLabel = fits(role, metadataWidth, 0.62, 15) ? role : 'View recorded role'
+  const sourceLabel = fits(source, metadataWidth, 0.57, 14) ? source : `Source: ${resumeDocumentReference(comparison)}`
+  const sourceNameLabel = sourceName === null ? null : fits(sourceName, metadataWidth, 0.57, 14) ? sourceName : 'View source-stated name'
+  const roleHeight = height(roleLabel, metadataWidth, 15), sourceHeight = height(sourceLabel, metadataWidth, 14)
+  const sourceNameHeight = sourceNameLabel === null ? 0 : height(sourceNameLabel, metadataWidth, 14)
+  const narrative = candidateNarrativeText(comparison)
+  for (const nameFont of [32, 28, 24, 22]) {
+    const nameHeight = height(name, metadataWidth, nameFont)
+    if (nameHeight > 1.45) continue
+    const summaryY = Math.max(3.02, 1.12 + nameHeight + 0.12 + roleHeight + 0.08 + sourceHeight +
+      (sourceNameHeight ? sourceNameHeight + 0.08 : 0) + 0.28)
+    for (const narrativeFont of [16, 14]) {
+      if (fits(narrative, BODY_WIDTH - 0.4, CONTENT_BOTTOM - summaryY - 0.71, narrativeFont)) {
+        return { nameFont, nameHeight, role: roleLabel, roleHeight, source: sourceLabel, sourceHeight,
+          sourceName: sourceNameLabel, sourceNameHeight, summaryY, narrativeFont, separateNarrative: false }
+      }
+    }
   }
-  const scoreBox = { x: 9.55, y: 1.16, w: BODY_WIDTH - 8.95, h: 1.64 }
-  rectangle(slide, scoreBox, C.text, `${key}-score-panel`)
-  text(slide, 'Overall score', { x: scoreBox.x + 0.2, y: 1.34, w: scoreBox.w - 0.4, h: 0.35 }, 14, { color: C.paper })
-  const score = comparison.overall.status === 'available' ? overallScoreLabel(comparison.overall) : 'Withheld'
-  const scoreFont = score.length > 15 ? 16 : 28
-  text(slide, score, { x: scoreBox.x + 0.2, y: 1.88, w: scoreBox.w - 0.4, h: 0.65 }, scoreFont, {
-    bold: true, color: C.paper, objectName: `${key}-overall-score`,
+  const nameFont = [30, 26, 22, 20].find(size => fits(name, BODY_WIDTH, 3.62, size))
+  const narrativeFont = [16, 14].find(size => fits(narrative, BODY_WIDTH, CONTENT_BOTTOM - 1.82, size))
+  if (!nameFont || !narrativeFont) {
+    throw new Error(`PowerPoint cannot preserve the full candidate name and saved assessment at readable sizes within three slides. ${LIMIT_MESSAGE}`)
+  }
+  return { nameFont, nameHeight: height(name, BODY_WIDTH, nameFont), role: roleLabel, roleHeight,
+    source: sourceLabel, sourceHeight, sourceName: sourceNameLabel, sourceNameHeight,
+    summaryY: 0, narrativeFont, separateNarrative: true }
+}
+
+function scorePanel(slide: PptxGenJS.Slide, comparison: ReportComparison, key: string, wide = false): void {
+  const box = wide ? { x: 0.6, y: 5.54, w: BODY_WIDTH, h: 0.76 } : { x: 9.55, y: 1.16, w: BODY_WIDTH - 8.95, h: 1.56 }
+  rectangle(slide, box, C.text, `${key}-score-panel`)
+  const value = comparison.overall.status === 'available' ? overallScoreLabel(comparison.overall) : 'Withheld'
+  if (wide) {
+    text(slide, `Overall score: ${value}`, { x: 0.82, y: 5.69, w: BODY_WIDTH - 0.44, h: 0.52 }, 22, {
+      color: C.paper, bold: true, objectName: `${key}-overall-score`,
+    })
+    return
+  }
+  text(slide, 'Overall score', { x: box.x + 0.2, y: 1.34, w: box.w - 0.4, h: 0.35 }, 14, { color: C.paper })
+  const fontSize = value.length > 15 ? 16 : 28
+  text(slide, value, { x: box.x + 0.2, y: 1.86, w: box.w - 0.4, h: 0.65 }, fontSize, {
+    color: C.paper, bold: true, objectName: `${key}-overall-score`,
   })
   if (comparison.overall.status === 'available') {
-    const track = { x: scoreBox.x + 0.2, y: 2.56, w: scoreBox.w - 0.4, h: 0.08 }
+    const track = { x: box.x + 0.2, y: 2.53, w: box.w - 0.4, h: 0.08 }
     rectangle(slide, track, C.border, `${key}-score-track`)
     const width = track.w * comparison.overall.score / 100
     if (width >= 1 / 914400) rectangle(slide, { ...track, w: width }, C.accent, `${key}-score-value`)
   }
-  const introduction = assessmentIntroduction(comparison, 320)
-  const summaryWidth = introduction ? 6.4 : BODY_WIDTH
-  rectangle(slide, { x: 0.6, y: 3.11, w: summaryWidth, h: 2.99 }, C.paper, `${key}-summary-panel`)
-  text(slide, 'Assessment summary', { x: 0.8, y: 3.32, w: summaryWidth - 0.4, h: 0.43 }, 18, {
-    bold: true, objectName: `${key}-summary-heading`,
-  })
-  text(slide, compactToBox(introduction ?? assessmentSummary(group.target, comparison, 360), summaryWidth - 0.4, 2.03, 16,
-    'See the full analysis for the recorded assessment.'), {
-    x: 0.8, y: 3.86, w: summaryWidth - 0.4, h: 2.03,
-  }, 16, { objectName: `${key}-summary` })
-  if (!introduction) {
-    candidateLinks(slide, group, links, key, needsFullScorecard(plan))
-    return
-  }
-  const highlightsX = 0.6 + summaryWidth + COLUMN_GAP
-  const highlightsWidth = BODY_WIDTH - summaryWidth - COLUMN_GAP
-  rectangle(slide, { x: highlightsX, y: 3.11, w: highlightsWidth, h: 2.99 }, C.paper, `${key}-highlights-panel`)
-  text(slide, 'Strengths & gaps', { x: highlightsX + 0.2, y: 3.32, w: highlightsWidth - 0.4, h: 0.43 }, 18, {
-    bold: true, objectName: `${key}-highlights-heading`,
-  })
-  const selected = selectKeyCriteria(plan.criteria, 2)
-  const explanations = overviewExplanations(group, comparison, selected, highlightsWidth - 0.4)
-  selected.forEach((criterion, index) => {
-    const y = 3.88 + index * 1.04
-    const fullLabel = `C${criterion.number} · ${criterion.label} · ${criterion.scoreLabel}`
-    const label = criterionHeading(criterion, highlightsWidth - 0.4)
-    text(slide, label, { x: highlightsX + 0.2, y, w: highlightsWidth - 0.4, h: 0.35 }, 14, {
-      bold: true, color: C.accent, objectName: `${key}-highlight-${index}-label`,
-      ...(label !== fullLabel ? { hyperlink: hyperlink(links.analysis, criterion.label) } : {}),
+}
+
+function candidateOverview(
+  deck: ReportDeck, group: ReportGroup, comparison: ReportComparison, links: ReviewLinks, plan: ReviewPlan,
+  layout: CandidateLayout, key: string, reference: string,
+): void {
+  const slide = deck.slide('', reference)
+  const width = layout.separateNarrative ? BODY_WIDTH : 8.55
+  text(slide, readableCandidateName(comparison.candidate), {
+    x: 0.6, y: 1.12, w: width, h: layout.nameHeight,
+  }, layout.nameFont, { bold: true, objectName: `${key}-overview-name` })
+  let y = 1.12 + layout.nameHeight + 0.12
+  const metadata = [
+    { index: 0, value: layout.role, full: comparison.candidate.role ? `Role: ${comparison.candidate.role}` : 'Role not recorded',
+      h: layout.roleHeight, font: 15, url: links.analysis },
+    { index: 1, value: layout.source, full: `Source: ${comparison.candidate.sourceLabel}`, h: layout.sourceHeight, font: 14, url: links.resume },
+    ...(layout.sourceName === null ? [] : [{
+      index: 2, value: layout.sourceName, full: `Source-stated name: ${comparison.candidate.name ?? 'Not stated'}`,
+      h: layout.sourceNameHeight, font: 14, url: links.resume,
+    }]),
+  ]
+  for (const item of layout.separateNarrative ? [...metadata.slice(2), metadata[1], metadata[0]] : metadata) {
+    if (layout.separateNarrative && y + item.h > 5.25) continue
+    text(slide, item.value, { x: 0.6, y, w: 8.55, h: item.h }, item.font, {
+      color: C.muted, objectName: `${key}-metadata-${item.index}`,
+      ...(item.value !== item.full ? { color: C.accent, hyperlink: hyperlink(item.url, item.full) } : {}),
     })
-    text(slide, explanations.get(criterion.id)!, {
-      x: highlightsX + 0.2, y: y + 0.41, w: highlightsWidth - 0.4, h: 0.6,
-    }, 14, { objectName: `${key}-highlight-${index}-rationale` })
+    y += item.h + 0.08
+  }
+  scorePanel(slide, comparison, key, layout.separateNarrative)
+  if (!layout.separateNarrative) {
+    rectangle(slide, { x: 0.6, y: layout.summaryY, w: BODY_WIDTH, h: CONTENT_BOTTOM - layout.summaryY }, C.paper, `${key}-summary-panel`)
+    text(slide, 'Assessment summary', { x: 0.8, y: layout.summaryY + 0.16, w: BODY_WIDTH - 0.4, h: 0.43 }, 18, {
+      bold: true, objectName: `${key}-summary-heading`,
+    })
+    text(slide, candidateNarrativeText(comparison), {
+      x: 0.8, y: layout.summaryY + 0.66, w: BODY_WIDTH - 0.4, h: CONTENT_BOTTOM - layout.summaryY - 0.71,
+    }, layout.narrativeFont, { objectName: `${key}-summary` })
+  } else if (fits(candidateNarrativeOverview(comparison), BODY_WIDTH, 5.21 - y, 16)) {
+    text(slide, candidateNarrativeOverview(comparison), { x: 0.6, y: y + 0.12, w: BODY_WIDTH, h: 5.33 - y }, 16, {
+      objectName: `${key}-identity-overview`,
+    })
+  }
+  candidateLinks(slide, group, comparison, links, key, plan.fullDetails)
+}
+
+function warnings(slide: PptxGenJS.Slide, plan: ReviewPlan, key: string, links: ReviewLinks): void {
+  if (!plan.warnings.height) return
+  const y = CONTENT_BOTTOM - plan.warnings.height
+  rectangle(slide, { x: 0.6, y, w: BODY_WIDTH, h: plan.warnings.height }, C.paper, `${key}-qualification-panel`)
+  text(slide, plan.warnings.heading, { x: 0.8, y: y + 0.13, w: BODY_WIDTH - 0.4, h: 0.35 }, 14, {
+    bold: true, objectName: `${key}-qualification-heading`,
   })
-  candidateLinks(slide, group, links, key, needsFullScorecard(plan))
+  text(slide, plan.warnings.text, {
+    x: 0.8, y: y + 0.53, w: BODY_WIDTH - 0.4, h: plan.warnings.height - 0.56,
+  }, 14, { objectName: `${key}-qualification-notes`, ...(plan.warnings.deferred ? { hyperlink: hyperlink(links.analysis) } : {}) })
+}
+
+function candidateIdentity(
+  comparison: ReportComparison, number: number, width: number, suffix = '', referenceWidth = width,
+): { label: string; fontSize: number; reference: boolean } {
+  const ending = suffix ? ` · ${suffix}` : ''
+  const full = `${readableCandidateName(comparison.candidate)}${ending}`
+  const fontSize = [20, 18].find(size => fits(full, width, 0.45, size))
+  if (fontSize) return { label: full, fontSize, reference: false }
+  const source = `Candidate ${number} · ${comparison.candidate.sourceLabel}${ending}`
+  const sourceFont = [20, 18].find(size => fits(source, referenceWidth, 0.45, size))
+  if (sourceFont) return { label: source, fontSize: sourceFont, reference: true }
+  const label = `Candidate ${number} · ${resumeDocumentReference(comparison)}${ending}`
+  const referenceFont = [20, 18].find(size => fits(label, referenceWidth, 0.45, size))
+  if (!referenceFont) throw new Error(`PowerPoint cannot fit a readable candidate/source reference. ${LIMIT_MESSAGE}`)
+  return { label, fontSize: referenceFont, reference: true }
+}
+
+function candidateOverviewLink(slide: PptxGenJS.Slide, destination: number, key: string, y: number): void {
+  text(slide, 'Back to candidate overview', { x: 8.8, y, w: BODY_WIDTH - 8.2, h: 0.35 }, 14, {
+    color: C.accent, underline: { style: 'sng' }, hyperlink: internalLink(destination), objectName: `${key}-overview-link`,
+  })
+}
+
+function candidateDetailHeading(
+  slide: PptxGenJS.Slide, comparison: ReportComparison, number: number, overviewSlide: number, key: string, keyCriteria: boolean,
+): void {
+  const identity = candidateIdentity(comparison, number, BODY_WIDTH, keyCriteria ? 'Key criteria' : '', 7.8)
+  text(slide, identity.label, { x: 0.6, y: 2.05, w: identity.reference ? 7.8 : BODY_WIDTH, h: 0.45 }, identity.fontSize, {
+    bold: true, objectName: `${key}-heading`,
+  })
+  if (identity.reference) candidateOverviewLink(slide, overviewSlide, key, 2.1)
 }
 
 function scorecard(
-  deck: ReportDeck, group: ReportGroup, comparison: ReportComparison, links: ReviewLinks, plan: ReviewPlan, key: string,
+  deck: ReportDeck, group: ReportGroup, comparison: ReportComparison, links: ReviewLinks,
+  plan: ReviewPlan, key: string, reference: string, number: number, overviewSlide: number,
 ): void {
-  const slide = deck.slide(readableCandidateName(comparison.candidate), readableTargetLabel(deck.report, group), {
-    titleLink: links.analysis, referenceLink: links.target, name: `${key}-scorecard-name`,
-  })
-  text(slide, plan.keyCriteria ? 'Scorecard · Key criteria' : 'Scorecard', {
-    x: 0.6, y: 2.05, w: BODY_WIDTH, h: 0.45,
-  }, 20, { bold: true, objectName: `${key}-scorecard-heading` })
-  table(slide, ['Criterion', 'Weight', 'Score'], plan.rows, [...CRITERION_WIDTHS], plan.rowHeights,
-    REVIEW_TABLE_Y, `${key}-scorecard-table`)
+  const slide = deck.slide(plan.combined ? 'Scorecard & evidence' : 'Scorecard', reference, `${key}-scorecard-name`)
+  candidateDetailHeading(slide, comparison, number, overviewSlide, `${key}-scorecard`, plan.keyCriteria)
+  table(slide, ['Criterion', 'Weight', 'Score', ...(plan.combined ? ['Evidence'] : [])],
+    plan.rows, plan.widths, plan.rowHeights, REVIEW_TABLE_Y, `${key}-scorecard-table`)
   if (plan.criteria.some(criterion => /^[~<]/.test(criterion.weightLabel))) {
-    text(slide, WEIGHT_NOTICE, { x: 0.6, y: 5.94, w: BODY_WIDTH, h: 0.3 }, 11, {
+    const y = plan.combined && plan.warnings.height ? CONTENT_BOTTOM - plan.warnings.height - 0.55 : CONTENT_BOTTOM - 0.3
+    text(slide, WEIGHT_NOTICE, { x: 0.6, y, w: BODY_WIDTH, h: 0.3 }, 11, {
       color: C.muted, objectName: `${key}-weight-note`,
     })
   }
-  candidateLinks(slide, group, links, key, needsFullScorecard(plan))
+  if (plan.combined) warnings(slide, plan, key, links)
+  candidateLinks(slide, group, comparison, links, key, plan.fullDetails)
 }
 
 function explanationSlide(
-  deck: ReportDeck, group: ReportGroup, comparison: ReportComparison, links: ReviewLinks, plan: ReviewPlan, key: string,
+  deck: ReportDeck, group: ReportGroup, comparison: ReportComparison, links: ReviewLinks,
+  plan: ReviewPlan, key: string, reference: string, number: number, overviewSlide: number,
 ): void {
-  const slide = deck.slide(readableCandidateName(comparison.candidate), readableTargetLabel(deck.report, group), {
-    titleLink: links.analysis, referenceLink: links.target, name: `${key}-explanations-name`,
-  })
-  text(slide, plan.keyCriteria ? 'Why these scores · Key criteria' : 'Why these scores', {
-    x: 0.6, y: 2.05, w: 7.7, h: 0.45,
-  }, 20, { bold: true, objectName: `${key}-explanations-heading` })
-  text(slide, 'Concise explanations', { x: 8.65, y: 2.12, w: BODY_WIDTH - 8.05, h: 0.35 }, 14, {
-    color: C.muted, objectName: `${key}-explanations-note`,
-  })
-  for (const [column, explanations] of [plan.explanations.slice(0, plan.split), plan.explanations.slice(plan.split)].entries()) {
-    let y = EXPLANATION_Y
-    for (const explanation of explanations) {
-      text(slide, [
-        {
-          text: `${explanation.label} — `,
-          options: {
-            bold: true, color: C.accent,
-            ...(explanation.label !== `C${explanation.criterion.number} · ${explanation.criterion.label} · ${explanation.criterion.scoreLabel}`
-              ? { hyperlink: hyperlink(links.analysis, explanation.criterion.label) } : {}),
-          },
-        },
-        { text: explanation.criterion.explanation },
-      ], { x: 0.6 + column * (EXPLANATION_WIDTH + COLUMN_GAP), y, w: EXPLANATION_WIDTH, h: explanation.height }, 14, {
-        objectName: `${key}-criterion-${explanation.criterion.number}-explanation`,
+  const slide = deck.slide('Why these scores', reference, `${key}-explanations-name`)
+  candidateDetailHeading(slide, comparison, number, overviewSlide, `${key}-explanations`, plan.keyCriteria)
+  const rowStarts: number[] = []
+  let rowY = REVIEW_TABLE_Y
+  for (const rowHeight of explanationRows(plan.explanations, plan.split)) {
+    rowStarts.push(rowY)
+    rowY += rowHeight + 0.22
+  }
+  for (const [column, items] of [plan.explanations.slice(0, plan.split), plan.explanations.slice(plan.split)].entries()) {
+    for (const [index, item] of items.entries()) {
+      const x = 0.6 + column * (EXPLANATION_WIDTH + COLUMN_GAP), y = rowStarts[index]
+      text(slide, item.label, { x, y, w: EXPLANATION_WIDTH, h: item.headingHeight }, 14, {
+        bold: true, color: C.accent, objectName: `${key}-criterion-${item.criterion.number}-heading`,
+        ...(item.deferred ? { hyperlink: hyperlink(links.analysis, item.criterion.label) } : {}),
       })
-      y += explanation.height + 0.22
+      text(slide, item.body, {
+        x, y: y + item.headingHeight + EXPLANATION_TEXT_GAP, w: EXPLANATION_WIDTH, h: item.bodyHeight,
+      }, 14, {
+        objectName: `${key}-criterion-${item.criterion.number}-explanation`,
+        ...(item.deferred ? { hyperlink: hyperlink(links.analysis, item.criterion.label) } : {}),
+      })
     }
   }
-  if (plan.notes.length) {
-    const y = CONTENT_BOTTOM - plan.notesHeight
-    rectangle(slide, { x: 0.6, y, w: BODY_WIDTH, h: plan.notesHeight }, C.paper, `${key}-qualification-panel`)
-    text(slide, 'Unscored qualification caveats', { x: 0.8, y: y + 0.13, w: BODY_WIDTH - 0.4, h: 0.35 }, 14, {
-      bold: true, objectName: `${key}-qualification-heading`,
+  warnings(slide, plan, key, links)
+  candidateLinks(slide, group, comparison, links, key, plan.fullDetails)
+}
+
+function featuredReview(deck: ReportDeck, group: ReportGroup, comparison: ReportComparison, groupIndex: number, index: number): number {
+  const before = deck.slideCount
+  const links = deck.links(comparison)
+  const key = `review-${groupIndex}-${index}`
+  const reference = `${sectionReference(group, groupIndex)} · Candidate ${index + 1}`
+  const layout = candidateLayout(comparison)
+  const plan = reviewPlan(group, comparison, links, layout.separateNarrative)
+  candidateOverview(deck, group, comparison, links, plan, layout, key, reference)
+  if (layout.separateNarrative) {
+    const slide = deck.slide('', reference)
+    text(slide, 'Assessment summary', { x: 0.6, y: 1.12, w: 3.65, h: 0.45 }, 20, {
+      bold: true, objectName: `${key}-assessment-name`,
     })
-    text(slide, plan.notes.join('\n'), {
-      x: 0.8, y: y + 0.53, w: BODY_WIDTH - 0.4, h: plan.notesHeight - 0.56,
-    }, 14, { objectName: `${key}-qualification-notes` })
+    const identity = candidateIdentity(comparison, index + 1, 4.0)
+    text(slide, identity.label, { x: 4.5, y: 1.12, w: 4.0, h: 0.45 }, identity.fontSize, {
+      bold: true, objectName: `${key}-assessment-heading`,
+    })
+    candidateOverviewLink(slide, before + 1, `${key}-assessment`, 1.18)
+    text(slide, candidateNarrativeText(comparison), {
+      x: 0.6, y: 1.82, w: BODY_WIDTH, h: CONTENT_BOTTOM - 1.82,
+    }, layout.narrativeFont, { objectName: `${key}-summary` })
+    candidateLinks(slide, group, comparison, links, key, plan.fullDetails)
   }
-  candidateLinks(slide, group, links, key, needsFullScorecard(plan))
+  scorecard(deck, group, comparison, links, plan, key, reference, index + 1, before + 1)
+  if (!layout.separateNarrative) explanationSlide(deck, group, comparison, links, plan, key, reference, index + 1, before + 1)
+  if (deck.slideCount - before > 3) throw new Error('PowerPoint candidate reviews must not exceed three slides.')
+  return before + 1
 }
 
 export async function generatePptxReport(report: AnalysisReport, options?: ReportGenerationOptions): Promise<Uint8Array> {
   assertReportResourceLimits(report)
-  const deck = new ReportDeck(report, options)
+  requireReportNarratives(report)
   validatedReportLinkContext(report, options)
+  const deck = new ReportDeck(report, options)
   opening(deck)
+  const agenda = reserveAgenda(deck)
+  const contentsByTarget = new Map(agenda.flatMap(page => page.entries.map(entry => [entry.group.target.id, page.number] as const)))
+  const destinations = new Map<string, number>()
   report.groups.forEach((group, groupIndex) => {
-    if (report.groups.length > 1) jobIntroduction(deck, group)
-    overview(deck, group, groupIndex)
+    const contentsSlide = contentsByTarget.get(group.target.id)
+    if (contentsSlide === undefined) throw new Error('PowerPoint target is missing from the contents.')
+    destinations.set(group.target.id, jobIntroduction(deck, group, groupIndex, contentsSlide))
     const featured = new Set(group.highlightedComparisonIds)
+    if (featured.size !== group.highlightedComparisonIds.length || [...featured].some(id =>
+      !group.comparisons.some(item => item.id === id && item.status === 'complete' && item.overall.status === 'available'))) {
+      throw new Error('PowerPoint highlights must retain the exact completed, scored reviews from the saved target.')
+    }
+    const candidateOverviews = new Map<string, number>()
     group.comparisons.forEach((comparison, index) => {
-      if (comparison.status !== 'complete' || !featured.has(comparison.id)) return
-      const links = deck.links(comparison)
-      const key = `review-${groupIndex}-${index}`
-      const plan = reviewPlan(group, comparison, links)
-      candidateOverview(deck, group, comparison, links, plan, key)
-      scorecard(deck, group, comparison, links, plan, key)
-      explanationSlide(deck, group, comparison, links, plan, key)
+      if (featured.has(comparison.id)) candidateOverviews.set(comparison.id, featuredReview(deck, group, comparison, groupIndex, index))
     })
+    overview(deck, group, groupIndex, candidateOverviews)
   })
+  finishAgenda(deck, agenda, destinations)
   deck.checkBudget()
   const result = await deck.presentation.write({ outputType: 'arraybuffer', compression: true })
   deck.checkBudget()

@@ -1,4 +1,12 @@
 import type { DocumentPagination } from './document-formats'
+import type {
+  AnalysisNarrativeReportCapture,
+  ReadyAnalysisCandidateNarrative,
+  ReadyAnalysisTargetNarrative,
+  RealAnalysisCandidateNarrative,
+  RealAnalysisNarrativeReportCapture,
+  RealAnalysisTargetNarrative,
+} from './analysis-narratives'
 import type { RealAnalysisTargetSelection } from './real-analyses'
 
 export const ANALYSIS_REPORT_SCHEMA_VERSION = 1 as const
@@ -78,6 +86,16 @@ export interface ReportCriterionDefinition {
   requirementType: ReportRequirementType
 }
 
+// Derived only from frozen inputs, independently of legacy label/sublabel and readable helpers.
+export interface ReportTargetPresentation {
+  title: string
+  organization: string
+  description: string
+  series: string
+  grade: string
+  versionLabel: string
+}
+
 export interface ReportTarget {
   id: string
   dataKind: ReportDataKind
@@ -92,12 +110,15 @@ export interface ReportTarget {
   snapshot: ReportSnapshotIdentity | null
   criteria: ReportCriterionDefinition[]
   facts: ReportFact[]
+  presentation?: ReportTargetPresentation
+  narrative?: ReadyAnalysisTargetNarrative
 }
 
 export interface RealReportTarget extends ReportTarget {
   dataKind: 'real'
   selection: RealAnalysisTargetSelection
   snapshot: ReportSnapshotIdentity
+  narrative?: RealAnalysisTargetNarrative
 }
 
 export interface ReportCandidate {
@@ -180,6 +201,7 @@ export interface ReportComparison {
   completion: ReportCompletion | null
   overall: ReportOverallScore
   summary: string | null
+  narrative?: ReadyAnalysisCandidateNarrative
   coverage: ReportEvidenceCoverage | null
   criteria: ReportCriterionAssessment[]
   qualifications: ReportQualificationAssessment[]
@@ -193,6 +215,7 @@ export interface ReportComparison {
 export interface RealReportComparison extends ReportComparison {
   dataKind: 'real'
   candidate: RealReportCandidate
+  narrative?: RealAnalysisCandidateNarrative
 }
 
 export interface RankedReportComparison extends ReportComparison {
@@ -229,6 +252,8 @@ export interface ReportRun {
 export interface ReportCaptureInterval {
   startedAt: string
   completedAt: string
+  // Required and current for real PDF/Word/PPTX, optional for CSV payloads.
+  summaries?: AnalysisNarrativeReportCapture
 }
 
 export interface AnalysisReportInput {
@@ -272,6 +297,7 @@ export interface RealReportBatchResponse {
   runId: string
   targets: RealReportTarget[]
   comparisons: RealReportComparison[]
+  summaries?: RealAnalysisNarrativeReportCapture
 }
 
 export interface ReportFontData {

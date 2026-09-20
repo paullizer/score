@@ -203,8 +203,11 @@ function serviceError(error: unknown, stage: AnalysisModelStage): AnalysisModelE
   })
 }
 
-async function invokeAnalysisModel(
-  request: StructuredModelRequest, stage: AnalysisModelStage, options: AnalysisAssessmentOptions, clock: Clock, correctionCount: number,
+export async function invokeAnalysisModel(
+  request: StructuredModelRequest, stage: AnalysisModelStage,
+  options: Pick<AnalysisAssessmentOptions, 'model' | 'signal' | 'onEvent'>, clock: Clock, correctionCount: number,
+  versions: { promptVersion: string; schemaVersion: string } =
+    { promptVersion: ANALYSIS_MODEL_PROMPT_VERSIONS[stage], schemaVersion: ANALYSIS_MODEL_SCHEMA_VERSIONS[stage] },
 ): Promise<ModelCallResult> {
   checkCancelled(options.signal, stage)
   const inputCharacters = requestCharacters(request)
@@ -215,7 +218,7 @@ async function invokeAnalysisModel(
     const timestamp = event.timestamp ?? clock.now().toISOString()
     emitAnalysisTelemetry(options.onEvent, {
       timestamp, stage, modelCallId: callId, deployment: options.model.deployment,
-      promptVersion: ANALYSIS_MODEL_PROMPT_VERSIONS[stage], schemaVersion: ANALYSIS_MODEL_SCHEMA_VERSIONS[stage],
+      promptVersion: versions.promptVersion, schemaVersion: versions.schemaVersion,
       inputCharacters, contextCharacterLimit: ANALYSIS_MODEL_LIMITS.maxContextCharacters,
       completionTokenLimit: request.maxCompletionTokens,
       correctionCount, transportAttempt, durationMilliseconds: Math.max(0, Date.parse(timestamp) - Date.parse(startedAt)),
@@ -300,8 +303,8 @@ async function invokeAnalysisModel(
       content: response.content, callId,
       provenance: {
         model: actualModel, deployment: options.model.deployment,
-        promptVersion: ANALYSIS_MODEL_PROMPT_VERSIONS[stage],
-        schemaVersion: ANALYSIS_MODEL_SCHEMA_VERSIONS[stage],
+        promptVersion: versions.promptVersion,
+        schemaVersion: versions.schemaVersion,
         startedAt, completedAt: clock.now().toISOString(), inputCharacters,
       },
     }

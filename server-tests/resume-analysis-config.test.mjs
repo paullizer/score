@@ -92,6 +92,8 @@ test('feature discovery keeps existing fields, authenticated privacy, and author
   assert.equal(features.realResumeImports, false)
   assert.equal(features.markdownResumeImports, false)
   assert.equal(features.realAnalyses, false)
+  assert.equal(Object.hasOwn(features, 'analysisNarratives'), false)
+  assert.equal(features.analysisSummaryGeneration, false)
   assert.equal(features.wordDocumentImports, false)
   assert.equal(features.limits.maxFileBytes, 10 * 1024 * 1024)
   assert.equal(features.limits.maxPdfBytes, 10 * 1024 * 1024)
@@ -155,6 +157,7 @@ test('analysis history remains authorized and available when source services dis
   const url = await featureServer(t, { realAnalyses: configured }, { analyses })
   const features = await (await fetch(url, { headers: authHeaders() })).json()
   assert.equal(features.realAnalyses, false)
+  assert.equal(features.analysisSummaryGeneration, true, 'Frozen history supports narratives without live sources or new-run readiness.')
   assert.deepEqual(reads, [], 'feature readiness must not scan workspace records')
   const session = await (await fetch(url.replace(/features$/, 'session'), { headers: authHeaders() })).json()
   const workspaceId = session.workspaces[0].id
@@ -178,6 +181,7 @@ test('analysis history still requires its own configured store and blob dependen
     [{ realAnalyses: configured }, { blobs: {} }],
   ]) {
     const url = await featureServer(t, config, { analyses })
+    assert.equal((await (await fetch(url, { headers: authHeaders() })).json()).analysisSummaryGeneration, false)
     const session = await (await fetch(url.replace(/features$/, 'session'), { headers: authHeaders() })).json()
     const historyUrl = url.replace(/features$/, `workspaces/${session.workspaces[0].id}/analyses`)
     assert.equal((await fetch(historyUrl, { headers: authHeaders() })).status, 503)

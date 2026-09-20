@@ -4,6 +4,7 @@ import type { TokenCredential } from '@azure/identity'
 import { WORD_DOCUMENT_LIMITS, isWordContentType, storedDocumentContentType } from '../../src/domain/document-formats'
 import {
   ANALYSIS_LIMITS, analysisRunCanScore, type AnalysisEntity, type VersionedAnalysisEntity,
+  type AnalysisTargetSnapshotReference,
 } from '../../src/domain/real-analyses'
 import { MAX_MARKDOWN_BYTES } from '../../src/domain/source-files'
 import { WORKSPACE_ID_PATTERN } from '../ids'
@@ -18,8 +19,11 @@ import {
   analysisControlId, analysisIsRemoved, assertAnalysisRunWritable, parseAnalysisControl, prepareAnalysisGuards,
 } from './guards'
 import {
+  analysisNarrativeCanWork, analysisNarrativeRequestCanAdvance, analysisNarrativeRequestCancelled, candidateNarrativeBinding,
+} from './narrative-records'
+import {
   analysisBlobInRun, analysisBytesHash, analysisCancellationNeedsRetry, analysisHash, assertAnalysis, isAnalysisId, isSafeAnalysisBlobName, MAX_ANALYSIS_JSON_BYTES,
-  MAX_ANALYSIS_ORIGINAL_BYTES, MAX_ANALYSIS_TRANSACTION_BYTES, parseAnalysisEntity,
+  isAnalysisRecordId, MAX_ANALYSIS_ORIGINAL_BYTES, MAX_ANALYSIS_TRANSACTION_BYTES, parseAnalysisEntity,
 } from './validation'
 
 function status(error: unknown): number | undefined {
@@ -29,7 +33,7 @@ function status(error: unknown): number | undefined {
 }
 function scope(workspaceId: string, id?: string): void {
   assertAnalysis(WORKSPACE_ID_PATTERN.test(workspaceId) &&
-    (id === undefined || isAnalysisId(id, 'run') || isAnalysisId(id, 'comparison')), 'Invalid workspace or record identity.')
+    (id === undefined || isAnalysisRecordId(id)), 'Invalid workspace or record identity.')
 }
 function etag(value: string): void {
   assertAnalysis(typeof value === 'string' && value && value.trim() === value && value !== '*' && !value.startsWith('W/') && value.length <= 1024 &&
@@ -77,6 +81,8 @@ export function assertAnalysisReplacement(previous: AnalysisEntity, next: Analys
         next.cancellation.requestedBy === previous.cancellation.requestedBy &&
         next.cancellation.nextComparisonIndex >= previous.cancellation.nextComparisonIndex, 'Unfinished cancellation cannot be cleared.')
     }
+    assertAnalysis(!previous.narrativeCancelledAt || Boolean(next.narrativeCancelledAt &&
+      next.narrativeCancelledAt >= previous.narrativeCancelledAt), 'Narrative cancellation cannot move backwards.')
   } else if (previous.recordType === 'analysis-comparison' && next.recordType === 'analysis-comparison') {
     assertAnalysis(previous.runId === next.runId && previous.index === next.index &&
       analysisHash(previous.resume) === analysisHash(next.resume) && analysisHash(previous.target) === analysisHash(next.target),
@@ -88,6 +94,40 @@ export function assertAnalysisReplacement(previous: AnalysisEntity, next: Analys
       'Failure diagnostic history cannot be erased or an immutable attempt replaced.')
     }
     assertAnalysis(previous.status !== 'complete' || analysisHash(previous) === analysisHash(next), 'Completed evidence cannot be retried, cancelled, or changed.')
+  } else if (previous.recordType === 'analysis-narrative-request' && next.recordType === 'analysis-narrative-request') {
+    for (const key of ['runId', 'manifestSha256', 'requestId', 'requestedBy', 'mode', 'targetId', 'scopeRevision', 'plan', 'scheduled'] as const) {
+      assertAnalysis(analysisHash(previous[key]) === analysisHash(next[key]), 'Accepted narrative request inputs are immutable.')
+    }
+    assertAnalysis(next.nextIndex >= previous.nextIndex &&
+      (previous.status === 'queued' || analysisHash(previous) === analysisHash(next)),
+    'Accepted narrative receipts are immutable and cannot replay older requests.')
+  } else if ((previous.recordType === 'analysis-candidate-narrative' && next.recordType === 'analysis-candidate-narrative') ||
+    (previous.recordType === 'analysis-target-narrative' && next.recordType === 'analysis-target-narrative')) {
+    assertAnalysis(previous.runId === next.runId && previous.manifestSha256 === next.manifestSha256 &&
+      previous.targetId === next.targetId && analysisHash(previous.targetSnapshot) === analysisHash(next.targetSnapshot),
+    'Narrative frozen target identity is immutable.')
+    if (previous.recordType === 'analysis-candidate-narrative' && next.recordType === 'analysis-candidate-narrative') {
+      assertAnalysis(previous.comparisonId === next.comparisonId && previous.resultSha256 === next.resultSha256 &&
+        previous.inputFingerprint === next.inputFingerprint && analysisHash(previous.resumeSnapshot) === analysisHash(next.resumeSnapshot),
+      'Narrative frozen comparison identity is immutable.')
+    }
+    if (previous.generationId === next.generationId) {
+      assertAnalysis(previous.requestId === next.requestId && previous.requestedAt === next.requestedAt &&
+        previous.requestedBy === next.requestedBy && previous.reason === next.reason &&
+        (!previous.inputFingerprint || previous.inputFingerprint === next.inputFingerprint) &&
+        next.attempts >= previous.attempts && next.retryCount === previous.retryCount,
+      'A narrative generation cannot change its accepted inputs.')
+      assertAnalysis(previous.status !== 'ready' || analysisHash(previous) === analysisHash(next),
+        'Published narrative generations are immutable.')
+      assertAnalysis(!['failed', 'cancelled'].includes(previous.status) || next.status === previous.status,
+        'Stopped narrative generations require a fresh explicit or dependent generation.')
+    } else {
+      assertAnalysis(next.requestedAt >= previous.requestedAt && next.attempts === 0 && !next.lease &&
+        ['waiting', 'queued', 'cancelled'].includes(next.status), 'New narrative generations must start unclaimed.')
+    }
+    assertAnalysis(analysisHash(previous.published ?? null) === analysisHash(next.published ?? null) ||
+      next.status === 'ready' && next.published?.generationId === next.generationId,
+    'Narrative refresh must retain its previous publication until a replacement is ready.')
   }
 }
 function checkReplacement(current: VersionedAnalysisEntity | undefined, record: AnalysisEntity, expected: string): void {
@@ -101,7 +141,8 @@ export function analysisWorkIsPending(record: AnalysisEntity, now: string): bool
     ? !analysisIsRemoved(record.lifecycle) &&
       ((!record.lifecycle?.archivedAt && record.status === 'initializing') || Boolean(record.cancellation && !record.cancellation.completedAt)) &&
       !analysisCancellationNeedsRetry(record)
-    : record.status === 'queued' || record.status === 'running'
+    : record.status === 'queued' || record.status === 'running' ||
+      record.recordType === 'analysis-target-narrative' && record.status === 'waiting'
   return eligible && (!record.nextAttemptAt || record.nextAttemptAt <= now) && (!record.lease || record.lease.expiresAt <= now)
 }
 
@@ -150,13 +191,15 @@ export function createAnalysisStoreFromContainer(container: Pick<Container, 'ite
       scope(workspaceId, options.runId)
       const limit = options.limit ?? 50
       assertAnalysis(Number.isInteger(limit) && limit > 0 && limit <= 100 &&
-        ['analysis-run', 'analysis-comparison'].includes(options.recordType) &&
-        (options.runId === undefined || (options.recordType === 'analysis-comparison' && isAnalysisId(options.runId, 'run'))) &&
+        ['analysis-run', 'analysis-comparison', 'analysis-candidate-narrative', 'analysis-target-narrative', 'analysis-narrative-request'].includes(options.recordType) &&
+        (options.runId === undefined || (options.recordType !== 'analysis-run' && isAnalysisId(options.runId, 'run'))) &&
         (options.continuationToken === undefined || (typeof options.continuationToken === 'string' &&
           options.continuationToken.length > 0 && options.continuationToken.length <= 12 * 1024)), 'Invalid analysis query options.')
       const allowed = options.recordType === 'analysis-run'
         ? ['initializing', 'queued', 'running', 'complete', 'partial', 'failed', 'cancelled']
-        : ['queued', 'running', 'complete', 'failed', 'cancelled']
+        : options.recordType === 'analysis-comparison' ? ['queued', 'running', 'complete', 'failed', 'cancelled']
+          : options.recordType === 'analysis-narrative-request' ? ['queued', 'complete', 'cancelled']
+            : ['waiting', 'queued', 'running', 'ready', 'failed', 'cancelled']
       assertAnalysis(options.status === undefined || allowed.includes(options.status), 'Invalid status filter.')
       const filters = ['c.workspaceId = @workspaceId', 'c.recordType = @recordType']
       const parameters: SqlParameter[] = [{ name: '@workspaceId', value: workspaceId }, { name: '@recordType', value: options.recordType }]
@@ -170,7 +213,7 @@ export function createAnalysisStoreFromContainer(container: Pick<Container, 'ite
       }, { partitionKey: workspaceId, maxItemCount: limit, continuationToken: options.continuationToken }))
       const items = response.resources.map(value => decode(value, workspaceId))
       assertAnalysis(items.length <= limit && items.every(({ record }) => record.recordType === options.recordType &&
-        (options.runId === undefined || (record.recordType === 'analysis-comparison' && record.runId === options.runId)) &&
+        (options.runId === undefined || (record.recordType !== 'analysis-run' && record.runId === options.runId)) &&
         (options.status === undefined || record.status === options.status)), 'Analysis query escaped its scope.')
       return {
         items: items as VersionedAnalysisEntity<Extract<AnalysisEntity, { recordType: K }>>[],
@@ -204,7 +247,8 @@ export function createAnalysisStoreFromContainer(container: Pick<Container, 'ite
       checkReplacement(current, record, expected)
       assertAnalysis(current?.record.recordType === 'analysis-run' &&
         analysisHash(current.record.progress) === analysisHash(record.progress) &&
-        analysisHash(current.record.initialization) === analysisHash(record.initialization),
+        analysisHash(current.record.initialization) === analysisHash(record.initialization) &&
+        current.record.narrativeRequestId === record.narrativeRequestId,
       'Run progress must change atomically with its comparisons.')
       const controls = await prepareAnalysisGuards(store, record.workspaceId, [{ kind: 'replace', record, etag: expected }])
       await batch(record.workspaceId, [{
@@ -217,7 +261,7 @@ export function createAnalysisStoreFromContainer(container: Pick<Container, 'ite
     async transact(workspaceId, operations, options = {}) {
       scope(workspaceId)
       assertAnalysis((operations.length > 0 || options.controls?.length) && operations.length <= ANALYSIS_LIMITS.initializationChunkSize + 1 &&
-        new Set(operations.map(item => item.record.id)).size === operations.length, 'Analysis transactions require at most 25 unique pairs and a run fence.')
+        new Set(operations.map(item => item.record.id)).size === operations.length, 'Analysis transactions require at most 25 unique children and a run fence.')
       const validated = operations.map(operation => {
         assertAnalysis(operation.kind === 'create' || operation.kind === 'replace' ||
           (options.lifecycle && operation.kind === 'delete'), 'Unsupported transaction operation.')
@@ -249,6 +293,66 @@ export function createAnalysisStoreFromContainer(container: Pick<Container, 'ite
       }))
       const oldRun = previous.get(run.record.id)
       assertAnalysis(oldRun?.recordType === 'analysis-run' && run.record.recordType === 'analysis-run', 'Missing run publication fence.')
+      const targetParents = new Map<string, AnalysisTargetSnapshotReference>()
+      for (const item of validated) if (item.record.recordType === 'analysis-comparison') {
+        targetParents.set(item.record.target.summary.id, item.record.target)
+      }
+      let readTargets = false
+      for (const operation of validated) {
+        const record = operation.record
+        if (record.recordType === 'analysis-run' || record.recordType === 'analysis-comparison' || operation.kind === 'delete') continue
+        assertAnalysis(record.manifestSha256 === oldRun.manifest.sha256, 'Narrative must use the accepted run manifest.')
+        assertAnalysis(record.updatedAt <= run.record.updatedAt, 'The run cancellation fence must cover every narrative generation.')
+        if (!options.lifecycle && record.status !== 'cancelled' &&
+          !(record.recordType === 'analysis-narrative-request' && analysisNarrativeRequestCancelled(run.record, record))) {
+          assertAnalysis(analysisNarrativeCanWork(run.record, record),
+          'Cancellation fences narrative scheduling and publication.')
+        }
+        if (record.recordType === 'analysis-candidate-narrative') {
+          const pair = validated.find(item => item.record.id === record.comparisonId)?.record ??
+            (await store.get(workspaceId, record.comparisonId))?.record
+          assertAnalysis(pair?.recordType === 'analysis-comparison' && pair.status === 'complete', 'Narrative has no completed comparison.')
+          const binding = candidateNarrativeBinding(run.record, pair)
+          assertAnalysis(binding.targetId === record.targetId && analysisHash(binding.targetSnapshot) === analysisHash(record.targetSnapshot) &&
+            analysisHash(binding.resumeSnapshot) === analysisHash(record.resumeSnapshot) && binding.resultSha256 === record.resultSha256 &&
+            analysisHash(binding) === record.inputFingerprint, 'Narrative result or frozen input binding mismatch.')
+        } else if (record.recordType === 'analysis-target-narrative' && operation.kind === 'create') {
+          if (!targetParents.has(record.targetId) && !readTargets) {
+            let token: string | undefined
+            const seen = new Set<string>()
+            let count = 0
+            do {
+              const page = await store.list(workspaceId, { recordType: 'analysis-comparison', runId: oldRun.id, limit: 100, continuationToken: token })
+              for (const item of page.items) targetParents.set(item.record.target.summary.id, item.record.target)
+              count += page.items.length
+              assertAnalysis(count <= ANALYSIS_LIMITS.maxComparisons, 'Narrative parent inventory exceeds the frozen comparison bound.')
+              token = page.continuationToken
+              if (token) { assertAnalysis(!seen.has(token), 'Narrative parent lookup did not advance.'); seen.add(token) }
+            } while (token)
+            readTargets = true
+          }
+          const target = targetParents.get(record.targetId)
+          assertAnalysis(target && target.snapshotId === record.targetSnapshot.snapshotId && target.blob.sha256 === record.targetSnapshot.sha256,
+            'Target narrative has no matching frozen comparison target.')
+        } else if (record.recordType === 'analysis-narrative-request' && operation.kind === 'create') {
+          assertAnalysis(record.status === 'complete' && record.nextIndex === 0 ||
+            record.status === 'queued' && run.record.narrativeRequestId === record.requestId && record.nextIndex === 0,
+          'New narrative receipts require an atomic bounded scheduling fence.')
+        }
+      }
+      if (run.record.narrativeRequestId) {
+        const requestId = `analysis-narrative-request:${oldRun.id}:${run.record.narrativeRequestId}`
+        const request = validated.find(item => item.record.id === requestId)?.record ?? (await store.get(workspaceId, requestId))?.record
+        assertAnalysis(request?.recordType === 'analysis-narrative-request' && request.status === 'queued',
+          'Narrative scheduling fence has no pending durable receipt.')
+      }
+      if (oldRun.narrativeRequestId && oldRun.narrativeRequestId !== run.record.narrativeRequestId &&
+        !(options.lifecycle && analysisIsRemoved(run.record.lifecycle))) {
+        const request = validated.find(item => item.record.recordType === 'analysis-narrative-request' &&
+          item.record.requestId === oldRun.narrativeRequestId)?.record
+        assertAnalysis(request?.recordType === 'analysis-narrative-request' && ['complete', 'cancelled'].includes(request.status),
+          'A pending narrative coordinator cannot be discarded before scheduling completes.')
+      }
       const progress = { ...oldRun.progress }
       const createdIndexes: number[] = []
       for (const operation of validated) {
@@ -285,12 +389,17 @@ export function createAnalysisStoreFromContainer(container: Pick<Container, 'ite
           'Analysis source writers have not drained.')
         let token: string | undefined
         const seen = new Set<string>()
-        do {
-          const page = await store.list(workspaceId, { recordType: 'analysis-comparison', runId: run.record.id, limit: 1, continuationToken: token })
-          assertAnalysis(!page.items.length, 'Run still owns comparisons.')
-          token = page.continuationToken
-          if (token) { assertAnalysis(!seen.has(token), 'Comparison cleanup pagination did not advance.'); seen.add(token) }
-        } while (token)
+        for (const recordType of ['analysis-comparison', 'analysis-candidate-narrative', 'analysis-target-narrative', 'analysis-narrative-request'] as const) {
+          token = undefined
+          seen.clear()
+          do {
+            const page: { items: VersionedAnalysisEntity[]; continuationToken?: string } =
+              await store.list(workspaceId, { recordType, runId: run.record.id, limit: 1, continuationToken: token })
+            assertAnalysis(!page.items.length, 'Run still owns comparisons, narratives, or request receipts.')
+            token = page.continuationToken
+            if (token) { assertAnalysis(!seen.has(token), 'Analysis cleanup pagination did not advance.'); seen.add(token) }
+          } while (token)
+        }
       }
       const pending: OperationInput[] = validated.map(operation => operation.kind === 'create'
         ? { operationType: 'Create', resourceBody: operation.record as unknown as JSONObject }
@@ -343,14 +452,15 @@ export function createAnalysisStoreFromContainer(container: Pick<Container, 'ite
     async listPending(now, limit) {
       assertAnalysis(Number.isFinite(Date.parse(now)) && Number.isInteger(limit) && limit > 0 && limit <= 100, 'Invalid pending work query.')
       const records: VersionedAnalysisEntity[] = []
-      const parents = new Map<string, boolean>()
+      const parents = new Map<string, Extract<AnalysisEntity, { recordType: 'analysis-run' }> | undefined>()
       const workspaces = new Map<string, string>()
       // Initialize/cancel first; blocked children must not consume the ready-work limit.
-      for (const recordType of ['analysis-run', 'analysis-comparison'] as const) {
+      for (const recordType of ['analysis-run', 'analysis-comparison', 'analysis-narrative-request', 'analysis-candidate-narrative', 'analysis-target-narrative'] as const) {
         const eligible = recordType === 'analysis-run'
           ? `(c.status = 'initializing' OR (IS_DEFINED(c.cancellation) AND NOT IS_DEFINED(c.cancellation.completedAt)
               AND (NOT IS_DEFINED(c.error) OR (c.error.retryable = true AND c.attempts < @maxAttempts))))`
-          : "(c.status = 'queued' OR c.status = 'running')"
+          : recordType === 'analysis-target-narrative' ? "(c.status = 'queued' OR c.status = 'running' OR c.status = 'waiting')"
+            : recordType === 'analysis-narrative-request' ? "c.status = 'queued'" : "(c.status = 'queued' OR c.status = 'running')"
         const query = {
           query: `SELECT * FROM c WHERE c.recordType = @recordType AND ${eligible}
             ${recordType === 'analysis-run' ? `AND NOT IS_DEFINED(c.lifecycle.deletingAt) AND NOT IS_DEFINED(c.lifecycle.deletedAt)
@@ -376,16 +486,21 @@ export function createAnalysisStoreFromContainer(container: Pick<Container, 'ite
               workspaces.set(record.workspaceId, (await store.getControl(record.workspaceId))?.record.state ?? 'active')
             }
             const state = workspaces.get(record.workspaceId)
-            if (state !== 'active' && !(state === 'archived' && record.recordType === 'analysis-run' &&
-              record.cancellation && !record.cancellation.completedAt)) continue
-            if (record.recordType === 'analysis-comparison') {
+            if (state !== 'active' && !(state === 'archived' &&
+              (record.recordType === 'analysis-run' && record.cancellation && !record.cancellation.completedAt ||
+                record.recordType === 'analysis-narrative-request'))) continue
+            if (record.recordType !== 'analysis-run') {
               const key = JSON.stringify([record.workspaceId, record.runId])
               if (!parents.has(key)) {
                 const parent = await store.get(record.workspaceId, record.runId)
                 assertAnalysis(!parent || parent.record.recordType === 'analysis-run', 'Pending comparison has no valid parent run.')
-                parents.set(key, Boolean(parent && parent.record.recordType === 'analysis-run' && analysisRunCanScore(parent.record)))
+                parents.set(key, parent?.record.recordType === 'analysis-run' ? parent.record : undefined)
               }
-              if (!parents.get(key)) continue
+              const parent = parents.get(key)
+              if (!parent || (record.recordType === 'analysis-comparison' ? !analysisRunCanScore(parent)
+                : record.recordType === 'analysis-narrative-request'
+                  ? !analysisNarrativeRequestCanAdvance(parent, record) || state === 'archived' && !analysisNarrativeRequestCancelled(parent, record)
+                  : !analysisNarrativeCanWork(parent, record) || Boolean(parent.narrativeRequestId))) continue
             }
             records.push(item)
             if (records.length === limit) return records

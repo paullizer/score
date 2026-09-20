@@ -127,9 +127,9 @@ async function pdfHyperlinks(bytes) {
   }
   return links
 }
-async function pptxHyperlinks(bytes) {
+async function officeHyperlinks(bytes, pattern) {
   const links = []
-  for (const xml of await xmlParts(bytes, /^ppt\/slides\/_rels\/slide\d+\.xml\.rels$/)) {
+  for (const xml of await xmlParts(bytes, pattern)) {
     const parser = new SaxesParser()
     parser.on('opentag', (node) => {
       if (node.name === 'Relationship' && node.attributes.Type?.endsWith('/hyperlink')) {
@@ -141,6 +141,7 @@ async function pptxHyperlinks(bytes) {
   }
   return links
 }
+const pptxHyperlinks = bytes => officeHyperlinks(bytes, /^ppt\/slides\/_rels\/slide\d+\.xml\.rels$/)
 async function followSampleSources(page, row, run) {
   const pair = run.comparisons.find((comparison) => comparison.id === new URL(row['Analysis link']).searchParams.get('result'))
   assert.ok(pair)
@@ -334,11 +335,15 @@ test('a read-only reviewer downloads genuine CSV, PDF, Word and PowerPoint files
         const content = parts.join('\n')
         assert.match(content, /Jordan Example/)
         assert.match(content, /Engineering methods/)
-        for (const { comparison } of pairs) assert.equal(content.includes(comparison.id), format === 'docx')
-        if (format === 'pptx') {
-          const destinations = await pptxHyperlinks(bytes)
-          for (const link of rows.flatMap(reportDestinations)) assert.ok(destinations.includes(link), `PowerPoint link: ${link}`)
-          assert.doesNotMatch(content, /Partial report|cutoff ties|Comparison ID|Run ID/)
+        for (const { comparison } of pairs) assert.equal(content.includes(comparison.id), false)
+        const destinations = format === 'pptx' ? await pptxHyperlinks(bytes)
+          : await officeHyperlinks(bytes, /^word\/_rels\/document\.xml\.rels$/)
+        for (const link of rows.flatMap(reportDestinations)) assert.ok(destinations.includes(link), `${format} link: ${link}`)
+        assert.doesNotMatch(content, /Partial report|cutoff ties|Comparison ID|Run ID/)
+        if (format === 'docx') {
+          assert.match(content, /Saved analysis overview/)
+          assert.match(content, /Contents/)
+          assert.ok(content.indexOf('Why this score') < content.indexOf('Candidates at a glance'))
         }
         assert.match(content, /[Hh]uman|hiring recommendation/)
       }
@@ -464,7 +469,7 @@ test('unfinished analyses explain why export is disabled until a comparison comp
   } finally { await context.close(); await fixture.close() }
 })
 
-test('an active run reports completion counts, excludes unfinished CSV rows, and retains detailed Word behavior', { timeout: 90_000 }, async () => {
+test('an active run reports completion counts, excludes unfinished CSV rows, and blocks Word exactly like PDF', { timeout: 90_000 }, async () => {
   const { fixture, runId, pairs } = await completedFixture({ partial: true })
   const { context, page, errors } = await newPage()
   try {
@@ -482,12 +487,13 @@ test('an active run reports completion counts, excludes unfinished CSV rows, and
     assert.equal(rows.length, 1)
     assert.equal(new URL(rows[0]['Analysis link']).searchParams.get('result'), pairs.find(({ comparison }) => comparison.status === 'complete').comparison.id)
     assert.doesNotMatch(output.bytes.toString('utf8'), /"Queued"|"Partial report"/)
-    const word = await download(page, 'docx')
-    assert.match(word.filename, / - partial\.docx$/)
-    await visible(dialog.getByText('Partial report', { exact: true }))
-    const wordText = (await xmlParts(word.bytes, /^word\/document\.xml$/)).join('\n')
-    assert.match(wordText, /Queued/)
-    for (const { comparison } of pairs) assert.ok(wordText.includes(comparison.id))
+    for (const format of ['docx', 'pdf']) {
+      await dialog.getByLabel('Report format', { exact: true }).selectOption(format)
+      await visible(dialog.getByText(/Missing, outdated, failed, waiting, or generating summaries block/))
+      await visible(dialog.getByText('Reporting on 1 of 2 candidates', { exact: true }))
+      assert.equal(await dialog.getByRole('button', { name: /^Download / }).isDisabled(), true)
+      assert.equal(await dialog.getByText('Partial report', { exact: true }).count(), 0)
+    }
     assert.deepEqual(errors, [])
   } finally { await context.close(); await fixture.close() }
 })

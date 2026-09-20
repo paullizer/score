@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { Link, useNavigate, useSearchParams } from 'react-router-dom'
 import { ArrowLeft, ArrowUpRight, Layers3, LoaderCircle, RotateCcw, ShieldCheck, X } from 'lucide-react'
 import { useRealAnalyses } from '../../app/real-analyses-context'
@@ -15,6 +15,7 @@ import {
 } from './analysisTableBrowsing'
 import { RealComparisonReview } from './RealComparisonReview'
 import { AnalysisReportExport } from './AnalysisReportExport'
+import { ManageAnalysisSummaries, RealTargetNarrative } from './AnalysisSummaries'
 import { ArchivedBadge, EntityLifecycleActions, LifecycleBanner } from '../../components/lifecycle/LifecycleControls'
 import { useLifecycleAccess } from '../../components/lifecycle/useLifecycleAccess'
 import { getDisplayName } from '../../domain/displayNames'
@@ -97,6 +98,9 @@ function RealAnalysisView({ id }: { id: string }) {
   const [query, setQuery] = useState('')
   const [targetId, setTargetId] = useState('')
   const [sort, setSort] = useState<TableSort<RealComparisonSortKey> | null>(null)
+  const [summaryScope, setSummaryScope] = useState<{ targetId?: string } | null>(null)
+  const summaryTrigger = useRef<HTMLButtonElement>(null)
+  const summaryWasOpen = useRef(false)
   const entry = api?.detail(id)
   const pairs = api?.comparisons(id)
   const ensure = api?.ensureDetail
@@ -108,6 +112,10 @@ function RealAnalysisView({ id }: { id: string }) {
     void ensure?.(id)
     void ensurePairs?.(id)
   }, [api?.phase, ensure, ensurePairs, entry?.state, id, pairs?.state])
+  useEffect(() => {
+    if (!summaryScope && summaryWasOpen.current) summaryTrigger.current?.focus()
+    summaryWasOpen.current = summaryScope !== null
+  }, [summaryScope])
   if (!api) return <EmptyState title="Real analyses require a cloud workspace" description="A real analysis cannot be read from sample storage." />
   const back = <Link className="back-link" to={selectedId ? `/analyses/${encodeURIComponent(id)}?data=real` : '/analyses?data=real'}><ArrowLeft size={14} aria-hidden="true" />{selectedId ? 'All saved comparisons' : 'Back to real analyses'}</Link>
   if (deleting || (removed && entry?.state === 'ready')) return <>{back}<LifecycleBanner target={{ kind: 'analysis', id }} /><EmptyState title="Analysis cleanup or removal" description="Cached comparisons, snapshots, and downloads are no longer available. Retry the lifecycle operation above if permanent cleanup is incomplete." /></>
@@ -122,6 +130,10 @@ function RealAnalysisView({ id }: { id: string }) {
   const finished = run.progress.complete + run.progress.failed + run.progress.cancelled
   const savedPairs = pairs?.state === 'ready' ? pairs.value : []
   const browsing = selectRealComparisons(savedPairs, detail.targets, { query, targetId, sort }, summary)
+  const viewedTarget = (selectedId
+    ? savedPairs.find((item) => item.comparison.id === selectedId)?.comparison.target.summary
+    : detail.targets.find((target) => targetIdentity(target.selection) === targetId))
+    ?? (detail.targets.length === 1 ? detail.targets[0] : undefined)
   const targetLabels = distinctTargetLabels(browsing.targets, realComparisonTargetLabel)
   const sortOptions = realComparisonSortOptions.map((option) => ({
     ...option, disabled: option.key === 'score' && !browsing.scoreEnabled,
@@ -141,10 +153,11 @@ function RealAnalysisView({ id }: { id: string }) {
   }
   return <>{back}
     <PageHeader eyebrow="REAL EVIDENCE · FROZEN INPUTS" title={getDisplayName(run, run.name)} description="Review each saved resume/target pair independently. Completion, coverage, and overall-score availability are separate."
-      actions={<><RenameEntityButton target={{ kind: 'analysis', id }} name={getDisplayName(run, run.name)} etag={summary.etag} disabled={!api.canWrite || api.phase !== 'ready' || !summary.etag || api.pending(id)} /><EntityLifecycleActions target={{ kind: 'analysis', id }} name={getDisplayName(run, run.name)} onComplete={(action) => { if (action === 'delete') navigate('/analyses?data=real') }} /><RealRunActions summary={summary} /><AnalysisReportExport source={{
+      actions={<><RenameEntityButton target={{ kind: 'analysis', id }} name={getDisplayName(run, run.name)} etag={summary.etag} disabled={!api.canWrite || api.phase !== 'ready' || !summary.etag || api.pending(id)} /><EntityLifecycleActions target={{ kind: 'analysis', id }} name={getDisplayName(run, run.name)} onComplete={(action) => { if (action === 'delete') navigate('/analyses?data=real') }} /><RealRunActions summary={summary} />
+        <Button ref={summaryTrigger} onClick={() => setSummaryScope({ targetId: viewedTarget?.id })}>Manage summaries</Button><AnalysisReportExport source={{
         kind: 'real', workspaceId: api.workspaceId, detail: { ...detail, ...summary },
         comparisons: pairs?.state === 'ready' ? pairs.value : null, available: api.phase === 'ready',
-      }} />{canEdit && api.canWrite && api.features?.realAnalyses
+      }} onManageSummaries={(targetId) => setSummaryScope({ targetId })} />{canEdit && api.canWrite && api.features?.realAnalyses
         ? <Link className="button button-secondary button-md" {...realAnalysisLink({ from: id }, api.workspaceId)}><Layers3 size={15} aria-hidden="true" />New run with these inputs</Link>
         : <Button icon={Layers3} disabled title={!canEdit ? 'Unarchive this analysis and its workspace before creating another run.' : api.creationError ?? 'New-run readiness has not been confirmed.'}>New run with these inputs</Button>}</>} />
     <LifecycleBanner target={{ kind: 'analysis', id }} />
@@ -158,6 +171,7 @@ function RealAnalysisView({ id }: { id: string }) {
       <p>{run.progress.scored} with a server-calculated score · {run.progress.unscored} completed without an overall score. Saved results are never overwritten when other pairs retry.</p>
       {realAnalysisCancellationPending(summary) && <p>Cancellation is progressing in bounded batches. This view keeps polling until the server confirms completion.</p>}
     </section>
+    {viewedTarget && <RealTargetNarrative runId={id} target={viewedTarget} />}
     {selectedId ? <SelectedRealComparison runId={id} comparisonId={selectedId} initialView={sourceView} /> : <section className="panel mt-5" aria-label="Real comparisons">
       <div className="section-heading"><div><h2>Separate comparisons, not a cross-job ranking</h2><p>Open a result for the complete criterion breakdown and exact source quotations.</p></div>
         <Button size="sm" icon={RotateCcw} onClick={() => { void api.ensureDetail(id, true); void api.ensureComparisons(id, true) }}>Refresh pairs</Button></div>
@@ -199,6 +213,8 @@ function RealAnalysisView({ id }: { id: string }) {
       <div className="table-bottom"><span>Showing {browsing.rows.length} of {savedPairs.length} saved comparison records / {run.progress.total} planned</span><span>Retries reuse saved inputs, not current live sources.</span></div>
     </section>}
     <div className="info-callout mt-5"><ShieldCheck size={18} aria-hidden="true" /><p>Human review only. Scores describe evidence in the submitted document, not a person’s intrinsic ability. Missing evidence is not proof of missing skills; GS assessments are not official qualification or eligibility determinations.</p></div>
+    {summaryScope && <ManageAnalysisSummaries detail={detail} open initialTargetId={summaryScope.targetId}
+      onOpenChange={(open) => { if (!open) setSummaryScope(null) }} />}
   </>
 }
 

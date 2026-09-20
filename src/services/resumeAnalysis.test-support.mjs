@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
 import { PDFDocument, StandardFonts } from 'pdf-lib'
 import { buildGradeTestRuntime, memoryBlobs, startGradeFixture } from './gradeLadders.test-support.mjs'
+import { narrativeModelResponse } from '../../server-tests/real-analysis-narratives.test-support.mjs'
 import { passageSelection } from '../../worker-tests/analysis-selection-test-support.mjs'
 
 const clone = (value) => structuredClone(value)
@@ -16,6 +17,7 @@ export { resumeControlId, parseResumeControl, prepareResumeTransaction } from '.
 export { analysisControlId, parseAnalysisControl, prepareAnalysisGuards } from './server/analyses/guards.ts'
 export { assertAnalysisReplacement, analysisWorkIsPending } from './server/analyses/azure-store.ts'
 export { analysisRunCanScore } from './src/domain/real-analyses.ts'
+export { analysisNarrativeCanWork, analysisNarrativeRequestCanAdvance, analysisNarrativeRequestCancelled } from './server/analyses/narrative-records.ts'
 export * as resumeWorker from './worker/resumes/runtime.ts'
 export * as analysisWorker from './worker/analyses/runtime.ts'
 ${options.serverExports ?? ''}
@@ -71,7 +73,8 @@ export function memoryRecords(api, parse, kind, { pageSize = 2 } = {}) {
       return store.get(record.workspaceId, record.id)
     },
     async transact(workspaceId, operations, options = {}) {
-      assert.ok((operations.length > 0 || options.controls?.length) && operations.length <= 100, 'Cosmos transaction operation limit.')
+      assert.ok((operations.length > 0 || options.controls?.length) && operations.length <= (kind === 'analysis' ? 26 : 100),
+        'The bounded operation budget leaves room for atomic lifecycle controls.')
       assert.ok(Buffer.byteLength(JSON.stringify(operations)) <= 1_800_000, 'Cosmos transaction payload budget.')
       const prepared = await prepare(store, workspaceId, operations, options)
       const ids = new Set()
@@ -81,6 +84,10 @@ export function memoryRecords(api, parse, kind, { pageSize = 2 } = {}) {
         ids.add(operation.record.id)
         parse(operation.record)
         assert.ok(Buffer.byteLength(JSON.stringify(operation.record)) <= 512 * 1024, 'Records cannot contain unbounded source text.')
+        if (kind === 'analysis' && operation.kind !== 'delete' && operation.record.recordType.includes('narrative')) {
+          const parent = operations.find(item => item.record.id === operation.record.runId)?.record
+          assert.ok(parent && parent.updatedAt >= operation.record.updatedAt, 'The parent timestamp fences every narrative generation.')
+        }
         const current = values.get(key(workspaceId, operation.record.id))
         if (operation.kind === 'create' ? Boolean(current) : !current || current.etag !== operation.etag) {
           throw new api.StoreConflictError('Concurrent integration publication.')
@@ -121,9 +128,16 @@ export function memoryRecords(api, parse, kind, { pageSize = 2 } = {}) {
             ['queued', 'parsing', 'profiling'].includes(record.resume.status)
         }
         if (record.recordType === 'resume-batch') return false
-        if (rootState !== 'active' && !(rootState === 'archived' && record.recordType === 'analysis-run' && record.cancellation)) return false
+        if (rootState !== 'active' && !(rootState === 'archived' &&
+          (record.recordType === 'analysis-run' && record.cancellation || record.recordType === 'analysis-narrative-request'))) return false
         if (!api.analysisWorkIsPending(record, now)) return false
-        return record.recordType === 'analysis-run' || api.analysisRunCanScore(values.get(key(record.workspaceId, record.runId))?.record)
+        if (record.recordType === 'analysis-run') return true
+        const parent = values.get(key(record.workspaceId, record.runId))?.record
+        return parent && (record.recordType === 'analysis-comparison' ? api.analysisRunCanScore(parent)
+          : record.recordType === 'analysis-narrative-request'
+            ? api.analysisNarrativeRequestCanAdvance(parent, record) &&
+              (rootState !== 'archived' || api.analysisNarrativeRequestCancelled(parent, record))
+            : api.analysisNarrativeCanWork(parent, record) && !parent.narrativeRequestId)
       }).sort((left, right) => left.record.createdAt.localeCompare(right.record.createdAt))
         .slice(0, limit).map(clone)
     },
@@ -347,6 +361,7 @@ function analysisCitationFor(input, text) {
 
 export function processingStubs(fixture, { urlPages = new Map(), onModelRequest, ocrParagraphs = resumeParagraphs } = {}) {
   const modelCalls = []
+  const narrativeEvents = []
   const sourceCalls = []
   const ocrCalls = []
   const browserCalls = []
@@ -422,7 +437,8 @@ export function processingStubs(fixture, { urlPages = new Map(), onModelRequest,
         assert.ok(user.input && user.assessment, 'Grounding must independently receive the input and normalized assessment.')
         output = { outcome: 'supported', issues: [] }
       } else {
-        assert.fail(`Unexpected inference schema: ${schema}`)
+        output = narrativeModelResponse(schema, user)
+        assert.ok(output, `Unexpected inference schema: ${schema}`)
       }
       return Response.json({
         model: 'gpt-5-mini-fixture',
@@ -487,7 +503,7 @@ export function processingStubs(fixture, { urlPages = new Map(), onModelRequest,
     },
   }
   return {
-    modelCalls, sourceCalls, ocrCalls, browserCalls,
+    modelCalls, narrativeEvents, sourceCalls, ocrCalls, browserCalls,
     resumes: {
       ...fixture.resumes, documentIntelligence, model, safeFetchOptions, browser, clock: fixture.clock,
       owner: `resume-integration-${randomUUID()}`,
@@ -495,6 +511,7 @@ export function processingStubs(fixture, { urlPages = new Map(), onModelRequest,
     analyses: {
       ...fixture.analyses, model, clock: fixture.clock,
       owner: `analysis-integration-${randomUUID()}`,
+      onNarrativeEvent: event => narrativeEvents.push(event),
     },
   }
 }
@@ -511,11 +528,16 @@ export async function processAllResumes(fixture, stubs) {
 }
 
 export async function processAllAnalyses(fixture, stubs) {
-  for (let pass = 0; pass < 40; pass++) {
-    const pending = [...fixture.analyses.store.values.values()].some(({ record }) =>
-      record.recordType === 'analysis-run'
-        ? record.status === 'initializing' || Boolean(record.cancellation && !record.cancellation.completedAt)
-        : record.recordType === 'analysis-comparison' && ['queued', 'running'].includes(record.status))
+  for (let pass = 0; pass < 100; pass++) {
+    const pending = [...fixture.analyses.store.values.values()].some(({ record }) => {
+      if (record.recordType === 'analysis-run') return record.status === 'initializing' || Boolean(record.cancellation && !record.cancellation.completedAt)
+      const parent = fixture.analyses.store.values.get(`${record.workspaceId}/${record.runId}`)?.record
+      if (!parent) return false
+      if (record.recordType === 'analysis-comparison') return fixture.runtime.api.analysisRunCanScore(parent) && ['queued', 'running'].includes(record.status)
+      return record.recordType === 'analysis-narrative-request'
+        ? fixture.runtime.api.analysisNarrativeRequestCanAdvance(parent, record)
+        : fixture.runtime.api.analysisNarrativeCanWork(parent, record) && ['waiting', 'queued', 'running'].includes(record.status)
+    })
     if (!pending) return
     await fixture.runtime.api.analysisWorker.runAnalysisWorker(stubs.analyses, { maxItems: 20 })
     fixture.advanceClock(120_000)

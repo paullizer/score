@@ -25,7 +25,14 @@ import type {
 } from './real-resumes'
 import type { Citation, Job, Rubric, SourceDocument } from './types'
 import type { LifecycleMetadata, LifecycleOperation } from './lifecycle'
+import type { RealAnalysisCandidateNarrativeSummary, RealAnalysisNarrativeRecord } from './analysis-narratives'
 import type { AnalysisDiagnosticCapture, AnalysisFailureDiagnosticReference } from './analysis-diagnostics'
+
+export type {
+  RealAnalysisCandidateNarrativeRecord,
+  RealAnalysisNarrativeRecord,
+  RealAnalysisTargetNarrativeRecord,
+} from './analysis-narratives'
 
 export const ANALYSIS_LIMITS = {
   maxComparisons: 500,
@@ -271,6 +278,9 @@ export interface RealAnalysisRunRecord extends AnalysisEntityBase, AnalysisWorkS
   progress: RealAnalysisProgress
   completedAt?: string
   cancellation?: { requestedAt: string; requestedBy: string; nextComparisonIndex: number; completedAt?: string }
+  // The private receipt keeps scheduling/cancellation bounded and recoverable.
+  narrativeRequestId?: string
+  narrativeCancelledAt?: string
 }
 
 export type AnalysisCriterionScore = 0 | 1 | 2 | 3 | 4 | 5
@@ -414,7 +424,23 @@ export interface RealAnalysisComparisonRecord extends AnalysisEntityBase, Analys
   diagnosticCapture?: AnalysisDiagnosticCapture
 }
 
-export type AnalysisEntity = RealAnalysisRunRecord | RealAnalysisComparisonRecord
+export interface RealAnalysisNarrativeRequestRecord extends AnalysisEntityBase, AnalysisWorkState {
+  recordType: 'analysis-narrative-request'
+  runId: string
+  manifestSha256: string
+  requestId: string
+  requestedBy: string
+  mode: 'missing' | 'all'
+  targetId: string | null
+  scopeRevision: string
+  plan: ImmutableJsonBlobReference
+  status: 'queued' | 'complete' | 'cancelled'
+  nextIndex: number
+  scheduled: { candidates: number; targets: number }
+}
+
+export type AnalysisEntity = RealAnalysisRunRecord | RealAnalysisComparisonRecord |
+  RealAnalysisNarrativeRecord | RealAnalysisNarrativeRequestRecord
 
 export interface VersionedAnalysisEntity<T extends AnalysisEntity = AnalysisEntity> {
   record: T
@@ -449,6 +475,8 @@ export interface RealAnalysisComparisonDetail extends RealAnalysisComparisonSumm
   resumeSnapshot: FrozenRealResumeSnapshot
   targetSnapshot: FrozenRealAnalysisTargetSnapshot
   result: RealAnalysisResult | null
+  // A separately versioned sidecar; never part of the immutable comparison or result hash.
+  narrative?: RealAnalysisCandidateNarrativeSummary
 }
 
 export interface RealAnalysisComparisonsPage {
@@ -467,6 +495,8 @@ export interface RealAnalysisDocumentQuery {
 export interface AnalysisProcessingFeatures {
   realAnalyses: boolean
   analysisLimits: typeof ANALYSIS_LIMITS
+  // Independent of new-run/source-service readiness; historical summary reads do not require it.
+  analysisSummaryGeneration?: boolean
 }
 
 export interface CreateRealAnalysisInput {

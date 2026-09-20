@@ -140,8 +140,8 @@ export async function advanceAnalysisRun(
   let current = await loadAnalysisRun(deps.store, workspaceId, runId)
   assertAnalysis(current, 'Run was not found.')
   while (chunks < maxChunks) {
-    const timestamp = (options.now ?? (() => new Date()))().toISOString()
     const run = current.record
+    const timestamp = new Date(Math.max((options.now ?? (() => new Date()))().getTime(), Date.parse(run.updatedAt))).toISOString()
     if (analysisIsRemoved(run.lifecycle) && !options.lifecycle) return current
     if (options.expectedAttemptId !== undefined && run.attemptId !== options.expectedAttemptId) return current
     const cancelling = Boolean(run.cancellation && !run.cancellation.completedAt)

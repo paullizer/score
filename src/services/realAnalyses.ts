@@ -1,3 +1,4 @@
+import { z } from 'zod'
 import {
   ANALYSIS_LIMITS,
   type AnalysisModelProvenance,
@@ -17,6 +18,11 @@ import {
   type RealComparisonMutationResponse,
   type RetryRealAnalysisInput,
 } from '../domain/real-analyses'
+import {
+  ANALYSIS_NARRATIVE_LIMITS, analysisNarrativeIsCurrent,
+  type GenerateRealAnalysisSummariesInput, type RealAnalysisSummariesMutationResponse,
+  type RealAnalysisSummariesQuery, type RealAnalysisSummariesResponse,
+} from '../domain/analysis-narratives'
 import {
   ANALYSIS_DIAGNOSTIC_LIMITS, ANALYSIS_DIAGNOSTIC_REASONS,
   type AnalysisFailureDiagnostic, type RealAnalysisDiagnosticsPage,
@@ -56,10 +62,141 @@ function checkedComparison(value: RealAnalysisComparisonSummary, workspaceId: st
   return value
 }
 
+const narrativeId = z.string().min(1).max(1024).refine((value) => value === value.trim())
+const narrativeHash = z.string().regex(/^[a-f0-9]{64}$/)
+const narrativeCount = z.number().int().min(0).max(ANALYSIS_LIMITS.maxComparisons)
+const narrativeStatus = z.enum(['waiting', 'queued', 'running', 'ready', 'failed', 'cancelled', 'missing', 'stale', 'not-required'])
+const comparisonStatus = z.enum(['queued', 'running', 'complete', 'failed', 'cancelled'])
+const narrativeRevision = z.object({ revision: narrativeHash, inputFingerprint: narrativeHash })
+const narrativePublication = narrativeRevision.extend({ dataKind: z.literal('real'), generationId: narrativeId, publishedAt: narrativeId })
+const narrativeCounts = z.object({
+  total: narrativeCount, missing: narrativeCount, waiting: narrativeCount, queued: narrativeCount, running: narrativeCount,
+  ready: narrativeCount, stale: narrativeCount, failed: narrativeCount, cancelled: narrativeCount, notRequired: narrativeCount,
+}).refine(({ total, ...counts }) => Object.values(counts).reduce((sum, count) => sum + count, 0) === total)
+const narrativeScope = z.object({ targetId: narrativeId.nullable() })
+const narrativeState = z.object({
+  targetId: narrativeId, status: narrativeStatus, generationId: narrativeId.nullable(), inputFingerprint: narrativeHash.nullable(),
+  waitingFor: z.enum(['scoring', 'candidate-narratives']).nullable(),
+  attempts: z.number().int().min(0), retryCount: z.number().int().min(0),
+  nextAttemptAt: narrativeId.nullable(), updatedAt: narrativeId.nullable(),
+  error: z.object({
+    code: z.enum(['invalid-input', 'stale-input', 'snapshot-unavailable', 'snapshot-invalid', 'context-limit', 'invalid-model-output',
+      'invalid-citation', 'grounding-failed', 'service-unavailable', 'storage-error', 'timeout', 'internal-error', 'dependency-failed']),
+    stage: z.enum(['dependencies', 'candidate-generation', 'target-generation', 'grounding', 'publication']),
+    message: z.string().min(1).max(16_000), retryable: z.boolean(),
+  }).nullable(),
+})
+const summariesEnvelope: z.ZodType<RealAnalysisSummariesResponse> = z.object({
+  schemaVersion: z.literal(1), dataKind: z.literal('real'), workspaceId: narrativeId, runId: narrativeId,
+  scope: narrativeScope, revision: narrativeHash, etag: narrativeId, ready: z.boolean(),
+  scoring: z.object({
+    total: narrativeCount, initialized: narrativeCount, queued: narrativeCount, running: narrativeCount,
+    complete: narrativeCount, failed: narrativeCount, cancelled: narrativeCount,
+  }),
+  counts: z.object({ candidates: narrativeCounts, targets: narrativeCounts }),
+  capabilities: z.object({
+    canGenerate: z.boolean(), reason: z.enum(['read-only', 'archived', 'deleting', 'cancelling', 'service-unavailable']).nullable(),
+  }),
+  comparisons: z.array(narrativeState.extend({
+    kind: z.literal('candidate'), comparisonId: narrativeId, comparisonStatus,
+    published: narrativePublication.extend({
+      text: z.string().min(1).max(ANALYSIS_NARRATIVE_LIMITS.candidateMaxCharacters),
+      overview: z.string().min(1).max(ANALYSIS_NARRATIVE_LIMITS.overviewMaxCharacters),
+    }).nullable(),
+  })).max(ANALYSIS_LIMITS.maxComparisons),
+  targets: z.array(narrativeState.extend({
+    kind: z.literal('target'), published: narrativePublication.extend({
+      paragraphs: z.array(z.string().min(1).max(ANALYSIS_NARRATIVE_LIMITS.targetParagraphMaxCharacters))
+        .min(1).max(ANALYSIS_NARRATIVE_LIMITS.targetMaxParagraphs),
+    }).nullable(),
+  })).max(ANALYSIS_LIMITS.maxComparisons),
+  capture: z.object({
+    dataKind: z.literal('real'), scope: narrativeScope, revision: narrativeHash, ready: z.boolean(),
+    comparisons: z.array(z.object({
+      comparisonId: narrativeId, targetId: narrativeId, status: comparisonStatus,
+      resultSha256: narrativeHash.nullable(), narrative: narrativeRevision.nullable(),
+    })).max(ANALYSIS_LIMITS.maxComparisons),
+    targets: z.array(z.object({ targetId: narrativeId, narrative: narrativeRevision.nullable() })).max(ANALYSIS_LIMITS.maxComparisons),
+  }),
+})
+
+function checkedSummaryScope(workspaceId: string, runId: string, query: RealAnalysisSummariesQuery): string | null {
+  if (!narrativeId.safeParse(workspaceId).success || !narrativeId.safeParse(runId).success ||
+    (query.targetId !== undefined && !narrativeId.safeParse(query.targetId).success)) {
+    throw new Error('Select a saved workspace, analysis, and optional exact job or grade before requesting summaries.')
+  }
+  return query.targetId ?? null
+}
+
+function checkedSummaries(payload: unknown, workspaceId: string, runId: string, targetId: string | null): RealAnalysisSummariesResponse {
+  const parsed = summariesEnvelope.safeParse(payload)
+  if (!parsed.success) throw new Error('The summary service returned an invalid saved-summary envelope. Reload summaries before continuing.')
+  const value = parsed.data
+  const { capture, scoring } = value
+  const targets = new Set(value.targets.map((item) => item.targetId))
+  const comparisons = new Map(value.comparisons.map((item) => [item.comparisonId, item]))
+  if (value.workspaceId !== workspaceId || value.runId !== runId || value.scope.targetId !== targetId ||
+    capture.scope.targetId !== targetId || capture.revision !== value.revision || capture.ready !== value.ready ||
+    value.etag !== `"${value.revision}"` || targets.size !== value.targets.length || comparisons.size !== value.comparisons.length ||
+    (targetId !== null && (targets.size !== 1 || !targets.has(targetId))) ||
+    value.comparisons.some((item) => !targets.has(item.targetId)) ||
+    value.counts.candidates.total !== value.comparisons.length || value.counts.targets.total !== value.targets.length ||
+    new Set(capture.targets.map((item) => item.targetId)).size !== targets.size ||
+    capture.targets.length !== targets.size || capture.targets.some((item) => !targets.has(item.targetId)) ||
+    capture.comparisons.length !== comparisons.size || new Set(capture.comparisons.map((item) => item.comparisonId)).size !== comparisons.size ||
+    capture.comparisons.some((item) => {
+      const comparison = comparisons.get(item.comparisonId)
+      return !comparison || comparison.targetId !== item.targetId || comparison.comparisonStatus !== item.status ||
+        (value.ready && item.status === 'complete' && (!item.resultSha256 || !item.narrative ||
+          item.narrative.revision !== comparison.published?.revision || item.narrative.inputFingerprint !== comparison.published.inputFingerprint))
+    }) || scoring.total !== comparisons.size || scoring.initialized > scoring.total ||
+    scoring.queued + scoring.running + scoring.complete + scoring.failed + scoring.cancelled !== scoring.total ||
+    scoring.running + scoring.complete + scoring.failed + scoring.cancelled > scoring.initialized ||
+    (value.ready && (scoring.total !== scoring.initialized || scoring.queued > 0 || scoring.running > 0 ||
+      value.comparisons.some((item) => item.comparisonStatus === 'complete' && !analysisNarrativeIsCurrent(item, item.inputFingerprint)) ||
+      value.targets.some((item) => {
+        const pinned = capture.targets.find((target) => target.targetId === item.targetId)?.narrative
+        return item.status !== 'not-required' && (!analysisNarrativeIsCurrent(item, item.inputFingerprint) ||
+          !pinned || pinned.revision !== item.published?.revision || pinned.inputFingerprint !== item.published.inputFingerprint)
+      })))) {
+    throw new Error('The summary service returned mismatched workspace, analysis, scope, or readiness information. Nothing was substituted.')
+  }
+  return value
+}
+
+export async function getRealAnalysisSummaries(
+  workspaceId: string, runId: string, query: RealAnalysisSummariesQuery = {}, signal?: AbortSignal,
+): Promise<RealAnalysisSummariesResponse> {
+  const targetId = checkedSummaryScope(workspaceId, runId, query)
+  const suffix = targetId === null ? '' : `?targetId=${encodeURIComponent(targetId)}`
+  const result = await cloudJsonRequest<unknown>(`${base(workspaceId, runId)}/summaries${suffix}`, { method: 'GET', signal })
+  signal?.throwIfAborted()
+  return checkedSummaries(result, workspaceId, runId, targetId)
+}
+
+export async function generateRealAnalysisSummaries(
+  workspaceId: string, runId: string, input: GenerateRealAnalysisSummariesInput, etag: string, key: string,
+): Promise<RealAnalysisSummariesMutationResponse> {
+  const targetId = checkedSummaryScope(workspaceId, runId, input)
+  if (input.mode !== 'missing' && input.mode !== 'all') throw new Error('Choose Generate missing summaries or Regenerate all summaries.')
+  if (!/^"[a-f0-9]{64}"$/.test(etag)) throw new Error('Reload the selected summary scope before generating. A summary ETag, not a scoring ETag, is required.')
+  if (!z.uuid().safeParse(key).success) throw new Error('A stable UUID idempotency key is required for summary generation.')
+  const result = await cloudJsonRequest<unknown>(`${base(workspaceId, runId)}/summaries`, {
+    method: 'POST', headers: { 'If-Match': etag, 'Idempotency-Key': key },
+    body: JSON.stringify({ mode: input.mode, ...(targetId === null ? {} : { targetId }) }),
+  })
+  const parsed = z.object({
+    requestId: z.string().uuid(), scheduled: z.object({ candidates: narrativeCount, targets: narrativeCount }), summaries: z.unknown(),
+  }).safeParse(result)
+  if (!parsed.success || parsed.data.requestId !== key) throw new Error('The summary request was not acknowledged with its original request ID. Refresh status before retrying the same request.')
+  return { ...parsed.data, summaries: checkedSummaries(parsed.data.summaries, workspaceId, runId, targetId) }
+}
+
 export async function fetchAnalysisProcessingFeatures(signal?: AbortSignal): Promise<AnalysisProcessingFeatures> {
   // realAnalyses indicates new-run readiness; historical reads have their own authorized endpoints.
   const result = await cloudJsonRequest<Partial<AnalysisProcessingFeatures>>('/features', { method: 'GET', signal })
-  return { realAnalyses: result.realAnalyses === true, analysisLimits: result.analysisLimits ?? ANALYSIS_LIMITS }
+  return { realAnalyses: result.realAnalyses === true, analysisLimits: result.analysisLimits ?? ANALYSIS_LIMITS,
+    analysisSummaryGeneration: result.analysisSummaryGeneration === true }
 }
 
 export interface RealAnalysisCollectionLimits {

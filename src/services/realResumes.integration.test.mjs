@@ -480,7 +480,7 @@ function markdownComparison(kind) {
   const criterion = { id: 'criterion-one', label: 'Documentation', weight: 100, description: 'Document engineering work.', guidance: 'Assess exact source evidence.', requirementType: 'required' }
   const rubric = { version: 2, criteria: [criterion] }
   const target = {
-    kind, summary: { label: 'Saved requirements', sublabel: 'Exact Markdown source' },
+    kind, summary: { id: `target-${kind}`, label: 'Saved requirements', sublabel: 'Exact Markdown source' },
     selection: kind === 'job' ? { kind, rubricVersion: 2, documentVersion: 3 } : { kind, grade: 9, version: 2 },
     requirementEvidence: [{ kind: 'criterion', criterionId: criterion.id, citations: [requirementCitation] }],
     ...(kind === 'job' ? { rubric, document: jobDocument, original: { contentType: 'text/markdown' } }
@@ -489,7 +489,8 @@ function markdownComparison(kind) {
   }
   return {
     comparison: { id: `comparison-${kind}`, runId: 'run-one', status: 'complete',
-      resume: { summary: { name: saved.resume.name, role: saved.resume.role, sourceLabel: saved.resume.sourceLabel } } },
+      resume: { summary: { name: saved.resume.name, role: saved.resume.role, sourceLabel: saved.resume.sourceLabel } },
+      target: { summary: target.summary } },
     resumeSnapshot: { resume: saved.resume, document: saved.document, extraction: saved.extraction },
     targetSnapshot: target,
     result: {

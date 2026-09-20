@@ -6,12 +6,12 @@ import { pathToFileURL } from 'node:url'
 import { after, afterEach, before, beforeEach, test } from 'node:test'
 import { setTimeout as delay } from 'node:timers/promises'
 import { build } from 'esbuild'
-import { realReportFixture, REPORT_TEST_HASH, REPORT_TEST_TIMESTAMP } from './test-support.mjs'
+import { realReportFixture, reportSummariesFixture, withReportNarratives, REPORT_TEST_HASH, REPORT_TEST_TIMESTAMP } from './test-support.mjs'
 
 const output = resolve(`.analysis-report-real-tests-${randomUUID()}`)
 const originalFetch = globalThis.fetch
 const storageDescriptors = new Map()
-let loadRealAnalysisReport, requests
+let loadRealAnalysisReport, assertRealAnalysisReportNarrativesCurrent, requests
 const clone = value => structuredClone(value)
 const json = (value, status = 200) => new Response(JSON.stringify(value), { status, headers: { 'Content-Type': 'application/json' } })
 const reference = (name, sha256 = REPORT_TEST_HASH) => ({ blobName: name, sha256, bytes: 1024, contentType: 'application/json' })
@@ -79,12 +79,16 @@ function batch(f, ids) {
     targets: clone(f.report.targets.filter(target => targetIds.has(target.id))), comparisons }
 }
 
-function serve(f, { pageSize = 50, page, report, detail } = {}) {
+function serve(f, { pageSize = 50, page, report, detail, summaries } = {}) {
   globalThis.fetch = async (url, init) => {
     requests.push({ url, init })
     assert.equal(init.method, 'GET', 'Export must not create analyses or invoke models.')
     assert.equal(init.cache, 'no-store')
     const parsed = new URL(url, 'https://score.test')
+    if (parsed.pathname.endsWith('/summaries')) {
+      const body = reportSummariesFixture(f.report, { targetId: parsed.searchParams.get('targetId') })
+      return summaries ? summaries(body, init, parsed) : json(body)
+    }
     if (parsed.pathname.endsWith('/report-comparisons')) {
       const ids = parsed.searchParams.getAll('comparisonId')
       assert.ok(ids.length >= 1 && ids.length <= 25)
@@ -104,6 +108,36 @@ function serve(f, { pageSize = 50, page, report, detail } = {}) {
 
 function load(f, options) { return loadRealAnalysisReport(f.report.workspaceId, f.report.run.id, options) }
 function reportRequests() { return requests.filter(request => request.url.includes('/report-comparisons?')) }
+function summaryRequests() { return requests.filter(request => /\/summaries(?:\?|$)/.test(request.url)) }
+function narrativeFixture(options) {
+  const f = fixture(options)
+  f.report.targets = withReportNarratives(f.report).targets.map(target => { delete target.narrative; return target })
+  return f
+}
+function summaryState(body, kind, status) {
+  const state = kind === 'candidate' ? body.comparisons[0] : body.targets[0]
+  const counts = kind === 'candidate' ? body.counts.candidates : body.counts.targets
+  counts[state.status === 'not-required' ? 'notRequired' : state.status]--
+  state.status = status
+  counts[status === 'not-required' ? 'notRequired' : status]++
+  body.ready = body.capture.ready = false
+  return body
+}
+function regenerate(body) {
+  const candidate = body.comparisons.find(comparison => comparison.comparisonStatus === 'complete')
+  candidate.generationId += '-replacement'
+  candidate.published.generationId = candidate.generationId
+  candidate.published.revision = 'b'.repeat(64)
+  body.capture.comparisons.find(pin => pin.comparisonId === candidate.comparisonId).narrative.revision = candidate.published.revision
+  const target = body.targets.find(target => target.targetId === candidate.targetId)
+  target.generationId += '-replacement'
+  target.published.generationId = target.generationId
+  target.published.revision = 'c'.repeat(64)
+  body.capture.targets.find(pin => pin.targetId === target.targetId).narrative.revision = target.published.revision
+  body.revision = body.capture.revision = 'd'.repeat(64)
+  body.etag = `"${body.revision}"`
+  return body
+}
 
 function addDisplayLabels(f) {
   f.detail.run.displayName = 'Renamed saved run'
@@ -124,7 +158,7 @@ before(async () => {
     bundle: true, packages: 'external', platform: 'node', format: 'esm', logLevel: 'silent',
     define: { 'import.meta.env.VITE_DEPLOYMENT_MODE': '"cloud"' },
   })
-  ;({ loadRealAnalysisReport } = await import(pathToFileURL(join(output, 'real.mjs')).href))
+  ;({ loadRealAnalysisReport, assertRealAnalysisReportNarrativesCurrent } = await import(pathToFileURL(join(output, 'real.mjs')).href))
   for (const name of ['localStorage', 'sessionStorage', 'indexedDB']) {
     storageDescriptors.set(name, Object.getOwnPropertyDescriptor(globalThis, name))
     Object.defineProperty(globalThis, name, { configurable: true, get() { throw new Error('Report data must never access browser persistence.') } })
@@ -470,4 +504,269 @@ test('every new export reauthorizes and reloads private data rather than returni
   serve(f, { detail: () => json({ error: { code: 'forbidden', message: 'Workspace membership ended.' } }, 403) })
   await assert.rejects(load(f), /Workspace membership ended/)
   assert.equal(requests.length, firstCount + 1)
+})
+
+test('ready narrative capture pins the exhaustive scope, attaches exact saved prose, and rechecks without model or document calls', async () => {
+  const f = narrativeFixture({ scores: [90, null, 70, 60], statuses: ['complete', 'complete', 'failed', 'cancelled'], targetCount: 2 })
+  serve(f)
+  const report = await load(f, { requireSummaries: true })
+  const summaries = reportSummariesFixture(f.report)
+  assert.equal(summaryRequests().length, 2)
+  assert.ok(requests[0].url.endsWith('/summaries'))
+  assert.ok(requests.at(-1).url.endsWith('/summaries'))
+  assert.deepEqual(report.capture.summaries, summaries.capture)
+  assert.equal(report.counts.total, 8)
+  assert.equal(report.counts.complete, 4)
+  assert.equal(report.counts.withheld, 2)
+  assert.equal(report.groups.length, 2)
+  for (const group of report.groups) {
+    assert.deepEqual(group.target.narrative, summaries.targets.find(target => target.targetId === group.target.id).published)
+    for (const comparison of group.comparisons) {
+      assert.equal(comparison.summary, f.report.comparisons.find(saved => saved.id === comparison.id).summary)
+      assert.deepEqual(comparison.narrative ?? null, summaries.comparisons.find(saved => saved.comparisonId === comparison.id).published)
+    }
+  }
+  assert.ok(requests.every(({ init }) => init.method === 'GET' && init.signal && init.cache === 'no-store'))
+  assert.ok(!requests.some(({ url }) => /\/documents\/|\/comparisons\/[^?]+/.test(url)))
+  assert.ok(report.capture.startedAt <= report.capture.completedAt && report.capture.completedAt <= report.generatedAt)
+  await assertRealAnalysisReportNarrativesCurrent(f.report.workspaceId, f.report.run.id, report)
+  assert.equal(summaryRequests().length, 3)
+})
+
+test('legacy default and explicit false never read summaries even when generation is unavailable', async () => {
+  const f = fixture()
+  serve(f, { summaries: () => { throw new Error('Legacy exports must not depend on summaries.') } })
+  for (const options of [undefined, { requireSummaries: false }]) {
+    const report = await load(f, options)
+    assert.equal(report.capture.summaries, undefined)
+    assert.ok(report.groups.every(group => group.target.narrative === undefined))
+  }
+  assert.equal(summaryRequests().length, 0)
+})
+
+test('missing, stale, failed, waiting and active summaries reject preflight without falling back to older publications', async () => {
+  for (const kind of ['candidate', 'target']) for (const status of ['missing', 'stale', 'failed', 'waiting', 'queued', 'running', 'cancelled']) {
+    requests = []
+    const f = narrativeFixture()
+    serve(f, { summaries: body => json(summaryState(body, kind, status)) })
+    await assert.rejects(load(f, { requireSummaries: true }), /summaries|summary/i, `${kind}:${status}`)
+    assert.equal(requests.length, 1)
+    assert.equal(reportRequests().length, 0)
+  }
+  const f = narrativeFixture({ scores: [80, 60], statuses: ['complete', 'running'] })
+  serve(f)
+  await assert.rejects(load(f, { requireSummaries: true }), /summaries|summary/i)
+})
+
+test('ready target exports ignore other targets still scoring or missing summaries, while full-run export waits', async () => {
+  const f = narrativeFixture({ scores: [90], targetCount: 2 })
+  const second = f.report.comparisons[1]
+  const pending = f.inventory[1].comparison
+  Object.assign(second, { status: 'queued', completion: null, summary: null, coverage: null, criteria: [], qualifications: [],
+    limitations: [], analyzedAt: null, resultSha256: null, provenance: [],
+    overall: { status: 'unavailable', score: null, reason: 'not-complete', message: 'This review has not completed.' } })
+  pending.status = 'queued'
+  for (const field of ['attemptId', 'result', 'resultSummary', 'completedAt']) delete pending[field]
+  Object.assign(f.detail.run.progress, { complete: 1, scored: 1, queued: 1 })
+  f.detail.run.status = 'queued'
+  serve(f)
+  const targetId = f.report.targets[0].id
+  const report = await load(f, { requireSummaries: true, targetId })
+  assert.equal(report.groups.length, 1)
+  assert.equal(report.groups[0].target.id, targetId)
+  assert.equal(report.counts.total, 1)
+  assert.ok(summaryRequests().every(request => new URL(request.url, 'https://score.test').searchParams.get('targetId') === targetId))
+  await assert.rejects(load(f, { requireSummaries: true }), /summaries|summary/i)
+  assert.equal(reportRequests().length, 1)
+})
+
+test('a ready exact target need not wait for unrelated target initialization; legacy inventory rules stay unchanged', async () => {
+  const f = narrativeFixture({ scores: [90], targetCount: 2 })
+  f.inventory.pop()
+  Object.assign(f.detail.run.progress, { initialized: 1, complete: 1, scored: 1 })
+  f.detail.run.status = 'initializing'
+  f.detail.run.initialization = { nextComparisonIndex: 1 }
+  serve(f)
+  const targetId = f.report.targets[0].id
+  const report = await load(f, { requireSummaries: true, targetId })
+  assert.equal(report.counts.total, 1)
+  await assert.rejects(load(f, { targetId }), /inventory is incomplete/)
+})
+
+test('targets with no completed comparisons are captured as not-required without fabricated overviews', async () => {
+  const f = narrativeFixture({ scores: [90], targetCount: 2 })
+  const other = f.report.comparisons[1]
+  const record = f.inventory[1].comparison
+  Object.assign(other, { status: 'cancelled', completion: null, summary: null, coverage: null, criteria: [], qualifications: [],
+    limitations: [], analyzedAt: null, resultSha256: null, provenance: [],
+    overall: { status: 'unavailable', score: null, reason: 'not-complete', message: 'This review was cancelled.' } })
+  record.status = 'cancelled'
+  for (const field of ['attemptId', 'result', 'resultSummary', 'completedAt']) delete record[field]
+  Object.assign(f.detail.run.progress, { complete: 1, scored: 1, cancelled: 1 })
+  f.detail.run.status = 'partial'
+  serve(f)
+  const report = await load(f, { requireSummaries: true })
+  assert.equal(report.groups[1].target.narrative, undefined)
+  assert.equal(report.capture.summaries.targets[1].narrative, null)
+  assert.equal(report.capture.summaries.comparisons[1].narrative, null)
+})
+
+test('malformed scope, result, generation, revision, duplicate, omitted and extraneous summary pins fail closed', async () => {
+  const changes = [
+    body => { body.workspaceId = 'foreign-workspace' },
+    body => { body.runId = 'foreign-run' },
+    body => { body.scope.targetId = 'foreign-target' },
+    body => { delete body.capture },
+    body => { body.capture.scope.targetId = body.targets[0].targetId },
+    body => { body.capture.revision = 'e'.repeat(64) },
+    body => { body.capture.ready = false },
+    body => { body.capture.comparisons[0].resultSha256 = 'b'.repeat(64) },
+    body => { body.capture.comparisons[0].narrative.revision = 'b'.repeat(64) },
+    body => { body.capture.comparisons[0].narrative.inputFingerprint = 'b'.repeat(64) },
+    body => { body.capture.targets[0].narrative.revision = 'b'.repeat(64) },
+    body => { body.comparisons[0].generationId += '-pending' },
+    body => { body.targets[0].generationId += '-pending' },
+    body => { body.comparisons[0].published.inputFingerprint = 'b'.repeat(64) },
+    body => { body.comparisons[0].published = null },
+    body => { body.targets[0].published = null },
+    body => { body.comparisons[0].published.text = 'Too short.' },
+    body => { body.comparisons[0].published.overview = 'An unfinished overview...' },
+    body => { body.targets[0].published.paragraphs = [] },
+    body => { body.capture.comparisons.push(clone(body.capture.comparisons[0])) },
+    body => { body.capture.comparisons.pop() },
+    body => { body.comparisons.pop() },
+    body => { body.capture.targets.push(clone(body.capture.targets[0])) },
+    body => { body.capture.targets.pop() },
+    body => { body.targets.pop() },
+    body => { body.capture.comparisons[0].comparisonId = body.comparisons[0].comparisonId = 'foreign-comparison' },
+    body => { body.capture.comparisons[0].targetId = body.comparisons[0].targetId = 'foreign-target' },
+    body => { body.scoring.complete-- },
+    body => { body.counts.candidates.ready-- },
+  ]
+  for (const change of changes) {
+    requests = []
+    const f = narrativeFixture({ scores: [90, 80], targetCount: 2 })
+    serve(f, { summaries: body => { change(body); return json(body) } })
+    await assert.rejects(load(f, { requireSummaries: true }), undefined, change.toString())
+    assert.equal(reportRequests().length, 0, change.toString())
+  }
+})
+
+test('a self-consistent but incomplete summary DTO cannot replace the full selected manifest inventory', async () => {
+  for (const omit of ['comparison', 'target']) {
+    const f = narrativeFixture({ scores: [90, 80], targetCount: 2 })
+    serve(f, { summaries: () => {
+      const subset = clone(f.report)
+      if (omit === 'comparison') subset.comparisons.pop()
+      else {
+        const target = subset.targets.pop()
+        subset.comparisons = subset.comparisons.filter(comparison => comparison.targetId !== target.id)
+      }
+      return json(reportSummariesFixture(subset))
+    } })
+    await assert.rejects(load(f, { requireSummaries: true }), /pins omit or add/)
+  }
+})
+
+test('batch scoring drift and missing frozen presentation cannot degrade a ready narrative export', async () => {
+  const changes = [
+    response => { response.comparisons[0].resultSha256 = 'b'.repeat(64) },
+    response => { delete response.targets[0].presentation },
+    response => {
+      const comparison = response.comparisons.find(comparison => comparison.status === 'failed')
+      comparison.status = 'cancelled'
+      comparison.error = null
+    },
+    response => {
+      const saved = withReportNarratives({ ...realReportFixture(), targets: response.targets, comparisons: response.comparisons })
+      response.comparisons[0].narrative = saved.comparisons[0].narrative
+      response.comparisons[0].narrative.generationId += '-other'
+    },
+  ]
+  for (const change of changes) {
+    const f = narrativeFixture({ scores: [90, 80], statuses: ['complete', 'failed'] })
+    serve(f, { report: ids => { const response = batch(f, ids); change(response); return json(response) } })
+    await assert.rejects(load(f, { requireSummaries: true }))
+  }
+})
+
+test('regeneration between bounded batches aborts a capture rather than mixing saved narrative generations', async () => {
+  const f = narrativeFixture({ scores: Array(51).fill(80) })
+  let changed = false
+  serve(f, {
+    report: async ids => { changed = true; await delay(2); return json(batch(f, ids)) },
+    summaries: body => json(changed ? regenerate(body) : body),
+  })
+  await assert.rejects(load(f, { requireSummaries: true }), /changed during report preparation/)
+  assert.equal(reportRequests().length, 3)
+  assert.equal(summaryRequests().length, 2)
+})
+
+test('before-download checks reject regeneration, forged generations, wrong scope, cancellation, deletion and access loss', async () => {
+  const f = narrativeFixture({ scores: [80], targetCount: 2 })
+  serve(f)
+  const report = await load(f, { requireSummaries: true, targetId: f.report.targets[0].id })
+  for (const failure of ['regeneration', 'old-generation', 'access', 'delete', 'cancelling']) {
+    serve(f, { summaries: body => {
+      if (failure === 'access') return json({ error: { code: 'forbidden', message: 'Workspace membership ended.' } }, 403)
+      if (failure === 'delete') return json({ error: { code: 'not-found', message: 'The saved analysis was deleted.' } }, 404)
+      if (failure === 'regeneration') return json(regenerate(body))
+      if (failure === 'old-generation') {
+        body.comparisons[0].published.generationId += '-other'
+        body.comparisons[0].generationId = body.comparisons[0].published.generationId
+      }
+      if (failure === 'cancelling') body.capabilities = { canGenerate: false, reason: 'cancelling' }
+      return json(body)
+    } })
+    await assert.rejects(assertRealAnalysisReportNarrativesCurrent(f.report.workspaceId, f.report.run.id, report), undefined, failure)
+  }
+  serve(f)
+  await assert.rejects(assertRealAnalysisReportNarrativesCurrent('another-workspace', f.report.run.id, report), /different workspace/)
+  const wrongScope = clone(report)
+  wrongScope.scope.targetId = null
+  await assert.rejects(assertRealAnalysisReportNarrativesCurrent(f.report.workspaceId, f.report.run.id, wrongScope), /different export scope/)
+  const controller = new AbortController()
+  controller.abort()
+  const calls = requests.length
+  await assert.rejects(assertRealAnalysisReportNarrativesCurrent(f.report.workspaceId, f.report.run.id, report, controller.signal), error => error.name === 'AbortError')
+  assert.equal(requests.length, calls)
+})
+
+test('ready archived and read-only scopes remain exportable, but summary read failures or cancellation stop all capture reads', async () => {
+  const f = narrativeFixture()
+  for (const reason of ['archived', 'read-only', 'service-unavailable']) {
+    serve(f, { summaries: body => { body.capabilities = { canGenerate: false, reason }; return json(body) } })
+    const report = await load(f, { requireSummaries: true })
+    await assertRealAnalysisReportNarrativesCurrent(f.report.workspaceId, f.report.run.id, report)
+  }
+  for (const status of [401, 403, 404]) {
+    requests = []
+    serve(f, { summaries: () => json({ error: { code: 'unavailable', message: 'The saved summaries are not accessible.' } }, status) })
+    await assert.rejects(load(f, { requireSummaries: true }), /not accessible/)
+    assert.equal(requests.length, 1)
+  }
+  const controller = new AbortController()
+  requests = []
+  serve(f, { summaries: body => { controller.abort(); return json(body) } })
+  await assert.rejects(load(f, { requireSummaries: true, signal: controller.signal }), error => error.name === 'AbortError')
+  assert.equal(requests.length, 1)
+})
+
+test('ready narrative capture retains the full 500-comparison bound and unchanged batch concurrency limits', async () => {
+  const f = narrativeFixture({ scores: Array.from({ length: 250 }, (_, index) => index % 101), targetCount: 2 })
+  let active = 0, maximum = 0
+  serve(f, { report: async ids => {
+    active++
+    maximum = Math.max(maximum, active)
+    await delay(1)
+    active--
+    return json(batch(f, ids))
+  } })
+  const report = await load(f, { requireSummaries: true })
+  assert.equal(report.counts.complete, 500)
+  assert.equal(report.capture.summaries.comparisons.length, 500)
+  assert.ok(report.groups.every(group => group.comparisons.every(comparison => comparison.narrative?.dataKind === 'real')))
+  assert.equal(reportRequests().length, 20)
+  assert.equal(summaryRequests().length, 2)
+  assert.ok(maximum > 1 && maximum <= 3)
 })

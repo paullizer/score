@@ -1,7 +1,5 @@
 import type {
   AnalysisEntity,
-  RealAnalysisComparisonRecord,
-  RealAnalysisRunRecord,
   VersionedAnalysisEntity,
 } from '../../src/domain/real-analyses'
 import type { LifecycleOperation, LifecycleTarget } from '../../src/domain/lifecycle'
@@ -56,11 +54,11 @@ export interface AnalysisStore {
   getControl(workspaceId: string, runId?: string): Promise<StoredAnalysisControl | undefined>
   listControls(workspaceId: string, continuationToken?: string): Promise<{ items: StoredAnalysisControl[]; continuationToken?: string }>
   pendingLifecycleWorkspaces(limit: number): Promise<string[]>
-  // Includes due/lease-expired initialization, unfinished cancellation, and eligible comparison work.
+  // Includes bounded narrative scheduling and due/lease-expired sidecar work.
   listPending(
     now: string,
     limit: number,
-  ): Promise<VersionedAnalysisEntity<RealAnalysisRunRecord | RealAnalysisComparisonRecord>[]>
+  ): Promise<VersionedAnalysisEntity[]>
 }
 
 export interface AnalysisBlob {

@@ -5,10 +5,11 @@ import { analysisRunCanScore, type RealAnalysisRunRecord } from '../../src/domai
 import { WORKSPACE_ID_PATTERN } from '../ids'
 import { assertWorkspaceMutationLease } from '../lifecycle/lease'
 import { StoreConflictError } from '../store'
+import { analysisNarrativeCanWork } from './narrative-records'
 import type {
   AnalysisBlobStore, AnalysisLifecycleControl, AnalysisStore, AnalysisTransaction, AnalysisTransactionOptions, RealAnalysesDeps,
 } from './store'
-import { analysisBlobInRun, analysisHash, assertAnalysis, isAnalysisId } from './validation'
+import { analysisBlobInRun, analysisHash, analysisNarrativeId, assertAnalysis, isAnalysisId } from './validation'
 
 export const ANALYSIS_WRITER_MILLISECONDS = 120_000
 export const ANALYSIS_BLOB_REQUEST_MILLISECONDS = 30_000
@@ -88,7 +89,15 @@ export async function prepareAnalysisGuards(
   assertAnalysis(families.size <= 1, 'An analysis transaction cannot mix runs.')
   const parent = operations.find(item => item.record.recordType === 'analysis-run')
   const nextRun = parent?.kind !== 'delete' && parent?.record.recordType === 'analysis-run' ? parent.record : undefined
-  const cancellationOnly = Boolean(nextRun?.cancellation && nextRun.status === 'cancelled' &&
+  const cancelledRequest = operations.find(item => item.record.recordType === 'analysis-narrative-request' &&
+    nextRun?.narrativeCancelledAt && item.record.createdAt <= nextRun.narrativeCancelledAt &&
+    (item.record.status === 'queued' && nextRun.narrativeRequestId === item.record.requestId ||
+      item.record.status === 'cancelled' && !nextRun.narrativeRequestId))
+  const narrativeCancellation = Boolean(cancelledRequest && operations.every(item => item.kind !== 'delete' &&
+    (item.record.recordType === 'analysis-run' || item === cancelledRequest ||
+      (item.record.recordType === 'analysis-candidate-narrative' || item.record.recordType === 'analysis-target-narrative') &&
+      item.record.status === 'cancelled')))
+  const cancellationOnly = narrativeCancellation || Boolean(nextRun?.cancellation && nextRun.status === 'cancelled' &&
     operations.every(item => item.kind !== 'delete' &&
       (item.record.recordType === 'analysis-run' || item.record.status === 'cancelled')))
   const controls: NonNullable<AnalysisTransactionOptions['controls']> = []
@@ -131,9 +140,9 @@ export async function prepareAnalysisGuards(
     for (const item of operations) {
       if (item.kind === 'delete') {
         if (!options.lifecycle || !oldRun?.lifecycle?.deletingAt || !['deleting', 'deleted'].includes(guard.state)) denied()
-      } else if (item.record.recordType === 'analysis-comparison' &&
+      } else if (item.record.recordType !== 'analysis-run' &&
         (workspace.state !== 'active' || guard.state !== 'active' || analysisIsLocked(nextRun?.lifecycle ?? oldRun?.lifecycle)) &&
-        item.record.status !== 'cancelled') denied()
+        item.record.status !== 'cancelled' && !(narrativeCancellation && item === cancelledRequest)) denied()
       if (options.lifecycle && item.kind === 'create' &&
         (item.record.recordType !== 'analysis-comparison' || item.record.status !== 'cancelled' || !nextRun?.cancellation)) denied()
     }
@@ -163,7 +172,7 @@ export async function updateAnalysisControl(
 
 /** Finite Blob leases fence the content PUT itself, not just the later Cosmos publication. */
 export function fencedAnalysisBlobs(
-  deps: RealAnalysesDeps, workspaceId: string, runId: string, signal?: AbortSignal,
+  deps: RealAnalysesDeps, workspaceId: string, runId: string, signal?: AbortSignal, assertWorkActive?: () => Promise<unknown>,
 ): AnalysisBlobStore {
   const blobs = deps.blobs
   return {
@@ -184,6 +193,7 @@ export function fencedAnalysisBlobs(
       }), false)
       const assertActive = async () => {
         signal?.throwIfAborted()
+        await assertWorkActive?.()
         assertWorkspaceMutationLease(workspaceId)
         const [workspace, control, run] = await Promise.all([
           deps.store.getControl(workspaceId), deps.store.getControl(workspaceId, runId), deps.store.get(workspaceId, runId),
@@ -198,6 +208,18 @@ export function fencedAnalysisBlobs(
           const comparison = await deps.store.get(workspaceId, parts[3])
           if (comparison?.record.recordType !== 'analysis-comparison' || comparison.record.runId !== runId ||
             comparison.record.status !== 'running' || `${comparison.record.attemptId}.json` !== parts[4]) denied()
+        }
+        if (name.includes('/narratives/')) {
+          if (run?.record.recordType !== 'analysis-run' || !analysisNarrativeCanWork(run.record)) denied()
+          const parts = name.split('/')
+          if (parts[3] !== 'requests') {
+            const kind = parts[3] === 'candidate' ? 'candidate' : 'target'
+            const value = await deps.store.get(workspaceId, analysisNarrativeId(kind, runId, parts[4]))
+            if (!value || (value.record.recordType !== 'analysis-candidate-narrative' && value.record.recordType !== 'analysis-target-narrative') ||
+              !analysisNarrativeCanWork(run.record, value.record) || run.record.narrativeRequestId ||
+              value.record.status !== 'running' || value.record.generationId !== parts[5] ||
+              `${value.record.attemptId}.json` !== parts[6] || !value.record.lease) denied()
+          }
         }
         assertWorkspaceMutationLease(workspaceId)
       }
