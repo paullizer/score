@@ -9,7 +9,7 @@ import { build } from 'esbuild'
 import { SaxesParser } from 'saxes'
 import yauzl from 'yauzl'
 import {
-  loadReportFoundation, realReportFixture, reportFixtureCitation, REPORT_TEST_TIMESTAMP, withReportNarratives,
+  loadReportFoundation, realReportFixture, reportFixtureCitation, REPORT_TEST_TIMESTAMP, version2ReportFixture, withReportNarratives,
 } from './test-support.mjs'
 import {
   fictionalPdfNavigationQaFixture, fictionalPdfQaFixture, fictionalSampleInput, readablePdfFixture, readPdf,
@@ -153,6 +153,24 @@ async function generate(report, generationOptions = options) {
   return { bytes, entries, parts, document, sections: documentSections(document, parts) }
 }
 const reportFor = (input = readablePdfFixture(), buildOptions = {}) => foundation.buildAnalysisReport(input, buildOptions)
+
+test('Word retains full long v2 prose, manual labels and known issues as native flowing text and table content', async () => {
+  const report = reportFor(version2ReportFixture({ long: true }))
+  const word = await generate(report)
+  containsText(word.document, 'Manually approved summary. Automated review: needs-correction.')
+  for (const group of report.groups) {
+    for (const paragraph of group.target.narrative.paragraphs) containsText(word.document, paragraph)
+    containsText(word.document, `Known issue: ${group.target.narrative.approval.issues[0].message}`)
+    for (const comparison of group.comparisons) {
+      if (comparison.highlighted) containsText(word.document, comparison.narrative.text)
+      containsText(word.document, comparison.narrative.overview)
+      containsText(word.document, `Known issue: ${comparison.narrative.approval.issues[0].message}`)
+    }
+  }
+  assert.ok(all(word.document, 'w:tbl').length > 0)
+  assert.equal(all(word.document, 'w:txbxContent').length, 0, 'Accepted prose flows instead of clipping in fixed text boxes.')
+  assert.equal(all(word.document, 'w:drawing').length, 0)
+})
 
 test('Word and PDF emit the same completed report content, saved summaries, section order and source destinations', async () => {
   const report = reportFor(readablePdfFixture({ scores: [90, null], targetCount: 2, criterionCount: 2 }))

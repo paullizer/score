@@ -71,6 +71,9 @@ All paths below have prefix `/api/workspaces/:workspaceId/analyses`:
 | `GET /:runId/comparisons/:comparisonId/documents/:documentId?version=N` | `RealAnalysisDocumentResponse` |
 | `GET /:runId/summaries` with optional `targetId` query | `RealAnalysisSummariesResponse`, including selected-scope ETag, status, published narratives, and report capture pins |
 | `POST /:runId/summaries` with `{mode: "missing" \| "all", targetId?}` | `RealAnalysisSummariesMutationResponse` with durable request ID, scheduled counts, and summary state |
+| `GET /:runId/summaries/:kind/:subjectId/history?continuationToken=...` | Owner/editor-only `AnalysisSummaryHistoryPage`, up to 12 private checkpoint events and the narrative record ETag |
+| `POST /:runId/summaries/:kind/:subjectId/publish` with `{generationId, round, outputSha256}` | `{summaries}` for the subject's exact target; explicit manual approval of a persisted final draft |
+| `POST /:runId/summaries/:kind/:subjectId/retry` with `{}` | HTTP 202 `{summaries}` for the subject's exact target; a fresh three-round generation |
 | `POST /:runId/retry` with `{comparisonIds?}` | `{run: RealAnalysisRunSummary}` |
 | `POST /:runId/cancel` with `{}` | `{run: RealAnalysisRunSummary}` |
 | `POST /:runId/comparisons/:comparisonId/retry` or `/cancel` with `{}` | `{comparison: RealAnalysisComparisonSummary}` |
@@ -142,19 +145,101 @@ viewers can read ready narratives; writable, non-archived runs are required for
 generation. A settled partial/cancelled run may explicitly summarize its completed
 results without restarting scoring.
 
-Summary claims are checked against the saved assessment with independent
-grounding review and bounded correction attempts. Output has explicit prose
-length limits, and large target cohorts use bounded exhaustive synthesis rather
-than selecting only the first page or featured candidates. Failures are actionable
-summary errors, not successful count-based fallbacks or failed scoring results.
-Model provenance and output/input bindings remain attached to the immutable
-artifact. Routine logs exclude narrative text, source passages, private URLs, and
-raw model responses.
+Version 2 summaries undergo a narrow factual review against the supplied saved
+assessment, not a new assessment of the original resume. Each generation has
+three durable logical rounds: an initial draft and at most two revisions with
+earlier findings carried forward. Sentence counts, exact wording, number
+formatting, score mentions, and exhaustive sentence/reference coverage are not
+publication gates. Nonempty response shapes, exact input/output bindings, and
+the technical bounds in `SUMMARY_LIMITS` still apply. Large target cohorts use
+bounded exhaustive reductions rather than selecting a first page or top-N
+subset. Reductions retain their own history but are never selectable final
+summaries.
+
+Legacy v1 artifacts keep their original bytes, hashes, claims, and legacy
+validation. V2 has `claims: []` only for storage-shape compatibility; it does
+not ask the model for claims. Its output hash covers the tagged draft
+`{kind: "candidate", text, overview}` or `{kind: "target", paragraphs}`.
+Automatic approval requires a supported review of that exact output and input.
+The v2 artifact reader does not invoke the legacy prose or citation-coverage
+validators. Published v2 DTOs carry `summaryVersion: 2` and `approval`; legacy
+DTOs do not invent that metadata.
+
+### Private history and owner/editor actions
+
+`:kind` is `candidate` or `target`; `:subjectId` is the exact frozen
+comparison ID or target ID, never a label or arbitrary blob path. Owners and
+editors can inspect all captured checkpoint events, including completed
+generations and earlier retries. Viewers can read publications but cannot read
+unpublished history or invoke either action. Archived history remains readable
+to owners/editors; archived, deleting, and cancelling work cannot be mutated.
+History GET never schedules inference or repairs old runs. A pre-upgrade failure
+without captured history returns an empty history, not a reconstructed draft.
+
+Single-summary actions require a UUID `Idempotency-Key` and the **narrative
+record ETag returned by history**, not the selected summary scope's ETag.
+Publication verifies the latest usable final checkpoint for the selected
+generation/round and its exact current frozen input. A changed output, stale
+input, foreign subject, or racing generation is rejected. Explicit manual
+approval retains the selected draft, original failed or absent review, known
+issues, actor, and approval timestamp. It neither fabricates a supported
+verdict nor claims a worker lease. Published text and narrative-bearing reports
+must disclose manual approval and its known issues.
+
+An immutable action reservation plus the committed request/generation identity
+reconciles ambiguous responses. Replaying a committed action does not repeat
+approval or create another generation; replay over newer work is rejected.
+Retry retains the previous publication and entire history. Candidate retry or
+manual publication queues only its dependent target overview through the
+existing narrative constructors. It never modifies scores, result bytes, or
+unrelated candidates.
+
+Checkpoint blobs use
+`<workspace>/<run>/narrative-history/<kind>/<subject>/<generation>/<attempt>/<entry>.json`;
+action reservations use `<workspace>/<run>/narrative-actions/<request>.json`.
+Each immutable checkpoint links its predecessor, keeping Cosmos records bounded
+to a history head and optional `summaryRound`. Writers verify the stored bytes
+before advancing that head. Resume reads include every current-generation phase
+and a compatible prior final draft/review seed; corrupt, missing, cyclic, or
+over-budget history fails explicitly rather than silently dropping rounds.
+History pages are scope-bound and pinned to a history head; reload the first page
+if new checkpoints invalidate a continuation token.
+
+History capture failures are distinct from factual disagreements
+(`history-write-failed` versus `factual-review` diagnostics). Full drafts and
+review text belong only in private artifacts and authorized history responses.
+Routine audit events record allowlisted action/subject/generation/request IDs,
+rounds, outcome and issue codes/counts, never drafts, reviewer messages, source
+passages, private URLs, or raw model responses.
+
+Worker events and API action audits are single-line JSON with
+`component: "score-analysis-narrative"` and
+`pipelineVersion: "score-analysis-summaries-v2"`. Model events preserve HTTP
+status, safe request/call IDs, measured request budgets, timing, and completion
+finish reasons. A transport or storage failure is not a factual-review verdict.
+For worker diagnostics in the Container Apps Log Analytics table:
+
+```kusto
+ContainerAppConsoleLogs
+| where TimeGenerated > ago(24h)
+| extend Event = parse_json(Log)
+| where tostring(Event.component) == "score-analysis-narrative"
+| where tostring(Event.runId) == "<analysis-run-id>"
+| project TimeGenerated, event = Event.event, stage = Event.stage,
+    round = Event.round, code = Event.code, reason = Event.reason,
+    httpStatus = Event.httpStatus, finishReason = Event.finishReason,
+    comparisonId = Event.comparisonId, generationId = Event.generationId,
+    modelCallId = Event.modelCallId, reviewOutcome = Event.reviewOutcome
+| order by TimeGenerated asc
+```
+
+API approval/retry audit events use the same component in the web app's logs.
 
 Worker claims, heartbeats, retries, and publication use independent narrative
 attempt/generation fences in addition to current run/workspace lifecycle
 controls. Cancellation, archive, and deletion prevent late publication. Cleanup
-includes narrative records, versions, and request artifacts; late Blob writers
+includes narrative records, versions, request artifacts, checkpoint history, and
+action reservations, including orphaned immutable uploads; late Blob writers
 must not recreate deleted content. New sidecar writes count toward the same
 transaction operation/byte limits as scoring and initialization.
 

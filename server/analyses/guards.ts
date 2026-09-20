@@ -1,15 +1,20 @@
 import { randomUUID } from 'node:crypto'
+import { AsyncLocalStorage } from 'node:async_hooks'
 import { z } from 'zod'
+import type { RealAnalysisNarrativeRecord } from '../../src/domain/analysis-narratives'
 import type { LifecycleMetadata } from '../../src/domain/lifecycle'
 import { analysisRunCanScore, type RealAnalysisRunRecord } from '../../src/domain/real-analyses'
 import { WORKSPACE_ID_PATTERN } from '../ids'
 import { assertWorkspaceMutationLease } from '../lifecycle/lease'
 import { StoreConflictError } from '../store'
-import { analysisNarrativeCanWork } from './narrative-records'
+import { analysisNarrativeCanWork, narrativeGenerationId } from './narrative-records'
 import type {
   AnalysisBlobStore, AnalysisLifecycleControl, AnalysisStore, AnalysisTransaction, AnalysisTransactionOptions, RealAnalysesDeps,
 } from './store'
-import { analysisBlobInRun, analysisHash, analysisNarrativeId, assertAnalysis, isAnalysisId } from './validation'
+import {
+  analysisBlobInRun, analysisHash, analysisNarrativeBlobName, analysisNarrativeId, analysisSummaryActionBlobName,
+  assertAnalysis, isAnalysisId,
+} from './validation'
 
 export const ANALYSIS_WRITER_MILLISECONDS = 120_000
 export const ANALYSIS_BLOB_REQUEST_MILLISECONDS = 30_000
@@ -174,6 +179,54 @@ export async function updateAnalysisControl(
 export function fencedAnalysisBlobs(
   deps: RealAnalysesDeps, workspaceId: string, runId: string, signal?: AbortSignal, assertWorkActive?: () => Promise<unknown>,
 ): AnalysisBlobStore {
+  return fencedBlobs(deps, workspaceId, runId, signal, assertWorkActive)
+}
+
+export interface SummaryActionWriteAuthorization {
+  action: 'publish' | 'retry'
+  kind: 'candidate' | 'target'
+  subjectId: string
+  recordId: string
+  etag?: string
+  generationId?: string
+  requestId: string
+  publicationAttemptId?: string
+}
+
+const manualPublication = new AsyncLocalStorage<{ previous: string; next: string }>()
+
+export function isAuthorizedManualSummaryPublication(previous: RealAnalysisNarrativeRecord, next: RealAnalysisNarrativeRecord): boolean {
+  const authorization = manualPublication.getStore()
+  return Boolean(authorization && authorization.previous === analysisHash(previous) && authorization.next === analysisHash(next))
+}
+
+export async function withManualSummaryPublication<T>(
+  previous: RealAnalysisNarrativeRecord, next: RealAnalysisNarrativeRecord, operation: () => Promise<T>,
+): Promise<T> {
+  assertWorkspaceMutationLease(next.workspaceId)
+  assertAnalysis(previous.id === next.id && previous.workspaceId === next.workspaceId && previous.runId === next.runId &&
+    next.generationId !== previous.generationId && next.status === 'ready' && next.attempts === 0 && !next.lease &&
+    next.history && analysisHash(next.history) === analysisHash(previous.history) &&
+    next.published?.generationId === next.generationId && next.published.inputFingerprint === next.inputFingerprint,
+  'Manual publication requires the exact new approved generation and retained history.')
+  return manualPublication.run({ previous: analysisHash(previous), next: analysisHash(next) }, operation)
+}
+
+/** Only the authenticated summary action service may reserve or publish this exact CAS-bound action. */
+export function fencedSummaryActionBlobs(
+  deps: RealAnalysesDeps, workspaceId: string, runId: string, authorization: SummaryActionWriteAuthorization,
+  assertCurrent: () => Promise<unknown>,
+): AnalysisBlobStore {
+  assertAnalysis(authorization.recordId === analysisNarrativeId(authorization.kind, runId, authorization.subjectId) &&
+    (authorization.action === 'retry' || authorization.etag && authorization.generationId && authorization.publicationAttemptId),
+  'Invalid summary action writer authorization.')
+  return fencedBlobs(deps, workspaceId, runId, undefined, assertCurrent, authorization)
+}
+
+function fencedBlobs(
+  deps: RealAnalysesDeps, workspaceId: string, runId: string, signal?: AbortSignal, assertWorkActive?: () => Promise<unknown>,
+  action?: SummaryActionWriteAuthorization,
+): AnalysisBlobStore {
   const blobs = deps.blobs
   return {
     read: name => blobs.read(name),
@@ -182,6 +235,12 @@ export function fencedAnalysisBlobs(
     putFenced: (name, bytes, type, fence) => blobs.putFenced(name, bytes, type, fence),
     async putImmutable(name, bytes, contentType) {
       assertAnalysis(analysisBlobInRun(name, workspaceId, runId), 'Invalid analysis Blob writer scope.')
+      const actionName = action ? analysisSummaryActionBlobName(workspaceId, runId, action.requestId) : undefined
+      const publicationName = action?.action === 'publish' ? analysisNarrativeBlobName(
+        workspaceId, runId, action.kind, action.subjectId, narrativeGenerationId(action.requestId, action.recordId),
+        action.publicationAttemptId!,
+      ) : undefined
+      if (action && name !== actionName && name !== publicationName || !action && name.includes('/narrative-actions/')) denied()
       signal?.throwIfAborted()
       const id = randomUUID()
       const expiresAt = new Date(Date.now() + ANALYSIS_WRITER_MILLISECONDS).toISOString()
@@ -202,6 +261,13 @@ export function fencedAnalysisBlobs(
         if (Date.parse(expiresAt) <= Date.now() || workspace?.record.state !== 'active' || control?.record.state !== 'active' ||
           writer?.blobName !== name || writer.expiresAt !== expiresAt) denied()
         if (run?.record.recordType === 'analysis-run') assertAnalysisRunWritable(run.record)
+        if (action) {
+          if (run?.record.recordType !== 'analysis-run' || !analysisNarrativeCanWork(run.record) || run.record.narrativeRequestId) denied()
+          const current = await deps.store.get(workspaceId, action.recordId)
+          if (current?.etag !== action.etag || current &&
+            ((current.record.recordType !== 'analysis-candidate-narrative' && current.record.recordType !== 'analysis-target-narrative') ||
+              current.record.runId !== runId || current.record.generationId !== action.generationId)) denied()
+        }
         if (name.includes('/results/') || name.includes('/diagnostics/')) {
           if (run?.record.recordType !== 'analysis-run' || !analysisRunCanScore(run.record)) denied()
           const parts = name.split('/')
@@ -209,16 +275,17 @@ export function fencedAnalysisBlobs(
           if (comparison?.record.recordType !== 'analysis-comparison' || comparison.record.runId !== runId ||
             comparison.record.status !== 'running' || `${comparison.record.attemptId}.json` !== parts[4]) denied()
         }
-        if (name.includes('/narratives/')) {
+        if (name.includes('/narratives/') || name.includes('/narrative-history/')) {
           if (run?.record.recordType !== 'analysis-run' || !analysisNarrativeCanWork(run.record)) denied()
           const parts = name.split('/')
-          if (parts[3] !== 'requests') {
+          if (parts[3] !== 'requests' && name !== publicationName) {
             const kind = parts[3] === 'candidate' ? 'candidate' : 'target'
             const value = await deps.store.get(workspaceId, analysisNarrativeId(kind, runId, parts[4]))
             if (!value || (value.record.recordType !== 'analysis-candidate-narrative' && value.record.recordType !== 'analysis-target-narrative') ||
               !analysisNarrativeCanWork(run.record, value.record) || run.record.narrativeRequestId ||
               value.record.status !== 'running' || value.record.generationId !== parts[5] ||
-              `${value.record.attemptId}.json` !== parts[6] || !value.record.lease) denied()
+              (parts[2] === 'narrative-history' ? value.record.attemptId !== parts[6] : `${value.record.attemptId}.json` !== parts[6]) ||
+              !value.record.lease) denied()
           }
         }
         assertWorkspaceMutationLease(workspaceId)

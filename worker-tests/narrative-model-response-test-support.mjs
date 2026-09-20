@@ -153,6 +153,20 @@ function targetResponse(source) {
 export function narrativeModelTestResponseFor(kind, body) {
   if (!names.has(kind)) return undefined
   if (kind === 'analysis_narrative_grounding_review') return { outcome: 'supported', issues: [] }
+  if (body.version === 2) {
+    if (kind === 'analysis_candidate_narrative') {
+      const assessment = body.source.analysis
+      return {
+        text: assessment.criteria.some(row => row.evidenceStatus !== 'supported')
+          ? 'The saved analysis documents relevant professional work. Some findings remain partial, missing, or unassessed and require human review.'
+          : 'The saved analysis documents professional work relevant to the role. Its findings describe the submitted evidence, not a hiring recommendation.',
+        overview: 'The saved analysis describes the documented work and its evidence limitations.',
+      }
+    }
+    return { paragraphs: [
+      'The saved analyses describe professional work against the selected role. Their documented distinctions and evidence limitations remain matters for human review.',
+    ] }
+  }
   if (kind === 'analysis_candidate_narrative') return candidateResponse(body.source)
   if (kind === 'analysis_target_narrative') return targetResponse(body.source)
   const output = { members: [...body.source.members], findings: cohortFindings(body.source) }

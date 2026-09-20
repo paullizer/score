@@ -11,6 +11,7 @@ import { getDisplayName } from '../../domain/displayNames'
 import { Badge, Button, InlineError, Modal } from '../../components/ui'
 import { useLifecycleAccess } from '../../components/lifecycle/useLifecycleAccess'
 import { targetVersionLabel } from './realAnalysisUi'
+import { SummaryApprovalDisclosure, SummaryHistoryControl } from './AnalysisSummaryHistory'
 
 function useSavedSummaries(runId: string, targetId?: string, enabled = true) {
   const api = useRealAnalyses()
@@ -37,9 +38,12 @@ export function AnalysisSummaryStatus({ summaries }: { summaries: RealAnalysisSu
   const scoring = summaries.scoring
   const pending = scoring.queued + scoring.running
   const uninitialized = scoring.total - scoring.initialized
+  const rounds = [...new Set([...summaries.comparisons, ...summaries.targets]
+    .filter(item => ['queued', 'running'].includes(item.status) && item.summaryRound !== undefined).map(item => item.summaryRound))]
   return <div className="space-y-4" aria-label="Summary readiness" aria-live="polite">
     <SummaryCounts label="Candidate summaries" counts={summaries.counts.candidates} />
     <SummaryCounts label="Job / grade overviews" counts={summaries.counts.targets} />
+    {rounds.length > 0 && <p className="text-[12px] text-muted">Summary checks: {rounds.sort().map(round => `round ${round} of 3`).join(' · ')}.</p>}
     {pending > 0 && <p className="text-[12px] text-muted">{pending} {pending === 1 ? 'comparison is' : 'comparisons are'} still awaiting or undergoing scoring in this scope. Overviews wait for selected scoring and candidate summaries to finish.</p>}
     {uninitialized > 0 && <p className="text-[11px] text-muted">Not initialized yet: {uninitialized} (included in the waiting count).</p>}
     {(scoring.failed > 0 || scoring.cancelled > 0) && <p className="text-[11px] text-muted">{scoring.failed} failed and {scoring.cancelled} cancelled comparisons remain unassessed, not unsuccessful candidates.</p>}
@@ -113,6 +117,14 @@ export function ManageAnalysisSummaries({ detail, open, initialTargetId, onOpenC
 
   const targetNames = new Map(detail.targets.map((target) => [target.id, getDisplayName(target, target.label)]))
   const labels = detail.targets.map((target) => `${targetNames.get(target.id)} / ${targetVersionLabel(target.selection)}`)
+  const summaryLabel = (item: RealAnalysisCandidateNarrativeSummary | RealAnalysisTargetNarrativeSummary) =>
+    item.kind === 'candidate' ? `Candidate summary (${item.comparisonId})` : `Overview (${targetNames.get(item.targetId) ?? item.targetId})`
+  const failures = new Map<string, (RealAnalysisCandidateNarrativeSummary | RealAnalysisTargetNarrativeSummary)[]>()
+  for (const item of summaries ? [...summaries.comparisons, ...summaries.targets] : []) {
+    if (!item.error) continue
+    const key = JSON.stringify([item.error.code, item.error.stage, item.error.message])
+    failures.set(key, [...(failures.get(key) ?? []), item])
+  }
   return <Modal open={open} onOpenChange={onOpenChange} title="Manage summaries"
     description="Update narrative text for this saved analysis, without rerunning scoring or changing frozen evidence."
     footer={<>
@@ -140,12 +152,25 @@ export function ManageAnalysisSummaries({ detail, open, initialTargetId, onOpenC
       {(loadingError || error) && <InlineError>{error || loadingError}
         <p className="mt-2">If acknowledgement was interrupted, repeating the same action reuses its request key rather than starting a duplicate generation.</p>
       </InlineError>}
-      {summaries && [...summaries.comparisons, ...summaries.targets].some((item) => item.error) && <div className="space-y-3">
-        {[...summaries.comparisons, ...summaries.targets].filter((item) => item.error).map((item) => <InlineError key={item.kind === 'candidate' ? item.comparisonId : item.targetId}>
-          {item.kind === 'candidate' ? `Candidate summary (${item.comparisonId})` : `Overview (${targetNames.get(item.targetId) ?? item.targetId})`}: {item.error?.message}
-          {' '}Use Generate missing summaries to retry summary work, not scoring.
-        </InlineError>)}
+      {failures.size > 0 && <div className="space-y-3">
+        {[...failures].map(([key, items]) => <section key={key} className="space-y-3 rounded-lg border p-3" aria-label="Affected summaries">
+          <InlineError>{items[0].error?.message} {items.length} {items.length === 1 ? 'summary affected' : 'summaries affected'}.
+            {' '}Retry summary work, not scoring.</InlineError>
+          <details><summary className="cursor-pointer text-[12px] font-semibold">Show affected summaries and history ({items.length})</summary>
+            <ul className="mt-3 space-y-3">{items.map(item => <li key={`${targetId}:${item.kind}:${item.kind === 'candidate' ? item.comparisonId : item.targetId}`} className="space-y-2">
+              <p className="text-[12px]">{summaryLabel(item)}{item.summaryRound !== undefined ? ` · round ${item.summaryRound} of 3` : ''}</p>
+              <SummaryHistoryControl runId={detail.run.id} narrative={item} label={summaryLabel(item)} />
+            </li>)}</ul>
+          </details>
+        </section>)}
       </div>}
+      {api?.canReviewSummaries && summaries && <details className="space-y-3" key={`history:${targetId}`}>
+        <summary className="cursor-pointer text-[12px] font-semibold">All summary histories</summary>
+        <p className="text-[11px] text-muted">Private drafts and factual reviews, including successful and earlier attempts. Viewing history does not generate summaries.</p>
+        {[...summaries.comparisons, ...summaries.targets].map(item => <SummaryHistoryControl
+          key={`${item.kind}:${item.kind === 'candidate' ? item.comparisonId : item.targetId}`}
+          runId={detail.run.id} narrative={item} label={summaryLabel(item)} />)}
+      </details>}
       {success && <p className="text-[12px]" role="status">{success}</p>}
       <div className="flex flex-wrap gap-2">
         <Button size="sm" icon={RotateCcw} disabled={pending || api?.phase !== 'ready'}
@@ -164,8 +189,8 @@ export function ManageAnalysisSummaries({ detail, open, initialTargetId, onOpenC
   </Modal>
 }
 
-function NarrativeContent({ narrative, loadError }: {
-  narrative: RealAnalysisCandidateNarrativeSummary | RealAnalysisTargetNarrativeSummary; loadError?: string
+function NarrativeContent({ runId, narrative, loadError }: {
+  runId: string; narrative: RealAnalysisCandidateNarrativeSummary | RealAnalysisTargetNarrativeSummary; loadError?: string
 }) {
   const updating = ['waiting', 'queued', 'running'].includes(narrative.status)
   const ready = narrative.status === 'ready' && !loadError
@@ -175,10 +200,12 @@ function NarrativeContent({ narrative, loadError }: {
   })[narrative.status]
   return <div className="space-y-3">
     <Badge tone={ready ? 'success' : narrative.status === 'failed' ? 'danger' : 'warning'}>{label}</Badge>
+    {narrative.summaryRound !== undefined && !ready && <p className="text-[12px]">Summary progress: round {narrative.summaryRound} of 3.</p>}
     {narrative.published ? <>
       {!ready && <p className="text-[12px] font-semibold" role="status">Previous published summary - {updating && !loadError ? 'updating' : 'outdated'}. It is not current for PDF, Word, or PowerPoint export.</p>}
-      {narrative.kind === 'candidate' ? <p className="whitespace-pre-line text-[13px] leading-relaxed">{narrative.published.text}</p>
-        : narrative.published.paragraphs.map((paragraph, index) => <p key={index} className="whitespace-pre-line text-[13px] leading-relaxed">{paragraph}</p>)}
+      <SummaryApprovalDisclosure publication={narrative.published} />
+      {narrative.kind === 'candidate' ? <p className="whitespace-pre-wrap break-words text-[13px] leading-relaxed">{narrative.published.text}</p>
+        : narrative.published.paragraphs.map((paragraph, index) => <p key={index} className="whitespace-pre-wrap break-words text-[13px] leading-relaxed">{paragraph}</p>)}
       <p className="text-[10px] text-muted">Published {dateLabel(narrative.published.publishedAt)}. Narrative only; saved scores and evidence are unchanged.</p>
     </> : <p className="text-[12px] text-muted">{narrative.status === 'not-required'
       ? 'No completed assessment is available to summarize.'
@@ -187,6 +214,7 @@ function NarrativeContent({ narrative, loadError }: {
       ? 'Waiting for this target’s scoring to finish.' : 'Waiting for this target’s completed candidate summaries.'}</p>}
     {narrative.nextAttemptAt && <p className="text-[11px] text-muted">Automatic summary retry {dateLabel(narrative.nextAttemptAt)}</p>}
     {narrative.error && <InlineError>{narrative.error.message} Previous published text, if any, is retained. Retry summary work in Manage summaries.</InlineError>}
+    <SummaryHistoryControl runId={runId} narrative={narrative} label={narrative.kind === 'candidate' ? 'Candidate summary' : 'Job / grade overview'} />
   </div>
 }
 
@@ -200,7 +228,7 @@ export function RealTargetNarrative({ runId, target }: { runId: string; target: 
     <h2 className="text-[15px] font-semibold">{target.kind === 'grade' ? 'Grade' : 'Job'} overview</h2>
     <p className="text-[11px] text-muted">{getDisplayName(target, target.label)} · {targetVersionLabel(target.selection)}. This exact target only, across all its saved comparisons.</p>
     {target.displayName !== undefined && <p className="text-[11px] text-muted">Source title: {target.label}</p>}
-    {narrative ? <NarrativeContent narrative={narrative} loadError={error} /> : !error && <p className="text-[12px]" role="status">Loading saved overview...</p>}
+    {narrative ? <NarrativeContent runId={runId} narrative={narrative} loadError={error} /> : !error && <p className="text-[12px]" role="status">Loading saved overview...</p>}
     {error && <InlineError>{error}</InlineError>}
   </section>
 }
@@ -215,7 +243,7 @@ export function RealCandidateNarrative({ runId, comparisonId, targetId }: { runI
     : undefined
   return <section className="panel mt-5 space-y-3 p-5" aria-label="Saved candidate assessment summary">
     <h2 className="text-[15px] font-semibold">Candidate assessment summary</h2>
-    {narrative ? <NarrativeContent narrative={narrative} loadError={error} /> : !error && <p className="text-[12px]" role="status">Loading saved candidate summary...</p>}
+    {narrative ? <NarrativeContent runId={runId} narrative={narrative} loadError={error} /> : !error && <p className="text-[12px]" role="status">Loading saved candidate summary...</p>}
     {error && <InlineError>{error}</InlineError>}
   </section>
 }

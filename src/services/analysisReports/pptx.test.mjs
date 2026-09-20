@@ -5,7 +5,7 @@ import { createContext, runInContext } from 'node:vm'
 import { after, before, test } from 'node:test'
 import { build } from 'esbuild'
 import fontkit from '@pdf-lib/fontkit'
-import { loadReportFoundation, reportFixtureCitation, REPORT_TEST_TIMESTAMP } from './test-support.mjs'
+import { loadReportFoundation, reportFixtureCitation, REPORT_TEST_TIMESTAMP, version2ReportFixture } from './test-support.mjs'
 import {
   fictionalPptxFixture, inspectPptx, loadPptxTestApi, longPptxFixture, PPTX_SAMPLE_LINKS,
   PPTX_TEST_LINKS, powerpointLayoutFixture, readablePptxFixture, readyPptxFixture, refreshPptxCoverage, unzipPptx,
@@ -76,6 +76,40 @@ function assertReadableGeometry(slides) {
     }
   }
 }
+
+test('long v2 summaries and manual known issues continue across readable slides and overview rows without clipping', async () => {
+  const report = foundation.buildAnalysisReport(version2ReportFixture({ long: true }))
+  const before = JSON.stringify(report)
+  const result = await inspectReport(report)
+  const group = report.groups[0]
+  const candidate = group.comparisons[0]
+  const summaryParts = matchingShapes(result.slides, /^review-0-0-summary-part-/)
+  assert.ok(summaryParts.length > 1)
+  assert.equal(summaryParts.map(shape => shape.text).join(''), candidate.narrative.text)
+  const candidateDisclosures = matchingShapes(result.slides, /^review-0-0-disclosure-/).map(shape => shape.text).join('')
+  assert.ok(candidateDisclosures.includes('Manually approved summary. Automated review: needs-correction.'))
+  assert.ok(candidateDisclosures.includes(`Known issue: ${candidate.narrative.approval.issues[0].message}`))
+  for (const [index, paragraph] of group.target.narrative.paragraphs.entries()) {
+    assert.equal(matchingShapes(result.slides, new RegExp(`^target-0-narrative-${index}-part-`)).map(shape => shape.text).join(''), paragraph)
+  }
+  const targetDisclosures = matchingShapes(result.slides, /^target-0-disclosure-/).map(shape => shape.text).join('')
+  assert.ok(targetDisclosures.includes(`Known issue: ${group.target.narrative.approval.issues[0].message}`))
+  const overviewRows = matchingShapes(result.slides, /^overview-0-\d+$/).flatMap(shape => shape.rows.slice(1))
+  for (const comparison of group.comparisons) {
+    const rows = overviewRows.filter(row => row.cells[0].text === comparison.candidate.name)
+    assert.ok(rows.length > 1, 'Accepted overviews and disclosures continue with the same candidate identity and score.')
+    assert.equal(rows.map(row => row.cells[2].text).join(''),
+      [...foundation.candidateNarrativeDisclosures(comparison), comparison.narrative.overview].join('\n\n'))
+    assert.ok(rows.every(row => row.cells[1].text === (comparison.overall.status === 'available' ? `${comparison.overall.score} / 100` : 'Withheld')))
+  }
+  assert.equal(JSON.stringify(report), before)
+  assert.ok(result.slides.some(slide => slide.text.includes('Candidates at a glance (continued)')))
+  assert.ok(matchingShapes(result.slides, /^overview-link-note$/).some(shape => shape.text.includes('Manually approved summary and known issues (continued)')))
+  for (const slide of result.slides.filter(slide => slide.shapes.some(shape => /^review-0-0-summary-part-|^target-0-narrative-/.test(shape.name)))) {
+    assert.match(slide.xml, /<a:spcPts val="2000"\s*\/>/, 'V2 paragraph leading must match measured pagination in native PowerPoint.')
+  }
+  assertReadableGeometry(result.slides)
+})
 
 test('presentation display labels never replace original candidate or target identities', async () => {
   const input = readablePptxFixture({ scores: [92.75, null], criterionCount: 6 })

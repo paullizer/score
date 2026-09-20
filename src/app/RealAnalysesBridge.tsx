@@ -5,6 +5,7 @@ import type {
   RealAnalysisRunSummary, RealAnalysisTargetSummary,
 } from '../domain/real-analyses'
 import type { RealAnalysisSummariesResponse } from '../domain/analysis-narratives'
+import type { AnalysisSummaryHistoryPage, AnalysisSummarySubject, PublishSummaryDraftInput } from '../domain/analysis-summary-history'
 import * as api from '../services/realAnalyses'
 import { CloudApiError, CloudConflictError, LifecycleOperationError } from '../services/cloudWorkspace'
 import { lifecycleIsRemoved, isEntityArchived, isEntityRemoved, type LifecycleAction, type LifecycleTarget } from '../domain/lifecycle'
@@ -18,6 +19,7 @@ import { assertRealLifecyclePermission, discoveredLifecycle, projectRealLifecycl
 
 const pairKey = (runId: string, id: string) => `${runId}/${id}`
 const narrativeKey = (runId: string, targetId?: string) => JSON.stringify([runId, targetId ?? null])
+const summaryHistoryKey = (runId: string, subject: AnalysisSummarySubject) => `${runId}/${JSON.stringify([subject.kind, subject.subjectId])}`
 const narrativeWorkActive = (value: RealAnalysisSummariesResponse) =>
   value.scoring.initialized < value.scoring.total || value.scoring.queued > 0 || value.scoring.running > 0 ||
   [value.counts.candidates, value.counts.targets].some((count) => count.waiting + count.queued + count.running > 0)
@@ -53,6 +55,7 @@ function RealAnalysesProvider({ workspaceId, children }: { workspaceId: string; 
   const narrativesRef = useRef(narratives)
   const narrativeScopes = useRef(new Map<string, { runId: string; targetId?: string }>())
   const narrativeRequests = useRef(new Map<string, { key: string; etag: string; runId: string }>())
+  const summaryHistoryScopes = useRef(new Map<string, Pick<AnalysisSummaryHistoryPage, 'etag' | 'capabilities'> & { runId: string; targetId: string }>())
   const pairSummaries = useRef(new Map<string, RealAnalysisComparisonSummary>())
   const createKeys = useRef(new Map<string, string>())
   const [pendingCount, setPendingCount] = useState(0)
@@ -63,7 +66,18 @@ function RealAnalysesProvider({ workspaceId, children }: { workspaceId: string; 
     setPendingLifecycleState(next)
   }, [])
   const canWrite = realWorkspaceWritable(parent, workspaceId)
+  const mayReviewSummaries = () => {
+    const role = parentRef.current.cloud?.workspaces.find(item => item.id === workspaceId)?.role
+    return parentRef.current.cloud?.currentWorkspaceId === workspaceId && (role === 'owner' || role === 'editor')
+  }
+  const canReviewSummaries = mayReviewSummaries()
   const leaveGuard = useGradeLeaveGuard(false, pendingCount > 0, 'Analysis request (not yet acknowledged)')
+
+  useEffect(() => {
+    if (canReviewSummaries) return
+    scope.cancelReads(key => key.startsWith('summary-history:'))
+    summaryHistoryScopes.current.clear()
+  }, [canReviewSummaries, scope])
 
   const putDetail = useCallback((id: string, entry: RealLoadState<RealAnalysisRunDetail>) => {
     detailRef.current = { ...detailRef.current, [id]: entry }
@@ -86,6 +100,7 @@ function RealAnalysesProvider({ workspaceId, children }: { workspaceId: string; 
     const removedScopes = new Set([...narrativeScopes.current].filter(([, item]) => item.runId === id).map(([key]) => key))
     scope.cancelReads((key) => key === `detail:${id}` || key === `pairs:${id}` || key.startsWith(`result:${id}/`) ||
       key.startsWith(`document:${id}/`) || key.startsWith(`diagnostics:${id}/`) ||
+      key.startsWith(`summary-history:${id}/`) ||
       [...removedScopes].some((item) => key === `narratives:${item}`))
     putDetail(id, { state: 'error', error: 'This analysis was removed or is awaiting permanent cleanup. Cached inputs and results are no longer available.' })
     const next = { ...comparisonsRef.current }; delete next[id]
@@ -96,6 +111,7 @@ function RealAnalysesProvider({ workspaceId, children }: { workspaceId: string; 
     setNarratives(narrativesRef.current)
     for (const key of removedScopes) narrativeScopes.current.delete(key)
     for (const [key, request] of narrativeRequests.current) if (request.runId === id) narrativeRequests.current.delete(key)
+    for (const [key, selected] of summaryHistoryScopes.current) if (selected.runId === id) summaryHistoryScopes.current.delete(key)
     for (const key of pairSummaries.current.keys()) if (key.startsWith(`${id}/`)) pairSummaries.current.delete(key)
   }, [putDetail, scope])
 
@@ -468,8 +484,43 @@ function RealAnalysesProvider({ workspaceId, children }: { workspaceId: string; 
     })
   }
 
+  async function changeSummary(
+    runId: string, subject: AnalysisSummarySubject, action: 'publish' | 'retry', etag: string, input?: PublishSummaryDraftInput,
+  ): Promise<RealAnalysisSummariesResponse> {
+    if (!mayReviewSummaries()) throw new Error('Only workspace owners and editors can review or change private summary drafts.')
+    const historyKey = summaryHistoryKey(runId, subject)
+    const history = summaryHistoryScopes.current.get(historyKey)
+    const fingerprint = JSON.stringify([runId, subject.kind, subject.subjectId, action, input ?? null])
+    const previous = narrativeRequests.current.get(fingerprint)
+    if (!history || (!previous && history.etag !== etag)) throw new Error('Refresh this summary history and review the current draft before submitting.')
+    if (!previous && !history.capabilities[action === 'publish' ? 'canPublish' : 'canRetry']) {
+      throw new Error('This summary action is not currently permitted. Refresh its history and check access or lifecycle status.')
+    }
+    // An uncertain acknowledgement keeps the exact intent, key and original ETag, even after a status refresh.
+    const request = previous ?? { key: crypto.randomUUID(), etag, runId }
+    narrativeRequests.current.set(fingerprint, request)
+    const result = await mutate(runId, async () => {
+      try {
+        return action === 'publish' && input
+          ? await api.publishRealAnalysisSummaryDraft(workspaceId, runId, subject, input, request.etag, request.key, history.targetId)
+          : await api.retryRealAnalysisSummary(workspaceId, runId, subject, request.etag, request.key, history.targetId)
+      } catch (caught) {
+        if (caught instanceof CloudApiError && caught.status >= 400 && caught.status < 500 && ![408, 429].includes(caught.status)) {
+          narrativeRequests.current.delete(fingerprint)
+        }
+        throw caught
+      }
+    }, (response, sequence) => {
+      invalidateNarratives(runId, history.targetId)
+      rememberNarratives(response, sequence)
+    }, false, true)
+    narrativeRequests.current.delete(fingerprint)
+    summaryHistoryScopes.current.delete(historyKey)
+    return result
+  }
+
   const value: RealAnalysesContextValue = {
-    workspaceId, canWrite, phase, features, error, creationError, summaries, targets, refresh, refreshTargets, ensureDetail, ensureComparisons, ensureComparison, ensureNarratives,
+    workspaceId, canWrite, canReviewSummaries, phase, features, error, creationError, summaries, targets, refresh, refreshTargets, ensureDetail, ensureComparisons, ensureComparison, ensureNarratives,
     detail: (id) => details[id] ?? { state: 'idle' },
     comparisons: (id) => comparisons[id] ?? { state: 'idle' },
     comparison: (runId, id) => results[pairKey(runId, id)] ?? { state: 'idle' },
@@ -500,6 +551,39 @@ function RealAnalysesProvider({ workspaceId, children }: { workspaceId: string; 
       narrativeRequests.current.delete(fingerprint)
       return result
     },
+    summaryHistory: async (runId, subject, cursor, signal) => {
+      signal?.throwIfAborted()
+      if (!mayReviewSummaries()) throw new Error('Only workspace owners and editors can read private summary history.')
+      if (!historyAvailable.current || !readableRun(runId)) throw new Error('Private summary history is unavailable or this analysis is being deleted.')
+      const key = summaryHistoryKey(runId, subject)
+      const ticket = scope.read(`summary-history:${key}`)
+      if (!ticket) throw new Error('Wait for the pending analysis request, then reopen summary history.')
+      const cancel = () => { ticket.controller.abort(); scope.finish(ticket) }
+      signal?.addEventListener('abort', cancel, { once: true })
+      try {
+        const page = await api.getRealAnalysisSummaryHistory(workspaceId, runId, subject, cursor,
+          signal ? AbortSignal.any([signal, ticket.controller.signal]) : ticket.controller.signal)
+        if (!scope.current(ticket) || !readableRun(runId) || !mayReviewSummaries() || signal?.aborted) {
+          throw new DOMException('The private summary history request was cancelled.', 'AbortError')
+        }
+        const run = summariesRef.current.find(item => item.run.id === runId)?.run
+        if (run && page.entries.some(entry => entry.manifestSha256 !== run.manifest.sha256)) {
+          throw new Error('The summary history does not match this run’s frozen manifest. Reload the saved analysis.')
+        }
+        const targetId = subject.kind === 'target' ? subject.subjectId
+          : Object.values(narrativesRef.current).flatMap(entry =>
+            entry.state === 'ready' && entry.value.runId === runId ? entry.value.comparisons : [])
+            .find(item => item.comparisonId === subject.subjectId)?.targetId
+          ?? pairSummaries.current.get(pairKey(runId, subject.subjectId))?.comparison.target.summary.id
+          ?? page.entries[0]?.targetId
+        if (!targetId) throw new Error('The summary’s exact target scope is unavailable. Reload its saved comparison.')
+        if (page.entries.some(entry => entry.targetId !== targetId)) throw new Error('The private history does not match this summary’s exact job / grade target.')
+        summaryHistoryScopes.current.set(key, { etag: page.etag, capabilities: page.capabilities, runId, targetId })
+        return page
+      } finally { signal?.removeEventListener('abort', cancel); scope.finish(ticket) }
+    },
+    publishSummaryDraft: (runId, subject, input, etag) => changeSummary(runId, subject, 'publish', etag, input),
+    retrySummary: (runId, subject, etag) => changeSummary(runId, subject, 'retry', etag),
     pending: (id) => scope.pending(id ? `run:${id}` : '$create'),
     requestKey: (input) => {
       const fingerprint = JSON.stringify(input)

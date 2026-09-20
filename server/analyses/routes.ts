@@ -4,11 +4,12 @@ import type { RealJobsDeps } from '../jobs/routes'
 import type { RealGradesDeps } from '../grades/service'
 import type { RealResumesDeps } from '../resumes/store'
 import { getPrincipal } from '../request-context'
-import { invalidRequest, notFound, preconditionRequired, unavailable } from '../errors'
+import { forbidden, invalidRequest, notFound, preconditionRequired, unavailable } from '../errors'
 import { isUuid } from '../jobs/validation'
 import type { RealAnalysesDeps } from './store'
 import { RealAnalysisService } from './service'
 import { AnalysisLibraryLifecycleService } from './library-lifecycle'
+import { publishSummaryDraftInputSchema, type AnalysisSummarySubject } from '../../src/domain/analysis-summary-history'
 import {
   analysisLifecycleInputSchema, createAnalysisInputSchema, emptyAnalysisInputSchema,
   analysisNarrativeTargetIdSchema, generateAnalysisSummariesInputSchema, isAnalysisId, reportComparisonIdsSchema, retryAnalysisInputSchema,
@@ -32,6 +33,14 @@ function recordId(req: Request, kind: 'run' | 'comparison'): string {
   const value = param(req, `${kind}Id`)
   if (!isAnalysisId(value, kind)) throw notFound('The requested analysis record was not found.')
   return value
+}
+function summarySubject(req: Request): AnalysisSummarySubject {
+  const kind = param(req, 'kind'), subjectId = param(req, 'subjectId')
+  if (kind !== 'candidate' && kind !== 'target' ||
+    (kind === 'candidate' ? !isAnalysisId(subjectId, 'comparison') : !analysisNarrativeTargetIdSchema.safeParse(subjectId).success)) {
+    throw notFound('The exact saved summary was not found.')
+  }
+  return { kind, subjectId }
 }
 function match(req: Request): string {
   const value = req.header('If-Match')
@@ -155,6 +164,35 @@ export function createRealAnalysesRouter(deps: RealAnalysesRouterDeps): Router {
     query(req, [])
     const result = await requireService().generateSummaries(param(req, 'workspaceId'), recordId(req, 'run'),
       body(generateAnalysisSummariesInputSchema, req.body), key(req), match(req), getPrincipal(req).principalKey)
+    res.setHeader('ETag', result.summaries.etag)
+    res.status(202).json(result)
+  }))
+  const summaryBase = `${base}/:runId/summaries/:kind/:subjectId`
+  router.get(`${summaryBase}/history`, async (req, res) => {
+    if (!['owner', 'editor'].includes(res.locals.analysisWorkspaceRole)) {
+      throw forbidden('Only workspace owners and editors may inspect unpublished summary history.')
+    }
+    query(req, ['continuationToken'])
+    const token = req.query.continuationToken
+    if (token !== undefined && (typeof token !== 'string' || !token || token.length > 16 * 1024)) {
+      throw invalidRequest('continuationToken must be a single valid summary history token.')
+    }
+    const history = await requireService().summaryHistory(param(req, 'workspaceId'), recordId(req, 'run'), summarySubject(req), token)
+    res.setHeader('ETag', history.etag)
+    res.json(history)
+  })
+  router.post(`${summaryBase}/publish`, mutate('write', async (req, res) => {
+    query(req, [])
+    const result = await requireService().publishSummary(param(req, 'workspaceId'), recordId(req, 'run'), summarySubject(req),
+      body(publishSummaryDraftInputSchema, req.body), key(req), match(req), getPrincipal(req).principalKey)
+    res.setHeader('ETag', result.summaries.etag)
+    res.json(result)
+  }))
+  router.post(`${summaryBase}/retry`, mutate('write', async (req, res) => {
+    query(req, [])
+    body(emptyAnalysisInputSchema, actionBody(req))
+    const result = await requireService().retrySummary(param(req, 'workspaceId'), recordId(req, 'run'), summarySubject(req),
+      key(req), match(req), getPrincipal(req).principalKey)
     res.setHeader('ETag', result.summaries.etag)
     res.status(202).json(result)
   }))

@@ -17,6 +17,7 @@ import type { Citation } from '../../src/domain/types'
 import { assessmentInputSchema } from './model-schema'
 import { ANALYSIS_WEIGHT_TOLERANCE, AnalysisModelError, validateAnalysisAssessmentInput } from './validation'
 import { NARRATIVE_MODEL_LIMITS } from './narrative-model-schema'
+import { summaryApprovalSchema, summaryCandidateContentSchema } from '../../src/domain/analysis-summary-history'
 
 const identifier = z.string().min(1).max(200).regex(/^[A-Za-z0-9][A-Za-z0-9_.:-]*$/)
 const hash = z.string().regex(/^[a-f0-9]{64}$/)
@@ -44,11 +45,17 @@ const targetBindingSchema = z.strictObject({
     }).nullable(),
   })).min(1).max(ANALYSIS_NARRATIVE_LIMITS.maxComparisons),
 })
-const publishedCandidate = publication.extend({
+const legacyPublishedCandidate = publication.extend({
   dataKind: z.literal('real'),
   text: z.string().min(1).max(ANALYSIS_NARRATIVE_LIMITS.candidateMaxCharacters),
   overview: z.string().min(1).max(ANALYSIS_NARRATIVE_LIMITS.overviewMaxCharacters),
+  summaryVersion: z.undefined().optional(),
+  approval: z.undefined().optional(),
 })
+const publishedCandidate = z.union([legacyPublishedCandidate, publication.extend({
+  dataKind: z.literal('real'), ...summaryCandidateContentSchema.shape,
+  summaryVersion: z.literal(2), approval: summaryApprovalSchema,
+})])
 
 export class NarrativeInputError extends Error {
   constructor(readonly code: 'invalid-input' | 'stale-input' | 'context-limit', message: string) {
@@ -204,11 +211,13 @@ export function validateTargetNarrativeInput(value: AnalysisTargetNarrativeModel
     }
     const published = member.narrative!.published!
     try {
-      const sentences = narrativeSentences(validateNarrativeProse(narrative.data.text))
-      if (sentences.length < ANALYSIS_NARRATIVE_LIMITS.candidateMinSentences ||
-        sentences.length > ANALYSIS_NARRATIVE_LIMITS.candidateMaxSentences ||
-        narrativeSentences(validateNarrativeProse(narrative.data.overview)).length !== 1) {
-        invalid('A saved candidate narrative does not contain complete bounded narrative prose.', true)
+      if (narrative.data.summaryVersion !== 2) {
+        const sentences = narrativeSentences(validateNarrativeProse(narrative.data.text))
+        if (sentences.length < ANALYSIS_NARRATIVE_LIMITS.candidateMinSentences ||
+          sentences.length > ANALYSIS_NARRATIVE_LIMITS.candidateMaxSentences ||
+          narrativeSentences(validateNarrativeProse(narrative.data.overview)).length !== 1) {
+          invalid('A saved candidate narrative does not contain complete bounded narrative prose.', true)
+        }
       }
     } catch {
       invalid('A saved candidate narrative does not contain complete bounded narrative prose.', true)

@@ -14,6 +14,7 @@ import {
   validateNarrativeProse, validateTargetNarrativeOutput,
 } from '../../src/domain/analysis-narrative-validation'
 import type { AnalysisModelProvenance } from '../../src/domain/real-analyses'
+import type { AnalysisSummaryDiagnostic } from '../../src/domain/analysis-summary-history'
 import { systemClock, type Clock, type RubricModelOptions, type StructuredModelRequest } from '../runtime'
 import { invokeAnalysisModel, AnalysisModelError } from './model'
 import { ANALYSIS_MODEL_LIMITS, analysisStructuredSchema } from './model-schema'
@@ -43,16 +44,18 @@ export interface NarrativeModelOptions {
 export class NarrativeModelError extends Error implements AnalysisNarrativeProcessingError {
   readonly retryable: boolean
   readonly cancelled: boolean
+  readonly diagnostic?: AnalysisSummaryDiagnostic
   constructor(
     readonly code: AnalysisNarrativeProcessingError['code'],
     message: string,
     readonly stage: AnalysisNarrativeProcessingError['stage'],
-    options: { retryable?: boolean; cancelled?: boolean } = {},
+    options: { retryable?: boolean; cancelled?: boolean; diagnostic?: AnalysisSummaryDiagnostic } = {},
   ) {
     super(message)
     this.name = options.cancelled ? 'AbortError' : 'NarrativeModelError'
     this.retryable = options.retryable ?? false
     this.cancelled = options.cancelled ?? false
+    this.diagnostic = options.diagnostic
   }
 }
 
@@ -142,7 +145,7 @@ function cancelled(stage: NarrativeStage): NarrativeModelError {
   return new NarrativeModelError('timeout', 'Narrative processing was cancelled; no narrative was published.', stage, { cancelled: true })
 }
 
-function validateOptions(options: NarrativeModelOptions, stage: GenerationStage): void {
+export function validateNarrativeModelOptions(options: NarrativeModelOptions, stage: GenerationStage): void {
   if (options?.signal?.aborted) throw cancelled(stage)
   if (!options || typeof options.attemptId !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$/.test(options.attemptId) ||
     !options.model || typeof options.model.endpoint !== 'string' || !options.model.endpoint.trim() ||
@@ -358,7 +361,7 @@ function resolveClaims(
 export async function generateCandidateNarrative(
   input: AnalysisCandidateNarrativeModelInput, options: NarrativeModelOptions,
 ): Promise<{ output: AnalysisCandidateNarrativeModelOutput; provenance: AnalysisNarrativeProvenance }> {
-  validateOptions(options, 'candidate-generation')
+  validateNarrativeModelOptions(options, 'candidate-generation')
   const frozen = frozenInput(() => validateCandidateNarrativeInput(input), 'candidate-generation')
   const catalog = createNarrativeEvidenceCatalog(frozen)
   const session = new NarrativeSession(options, 'candidate-generation', catalog)
@@ -585,7 +588,7 @@ async function targetScope(input: AnalysisTargetNarrativeModelInput, session: Na
 export async function generateTargetNarrative(
   input: AnalysisTargetNarrativeModelInput, options: NarrativeModelOptions,
 ): Promise<{ output: AnalysisTargetNarrativeModelOutput; provenance: AnalysisNarrativeProvenance }> {
-  validateOptions(options, 'target-generation')
+  validateNarrativeModelOptions(options, 'target-generation')
   const frozen = frozenInput(() => validateTargetNarrativeInput(input), 'target-generation')
   const catalog = createNarrativeEvidenceCatalog(frozen)
   const session = new NarrativeSession(options, 'target-generation', catalog)

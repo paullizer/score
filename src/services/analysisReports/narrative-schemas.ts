@@ -6,6 +6,9 @@ import {
 } from '../../domain/analysis-narratives'
 import { REPORT_LIMITS, type ReportTargetPresentation } from '../../domain/analysis-reports'
 import { AnalysisNarrativeValidationError, narrativeSentences, validateNarrativeProse } from '../../domain/analysis-narrative-validation'
+import {
+  SUMMARY_LIMITS, summaryApprovalSchema, summaryCandidateContentSchema, summaryDiagnosticSchema, summaryTargetContentSchema,
+} from '../../domain/analysis-summary-history'
 
 const id = z.string().min(1).max(1024).refine(value => value === value.trim())
 const hash = z.string().regex(/^[a-f0-9]{64}$/i)
@@ -53,10 +56,19 @@ const realRevision = { revision: hash, inputFingerprint: hash }
 const published = { ...realRevision, generationId: id, publishedAt: timestamp }
 const sampleRevision = { revision: id, inputFingerprint: id, fixtureId: id, dataKind: z.literal('sample') }
 
-export const realCandidateNarrativeSchema = z.strictObject({ dataKind: z.literal('real'), ...published, ...candidateContent })
+const legacyCandidateNarrativeSchema = z.strictObject({ dataKind: z.literal('real'), ...published, ...candidateContent })
   .superRefine((value, context) => { realProse(value.text, context); realProse(value.overview, context) })
-export const realTargetNarrativeSchema = z.strictObject({ dataKind: z.literal('real'), ...published, ...targetContent })
+const legacyTargetNarrativeSchema = z.strictObject({ dataKind: z.literal('real'), ...published, ...targetContent })
   .superRefine((value, context) => { for (const paragraph of value.paragraphs) realProse(paragraph, context) })
+const summaryPublication = { dataKind: z.literal('real'), ...published, summaryVersion: z.literal(2), approval: summaryApprovalSchema }
+export const realCandidateNarrativeSchema = z.union([
+  z.strictObject({ ...summaryPublication, ...summaryCandidateContentSchema.shape }), legacyCandidateNarrativeSchema,
+])
+export const realTargetNarrativeSchema = z.union([
+  z.strictObject({ ...summaryPublication, ...summaryTargetContentSchema.shape }).refine(value =>
+    value.paragraphs.join('\n\n').length <= SUMMARY_LIMITS.totalCharacters, 'The saved summary exceeds its resource budget.'),
+  legacyTargetNarrativeSchema,
+])
 export const reportCandidateNarrativeSchema: z.ZodType<ReadyAnalysisCandidateNarrative> = z.union([
   realCandidateNarrativeSchema, z.strictObject({ ...sampleRevision, ...candidateContent }),
 ])
@@ -126,11 +138,13 @@ const summaryState = {
   waitingFor: z.enum(['scoring', 'candidate-narratives']).nullable(),
   attempts: z.number().int().min(0), retryCount: z.number().int().min(0),
   nextAttemptAt: timestamp.nullable(), updatedAt: timestamp.nullable(),
+  hasHistory: z.boolean().optional(), summaryRound: z.number().int().min(1).max(SUMMARY_LIMITS.rounds).optional(),
   error: z.strictObject({
     code: z.enum(['invalid-input', 'stale-input', 'snapshot-unavailable', 'snapshot-invalid', 'context-limit', 'invalid-model-output',
       'invalid-citation', 'grounding-failed', 'service-unavailable', 'storage-error', 'timeout', 'internal-error', 'dependency-failed']),
     stage: z.enum(['dependencies', 'candidate-generation', 'target-generation', 'grounding', 'publication']),
     message: nonempty, retryable: z.boolean(),
+    diagnostic: summaryDiagnosticSchema.optional(),
   }).nullable(),
 }
 const summaryCounts = z.strictObject({

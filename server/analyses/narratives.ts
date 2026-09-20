@@ -27,7 +27,7 @@ import { analysisBlobReference, assertComparisonManifestBinding, parseAnalysisJs
 import type { AnalysisStore, AnalysisTransaction, RealAnalysesDeps } from './store'
 import {
   analysisHash, analysisNarrativeId, analysisNarrativeRequestBlobName, analysisNarrativeTargetIdSchema, assertAnalysis,
-  generateAnalysisSummariesInputSchema, isAnalysisId, MAX_ANALYSIS_TRANSACTION_BYTES, parseAnalysisEntity,
+  analysisSummaryActionBlobName, generateAnalysisSummariesInputSchema, isAnalysisId, MAX_ANALYSIS_TRANSACTION_BYTES, parseAnalysisEntity,
 } from './validation'
 
 type Run = VersionedAnalysisEntity<RealAnalysisRunRecord>
@@ -252,6 +252,7 @@ function workSummary(record: RealAnalysisNarrativeRecord | undefined, state: Ana
   return {
     waitingFor: state.status === 'waiting' ? record?.waitingFor ?? null : null, attempts: record?.attempts ?? 0, retryCount: record?.retryCount ?? 0,
     nextAttemptAt: pending ? record?.nextAttemptAt ?? null : null, updatedAt: record?.updatedAt ?? null, error: record?.error ?? null,
+    hasHistory: Boolean(record?.history), ...(record?.summaryRound ? { summaryRound: record.summaryRound } : {}),
   }
 }
 export async function readAnalysisSummaries(
@@ -268,6 +269,7 @@ export async function readAnalysisSummaries(
         ...pair.state, ...workSummary(pair.narrative, pair.state),
         published: artifact?.kind === 'candidate' && pair.narrative?.published ? {
           ...narrativePublicationVersion(pair.narrative.published), dataKind: 'real', text: artifact.text, overview: artifact.overview,
+          ...(artifact.schemaVersion === 2 ? { summaryVersion: 2 as const, approval: artifact.approval } : {}),
         } : null,
       })
     }
@@ -279,6 +281,7 @@ export async function readAnalysisSummaries(
         kind: 'target', targetId: target.target.summary.id, ...target.state, ...workSummary(target.narrative, target.state),
         published: artifact?.kind === 'target' && target.narrative?.published ? {
           ...narrativePublicationVersion(target.narrative.published), dataKind: 'real', paragraphs: artifact.paragraphs,
+          ...(artifact.schemaVersion === 2 ? { summaryVersion: 2 as const, approval: artifact.approval } : {}),
         } : null,
       })
     }
@@ -349,6 +352,9 @@ export async function generateAnalysisSummaries(
   if (!/^"[a-f0-9]{64}"$/.test(expected)) throw invalidRequest('If-Match must contain one exact quoted summary scope revision, not a run ETag.')
   requestId = requestId.toLowerCase()
   input = parsed.data
+  if (await deps.blobs.read(analysisSummaryActionBlobName(workspaceId, runId, requestId))) {
+    throw conflict('This Idempotency-Key already identifies a single-summary publication or retry.')
+  }
   for (let attempt = 0; attempt < 8; attempt++) {
     await assertAnalysisWorkspaceActive(deps.store, workspaceId)
     const existing = await receipt(deps.store, workspaceId, runId, requestId)

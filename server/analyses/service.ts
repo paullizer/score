@@ -27,6 +27,9 @@ import { analysisPageCursor, analysisPageToken, validateAnalysisPage } from './p
 import { readAnalysisReportComparisons } from './reports'
 import { generateAnalysisSummaries, readAnalysisNarrativeInventory, readAnalysisSummaries } from './narratives'
 import type { GenerateRealAnalysisSummariesInput } from '../../src/domain/analysis-narratives'
+import type { AnalysisSummarySubject, PublishSummaryDraftInput } from '../../src/domain/analysis-summary-history'
+import { readAnalysisSummaryHistory } from './summary-history'
+import { publishAnalysisSummaryDraft, retryAnalysisSummary } from './summary-actions'
 import { prepareAnalysisNarrativeTransitions } from './narrative-scheduling'
 import { readAnalysisFailureDiagnostics } from './diagnostics'
 import {
@@ -294,6 +297,18 @@ export class RealAnalysisService {
   }
   generateSummaries(workspaceId: string, runId: string, input: GenerateRealAnalysisSummariesInput, requestId: string, expected: string, actor: string) {
     return generateAnalysisSummaries(this.deps, workspaceId, runId, input, requestId, expected, actor, this.clock)
+  }
+  summaryHistory(workspaceId: string, runId: string, subject: AnalysisSummarySubject, continuationToken?: string) {
+    return readAnalysisSummaryHistory(this.deps, workspaceId, runId, subject, continuationToken)
+  }
+  publishSummary(
+    workspaceId: string, runId: string, subject: AnalysisSummarySubject, input: PublishSummaryDraftInput,
+    requestId: string, expected: string, actor: string,
+  ) {
+    return publishAnalysisSummaryDraft(this.deps, workspaceId, runId, subject, input, requestId, expected, actor, this.clock)
+  }
+  retrySummary(workspaceId: string, runId: string, subject: AnalysisSummarySubject, requestId: string, expected: string, actor: string) {
+    return retryAnalysisSummary(this.deps, workspaceId, runId, subject, requestId, expected, actor, this.clock)
   }
   async diagnostics(workspaceId: string, runId: string, comparisonId: string, continuationToken?: string) {
     const [run, comparison] = await Promise.all([this.run(workspaceId, runId), this.comparison(workspaceId, runId, comparisonId)])

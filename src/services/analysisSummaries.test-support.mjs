@@ -1,4 +1,4 @@
-import { createHash } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 
 export const summaryWorkspaceId = 'workspace-one'
 export const summaryRunId = 'run-one'
@@ -97,7 +97,7 @@ function counts(items) {
 export function summaryResponse(fixture, {
   targetId = null, candidateStatus = 'missing', targetStatus = 'missing', states = {}, previous = false,
   text = candidateNarrativeText, paragraphs = [targetNarrativeText], revisionTag = 'initial', canGenerate = true, reason = null,
-  uninitializedIds = [],
+  uninitializedIds = [], summaryVersion, approval, hasHistory, summaryRound,
 } = {}) {
   const selectedTargets = fixture.targets.filter((target) => targetId === null || target.id === targetId)
   const selected = fixture.details.filter(({ comparison }) => targetId === null || comparison.target.summary.id === targetId)
@@ -106,15 +106,21 @@ export function summaryResponse(fixture, {
     const status = options.status ?? defaultStatus
     const published = status === 'ready' || (options.previous ?? previous)
       ? { dataKind: 'real', revision: createHash('sha256').update(`${id}:${options.text ?? text}:${revisionTag}`).digest('hex'),
-        inputFingerprint: hash, generationId: `${id}:published`, publishedAt: summaryTimestamp,
-        ...(kind === 'candidate' ? { text: options.text ?? text, overview: 'Documented engineering work is relevant, with limited evidence about breadth.' }
-          : { paragraphs: options.paragraphs ?? paragraphs }) } : null
+        inputFingerprint: hash, generationId: options.generationId ?? `${id}:published`, publishedAt: summaryTimestamp,
+        ...(kind === 'candidate' ? { text: options.text ?? text, overview: options.overview ?? 'Documented engineering work is relevant, with limited evidence about breadth.' }
+          : { paragraphs: options.paragraphs ?? paragraphs }),
+        ...((options.summaryVersion ?? summaryVersion) === undefined ? {} : {
+          summaryVersion: options.summaryVersion ?? summaryVersion, approval: options.approval ?? approval ?? { kind: 'automatic' },
+        }) } : null
     return { kind, ...(kind === 'candidate' ? { comparisonId: id } : {}), targetId, status,
-      generationId: status === 'ready' ? published.generationId : `${id}:requested`,
+      generationId: status === 'ready' ? published.generationId : options.generationId ?? `${id}:requested`,
       inputFingerprint: hash, waitingFor: status === 'waiting' ? (options.waitingFor ?? 'candidate-narratives') : null,
       attempts: 1, retryCount: 0, nextAttemptAt: null, updatedAt: summaryTimestamp, published,
+      ...((options.hasHistory ?? hasHistory) === undefined ? {} : { hasHistory: options.hasHistory ?? hasHistory }),
+      ...((options.summaryRound ?? summaryRound) === undefined ? {} : { summaryRound: options.summaryRound ?? summaryRound }),
       error: status === 'failed' ? { code: 'grounding-failed', stage: 'grounding',
-        message: options.error ?? 'Summary grounding needs an explicit retry.', retryable: false } : null }
+        message: options.error ?? 'Summary grounding needs an explicit retry.', retryable: false,
+        ...(options.diagnostic ? { diagnostic: options.diagnostic } : {}) } : null }
   }
   const comparisons = selected.map(({ comparison }) => ({
     ...state('candidate', comparison.id, comparison.target.summary.id,
@@ -138,5 +144,43 @@ export function summaryResponse(fixture, {
       comparisons: comparisons.map((item) => ({ comparisonId: item.comparisonId, targetId: item.targetId,
         status: item.comparisonStatus, resultSha256: item.comparisonStatus === 'complete' ? hash : null, narrative: pin(item) })),
       targets: targets.map((item) => ({ targetId: item.targetId, narrative: pin(item) })) },
+  }
+}
+
+export function summaryHistoryFixture(fixture, {
+  kind = 'candidate', subjectId = 'comparison-1', generationId = randomUUID(), rounds = 3,
+} = {}) {
+  const targetId = kind === 'target' ? subjectId
+    : fixture.details.find(item => item.comparison.id === subjectId).comparison.target.summary.id
+  const attemptId = randomUUID()
+  const entries = []
+  for (let round = 1; round <= rounds; round++) {
+    const timestamp = `2026-09-19T15:0${round}:00.000Z`
+    const draft = kind === 'candidate' ? {
+      kind, text: `Retained candidate draft ${round} summarizes the saved 60/100 assessment. It describes 1,000 samples as 1000 and a rated 480-volt system.`,
+      overview: `Draft ${round} records the saved scope with known limitations.`,
+    } : { kind, paragraphs: [`Retained target draft ${round} covers every saved assessment. It does not change scoring.`] }
+    const outputSha256 = createHash('sha256').update(JSON.stringify(draft)).digest('hex')
+    const provenance = { model: 'fixture-summary-model', deployment: 'fixture-deployment',
+      promptVersion: 'summary-v2', schemaVersion: 'summary-v2', startedAt: timestamp, completedAt: timestamp, inputCharacters: 1000 }
+    const entry = {
+      schemaVersion: 1, dataKind: 'real', workspaceId: fixture.workspaceId, runId: summaryRunId,
+      targetId, kind, subjectId, generationId, attemptId, inputFingerprint: hash, manifestSha256: hash,
+      scopeId: 'final', sourceFingerprint: hash, round, phase: 'generated', draft, outputSha256,
+      modelCallId: randomUUID(), generation: provenance, createdAt: timestamp,
+    }
+    entries.unshift({ ...entry, id: randomUUID() })
+    entries.unshift({
+      ...entry, id: randomUUID(), phase: 'reviewed',
+      review: { id: randomUUID(), modelCallId: randomUUID(), inputFingerprint: hash, outputSha256,
+        outcome: 'needs-correction', issues: [{
+          code: 'unsupported-claim', message: `Draft ${round}: nationwide experience was not established by the supplied assessment.`,
+          field: kind === 'candidate' ? 'text' : 'paragraphs', paragraphIndex: kind === 'candidate' ? null : 0,
+        }], provenance: { ...provenance, model: 'fixture-factual-reviewer', promptVersion: 'summary-review-v2' } },
+    })
+  }
+  return {
+    schemaVersion: 1, workspaceId: fixture.workspaceId, runId: summaryRunId, kind, subjectId,
+    etag: '"summary-record-etag"', inputFingerprint: hash, entries, capabilities: { canPublish: true, canRetry: true },
   }
 }

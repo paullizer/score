@@ -27,6 +27,11 @@ import {
   ANALYSIS_DIAGNOSTIC_LIMITS, ANALYSIS_DIAGNOSTIC_REASONS,
   type AnalysisFailureDiagnostic, type RealAnalysisDiagnosticsPage,
 } from '../domain/analysis-diagnostics'
+import {
+  SUMMARY_LIMITS, publishSummaryDraftInputSchema, summaryApprovalSchema, summaryCandidateContentSchema,
+  summaryDiagnosticSchema, summaryHistoryPageSchema, summaryTargetContentSchema,
+  type AnalysisSummaryHistoryPage, type AnalysisSummarySubject, type PublishSummaryDraftInput,
+} from '../domain/analysis-summary-history'
 import type { Citation } from '../domain/types'
 import { cloudJsonRequest, cloudLifecycleRequest } from './cloudWorkspace'
 import type { LifecycleAction, LifecycleImpact, LifecycleOperation } from '../domain/lifecycle'
@@ -69,6 +74,23 @@ const narrativeStatus = z.enum(['waiting', 'queued', 'running', 'ready', 'failed
 const comparisonStatus = z.enum(['queued', 'running', 'complete', 'failed', 'cancelled'])
 const narrativeRevision = z.object({ revision: narrativeHash, inputFingerprint: narrativeHash })
 const narrativePublication = narrativeRevision.extend({ dataKind: z.literal('real'), generationId: narrativeId, publishedAt: narrativeId })
+const legacyPublication = narrativePublication.extend({ summaryVersion: z.never().optional(), approval: z.never().optional() })
+const summaryPublication = narrativePublication.extend({ summaryVersion: z.literal(2), approval: summaryApprovalSchema })
+const candidatePublication = z.union([
+  summaryPublication.extend(summaryCandidateContentSchema.shape),
+  legacyPublication.extend({
+    text: z.string().min(1).max(ANALYSIS_NARRATIVE_LIMITS.candidateMaxCharacters),
+    overview: z.string().min(1).max(ANALYSIS_NARRATIVE_LIMITS.overviewMaxCharacters),
+  }),
+])
+const targetPublication = z.union([
+  summaryPublication.extend(summaryTargetContentSchema.shape).refine(value =>
+    value.paragraphs.join('\n\n').length <= SUMMARY_LIMITS.totalCharacters),
+  legacyPublication.extend({
+    paragraphs: z.array(z.string().min(1).max(ANALYSIS_NARRATIVE_LIMITS.targetParagraphMaxCharacters))
+      .min(1).max(ANALYSIS_NARRATIVE_LIMITS.targetMaxParagraphs),
+  }),
+])
 const narrativeCounts = z.object({
   total: narrativeCount, missing: narrativeCount, waiting: narrativeCount, queued: narrativeCount, running: narrativeCount,
   ready: narrativeCount, stale: narrativeCount, failed: narrativeCount, cancelled: narrativeCount, notRequired: narrativeCount,
@@ -79,11 +101,13 @@ const narrativeState = z.object({
   waitingFor: z.enum(['scoring', 'candidate-narratives']).nullable(),
   attempts: z.number().int().min(0), retryCount: z.number().int().min(0),
   nextAttemptAt: narrativeId.nullable(), updatedAt: narrativeId.nullable(),
+  hasHistory: z.boolean().optional(), summaryRound: z.number().int().min(1).max(SUMMARY_LIMITS.rounds).optional(),
   error: z.object({
     code: z.enum(['invalid-input', 'stale-input', 'snapshot-unavailable', 'snapshot-invalid', 'context-limit', 'invalid-model-output',
       'invalid-citation', 'grounding-failed', 'service-unavailable', 'storage-error', 'timeout', 'internal-error', 'dependency-failed']),
     stage: z.enum(['dependencies', 'candidate-generation', 'target-generation', 'grounding', 'publication']),
     message: z.string().min(1).max(16_000), retryable: z.boolean(),
+    diagnostic: summaryDiagnosticSchema.optional(),
   }).nullable(),
 })
 const summariesEnvelope: z.ZodType<RealAnalysisSummariesResponse> = z.object({
@@ -99,16 +123,10 @@ const summariesEnvelope: z.ZodType<RealAnalysisSummariesResponse> = z.object({
   }),
   comparisons: z.array(narrativeState.extend({
     kind: z.literal('candidate'), comparisonId: narrativeId, comparisonStatus,
-    published: narrativePublication.extend({
-      text: z.string().min(1).max(ANALYSIS_NARRATIVE_LIMITS.candidateMaxCharacters),
-      overview: z.string().min(1).max(ANALYSIS_NARRATIVE_LIMITS.overviewMaxCharacters),
-    }).nullable(),
+    published: candidatePublication.nullable(),
   })).max(ANALYSIS_LIMITS.maxComparisons),
   targets: z.array(narrativeState.extend({
-    kind: z.literal('target'), published: narrativePublication.extend({
-      paragraphs: z.array(z.string().min(1).max(ANALYSIS_NARRATIVE_LIMITS.targetParagraphMaxCharacters))
-        .min(1).max(ANALYSIS_NARRATIVE_LIMITS.targetMaxParagraphs),
-    }).nullable(),
+    kind: z.literal('target'), published: targetPublication.nullable(),
   })).max(ANALYSIS_LIMITS.maxComparisons),
   capture: z.object({
     dataKind: z.literal('real'), scope: narrativeScope, revision: narrativeHash, ready: z.boolean(),
@@ -190,6 +208,76 @@ export async function generateRealAnalysisSummaries(
   }).safeParse(result)
   if (!parsed.success || parsed.data.requestId !== key) throw new Error('The summary request was not acknowledged with its original request ID. Refresh status before retrying the same request.')
   return { ...parsed.data, summaries: checkedSummaries(parsed.data.summaries, workspaceId, runId, targetId) }
+}
+
+function summarySubjectPath(workspaceId: string, runId: string, subject: AnalysisSummarySubject): string {
+  checkedSummaryScope(workspaceId, runId, {})
+  if (!['candidate', 'target'].includes(subject.kind) || !narrativeId.safeParse(subject.subjectId).success) {
+    throw new Error('Select one exact saved candidate summary or job / grade overview.')
+  }
+  return `${base(workspaceId, runId)}/summaries/${subject.kind}/${encodeURIComponent(subject.subjectId)}`
+}
+
+export async function getRealAnalysisSummaryHistory(
+  workspaceId: string, runId: string, subject: AnalysisSummarySubject, continuationToken?: string, signal?: AbortSignal,
+): Promise<AnalysisSummaryHistoryPage> {
+  const path = summarySubjectPath(workspaceId, runId, subject)
+  if (continuationToken !== undefined && (!continuationToken || continuationToken.length > 16 * 1024)) {
+    throw new Error('The summary history cursor is invalid. Reopen the latest history.')
+  }
+  const suffix = continuationToken ? `?continuationToken=${encodeURIComponent(continuationToken)}` : ''
+  const result = await cloudJsonRequest<unknown>(`${path}/history${suffix}`, { method: 'GET', signal })
+  signal?.throwIfAborted()
+  const parsed = summaryHistoryPageSchema.safeParse(result)
+  if (!parsed.success) throw new Error('The summary service returned invalid private history. No draft was substituted.')
+  const page = parsed.data
+  if (page.workspaceId !== workspaceId || page.runId !== runId || page.kind !== subject.kind || page.subjectId !== subject.subjectId ||
+    new Set(page.entries.map(entry => entry.id)).size !== page.entries.length ||
+    new Set(page.entries.map(entry => entry.targetId)).size > 1 ||
+    page.entries.some(entry => entry.workspaceId !== workspaceId || entry.runId !== runId || entry.kind !== subject.kind ||
+      entry.subjectId !== subject.subjectId || (subject.kind === 'target' && entry.targetId !== subject.subjectId) ||
+      (entry.draft && (entry.scopeId === 'final' ? entry.draft.kind !== subject.kind : entry.draft.kind !== 'reduction')) ||
+      (entry.review && entry.review.outputSha256 !== entry.outputSha256)) ||
+    (page.continuationToken !== undefined && page.continuationToken === continuationToken)) {
+    throw new Error('The private summary history does not match this saved subject or repeats a checkpoint. Reopen history.')
+  }
+  return page
+}
+
+async function mutateSummarySubject(
+  workspaceId: string, runId: string, subject: AnalysisSummarySubject, action: 'publish' | 'retry',
+  input: PublishSummaryDraftInput | Record<string, never>, etag: string, key: string, targetId: string,
+): Promise<RealAnalysisSummariesResponse> {
+  const path = summarySubjectPath(workspaceId, runId, subject)
+  checkedSummaryScope(workspaceId, runId, { targetId })
+  if (subject.kind === 'target' && targetId !== subject.subjectId) throw new Error('The overview action must retain its exact target scope.')
+  if (!etag || etag.length > 1_024) throw new Error('Refresh this summary history before making a change.')
+  if (!z.uuid().safeParse(key).success) throw new Error('A stable UUID idempotency key is required for this summary action.')
+  const result = await cloudJsonRequest<unknown>(`${path}/${action}`, {
+    method: 'POST', headers: { 'If-Match': etag, 'Idempotency-Key': key }, body: JSON.stringify(input),
+  })
+  const parsed = z.object({ summaries: z.unknown() }).safeParse(result)
+  if (!parsed.success) throw new Error('The summary action was not acknowledged. Refresh status before repeating the same action.')
+  const summaries = checkedSummaries(parsed.data.summaries, workspaceId, runId, targetId)
+  if (subject.kind === 'candidate' && !summaries.comparisons.some(item => item.comparisonId === subject.subjectId)) {
+    throw new Error('The summary acknowledgement omitted the selected candidate. Refresh before repeating the same action.')
+  }
+  return summaries
+}
+
+export function publishRealAnalysisSummaryDraft(
+  workspaceId: string, runId: string, subject: AnalysisSummarySubject, input: PublishSummaryDraftInput,
+  etag: string, key: string, targetId: string,
+): Promise<RealAnalysisSummariesResponse> {
+  const parsed = publishSummaryDraftInputSchema.safeParse(input)
+  if (!parsed.success) throw new Error('Choose an exact recorded final draft before publishing.')
+  return mutateSummarySubject(workspaceId, runId, subject, 'publish', parsed.data, etag, key, targetId)
+}
+
+export function retryRealAnalysisSummary(
+  workspaceId: string, runId: string, subject: AnalysisSummarySubject, etag: string, key: string, targetId: string,
+): Promise<RealAnalysisSummariesResponse> {
+  return mutateSummarySubject(workspaceId, runId, subject, 'retry', {}, etag, key, targetId)
 }
 
 export async function fetchAnalysisProcessingFeatures(signal?: AbortSignal): Promise<AnalysisProcessingFeatures> {

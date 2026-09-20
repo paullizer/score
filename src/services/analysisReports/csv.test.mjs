@@ -5,7 +5,7 @@ import { mkdir, rm } from 'node:fs/promises'
 import { resolve, join } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { build } from 'esbuild'
-import { loadReportFoundation, realReportFixture } from './test-support.mjs'
+import { loadReportFoundation, realReportFixture, version2ReportFixture } from './test-support.mjs'
 
 const output = resolve(`.csv-report-tests-${randomUUID()}`)
 let foundation, writer, model
@@ -53,6 +53,18 @@ before(async () => {
   writer = await import(pathToFileURL(join(output, 'csv.mjs')).href)
 })
 after(async () => { await foundation?.cleanup(); await rm(output, { recursive: true, force: true }) })
+
+test('v2 manual summaries do not change the existing CSV assessment, scores or columns', () => {
+  const input = version2ReportFixture({ long: true })
+  const legacy = structuredClone(input)
+  delete legacy.capture.summaries
+  legacy.targets.forEach(target => { delete target.narrative })
+  legacy.comparisons.forEach(comparison => { delete comparison.narrative })
+  const current = writer.generateCsvReport(model.buildAnalysisReport(input), options)
+  const baseline = writer.generateCsvReport(model.buildAnalysisReport(legacy), options)
+  assert.deepEqual(current, baseline)
+  assert.doesNotMatch(Buffer.from(current).toString('utf8'), /Manually approved|Known issue|Saved overview/)
+})
 
 test('custom labels get separate CSV columns without replacing source identity or saved scores', () => {
   const input = realReportFixture({ scores: [92.75] })

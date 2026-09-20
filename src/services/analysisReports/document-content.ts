@@ -14,7 +14,8 @@ import type { ReadableCriterion } from './readable'
 import { reportReviewLinks, validatedReportLinkContext } from './links'
 import { assertReportResourceLimits } from './model'
 import {
-  candidateNarrativeOverview, candidateNarrativeText, reportTargetPresentation, requireReportNarratives, targetNarrativeParagraphs,
+  candidateNarrativeDisclosures, candidateNarrativeOverview, candidateNarrativeText, reportTargetPresentation,
+  requireReportNarratives, targetNarrativeDisclosures, targetNarrativeParagraphs,
 } from './narratives'
 import type { DocumentReportLayout } from './document-layout'
 
@@ -119,6 +120,9 @@ function writeTargetOverview<Color>(
     layout.paragraph(`${fact.label}: ${fact.value}`, { size: 10, leading: 15, after: 6 })
   }
   layout.heading('Saved analysis overview', 14)
+  for (const disclosure of targetNarrativeDisclosures(group.target)) {
+    layout.paragraph(disclosure, { size: 10, leading: 15, after: 7, color: layout.colors.accent })
+  }
   for (const paragraph of targetNarrativeParagraphs(group.target)) {
     layout.paragraph(paragraph, { size: 10.5, leading: 16, after: 10 })
   }
@@ -135,7 +139,7 @@ function writeCandidatesAtAGlance<Color>(
   layout.table(
     ['Name', 'Score', 'Assessment highlights'],
     completed.map(comparison => {
-      const overview = candidateNarrativeOverview(comparison)
+      const overview = [...candidateNarrativeDisclosures(comparison), candidateNarrativeOverview(comparison)].join('\n\n')
       return [
         { text: readableCandidateName(comparison.candidate), url: reportReviewLinks(report, comparison, options).analysis },
         comparison.overall.status === 'available' ? overallScoreLabel(comparison.overall) : 'Withheld',
@@ -208,6 +212,9 @@ function writeComparison<Color>(
     padding: 10, background: layout.colors.background, after: 8,
   })
   layout.heading('Why this score', 13)
+  for (const disclosure of candidateNarrativeDisclosures(comparison)) {
+    layout.paragraph(disclosure, { size: 10, leading: 15, after: 7, color: layout.colors.accent })
+  }
   layout.paragraph(summary, { size: 10.5, leading: 16, after: 8 })
   layout.links([
     { text: 'View analysis', url: links.analysis },

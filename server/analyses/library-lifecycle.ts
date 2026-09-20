@@ -252,6 +252,7 @@ async function purgeBlobs(analyses: RealAnalysesDeps, workspaceId: string, runId
       assertWorkspaceMutationLease(workspaceId)
       await analyses.blobs.delete(workspaceId, runId, item.name, item.etag)
     }
+    // The run prefix also includes summary checkpoints and action reservations, including orphaned PUTs.
     // Writers are drained and new writes are fenced, so an exhausted page proves cleanup is complete.
     if (!page.continuationToken) return true
     if (page.items.length) {
