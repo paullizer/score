@@ -1,0 +1,459 @@
+{
+  "type": "excalidraw",
+  "version": 2,
+  "source": "https://aka.ms/excalidraw",
+  "elements": [
+    {
+      "id": "diagram-title", "type": "text", "x": 48, "y": 36, "width": 1700, "height": 100,
+      "text": "Score / application architecture", "originalText": "Score / application architecture",
+      "fontSize": 40, "fontFamily": 2, "lineHeight": 1.25, "textAlign": "left", "verticalAlign": "top",
+      "strokeColor": "#000000", "backgroundColor": "transparent", "angle": 0, "opacity": 100, "groupIds": [], "containerId": null, "seed": 101, "version": 1, "versionNonce": 101, "isDeleted": false
+    },
+    {
+      "id": "diagram-subtitle", "type": "text", "x": 48, "y": 111, "width": 1650, "height": 50,
+      "text": "From source documents to evidence-backed review. Cloud processing and standalone samples stay separate.",
+      "originalText": "From source documents to evidence-backed review. Cloud processing and standalone samples stay separate.",
+      "fontSize": 20, "fontFamily": 2, "lineHeight": 1.35, "textAlign": "left", "verticalAlign": "top",
+      "strokeColor": "#000000", "backgroundColor": "transparent", "angle": 0, "opacity": 100, "groupIds": [], "containerId": null, "seed": 102, "version": 1, "versionNonce": 102, "isDeleted": false
+    },
+    {
+      "id": "diagram-legend", "type": "text", "x": 1280, "y": 162, "width": 470, "height": 40,
+      "text": "Double arrows: requests/responses or reads/writes",
+      "originalText": "Double arrows: requests/responses or reads/writes",
+      "fontSize": 16, "fontFamily": 2, "lineHeight": 1.35, "textAlign": "right", "verticalAlign": "top",
+      "strokeColor": "#000000", "backgroundColor": "transparent", "angle": 0, "opacity": 100, "groupIds": [], "containerId": null, "seed": 103, "version": 1, "versionNonce": 103, "isDeleted": false
+    },
+    {
+      "id": "review-lane", "type": "text", "x": 48, "y": 195, "width": 320, "height": 45,
+      "text": "01 / REVIEW", "originalText": "01 / REVIEW",
+      "fontSize": 18, "fontFamily": 2, "lineHeight": 1.35, "textAlign": "left", "verticalAlign": "top",
+      "strokeColor": "#000000", "backgroundColor": "transparent", "angle": 0, "opacity": 100, "groupIds": [], "containerId": null, "seed": 104, "version": 1, "versionNonce": 104, "isDeleted": false
+    },
+    {
+      "id": "api-lane", "type": "text", "x": 470, "y": 195, "width": 320, "height": 45,
+      "text": "02 / AUTHENTICATED API", "originalText": "02 / AUTHENTICATED API",
+      "fontSize": 18, "fontFamily": 2, "lineHeight": 1.35, "textAlign": "left", "verticalAlign": "top",
+      "strokeColor": "#000000", "backgroundColor": "transparent", "angle": 0, "opacity": 100, "groupIds": [], "containerId": null, "seed": 105, "version": 1, "versionNonce": 105, "isDeleted": false
+    },
+    {
+      "id": "storage-lane", "type": "text", "x": 900, "y": 195, "width": 330, "height": 45,
+      "text": "03 / DURABLE STATE", "originalText": "03 / DURABLE STATE",
+      "fontSize": 18, "fontFamily": 2, "lineHeight": 1.35, "textAlign": "left", "verticalAlign": "top",
+      "strokeColor": "#000000", "backgroundColor": "transparent", "angle": 0, "opacity": 100, "groupIds": [], "containerId": null, "seed": 106, "version": 1, "versionNonce": 106, "isDeleted": false
+    },
+    {
+      "id": "processing-lane", "type": "text", "x": 1380, "y": 195, "width": 370, "height": 45,
+      "text": "04 / ASYNC PROCESSING", "originalText": "04 / ASYNC PROCESSING",
+      "fontSize": 18, "fontFamily": 2, "lineHeight": 1.35, "textAlign": "left", "verticalAlign": "top",
+      "strokeColor": "#000000", "backgroundColor": "transparent", "angle": 0, "opacity": 100, "groupIds": [], "containerId": null, "seed": 107, "version": 1, "versionNonce": 107, "isDeleted": false
+    },
+    {
+      "id": "human-review", "type": "rectangle", "x": 48, "y": 245, "width": 320, "height": 130,
+      "strokeColor": "#495057", "backgroundColor": "#f8f9fa", "fillStyle": "solid", "strokeWidth": 1.5, "strokeStyle": "solid", "roughness": 0, "opacity": 100, "angle": 0, "roundness": { "type": 3 },
+      "groupIds": ["human-review-card"], "boundElements": [{ "id": "human-review-text", "type": "text" }], "seed": 108, "version": 1, "versionNonce": 108, "isDeleted": false
+    },
+    {
+      "id": "human-review-text", "type": "text", "x": 68, "y": 265, "width": 280, "height": 90,
+      "text": "Human-directed review\nImporting never starts scoring", "originalText": "Human-directed review\nImporting never starts scoring",
+      "fontSize": 18, "fontFamily": 2, "lineHeight": 2.5, "textAlign": "center", "verticalAlign": "middle",
+      "strokeColor": "#000000", "backgroundColor": "transparent", "angle": 0, "opacity": 100, "groupIds": ["human-review-card"], "containerId": "human-review", "seed": 109, "version": 1, "versionNonce": 109, "isDeleted": false
+    },
+    {
+      "id": "browser", "type": "rectangle", "x": 48, "y": 440, "width": 320, "height": 300,
+      "strokeColor": "#1864ab", "backgroundColor": "#e7f5ff", "fillStyle": "solid", "strokeWidth": 2, "strokeStyle": "solid", "roughness": 0, "opacity": 100, "angle": 0, "roundness": { "type": 3 },
+      "groupIds": ["browser-card"], "boundElements": [{ "id": "browser-api", "type": "arrow" }], "seed": 110, "version": 1, "versionNonce": 110, "isDeleted": false
+    },
+    {
+      "id": "browser-title", "type": "text", "x": 68, "y": 456, "width": 280, "height": 60,
+      "text": "React web app", "originalText": "React web app",
+      "fontSize": 24, "fontFamily": 2, "lineHeight": 1.35, "textAlign": "left", "verticalAlign": "top",
+      "strokeColor": "#000000", "backgroundColor": "transparent", "angle": 0, "opacity": 100, "groupIds": ["browser-card"], "containerId": null, "seed": 111, "version": 1, "versionNonce": 111, "isDeleted": false
+    },
+    {
+      "id": "browser-stack", "type": "text", "x": 68, "y": 522, "width": 280, "height": 45,
+      "text": "Browser / TypeScript / Vite", "originalText": "Browser / TypeScript / Vite",
+      "fontSize": 18, "fontFamily": 2, "lineHeight": 1.35, "textAlign": "left", "verticalAlign": "top",
+      "strokeColor": "#000000", "backgroundColor": "transparent", "angle": 0, "opacity": 100, "groupIds": ["browser-card"], "containerId": null, "seed": 112, "version": 1, "versionNonce": 112, "isDeleted": false
+    },
+    {
+      "id": "browser-features", "type": "text", "x": 68, "y": 575, "width": 280, "height": 100,
+      "text": "Jobs / resumes / rubrics\nAnalyses + evidence review", "originalText": "Jobs / resumes / rubrics\nAnalyses + evidence review",
+      "fontSize": 20, "fontFamily": 2, "lineHeight": 1.35, "textAlign": "left", "verticalAlign": "top",
+      "strokeColor": "#000000", "backgroundColor": "transparent", "angle": 0, "opacity": 100, "groupIds": ["browser-card"], "containerId": null, "seed": 113, "version": 1, "versionNonce": 113, "isDeleted": false
+    },
+    {
+      "id": "browser-reports", "type": "text", "x": 68, "y": 682, "width": 280, "height": 45,
+      "text": "Reports: browser Web Worker", "originalText": "Reports: browser Web Worker",
+      "fontSize": 18, "fontFamily": 2, "lineHeight": 1.35, "textAlign": "left", "verticalAlign": "top",
+      "strokeColor": "#000000", "backgroundColor": "transparent", "angle": 0, "opacity": 100, "groupIds": ["browser-card"], "containerId": null, "seed": 114, "version": 1, "versionNonce": 114, "isDeleted": false
+    },
+    {
+      "id": "entra", "type": "rectangle", "x": 470, "y": 245, "width": 320, "height": 130,
+      "strokeColor": "#862e9c", "backgroundColor": "#f3d9fa", "fillStyle": "solid", "strokeWidth": 2, "strokeStyle": "solid", "roughness": 0, "opacity": 100, "angle": 0, "roundness": { "type": 3 },
+      "groupIds": ["entra-card"], "boundElements": [{ "id": "entra-api", "type": "arrow" }], "seed": 115, "version": 1, "versionNonce": 115, "isDeleted": false
+    },
+    {
+      "id": "entra-title", "type": "text", "x": 490, "y": 264, "width": 280, "height": 60,
+      "text": "Microsoft Entra ID", "originalText": "Microsoft Entra ID",
+      "fontSize": 24, "fontFamily": 2, "lineHeight": 1.35, "textAlign": "left", "verticalAlign": "top",
+      "strokeColor": "#000000", "backgroundColor": "transparent", "angle": 0, "opacity": 100, "groupIds": ["entra-card"], "containerId": null, "seed": 116, "version": 1, "versionNonce": 116, "isDeleted": false
+    },
+    {
+      "id": "entra-detail", "type": "text", "x": 490, "y": 324, "width": 280, "height": 45,
+      "text": "Single-tenant sign-in", "originalText": "Single-tenant sign-in",
+      "fontSize": 18, "fontFamily": 2, "lineHeight": 1.35, "textAlign": "left", "verticalAlign": "top",
+      "strokeColor": "#000000", "backgroundColor": "transparent", "angle": 0, "opacity": 100, "groupIds": ["entra-card"], "containerId": null, "seed": 117, "version": 1, "versionNonce": 117, "isDeleted": false
+    },
+    {
+      "id": "api", "type": "rectangle", "x": 470, "y": 440, "width": 320, "height": 300,
+      "strokeColor": "#862e9c", "backgroundColor": "#f3d9fa", "fillStyle": "solid", "strokeWidth": 2, "strokeStyle": "solid", "roughness": 0, "opacity": 100, "angle": 0, "roundness": { "type": 3 },
+      "groupIds": ["api-card"], "boundElements": [{ "id": "browser-api", "type": "arrow" }, { "id": "entra-api", "type": "arrow" }, { "id": "api-cosmos", "type": "arrow" }, { "id": "api-blobs", "type": "arrow" }], "seed": 118, "version": 1, "versionNonce": 118, "isDeleted": false
+    },
+    {
+      "id": "api-title", "type": "text", "x": 490, "y": 456, "width": 280, "height": 60,
+      "text": "App Service + Express", "originalText": "App Service + Express",
+      "fontSize": 24, "fontFamily": 2, "lineHeight": 1.35, "textAlign": "left", "verticalAlign": "top",
+      "strokeColor": "#000000", "backgroundColor": "transparent", "angle": 0, "opacity": 100, "groupIds": ["api-card"], "containerId": null, "seed": 119, "version": 1, "versionNonce": 119, "isDeleted": false
+    },
+    {
+      "id": "api-detail", "type": "text", "x": 490, "y": 540, "width": 280, "height": 150,
+      "text": "SPA + same-origin API\nMembership + write checks\nFreezes analysis inputs", "originalText": "SPA + same-origin API\nMembership + write checks\nFreezes analysis inputs",
+      "fontSize": 20, "fontFamily": 2, "lineHeight": 1.35, "textAlign": "left", "verticalAlign": "top",
+      "strokeColor": "#000000", "backgroundColor": "transparent", "angle": 0, "opacity": 100, "groupIds": ["api-card"], "containerId": null, "seed": 120, "version": 1, "versionNonce": 120, "isDeleted": false
+    },
+    {
+      "id": "api-runtime", "type": "text", "x": 490, "y": 690, "width": 280, "height": 45,
+      "text": "Node.js / managed identity", "originalText": "Node.js / managed identity",
+      "fontSize": 18, "fontFamily": 2, "lineHeight": 1.35, "textAlign": "left", "verticalAlign": "top",
+      "strokeColor": "#000000", "backgroundColor": "transparent", "angle": 0, "opacity": 100, "groupIds": ["api-card"], "containerId": null, "seed": 121, "version": 1, "versionNonce": 121, "isDeleted": false
+    },
+    {
+      "id": "cosmos", "type": "rectangle", "x": 900, "y": 295, "width": 330, "height": 210,
+      "strokeColor": "#1864ab", "backgroundColor": "#e7f5ff", "fillStyle": "solid", "strokeWidth": 2, "strokeStyle": "solid", "roughness": 0, "opacity": 100, "angle": 0, "roundness": { "type": 3 },
+      "groupIds": ["cosmos-card"], "boundElements": [{ "id": "api-cosmos", "type": "arrow" }, { "id": "cosmos-workers", "type": "arrow" }], "seed": 122, "version": 1, "versionNonce": 122, "isDeleted": false
+    },
+    {
+      "id": "cosmos-title", "type": "text", "x": 920, "y": 314, "width": 290, "height": 60,
+      "text": "Azure Cosmos DB", "originalText": "Azure Cosmos DB",
+      "fontSize": 24, "fontFamily": 2, "lineHeight": 1.35, "textAlign": "left", "verticalAlign": "top",
+      "strokeColor": "#000000", "backgroundColor": "transparent", "angle": 0, "opacity": 100, "groupIds": ["cosmos-card"], "containerId": null, "seed": 123, "version": 1, "versionNonce": 123, "isDeleted": false
+    },
+    {
+      "id": "cosmos-detail", "type": "text", "x": 920, "y": 390, "width": 290, "height": 100,
+      "text": "Workspace + feature records\nDurable queue + progress", "originalText": "Workspace + feature records\nDurable queue + progress",
+      "fontSize": 20, "fontFamily": 2, "lineHeight": 1.35, "textAlign": "left", "verticalAlign": "top",
+      "strokeColor": "#000000", "backgroundColor": "transparent", "angle": 0, "opacity": 100, "groupIds": ["cosmos-card"], "containerId": null, "seed": 124, "version": 1, "versionNonce": 124, "isDeleted": false
+    },
+    {
+      "id": "blobs", "type": "rectangle", "x": 900, "y": 570, "width": 330, "height": 250,
+      "strokeColor": "#1864ab", "backgroundColor": "#e7f5ff", "fillStyle": "solid", "strokeWidth": 2, "strokeStyle": "solid", "roughness": 0, "opacity": 100, "angle": 0, "roundness": { "type": 3 },
+      "groupIds": ["blobs-card"], "boundElements": [{ "id": "api-blobs", "type": "arrow" }, { "id": "blobs-workers", "type": "arrow" }], "seed": 125, "version": 1, "versionNonce": 125, "isDeleted": false
+    },
+    {
+      "id": "blobs-title", "type": "text", "x": 920, "y": 589, "width": 290, "height": 60,
+      "text": "Azure Blob Storage", "originalText": "Azure Blob Storage",
+      "fontSize": 24, "fontFamily": 2, "lineHeight": 1.35, "textAlign": "left", "verticalAlign": "top",
+      "strokeColor": "#000000", "backgroundColor": "transparent", "angle": 0, "opacity": 100, "groupIds": ["blobs-card"], "containerId": null, "seed": 126, "version": 1, "versionNonce": 126, "isDeleted": false
+    },
+    {
+      "id": "blobs-detail", "type": "text", "x": 920, "y": 650, "width": 290, "height": 150,
+      "text": "Private originals + sources\nFrozen inputs + saved results\nCloud samples: separate state", "originalText": "Private originals + sources\nFrozen inputs + saved results\nCloud samples: separate state",
+      "fontSize": 20, "fontFamily": 2, "lineHeight": 1.35, "textAlign": "left", "verticalAlign": "top",
+      "strokeColor": "#000000", "backgroundColor": "transparent", "angle": 0, "opacity": 100, "groupIds": ["blobs-card"], "containerId": null, "seed": 127, "version": 1, "versionNonce": 127, "isDeleted": false
+    },
+    {
+      "id": "workers", "type": "rectangle", "x": 1380, "y": 240, "width": 370, "height": 610,
+      "strokeColor": "#2f9e44", "backgroundColor": "transparent", "fillStyle": "solid", "strokeWidth": 2, "strokeStyle": "solid", "roughness": 0, "opacity": 100, "angle": 0, "roundness": { "type": 3 },
+      "groupIds": [], "boundElements": [{ "id": "cosmos-workers", "type": "arrow" }, { "id": "blobs-workers", "type": "arrow" }, { "id": "workers-sources", "type": "arrow" }, { "id": "workers-foundry", "type": "arrow" }], "seed": 128, "version": 1, "versionNonce": 128, "isDeleted": false
+    },
+    {
+      "id": "workers-title", "type": "text", "x": 1400, "y": 262, "width": 330, "height": 60,
+      "text": "Background processing", "originalText": "Background processing",
+      "fontSize": 24, "fontFamily": 2, "lineHeight": 1.35, "textAlign": "left", "verticalAlign": "top",
+      "strokeColor": "#000000", "backgroundColor": "transparent", "angle": 0, "opacity": 100, "groupIds": [], "containerId": null, "seed": 129, "version": 1, "versionNonce": 129, "isDeleted": false
+    },
+    {
+      "id": "workers-host", "type": "text", "x": 1400, "y": 322, "width": 330, "height": 45,
+      "text": "4 scheduled Container Apps Jobs", "originalText": "4 scheduled Container Apps Jobs",
+      "fontSize": 18, "fontFamily": 2, "lineHeight": 1.35, "textAlign": "left", "verticalAlign": "top",
+      "strokeColor": "#000000", "backgroundColor": "transparent", "angle": 0, "opacity": 100, "groupIds": [], "containerId": null, "seed": 130, "version": 1, "versionNonce": 130, "isDeleted": false
+    },
+    {
+      "id": "job-worker", "type": "rectangle", "x": 1400, "y": 390, "width": 330, "height": 70,
+      "strokeColor": "#2f9e44", "backgroundColor": "#ebfbee", "fillStyle": "solid", "strokeWidth": 1.5, "strokeStyle": "solid", "roughness": 0, "opacity": 100, "angle": 0, "roundness": { "type": 3 },
+      "groupIds": ["job-worker-card"], "boundElements": [{ "id": "job-worker-text", "type": "text" }], "seed": 131, "version": 1, "versionNonce": 131, "isDeleted": false
+    },
+    {
+      "id": "job-worker-text", "type": "text", "x": 1415, "y": 400, "width": 300, "height": 50,
+      "text": "Jobs: import + rubric", "originalText": "Jobs: import + rubric",
+      "fontSize": 20, "fontFamily": 2, "lineHeight": 2.5, "textAlign": "center", "verticalAlign": "middle",
+      "strokeColor": "#000000", "backgroundColor": "transparent", "angle": 0, "opacity": 100, "groupIds": ["job-worker-card"], "containerId": "job-worker", "seed": 132, "version": 1, "versionNonce": 132, "isDeleted": false
+    },
+    {
+      "id": "grade-worker", "type": "rectangle", "x": 1400, "y": 480, "width": 330, "height": 70,
+      "strokeColor": "#2f9e44", "backgroundColor": "#ebfbee", "fillStyle": "solid", "strokeWidth": 1.5, "strokeStyle": "solid", "roughness": 0, "opacity": 100, "angle": 0, "roundness": { "type": 3 },
+      "groupIds": ["grade-worker-card"], "boundElements": [{ "id": "grade-worker-text", "type": "text" }], "seed": 133, "version": 1, "versionNonce": 133, "isDeleted": false
+    },
+    {
+      "id": "grade-worker-text", "type": "text", "x": 1415, "y": 490, "width": 300, "height": 50,
+      "text": "Grades: GS ladders", "originalText": "Grades: GS ladders",
+      "fontSize": 20, "fontFamily": 2, "lineHeight": 2.5, "textAlign": "center", "verticalAlign": "middle",
+      "strokeColor": "#000000", "backgroundColor": "transparent", "angle": 0, "opacity": 100, "groupIds": ["grade-worker-card"], "containerId": "grade-worker", "seed": 134, "version": 1, "versionNonce": 134, "isDeleted": false
+    },
+    {
+      "id": "resume-worker", "type": "rectangle", "x": 1400, "y": 570, "width": 330, "height": 70,
+      "strokeColor": "#2f9e44", "backgroundColor": "#ebfbee", "fillStyle": "solid", "strokeWidth": 1.5, "strokeStyle": "solid", "roughness": 0, "opacity": 100, "angle": 0, "roundness": { "type": 3 },
+      "groupIds": ["resume-worker-card"], "boundElements": [{ "id": "resume-worker-text", "type": "text" }], "seed": 135, "version": 1, "versionNonce": 135, "isDeleted": false
+    },
+    {
+      "id": "resume-worker-text", "type": "text", "x": 1415, "y": 580, "width": 300, "height": 50,
+      "text": "Resumes: import + profile", "originalText": "Resumes: import + profile",
+      "fontSize": 20, "fontFamily": 2, "lineHeight": 2.5, "textAlign": "center", "verticalAlign": "middle",
+      "strokeColor": "#000000", "backgroundColor": "transparent", "angle": 0, "opacity": 100, "groupIds": ["resume-worker-card"], "containerId": "resume-worker", "seed": 136, "version": 1, "versionNonce": 136, "isDeleted": false
+    },
+    {
+      "id": "analysis-worker", "type": "rectangle", "x": 1400, "y": 660, "width": 330, "height": 70,
+      "strokeColor": "#2f9e44", "backgroundColor": "#ebfbee", "fillStyle": "solid", "strokeWidth": 1.5, "strokeStyle": "solid", "roughness": 0, "opacity": 100, "angle": 0, "roundness": { "type": 3 },
+      "groupIds": ["analysis-worker-card"], "boundElements": [{ "id": "analysis-worker-text", "type": "text" }], "seed": 137, "version": 1, "versionNonce": 137, "isDeleted": false
+    },
+    {
+      "id": "analysis-worker-text", "type": "text", "x": 1415, "y": 670, "width": 300, "height": 50,
+      "text": "Analyses: scores + summaries", "originalText": "Analyses: scores + summaries",
+      "fontSize": 20, "fontFamily": 2, "lineHeight": 2.5, "textAlign": "center", "verticalAlign": "middle",
+      "strokeColor": "#000000", "backgroundColor": "transparent", "angle": 0, "opacity": 100, "groupIds": ["analysis-worker-card"], "containerId": "analysis-worker", "seed": 138, "version": 1, "versionNonce": 138, "isDeleted": false
+    },
+    {
+      "id": "workers-isolation", "type": "text", "x": 1400, "y": 753, "width": 330, "height": 90,
+      "text": "Dedicated identity per worker\nOnly its own feature stores", "originalText": "Dedicated identity per worker\nOnly its own feature stores",
+      "fontSize": 18, "fontFamily": 2, "lineHeight": 1.35, "textAlign": "left", "verticalAlign": "top",
+      "strokeColor": "#000000", "backgroundColor": "transparent", "angle": 0, "opacity": 100, "groupIds": [], "containerId": null, "seed": 139, "version": 1, "versionNonce": 139, "isDeleted": false
+    },
+    {
+      "id": "source-tools", "type": "rectangle", "x": 48, "y": 990, "width": 1182, "height": 300,
+      "strokeColor": "#e67700", "backgroundColor": "transparent", "fillStyle": "solid", "strokeWidth": 2, "strokeStyle": "solid", "roughness": 0, "opacity": 100, "angle": 0, "roundness": { "type": 3 },
+      "groupIds": [], "boundElements": [{ "id": "workers-sources", "type": "arrow" }], "seed": 140, "version": 1, "versionNonce": 140, "isDeleted": false
+    },
+    {
+      "id": "source-tools-title", "type": "text", "x": 68, "y": 1009, "width": 1142, "height": 60,
+      "text": "Source acquisition + extraction / selected by input type", "originalText": "Source acquisition + extraction / selected by input type",
+      "fontSize": 24, "fontFamily": 2, "lineHeight": 1.35, "textAlign": "left", "verticalAlign": "top",
+      "strokeColor": "#000000", "backgroundColor": "transparent", "angle": 0, "opacity": 100, "groupIds": [], "containerId": null, "seed": 141, "version": 1, "versionNonce": 141, "isDeleted": false
+    },
+    {
+      "id": "public-sources", "type": "rectangle", "x": 68, "y": 1080, "width": 330, "height": 185,
+      "strokeColor": "#e67700", "backgroundColor": "#fff4e6", "fillStyle": "solid", "strokeWidth": 1.5, "strokeStyle": "solid", "roughness": 0, "opacity": 100, "angle": 0, "roundness": { "type": 3 },
+      "groupIds": ["public-sources-card"], "boundElements": [], "seed": 142, "version": 1, "versionNonce": 142, "isDeleted": false
+    },
+    {
+      "id": "public-sources-title", "type": "text", "x": 88, "y": 1096, "width": 290, "height": 55,
+      "text": "Public fetch + local parsers", "originalText": "Public fetch + local parsers",
+      "fontSize": 22, "fontFamily": 2, "lineHeight": 1.35, "textAlign": "left", "verticalAlign": "top",
+      "strokeColor": "#000000", "backgroundColor": "transparent", "angle": 0, "opacity": 100, "groupIds": ["public-sources-card"], "containerId": null, "seed": 143, "version": 1, "versionNonce": 143, "isDeleted": false
+    },
+    {
+      "id": "public-sources-detail", "type": "text", "x": 88, "y": 1156, "width": 290, "height": 90,
+      "text": "Bounded public URLs / OPM\nLocal Markdown + DOC parsing", "originalText": "Bounded public URLs / OPM\nLocal Markdown + DOC parsing",
+      "fontSize": 18, "fontFamily": 2, "lineHeight": 1.35, "textAlign": "left", "verticalAlign": "top",
+      "strokeColor": "#000000", "backgroundColor": "transparent", "angle": 0, "opacity": 100, "groupIds": ["public-sources-card"], "containerId": null, "seed": 144, "version": 1, "versionNonce": 144, "isDeleted": false
+    },
+    {
+      "id": "document-intelligence", "type": "rectangle", "x": 418, "y": 1080, "width": 390, "height": 185,
+      "strokeColor": "#e67700", "backgroundColor": "#fff4e6", "fillStyle": "solid", "strokeWidth": 1.5, "strokeStyle": "solid", "roughness": 0, "opacity": 100, "angle": 0, "roundness": { "type": 3 },
+      "groupIds": ["document-intelligence-card"], "boundElements": [], "seed": 145, "version": 1, "versionNonce": 145, "isDeleted": false
+    },
+    {
+      "id": "document-intelligence-title", "type": "text", "x": 438, "y": 1096, "width": 350, "height": 55,
+      "text": "Azure Document Intelligence", "originalText": "Azure Document Intelligence",
+      "fontSize": 22, "fontFamily": 2, "lineHeight": 1.35, "textAlign": "left", "verticalAlign": "top",
+      "strokeColor": "#000000", "backgroundColor": "transparent", "angle": 0, "opacity": 100, "groupIds": ["document-intelligence-card"], "containerId": null, "seed": 146, "version": 1, "versionNonce": 146, "isDeleted": false
+    },
+    {
+      "id": "document-intelligence-detail", "type": "text", "x": 438, "y": 1156, "width": 350, "height": 90,
+      "text": "PDF text + OCR; DOCX text\nCloud document extraction", "originalText": "PDF text + OCR; DOCX text\nCloud document extraction",
+      "fontSize": 18, "fontFamily": 2, "lineHeight": 1.35, "textAlign": "left", "verticalAlign": "top",
+      "strokeColor": "#000000", "backgroundColor": "transparent", "angle": 0, "opacity": 100, "groupIds": ["document-intelligence-card"], "containerId": null, "seed": 147, "version": 1, "versionNonce": 147, "isDeleted": false
+    },
+    {
+      "id": "renderer", "type": "rectangle", "x": 828, "y": 1080, "width": 380, "height": 185,
+      "strokeColor": "#e67700", "backgroundColor": "#fff4e6", "fillStyle": "solid", "strokeWidth": 1.5, "strokeStyle": "solid", "roughness": 0, "opacity": 100, "angle": 0, "roundness": { "type": 3 },
+      "groupIds": ["renderer-card"], "boundElements": [], "seed": 148, "version": 1, "versionNonce": 148, "isDeleted": false
+    },
+    {
+      "id": "renderer-title", "type": "text", "x": 848, "y": 1096, "width": 340, "height": 55,
+      "text": "Internal Chromium renderer", "originalText": "Internal Chromium renderer",
+      "fontSize": 22, "fontFamily": 2, "lineHeight": 1.35, "textAlign": "left", "verticalAlign": "top",
+      "strokeColor": "#000000", "backgroundColor": "transparent", "angle": 0, "opacity": 100, "groupIds": ["renderer-card"], "containerId": null, "seed": 149, "version": 1, "versionNonce": 149, "isDeleted": false
+    },
+    {
+      "id": "renderer-detail", "type": "text", "x": 848, "y": 1156, "width": 340, "height": 90,
+      "text": "Container App for JavaScript pages\nNo browser runtime credentials", "originalText": "Container App for JavaScript pages\nNo browser runtime credentials",
+      "fontSize": 18, "fontFamily": 2, "lineHeight": 1.35, "textAlign": "left", "verticalAlign": "top",
+      "strokeColor": "#000000", "backgroundColor": "transparent", "angle": 0, "opacity": 100, "groupIds": ["renderer-card"], "containerId": null, "seed": 150, "version": 1, "versionNonce": 150, "isDeleted": false
+    },
+    {
+      "id": "foundry", "type": "rectangle", "x": 1380, "y": 1030, "width": 370, "height": 240,
+      "strokeColor": "#2f9e44", "backgroundColor": "#ebfbee", "fillStyle": "solid", "strokeWidth": 2, "strokeStyle": "solid", "roughness": 0, "opacity": 100, "angle": 0, "roundness": { "type": 3 },
+      "groupIds": ["foundry-card"], "boundElements": [{ "id": "workers-foundry", "type": "arrow" }], "seed": 151, "version": 1, "versionNonce": 151, "isDeleted": false
+    },
+    {
+      "id": "foundry-title", "type": "text", "x": 1400, "y": 1048, "width": 330, "height": 60,
+      "text": "Foundry model inference", "originalText": "Foundry model inference",
+      "fontSize": 24, "fontFamily": 2, "lineHeight": 1.35, "textAlign": "left", "verticalAlign": "top",
+      "strokeColor": "#000000", "backgroundColor": "transparent", "angle": 0, "opacity": 100, "groupIds": ["foundry-card"], "containerId": null, "seed": 152, "version": 1, "versionNonce": 152, "isDeleted": false
+    },
+    {
+      "id": "foundry-detail", "type": "text", "x": 1400, "y": 1110, "width": 330, "height": 150,
+      "text": "GPT-5 mini / job-rubric\nRubrics, profiles, assessments\nSaved narratives + review", "originalText": "GPT-5 mini / job-rubric\nRubrics, profiles, assessments\nSaved narratives + review",
+      "fontSize": 20, "fontFamily": 2, "lineHeight": 1.35, "textAlign": "left", "verticalAlign": "top",
+      "strokeColor": "#000000", "backgroundColor": "transparent", "angle": 0, "opacity": 100, "groupIds": ["foundry-card"], "containerId": null, "seed": 153, "version": 1, "versionNonce": 153, "isDeleted": false
+    },
+    {
+      "id": "local-mode", "type": "rectangle", "x": 48, "y": 1340, "width": 550, "height": 220,
+      "strokeColor": "#495057", "backgroundColor": "#f8f9fa", "fillStyle": "solid", "strokeWidth": 1.5, "strokeStyle": "dashed", "roughness": 0, "opacity": 100, "angle": 0, "roundness": { "type": 3 },
+      "groupIds": ["local-mode-card"], "boundElements": [], "seed": 154, "version": 1, "versionNonce": 154, "isDeleted": false
+    },
+    {
+      "id": "local-mode-title", "type": "text", "x": 68, "y": 1355, "width": 510, "height": 55,
+      "text": "Separate mode / local samples", "originalText": "Separate mode / local samples",
+      "fontSize": 22, "fontFamily": 2, "lineHeight": 1.35, "textAlign": "left", "verticalAlign": "top",
+      "strokeColor": "#000000", "backgroundColor": "transparent", "angle": 0, "opacity": 100, "groupIds": ["local-mode-card"], "containerId": null, "seed": 155, "version": 1, "versionNonce": 155, "isDeleted": false
+    },
+    {
+      "id": "local-mode-detail", "type": "text", "x": 68, "y": 1412, "width": 510, "height": 135,
+      "text": "Vite + fictional fixtures + browser local storage\nNo real uploads, extraction, or AI calls\nCloud errors never switch to samples",
+      "originalText": "Vite + fictional fixtures + browser local storage\nNo real uploads, extraction, or AI calls\nCloud errors never switch to samples",
+      "fontSize": 18, "fontFamily": 2, "lineHeight": 1.35, "textAlign": "left", "verticalAlign": "top",
+      "strokeColor": "#000000", "backgroundColor": "transparent", "angle": 0, "opacity": 100, "groupIds": ["local-mode-card"], "containerId": null, "seed": 156, "version": 1, "versionNonce": 156, "isDeleted": false
+    },
+    {
+      "id": "privacy-boundary", "type": "rectangle", "x": 628, "y": 1340, "width": 1122, "height": 220,
+      "strokeColor": "#495057", "backgroundColor": "#f8f9fa", "fillStyle": "solid", "strokeWidth": 1.5, "strokeStyle": "solid", "roughness": 0, "opacity": 100, "angle": 0, "roundness": { "type": 3 },
+      "groupIds": ["privacy-boundary-card"], "boundElements": [], "seed": 157, "version": 1, "versionNonce": 157, "isDeleted": false
+    },
+    {
+      "id": "privacy-boundary-title", "type": "text", "x": 648, "y": 1355, "width": 1082, "height": 55,
+      "text": "Private evidence stays out of shared search", "originalText": "Private evidence stays out of shared search",
+      "fontSize": 22, "fontFamily": 2, "lineHeight": 1.35, "textAlign": "left", "verticalAlign": "top",
+      "strokeColor": "#000000", "backgroundColor": "transparent", "angle": 0, "opacity": 100, "groupIds": ["privacy-boundary-card"], "containerId": null, "seed": 158, "version": 1, "versionNonce": 158, "isDeleted": false
+    },
+    {
+      "id": "privacy-boundary-detail", "type": "text", "x": 648, "y": 1412, "width": 1082, "height": 135,
+      "text": "Analysis uses frozen analysis stores, not live job/resume/grade stores or extraction services.\nShared AI Search / Foundry IQ: a nonsensitive app guide, never private source/result indexing.\nThis is repository-defined architecture; deployed services and feature flags control availability.",
+      "originalText": "Analysis uses frozen analysis stores, not live job/resume/grade stores or extraction services.\nShared AI Search / Foundry IQ: a nonsensitive app guide, never private source/result indexing.\nThis is repository-defined architecture; deployed services and feature flags control availability.",
+      "fontSize": 18, "fontFamily": 2, "lineHeight": 1.35, "textAlign": "left", "verticalAlign": "top",
+      "strokeColor": "#000000", "backgroundColor": "transparent", "angle": 0, "opacity": 100, "groupIds": ["privacy-boundary-card"], "containerId": null, "seed": 159, "version": 1, "versionNonce": 159, "isDeleted": false
+    },
+    {
+      "id": "browser-api", "type": "arrow", "x": 378, "y": 555, "width": 82, "height": 0, "points": [[0, 0], [82, 0]],
+      "strokeColor": "#495057", "backgroundColor": "transparent", "fillStyle": "solid", "strokeWidth": 2, "strokeStyle": "solid", "roughness": 0, "opacity": 100, "angle": 0, "roundness": null,
+      "startArrowhead": "arrow", "endArrowhead": "arrow", "startBinding": { "elementId": "browser", "focus": -0.233333, "gap": 10 }, "endBinding": { "elementId": "api", "focus": 0.233333, "gap": 10 },
+      "groupIds": ["browser-api-flow"], "boundElements": [], "seed": 160, "version": 1, "versionNonce": 160, "isDeleted": false
+    },
+    {
+      "id": "browser-api-label", "type": "text", "x": 378, "y": 482, "width": 82, "height": 40,
+      "text": "HTTPS", "originalText": "HTTPS",
+      "fontSize": 16, "fontFamily": 2, "lineHeight": 1.35, "textAlign": "center", "verticalAlign": "top",
+      "strokeColor": "#000000", "backgroundColor": "transparent", "angle": 0, "opacity": 100, "groupIds": ["browser-api-flow"], "containerId": null, "seed": 161, "version": 1, "versionNonce": 161, "isDeleted": false
+    },
+    {
+      "id": "browser-api-detail", "type": "text", "x": 373, "y": 580, "width": 92, "height": 120,
+      "text": "Upload\nReview\nPoll status", "originalText": "Upload\nReview\nPoll status",
+      "fontSize": 16, "fontFamily": 2, "lineHeight": 1.35, "textAlign": "center", "verticalAlign": "top",
+      "strokeColor": "#000000", "backgroundColor": "transparent", "angle": 0, "opacity": 100, "groupIds": ["browser-api-flow"], "containerId": null, "seed": 162, "version": 1, "versionNonce": 162, "isDeleted": false
+    },
+    {
+      "id": "entra-api", "type": "arrow", "x": 630, "y": 385, "width": 0, "height": 45, "points": [[0, 0], [0, 45]],
+      "strokeColor": "#862e9c", "backgroundColor": "transparent", "fillStyle": "solid", "strokeWidth": 2, "strokeStyle": "solid", "roughness": 0, "opacity": 100, "angle": 0, "roundness": null,
+      "startArrowhead": null, "endArrowhead": "arrow", "startBinding": { "elementId": "entra", "focus": 0, "gap": 10 }, "endBinding": { "elementId": "api", "focus": 0, "gap": 10 },
+      "groupIds": ["entra-api-flow"], "boundElements": [], "seed": 163, "version": 1, "versionNonce": 163, "isDeleted": false
+    },
+    {
+      "id": "entra-api-label", "type": "text", "x": 650, "y": 392, "width": 130, "height": 40,
+      "text": "Easy Auth", "originalText": "Easy Auth",
+      "fontSize": 16, "fontFamily": 2, "lineHeight": 1.35, "textAlign": "left", "verticalAlign": "top",
+      "strokeColor": "#000000", "backgroundColor": "transparent", "angle": 0, "opacity": 100, "groupIds": ["entra-api-flow"], "containerId": null, "seed": 164, "version": 1, "versionNonce": 164, "isDeleted": false
+    },
+    {
+      "id": "api-cosmos", "type": "arrow", "x": 800, "y": 480, "width": 90, "height": 0, "points": [[0, 0], [90, 0]],
+      "strokeColor": "#495057", "backgroundColor": "transparent", "fillStyle": "solid", "strokeWidth": 2, "strokeStyle": "solid", "roughness": 0, "opacity": 100, "angle": 0, "roundness": null,
+      "startArrowhead": "arrow", "endArrowhead": "arrow", "startBinding": { "elementId": "api", "focus": -0.733333, "gap": 10 }, "endBinding": { "elementId": "cosmos", "focus": -0.761905, "gap": 10 },
+      "groupIds": ["api-cosmos-flow"], "boundElements": [], "seed": 165, "version": 1, "versionNonce": 165, "isDeleted": false
+    },
+    {
+      "id": "api-cosmos-label", "type": "text", "x": 795, "y": 400, "width": 100, "height": 80,
+      "text": "Records +\nqueued work", "originalText": "Records +\nqueued work",
+      "fontSize": 16, "fontFamily": 2, "lineHeight": 1.35, "textAlign": "center", "verticalAlign": "top",
+      "strokeColor": "#000000", "backgroundColor": "transparent", "angle": 0, "opacity": 100, "groupIds": ["api-cosmos-flow"], "containerId": null, "seed": 166, "version": 1, "versionNonce": 166, "isDeleted": false
+    },
+    {
+      "id": "api-blobs", "type": "arrow", "x": 800, "y": 660, "width": 90, "height": 0, "points": [[0, 0], [90, 0]],
+      "strokeColor": "#495057", "backgroundColor": "transparent", "fillStyle": "solid", "strokeWidth": 2, "strokeStyle": "solid", "roughness": 0, "opacity": 100, "angle": 0, "roundness": null,
+      "startArrowhead": "arrow", "endArrowhead": "arrow", "startBinding": { "elementId": "api", "focus": 0.466667, "gap": 10 }, "endBinding": { "elementId": "blobs", "focus": 0.28, "gap": 10 },
+      "groupIds": ["api-blobs-flow"], "boundElements": [], "seed": 167, "version": 1, "versionNonce": 167, "isDeleted": false
+    },
+    {
+      "id": "api-blobs-label", "type": "text", "x": 795, "y": 590, "width": 100, "height": 80,
+      "text": "Uploads /\nsnapshots", "originalText": "Uploads /\nsnapshots",
+      "fontSize": 16, "fontFamily": 2, "lineHeight": 1.35, "textAlign": "center", "verticalAlign": "top",
+      "strokeColor": "#000000", "backgroundColor": "transparent", "angle": 0, "opacity": 100, "groupIds": ["api-blobs-flow"], "containerId": null, "seed": 168, "version": 1, "versionNonce": 168, "isDeleted": false
+    },
+    {
+      "id": "cosmos-workers", "type": "arrow", "x": 1240, "y": 410, "width": 130, "height": 0, "points": [[0, 0], [130, 0]],
+      "strokeColor": "#495057", "backgroundColor": "transparent", "fillStyle": "solid", "strokeWidth": 2, "strokeStyle": "solid", "roughness": 0, "opacity": 100, "angle": 0, "roundness": null,
+      "startArrowhead": "arrow", "endArrowhead": "arrow", "startBinding": { "elementId": "cosmos", "focus": 0.095238, "gap": 10 }, "endBinding": { "elementId": "workers", "focus": 0.442623, "gap": 10 },
+      "groupIds": ["cosmos-workers-flow"], "boundElements": [], "seed": 169, "version": 1, "versionNonce": 169, "isDeleted": false
+    },
+    {
+      "id": "cosmos-workers-label", "type": "text", "x": 1240, "y": 341, "width": 130, "height": 80,
+      "text": "Claim work /\nwrite status", "originalText": "Claim work /\nwrite status",
+      "fontSize": 16, "fontFamily": 2, "lineHeight": 1.35, "textAlign": "center", "verticalAlign": "top",
+      "strokeColor": "#000000", "backgroundColor": "transparent", "angle": 0, "opacity": 100, "groupIds": ["cosmos-workers-flow"], "containerId": null, "seed": 170, "version": 1, "versionNonce": 170, "isDeleted": false
+    },
+    {
+      "id": "blobs-workers", "type": "arrow", "x": 1240, "y": 690, "width": 130, "height": 0, "points": [[0, 0], [130, 0]],
+      "strokeColor": "#495057", "backgroundColor": "transparent", "fillStyle": "solid", "strokeWidth": 2, "strokeStyle": "solid", "roughness": 0, "opacity": 100, "angle": 0, "roundness": null,
+      "startArrowhead": "arrow", "endArrowhead": "arrow", "startBinding": { "elementId": "blobs", "focus": -0.04, "gap": 10 }, "endBinding": { "elementId": "workers", "focus": -0.47541, "gap": 10 },
+      "groupIds": ["blobs-workers-flow"], "boundElements": [], "seed": 171, "version": 1, "versionNonce": 171, "isDeleted": false
+    },
+    {
+      "id": "blobs-workers-label", "type": "text", "x": 1240, "y": 620, "width": 130, "height": 80,
+      "text": "Own sources /\nresults", "originalText": "Own sources /\nresults",
+      "fontSize": 16, "fontFamily": 2, "lineHeight": 1.35, "textAlign": "center", "verticalAlign": "top",
+      "strokeColor": "#000000", "backgroundColor": "transparent", "angle": 0, "opacity": 100, "groupIds": ["blobs-workers-flow"], "containerId": null, "seed": 172, "version": 1, "versionNonce": 172, "isDeleted": false
+    },
+    {
+      "id": "workers-sources", "type": "arrow", "x": 1410, "y": 860, "width": 770, "height": 120, "points": [[0, 0], [0, 65], [-770, 65], [-770, 120]],
+      "strokeColor": "#e67700", "backgroundColor": "transparent", "fillStyle": "solid", "strokeWidth": 2, "strokeStyle": "solid", "roughness": 0, "opacity": 100, "angle": 0, "roundness": null,
+      "startArrowhead": "arrow", "endArrowhead": "arrow", "startBinding": { "elementId": "workers", "focus": 0.837838, "gap": 10 }, "endBinding": { "elementId": "source-tools", "focus": 0.001692, "gap": 10 },
+      "groupIds": ["workers-sources-flow"], "boundElements": [], "seed": 173, "version": 1, "versionNonce": 173, "isDeleted": false
+    },
+    {
+      "id": "workers-sources-label", "type": "text", "x": 770, "y": 867, "width": 570, "height": 45,
+      "text": "Jobs / grades / resumes only: fetch + extract", "originalText": "Jobs / grades / resumes only: fetch + extract",
+      "fontSize": 18, "fontFamily": 2, "lineHeight": 1.35, "textAlign": "center", "verticalAlign": "top",
+      "strokeColor": "#000000", "backgroundColor": "transparent", "angle": 0, "opacity": 100, "groupIds": ["workers-sources-flow"], "containerId": null, "seed": 174, "version": 1, "versionNonce": 174, "isDeleted": false
+    },
+    {
+      "id": "workers-foundry", "type": "arrow", "x": 1565, "y": 860, "width": 0, "height": 160, "points": [[0, 0], [0, 160]],
+      "strokeColor": "#2f9e44", "backgroundColor": "transparent", "fillStyle": "solid", "strokeWidth": 2, "strokeStyle": "solid", "roughness": 0, "opacity": 100, "angle": 0, "roundness": null,
+      "startArrowhead": "arrow", "endArrowhead": "arrow", "startBinding": { "elementId": "workers", "focus": 0, "gap": 10 }, "endBinding": { "elementId": "foundry", "focus": 0, "gap": 10 },
+      "groupIds": ["workers-foundry-flow"], "boundElements": [], "seed": 175, "version": 1, "versionNonce": 175, "isDeleted": false
+    },
+    {
+      "id": "workers-foundry-label", "type": "text", "x": 1590, "y": 902, "width": 160, "height": 80,
+      "text": "All four workers\nGrounded inference", "originalText": "All four workers\nGrounded inference",
+      "fontSize": 16, "fontFamily": 2, "lineHeight": 1.35, "textAlign": "left", "verticalAlign": "top",
+      "strokeColor": "#000000", "backgroundColor": "transparent", "angle": 0, "opacity": 100, "groupIds": ["workers-foundry-flow"], "containerId": null, "seed": 176, "version": 1, "versionNonce": 176, "isDeleted": false
+    }
+  ],
+  "appState": {
+    "viewBackgroundColor": "#ffffff",
+    "theme": "light",
+    "name": "Score application architecture",
+    "gridSize": 20,
+    "scrollX": 0,
+    "scrollY": 0,
+    "zoom": { "value": 0.5 }
+  },
+  "files": {}
+}
