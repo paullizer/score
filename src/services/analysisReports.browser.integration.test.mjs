@@ -229,6 +229,27 @@ async function completedFixture({ comparisons = 2, partial = false } = {}) {
   } catch (error) { await fixture.close(); throw error }
 }
 
+async function deleteAnalysis(fixture, runId) {
+  const path = `/api/workspaces/${fixture.workspaceId}/analyses/${runId}`
+  for (let attempt = 0; attempt < 10; attempt++) {
+    const detail = await jsonResponse(await fixture.request(path))
+    const response = await fixture.request(`${path}/lifecycle`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json', 'If-Match': detail.etag },
+      body: JSON.stringify({ action: 'delete' }),
+    })
+    const result = await jsonResponse(response, [200, 202])
+    if (response.status === 200) {
+      assert.equal(result.deleted, true)
+      return
+    }
+    assert.equal(result.operation?.action, 'delete')
+    assert.equal(result.operation?.status, 'pending')
+    assert.ok(result.analysis?.lifecycle?.deletingAt)
+    assert.equal(result.etag, result.analysis.etag)
+  }
+  assert.fail('Bounded analysis cleanup did not complete after explicit retries.')
+}
+
 before(async () => {
   runtime = await buildResumeAnalysisTestRuntime({ browser: true, productionBrowser: true })
   try { browser = await chromium.launch({ headless: true }) }
@@ -618,12 +639,7 @@ test('analysis deletion removes the export controls and cancels a delayed report
     await dialog.getByLabel('Report format', { exact: true }).selectOption('csv')
     await dialog.getByRole('button', { name: 'Download CSV', exact: true }).click()
     await captured.promise
-    const detail = await jsonResponse(await fixture.request(`/api/workspaces/${fixture.workspaceId}/analyses/${runId}`))
-    const removed = await jsonResponse(await fixture.request(`/api/workspaces/${fixture.workspaceId}/analyses/${runId}/lifecycle`, {
-      method: 'POST', headers: { 'Content-Type': 'application/json', 'If-Match': detail.etag },
-      body: JSON.stringify({ action: 'delete' }),
-    }))
-    assert.equal(removed.deleted, true)
+    await deleteAnalysis(fixture, runId)
     await dialog.waitFor({ state: 'hidden' })
     release.resolve()
     await finished.promise
@@ -786,11 +802,7 @@ test('generated saved source links preserve workspace, access, missing-result, a
     await visible(page.getByText('Saved analysis access denied.', { exact: true }).first())
     assert.equal(await page.locator('.document-viewer').count(), 0)
     await page.unroute(`**/api/workspaces/${fixture.workspaceId}/analyses**`)
-    const detail = await jsonResponse(await fixture.request(`/api/workspaces/${fixture.workspaceId}/analyses/${runId}`))
-    const removed = await jsonResponse(await fixture.request(`/api/workspaces/${fixture.workspaceId}/analyses/${runId}/lifecycle`, {
-      method: 'POST', headers: { 'Content-Type': 'application/json', 'If-Match': detail.etag }, body: JSON.stringify({ action: 'delete' }),
-    }))
-    assert.equal(removed.deleted, true)
+    await deleteAnalysis(fixture, runId)
     await page.goto(row['Resume link'])
     await visible(page.getByRole('heading', { name: 'This real analysis could not be opened', exact: true }))
     assert.equal(await page.locator('.document-viewer').count(), 0)

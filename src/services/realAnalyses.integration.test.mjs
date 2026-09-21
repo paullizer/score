@@ -1031,11 +1031,105 @@ test('manual run and pair retries stay available after automatic retries stop an
 
 function Probe() { current = ui.useRealAnalyses(); projected = ui.useWorkspace(); return React.createElement('span', null, current.phase) }
 const legacy = { schemaVersion: 1, jobs: [], resumes: [], rubrics: [], documents: [], runs: [] }
-function bridge(workspace = workspaceId, role = 'owner', show = true) {
+function bridge(workspace = workspaceId, role = 'owner', show = true, location) {
   return router(React.createElement(ui.WorkspaceContext.Provider, { value: frontendWorkspaceContext({ workspace: legacy, cloud: { currentWorkspaceId: workspace, workspaces: [{ id: workspace, role }] } }) },
-    React.createElement(ui.RealAnalysesBridge, { workspaceId: workspace }, show ? React.createElement(Probe) : null)))
+    React.createElement(ui.RealAnalysesBridge, { workspaceId: workspace }, show ? React.createElement(Probe) : null)), location)
 }
 function deferred() { let resolve; const promise = new Promise((done) => { resolve = done }); return { promise, resolve } }
+
+test('live target discovery requires a setup subscriber or explicit refresh, and inactive replies cannot revive eligible targets', async () => {
+  let selected = target('job', 1)
+  let held
+  let targetSignal
+  globalThis.fetch = async (url, init) => {
+    requests.push({ url, init })
+    if (url === '/api/features') return json({ realAnalyses: true })
+    if (url.endsWith('/analyses/targets')) {
+      targetSignal = init.signal
+      const captured = structuredClone(selected)
+      if (held) await held.promise
+      return json({ targets: [captured] })
+    }
+    if (url.endsWith('/analyses')) return json({ runs: [runSummary()] })
+    throw new Error(`Unexpected discovery dependency: ${url}`)
+  }
+  const targetReads = () => requests.filter(({ url }) => url.endsWith('/analyses/targets')).length
+  await render(bridge(workspaceId, 'owner', true, '/analyses/run-one?data=real'))
+  await settle(() => current?.features?.realAnalyses && current.phase === 'ready')
+  await act(async () => { await current.refresh(); dom.window.dispatchEvent(new dom.window.Event('focus')) })
+  assert.equal(targetReads(), 0)
+  assert.equal(current.targets.state, 'idle')
+  await act(async () => current.refreshTargets())
+  assert.equal(targetReads(), 1, 'Explicit caller refresh remains available without a setup subscription.')
+  assert.equal(current.targets.state, 'ready')
+  held = deferred()
+  let release
+  await act(async () => { release = current.subscribeTargets() })
+  await settle(() => targetReads() === 2)
+  assert.equal(current.targets.state, 'loading', 'A new setup invalidates old eligibility before selecting current targets.')
+  await act(async () => release())
+  assert.equal(targetSignal.aborted, true)
+  assert.equal(current.targets.state, 'idle')
+  await act(async () => { held.resolve(); await new Promise((resolve) => setTimeout(resolve, 0)) })
+  assert.equal(current.targets.state, 'idle', 'A cancelled live discovery reply cannot repopulate an inactive scope.')
+  held = null
+  selected = target('job', 2)
+  await act(async () => { release = current.subscribeTargets() })
+  await settle(() => current.targets.state === 'ready')
+  assert.equal(targetReads(), 3)
+  assert.equal(current.targets.value[0].rubricVersion, 2)
+  await act(async () => release())
+})
+
+test('target discovery pauses while hidden, resumes only for setup, and invalidates when creation readiness is lost', async () => {
+  let enabled = true
+  let held
+  let targetSignal
+  const targetReads = () => requests.filter(({ url }) => url.endsWith('/analyses/targets')).length
+  globalThis.fetch = async (url, init) => {
+    requests.push({ url, init })
+    if (url === '/api/features') return json({ realAnalyses: enabled })
+    if (url.endsWith('/analyses/targets')) {
+      targetSignal = init.signal
+      if (held) await held.promise
+      return json({ targets: [target()] })
+    }
+    if (url.endsWith('/analyses')) return json({ runs: [runSummary()] })
+    throw new Error(`Unexpected discovery dependency: ${url}`)
+  }
+  let release
+  try {
+    Object.defineProperty(dom.window.document, 'visibilityState', { configurable: true, value: 'hidden' })
+    await render(bridge())
+    await settle(() => current?.features?.realAnalyses && current.phase === 'ready')
+    await act(async () => { release = current.subscribeTargets() })
+    assert.equal(targetReads(), 0)
+    held = deferred()
+    await act(async () => {
+      Object.defineProperty(dom.window.document, 'visibilityState', { configurable: true, value: 'visible' })
+      dom.window.document.dispatchEvent(new dom.window.Event('visibilitychange'))
+      dom.window.dispatchEvent(new dom.window.Event('focus'))
+    })
+    await settle(() => targetReads() === 1)
+    enabled = false
+    await act(async () => current.refresh())
+    assert.equal(targetSignal.aborted, true)
+    assert.equal(current.targets.state, 'error')
+    assert.equal(current.features.realAnalyses, false)
+    assert.equal(current.phase, 'ready', 'Historical availability remains independent of live source readiness.')
+    await act(async () => { held.resolve(); await new Promise((resolve) => setTimeout(resolve, 0)) })
+    assert.equal(current.targets.state, 'error')
+    held = null
+    enabled = true
+    await act(async () => current.refresh())
+    await settle(() => current.targets.state === 'ready')
+    assert.equal(targetReads(), 2)
+  } finally {
+    held?.resolve()
+    if (release) await act(async () => release())
+    delete dom.window.document.visibilityState
+  }
+})
 
 test('analysis rename uses captured concurrency without requiring new-run sources or changing manifest identity', async () => {
   let run = runSummary()
@@ -1135,6 +1229,9 @@ test('feature-readiness failures do not hide healthy saved history, but an unava
 test('historical initialization and cancellation keep polling while new-run readiness is false', async () => {
   const originalSetInterval = dom.window.setInterval
   const originalClearInterval = dom.window.clearInterval
+  const originalNow = Date.now
+  let now = originalNow()
+  Date.now = () => now
   const timers = new Map()
   let timerId = 0
   dom.window.setInterval = (callback) => { timers.set(++timerId, callback); return timerId }
@@ -1149,15 +1246,17 @@ test('historical initialization and cancellation keep polling while new-run read
     return json({ runs: [saved] })
   }
   try {
-    await render(bridge())
+    await render(bridge(workspaceId, 'owner', true, '/analyses?data=real'))
     await settle(() => current?.phase === 'ready' && timers.size > 0)
     assert.equal(current.features.realAnalyses, false)
     saved = runSummary('run-one', 'cancelled')
     saved.run.cancellation = { requestedAt: timestamp, requestedBy: 'reviewer', nextComparisonIndex: 25 }
+    now += 3000
     await act(async () => { [...timers.values()][0](); await new Promise((resolve) => setTimeout(resolve, 0)) })
     assert.equal(current.summaries[0].run.status, 'cancelled')
     assert.equal(timers.size, 1, 'pending bounded cancellation continues polling independently of source readiness')
     saved.run.cancellation.completedAt = timestamp
+    now += 3000
     await act(async () => { [...timers.values()][0](); await new Promise((resolve) => setTimeout(resolve, 0)) })
     assert.equal(current.summaries[0].run.cancellation.completedAt, timestamp)
     assert.equal(timers.size, 0)
@@ -1166,6 +1265,7 @@ test('historical initialization and cancellation keep polling while new-run read
     if (root) { await act(async () => root.unmount()); root = null }
     dom.window.setInterval = originalSetInterval
     dom.window.clearInterval = originalClearInterval
+    Date.now = originalNow
   }
 })
 

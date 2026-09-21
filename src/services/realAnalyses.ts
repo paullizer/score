@@ -21,7 +21,7 @@ import {
 import {
   ANALYSIS_NARRATIVE_LIMITS, analysisNarrativeIsCurrent,
   type GenerateRealAnalysisSummariesInput, type RealAnalysisSummariesMutationResponse,
-  type RealAnalysisSummariesQuery, type RealAnalysisSummariesResponse,
+  type RealAnalysisSummariesQuery, type RealAnalysisSummariesResponse, type RealAnalysisSummarySubjectResponse,
 } from '../domain/analysis-narratives'
 import {
   ANALYSIS_DIAGNOSTIC_LIMITS, ANALYSIS_DIAGNOSTIC_REASONS,
@@ -33,7 +33,7 @@ import {
   type AnalysisSummaryHistoryPage, type AnalysisSummarySubject, type PublishSummaryDraftInput,
 } from '../domain/analysis-summary-history'
 import type { Citation } from '../domain/types'
-import { cloudJsonRequest, cloudLifecycleRequest } from './cloudWorkspace'
+import { cloudJsonRequest, cloudJsonResponse, cloudLifecycleRequest } from './cloudWorkspace'
 import type { LifecycleAction, LifecycleImpact, LifecycleOperation } from '../domain/lifecycle'
 import { normalizeDisplayName } from '../domain/displayNames'
 
@@ -110,6 +110,21 @@ const narrativeState = z.object({
     diagnostic: summaryDiagnosticSchema.optional(),
   }).nullable(),
 })
+const candidateSummary = narrativeState.extend({
+  kind: z.literal('candidate'), comparisonId: narrativeId, comparisonStatus,
+  published: candidatePublication.nullable(),
+})
+const targetSummary = narrativeState.extend({
+  kind: z.literal('target'), published: targetPublication.nullable(),
+})
+const summarySubjectBase = z.object({
+  schemaVersion: z.literal(1), dataKind: z.literal('real'), workspaceId: narrativeId, runId: narrativeId,
+  subjectId: narrativeId, revision: narrativeHash, etag: narrativeId,
+})
+const summarySubjectEnvelope: z.ZodType<RealAnalysisSummarySubjectResponse> = z.discriminatedUnion('kind', [
+  summarySubjectBase.extend({ kind: z.literal('candidate'), narrative: candidateSummary }),
+  summarySubjectBase.extend({ kind: z.literal('target'), narrative: targetSummary }),
+])
 const summariesEnvelope: z.ZodType<RealAnalysisSummariesResponse> = z.object({
   schemaVersion: z.literal(1), dataKind: z.literal('real'), workspaceId: narrativeId, runId: narrativeId,
   scope: narrativeScope, revision: narrativeHash, etag: narrativeId, ready: z.boolean(),
@@ -121,13 +136,8 @@ const summariesEnvelope: z.ZodType<RealAnalysisSummariesResponse> = z.object({
   capabilities: z.object({
     canGenerate: z.boolean(), reason: z.enum(['read-only', 'archived', 'deleting', 'cancelling', 'service-unavailable']).nullable(),
   }),
-  comparisons: z.array(narrativeState.extend({
-    kind: z.literal('candidate'), comparisonId: narrativeId, comparisonStatus,
-    published: candidatePublication.nullable(),
-  })).max(ANALYSIS_LIMITS.maxComparisons),
-  targets: z.array(narrativeState.extend({
-    kind: z.literal('target'), published: targetPublication.nullable(),
-  })).max(ANALYSIS_LIMITS.maxComparisons),
+  comparisons: z.array(candidateSummary).max(ANALYSIS_LIMITS.maxComparisons),
+  targets: z.array(targetSummary).max(ANALYSIS_LIMITS.maxComparisons),
   capture: z.object({
     dataKind: z.literal('real'), scope: narrativeScope, revision: narrativeHash, ready: z.boolean(),
     comparisons: z.array(z.object({
@@ -137,6 +147,11 @@ const summariesEnvelope: z.ZodType<RealAnalysisSummariesResponse> = z.object({
     targets: z.array(z.object({ targetId: narrativeId, narrative: narrativeRevision.nullable() })).max(ANALYSIS_LIMITS.maxComparisons),
   }),
 })
+
+function validCurrentSummary(item: RealAnalysisSummarySubjectResponse['narrative']): boolean {
+  return item.status !== 'ready' || (analysisNarrativeIsCurrent(item, item.inputFingerprint) &&
+    (item.kind !== 'candidate' || item.comparisonStatus === 'complete'))
+}
 
 function checkedSummaryScope(workspaceId: string, runId: string, query: RealAnalysisSummariesQuery): string | null {
   if (!narrativeId.safeParse(workspaceId).success || !narrativeId.safeParse(runId).success ||
@@ -157,6 +172,7 @@ function checkedSummaries(payload: unknown, workspaceId: string, runId: string, 
     capture.scope.targetId !== targetId || capture.revision !== value.revision || capture.ready !== value.ready ||
     value.etag !== `"${value.revision}"` || targets.size !== value.targets.length || comparisons.size !== value.comparisons.length ||
     (targetId !== null && (targets.size !== 1 || !targets.has(targetId))) ||
+    [...value.comparisons, ...value.targets].some((item) => !validCurrentSummary(item)) ||
     value.comparisons.some((item) => !targets.has(item.targetId)) ||
     value.counts.candidates.total !== value.comparisons.length || value.counts.targets.total !== value.targets.length ||
     new Set(capture.targets.map((item) => item.targetId)).size !== targets.size ||
@@ -216,6 +232,24 @@ function summarySubjectPath(workspaceId: string, runId: string, subject: Analysi
     throw new Error('Select one exact saved candidate summary or job / grade overview.')
   }
   return `${base(workspaceId, runId)}/summaries/${subject.kind}/${encodeURIComponent(subject.subjectId)}`
+}
+
+export async function getRealAnalysisSummarySubject(
+  workspaceId: string, runId: string, subject: AnalysisSummarySubject, signal?: AbortSignal,
+): Promise<RealAnalysisSummarySubjectResponse> {
+  const result = await cloudJsonResponse<unknown>(summarySubjectPath(workspaceId, runId, subject), { method: 'GET', signal })
+  signal?.throwIfAborted()
+  const parsed = summarySubjectEnvelope.safeParse(result.value)
+  if (!parsed.success) throw new Error('The summary service returned an invalid saved-summary envelope. Retry this summary; scores and frozen evidence are unchanged.')
+  const value = parsed.data
+  const item = value.narrative
+  if (value.workspaceId !== workspaceId || value.runId !== runId || value.kind !== subject.kind ||
+    value.subjectId !== subject.subjectId || item.kind !== subject.kind ||
+    (item.kind === 'candidate' ? item.comparisonId : item.targetId) !== subject.subjectId ||
+    value.etag !== `"${value.revision}"` || result.etag !== value.etag || !validCurrentSummary(item)) {
+    throw new Error('The summary service returned mismatched workspace, analysis, subject, or revision information. Nothing was substituted.')
+  }
+  return value
 }
 
 export async function getRealAnalysisSummaryHistory(

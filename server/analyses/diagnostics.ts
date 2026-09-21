@@ -11,7 +11,9 @@ import {
 
 export async function readAnalysisFailureDiagnostics(
   blobs: AnalysisBlobStore, run: RealAnalysisRunRecord, comparison: RealAnalysisComparisonRecord, continuationToken?: string,
+  signal?: AbortSignal,
 ): Promise<RealAnalysisDiagnosticsPage> {
+  signal?.throwIfAborted()
   const scope = { workspaceId: run.workspaceId, runId: run.id, comparisonId: comparison.id, kind: 'diagnostics' as const }
   const cursor = analysisPageCursor(scope, continuationToken)
   let reference = comparison.failureDiagnostic
@@ -27,11 +29,11 @@ export async function readAnalysisFailureDiagnostics(
   if (!reference) return { attempts: [] }
   assertAnalysisFailureDiagnosticReference(reference, run.workspaceId, run.id, comparison.id)
   const diagnostic = parseAnalysisFailureDiagnostic(parseAnalysisJson(
-    await readAnalysisBlob(blobs, reference.blob, run.workspaceId, run.id),
+    await readAnalysisBlob(blobs, reference.blob, run.workspaceId, run.id, signal),
   ))
   assertAnalysis(diagnostic.attemptId === reference.attemptId && diagnostic.createdAt === reference.createdAt,
     'Diagnostic history reference does not identify this attempt.')
-  const snapshots = diagnostic.assessments.length ? await readAnalysisSnapshots(blobs, run, comparison) : undefined
+  const snapshots = diagnostic.assessments.length ? await readAnalysisSnapshots(blobs, run, comparison, signal) : undefined
   assertAnalysisFailureDiagnosticBinding(diagnostic, run, comparison, snapshots)
   const next = diagnostic.previous ? analysisPageToken(scope, JSON.stringify(diagnostic.previous)) : undefined
   return { attempts: [diagnostic], ...(next ? { continuationToken: next } : {}) }
