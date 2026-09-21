@@ -42,6 +42,7 @@ const actionReceiptSchema = z.strictObject({
   selection: publishSummaryDraftInputSchema.optional(),
   processingSettings: processingSettingsSnapshotSchema.optional(),
   resumeGenerationId: z.string().uuid().optional(),
+  resultRevisionId: z.string().uuid().optional(),
 })
 type ActionReceipt = z.infer<typeof actionReceiptSchema>
 type SubjectState = Awaited<ReturnType<typeof readSummarySubject>>
@@ -85,14 +86,14 @@ async function selectedDraft(
 
 function verifyReceipt(
   receipt: ActionReceipt, workspaceId: string, runId: string, subject: AnalysisSummarySubject,
-  action: ActionReceipt['action'], requestId: string, expected: string, actor: string, selection?: PublishSummaryDraftInput,
+  action: ActionReceipt['action'], requestId: string, expected: string, actor: string, recordId: string, selection?: PublishSummaryDraftInput,
 ): void {
   if (receipt.workspaceId !== workspaceId || receipt.runId !== runId || receipt.kind !== subject.kind ||
     receipt.subjectId !== subject.subjectId || receipt.action !== action || receipt.requestId !== requestId ||
     receipt.expectedEtag !== expected || receipt.requestedBy !== actor ||
     analysisHash(receipt.selection ?? null) !== analysisHash(selection ?? null) ||
-    receipt.generationId !== (receipt.resumeGenerationId ??
-      narrativeGenerationId(requestId, analysisNarrativeId(subject.kind, runId, subject.subjectId)))) {
+    recordId !== analysisNarrativeId(subject.kind, runId, subject.subjectId, receipt.resultRevisionId) ||
+    receipt.generationId !== (receipt.resumeGenerationId ?? narrativeGenerationId(requestId, recordId))) {
     throw conflict('This Idempotency-Key already identifies a different summary action, actor, draft, or revision.')
   }
 }
@@ -135,12 +136,12 @@ async function executeSummaryAction(
   await assertAnalysisWorkspaceActive(deps.store, workspaceId)
   const state = await readSummarySubject(deps, workspaceId, runId, subject)
   assertWritable(state)
-  const id = analysisNarrativeId(subject.kind, runId, subject.subjectId)
+  const id = state.recordId
   const name = analysisSummaryActionBlobName(workspaceId, runId, requestId)
   let stored = await deps.blobs.read(name)
   let receipt = stored ? actionReceiptSchema.parse(parseAnalysisJson(stored)) : undefined
   if (receipt) {
-    verifyReceipt(receipt, workspaceId, runId, subject, action, requestId, expected, actor, selection)
+    verifyReceipt(receipt, workspaceId, runId, subject, action, requestId, expected, actor, id, selection)
     if (committed(state, receipt)) return { summaries: await readAnalysisSummaries(deps, workspaceId, runId, receipt.targetId) }
   } else if (await deps.blobs.read(analysisNarrativeRequestBlobName(workspaceId, runId, requestId))) {
     throw conflict('This Idempotency-Key already belongs to a summary generation request.')
@@ -168,6 +169,7 @@ async function executeSummaryAction(
     generationId, previousGenerationId: state.current?.record.generationId ?? null, ...(selection ? { selection } : {}),
     processingSettings: resumeGeneration || action === 'publish' ? processingSettings : newProcessingSettings(settings, processingSettings),
     ...(resumeGeneration ? { resumeGenerationId: resumeGeneration.generationId } : {}),
+    ...(state.pair?.comparison?.resultRevision ? { resultRevisionId: state.pair.comparison.resultRevision.id } : {}),
   }
   const assertCurrent = async () => {
     assertWorkspaceMutationLease(workspaceId)
@@ -182,6 +184,7 @@ async function executeSummaryAction(
   const authorization: SummaryActionWriteAuthorization = {
     action, ...subject, recordId: id, etag: state.current?.etag, generationId: state.current?.record.generationId,
     requestId, ...(selected ? { publicationAttemptId: selected.attemptId } : {}),
+    ...(planned.resultRevisionId ? { resultRevisionId: planned.resultRevisionId } : {}),
   }
   const blobs = fencedSummaryActionBlobs(deps, workspaceId, runId, authorization, assertCurrent)
   if (!stored) {
@@ -193,7 +196,7 @@ async function executeSummaryAction(
     receipt = actionReceiptSchema.parse(parseAnalysisJson(stored))
   }
   assertAnalysis(receipt, 'The immutable summary action receipt is missing.')
-  verifyReceipt(receipt, workspaceId, runId, subject, action, requestId, expected, actor, selection)
+  verifyReceipt(receipt, workspaceId, runId, subject, action, requestId, expected, actor, id, selection)
   if (receipt.inputFingerprint !== planned.inputFingerprint || receipt.manifestSha256 !== planned.manifestSha256 ||
     receipt.targetId !== planned.targetId || receipt.previousGenerationId !== planned.previousGenerationId ||
     receipt.createdAt <= (state.inventory.run.record.narrativeCancelledAt ?? '')) {

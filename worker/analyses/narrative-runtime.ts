@@ -183,6 +183,7 @@ class NarrativeLease {
           const inventory = await readAnalysisNarrativeInventory(this.deps, run.record.workspaceId, run.record.id, narrative.record.targetId)
           if (inventory.run.etag !== run.etag) continue
           const comparisonId = narrative.record.recordType === 'analysis-candidate-narrative' ? narrative.record.comparisonId : undefined
+          if (!comparisonId && inventory.comparisons.some(pair => pair.correctionPending)) throw new LostNarrativeWork()
           const binding = comparisonId ? inventory.comparisons.find(pair => pair.id === comparisonId)?.binding : inventory.targets[0]?.binding
           if (!binding || analysisHash(binding) !== fingerprint) throw new LostNarrativeWork()
         }
@@ -245,6 +246,7 @@ async function candidateInput(
 async function targetInput(
   deps: AnalysisWorkerDependencies, inventory: AnalysisNarrativeInventory, signal: AbortSignal,
 ): Promise<AnalysisTargetNarrativeModelInput> {
+  if (inventory.comparisons.some(pair => pair.correctionPending)) throw new LostNarrativeWork()
   const selected = inventory.targets[0]
   assertAnalysis(inventory.targets.length === 1 && analysisTargetNarrativeCanGenerate(selected.binding, inventory.comparisons.map(pair => pair.id)),
     'Target generation requires every settled pair and current candidate narrative.')
@@ -298,12 +300,13 @@ async function reconcileTarget(
       }, current.record)
       : { ...current.record, updatedAt: timestamp }
     if (pinned) next.processingSettings = pinned
-    const pendingScoring = inventory.comparisons.some(pair => !pair.comparison || pair.status === 'queued' || pair.status === 'running')
+    const pendingScoring = inventory.comparisons.some(pair => !pair.comparison || pair.status === 'queued' || pair.status === 'running' || pair.correctionPending)
     let bytes = Buffer.byteLength(JSON.stringify(next)) + Buffer.byteLength(JSON.stringify(inventory.run.record)) + 8192
     for (const pair of inventory.comparisons) {
       if (!pair.comparison || !pair.binding || !['missing', 'stale', 'cancelled'].includes(pair.state.status)) continue
       if (operations.length === ANALYSIS_LIMITS.initializationChunkSize - 1) break
-      const previous = await loadAnalysisNarrative(deps.store, record.workspaceId, analysisNarrativeId('candidate', record.runId, pair.id))
+      const previous = await loadAnalysisNarrative(deps.store, record.workspaceId,
+        analysisNarrativeId('candidate', record.runId, pair.id, pair.comparison.resultRevision?.id))
       assertAnalysis(!previous || previous.record.recordType === 'analysis-candidate-narrative', 'Candidate prerequisite identity is invalid.')
       const child = newCandidateNarrative(inventory.run.record, pair.comparison, {
         requestId: next.requestId, requestedAt: timestamp, requestedBy: next.requestedBy, reason: next.reason,

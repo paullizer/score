@@ -100,6 +100,7 @@ export const summaryHistoryEntrySchema = summaryStepSchema.extend({
 export const summaryHistoryPageSchema = z.strictObject({
   schemaVersion: z.literal(1), workspaceId: id, runId: id,
   kind: z.enum(['candidate', 'target']), subjectId: id,
+  resultRevisionId: z.union([z.literal('original'), z.string().uuid()]).optional(),
   etag: z.string().min(1).max(1_024), inputFingerprint: hash.nullable(),
   entries: z.array(summaryHistoryEntrySchema).max(SUMMARY_LIMITS.historyPageSize),
   continuationToken: z.string().min(1).max(16 * 1024).optional(),

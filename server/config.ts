@@ -255,6 +255,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   const gradesEnabled = featureEnabled(env, 'REAL_GRADE_LADDERS_ENABLED')
   const resumesEnabled = featureEnabled(env, 'REAL_RESUME_IMPORTS_ENABLED')
   const analysesEnabled = featureEnabled(env, 'REAL_ANALYSES_ENABLED')
+  const evidenceCorrectionsEnabled = featureEnabled(env, 'ANALYSIS_EVIDENCE_CORRECTIONS_ENABLED')
   const wordDocumentImports = featureEnabled(env, 'WORD_DOCUMENT_IMPORTS_ENABLED')
   const jobRecords = jobsEnabled ? required(env, 'JOB_RECORDS_CONTAINER') : optional(env, 'JOB_RECORDS_CONTAINER') ?? 'job-records'
   const jobSources = jobsEnabled ? required(env, 'JOB_SOURCE_CONTAINER') : optional(env, 'JOB_SOURCE_CONTAINER') ?? 'job-sources'
@@ -288,7 +289,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   const realResumes: RealResumesConfig | undefined = resumesEnabled
     ? { ...shared, container: resumeRecords, blobContainer: resumeSources } : undefined
   const realAnalyses: RealAnalysesConfig | undefined = analysesEnabled
-    ? { ...shared, container: analysisRecords, blobContainer: analysisSources } : undefined
+    ? { ...shared, container: analysisRecords, blobContainer: analysisSources, ...(evidenceCorrectionsEnabled ? { evidenceCorrectionsEnabled: true } : {}) } : undefined
 
   const configuredJobRecords = optional(env, 'JOB_RECORDS_CONTAINER')
   const configuredJobSources = optional(env, 'JOB_SOURCE_CONTAINER')

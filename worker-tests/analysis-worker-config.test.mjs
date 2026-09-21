@@ -41,9 +41,10 @@ test('analysis configuration requires only its dedicated stores, identity, and m
   assert.equal(result.localDevelopment, false)
   for (const key of ['rendererUrl', 'documentIntelligenceEndpoint', 'jobs', 'resumes', 'grades']) assert.equal(result[key], undefined)
   const deps = createAnalysisWorkerDependencies(result, { getToken: async () => ({ token: 'test-token', expiresOnTimestamp: 0 }) })
-  assert.deepEqual(Object.keys(deps).sort(), ['blobs', 'model', 'onEvent', 'settings', 'store'])
+  assert.deepEqual(Object.keys(deps).sort(), ['blobs', 'correctionsEnabled', 'model', 'onEvent', 'settings', 'store'])
   assert.equal(deps.settings.legacy.revision, 'legacy-v1')
   assert.equal(deps.settings.legacy.tasks.assessment.deploymentName, result.modelDeployment)
+  assert.notEqual(deps.correctionsEnabled, true)
   assert.equal(typeof deps.onEvent, 'function')
   assert.equal(deps.model.endpoint, result.modelEndpoint)
 })
@@ -72,6 +73,17 @@ test('configured and unconfigured dependency factories accept legacy short execu
       if (configured) assert.throws(() => deps.settings.legacy, /must be loaded/)
       else assert.equal(deps.settings.legacy.tasks.assessment.deploymentName, options.modelDeployment)
     }
+  }
+})
+
+test('evidence correction discovery is default-off and only explicit true enables it', () => {
+  const credential = { getToken: async () => ({ token: 'test-token', expiresOnTimestamp: 0 }) }
+  for (const value of [undefined, 'false', 'true']) {
+    const result = loadAnalysisWorkerConfig(config({ ANALYSIS_EVIDENCE_CORRECTIONS_ENABLED: value }))
+    assert.equal(createAnalysisWorkerDependencies(result, credential).correctionsEnabled === true, value === 'true')
+  }
+  for (const value of ['TRUE', 'yes', '1', 'enabled']) {
+    assert.throws(() => loadAnalysisWorkerConfig(config({ ANALYSIS_EVIDENCE_CORRECTIONS_ENABLED: value })), /must be true or false/)
   }
 })
 

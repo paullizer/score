@@ -7,7 +7,7 @@ import {
 import type { ModelDraft, ModelIssue, ModelPlan, ModelQualification } from './model-schema'
 
 export const SCORE_INTERPRETATION =
-  'Score weights and 0–5 guidance are proposed reviewer-facing interpretations, not OPM classification points or an official classification or eligibility decision.'
+  'Score weights and 0–5 guidance are proposed reviewer-facing interpretations, not OPM classification points or an official classification or eligibility decision. Zero means no supporting evidence in the submitted resume for the criterion, not personal inability or legal noncompliance; positive anchors describe documentary support.'
 export const QUALIFICATION_INTERPRETATION =
   'This is an unscored source requirement, separate from work-level weights; it is not an eligibility determination. Alternative paths are not cumulative requirements.'
 

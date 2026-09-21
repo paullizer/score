@@ -251,7 +251,10 @@ export function reportSummariesFixture(input, options) {
   })
   const comparisons = capture.comparisons.map(pin => {
     const comparison = value.comparisons.find(comparison => comparison.id === pin.comparisonId)
-    return { ...state(comparison.narrative), kind: 'candidate', comparisonId: pin.comparisonId, targetId: pin.targetId, comparisonStatus: pin.status }
+    return {
+      ...state(comparison.narrative), kind: 'candidate', comparisonId: pin.comparisonId, targetId: pin.targetId,
+      comparisonStatus: pin.status, resultSha256: pin.resultSha256,
+    }
   })
   const targets = capture.targets.map(pin => {
     const target = value.targets.find(target => target.id === pin.targetId)

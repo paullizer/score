@@ -1,0 +1,220 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1800" height="1608" viewBox="0 0 1800 1608" role="img" aria-labelledby="svg-title svg-description">
+  <title id="svg-title">Score application architecture</title>
+  <desc id="svg-description">The React browser application calls an Entra-protected Express API hosted on Azure App Service. The API reads and writes workspace-scoped Cosmos records and private Blob sources, snapshots, and results. Cosmos feature records are the durable work queue for four independent Container Apps Jobs: jobs, grades, resumes, and analyses. Each worker uses its own feature stores. Job, grade, and resume workers acquire and extract sources through bounded public fetching, local parsers, Azure Document Intelligence, and an isolated internal Chromium renderer. All four workers use Foundry model inference. Analyses require an explicit user action and use frozen analysis inputs. Browser Web Workers export reports. Standalone samples use fictional browser-local data and are not a cloud fallback. Shared AI Search and Foundry IQ contain only a separate nonsensitive guide, not private evidence. This diagram describes the repository, not verified deployment status.</desc>
+  <defs>
+    <marker id="arrow-495057" viewBox="0 0 12 12" refX="11" refY="6" markerWidth="12" markerHeight="12" orient="auto-start-reverse" markerUnits="userSpaceOnUse">
+      <path d="M 2 1 L 11 6 L 2 11" fill="none" stroke="#495057" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+    </marker>
+    <marker id="arrow-862e9c" viewBox="0 0 12 12" refX="11" refY="6" markerWidth="12" markerHeight="12" orient="auto-start-reverse" markerUnits="userSpaceOnUse">
+      <path d="M 2 1 L 11 6 L 2 11" fill="none" stroke="#862e9c" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+    </marker>
+    <marker id="arrow-e67700" viewBox="0 0 12 12" refX="11" refY="6" markerWidth="12" markerHeight="12" orient="auto-start-reverse" markerUnits="userSpaceOnUse">
+      <path d="M 2 1 L 11 6 L 2 11" fill="none" stroke="#e67700" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+    </marker>
+    <marker id="arrow-2f9e44" viewBox="0 0 12 12" refX="11" refY="6" markerWidth="12" markerHeight="12" orient="auto-start-reverse" markerUnits="userSpaceOnUse">
+      <path d="M 2 1 L 11 6 L 2 11" fill="none" stroke="#2f9e44" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+    </marker>
+  </defs>
+  <rect width="1800" height="1608" fill="#ffffff"/>
+  <text id="diagram-title" fill="#000000" font-family="Helvetica, Arial, sans-serif" font-size="40" text-anchor="start">
+    <tspan x="48" y="81">Score / application architecture</tspan>
+  </text>
+  <text id="diagram-subtitle" fill="#000000" font-family="Helvetica, Arial, sans-serif" font-size="20" text-anchor="start">
+    <tspan x="48" y="134.5">From source documents to evidence-backed review. Cloud processing and standalone samples stay separate.</tspan>
+  </text>
+  <text id="diagram-legend" fill="#000000" font-family="Helvetica, Arial, sans-serif" font-size="16" text-anchor="end">
+    <tspan x="1750" y="180.8">Double arrows: requests/responses or reads/writes</tspan>
+  </text>
+  <text id="review-lane" fill="#000000" font-family="Helvetica, Arial, sans-serif" font-size="18" text-anchor="start">
+    <tspan x="48" y="216.15">01 / REVIEW</tspan>
+  </text>
+  <text id="api-lane" fill="#000000" font-family="Helvetica, Arial, sans-serif" font-size="18" text-anchor="start">
+    <tspan x="470" y="216.15">02 / AUTHENTICATED API</tspan>
+  </text>
+  <text id="storage-lane" fill="#000000" font-family="Helvetica, Arial, sans-serif" font-size="18" text-anchor="start">
+    <tspan x="900" y="216.15">03 / DURABLE STATE</tspan>
+  </text>
+  <text id="processing-lane" fill="#000000" font-family="Helvetica, Arial, sans-serif" font-size="18" text-anchor="start">
+    <tspan x="1380" y="216.15">04 / ASYNC PROCESSING</tspan>
+  </text>
+  <rect id="human-review" x="48" y="245" width="320" height="130" rx="16" fill="#f8f9fa" stroke="#495057" stroke-width="1.5"/>
+  <text id="human-review-text" fill="#000000" font-family="Helvetica, Arial, sans-serif" font-size="18" text-anchor="middle">
+    <tspan x="208" y="296.5">Human-directed review</tspan>
+    <tspan x="208" y="341.5">Importing never starts scoring</tspan>
+  </text>
+  <rect id="browser" x="48" y="440" width="320" height="300" rx="16" fill="#e7f5ff" stroke="#1864ab" stroke-width="2"/>
+  <text id="browser-title" fill="#000000" font-family="Helvetica, Arial, sans-serif" font-size="24" text-anchor="start">
+    <tspan x="68" y="484.2">React web app</tspan>
+  </text>
+  <text id="browser-stack" fill="#000000" font-family="Helvetica, Arial, sans-serif" font-size="18" text-anchor="start">
+    <tspan x="68" y="543.15">Browser / TypeScript / Vite</tspan>
+  </text>
+  <text id="browser-features" fill="#000000" font-family="Helvetica, Arial, sans-serif" font-size="20" text-anchor="start">
+    <tspan x="68" y="598.5">Jobs / resumes / rubrics</tspan>
+    <tspan x="68" y="625.5">Analyses + evidence review</tspan>
+  </text>
+  <text id="browser-reports" fill="#000000" font-family="Helvetica, Arial, sans-serif" font-size="18" text-anchor="start">
+    <tspan x="68" y="703.15">Reports: browser Web Worker</tspan>
+  </text>
+  <rect id="entra" x="470" y="245" width="320" height="130" rx="16" fill="#f3d9fa" stroke="#862e9c" stroke-width="2"/>
+  <text id="entra-title" fill="#000000" font-family="Helvetica, Arial, sans-serif" font-size="24" text-anchor="start">
+    <tspan x="490" y="292.2">Microsoft Entra ID</tspan>
+  </text>
+  <text id="entra-detail" fill="#000000" font-family="Helvetica, Arial, sans-serif" font-size="18" text-anchor="start">
+    <tspan x="490" y="345.15">Single-tenant sign-in</tspan>
+  </text>
+  <rect id="api" x="470" y="440" width="320" height="300" rx="16" fill="#f3d9fa" stroke="#862e9c" stroke-width="2"/>
+  <text id="api-title" fill="#000000" font-family="Helvetica, Arial, sans-serif" font-size="24" text-anchor="start">
+    <tspan x="490" y="484.2">App Service + Express</tspan>
+  </text>
+  <text id="api-detail" fill="#000000" font-family="Helvetica, Arial, sans-serif" font-size="20" text-anchor="start">
+    <tspan x="490" y="563.5">SPA + same-origin API</tspan>
+    <tspan x="490" y="590.5">Membership + write checks</tspan>
+    <tspan x="490" y="617.5">Freezes analysis inputs</tspan>
+  </text>
+  <text id="api-runtime" fill="#000000" font-family="Helvetica, Arial, sans-serif" font-size="18" text-anchor="start">
+    <tspan x="490" y="711.15">Node.js / managed identity</tspan>
+  </text>
+  <rect id="cosmos" x="900" y="295" width="330" height="210" rx="16" fill="#e7f5ff" stroke="#1864ab" stroke-width="2"/>
+  <text id="cosmos-title" fill="#000000" font-family="Helvetica, Arial, sans-serif" font-size="24" text-anchor="start">
+    <tspan x="920" y="342.2">Azure Cosmos DB</tspan>
+  </text>
+  <text id="cosmos-detail" fill="#000000" font-family="Helvetica, Arial, sans-serif" font-size="20" text-anchor="start">
+    <tspan x="920" y="413.5">Workspace + feature records</tspan>
+    <tspan x="920" y="440.5">Durable queue + progress</tspan>
+  </text>
+  <rect id="blobs" x="900" y="570" width="330" height="250" rx="16" fill="#e7f5ff" stroke="#1864ab" stroke-width="2"/>
+  <text id="blobs-title" fill="#000000" font-family="Helvetica, Arial, sans-serif" font-size="24" text-anchor="start">
+    <tspan x="920" y="617.2">Azure Blob Storage</tspan>
+  </text>
+  <text id="blobs-detail" fill="#000000" font-family="Helvetica, Arial, sans-serif" font-size="20" text-anchor="start">
+    <tspan x="920" y="673.5">Private originals + sources</tspan>
+    <tspan x="920" y="700.5">Frozen inputs + saved results</tspan>
+    <tspan x="920" y="727.5">Cloud samples: separate state</tspan>
+  </text>
+  <rect id="workers" x="1380" y="240" width="370" height="610" rx="16" fill="none" stroke="#2f9e44" stroke-width="2"/>
+  <text id="workers-title" fill="#000000" font-family="Helvetica, Arial, sans-serif" font-size="24" text-anchor="start">
+    <tspan x="1400" y="290.2">Background processing</tspan>
+  </text>
+  <text id="workers-host" fill="#000000" font-family="Helvetica, Arial, sans-serif" font-size="18" text-anchor="start">
+    <tspan x="1400" y="343.15">4 scheduled Container Apps Jobs</tspan>
+  </text>
+  <rect id="job-worker" x="1400" y="390" width="330" height="70" rx="16" fill="#ebfbee" stroke="#2f9e44" stroke-width="1.5"/>
+  <text id="job-worker-text" fill="#000000" font-family="Helvetica, Arial, sans-serif" font-size="20" text-anchor="middle">
+    <tspan x="1565" y="435">Jobs: import + rubric</tspan>
+  </text>
+  <rect id="grade-worker" x="1400" y="480" width="330" height="70" rx="16" fill="#ebfbee" stroke="#2f9e44" stroke-width="1.5"/>
+  <text id="grade-worker-text" fill="#000000" font-family="Helvetica, Arial, sans-serif" font-size="20" text-anchor="middle">
+    <tspan x="1565" y="525">Grades: GS ladders</tspan>
+  </text>
+  <rect id="resume-worker" x="1400" y="570" width="330" height="70" rx="16" fill="#ebfbee" stroke="#2f9e44" stroke-width="1.5"/>
+  <text id="resume-worker-text" fill="#000000" font-family="Helvetica, Arial, sans-serif" font-size="20" text-anchor="middle">
+    <tspan x="1565" y="615">Resumes: import + profile</tspan>
+  </text>
+  <rect id="analysis-worker" x="1400" y="660" width="330" height="70" rx="16" fill="#ebfbee" stroke="#2f9e44" stroke-width="1.5"/>
+  <text id="analysis-worker-text" fill="#000000" font-family="Helvetica, Arial, sans-serif" font-size="20" text-anchor="middle">
+    <tspan x="1565" y="705">Analyses: scores + summaries</tspan>
+  </text>
+  <text id="workers-isolation" fill="#000000" font-family="Helvetica, Arial, sans-serif" font-size="18" text-anchor="start">
+    <tspan x="1400" y="774.15">Dedicated identity per worker</tspan>
+    <tspan x="1400" y="798.45">Only its own feature stores</tspan>
+  </text>
+  <rect id="source-tools" x="48" y="990" width="1182" height="300" rx="16" fill="none" stroke="#e67700" stroke-width="2"/>
+  <text id="source-tools-title" fill="#000000" font-family="Helvetica, Arial, sans-serif" font-size="24" text-anchor="start">
+    <tspan x="68" y="1037.2">Source acquisition + extraction / selected by input type</tspan>
+  </text>
+  <rect id="public-sources" x="68" y="1080" width="330" height="185" rx="16" fill="#fff4e6" stroke="#e67700" stroke-width="1.5"/>
+  <text id="public-sources-title" fill="#000000" font-family="Helvetica, Arial, sans-serif" font-size="22" text-anchor="start">
+    <tspan x="88" y="1121.85">Public fetch + local parsers</tspan>
+  </text>
+  <text id="public-sources-detail" fill="#000000" font-family="Helvetica, Arial, sans-serif" font-size="18" text-anchor="start">
+    <tspan x="88" y="1177.15">Bounded public URLs / OPM</tspan>
+    <tspan x="88" y="1201.45">Local Markdown + DOC parsing</tspan>
+  </text>
+  <rect id="document-intelligence" x="418" y="1080" width="390" height="185" rx="16" fill="#fff4e6" stroke="#e67700" stroke-width="1.5"/>
+  <text id="document-intelligence-title" fill="#000000" font-family="Helvetica, Arial, sans-serif" font-size="22" text-anchor="start">
+    <tspan x="438" y="1121.85">Azure Document Intelligence</tspan>
+  </text>
+  <text id="document-intelligence-detail" fill="#000000" font-family="Helvetica, Arial, sans-serif" font-size="18" text-anchor="start">
+    <tspan x="438" y="1177.15">PDF text + OCR; DOCX text</tspan>
+    <tspan x="438" y="1201.45">Cloud document extraction</tspan>
+  </text>
+  <rect id="renderer" x="828" y="1080" width="380" height="185" rx="16" fill="#fff4e6" stroke="#e67700" stroke-width="1.5"/>
+  <text id="renderer-title" fill="#000000" font-family="Helvetica, Arial, sans-serif" font-size="22" text-anchor="start">
+    <tspan x="848" y="1121.85">Internal Chromium renderer</tspan>
+  </text>
+  <text id="renderer-detail" fill="#000000" font-family="Helvetica, Arial, sans-serif" font-size="18" text-anchor="start">
+    <tspan x="848" y="1177.15">Container App for JavaScript pages</tspan>
+    <tspan x="848" y="1201.45">No browser runtime credentials</tspan>
+  </text>
+  <rect id="foundry" x="1380" y="1030" width="370" height="240" rx="16" fill="#ebfbee" stroke="#2f9e44" stroke-width="2"/>
+  <text id="foundry-title" fill="#000000" font-family="Helvetica, Arial, sans-serif" font-size="24" text-anchor="start">
+    <tspan x="1400" y="1076.2">Foundry model inference</tspan>
+  </text>
+  <text id="foundry-detail" fill="#000000" font-family="Helvetica, Arial, sans-serif" font-size="20" text-anchor="start">
+    <tspan x="1400" y="1133.5">GPT-5 mini / job-rubric</tspan>
+    <tspan x="1400" y="1160.5">Rubrics, profiles, assessments</tspan>
+    <tspan x="1400" y="1187.5">Saved narratives + review</tspan>
+  </text>
+  <rect id="local-mode" x="48" y="1340" width="550" height="220" rx="16" fill="#f8f9fa" stroke="#495057" stroke-width="1.5" stroke-dasharray="8 6"/>
+  <text id="local-mode-title" fill="#000000" font-family="Helvetica, Arial, sans-serif" font-size="22" text-anchor="start">
+    <tspan x="68" y="1380.85">Separate mode / local samples</tspan>
+  </text>
+  <text id="local-mode-detail" fill="#000000" font-family="Helvetica, Arial, sans-serif" font-size="18" text-anchor="start">
+    <tspan x="68" y="1433.15">Vite + fictional fixtures + browser local storage</tspan>
+    <tspan x="68" y="1457.45">No real uploads, extraction, or AI calls</tspan>
+    <tspan x="68" y="1481.75">Cloud errors never switch to samples</tspan>
+  </text>
+  <rect id="privacy-boundary" x="628" y="1340" width="1122" height="220" rx="16" fill="#f8f9fa" stroke="#495057" stroke-width="1.5"/>
+  <text id="privacy-boundary-title" fill="#000000" font-family="Helvetica, Arial, sans-serif" font-size="22" text-anchor="start">
+    <tspan x="648" y="1380.85">Private evidence stays out of shared search</tspan>
+  </text>
+  <text id="privacy-boundary-detail" fill="#000000" font-family="Helvetica, Arial, sans-serif" font-size="18" text-anchor="start">
+    <tspan x="648" y="1433.15">Analysis uses frozen analysis stores, not live job/resume/grade stores or extraction services.</tspan>
+    <tspan x="648" y="1457.45">Shared AI Search / Foundry IQ: a nonsensitive app guide, never private source/result indexing.</tspan>
+    <tspan x="648" y="1481.75">This is repository-defined architecture; deployed services and feature flags control availability.</tspan>
+  </text>
+  <polyline id="browser-api" points="378,555 460,555" fill="none" stroke="#495057" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-start="url(#arrow-495057)" marker-end="url(#arrow-495057)"/>
+  <text id="browser-api-label" fill="#000000" font-family="Helvetica, Arial, sans-serif" font-size="16" text-anchor="middle">
+    <tspan x="419" y="500.8">HTTPS</tspan>
+  </text>
+  <text id="browser-api-detail" fill="#000000" font-family="Helvetica, Arial, sans-serif" font-size="16" text-anchor="middle">
+    <tspan x="419" y="598.8">Upload</tspan>
+    <tspan x="419" y="620.4">Review</tspan>
+    <tspan x="419" y="642">Poll status</tspan>
+  </text>
+  <polyline id="entra-api" points="630,385 630,430" fill="none" stroke="#862e9c" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow-862e9c)"/>
+  <text id="entra-api-label" fill="#000000" font-family="Helvetica, Arial, sans-serif" font-size="16" text-anchor="start">
+    <tspan x="650" y="410.8">Easy Auth</tspan>
+  </text>
+  <polyline id="api-cosmos" points="800,480 890,480" fill="none" stroke="#495057" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-start="url(#arrow-495057)" marker-end="url(#arrow-495057)"/>
+  <text id="api-cosmos-label" fill="#000000" font-family="Helvetica, Arial, sans-serif" font-size="16" text-anchor="middle">
+    <tspan x="845" y="418.8">Records +</tspan>
+    <tspan x="845" y="440.4">queued work</tspan>
+  </text>
+  <polyline id="api-blobs" points="800,660 890,660" fill="none" stroke="#495057" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-start="url(#arrow-495057)" marker-end="url(#arrow-495057)"/>
+  <text id="api-blobs-label" fill="#000000" font-family="Helvetica, Arial, sans-serif" font-size="16" text-anchor="middle">
+    <tspan x="845" y="608.8">Uploads /</tspan>
+    <tspan x="845" y="630.4">snapshots</tspan>
+  </text>
+  <polyline id="cosmos-workers" points="1240,410 1370,410" fill="none" stroke="#495057" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-start="url(#arrow-495057)" marker-end="url(#arrow-495057)"/>
+  <text id="cosmos-workers-label" fill="#000000" font-family="Helvetica, Arial, sans-serif" font-size="16" text-anchor="middle">
+    <tspan x="1305" y="359.8">Claim work /</tspan>
+    <tspan x="1305" y="381.4">write status</tspan>
+  </text>
+  <polyline id="blobs-workers" points="1240,690 1370,690" fill="none" stroke="#495057" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-start="url(#arrow-495057)" marker-end="url(#arrow-495057)"/>
+  <text id="blobs-workers-label" fill="#000000" font-family="Helvetica, Arial, sans-serif" font-size="16" text-anchor="middle">
+    <tspan x="1305" y="638.8">Own sources /</tspan>
+    <tspan x="1305" y="660.4">results</tspan>
+  </text>
+  <polyline id="workers-sources" points="1410,860 1410,925 640,925 640,980" fill="none" stroke="#e67700" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-start="url(#arrow-e67700)" marker-end="url(#arrow-e67700)"/>
+  <text id="workers-sources-label" fill="#000000" font-family="Helvetica, Arial, sans-serif" font-size="18" text-anchor="middle">
+    <tspan x="1055" y="888.15">Jobs / grades / resumes only: fetch + extract</tspan>
+  </text>
+  <polyline id="workers-foundry" points="1565,860 1565,1020" fill="none" stroke="#2f9e44" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-start="url(#arrow-2f9e44)" marker-end="url(#arrow-2f9e44)"/>
+  <text id="workers-foundry-label" fill="#000000" font-family="Helvetica, Arial, sans-serif" font-size="16" text-anchor="start">
+    <tspan x="1590" y="920.8">All four workers</tspan>
+    <tspan x="1590" y="942.4">Grounded inference</tspan>
+  </text>
+</svg>

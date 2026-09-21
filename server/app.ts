@@ -27,6 +27,8 @@ import { createJobLifecycleParticipant } from './jobs/lifecycle'
 import { createGradeLifecycleParticipant } from './grades/lifecycle'
 import { createResumeLifecycleParticipant } from './resumes/lifecycle'
 import { createAnalysisLifecycleParticipant } from './analyses/library-lifecycle'
+import { recordRequestError, telemetryMiddleware, telemetryRequests } from './telemetry-http'
+import { errorCategory, safeMethod, safeRoute } from './telemetry-schema'
 export { WorkspaceRepository } from './repository'
 export { WorkspaceLifecycleService } from './lifecycle/service'
 export { createLifecycleDependencies } from './lifecycle/dependencies'
@@ -152,7 +154,7 @@ export function createApp(deps: AppDeps): Express {
   const grades = config.realGrades && deps.grades?.store && deps.grades.blobs ? deps.grades : undefined
   const resumes = config.realResumes && deps.resumes?.store && deps.resumes.blobs ? deps.resumes : undefined
   const analyses = config.realAnalyses && deps.analyses?.store && deps.analyses.blobs
-    ? deps.analyses : undefined
+    ? { ...deps.analyses, evidenceCorrectionsEnabled: config.realAnalyses.evidenceCorrectionsEnabled === true } : undefined
   const canCreateAnalyses = Boolean(analyses && resumes && (jobs || grades))
   const wordDocumentImports = config.wordDocumentImports === true
 
@@ -160,6 +162,7 @@ export function createApp(deps: AppDeps): Express {
   app.locals.reconcileLifecycle = () => workspaceLifecycle.reconcile()
   app.locals.bootstrapSettings = async () => deps.settings?.current()
   app.disable('x-powered-by')
+  app.use(telemetryRequests)
   const parseJson = express.json({ limit: MAX_JSON_BODY })
   app.use((req, res, next) => {
     // Even a mislabeled JSON upload must reach authorization before body parsing.
@@ -174,8 +177,8 @@ export function createApp(deps: AppDeps): Express {
 
   const api = express.Router()
   api.use(noStore)
-  api.use(createAuthMiddleware(config))
-  api.use(createCsrfMiddleware(config))
+  api.use(telemetryMiddleware('score.auth', createAuthMiddleware(config)))
+  api.use(telemetryMiddleware('score.csrf', createCsrfMiddleware(config)))
   api.use(attachSettingsContext(config, deps.settings))
   api.use(createAdminSettingsRouter(config, deps.settings))
   api.get('/features', async (req, res) => {
@@ -183,6 +186,7 @@ export function createApp(deps: AppDeps): Express {
     res.json(effectiveFeatures({
       realJobImports: Boolean(jobs), realGradeLadders: Boolean(grades), realResumeImports: Boolean(resumes),
       realAnalyses: canCreateAnalyses, analysisSummaryGeneration: Boolean(analyses),
+      analysisEvidenceCorrections: Boolean(analyses?.evidenceCorrectionsEnabled),
       wordDocumentImports: wordDocumentImports && Boolean(jobs || resumes),
     }, snapshot, config.settings?.runtimeEnabled === true, Boolean(config.settings || deps.settings)))
   })
@@ -255,10 +259,11 @@ export function createApp(deps: AppDeps): Express {
   })
 
   // Every remaining route (the static SPA shell/assets) also requires a valid principal.
-  app.use(createAuthMiddleware(config))
+  app.use(telemetryMiddleware('score.auth', createAuthMiddleware(config)))
   mountStaticSpa(app, distDir)
 
   app.use((err: unknown, req: Request, res: Response, next: NextFunction) => {
+    recordRequestError(err)
     if (res.headersSent) {
       next(err)
       return
@@ -278,9 +283,9 @@ export function createApp(deps: AppDeps): Express {
       }
     }
     console.error('Unhandled server error:', {
-      name: err instanceof Error ? err.name : 'UnknownError',
-      method: req.method,
-      path: req.path,
+      category: errorCategory(err),
+      method: safeMethod(req.method),
+      route: safeRoute(req.originalUrl),
     })
     res.status(503).json(toCloudApiError(unavailable()))
   })

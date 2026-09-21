@@ -6,6 +6,7 @@ import type { ReferenceDocument } from '../../src/domain/real-grades'
 import type { ImmutableBlobReference, ImmutableJsonBlobReference } from '../../src/domain/real-resumes'
 import { ANALYSIS_LIMITS } from '../../src/domain/real-analyses'
 import { invalidRequest } from '../errors'
+import { traceOperation } from '../telemetry-operations'
 import { validateGradeApproval, validateReferenceDocument } from '../grades/validation'
 import { preservesProcessingSettings } from '../jobs/policy'
 import type { AnalysisBlob, AnalysisBlobStore } from './store'
@@ -22,6 +23,33 @@ export interface AnalysisSnapshots {
 
 type AnalysisBlobReader = Pick<AnalysisBlobStore, 'read'>
 
+/** A bounded immutable-byte cache owned by one read request, never a shared private-content cache. */
+export function createAnalysisImmutableBlobReader(blobs: AnalysisBlobReader): AnalysisBlobReader {
+  const cache = new Map<string, Promise<AnalysisBlob | undefined>>()
+  let retainedBytes = 0
+  return {
+    async read(name, signal) {
+      signal?.throwIfAborted()
+      let pending = cache.get(name)
+      if (!pending) {
+        pending = blobs.read(name, signal)
+        if (cache.size < 16) {
+          const retained = pending.then(blob => {
+            if (!blob || retainedBytes + blob.bytes.byteLength > MAX_ANALYSIS_JSON_BYTES) cache.delete(name)
+            else retainedBytes += blob.bytes.byteLength
+            return blob
+          }, error => { cache.delete(name); throw error })
+          cache.set(name, retained)
+          pending = retained
+        }
+      }
+      const blob = await pending
+      signal?.throwIfAborted()
+      return blob
+    },
+  }
+}
+
 export function parseAnalysisJson(blob: AnalysisBlob): unknown {
   assertAnalysis(blob.contentType === 'application/json' && blob.bytes.byteLength <= MAX_ANALYSIS_JSON_BYTES &&
     blob.sha256 === analysisBytesHash(blob.bytes), 'Invalid JSON blob metadata or digest.')
@@ -36,10 +64,12 @@ export function analysisBlobReference(name: string, blob: AnalysisBlob): Immutab
 }
 
 export async function readAnalysisBlob(
-  blobs: AnalysisBlobReader, reference: ImmutableBlobReference, workspaceId: string, runId: string,
+  blobs: AnalysisBlobReader, reference: ImmutableBlobReference, workspaceId: string, runId: string, signal?: AbortSignal,
 ): Promise<AnalysisBlob> {
+  signal?.throwIfAborted()
   assertAnalysis(analysisBlobInRun(reference.blobName, workspaceId, runId), 'Blob is outside the analysis run.')
-  const blob = await blobs.read(reference.blobName)
+  const blob = await blobs.read(reference.blobName, signal)
+  signal?.throwIfAborted()
   assertAnalysis(blob && blob.contentType === reference.contentType && blob.bytes.byteLength === reference.bytes &&
     blob.sha256 === reference.sha256 && analysisBytesHash(blob.bytes) === reference.sha256, 'Captured blob is missing or its digest changed.')
   return blob
@@ -58,17 +88,18 @@ export async function putAnalysisJson(
 }
 
 export async function readAnalysisManifest(
-  blobs: AnalysisBlobReader, run: RealAnalysisRunRecord,
+  blobs: AnalysisBlobReader, run: RealAnalysisRunRecord, signal?: AbortSignal,
 ): Promise<RealAnalysisInitializationManifest> {
-  parseAnalysisEntity(run)
-  const manifest = parseAnalysisInitializationManifest(parseAnalysisJson(await readAnalysisBlob(blobs, run.manifest, run.workspaceId, run.id)))
-  assertAnalysis(manifest.workspaceId === run.workspaceId && manifest.runId === run.id &&
-    manifest.createdAt === run.createdAt && manifest.createdBy === run.createdBy &&
-    manifest.inputFingerprint === run.inputFingerprint && manifest.request.name === run.name &&
-    manifest.comparisons.length === run.progress.total &&
-    preservesProcessingSettings(manifest.processingSettings, run.processingSettings),
-  'Manifest does not belong to this run.')
-  return manifest
+  return traceOperation('score.analysis.manifest.read', { 'score.operation.bytes': run.manifest.bytes }, async () => {
+    parseAnalysisEntity(run)
+    const manifest = parseAnalysisInitializationManifest(parseAnalysisJson(await readAnalysisBlob(blobs, run.manifest, run.workspaceId, run.id, signal)))
+    assertAnalysis(manifest.workspaceId === run.workspaceId && manifest.runId === run.id &&
+      manifest.createdAt === run.createdAt && manifest.createdBy === run.createdBy &&
+      manifest.inputFingerprint === run.inputFingerprint && manifest.request.name === run.name &&
+      manifest.comparisons.length === run.progress.total &&
+      preservesProcessingSettings(manifest.processingSettings, run.processingSettings), 'Manifest does not belong to this run.')
+    return manifest
+  })
 }
 
 export function assertComparisonManifestBinding(
@@ -85,9 +116,9 @@ export function assertComparisonManifestBinding(
 }
 
 async function validatedReferenceDocument(
-  blobs: AnalysisBlobReader, run: RealAnalysisRunRecord, reference: ImmutableJsonBlobReference,
+  blobs: AnalysisBlobReader, run: RealAnalysisRunRecord, reference: ImmutableJsonBlobReference, signal?: AbortSignal,
 ): Promise<ReferenceDocument> {
-  const document = parseAnalysisJson(await readAnalysisBlob(blobs, reference, run.workspaceId, run.id)) as ReferenceDocument
+  const document = parseAnalysisJson(await readAnalysisBlob(blobs, reference, run.workspaceId, run.id, signal)) as ReferenceDocument
   assertAnalysis(validateReferenceDocument(document).length === 0, 'Invalid frozen reference document.')
   return document
 }
@@ -113,9 +144,9 @@ async function bindReferenceDocuments(
 }
 
 export async function readAnalysisReferenceDocuments(
-  blobs: AnalysisBlobReader, run: RealAnalysisRunRecord, target: FrozenGradeTargetSnapshot,
+  blobs: AnalysisBlobReader, run: RealAnalysisRunRecord, target: FrozenGradeTargetSnapshot, signal?: AbortSignal,
 ): Promise<ReferenceDocument[]> {
-  return bindReferenceDocuments(target, reference => validatedReferenceDocument(blobs, run, reference))
+  return bindReferenceDocuments(target, reference => validatedReferenceDocument(blobs, run, reference, signal))
 }
 
 function assertSnapshotSummaryBinding(
@@ -134,33 +165,35 @@ function assertSnapshotSummaryBinding(
 }
 
 export async function readAnalysisSnapshots(
-  blobs: AnalysisBlobReader, run: RealAnalysisRunRecord, comparison: RealAnalysisComparisonRecord,
+  blobs: AnalysisBlobReader, run: RealAnalysisRunRecord, comparison: RealAnalysisComparisonRecord, signal?: AbortSignal,
 ): Promise<AnalysisSnapshots> {
   parseAnalysisEntity(comparison)
-  const manifest = await readAnalysisManifest(blobs, run)
+  const manifest = await readAnalysisManifest(blobs, run, signal)
   assertComparisonManifestBinding(manifest, comparison)
   const [resumeBlob, targetBlob] = await Promise.all([
-    readAnalysisBlob(blobs, comparison.resume.blob, run.workspaceId, run.id),
-    readAnalysisBlob(blobs, comparison.target.blob, run.workspaceId, run.id),
+    readAnalysisBlob(blobs, comparison.resume.blob, run.workspaceId, run.id, signal),
+    readAnalysisBlob(blobs, comparison.target.blob, run.workspaceId, run.id, signal),
   ])
   const resumeSnapshot = parseFrozenResumeSnapshot(parseAnalysisJson(resumeBlob))
   const targetSnapshot = parseFrozenTargetSnapshot(parseAnalysisJson(targetBlob))
   assertSnapshotSummaryBinding(manifest, comparison, { resumeSnapshot, targetSnapshot })
   if (targetSnapshot.kind === 'grade') {
-    await readAnalysisReferenceDocuments(blobs, run, targetSnapshot)
+    await readAnalysisReferenceDocuments(blobs, run, targetSnapshot, signal)
   } else {
-    await readAnalysisBlob(blobs, targetSnapshot.original, run.workspaceId, run.id)
+    await readAnalysisBlob(blobs, targetSnapshot.original, run.workspaceId, run.id, signal)
   }
   return { resumeSnapshot, targetSnapshot }
 }
 
 export async function readAnalysisResult(
   blobs: AnalysisBlobReader, run: RealAnalysisRunRecord, comparison: RealAnalysisComparisonRecord, snapshots?: AnalysisSnapshots,
+  signal?: AbortSignal,
 ): Promise<RealAnalysisResult | null> {
+  signal?.throwIfAborted()
   parseAnalysisEntity(comparison)
   if (!comparison.result) return null
-  const captured = snapshots ?? await readAnalysisSnapshots(blobs, run, comparison)
-  const result = parseAnalysisResult(parseAnalysisJson(await readAnalysisBlob(blobs, comparison.result, run.workspaceId, run.id)))
+  const captured = snapshots ?? await readAnalysisSnapshots(blobs, run, comparison, signal)
+  const result = parseAnalysisResult(parseAnalysisJson(await readAnalysisBlob(blobs, comparison.result, run.workspaceId, run.id, signal)))
   assertAnalysisResultBinding(result, run, comparison, captured.resumeSnapshot, captured.targetSnapshot)
   assertAnalysis(analysisHash({ completion: result.completion, overall: result.overall, coverage: result.coverage }) ===
     analysisHash(comparison.resultSummary), 'Comparison summary differs from its immutable result.')
@@ -184,7 +217,7 @@ export function createAnalysisSnapshotReader(
   const boundedBlobs: AnalysisBlobReader = {
     async read(name) {
       options.signal?.throwIfAborted()
-      const blob = await blobs.read(name)
+      const blob = await blobs.read(name, options.signal)
       options.signal?.throwIfAborted()
       bytesRead += blob?.bytes.byteLength ?? 0
       if (bytesRead > options.maxBytes) {

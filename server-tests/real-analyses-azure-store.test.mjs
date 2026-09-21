@@ -2,14 +2,17 @@ import assert from 'node:assert/strict'
 import { Readable } from 'node:stream'
 import test from 'node:test'
 import { randomUUID } from 'node:crypto'
+import { setImmediate as nextTurn } from 'node:timers/promises'
 import { api, fixture, createRun, publishResult, NOW, LATER, ACTOR, clone } from './real-analyses.test-support.mjs'
 import { narrativeRuntime, narrativeWorker } from './real-analysis-narratives.test-support.mjs'
+import { reviewedCorrection } from './analysis-corrections.test-support.mjs'
 
 function cosmos() {
   const values = new Map()
   const batches = []
   const queries = []
   const replacements = []
+  const reads = []
   let counter = 0
   let code
   let race
@@ -22,12 +25,13 @@ function cosmos() {
     return clone(resource)
   }
   return {
-    values, batches, queries, replacements, save,
+    values, batches, queries, replacements, reads, save,
     _fail(value) { code = value },
     _race(callback) { race = callback },
     item(id, workspaceId) {
       return {
-        async read() {
+        async read(options) {
+          reads.push({ workspaceId, id, options })
           const resource = values.get(key(workspaceId, id))
           return { statusCode: resource ? 200 : 404, resource: clone(resource) }
         },
@@ -52,6 +56,7 @@ function cosmos() {
           (!options?.partitionKey || record.workspaceId === options.partitionKey) &&
           (!parameter('@recordType') || record.recordType === parameter('@recordType')) &&
           (!parameter('@runId') || record.runId === parameter('@runId')) &&
+          (!parameter('@targetId') || (record.recordType === 'analysis-comparison' ? record.target.summary.id : record.targetId) === parameter('@targetId')) &&
           (!parameter('@status') || record.status === parameter('@status')) &&
           (!parameter('@now') || api.analysisWorkIsPending(record, parameter('@now')))).map(clone)
         return {
@@ -102,14 +107,63 @@ async function initializedPair() {
   return { f, run: created.run, comparison, initial }
 }
 
-function backedFixture(original) {
+function backedFixture(original, correctionsEnabled = false) {
   const container = cosmos()
   for (const value of [...original.analysis.store.values.values(), ...original.analysis.store.controls.values()]) container.save(value.record)
-  const store = api.createAnalysisStoreFromContainer(container)
+  const store = api.createAnalysisStoreFromContainer(container, correctionsEnabled)
   const f = { ...original, analysis: { ...original.analysis, store } }
   f.service = new api.RealAnalysisService(f.analysis, f, () => new Date(f.now))
   return { f, store, container }
 }
+
+test('Cosmos correction publication atomically preserves original evidence, changes effective counts, and binds new summary identities', async () => {
+  const initial = fixture()
+  initial.analysis.evidenceCorrectionsEnabled = true
+  const created = await createRun(initial)
+  const comparisonId = (await initial.service.comparisons(initial.workspaceId, created.run.id)).comparisons[0].comparison.id
+  await publishResult(initial, created.run.id, comparisonId, true)
+  const { f, store, container } = backedFixture(initial, true)
+  const original = await store.get(f.workspaceId, comparisonId)
+  const preview = await f.service.correctionPreview(f.workspaceId, created.run.id, comparisonId)
+  const response = await f.service.requestCorrection(f.workspaceId, created.run.id, comparisonId, {
+    resultSha256: preview.resultSha256, criterionIds: preview.criterionIds, reason: 'Synthetic reviewed evidence gap.',
+  }, randomUUID(), preview.etag, ACTOR)
+  const accepted = await api.loadAnalysisCorrection(store, f.workspaceId, created.run.id, comparisonId)
+  const runFence = await store.get(f.workspaceId, created.run.id)
+  const otherPolicy = api.captureProcessingSettings(api.createDefaultAdminSettings(), 'different-correction-policy', f.now)
+  for (const processingSettings of [undefined, otherPolicy]) {
+    const record = clone(accepted.record)
+    if (processingSettings) record.processingSettings = processingSettings
+    else delete record.processingSettings
+    await assert.rejects(store.transact(f.workspaceId, [
+      { kind: 'replace', record, etag: accepted.etag },
+      { kind: 'replace', record: runFence.record, etag: runFence.etag },
+    ]), /Accepted correction processing settings are immutable/)
+    assert.deepEqual(await api.loadAnalysisCorrection(store, f.workspaceId, created.run.id, comparisonId), accepted)
+  }
+  assert.ok((await store.listPending(f.now, 100)).some(item => item.record.recordType === 'analysis-correction'))
+  assert.ok(!(await api.createAnalysisStoreFromContainer(container).listPending(f.now, 100))
+    .some(item => item.record.recordType === 'analysis-correction'))
+  const prepared = await reviewedCorrection({ f, runId: created.run.id, comparisonId })
+  await prepared.publish()
+  await prepared.publish()
+  assert.deepEqual(await store.get(f.workspaceId, comparisonId), original)
+  const current = await f.service.comparisonDetail(f.workspaceId, created.run.id, comparisonId)
+  assert.equal(current.result.overall.score, 0)
+  assert.equal(current.comparison.resultRevision.id, response.requestId)
+  const parent = await store.get(f.workspaceId, created.run.id)
+  assert.equal(parent.record.progress.scored, 1)
+  assert.equal(parent.record.progress.unscored, 0)
+  const publications = container.batches.filter(batch => batch.some(item =>
+    item.resourceBody?.recordType === 'analysis-correction' && item.resourceBody.status === 'ready'))
+  assert.equal(publications.length, 1)
+  assert.equal(publications[0].filter(item => item.resourceBody?.recordType === 'analysis-candidate-narrative').length, 1)
+  assert.equal(publications[0].filter(item => item.resourceBody?.recordType === 'analysis-target-narrative').length, 1)
+  await assert.rejects(store.transact(f.workspaceId, [
+    { kind: 'replace', record: { ...original.record, ...current.comparison }, etag: original.etag },
+    { kind: 'replace', record: parent.record, etag: parent.etag },
+  ]), /projections|Completed evidence/)
+})
 
 test('Cosmos publishes automatic sidecars and selected refreshes with exact root/control CAS while completed comparisons remain immutable', async () => {
   const original = fixture()
@@ -458,6 +512,88 @@ test('blob adapter enforces safe namespaces, bounds, exact media metadata and im
   await assert.rejects(store.read(name), /bounded size/)
   badLength = 999
   await assert.rejects(store.read(name), /truncated/)
+})
+
+test('analysis metadata reads pass cancellation to Cosmos and scope narrative queries to the exact target', async () => {
+  const original = fixture(), created = await createRun(original, 1, 2)
+  const pairs = [...original.analysis.store.values.values()].filter(value => value.record.recordType === 'analysis-comparison')
+  for (const pair of pairs) await publishResult(original, created.run.id, pair.record.id)
+  const { f, store, container } = backedFixture(original)
+  const controller = new AbortController(), signal = controller.signal
+  const targetId = pairs[0].record.target.summary.id
+  await store.get(f.workspaceId, created.run.id, signal)
+  await store.getControl(f.workspaceId, undefined, signal)
+  assert.ok(container.reads.every(call => call.options.abortSignal === signal))
+  for (const recordType of ['analysis-comparison', 'analysis-candidate-narrative', 'analysis-target-narrative']) {
+    const page = await store.list(f.workspaceId, { recordType, runId: created.run.id, targetId, limit: 100, signal })
+    assert.equal(page.items.length, 1)
+    const query = container.queries.at(-1)
+    assert.equal(query.options.abortSignal, signal)
+    assert.ok(query.spec.query.includes(`${recordType === 'analysis-comparison' ? 'c.target.summary.id' : 'c.targetId'} = @targetId`))
+    assert.equal(query.spec.parameters.find(value => value.name === '@targetId').value, targetId)
+  }
+  await assert.rejects(store.list(f.workspaceId, { recordType: 'analysis-run', targetId, signal }), /target filter/)
+  const before = { reads: container.reads.length, queries: container.queries.length }
+  controller.abort()
+  await assert.rejects(store.get(f.workspaceId, created.run.id, signal), { name: 'AbortError' })
+  await assert.rejects(store.getControl(f.workspaceId, undefined, signal), { name: 'AbortError' })
+  await assert.rejects(store.list(f.workspaceId, { recordType: 'analysis-comparison', runId: created.run.id, signal }), { name: 'AbortError' })
+  assert.deepEqual({ reads: container.reads.length, queries: container.queries.length }, before)
+
+  const during = new AbortController()
+  let pages = 0
+  container.items.query = (_spec, options) => {
+    assert.equal(options.abortSignal, during.signal)
+    return { async fetchNext() {
+      pages++
+      during.abort()
+      return { hasMoreResults: true }
+    } }
+  }
+  await assert.rejects(store.list(f.workspaceId, {
+    recordType: 'analysis-comparison', runId: created.run.id, signal: during.signal,
+  }), { name: 'AbortError' })
+  assert.equal(pages, 1, 'Cancellation stops Cosmos progress-only pagination rather than starting the next request.')
+})
+
+test('Azure analysis blob reads forward AbortSignal, destroy cancelled bodies, and retain streaming byte bounds', async () => {
+  const name = `workspace-one/analysis-run-${randomUUID()}/manifest.json`
+  let calls = 0, options
+  const stream = new Readable({ read() {} })
+  const store = api.createAnalysisBlobStoreFromContainer({
+    getBlockBlobClient() {
+      return {
+        async download(offset, count, requestOptions) {
+          calls++
+          options = requestOptions
+          assert.equal(offset, 0)
+          assert.equal(count, undefined)
+          return { readableStreamBody: stream, contentType: 'application/json', contentLength: 2, etag: '"saved"' }
+        },
+      }
+    },
+  })
+  const controller = new AbortController()
+  const reading = store.read(name, controller.signal)
+  const rejected = assert.rejects(reading, { name: 'AbortError' })
+  await nextTurn()
+  assert.equal(options.abortSignal, controller.signal)
+  assert.equal(stream.destroyed, false)
+  controller.abort()
+  await rejected
+  assert.equal(stream.destroyed, true)
+  await assert.rejects(store.read(name, controller.signal), { name: 'AbortError' })
+  assert.equal(calls, 1)
+  const oversized = Readable.from([Buffer.alloc(api.MAX_ANALYSIS_JSON_BYTES), Buffer.from('x')])
+  const bounded = api.createAnalysisBlobStoreFromContainer({
+    getBlockBlobClient() {
+      return {
+        async download() { return { readableStreamBody: oversized, contentType: 'application/json', etag: '"oversized"' } },
+      }
+    },
+  })
+  await assert.rejects(bounded.read(name), /bounded size/)
+  assert.equal(oversized.destroyed, true)
 })
 
 test('analysis Markdown originals round-trip as immutable .md blobs with exact media and 10 MiB bounds', async () => {

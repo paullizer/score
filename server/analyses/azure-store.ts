@@ -23,9 +23,11 @@ import {
 import {
   analysisNarrativeCanWork, analysisNarrativeRequestCanAdvance, analysisNarrativeRequestCancelled, candidateNarrativeBinding,
 } from './narrative-records'
+import { analysisCorrectionCanWork, projectAnalysisComparison } from './current-results'
 import {
-  analysisBlobInRun, analysisBytesHash, analysisCancellationNeedsRetry, analysisHash, assertAnalysis, isAnalysisId, isSafeAnalysisBlobName, MAX_ANALYSIS_JSON_BYTES,
-  isAnalysisRecordId, MAX_ANALYSIS_ORIGINAL_BYTES, MAX_ANALYSIS_TRANSACTION_BYTES, parseAnalysisEntity,
+  analysisBlobInRun, analysisBytesHash, analysisCancellationNeedsRetry, analysisHash, analysisNarrativeTargetIdSchema,
+  assertAnalysis, isAnalysisId, isSafeAnalysisBlobName, MAX_ANALYSIS_JSON_BYTES,
+  analysisCorrectionId, analysisNarrativeId, isAnalysisRecordId, MAX_ANALYSIS_ORIGINAL_BYTES, MAX_ANALYSIS_TRANSACTION_BYTES, parseAnalysisEntity,
 } from './validation'
 
 function status(error: unknown): number | undefined {
@@ -47,6 +49,8 @@ function decode(value: unknown, workspaceId?: string, id?: string): VersionedAna
   const tag = data._etag
   for (const field of ['_etag', '_rid', '_self', '_attachments', '_ts']) delete data[field]
   const record = parseAnalysisEntity(data)
+  assertAnalysis(record.recordType !== 'analysis-comparison' || !record.resultRevision,
+    'Corrected results belong in a separate head, not the original comparison record.')
   assertAnalysis(typeof tag === 'string' && tag && (workspaceId === undefined || record.workspaceId === workspaceId) &&
     (id === undefined || record.id === id), 'Stored ownership or ETag mismatch.')
   return { record, etag: tag }
@@ -100,6 +104,39 @@ export function assertAnalysisReplacement(previous: AnalysisEntity, next: Analys
       'Failure diagnostic history cannot be erased or an immutable attempt replaced.')
     }
     assertAnalysis(previous.status !== 'complete' || analysisHash(previous) === analysisHash(next), 'Completed evidence cannot be retried, cancelled, or changed.')
+  } else if (previous.recordType === 'analysis-correction' && next.recordType === 'analysis-correction') {
+    for (const key of ['runId', 'comparisonId', 'manifestSha256', 'originalResult', 'resumeSnapshot', 'targetSnapshot'] as const) {
+      assertAnalysis(analysisHash(previous[key]) === analysisHash(next[key]), 'Correction ancestry and frozen inputs are immutable.')
+    }
+    if (previous.requestId === next.requestId) {
+      assertAnalysis(preservesProcessingSettings(previous.processingSettings, next.processingSettings),
+        'Accepted correction processing settings are immutable.')
+      for (const key of ['requestFingerprint', 'requestedAt', 'requestedBy', 'reason', 'policyVersion', 'criterionIds',
+        'baseResult', 'baseAttemptId', 'baseRevision', 'proposal'] as const) {
+        assertAnalysis(analysisHash(previous[key] ?? null) === analysisHash(next[key] ?? null),
+          'An accepted correction request cannot change its proposal or base result.')
+      }
+      assertAnalysis(next.attempts >= previous.attempts && next.retryCount === previous.retryCount &&
+        (previous.status !== 'ready' || analysisHash(previous) === analysisHash(next)) &&
+        (!['failed', 'cancelled'].includes(previous.status) || next.status === previous.status),
+      'Terminal corrections require a new explicit request.')
+    } else {
+      assertAnalysis(['ready', 'failed', 'cancelled'].includes(previous.status) && next.status === 'queued' &&
+        next.attempts === 0 && !next.lease && !next.attemptId && next.requestedAt >= previous.updatedAt &&
+        next.retryCount === previous.retryCount + 1 &&
+        analysisHash(previous.history ?? null) === analysisHash(next.history ?? null),
+      'A new correction must preserve stopped work and its audit history.')
+      assertAnalysis(analysisHash(next.baseResult) === analysisHash(previous.published?.result ?? previous.originalResult) &&
+        next.baseAttemptId === (previous.published?.attemptId ?? previous.baseAttemptId) &&
+        analysisHash(next.baseRevision ?? null) === analysisHash(previous.published?.revision ?? null),
+      'A new correction must start from the current published result.')
+    }
+    assertAnalysis(!previous.history || next.history && (next.history.id !== previous.history.id ||
+      analysisHash(next.history) === analysisHash(previous.history)), 'Correction history cannot be erased or overwritten.')
+    assertAnalysis(analysisHash(previous.published ?? null) === analysisHash(next.published ?? null) ||
+      previous.status === 'running' && previous.requestId === next.requestId && next.status === 'ready' &&
+      next.published?.revision.id === next.requestId && next.published.result.sha256 !== next.baseResult.sha256,
+    'A correction must retain the previous result until the exact leased replacement is ready.')
   } else if (previous.recordType === 'analysis-narrative-request' && next.recordType === 'analysis-narrative-request') {
     assertAnalysis(preservesProcessingSettings(previous.processingSettings, next.processingSettings),
       'Accepted summary scheduling settings are immutable.')
@@ -116,6 +153,7 @@ export function assertAnalysisReplacement(previous: AnalysisEntity, next: Analys
     'Narrative frozen target identity is immutable.')
     if (previous.recordType === 'analysis-candidate-narrative' && next.recordType === 'analysis-candidate-narrative') {
       assertAnalysis(previous.comparisonId === next.comparisonId && previous.resultSha256 === next.resultSha256 &&
+        previous.resultRevisionId === next.resultRevisionId &&
         previous.inputFingerprint === next.inputFingerprint && analysisHash(previous.resumeSnapshot) === analysisHash(next.resumeSnapshot),
       'Narrative frozen comparison identity is immutable.')
     }
@@ -176,9 +214,11 @@ export function analysisWorkIsPending(record: AnalysisEntity, now: string): bool
 
 export function createAzureAnalysisStore(config: RealAnalysesConfig, credential: TokenCredential): AnalysisStore {
   const client = new CosmosClient({ endpoint: config.cosmosEndpoint, aadCredentials: credential })
-  return createAnalysisStoreFromContainer(client.database(config.database).container(config.container))
+  return createAnalysisStoreFromContainer(client.database(config.database).container(config.container), config.evidenceCorrectionsEnabled)
 }
-export function createAnalysisStoreFromContainer(container: Pick<Container, 'item' | 'items'>): AnalysisStore {
+export function createAnalysisStoreFromContainer(
+  container: Pick<Container, 'item' | 'items'>, correctionsEnabled = false,
+): AnalysisStore {
   async function batch(workspaceId: string, operations: OperationInput[], controls: NonNullable<AnalysisTransactionOptions['controls']>) {
     const input: OperationInput[] = [
       ...controls.map<OperationInput>(control => control.etag
@@ -204,25 +244,32 @@ export function createAnalysisStoreFromContainer(container: Pick<Container, 'ite
     }
   }
   const store: AnalysisStore = {
-    async get(workspaceId, id) {
+    async get(workspaceId, id, signal) {
+      signal?.throwIfAborted()
       scope(workspaceId, id)
       try {
-        const response = await container.item(id, workspaceId).read()
+        const response = await container.item(id, workspaceId).read({ abortSignal: signal })
+        signal?.throwIfAborted()
         if (response.statusCode === 404 || !response.resource) return undefined
         return decode(response.resource, workspaceId, id)
       } catch (error) {
+        signal?.throwIfAborted()
         if (status(error) === 404) return undefined
         throw error
       }
     },
     async list<K extends AnalysisEntity['recordType']>(workspaceId: string, options: import('./store').AnalysisListOptions<K>) {
+      options.signal?.throwIfAborted()
       scope(workspaceId, options.runId)
       const limit = options.limit ?? 50
       assertAnalysis(Number.isInteger(limit) && limit > 0 && limit <= 100 &&
-        ['analysis-run', 'analysis-comparison', 'analysis-candidate-narrative', 'analysis-target-narrative', 'analysis-narrative-request'].includes(options.recordType) &&
+        ['analysis-run', 'analysis-comparison', 'analysis-candidate-narrative', 'analysis-target-narrative', 'analysis-narrative-request', 'analysis-correction'].includes(options.recordType) &&
         (options.runId === undefined || (options.recordType !== 'analysis-run' && isAnalysisId(options.runId, 'run'))) &&
         (options.continuationToken === undefined || (typeof options.continuationToken === 'string' &&
           options.continuationToken.length > 0 && options.continuationToken.length <= 12 * 1024)), 'Invalid analysis query options.')
+      assertAnalysis(options.targetId === undefined || options.runId !== undefined &&
+        ['analysis-comparison', 'analysis-candidate-narrative', 'analysis-target-narrative'].includes(options.recordType) &&
+        analysisNarrativeTargetIdSchema.safeParse(options.targetId).success, 'Invalid exact target filter.')
       const allowed = options.recordType === 'analysis-run'
         ? ['initializing', 'queued', 'running', 'complete', 'partial', 'failed', 'cancelled']
         : options.recordType === 'analysis-comparison' ? ['queued', 'running', 'complete', 'failed', 'cancelled']
@@ -235,13 +282,27 @@ export function createAnalysisStoreFromContainer(container: Pick<Container, 'ite
         filters.push(`c.${key} = @${key}`)
         parameters.push({ name: `@${key}`, value: options[key] })
       }
-      const response = await fetchCosmosPage(container.items.query({
+      if (options.targetId !== undefined) {
+        filters.push(`${options.recordType === 'analysis-comparison' ? 'c.target.summary.id' : 'c.targetId'} = @targetId`)
+        parameters.push({ name: '@targetId', value: options.targetId })
+      }
+      const iterator = container.items.query({
         query: `SELECT * FROM c WHERE ${filters.join(' AND ')} ORDER BY c.${options.recordType === 'analysis-comparison' ? 'index ASC' : 'createdAt DESC'}`,
         parameters,
-      }, { partitionKey: workspaceId, maxItemCount: limit, continuationToken: options.continuationToken }))
+      }, { partitionKey: workspaceId, maxItemCount: limit, continuationToken: options.continuationToken, abortSignal: options.signal })
+      const response = await fetchCosmosPage({
+        async fetchNext() {
+          options.signal?.throwIfAborted()
+          const page = await iterator.fetchNext()
+          options.signal?.throwIfAborted()
+          return page
+        },
+      })
       const items = response.resources.map(value => decode(value, workspaceId))
       assertAnalysis(items.length <= limit && items.every(({ record }) => record.recordType === options.recordType &&
         (options.runId === undefined || (record.recordType !== 'analysis-run' && record.runId === options.runId)) &&
+        (options.targetId === undefined || (record.recordType === 'analysis-comparison' ? record.target.summary.id === options.targetId
+          : 'targetId' in record && record.targetId === options.targetId)) &&
         (options.status === undefined || record.status === options.status)), 'Analysis query escaped its scope.')
       return {
         items: items as VersionedAnalysisEntity<Extract<AnalysisEntity, { recordType: K }>>[],
@@ -294,6 +355,8 @@ export function createAnalysisStoreFromContainer(container: Pick<Container, 'ite
         assertAnalysis(operation.kind === 'create' || operation.kind === 'replace' ||
           (options.lifecycle && operation.kind === 'delete'), 'Unsupported transaction operation.')
         const record = parseAnalysisEntity(operation.record)
+        assertAnalysis(record.recordType !== 'analysis-comparison' || !record.resultRevision,
+          'Current-result projections cannot be persisted over original comparisons.')
         assertAnalysis(record.workspaceId === workspaceId, 'Transaction cannot cross workspace partitions.')
         if (operation.kind !== 'create') etag(operation.etag)
         return { ...operation, record }
@@ -329,20 +392,48 @@ export function createAnalysisStoreFromContainer(container: Pick<Container, 'ite
       for (const operation of validated) {
         const record = operation.record
         if (record.recordType === 'analysis-run' || record.recordType === 'analysis-comparison' || operation.kind === 'delete') continue
-        assertAnalysis(record.manifestSha256 === oldRun.manifest.sha256, 'Narrative must use the accepted run manifest.')
+        assertAnalysis(record.manifestSha256 === oldRun.manifest.sha256, 'Sidecar work must use the accepted run manifest.')
         assertAnalysis(record.updatedAt <= run.record.updatedAt, 'The run cancellation fence must cover every narrative generation.')
         if (!options.lifecycle && record.status !== 'cancelled' &&
           !(record.recordType === 'analysis-narrative-request' && analysisNarrativeRequestCancelled(run.record, record))) {
-          assertAnalysis(analysisNarrativeCanWork(run.record, record),
+          assertAnalysis(record.recordType === 'analysis-correction'
+            ? record.status === 'failed' ? analysisNarrativeCanWork(run.record) : analysisCorrectionCanWork(run.record, record)
+            : analysisNarrativeCanWork(run.record, record),
           'Cancellation fences narrative scheduling and publication.')
         }
-        if (record.recordType === 'analysis-candidate-narrative') {
-          const pair = validated.find(item => item.record.id === record.comparisonId)?.record ??
+        if (record.recordType === 'analysis-correction') {
+          const original = (await store.get(workspaceId, record.comparisonId))?.record
+          assertAnalysis(original?.recordType === 'analysis-comparison' && original.status === 'complete',
+            'A correction requires the original completed comparison.')
+          projectAnalysisComparison(original, record)
+          const prior = previous.get(record.id)
+          if (operation.kind === 'create') assertAnalysis(record.status === 'queued' && record.attempts === 0 &&
+            !record.published && !record.history && !record.attemptId && record.retryCount === 0 && !record.baseRevision &&
+            analysisHash(record.baseResult) === analysisHash(original.result) && record.baseAttemptId === original.attemptId,
+          'A new correction must start as an explicit, unclaimed proposal.')
+          if (prior?.recordType === 'analysis-correction' &&
+            analysisHash(prior.published ?? null) !== analysisHash(record.published ?? null)) {
+            assertAnalysis(!validated.some(item => item.record.id === original.id) &&
+              projectAnalysisComparison(original, prior).result?.sha256 === record.baseResult.sha256 &&
+              validated.some(item => item.kind === 'create' &&
+                item.record.id === analysisNarrativeId('candidate', oldRun.id, original.id, record.requestId)) &&
+              validated.some(item => item.record.recordType === 'analysis-target-narrative' &&
+                item.record.targetId === original.target.summary.id),
+            'Correction publication must retain its exact base and atomically refresh dependent summaries.')
+          }
+        } else if (record.recordType === 'analysis-candidate-narrative' && record.status !== 'cancelled') {
+          const original = validated.find(item => item.record.id === record.comparisonId)?.record ??
             (await store.get(workspaceId, record.comparisonId))?.record
-          assertAnalysis(pair?.recordType === 'analysis-comparison' && pair.status === 'complete', 'Narrative has no completed comparison.')
+          assertAnalysis(original?.recordType === 'analysis-comparison' && original.status === 'complete', 'Narrative has no completed comparison.')
+          const correctionId = analysisCorrectionId(oldRun.id, original.id)
+          const correction = validated.find(item => item.record.id === correctionId)?.record ??
+            (await store.get(workspaceId, correctionId))?.record
+          assertAnalysis(!correction || correction.recordType === 'analysis-correction', 'Invalid current-result head.')
+          const pair = projectAnalysisComparison(original, correction?.recordType === 'analysis-correction' ? correction : undefined)
           const binding = candidateNarrativeBinding(run.record, pair)
           assertAnalysis(binding.targetId === record.targetId && analysisHash(binding.targetSnapshot) === analysisHash(record.targetSnapshot) &&
             analysisHash(binding.resumeSnapshot) === analysisHash(record.resumeSnapshot) && binding.resultSha256 === record.resultSha256 &&
+            record.resultRevisionId === pair.resultRevision?.id &&
             analysisHash(binding) === record.inputFingerprint, 'Narrative result or frozen input binding mismatch.')
         } else if (record.recordType === 'analysis-target-narrative' && operation.kind === 'create') {
           if (!targetParents.has(record.targetId) && !readTargets) {
@@ -384,6 +475,19 @@ export function createAnalysisStoreFromContainer(container: Pick<Container, 'ite
       const progress = { ...oldRun.progress }
       const createdIndexes: number[] = []
       for (const operation of validated) {
+        if (operation.record.recordType === 'analysis-correction' && operation.kind === 'replace') {
+          const next = operation.record
+          const old = previous.get(next.id)
+          if (old?.recordType === 'analysis-correction' &&
+            analysisHash(old.published ?? null) !== analysisHash(next.published ?? null)) {
+            const original = (await store.get(workspaceId, next.comparisonId))?.record
+            assertAnalysis(original?.recordType === 'analysis-comparison', 'Correction progress has no original comparison.')
+            const before = projectAnalysisComparison(original, old)
+            const after = projectAnalysisComparison(original, next)
+            progress[before.resultSummary!.overall.status === 'available' ? 'scored' : 'unscored']--
+            progress[after.resultSummary!.overall.status === 'available' ? 'scored' : 'unscored']++
+          }
+        }
         if (operation.record.recordType !== 'analysis-comparison') continue
         if (operation.kind === 'delete') continue
         const next = operation.record
@@ -417,7 +521,7 @@ export function createAnalysisStoreFromContainer(container: Pick<Container, 'ite
           'Analysis source writers have not drained.')
         let token: string | undefined
         const seen = new Set<string>()
-        for (const recordType of ['analysis-comparison', 'analysis-candidate-narrative', 'analysis-target-narrative', 'analysis-narrative-request'] as const) {
+        for (const recordType of ['analysis-comparison', 'analysis-candidate-narrative', 'analysis-target-narrative', 'analysis-narrative-request', 'analysis-correction'] as const) {
           token = undefined
           seen.clear()
           do {
@@ -435,15 +539,17 @@ export function createAnalysisStoreFromContainer(container: Pick<Container, 'ite
         : { operationType: 'Replace', id: operation.record.id, resourceBody: operation.record as unknown as JSONObject, ifMatch: operation.etag })
       await batch(workspaceId, pending, controls)
     },
-    async getControl(workspaceId, runId) {
+    async getControl(workspaceId, runId, signal) {
+      signal?.throwIfAborted()
       scope(workspaceId, runId)
       try {
-        const response = await container.item(analysisControlId(runId), workspaceId).read()
+        const response = await container.item(analysisControlId(runId), workspaceId).read({ abortSignal: signal })
+        signal?.throwIfAborted()
         if (response.statusCode === 404 || !response.resource) return undefined
         const value = decodeControl(response.resource, workspaceId, runId)
         assertAnalysis(value.record.runId === runId, 'Analysis lifecycle scope mismatch.')
         return value
-      } catch (error) { if (status(error) === 404) return undefined; throw error }
+      } catch (error) { signal?.throwIfAborted(); if (status(error) === 404) return undefined; throw error }
     },
     async listControls(workspaceId, continuationToken) {
       scope(workspaceId)
@@ -483,7 +589,8 @@ export function createAnalysisStoreFromContainer(container: Pick<Container, 'ite
       const parents = new Map<string, Extract<AnalysisEntity, { recordType: 'analysis-run' }> | undefined>()
       const workspaces = new Map<string, string>()
       // Initialize/cancel first; blocked children must not consume the ready-work limit.
-      for (const recordType of ['analysis-run', 'analysis-comparison', 'analysis-narrative-request', 'analysis-candidate-narrative', 'analysis-target-narrative'] as const) {
+      for (const recordType of ['analysis-run', 'analysis-comparison', 'analysis-correction', 'analysis-narrative-request', 'analysis-candidate-narrative', 'analysis-target-narrative'] as const) {
+        if (recordType === 'analysis-correction' && !correctionsEnabled) continue
         const eligible = recordType === 'analysis-run'
           ? `(c.status = 'initializing' OR (IS_DEFINED(c.cancellation) AND NOT IS_DEFINED(c.cancellation.completedAt)
               AND (NOT IS_DEFINED(c.error) OR (c.error.retryable = true AND c.attempts < @maxAttempts))))`
@@ -528,7 +635,14 @@ export function createAnalysisStoreFromContainer(container: Pick<Container, 'ite
               if (!parent || (record.recordType === 'analysis-comparison' ? !analysisRunCanScore(parent)
                 : record.recordType === 'analysis-narrative-request'
                   ? !analysisNarrativeRequestCanAdvance(parent, record) || state === 'archived' && !analysisNarrativeRequestCancelled(parent, record)
+                  : record.recordType === 'analysis-correction' ? !analysisCorrectionCanWork(parent, record)
                   : !analysisNarrativeCanWork(parent, record) || Boolean(parent.narrativeRequestId))) continue
+              if (record.recordType === 'analysis-candidate-narrative') {
+                const correction = await store.get(record.workspaceId, analysisCorrectionId(record.runId, record.comparisonId))
+                assertAnalysis(!correction || correction.record.recordType === 'analysis-correction', 'Invalid candidate current-result head.')
+                const currentRevision = correction?.record.recordType === 'analysis-correction' ? correction.record.published?.revision.id : undefined
+                if (record.resultRevisionId !== currentRevision) continue
+              }
             }
             records.push(item)
             if (records.length === limit) return records
@@ -548,7 +662,7 @@ export function createAnalysisStoreFromContainer(container: Pick<Container, 'ite
 
 interface AnalysisBlobContainer {
   getBlockBlobClient(name: string): {
-    download(): Promise<Pick<Awaited<ReturnType<BlockBlobClient['download']>>, 'readableStreamBody' | 'contentType' | 'contentLength' | 'etag' | 'metadata'>>
+    download(...args: Parameters<BlockBlobClient['download']>): Promise<Pick<Awaited<ReturnType<BlockBlobClient['download']>>, 'readableStreamBody' | 'contentType' | 'contentLength' | 'etag' | 'metadata'>>
     upload(...args: Parameters<BlockBlobClient['upload']>): Promise<Pick<Awaited<ReturnType<BlockBlobClient['upload']>>, 'etag'>>
     getProperties?: BlockBlobClient['getProperties']
     getBlobLeaseClient?: BlockBlobClient['getBlobLeaseClient']
@@ -570,21 +684,34 @@ function maximum(name: string): number {
   assertAnalysis(contentType === 'application/json', 'Unsupported analysis blob content type.')
   return MAX_ANALYSIS_JSON_BYTES
 }
-async function readBounded(stream: NodeJS.ReadableStream, length: number | undefined, max: number): Promise<Uint8Array> {
+async function readBounded(stream: NodeJS.ReadableStream, length: number | undefined, max: number, signal?: AbortSignal): Promise<Uint8Array> {
+  const destroy = () => { if ('destroy' in stream && typeof stream.destroy === 'function') stream.destroy() }
   if (length !== undefined && length > max) {
-    if ('destroy' in stream && typeof stream.destroy === 'function') stream.destroy()
+    destroy()
     throw new Error('Analysis blob exceeds its bounded size.')
   }
   const chunks: Buffer[] = []
   let size = 0
-  for await (const chunk of stream) {
-    const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)
-    size += bytes.byteLength
-    if (size > max) throw new Error('Analysis blob exceeds its bounded size.')
-    chunks.push(bytes)
+  signal?.addEventListener('abort', destroy, { once: true })
+  try {
+    if (signal?.aborted) { destroy(); signal.throwIfAborted() }
+    for await (const chunk of stream) {
+      signal?.throwIfAborted()
+      const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)
+      size += bytes.byteLength
+      if (size > max) throw new Error('Analysis blob exceeds its bounded size.')
+      chunks.push(bytes)
+    }
+    signal?.throwIfAborted()
+    assertAnalysis(size > 0 && (length === undefined || size === length), 'Analysis blob is empty or truncated.')
+    return Buffer.concat(chunks, size)
+  } catch (error) {
+    destroy()
+    signal?.throwIfAborted()
+    throw error
+  } finally {
+    signal?.removeEventListener('abort', destroy)
   }
-  assertAnalysis(size > 0 && (length === undefined || size === length), 'Analysis blob is empty or truncated.')
-  return Buffer.concat(chunks, size)
 }
 export function createAzureAnalysisBlobStore(config: RealAnalysesConfig, credential: TokenCredential): AnalysisBlobStore {
   return createAnalysisBlobStoreFromContainer(new BlobServiceClient(config.storageAccountUrl, credential, {
@@ -592,10 +719,16 @@ export function createAzureAnalysisBlobStore(config: RealAnalysesConfig, credent
   }).getContainerClient(config.blobContainer))
 }
 export function createAnalysisBlobStoreFromContainer(container: AnalysisBlobContainer): AnalysisBlobStore {
-  async function read(name: string): Promise<AnalysisBlob | undefined> {
+  async function read(name: string, signal?: AbortSignal): Promise<AnalysisBlob | undefined> {
+    signal?.throwIfAborted()
     assertAnalysis(isSafeAnalysisBlobName(name), 'Invalid analysis blob name.')
     try {
-      const response = await container.getBlockBlobClient(name).download()
+      const response = await container.getBlockBlobClient(name).download(0, undefined, { abortSignal: signal })
+      if (signal?.aborted) {
+        const stream = response.readableStreamBody
+        if (stream && 'destroy' in stream && typeof stream.destroy === 'function') stream.destroy()
+        signal.throwIfAborted()
+      }
       if (response.metadata?.scorepreparing === 'true') {
         const stream = response.readableStreamBody
         if (stream && 'destroy' in stream && typeof stream.destroy === 'function') stream.destroy()
@@ -603,9 +736,10 @@ export function createAnalysisBlobStoreFromContainer(container: AnalysisBlobCont
       }
       assertAnalysis(response.readableStreamBody && response.etag && typeof response.contentType === 'string' &&
         response.contentType === mime(name), 'Invalid analysis blob content metadata.')
-      const bytes = await readBounded(response.readableStreamBody, response.contentLength, maximum(name))
+      const bytes = await readBounded(response.readableStreamBody, response.contentLength, maximum(name), signal)
       return { bytes, contentType: response.contentType, sha256: analysisBytesHash(bytes), etag: response.etag }
     } catch (error) {
+      signal?.throwIfAborted()
       if (status(error) === 404) return undefined
       throw error
     }

@@ -223,7 +223,7 @@ test('the live structured schema excludes seed job IDs from every grade-basis ci
   assert.deepEqual(basis.items.properties.documentId.enum, [f.grading.id])
   assert.deepEqual(JSON.parse(request.user).input.eligibleGradingDocumentIds, [f.grading.id])
   assert.ok(!basis.items.properties.documentId.enum.includes(f.role.id))
-  assert.equal(GRADE_MODEL_PROMPT_VERSIONS.draft, 'score-grade-draft-v3')
+  assert.equal(GRADE_MODEL_PROMPT_VERSIONS.draft, 'score-grade-draft-v4')
 })
 
 test('the structured schema requires an empty grade basis when no grading source is eligible', async () => {
@@ -410,6 +410,33 @@ test('drafts align competency IDs across grades and use caller-owned immutable i
     })
     assert.equal(result.issues.some(value => value.severity === 'blocker'), false)
   }
+})
+
+test('versioned real-grade prompts make zero documentary absence and distinguish missing resume evidence from source gaps', async () => {
+  assert.deepEqual(GRADE_MODEL_PROMPT_VERSIONS, {
+    competencies: 'score-grade-competencies-v3', draft: 'score-grade-draft-v4', review: 'score-grade-review-v3',
+  })
+  const f = fixture()
+  const model = invoker(draftOutput(f))
+  const result = await draftGradeRubric(draftInput(f), model.invoke)
+  const policy = model.calls[0].request.system
+  assert.match(policy, /Anchor 0 means "No supporting evidence in the submitted resume for this criterion"/)
+  assert.match(policy, /never use "No understanding", "No awareness\/practice", or "No advisory experience" as zero anchors/)
+  assert.match(policy, /Anchors 1 through 5 describe progressively stronger documentary support/)
+  assert.match(policy, /Confidentiality, legal\/data-protection practices, and statistical advising are professional work, not protected personal traits/)
+  assert.match(policy, /Missing requirement-source support must remain an explicit support gap/)
+  assert.match(policy, /Genuine unusable resume sources or processing failures must not be described as completed zeros/)
+  assert.match(result.rubric.criteria[0].interpretation, /Zero means no supporting evidence in the submitted resume/)
+  assert.match(result.rubric.description, /not personal inability or legal noncompliance/)
+  const version = versionRecord(f, result)
+  const before = structuredClone(version)
+  const reviewer = invoker({ outcome: 'supported', issues: [] })
+  const review = await reviewGradeRubric(reviewInput(f, version), reviewer.invoke)
+  assert.equal(review.promptVersion, 'score-grade-review-v3')
+  assert.match(reviewer.calls[0].request.system, /Confirm that zero denotes no supporting evidence in a submitted resume/)
+  assert.match(reviewer.calls[0].request.system, /Do not confuse missing resume evidence with a gap in the requirement sources or a saved zero-weight work-level exclusion/)
+  assert.deepEqual(version, before)
+  assert.deepEqual(JSON.parse(reviewer.calls[0].request.user).input.version.rubric, before.rubric)
 })
 
 test('arbitrary confirmed GS series are not whitelisted or inferred from seed titles', async () => {

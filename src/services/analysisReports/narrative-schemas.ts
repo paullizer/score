@@ -164,6 +164,7 @@ export const realAnalysisSummariesResponseSchema: z.ZodType<RealAnalysisSummarie
   }),
   comparisons: z.array(z.strictObject({
     ...summaryState, kind: z.literal('candidate'), comparisonId: id, comparisonStatus,
+    resultSha256: hash.nullable().optional(),
     published: realCandidateNarrativeSchema.nullable(),
   })).min(1).max(REPORT_LIMITS.maxComparisons),
   targets: z.array(z.strictObject({
@@ -185,8 +186,9 @@ export const realAnalysisSummariesResponseSchema: z.ZodType<RealAnalysisSummarie
     left === null ? right === null : right !== null && left.revision === right.revision && left.inputFingerprint === right.inputFingerprint
   for (const pin of capture.comparisons) {
     const state = comparisons.get(pin.comparisonId)
-    if (!state || state.targetId !== pin.targetId || state.comparisonStatus !== pin.status) {
-      invalid(context, 'Candidate summary identity or scoring status does not match its authoritative pin.')
+    if (!state || state.targetId !== pin.targetId || state.comparisonStatus !== pin.status ||
+      state.resultSha256 !== undefined && state.resultSha256 !== pin.resultSha256) {
+      invalid(context, 'Candidate summary identity, scoring status, or result hash does not match its authoritative pin.')
       continue
     }
     if (response.ready && (pin.status === 'complete'

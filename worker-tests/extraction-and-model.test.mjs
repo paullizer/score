@@ -24,7 +24,7 @@ const document = {
   ],
 }
 
-const guidance = '0: no evidence; 1: minimal; 2: limited; 3: capable; 4: strong; 5: expert.'
+const guidance = '0: No supporting evidence in the submitted resume for this criterion; 1: Documents a bounded example; 2: Documents practice with regular review; 3: Documents independent work within the stated scope; 4: Documents complex work with clear outcomes; 5: Documents repeated complex work with validated outcomes.'
 const validResult = {
   isJobPosting: true,
   rejectionReason: null,
@@ -168,6 +168,11 @@ test('grounded rubric generation repairs protected criteria once and preserves e
       assert.equal(body.model, 'rubric-deployment')
       assert.equal(body.reasoning_effort, 'low')
       assert.equal(body.response_format.json_schema.strict, true)
+      assert.match(body.messages[0].content, /Anchor 0 means "No supporting evidence in the submitted resume for this criterion"/)
+      assert.match(body.messages[0].content, /Anchors 1 through 5 describe progressively stronger documented examples/)
+      assert.match(body.messages[0].content, /never use "No understanding", "No awareness\/practice", "No advisory experience"/)
+      assert.match(body.messages[0].content, /confidentiality, legal\/data-protection practice, and statistical advising/)
+      assert.match(body.messages[0].content, /Genuine unusable-source or processing failures are not completed zeros/)
       if (calls === 2) {
         assert.match(body.messages[1].content, /protected/)
         assert.match(body.messages[1].content, /organization is not grounded/)
@@ -188,7 +193,7 @@ test('grounded rubric generation repairs protected criteria once and preserves e
   assert.deepEqual(generated.rubric.provenance, {
     kind: 'generated',
     model: 'gpt-5-mini-2026-08-01',
-    promptVersion: 'score-job-rubric-v2',
+    promptVersion: 'score-job-rubric-v3',
   })
   assert.deepEqual(generated.warnings, ['Location is not stated.'])
 })

@@ -437,11 +437,13 @@ async function seedBrowsingInputs(fixture) {
         criteria: input.rubric.criteria.map((criterion) => ({
           criterionId: criterion.id, score,
           evidenceStatus: score === null ? 'not-assessed' : score === 0 ? 'missing' : 'supported',
-          rationale: score === null ? 'The captured source does not establish the scope needed by this saved criterion.'
+          rationale: score === null ? 'The saved criterion guidance is ambiguous about the required scope of work.'
             : score === 0 ? 'No supporting evidence was assigned to this criterion in this controlled fixture.'
               : 'The quoted passage provides the controlled fixture evidence for this saved criterion.',
           citations: score > 0 ? [work] : [],
-          limitation: score === null ? { code: 'not-assessable', message: 'The captured source scope requires human evidence review.' } : null,
+          limitation: score === null ? {
+            code: 'ambiguous-guidance', message: 'Human review must resolve the ambiguous scope of the saved scoring guidance.',
+          } : null,
         })),
         qualifications: [],
       })
@@ -628,7 +630,8 @@ test('browser comparison browsing searches every page, scopes score sorting, and
   const runPath = `/api/workspaces/${fixture.workspaceId}/analyses/${created.run.id}`
   const pairs = await allPages(fixture, `${runPath}/comparisons`, 'comparisons')
   assert.equal(pairs.length, 8)
-  assert.ok(pairs.every(({ comparison }) => comparison.status === 'complete'))
+  assert.ok(pairs.every(({ comparison }) => comparison.status === 'complete'),
+    JSON.stringify(pairs.map(({ comparison }) => ({ id: comparison.id, status: comparison.status, error: comparison.error }))))
   const recordsBefore = JSON.stringify([...fixture.analyses.store.values.values()])
   const modelCallsBefore = stubs.modelCalls.length
   const requestStart = fixture.requests.length

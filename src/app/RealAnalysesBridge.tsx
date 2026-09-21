@@ -4,7 +4,7 @@ import type {
   AnalysisProcessingFeatures, CreateRealAnalysisInput, RealAnalysisComparisonDetail, RealAnalysisComparisonSummary, RealAnalysisRunDetail,
   RealAnalysisRunSummary, RealAnalysisTargetSummary,
 } from '../domain/real-analyses'
-import type { RealAnalysisSummariesResponse } from '../domain/analysis-narratives'
+import type { RealAnalysisSummariesResponse, RealAnalysisSummarySubjectResponse } from '../domain/analysis-narratives'
 import type { AnalysisSummaryHistoryPage, AnalysisSummarySubject, PublishSummaryDraftInput } from '../domain/analysis-summary-history'
 import * as api from '../services/realAnalyses'
 import { assertClientAdmission, clientAdmissionReason, usePublicSettings } from './public-settings-context'
@@ -15,13 +15,24 @@ import { WorkspaceContext, useWorkspace, type PendingLifecycleChange, type Renam
 import { getDisplayName } from '../domain/displayNames'
 import { useGradeLeaveGuard } from './grade-navigation-context'
 import { RealAnalysesContext, type RealAnalysesContextValue } from './real-analyses-context'
-import { RealRequestScope, realRequestError, type RealLoadState } from './real-request-scope'
+import { RealReadBackoff, RealRequestScope, realRequestError, type RealLoadState } from './real-request-scope'
 import { realAnalysisWorkActive as active, realTargetAvailable } from '../features/analyses/realAnalysisUi'
 import { assertRealLifecyclePermission, discoveredLifecycle, projectRealLifecycle, realWorkspaceWritable, reconcileLifecycleOperations } from './real-lifecycle'
 
 const pairKey = (runId: string, id: string) => `${runId}/${id}`
 const narrativeKey = (runId: string, targetId?: string) => JSON.stringify([runId, targetId ?? null])
 const summaryHistoryKey = (runId: string, subject: AnalysisSummarySubject) => `${runId}/${JSON.stringify([subject.kind, subject.subjectId])}`
+const summarySubjectKey = summaryHistoryKey
+const tabVisible = () => document.visibilityState !== 'hidden'
+function retainSubscription(subscriptions: Map<string, number>, key: string) {
+  subscriptions.set(key, (subscriptions.get(key) ?? 0) + 1)
+  return () => {
+    const count = subscriptions.get(key) ?? 0
+    if (count <= 1) subscriptions.delete(key)
+    else subscriptions.set(key, count - 1)
+    return !subscriptions.has(key)
+  }
+}
 const narrativeWorkActive = (value: RealAnalysisSummariesResponse) =>
   value.scoring.initialized < value.scoring.total || value.scoring.queued > 0 || value.scoring.running > 0 ||
   [value.counts.candidates, value.counts.targets].some((count) => count.waiting + count.queued + count.running > 0)
@@ -40,6 +51,13 @@ function RealAnalysesProvider({ workspaceId, children }: { workspaceId: string; 
   parentRef.current = parent
   const location = useLocation()
   const [scope] = useState(() => new RealRequestScope())
+  const [backoff] = useState(() => new RealReadBackoff())
+  const activeAnalyses = useRef(new Map<string, number>())
+  const activeComparisons = useRef(new Map<string, number>())
+  const [subscriptionsVersion, setSubscriptionsVersion] = useState(0)
+  const subscriptionsChanged = useCallback(() => {
+    if (scope.isOpen) setSubscriptionsVersion((version) => version + 1)
+  }, [scope])
   const [features, setFeatures] = useState<AnalysisProcessingFeatures | null>(null)
   const featuresRef = useRef(features)
   const historyAvailable = useRef(false)
@@ -51,6 +69,7 @@ function RealAnalysesProvider({ workspaceId, children }: { workspaceId: string; 
   const knownIds = useRef(new Set<string>())
   const [targets, setTargets] = useState<RealLoadState<RealAnalysisTargetSummary[]>>({ state: 'idle' })
   const targetsRef = useRef(targets)
+  const targetSubscriptions = useRef(new Map<string, number>())
   const [details, setDetails] = useState<Record<string, RealLoadState<RealAnalysisRunDetail>>>({})
   const detailRef = useRef(details)
   const [comparisons, setComparisons] = useState<Record<string, RealLoadState<RealAnalysisComparisonSummary[]>>>({})
@@ -60,6 +79,12 @@ function RealAnalysesProvider({ workspaceId, children }: { workspaceId: string; 
   const [narratives, setNarratives] = useState<Record<string, RealLoadState<RealAnalysisSummariesResponse>>>({})
   const narrativesRef = useRef(narratives)
   const narrativeScopes = useRef(new Map<string, { runId: string; targetId?: string }>())
+  const narrativeSubscriptions = useRef(new Map<string, number>())
+  const narrativeProgress = useRef(new Map<string, { runId: string; targetId?: string }>())
+  const [summarySubjects, setSummarySubjects] = useState<Record<string, RealLoadState<RealAnalysisSummarySubjectResponse>>>({})
+  const summarySubjectsRef = useRef(summarySubjects)
+  const summarySubjectScopes = useRef(new Map<string, { runId: string; subject: AnalysisSummarySubject }>())
+  const summarySubjectSubscriptions = useRef(new Map<string, number>())
   const narrativeRequests = useRef(new Map<string, { key: string; etag: string; runId: string }>())
   const summaryHistoryScopes = useRef(new Map<string, Pick<AnalysisSummaryHistoryPage, 'etag' | 'capabilities'> & { runId: string; targetId: string }>())
   const pairSummaries = useRef(new Map<string, RealAnalysisComparisonSummary>())
@@ -104,13 +129,20 @@ function RealAnalysesProvider({ workspaceId, children }: { workspaceId: string; 
     narrativesRef.current = { ...narrativesRef.current, [key]: entry }
     setNarratives(narrativesRef.current)
   }, [])
+  const putSummarySubject = useCallback((key: string, entry: RealLoadState<RealAnalysisSummarySubjectResponse>) => {
+    summarySubjectsRef.current = { ...summarySubjectsRef.current, [key]: entry }
+    setSummarySubjects(summarySubjectsRef.current)
+  }, [])
 
   const clearRunContent = useCallback((id: string) => {
     const removedScopes = new Set([...narrativeScopes.current].filter(([, item]) => item.runId === id).map(([key]) => key))
-    scope.cancelReads((key) => key === `detail:${id}` || key === `pairs:${id}` || key.startsWith(`result:${id}/`) ||
+    const removedSubjects = new Set([...summarySubjectScopes.current].filter(([, item]) => item.runId === id).map(([key]) => key))
+    const removedRead = (key: string) => key === `detail:${id}` || key === `pairs:${id}` || key.startsWith(`result:${id}/`) ||
       key.startsWith(`document:${id}/`) || key.startsWith(`diagnostics:${id}/`) ||
-      key.startsWith(`summary-history:${id}/`) ||
-      [...removedScopes].some((item) => key === `narratives:${item}`))
+      key.startsWith(`summary-history:${id}/`) || key.startsWith(`summary:${id}/`) ||
+      [...removedScopes].some((item) => key === `narratives:${item}`)
+    scope.cancelReads(removedRead)
+    backoff.clear(removedRead)
     putDetail(id, { state: 'error', error: 'This analysis was removed or is awaiting permanent cleanup. Cached inputs and results are no longer available.' })
     const next = { ...comparisonsRef.current }; delete next[id]
     comparisonsRef.current = next; setComparisons(next)
@@ -118,11 +150,21 @@ function RealAnalysesProvider({ workspaceId, children }: { workspaceId: string; 
     setResults(resultsRef.current)
     narrativesRef.current = Object.fromEntries(Object.entries(narrativesRef.current).filter(([key]) => !removedScopes.has(key)))
     setNarratives(narrativesRef.current)
-    for (const key of removedScopes) narrativeScopes.current.delete(key)
+    summarySubjectsRef.current = Object.fromEntries(Object.entries(summarySubjectsRef.current).filter(([key]) => !removedSubjects.has(key)))
+    setSummarySubjects(summarySubjectsRef.current)
+    for (const key of removedScopes) {
+      narrativeScopes.current.delete(key)
+      narrativeSubscriptions.current.delete(key)
+      narrativeProgress.current.delete(key)
+    }
+    for (const key of removedSubjects) {
+      summarySubjectScopes.current.delete(key)
+      summarySubjectSubscriptions.current.delete(key)
+    }
     for (const [key, request] of narrativeRequests.current) if (request.runId === id) narrativeRequests.current.delete(key)
     for (const [key, selected] of summaryHistoryScopes.current) if (selected.runId === id) summaryHistoryScopes.current.delete(key)
     for (const key of pairSummaries.current.keys()) if (key.startsWith(`${id}/`)) pairSummaries.current.delete(key)
-  }, [putDetail, scope])
+  }, [backoff, putDetail, scope])
 
   const removeRun = useCallback((id: string, sequence: number) => {
     if (!scope.accept(`run:${id}`, sequence)) return
@@ -180,20 +222,22 @@ function RealAnalysesProvider({ workspaceId, children }: { workspaceId: string; 
     try {
       const value = await api.getRealAnalysis(workspaceId, id, ticket.controller.signal)
       if (!scope.current(ticket)) return
+      backoff.record(ticket.key, value.etag)
       if (lifecycleIsRemoved(value.lifecycle ?? value.run.lifecycle)) { superseded = !rememberRun(value, ticket.sequence); return }
       if (rememberRun(value, ticket.sequence) || summariesRef.current.find((item) => item.run.id === id)?.etag === value.etag) putDetail(id, { state: 'ready', value })
       else superseded = true
     } catch (caught) {
       if (!scope.current(ticket)) return
       if (!scope.canAccept(`run:${id}`, ticket.sequence)) { superseded = true; return }
-      if (caught instanceof CloudApiError && [403, 404].includes(caught.status)) { removeRun(id, ticket.sequence); return }
+      backoff.record(ticket.key)
+      if (caught instanceof CloudApiError && [401, 403, 404].includes(caught.status)) { removeRun(id, ticket.sequence); return }
       const message = realRequestError(caught, 'The saved real analysis could not be opened.')
       putDetail(id, previous?.state === 'ready' ? { ...previous, error: message } : { state: 'error', error: message })
     } finally {
       scope.finish(ticket)
       if (superseded) void loadDetail(id, true)
     }
-  }, [putDetail, readableRun, rememberRun, removeRun, scope, workspaceId])
+  }, [backoff, putDetail, readableRun, rememberRun, removeRun, scope, workspaceId])
 
   const ensureComparisons = useCallback(async (id: string, force = false) => {
     if (!historyAvailable.current || !readableRun(id)) return
@@ -205,17 +249,19 @@ function RealAnalysesProvider({ workspaceId, children }: { workspaceId: string; 
     try {
       const values = await api.listAllRealAnalysisComparisons(workspaceId, id, ticket.controller.signal)
       if (!scope.current(ticket) || !readableRun(id)) return
+      backoff.record(ticket.key, JSON.stringify(values.map((item) => [item.comparison.id, item.etag])))
       for (const summary of values) rememberPair(summary, ticket.sequence)
       const merged = new Map<string, RealAnalysisComparisonSummary>()
       for (const summary of values) merged.set(summary.comparison.id, pairSummaries.current.get(pairKey(id, summary.comparison.id)) ?? summary)
       putComparisons(id, { state: 'ready', value: [...merged.values()].sort((a, b) => a.comparison.index - b.comparison.index) })
     } catch (caught) {
       if (!scope.current(ticket)) return
-      if (caught instanceof CloudApiError && [403, 404].includes(caught.status)) { removeRun(id, ticket.sequence); return }
+      backoff.record(ticket.key)
+      if (caught instanceof CloudApiError && [401, 403, 404].includes(caught.status)) { removeRun(id, ticket.sequence); return }
       const message = realRequestError(caught, 'The real comparisons could not be loaded.')
       putComparisons(id, previous?.state === 'ready' ? { ...previous, error: message } : { state: 'error', error: message })
     } finally { scope.finish(ticket) }
-  }, [putComparisons, readableRun, rememberPair, removeRun, scope, workspaceId])
+  }, [backoff, putComparisons, readableRun, rememberPair, removeRun, scope, workspaceId])
 
   const ensureComparison = useCallback(async function loadComparison(runId: string, id: string, force = false): Promise<void> {
     if (!historyAvailable.current || !readableRun(runId)) return
@@ -229,12 +275,14 @@ function RealAnalysesProvider({ workspaceId, children }: { workspaceId: string; 
     try {
       const value = await api.getRealAnalysisComparison(workspaceId, runId, id, ticket.controller.signal)
       if (!scope.current(ticket) || !readableRun(runId)) return
+      backoff.record(ticket.key, value.etag)
       if (rememberPair(value, ticket.sequence) || pairSummaries.current.get(key)?.etag === value.etag) putResult(key, { state: 'ready', value })
       else superseded = true
     } catch (caught) {
       if (!scope.current(ticket)) return
       if (!scope.canAccept(`pair:${key}`, ticket.sequence)) { superseded = true; return }
-      if (caught instanceof CloudApiError && [403, 404].includes(caught.status)) {
+      backoff.record(ticket.key)
+      if (caught instanceof CloudApiError && [401, 403, 404].includes(caught.status)) {
         scope.cancelReads((request) => request === `diagnostics:${key}`)
         pairSummaries.current.delete(key)
         putResult(key, { state: 'error', error: 'This saved comparison is no longer available. Cached source snapshots have been cleared.' })
@@ -246,14 +294,24 @@ function RealAnalysesProvider({ workspaceId, children }: { workspaceId: string; 
       scope.finish(ticket)
       if (superseded) void loadComparison(runId, id, true)
     }
-  }, [putResult, readableRun, rememberPair, scope, workspaceId])
+  }, [backoff, putResult, readableRun, rememberPair, scope, workspaceId])
 
-  const rememberNarratives = useCallback((value: RealAnalysisSummariesResponse, sequence: number) => {
+  const rememberNarratives = useCallback((value: RealAnalysisSummariesResponse, sequence: number, acknowledged = false) => {
     const key = narrativeKey(value.runId, value.scope.targetId ?? undefined)
     if (!readableRun(value.runId) || !scope.accept(`narrative:${key}`, sequence)) return
-    narrativeScopes.current.set(key, { runId: value.runId, ...(value.scope.targetId ? { targetId: value.scope.targetId } : {}) })
+    const selected = { runId: value.runId, ...(value.scope.targetId ? { targetId: value.scope.targetId } : {}) }
+    narrativeScopes.current.set(key, selected)
+    backoff.record(`narratives:${key}`, value.revision)
     putNarratives(key, { state: 'ready', value })
-  }, [putNarratives, readableRun, scope])
+    if (!narrativeWorkActive(value)) narrativeProgress.current.delete(key)
+    else if (activeAnalyses.current.has(value.runId) &&
+      (acknowledged || narrativeSubscriptions.current.has(key) || narrativeProgress.current.has(key))) {
+      if (!selected.targetId) {
+        for (const [key, scope] of narrativeProgress.current) if (scope.runId === value.runId) narrativeProgress.current.delete(key)
+      }
+      if (!selected.targetId || !narrativeProgress.current.has(narrativeKey(value.runId))) narrativeProgress.current.set(key, selected)
+    }
+  }, [backoff, putNarratives, readableRun, scope])
 
   const ensureNarratives = useCallback(async (runId: string, targetId?: string, force = false) => {
     if (!historyAvailable.current || !readableRun(runId)) return
@@ -263,29 +321,148 @@ function RealAnalysesProvider({ workspaceId, children }: { workspaceId: string; 
     if (!force && previous && !['idle', 'loading'].includes(previous.state)) return
     const ticket = scope.read(`narratives:${key}`)
     if (!ticket) return
-    if (previous?.state !== 'ready') putNarratives(key, { state: 'loading' })
+    putNarratives(key, previous?.state === 'ready' ? { ...previous, refreshing: true } : { state: 'loading' })
     try {
       const value = await api.getRealAnalysisSummaries(workspaceId, runId, targetId ? { targetId } : {}, ticket.controller.signal)
       if (!scope.current(ticket) || !readableRun(runId)) return
       rememberNarratives(value, ticket.sequence)
     } catch (caught) {
       if (!scope.current(ticket) || !readableRun(runId) || !scope.canAccept(`narrative:${key}`, ticket.sequence)) return
+      backoff.record(ticket.key)
       const inaccessible = caught instanceof CloudApiError && [401, 403, 404].includes(caught.status)
       const message = realRequestError(caught, 'Saved summaries could not be loaded. Scores and frozen evidence are unchanged.')
       putNarratives(key, previous?.state === 'ready' && !inaccessible
-        ? { ...previous, error: message } : { state: 'error', error: message })
+        ? { ...previous, refreshing: false, error: message } : { state: 'error', error: message })
       if (inaccessible) void ensureDetail(runId, true)
     } finally { scope.finish(ticket) }
-  }, [ensureDetail, putNarratives, readableRun, rememberNarratives, scope, workspaceId])
+  }, [backoff, ensureDetail, putNarratives, readableRun, rememberNarratives, scope, workspaceId])
+
+  const ensureSummarySubject = useCallback(async (runId: string, subject: AnalysisSummarySubject, force = false) => {
+    if (!historyAvailable.current || !readableRun(runId)) return
+    const key = summarySubjectKey(runId, subject)
+    summarySubjectScopes.current.set(key, { runId, subject })
+    const previous = summarySubjectsRef.current[key]
+    if (!force && previous && !['idle', 'loading'].includes(previous.state)) return
+    const ticket = scope.read(`summary:${key}`)
+    if (!ticket) return
+    putSummarySubject(key, previous?.state === 'ready' ? { ...previous, refreshing: true } : { state: 'loading' })
+    try {
+      const value = await api.getRealAnalysisSummarySubject(workspaceId, runId, subject, ticket.controller.signal)
+      if (!scope.current(ticket) || !readableRun(runId) || !scope.canAccept(`summary:${key}`, ticket.sequence)) return
+      const targetId = subject.kind === 'target' ? subject.subjectId
+        : pairSummaries.current.get(pairKey(runId, subject.subjectId))?.comparison.target.summary.id
+      const detail = detailRef.current[runId]
+      if ((targetId && value.narrative.targetId !== targetId) ||
+        (detail?.state === 'ready' && !detail.value.targets.some((target) => target.id === value.narrative.targetId))) {
+        throw new Error('The summary does not match this comparison’s exact saved job or grade. No other target was substituted.')
+      }
+      if (!scope.accept(`summary:${key}`, ticket.sequence)) return
+      backoff.record(ticket.key, value.revision)
+      putSummarySubject(key, { state: 'ready', value })
+    } catch (caught) {
+      if (!scope.current(ticket) || !readableRun(runId) || !scope.canAccept(`summary:${key}`, ticket.sequence)) return
+      backoff.record(ticket.key)
+      const inaccessible = caught instanceof CloudApiError && [401, 403, 404].includes(caught.status)
+      const message = realRequestError(caught, 'This saved summary could not be loaded. Scores and frozen evidence are unchanged.')
+      putSummarySubject(key, previous?.state === 'ready' && !inaccessible
+        ? { ...previous, refreshing: false, error: message } : { state: 'error', error: message })
+      if (inaccessible) void ensureDetail(runId, true)
+    } finally { scope.finish(ticket) }
+  }, [backoff, ensureDetail, putSummarySubject, readableRun, scope, workspaceId])
 
   const invalidateNarratives = useCallback((runId: string, targetId?: string) => {
+    const invalidatedReads = new Set<string>()
     for (const [key, selected] of narrativeScopes.current) {
       if (selected.runId !== runId || (targetId && selected.targetId && selected.targetId !== targetId)) continue
+      invalidatedReads.add(`narratives:${key}`)
       const previous = narrativesRef.current[key]
       if (previous?.state === 'ready') putNarratives(key, { ...previous, error: 'Summary state changed. Refreshing its current revision; previous text is not current for export.' })
       else putNarratives(key, { state: 'idle' })
     }
-  }, [putNarratives])
+    for (const [key, selected] of summarySubjectScopes.current) {
+      const previous = summarySubjectsRef.current[key]
+      if (selected.runId !== runId || (targetId && previous?.state === 'ready' && previous.value.narrative.targetId !== targetId)) continue
+      invalidatedReads.add(`summary:${key}`)
+      if (previous?.state === 'ready') putSummarySubject(key, { ...previous, error: 'Summary state changed. Refreshing its current revision; previous text is not current for export.' })
+      else putSummarySubject(key, { state: 'idle' })
+    }
+    scope.cancelReads((key) => invalidatedReads.has(key))
+    backoff.clear((key) => invalidatedReads.has(key))
+  }, [backoff, putNarratives, putSummarySubject, scope])
+
+  const subscribeAnalysis = useCallback((runId: string) => {
+    const release = retainSubscription(activeAnalyses.current, runId)
+    subscriptionsChanged()
+    return () => {
+      if (!release()) return
+      subscriptionsChanged()
+      scope.cancelReads((key) => key === `detail:${runId}` || key === `pairs:${runId}`)
+      for (const [key, selected] of narrativeProgress.current) if (selected.runId === runId) {
+        narrativeProgress.current.delete(key)
+        if (!narrativeSubscriptions.current.has(key)) scope.cancelReads((request) => request === `narratives:${key}`)
+      }
+    }
+  }, [scope, subscriptionsChanged])
+
+  const subscribeComparison = useCallback((runId: string, comparisonId: string) => {
+    const key = pairKey(runId, comparisonId)
+    const release = retainSubscription(activeComparisons.current, key)
+    subscriptionsChanged()
+    return () => {
+      if (release()) {
+        subscriptionsChanged()
+        scope.cancelReads((request) => request === `result:${key}` || request === `diagnostics:${key}`)
+      }
+    }
+  }, [scope, subscriptionsChanged])
+
+  const subscribeNarratives = useCallback((runId: string, targetId?: string) => {
+    const key = narrativeKey(runId, targetId)
+    narrativeScopes.current.set(key, { runId, targetId })
+    const release = retainSubscription(narrativeSubscriptions.current, key)
+    subscriptionsChanged()
+    return () => {
+      if (release()) {
+        subscriptionsChanged()
+        if (!narrativeProgress.current.has(key)) scope.cancelReads((request) => request === `narratives:${key}`)
+      }
+    }
+  }, [scope, subscriptionsChanged])
+
+  const subscribeSummarySubject = useCallback((runId: string, subject: AnalysisSummarySubject) => {
+    const key = summarySubjectKey(runId, subject)
+    summarySubjectScopes.current.set(key, { runId, subject })
+    const release = retainSubscription(summarySubjectSubscriptions.current, key)
+    subscriptionsChanged()
+    return () => {
+      if (release()) {
+        subscriptionsChanged()
+        scope.cancelReads((request) => request === `summary:${key}`)
+      }
+    }
+  }, [scope, subscriptionsChanged])
+
+  const refreshRelevantNarratives = useCallback((runId?: string, dueOnly = false) => {
+    if (!tabVisible()) return
+    const selectedScopes = new Map([...narrativeSubscriptions.current.keys()].flatMap((key) => {
+      const selected = narrativeScopes.current.get(key)
+      return selected ? [[key, selected] as const] : []
+    }))
+    for (const [key, selected] of narrativeProgress.current) {
+      if (activeAnalyses.current.has(selected.runId)) selectedScopes.set(key, selected)
+    }
+    for (const [key, selected] of selectedScopes) {
+      if ((runId && selected.runId !== runId) || (dueOnly && !backoff.due(`narratives:${key}`))) continue
+      // A subscribed/acknowledged whole-run read already covers any background target progress.
+      if (selected.targetId && !narrativeSubscriptions.current.has(key) && selectedScopes.has(narrativeKey(selected.runId))) continue
+      void ensureNarratives(selected.runId, selected.targetId, true)
+    }
+    for (const key of summarySubjectSubscriptions.current.keys()) {
+      const selected = summarySubjectScopes.current.get(key)
+      if (!selected || (runId && selected.runId !== runId) || (dueOnly && !backoff.due(`summary:${key}`))) continue
+      void ensureSummarySubject(selected.runId, selected.subject, true)
+    }
+  }, [backoff, ensureNarratives, ensureSummarySubject])
 
   const refreshTargets = useCallback(async () => {
     if (!featuresRef.current?.realAnalyses) return
@@ -306,6 +483,24 @@ function RealAnalysesProvider({ workspaceId, children }: { workspaceId: string; 
     } finally { scope.finish(ticket) }
   }, [scope, workspaceId])
 
+  const subscribeTargets = useCallback(() => {
+    const first = !targetSubscriptions.current.has('$targets')
+    const release = retainSubscription(targetSubscriptions.current, '$targets')
+    if (first) {
+      scope.cancelReads((key) => key === '$targets')
+      targetsRef.current = { state: 'idle' }
+      setTargets(targetsRef.current)
+    }
+    subscriptionsChanged()
+    return () => {
+      if (!release()) return
+      scope.cancelReads((key) => key === '$targets')
+      targetsRef.current = { state: 'idle' }
+      if (scope.isOpen) setTargets(targetsRef.current)
+      subscriptionsChanged()
+    }
+  }, [scope, subscriptionsChanged])
+
   const refresh = useCallback(async () => {
     const creationTicket = scope.read('$features')
     const ticket = scope.read('$list')
@@ -319,8 +514,8 @@ function RealAnalysesProvider({ workspaceId, children }: { workspaceId: string; 
         setFeatures(available)
         if (available.realAnalyses) {
           setCreationError(null)
-          if (targetsRef.current.state !== 'ready') void refreshTargets()
         } else {
+          scope.cancelReads((key) => key === '$targets')
           const message = 'New analyses are unavailable because their source or processing dependencies are not enabled. Saved history and frozen evidence remain separate; no samples are substituted.'
           setCreationError(message)
           targetsRef.current = { state: 'error', error: message }
@@ -328,6 +523,7 @@ function RealAnalysesProvider({ workspaceId, children }: { workspaceId: string; 
         }
       } catch (caught) {
         if (!scope.current(creationTicket)) return
+        scope.cancelReads((key) => key === '$targets')
         const message = realRequestError(caught, 'New-run readiness could not be checked. Creation remains disabled.')
         featuresRef.current = null
         setFeatures(null)
@@ -342,6 +538,7 @@ function RealAnalysesProvider({ workspaceId, children }: { workspaceId: string; 
         // Creation readiness is not historical availability; existing runs own their frozen inputs.
         const values = await api.listAllRealAnalyses(workspaceId, ticket.controller.signal)
         if (!scope.current(ticket)) return
+        backoff.record(ticket.key, JSON.stringify(values.map((item) => [item.run.id, item.etag])))
         historyAvailable.current = true
         scope.reconcile('run:', ticket.sequence)
         const present = new Set(values.map((item) => item.run.id))
@@ -351,13 +548,14 @@ function RealAnalysesProvider({ workspaceId, children }: { workspaceId: string; 
         setPhase('ready')
         setError(null)
         for (const [id, entry] of Object.entries(detailRef.current)) {
-          if (entry.state === 'idle' || entry.state === 'loading') void ensureDetail(id, true)
+          if (activeAnalyses.current.has(id) && (entry.state === 'idle' || entry.state === 'loading')) void ensureDetail(id, true)
         }
         for (const [id, entry] of Object.entries(comparisonsRef.current)) {
-          if (entry.state === 'idle' || entry.state === 'loading') void ensureComparisons(id, true)
+          if (activeAnalyses.current.has(id) && (entry.state === 'idle' || entry.state === 'loading')) void ensureComparisons(id, true)
         }
       } catch (caught) {
         if (!scope.current(ticket)) return
+        backoff.record(ticket.key)
         if (caught instanceof CloudApiError && [401, 403].includes(caught.status)) {
           scope.reconcile('run:', ticket.sequence)
           for (const item of summariesRef.current) removeRun(item.run.id, ticket.sequence)
@@ -368,7 +566,7 @@ function RealAnalysesProvider({ workspaceId, children }: { workspaceId: string; 
       } finally { scope.finish(ticket) }
     }
     await Promise.all([checkCreation(), readHistory()])
-  }, [ensureComparisons, ensureDetail, refreshTargets, rememberRun, removeRun, scope, workspaceId])
+  }, [backoff, ensureComparisons, ensureDetail, rememberRun, removeRun, scope, workspaceId])
 
   useEffect(() => {
     scope.activate()
@@ -379,63 +577,78 @@ function RealAnalysesProvider({ workspaceId, children }: { workspaceId: string; 
   useEffect(() => { void refresh() }, [policy.settings?.revision, refresh])
 
   useEffect(() => {
-    void refreshTargets()
-  }, [location.key, features?.realAnalyses, refreshTargets])
+    if (targetSubscriptions.current.size && features?.realAnalyses && tabVisible() && targetsRef.current.state !== 'ready') {
+      void refreshTargets()
+    }
+  }, [features, refreshTargets, subscriptionsVersion])
 
+  const listWorkPending = summaries.some(active)
   useEffect(() => {
-    if (phase !== 'ready' || (!summaries.some(active) && !Object.values(comparisons).some((entry) => entry.state === 'ready'
-      && entry.value.some((item) => ['queued', 'running'].includes(item.comparison.status))))) return
+    if (phase !== 'ready' || (!activeAnalyses.current.size && !activeComparisons.current.size &&
+      !narrativeSubscriptions.current.size && !summarySubjectSubscriptions.current.size && !narrativeProgress.current.size &&
+      !(location.pathname === '/analyses' && listWorkPending))) return
     const timer = window.setInterval(() => {
-      void refresh()
-      for (const [id, entry] of Object.entries(detailRef.current)) {
-        if (entry.state === 'idle' || entry.state === 'loading' || (entry.state === 'ready' && active(entry.value))) {
-          void ensureDetail(id, true)
-          if (comparisonsRef.current[id]?.state !== 'error') void ensureComparisons(id, true)
+      if (!tabVisible()) return
+      if ((location.pathname === '/analyses' || activeAnalyses.current.size > 0) &&
+        summariesRef.current.some(active) && backoff.due('$list')) void refresh()
+      for (const id of activeAnalyses.current.keys()) {
+        const entry = detailRef.current[id]
+        const pairs = comparisonsRef.current[id]
+        if (entry?.state !== 'ready' || entry.error || active(entry.value)) {
+          if (backoff.due(`detail:${id}`)) void ensureDetail(id, true)
+          if (backoff.due(`pairs:${id}`)) void ensureComparisons(id, true)
+        } else if (pairs?.state !== 'ready' || pairs.error ||
+          pairs.value.some((item) => ['queued', 'running'].includes(item.comparison.status))) {
+          if (backoff.due(`pairs:${id}`)) void ensureComparisons(id, true)
         }
       }
-      for (const [id, entry] of Object.entries(comparisonsRef.current)) {
-        if (entry.state === 'idle' || entry.state === 'loading' || (entry.state === 'ready' && entry.value.some((item) => ['queued', 'running'].includes(item.comparison.status)))) void ensureComparisons(id, true)
-      }
-      for (const [key, entry] of Object.entries(resultsRef.current)) {
-        if (entry.state === 'ready' && ['queued', 'running'].includes(entry.value.comparison.status)) {
-          void ensureComparison(entry.value.comparison.runId, entry.value.comparison.id, true)
-        } else if (entry.state === 'idle' || entry.state === 'loading') {
-          const summary = pairSummaries.current.get(key)
-          if (summary) void ensureComparison(summary.comparison.runId, summary.comparison.id, true)
+      for (const key of activeComparisons.current.keys()) {
+        const entry = resultsRef.current[key]
+        if (entry?.state !== 'ready' || entry.error || ['queued', 'running'].includes(entry.value.comparison.status)) {
+          const pair = pairSummaries.current.get(key)?.comparison
+          if (pair && backoff.due(`result:${key}`)) void ensureComparison(pair.runId, pair.id, true)
         }
       }
+      refreshRelevantNarratives(undefined, true)
     }, pollingInterval)
     return () => window.clearInterval(timer)
-  }, [comparisons, ensureComparison, ensureComparisons, ensureDetail, phase, pollingInterval, refresh, summaries])
+  }, [backoff, ensureComparison, ensureComparisons, ensureDetail, listWorkPending, location.pathname, phase, pollingInterval, refresh, refreshRelevantNarratives, subscriptionsVersion])
 
-  const scoringRevision = summaries.map((item) => `${item.run.id}:${item.etag}`).join('|')
+  const scoringRevisions = useRef(new Map<string, string>())
   useEffect(() => {
     if (phase !== 'ready') return
-    for (const selected of narrativeScopes.current.values()) void ensureNarratives(selected.runId, selected.targetId, true)
-  }, [ensureNarratives, phase, scoringRevision])
-
-  useEffect(() => {
-    if (phase !== 'ready' || !Object.values(narratives).some((entry) => entry.state === 'idle' || entry.state === 'loading' ||
-      (entry.state === 'ready' && (entry.error || narrativeWorkActive(entry.value))))) return
-    const timer = window.setInterval(() => {
-      for (const [key, selected] of narrativeScopes.current) {
-        const entry = narrativesRef.current[key]
-        if (entry?.state === 'idle' || entry?.state === 'loading' || (entry?.state === 'ready' && (entry.error || narrativeWorkActive(entry.value)))) {
-          void ensureNarratives(selected.runId, selected.targetId, true)
-        }
+    for (const item of summaries) {
+      const previous = scoringRevisions.current.get(item.run.id)
+      if (previous && previous !== item.etag) {
+        invalidateNarratives(item.run.id)
+        refreshRelevantNarratives(item.run.id)
       }
-    }, pollingInterval)
-    return () => window.clearInterval(timer)
-  }, [ensureNarratives, narratives, phase, pollingInterval])
+    }
+    scoringRevisions.current = new Map(summaries.map((item) => [item.run.id, item.etag]))
+  }, [invalidateNarratives, phase, refreshRelevantNarratives, summaries])
 
   useEffect(() => {
-    const focus = () => {
-      void refresh(); void refreshTargets()
-      for (const selected of narrativeScopes.current.values()) void ensureNarratives(selected.runId, selected.targetId, true)
+    let lastResume = -Infinity
+    const resume = () => {
+      if (!tabVisible()) { lastResume = -Infinity; return }
+      if (Date.now() - lastResume < 250) return
+      lastResume = Date.now()
+      if (!location.pathname.startsWith('/analyses') && !activeAnalyses.current.size && !targetSubscriptions.current.size) return
+      void refresh()
+      if (targetSubscriptions.current.size) void refreshTargets()
+      for (const id of activeAnalyses.current.keys()) {
+        void ensureDetail(id, true)
+        void ensureComparisons(id, true)
+      }
+      refreshRelevantNarratives()
     }
-    window.addEventListener('focus', focus)
-    return () => window.removeEventListener('focus', focus)
-  }, [ensureNarratives, refresh, refreshTargets])
+    window.addEventListener('focus', resume)
+    document.addEventListener('visibilitychange', resume)
+    return () => {
+      window.removeEventListener('focus', resume)
+      document.removeEventListener('visibilitychange', resume)
+    }
+  }, [ensureComparisons, ensureDetail, location.pathname, refresh, refreshRelevantNarratives, refreshTargets])
 
   async function mutate<T>(runId: string | undefined, operation: () => Promise<T>, commit: (value: T, sequence: number) => void, lifecycle = false, summariesOnly = false): Promise<T> {
     if (lifecycle) {
@@ -474,12 +687,10 @@ function RealAnalysesProvider({ workspaceId, children }: { workspaceId: string; 
         setPendingCount((value) => value - 1)
         if (!scope.busy) {
           leaveGuard.release()
-          void refresh()
-          if (runId) {
-            if (!summariesOnly) { void ensureDetail(runId, true); void ensureComparisons(runId, true) }
-            for (const selected of narrativeScopes.current.values()) {
-              if (selected.runId === runId) void ensureNarratives(runId, selected.targetId, true)
-            }
+          if (tabVisible()) void refresh()
+          if (runId && tabVisible()) {
+            if (!summariesOnly && activeAnalyses.current.has(runId)) { void ensureDetail(runId, true); void ensureComparisons(runId, true) }
+            refreshRelevantNarratives(runId)
           }
         }
         void parentRef.current.cloud?.refreshWorkspaces().catch(() => undefined)
@@ -555,7 +766,7 @@ function RealAnalysesProvider({ workspaceId, children }: { workspaceId: string; 
       }
     }, (response, sequence) => {
       invalidateNarratives(runId, history.targetId)
-      rememberNarratives(response, sequence)
+      rememberNarratives(response, sequence, true)
     }, false, true)
     narrativeRequests.current.delete(fingerprint)
     summaryHistoryScopes.current.delete(historyKey)
@@ -567,11 +778,15 @@ function RealAnalysesProvider({ workspaceId, children }: { workspaceId: string; 
       ...analysisFeaturesWithPolicy(features, policy.settings),
       realAnalyses: features.realAnalyses && !clientAdmissionReason(policy, 'newAnalyses'),
       analysisSummaryGeneration: features.analysisSummaryGeneration === true && !clientAdmissionReason(policy, 'summaryGeneration'),
-    } : null, error, creationError: clientAdmissionReason(policy, 'newAnalyses') ?? creationError, summaries, targets, refresh, refreshTargets, ensureDetail, ensureComparisons, ensureComparison, ensureNarratives,
+      analysisEvidenceCorrections: features.analysisEvidenceCorrections === true && !clientAdmissionReason(policy),
+    } : null, error, creationError: clientAdmissionReason(policy, 'newAnalyses') ?? creationError,
+    summaries, targets, refresh, refreshTargets, subscribeTargets, ensureDetail, ensureComparisons, ensureComparison, ensureNarratives,
+    subscribeAnalysis, subscribeComparison, subscribeNarratives, ensureSummarySubject, subscribeSummarySubject,
     detail: (id) => details[id] ?? { state: 'idle' },
     comparisons: (id) => comparisons[id] ?? { state: 'idle' },
     comparison: (runId, id) => results[pairKey(runId, id)] ?? { state: 'idle' },
     narratives: (runId, targetId) => narratives[narrativeKey(runId, targetId)] ?? { state: 'idle' },
+    summarySubject: (runId, subject) => summarySubjects[summarySubjectKey(runId, subject)] ?? { state: 'idle' },
     generateSummaries: async (runId, input, etag) => {
       assertClientAdmission(policy, 'summaryGeneration')
       if (featuresRef.current?.analysisSummaryGeneration !== true) throw new Error('Summary generation is unavailable. Saved summaries, scores, and frozen evidence remain separate from new-run readiness.')
@@ -594,7 +809,7 @@ function RealAnalysesProvider({ workspaceId, children }: { workspaceId: string; 
         }
       }, (response, sequence) => {
         invalidateNarratives(runId, input.targetId)
-        rememberNarratives(response.summaries, sequence)
+        rememberNarratives(response.summaries, sequence, true)
       }, false, true)
       narrativeRequests.current.delete(fingerprint)
       return result
@@ -618,8 +833,10 @@ function RealAnalysesProvider({ workspaceId, children }: { workspaceId: string; 
         if (run && page.entries.some(entry => entry.manifestSha256 !== run.manifest.sha256)) {
           throw new Error('The summary history does not match this run’s frozen manifest. Reload the saved analysis.')
         }
+        const subjectEntry = summarySubjectsRef.current[summarySubjectKey(runId, subject)]
         const targetId = subject.kind === 'target' ? subject.subjectId
-          : Object.values(narrativesRef.current).flatMap(entry =>
+          : (subjectEntry?.state === 'ready' ? subjectEntry.value.narrative.targetId : undefined)
+          ?? Object.values(narrativesRef.current).flatMap(entry =>
             entry.state === 'ready' && entry.value.runId === runId ? entry.value.comparisons : [])
             .find(item => item.comparisonId === subject.subjectId)?.targetId
           ?? pairSummaries.current.get(pairKey(runId, subject.subjectId))?.comparison.target.summary.id

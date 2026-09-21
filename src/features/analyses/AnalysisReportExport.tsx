@@ -54,14 +54,16 @@ export function AnalysisReportExport({ source, onManageSummaries }: { source: Re
   const workspaceId = source.kind === 'real' ? source.workspaceId : null
   const summaryEntry = runId ? analyses?.narratives?.(runId, targetId || undefined) : undefined
   const ensureSummaries = analyses?.ensureNarratives
+  const subscribeSummaries = analyses?.subscribeNarratives
   const [checkingSummaries, setCheckingSummaries] = useState(false)
   useEffect(() => {
     if (!open || !requiresSummaries || !runId || !historyAvailable || !ensureSummaries || policyDisabledReason || formatDisabledReason) return
     let current = true
+    const release = subscribeSummaries?.(runId, targetId || undefined)
     setCheckingSummaries(true)
     void ensureSummaries(runId, targetId || undefined, true).finally(() => { if (current) setCheckingSummaries(false) })
-    return () => { current = false }
-  }, [ensureSummaries, format, formatDisabledReason, historyAvailable, open, policyDisabledReason, requiresSummaries, runId, targetId, workspaceId])
+    return () => { current = false; release?.() }
+  }, [ensureSummaries, format, formatDisabledReason, historyAvailable, open, policyDisabledReason, requiresSummaries, runId, subscribeSummaries, targetId, workspaceId])
   useEffect(() => {
     if (!open && !active.current) setFormat(reportPolicy.defaultFormat)
   }, [open, reportPolicy.defaultFormat])
@@ -106,8 +108,9 @@ export function AnalysisReportExport({ source, onManageSummaries }: { source: Re
   const busy = stage !== null
   const summaries = summaryEntry?.state === 'ready' ? summaryEntry.value : null
   const summaryError = summaryEntry?.state === 'ready' || summaryEntry?.state === 'error' ? summaryEntry.error : undefined
+  const refreshingSummaries = checkingSummaries || (summaryEntry?.state === 'ready' && summaryEntry.refreshing)
   const narrativeReady = source.kind === 'sample' ? unfinished === 0
-    : !checkingSummaries && !summaryError && Boolean(summaries?.ready && summaries.capture.ready &&
+    : !refreshingSummaries && !summaryError && Boolean(summaries?.ready && summaries.capture.ready &&
       summaries.scoring.total === source.detail.resumes.length * (targetId ? 1 : source.detail.targets.length) &&
       summaries.scoring.complete === complete && summaries.scoring.initialized === summaries.scoring.total &&
       summaries.scoring.queued === 0 && summaries.scoring.running === 0)
@@ -235,7 +238,7 @@ export function AnalysisReportExport({ source, onManageSummaries }: { source: Re
           <p className="text-[12px] font-semibold">PDF, Word, and PowerPoint require current, ready summaries and settled scoring in the selected scope.</p>
           {source.kind === 'real' ? <>
             {summaries && <AnalysisSummaryStatus summaries={summaries} />}
-            {(checkingSummaries || (!summaryError && !summaries)) && <p className="text-[12px]" role="status">Checking selected summary readiness...</p>}
+            {(refreshingSummaries || (!summaryError && !summaries)) && <p className="text-[12px]" role="status">Checking selected summary readiness...</p>}
             {summaryError && <InlineError>{summaryError}</InlineError>}
             {narrativeBlocked && <p className="text-[12px]" role="status">Missing, outdated, failed, waiting, or generating summaries block this download, even if previous text is still available. CSV remains available under its usual rules. Export never starts summary generation.</p>}
             {narrativeBlocked && <div className="flex flex-wrap gap-2">

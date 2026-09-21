@@ -22,9 +22,13 @@ export const ANALYSIS_MODEL_LIMITS = {
 } as const
 
 export const ANALYSIS_MODEL_SCHEMA_VERSIONS = {
-  assessment: 'score-analysis-assessment-v2',
+  assessment: 'score-analysis-assessment-v3',
   grounding: 'score-analysis-grounding-v2',
 } as const
+
+export const ANALYSIS_CRITERION_BLOCKER_CODES = [
+  'unusable-source', 'ambiguous-guidance', 'restricted-personal-characteristic',
+] as const
 
 const identifier = z.string().min(1).max(200).regex(/\S/)
 const nonblank = (max: number) => z.string().min(1).max(max).regex(/\S/)
@@ -120,6 +124,9 @@ const limitation = z.strictObject({
   code: z.enum(['sparse-source', 'not-assessable', 'source-quality']),
   message: nonblank(ANALYSIS_MODEL_LIMITS.maxLimitationCharacters),
 })
+const criterionBlocker = limitation.extend({
+  code: z.enum(ANALYSIS_CRITERION_BLOCKER_CODES),
+})
 const criterionResult = z.strictObject({
   criterionId: identifier,
   evidenceStatus: z.enum(['supported', 'partial', 'missing', 'not-assessed', 'not-applicable']),
@@ -197,6 +204,7 @@ export function assessmentSelectionSchemaForInput(input: RealAnalysisAssessmentI
   return assessmentSchema.extend({
     criteria: z.array(criterionResult.extend({
       criterionId: z.enum(input.rubric.criteria.map(value => value.id)), citations,
+      limitation: criterionBlocker.nullable(),
     })).length(input.rubric.criteria.length),
     qualifications: z.array(qualificationResult.extend({
       qualificationId: input.qualifications.length ? z.enum(input.qualifications.map(value => value.id)) : identifier,

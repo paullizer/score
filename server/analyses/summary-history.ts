@@ -12,9 +12,11 @@ import {
 import { conflict, invalidRequest, notFound } from '../errors'
 import { preservesProcessingSettings } from '../jobs/policy'
 import { StoreConflictError } from '../store'
+import { isUuid } from '../jobs/validation'
+import { resolveAnalysisComparisonRevision } from './current-results'
 import { analysisIsRemoved, fencedAnalysisBlobs } from './guards'
-import { loadAnalysisRun } from './lifecycle'
-import { analysisNarrativeCanWork } from './narrative-records'
+import { loadAnalysisComparison, loadAnalysisRun } from './lifecycle'
+import { analysisNarrativeCanWork, candidateNarrativeBinding } from './narrative-records'
 import { loadAnalysisNarrative, readAnalysisNarrativeInventory } from './narratives'
 import { analysisPageCursor, analysisPageToken } from './paging'
 import { analysisBlobReference, parseAnalysisJson, readAnalysisBlob } from './snapshots'
@@ -79,12 +81,12 @@ function validateStep(step: AnalysisSummaryStep, kind: AnalysisSummarySubject['k
 }
 
 export async function readSummaryHistoryEntry(
-  deps: RealAnalysesDeps, record: RealAnalysisNarrativeRecord, reference: AnalysisSummaryHistoryReference,
+  deps: RealAnalysesDeps, record: RealAnalysisNarrativeRecord, reference: AnalysisSummaryHistoryReference, signal?: AbortSignal,
 ): Promise<AnalysisSummaryHistoryEntry> {
   const subject = summarySubject(record)
   assertAnalysisSummaryHistoryReference(reference, record.workspaceId, record.runId, subject.kind, subject.subjectId)
   const entry = summaryHistoryEntrySchema.parse(parseAnalysisJson(
-    await readAnalysisBlob(deps.blobs, reference.blob, record.workspaceId, record.runId),
+    await readAnalysisBlob(deps.blobs, reference.blob, record.workspaceId, record.runId, signal),
   ))
   assertAnalysis(entry.id === reference.id && entry.generationId === reference.generationId && entry.createdAt === reference.createdAt &&
     entry.workspaceId === record.workspaceId && entry.runId === record.runId && entry.targetId === record.targetId &&
@@ -213,19 +215,28 @@ export async function readSummaryGeneration(
 }
 
 export async function readSummarySubject(
-  deps: RealAnalysesDeps, workspaceId: string, runId: string, subject: AnalysisSummarySubject,
+  deps: RealAnalysesDeps, workspaceId: string, runId: string, subject: AnalysisSummarySubject, signal?: AbortSignal, resultRevisionId?: string,
 ) {
   if (subject.kind !== 'candidate' && subject.kind !== 'target' ||
     (subject.kind === 'candidate' ? !isAnalysisId(subject.subjectId, 'comparison')
       : !analysisNarrativeTargetIdSchema.safeParse(subject.subjectId).success)) {
     throw notFound('The exact saved summary was not found.')
   }
-  const inventory = await readAnalysisNarrativeInventory(deps, workspaceId, runId)
-  const pair = subject.kind === 'candidate' ? inventory.comparisons.find(item => item.id === subject.subjectId) : undefined
+  const inventory = await readAnalysisNarrativeInventory(deps, workspaceId, runId, undefined, signal)
+  let pair = subject.kind === 'candidate' ? inventory.comparisons.find(item => item.id === subject.subjectId) : undefined
   const target = inventory.targets.find(item => item.target.summary.id === (pair?.target.summary.id ?? subject.subjectId))
   if (!target || subject.kind === 'candidate' && !pair) throw notFound('The exact saved summary was not found in this run.')
-  const id = analysisNarrativeId(subject.kind, runId, subject.subjectId)
-  const current = await loadAnalysisNarrative(deps.store, workspaceId, id)
+  if (resultRevisionId !== undefined) {
+    if (subject.kind !== 'candidate' || !pair || resultRevisionId !== 'original' && !isUuid(resultRevisionId)) {
+      throw invalidRequest('Historical summary reads require one original or published candidate result revision.')
+    }
+    const original = await loadAnalysisComparison(deps.store, workspaceId, runId, subject.subjectId, signal)
+    if (!original) throw notFound('The original comparison was not found.')
+    const selected = await resolveAnalysisComparisonRevision(deps, inventory.run.record, original, resultRevisionId, signal)
+    pair = { ...pair, comparison: selected.record, binding: candidateNarrativeBinding(inventory.run.record, selected.record), correctionPending: false }
+  }
+  const id = analysisNarrativeId(subject.kind, runId, subject.subjectId, pair?.comparison?.resultRevision?.id)
+  const current = await loadAnalysisNarrative(deps.store, workspaceId, id, signal)
   if (current) assertAnalysis(current.record.runId === runId && current.record.targetId === target.target.summary.id &&
     current.record.manifestSha256 === inventory.run.record.manifest.sha256 &&
     analysisHash(current.record.targetSnapshot) === analysisHash({ snapshotId: target.target.snapshotId, sha256: target.target.blob.sha256 }),
@@ -233,8 +244,13 @@ export async function readSummarySubject(
   const binding: AnalysisNarrativeInputBinding | null = subject.kind === 'candidate' ? pair!.binding
     : target.binding.comparisons.some(item => item.status === 'complete') ? target.binding : null
   const inputFingerprint = binding ? analysisHash(binding) : null
+  if (current?.record.recordType === 'analysis-candidate-narrative') assertAnalysis(pair?.binding &&
+    current.record.comparisonId === pair.id && current.record.resultSha256 === pair.binding.resultSha256 &&
+    current.record.inputFingerprint === inputFingerprint &&
+    analysisHash(current.record.resumeSnapshot) === analysisHash(pair.binding.resumeSnapshot),
+  'Historical candidate summary is not bound to the selected assessment revision.')
   const etag = current?.etag ?? `"${analysisHash({ id, missing: true, inputFingerprint, manifestSha256: inventory.run.record.manifest.sha256 })}"`
-  return { inventory, current, pair, target, binding, etag, inputFingerprint }
+  return { inventory, current, pair, target, binding, etag, inputFingerprint, recordId: id }
 }
 
 const historyCursorSchema = z.strictObject({
@@ -243,15 +259,16 @@ const historyCursorSchema = z.strictObject({
 
 export async function readAnalysisSummaryHistory(
   deps: RealAnalysesDeps, workspaceId: string, runId: string, subject: AnalysisSummarySubject, continuationToken?: string,
-  pageSize: number = SUMMARY_LIMITS.historyPageSize,
+  signal?: AbortSignal, resultRevisionId?: string, pageSize: number = SUMMARY_LIMITS.historyPageSize,
 ): Promise<AnalysisSummaryHistoryPage> {
   if (!Number.isInteger(pageSize) || pageSize < 1 || pageSize > SUMMARY_LIMITS.historyPageSize) {
     throw invalidRequest('Summary history page size exceeds its supported resource bound.')
   }
-  const scope = { workspaceId, runId, kind: 'summary-history' as const, summaryKind: subject.kind, subjectId: subject.subjectId }
+  const scope = { workspaceId, runId, kind: 'summary-history' as const, summaryKind: subject.kind, subjectId: subject.subjectId,
+    ...(resultRevisionId ? { resultRevisionId } : {}) }
   const cursor = analysisPageCursor(scope, continuationToken)
   for (let race = 0; race < 4; race++) {
-    const state = await readSummarySubject(deps, workspaceId, runId, subject)
+    const state = await readSummarySubject(deps, workspaceId, runId, subject, signal, resultRevisionId)
     const record = state.current?.record
     let reference = record?.history
     if (cursor) {
@@ -271,24 +288,26 @@ export async function readAnalysisSummaryHistory(
     while (reference && entries.length < pageSize) {
       assertAnalysis(!seen.has(reference.id), 'Summary history contains a repeated checkpoint.')
       seen.add(reference.id)
-      const entry = await readSummaryHistoryEntry(deps, record!, reference)
+      const entry = await readSummaryHistoryEntry(deps, record!, reference, signal)
       entries.push(entry)
       reference = entry.previous
     }
     const [run, latest, workspace] = await Promise.all([
-      loadAnalysisRun(deps.store, workspaceId, runId),
-      loadAnalysisNarrative(deps.store, workspaceId, analysisNarrativeId(subject.kind, runId, subject.subjectId)),
-      deps.store.getControl(workspaceId),
+      loadAnalysisRun(deps.store, workspaceId, runId, signal),
+      loadAnalysisNarrative(deps.store, workspaceId, state.recordId, signal),
+      deps.store.getControl(workspaceId, undefined, signal),
     ])
+    signal?.throwIfAborted()
     if (!run || analysisIsRemoved(run.record.lifecycle) || workspace && ['deleting', 'deleted'].includes(workspace.record.state)) {
       throw notFound('The saved analysis is being removed.')
     }
     if (run.etag !== state.inventory.run.etag || latest?.etag !== state.current?.etag) continue
-    const writable = (!workspace || workspace.record.state === 'active') && analysisNarrativeCanWork(run.record) &&
+    const writable = !resultRevisionId && (!workspace || workspace.record.state === 'active') && analysisNarrativeCanWork(run.record) &&
       !run.record.narrativeRequestId && Boolean(state.binding)
     const next = reference ? analysisPageToken(scope, JSON.stringify({ headId: record!.history!.id, next: reference })) : undefined
     return summaryHistoryPageSchema.parse({
       schemaVersion: 1, workspaceId, runId, ...subject, etag: state.etag, inputFingerprint: state.inputFingerprint,
+      ...(resultRevisionId ? { resultRevisionId } : {}),
       entries, ...(next ? { continuationToken: next } : {}),
       capabilities: { canPublish: writable && Boolean(record?.history), canRetry: writable },
     })

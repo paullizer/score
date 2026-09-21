@@ -240,6 +240,8 @@ test('archive preserves completed comparisons, model reviews, original bytes and
   const completed = clone(comparisons(f, run.run.id)[0])
   const evidence = clone([...f.analysis.blobs.values])
   const detail = await f.service.comparisonDetail(f.workspaceId, run.run.id, first.record.id)
+  const subject = { kind: 'candidate', subjectId: first.record.id }
+  assert.equal((await f.service.summarySubject(f.workspaceId, run.run.id, subject)).narrative.status, 'queued')
   const result = await change(f, run.run.id, 'archive')
   assert.equal(result.pending, undefined)
   assert.equal(result.analysis.run.progress.complete, 1)
@@ -247,8 +249,10 @@ test('archive preserves completed comparisons, model reviews, original bytes and
   assert.deepEqual(comparisons(f, run.run.id)[0], completed)
   assert.deepEqual([...f.analysis.blobs.values], evidence)
   const archivedDetail = await f.service.comparisonDetail(f.workspaceId, run.run.id, first.record.id)
-  assert.equal(archivedDetail.narrative.status, 'cancelled', 'Archive fences pending sidecar work, not the immutable result.')
-  assert.deepEqual({ ...archivedDetail, narrative: undefined }, { ...detail, narrative: undefined })
+  const archivedSummary = await f.service.summarySubject(f.workspaceId, run.run.id, subject)
+  assert.equal(archivedSummary.narrative.status, 'cancelled', 'Archive fences pending sidecar work, not the immutable result.')
+  assert.equal(archivedDetail.narrative, undefined, 'Narratives load independently of immutable comparison evidence.')
+  assert.deepEqual(archivedDetail, detail)
   assert.deepEqual((await f.service.document(f.workspaceId, run.run.id, first.record.id,
     detail.resumeSnapshot.document.id, detail.resumeSnapshot.document.version)).document, detail.resumeSnapshot.document)
   await change(f, run.run.id, 'unarchive')

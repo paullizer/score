@@ -12,9 +12,11 @@ import { acceptedProcessingSettings } from '../jobs/policy'
 import type { ProcessingSettingsSnapshot } from '../../src/domain/admin-settings'
 
 export async function loadAnalysisRun(
-  store: AnalysisStore, workspaceId: string, runId: string,
+  store: AnalysisStore, workspaceId: string, runId: string, signal?: AbortSignal,
 ): Promise<VersionedAnalysisEntity<RealAnalysisRunRecord> | undefined> {
-  const value = await store.get(workspaceId, runId)
+  signal?.throwIfAborted()
+  const value = await store.get(workspaceId, runId, signal)
+  signal?.throwIfAborted()
   if (!value) return undefined
   const record = parseAnalysisEntity(value.record)
   if (record.recordType !== 'analysis-run' || record.workspaceId !== workspaceId || record.id !== runId) return undefined
@@ -22,9 +24,11 @@ export async function loadAnalysisRun(
   return { record, etag: value.etag }
 }
 export async function loadAnalysisComparison(
-  store: AnalysisStore, workspaceId: string, runId: string, comparisonId: string,
+  store: AnalysisStore, workspaceId: string, runId: string, comparisonId: string, signal?: AbortSignal,
 ): Promise<VersionedAnalysisEntity<RealAnalysisComparisonRecord> | undefined> {
-  const value = await store.get(workspaceId, comparisonId)
+  signal?.throwIfAborted()
+  const value = await store.get(workspaceId, comparisonId, signal)
+  signal?.throwIfAborted()
   if (!value) return undefined
   const record = parseAnalysisEntity(value.record)
   if (record.recordType !== 'analysis-comparison' || record.workspaceId !== workspaceId || record.id !== comparisonId || record.runId !== runId) return undefined

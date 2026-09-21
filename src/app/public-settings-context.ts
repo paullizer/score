@@ -27,7 +27,7 @@ export function originalDownloadReason(policy: PublicSettingsContextValue, role?
   return null
 }
 
-export function clientAdmissionReason(policy: PublicSettingsContextValue, kind: NewWorkKind): string | null {
+export function clientAdmissionReason(policy: PublicSettingsContextValue, kind?: NewWorkKind): string | null {
   if (policy.cloud && policy.phase !== 'ready') return policy.error ?? 'Checking current application policy before starting new work.'
   return admissionReason(policy.settings, kind)
 }

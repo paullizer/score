@@ -15,13 +15,13 @@ export function fetchPublicFeatures(signal?: AbortSignal): Promise<PublicFeature
 
 export type NewWorkKind = 'jobImports' | 'resumeImports' | 'gradeLadders' | 'newAnalyses' | 'summaryGeneration'
 
-export function admissionReason(settings: PublicSettings | null | undefined, kind: NewWorkKind): string | null {
+export function admissionReason(settings: PublicSettings | null | undefined, kind?: NewWorkKind): string | null {
   if (!settings) return null
   if (settings.runtimeReadiness?.newProcessingAllowed === false) {
     return settings.runtimeReadiness.message || 'New processing is paused until the worker rollout is verified. Saved records and evidence remain readable.'
   }
   if (settings.maintenance.pauseNewWork) return settings.maintenance.explanation || 'New work is paused by an application administrator. Saved work remains available.'
-  if (!settings.features[kind]) return 'This new action is disabled by application policy. Saved records, evidence, and history remain available.'
+  if (kind && !settings.features[kind]) return 'This new action is disabled by application policy. Saved records, evidence, and history remain available.'
   return null
 }
 
@@ -109,5 +109,6 @@ export function gradeFeaturesWithPolicy(features: GradeProcessingFeatures, setti
 export function analysisFeaturesWithPolicy(features: AnalysisProcessingFeatures, settings?: PublicSettings | null): AnalysisProcessingFeatures {
   return { ...features, realAnalyses: features.realAnalyses && !admissionReason(settings, 'newAnalyses'),
     analysisSummaryGeneration: features.analysisSummaryGeneration === true && !admissionReason(settings, 'summaryGeneration'),
+    analysisEvidenceCorrections: features.analysisEvidenceCorrections === true && !admissionReason(settings),
     analysisLimits: clampClientLimits(ANALYSIS_LIMITS, { ...features.analysisLimits, ...(settings ? { maxComparisons: settings.analyses.maxComparisons } : {}) }) }
 }

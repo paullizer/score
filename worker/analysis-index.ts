@@ -20,6 +20,7 @@ export function createAnalysisWorkerDependencies(
     }),
     store: createAzureAnalysisStore(config.stores, credential),
     blobs: createAzureAnalysisBlobStore(config.stores, credential),
+    correctionsEnabled: config.stores.evidenceCorrectionsEnabled === true,
     onEvent: logAnalysisTelemetry,
     model: {
       endpoint: config.modelEndpoint, deployment: config.modelDeployment,

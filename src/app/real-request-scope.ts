@@ -1,6 +1,6 @@
 export type RealLoadState<T> =
   | { state: 'idle' | 'loading' }
-  | { state: 'ready'; value: T; error?: string }
+  | { state: 'ready'; value: T; error?: string; refreshing?: boolean }
   | { state: 'error'; error: string }
 
 interface Ticket {
@@ -100,4 +100,22 @@ export class RealRequestScope {
 
 export function realRequestError(error: unknown, fallback: string): string {
   return error instanceof Error ? error.message : fallback
+}
+
+// This schedules active reads only; request ownership and single-flight remain in RealRequestScope.
+export class RealReadBackoff {
+  private entries = new Map<string, { revision?: string; delay: number; nextAt: number }>()
+
+  due(key: string, now = Date.now()) { return (this.entries.get(key)?.nextAt ?? 0) <= now }
+
+  record(key: string, revision?: string, now = Date.now()) {
+    const previous = this.entries.get(key)
+    const changed = revision !== undefined && revision !== previous?.revision
+    const delay = !previous || changed ? 3000 : Math.min(previous.delay * 2, 30000)
+    this.entries.set(key, { revision: revision ?? previous?.revision, delay, nextAt: now + delay })
+  }
+
+  clear(matches: (key: string) => boolean) {
+    for (const key of this.entries.keys()) if (matches(key)) this.entries.delete(key)
+  }
 }

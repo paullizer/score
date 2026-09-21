@@ -5,6 +5,7 @@ import { usePublicSettings } from '../../app/public-settings-context'
 import { useWorkspace } from '../../app/workspace-context'
 import { Badge, Button, InlineError } from '../../components/ui'
 import { useLifecycleAccess } from '../../components/lifecycle/useLifecycleAccess'
+import { getRealAnalysisSummaryHistory, getRealAnalysisSummarySubject } from '../../services/realAnalyses'
 import type { RealAnalysisCandidateNarrativeSummary, RealAnalysisTargetNarrativeSummary } from '../../domain/analysis-narratives'
 import {
   summaryIssueDisclosures,
@@ -13,7 +14,7 @@ import {
 } from '../../domain/analysis-summary-history'
 
 type Summary = RealAnalysisCandidateNarrativeSummary | RealAnalysisTargetNarrativeSummary
-interface Props { runId: string; narrative: Summary; label: string }
+interface Props { runId: string; narrative: Summary; label: string; resultRevisionId?: string }
 
 export function SummaryApprovalDisclosure({ publication }: { publication: AnalysisSummaryPublicationMetadata }) {
   const disclosures = summaryIssueDisclosures(publication)
@@ -29,7 +30,52 @@ export function SummaryHistoryControl(props: Props) {
   const api = useRealAnalyses()
   if (!api?.canReviewSummaries) return null
   const subjectId = props.narrative.kind === 'candidate' ? props.narrative.comparisonId : props.narrative.targetId
-  return <HistoryDisclosure key={`${api.workspaceId}:${props.runId}:${props.narrative.kind}:${subjectId}`} {...props} />
+  return <HistoryDisclosure key={`${api.workspaceId}:${props.runId}:${props.narrative.kind}:${subjectId}:${props.resultRevisionId ?? 'current'}`} {...props} />
+}
+
+export function HistoricalCandidateNarrative({ runId, comparisonId, resultRevisionId, resultSha256, label }: {
+  runId: string; comparisonId: string; resultRevisionId: string; resultSha256: string; label: string
+}) {
+  const api = useRealAnalyses()
+  const [open, setOpen] = useState(false)
+  const [reload, setReload] = useState(0)
+  const [narrative, setNarrative] = useState<RealAnalysisCandidateNarrativeSummary | null>(null)
+  const [error, setError] = useState('')
+  useEffect(() => {
+    if (!open || !api?.canReviewSummaries) return
+    const controller = new AbortController()
+    setNarrative(null)
+    setError('')
+    void getRealAnalysisSummarySubject(api.workspaceId, runId, { kind: 'candidate', subjectId: comparisonId }, controller.signal, resultRevisionId)
+      .then(value => {
+        if (controller.signal.aborted) return
+        if (value.kind !== 'candidate' || value.narrative.resultSha256 !== resultSha256) {
+          throw new Error('The historical summary does not match this exact saved assessment hash.')
+        }
+        setNarrative(value.narrative)
+      }).catch(caught => {
+        if (!controller.signal.aborted) setError(caught instanceof Error ? caught.message : 'The historical summary could not be loaded.')
+      })
+    return () => controller.abort()
+  }, [api?.canReviewSummaries, api?.workspaceId, comparisonId, open, reload, resultRevisionId, resultSha256, runId])
+  if (!api?.canReviewSummaries) return null
+  return <div className="space-y-3">
+    <Button size="sm" icon={History} aria-expanded={open} onClick={() => setOpen(value => !value)}>
+      {open ? 'Hide' : 'View'} {label}
+    </Button>
+    {open && <section className="space-y-3 rounded-lg border p-3" aria-label={label}>
+      <Badge tone="warning">Historical assessment revision - read only</Badge>
+      <p>Saved narrative and review history for this assessment only. It is not substituted into the current result or exports.</p>
+      {narrative?.published ? <>
+        <SummaryApprovalDisclosure publication={narrative.published} />
+        <p className="whitespace-pre-wrap break-words">{narrative.published.text}</p>
+        <p>Published {narrative.published.publishedAt}</p>
+      </> : narrative && <p>No narrative was published for this assessment revision. Its saved attempt history is retained.</p>}
+      {narrative && <SummaryHistoryControl runId={runId} narrative={narrative} label={label} resultRevisionId={resultRevisionId} />}
+      {!narrative && !error && <p role="status">Loading historical summary...</p>}
+      {error && <InlineError>{error} <Button size="sm" onClick={() => setReload(value => value + 1)}>Retry historical summary</Button></InlineError>}
+    </section>}
+  </div>
 }
 
 function HistoryDisclosure(props: Props) {
@@ -64,7 +110,7 @@ function matchingPublished(entry: AnalysisSummaryHistoryEntry, narrative: Summar
       JSON.stringify(entry.draft.paragraphs) === JSON.stringify(narrative.published?.paragraphs)
 }
 
-function SummaryHistory({ runId, narrative, label }: Props) {
+function SummaryHistory({ runId, narrative, label, resultRevisionId }: Props) {
   const api = useRealAnalyses()
   const { settings } = usePublicSettings()
   const { cloud } = useWorkspace()
@@ -72,8 +118,8 @@ function SummaryHistory({ runId, narrative, label }: Props) {
   const publicationAllowed = settings?.summaries.allowManualPublication !== false && (settings?.summaries.manualPublicationRoles !== 'owner' || role === 'owner')
   const lifecycle = useLifecycleAccess({ kind: 'analysis', id: runId })
   const subject = { kind: narrative.kind, subjectId: narrative.kind === 'candidate' ? narrative.comparisonId : narrative.targetId }
-  const context = useRef({ api, runId, subject })
-  context.current = { api, runId, subject }
+  const context = useRef({ api, runId, subject, resultRevisionId })
+  context.current = { api, runId, subject, resultRevisionId }
   const controller = useRef<AbortController | null>(null)
   const lifetime = useRef(0)
   const submittingRef = useRef(false)
@@ -96,7 +142,7 @@ function SummaryHistory({ runId, narrative, label }: Props) {
     item.generationId === entry.generationId && item.scopeId === entry.scopeId && item.round === entry.round &&
     item.outputSha256 === entry.outputSha256 && item.review)?.review
   const pending = submitting || Boolean(api?.pending(runId))
-  const writable = Boolean(api?.canWrite && api.canReviewSummaries && lifecycle.canEdit &&
+  const writable = Boolean(!resultRevisionId && api?.canWrite && api.canReviewSummaries && lifecycle.canEdit &&
     !lifecycle.archived && !lifecycle.inherited && !lifecycle.deleting && !lifecycle.removed)
   const allowed = Boolean(writable && page && !pending && !loading && !loadError)
 
@@ -108,10 +154,12 @@ function SummaryHistory({ runId, narrative, label }: Props) {
     setLoadError(null)
     setSelectedId(null)
     try {
-      const { api: service, runId, subject } = context.current
+      const { api: service, runId, subject, resultRevisionId } = context.current
       if (!service?.canReviewSummaries) throw new Error('Private summary history requires a workspace owner or editor.')
       if (cursor && cursors.current.has(cursor)) throw new Error('The summary history cursor was repeated. Refresh the latest history.')
-      const next = await service.summaryHistory(runId, subject, cursor, request.signal)
+      const next = resultRevisionId
+        ? await getRealAnalysisSummaryHistory(service.workspaceId, runId, subject, cursor, request.signal, resultRevisionId)
+        : await service.summaryHistory(runId, subject, cursor, request.signal)
       request.signal.throwIfAborted()
       if (controller.current !== request) return
       if (cursor && (next.entries.some(entry => seen.current.has(entry.id)) ||
@@ -184,7 +232,8 @@ function SummaryHistory({ runId, narrative, label }: Props) {
     <p className="text-muted">{settings?.summaries.historyRoles === 'owner' ? 'Workspace owners only.' : 'Workspace owners and editors only.'} Opening history does not generate model work. Drafts and reviewer findings are not accepted summaries.</p>
     {settings && <p className="text-muted">The server returns up to {settings.summaries.historyPageSize} checkpoints per page under current policy. Older checkpoints remain available through pagination.</p>}
     {!publicationAllowed && <p className="text-muted" role="status">Manual publication is disabled for your role by application policy. Published text and authorized history are unchanged.</p>}
-    {narrative.published && <p>{narrative.status === 'ready' ? 'Current published version' : 'Previous published version'}: {narrative.published.publishedAt}
+    {resultRevisionId && <p>This assessment revision is read-only. Its drafts cannot replace the current assessment summary.</p>}
+    {narrative.published && <p>{resultRevisionId ? 'Historical published version' : narrative.status === 'ready' ? 'Current published version' : 'Previous published version'}: {narrative.published.publishedAt}
       {' · '}{narrative.published.approval?.kind === 'manual' ? 'Manually approved' : narrative.published.approval?.kind === 'automatic'
         ? 'Automatically reviewed' : 'Legacy publication · approval metadata was not recorded.'}</p>}
     {narrative.published?.approval?.kind === 'manual' && <p className="break-words text-muted">

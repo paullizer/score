@@ -625,6 +625,7 @@ test('public capability composition never overrides service or Word deployment g
   assert.equal(absent.realJobImports, false)
   assert.equal(absent.wordDocumentImports, false)
   assert.equal(absent.realAnalyses, false)
+  assert.equal(absent.analysisEvidenceCorrections, false)
   assert.equal(absent.publicSettings.features.jobImports, false)
   assert.deepEqual(absent.publicSettings.imports.jobs.allowedFormats, [])
   const noWord = effectiveFeatures({
@@ -635,15 +636,17 @@ test('public capability composition never overrides service or Word deployment g
   const paused = mergeAdminSettings(snapshot.settings, { maintenance: { pauseNewWork: true } })
   const result = effectiveFeatures({
     realJobImports: true, realResumeImports: true, realGradeLadders: true, realAnalyses: true,
-    analysisSummaryGeneration: true, wordDocumentImports: true,
+    analysisSummaryGeneration: true, analysisEvidenceCorrections: true, wordDocumentImports: true,
   }, captureProcessingSettings(paused, 'revision-2', now().toISOString()), true)
   assert.equal(result.realAnalyses, false)
   assert.equal(result.analysisSummaryGeneration, false)
+  assert.equal(result.analysisEvidenceCorrections, false)
+  assert.equal(result.deploymentCapabilities.analysisEvidenceCorrections, true)
   assert.equal(result.deploymentCapabilities.realAnalyses, true)
   assert.doesNotMatch(JSON.stringify(result), /administratorUserIds|job-rubric|modelName|credential/)
   const capabilities = {
     realJobImports: true, realResumeImports: true, realGradeLadders: true, realAnalyses: true,
-    analysisSummaryGeneration: true, wordDocumentImports: true,
+    analysisSummaryGeneration: true, analysisEvidenceCorrections: true, wordDocumentImports: true,
   }
   const inactive = effectiveFeatures(capabilities, snapshot, false, true)
   assert.equal(inactive.realJobImports, false)
@@ -651,12 +654,20 @@ test('public capability composition never overrides service or Word deployment g
   assert.equal(inactive.realGradeLadders, false)
   assert.equal(inactive.realAnalyses, false)
   assert.equal(inactive.analysisSummaryGeneration, false)
+  assert.equal(inactive.analysisEvidenceCorrections, false)
   assert.equal(inactive.deploymentCapabilities.realJobImports, true)
   assert.equal(inactive.publicSettings.runtimeReadiness.newProcessingAllowed, false)
   const legacy = effectiveFeatures(capabilities, snapshot, false, false)
   assert.equal(legacy.realJobImports, true)
   assert.equal(legacy.realAnalyses, true)
+  assert.equal(legacy.analysisEvidenceCorrections, true)
   assert.equal(legacy.publicSettings.runtimeReadiness.configured, false)
+  const noNewRuns = captureProcessingSettings(
+    mergeAdminSettings(snapshot.settings, { features: { newAnalyses: false } }), 'revision-3', now().toISOString(),
+  )
+  const frozenOnly = effectiveFeatures({ ...capabilities, realAnalyses: false, realResumeImports: false }, noNewRuns, true)
+  assert.equal(frozenOnly.realAnalyses, false)
+  assert.equal(frozenOnly.analysisEvidenceCorrections, true)
 })
 
 test('configuration keeps admins optional, tenant scoped, sign-in constrained, and model endpoints deployment-owned', () => {

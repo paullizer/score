@@ -19,11 +19,13 @@ await build({
     contents: [
       'service', 'routes', 'validation', 'snapshots', 'diagnostics', 'paging', 'lifecycle', 'library-lifecycle', 'guards', 'azure-store',
       'narratives', 'narrative-records', 'narrative-artifacts', 'narrative-scheduling', 'summary-history', 'summary-actions', 'reports',
+      'corrections', 'current-results', 'correction-actions', 'correction-validation',
     ].map(name => `export * from './server/analyses/${name}.ts';`).join('\n') +
       "\nexport * from './server/errors.ts'; export * from './server/store.ts';" +
       "\nexport * from './server/ids.ts'; export * from './server/middleware.ts';" +
       "\nexport { analysisRunCanScore } from './src/domain/real-analyses.ts';" +
       "\nexport * from './src/domain/analysis-diagnostics.ts';" +
+      "\nexport * from './src/domain/analysis-corrections.ts';" +
       "\nexport { WorkspaceRepository } from './server/repository.ts';" +
       "\nexport * from './server/settings/request-context.ts'; export * from './src/domain/admin-settings.ts';" +
       "\nexport { createJobStoreFromContainer } from './server/jobs/azure-store.ts';" +
@@ -65,7 +67,7 @@ export function blobs() {
   let beforeFencedPut
   const store = {
     values, events,
-    async read(name) { events.push(['read', name]); return clone(values.get(name)) },
+    async read(name, signal) { signal?.throwIfAborted(); events.push(['read', name]); return clone(values.get(name)) },
     async putImmutable(name, bytes, contentType) {
       events.push(['put', name])
       const old = values.get(name)
@@ -134,7 +136,7 @@ export function analysisStore() {
   }
   const store = {
     values, controls, batches, save,
-    async get(workspaceId, id) { return clone(values.get(key(workspaceId, id))) },
+    async get(workspaceId, id, signal) { signal?.throwIfAborted(); return clone(values.get(key(workspaceId, id))) },
     async create(record) {
       if (beforeCreate) await beforeCreate(record)
       assert.equal(record.recordType, 'analysis-run')
@@ -182,6 +184,17 @@ export function analysisStore() {
       }
       const progress = clone(values.get(key(workspaceId, runs[0].record.id)).record.progress)
       for (const operation of operations) {
+        if (operation.record.recordType === 'analysis-correction' && operation.kind === 'replace') {
+          const next = operation.record
+          const previous = values.get(key(workspaceId, next.id))?.record
+          if (previous && api.analysisHash(previous.published ?? null) !== api.analysisHash(next.published ?? null)) {
+            const original = values.get(key(workspaceId, next.comparisonId)).record
+            const before = api.projectAnalysisComparison(original, previous)
+            const after = api.projectAnalysisComparison(original, next)
+            progress[before.resultSummary.overall.status === 'available' ? 'scored' : 'unscored']--
+            progress[after.resultSummary.overall.status === 'available' ? 'scored' : 'unscored']++
+          }
+        }
         if (operation.record.recordType !== 'analysis-comparison' || operation.kind === 'delete') continue
         const previous = values.get(key(workspaceId, operation.record.id))?.record
         if (previous) {
@@ -202,10 +215,12 @@ export function analysisStore() {
       if (afterBatch) { const callback = afterBatch; afterBatch = undefined; await callback(operations) }
     },
     async list(workspaceId, options) {
+      options.signal?.throwIfAborted()
       const offset = Number(options.continuationToken ?? 0)
       assert.ok(Number.isInteger(offset) && offset >= 0)
       const all = [...values.values()].filter(({ record }) => record.workspaceId === workspaceId && record.recordType === options.recordType &&
-        (options.runId === undefined || options.runId === record.runId) && (options.status === undefined || record.status === options.status))
+        (options.runId === undefined || options.runId === record.runId) && (options.status === undefined || record.status === options.status) &&
+        (options.targetId === undefined || (record.recordType === 'analysis-comparison' ? record.target.summary.id : record.targetId) === options.targetId))
         .sort((a, b) => options.recordType === 'analysis-comparison' ? a.record.index - b.record.index :
           b.record.createdAt.localeCompare(a.record.createdAt) || a.record.id.localeCompare(b.record.id))
       const items = all.slice(offset, offset + (options.limit ?? 50)).map(clone)
@@ -224,13 +239,16 @@ export function analysisStore() {
             : record.recordType === 'analysis-narrative-request'
               ? api.analysisNarrativeRequestCanAdvance(parent.record, record) &&
                 (state !== 'archived' || api.analysisNarrativeRequestCancelled(parent.record, record))
+              : record.recordType === 'analysis-correction' ? api.analysisCorrectionCanWork(parent.record, record)
+              : record.recordType === 'analysis-candidate-narrative' && record.resultRevisionId !==
+                values.get(key(record.workspaceId, api.analysisCorrectionId(record.runId, record.comparisonId)))?.record.published?.revision.id ? false
               : api.analysisNarrativeCanWork(parent.record, record) && !parent.record.narrativeRequestId
         })
-        .sort((a, b) => ['analysis-run', 'analysis-comparison', 'analysis-narrative-request', 'analysis-candidate-narrative', 'analysis-target-narrative'].indexOf(a.record.recordType) -
-          ['analysis-run', 'analysis-comparison', 'analysis-narrative-request', 'analysis-candidate-narrative', 'analysis-target-narrative'].indexOf(b.record.recordType))
+        .sort((a, b) => ['analysis-run', 'analysis-comparison', 'analysis-correction', 'analysis-narrative-request', 'analysis-candidate-narrative', 'analysis-target-narrative'].indexOf(a.record.recordType) -
+          ['analysis-run', 'analysis-comparison', 'analysis-correction', 'analysis-narrative-request', 'analysis-candidate-narrative', 'analysis-target-narrative'].indexOf(b.record.recordType))
         .slice(0, limit).map(clone)
     },
-    async getControl(workspaceId, runId) { return clone(controls.get(key(workspaceId, api.analysisControlId(runId)))) },
+    async getControl(workspaceId, runId, signal) { signal?.throwIfAborted(); return clone(controls.get(key(workspaceId, api.analysisControlId(runId)))) },
     async listControls(workspaceId, token) {
       const all = [...controls.values()].filter(value => value.record.workspaceId === workspaceId)
       const start = Number(token ?? 0)
@@ -390,6 +408,7 @@ export async function seedJob(f, title = 'Engineering role', key = randomUUID(),
     id: `document-${key}`, kind: 'job', sample: false, title, version: 1,
     paragraphs: [{ id: 'job-p1', page: options.page ?? 1, heading: 'Duties', text: 'Evaluate engineering systems independently and explain evidence-based recommendations.' }],
   }
+  options.configureDocument?.(document)
   const rubric = {
     id: `rubric-${key}`, groupId: `rubric-group-${key}`, kind: 'job', dataKind: 'real', jobId: id,
     name: `${title} requirements`, description: 'Source-grounded engineering expectations.', version: 1, createdAt: NOW,
@@ -397,6 +416,7 @@ export async function seedJob(f, title = 'Engineering role', key = randomUUID(),
     criteria: [{ id: 'engineering', key: 'custom', label: 'Engineering analysis', description: document.paragraphs[0].text,
       weight: 100, guidance, requirementType: 'required', sourceCitations: [citation(document)] }],
   }
+  options.configureRubric?.(rubric, document)
   const documentRef = await putJson(f.jobs.blobs, `${f.workspaceId}/${id}/source-document.json`, document)
   const file = await sourceFile(document, options)
   const originalName = `${f.workspaceId}/${id}/original.${file.extension}`
@@ -544,7 +564,7 @@ export async function createRun(f, resumeCount = 1, targetCount = 1) {
 export async function finishInitialization(f, id) {
   return api.advanceAnalysisRun(f.analysis, f.workspaceId, id, { now: () => new Date(f.now), maxChunks: 4 })
 }
-export async function publishResult(f, runId, comparisonId, withheld = false, { scheduleNarratives = true } = {}) {
+export async function publishResult(f, runId, comparisonId, withheld = false, { scheduleNarratives = true, configureAssessment } = {}) {
   let run = await f.analysis.store.get(f.workspaceId, runId)
   let comparison = await f.analysis.store.get(f.workspaceId, comparisonId)
   const timestamp = new Date(Math.max(Date.parse(f.now), Date.parse(run.record.updatedAt), Date.parse(comparison.record.updatedAt))).toISOString()
@@ -570,11 +590,13 @@ export async function publishResult(f, runId, comparisonId, withheld = false, { 
       : { ...base, evidenceStatus: 'supported', score: 4, citations: [citation(snapshots.resumeSnapshot.document)] }
   })
   const assessment = { criteria, qualifications: [], summary: 'Evidence in the submitted document, for human review only.', limitations: [] }
+  configureAssessment?.(assessment, snapshots)
   const assessmentSha256 = api.analysisHash(assessment)
   const model = { model: 'test-assessor', deployment: 'test-deployment', promptVersion: 'assessment-v1', schemaVersion: '1',
     startedAt: timestamp, completedAt: timestamp, inputCharacters: 1000 }
   const result = api.parseAnalysisResult({
-    ...assessment, ...api.calculateAnalysisSummary(criteria), schemaVersion: 1, dataKind: 'real', workspaceId: f.workspaceId,
+    ...assessment, ...api.calculateAnalysisSummary(assessment.criteria, assessment.qualifications, assessment.limitations),
+    schemaVersion: 1, dataKind: 'real', workspaceId: f.workspaceId,
     runId, comparisonId, createdAt: timestamp, humanReviewRequired: true, provenance: {
       attemptId, manifestSha256: run.record.manifest.sha256, assessmentSha256, assessment: model,
       resumeSnapshot: { snapshotId: comparison.record.resume.snapshotId, sha256: comparison.record.resume.blob.sha256 },
@@ -666,7 +688,7 @@ export async function startHttp(f, enabled = true, settings, runtimeEnabled = tr
       const oid = options.role === 'viewer' ? VIEWER : options.role === 'editor' ? EDITOR : options.role === 'stranger' ? STRANGER : OWNER
       const principal = { auth_typ: 'aad', claims: [{ typ: 'tid', val: TENANT }, { typ: 'oid', val: oid }], name_typ: 'name', role_typ: 'roles' }
       return fetch(`${base}${suffix}`, {
-        method, headers: {
+        method, signal: options.signal, headers: {
           ...(options.noAuth ? {} : { 'x-ms-client-principal': Buffer.from(JSON.stringify(principal)).toString('base64') }),
           ...(method === 'GET' ? {} : {
             origin: ORIGIN, 'x-score-request': 'workspace',

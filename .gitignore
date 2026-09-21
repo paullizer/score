@@ -16,3 +16,5 @@ node_modules/
 .grade-integration-*/
 .lifecycle-browser-*/
 .word-preview-browser-*/
+.summary-browser-tests-*/
+.telemetry-tests-*/

@@ -215,9 +215,11 @@ export function validateAnalysisNarrativeArtifactInput(
 
 export async function readAnalysisNarrativePublication(
   blobs: Pick<AnalysisBlobStore, 'read'>, record: RealAnalysisNarrativeRecord, published = record.published,
+  signal?: AbortSignal,
 ): Promise<RealAnalysisNarrativeArtifact | undefined> {
+  signal?.throwIfAborted()
   if (!published) return undefined
-  const artifact = parseAnalysisNarrativeArtifact(parseAnalysisJson(await readAnalysisBlob(blobs, published.blob, record.workspaceId, record.runId)))
+  const artifact = parseAnalysisNarrativeArtifact(parseAnalysisJson(await readAnalysisBlob(blobs, published.blob, record.workspaceId, record.runId, signal)))
   const kind = record.recordType === 'analysis-candidate-narrative' ? 'candidate' : 'target'
   const subject = record.recordType === 'analysis-candidate-narrative' ? record.comparisonId : record.targetId
   const referenceMatches = (reference: AnalysisNarrativePublicationReference) =>

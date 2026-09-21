@@ -34,6 +34,7 @@ import {
   type WorkerSettingsDependencies,
 } from '../settings'
 export { RUNTIME_SETTINGS_VERSION } from '../../src/domain/admin-settings'
+import { runAnalysisCorrectionWork } from './correction-runtime'
 
 const LEASE_MS = 90_000
 const HEARTBEAT_MS = 25_000
@@ -48,6 +49,7 @@ export interface AnalysisWorkerDependencies extends WorkerSettingsDependencies {
   owner?: string
   onEvent?: AnalysisTelemetrySink
   onNarrativeEvent?: (event: AnalysisNarrativeTelemetryEvent) => void
+  correctionsEnabled?: boolean
 }
 
 export interface AnalysisWorkerOptions {
@@ -731,6 +733,9 @@ export async function runAnalysisWorker(
           if (await processClaimedComparison(claimed, deps, {
             deadline, signal: options.signal, attemptLimitReached: claimed.attemptLimitReached,
           })) result.completed++
+        } else if (record.recordType === 'analysis-correction') {
+          if (deps.correctionsEnabled === true &&
+            await runAnalysisCorrectionWork(deps, { record, etag: candidate.etag }, { deadline, signal: options.signal })) result.claimed++
         } else {
           if (await runAnalysisNarrativeWork(deps, { record, etag: candidate.etag }, { deadline, signal: options.signal })) result.claimed++
         }

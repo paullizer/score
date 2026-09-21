@@ -147,6 +147,21 @@ export function summaryResponse(fixture, {
   }
 }
 
+export function summarySubjectResponse(fixture, subject, options = {}) {
+  const targetId = subject.kind === 'target' ? subject.subjectId
+    : fixture.details.find(({ comparison }) => comparison.id === subject.subjectId)?.comparison.target.summary.id
+  const scope = summaryResponse(fixture, { ...options, targetId })
+  const narrative = subject.kind === 'candidate'
+    ? scope.comparisons.find((item) => item.comparisonId === subject.subjectId)
+    : scope.targets.find((item) => item.targetId === subject.subjectId)
+  if (!narrative) throw new Error('The summary fixture does not contain this subject.')
+  const revision = createHash('sha256').update(JSON.stringify({ subject, narrative })).digest('hex')
+  return {
+    schemaVersion: 1, dataKind: 'real', workspaceId: fixture.workspaceId, runId: fixture.summary.run.id,
+    ...subject, revision, etag: `"${revision}"`, narrative,
+  }
+}
+
 export function summaryHistoryFixture(fixture, {
   kind = 'candidate', subjectId = 'comparison-1', generationId = randomUUID(), rounds = 3,
 } = {}) {

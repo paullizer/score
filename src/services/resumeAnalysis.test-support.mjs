@@ -51,6 +51,8 @@ export function memoryRecords(api, parse, kind, { pageSize = 2 } = {}) {
         record.workspaceId === workspaceId && record.recordType === options.recordType &&
         (!options.batchId || record.batchId === options.batchId) &&
         (!options.runId || record.runId === options.runId) &&
+        (options.targetId === undefined ||
+          (record.recordType === 'analysis-comparison' ? record.target.summary.id : record.targetId) === options.targetId) &&
         (!options.status || (record.resume?.status ?? record.status) === options.status))
         .sort((left, right) => right.record.createdAt.localeCompare(left.record.createdAt) ||
           left.record.id.localeCompare(right.record.id))
@@ -544,5 +546,11 @@ export async function processAllAnalyses(fixture, stubs) {
     // In-memory work must yield so the HTTP fixture can service idle socket timers.
     await new Promise(resolve => setImmediate(resolve))
   }
-  assert.fail('Analysis processing did not reach a terminal state within its bounded integration fixture.')
+  const remaining = [...fixture.analyses.store.values.values()]
+    .filter(({ record }) => ['initializing', 'queued', 'running', 'waiting'].includes(record.status))
+    .map(({ record }) => ({
+      id: record.id, kind: record.recordType, status: record.status, attempts: record.attempts,
+      waitingFor: record.waitingFor, nextAttemptAt: record.nextAttemptAt, error: record.error,
+    }))
+  assert.fail(`Analysis processing did not reach a terminal state within its bounded integration fixture: ${JSON.stringify(remaining)}`)
 }

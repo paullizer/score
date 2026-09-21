@@ -249,6 +249,7 @@ export interface SettingsDeploymentCapabilities {
   realGradeLadders: boolean
   realAnalyses: boolean
   analysisSummaryGeneration: boolean
+  analysisEvidenceCorrections?: boolean
   wordDocumentImports: boolean
 }
 export type RuntimeNumericLimits<T> = { -readonly [K in keyof T]: T[K] extends number ? number : T[K] }

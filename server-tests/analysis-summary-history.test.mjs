@@ -358,6 +358,8 @@ test('manual publication keeps the selected failed review, immutable drafts, exp
   assert.equal(summary.published.approval.reviewOutcome, 'needs-correction')
   assert.deepEqual(summary.published.approval.issues, [issue])
   assert.equal(summary.hasHistory, true)
+  assert.deepEqual((await f.service.summarySubject(f.workspaceId, runId, subject)).narrative, summary,
+    'The narrow reader must disclose the same manual approval, review issues, and private-history availability.')
   const current = await f.analysis.store.get(f.workspaceId, result.current.record.id)
   assert.equal(current.record.lease, undefined)
   assert.equal(current.record.attempts, 0)
@@ -432,6 +434,23 @@ test('target reductions remain supporting history, not selectable finals, and ch
   assert.deepEqual(resume, { steps: [] })
   await assert.rejects(api.publishAnalysisSummaryDraft(f.analysis, f.workspaceId, runId, target,
     selection(result.current.record, result.entries[0]), randomUUID(), refreshed.etag, ACTOR, clock(f)), { status: 409 })
+})
+
+test('narrow target reads retain v2 manual approval and its exact failed review without downloading candidate publications', async () => {
+  const { f, runId } = await setup()
+  const inventory = await api.readAnalysisNarrativeInventory(f.analysis, f.workspaceId, runId)
+  const subject = { kind: 'target', subjectId: inventory.targets[0].target.summary.id }
+  const result = await rounds(f, runId, subject, 1)
+  const history = await api.readAnalysisSummaryHistory(f.analysis, f.workspaceId, runId, subject)
+  const published = await api.publishAnalysisSummaryDraft(f.analysis, f.workspaceId, runId, subject,
+    selection(result.current.record, result.entries[0]), randomUUID(), history.etag, ACTOR, clock(f))
+  f.analysis.blobs.events.length = 0
+  const selected = await f.service.summarySubject(f.workspaceId, runId, subject)
+  assert.deepEqual(selected.narrative, published.summaries.targets[0])
+  assert.equal(selected.narrative.published.summaryVersion, 2)
+  assert.equal(selected.narrative.published.approval.kind, 'manual')
+  assert.equal(selected.narrative.published.approval.reviewOutcome, 'needs-correction')
+  assert.equal(f.analysis.blobs.events.filter(([kind, name]) => kind === 'read' && name.includes('/narratives/candidate/')).length, 0)
 })
 
 test('manual publication races fail closed and cannot overwrite a newly requested generation', async () => {
@@ -683,6 +702,7 @@ test('legacy v1 publications remain hash-stable and use legacy provenance/prose 
   const summaries = await api.readAnalysisSummaries(f.analysis, f.workspaceId, runId)
   assert.equal(summaries.comparisons[0].published.summaryVersion, undefined)
   assert.equal(summaries.comparisons[0].published.approval, undefined)
+  assert.deepEqual((await f.service.summarySubject(f.workspaceId, runId, subject)).narrative, summaries.comparisons[0])
   assert.equal(sha(f.analysis.blobs.values.get(name).bytes), blob.sha256)
   assert.equal((await api.readAnalysisNarrativePublication(f.analysis.blobs, record)).provenance.outputSha256, api.analysisHash(output))
   const newer = api.captureProcessingSettings(api.createDefaultAdminSettings(), 'newer-publication-policy', f.now)

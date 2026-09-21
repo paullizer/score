@@ -16,6 +16,7 @@ import {
 import { RealComparisonReview } from './RealComparisonReview'
 import { AnalysisReportExport } from './AnalysisReportExport'
 import { ManageAnalysisSummaries, RealTargetNarrative } from './AnalysisSummaries'
+import { ReviewWithheldScores } from './AnalysisCorrections'
 import { ArchivedBadge, EntityLifecycleActions, LifecycleBanner } from '../../components/lifecycle/LifecycleControls'
 import { useLifecycleAccess } from '../../components/lifecycle/useLifecycleAccess'
 import { getDisplayName } from '../../domain/displayNames'
@@ -105,8 +106,10 @@ function RealAnalysisView({ id }: { id: string }) {
   const pairs = api?.comparisons(id)
   const ensure = api?.ensureDetail
   const ensurePairs = api?.ensureComparisons
+  const subscribe = api?.subscribeAnalysis
   const selectedId = params.get('result')
   const sourceView = savedReviewView(params)
+  useEffect(() => subscribe?.(id), [id, subscribe])
   useEffect(() => {
     if (api?.phase !== 'ready') return
     void ensure?.(id)
@@ -154,6 +157,7 @@ function RealAnalysisView({ id }: { id: string }) {
   return <>{back}
     <PageHeader eyebrow="REAL EVIDENCE · FROZEN INPUTS" title={getDisplayName(run, run.name)} description="Review each saved resume/target pair independently. Completion, coverage, and overall-score availability are separate."
       actions={<><RenameEntityButton target={{ kind: 'analysis', id }} name={getDisplayName(run, run.name)} etag={summary.etag} disabled={!api.canWrite || api.phase !== 'ready' || !summary.etag || api.pending(id)} /><EntityLifecycleActions target={{ kind: 'analysis', id }} name={getDisplayName(run, run.name)} onComplete={(action) => { if (action === 'delete') navigate('/analyses?data=real') }} /><RealRunActions summary={summary} />
+        <ReviewWithheldScores runId={id} comparisons={savedPairs} available={pairs?.state === 'ready' && !pairs.error && api.phase === 'ready'} />
         <Button ref={summaryTrigger} onClick={() => setSummaryScope({ targetId: viewedTarget?.id })}>Manage summaries</Button><AnalysisReportExport source={{
         kind: 'real', workspaceId: api.workspaceId, detail: { ...detail, ...summary },
         comparisons: pairs?.state === 'ready' ? pairs.value : null, available: api.phase === 'ready',
@@ -222,6 +226,8 @@ function SelectedRealComparison({ runId, comparisonId, initialView }: { runId: s
   const api = useRealAnalyses()!
   const entry = api.comparison(runId, comparisonId)
   const ensure = api.ensureComparison
+  const subscribe = api.subscribeComparison
+  useEffect(() => subscribe?.(runId, comparisonId), [comparisonId, runId, subscribe])
   useEffect(() => { if (api.phase === 'ready') void ensure(runId, comparisonId) }, [api.phase, comparisonId, ensure, entry.state, runId])
   if (entry.state !== 'ready') return <section className="panel mt-5"><EmptyState icon={entry.state === 'error' ? Layers3 : LoaderCircle}
     title={entry.state === 'error' ? 'This comparison could not be opened' : 'Opening exact saved snapshots'}

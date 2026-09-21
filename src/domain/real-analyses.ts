@@ -28,6 +28,7 @@ import type { LifecycleMetadata, LifecycleOperation } from './lifecycle'
 import type { RealAnalysisCandidateNarrativeSummary, RealAnalysisNarrativeRecord } from './analysis-narratives'
 import type { AnalysisDiagnosticCapture, AnalysisFailureDiagnosticReference } from './analysis-diagnostics'
 import type { ModelTaskId, ProcessingSettingsSnapshot } from './admin-settings'
+import type { AnalysisCorrectionProvenance, AnalysisResultRevision, RealAnalysisCorrectionRecord } from './analysis-corrections'
 
 export type {
   RealAnalysisCandidateNarrativeRecord,
@@ -401,6 +402,7 @@ export interface RealAnalysisResultProvenance {
   groundingReviews: RealAnalysisGroundingReview[]
   correctionCount: number
   calculationVersion: 'weighted-0-100-v1'
+  correction?: AnalysisCorrectionProvenance
 }
 
 export interface RealAnalysisResult extends RealAnalysisAssessmentOutput, RealAnalysisResultSummary {
@@ -427,6 +429,8 @@ export interface RealAnalysisComparisonRecord extends AnalysisEntityBase, Analys
   cancelledAt?: string
   failureDiagnostic?: AnalysisFailureDiagnosticReference
   diagnosticCapture?: AnalysisDiagnosticCapture
+  // Read projection only; the original completed record remains immutable.
+  resultRevision?: AnalysisResultRevision
 }
 
 export interface RealAnalysisNarrativeRequestRecord extends AnalysisEntityBase, AnalysisWorkState {
@@ -445,7 +449,7 @@ export interface RealAnalysisNarrativeRequestRecord extends AnalysisEntityBase, 
 }
 
 export type AnalysisEntity = RealAnalysisRunRecord | RealAnalysisComparisonRecord |
-  RealAnalysisNarrativeRecord | RealAnalysisNarrativeRequestRecord
+  RealAnalysisNarrativeRecord | RealAnalysisNarrativeRequestRecord | RealAnalysisCorrectionRecord
 
 export interface VersionedAnalysisEntity<T extends AnalysisEntity = AnalysisEntity> {
   record: T
@@ -502,6 +506,7 @@ export interface AnalysisProcessingFeatures {
   analysisLimits: { [K in keyof typeof ANALYSIS_LIMITS]: number }
   // Independent of new-run/source-service readiness; historical summary reads do not require it.
   analysisSummaryGeneration?: boolean
+  analysisEvidenceCorrections?: boolean
 }
 
 export interface CreateRealAnalysisInput {

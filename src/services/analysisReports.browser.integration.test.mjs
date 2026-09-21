@@ -40,7 +40,12 @@ async function download(page, format) {
   const dialog = page.getByRole('dialog', { name: 'Export analysis report', exact: true })
   await dialog.getByLabel('Report format', { exact: true }).selectOption(format)
   const [result] = await Promise.all([
-    page.waitForEvent('download', { timeout: 90_000 }),
+    Promise.race([
+      page.waitForEvent('download', { timeout: 90_000 }),
+      dialog.getByRole('alert').first().waitFor({ state: 'visible', timeout: 90_000 }).then(async () => {
+        throw new Error(`${format} export failed: ${await dialog.getByRole('alert').first().innerText()}`)
+      }),
+    ]),
     dialog.getByRole('button', { name: /^Download / }).click(),
   ]).catch(async (cause) => {
     const state = await dialog.innerText().catch(() => 'The report dialog is no longer available.')
@@ -231,6 +236,27 @@ async function completedFixture({ comparisons = 2, partial = false } = {}) {
     if (!partial) assert.ok(pairs.every(({ comparison }) => comparison.status === 'complete'))
     return { fixture, stubs, runId, pairs }
   } catch (error) { await fixture.close(); throw error }
+}
+
+async function deleteAnalysis(fixture, runId) {
+  const path = `/api/workspaces/${fixture.workspaceId}/analyses/${runId}`
+  for (let attempt = 0; attempt < 10; attempt++) {
+    const detail = await jsonResponse(await fixture.request(path))
+    const response = await fixture.request(`${path}/lifecycle`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json', 'If-Match': detail.etag },
+      body: JSON.stringify({ action: 'delete' }),
+    })
+    const result = await jsonResponse(response, [200, 202])
+    if (response.status === 200) {
+      assert.equal(result.deleted, true)
+      return
+    }
+    assert.equal(result.operation?.action, 'delete')
+    assert.equal(result.operation?.status, 'pending')
+    assert.ok(result.analysis?.lifecycle?.deletingAt)
+    assert.equal(result.etag, result.analysis.etag)
+  }
+  assert.fail('Bounded analysis cleanup did not complete after explicit retries.')
 }
 
 before(async () => {
@@ -627,12 +653,7 @@ test('analysis deletion removes the export controls and cancels a delayed report
     await dialog.getByLabel('Report format', { exact: true }).selectOption('csv')
     await dialog.getByRole('button', { name: 'Download CSV', exact: true }).click()
     await captured.promise
-    const detail = await jsonResponse(await fixture.request(`/api/workspaces/${fixture.workspaceId}/analyses/${runId}`))
-    const removed = await jsonResponse(await fixture.request(`/api/workspaces/${fixture.workspaceId}/analyses/${runId}/lifecycle`, {
-      method: 'POST', headers: { 'Content-Type': 'application/json', 'If-Match': detail.etag },
-      body: JSON.stringify({ action: 'delete' }),
-    }))
-    assert.equal(removed.deleted, true)
+    await deleteAnalysis(fixture, runId)
     await dialog.waitFor({ state: 'hidden' })
     release.resolve()
     await finished.promise

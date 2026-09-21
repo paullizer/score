@@ -12,6 +12,7 @@ import { RealCandidateNarrative } from './AnalysisSummaries'
 import { getDisplayName } from '../../domain/displayNames'
 import { analysisFailureExplanation, analysisFailureStages, citationMatches, targetVersionLabel } from './realAnalysisUi'
 import { RealComparisonDiagnostics } from './RealComparisonDiagnostics'
+import { AnalysisCorrectionDetails } from './AnalysisCorrections'
 
 type EvidenceSelection = { kind: 'resume' | 'requirement'; citation: Citation; label: string }
 type SavedDocumentSelection = { kind: EvidenceSelection['kind']; documentId: string; documentVersion: number; label: string }
@@ -104,7 +105,9 @@ export function RealComparisonReview({ detail, actions, initialView }: {
         <span>{result.overall.status === 'available' ? 'Weighted saved criterion scores · not a ranking' : 'Not a zero and not a failed candidate'}</span></div>
       <div className="result-summary"><ShieldCheck size={16} aria-hidden="true" /><div><h3>Evidence-based assessment</h3><p>{result.summary}</p></div></div>
     </section>
-    <RealCandidateNarrative runId={comparison.runId} comparisonId={comparison.id} targetId={comparison.target.summary.id} />
+    <AnalysisCorrectionDetails detail={detail} />
+    <RealCandidateNarrative runId={comparison.runId} comparisonId={comparison.id} targetId={comparison.target.summary.id}
+      resultSha256={comparison.result?.sha256} resultRevisionId={comparison.resultRevision?.id} />
     <section className="panel mt-5" aria-label="Evidence coverage and limitations"><div className="section-heading"><div><h2>Completion is separate from evidence coverage</h2>
       <p>{result.coverage.supported} supported · {result.coverage.partial} partial · {result.coverage.missing} missing · {result.coverage.notAssessed} not assessed · {result.coverage.notApplicable} not applicable</p>
       <p>{result.coverage.assessedWeight}% assessed weight / {result.coverage.totalWeight}% total weight. No client-side total or missing-criterion renormalization is used.</p></div></div>

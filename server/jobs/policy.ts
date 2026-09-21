@@ -75,11 +75,11 @@ export function newProcessingAllowed(provider?: ProcessingSettingsProvider): boo
   return provider?.newProcessingAllowed?.() ?? true
 }
 
-export function assertNewWork(snapshot: ProcessingSettingsSnapshot, feature: keyof AdminSettings['features']): void {
+export function assertNewWork(snapshot: ProcessingSettingsSnapshot, feature?: keyof AdminSettings['features']): void {
   if (snapshot.settings.maintenance.pauseNewWork) {
     throw unavailable(snapshot.settings.maintenance.explanation || 'New work is temporarily paused by application policy.')
   }
-  if (!snapshot.settings.features[feature]) throw unavailable('New work of this type is disabled by application policy.')
+  if (feature && !snapshot.settings.features[feature]) throw unavailable('New work of this type is disabled by application policy.')
 }
 
 export function assertImportPolicy(

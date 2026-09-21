@@ -538,9 +538,11 @@ function markdownComparison(kind) {
 
 test('frozen Markdown resume, job and grade-seed evidence keep section labels and exact citations', async () => {
   root = createRoot(dom.window.document.getElementById('root'))
+  const content = (detail, key) => React.createElement(ui.WorkspaceContext.Provider, { value: frontendWorkspaceContext() },
+    React.createElement(ui.RealComparisonReview, { key, detail }))
   for (const kind of ['job', 'grade']) {
     const saved = markdownComparison(kind)
-    await act(async () => root.render(React.createElement(ui.RealComparisonReview, { key: kind, detail: saved })))
+    await act(async () => root.render(content(saved, kind)))
     assert.match(dom.window.document.querySelector('.document-viewer').textContent, /Markdown section 1 of 1/)
     await act(async () => dom.window.document.querySelector('button[aria-label^="View resume evidence"]').click())
     await settle(() => dom.window.document.querySelector('.document-viewer mark')?.textContent === 'accessible project documentation')
@@ -553,7 +555,7 @@ test('frozen Markdown resume, job and grade-seed evidence keep section labels an
   }
   const mismatched = markdownComparison('job')
   mismatched.result.criteria[0].requirementCitations[0].quote = 'An absent quotation'
-  await act(async () => root.render(React.createElement(ui.RealComparisonReview, { key: 'invalid', detail: mismatched })))
+  await act(async () => root.render(content(mismatched, 'invalid')))
   await act(async () => dom.window.document.querySelector('button[aria-label^="View requirement evidence"]').click())
   await settle(() => dom.window.document.querySelector('[role="alert"]')?.textContent.includes('does not exactly match'))
   assert.equal(dom.window.document.querySelector('.document-viewer mark'), null)
@@ -568,10 +570,11 @@ test('copied frozen Markdown seed references use their captured MIME and the exa
     document: { documentId: reference.id, documentVersion: reference.version },
   }]
   const calls = []
-  const api = { document: async (...args) => { calls.push(args); return reference } }
+  const api = { phase: 'unavailable', summaries: [], document: async (...args) => { calls.push(args); return reference } }
   root = createRoot(dom.window.document.getElementById('root'))
-  await act(async () => root.render(React.createElement(ui.RealAnalysesContext.Provider, { value: api },
-    React.createElement(ui.RealComparisonReview, { detail: saved }))))
+  await act(async () => root.render(React.createElement(ui.WorkspaceContext.Provider, { value: frontendWorkspaceContext() },
+    React.createElement(ui.RealAnalysesContext.Provider, { value: api },
+      React.createElement(ui.RealComparisonReview, { detail: saved })))))
   await act(async () => dom.window.document.querySelector('button[aria-label^="View requirement evidence"]').click())
   await settle(() => dom.window.document.querySelector('.document-viewer mark')?.textContent === 'documented engineering projects')
   assert.equal(calls.length, 1)
