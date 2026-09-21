@@ -1,13 +1,15 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import {
+import { loadWorker } from './shared-model-loader.mjs'
+
+const {
   analyzePdf,
   documentIntelligenceParagraphs,
   extractHtml,
   generateGroundedRubric,
   validateModelRubric,
   workerConstants,
-} from '../dist-worker/runtime.mjs'
+} = await loadWorker('../worker/runtime.ts')
 
 const jobId = 'job-11111111-1111-4111-8111-111111111111'
 const document = {
@@ -22,7 +24,7 @@ const document = {
   ],
 }
 
-const guidance = '0: no evidence; 1: minimal; 2: limited; 3: capable; 4: strong; 5: expert.'
+const guidance = '0: No supporting evidence in the submitted resume for this criterion; 1: Documents a bounded example; 2: Documents practice with regular review; 3: Documents independent work within the stated scope; 4: Documents complex work with clear outcomes; 5: Documents repeated complex work with validated outcomes.'
 const validResult = {
   isJobPosting: true,
   rejectionReason: null,
