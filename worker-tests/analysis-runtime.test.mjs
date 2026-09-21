@@ -44,8 +44,8 @@ function modelAssessment(input, { limited = false } = {}) {
       rationale: 'The saved approved rubric excludes this work from scoring.', citations: [], limitation: null,
     } : limited ? {
       criterionId: criterion.id, evidenceStatus: 'not-assessed', score: null,
-      rationale: 'The submitted document does not establish the scope needed to distinguish the saved anchors.',
-      citations: [], limitation: { code: 'not-assessable', message: 'The stated responsibility scope needs human review.' },
+      rationale: 'The captured source interleaves work descriptions without recoverable attribution.',
+      citations: [], limitation: { code: 'unusable-source', message: 'The merged source text is ambiguous about whose work is described and needs human review.' },
     } : {
       criterionId: criterion.id, evidenceStatus: 'supported', score: 3,
       rationale: 'The cited document describes independently evaluating engineering systems, matching the saved independent-work anchor.',
@@ -293,9 +293,9 @@ test('an actual cited assessment and independent review persist a result accepte
   assert.equal(detail.result.provenance.assessment.model, 'actual-analysis-model-1')
   assert.equal(detail.result.provenance.groundingReviews[0].provenance.model, 'actual-analysis-model-2')
   assert.equal(detail.result.schemaVersion, 1)
-  assert.equal(detail.result.provenance.assessment.promptVersion, 'score-analysis-assessment-v3')
-  assert.equal(detail.result.provenance.assessment.schemaVersion, 'score-analysis-assessment-v2')
-  assert.equal(detail.result.provenance.groundingReviews[0].provenance.promptVersion, 'score-analysis-grounding-v3')
+  assert.equal(detail.result.provenance.assessment.promptVersion, 'score-analysis-assessment-v4')
+  assert.equal(detail.result.provenance.assessment.schemaVersion, 'score-analysis-assessment-v3')
+  assert.equal(detail.result.provenance.groundingReviews[0].provenance.promptVersion, 'score-analysis-grounding-v4')
   assert.equal(detail.result.provenance.groundingReviews[0].provenance.schemaVersion, 'score-analysis-grounding-v2')
   assert.doesNotMatch(JSON.stringify(detail.result), /"passageId"/)
   assert.equal(detail.result.provenance.calculationVersion, 'weighted-0-100-v1')

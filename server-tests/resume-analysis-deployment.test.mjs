@@ -131,6 +131,20 @@ test('Azure resource-ID casing does not change worker identity ownership', () =>
   }
 })
 
+test('only the analysis worker accepts the explicit correction gate, while legacy unset templates remain valid', () => {
+  for (const definition of WORKER_DEFINITIONS) {
+    validateWorkerTemplate(env, template(definition), definition)
+    for (const setting of ['false', 'true', 'yes', '', 'TRUE']) {
+      const value = template(definition)
+      value.properties.template.containers[0].env.push({ name: 'ANALYSIS_EVIDENCE_CORRECTIONS_ENABLED', value: setting })
+      if (definition.kind === 'analysis' && ['true', 'false'].includes(setting)) {
+        const result = validateWorkerTemplate(env, value, definition)
+        assert.equal(result.container.env.find(item => item.name === 'ANALYSIS_EVIDENCE_CORRECTIONS_ENABLED').value, setting)
+      } else assert.throws(() => validateWorkerTemplate(env, value, definition))
+    }
+  }
+})
+
 test('renderer isolation compares complete Azure IDs case-insensitively without accepting different identities', () => {
   const identityId = `${group}/providers/Microsoft.ManagedIdentity/userAssignedIdentities/id-render-pull-test`
   const environmentId = `${group}/providers/Microsoft.App/managedEnvironments/workers`

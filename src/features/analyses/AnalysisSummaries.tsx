@@ -211,7 +211,7 @@ function NarrativeContent({ runId, narrative, loadError }: {
       ? 'No completed assessment is available to summarize.'
       : 'No published summary is available. Use Manage summaries above to generate narratives from the saved evidence without rescoring.'}</p>}
     {narrative.waitingFor && <p className="text-[11px] text-muted">{narrative.waitingFor === 'scoring'
-      ? 'Waiting for this target’s scoring to finish.' : 'Waiting for this target’s completed candidate summaries.'}</p>}
+      ? 'Waiting for this target’s assessments or reviewed corrections to finish.' : 'Waiting for this target’s completed candidate summaries.'}</p>}
     {narrative.nextAttemptAt && <p className="text-[11px] text-muted">Automatic summary retry {dateLabel(narrative.nextAttemptAt)}</p>}
     {narrative.error && <InlineError>{narrative.error.message} Previous published text, if any, is retained. Retry summary work in Manage summaries.</InlineError>}
     <SummaryHistoryControl runId={runId} narrative={narrative} label={narrative.kind === 'candidate' ? 'Candidate summary' : 'Job / grade overview'} />

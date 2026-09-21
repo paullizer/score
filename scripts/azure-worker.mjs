@@ -115,11 +115,16 @@ export function validateWorkerTemplate(env, existing, definition) {
       JOB_RENDERER_URL: required(env, 'AZURE_JOB_RENDERER_URL'),
     } : {}),
   }
-  const allowed = new Set([...Object.keys(expected), maxItemsSetting])
+  const allowed = new Set([...Object.keys(expected), maxItemsSetting,
+    ...(kind === 'analysis' ? ['ANALYSIS_EVIDENCE_CORRECTIONS_ENABLED'] : [])])
   if (settings.size !== container.env?.length ||
     container.env.some(setting => !allowed.has(setting.name) || typeof setting.value !== 'string' || setting.secretRef) ||
     Object.entries(expected).some(([name, value]) => !value || settings.get(name) !== value)) {
     throw new Error(`The ${containerName} must use only its dedicated ${records}/${sources} stores, identity, and configured processing services.`)
+  }
+  if (settings.has('ANALYSIS_EVIDENCE_CORRECTIONS_ENABLED') &&
+    !['false', 'true'].includes(settings.get('ANALYSIS_EVIDENCE_CORRECTIONS_ENABLED'))) {
+    throw new Error('ANALYSIS_EVIDENCE_CORRECTIONS_ENABLED must be explicitly true or false.')
   }
   const maxItems = Number(settings.get(maxItemsSetting))
   if (!Number.isInteger(maxItems) || maxItems < 1 || maxItems > 100) {

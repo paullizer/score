@@ -89,3 +89,14 @@ export function calculateAnalysisSummary(
     overall, coverage,
   }
 }
+
+export function describeAnalysisSummary(summary: RealAnalysisResultSummary, qualificationCount: number): string {
+  const { coverage, overall } = summary
+  return [
+    'The submitted document was compared only with this exact saved rubric.',
+    `Criterion evidence: ${coverage.supported} supported, ${coverage.partial} partial, ${coverage.missing} missing, ${coverage.notAssessed} not assessed, and ${coverage.notApplicable} excluded.`,
+    overall.status === 'available' ? `The document evidence-match total is ${overall.score}/100.` : overall.message,
+    ...(qualificationCount ? [`The ${qualificationCount} qualification notes are separate, unscored, and require human review.`] : []),
+    "Missing evidence does not establish that a person lacks ability. This is a human-review aid, not a hiring recommendation or an official GS eligibility decision.",
+  ].join(' ')
+}

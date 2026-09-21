@@ -19,11 +19,13 @@ await build({
     contents: [
       'service', 'routes', 'validation', 'snapshots', 'diagnostics', 'paging', 'lifecycle', 'library-lifecycle', 'guards', 'azure-store',
       'narratives', 'narrative-records', 'narrative-artifacts', 'narrative-scheduling', 'summary-history', 'summary-actions',
+      'corrections', 'current-results', 'correction-actions', 'correction-validation',
     ].map(name => `export * from './server/analyses/${name}.ts';`).join('\n') +
       "\nexport * from './server/errors.ts'; export * from './server/store.ts';" +
       "\nexport * from './server/ids.ts'; export * from './server/middleware.ts';" +
       "\nexport { analysisRunCanScore } from './src/domain/real-analyses.ts';" +
       "\nexport * from './src/domain/analysis-diagnostics.ts';" +
+      "\nexport * from './src/domain/analysis-corrections.ts';" +
       "\nexport { WorkspaceRepository } from './server/repository.ts';" +
       "\nexport { parseGradeEntity, parseGradeSeedSnapshot, gradeContentHash, gradeVersionHash, gradeSourceSetHash, validateGradeApproval } from './server/grades/validation.ts';" +
       "\nexport { createGradeBlobStoreFromContainer } from './server/grades/azure-store.ts';" +
@@ -180,6 +182,17 @@ export function analysisStore() {
       }
       const progress = clone(values.get(key(workspaceId, runs[0].record.id)).record.progress)
       for (const operation of operations) {
+        if (operation.record.recordType === 'analysis-correction' && operation.kind === 'replace') {
+          const next = operation.record
+          const previous = values.get(key(workspaceId, next.id))?.record
+          if (previous && api.analysisHash(previous.published ?? null) !== api.analysisHash(next.published ?? null)) {
+            const original = values.get(key(workspaceId, next.comparisonId)).record
+            const before = api.projectAnalysisComparison(original, previous)
+            const after = api.projectAnalysisComparison(original, next)
+            progress[before.resultSummary.overall.status === 'available' ? 'scored' : 'unscored']--
+            progress[after.resultSummary.overall.status === 'available' ? 'scored' : 'unscored']++
+          }
+        }
         if (operation.record.recordType !== 'analysis-comparison' || operation.kind === 'delete') continue
         const previous = values.get(key(workspaceId, operation.record.id))?.record
         if (previous) {
@@ -222,10 +235,13 @@ export function analysisStore() {
             : record.recordType === 'analysis-narrative-request'
               ? api.analysisNarrativeRequestCanAdvance(parent.record, record) &&
                 (state !== 'archived' || api.analysisNarrativeRequestCancelled(parent.record, record))
+              : record.recordType === 'analysis-correction' ? api.analysisCorrectionCanWork(parent.record, record)
+              : record.recordType === 'analysis-candidate-narrative' && record.resultRevisionId !==
+                values.get(key(record.workspaceId, api.analysisCorrectionId(record.runId, record.comparisonId)))?.record.published?.revision.id ? false
               : api.analysisNarrativeCanWork(parent.record, record) && !parent.record.narrativeRequestId
         })
-        .sort((a, b) => ['analysis-run', 'analysis-comparison', 'analysis-narrative-request', 'analysis-candidate-narrative', 'analysis-target-narrative'].indexOf(a.record.recordType) -
-          ['analysis-run', 'analysis-comparison', 'analysis-narrative-request', 'analysis-candidate-narrative', 'analysis-target-narrative'].indexOf(b.record.recordType))
+        .sort((a, b) => ['analysis-run', 'analysis-comparison', 'analysis-correction', 'analysis-narrative-request', 'analysis-candidate-narrative', 'analysis-target-narrative'].indexOf(a.record.recordType) -
+          ['analysis-run', 'analysis-comparison', 'analysis-correction', 'analysis-narrative-request', 'analysis-candidate-narrative', 'analysis-target-narrative'].indexOf(b.record.recordType))
         .slice(0, limit).map(clone)
     },
     async getControl(workspaceId, runId) { return clone(controls.get(key(workspaceId, api.analysisControlId(runId)))) },
@@ -388,6 +404,7 @@ export async function seedJob(f, title = 'Engineering role', key = randomUUID(),
     id: `document-${key}`, kind: 'job', sample: false, title, version: 1,
     paragraphs: [{ id: 'job-p1', page: options.page ?? 1, heading: 'Duties', text: 'Evaluate engineering systems independently and explain evidence-based recommendations.' }],
   }
+  options.configureDocument?.(document)
   const rubric = {
     id: `rubric-${key}`, groupId: `rubric-group-${key}`, kind: 'job', dataKind: 'real', jobId: id,
     name: `${title} requirements`, description: 'Source-grounded engineering expectations.', version: 1, createdAt: NOW,
@@ -395,6 +412,7 @@ export async function seedJob(f, title = 'Engineering role', key = randomUUID(),
     criteria: [{ id: 'engineering', key: 'custom', label: 'Engineering analysis', description: document.paragraphs[0].text,
       weight: 100, guidance, requirementType: 'required', sourceCitations: [citation(document)] }],
   }
+  options.configureRubric?.(rubric, document)
   const documentRef = await putJson(f.jobs.blobs, `${f.workspaceId}/${id}/source-document.json`, document)
   const file = await sourceFile(document, options)
   const originalName = `${f.workspaceId}/${id}/original.${file.extension}`
@@ -542,7 +560,7 @@ export async function createRun(f, resumeCount = 1, targetCount = 1) {
 export async function finishInitialization(f, id) {
   return api.advanceAnalysisRun(f.analysis, f.workspaceId, id, { now: () => new Date(f.now), maxChunks: 4 })
 }
-export async function publishResult(f, runId, comparisonId, withheld = false, { scheduleNarratives = true } = {}) {
+export async function publishResult(f, runId, comparisonId, withheld = false, { scheduleNarratives = true, configureAssessment } = {}) {
   let run = await f.analysis.store.get(f.workspaceId, runId)
   let comparison = await f.analysis.store.get(f.workspaceId, comparisonId)
   const timestamp = new Date(Math.max(Date.parse(f.now), Date.parse(run.record.updatedAt), Date.parse(comparison.record.updatedAt))).toISOString()
@@ -568,11 +586,13 @@ export async function publishResult(f, runId, comparisonId, withheld = false, { 
       : { ...base, evidenceStatus: 'supported', score: 4, citations: [citation(snapshots.resumeSnapshot.document)] }
   })
   const assessment = { criteria, qualifications: [], summary: 'Evidence in the submitted document, for human review only.', limitations: [] }
+  configureAssessment?.(assessment, snapshots)
   const assessmentSha256 = api.analysisHash(assessment)
   const model = { model: 'test-assessor', deployment: 'test-deployment', promptVersion: 'assessment-v1', schemaVersion: '1',
     startedAt: timestamp, completedAt: timestamp, inputCharacters: 1000 }
   const result = api.parseAnalysisResult({
-    ...assessment, ...api.calculateAnalysisSummary(criteria), schemaVersion: 1, dataKind: 'real', workspaceId: f.workspaceId,
+    ...assessment, ...api.calculateAnalysisSummary(assessment.criteria, assessment.qualifications, assessment.limitations),
+    schemaVersion: 1, dataKind: 'real', workspaceId: f.workspaceId,
     runId, comparisonId, createdAt: timestamp, humanReviewRequired: true, provenance: {
       attemptId, manifestSha256: run.record.manifest.sha256, assessmentSha256, assessment: model,
       resumeSnapshot: { snapshotId: comparison.record.resume.snapshotId, sha256: comparison.record.resume.blob.sha256 },

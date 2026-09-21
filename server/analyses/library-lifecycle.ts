@@ -199,7 +199,7 @@ async function startOperation(
 
 async function purgeComparisons(
   analyses: RealAnalysesDeps, workspaceId: string, runId: string, timestamp: string,
-  recordType: 'analysis-comparison' | 'analysis-candidate-narrative' | 'analysis-target-narrative' | 'analysis-narrative-request',
+  recordType: 'analysis-comparison' | 'analysis-candidate-narrative' | 'analysis-target-narrative' | 'analysis-narrative-request' | 'analysis-correction',
 ): Promise<boolean> {
   let continuationToken: string | undefined
   const seen = new Set<string>()
@@ -288,7 +288,7 @@ async function finishOperation(analyses: RealAnalysesDeps, workspaceId: string, 
     if (needsCancellation(current.record)) return false
   }
   if (operation.action === 'delete') {
-    for (const type of ['analysis-candidate-narrative', 'analysis-target-narrative', 'analysis-narrative-request', 'analysis-comparison'] as const) {
+    for (const type of ['analysis-candidate-narrative', 'analysis-target-narrative', 'analysis-narrative-request', 'analysis-correction', 'analysis-comparison'] as const) {
       if (!await purgeComparisons(analyses, workspaceId, runId, timestamp, type)) return false
     }
     if (!await purgeBlobs(analyses, workspaceId, runId)) return false

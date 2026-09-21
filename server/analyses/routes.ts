@@ -9,6 +9,7 @@ import { isUuid } from '../jobs/validation'
 import type { RealAnalysesDeps } from './store'
 import { RealAnalysisService } from './service'
 import { AnalysisLibraryLifecycleService } from './library-lifecycle'
+import { analysisCorrectionInputSchema } from './correction-validation'
 import { publishSummaryDraftInputSchema, type AnalysisSummarySubject } from '../../src/domain/analysis-summary-history'
 import {
   analysisLifecycleInputSchema, createAnalysisInputSchema, emptyAnalysisInputSchema,
@@ -233,6 +234,49 @@ export function createRealAnalysesRouter(deps: RealAnalysesRouterDeps): Router {
       param(req, 'workspaceId'), recordId(req, 'run'), recordId(req, 'comparison'), token,
     ))
   })
+  const correctionBase = `${base}/:runId/comparisons/:comparisonId/corrections`
+  const correctionRead = (res: Response) => {
+    if (!['owner', 'editor'].includes(res.locals.analysisWorkspaceRole)) {
+      throw forbidden('Only workspace owners and editors may review correction proposals and history.')
+    }
+  }
+  router.get(correctionBase, async (req, res) => {
+    query(req, [])
+    correctionRead(res)
+    res.json(await requireService().correctionState(param(req, 'workspaceId'), recordId(req, 'run'), recordId(req, 'comparison')))
+  })
+  router.get(`${correctionBase}/preview`, async (req, res) => {
+    query(req, [])
+    correctionRead(res)
+    const preview = await requireService().correctionPreview(param(req, 'workspaceId'), recordId(req, 'run'), recordId(req, 'comparison'))
+    res.setHeader('ETag', preview.etag)
+    res.json(preview)
+  })
+  router.get(`${correctionBase}/history`, async (req, res) => {
+    query(req, ['continuationToken'])
+    correctionRead(res)
+    const token = req.query.continuationToken
+    if (token !== undefined && (typeof token !== 'string' || !token || token.length > 2048)) throw invalidRequest('Invalid correction history token.')
+    res.json(await requireService().correctionHistory(param(req, 'workspaceId'), recordId(req, 'run'), recordId(req, 'comparison'), token))
+  })
+  router.post(correctionBase, mutate('write', async (req, res) => {
+    query(req, [])
+    const result = await requireService().requestCorrection(
+      param(req, 'workspaceId'), recordId(req, 'run'), recordId(req, 'comparison'),
+      body(analysisCorrectionInputSchema, req.body), key(req), match(req), getPrincipal(req).principalKey,
+    )
+    res.setHeader('ETag', result.correction.etag)
+    res.status(202).json(result)
+  }))
+  router.post(`${correctionBase}/cancel`, mutate('write', async (req, res) => {
+    query(req, [])
+    body(emptyAnalysisInputSchema, actionBody(req))
+    const result = await requireService().cancelCorrection(
+      param(req, 'workspaceId'), recordId(req, 'run'), recordId(req, 'comparison'), match(req),
+    )
+    res.setHeader('ETag', result.correction.etag)
+    res.json(result)
+  }))
   router.get(`${base}/:runId/comparisons/:comparisonId/documents/:documentId`, async (req, res) => {
     query(req, ['version'])
     const version = req.query.version

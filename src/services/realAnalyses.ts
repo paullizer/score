@@ -284,7 +284,8 @@ export async function fetchAnalysisProcessingFeatures(signal?: AbortSignal): Pro
   // realAnalyses indicates new-run readiness; historical reads have their own authorized endpoints.
   const result = await cloudJsonRequest<Partial<AnalysisProcessingFeatures>>('/features', { method: 'GET', signal })
   return { realAnalyses: result.realAnalyses === true, analysisLimits: result.analysisLimits ?? ANALYSIS_LIMITS,
-    analysisSummaryGeneration: result.analysisSummaryGeneration === true }
+    analysisSummaryGeneration: result.analysisSummaryGeneration === true,
+    analysisEvidenceCorrections: result.analysisEvidenceCorrections === true }
 }
 
 export interface RealAnalysisCollectionLimits {

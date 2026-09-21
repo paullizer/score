@@ -1,6 +1,9 @@
 import { createHash } from 'node:crypto'
 import { z } from 'zod'
 import { REPORT_LIMITS } from '../../src/domain/analysis-reports'
+import {
+  ANALYSIS_CORRECTION_POLICY_VERSION, type RealAnalysisCorrectionRecord,
+} from '../../src/domain/analysis-corrections'
 import type { RealAnalysisNarrativeRecord } from '../../src/domain/analysis-narratives'
 import {
   SUMMARY_LIMITS, summaryDiagnosticSchema, summaryHistoryReferenceSchema, type AnalysisSummaryHistoryReference,
@@ -172,6 +175,20 @@ const overallSchema = z.discriminatedUnion('status', [
 const resultSummarySchema = z.strictObject({
   completion: z.enum(['assessed', 'limited']), overall: overallSchema, coverage: coverageSchema,
 })
+export const analysisCorrectionCriterionIdsSchema = z.array(identifier).min(1).max(20).refine(unique)
+export const analysisResultRevisionSchema = z.strictObject({
+  id: z.string().uuid(), policyVersion: z.literal(ANALYSIS_CORRECTION_POLICY_VERSION),
+  originalResultSha256: hash, baseResultSha256: hash, correctedAt: timestamp,
+  criterionIds: analysisCorrectionCriterionIdsSchema,
+})
+export const analysisCorrectionProvenanceSchema = z.strictObject({
+  requestId: z.string().uuid(), policyVersion: z.literal(ANALYSIS_CORRECTION_POLICY_VERSION),
+  originalResultSha256: hash, baseResultSha256: hash, baseAssessmentSha256: hash,
+  criterionIds: analysisCorrectionCriterionIdsSchema, requestedBy: text(200), requestedAt: timestamp, reason: text(1000),
+})
+export const analysisCorrectionHistoryReferenceSchema = z.strictObject({
+  id: z.string().uuid(), createdAt: timestamp, blob: jsonReferenceSchema,
+})
 const runSchema = z.strictObject({
   ...base, id: runId, recordType: z.literal('analysis-run'), name: text(160), createdBy: text(200),
   displayName: displayName.optional(),
@@ -200,8 +217,24 @@ const comparisonSchema = z.strictObject({
   diagnosticCapture: z.strictObject({
     attemptId: z.string().uuid(), status: z.enum(['saved', 'unavailable']), pipelineVersion: text(200),
   }).optional(),
+  resultRevision: analysisResultRevisionSchema.optional(),
 })
 const narrativeIdentity = z.strictObject({ snapshotId, sha256: hash })
+const correctionSchema = z.strictObject({
+  ...base, id: z.string(), recordType: z.literal('analysis-correction'), runId, comparisonId,
+  manifestSha256: hash, originalResult: jsonReferenceSchema,
+  resumeSnapshot: narrativeIdentity, targetSnapshot: narrativeIdentity,
+  status: z.enum(['queued', 'running', 'ready', 'failed', 'cancelled']),
+  requestId: z.string().uuid(), requestFingerprint: hash, requestedAt: timestamp, requestedBy: text(200),
+  reason: text(1000), policyVersion: z.literal(ANALYSIS_CORRECTION_POLICY_VERSION),
+  criterionIds: analysisCorrectionCriterionIdsSchema,
+  baseResult: jsonReferenceSchema, baseAttemptId: z.string().uuid(), baseRevision: analysisResultRevisionSchema.optional(),
+  proposal: jsonReferenceSchema,
+  published: z.strictObject({
+    revision: analysisResultRevisionSchema, result: jsonReferenceSchema, summary: resultSummarySchema, attemptId: z.string().uuid(),
+  }).optional(),
+  history: analysisCorrectionHistoryReferenceSchema.optional(),
+})
 const narrativePublicationSchema = z.strictObject({
   revision: hash, inputFingerprint: hash, generationId: z.string().uuid(), publishedAt: timestamp,
   blob: jsonReferenceSchema,
@@ -226,6 +259,7 @@ const narrativeBase = {
 const candidateNarrativeSchema = z.strictObject({
   ...narrativeBase, id: z.string(), recordType: z.literal('analysis-candidate-narrative'),
   comparisonId, resumeSnapshot: narrativeIdentity, resultSha256: hash, inputFingerprint: hash,
+  resultRevisionId: z.string().uuid().optional(),
 })
 const targetNarrativeSchema = z.strictObject({
   ...narrativeBase, id: z.string(), recordType: z.literal('analysis-target-narrative'),
@@ -239,7 +273,7 @@ const narrativeRequestSchema = z.strictObject({
   scheduled: z.strictObject({ candidates: count, targets: count }),
 })
 const entitySchema = z.discriminatedUnion('recordType', [
-  runSchema, comparisonSchema, candidateNarrativeSchema, targetNarrativeSchema, narrativeRequestSchema,
+  runSchema, comparisonSchema, candidateNarrativeSchema, targetNarrativeSchema, narrativeRequestSchema, correctionSchema,
 ])
 const manifestSchema = z.strictObject({
   schemaVersion: z.literal(1), dataKind: z.literal('real'), workspaceId: workspace, runId,
@@ -268,16 +302,38 @@ export function parseAnalysisTargetSummary(value: unknown) {
 export function isAnalysisId(value: string, kind: 'run' | 'comparison' | 'snapshot'): boolean {
   return new RegExp(`^analysis-${kind}-${UUID}$`).test(value)
 }
-export function analysisNarrativeId(kind: 'candidate' | 'target' | 'request', runId: string, subjectId: string): string {
-  return `analysis-${kind === 'request' ? 'narrative-request' : `${kind}-narrative`}:${runId}:${subjectId}`
+export function analysisNarrativeId(
+  kind: 'candidate' | 'target' | 'request', runId: string, subjectId: string, resultRevisionId?: string,
+): string {
+  assertAnalysis(!resultRevisionId || kind === 'candidate' && z.string().uuid().safeParse(resultRevisionId).success,
+    'Only candidate narratives may bind a result revision.')
+  return `analysis-${kind === 'request' ? 'narrative-request' : `${kind}-narrative`}:${runId}:${subjectId}${resultRevisionId ? `:${resultRevisionId}` : ''}`
+}
+export function analysisCorrectionId(runId: string, comparisonId: string): string {
+  return `analysis-correction:${runId}:${comparisonId}`
 }
 export function isAnalysisRecordId(value: string): boolean {
   if (isAnalysisId(value, 'run') || isAnalysisId(value, 'comparison')) return true
-  const [kind, run, subject, extra] = value.split(':')
+  const [kind, run, subject, revision, extra] = value.split(':')
   if (extra !== undefined || !isAnalysisId(run ?? '', 'run')) return false
-  return kind === 'analysis-candidate-narrative' ? isAnalysisId(subject ?? '', 'comparison')
+  if (kind === 'analysis-candidate-narrative') return isAnalysisId(subject ?? '', 'comparison') &&
+    (revision === undefined || new RegExp(`^${UUID}$`).test(revision))
+  if (revision !== undefined) return false
+  return kind === 'analysis-correction' ? isAnalysisId(subject ?? '', 'comparison')
     : kind === 'analysis-target-narrative' ? analysisNarrativeTargetIdSchema.safeParse(subject).success
       : kind === 'analysis-narrative-request' && new RegExp(`^${UUID}$`).test(subject ?? '')
+}
+export function analysisCorrectionProposalBlobName(workspaceId: string, runId: string, comparisonId: string, requestId: string): string {
+  const name = `${workspaceId}/${runId}/corrections/${comparisonId}/${requestId}.json`
+  assertAnalysis(isSafeAnalysisBlobName(name), 'Invalid correction proposal identity.')
+  return name
+}
+export function analysisCorrectionHistoryBlobName(
+  workspaceId: string, runId: string, comparisonId: string, requestId: string, entryId: string,
+): string {
+  const name = `${workspaceId}/${runId}/correction-history/${comparisonId}/${requestId}/${entryId}.json`
+  assertAnalysis(isSafeAnalysisBlobName(name), 'Invalid correction history identity.')
+  return name
 }
 export function analysisNarrativeBlobName(
   workspaceId: string, runId: string, kind: 'candidate' | 'target', subjectId: string, generationId: string, attemptId: string,
@@ -326,6 +382,10 @@ export function isSafeAnalysisBlobName(name: string): boolean {
   if (parts.length === 3) return parts[2] === 'manifest.json'
   if (parts.length === 4 && parts[2] === 'evidence') return /^[a-f0-9]{64}\.(?:json|pdf|md|docx|doc|html)$/.test(parts[3])
   if (parts.length === 5 && parts[2] === 'snapshots' && isAnalysisId(parts[3], 'snapshot')) return /^[a-f0-9]{64}\.json$/.test(parts[4])
+  if (parts[2] === 'corrections') return parts.length === 5 && isAnalysisId(parts[3], 'comparison') &&
+    new RegExp(`^${UUID}\\.json$`).test(parts[4])
+  if (parts[2] === 'correction-history') return parts.length === 6 && isAnalysisId(parts[3], 'comparison') &&
+    new RegExp(`^${UUID}$`).test(parts[4]) && new RegExp(`^${UUID}\\.json$`).test(parts[5])
   if (parts[2] === 'narrative-actions') return parts.length === 4 && new RegExp(`^${UUID}\\.json$`).test(parts[3])
   if (parts[2] === 'narrative-history') return parts.length === 8 &&
     (parts[3] === 'candidate' ? isAnalysisId(parts[4], 'comparison')
@@ -421,6 +481,8 @@ export function parseAnalysisEntity(value: unknown): AnalysisEntity {
         !record.lease && !record.nextAttemptAt && !record.error && !record.cancelledAt, 'Completed result has invalid publication metadata.')
       validateSummary(record.resultSummary!)
     }
+    assertAnalysis(!record.resultRevision || record.status === 'complete' &&
+      record.resultRevision.correctedAt === record.completedAt, 'Only completed projections may identify a corrected result.')
     if (record.status === 'cancelled') assertAnalysis(record.cancelledAt && !record.lease && !record.nextAttemptAt,
       'Cancelled comparisons must release work.')
     if (record.status === 'failed') assertAnalysis(record.error && !record.lease && !record.nextAttemptAt, 'Failed comparison must retain a terminal error.')
@@ -432,16 +494,58 @@ export function parseAnalysisEntity(value: unknown): AnalysisEntity {
     assertAnalysis(record.nextIndex <= total && (record.status === 'queued' ? record.nextIndex < total : record.nextIndex === total) &&
       !record.lease && !record.attemptId && record.attempts === 0 && record.retryCount === 0 && !record.error && !record.nextAttemptAt,
     'Invalid bounded narrative scheduling cursor.')
+  } else if (record.recordType === 'analysis-correction') {
+    validateCorrectionRecord(record)
   } else {
     validateNarrativeRecord(record)
   }
   return record
 }
 
+function validateCorrectionRecord(record: RealAnalysisCorrectionRecord): void {
+  const { workspaceId, runId, comparisonId } = record
+  assertAnalysis(record.id === analysisCorrectionId(runId, comparisonId) &&
+    record.createdAt <= record.requestedAt && record.requestedAt <= record.updatedAt &&
+    record.proposal.blobName === analysisCorrectionProposalBlobName(workspaceId, runId, comparisonId, record.requestId) &&
+    record.baseResult.blobName === analysisResultBlobName(workspaceId, runId, comparisonId, record.baseAttemptId) &&
+    analysisBlobInRun(record.originalResult.blobName, workspaceId, runId) &&
+    record.originalResult.blobName.startsWith(`${workspaceId}/${runId}/results/${comparisonId}/`),
+  'Correction identity, base result, or proposal scope mismatch.')
+  if (record.baseRevision) assertAnalysis(record.baseRevision.originalResultSha256 === record.originalResult.sha256 &&
+    record.baseRevision.correctedAt <= record.requestedAt, 'Correction base revision has invalid ancestry.')
+  if (record.status === 'running') assertAnalysis(record.lease && record.attemptId && record.attempts > 0 &&
+    !record.nextAttemptAt && !record.error, 'Running corrections require an exclusive attempt lease.')
+  else assertAnalysis(!record.lease, 'Stopped correction work cannot retain a lease.')
+  if (record.status === 'queued') assertAnalysis(record.nextAttemptAt, 'Queued corrections require a due time.')
+  else assertAnalysis(!record.nextAttemptAt, 'Only queued corrections may remain scheduled.')
+  if (record.status === 'failed') assertAnalysis(record.error, 'Failed corrections require an explicit safe error.')
+  if (record.history) {
+    const parts = record.history.blob.blobName.split('/')
+    assertAnalysis(record.history.blob.blobName === analysisCorrectionHistoryBlobName(
+      workspaceId, runId, comparisonId, parts[4], record.history.id,
+    ) && record.history.createdAt >= record.createdAt && record.history.createdAt <= record.updatedAt,
+    'Correction history scope or timestamp mismatch.')
+  }
+  if (record.published) {
+    const { revision, result, summary, attemptId } = record.published
+    validateSummary(summary)
+    assertAnalysis(revision.originalResultSha256 === record.originalResult.sha256 &&
+      revision.correctedAt >= record.createdAt && revision.correctedAt <= record.updatedAt &&
+      result.blobName === analysisResultBlobName(workspaceId, runId, comparisonId, attemptId) &&
+      result.sha256 !== record.originalResult.sha256, 'Corrected result publication has invalid scope or ancestry.')
+  }
+  if (record.status === 'ready') assertAnalysis(record.published && record.history && !record.error &&
+    record.published.revision.id === record.requestId && record.published.attemptId === record.attemptId &&
+    record.published.revision.baseResultSha256 === record.baseResult.sha256 &&
+    analysisHash(record.published.revision.criterionIds) === analysisHash(record.criterionIds),
+  'Ready corrections require the exact reviewed request and immutable history.')
+}
+
 function validateNarrativeRecord(record: RealAnalysisNarrativeRecord): void {
   const kind = record.recordType === 'analysis-candidate-narrative' ? 'candidate' : 'target'
   const subject = record.recordType === 'analysis-candidate-narrative' ? record.comparisonId : record.targetId
-  assertAnalysis(record.id === analysisNarrativeId(kind, record.runId, subject) &&
+  assertAnalysis(record.id === analysisNarrativeId(kind, record.runId, subject,
+    record.recordType === 'analysis-candidate-narrative' ? record.resultRevisionId : undefined) &&
     record.requestedAt >= record.createdAt && record.requestedAt <= record.updatedAt, 'Narrative identity or request time mismatch.')
   if (kind === 'candidate') assertAnalysis(record.status !== 'waiting' && !record.waitingFor, 'Candidate work cannot wait on other narratives.')
   if (record.recordType === 'analysis-candidate-narrative') assertAnalysis(record.inputFingerprint === analysisHash({
@@ -875,6 +979,7 @@ const resultSchema = analysisAssessmentOutputSchema.extend({
     groundingReviews: z.array(groundingReviewSchema).min(1).max(ANALYSIS_LIMITS.maxOutputCorrections + 1),
     correctionCount: z.number().int().min(0).max(ANALYSIS_LIMITS.maxOutputCorrections),
     calculationVersion: z.literal('weighted-0-100-v1'),
+    correction: analysisCorrectionProvenanceSchema.optional(),
   }),
 })
 
@@ -944,6 +1049,11 @@ export function parseAnalysisResult(value: unknown): RealAnalysisResult {
       (review.outcome === 'supported' ? review.issues.length === 0 : review.issues.length > 0), 'Review provenance mismatch.')
   }
   assertAnalysis(provenance.assessment.completedAt >= provenance.assessment.startedAt, 'Invalid assessment provenance.')
+  if (provenance.correction) assertAnalysis(provenance.correction.requestedAt <= result.createdAt &&
+    provenance.correction.baseAssessmentSha256 !== provenance.assessmentSha256 &&
+    provenance.correction.criterionIds.every(id => result.criteria.some(row =>
+      row.criterionId === id && row.evidenceStatus === 'missing' && row.score === 0 && row.citations.length === 0)),
+  'Corrected results must identify the changed evidence-gap rows and original assessment.')
   validateSummary(result)
   return result
 }
@@ -958,6 +1068,13 @@ export function assertAnalysisResultBinding(
     result.provenance.targetSnapshot.snapshotId === comparison.target.snapshotId &&
     result.provenance.targetSnapshot.sha256 === comparison.target.blob.sha256 &&
     result.provenance.attemptId === comparison.attemptId, 'Result belongs to another comparison or attempt.')
+  const correction = result.provenance.correction
+  const revision = comparison.resultRevision
+  assertAnalysis(!revision && !correction || revision && correction && revision.id === correction.requestId &&
+    revision.policyVersion === correction.policyVersion && revision.originalResultSha256 === correction.originalResultSha256 &&
+    revision.baseResultSha256 === correction.baseResultSha256 && revision.correctedAt === result.createdAt &&
+    analysisHash(revision.criterionIds) === analysisHash(correction.criterionIds),
+  'Result correction provenance does not match its selected revision.')
   const assessment = { criteria: result.criteria, qualifications: result.qualifications, summary: result.summary, limitations: result.limitations }
   assertAnalysis(validateAnalysisAssessment(assessment, resume.document, target).length === 0, 'Result evidence does not match the frozen inputs.')
   for (const review of result.provenance.groundingReviews) for (const issue of review.issues) {
@@ -971,4 +1088,10 @@ export function assertAnalysisResultBinding(
 export function assertApprovedGradeBindings(version: GradeRubricVersionRecord, sourceSet: GradeSourceSetRecord): void {
   assertAnalysis(version.workspaceId === sourceSet.workspaceId && version.ladderId === sourceSet.ladderId &&
     version.sourceSetId === sourceSet.id && sourceSet.grades.includes(version.grade), 'Grade source-set binding mismatch.')
+}
+
+export {
+  jsonReferenceSchema as analysisJsonReferenceSchema, resultSummarySchema as analysisResultSummarySchema,
+  errorSchema as analysisProcessingErrorSchema, narrativeIdentity as analysisSnapshotIdentitySchema,
+  groundingReviewSchema as analysisGroundingReviewSchema,
 }

@@ -31,6 +31,9 @@ import type { AnalysisSummarySubject, PublishSummaryDraftInput } from '../../src
 import { readAnalysisSummaryHistory } from './summary-history'
 import { publishAnalysisSummaryDraft, retryAnalysisSummary } from './summary-actions'
 import { prepareAnalysisNarrativeTransitions } from './narrative-scheduling'
+import { resolveAnalysisComparison, resolveAnalysisComparisons } from './current-results'
+import { AnalysisCorrectionService } from './correction-actions'
+import type { AnalysisCorrectionInput } from '../../src/domain/analysis-corrections'
 import { readAnalysisFailureDiagnostics } from './diagnostics'
 import {
   advanceAnalysisRun, applyAnalysisComparisonTransition, cancelAnalysisComparisonRecord, loadAnalysisComparison,
@@ -71,10 +74,12 @@ const comparisonSummary = (value: VersionedAnalysisEntity<RealAnalysisComparison
 export class RealAnalysisService {
   private readonly targets: RealAnalysisTargets
   private readonly clock: () => Date
+  private readonly corrections: AnalysisCorrectionService
 
   constructor(private readonly deps: RealAnalysesDeps, private readonly sources: AnalysisSourceDeps = {}, now?: () => Date) {
     this.targets = new RealAnalysisTargets(sources)
     this.clock = now ?? (() => new Date())
+    this.corrections = new AnalysisCorrectionService(deps, this.clock)
   }
   private now(): string { return this.clock().toISOString() }
   private async run(workspaceId: string, runId: string, recovery = false) {
@@ -277,7 +282,8 @@ export class RealAnalysisService {
       this.deps.store.list(workspaceId, { recordType: 'analysis-comparison', runId, limit, continuationToken: analysisPageCursor(scope, continuationToken) }),
     ])
     assertAnalysis(page.items.length <= limit, 'Comparison page exceeds its limit.')
-    const comparisons = page.items.map(value => {
+    const resolved = await resolveAnalysisComparisons(this.deps.store, run.record, page.items)
+    const comparisons = resolved.map(value => {
       const record = parseAnalysisEntity(value.record)
       assertAnalysis(record.recordType === 'analysis-comparison' && value.etag, 'Invalid comparison page.')
       assertComparisonManifestBinding(manifest, record)
@@ -286,7 +292,8 @@ export class RealAnalysisService {
     return { comparisons, ...(page.continuationToken ? { continuationToken: analysisPageToken(scope, page.continuationToken) } : {}) }
   }
   async comparisonDetail(workspaceId: string, runId: string, comparisonId: string): Promise<RealAnalysisComparisonDetail> {
-    const [run, comparison] = await Promise.all([this.run(workspaceId, runId), this.comparison(workspaceId, runId, comparisonId)])
+    const [run, original] = await Promise.all([this.run(workspaceId, runId), this.comparison(workspaceId, runId, comparisonId)])
+    const comparison = await resolveAnalysisComparison(this.deps.store, run.record, original)
     const snapshots = await readAnalysisSnapshots(this.deps.blobs, run.record, comparison.record)
     const result = await readAnalysisResult(this.deps.blobs, run.record, comparison.record, snapshots)
     const summaries = await readAnalysisSummaries(this.deps, workspaceId, runId, comparison.record.target.summary.id)
@@ -294,6 +301,23 @@ export class RealAnalysisService {
   }
   summaries(workspaceId: string, runId: string, targetId?: string) {
     return readAnalysisSummaries(this.deps, workspaceId, runId, targetId)
+  }
+  correctionPreview(workspaceId: string, runId: string, comparisonId: string) {
+    return this.corrections.preview(workspaceId, runId, comparisonId)
+  }
+  correctionState(workspaceId: string, runId: string, comparisonId: string) {
+    return this.corrections.state(workspaceId, runId, comparisonId)
+  }
+  correctionHistory(workspaceId: string, runId: string, comparisonId: string, continuationToken?: string) {
+    return this.corrections.history(workspaceId, runId, comparisonId, continuationToken)
+  }
+  requestCorrection(
+    workspaceId: string, runId: string, comparisonId: string, input: AnalysisCorrectionInput, requestId: string, expected: string, actor: string,
+  ) {
+    return this.corrections.request(workspaceId, runId, comparisonId, input, requestId, expected, actor)
+  }
+  cancelCorrection(workspaceId: string, runId: string, comparisonId: string, expected: string) {
+    return this.corrections.cancel(workspaceId, runId, comparisonId, expected)
   }
   generateSummaries(workspaceId: string, runId: string, input: GenerateRealAnalysisSummariesInput, requestId: string, expected: string, actor: string) {
     return generateAnalysisSummaries(this.deps, workspaceId, runId, input, requestId, expected, actor, this.clock)
@@ -320,12 +344,14 @@ export class RealAnalysisService {
     comparisonIds = input(reportComparisonIdsSchema, comparisonIds)
     signal?.throwIfAborted()
     const run = await this.run(workspaceId, runId)
-    const comparisons: RealAnalysisComparisonRecord[] = []
+    const comparisons: VersionedAnalysisEntity<RealAnalysisComparisonRecord>[] = []
     for (const id of comparisonIds) {
       signal?.throwIfAborted()
-      comparisons.push((await this.comparison(workspaceId, runId, id)).record)
+      comparisons.push(await this.comparison(workspaceId, runId, id))
     }
-    return readAnalysisReportComparisons(this.deps.blobs, run.record, comparisons, signal)
+    const current = await resolveAnalysisComparisons(this.deps.store, run.record, comparisons)
+    signal?.throwIfAborted()
+    return readAnalysisReportComparisons(this.deps.blobs, run.record, current.map(value => value.record), signal)
   }
   async document(workspaceId: string, runId: string, comparisonId: string, documentId: string, version: number): Promise<RealAnalysisDocumentResponse> {
     if (typeof documentId !== 'string' || !/^[a-zA-Z0-9][a-zA-Z0-9_.:-]{0,179}$/.test(documentId) ||
@@ -358,8 +384,12 @@ export class RealAnalysisService {
     const p = current.record.progress
     if (p.initialized === p.total && p.queued + p.running === 0) {
       const inventory = await readAnalysisNarrativeInventory(this.deps, workspaceId, runId)
-      const active = [...inventory.comparisons, ...inventory.targets].some(item => ['waiting', 'queued', 'running'].includes(item.state.status))
-      if (!active) throw conflict('This run has no active comparisons or summaries to cancel. Completed results are immutable.')
+      const corrections = await Promise.all((['queued', 'running'] as const).map(status => this.deps.store.list(
+        workspaceId, { recordType: 'analysis-correction', runId, status, limit: 1 },
+      )))
+      const active = [...inventory.comparisons, ...inventory.targets].some(item => ['waiting', 'queued', 'running'].includes(item.state.status)) ||
+        corrections.some(page => page.items.length > 0)
+      if (!active) throw conflict('This run has no active comparisons, corrections, or summaries to cancel. Completed results are immutable.')
       const timestamp = new Date(Math.max(Date.parse(this.now()), Date.parse(current.record.updatedAt))).toISOString()
       const updated = { ...current.record, updatedAt: timestamp, narrativeCancelledAt: timestamp }
       assertWorkspaceMutationLease(workspaceId)

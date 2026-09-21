@@ -29,6 +29,7 @@ import { systemClock, type Clock, type RubricModelOptions } from '../runtime'
 import { AnalysisModelError, assessResumeAgainstTarget } from './model'
 import { emitAnalysisTelemetry, type AnalysisTelemetrySink } from './telemetry'
 import { runAnalysisNarrativeWork, type AnalysisNarrativeTelemetryEvent } from './narrative-runtime'
+import { runAnalysisCorrectionWork } from './correction-runtime'
 
 const LEASE_MS = 90_000
 const HEARTBEAT_MS = 25_000
@@ -44,6 +45,7 @@ export interface AnalysisWorkerDependencies {
   owner?: string
   onEvent?: AnalysisTelemetrySink
   onNarrativeEvent?: (event: AnalysisNarrativeTelemetryEvent) => void
+  correctionsEnabled?: boolean
 }
 
 export interface AnalysisWorkerOptions {
@@ -704,6 +706,9 @@ export async function runAnalysisWorker(
           if (await processClaimedComparison(claimed, deps, {
             deadline, signal: options.signal, attemptLimitReached: claimed.attemptLimitReached,
           })) result.completed++
+        } else if (record.recordType === 'analysis-correction') {
+          if (deps.correctionsEnabled === true &&
+            await runAnalysisCorrectionWork(deps, { record, etag: candidate.etag }, { deadline, signal: options.signal })) result.claimed++
         } else {
           if (await runAnalysisNarrativeWork(deps, { record, etag: candidate.etag }, { deadline, signal: options.signal })) result.claimed++
         }

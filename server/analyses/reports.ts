@@ -115,6 +115,19 @@ function provenanceFacts(result: RealAnalysisResult, snapshots: AnalysisSnapshot
     { label: 'Resume source captured', value: snapshots.resumeSnapshot.capture.capturedAt },
     { label: 'Resume extraction', value: `${snapshots.resumeSnapshot.extraction.method} · ${snapshots.resumeSnapshot.extraction.version}` },
   ]
+  if (provenance.correction) {
+    const correction = provenance.correction
+    facts.push(
+      { label: 'Evidence correction revision', value: correction.requestId },
+      { label: 'Evidence correction policy', value: correction.policyVersion },
+      { label: 'Original result SHA-256', value: correction.originalResultSha256 },
+      { label: 'Previous result SHA-256', value: correction.baseResultSha256 },
+      { label: 'Corrected criteria', value: correction.criterionIds.join(', ') },
+      { label: 'Correction reason', value: correction.reason },
+      { label: 'Correction requested', value: correction.requestedAt },
+      { label: 'Correction provenance', value: 'Deterministic evidence-gap correction; the assessment model above produced the original assessment. A fresh grounding review approved this revision.' },
+    )
+  }
   for (const [index, review] of provenance.groundingReviews.entries()) {
     facts.push(
       { label: `Grounding review ${index + 1}`, value: `${review.id} · ${review.outcome}` },

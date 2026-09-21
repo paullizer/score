@@ -73,6 +73,7 @@ function main(): void {
     ? {
         store: createAzureAnalysisStore(analysisStorage, credential),
         blobs: createAzureAnalysisBlobStore(analysisStorage, credential),
+        evidenceCorrectionsEnabled: analysisStorage.evidenceCorrectionsEnabled === true,
       }
     : undefined
   const app = createApp({ config, directory, state, jobs, grades, resumes, analyses })

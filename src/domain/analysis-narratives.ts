@@ -302,6 +302,7 @@ export interface RealAnalysisCandidateNarrativeRecord extends AnalysisNarrativeR
   resumeSnapshot: AnalysisNarrativeSnapshotIdentity
   resultSha256: string
   inputFingerprint: string
+  resultRevisionId?: string
 }
 
 export interface RealAnalysisTargetNarrativeRecord extends AnalysisNarrativeRecordBase {

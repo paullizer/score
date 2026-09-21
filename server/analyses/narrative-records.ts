@@ -94,11 +94,14 @@ export function newCandidateNarrative(
 ): RealAnalysisCandidateNarrativeRecord {
   request = { ...request, requestedAt: request.requestedAt < (previous?.updatedAt ?? '') ? previous!.updatedAt : request.requestedAt }
   const binding = candidateNarrativeBinding(run, comparison)
-  const id = analysisNarrativeId('candidate', run.id, comparison.id)
+  const id = analysisNarrativeId('candidate', run.id, comparison.id, comparison.resultRevision?.id)
+  assertAnalysis(!previous || previous.id === id && previous.resultSha256 === comparison.result?.sha256,
+    'A new result revision requires its own narrative history.')
   return {
     workspaceId: binding.workspaceId, runId: binding.runId, manifestSha256: binding.manifestSha256,
     targetId: binding.targetId, targetSnapshot: binding.targetSnapshot, comparisonId: binding.comparisonId,
     resumeSnapshot: binding.resumeSnapshot, resultSha256: binding.resultSha256,
+    ...(comparison.resultRevision ? { resultRevisionId: comparison.resultRevision.id } : {}),
     id, recordType: 'analysis-candidate-narrative', schemaVersion: 1, dataKind: 'real',
     createdAt: previous?.createdAt ?? request.requestedAt, updatedAt: request.requestedAt,
     ...request, generationId: narrativeGenerationId(request.requestId, id), status: 'queued',

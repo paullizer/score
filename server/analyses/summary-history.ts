@@ -217,7 +217,7 @@ export async function readSummarySubject(
   const pair = subject.kind === 'candidate' ? inventory.comparisons.find(item => item.id === subject.subjectId) : undefined
   const target = inventory.targets.find(item => item.target.summary.id === (pair?.target.summary.id ?? subject.subjectId))
   if (!target || subject.kind === 'candidate' && !pair) throw notFound('The exact saved summary was not found in this run.')
-  const id = analysisNarrativeId(subject.kind, runId, subject.subjectId)
+  const id = analysisNarrativeId(subject.kind, runId, subject.subjectId, pair?.comparison?.resultRevision?.id)
   const current = await loadAnalysisNarrative(deps.store, workspaceId, id)
   if (current) assertAnalysis(current.record.runId === runId && current.record.targetId === target.target.summary.id &&
     current.record.manifestSha256 === inventory.run.record.manifest.sha256 &&
@@ -227,7 +227,7 @@ export async function readSummarySubject(
     : target.binding.comparisons.some(item => item.status === 'complete') ? target.binding : null
   const inputFingerprint = binding ? analysisHash(binding) : null
   const etag = current?.etag ?? `"${analysisHash({ id, missing: true, inputFingerprint, manifestSha256: inventory.run.record.manifest.sha256 })}"`
-  return { inventory, current, pair, target, binding, etag, inputFingerprint }
+  return { inventory, current, pair, target, binding, etag, inputFingerprint, recordId: id }
 }
 
 const historyCursorSchema = z.strictObject({
@@ -266,7 +266,7 @@ export async function readAnalysisSummaryHistory(
     }
     const [run, latest, workspace] = await Promise.all([
       loadAnalysisRun(deps.store, workspaceId, runId),
-      loadAnalysisNarrative(deps.store, workspaceId, analysisNarrativeId(subject.kind, runId, subject.subjectId)),
+      loadAnalysisNarrative(deps.store, workspaceId, state.recordId),
       deps.store.getControl(workspaceId),
     ])
     if (!run || analysisIsRemoved(run.record.lifecycle) || workspace && ['deleting', 'deleted'].includes(workspace.record.state)) {

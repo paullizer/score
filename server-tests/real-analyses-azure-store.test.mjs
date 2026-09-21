@@ -4,6 +4,7 @@ import test from 'node:test'
 import { randomUUID } from 'node:crypto'
 import { api, fixture, createRun, publishResult, NOW, LATER, ACTOR, clone } from './real-analyses.test-support.mjs'
 import { narrativeRuntime, narrativeWorker } from './real-analysis-narratives.test-support.mjs'
+import { reviewedCorrection } from './analysis-corrections.test-support.mjs'
 
 function cosmos() {
   const values = new Map()
@@ -102,14 +103,50 @@ async function initializedPair() {
   return { f, run: created.run, comparison, initial }
 }
 
-function backedFixture(original) {
+function backedFixture(original, correctionsEnabled = false) {
   const container = cosmos()
   for (const value of [...original.analysis.store.values.values(), ...original.analysis.store.controls.values()]) container.save(value.record)
-  const store = api.createAnalysisStoreFromContainer(container)
+  const store = api.createAnalysisStoreFromContainer(container, correctionsEnabled)
   const f = { ...original, analysis: { ...original.analysis, store } }
   f.service = new api.RealAnalysisService(f.analysis, f, () => new Date(f.now))
   return { f, store, container }
 }
+
+test('Cosmos correction publication atomically preserves original evidence, changes effective counts, and binds new summary identities', async () => {
+  const initial = fixture()
+  initial.analysis.evidenceCorrectionsEnabled = true
+  const created = await createRun(initial)
+  const comparisonId = (await initial.service.comparisons(initial.workspaceId, created.run.id)).comparisons[0].comparison.id
+  await publishResult(initial, created.run.id, comparisonId, true)
+  const { f, store, container } = backedFixture(initial, true)
+  const original = await store.get(f.workspaceId, comparisonId)
+  const preview = await f.service.correctionPreview(f.workspaceId, created.run.id, comparisonId)
+  const response = await f.service.requestCorrection(f.workspaceId, created.run.id, comparisonId, {
+    resultSha256: preview.resultSha256, criterionIds: preview.criterionIds, reason: 'Synthetic reviewed evidence gap.',
+  }, randomUUID(), preview.etag, ACTOR)
+  assert.ok((await store.listPending(f.now, 100)).some(item => item.record.recordType === 'analysis-correction'))
+  assert.ok(!(await api.createAnalysisStoreFromContainer(container).listPending(f.now, 100))
+    .some(item => item.record.recordType === 'analysis-correction'))
+  const prepared = await reviewedCorrection({ f, runId: created.run.id, comparisonId })
+  await prepared.publish()
+  await prepared.publish()
+  assert.deepEqual(await store.get(f.workspaceId, comparisonId), original)
+  const current = await f.service.comparisonDetail(f.workspaceId, created.run.id, comparisonId)
+  assert.equal(current.result.overall.score, 0)
+  assert.equal(current.comparison.resultRevision.id, response.requestId)
+  const parent = await store.get(f.workspaceId, created.run.id)
+  assert.equal(parent.record.progress.scored, 1)
+  assert.equal(parent.record.progress.unscored, 0)
+  const publications = container.batches.filter(batch => batch.some(item =>
+    item.resourceBody?.recordType === 'analysis-correction' && item.resourceBody.status === 'ready'))
+  assert.equal(publications.length, 1)
+  assert.equal(publications[0].filter(item => item.resourceBody?.recordType === 'analysis-candidate-narrative').length, 1)
+  assert.equal(publications[0].filter(item => item.resourceBody?.recordType === 'analysis-target-narrative').length, 1)
+  await assert.rejects(store.transact(f.workspaceId, [
+    { kind: 'replace', record: { ...original.record, ...current.comparison }, etag: original.etag },
+    { kind: 'replace', record: parent.record, etag: parent.etag },
+  ]), /projections|Completed evidence/)
+})
 
 test('Cosmos publishes automatic sidecars and selected refreshes with exact root/control CAS while completed comparisons remain immutable', async () => {
   const original = fixture()

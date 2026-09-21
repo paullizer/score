@@ -51,6 +51,10 @@ function integer(environment: NodeJS.ProcessEnv, key: string, fallback: number, 
 }
 
 export function loadAnalysisWorkerConfig(environment: NodeJS.ProcessEnv): AnalysisWorkerConfig {
+  const corrections = environment.ANALYSIS_EVIDENCE_CORRECTIONS_ENABLED?.trim()
+  if (corrections && corrections !== 'true' && corrections !== 'false') {
+    throw new Error('ANALYSIS_EVIDENCE_CORRECTIONS_ENABLED must be true or false.')
+  }
   const mode = environment.WORKER_AUTH_MODE?.trim()
   if (mode && mode !== 'azure-cli') throw new Error('WORKER_AUTH_MODE may only be azure-cli for explicit local development.')
   const localDevelopment = mode === 'azure-cli'
@@ -93,6 +97,7 @@ export function loadAnalysisWorkerConfig(environment: NodeJS.ProcessEnv): Analys
       database, container,
       storageAccountUrl: endpoint(environment, 'STORAGE_ACCOUNT_URL', '.blob.core.windows.net'),
       blobContainer,
+      ...(corrections === 'true' ? { evidenceCorrectionsEnabled: true } : {}),
     },
     tenantId, clientId, localDevelopment,
     modelEndpoint: endpoint(environment, 'RUBRIC_MODEL_ENDPOINT', '.openai.azure.com'),

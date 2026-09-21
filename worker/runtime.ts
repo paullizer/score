@@ -23,7 +23,7 @@ import { extractMarkdownBlocks } from './markdown'
 
 const COGNITIVE_SCOPE = 'https://cognitiveservices.azure.com/.default'
 const DOCUMENT_API_VERSION = '2024-11-30'
-const PROMPT_VERSION = 'score-job-rubric-v2'
+const PROMPT_VERSION = 'score-job-rubric-v3'
 const LEASE_MILLISECONDS = 90_000
 const HEARTBEAT_MILLISECONDS = 25_000
 const WRITE_ATTEMPTS = 8
@@ -1100,7 +1100,8 @@ Every non-null metadata value must be copied from the supplied document title or
 The title is only the concise role name. A source paragraph may combine title, employer, and location: copy the exact role-name substring, not that entire paragraph. Do not append employer names, addresses, location labels, or verification labels to the title.
 Create 1 to 20 job-related professional criteria whose integer weights total exactly 100. Distinguish required from preferred using explicit source wording and section headings. Duties/responsibilities are expected capabilities, not preferred merely because they have a lower weight. Only classify a criterion as preferred when the source explicitly presents it as optional, preferred, desired, a bonus, or a nice-to-have.
 Keep location, hybrid arrangements, salary, application instructions, and administrative eligibility in metadata or review warnings rather than inventing weighted professional-skill criteria for them.
-Each criterion must cite one exact, verbatim quote and paragraph ID from this document. Guidance must explicitly anchor every score from 0 through 5.
+Each criterion must cite one exact, verbatim quote and paragraph ID from this document. Guidance must explicitly anchor every score from 0 through 5 with distinct documentary-evidence levels, not assertions about a person's intrinsic ability. Anchor 0 means "No supporting evidence in the submitted resume for this criterion"; never use "No understanding", "No awareness/practice", "No advisory experience", or assert legal noncompliance. Anchors 1 through 5 describe progressively stronger documented examples, scope, responsibility, complexity, and outcomes appropriate to this exact requirement, not unsupported personal labels such as incapable or expert.
+A successfully reviewed usable resume with no supporting professional evidence receives zero, including for confidentiality, legal/data-protection practice, and statistical advising. Partial supporting evidence is evaluated under the saved anchors. Genuine unusable-source or processing failures are not completed zeros. Missing job-source support cannot justify inventing a criterion; job evidence establishes the requirement, while resume evidence establishes the later document-evidence score.
 Do not create weighted criteria for protected characteristics or questionable personal requirements. Instead, mention those source requirements in warnings for human review.
 Return only the requested JSON schema.`
 

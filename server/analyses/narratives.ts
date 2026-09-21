@@ -17,6 +17,8 @@ import { isUuid } from '../jobs/validation'
 import { StoreConflictError } from '../store'
 import { analysisIsRemoved, assertAnalysisRunWritable, assertAnalysisWorkspaceActive, fencedAnalysisBlobs } from './guards'
 import { loadAnalysisRun } from './lifecycle'
+import { analysisCorrectionCanWork, projectAnalysisComparison, resolveAnalysisComparison } from './current-results'
+import { ANALYSIS_CORRECTION_LIMITS } from '../../src/domain/analysis-corrections'
 import { readAnalysisNarrativePublication } from './narrative-artifacts'
 import {
   analysisNarrativeCanWork, analysisNarrativeRequestCanAdvance, analysisNarrativeRequestCancelled,
@@ -41,6 +43,7 @@ export interface AnalysisNarrativeInventoryComparison {
   target: AnalysisTargetSnapshotReference
   resumeSnapshot: { snapshotId: string; sha256: string }
   binding: AnalysisCandidateNarrativeInputBinding | null
+  correctionPending: boolean
   narrative?: RealAnalysisCandidateNarrativeRecord
   state: AnalysisNarrativeCurrentState
 }
@@ -130,7 +133,9 @@ async function records<K extends AnalysisEntity['recordType']>(
       ids.add(record.id)
       result.push(value)
     }
-    assertAnalysis(result.length <= ANALYSIS_LIMITS.maxComparisons, 'Narrative inventory exceeded its frozen comparison limit.')
+    const maximum = ANALYSIS_LIMITS.maxComparisons *
+      (recordType === 'analysis-candidate-narrative' ? ANALYSIS_CORRECTION_LIMITS.maxCriteria + 1 : 1)
+    assertAnalysis(result.length <= maximum, 'Narrative inventory exceeded its bounded result-revision limit.')
     continuationToken = page.continuationToken
     if (continuationToken) { assertAnalysis(!tokens.has(continuationToken), 'Narrative inventory pagination did not advance.'); tokens.add(continuationToken) }
   } while (continuationToken)
@@ -151,18 +156,22 @@ export async function readAnalysisNarrativeInventory(
   for (let attempt = 0; attempt < 8; attempt++) {
     const run = await loadAnalysisRun(deps.store, workspaceId, runId)
     if (!run || analysisIsRemoved(run.record.lifecycle)) throw notFound('The saved analysis is not available or is being removed.')
-    const [manifest, pairs, candidates, overviews] = await Promise.all([
+    const [manifest, pairs, candidates, overviews, corrections] = await Promise.all([
       readAnalysisManifest(deps.blobs, run.record),
       records(deps.store, workspaceId, runId, 'analysis-comparison'),
       records(deps.store, workspaceId, runId, 'analysis-candidate-narrative'),
       records(deps.store, workspaceId, runId, 'analysis-target-narrative'),
+      records(deps.store, workspaceId, runId, 'analysis-correction'),
     ])
     const selectedTargets = manifest.targets.filter(item => targetId === undefined || item.summary.id === targetId)
     if (!selectedTargets.length) throw notFound('This exact saved target is not part of the analysis.')
     const targetMap = new Map(selectedTargets.map(item => [item.snapshotId, item]))
-    const pairMap = new Map(pairs.map(value => [value.record.id, value.record]))
+    const correctionMap = new Map(corrections.map(value => [value.record.comparisonId, value.record]))
+    assertAnalysis(corrections.every(value => value.record.manifestSha256 === run.record.manifest.sha256 &&
+      pairs.some(pair => pair.record.id === value.record.comparisonId)), 'Correction inventory contains foreign completed results.')
+    const pairMap = new Map(pairs.map(value => [value.record.id, projectAnalysisComparison(value.record, correctionMap.get(value.record.id))]))
     for (const pair of pairs) assertComparisonManifestBinding(manifest, pair.record)
-    const candidateMap = new Map(candidates.map(value => [value.record.comparisonId, value.record]))
+    const candidateMap = new Map(candidates.map(value => [value.record.id, value.record]))
     const targetRecords = new Map(overviews.map(value => [value.record.targetId, value.record]))
     let pending: RequestPlan | undefined
     let pendingCancelled = false
@@ -183,7 +192,7 @@ export async function readAnalysisNarrativeInventory(
       const comparison = pairMap.get(pair.id)
       assertAnalysis(comparison || pair.index >= run.record.progress.initialized, 'An initialized comparison is missing.')
       const resume = manifest.resumes.find(item => item.snapshotId === pair.resumeSnapshotId)!
-      let narrative = candidateMap.get(pair.id)
+      let narrative = candidateMap.get(analysisNarrativeId('candidate', runId, pair.id, comparison?.resultRevision?.id))
       const binding = comparison?.status === 'complete' ? candidateNarrativeBinding(run.record, comparison) : null
       if (narrative) {
         assertNarrativeBinding(run.record, target, narrative)
@@ -198,6 +207,9 @@ export async function readAnalysisNarrativeInventory(
       }
       comparisons.push({
         comparison, id: pair.id, index: pair.index, status: comparison?.status ?? 'queued', target,
+        correctionPending: Boolean(correctionMap.get(pair.id) &&
+          ['queued', 'running'].includes(correctionMap.get(pair.id)!.status) &&
+          analysisCorrectionCanWork(run.record, correctionMap.get(pair.id))),
         resumeSnapshot: { snapshotId: resume.snapshotId, sha256: resume.blob.sha256 }, binding, narrative,
         state: binding ? narrativeCurrentState(run.record, narrative, analysisHash(binding))
           : { status: 'not-required', generationId: null, inputFingerprint: null, published: null },
@@ -453,17 +465,22 @@ export async function advanceAnalysisNarrativeRequest(
     let bytes = Buffer.byteLength(JSON.stringify(run.record)) + Buffer.byteLength(JSON.stringify(current.record)) + 8192
     for (; cursor < entries.length && operations.length < ANALYSIS_LIMITS.initializationChunkSize - 1; cursor++) {
       const entry = entries[cursor]
-      const id = analysisNarrativeId(entry.kind, runId, entry.id)
-      const previous = await loadAnalysisNarrative(deps.store, workspaceId, id)
-      if (cancelled && previous && previous.record.requestedAt > run.record.narrativeCancelledAt!) continue
-      let record: RealAnalysisNarrativeRecord
+      let comparison: RealAnalysisComparisonRecord | undefined
       if (entry.kind === 'candidate') {
         const value = await deps.store.get(workspaceId, entry.id)
         assertAnalysis(value?.record.recordType === 'analysis-comparison' && value.record.status === 'complete',
           'Accepted candidate summary no longer has its immutable completed comparison.')
-        assertComparisonManifestBinding(manifest, value.record)
+        comparison = (await resolveAnalysisComparison(deps.store, run.record, { record: value.record, etag: value.etag })).record
+        assertComparisonManifestBinding(manifest, comparison)
+      }
+      const id = analysisNarrativeId(entry.kind, runId, entry.id, comparison?.resultRevision?.id)
+      const previous = await loadAnalysisNarrative(deps.store, workspaceId, id)
+      if (cancelled && previous && previous.record.requestedAt > run.record.narrativeCancelledAt!) continue
+      let record: RealAnalysisNarrativeRecord
+      if (entry.kind === 'candidate') {
+        assertAnalysis(comparison, 'Candidate summary has no current comparison.')
         assertAnalysis(!previous || previous.record.recordType === 'analysis-candidate-narrative', 'Candidate work identity was replaced.')
-        record = newCandidateNarrative(run.record, value.record, request,
+        record = newCandidateNarrative(run.record, comparison, request,
           previous?.record.recordType === 'analysis-candidate-narrative' ? previous.record : undefined)
       } else {
         const target = manifest.targets.find(item => item.summary.id === entry.id)
