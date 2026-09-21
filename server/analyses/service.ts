@@ -32,6 +32,9 @@ import type { AnalysisSummarySubject, PublishSummaryDraftInput } from '../../src
 import { readAnalysisSummaryHistory } from './summary-history'
 import { publishAnalysisSummaryDraft, retryAnalysisSummary } from './summary-actions'
 import { prepareAnalysisNarrativeTransitions } from './narrative-scheduling'
+import { resolveAnalysisComparison, resolveAnalysisComparisons } from './current-results'
+import { AnalysisCorrectionService } from './correction-actions'
+import type { AnalysisCorrectionInput } from '../../src/domain/analysis-corrections'
 import { readAnalysisFailureDiagnostics } from './diagnostics'
 import {
   advanceAnalysisRun, applyAnalysisComparisonTransition, cancelAnalysisComparisonRecord, loadAnalysisComparison,
@@ -72,10 +75,12 @@ const comparisonSummary = (value: VersionedAnalysisEntity<RealAnalysisComparison
 export class RealAnalysisService {
   private readonly targets: RealAnalysisTargets
   private readonly clock: () => Date
+  private readonly corrections: AnalysisCorrectionService
 
   constructor(private readonly deps: RealAnalysesDeps, private readonly sources: AnalysisSourceDeps = {}, now?: () => Date) {
     this.targets = new RealAnalysisTargets(sources)
     this.clock = now ?? (() => new Date())
+    this.corrections = new AnalysisCorrectionService(deps, this.clock)
   }
   private now(): string { return this.clock().toISOString() }
   private async run(workspaceId: string, runId: string, recovery = false, signal?: AbortSignal) {
@@ -279,7 +284,8 @@ export class RealAnalysisService {
     ])
     signal?.throwIfAborted()
     assertAnalysis(page.items.length <= limit, 'Comparison page exceeds its limit.')
-    const comparisons = page.items.map(value => {
+    const resolved = await resolveAnalysisComparisons(this.deps.store, run.record, page.items, signal)
+    const comparisons = resolved.map(value => {
       const record = parseAnalysisEntity(value.record)
       assertAnalysis(record.recordType === 'analysis-comparison' && value.etag, 'Invalid comparison page.')
       assertComparisonManifestBinding(manifest, record)
@@ -289,9 +295,10 @@ export class RealAnalysisService {
   }
   async comparisonDetail(workspaceId: string, runId: string, comparisonId: string, signal?: AbortSignal): Promise<RealAnalysisComparisonDetail> {
     return traceOperation('score.analysis.comparison', { 'score.comparison.count': 1 }, async () => {
-      const [run, comparison] = await Promise.all([
+      const [run, original] = await Promise.all([
         this.run(workspaceId, runId, false, signal), this.comparison(workspaceId, runId, comparisonId, signal),
       ])
+      const comparison = await resolveAnalysisComparison(this.deps.store, run.record, original, signal)
       const snapshots = await traceOperation('score.analysis.snapshot.read', { 'score.comparison.count': 1 },
         () => readAnalysisSnapshots(this.deps.blobs, run.record, comparison.record, signal))
       const result = await traceOperation('score.analysis.result.read', { 'score.read.count': comparison.record.result ? 1 : 0 },
@@ -307,15 +314,32 @@ export class RealAnalysisService {
   summaries(workspaceId: string, runId: string, targetId?: string, signal?: AbortSignal) {
     return readAnalysisSummaries(this.deps, workspaceId, runId, targetId, signal)
   }
-  summarySubject(workspaceId: string, runId: string, subject: AnalysisSummarySubject, signal?: AbortSignal) {
+  summarySubject(workspaceId: string, runId: string, subject: AnalysisSummarySubject, signal?: AbortSignal, resultRevisionId?: string) {
     return traceOperation(subject.kind === 'candidate' ? 'score.analysis.summary.candidate' : 'score.analysis.summary.target',
-      { 'score.summary.kind': subject.kind }, () => readAnalysisSummarySubject(this.deps, workspaceId, runId, subject, signal))
+      { 'score.summary.kind': subject.kind }, () => readAnalysisSummarySubject(this.deps, workspaceId, runId, subject, signal, resultRevisionId))
+  }
+  correctionPreview(workspaceId: string, runId: string, comparisonId: string, signal?: AbortSignal) {
+    return this.corrections.preview(workspaceId, runId, comparisonId, signal)
+  }
+  correctionState(workspaceId: string, runId: string, comparisonId: string, signal?: AbortSignal) {
+    return this.corrections.state(workspaceId, runId, comparisonId, signal)
+  }
+  correctionHistory(workspaceId: string, runId: string, comparisonId: string, continuationToken?: string, signal?: AbortSignal) {
+    return this.corrections.history(workspaceId, runId, comparisonId, continuationToken, signal)
+  }
+  requestCorrection(
+    workspaceId: string, runId: string, comparisonId: string, input: AnalysisCorrectionInput, requestId: string, expected: string, actor: string,
+  ) {
+    return this.corrections.request(workspaceId, runId, comparisonId, input, requestId, expected, actor)
+  }
+  cancelCorrection(workspaceId: string, runId: string, comparisonId: string, expected: string) {
+    return this.corrections.cancel(workspaceId, runId, comparisonId, expected)
   }
   generateSummaries(workspaceId: string, runId: string, input: GenerateRealAnalysisSummariesInput, requestId: string, expected: string, actor: string) {
     return generateAnalysisSummaries(this.deps, workspaceId, runId, input, requestId, expected, actor, this.clock)
   }
-  summaryHistory(workspaceId: string, runId: string, subject: AnalysisSummarySubject, continuationToken?: string, signal?: AbortSignal) {
-    return readAnalysisSummaryHistory(this.deps, workspaceId, runId, subject, continuationToken, signal)
+  summaryHistory(workspaceId: string, runId: string, subject: AnalysisSummarySubject, continuationToken?: string, signal?: AbortSignal, resultRevisionId?: string) {
+    return readAnalysisSummaryHistory(this.deps, workspaceId, runId, subject, continuationToken, signal, resultRevisionId)
   }
   publishSummary(
     workspaceId: string, runId: string, subject: AnalysisSummarySubject, input: PublishSummaryDraftInput,
@@ -338,12 +362,14 @@ export class RealAnalysisService {
     comparisonIds = input(reportComparisonIdsSchema, comparisonIds)
     signal?.throwIfAborted()
     const run = await this.run(workspaceId, runId, false, signal)
-    const comparisons: RealAnalysisComparisonRecord[] = []
+    const comparisons: VersionedAnalysisEntity<RealAnalysisComparisonRecord>[] = []
     for (const id of comparisonIds) {
       signal?.throwIfAborted()
-      comparisons.push((await this.comparison(workspaceId, runId, id, signal)).record)
+      comparisons.push(await this.comparison(workspaceId, runId, id, signal))
     }
-    return readAnalysisReportComparisons(this.deps.blobs, run.record, comparisons, signal)
+    const current = await resolveAnalysisComparisons(this.deps.store, run.record, comparisons, signal)
+    signal?.throwIfAborted()
+    return readAnalysisReportComparisons(this.deps.blobs, run.record, current.map(value => value.record), signal)
   }
   async document(
     workspaceId: string, runId: string, comparisonId: string, documentId: string, version: number, signal?: AbortSignal,
@@ -380,8 +406,12 @@ export class RealAnalysisService {
     const p = current.record.progress
     if (p.initialized === p.total && p.queued + p.running === 0) {
       const inventory = await readAnalysisNarrativeInventory(this.deps, workspaceId, runId)
-      const active = [...inventory.comparisons, ...inventory.targets].some(item => ['waiting', 'queued', 'running'].includes(item.state.status))
-      if (!active) throw conflict('This run has no active comparisons or summaries to cancel. Completed results are immutable.')
+      const corrections = await Promise.all((['queued', 'running'] as const).map(status => this.deps.store.list(
+        workspaceId, { recordType: 'analysis-correction', runId, status, limit: 1 },
+      )))
+      const active = [...inventory.comparisons, ...inventory.targets].some(item => ['waiting', 'queued', 'running'].includes(item.state.status)) ||
+        corrections.some(page => page.items.length > 0)
+      if (!active) throw conflict('This run has no active comparisons, corrections, or summaries to cancel. Completed results are immutable.')
       const timestamp = new Date(Math.max(Date.parse(this.now()), Date.parse(current.record.updatedAt))).toISOString()
       const updated = { ...current.record, updatedAt: timestamp, narrativeCancelledAt: timestamp }
       assertWorkspaceMutationLease(workspaceId)

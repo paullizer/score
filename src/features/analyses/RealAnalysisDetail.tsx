@@ -16,6 +16,7 @@ import {
 import { RealComparisonReview } from './RealComparisonReview'
 import { AnalysisReportExport } from './AnalysisReportExport'
 import { ManageAnalysisSummaries, RealTargetNarrative } from './AnalysisSummaries'
+import { ReviewWithheldScores } from './AnalysisCorrections'
 import { ArchivedBadge, EntityLifecycleActions, LifecycleBanner } from '../../components/lifecycle/LifecycleControls'
 import { useLifecycleAccess } from '../../components/lifecycle/useLifecycleAccess'
 import { getDisplayName } from '../../domain/displayNames'
@@ -156,6 +157,7 @@ function RealAnalysisView({ id }: { id: string }) {
   return <>{back}
     <PageHeader eyebrow="REAL EVIDENCE · FROZEN INPUTS" title={getDisplayName(run, run.name)} description="Review each saved resume/target pair independently. Completion, coverage, and overall-score availability are separate."
       actions={<><RenameEntityButton target={{ kind: 'analysis', id }} name={getDisplayName(run, run.name)} etag={summary.etag} disabled={!api.canWrite || api.phase !== 'ready' || !summary.etag || api.pending(id)} /><EntityLifecycleActions target={{ kind: 'analysis', id }} name={getDisplayName(run, run.name)} onComplete={(action) => { if (action === 'delete') navigate('/analyses?data=real') }} /><RealRunActions summary={summary} />
+        <ReviewWithheldScores runId={id} comparisons={savedPairs} available={pairs?.state === 'ready' && !pairs.error && api.phase === 'ready'} />
         <Button ref={summaryTrigger} onClick={() => setSummaryScope({ targetId: viewedTarget?.id })}>Manage summaries</Button><AnalysisReportExport source={{
         kind: 'real', workspaceId: api.workspaceId, detail: { ...detail, ...summary },
         comparisons: pairs?.state === 'ready' ? pairs.value : null, available: api.phase === 'ready',

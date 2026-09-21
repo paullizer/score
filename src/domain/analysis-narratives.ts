@@ -302,6 +302,7 @@ export interface RealAnalysisCandidateNarrativeRecord extends AnalysisNarrativeR
   resumeSnapshot: AnalysisNarrativeSnapshotIdentity
   resultSha256: string
   inputFingerprint: string
+  resultRevisionId?: string
 }
 
 export interface RealAnalysisTargetNarrativeRecord extends AnalysisNarrativeRecordBase {
@@ -337,6 +338,7 @@ export interface RealAnalysisCandidateNarrativeSummary extends AnalysisNarrative
   kind: 'candidate'
   comparisonId: string
   comparisonStatus: RealAnalysisComparisonStatus
+  resultSha256?: string | null
   published: RealAnalysisCandidateNarrative | null
 }
 
@@ -408,6 +410,7 @@ export type RealAnalysisSummarySubjectResponse = {
   // This subject's revision is not the management/export scope revision used for mutations.
   revision: string
   etag: string
+  resultRevisionId?: string
 } & (
   | { kind: 'candidate'; narrative: RealAnalysisCandidateNarrativeSummary }
   | { kind: 'target'; narrative: RealAnalysisTargetNarrativeSummary }

@@ -245,6 +245,24 @@ test('summary DTO validation requires current ready state and does not treat ret
   }
 })
 
+test('summary DTOs accept result-bound candidates and legacy reads but reject mismatched or malformed result hashes', () => {
+  const response = reportSummariesFixture(realReportFixture({ scores: [90, null], statuses: ['complete', 'failed'] }))
+  const parsed = api.realAnalysisSummariesResponseSchema.parse(response)
+  assert.equal(parsed.comparisons[0].resultSha256, response.capture.comparisons[0].resultSha256)
+  assert.equal(parsed.comparisons[1].resultSha256, null)
+  for (const resultSha256 of ['f'.repeat(64), null, 'not-a-hash', 42]) {
+    const copy = structuredClone(response)
+    copy.comparisons[0].resultSha256 = resultSha256
+    assert.equal(api.realAnalysisSummariesResponseSchema.safeParse(copy).success, false, String(resultSha256))
+  }
+  const unfinished = structuredClone(response)
+  unfinished.comparisons[1].resultSha256 = 'f'.repeat(64)
+  assert.equal(api.realAnalysisSummariesResponseSchema.safeParse(unfinished).success, false)
+  const legacy = structuredClone(response)
+  for (const comparison of legacy.comparisons) delete comparison.resultSha256
+  assert.equal(api.realAnalysisSummariesResponseSchema.safeParse(legacy).success, true)
+})
+
 test('opt-in shared fixture stamping preserves supplied prose and presentation with deterministic real or sample identities', () => {
   const real = realReportFixture({ scores: [90], targetCount: 2 })
   const candidate = {

@@ -11,6 +11,8 @@ param rendererImage string
 param gradeWorkerImage string
 param resumeWorkerImage string
 param analysisWorkerImage string
+@allowed(['false', 'true'])
+param analysisEvidenceCorrectionsEnabled string = 'false'
 param appServiceSku string
 param searchSku string
 
@@ -307,6 +309,7 @@ module analyses 'private-processing.bicep' = {
     environmentId: ingestion.outputs.environmentId
     tenantId: tenantId
     workerImage: analysisWorkerImage
+    analysisEvidenceCorrectionsEnabled: analysisEvidenceCorrectionsEnabled
   }
 }
 
@@ -385,6 +388,7 @@ resource appSettings 'Microsoft.Web/sites/config@2024-11-01' = {
     RESUME_RECORDS_CONTAINER: 'resume-records'
     RESUME_SOURCE_CONTAINER: 'resume-sources'
     REAL_ANALYSES_ENABLED: analyses.outputs.isDeployed ? 'true' : 'false'
+    ANALYSIS_EVIDENCE_CORRECTIONS_ENABLED: analysisEvidenceCorrectionsEnabled
     ANALYSIS_RECORDS_CONTAINER: 'analysis-records'
     ANALYSIS_SOURCE_CONTAINER: 'analysis-sources'
     APP_ORIGIN: 'https://${web.properties.defaultHostName}'

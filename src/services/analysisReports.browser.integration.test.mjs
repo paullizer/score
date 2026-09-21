@@ -39,7 +39,12 @@ async function newPage() {
 async function download(page, format) {
   const dialog = page.getByRole('dialog', { name: 'Export analysis report', exact: true })
   await dialog.getByLabel('Report format', { exact: true }).selectOption(format)
-  const pending = page.waitForEvent('download', { timeout: 90_000 })
+  const pending = Promise.race([
+    page.waitForEvent('download', { timeout: 90_000 }),
+    dialog.getByRole('alert').first().waitFor({ state: 'visible', timeout: 90_000 }).then(async () => {
+      throw new Error(`${format} export failed: ${await dialog.getByRole('alert').first().innerText()}`)
+    }),
+  ])
   await dialog.getByRole('button', { name: /^Download / }).click()
   const result = await pending
   assert.equal(await result.failure(), null)

@@ -68,6 +68,11 @@ All paths below have prefix `/api/workspaces/:workspaceId/analyses`:
 | `GET /:runId/comparisons` | `RealAnalysisComparisonsPage` |
 | `GET /:runId/comparisons/:comparisonId` | Unwrapped `RealAnalysisComparisonDetail` |
 | `GET /:runId/comparisons/:comparisonId/diagnostics?continuationToken=...` | `RealAnalysisDiagnosticsPage`; at most one private failed-attempt artifact per page |
+| `GET /:runId/comparisons/:comparisonId/corrections/preview` | Owner/editor-only `AnalysisCorrectionPreview`; read-only before/after totals, exact ETag and result hashes |
+| `GET /:runId/comparisons/:comparisonId/corrections` | Owner/editor-only `{correction}`; cheap status without loading evidence blobs |
+| `POST /:runId/comparisons/:comparisonId/corrections` with `{resultSha256, criterionIds, reason}` | HTTP 202 `AnalysisCorrectionResponse`; exact preview `If-Match` and UUID `Idempotency-Key` |
+| `POST /:runId/comparisons/:comparisonId/corrections/cancel` with `{}` | `AnalysisCorrectionResponse`; exact correction-head `If-Match` |
+| `GET /:runId/comparisons/:comparisonId/corrections/history?continuationToken=...` | Owner/editor-only immutable original assessment and up to 12 correction checkpoints |
 | `GET /:runId/comparisons/:comparisonId/documents/:documentId?version=N` | `RealAnalysisDocumentResponse` |
 | `GET /:runId/summaries` with optional `targetId` query | `RealAnalysisSummariesResponse`, including selected-scope ETag, status, published narratives, and report capture pins |
 | `GET /:runId/summaries/:kind/:subjectId` | `RealAnalysisSummarySubjectResponse`; one candidate summary or exact target overview, with its own revision and ETag |
@@ -103,6 +108,58 @@ Nonempty action bodies must use supported JSON and the exact action schema.
 Lifecycle actions always require the **run** ETag, never a comparison ETag.
 `RealAnalysisDetail` is an alias of the existing `RealAnalysisRunDetail`.
 
+## Missing evidence and reviewed result corrections
+
+A successfully reviewed source without supporting evidence for an applicable
+professional criterion is `missing`, with score `0` and no purported supporting
+citations. Professional confidentiality/compliance is not a protected personal
+trait. Zero describes the submitted evidence, not personal inability or a legal
+finding. Newly generated zero anchors use this interpretation; historical frozen
+rubric wording and hashes are never rewritten.
+
+The assessment and independent grounding contracts explicitly distinguish evidence
+gaps from genuine blockers. Source-quality/context failures, ambiguous requirements,
+restricted personal-trait inferences, and failed processing must not become invented
+zeros. GS exclusions stay zero-weight and unscored; separate qualifications remain
+unscored. The deterministic calculator is unchanged: missing evidence retains its
+full original weight, totals are not renormalized, and an entirely missing-evidence
+assessment can be an available `0/100`.
+
+Completed comparisons and original result bytes remain immutable. An
+`analysis-correction:<runId>:<comparisonId>` head stores a separately guarded
+current publication and durable worker state. Every explicit request binds its
+actor, reason, selected criterion IDs, exact base/original result hashes, frozen
+snapshots, manifest, and `missing-evidence-zero-v1` policy. Its immutable proposal
+only changes selected unassessed evidence-gap rows, related limitations/coverage,
+and the deterministic explanation and total. Contextual citations alone do not
+establish support or determine correction eligibility.
+
+Preview eligibility means eligible for a fresh semantic review, not guaranteed
+publication. The worker reviews the exact deterministic proposal without rescoring
+other criteria, then publishes new immutable result and history artifacts. The
+result retains original assessor attribution while recording fresh review and
+correction provenance. Failed, cancelled, expired, or superseded work cannot
+replace the last publication. Publication atomically fences the correction head,
+run counts, lifecycle/cancellation state, and revision-bound summary scheduling.
+Replay cannot double-count the recovered score.
+
+All current readers resolve this head, including list/detail, report batches, and
+summary inputs. `comparison.resultRevision` is a read projection and must never be
+persisted over the original comparison record. Detail and candidate-summary reads
+add only one constant correction-head lookup. Lists and target metadata use bounded
+run-scoped head queries, not one lookup per comparison. Original results and every
+prior candidate narrative publication remain available in private correction
+history; rejected proposals and failed review findings are distinct from published
+results.
+
+`ANALYSIS_EVIDENCE_CORRECTIONS_ENABLED` defaults to `false` in the API, worker, and
+deployment templates. The UI capability is `analysisEvidenceCorrections`. The gate
+controls new requests and worker discovery, not historical reads or authorized
+cancellation of accepted work. Deploy compatible readers/workers and drain older
+workers before deliberately enabling it. Turning the gate off does not reinterpret
+already-published revisions. Production deployment and a historical repair batch
+require separate approval and exact-hash scope verification.
+
 ## Saved narrative summaries
 
 Narratives are versioned sidecars, not modifications to completed comparison
@@ -120,6 +177,15 @@ independently through the subject GET. `kind` is `candidate` or `target`;
 `subjectId` is the comparison ID or exact saved target ID, respectively. The
 envelope binds `workspaceId`, `runId`, `kind`, `subjectId`, `revision`, `etag`, and
 the matching `narrative`. It does not expose unpublished history to viewers.
+Candidate DTOs include the bound `resultSha256`; corrected-score views reject an
+older or unbound narrative as current, even while it remains readable as history.
+
+Candidate subject/history GETs accept owner/editor-only
+`resultRevisionId=original` or an exact published correction request UUID. These
+explicit reads echo the selected revision, keep pagination bound to that revision,
+and cannot publish or retry its drafts over the current assessment. Correction
+history exposes these reads lazily. Historical reads do not replace current UI
+caches or report pins, and do not enqueue any work.
 
 Candidate-summary reads use scoped point reads and do not enumerate unrelated
 candidates. Target-overview reads retain the metadata needed to prove their exact
@@ -152,6 +218,10 @@ accepted request after an ambiguous response.
 New completed scoring results durably schedule candidate summaries and coalesce
 the affected target overview. Target synthesis waits until selected scoring has
 settled and every completed comparison has a current candidate narrative. A
+pending correction cohort also holds the affected overview until its reviews
+settle. Published corrections get a new candidate sidecar identity containing
+the correction request UUID; old sidecars are never rebound to changed result
+hashes. Only changed candidates and their affected targets are regenerated. A
 scoring retry invalidates the affected overview immediately; a later completion
 refreshes it without regenerating unchanged candidates. Failed/cancelled
 comparisons contribute processing-status facts, not invented evidence or zero
@@ -683,6 +753,7 @@ Focused validation (independently bundles its own entry point):
 
 ```powershell
 node --test server-tests\real-analyses.test.mjs server-tests\real-analyses-lifecycle.test.mjs server-tests\real-analyses-azure-store.test.mjs server-tests\real-analyses-model-boundary.test.mjs server-tests\analysis-diagnostics.test.mjs worker-tests\analysis-runtime.test.mjs worker-tests\analysis-evidence-passages.test.mjs worker-tests\analysis-telemetry.test.mjs
+node --test server-tests\analysis-corrections.test.mjs server-tests\analysis-read-performance.test.mjs worker-tests\analysis-corrections.test.mjs src\services\analysisCorrections.synthetic.integration.test.mjs src\services\analysisCorrections.synthetic.browser.integration.test.mjs
 npx tsc --project tsconfig.server.json --noEmit
 npx eslint server\analyses server-tests\real-analyses*.mjs --quiet
 ```

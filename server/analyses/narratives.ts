@@ -19,6 +19,11 @@ import { StoreConflictError } from '../store'
 import { traceOperation } from '../telemetry-operations'
 import { analysisIsRemoved, assertAnalysisRunWritable, assertAnalysisWorkspaceActive, fencedAnalysisBlobs } from './guards'
 import { loadAnalysisComparison, loadAnalysisRun } from './lifecycle'
+import {
+  analysisCorrectionCanWork, loadAnalysisCorrection, projectAnalysisComparison,
+  resolveAnalysisComparison, resolveAnalysisComparisonRevision,
+} from './current-results'
+import { ANALYSIS_CORRECTION_LIMITS, type RealAnalysisCorrectionRecord } from '../../src/domain/analysis-corrections'
 import { readAnalysisNarrativePublication } from './narrative-artifacts'
 import {
   analysisNarrativeCanWork, analysisNarrativeRequestCanAdvance, analysisNarrativeRequestCancelled,
@@ -46,6 +51,7 @@ export interface AnalysisNarrativeInventoryComparison {
   target: AnalysisTargetSnapshotReference
   resumeSnapshot: { snapshotId: string; sha256: string }
   binding: AnalysisCandidateNarrativeInputBinding | null
+  correctionPending: boolean
   narrative?: RealAnalysisCandidateNarrativeRecord
   state: AnalysisNarrativeCurrentState
 }
@@ -149,7 +155,9 @@ async function records<K extends AnalysisEntity['recordType']>(
       ids.add(record.id)
       result.push(value)
     }
-    assertAnalysis(result.length <= ANALYSIS_LIMITS.maxComparisons, 'Narrative inventory exceeded its frozen comparison limit.')
+    const maximum = ANALYSIS_LIMITS.maxComparisons *
+      (recordType === 'analysis-candidate-narrative' ? ANALYSIS_CORRECTION_LIMITS.maxCriteria + 1 : 1)
+    assertAnalysis(result.length <= maximum, 'Narrative inventory exceeded its bounded result-revision limit.')
     continuationToken = page.continuationToken
     if (continuationToken) { assertAnalysis(!tokens.has(continuationToken), 'Narrative inventory pagination did not advance.'); tokens.add(continuationToken) }
   } while (continuationToken)
@@ -185,7 +193,7 @@ function inventoryComparison(
   run: RealAnalysisRunRecord, manifest: RealAnalysisInitializationManifest,
   pair: RealAnalysisInitializationManifest['comparisons'][number], target: AnalysisTargetSnapshotReference,
   comparison: RealAnalysisComparisonRecord | undefined, narrative: RealAnalysisCandidateNarrativeRecord | undefined,
-  pending: PendingNarratives,
+  pending: PendingNarratives, correction?: RealAnalysisCorrectionRecord,
 ): AnalysisNarrativeInventoryComparison {
   assertAnalysis(comparison || pair.index >= run.progress.initialized, 'An initialized comparison is missing.')
   if (comparison) assertComparisonManifestBinding(manifest, comparison)
@@ -204,6 +212,7 @@ function inventoryComparison(
   }
   return {
     comparison, id: pair.id, index: pair.index, status: comparison?.status ?? 'queued', target,
+    correctionPending: Boolean(correction && ['queued', 'running'].includes(correction.status) && analysisCorrectionCanWork(run, correction)),
     resumeSnapshot: { snapshotId: resume.snapshotId, sha256: resume.blob.sha256 }, binding, narrative,
     state: binding ? narrativeCurrentState(run, narrative, analysisHash(binding))
       : { status: 'not-required', generationId: null, inputFingerprint: null, published: null },
@@ -277,7 +286,7 @@ export async function readAnalysisNarrativeInventory(
   requireScope(workspaceId, runId, targetId)
   const captured = await traceOperation('score.analysis.summary.inventory', {}, () =>
     captureNarrativeMetadata(deps, workspaceId, runId, async run => {
-      const [manifest, pairs, candidates, overviews] = await Promise.all([
+      const [manifest, pairs, candidates, overviews, corrections] = await Promise.all([
         readAnalysisManifest(deps.blobs, run, signal),
         records(deps.store, workspaceId, runId, 'analysis-comparison', targetId, signal),
         records(deps.store, workspaceId, runId, 'analysis-candidate-narrative', targetId, signal),
@@ -286,20 +295,28 @@ export async function readAnalysisNarrativeInventory(
             assertAnalysis(!value || value.record.recordType === 'analysis-target-narrative', 'Target lookup returned a different kind.')
             return value ? [value as VersionedAnalysisEntity<RealAnalysisTargetNarrativeRecord>] : []
           }),
+        records(deps.store, workspaceId, runId, 'analysis-correction', undefined, signal),
       ])
       const selectedTargets = manifest.targets.filter(item => targetId === undefined || item.summary.id === targetId)
       if (!selectedTargets.length) throw notFound('This exact saved target is not part of the analysis.')
       const targetMap = new Map(selectedTargets.map(item => [item.snapshotId, item]))
-      const pairMap = new Map(pairs.map(value => [value.record.id, value.record]))
+      const correctionMap = new Map(corrections.map(value => [value.record.comparisonId, value.record]))
+      assertAnalysis(corrections.every(value => value.record.manifestSha256 === run.manifest.sha256 &&
+        manifest.comparisons.some(pair => pair.id === value.record.comparisonId &&
+          pair.resumeSnapshotId === value.record.resumeSnapshot.snapshotId && pair.targetSnapshotId === value.record.targetSnapshot.snapshotId)),
+      'Correction inventory contains foreign frozen results.')
+      const pairMap = new Map(pairs.map(value => [value.record.id, projectAnalysisComparison(value.record, correctionMap.get(value.record.id))]))
       for (const pair of pairs) assertComparisonManifestBinding(manifest, pair.record)
-      const candidateMap = new Map(candidates.map(value => [value.record.comparisonId, value.record]))
+      const candidateMap = new Map(candidates.map(value => [value.record.id, value.record]))
       const targetRecords = new Map(overviews.map(value => [value.record.targetId, value.record]))
       const pending = await pendingNarratives(deps, run, manifest, signal)
       const comparisons: AnalysisNarrativeInventoryComparison[] = []
       for (const pair of manifest.comparisons) {
         const target = targetMap.get(pair.targetSnapshotId)
         if (!target) continue
-        comparisons.push(inventoryComparison(run, manifest, pair, target, pairMap.get(pair.id), candidateMap.get(pair.id), pending))
+        const comparison = pairMap.get(pair.id)
+        const narrative = candidateMap.get(analysisNarrativeId('candidate', runId, pair.id, comparison?.resultRevision?.id))
+        comparisons.push(inventoryComparison(run, manifest, pair, target, comparison, narrative, pending, correctionMap.get(pair.id)))
       }
       const targets = selectedTargets.map(target => inventoryTarget(run, target,
         comparisons.filter(pair => pair.target.snapshotId === target.snapshotId), targetRecords.get(target.summary.id), pending))
@@ -339,6 +356,7 @@ async function candidateSummary(
   assertAnalysis(!artifact || artifact.kind === 'candidate', 'Candidate summary has the wrong artifact kind.')
   return {
     kind: 'candidate', comparisonId: pair.id, comparisonStatus: pair.status, targetId: pair.target.summary.id,
+    resultSha256: pair.binding?.resultSha256 ?? null,
     ...pair.state, ...workSummary(pair.narrative, pair.state),
     published: artifact?.kind === 'candidate' && pair.narrative?.published ? {
       ...narrativePublicationVersion(pair.narrative.published), dataKind: 'real', text: artifact.text, overview: artifact.overview,
@@ -408,7 +426,7 @@ function subjectRevision(
   })
 }
 async function readSubjectInventory(
-  deps: RealAnalysesDeps, workspaceId: string, runId: string, subject: AnalysisSummarySubject, signal?: AbortSignal,
+  deps: RealAnalysesDeps, workspaceId: string, runId: string, subject: AnalysisSummarySubject, signal?: AbortSignal, resultRevisionId?: string,
 ): Promise<SubjectInventory> {
   if (subject.kind === 'target') {
     const inventory = await readAnalysisNarrativeInventory(deps, workspaceId, runId, subject.subjectId, signal)
@@ -416,44 +434,57 @@ async function readSubjectInventory(
     return { kind: 'target', run: inventory.run, selected, revision: subjectRevision(subject, inventory.run.record, selected) }
   }
   const { run, value: selected } = await captureNarrativeMetadata(deps, workspaceId, runId, async run => {
-    const [manifest, comparison, narrative] = await Promise.all([
+    const [manifest, original, correction] = await Promise.all([
       readAnalysisManifest(deps.blobs, run, signal),
       loadAnalysisComparison(deps.store, workspaceId, runId, subject.subjectId, signal),
-      loadAnalysisNarrative(deps.store, workspaceId, analysisNarrativeId('candidate', runId, subject.subjectId), signal),
+      resultRevisionId ? undefined : loadAnalysisCorrection(deps.store, workspaceId, runId, subject.subjectId, signal),
     ])
     const pair = manifest.comparisons.find(pair => pair.id === subject.subjectId)
     if (!pair) throw notFound('This exact saved comparison is not part of the analysis.')
+    assertAnalysis(!correction || original && correction.record.manifestSha256 === run.manifest.sha256,
+      'Correction lookup is not bound to this frozen manifest and comparison.')
+    const comparison = original ? resultRevisionId
+      ? (await resolveAnalysisComparisonRevision(deps, run, original, resultRevisionId, signal)).record
+      : projectAnalysisComparison(original.record, correction?.record) : undefined
+    if (resultRevisionId && !comparison) throw notFound('This comparison has no completed assessment history.')
+    const narrative = await loadAnalysisNarrative(deps.store, workspaceId,
+      analysisNarrativeId('candidate', runId, subject.subjectId, comparison?.resultRevision?.id), signal)
     assertAnalysis(!narrative || narrative.record.recordType === 'analysis-candidate-narrative', 'Candidate lookup returned a different kind.')
     const target = manifest.targets.find(target => target.snapshotId === pair.targetSnapshotId)!
-    return inventoryComparison(run, manifest, pair, target, comparison?.record,
-      narrative?.record as RealAnalysisCandidateNarrativeRecord | undefined, await pendingNarratives(deps, run, manifest, signal))
+    return inventoryComparison(run, manifest, pair, target, comparison,
+      narrative?.record as RealAnalysisCandidateNarrativeRecord | undefined,
+      resultRevisionId ? { cancelled: false } : await pendingNarratives(deps, run, manifest, signal), correction?.record)
   }, signal)
   return { kind: 'candidate', run, selected, revision: subjectRevision(subject, run.record, selected) }
 }
 
 /** Read only the requested publication; candidate metadata uses point reads, never a run inventory. */
 export async function readAnalysisSummarySubject(
-  deps: RealAnalysesDeps, workspaceId: string, runId: string, subject: AnalysisSummarySubject, signal?: AbortSignal,
+  deps: RealAnalysesDeps, workspaceId: string, runId: string, subject: AnalysisSummarySubject, signal?: AbortSignal, resultRevisionId?: string,
 ): Promise<RealAnalysisSummarySubjectResponse> {
   requireScope(workspaceId, runId)
   if (subject.kind !== 'candidate' && subject.kind !== 'target' ||
     (subject.kind === 'candidate' ? !isAnalysisId(subject.subjectId, 'comparison')
       : !analysisNarrativeTargetIdSchema.safeParse(subject.subjectId).success)) throw notFound('The exact saved summary was not found.')
+  if (resultRevisionId !== undefined && (subject.kind !== 'candidate' || resultRevisionId !== 'original' && !isUuid(resultRevisionId))) {
+    throw invalidRequest('Historical summary reads require one original or published candidate result revision.')
+  }
   deps = immutableReadDeps(deps)
   for (let attempt = 0; attempt < 4; attempt++) {
-    const inventory = await readSubjectInventory(deps, workspaceId, runId, subject, signal)
+    const inventory = await readSubjectInventory(deps, workspaceId, runId, subject, signal, resultRevisionId)
     try {
       const narrative = inventory.kind === 'candidate' ? await candidateSummary(deps.blobs, inventory.selected, signal)
         : await targetSummary(deps.blobs, inventory.selected, signal)
       const latest = await readableRun(deps, workspaceId, runId, signal)
       if (latest.etag !== inventory.run.etag) {
-        const current = await readSubjectInventory(deps, workspaceId, runId, subject, signal)
+        const current = await readSubjectInventory(deps, workspaceId, runId, subject, signal, resultRevisionId)
         if (current.revision !== inventory.revision) continue
       }
       await readableWorkspace(deps, workspaceId, signal)
       const response = {
         schemaVersion: ANALYSIS_NARRATIVE_SCHEMA_VERSION, dataKind: 'real' as const, workspaceId, runId,
         subjectId: subject.subjectId, revision: inventory.revision, etag: `"${inventory.revision}"`,
+        ...(resultRevisionId ? { resultRevisionId } : {}),
       }
       return narrative.kind === 'candidate' ? { ...response, kind: 'candidate', narrative } : { ...response, kind: 'target', narrative }
     } catch (error) {
@@ -652,17 +683,22 @@ export async function advanceAnalysisNarrativeRequest(
     let bytes = Buffer.byteLength(JSON.stringify(run.record)) + Buffer.byteLength(JSON.stringify(current.record)) + 8192
     for (; cursor < entries.length && operations.length < ANALYSIS_LIMITS.initializationChunkSize - 1; cursor++) {
       const entry = entries[cursor]
-      const id = analysisNarrativeId(entry.kind, runId, entry.id)
-      const previous = await loadAnalysisNarrative(deps.store, workspaceId, id)
-      if (cancelled && previous && previous.record.requestedAt > run.record.narrativeCancelledAt!) continue
-      let record: RealAnalysisNarrativeRecord
+      let comparison: RealAnalysisComparisonRecord | undefined
       if (entry.kind === 'candidate') {
         const value = await deps.store.get(workspaceId, entry.id)
         assertAnalysis(value?.record.recordType === 'analysis-comparison' && value.record.status === 'complete',
           'Accepted candidate summary no longer has its immutable completed comparison.')
-        assertComparisonManifestBinding(manifest, value.record)
+        comparison = (await resolveAnalysisComparison(deps.store, run.record, { record: value.record, etag: value.etag })).record
+        assertComparisonManifestBinding(manifest, comparison)
+      }
+      const id = analysisNarrativeId(entry.kind, runId, entry.id, comparison?.resultRevision?.id)
+      const previous = await loadAnalysisNarrative(deps.store, workspaceId, id)
+      if (cancelled && previous && previous.record.requestedAt > run.record.narrativeCancelledAt!) continue
+      let record: RealAnalysisNarrativeRecord
+      if (entry.kind === 'candidate') {
+        assertAnalysis(comparison, 'Candidate summary has no current comparison.')
         assertAnalysis(!previous || previous.record.recordType === 'analysis-candidate-narrative', 'Candidate work identity was replaced.')
-        record = newCandidateNarrative(run.record, value.record, request,
+        record = newCandidateNarrative(run.record, comparison, request,
           previous?.record.recordType === 'analysis-candidate-narrative' ? previous.record : undefined)
       } else {
         const target = manifest.targets.find(item => item.summary.id === entry.id)

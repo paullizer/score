@@ -1,12 +1,14 @@
 import {
-  analysisAssessmentHash, analysisHash, analysisRequirementEvidenceForInput,
+  analysisAssessmentHash, analysisHash, analysisRequirementEvidenceForInput, describeAnalysisSummary,
   calculateAnalysisSummary as summarizeValidatedAnalysis,
 } from '../../server/analyses/deterministic'
+import { analysisAssessmentOutputSchema, citationMatchesDocument } from '../../server/analyses/validation'
 import type {
   AnalysisLimitation, AnalysisProcessingErrorCode, RealAnalysisAssessmentInput, RealAnalysisAssessmentOutput,
   RealAnalysisGroundingReviewOutput, RealAnalysisResultSummary, RealCriterionResult, RealQualificationAssessment,
 } from '../../src/domain/real-analyses'
 import type { AnalysisDiagnosticReason, AnalysisSchemaDiagnostics } from '../../src/domain/analysis-diagnostics'
+import { isPersonalTraitCriterion } from '../../src/domain/analysis-evidence-policy'
 import { RESUME_IMPORT_LIMITS } from '../../src/domain/real-resumes'
 import type { Citation } from '../../src/domain/types'
 import {
@@ -24,6 +26,7 @@ import {
 import { analysisSchemaDiagnostics } from './diagnostics'
 
 export type { AnalysisModelStage } from './citation-diagnostics'
+export { describeAnalysisSummary as describeAnalysisAssessment } from '../../server/analyses/deterministic'
 
 export interface AnalysisModelErrorOptions {
   retryable?: boolean
@@ -202,12 +205,6 @@ function checkAssessmentLanguage(value: string): void {
   }
 }
 
-function personalTraitCriterion(label: string, description: string): boolean {
-  const traits = 'age|race|racial background|ethnicity|religion|sex|gender|pregnancy|disability status|genetic information|marital status|national origin|sexual orientation|citizenship|veteran status'
-  return new RegExp(`^(?:(?:applicant|candidate|personal)\\s+)?(?:${traits})(?:\\s+(?:preference|score|matching))?[.!]?\\s*$`, 'i').test(label.trim()) ||
-    new RegExp(`\\b(?:score|rank|reward|prefer|evaluate|assess)(?:s|d|ing)?\\s+(?:(?:the|an?)\\s+)?(?:applicants?|candidates?)(?:['’]s?)?\\s+(?:${traits})\\b`, 'i').test(description)
-}
-
 function withPassageSelections<T>(
   value: unknown, input: RealAnalysisAssessmentInput, catalog: AnalysisEvidenceCatalog, stage: AnalysisModelStage,
   validate: (resolve: (passageId: number) => ModelResumeQuote) => T,
@@ -233,12 +230,99 @@ export function validateAnalysisAssessmentSelections(
     if (!parsed.success) {
       invalidSchema('The analysis model output does not match the exact bounded passage-selection schema or allowed identities.', parsed.error.issues)
     }
+    for (const row of parsed.data.criteria) {
+      if (row.evidenceStatus === 'not-assessed') {
+        if (row.score !== null || !row.limitation) {
+          invalidOutput('An unassessed criterion requires a null score and an explicit unusable-source, ambiguous-guidance, or restricted-personal-characteristic blocker. A usable resume with no supporting evidence requires missing, score 0, and no limitation.')
+        }
+      } else if (row.limitation !== null) {
+        invalidOutput('Only a genuinely blocked, not-assessed criterion may carry a limitation; missing evidence requires score 0, no citations, and no limitation.')
+      }
+      const criterion = input.rubric.criteria.find(criterion => criterion.id === row.criterionId)!
+      const personalTrait = isPersonalTraitCriterion(criterion.label, criterion.description)
+      if (personalTrait && !notApplicable(input.rubric, criterion.id) &&
+        (row.evidenceStatus !== 'not-assessed' || row.limitation?.code !== 'restricted-personal-characteristic')) {
+        invalidOutput('A personal-characteristic requirement must remain unscored with a restricted-personal-characteristic blocker for human review.', 'assessment', false, 'policy-language')
+      }
+    }
     return validateAnalysisAssessment({
       ...parsed.data,
-      criteria: parsed.data.criteria.map(row => ({ ...row, citations: row.citations.map(item => resolve(item.passageId)) })),
+      criteria: parsed.data.criteria.map(row => ({
+        ...row, citations: row.citations.map(item => resolve(item.passageId)),
+        limitation: row.limitation ? {
+          code: row.limitation.code === 'unusable-source' ? 'source-quality' : 'not-assessable',
+          message: row.limitation.message,
+        } : null,
+      })),
       qualifications: parsed.data.qualifications.map(row => ({ ...row, citations: row.citations.map(item => resolve(item.passageId)) })),
     }, input)
   })
+}
+
+/** Validate a saved proposal without regenerating its summary, reordering rows, or narrowing legacy limitations. */
+export function validateAnalysisAssessmentForReview(
+  value: unknown, input: RealAnalysisAssessmentInput,
+): RealAnalysisAssessmentOutput {
+  const invalid = (message: string): never => {
+    throw new AnalysisModelError('invalid-input', message, { stage: 'grounding', reason: 'input-contract' })
+  }
+  const parsed = analysisAssessmentOutputSchema.safeParse(value)
+  if (!parsed.success) {
+    throw new AnalysisModelError('invalid-input', 'Grounding review requires an exact bounded saved assessment proposal.', {
+      stage: 'grounding', reason: 'input-contract', schemaDiagnostics: analysisSchemaDiagnostics(parsed.error.issues),
+    })
+  }
+  const assessment = parsed.data as RealAnalysisAssessmentOutput
+  try {
+    calculateAnalysisSummary(input.rubric, assessment)
+  } catch (error) {
+    if (error instanceof AnalysisModelError) invalid('The proposed assessment must preserve the saved criterion identities, weights, scores, and exclusions.')
+    throw error
+  }
+  if (assessment.qualifications.length !== input.qualifications.length ||
+    input.qualifications.some(row => !assessment.qualifications.some(item => item.qualificationId === row.id))) {
+    invalid('The proposed assessment must preserve every separate saved qualification.')
+  }
+  for (const row of [...assessment.criteria, ...assessment.qualifications]) {
+    const isCriterion = 'criterionId' in row
+    const kind = isCriterion ? 'criterion' : 'qualification'
+    const id = isCriterion ? row.criterionId : row.qualificationId
+    if (analysisHash(row.requirementCitations) !== analysisHash(requirementCitations(input, kind, id))) {
+      invalid('The proposed assessment must preserve the exact ordered frozen requirement citations.')
+    }
+    if (!unique(row.citations.map(citation => analysisHash(citation))) ||
+      row.citations.some(citation => !citationMatchesDocument(citation, input.resume))) {
+      throw new AnalysisModelError('invalid-citation', 'The proposed assessment contains duplicate or foreign resume evidence; grounding cannot repair a saved proposal.', {
+        stage: 'grounding', reason: 'citation-mismatch',
+      })
+    }
+    const limitation = 'limitation' in row ? row.limitation : undefined
+    if (row.evidenceStatus === 'not-assessed') {
+      if (!limitation || (isCriterion
+        ? limitation.criterionId !== id || limitation.qualificationId !== undefined
+        : limitation.qualificationId !== id || limitation.criterionId !== undefined)) {
+        invalid('Every unassessed proposal row must retain an explicit limitation scoped only to that requirement.')
+      }
+    } else if (limitation) {
+      invalid('Only an unassessed proposal row may carry a limitation.')
+    }
+    if (!isCriterion && (row.evidenceStatus === 'missing' && row.citations.length ||
+      ['supported', 'partial'].includes(row.evidenceStatus) && !row.citations.length)) {
+      invalid('Proposed qualification evidence statuses must agree with their saved citations.')
+    }
+  }
+  const rowLimitations = [...assessment.criteria, ...assessment.qualifications].flatMap(row =>
+    'limitation' in row && row.limitation ? [row.limitation] : [])
+  if (rowLimitations.some(limitation => !assessment.limitations.some(item => analysisHash(item) === analysisHash(limitation))) ||
+    assessment.limitations.some(limitation =>
+      limitation.criterionId && limitation.qualificationId ||
+      limitation.criterionId && !assessment.criteria.some(row => row.evidenceStatus === 'not-assessed' &&
+        row.criterionId === limitation.criterionId && analysisHash(row.limitation) === analysisHash(limitation)) ||
+      limitation.qualificationId && !assessment.qualifications.some(row => row.evidenceStatus === 'not-assessed' &&
+        row.qualificationId === limitation.qualificationId && analysisHash(row.limitation) === analysisHash(limitation)))) {
+    invalid('The proposed assessment must preserve its unassessed row limitations without stale or mismatched requirement scopes.')
+  }
+  return assessment
 }
 
 export function validateAnalysisGroundingSelections(
@@ -289,7 +373,7 @@ export function validateAnalysisAssessment(value: unknown, input: RealAnalysisAs
     if (item.evidenceStatus === 'not-applicable') {
       invalidOutput('The model cannot exclude an applicable saved criterion.')
     }
-    if (personalTraitCriterion(criterion.label, criterion.description) && item.evidenceStatus !== 'not-assessed') {
+    if (isPersonalTraitCriterion(criterion.label, criterion.description) && item.evidenceStatus !== 'not-assessed') {
       invalidOutput('A personal-characteristic requirement must remain unassessed for human review, never a scored or inferred personal attribute.')
     }
     if (item.evidenceStatus === 'not-assessed') {
@@ -334,7 +418,7 @@ export function validateAnalysisAssessment(value: unknown, input: RealAnalysisAs
     ...qualifications.flatMap(item => item.limitation ? [item.limitation] : []),
   ]
   const output: RealAnalysisAssessmentOutput = { criteria, qualifications, summary: '', limitations }
-  output.summary = describeAnalysisAssessment(calculateAnalysisSummary(input.rubric, output), qualifications.length)
+  output.summary = describeAnalysisSummary(calculateAnalysisSummary(input.rubric, output), qualifications.length)
   return output
 }
 
@@ -377,17 +461,6 @@ export function calculateAnalysisSummary(
     }
   }
   return summarizeValidatedAnalysis(ordered, assessment.qualifications, assessment.limitations)
-}
-
-export function describeAnalysisAssessment(summary: RealAnalysisResultSummary, qualificationCount: number): string {
-  const { coverage, overall } = summary
-  return [
-    'The submitted document was compared only with this exact saved rubric.',
-    `Criterion evidence: ${coverage.supported} supported, ${coverage.partial} partial, ${coverage.missing} missing, ${coverage.notAssessed} not assessed, and ${coverage.notApplicable} excluded.`,
-    overall.status === 'available' ? `The document evidence-match total is ${overall.score}/100.` : overall.message,
-    ...(qualificationCount ? [`The ${qualificationCount} qualification notes are separate, unscored, and require human review.`] : []),
-    "Missing evidence does not establish that a person lacks ability. This is a human-review aid, not a hiring recommendation or an official GS eligibility decision.",
-  ].join(' ')
 }
 
 export function validateAnalysisGroundingReview(

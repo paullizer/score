@@ -41,9 +41,21 @@ test('analysis configuration requires only its dedicated stores, identity, and m
   assert.equal(result.localDevelopment, false)
   for (const key of ['rendererUrl', 'documentIntelligenceEndpoint', 'jobs', 'resumes', 'grades']) assert.equal(result[key], undefined)
   const deps = createAnalysisWorkerDependencies(result, { getToken: async () => ({ token: 'test-token', expiresOnTimestamp: 0 }) })
-  assert.deepEqual(Object.keys(deps).sort(), ['blobs', 'model', 'onEvent', 'store'])
+  assert.deepEqual(Object.keys(deps).sort(), ['blobs', 'correctionsEnabled', 'model', 'onEvent', 'store'])
+  assert.notEqual(deps.correctionsEnabled, true)
   assert.equal(typeof deps.onEvent, 'function')
   assert.equal(deps.model.endpoint, result.modelEndpoint)
+})
+
+test('evidence correction discovery is default-off and only explicit true enables it', () => {
+  const credential = { getToken: async () => ({ token: 'test-token', expiresOnTimestamp: 0 }) }
+  for (const value of [undefined, 'false', 'true']) {
+    const result = loadAnalysisWorkerConfig(config({ ANALYSIS_EVIDENCE_CORRECTIONS_ENABLED: value }))
+    assert.equal(createAnalysisWorkerDependencies(result, credential).correctionsEnabled === true, value === 'true')
+  }
+  for (const value of ['TRUE', 'yes', '1', 'enabled']) {
+    assert.throws(() => loadAnalysisWorkerConfig(config({ ANALYSIS_EVIDENCE_CORRECTIONS_ENABLED: value })), /must be true or false/)
+  }
 })
 
 test('analysis stores cannot alias job, grade, resume, or legacy containers', () => {

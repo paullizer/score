@@ -18,6 +18,9 @@ param rendererImage string
 param gradeWorkerImage string
 param resumeWorkerImage string
 param analysisWorkerImage string
+@description('Enable reviewed evidence corrections only after compatible API and analysis workers are deployed and older workers have drained.')
+@allowed(['false', 'true'])
+param analysisEvidenceCorrectionsEnabled string = 'false'
 
 @allowed(['B1', 'B2', 'B3', 'S1'])
 param appServiceSku string = 'B3'
@@ -55,6 +58,7 @@ module resources 'resources.bicep' = {
     gradeWorkerImage: gradeWorkerImage
     resumeWorkerImage: resumeWorkerImage
     analysisWorkerImage: analysisWorkerImage
+    analysisEvidenceCorrectionsEnabled: analysisEvidenceCorrectionsEnabled
     appServiceSku: appServiceSku
     searchSku: searchSku
   }

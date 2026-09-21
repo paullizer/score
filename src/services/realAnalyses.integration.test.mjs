@@ -443,7 +443,9 @@ test('direct IDs retain explicit modes, mixed sample links do not reach the fixt
 
 test('results display server totals, limited completion, exact statuses and unscored GS qualifications separately', () => {
   const detail = comparisonDetail()
-  let html = renderToStaticMarkup(React.createElement(ui.RealComparisonReview, { detail }))
+  const renderReview = () => renderToStaticMarkup(React.createElement(ui.WorkspaceContext.Provider, { value: frontendWorkspaceContext() },
+    React.createElement(ui.RealComparisonReview, { detail })))
+  let html = renderReview()
   assert.match(html, /SERVER-CALCULATED EVIDENCE MATCH/)
   assert.match(html, />36<\/strong>/)
   assert.match(html, /Complete · limited assessment/)
@@ -458,7 +460,7 @@ test('results display server totals, limited completion, exact statuses and unsc
   assert.match(html, /Captured HTML section/)
   assert.doesNotMatch(html, /Original page 1/)
   detail.result.overall = { status: 'withheld', score: null, reason: 'unassessed-weighted-criteria', message: 'A weighted criterion could not be assessed.' }
-  html = renderToStaticMarkup(React.createElement(ui.RealComparisonReview, { detail }))
+  html = renderReview()
   assert.match(html, /Score withheld/)
   assert.match(html, /A weighted criterion could not be assessed/)
   assert.doesNotMatch(html, />36<\/strong>/)
@@ -473,7 +475,8 @@ test('saved two-correction results display all three grounding reviews without r
   detail.result.provenance.groundingReviews = Array.from({ length: 3 }, (_, index) => ({
     ...structuredClone(original), id: `grounding-${index}`, outcome: index === 2 ? 'supported' : 'needs-correction',
   }))
-  const html = renderToStaticMarkup(React.createElement(ui.RealComparisonReview, { detail }))
+  const html = renderToStaticMarkup(React.createElement(ui.WorkspaceContext.Provider, { value: frontendWorkspaceContext() },
+    React.createElement(ui.RealComparisonReview, { detail })))
   assert.match(html, /2 bounded corrections/)
   assert.match(html, /needs-correction.*needs-correction.*supported/)
   assert.match(html, />36<\/strong>/)

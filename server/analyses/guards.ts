@@ -8,6 +8,7 @@ import { WORKSPACE_ID_PATTERN } from '../ids'
 import { assertWorkspaceMutationLease } from '../lifecycle/lease'
 import { StoreConflictError } from '../store'
 import { analysisNarrativeCanWork, narrativeGenerationId } from './narrative-records'
+import { analysisCorrectionCanWork, loadAnalysisCorrection, projectAnalysisComparison } from './current-results'
 import type {
   AnalysisBlobStore, AnalysisLifecycleControl, AnalysisStore, AnalysisTransaction, AnalysisTransactionOptions, RealAnalysesDeps,
 } from './store'
@@ -191,6 +192,7 @@ export interface SummaryActionWriteAuthorization {
   generationId?: string
   requestId: string
   publicationAttemptId?: string
+  resultRevisionId?: string
 }
 
 const manualPublication = new AsyncLocalStorage<{ previous: string; next: string }>()
@@ -217,7 +219,7 @@ export function fencedSummaryActionBlobs(
   deps: RealAnalysesDeps, workspaceId: string, runId: string, authorization: SummaryActionWriteAuthorization,
   assertCurrent: () => Promise<unknown>,
 ): AnalysisBlobStore {
-  assertAnalysis(authorization.recordId === analysisNarrativeId(authorization.kind, runId, authorization.subjectId) &&
+  assertAnalysis(authorization.recordId === analysisNarrativeId(authorization.kind, runId, authorization.subjectId, authorization.resultRevisionId) &&
     (authorization.action === 'retry' || authorization.etag && authorization.generationId && authorization.publicationAttemptId),
   'Invalid summary action writer authorization.')
   return fencedBlobs(deps, workspaceId, runId, undefined, assertCurrent, authorization)
@@ -269,18 +271,38 @@ function fencedBlobs(
               current.record.runId !== runId || current.record.generationId !== action.generationId)) denied()
         }
         if (name.includes('/results/') || name.includes('/diagnostics/')) {
-          if (run?.record.recordType !== 'analysis-run' || !analysisRunCanScore(run.record)) denied()
+          if (run?.record.recordType !== 'analysis-run') denied()
+          const parts = name.split('/')
+          const comparison = await deps.store.get(workspaceId, parts[3])
+          if (comparison?.record.recordType !== 'analysis-comparison' || comparison.record.runId !== runId) denied()
+          if (parts[2] === 'results' && comparison.record.status === 'complete') {
+            const correction = await loadAnalysisCorrection(deps.store, workspaceId, runId, comparison.record.id)
+            if (!correction || !assertWorkActive || !analysisCorrectionCanWork(run.record, correction.record) ||
+              correction.record.manifestSha256 !== run.record.manifest.sha256 || correction.record.status !== 'running' ||
+              !correction.record.lease || `${correction.record.attemptId}.json` !== parts[4] ||
+              projectAnalysisComparison(comparison.record, correction.record).result?.sha256 !== correction.record.baseResult.sha256) denied()
+          } else if (!analysisRunCanScore(run.record) || comparison.record.status !== 'running' ||
+            `${comparison.record.attemptId}.json` !== parts[4]) denied()
+        }
+        if (name.includes('/corrections/') || name.includes('/correction-history/')) {
+          if (run?.record.recordType !== 'analysis-run' || !assertWorkActive ||
+            !analysisCorrectionCanWork(run.record)) denied()
           const parts = name.split('/')
           const comparison = await deps.store.get(workspaceId, parts[3])
           if (comparison?.record.recordType !== 'analysis-comparison' || comparison.record.runId !== runId ||
-            comparison.record.status !== 'running' || `${comparison.record.attemptId}.json` !== parts[4]) denied()
+            comparison.record.status !== 'complete') denied()
+          if (parts[2] === 'correction-history') {
+            const correction = await loadAnalysisCorrection(deps.store, workspaceId, runId, parts[3])
+            if (!correction || correction.record.requestId !== parts[4] || correction.record.status === 'ready') denied()
+          }
         }
         if (name.includes('/narratives/') || name.includes('/narrative-history/')) {
           if (run?.record.recordType !== 'analysis-run' || !analysisNarrativeCanWork(run.record)) denied()
           const parts = name.split('/')
           if (parts[3] !== 'requests' && name !== publicationName) {
             const kind = parts[3] === 'candidate' ? 'candidate' : 'target'
-            const value = await deps.store.get(workspaceId, analysisNarrativeId(kind, runId, parts[4]))
+            const correction = kind === 'candidate' ? await loadAnalysisCorrection(deps.store, workspaceId, runId, parts[4]) : undefined
+            const value = await deps.store.get(workspaceId, analysisNarrativeId(kind, runId, parts[4], correction?.record.published?.revision.id))
             if (!value || (value.record.recordType !== 'analysis-candidate-narrative' && value.record.recordType !== 'analysis-target-narrative') ||
               !analysisNarrativeCanWork(run.record, value.record) || run.record.narrativeRequestId ||
               value.record.status !== 'running' || value.record.generationId !== parts[5] ||

@@ -33,9 +33,9 @@ function assessmentResponse(input, { scores = [4], unassessed = false, unassesse
         evidenceStatus: 'not-applicable', score: null, citations: [], limitation: null,
       }
       if (unassessed || unassessedIds.includes(criterion.id)) return {
-        ...base, rationale: 'The saved document does not establish enough scope to assess the saved anchor.',
+        ...base, rationale: 'The captured source interleaves work descriptions without recoverable attribution.',
         evidenceStatus: 'not-assessed', score: null, citations: [],
-        limitation: { code: 'source-quality', message: 'The document does not establish enough work scope for a defensible assessment.' },
+        limitation: { code: 'unusable-source', message: 'The merged source text does not identify whose work is described; source repair is required.' },
       }
       const score = scores[index] ?? scores[0]
       return {
@@ -150,10 +150,10 @@ async function realModelPublication(f, resume, target, options = {}) {
   const detail = await f.service.comparisonDetail(f.workspaceId, run.record.id, comparison.record.id)
   assert.deepEqual(detail.result, result)
   assert.equal(result.schemaVersion, 1)
-  assert.equal(result.provenance.assessment.promptVersion, 'score-analysis-assessment-v3')
-  assert.equal(result.provenance.assessment.schemaVersion, 'score-analysis-assessment-v2')
+  assert.equal(result.provenance.assessment.promptVersion, 'score-analysis-assessment-v4')
+  assert.equal(result.provenance.assessment.schemaVersion, 'score-analysis-assessment-v3')
   assert.ok(result.provenance.groundingReviews.every(review =>
-    review.provenance.promptVersion === 'score-analysis-grounding-v3' &&
+    review.provenance.promptVersion === 'score-analysis-grounding-v4' &&
     review.provenance.schemaVersion === 'score-analysis-grounding-v2'))
   assert.doesNotMatch(JSON.stringify(result), /"passageId"|"passages"/)
   return { detail, result, calls, input, snapshots, run, comparison: complete }

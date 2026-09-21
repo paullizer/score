@@ -158,6 +158,8 @@ test('summary envelopes reject foreign identities, implicit scopes, malformed co
     (value) => { delete value.capture },
     (value) => { value.capture.revision = 'b'.repeat(64) },
     (value) => { value.capture.comparisons[0].comparisonId = 'foreign-comparison' },
+    (value) => { value.comparisons[0].resultSha256 = 'f'.repeat(64) },
+    (value) => { value.comparisons[0].resultSha256 = null },
     (value) => { value.capture.comparisons[0].narrative = null },
     (value) => { value.capture.targets[0].narrative.revision = 'c'.repeat(64) },
     (value) => { value.comparisons[0].targetId = 'foreign-target' },

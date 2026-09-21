@@ -22,10 +22,11 @@ import {
 import {
   analysisNarrativeCanWork, analysisNarrativeRequestCanAdvance, analysisNarrativeRequestCancelled, candidateNarrativeBinding,
 } from './narrative-records'
+import { analysisCorrectionCanWork, projectAnalysisComparison } from './current-results'
 import {
   analysisBlobInRun, analysisBytesHash, analysisCancellationNeedsRetry, analysisHash, analysisNarrativeTargetIdSchema,
   assertAnalysis, isAnalysisId, isSafeAnalysisBlobName, MAX_ANALYSIS_JSON_BYTES,
-  isAnalysisRecordId, MAX_ANALYSIS_ORIGINAL_BYTES, MAX_ANALYSIS_TRANSACTION_BYTES, parseAnalysisEntity,
+  analysisCorrectionId, analysisNarrativeId, isAnalysisRecordId, MAX_ANALYSIS_ORIGINAL_BYTES, MAX_ANALYSIS_TRANSACTION_BYTES, parseAnalysisEntity,
 } from './validation'
 
 function status(error: unknown): number | undefined {
@@ -47,6 +48,8 @@ function decode(value: unknown, workspaceId?: string, id?: string): VersionedAna
   const tag = data._etag
   for (const field of ['_etag', '_rid', '_self', '_attachments', '_ts']) delete data[field]
   const record = parseAnalysisEntity(data)
+  assertAnalysis(record.recordType !== 'analysis-comparison' || !record.resultRevision,
+    'Corrected results belong in a separate head, not the original comparison record.')
   assertAnalysis(typeof tag === 'string' && tag && (workspaceId === undefined || record.workspaceId === workspaceId) &&
     (id === undefined || record.id === id), 'Stored ownership or ETag mismatch.')
   return { record, etag: tag }
@@ -96,6 +99,37 @@ export function assertAnalysisReplacement(previous: AnalysisEntity, next: Analys
       'Failure diagnostic history cannot be erased or an immutable attempt replaced.')
     }
     assertAnalysis(previous.status !== 'complete' || analysisHash(previous) === analysisHash(next), 'Completed evidence cannot be retried, cancelled, or changed.')
+  } else if (previous.recordType === 'analysis-correction' && next.recordType === 'analysis-correction') {
+    for (const key of ['runId', 'comparisonId', 'manifestSha256', 'originalResult', 'resumeSnapshot', 'targetSnapshot'] as const) {
+      assertAnalysis(analysisHash(previous[key]) === analysisHash(next[key]), 'Correction ancestry and frozen inputs are immutable.')
+    }
+    if (previous.requestId === next.requestId) {
+      for (const key of ['requestFingerprint', 'requestedAt', 'requestedBy', 'reason', 'policyVersion', 'criterionIds',
+        'baseResult', 'baseAttemptId', 'baseRevision', 'proposal'] as const) {
+        assertAnalysis(analysisHash(previous[key] ?? null) === analysisHash(next[key] ?? null),
+          'An accepted correction request cannot change its proposal or base result.')
+      }
+      assertAnalysis(next.attempts >= previous.attempts && next.retryCount === previous.retryCount &&
+        (previous.status !== 'ready' || analysisHash(previous) === analysisHash(next)) &&
+        (!['failed', 'cancelled'].includes(previous.status) || next.status === previous.status),
+      'Terminal corrections require a new explicit request.')
+    } else {
+      assertAnalysis(['ready', 'failed', 'cancelled'].includes(previous.status) && next.status === 'queued' &&
+        next.attempts === 0 && !next.lease && !next.attemptId && next.requestedAt >= previous.updatedAt &&
+        next.retryCount === previous.retryCount + 1 &&
+        analysisHash(previous.history ?? null) === analysisHash(next.history ?? null),
+      'A new correction must preserve stopped work and its audit history.')
+      assertAnalysis(analysisHash(next.baseResult) === analysisHash(previous.published?.result ?? previous.originalResult) &&
+        next.baseAttemptId === (previous.published?.attemptId ?? previous.baseAttemptId) &&
+        analysisHash(next.baseRevision ?? null) === analysisHash(previous.published?.revision ?? null),
+      'A new correction must start from the current published result.')
+    }
+    assertAnalysis(!previous.history || next.history && (next.history.id !== previous.history.id ||
+      analysisHash(next.history) === analysisHash(previous.history)), 'Correction history cannot be erased or overwritten.')
+    assertAnalysis(analysisHash(previous.published ?? null) === analysisHash(next.published ?? null) ||
+      previous.status === 'running' && previous.requestId === next.requestId && next.status === 'ready' &&
+      next.published?.revision.id === next.requestId && next.published.result.sha256 !== next.baseResult.sha256,
+    'A correction must retain the previous result until the exact leased replacement is ready.')
   } else if (previous.recordType === 'analysis-narrative-request' && next.recordType === 'analysis-narrative-request') {
     for (const key of ['runId', 'manifestSha256', 'requestId', 'requestedBy', 'mode', 'targetId', 'scopeRevision', 'plan', 'scheduled'] as const) {
       assertAnalysis(analysisHash(previous[key]) === analysisHash(next[key]), 'Accepted narrative request inputs are immutable.')
@@ -110,6 +144,7 @@ export function assertAnalysisReplacement(previous: AnalysisEntity, next: Analys
     'Narrative frozen target identity is immutable.')
     if (previous.recordType === 'analysis-candidate-narrative' && next.recordType === 'analysis-candidate-narrative') {
       assertAnalysis(previous.comparisonId === next.comparisonId && previous.resultSha256 === next.resultSha256 &&
+        previous.resultRevisionId === next.resultRevisionId &&
         previous.inputFingerprint === next.inputFingerprint && analysisHash(previous.resumeSnapshot) === analysisHash(next.resumeSnapshot),
       'Narrative frozen comparison identity is immutable.')
     }
@@ -161,9 +196,11 @@ export function analysisWorkIsPending(record: AnalysisEntity, now: string): bool
 
 export function createAzureAnalysisStore(config: RealAnalysesConfig, credential: TokenCredential): AnalysisStore {
   const client = new CosmosClient({ endpoint: config.cosmosEndpoint, aadCredentials: credential })
-  return createAnalysisStoreFromContainer(client.database(config.database).container(config.container))
+  return createAnalysisStoreFromContainer(client.database(config.database).container(config.container), config.evidenceCorrectionsEnabled)
 }
-export function createAnalysisStoreFromContainer(container: Pick<Container, 'item' | 'items'>): AnalysisStore {
+export function createAnalysisStoreFromContainer(
+  container: Pick<Container, 'item' | 'items'>, correctionsEnabled = false,
+): AnalysisStore {
   async function batch(workspaceId: string, operations: OperationInput[], controls: NonNullable<AnalysisTransactionOptions['controls']>) {
     const input: OperationInput[] = [
       ...controls.map<OperationInput>(control => control.etag
@@ -208,7 +245,7 @@ export function createAnalysisStoreFromContainer(container: Pick<Container, 'ite
       scope(workspaceId, options.runId)
       const limit = options.limit ?? 50
       assertAnalysis(Number.isInteger(limit) && limit > 0 && limit <= 100 &&
-        ['analysis-run', 'analysis-comparison', 'analysis-candidate-narrative', 'analysis-target-narrative', 'analysis-narrative-request'].includes(options.recordType) &&
+        ['analysis-run', 'analysis-comparison', 'analysis-candidate-narrative', 'analysis-target-narrative', 'analysis-narrative-request', 'analysis-correction'].includes(options.recordType) &&
         (options.runId === undefined || (options.recordType !== 'analysis-run' && isAnalysisId(options.runId, 'run'))) &&
         (options.continuationToken === undefined || (typeof options.continuationToken === 'string' &&
           options.continuationToken.length > 0 && options.continuationToken.length <= 12 * 1024)), 'Invalid analysis query options.')
@@ -300,6 +337,8 @@ export function createAnalysisStoreFromContainer(container: Pick<Container, 'ite
         assertAnalysis(operation.kind === 'create' || operation.kind === 'replace' ||
           (options.lifecycle && operation.kind === 'delete'), 'Unsupported transaction operation.')
         const record = parseAnalysisEntity(operation.record)
+        assertAnalysis(record.recordType !== 'analysis-comparison' || !record.resultRevision,
+          'Current-result projections cannot be persisted over original comparisons.')
         assertAnalysis(record.workspaceId === workspaceId, 'Transaction cannot cross workspace partitions.')
         if (operation.kind !== 'create') etag(operation.etag)
         return { ...operation, record }
@@ -335,20 +374,48 @@ export function createAnalysisStoreFromContainer(container: Pick<Container, 'ite
       for (const operation of validated) {
         const record = operation.record
         if (record.recordType === 'analysis-run' || record.recordType === 'analysis-comparison' || operation.kind === 'delete') continue
-        assertAnalysis(record.manifestSha256 === oldRun.manifest.sha256, 'Narrative must use the accepted run manifest.')
+        assertAnalysis(record.manifestSha256 === oldRun.manifest.sha256, 'Sidecar work must use the accepted run manifest.')
         assertAnalysis(record.updatedAt <= run.record.updatedAt, 'The run cancellation fence must cover every narrative generation.')
         if (!options.lifecycle && record.status !== 'cancelled' &&
           !(record.recordType === 'analysis-narrative-request' && analysisNarrativeRequestCancelled(run.record, record))) {
-          assertAnalysis(analysisNarrativeCanWork(run.record, record),
+          assertAnalysis(record.recordType === 'analysis-correction'
+            ? record.status === 'failed' ? analysisNarrativeCanWork(run.record) : analysisCorrectionCanWork(run.record, record)
+            : analysisNarrativeCanWork(run.record, record),
           'Cancellation fences narrative scheduling and publication.')
         }
-        if (record.recordType === 'analysis-candidate-narrative') {
-          const pair = validated.find(item => item.record.id === record.comparisonId)?.record ??
+        if (record.recordType === 'analysis-correction') {
+          const original = (await store.get(workspaceId, record.comparisonId))?.record
+          assertAnalysis(original?.recordType === 'analysis-comparison' && original.status === 'complete',
+            'A correction requires the original completed comparison.')
+          projectAnalysisComparison(original, record)
+          const prior = previous.get(record.id)
+          if (operation.kind === 'create') assertAnalysis(record.status === 'queued' && record.attempts === 0 &&
+            !record.published && !record.history && !record.attemptId && record.retryCount === 0 && !record.baseRevision &&
+            analysisHash(record.baseResult) === analysisHash(original.result) && record.baseAttemptId === original.attemptId,
+          'A new correction must start as an explicit, unclaimed proposal.')
+          if (prior?.recordType === 'analysis-correction' &&
+            analysisHash(prior.published ?? null) !== analysisHash(record.published ?? null)) {
+            assertAnalysis(!validated.some(item => item.record.id === original.id) &&
+              projectAnalysisComparison(original, prior).result?.sha256 === record.baseResult.sha256 &&
+              validated.some(item => item.kind === 'create' &&
+                item.record.id === analysisNarrativeId('candidate', oldRun.id, original.id, record.requestId)) &&
+              validated.some(item => item.record.recordType === 'analysis-target-narrative' &&
+                item.record.targetId === original.target.summary.id),
+            'Correction publication must retain its exact base and atomically refresh dependent summaries.')
+          }
+        } else if (record.recordType === 'analysis-candidate-narrative' && record.status !== 'cancelled') {
+          const original = validated.find(item => item.record.id === record.comparisonId)?.record ??
             (await store.get(workspaceId, record.comparisonId))?.record
-          assertAnalysis(pair?.recordType === 'analysis-comparison' && pair.status === 'complete', 'Narrative has no completed comparison.')
+          assertAnalysis(original?.recordType === 'analysis-comparison' && original.status === 'complete', 'Narrative has no completed comparison.')
+          const correctionId = analysisCorrectionId(oldRun.id, original.id)
+          const correction = validated.find(item => item.record.id === correctionId)?.record ??
+            (await store.get(workspaceId, correctionId))?.record
+          assertAnalysis(!correction || correction.recordType === 'analysis-correction', 'Invalid current-result head.')
+          const pair = projectAnalysisComparison(original, correction?.recordType === 'analysis-correction' ? correction : undefined)
           const binding = candidateNarrativeBinding(run.record, pair)
           assertAnalysis(binding.targetId === record.targetId && analysisHash(binding.targetSnapshot) === analysisHash(record.targetSnapshot) &&
             analysisHash(binding.resumeSnapshot) === analysisHash(record.resumeSnapshot) && binding.resultSha256 === record.resultSha256 &&
+            record.resultRevisionId === pair.resultRevision?.id &&
             analysisHash(binding) === record.inputFingerprint, 'Narrative result or frozen input binding mismatch.')
         } else if (record.recordType === 'analysis-target-narrative' && operation.kind === 'create') {
           if (!targetParents.has(record.targetId) && !readTargets) {
@@ -390,6 +457,19 @@ export function createAnalysisStoreFromContainer(container: Pick<Container, 'ite
       const progress = { ...oldRun.progress }
       const createdIndexes: number[] = []
       for (const operation of validated) {
+        if (operation.record.recordType === 'analysis-correction' && operation.kind === 'replace') {
+          const next = operation.record
+          const old = previous.get(next.id)
+          if (old?.recordType === 'analysis-correction' &&
+            analysisHash(old.published ?? null) !== analysisHash(next.published ?? null)) {
+            const original = (await store.get(workspaceId, next.comparisonId))?.record
+            assertAnalysis(original?.recordType === 'analysis-comparison', 'Correction progress has no original comparison.')
+            const before = projectAnalysisComparison(original, old)
+            const after = projectAnalysisComparison(original, next)
+            progress[before.resultSummary!.overall.status === 'available' ? 'scored' : 'unscored']--
+            progress[after.resultSummary!.overall.status === 'available' ? 'scored' : 'unscored']++
+          }
+        }
         if (operation.record.recordType !== 'analysis-comparison') continue
         if (operation.kind === 'delete') continue
         const next = operation.record
@@ -423,7 +503,7 @@ export function createAnalysisStoreFromContainer(container: Pick<Container, 'ite
           'Analysis source writers have not drained.')
         let token: string | undefined
         const seen = new Set<string>()
-        for (const recordType of ['analysis-comparison', 'analysis-candidate-narrative', 'analysis-target-narrative', 'analysis-narrative-request'] as const) {
+        for (const recordType of ['analysis-comparison', 'analysis-candidate-narrative', 'analysis-target-narrative', 'analysis-narrative-request', 'analysis-correction'] as const) {
           token = undefined
           seen.clear()
           do {
@@ -491,7 +571,8 @@ export function createAnalysisStoreFromContainer(container: Pick<Container, 'ite
       const parents = new Map<string, Extract<AnalysisEntity, { recordType: 'analysis-run' }> | undefined>()
       const workspaces = new Map<string, string>()
       // Initialize/cancel first; blocked children must not consume the ready-work limit.
-      for (const recordType of ['analysis-run', 'analysis-comparison', 'analysis-narrative-request', 'analysis-candidate-narrative', 'analysis-target-narrative'] as const) {
+      for (const recordType of ['analysis-run', 'analysis-comparison', 'analysis-correction', 'analysis-narrative-request', 'analysis-candidate-narrative', 'analysis-target-narrative'] as const) {
+        if (recordType === 'analysis-correction' && !correctionsEnabled) continue
         const eligible = recordType === 'analysis-run'
           ? `(c.status = 'initializing' OR (IS_DEFINED(c.cancellation) AND NOT IS_DEFINED(c.cancellation.completedAt)
               AND (NOT IS_DEFINED(c.error) OR (c.error.retryable = true AND c.attempts < @maxAttempts))))`
@@ -536,7 +617,14 @@ export function createAnalysisStoreFromContainer(container: Pick<Container, 'ite
               if (!parent || (record.recordType === 'analysis-comparison' ? !analysisRunCanScore(parent)
                 : record.recordType === 'analysis-narrative-request'
                   ? !analysisNarrativeRequestCanAdvance(parent, record) || state === 'archived' && !analysisNarrativeRequestCancelled(parent, record)
+                  : record.recordType === 'analysis-correction' ? !analysisCorrectionCanWork(parent, record)
                   : !analysisNarrativeCanWork(parent, record) || Boolean(parent.narrativeRequestId))) continue
+              if (record.recordType === 'analysis-candidate-narrative') {
+                const correction = await store.get(record.workspaceId, analysisCorrectionId(record.runId, record.comparisonId))
+                assertAnalysis(!correction || correction.record.recordType === 'analysis-correction', 'Invalid candidate current-result head.')
+                const currentRevision = correction?.record.recordType === 'analysis-correction' ? correction.record.published?.revision.id : undefined
+                if (record.resultRevisionId !== currentRevision) continue
+              }
             }
             records.push(item)
             if (records.length === limit) return records

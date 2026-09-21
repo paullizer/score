@@ -140,7 +140,7 @@ export function createApp(deps: AppDeps): Express {
   const grades = config.realGrades && deps.grades?.store && deps.grades.blobs ? deps.grades : undefined
   const resumes = config.realResumes && deps.resumes?.store && deps.resumes.blobs ? deps.resumes : undefined
   const analyses = config.realAnalyses && deps.analyses?.store && deps.analyses.blobs
-    ? deps.analyses : undefined
+    ? { ...deps.analyses, evidenceCorrectionsEnabled: config.realAnalyses.evidenceCorrectionsEnabled === true } : undefined
   const canCreateAnalyses = Boolean(analyses && resumes && (jobs || grades))
   const wordDocumentImports = config.wordDocumentImports === true
 
@@ -171,6 +171,7 @@ export function createApp(deps: AppDeps): Express {
       realResumeImports: Boolean(resumes), markdownResumeImports: Boolean(resumes), resumeLimits: RESUME_IMPORT_LIMITS,
       realAnalyses: canCreateAnalyses, analysisLimits: ANALYSIS_LIMITS,
       analysisSummaryGeneration: Boolean(analyses),
+      analysisEvidenceCorrections: Boolean(analyses?.evidenceCorrectionsEnabled),
       wordDocumentImports: wordDocumentImports && Boolean(jobs || resumes),
     })
   })

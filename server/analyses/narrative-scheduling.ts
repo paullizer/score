@@ -16,18 +16,20 @@ export async function prepareAnalysisNarrativeTransitions(
   const operations: AnalysisTransaction[] = []
   const targets = new Map<string, { comparison: RealAnalysisComparisonRecord; completion: boolean }>()
   for (const { previous, next } of transitions) {
-    if (previous.status === next.status) continue
+    const corrected = next.status === 'complete' && previous.status === 'complete' &&
+      next.result?.sha256 !== previous.result?.sha256
+    if (previous.status === next.status && !corrected) continue
     const completion = next.status === 'complete'
     const targetId = next.target.summary.id
     const existing = targets.get(targetId)
     targets.set(targetId, { comparison: next, completion: completion || Boolean(existing?.completion) })
     if (!completion) continue
-    const id = analysisNarrativeId('candidate', run.id, next.id)
+    const id = analysisNarrativeId('candidate', run.id, next.id, next.resultRevision?.id)
     const value = await store.get(run.workspaceId, id)
     assertAnalysis(!value, 'A newly completed comparison already has a narrative sidecar.')
     const requestId = next.attemptId!
     const record = newCandidateNarrative(run, next, {
-      requestId, requestedAt: timestamp, requestedBy: null, reason: 'comparison-completed',
+      requestId, requestedAt: timestamp, requestedBy: null, reason: corrected ? 'comparison-changed' : 'comparison-completed',
     })
     operations.push({ kind: 'create', record })
   }

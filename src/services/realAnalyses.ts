@@ -112,6 +112,7 @@ const narrativeState = z.object({
 })
 const candidateSummary = narrativeState.extend({
   kind: z.literal('candidate'), comparisonId: narrativeId, comparisonStatus,
+  resultSha256: narrativeHash.nullable().optional(),
   published: candidatePublication.nullable(),
 })
 const targetSummary = narrativeState.extend({
@@ -120,6 +121,7 @@ const targetSummary = narrativeState.extend({
 const summarySubjectBase = z.object({
   schemaVersion: z.literal(1), dataKind: z.literal('real'), workspaceId: narrativeId, runId: narrativeId,
   subjectId: narrativeId, revision: narrativeHash, etag: narrativeId,
+  resultRevisionId: z.union([z.literal('original'), z.string().uuid()]).optional(),
 })
 const summarySubjectEnvelope: z.ZodType<RealAnalysisSummarySubjectResponse> = z.discriminatedUnion('kind', [
   summarySubjectBase.extend({ kind: z.literal('candidate'), narrative: candidateSummary }),
@@ -181,6 +183,7 @@ function checkedSummaries(payload: unknown, workspaceId: string, runId: string, 
     capture.comparisons.some((item) => {
       const comparison = comparisons.get(item.comparisonId)
       return !comparison || comparison.targetId !== item.targetId || comparison.comparisonStatus !== item.status ||
+        (comparison.resultSha256 !== undefined && comparison.resultSha256 !== item.resultSha256) ||
         (value.ready && item.status === 'complete' && (!item.resultSha256 || !item.narrative ||
           item.narrative.revision !== comparison.published?.revision || item.narrative.inputFingerprint !== comparison.published.inputFingerprint))
     }) || scoring.total !== comparisons.size || scoring.initialized > scoring.total ||
@@ -234,16 +237,29 @@ function summarySubjectPath(workspaceId: string, runId: string, subject: Analysi
   return `${base(workspaceId, runId)}/summaries/${subject.kind}/${encodeURIComponent(subject.subjectId)}`
 }
 
+function summaryResultRevision(params: URLSearchParams, subject: AnalysisSummarySubject, revisionId?: string): void {
+  if (revisionId === undefined) return
+  if (subject.kind !== 'candidate' || revisionId !== 'original' && !z.uuid().safeParse(revisionId).success) {
+    throw new Error('Choose the original assessment or one exact published correction revision.')
+  }
+  params.set('resultRevisionId', revisionId)
+}
+
 export async function getRealAnalysisSummarySubject(
-  workspaceId: string, runId: string, subject: AnalysisSummarySubject, signal?: AbortSignal,
+  workspaceId: string, runId: string, subject: AnalysisSummarySubject, signal?: AbortSignal, resultRevisionId?: string,
 ): Promise<RealAnalysisSummarySubjectResponse> {
-  const result = await cloudJsonResponse<unknown>(summarySubjectPath(workspaceId, runId, subject), { method: 'GET', signal })
+  const params = new URLSearchParams()
+  summaryResultRevision(params, subject, resultRevisionId)
+  const path = summarySubjectPath(workspaceId, runId, subject)
+  const result = await cloudJsonResponse<unknown>(`${path}${params.size ? `?${params}` : ''}`, { method: 'GET', signal })
   signal?.throwIfAborted()
   const parsed = summarySubjectEnvelope.safeParse(result.value)
   if (!parsed.success) throw new Error('The summary service returned an invalid saved-summary envelope. Retry this summary; scores and frozen evidence are unchanged.')
   const value = parsed.data
   const item = value.narrative
   if (value.workspaceId !== workspaceId || value.runId !== runId || value.kind !== subject.kind ||
+    value.resultRevisionId !== resultRevisionId ||
+    Boolean(resultRevisionId && item.kind === 'candidate' && !item.resultSha256) ||
     value.subjectId !== subject.subjectId || item.kind !== subject.kind ||
     (item.kind === 'candidate' ? item.comparisonId : item.targetId) !== subject.subjectId ||
     value.etag !== `"${value.revision}"` || result.etag !== value.etag || !validCurrentSummary(item)) {
@@ -254,18 +270,23 @@ export async function getRealAnalysisSummarySubject(
 
 export async function getRealAnalysisSummaryHistory(
   workspaceId: string, runId: string, subject: AnalysisSummarySubject, continuationToken?: string, signal?: AbortSignal,
+  resultRevisionId?: string,
 ): Promise<AnalysisSummaryHistoryPage> {
   const path = summarySubjectPath(workspaceId, runId, subject)
   if (continuationToken !== undefined && (!continuationToken || continuationToken.length > 16 * 1024)) {
     throw new Error('The summary history cursor is invalid. Reopen the latest history.')
   }
-  const suffix = continuationToken ? `?continuationToken=${encodeURIComponent(continuationToken)}` : ''
+  const params = new URLSearchParams()
+  summaryResultRevision(params, subject, resultRevisionId)
+  if (continuationToken) params.set('continuationToken', continuationToken)
+  const suffix = params.size ? `?${params}` : ''
   const result = await cloudJsonRequest<unknown>(`${path}/history${suffix}`, { method: 'GET', signal })
   signal?.throwIfAborted()
   const parsed = summaryHistoryPageSchema.safeParse(result)
   if (!parsed.success) throw new Error('The summary service returned invalid private history. No draft was substituted.')
   const page = parsed.data
   if (page.workspaceId !== workspaceId || page.runId !== runId || page.kind !== subject.kind || page.subjectId !== subject.subjectId ||
+    page.resultRevisionId !== resultRevisionId || Boolean(resultRevisionId && (page.capabilities.canPublish || page.capabilities.canRetry)) ||
     new Set(page.entries.map(entry => entry.id)).size !== page.entries.length ||
     new Set(page.entries.map(entry => entry.targetId)).size > 1 ||
     page.entries.some(entry => entry.workspaceId !== workspaceId || entry.runId !== runId || entry.kind !== subject.kind ||
@@ -318,7 +339,8 @@ export async function fetchAnalysisProcessingFeatures(signal?: AbortSignal): Pro
   // realAnalyses indicates new-run readiness; historical reads have their own authorized endpoints.
   const result = await cloudJsonRequest<Partial<AnalysisProcessingFeatures>>('/features', { method: 'GET', signal })
   return { realAnalyses: result.realAnalyses === true, analysisLimits: result.analysisLimits ?? ANALYSIS_LIMITS,
-    analysisSummaryGeneration: result.analysisSummaryGeneration === true }
+    analysisSummaryGeneration: result.analysisSummaryGeneration === true,
+    analysisEvidenceCorrections: result.analysisEvidenceCorrections === true }
 }
 
 export interface RealAnalysisCollectionLimits {

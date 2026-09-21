@@ -95,6 +95,7 @@ export interface AnalysisBlobWriteFence {
 export interface RealAnalysesDeps {
   readonly store: AnalysisStore
   readonly blobs: AnalysisBlobStore
+  readonly evidenceCorrectionsEnabled?: boolean
 }
 
 export interface RealAnalysesConfig {
@@ -103,4 +104,5 @@ export interface RealAnalysesConfig {
   container: string
   storageAccountUrl: string
   blobContainer: string
+  evidenceCorrectionsEnabled?: boolean
 }
