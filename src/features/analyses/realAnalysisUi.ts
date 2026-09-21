@@ -111,6 +111,9 @@ export function analysisDiagnosticNotice(comparison: RealAnalysisComparisonRecor
   const currentCapture = (comparison.error || comparison.status === 'failed') && comparison.attemptId
     && comparison.diagnosticCapture?.attemptId === comparison.attemptId
     ? comparison.diagnosticCapture : undefined
+  if (currentCapture?.status === 'disabled') {
+    return 'Private diagnostic capture was disabled by application policy for this attempt. No private diagnostic artifact was saved. Assessment and grounding requirements are unchanged; no passing result is implied.'
+  }
   if (currentCapture?.status === 'unavailable') {
     return 'Diagnostic details are unavailable for this attempt because they could not be saved. The processing failure is unchanged; an older saved diagnostic is not a substitute.'
   }
@@ -119,7 +122,11 @@ export function analysisDiagnosticNotice(comparison: RealAnalysisComparisonRecor
   }
   if ((comparison.error || comparison.status === 'failed') && !currentAnalysisDiagnostic(comparison)) {
     return `Details were not recorded for this attempt.${comparison.diagnosticCapture?.status === 'unavailable'
-      ? ' Diagnostic details could not be saved for an earlier attempt either.' : ''}`
+      ? ' Diagnostic details could not be saved for an earlier attempt either.' : comparison.diagnosticCapture?.status === 'disabled'
+        ? ' Private diagnostic capture was disabled by application policy for an earlier attempt.' : ''}`
+  }
+  if (comparison.diagnosticCapture?.status === 'disabled') {
+    return `Private diagnostic capture was disabled by application policy for ${comparison.diagnosticCapture.attemptId === comparison.attemptId ? 'this' : 'an earlier'} attempt. The current comparison state and any saved diagnostic history are unchanged.`
   }
   if (comparison.diagnosticCapture?.status === 'unavailable') {
     return 'Diagnostic details could not be saved for an earlier attempt. This does not change the current comparison state.'

@@ -7,6 +7,7 @@ import type {
   PublicFetchOptions,
   RenderedJobPage,
 } from '../src/domain/rendering'
+import { renderRequestPolicySchema, urlMatchesPolicy, type RenderRequestPolicy } from './request-policy'
 
 const DEFAULT_RENDER_TIMEOUT_MS = 30_000
 const DEFAULT_SETTLE_TIMEOUT_MS = 2_000
@@ -78,6 +79,7 @@ export interface RenderJobPageOptions {
   readonly fetcher: PublicFetcher
   readonly launchBrowser?: () => Promise<Browser>
   readonly limits?: Partial<RenderLimits>
+  readonly policy?: RenderRequestPolicy
 }
 
 interface CachedResponse {
@@ -205,14 +207,18 @@ class PublicRouteBroker {
   readonly #fetcher: PublicFetcher
   readonly #signal: AbortSignal
   readonly #limits: RenderLimits
+  readonly #policy?: RenderRequestPolicy
+  failure?: unknown
   readonly #cache = new Map<string, CachedResponse>()
   #requestCount = 0
   #aggregateBytes = 0
+  #queue = Promise.resolve()
 
-  constructor(fetcher: PublicFetcher, signal: AbortSignal, limits: RenderLimits) {
+  constructor(fetcher: PublicFetcher, signal: AbortSignal, limits: RenderLimits, policy?: RenderRequestPolicy) {
     this.#fetcher = fetcher
     this.#signal = signal
     this.#limits = limits
+    this.#policy = policy
   }
 
   async prime(
@@ -224,12 +230,13 @@ class PublicRouteBroker {
     seen = new Set<string>(),
   ): Promise<PrimedResponse> {
     const parsed = parseHttpUrl(url)
+    if (!urlMatchesPolicy(parsed.href, this.#policy?.urls)) throw new RendererError('unsafe_url', 'The URL is disallowed by the captured source policy.')
     const normalizedUrl = parsed.href
     const key = cacheKey(method, normalizedUrl, body)
     const cached = this.#cache.get(key)
     if (cached) return { response: cached.response, finalUrl: normalizedUrl }
 
-    if (redirectDepth > MAX_REDIRECTS || seen.has(key)) {
+    if (redirectDepth > (this.#policy?.urls.maxRedirects ?? MAX_REDIRECTS) || seen.has(key)) {
       throw new RendererError('render_failed', 'The page returned an invalid redirect chain.')
     }
     seen.add(key)
@@ -249,14 +256,16 @@ class PublicRouteBroker {
       method,
       headers,
       signal: this.#signal,
-      maxBytes: remainingBytes,
+      maxBytes: Math.min(remainingBytes, this.#policy?.urls.maxResponseBytes ?? Infinity),
       followRedirects: false,
     }
     if (body !== undefined) fetchOptions.body = body
 
     let response: PublicFetchedResponse
     try {
-      response = await this.#fetcher(normalizedUrl, fetchOptions)
+      const timeoutSignal = AbortSignal.timeout(Math.min(this.#policy?.urls.timeoutMilliseconds ?? this.#limits.timeoutMs, this.#limits.timeoutMs))
+      response = await raceWithAbort(this.#fetcher(normalizedUrl, { ...fetchOptions, signal: AbortSignal.any([this.#signal, timeoutSignal]) }),
+        AbortSignal.any([this.#signal, timeoutSignal]), () => timeoutSignal.aborted)
     } catch (error) {
       if (this.#signal.aborted) throw error
       if (isUnsafeFetchError(error)) {
@@ -277,10 +286,13 @@ class PublicRouteBroker {
     if (parseHttpUrl(response.url).href !== normalizedUrl) {
       throw new RendererError('render_failed', 'The public fetch transport followed a redirect unexpectedly.')
     }
-    if (response.body.byteLength > remainingBytes) {
+    if (response.body.byteLength > fetchOptions.maxBytes!) {
       throw new RendererError('limit_exceeded', 'The page exceeded the network byte limit.')
     }
     this.#aggregateBytes += response.body.byteLength
+    if (this.#aggregateBytes > this.#limits.maxAggregateBytes) {
+      throw new RendererError('limit_exceeded', 'The page exceeded the network byte limit.')
+    }
     this.#cache.set(key, { response, method, url: normalizedUrl, body })
 
     const location = Object.entries(response.headers)
@@ -291,6 +303,7 @@ class PublicRouteBroker {
 
     const nextUrl = new URL(location, normalizedUrl).href
     parseHttpUrl(nextUrl)
+    if (!urlMatchesPolicy(nextUrl, this.#policy?.urls)) throw new RendererError('unsafe_url', 'A redirect is disallowed by the captured source policy.')
     const next = redirectMethod(method, response.status)
     if (next.method === 'POST' && next.preserveBody) {
       throw new RendererError('render_failed', 'Redirects that replay POST bodies are not permitted.')
@@ -306,7 +319,17 @@ class PublicRouteBroker {
     return { response, finalUrl: primed.finalUrl }
   }
 
-  async handle(route: Route): Promise<void> {
+  handle(route: Route): Promise<void> {
+    // Concurrent subresources must not each reuse the same remaining byte allowance.
+    const result = this.#queue.then(() => {
+      if (this.failure) throw this.failure
+      return this.handleNow(route)
+    })
+    this.#queue = result.catch(error => { this.failure ??= error })
+    return result
+  }
+
+  private async handleNow(route: Route): Promise<void> {
     const request = route.request()
     const resourceType = request.resourceType()
     if (BLOCKED_RESOURCE_TYPES.has(resourceType)) {
@@ -327,6 +350,7 @@ class PublicRouteBroker {
       await route.abort('blockedbyclient')
       return
     }
+    if (!urlMatchesPolicy(url, this.#policy?.urls)) throw new RendererError('unsafe_url', 'A subresource is disallowed by the captured source policy.')
 
     const method = rawMethod
     const bodyBuffer = method === 'POST' ? request.postDataBuffer() ?? undefined : undefined
@@ -412,12 +436,18 @@ export async function renderJobPage(
   signal: AbortSignal,
   options: RenderJobPageOptions,
 ): Promise<RenderedJobPage> {
+  let policy: RenderRequestPolicy | undefined
+  if (options.policy) {
+    const parsed = renderRequestPolicySchema.safeParse(options.policy)
+    if (!parsed.success) throw new RendererError('render_failed', 'Renderer policy is invalid.')
+    policy = parsed.data
+  }
   const limits: RenderLimits = {
-    timeoutMs: options.limits?.timeoutMs ?? DEFAULT_RENDER_TIMEOUT_MS,
-    settleTimeoutMs: options.limits?.settleTimeoutMs ?? DEFAULT_SETTLE_TIMEOUT_MS,
-    maxNetworkRequests: options.limits?.maxNetworkRequests ?? DEFAULT_MAX_NETWORK_REQUESTS,
-    maxAggregateBytes: options.limits?.maxAggregateBytes ?? DEFAULT_MAX_AGGREGATE_BYTES,
-    maxDomBytes: options.limits?.maxDomBytes ?? DEFAULT_MAX_DOM_BYTES,
+    timeoutMs: Math.min(options.limits?.timeoutMs ?? DEFAULT_RENDER_TIMEOUT_MS, policy?.rendering.timeoutMilliseconds ?? DEFAULT_RENDER_TIMEOUT_MS),
+    settleTimeoutMs: Math.min(options.limits?.settleTimeoutMs ?? DEFAULT_SETTLE_TIMEOUT_MS, policy?.rendering.settleMilliseconds ?? DEFAULT_SETTLE_TIMEOUT_MS),
+    maxNetworkRequests: Math.min(options.limits?.maxNetworkRequests ?? DEFAULT_MAX_NETWORK_REQUESTS, policy?.rendering.maxRequests ?? DEFAULT_MAX_NETWORK_REQUESTS),
+    maxAggregateBytes: Math.min(options.limits?.maxAggregateBytes ?? DEFAULT_MAX_AGGREGATE_BYTES, policy?.rendering.maxAggregateBytes ?? DEFAULT_MAX_AGGREGATE_BYTES),
+    maxDomBytes: Math.min(options.limits?.maxDomBytes ?? DEFAULT_MAX_DOM_BYTES, policy?.rendering.maxDomBytes ?? DEFAULT_MAX_DOM_BYTES),
   }
   if (
     !Number.isInteger(limits.timeoutMs) || limits.timeoutMs < 1
@@ -429,6 +459,7 @@ export async function renderJobPage(
     throw new RendererError('render_failed', 'Renderer limits are invalid.')
   }
   const initialUrl = parseHttpUrl(rawUrl).href
+  if (!urlMatchesPolicy(initialUrl, policy?.urls)) throw new RendererError('unsafe_url', 'The URL is disallowed by the captured source policy.')
   const timeoutController = new AbortController()
   let timedOut = false
   const timeout = setTimeout(() => {
@@ -437,7 +468,7 @@ export async function renderJobPage(
   }, limits.timeoutMs)
   timeout.unref()
   const combinedSignal = AbortSignal.any([signal, timeoutController.signal])
-  const broker = new PublicRouteBroker(options.fetcher, combinedSignal, limits)
+  const broker = new PublicRouteBroker(options.fetcher, combinedSignal, limits, policy)
 
   let browser: Browser | undefined
   let context: BrowserContext | undefined
@@ -474,7 +505,12 @@ export async function renderJobPage(
       () => timedOut,
     )
     await raceWithAbort(
-      context.route('**/*', (route) => broker.handle(route)),
+      context.route('**/*', async route => {
+        try { await broker.handle(route) } catch (error) {
+          broker.failure ??= error
+          await route.abort('blockedbyclient').catch(() => undefined)
+        }
+      }),
       combinedSignal,
       () => timedOut,
     )
@@ -500,27 +536,32 @@ export async function renderJobPage(
       combinedSignal,
       () => timedOut,
     )
-    try {
+    if (limits.settleTimeoutMs > 0) {
+      try {
+        await raceWithAbort(
+          page.waitForLoadState('load', { timeout: limits.settleTimeoutMs }),
+          combinedSignal,
+          () => timedOut,
+        )
+      } catch (error) {
+        if (error instanceof RendererError) throw error
+        if (!(error instanceof Error) || error.name !== 'TimeoutError') throw error
+      }
       await raceWithAbort(
-        page.waitForLoadState('load', { timeout: limits.settleTimeoutMs }),
+        page.waitForTimeout(Math.min(500, limits.settleTimeoutMs)),
         combinedSignal,
         () => timedOut,
       )
-    } catch (error) {
-      if (error instanceof RendererError) throw error
-      if (!(error instanceof Error) || error.name !== 'TimeoutError') throw error
     }
-    await raceWithAbort(
-      page.waitForTimeout(Math.min(500, limits.settleTimeoutMs)),
-      combinedSignal,
-      () => timedOut,
-    )
 
     const html = await raceWithAbort(page.content(), combinedSignal, () => timedOut)
+    if (broker.failure) throw broker.failure
     if (Buffer.byteLength(html, 'utf8') > limits.maxDomBytes) {
       throw new RendererError('limit_exceeded', 'The rendered DOM exceeded the output limit.')
     }
-    return { html, finalUrl: parseHttpUrl(page.url()).href }
+    const finalUrl = parseHttpUrl(page.url()).href
+    if (!urlMatchesPolicy(finalUrl, policy?.urls)) throw new RendererError('unsafe_url', 'The rendered destination is disallowed by the captured source policy.')
+    return { html, finalUrl }
   } catch (error) {
     if (combinedSignal.aborted) throwForAbort(combinedSignal, timedOut)
     if (error instanceof RendererError) throw error

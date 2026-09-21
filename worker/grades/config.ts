@@ -1,4 +1,5 @@
 import type { RealGradesConfig } from '../../server/grades/store'
+import { workerSettingsContainer } from '../settings-store'
 
 export interface GradeWorkerConfig {
   stores: RealGradesConfig
@@ -13,6 +14,7 @@ export interface GradeWorkerConfig {
   rendererUrl: string
   maxItems: number
   budgetMilliseconds: number
+  settingsContainer?: string
 }
 
 function required(environment: NodeJS.ProcessEnv, key: string): string {
@@ -95,5 +97,6 @@ export function loadGradeWorkerConfig(environment: NodeJS.ProcessEnv): GradeWork
     modelName, reasoningEffort, rendererUrl: renderer.origin,
     maxItems: integer(environment, 'GRADE_WORKER_MAX_ITEMS', 5, 1, 20),
     budgetMilliseconds: integer(environment, 'GRADE_WORKER_BUDGET_MS', 660_000, 1000, 660_000),
+    settingsContainer: workerSettingsContainer(environment),
   }
 }

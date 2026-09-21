@@ -5,8 +5,8 @@ import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import test from 'node:test'
 import {
-  WORD_WORKER_ARTIFACTS, WORD_WORKER_CAPABILITY, WORD_WORKER_EXTRACTION_VERSION, WORKER_DEFINITIONS, configureScheduledWorker, configureWorkerDeployment,
-  disableWordAdmission, validateFeatureSettings, validateRendererTemplate, validateWorkerImage, validateWorkerTemplate, verifyWordWorkerReadiness,
+  WORD_WORKER_ARTIFACTS, WORD_WORKER_CAPABILITY, WORD_WORKER_EXTRACTION_VERSION, RUNTIME_SETTINGS_VERSION, SETTINGS_WORKER_RUNTIMES, WORKER_DEFINITIONS, configureScheduledWorker, configureWorkerDeployment,
+  disableRuntimeSettingsAdmission, disableWordAdmission, prepareWebDeployment, validateFeatureSettings, validateRendererTemplate, validateWorkerImage, validateWorkerTemplate, verifyWordWorkerReadiness,
   wordWorkerVerificationArgs,
 } from '../scripts/azure-worker.mjs'
 
@@ -35,6 +35,7 @@ function template(definition) {
   const settings = {
     NODE_ENV: 'production', AZURE_CLIENT_ID: `${definition.kind}-client`, AZURE_TENANT_ID: env.AZURE_TENANT_ID,
     COSMOS_ENDPOINT: env.AZURE_COSMOS_ENDPOINT, COSMOS_DATABASE: 'score',
+    SCORE_SETTINGS_CONTAINER: 'application-settings',
     STORAGE_ACCOUNT_URL: env.AZURE_STORAGE_ACCOUNT_URL,
     [definition.recordsSetting]: definition.records, [definition.sourcesSetting]: definition.sources,
     RUBRIC_MODEL_ENDPOINT: env.AZURE_RUBRIC_MODEL_ENDPOINT, RUBRIC_MODEL_DEPLOYMENT: env.AZURE_RUBRIC_MODEL_DEPLOYMENT,
@@ -68,6 +69,7 @@ function appSettings() {
     COSMOS_CONTAINER: 'workspaces', WORKSPACE_BLOB_CONTAINER: 'workspace-state',
     REAL_JOB_IMPORTS_ENABLED: 'true', REAL_GRADE_LADDERS_ENABLED: 'false', REAL_RESUME_IMPORTS_ENABLED: 'true',
     REAL_ANALYSES_ENABLED: 'true', WORD_DOCUMENT_IMPORTS_ENABLED: 'true',
+    SCORE_SETTINGS_CONTAINER: 'application-settings', SCORE_RUNTIME_SETTINGS_ENABLED: 'true',
     ...Object.fromEntries(WORKER_DEFINITIONS.flatMap(worker => [
       [worker.recordsSetting, worker.records], [worker.sourcesSetting, worker.sources],
     ])),
@@ -285,12 +287,13 @@ test('the in-container probe rejects old, incomplete, or modified artifacts befo
         "console.log('worker-entry-started');",
         '}',
       ].join('\n')
-      : name === 'runtime.mjs'
-        ? `export const WORD_EXTRACTION_VERSION = ${JSON.stringify(WORD_WORKER_EXTRACTION_VERSION)};\n`
+      : SETTINGS_WORKER_RUNTIMES.includes(name)
+        ? `${name === 'runtime.mjs' ? `export const WORD_EXTRACTION_VERSION = ${JSON.stringify(WORD_WORKER_EXTRACTION_VERSION)};\n` : ''}export const RUNTIME_SETTINGS_VERSION = ${JSON.stringify(RUNTIME_SETTINGS_VERSION)};\n`
         : `// ${name}\n`,
   ]))
   const manifest = {
     schemaVersion: 1, capability: WORD_WORKER_CAPABILITY,
+    runtimeSettingsVersion: RUNTIME_SETTINGS_VERSION,
     artifacts: Object.fromEntries(Object.entries(files).map(([name, contents]) =>
       [name, createHash('sha256').update(contents).digest('hex')])),
   }
@@ -319,6 +322,8 @@ test('the in-container probe rejects old, incomplete, or modified artifacts befo
     () => rmSync(join(root, 'dist-worker', 'word-imports.json')),
     () => writeManifest({ ...manifest, schemaVersion: 0 }),
     () => writeManifest({ ...manifest, capability: 'resume-analysis-only' }),
+    () => writeManifest({ ...manifest, runtimeSettingsVersion: undefined }),
+    () => writeManifest({ ...manifest, runtimeSettingsVersion: 'unsupported-settings' }),
     () => writeManifest({ ...manifest, artifacts: {} }),
     () => writeFileSync(join(root, 'dist-worker', 'word-parser.mjs'), '// modified parser\n'),
     () => rmSync(join(root, 'dist-worker', 'grade-worker.mjs')),
@@ -342,6 +347,18 @@ test('the in-container probe rejects old, incomplete, or modified artifacts befo
     assert.notEqual(result.status, 0)
     assert.match(result.stderr, /required Word extraction version/)
     assert.doesNotMatch(result.stdout, /worker-entry-started/, 'a valid hash manifest cannot certify an old extraction runtime')
+  }
+  for (const name of SETTINGS_WORKER_RUNTIMES) {
+    reset()
+    const oldReader = files[name].replace(RUNTIME_SETTINGS_VERSION, 'old-settings-reader')
+    writeFileSync(join(root, 'dist-worker', name), oldReader)
+    writeManifest({
+      ...manifest, artifacts: { ...manifest.artifacts, [name]: createHash('sha256').update(oldReader).digest('hex') },
+    })
+    const result = probe()
+    assert.notEqual(result.status, 0)
+    assert.match(result.stderr, /required runtime settings reader/)
+    assert.doesNotMatch(result.stdout, /worker-entry-started/)
   }
   reset()
   const failingWorker = 'process.exitCode = 7\n'
@@ -371,6 +388,7 @@ function rolloutHarness(options = {}) {
     },
   }
   let enableFailed = false
+  let runtimeEnableFailed = false
   const hooks = {
     delay: async () => {},
     setEnvironment: (key, value) => { pins.set(key, value); operations.push({ action: 'pin', key, value }) },
@@ -385,12 +403,18 @@ function rolloutHarness(options = {}) {
             enableFailed = true
             throw new Error('Ambiguous feature enablement response.')
           }
+          if (options.failRuntimeEnable && settings.SCORE_RUNTIME_SETTINGS_ENABLED === 'true' &&
+            settings.SCORE_RUNTIME_SETTINGS_WORKER_VERSION === RUNTIME_SETTINGS_VERSION && !runtimeEnableFailed) {
+            runtimeEnableFailed = true
+            throw new Error('Ambiguous runtime settings activation response.')
+          }
         }
         return { properties: structuredClone(settings) }
       }
       if (path === env.AZURE_JOB_RENDERER_ID) {
         if (method === 'PUT') {
           assert.equal(settings.WORD_DOCUMENT_IMPORTS_ENABLED, 'false', 'Word must be off before renderer mutation')
+          assert.equal(settings.SCORE_RUNTIME_SETTINGS_ENABLED, 'false', 'Settings admission must be off before renderer mutation')
           operations.push({ action: 'renderer' })
           renderer = {
             ...structuredClone(body), identity: renderer.identity,
@@ -410,6 +434,7 @@ function rolloutHarness(options = {}) {
         if (suffix === '') {
           if (method === 'PUT') {
             assert.equal(settings.WORD_DOCUMENT_IMPORTS_ENABLED, 'false', 'Word must be off before worker mutation')
+            assert.equal(settings.SCORE_RUNTIME_SETTINGS_ENABLED, 'false', 'Settings admission must be off before worker mutation')
             operations.push({ action: 'worker', kind: definition.kind, trigger: body.properties.configuration.triggerType })
             workers.set(definition.kind, {
               ...structuredClone(body), identity: current.identity,
@@ -438,18 +463,20 @@ function rolloutHarness(options = {}) {
             }
             return { value: [{ properties: { status: 'Running', template: template(definition).properties.template } }] }
           }
-          return { value: [structuredClone(executions.get(definition.kind))] }
+          return { value: executions.has(definition.kind) ? [structuredClone(executions.get(definition.kind))] : [] }
         }
       }
       if (path.includes('/Microsoft.DocumentDB/')) {
-        return { properties: { resource: { id: path.split('/').at(-1), partitionKey: { paths: ['/workspaceId'] } } } }
+        const id = path.split('/').at(-1)
+        const partition = id === 'application-settings' && !options.invalidSettingsPartition ? '/applicationId' : '/workspaceId'
+        return { properties: { resource: { id, partitionKey: { paths: [partition] } } } }
       }
       if (path.includes('/Microsoft.Storage/')) return { properties: { publicAccess: 'None' } }
       if (path.includes('/Microsoft.CognitiveServices/')) return { properties: { provisioningState: 'Succeeded' } }
       throw new Error(`Unexpected mocked management request: ${method} ${path}`)
     },
   }
-  return { hooks, operations, pins, settings: () => settings }
+  return { hooks, operations, pins, workers, settings: () => settings }
 }
 
 test('Word is disabled before any shared consumer changes and enabled only after all four verified workers', async () => {
@@ -472,7 +499,7 @@ test('Word is disabled before any shared consumer changes and enabled only after
   assert.equal(settings().CUSTOM_EXISTING_SETTING, 'unchanged')
 })
 
-test('pre-provision and pre-web hooks close Word without changing other feature flags or pins', async () => {
+test('legacy Word disablement preserves other flags and deployment hooks enforce reader preparation', async () => {
   const { hooks, operations, settings } = rolloutHarness()
   await disableWordAdmission(env, {}, hooks)
   await disableWordAdmission(env, {}, hooks)
@@ -482,8 +509,171 @@ test('pre-provision and pre-web hooks close Word without changing other feature 
     if (key !== 'WORD_DOCUMENT_IMPORTS_ENABLED') assert.equal(settings()[key], value)
   }
   const yaml = readFileSync(new URL('../azure.yaml', import.meta.url), 'utf8')
-  assert.match(yaml, /predeploy:[\s\S]*?azure-before-deploy\.mjs[\s\S]*?azure-worker\.mjs disable-word\r?\n\s+if \(\$LASTEXITCODE -ne 0\) \{ exit \$LASTEXITCODE \}/)
-  assert.match(yaml, /preprovision:[\s\S]*?azure-worker\.mjs disable-word --if-provisioned\r?\n\s+if \(\$LASTEXITCODE -ne 0\) \{ exit \$LASTEXITCODE \}/)
+  assert.match(yaml, /predeploy:[\s\S]*?azure-before-deploy\.mjs[\s\S]*?azure-worker\.mjs prepare-web-deploy\r?\n\s+if \(\$LASTEXITCODE -ne 0\) \{ exit \$LASTEXITCODE \}/)
+  assert.match(yaml, /preprovision:[\s\S]*?azure-worker\.mjs disable-admission --if-provisioned\r?\n\s+if \(\$LASTEXITCODE -ne 0\) \{ exit \$LASTEXITCODE \}/)
+})
+
+function webPreparationHarness(options) {
+  const harness = rolloutHarness(options)
+  for (const definition of WORKER_DEFINITIONS) {
+    const worker = harness.workers.get(definition.kind)
+    worker.properties.configuration = {
+      ...worker.properties.configuration, triggerType: 'Schedule', replicaTimeout: 900, replicaRetryLimit: 0,
+      scheduleTriggerConfig: { cronExpression: '* * * * *', parallelism: 1, replicaCompletionCount: 1 },
+    }
+    worker.properties.template.containers[0].image = `${env.AZURE_CONTAINER_REGISTRY_ENDPOINT}/score-worker:pre-settings-${definition.kind}`
+  }
+  return harness
+}
+
+test('pre-web preparation pauses and drains all old readers without changing their images, identities, stores, or pins', async () => {
+  const harness = webPreparationHarness()
+  const { hooks, operations, pins, workers, settings } = harness
+  const original = structuredClone(workers)
+  const send = hooks.request
+  hooks.request = async (...args) => {
+    if (new URL(args[2]).pathname.endsWith('/executions')) {
+      assert.ok([...workers.values()].every(worker => worker.properties.configuration.triggerType === 'Manual'),
+        'every schedule must be paused before checking for active old executions')
+      const result = await send(...args)
+      result.value = ['Succeeded', 'Failed', 'Stopped', 'Cancelled', 'Canceled'].map(status => ({ properties: { status } }))
+      return result
+    }
+    return send(...args)
+  }
+  await prepareWebDeployment(env, {}, hooks)
+  assert.equal(settings().WORD_DOCUMENT_IMPORTS_ENABLED, 'false')
+  assert.equal(settings().SCORE_RUNTIME_SETTINGS_ENABLED, 'false')
+  assert.equal(settings().CUSTOM_EXISTING_SETTING, 'unchanged')
+  for (const key of ['REAL_JOB_IMPORTS_ENABLED', 'REAL_GRADE_LADDERS_ENABLED', 'REAL_RESUME_IMPORTS_ENABLED', 'REAL_ANALYSES_ENABLED']) {
+    assert.equal(settings()[key], appSettings()[key], 'historical API capability must not be disabled to pause readers')
+  }
+  for (const definition of WORKER_DEFINITIONS) {
+    const current = workers.get(definition.kind)
+    const previous = original.get(definition.kind)
+    assert.deepEqual(current.properties.template, previous.properties.template)
+    assert.deepEqual(current.identity, previous.identity)
+    assert.deepEqual(current.properties.configuration.registries, previous.properties.configuration.registries)
+    assert.equal(current.properties.configuration.replicaTimeout, 900)
+    assert.equal(current.properties.configuration.replicaRetryLimit, 0)
+    assert.equal(current.properties.configuration.triggerType, 'Manual')
+    assert.equal(current.properties.configuration.scheduleTriggerConfig, undefined)
+    assert.equal(pins.get(definition.imageKey), `${definition.kind}-previous-pin`)
+  }
+  assert.ok(operations.every(operation => !['renderer', 'execution', 'pin'].includes(operation.action)))
+  assert.equal(operations.filter(operation => operation.action === 'worker').length, 4)
+  await prepareWebDeployment(env, {}, hooks)
+  assert.equal(operations.filter(operation => operation.action === 'worker').length, 4, 'retrying an already paused deployment is idempotent')
+})
+
+test('an active old reader on any history page blocks web replacement without cancelling accepted work', async () => {
+  for (const definition of WORKER_DEFINITIONS) {
+    const { hooks, operations, workers, settings } = webPreparationHarness({ oldExecutionKind: definition.kind, secondPage: true })
+    let webPublished = false
+    await assert.rejects(async () => {
+      await prepareWebDeployment(env, {}, hooks)
+      webPublished = true
+    }, /still has an execution.*Let it finish.*no execution was cancelled/)
+    assert.equal(webPublished, false)
+    assert.ok([...workers.values()].every(worker => worker.properties.configuration.triggerType === 'Manual'))
+    assert.equal(settings().WORD_DOCUMENT_IMPORTS_ENABLED, 'false')
+    assert.equal(settings().SCORE_RUNTIME_SETTINGS_ENABLED, 'false')
+    assert.ok(operations.every(operation => !['renderer', 'execution', 'pin'].includes(operation.action)))
+    assert.equal(operations.filter(operation => operation.action === 'history' && operation.kind === definition.kind).length, 2)
+  }
+})
+
+test('queued, running, and unknown execution states are never treated as drained', async () => {
+  for (const status of ['Running', 'Processing', 'Pending', 'Unknown', undefined]) {
+    const { hooks } = webPreparationHarness()
+    const send = hooks.request
+    hooks.request = async (...args) => {
+      const response = await send(...args)
+      return new URL(args[2]).pathname.endsWith('/executions') ? { value: [{ properties: { status } }] } : response
+    }
+    await assert.rejects(prepareWebDeployment(env, {}, hooks), /still has an execution/)
+  }
+})
+
+test('unreadable, malformed, cross-resource, or unbounded history cannot certify a drained reader', async () => {
+  const root = `https://management.azure.com${env.AZURE_JOB_WORKER_ID}/executions?api-version=2024-03-01`
+  for (const response of [
+    undefined, {}, { value: null },
+    { value: [], nextLink: 'https://other.example.test/executions' },
+    { value: [], nextLink: root.replace('/jobs/job/', '/jobs/grade/') },
+    { value: [], nextLink: 'not-a-url' },
+    { value: [], nextLink: `${root}#unexpected` },
+    { value: [], nextLink: root },
+  ]) {
+    const { hooks } = webPreparationHarness()
+    const send = hooks.request
+    let reads = 0
+    hooks.request = async (...args) => {
+      if (new URL(args[2]).pathname.endsWith('/executions')) {
+        reads++
+        return structuredClone(response)
+      }
+      return send(...args)
+    }
+    await assert.rejects(prepareWebDeployment(env, {}, hooks), /execution history|execution continuation/)
+    assert.ok(reads >= 1 && reads <= 100)
+  }
+  const { hooks } = webPreparationHarness()
+  const send = hooks.request
+  hooks.request = (...args) => {
+    if (new URL(args[2]).pathname.endsWith('/executions')) throw new Error('Execution listing unavailable.')
+    return send(...args)
+  }
+  await assert.rejects(prepareWebDeployment(env, {}, hooks), /Execution listing unavailable/)
+})
+
+test('failed, unconfirmed, or drifting worker pauses block the API upgrade', async () => {
+  for (const failure of ['Failed', 'Schedule', 'image', 'late-schedule']) {
+    const { hooks, operations } = webPreparationHarness()
+    const send = hooks.request
+    hooks.request = async (...args) => {
+      const response = await send(...args)
+      if (args[3] === undefined && new URL(args[2]).pathname === env.AZURE_JOB_WORKER_ID &&
+        operations.some(operation => operation.action === 'worker' && operation.kind === 'job')) {
+        if (failure === 'Failed') response.properties.provisioningState = 'Failed'
+        if (failure === 'Schedule' || failure === 'late-schedule' && operations.some(operation => operation.action === 'history')) {
+          response.properties.configuration.triggerType = 'Schedule'
+        }
+        if (failure === 'image') response.properties.template.containers[0].image = `${image}-concurrent-change`
+      }
+      return response
+    }
+    await assert.rejects(prepareWebDeployment(env, {}, hooks), /pause.*blocked/)
+    assert.ok(operations.every(operation => !['renderer', 'execution', 'pin'].includes(operation.action)))
+  }
+})
+
+test('worker pause polling is bounded and partial pauses never permit a web deployment', async () => {
+  const { hooks, operations } = webPreparationHarness()
+  const send = hooks.request
+  let waits = 0
+  hooks.delay = async milliseconds => { assert.equal(milliseconds, 5000); waits++ }
+  hooks.request = async (...args) => {
+    const response = await send(...args)
+    if (args[3] === undefined && new URL(args[2]).pathname === env.AZURE_JOB_WORKER_ID &&
+      operations.some(operation => operation.action === 'worker')) response.properties.provisioningState = 'Updating'
+    return response
+  }
+  await assert.rejects(prepareWebDeployment(env, {}, hooks), /pause did not finish/)
+  assert.equal(waits, 36)
+  assert.equal(operations.filter(operation => operation.action === 'worker').length, 1)
+  assert.ok(operations.every(operation => operation.action !== 'history'))
+})
+
+test('missing worker outputs or failed gate closure cannot change any reader schedule', async () => {
+  const denied = webPreparationHarness({ denyDisable: true })
+  await assert.rejects(prepareWebDeployment(env, {}, denied.hooks), /Settings update denied/)
+  assert.ok(denied.operations.every(operation => operation.action !== 'worker'))
+  for (const definition of WORKER_DEFINITIONS) {
+    await assert.rejects(prepareWebDeployment({ ...env, [definition.idKey]: undefined }, {}, {
+      request: async () => { assert.fail('Missing workers must fail before management calls') },
+    }), /ProvisionOnly/)
+  }
 })
 
 test('a failure in any worker leaves Word off while preserving only independently verified pins', async () => {
@@ -596,4 +786,70 @@ test('worker build and shared container packaging include both new entry points 
   assert.ok(requiredBundles?.includes("'word-parser.mjs'"))
   assert.ok(requiredBundles?.includes("'telemetry.mjs'"))
   assert.ok(serverDocker.includes('/app/dist-server ./dist-server'))
+})
+
+test('runtime settings activate only after every reader and active execution has been verified', async () => {
+  const { hooks, operations, settings } = rolloutHarness()
+  await configureWorkerDeployment(env, {}, { image, rendererImage }, hooks)
+  assert.equal(settings().SCORE_RUNTIME_SETTINGS_ENABLED, 'true')
+  assert.equal(settings().SCORE_RUNTIME_SETTINGS_WORKER_VERSION, RUNTIME_SETTINGS_VERSION)
+  assert.equal(settings().SCORE_RUNTIME_SETTINGS_VERIFIED_IMAGE, image)
+  assert.ok(Number.isFinite(Date.parse(settings().SCORE_RUNTIME_SETTINGS_VERIFIED_AT)))
+  const activation = operations.findIndex(operation => operation.action === 'settings' &&
+    operation.settings.SCORE_RUNTIME_SETTINGS_ENABLED === 'true' &&
+    operation.settings.SCORE_RUNTIME_SETTINGS_WORKER_VERSION === RUNTIME_SETTINGS_VERSION)
+  assert.ok(activation > 0)
+  for (const action of ['execution', 'history']) {
+    assert.deepEqual(
+      operations.slice(0, activation).filter(operation => operation.action === action).map(operation => operation.kind).sort(),
+      WORKER_DEFINITIONS.map(worker => worker.kind).sort(),
+    )
+  }
+})
+
+test('runtime settings failure and renderer-only paths keep admission disabled', async () => {
+  for (const options of [
+    { failedKind: 'job' }, { failedKind: 'grade' }, { failedKind: 'resume' }, { failedKind: 'analysis' },
+    { oldExecutionKind: 'resume', secondPage: true }, { failRuntimeEnable: true }, { invalidSettingsPartition: true },
+  ]) {
+    const { hooks, settings } = rolloutHarness(options)
+    await assert.rejects(configureWorkerDeployment(env, {}, { image, rendererImage }, hooks))
+    assert.equal(settings().SCORE_RUNTIME_SETTINGS_ENABLED, 'false')
+    assert.equal(settings().SCORE_RUNTIME_SETTINGS_WORKER_VERSION, '')
+    assert.equal(settings().WORD_DOCUMENT_IMPORTS_ENABLED, 'false')
+  }
+  const { hooks, settings } = rolloutHarness()
+  await configureWorkerDeployment(env, {}, { rendererImage, rendererOnly: true }, hooks)
+  assert.equal(settings().SCORE_RUNTIME_SETTINGS_ENABLED, 'false')
+})
+
+test('runtime settings pause is verified, idempotent, and preserves unrelated configuration', async () => {
+  const { hooks, operations, settings } = rolloutHarness()
+  await disableRuntimeSettingsAdmission(env, {}, hooks)
+  await disableRuntimeSettingsAdmission(env, {}, hooks)
+  assert.equal(operations.filter(operation => operation.action === 'settings').length, 1)
+  assert.equal(settings().SCORE_RUNTIME_SETTINGS_ENABLED, 'false')
+  for (const [key, value] of Object.entries(appSettings())) {
+    if (key !== 'SCORE_RUNTIME_SETTINGS_ENABLED') assert.equal(settings()[key], value)
+  }
+  assert.equal(settings().CUSTOM_EXISTING_SETTING, 'unchanged')
+})
+
+test('settings infrastructure separates administrator grants, four read-only consumers, and renderer isolation', () => {
+  const resources = readFileSync(new URL('../infra/resources.bicep', import.meta.url), 'utf8')
+  const ai = readFileSync(new URL('../infra/ai.bicep', import.meta.url), 'utf8')
+  const ingestion = readFileSync(new URL('../infra/ingestion.bicep', import.meta.url), 'utf8')
+  const provision = readFileSync(new URL('../scripts/deploy.ps1', import.meta.url), 'utf8')
+  assert.match(resources, /name: 'application-settings'[\s\S]*?paths: \['\/applicationId'\]/)
+  assert.match(resources, /settingsReaderKinds = \['job', 'grade', 'resume', 'analysis'\]/)
+  assert.match(resources, /settingsReadAccess[\s\S]*?00000000-0000-0000-0000-000000000001[\s\S]*?colls\/\$\{settingsContainer\.name\}/)
+  assert.match(resources, /SCORE_ADMIN_USER_IDS: adminUserIds/)
+  assert.match(resources, /SCORE_RUNTIME_SETTINGS_ENABLED: 'false'/)
+  assert.match(ai, /'Microsoft\.CognitiveServices\/accounts\/deployments\/read'/)
+  assert.doesNotMatch(ai, /'Microsoft\.CognitiveServices\/accounts\/(?:listKeys\/action|\*)'/)
+  const renderer = ingestion.slice(ingestion.indexOf("resource renderer '"), ingestion.indexOf("resource worker '"))
+  assert.doesNotMatch(renderer, /SCORE_SETTINGS_CONTAINER|settingsReadAccess/)
+  assert.match(provision, /PSBoundParameters\.ContainsKey\('AdminUserIds'\)/)
+  assert.match(provision, /get-values --environment \$EnvironmentName/)
+  assert.match(provision, /ContainsKey\('ids'\)/)
 })

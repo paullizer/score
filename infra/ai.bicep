@@ -51,6 +51,45 @@ resource account 'Microsoft.CognitiveServices/accounts@2025-06-01' = {
   }
 }
 
+resource deploymentReaderRole 'Microsoft.Authorization/roleDefinitions@2022-04-01' = {
+  name: guid(resourceGroup().id, 'score-model-deployment-reader')
+  properties: {
+    roleName: 'Score deployment inventory ${token}'
+    description: 'Read deployments in the assigned Score AI account without changing them or reading keys.'
+    type: 'CustomRole'
+    assignableScopes: [resourceGroup().id]
+    permissions: [{
+      actions: [
+        'Microsoft.CognitiveServices/accounts/read'
+        'Microsoft.CognitiveServices/accounts/deployments/read'
+      ]
+      notActions: []
+      dataActions: []
+      notDataActions: []
+    }]
+  }
+}
+
+resource deploymentReadAccess 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(account.id, appPrincipalId, 'score-model-inventory')
+  scope: account
+  properties: {
+    roleDefinitionId: deploymentReaderRole.id
+    principalId: appPrincipalId
+    principalType: 'ServicePrincipal'
+  }
+}
+
+resource modelProbeAccess 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(account.id, appPrincipalId, 'score-model-probes')
+  scope: account
+  properties: {
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '5e0bd9bd-7b93-4f28-af87-19fc36ad61bd')
+    principalId: appPrincipalId
+    principalType: 'ServicePrincipal'
+  }
+}
+
 resource project 'Microsoft.CognitiveServices/accounts/projects@2025-06-01' = {
   parent: account
   name: 'score'
@@ -138,6 +177,7 @@ resource blobConnection 'Microsoft.CognitiveServices/accounts/projects/connectio
 }
 
 output accountName string = account.name
+output accountResourceId string = account.id
 output projectName string = project.name
 output projectEndpoint string = 'https://${account.name}.services.ai.azure.com/api/projects/${project.name}'
 output searchName string = search.name

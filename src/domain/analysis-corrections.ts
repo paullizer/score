@@ -3,6 +3,7 @@ import type {
   RealAnalysisAssessmentOutput, RealAnalysisGroundingReview, RealAnalysisResultSummary,
 } from './real-analyses'
 import type { ImmutableJsonBlobReference } from './real-resumes'
+import type { ProcessingSettingsSnapshot } from './admin-settings'
 
 export const ANALYSIS_CORRECTION_POLICY_VERSION = 'missing-evidence-zero-v1' as const
 export const ANALYSIS_CORRECTION_LIMITS = { maxCriteria: 20, historyPageSize: 12, maxHistoryEntries: 1000 } as const
@@ -67,6 +68,7 @@ export interface RealAnalysisCorrectionRecord extends AnalysisEntityBase, Analys
 
 export interface AnalysisCorrectionProposal {
   schemaVersion: 1
+  processingSettings?: ProcessingSettingsSnapshot
   dataKind: 'real'
   workspaceId: string
   runId: string

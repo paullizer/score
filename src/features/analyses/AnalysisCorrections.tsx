@@ -2,6 +2,7 @@ import { useCallback, useEffect, useId, useMemo, useRef, useState } from 'react'
 import { History, LoaderCircle, RotateCcw, ShieldCheck, X } from 'lucide-react'
 import { useRealAnalyses, type RealAnalysesContextValue } from '../../app/real-analyses-context'
 import { useWorkspace } from '../../app/workspace-context'
+import { usePublicSettings } from '../../app/public-settings-context'
 import { useLifecycleAccess } from '../../components/lifecycle/useLifecycleAccess'
 import { Badge, Button, InlineError, Modal, Score } from '../../components/ui'
 import {
@@ -17,6 +18,7 @@ import {
   getAnalysisCorrectionPreview, requestAnalysisCorrection,
 } from '../../services/analysisCorrections'
 import { CloudApiError } from '../../services/cloudWorkspace'
+import { boundedPollingInterval } from '../../services/publicSettings'
 import { realAnalysisCancellationPending, targetVersionLabel } from './realAnalysisUi'
 import { HistoricalCandidateNarrative } from './AnalysisSummaryHistory'
 import {
@@ -70,6 +72,7 @@ function correctionError(caught: unknown, fallback: string, access: Access, runI
 }
 
 function useCorrectionMonitor(access: Access, runId: string, comparisons: RealAnalysisComparisonSummary[], initialRead = false) {
+  const pollingInterval = boundedPollingInterval(usePublicSettings().settings)
   const current = useRef({ access, runId, comparisons })
   current.current = { access, runId, comparisons }
   const [states, setStates] = useState<Record<string, CorrectionState>>({})
@@ -207,11 +210,11 @@ function useCorrectionMonitor(access: Access, runId: string, comparisons: RealAn
         rounds.current++
         await load(ids)
       } else if (ids.length) setPaused(true)
-      if (!life.signal.aborted) timer = setTimeout(() => void tick(), 3000)
+      if (!life.signal.aborted) timer = setTimeout(() => void tick(), pollingInterval)
     }
     if (access.readable) {
       if (initialRead) void load(current.current.comparisons.map(item => item.comparison.id))
-      timer = setTimeout(() => void tick(), 3000)
+      timer = setTimeout(() => void tick(), pollingInterval)
     }
     return () => {
       life.abort()
@@ -219,7 +222,7 @@ function useCorrectionMonitor(access: Access, runId: string, comparisons: RealAn
       activeReaders.forEach(request => request.abort())
       activeReaders.clear()
     }
-  }, [access.identity, access.readable, initialRead, load])
+  }, [access.identity, access.readable, initialRead, load, pollingInterval])
 
   return { states, paused, check, remember, hold }
 }

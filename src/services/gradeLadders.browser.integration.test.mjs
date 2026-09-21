@@ -6,7 +6,10 @@ import { buildGradeTestRuntime, completeReference, finishWork, publishNeedsSourc
 
 let runtime, browser
 const deferred = () => { let resolve; const promise = new Promise((done) => { resolve = done }); return { promise, resolve } }
-async function visible(locator) { await locator.waitFor({ state: 'visible', timeout: 15000 }); return locator }
+async function visible(locator) {
+  try { await locator.waitFor({ state: 'visible', timeout: 15000 }); return locator }
+  catch (error) { throw new Error(`${error.message}\nVisible fixture content:\n${await locator.page().locator('body').innerText()}`, { cause: error }) }
+}
 async function until(check, message) {
   const deadline = Date.now() + 15000
   while (Date.now() < deadline) {
@@ -35,7 +38,7 @@ before(async () => {
 })
 after(async () => { await browser?.close(); await runtime?.close() })
 
-test('direct grade links show feature-service errors and recover through an explicit retry', { timeout: 90000 }, async (t) => {
+test('direct grade links preserve saved evidence during feature-policy errors and recover new admissions explicitly', { timeout: 90000 }, async (t) => {
   const fixture = await startGradeFixture(runtime, { injectAuth: true })
   t.after(() => fixture.close())
   const { detail } = await seededLadder(fixture)
@@ -47,10 +50,12 @@ test('direct grade links show feature-service errors and recover through an expl
       else await route.continue()
     })
     await page.goto(`${fixture.origin}/workspaces/${fixture.workspaceId}/grade-ladders/${detail.ladder.id}`)
-    await visible(page.getByRole('heading', { name: 'The grade service is unavailable', exact: true }))
+    await visible(page.getByRole('heading', { name: detail.ladder.name, exact: true }))
+    assert.equal(await page.getByRole('button', { name: 'Rediscover OPM sources', exact: true }).isDisabled(), true)
     assert.equal(await page.getByRole('heading', { name: 'Loading private grade ladder', exact: true }).count(), 0)
     unavailable = false
-    await page.getByRole('button', { name: 'Retry grade service', exact: true }).click()
+    await page.getByRole('button', { name: 'Refresh application policy', exact: true }).click()
+    await until(async () => await page.getByRole('button', { name: 'Refresh application policy', exact: true }).count() === 0, 'The effective policy refresh should recover without replacing saved evidence')
     await visible(page.getByRole('heading', { name: detail.ladder.name, exact: true }))
     assert.deepEqual(errors, [])
   } finally { await context.close() }

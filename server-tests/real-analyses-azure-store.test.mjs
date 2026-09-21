@@ -128,6 +128,19 @@ test('Cosmos correction publication atomically preserves original evidence, chan
   const response = await f.service.requestCorrection(f.workspaceId, created.run.id, comparisonId, {
     resultSha256: preview.resultSha256, criterionIds: preview.criterionIds, reason: 'Synthetic reviewed evidence gap.',
   }, randomUUID(), preview.etag, ACTOR)
+  const accepted = await api.loadAnalysisCorrection(store, f.workspaceId, created.run.id, comparisonId)
+  const runFence = await store.get(f.workspaceId, created.run.id)
+  const otherPolicy = api.captureProcessingSettings(api.createDefaultAdminSettings(), 'different-correction-policy', f.now)
+  for (const processingSettings of [undefined, otherPolicy]) {
+    const record = clone(accepted.record)
+    if (processingSettings) record.processingSettings = processingSettings
+    else delete record.processingSettings
+    await assert.rejects(store.transact(f.workspaceId, [
+      { kind: 'replace', record, etag: accepted.etag },
+      { kind: 'replace', record: runFence.record, etag: runFence.etag },
+    ]), /Accepted correction processing settings are immutable/)
+    assert.deepEqual(await api.loadAnalysisCorrection(store, f.workspaceId, created.run.id, comparisonId), accepted)
+  }
   assert.ok((await store.listPending(f.now, 100)).some(item => item.record.recordType === 'analysis-correction'))
   assert.ok(!(await api.createAnalysisStoreFromContainer(container).listPending(f.now, 100))
     .some(item => item.record.recordType === 'analysis-correction'))

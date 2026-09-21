@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type ReactNode } from 'react'
+import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
 import { BrowserRouter, useLocation } from 'react-router-dom'
 import { AlertTriangle, Layers3, LogIn, ShieldCheck } from 'lucide-react'
 import { CloudWorkspaceProvider, type CloudWorkspaceProviderApi } from './CloudWorkspaceProvider'
@@ -12,7 +12,7 @@ import type { GradeLeaveProtectionApi } from './grade-navigation-context'
 import { LibraryViewStateProvider } from './LibraryViewStateProvider'
 import {
   authLoginUrl, authLogoutUrl, CloudApiError, CloudAuthError, CloudConflictError,
-  createWorkspace as createWorkspaceApi, fetchSession, listWorkspaces as listWorkspacesApi,
+  createWorkspace as createWorkspaceApi, fetchSession, fetchSessionIdentity, listWorkspaces as listWorkspacesApi,
   readLastWorkspaceId, renameWorkspace as renameWorkspaceApi, safeSameOriginPath,
   validateWorkspaceName, writeLastWorkspaceId,
   clearLastWorkspaceId, getWorkspaceLifecycleImpact as getWorkspaceLifecycleImpactApi, changeWorkspaceLifecycle as changeWorkspaceLifecycleApi, LifecycleOperationError,
@@ -22,6 +22,12 @@ import type { LifecycleAction } from '../domain/lifecycle'
 import { Button } from '../components/ui'
 import { WorkspaceSwitcher } from '../components/workspace/WorkspaceSwitcher'
 import { LifecycleDialogProvider } from '../components/lifecycle/LifecycleControls'
+import { PublicSettingsProvider } from './PublicSettingsProvider'
+import { usePublicSettings } from './public-settings-context'
+import { ApplicationNavigationContext } from './application-navigation-context'
+import { AdminSettingsPage } from '../features/admin/AdminSettingsPage'
+import { defaultApplicationPage } from '../services/publicSettings'
+import '../styles/admin-settings.css'
 
 type Result = { ok: true } | { ok: false; message: string }
 
@@ -31,9 +37,11 @@ type Phase =
   | { kind: 'unavailable'; message: string }
   | { kind: 'workspace-unavailable'; requestedId: string }
   | { kind: 'empty' }
+  | { kind: 'admin' }
   | { kind: 'ready'; workspaceId: string }
 
 const WORKSPACE_PATH = /^\/workspaces\/([^/]+)(?:\/|$)/
+function isAdminSettingsPath(path: string): boolean { return /^\/admin\/settings\/?$/.test(path) }
 
 function resolveRequestedWorkspaceId(): string | null {
   const match = WORKSPACE_PATH.exec(window.location.pathname)
@@ -56,10 +64,16 @@ function resolveRequestedWorkspaceId(): string | null {
  *  - workspace list/create/rename/switch and the flush-then-redirect sign-out flow.
  */
 export function CloudApplication() {
+  return <PublicSettingsProvider><CloudApplicationContent /></PublicSettingsProvider>
+}
+
+function CloudApplicationContent() {
+  const policy = usePublicSettings()
   const [phase, setPhase] = useState<Phase>({ kind: 'loading' })
   const [session, setSession] = useState<CloudSession | null>(null)
   const providerApiRef = useRef<CloudWorkspaceProviderApi | null>(null)
   const gradeLeaveRef = useRef<GradeLeaveProtectionApi | null>(null)
+  const adminLeaveRef = useRef<GradeLeaveProtectionApi | null>(null)
   const aliveRef = useRef(true)
   const lastPathRef = useRef(window.location.pathname + window.location.search + window.location.hash)
   const sessionRef = useRef(session)
@@ -69,13 +83,27 @@ export function CloudApplication() {
   const metadataSequence = useRef(0)
   const lifecyclePending = useRef(false)
   const lastHistoryStateRef = useRef<unknown>(window.history.state)
+  const policyRef = useRef(policy)
+  policyRef.current = policy
+  const initializationReady = isAdminSettingsPath(window.location.pathname) || policy.phase !== 'loading'
+
+  const homePath = useCallback((id: string) => {
+    const host = new URLSearchParams(window.location.search).get('scoutTheme')
+    return `/workspaces/${encodeURIComponent(id)}${defaultApplicationPage(policyRef.current.settings)}${host === 'light' || host === 'dark' ? `?scoutTheme=${host}` : ''}`
+  }, [])
 
   useEffect(() => {
+    if (!initializationReady) return
     aliveRef.current = true
     const controller = new AbortController()
-    fetchSession(controller.signal).then((value) => {
+    const directAdmin = isAdminSettingsPath(window.location.pathname)
+    const sessionRequest: Promise<CloudSession> = directAdmin
+      ? fetchSessionIdentity(controller.signal).then(identity => ({ ...identity, workspaces: [] }))
+      : fetchSession(controller.signal)
+    sessionRequest.then((value) => {
       if (!aliveRef.current || controller.signal.aborted) return
       setSession(value)
+      if (directAdmin) { setPhase({ kind: 'admin' }); return }
       const requested = resolveRequestedWorkspaceId()
       if (requested !== null) {
         if (!value.workspaces.some((item) => item.id === requested && !item.deletedAt)) {
@@ -90,7 +118,7 @@ export function CloudApplication() {
       const active = value.workspaces.filter(isActiveWorkspace)
       const target = (remembered && active.some((item) => item.id === remembered)) ? remembered : active[0]?.id
       if (!target) { clearLastWorkspaceId(value.user.tenantId, value.user.id); setPhase({ kind: 'empty' }); return }
-      window.history.replaceState(null, '', `/workspaces/${encodeURIComponent(target)}/jobs`)
+      window.history.replaceState(null, '', homePath(target))
       writeLastWorkspaceId(value.user.tenantId, value.user.id, target)
       setPhase({ kind: 'ready', workspaceId: target })
     }).catch((error: unknown) => {
@@ -100,7 +128,19 @@ export function CloudApplication() {
       setPhase({ kind: 'unavailable', message })
     })
     return () => { aliveRef.current = false; controller.abort() }
-  }, [])
+  }, [homePath, initializationReady])
+
+  async function openAdminSettings() {
+    if (sessionRef.current?.capabilities?.applicationAdmin !== true) return
+    const prepared = await providerApiRef.current?.prepareToLeave() ?? { ok: true as const }
+    if (!prepared.ok) return
+    const host = new URLSearchParams(window.location.search).get('scoutTheme')
+    const path = `/admin/settings${host === 'light' || host === 'dark' ? `?scoutTheme=${host}` : ''}`
+    window.history.pushState(null, '', path)
+    lastPathRef.current = path
+    lastHistoryStateRef.current = window.history.state
+    setPhase({ kind: 'admin' })
+  }
 
   async function switchWorkspace(id: string, availableSession = session, alreadyPrepared = false): Promise<Result> {
     if (!availableSession) return { ok: false, message: 'Your session is still loading. Try again in a moment.' }
@@ -109,7 +149,7 @@ export function CloudApplication() {
     const flushed = alreadyPrepared ? { ok: true as const } : await providerApiRef.current?.prepareToLeave() ?? { ok: true as const }
     if (!flushed.ok) return flushed
     writeLastWorkspaceId(availableSession.user.tenantId, availableSession.user.id, id)
-    window.history.pushState(null, '', `/workspaces/${encodeURIComponent(id)}/jobs`)
+    window.history.pushState(null, '', homePath(id))
     setPhase({ kind: 'ready', workspaceId: id })
     return { ok: true }
   }
@@ -119,16 +159,31 @@ export function CloudApplication() {
     function onPopState(event: PopStateEvent) {
       if (!session) return
       const requested = resolveRequestedWorkspaceId()
+      const adminRequested = isAdminSettingsPath(window.location.pathname)
+      if (phase.kind === 'admin' && adminRequested) return
       if (phase.kind === 'ready' && phase.workspaceId === requested) return
       event.stopImmediatePropagation()
       const incoming = window.location.pathname + window.location.search + window.location.hash
       const outgoing = lastPathRef.current
       const outgoingState = lastHistoryStateRef.current
-      void (providerApiRef.current?.prepareToLeave() ?? Promise.resolve({ ok: true as const })).then((result) => {
+      const leave = phase.kind === 'admin'
+        ? (adminLeaveRef.current?.confirmLeave() ?? Promise.resolve(true)).then(ok => ({ ok }))
+        : providerApiRef.current?.prepareToLeave() ?? Promise.resolve({ ok: true as const })
+      void leave.then((result) => {
         if (!aliveRef.current) return
         if (!result.ok) {
           window.history.pushState(outgoingState, '', outgoing)
           window.dispatchEvent(new PopStateEvent('popstate', { state: window.history.state }))
+          return
+        }
+        if (adminRequested) {
+          lastPathRef.current = incoming; lastHistoryStateRef.current = event.state
+          setPhase({ kind: 'admin' })
+          return
+        }
+        if (phase.kind === 'admin') {
+          adminLeaveRef.current?.releaseForLeave()
+          window.location.assign(incoming)
           return
         }
         if (requested === null) {
@@ -156,7 +211,7 @@ export function CloudApplication() {
     if (!currentSession) return
     const currentId = phaseRef.current.kind === 'ready' ? phaseRef.current.workspaceId : undefined
     const removed = currentId && !items.some((item) => item.id === currentId && !item.deletedAt)
-    if (removed && !lifecyclePending.current && (providerApiRef.current?.hasPendingChanges() || (gradeLeaveRef.current && !await gradeLeaveRef.current.confirmLeave()))) {
+    if (removed && !lifecyclePending.current && (providerApiRef.current?.hasPendingChanges() || (gradeLeaveRef.current && !await gradeLeaveRef.current.confirmLeave(undefined, true)))) {
       const previous = currentSession.workspaces.find((item) => item.id === currentId)
       if (previous) items.push({ ...previous, deletedAt: new Date().toISOString() })
     } else if (removed && !lifecyclePending.current) {
@@ -232,7 +287,7 @@ export function CloudApplication() {
   }
 
   async function leaveUnavailableWorkspace(): Promise<Result> {
-    if (gradeLeaveRef.current && !await gradeLeaveRef.current.confirmLeave()) return { ok: false, message: 'Leaving was stopped to preserve unsaved changes or a pending request.' }
+    if (gradeLeaveRef.current && !await gradeLeaveRef.current.confirmLeave(undefined, true)) return { ok: false, message: 'Leaving was stopped to preserve unsaved changes or a pending request.' }
     await providerApiRef.current?.discardPendingChanges()
     if (sessionRef.current) clearLastWorkspaceId(sessionRef.current.user.tenantId, sessionRef.current.user.id)
     window.history.replaceState(null, '', '/')
@@ -243,6 +298,9 @@ export function CloudApplication() {
 
   async function createWorkspace(name: string): Promise<Result> {
     if (!session) return { ok: false, message: 'Your session is still loading. Try again in a moment.' }
+    if (policyRef.current.phase !== 'ready' || policyRef.current.settings?.workspaces.allowCreation === false) {
+      return { ok: false, message: policyRef.current.error ?? 'New workspace creation is disabled by application policy.' }
+    }
     const invalid = validateWorkspaceName(name)
     if (invalid) return { ok: false, message: invalid }
     const flushed = await providerApiRef.current?.prepareToLeave() ?? { ok: true as const }
@@ -303,6 +361,17 @@ export function CloudApplication() {
 
   if (phase.kind === 'loading') return <CloudGateShell><p>Connecting to Score in the cloud…</p></CloudGateShell>
 
+  if (phase.kind === 'admin' && session) {
+    if (session.capabilities?.applicationAdmin !== true) return <CloudGateShell tone="error">
+      <ShieldCheck size={30} /><h1>Application administrator access required</h1>
+      <p>Your signed-in account is not designated as an application administrator. Owning a workspace does not grant access to application settings.</p>
+      <Button onClick={() => window.location.assign('/')}>Back to workspaces</Button>
+    </CloudGateShell>
+    return <GradeNavigationProtectionProvider workspaceId="application-settings" routePrefix="/admin/settings" apiRef={adminLeaveRef}>
+      <AdminSettingsPage onLeave={() => { adminLeaveRef.current?.releaseForLeave(); window.location.assign('/') }} />
+    </GradeNavigationProtectionProvider>
+  }
+
   if (phase.kind === 'sign-in') return <CloudGateShell>
     <ShieldCheck size={30} className="mb-1" />
     <h1>Sign in to Score</h1>
@@ -324,12 +393,15 @@ export function CloudApplication() {
     <h1>This workspace is unavailable</h1>
     <p>The workspace in this link doesn't exist, or your account no longer has access to it. Nothing was changed.</p>
     <Button variant="primary" onClick={() => { window.history.replaceState(null, '', '/'); window.location.reload() }}>Go to my workspaces</Button>
+    {session?.capabilities?.applicationAdmin === true && <Button onClick={() => void openAdminSettings()}>Application settings</Button>}
   </CloudGateShell>
 
   if (phase.kind === 'empty' && session) return <CloudGateShell>
     <h1>My workspaces</h1><p>No active workspace is selected. Create a workspace or unarchive one below. Deleted samples are never recreated automatically.</p>
     <WorkspaceSwitcher empty cloud={{ workspaces: session.workspaces, currentWorkspaceId: '', switchWorkspace, createWorkspace, renameWorkspace,
       refreshWorkspaces, getWorkspaceLifecycleImpact, changeWorkspaceLifecycle }} />
+    {policy.settings?.workspaces.allowCreation === false && <p>Creating new workspaces is disabled by application policy. Existing workspace history is unchanged.</p>}
+    {session.capabilities?.applicationAdmin === true && <Button onClick={() => void openAdminSettings()}>Application settings</Button>}
     <Button onClick={onSignedOut}>Sign out</Button>
   </CloudGateShell>
 
@@ -339,7 +411,7 @@ export function CloudApplication() {
   if (!activeSession) throw new Error('The cloud session is missing after initialization.')
   const viewScope = JSON.stringify([activeSession.user.tenantId, activeSession.user.id, workspaceId])
   // Keep pending saves above the router when browser history temporarily crosses its basename.
-  return <LibraryViewStateProvider scopeKey={viewScope}><GradeNavigationProtectionProvider key={workspaceId} workspaceId={workspaceId} apiRef={gradeLeaveRef}><CloudWorkspaceProvider
+  return <ApplicationNavigationContext.Provider value={{ applicationAdmin: activeSession.capabilities?.applicationAdmin === true, openAdminSettings }}><LibraryViewStateProvider scopeKey={viewScope}><GradeNavigationProtectionProvider key={workspaceId} workspaceId={workspaceId} apiRef={gradeLeaveRef}><CloudWorkspaceProvider
         key={workspaceId}
         workspaceId={workspaceId}
         user={activeSession.user}
@@ -362,7 +434,7 @@ export function CloudApplication() {
         <App />
       </RealAnalysesBridge></RealResumesBridge></RealGradeLaddersBridge></RealJobsBridge></GradeRouterProtection>
     </BrowserRouter>}
-  </CloudWorkspaceProvider></GradeNavigationProtectionProvider></LibraryViewStateProvider>
+  </CloudWorkspaceProvider></GradeNavigationProtectionProvider></LibraryViewStateProvider></ApplicationNavigationContext.Provider>
 }
 
 function isActiveWorkspace(workspace: WorkspaceSummary): boolean {
@@ -379,9 +451,10 @@ function TrackCloudPath({ pathRef, stateRef, basename }: { pathRef: { current: s
 }
 
 function CloudGateShell({ children, tone = 'default' }: { children: ReactNode; tone?: 'default' | 'error' }) {
+  const { settings } = usePublicSettings()
   return <LifecycleDialogProvider><main className="recovery-page">
     <div className={`panel recovery-card cloud-gate-card ${tone === 'error' ? 'is-error' : ''}`}>
-      <span className="cloud-gate-brand"><Layers3 size={20} strokeWidth={2} /> score<span className="brand-period">.</span></span>
+      <span className="cloud-gate-brand"><Layers3 size={20} strokeWidth={2} />{settings?.appearance.applicationTitle ?? 'Score'}</span>
       {children}
     </div>
   </main></LifecycleDialogProvider>

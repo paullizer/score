@@ -303,7 +303,7 @@ export function CloudWorkspaceProvider({
   }, [metadataStamp])
 
   async function prepareToLeave(): Promise<Result> {
-    if (leaveProtectionRef?.current && !await leaveProtectionRef.current.confirmLeave()) {
+    if (leaveProtectionRef?.current && !await leaveProtectionRef.current.confirmLeave(undefined, true)) {
       return { ok: false, reason: 'grade-protection', message: 'Leaving was stopped to preserve unsaved changes or an in-flight request.' }
     }
     engineRef.current?.stopPendingOperations('This browser paused the demo operations while leaving the workspace. Completed results are kept; retry unfinished items later.')

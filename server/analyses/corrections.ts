@@ -80,7 +80,8 @@ export async function publishAnalysisCorrection(
   parseAnalysisResult(result)
   const sameClaim = (record: RealAnalysisCorrectionRecord) => record.requestId === claimed.requestId &&
     record.requestFingerprint === claimed.requestFingerprint && record.attemptId === claimed.attemptId &&
-    record.attempts === claimed.attempts && record.retryCount === claimed.retryCount
+    record.attempts === claimed.attempts && record.retryCount === claimed.retryCount &&
+    analysisHash(record.processingSettings ?? null) === analysisHash(claimed.processingSettings ?? null)
   for (let race = 0; race < 8; race++) {
     signal?.throwIfAborted()
     const [run, work, original] = await Promise.all([
@@ -147,7 +148,9 @@ export async function publishAnalysisCorrection(
     progress[before.resultSummary!.overall.status === 'available' ? 'scored' : 'unscored']--
     progress[after.resultSummary!.overall.status === 'available' ? 'scored' : 'unscored']++
     const parent = { ...run.record, progress, updatedAt: timestamp }
-    const narratives = await prepareAnalysisNarrativeTransitions(deps.store, parent, [{ previous: before, next: after }], timestamp)
+    const narratives = await prepareAnalysisNarrativeTransitions(
+      deps.store, parent, [{ previous: before, next: after }], timestamp, work.record.processingSettings,
+    )
     parseAnalysisEntity(record)
     parseAnalysisEntity(parent)
     signal?.throwIfAborted()

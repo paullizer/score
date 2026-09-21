@@ -153,6 +153,9 @@ before(async () => {
       export { RealAnalysesContext, useRealAnalyses } from './src/app/real-analyses-context';
       export { RealResumesContext } from './src/app/real-resumes-context';
       export { WorkspaceContext, useWorkspace } from './src/app/workspace-context';
+      export { PublicSettingsContext } from './src/app/public-settings-context';
+      export { createDefaultAdminSettings, captureProcessingSettings } from './src/domain/admin-settings';
+      export { effectiveFeatures } from './server/settings/features';
       export { RealAnalysisSetup } from './src/features/analyses/RealAnalysisSetup';
       export { RealResumesPage } from './src/features/resumes/RealResumesPage';
       export { RealComparisonReview } from './src/features/analyses/RealComparisonReview';
@@ -255,6 +258,39 @@ test('run creation sends typed exact selections only, preserves UUIDs, allows 50
   assert.deepEqual(Object.keys(JSON.parse(requests.at(-1).init.body)).sort(), ['name', 'resumes', 'targets'])
   assert.equal(JSON.parse(requests.at(-1).init.body).resumes[0].document, undefined)
   assert.equal(JSON.parse(requests.at(-1).init.body).targets[0].approved, undefined)
+})
+
+test('analysis submission recovery retains immutable validated bytes and surfaces authoritative rejection', async () => {
+  const settings = ui.createDefaultAdminSettings()
+  const projection = () => ui.effectiveFeatures({
+    realJobImports: true, realGradeLadders: true, realResumeImports: true, realAnalyses: true,
+    analysisSummaryGeneration: true, wordDocumentImports: true,
+  }, ui.captureProcessingSettings(settings, 'submission-policy', timestamp), true, true).publicSettings
+  const input = { name: 'Original exact request', resumes: [resumeSelection()], targets: [target().selection] }
+  let attempts = 0
+  globalThis.fetch = async (url, init) => {
+    requests.push({ url, init })
+    if (++attempts === 1) throw new TypeError('Response lost before acceptance could be confirmed.')
+    return json({ error: { code: 'unavailable', message: 'No prior acceptance exists; current policy blocks new processing.' } }, 503)
+  }
+  assert.throws(() => client.startRealAnalysisSubmission(workspaceId, input, 'not-a-uuid', projection()), /stable UUID/)
+  assert.throws(() => client.startRealAnalysisSubmission(workspaceId, { ...input, resumes: [resumeSelection(), resumeSelection()] }, key, projection()), /only once/)
+  assert.throws(() => client.startRealAnalysisSubmission(workspaceId, { ...input, resumes: [{ ...resumeSelection(), documentSha256: 'invalid' }] }, key, projection()), /exact ready resume/)
+  assert.throws(() => client.startRealAnalysisSubmission(workspaceId, { ...input, resumes: Array.from({ length: 501 }, (_, index) => resumeSelection(`resume-${index}`)) }, key, projection()), /at most 500/)
+  assert.equal(requests.length, 0, 'Hard-invalid inputs cannot obtain a recovery handle or reach HTTP')
+  const submission = client.startRealAnalysisSubmission(workspaceId, input, key, projection())
+  await assert.rejects(submission.result, /Response lost/)
+  const originalBody = requests[0].init.body
+  input.name = 'Changed caller state'
+  input.resumes[0].documentVersion = 2
+  input.targets[0].rubricVersion = 2
+  settings.features.newAnalyses = false
+  await assert.rejects(client.createRealAnalysis(workspaceId, input, randomUUID(), projection()), /disabled by application policy/)
+  assert.equal(requests.length, 1, 'A fresh call cannot use the recovery path')
+  await assert.rejects(submission.retry(), /No prior acceptance exists; current policy blocks new processing/)
+  assert.equal(requests.length, 2)
+  assert.equal(requests[1].init.body, originalBody, 'Mutating caller objects cannot change a retained request')
+  assert.equal(requests[1].init.headers.get('Idempotency-Key'), key)
 })
 
 test('103 resumes against four jobs are submitted as one complete 412-comparison request', async () => {
@@ -697,6 +733,36 @@ test('legacy and unavailable current attempts never borrow older reasons; diagno
   assert.equal(calls, 2)
 })
 
+test('policy-disabled diagnostic capture is explicit without hiding earlier saved attempts or implying failed persistence', async () => {
+  const saved = comparisonDetail('job')
+  const older = diagnosticFixture(saved, 'prior-enabled-attempt')
+  const detail = failedComparisonFixture(saved, older)
+  detail.comparison.attemptId = 'capture-disabled-attempt'
+  detail.comparison.diagnosticCapture = { attemptId: detail.comparison.attemptId, status: 'disabled', pipelineVersion: 'fixture-disabled-capture' }
+  let calls = 0
+  const api = { ...baseApi, diagnostics: async () => { calls++; return { attempts: [older] } } }
+  const content = () => React.createElement(ui.RealAnalysesContext.Provider, { value: api }, React.createElement(ui.RealComparisonReview, { detail }))
+  await render(content())
+  assert.match(dom.window.document.body.textContent, /Private diagnostic capture was disabled by application policy for this attempt/)
+  assert.match(dom.window.document.body.textContent, /Assessment and grounding requirements are unchanged; no passing result is implied/)
+  assert.doesNotMatch(dom.window.document.body.textContent, /could not be saved|reference for this attempt is unavailable/)
+  assert.equal(calls, 0, 'Disabling new capture does not eagerly fetch older private reasons')
+  assert.equal(dom.window.document.querySelector('.overall-score'), null)
+  await act(async () => [...dom.window.document.querySelectorAll('summary')].find(item => item.textContent === 'Failure diagnostics and saved attempt history').click())
+  await settle(() => dom.window.document.body.textContent.includes(privateReviewReason))
+  assert.equal(calls, 1)
+  assert.match(dom.window.document.body.textContent, /Historical failure/)
+  assert.doesNotMatch(dom.window.document.body.textContent, /Recorded error for the current attempt/)
+  detail.comparison.status = 'complete'
+  detail.comparison.attemptId = 'later-successful-attempt'
+  delete detail.comparison.error
+  detail.result = saved.result
+  await render(content())
+  assert.match(dom.window.document.body.textContent, /diagnostic capture was disabled by application policy for an earlier attempt/)
+  assert.match(dom.window.document.querySelector('.overall-score').textContent, /36/)
+  assert.equal(calls, 1)
+})
+
 test('a diagnostic for different frozen snapshots is not displayed and stale comparison responses are discarded', async () => {
   const saved = comparisonDetail('job')
   const diagnostic = diagnosticFixture(saved)
@@ -744,7 +810,8 @@ function router(element, location = '/analyses/new?data=real') {
   return React.createElement(ui.MemoryRouter, { initialEntries: [entry], future: { v7_startTransition: true, v7_relativeSplatPath: true } }, element)
 }
 const baseApi = { workspaceId, canWrite: true, phase: 'ready', features: { realAnalyses: true, analysisLimits: { maxComparisons: 500 } },
-  error: null, summaries: [], pending: () => false, detail: () => ({ state: 'idle' }), ensureDetail: async () => {}, refresh: async () => {}, refreshTargets: async () => {}, requestKey: () => key }
+  error: null, summaries: [], pending: () => false, detail: () => ({ state: 'idle' }), ensureDetail: async () => {}, refresh: async () => {}, refreshTargets: async () => {}, requestKey: () => key,
+  hasRetainedCreation: () => false }
 const baseResumes = { workspaceId, canWrite: true, phase: 'ready', error: null, features: { realResumeImports: true }, refresh: async () => {} }
 function builder(api, resumes, location) {
   return router(React.createElement(ui.RealAnalysesContext.Provider, { value: api },
@@ -815,7 +882,9 @@ test('103-resume library navigation preserves every exact selection and requires
 test('builder requires a manual click, keeps exact versions while targets refresh, and marks newer drafts', async () => {
   const calls = []
   let eligible = target('grade', 1)
-  const api = { ...baseApi, targets: { state: 'ready', value: [eligible] }, create: async (input, requestKey) => { calls.push({ input, requestKey }); throw new Error('Response lost; acceptance unknown.') } }
+  const submit = async (input, requestKey) => { calls.push({ input, requestKey }); throw new Error('Response lost; acceptance unknown.') }
+  const api = { ...baseApi, targets: { state: 'ready', value: [eligible] }, create: submit, recoverCreation: submit,
+    hasRetainedCreation: (input, requestKey) => calls.some(call => call.requestKey === requestKey && JSON.stringify(call.input) === JSON.stringify(input)) }
   const location = ui.realAnalysisLink({ resumes: [resumeSelection()], targets: [eligible.selection] })
   await render(builder(api, [resumeSummary()], location))
   assert.equal(calls.length, 0)
@@ -1304,6 +1373,165 @@ test('analysis provider keeps uncertain creation keys across view remounts and n
   assert.equal(JSON.stringify(legacy), before)
   assert.equal(dom.window.localStorage.length, 0)
 })
+
+for (const change of ['disabled analyses', 'inactive rollout', 'lower comparison limit', 'unavailable policy']) {
+  test(`unchanged analysis creation recovers the original request after ${change} without reopening new admissions`, async () => {
+    const settings = ui.createDefaultAdminSettings()
+    const capabilities = {
+      realJobImports: true, realGradeLadders: true, realResumeImports: true, realAnalyses: true,
+      analysisSummaryGeneration: true, wordDocumentImports: true,
+    }
+    const originalPin = ui.captureProcessingSettings(settings, 'accepted-policy', timestamp)
+    let features = ui.effectiveFeatures(capabilities, originalPin, true, true)
+    let policy = { cloud: true, phase: 'ready', settings: features.publicSettings, error: null, refresh: async () => {} }
+    let unavailable = false
+    let accepted = null
+    let manifest = null
+    const input = { name: 'Unchanged captured request', resumes: [resumeSelection(), resumeSelection('resume-two')], targets: [target().selection] }
+    globalThis.fetch = async (url, init) => {
+      requests.push({ url, init })
+      if (url === '/api/features') return unavailable ? json({ error: { code: 'unavailable', message: 'Current policy is unavailable.' } }, 503) : json(features)
+      if (url.endsWith('/targets')) return json({ targets: [target()] })
+      if (init.method === 'GET') return json({ runs: accepted ? [accepted] : [] })
+      assert.equal(init.method, 'POST')
+      const request = { body: init.body, key: init.headers.get('Idempotency-Key') }
+      if (!manifest) {
+        manifest = request
+        throw new TypeError('Response lost after saving the immutable manifest, before run creation.')
+      }
+      assert.deepEqual(request, manifest, 'Recovery sends only the exact original request and key')
+      accepted = runSummary('recovered-original', 'queued')
+      accepted.run.processingSettings = originalPin
+      return json({ run: accepted }, 202)
+    }
+    const tree = (role = 'owner') => React.createElement(ui.PublicSettingsContext.Provider, { value: policy }, bridge(workspaceId, role))
+    await render(tree())
+    await settle(() => current?.phase === 'ready' && current.features?.realAnalyses)
+    const requestKey = current.requestKey(input)
+    await act(async () => { await assert.rejects(current.create(input, requestKey), /Response lost/) })
+    assert.equal(accepted, null, 'The acknowledged-unknown request has no run record to retry yet')
+
+    if (change === 'disabled analyses') settings.features.newAnalyses = false
+    if (change === 'lower comparison limit') settings.analyses.maxComparisons = 1
+    unavailable = change === 'unavailable policy'
+    features = ui.effectiveFeatures(capabilities, ui.captureProcessingSettings(settings, 'changed-policy', timestamp), change !== 'inactive rollout', true)
+    policy = { ...policy, settings: unavailable ? policy.settings : features.publicSettings,
+      phase: unavailable ? 'error' : 'ready', error: unavailable ? 'Current policy is unavailable.' : null }
+    await render(tree())
+    await act(async () => { await current.refresh() })
+    assert.equal(current.phase, 'ready', 'Authorized historical analysis service remains available')
+    await act(async () => {
+      await assert.rejects(current.create({ ...input, name: 'A separate new request' }, randomUUID()), /policy|unavailable|paused|at most 1/i)
+      await assert.rejects(current.recoverCreation({ ...input, name: 'Altered retained request' }, requestKey), /unchanged original/)
+      await assert.rejects(current.recoverCreation(input, randomUUID()), /No submitted request is retained/)
+    })
+    assert.equal(current.hasRetainedCreation(input, requestKey), true)
+    assert.equal(current.hasRetainedCreation({ ...input, name: 'Altered retained request' }, requestKey), false)
+    await render(tree('viewer'))
+    await act(async () => { await assert.rejects(current.recoverCreation(input, requestKey), /read-only/) })
+    await render(tree())
+    assert.equal(requests.filter(request => request.init.method === 'POST').length, 1, 'No fresh operation bypasses changed admission policy')
+    await act(async () => { await current.create(input, requestKey) })
+    const posts = requests.filter(request => request.init.method === 'POST')
+    assert.equal(posts.length, 2)
+    assert.equal(posts[1].init.body, posts[0].init.body)
+    assert.equal(posts[1].init.headers.get('Idempotency-Key'), requestKey)
+    assert.equal(accepted.run.processingSettings.revision, 'accepted-policy')
+    assert.deepEqual(JSON.parse(posts[1].init.body), input, 'No client policy or replacement input is sent as authority')
+    assert.equal(current.hasRetainedCreation(input, requestKey), false, 'Acknowledgement consumes the retained recovery handle')
+  })
+}
+
+for (const change of ['disabled analyses', 'inactive rollout', 'lower comparison limit', 'unavailable policy']) {
+  test(`builder enables only exact submitted-request recovery after ${change}`, async () => {
+    const settings = ui.createDefaultAdminSettings()
+    const capabilities = {
+      realJobImports: true, realGradeLadders: true, realResumeImports: true, realAnalyses: true,
+      analysisSummaryGeneration: true, wordDocumentImports: true,
+    }
+    let features = ui.effectiveFeatures(capabilities, ui.captureProcessingSettings(settings, 'initial-policy', timestamp), true, true)
+    let policy = { cloud: true, phase: 'ready', settings: features.publicSettings, error: null, refresh: async () => {} }
+    let policyUnavailable = false
+    let historyUnavailable = false
+    let role = 'owner'
+    let accepted = null
+    let manifest = null
+    const sources = [resumeSummary(), resumeSummary('resume-two')]
+    const selected = { resumes: sources.map(ui.realResumeSelection), targets: [target().selection] }
+    let resumeApi = { ...baseResumes, summaries: sources }
+    globalThis.fetch = async (url, init) => {
+      requests.push({ url, init })
+      if (url === '/api/features') return policyUnavailable ? json({ error: { code: 'unavailable', message: 'Current policy store is unavailable.' } }, 503) : json(features)
+      if (url.endsWith('/targets')) return json({ targets: [target()] })
+      if (init.method === 'GET') return historyUnavailable
+        ? json({ error: { code: 'unavailable', message: 'Historical analysis service is unavailable.' } }, 503)
+        : json({ runs: accepted ? [accepted] : [] })
+      assert.equal(init.method, 'POST')
+      const request = { body: init.body, key: init.headers.get('Idempotency-Key') }
+      if (!manifest) {
+        manifest = request
+        throw new TypeError('Acknowledgement lost after manifest capture; no run record exists yet.')
+      }
+      assert.deepEqual(request, manifest)
+      accepted = runSummary('recovered-builder')
+      return json({ run: accepted }, 202)
+    }
+    const tree = () => React.createElement(ui.PublicSettingsContext.Provider, { value: policy },
+      router(React.createElement(ui.WorkspaceContext.Provider, { value: frontendWorkspaceContext({
+        workspace: legacy, cloud: { currentWorkspaceId: workspaceId, workspaces: [{ id: workspaceId, role }] },
+      }) }, React.createElement(ui.RealAnalysesBridge, { workspaceId },
+        React.createElement(Probe),
+        React.createElement(ui.RealResumesContext.Provider, { value: resumeApi },
+          React.createElement(ui.Routes, null,
+            React.createElement(ui.Route, { path: '/analyses/new', element: React.createElement(ui.RealAnalysisSetup) }),
+            React.createElement(ui.Route, { path: '/analyses/:id', element: React.createElement('h1', null, 'Recovered original submission') }))))),
+      ui.realAnalysisLink(selected, workspaceId)))
+    const action = label => [...dom.window.document.querySelectorAll('button')].find(button => button.textContent === label)
+    await render(tree())
+    await settle(() => action('Run analysis')?.disabled === false)
+    await act(async () => { action('Run analysis').click() })
+    await settle(() => Boolean(action('Retry unchanged submission')))
+    assert.equal(accepted, null)
+    assert.equal(requests.filter(request => request.init.method === 'POST').length, 1)
+    assert.equal(dom.window.document.querySelector('.analysis-summary input').disabled, true, 'Unknown-acceptance name and inputs remain locked')
+
+    if (change === 'disabled analyses') settings.features.newAnalyses = false
+    if (change === 'lower comparison limit') settings.analyses.maxComparisons = 1
+    policyUnavailable = change === 'unavailable policy'
+    features = ui.effectiveFeatures(capabilities, ui.captureProcessingSettings(settings, 'changed-policy', timestamp), change !== 'inactive rollout', true)
+    policy = { ...policy, settings: policyUnavailable ? policy.settings : features.publicSettings,
+      phase: policyUnavailable ? 'error' : 'ready', error: policyUnavailable ? 'Current policy store is unavailable.' : null }
+    resumeApi = { ...resumeApi, phase: change === 'disabled analyses' ? 'unavailable' : 'error', summaries: [],
+      error: change === 'disabled analyses' ? 'Resume storage is not configured.' : 'New input lookup is unavailable.' }
+    await render(tree())
+    await act(async () => { await current.refresh() })
+    await settle(() => action('Retry unchanged submission')?.disabled === false)
+    assert.equal(current.phase, 'ready')
+    assert.match(dom.window.document.body.textContent, /server recovers any prior acceptance or applies current policy if this request was never accepted/)
+    assert.equal(dom.window.document.querySelector('.comparison-count strong').textContent, '2')
+    assert.match(dom.window.document.querySelector('.comparison-count').textContent, /Original submitted count/)
+    assert.doesNotMatch(dom.window.document.body.textContent, /2 comparisons exceeds the 1-comparison limit/)
+
+    role = 'viewer'
+    await render(tree())
+    assert.equal(action('Retry unchanged submission').disabled, true, 'Recovery does not grant workspace write permission')
+    role = 'owner'
+    historyUnavailable = true
+    await render(tree())
+    await act(async () => { await current.refresh() })
+    assert.equal(action('Retry unchanged submission').disabled, true, 'Recovery requires the authorized historical service')
+    historyUnavailable = false
+    await act(async () => { await current.refresh() })
+    await settle(() => action('Retry unchanged submission')?.disabled === false)
+    assert.equal(requests.filter(request => request.init.method === 'POST').length, 1, 'Refresh and policy changes never resubmit automatically')
+    await act(async () => { action('Retry unchanged submission').click() })
+    await settle(() => dom.window.document.body.textContent.includes('Recovered original submission'))
+    const posts = requests.filter(request => request.init.method === 'POST')
+    assert.equal(posts.length, 2)
+    assert.equal(posts[1].init.body, posts[0].init.body)
+    assert.equal(posts[1].init.headers.get('Idempotency-Key'), posts[0].init.headers.get('Idempotency-Key'))
+  })
+}
 
 test('stale list responses cannot replace acknowledged run mutations; workspace switches discard old private state', async () => {
   const stale = deferred()

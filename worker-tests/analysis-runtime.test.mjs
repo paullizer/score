@@ -5,6 +5,7 @@ import path from 'node:path'
 import { after, test } from 'node:test'
 import { pathToFileURL } from 'node:url'
 import { build } from 'esbuild'
+import { settingsSnapshot } from './runtime-settings-test-support.mjs'
 import { assertLosslessResume, passageSelection } from './analysis-selection-test-support.mjs'
 import { narrativeModelResponse } from '../server-tests/real-analysis-narratives.test-support.mjs'
 import {
@@ -671,7 +672,7 @@ test('exhausted semantic review retains private reasons and exact assessment bin
   assert.doesNotMatch(JSON.stringify(completedReport), /PRIVATE-REVIEW-SENTINEL|failureDiagnostic|diagnosticCapture/)
 })
 
-test('diagnostic write failures are explicit and do not mask the actual model failure or erase earlier history', async () => {
+test('diagnostic write failures round-trip historical statuses without masking the actual failure or erasing history', async () => {
   const f = fixture()
   const created = await createRun(f)
   const mock = modelFor(f, ({ kind, body }) => {
@@ -680,11 +681,13 @@ test('diagnostic write failures are explicit and do not mask the actual model fa
     value.criteria[0].score = 7
     return value
   })
+
   const events = []
   mock.deps.onEvent = event => events.push(event)
   await runAnalysisWorker(mock.deps)
   let saved = comparisons(f, created.run.id)[0]
   assert.equal(saved.record.diagnosticCapture.status, 'saved')
+  assert.deepEqual(api.parseAnalysisEntity(JSON.parse(JSON.stringify(saved.record))).diagnosticCapture, saved.record.diagnosticCapture)
   const previous = clone(saved.record.failureDiagnostic)
   await f.service.comparisonAction(f.workspaceId, created.run.id, saved.record.id, 'retry', saved.etag)
   const put = f.analysis.blobs.putImmutable.bind(f.analysis.blobs)
@@ -698,6 +701,7 @@ test('diagnostic write failures are explicit and do not mask the actual model fa
   assert.equal(saved.record.error.code, 'invalid-model-output')
   assert.equal(saved.record.diagnosticCapture.status, 'unavailable')
   assert.equal(saved.record.diagnosticCapture.attemptId, saved.record.attemptId)
+  assert.deepEqual(api.parseAnalysisEntity(JSON.parse(JSON.stringify(saved.record))).diagnosticCapture, saved.record.diagnosticCapture)
   assert.deepEqual(saved.record.failureDiagnostic, previous)
   assert.ok(events.some(event => event.event === 'diagnostic-write-failed' && event.code === 'storage-error'))
   assert.doesNotMatch(JSON.stringify(events), /PRIVATE-STORAGE-ERROR-SENTINEL/)
@@ -705,6 +709,63 @@ test('diagnostic write failures are explicit and do not mask the actual model fa
   assert.equal(page.attempts[0].attemptId, previous.attemptId)
   assert.equal(page.attempts[0].reason, 'schema-mismatch')
   assert.deepEqual(page.attempts[0].schemaDiagnostics.findings[0].path, ['criteria', 0, 'score'])
+})
+
+test('captured analysis automatic attempts do not adopt the current retry policy', async () => {
+  const f = fixture()
+  const accepted = settingsSnapshot(settings => {
+    settings.processing.analyses.maxAutomaticAttempts = 1
+    settings.ai.transport.maxAttempts = 1
+  })
+  f.service = new api.RealAnalysisService(f.analysis, { resumes: f.resumes, jobs: f.jobs, grades: f.grades },
+    () => new Date(f.now), async () => accepted)
+  const created = await createRun(f)
+  const mock = modelFor(f, () => new Response('', { status: 503 }))
+  mock.deps.settings = { legacy: accepted, current: async () => settingsSnapshot(() => {}, 'newer-analysis-policy') }
+  await runAnalysisWorker(mock.deps)
+  const failed = comparisons(f, created.run.id)[0].record
+  assert.equal(failed.status, 'failed')
+  assert.equal(failed.attempts, 1)
+  assert.equal(failed.nextAttemptAt, undefined)
+  assert.equal(mock.calls.length, 1)
+  assert.equal(mock.calls[0].request.model, 'deployment-assessment')
+})
+
+test('captured diagnostic opt-out skips private artifacts without weakening assessment validation', async () => {
+  const f = fixture()
+  const snapshot = settingsSnapshot(settings => {
+    settings.diagnostics.capturePrivateFailures = false
+    settings.analyses.maxOutputCorrections = 0
+  })
+  f.service = new api.RealAnalysisService(f.analysis, { resumes: f.resumes, jobs: f.jobs, grades: f.grades },
+    () => new Date(f.now), async () => snapshot)
+  const created = await createRun(f)
+  const write = f.analysis.blobs.putImmutable.bind(f.analysis.blobs)
+  f.analysis.blobs.putImmutable = async (name, bytes, type) => {
+    assert.ok(!name.includes('/diagnostics/'), 'disabled capture must not write a private diagnostic artifact')
+    return write(name, bytes, type)
+  }
+  const mock = modelFor(f, ({ kind, body }) => {
+    if (kind !== 'resume_rubric_assessment') return
+    const value = modelAssessment(body.input)
+    value.criteria[0].score = 7
+    return value
+  })
+  const events = []
+  mock.deps.onEvent = event => events.push(event)
+  await runAnalysisWorker(mock.deps)
+  const failed = comparisons(f, created.run.id)[0].record
+  assert.equal(failed.status, 'failed')
+  assert.equal(failed.error.code, 'invalid-model-output')
+  assert.equal(failed.diagnosticCapture.status, 'disabled')
+  assert.deepEqual(api.parseAnalysisEntity(JSON.parse(JSON.stringify(failed))).diagnosticCapture, failed.diagnosticCapture)
+  const legacy = JSON.parse(JSON.stringify(failed))
+  delete legacy.diagnosticCapture
+  assert.equal(api.parseAnalysisEntity(legacy).diagnosticCapture, undefined)
+  assert.equal(failed.failureDiagnostic, undefined)
+  assert.equal(failed.result, undefined)
+  assert.equal(mock.calls.length, 1)
+  assert.ok(!events.some(event => event.event === 'diagnostic-write-failed'))
 })
 
 test('ambiguous diagnostic upload acknowledgments recover the exact immutable artifact without repeating model work', async () => {

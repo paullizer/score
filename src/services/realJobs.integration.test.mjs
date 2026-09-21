@@ -643,6 +643,41 @@ function JobsProbe() {
   return React.createElement('span', null, current.phase)
 }
 
+for (const policyUnavailable of [false, true]) {
+  test(`job StrictMode bootstrap releases aborted reads and loads history with ${policyUnavailable ? 'unavailable' : 'ready'} feature policy`, async () => {
+    const record = markdownDetail()
+    globalThis.fetch = async (url, init) => {
+      requests.push({ url, init })
+      if (url === '/api/features') return policyUnavailable
+        ? json({ error: { code: 'unavailable', message: 'Current policy is unavailable.' } }, 503)
+        : json({ realJobImports: true, markdownJobImports: true })
+      if (url.endsWith('/jobs')) return json({ jobs: [{ ...record, document: undefined, rubricVersions: undefined }] })
+      if (url.endsWith(`/jobs/${record.job.id}`)) return json(record)
+      throw new Error(`Unexpected bootstrap request: ${url}`)
+    }
+    const value = workspaceValue()
+    const { cloud, ...legacyValue } = value
+    await mount(React.createElement(React.StrictMode, null,
+      React.createElement(ui.RealJobsBridge, { workspaceId: 'workspace-one', legacyValue, cloud },
+        React.createElement(JobsProbe))), value, `/jobs/${record.job.id}`)
+    for (let index = 0; index < 30 && (current?.phase !== 'ready' || current.detail(record.job.id).state !== 'ready'); index++) {
+      await act(async () => { await new Promise(resolve => setTimeout(resolve, 0)) })
+    }
+    assert.equal(current.phase, 'ready', 'StrictMode cleanup must release the aborted initial list request')
+    assert.equal(current.detail(record.job.id).state, 'ready', 'A cold source link loads its captured detail without manual refresh')
+    assert.deepEqual(current.detail(record.job.id).value.document, record.document)
+    const lists = requests.filter(request => request.url.endsWith('/jobs'))
+    assert.equal(lists.length, 2, 'Only the cancelled bootstrap and its replacement are fetched')
+    assert.equal(lists[0].init.signal.aborted, true)
+    assert.equal(lists[1].init.signal.aborted, false)
+    if (policyUnavailable) {
+      assert.equal(current.features, null)
+      assert.throws(() => current.importPdf(new File(['%PDF-source'], 'source.pdf'), randomUUID()), /New job imports are unavailable/)
+      assert.equal(requests.some(request => request.init.method === 'POST'), false, 'Unavailable policy never enables new imports')
+    }
+  })
+}
+
 test('job rename projects acknowledged metadata and preserves ready source details outside sample persistence', async () => {
   let record = markdownDetail()
   const original = structuredClone(record)

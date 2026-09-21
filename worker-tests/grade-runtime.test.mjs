@@ -5,6 +5,7 @@ import path from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { after, before, test } from 'node:test'
 import { build } from 'esbuild'
+import { settingsSnapshot } from './runtime-settings-test-support.mjs'
 import { PDFDocument } from 'pdf-lib'
 import { installGradeLifecycleFake, installGradeBlobLifecycleFake, gradeLifecycleTesting } from '../server-tests/grade-lifecycle-fakes.mjs'
 import {
@@ -405,12 +406,18 @@ test('worker rejects invalid limits before requesting tasks', async () => {
 
 test('competency planning atomically creates independent tasks for every selected grade', async () => {
   const f = fixture({ kind: 'plan-competencies', sourceSetId: setId, generationId })
+  const accepted = settingsSnapshot(() => {}, 'accepted-grade-operation')
+  const newer = settingsSnapshot(settings => { settings.ai.tasks.gradeDraft.deploymentId = 'gradeReview' }, 'newer-ladder-settings')
+  f.store.set({ ...f.work, processingSettings: accepted })
+  f.store.set({ ...f.ladder, processingSettings: newer })
+  f.deps.settings = { legacy: accepted, current: async () => newer }
   await f.blobs.putImmutable(f.sourceSet.sources[0].documentBlobName, bytesOf(f.document), 'application/json')
   await f.blobs.putImmutable(f.ladder.seedBlobName, bytesOf({
     job: { id: f.ladder.seedJobId }, rubric: { id: f.ladder.seedRubricId, version: 1 },
     document: f.document, source: {}, capturedAt: now,
   }), 'application/json')
   f.deps.planCompetencies = async input => {
+    assert.equal(input.processingSettings.revision, accepted.revision)
     assert.equal(input.sourceSet.id, setId)
     assert.equal(input.seed.rubric.id, f.ladder.seedRubricId)
     return {
@@ -423,9 +430,87 @@ test('competency planning atomically creates independent tasks for every selecte
   const tasks = f.store.values().filter(record => record.recordType === 'grade-work' && record.input.kind === 'generate-grade')
   assert.deepEqual(tasks.map(task => task.input.grade).sort((left, right) => left - right), [9, 11])
   assert.ok(tasks.every(task => task.input.sourceSetId === setId && task.input.generationId === generationId))
+  assert.ok(tasks.every(task => task.processingSettings.revision === accepted.revision))
   const plans = f.store.values().filter(record => record.recordType === 'grade-competency-plan')
   assert.equal(plans.length, 1)
   assert.equal(plans[0].model, 'model-from-response')
+  assert.equal(plans[0].processingSettings.revision, accepted.revision)
+})
+
+for (const provenance of ['revision-only', 'historical-full']) {
+  test(`${provenance} frozen reference policies remain provenance while generation uses its own accepted settings`, async () => {
+    const f = fixture({ kind: 'plan-competencies', sourceSetId: setId, generationId })
+    const captured = settingsSnapshot(settings => { settings.grades.references.maxSources = 1 }, 'reference-capture-policy')
+    const accepted = settingsSnapshot(() => {}, 'accepted-generation-policy')
+    const current = settingsSnapshot(settings => { settings.grades.references.maxSources = 1 }, 'current-policy')
+    const template = f.sourceSet.sources[0]
+    f.sourceSet.sources = Array.from({ length: 15 }, () => {
+      const sourceId = `source-${randomUUID()}`
+      return {
+        ...template, sourceId, documentId: `document-${randomUUID()}`,
+        documentBlobName: `${wid}/${lid}/${sourceId}/document-v1.json`,
+        originalBlobName: `${wid}/${lid}/${sourceId}/original.html`,
+        ...(provenance === 'revision-only' ? { processingSettingsRevision: captured.revision } : { processingSettings: captured }),
+      }
+    })
+    f.sourceSet.decisions = f.sourceSet.sources.map(source => ({
+      sourceId: source.sourceId, selected: true, applicability: 'applicable', reason: 'Confirmed frozen grading evidence.',
+    }))
+    f.sourceSet.processingSettings = accepted
+    f.sourceSet.contentHash = canonicalHash(f.sourceSet)
+    f.store.set(f.sourceSet)
+    f.store.set({ ...f.work, processingSettings: accepted })
+    f.store.set({ ...f.ladder, sourceIds: f.sourceSet.sources.map(source => source.sourceId), processingSettings: current })
+    for (const source of f.sourceSet.sources) {
+      await f.blobs.putImmutable(source.documentBlobName, bytesOf({ ...f.document, id: source.documentId }), 'application/json')
+    }
+    await f.blobs.putImmutable(f.ladder.seedBlobName, bytesOf({
+      job: { id: f.ladder.seedJobId }, rubric: { id: f.ladder.seedRubricId, version: 1 },
+      document: f.document, source: {}, capturedAt: now,
+    }), 'application/json')
+    const sourceIds = new Set(f.sourceSet.sources.map(source => source.sourceId))
+    const read = f.store.get.bind(f.store)
+    f.store.get = async (workspaceId, id) => {
+      assert.equal(sourceIds.has(id), false, 'Frozen generation must not resolve settings from mutable source records.')
+      return read(workspaceId, id)
+    }
+    f.deps.fetchOriginal = async () => { assert.fail('Frozen generation must not re-fetch reference originals.') }
+    f.deps.extractReference = async () => { assert.fail('Frozen generation must not repeat extraction.') }
+    let currentReads = 0
+    f.deps.settings = {
+      legacy: settingsSnapshot(() => {}, 'legacy-v1'),
+      current: async () => { currentReads++; return current },
+    }
+    f.deps.planCompetencies = async input => {
+      assert.deepEqual(input.processingSettings, accepted)
+      assert.deepEqual(input.sourceSet, f.sourceSet)
+      assert.deepEqual(input.documents.map(document => document.id), f.sourceSet.sources.map(source => source.documentId))
+      return {
+        competencies: [{ id: 'analysis', label: 'Program analysis', description: 'Analyze programs', seedCriterionIds: ['c1'], citations: [] }],
+        issues: [], model: 'model-from-response', promptVersion: 'plan-v1',
+      }
+    }
+    assert.equal((await runtime.runGradeWorker(f.deps)).succeeded, 1)
+    assert.equal(currentReads, 1, 'Only live execution tuning requires a current settings read.')
+    assert.deepEqual((await read(wid, setId)).record, f.sourceSet, 'Reading legacy provenance must not rewrite the frozen source-set hash.')
+    const children = f.store.values().filter(record => record.recordType === 'grade-competency-plan' ||
+      record.recordType === 'grade-work' && record.input.kind === 'generate-grade')
+    assert.equal(children.length, 3)
+    assert.ok(children.every(record => JSON.stringify(record.processingSettings) === JSON.stringify(accepted)))
+  })
+}
+
+test('an accepted one-attempt grade operation cannot acquire the current three-attempt retry policy', async () => {
+  const f = fixture()
+  const accepted = settingsSnapshot(settings => { settings.processing.grades.maxAutomaticAttempts = 1 })
+  f.store.set({ ...f.work, processingSettings: accepted })
+  f.deps.settings = { legacy: accepted, current: async () => settingsSnapshot(() => {}, 'newer-policy') }
+  f.deps.extractReference = async () => { throw new runtime.GradeWorkerError('temporary-ocr', 'Temporary extraction failure.', true) }
+  await runtime.runGradeWorker(f.deps)
+  const saved = (await f.store.get(wid, workId)).record
+  assert.equal(saved.status, 'failed')
+  assert.equal(saved.attempts, 1)
+  assert.equal(saved.nextAttemptAt, undefined)
 })
 
 for (const format of ['docx', 'doc']) {

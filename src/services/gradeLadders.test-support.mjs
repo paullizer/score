@@ -262,8 +262,10 @@ export async function startGradeFixture(runtime, { injectAuth = false, resumes, 
     }
     const serve = async () => {
       if (overrideRead && req.method === 'GET' && req.url === overrideRead.path) {
-        const override = overrideRead; overrideRead = undefined
+        const override = overrideRead
+        if (!override.repeat) overrideRead = undefined
         await override.wait
+        if (overrideRead === override) overrideRead = undefined
         res.statusCode = override.status
         res.setHeader('Content-Type', 'application/json'); res.end(JSON.stringify(override.body)); return
       }
@@ -297,7 +299,7 @@ export async function startGradeFixture(runtime, { injectAuth = false, resumes, 
       return () => { globalThis.fetch = previous }
     },
     holdMutation(promise) { holdNextMutation = promise },
-    staleRead(path, body, wait, status = 200) { overrideRead = { path, body, wait, status } },
+    staleRead(path, body, wait, status = 200, { repeat = false } = {}) { overrideRead = { path, body, wait, status, repeat } },
     setRole(role) {
       const principalId = api.principalKeyFor(tenantId, userId)
       const memberKey = `${workspaceId}/${api.membershipIdFor(principalId)}`

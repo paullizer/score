@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto'
 import express, { type NextFunction, type Request, type RequestHandler, type Response, type Router } from 'express'
 import ipaddr from 'ipaddr.js'
+import { PDFDocument } from 'pdf-lib'
 import type { RealJobDetail, RealJobRecord, RealJobSummary, VersionedRealJob } from '../../src/domain/real-jobs'
 import { JOB_IMPORT_LIMITS } from '../../src/domain/real-jobs'
 import { isOriginalContentType, isSafeUploadedFilename } from '../../src/domain/source-files'
@@ -10,13 +11,17 @@ import { validateWordUpload } from '../documents/upload'
 import type { AuthenticatedPrincipal } from '../auth'
 import { decodeMarkdown, MarkdownInputError } from '../documents/markdown'
 import { conflict, HttpError, invalidRequest, notFound, preconditionRequired, unavailable } from '../errors'
-import { getPrincipal } from '../request-context'
+import { getPrincipal, getRequestSettings } from '../request-context'
 import type { WorkspaceRepository } from '../repository'
 import type { LifecycleDependencies } from '../lifecycle/contracts'
 import { assertWorkspaceMutationLease } from '../lifecycle/lease'
 import { StoreConflictError } from '../store'
 import type { JobBlobStore, JobLifecycleScope, RealJobStore } from './store'
 import { assertJobWritable, putJobBlob } from './guards'
+import {
+  assertImportPolicy, assertOriginalDownload, newProcessingSettings, newWorkProcessingSettings,
+  requestProcessingSettings, resolveAcceptedProcessingSettings,
+} from './policy'
 import { JobCleanupPendingError, jobLifecycleImpact, purgeJob, purgeJobRubric, requireJobLifecycle } from './lifecycle'
 import {
   isValidJobId,
@@ -541,6 +546,18 @@ export function createRealJobsRouter(deps: RealJobsRouterDeps): Router {
           res.status(200).json({ job: await summary(jobs.store, existing) })
           return
         }
+        const settings = requestProcessingSettings(req)
+        const processingSettings = await newWorkProcessingSettings(settings)
+        assertImportPolicy(processingSettings, 'jobs', kind, { bytes: bytes.byteLength })
+        if (kind === 'pdf' && processingSettings.settings.imports.jobs.maxPdfPages < JOB_IMPORT_LIMITS.maxPdfPages) {
+          let pages: number
+          try {
+            const pdf = await PDFDocument.load(bytes, { ignoreEncryption: false, updateMetadata: false, throwOnInvalidObject: true })
+            if (pdf.isEncrypted) throw new Error('Encrypted PDF')
+            pages = pdf.getPageCount()
+          } catch { throw invalidRequest('The PDF cannot be read. Upload an unencrypted, structurally valid PDF.') }
+          assertImportPolicy(processingSettings, 'jobs', kind, { pages })
+        }
         const sourceBlob = await putJobBlob(jobs.store, jobs.blobs, workspaceId, jobId, blobName, bytes, contentType)
         if (sourceBlob.blob.sha256 !== digest || sourceBlob.blob.contentType !== contentType ||
           sourceBlob.blob.bytes.byteLength !== bytes.byteLength) {
@@ -568,6 +585,7 @@ export function createRealJobsRouter(deps: RealJobsRouterDeps): Router {
           attempts: 0,
           nextAttemptAt: timestamp,
           warnings: [],
+          processingSettings: newProcessingSettings(settings, processingSettings),
         }
         assertWorkspaceMutationLease(workspaceId)
         const created = await jobs.store.create(record)
@@ -594,6 +612,16 @@ export function createRealJobsRouter(deps: RealJobsRouterDeps): Router {
     const workspaceId = pathParam(req, 'workspaceId')
     const jobId = `job-${key}`
     await requireMutableWorkspace(jobs.store, workspaceId)
+    const existing = await jobs.store.get(workspaceId, jobId)
+    if (existing) {
+      assertJobWritable(existing.record)
+      if (existing.record.inputFingerprint !== fingerprint) throw conflict('This idempotency key was already used for different input.')
+      res.status(200).json({ job: await summary(jobs.store, existing) })
+      return
+    }
+    const settings = requestProcessingSettings(req)
+    const processingSettings = await newWorkProcessingSettings(settings)
+    assertImportPolicy(processingSettings, 'jobs', 'url', { url })
     const timestamp = clock().toISOString()
     const principal = (req as AuthorizedRequest).authorizedPrincipal
     const record: RealJobRecord = {
@@ -608,6 +636,7 @@ export function createRealJobsRouter(deps: RealJobsRouterDeps): Router {
       attempts: 0,
       nextAttemptAt: timestamp,
       warnings: [],
+      processingSettings: newProcessingSettings(settings, processingSettings),
     }
     assertWorkspaceMutationLease(workspaceId)
     const created = await jobs.store.create(record)
@@ -629,6 +658,7 @@ export function createRealJobsRouter(deps: RealJobsRouterDeps): Router {
     const timestamp = clock().toISOString()
     const replacement: RealJobRecord = {
       ...current.record,
+      processingSettings: await resolveAcceptedProcessingSettings(requestProcessingSettings(req), current.record.processingSettings),
       job: { ...withoutJobError(current.record.job), status: 'queued' },
       updatedAt: timestamp,
       attempts: 0,
@@ -686,6 +716,13 @@ export function createRealJobsRouter(deps: RealJobsRouterDeps): Router {
     const versions = await jobs.store.listRubrics(pathParam(req, 'workspaceId'), jobParam(req))
     const latest = versions.at(-1)
     if (!latest || latest.id !== current.record.job.rubricId) throw conflict('The current rubric version could not be loaded.')
+    if (Array.isArray(submitted.criteria) && submitted.criteria.some(criterion =>
+      !latest.criteria.some(previous => previous.id === criterion.id))) {
+      const policy = (await getRequestSettings(req)).settings.rubrics.jobs
+      if (submitted.criteria.length > policy.maxCriteria) {
+        throw invalidRequest(`New rubric criteria may not exceed the current ${policy.maxCriteria}-criterion limit.`)
+      }
+    }
 
     const timestamp = clock().toISOString()
     const rubric: Rubric = {
@@ -721,6 +758,8 @@ export function createRealJobsRouter(deps: RealJobsRouterDeps): Router {
 
   router.get(`${base}/:jobId/original`, authorize(deps.repository, 'read'), asyncHandler(async (req, res) => {
     const jobs = requireJobs(deps.jobs)
+    const role = await deps.repository.authorizeWorkspace(getPrincipal(req), pathParam(req, 'workspaceId'), 'read')
+    assertOriginalDownload(await getRequestSettings(req), role, req.query.preview === 'formatted')
     const current = await jobs.store.get(pathParam(req, 'workspaceId'), jobParam(req))
     if (!current) throw notFound('The requested job was not found.')
     if (current.record.lifecycle?.deletingAt || current.record.lifecycle?.deletedAt) throw notFound('This job source has been removed.')

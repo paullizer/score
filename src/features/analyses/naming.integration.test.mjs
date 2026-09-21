@@ -538,9 +538,19 @@ test('real setup freezes the resolved default, exact input objects and key acros
       documentId: job.documentId, documentVersion: 1, documentSha256: hash } }
   const saved = realResume()
   const resumes = resumeApi(saved)
+  let retained
   const api = analysisApi(undefined, { summaries: [], targets: { state: 'ready', value: [target] },
     requestKey: (input) => { calls.push(['key', structuredClone(input)]); return 'fixed-request-key' },
-    create: async (input, key) => { calls.push(['create', structuredClone(input), key]); throw new Error('Acceptance uncertain.') },
+    create: async (input, key) => {
+      retained = { input: structuredClone(input), key }
+      calls.push(['create', structuredClone(input), key])
+      throw new Error('Acceptance uncertain.')
+    },
+    hasRetainedCreation: (input, key) => retained?.key === key && JSON.stringify(retained.input) === JSON.stringify(input),
+    recoverCreation: (input, key) => {
+      assert.equal(api.hasRetainedCreation(input, key), true)
+      return api.create(input, key)
+    },
   })
   const workspace = context(data, {}, { resumes: [saved] })
   const url = `/analyses/new?data=real&resumes=${saved.resume.id}&jobs=${job.id}`

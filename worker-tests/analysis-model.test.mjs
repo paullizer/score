@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
 import test from 'node:test'
 import { loadWorker } from './shared-model-loader.mjs'
+import { settingsSnapshot } from './runtime-settings-test-support.mjs'
 import { assertLosslessModelInput, passageSelection } from './analysis-selection-test-support.mjs'
 
 const {
@@ -26,6 +27,34 @@ const timestamp = '2026-09-18T01:00:00.000Z'
 const resumeSnapshotSha256 = 'a'.repeat(64)
 const targetSnapshotSha256 = 'b'.repeat(64)
 const actualModel = 'actual-analysis-model-2026-09-18'
+
+test('assessment and mandatory grounding review independently resolve the same immutable processing revision', async () => {
+  const input = fixture()
+  const mock = mockModel([selectedAssessment(input), supportedReview()])
+  mock.model.processingSettings = settingsSnapshot(settings => {
+    settings.ai.tasks.assessment.reasoningEffort = 'high'
+    settings.ai.tasks.assessmentReview.reasoningEffort = null
+  })
+  const result = await assessResumeAgainstTarget(input, mock.options)
+  assert.deepEqual(mock.calls.map(call => call.request.model), ['deployment-assessment', 'deployment-assessmentReview'])
+  assert.deepEqual(mock.calls.map(call => call.request.reasoning_effort), ['high', undefined])
+  assert.equal(result.assessmentProvenance.deployment, 'deployment-assessment')
+  assert.equal(result.groundingReviews[0].provenance.deployment, 'deployment-assessmentReview')
+  assert.equal(result.assessmentProvenance.model, `${actualModel}-1`)
+  assert.equal(result.groundingReviews[0].provenance.model, `${actualModel}-2`)
+  assert.equal(result.assessmentProvenance.settingsRevision, mock.model.processingSettings.revision)
+  assert.equal(result.groundingReviews[0].provenance.settingsRevision, mock.model.processingSettings.revision)
+  assert.equal(result.assessmentProvenance.task, 'assessment')
+  assert.equal(result.groundingReviews[0].provenance.task, 'assessmentReview')
+  assert.deepEqual(result.summary.overall, { status: 'available', score: 56 })
+})
+
+test('captured assessment correction zero rejects bad output without spending a review or replacement attempt', async () => {
+  const mock = mockModel(['{invalid'])
+  mock.model.processingSettings = settingsSnapshot(settings => { settings.analyses.maxOutputCorrections = 0 })
+  await assert.rejects(assessResumeAgainstTarget(fixture(), mock.options), error => error.code === 'invalid-model-output')
+  assert.equal(mock.calls.length, 1)
+})
 const guidance = '0: No supporting document evidence; 1: Identifies the method in a bounded example; 2: Applies the method with regular review; 3: Independently applies the method within the stated scope; 4: Resolves unusual method problems with documented outcomes; 5: Repeatedly validates the method across varied complex cases with documented outcomes.'
 
 function requirementCitation(index, quote = `The role requires documented work in criterion ${index}.`) {

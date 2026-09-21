@@ -1,4 +1,9 @@
 import { z } from 'zod'
+import { processingSettingsSnapshotSchema } from '../../src/domain/admin-settings-schema'
+import {
+  admittedProcessingSettings, newProcessingSettings, resolveAcceptedProcessingSettings,
+  assertNewWork, currentProcessingSettings, newProcessingAllowed, newWorkProcessingSettings, type ProcessingSettingsProvider,
+} from '../jobs/policy'
 import type { RealAnalysisNarrativeRecord } from '../../src/domain/analysis-narratives'
 import {
   SUMMARY_PIPELINE_VERSION, publishSummaryDraftInputSchema,
@@ -35,6 +40,8 @@ const actionReceiptSchema = z.strictObject({
   manifestSha256: z.string().regex(/^[a-f0-9]{64}$/), inputFingerprint: z.string().regex(/^[a-f0-9]{64}$/),
   generationId: z.string().uuid(), previousGenerationId: z.string().uuid().nullable(),
   selection: publishSummaryDraftInputSchema.optional(),
+  processingSettings: processingSettingsSnapshotSchema.optional(),
+  resumeGenerationId: z.string().uuid().optional(),
   resultRevisionId: z.string().uuid().optional(),
 })
 type ActionReceipt = z.infer<typeof actionReceiptSchema>
@@ -86,12 +93,15 @@ function verifyReceipt(
     receipt.expectedEtag !== expected || receipt.requestedBy !== actor ||
     analysisHash(receipt.selection ?? null) !== analysisHash(selection ?? null) ||
     recordId !== analysisNarrativeId(subject.kind, runId, subject.subjectId, receipt.resultRevisionId) ||
-    receipt.generationId !== narrativeGenerationId(requestId, recordId)) {
+    receipt.generationId !== (receipt.resumeGenerationId ?? narrativeGenerationId(requestId, recordId))) {
     throw conflict('This Idempotency-Key already identifies a different summary action, actor, draft, or revision.')
   }
 }
 
 function committed(state: SubjectState, receipt: ActionReceipt): boolean {
+  if (receipt.action === 'retry' && receipt.resumeGenerationId) {
+    return state.current?.record.retryRequestId === receipt.requestId && state.current.record.generationId === receipt.generationId
+  }
   return state.current?.record.requestId === receipt.requestId && state.current.record.generationId === receipt.generationId &&
     state.current.record.requestedBy === receipt.requestedBy
 }
@@ -114,7 +124,7 @@ function audit(receipt: ActionReceipt, selected?: AnalysisSummaryHistoryEntry): 
 async function executeSummaryAction(
   deps: RealAnalysesDeps, workspaceId: string, runId: string, subject: AnalysisSummarySubject,
   action: ActionReceipt['action'], requestId: string, expected: string, actor: string,
-  now: () => Date, selection?: PublishSummaryDraftInput,
+  now: () => Date, selection?: PublishSummaryDraftInput, settings?: ProcessingSettingsProvider,
 ) {
   headers(requestId, expected, actor)
   requestId = requestId.toLowerCase()
@@ -137,9 +147,19 @@ async function executeSummaryAction(
     throw conflict('This Idempotency-Key already belongs to a summary generation request.')
   }
   if (state.etag !== expected) throw conflict('This summary changed. Reload its history before publishing or retrying.')
-  const generationId = narrativeGenerationId(requestId, id)
-  if (state.current?.record.generationId === generationId) throw conflict('Use a new request key for a new summary generation.')
+  const resumeGeneration = action === 'retry' && state.current &&
+    ['failed', 'cancelled'].includes(state.current.record.status) ? state.current.record : undefined
+  if (resumeGeneration?.inputFingerprint && resumeGeneration.inputFingerprint !== state.inputFingerprint) {
+    throw conflict('This summary has changed inputs. Explicitly regenerate it rather than rebinding a retry to different evidence.')
+  }
+  const generationId = resumeGeneration?.generationId ?? narrativeGenerationId(requestId, id)
+  if (!resumeGeneration && state.current?.record.generationId === generationId) throw conflict('Use a new request key for a new summary generation.')
   const selected = action === 'publish' ? await selectedDraft(deps, state, selection!) : undefined
+  const processingSettings = receipt ? await resolveAcceptedProcessingSettings(settings, receipt.processingSettings)
+    : resumeGeneration ? await resolveAcceptedProcessingSettings(settings, resumeGeneration.processingSettings)
+      : action === 'retry' ? await newWorkProcessingSettings(settings)
+        : await resolveAcceptedProcessingSettings(settings, selected?.processingSettings)
+  if (action === 'retry' && !resumeGeneration && !receipt) assertNewWork(processingSettings, 'summaryGeneration')
   const timestamp = narrativeTimestamp(state.inventory.run.record,
     new Date(Math.max(now().getTime(), Date.parse(state.current?.record.updatedAt ?? state.inventory.run.record.updatedAt))).toISOString())
   const planned: ActionReceipt = {
@@ -147,6 +167,8 @@ async function executeSummaryAction(
     requestedBy: actor, expectedEtag: expected, createdAt: timestamp,
     manifestSha256: state.inventory.run.record.manifest.sha256, inputFingerprint: state.inputFingerprint!,
     generationId, previousGenerationId: state.current?.record.generationId ?? null, ...(selection ? { selection } : {}),
+    processingSettings: resumeGeneration || action === 'publish' ? processingSettings : newProcessingSettings(settings, processingSettings),
+    ...(resumeGeneration ? { resumeGenerationId: resumeGeneration.generationId } : {}),
     ...(state.pair?.comparison?.resultRevision ? { resultRevisionId: state.pair.comparison.resultRevision.id } : {}),
   }
   const assertCurrent = async () => {
@@ -180,9 +202,28 @@ async function executeSummaryAction(
     receipt.createdAt <= (state.inventory.run.record.narrativeCancelledAt ?? '')) {
     throw conflict('This reserved summary action predates changed inputs or cancellation. Reload and use a new request key.')
   }
-  const request = { requestId, requestedAt: receipt.createdAt, requestedBy: actor, reason: 'all' as const }
+  const request = {
+    requestId, requestedAt: receipt.createdAt, requestedBy: actor, reason: 'all' as const,
+    processingSettings: resumeGeneration || action === 'publish'
+      ? await resolveAcceptedProcessingSettings(settings, receipt.processingSettings)
+      : await admittedProcessingSettings(settings, receipt.processingSettings),
+  }
   let record: RealAnalysisNarrativeRecord
-  if (action === 'retry') {
+  if (action === 'retry' && receipt.resumeGenerationId) {
+    assertAnalysis(resumeGeneration && resumeGeneration.generationId === receipt.resumeGenerationId,
+      'The retry no longer identifies its accepted summary generation.')
+    const waitingForInputs = resumeGeneration.recordType === 'analysis-target-narrative' && !resumeGeneration.inputFingerprint
+    record = {
+      ...resumeGeneration, processingSettings: request.processingSettings, retryRequestId: requestId,
+      requestedAt: receipt.createdAt, updatedAt: receipt.createdAt, status: waitingForInputs ? 'waiting' : 'queued',
+      attempts: 0, retryCount: resumeGeneration.retryCount + 1, nextAttemptAt: receipt.createdAt,
+      ...(waitingForInputs ? { waitingFor: 'candidate-narratives' as const } : {}),
+    }
+    delete record.lease
+    delete record.attemptId
+    delete record.error
+    if (!waitingForInputs) delete record.waitingFor
+  } else if (action === 'retry') {
     if (subject.kind === 'candidate') {
       assertAnalysis(state.pair?.comparison?.status === 'complete' &&
         (!state.current || state.current.record.recordType === 'analysis-candidate-narrative'), 'Candidate retry requires its exact completed comparison.')
@@ -199,6 +240,7 @@ async function executeSummaryAction(
     const review = selected.review
     const artifact = parseAnalysisNarrativeArtifact({
       schemaVersion: 2, dataKind: 'real', kind: subject.kind, createdAt: receipt.createdAt, generationId,
+      processingSettings: selected.processingSettings ?? request.processingSettings,
       requestId, inputFingerprint: state.inputFingerprint, humanReviewRequired: true, binding: state.binding, claims: [],
       ...(selected.draft.kind === 'candidate' ? { text: selected.draft.text, overview: selected.draft.overview }
         : { paragraphs: selected.draft.paragraphs }),
@@ -242,11 +284,16 @@ async function executeSummaryAction(
   const operations: AnalysisTransaction[] = [
     state.current ? { kind: 'replace', record, etag: state.current.etag } : { kind: 'create', record },
   ]
-  if (subject.kind === 'candidate') {
+  const dependentSettings = action === 'publish' ? await currentProcessingSettings(settings) : processingSettings
+  const dependentPolicy = dependentSettings.settings
+  if (subject.kind === 'candidate' && !resumeGeneration && (action !== 'publish' || newProcessingAllowed(settings) && dependentPolicy.features.summaryGeneration &&
+    dependentPolicy.summaries.generationMode === 'automatic' && !dependentPolicy.maintenance.pauseNewWork)) {
     const previous = await loadAnalysisNarrative(deps.store, workspaceId, analysisNarrativeId('target', runId, state.target.target.summary.id))
     assertAnalysis(!previous || previous.record.recordType === 'analysis-target-narrative', 'Dependent target summary has an invalid identity.')
     const next = newTargetNarrative(state.inventory.run.record, state.target.target,
-      { ...request, reason: 'comparison-changed' }, previous?.record.recordType === 'analysis-target-narrative' ? previous.record : undefined)
+      { ...request, processingSettings: action === 'publish' ? newProcessingSettings(settings, dependentSettings) : request.processingSettings,
+        reason: 'comparison-changed' },
+      previous?.record.recordType === 'analysis-target-narrative' ? previous.record : undefined)
     operations.push(previous ? { kind: 'replace', record: next, etag: previous.etag } : { kind: 'create', record: next })
   }
   await assertCurrent()
@@ -276,13 +323,15 @@ async function executeSummaryAction(
 export function publishAnalysisSummaryDraft(
   deps: RealAnalysesDeps, workspaceId: string, runId: string, subject: AnalysisSummarySubject, input: PublishSummaryDraftInput,
   requestId: string, expected: string, actor: string, now: () => Date = () => new Date(),
+  settings?: ProcessingSettingsProvider,
 ) {
-  return executeSummaryAction(deps, workspaceId, runId, subject, 'publish', requestId, expected, actor, now, input)
+  return executeSummaryAction(deps, workspaceId, runId, subject, 'publish', requestId, expected, actor, now, input, settings)
 }
 
 export function retryAnalysisSummary(
   deps: RealAnalysesDeps, workspaceId: string, runId: string, subject: AnalysisSummarySubject,
   requestId: string, expected: string, actor: string, now: () => Date = () => new Date(),
+  settings?: ProcessingSettingsProvider,
 ) {
-  return executeSummaryAction(deps, workspaceId, runId, subject, 'retry', requestId, expected, actor, now)
+  return executeSummaryAction(deps, workspaceId, runId, subject, 'retry', requestId, expected, actor, now, undefined, settings)
 }

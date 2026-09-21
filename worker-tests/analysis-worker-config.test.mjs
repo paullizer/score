@@ -41,10 +41,39 @@ test('analysis configuration requires only its dedicated stores, identity, and m
   assert.equal(result.localDevelopment, false)
   for (const key of ['rendererUrl', 'documentIntelligenceEndpoint', 'jobs', 'resumes', 'grades']) assert.equal(result[key], undefined)
   const deps = createAnalysisWorkerDependencies(result, { getToken: async () => ({ token: 'test-token', expiresOnTimestamp: 0 }) })
-  assert.deepEqual(Object.keys(deps).sort(), ['blobs', 'correctionsEnabled', 'model', 'onEvent', 'store'])
+  assert.deepEqual(Object.keys(deps).sort(), ['blobs', 'correctionsEnabled', 'model', 'onEvent', 'settings', 'store'])
+  assert.equal(deps.settings.legacy.revision, 'legacy-v1')
+  assert.equal(deps.settings.legacy.tasks.assessment.deploymentName, result.modelDeployment)
   assert.notEqual(deps.correctionsEnabled, true)
   assert.equal(typeof deps.onEvent, 'function')
   assert.equal(deps.model.endpoint, result.modelEndpoint)
+})
+
+test('analysis configuration accepts the dedicated settings reader without widening its processing stores', () => {
+  const shared = { SCORE_SETTINGS_CONTAINER: 'application-settings' }
+  assert.equal(loadAnalysisWorkerConfig(config(shared)).settingsContainer, 'application-settings')
+  for (const value of ['', 'analysis-records', 'resume-records', 'workspace-state']) {
+    assert.throws(() => loadAnalysisWorkerConfig(config({ SCORE_SETTINGS_CONTAINER: value })), /dedicated application-settings/)
+  }
+  assert.throws(() => loadAnalysisWorkerConfig(config({ ...shared, JOB_RECORDS_CONTAINER: 'job-records' })), /must not be configured/)
+})
+
+test('configured and unconfigured dependency factories accept legacy short execution budgets without unused-default validation', () => {
+  for (const configured of [false, true]) {
+    for (const budget of [1000, 300000]) {
+      const options = loadAnalysisWorkerConfig(config({
+        ANALYSIS_WORKER_BUDGET_MS: String(budget),
+        ...(configured ? { SCORE_SETTINGS_CONTAINER: 'application-settings' } : {}),
+      }))
+      const deps = createAnalysisWorkerDependencies(options, {
+        getToken: async () => assert.fail('Constructing dependencies must not access Azure.'),
+      })
+      assert.equal(options.budgetMilliseconds, budget)
+      assert.equal(deps.settings.mode, configured ? 'configured' : 'unconfigured')
+      if (configured) assert.throws(() => deps.settings.legacy, /must be loaded/)
+      else assert.equal(deps.settings.legacy.tasks.assessment.deploymentName, options.modelDeployment)
+    }
+  }
 })
 
 test('evidence correction discovery is default-off and only explicit true enables it', () => {

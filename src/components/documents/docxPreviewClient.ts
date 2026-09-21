@@ -29,7 +29,9 @@ export async function fetchPrivateDocx(value: string, metadata: PrivateOriginalM
     throw new Error('The saved original size is outside the 10 MiB preview limit.')
   }
   if (metadata.sha256 !== undefined && !/^[a-f\d]{64}$/i.test(metadata.sha256)) throw new Error('The saved original hash cannot be verified.')
-  const response = await fetch(privateOriginalUrl(value), {
+  const url = new URL(privateOriginalUrl(value))
+  url.searchParams.set('preview', 'formatted')
+  const response = await fetch(url.href, {
     credentials: 'same-origin', mode: 'same-origin', cache: 'no-store', redirect: 'error', signal,
     headers: { Accept: UPLOAD_CONTENT_TYPES.docx, 'X-Score-Request': 'workspace' },
   })

@@ -7,9 +7,13 @@ import {
   type AnalysisCorrectionResponse, type RealAnalysisCorrectionRecord,
 } from '../../src/domain/analysis-corrections'
 import type { RealAnalysisAssessmentOutput, RealAnalysisResult, RealAnalysisResultSummary } from '../../src/domain/real-analyses'
+import type { ProcessingSettingsSnapshot } from '../../src/domain/admin-settings'
 import { conflict, invalidRequest, notFound, preconditionRequired, unavailable } from '../errors'
 import { WORKSPACE_ID_PATTERN } from '../ids'
 import { isUuid } from '../jobs/validation'
+import {
+  admittedProcessingSettings, assertNewWork, newProcessingSettings, newWorkProcessingSettings, type ProcessingSettingsProvider,
+} from '../jobs/policy'
 import { StoreConflictError } from '../store'
 import { analysisIsRemoved, assertAnalysisRunWritable, assertAnalysisWorkspaceActive, fencedAnalysisBlobs } from './guards'
 import { loadAnalysisComparison, loadAnalysisRun } from './lifecycle'
@@ -46,7 +50,10 @@ function scope(workspaceId: string, runId: string, comparisonId: string): void {
 }
 
 export class AnalysisCorrectionService {
-  constructor(private readonly deps: RealAnalysesDeps, private readonly now: () => Date = () => new Date()) {}
+  constructor(
+    private readonly deps: RealAnalysesDeps, private readonly now: () => Date = () => new Date(),
+    private readonly settings?: ProcessingSettingsProvider,
+  ) {}
 
   private async context(workspaceId: string, runId: string, comparisonId: string, signal?: AbortSignal) {
     scope(workspaceId, runId, comparisonId)
@@ -200,7 +207,7 @@ export class AnalysisCorrectionService {
     requestId = requestId.toLowerCase()
     const fingerprint = analysisCorrectionFingerprint(workspaceId, runId, comparisonId, input, actor)
     let state = await this.context(workspaceId, runId, comparisonId)
-    await this.writable(state)
+    await this.writable(state, false)
     const replay = () => {
       if (state.correction?.record.requestId !== requestId) return undefined
       if (state.correction.record.requestFingerprint !== fingerprint) throw conflict('This request key belongs to a different correction or actor.')
@@ -211,6 +218,15 @@ export class AnalysisCorrectionService {
     if (state.etag !== expected) throw conflict('This correction or result changed. Reload its preview before requesting a correction.')
     if (!state.current.result || !state.original.record.result || state.current.result.sha256 !== input.resultSha256) {
       throw conflict('The preview no longer identifies this exact completed result.')
+    }
+    const name = analysisCorrectionProposalBlobName(workspaceId, runId, comparisonId, requestId)
+    let blob = await this.deps.blobs.read(name)
+    let processingSettings: ProcessingSettingsSnapshot | undefined
+    if (!blob) {
+      await this.writable(state)
+      const current = await newWorkProcessingSettings(this.settings)
+      assertNewWork(current)
+      processingSettings = newProcessingSettings(this.settings, current)
     }
     if (state.correction && ['queued', 'running'].includes(state.correction.record.status)) {
       if (analysisCorrectionCanWork(state.run.record, state.correction.record)) {
@@ -223,8 +239,6 @@ export class AnalysisCorrectionService {
       state = await this.context(workspaceId, runId, comparisonId)
     }
     const headEtag = state.etag
-    const name = analysisCorrectionProposalBlobName(workspaceId, runId, comparisonId, requestId)
-    let blob = await this.deps.blobs.read(name)
     let proposal: AnalysisCorrectionProposal
     if (blob) {
       proposal = parseAnalysisCorrectionProposal(parseAnalysisJson(blob))
@@ -242,6 +256,7 @@ export class AnalysisCorrectionService {
       const timestamp = narrativeTimestamp(state.run.record, [this.now().toISOString(), state.correction?.record.updatedAt ?? ''].sort().at(-1)!)
       proposal = parseAnalysisCorrectionProposal({
         schemaVersion: 1, dataKind: 'real', workspaceId, runId, comparisonId, requestId, createdAt: timestamp,
+        ...(processingSettings ? { processingSettings } : {}),
         requestFingerprint: fingerprint, expectedEtag: headEtag, manifestSha256: state.run.record.manifest.sha256,
         originalResultSha256: state.original.record.result.sha256, baseResult: state.current.result,
         baseAttemptId: state.current.attemptId, ...(state.current.resultRevision ? { baseRevision: state.current.resultRevision } : {}),
@@ -256,7 +271,7 @@ export class AnalysisCorrectionService {
       })
       const assertCurrent = async () => {
         const current = await this.context(workspaceId, runId, comparisonId)
-        await this.writable(current)
+        await this.writable(current, false)
         if (current.etag !== headEtag || current.current.result?.sha256 !== input.resultSha256) {
           throw conflict('The accepted result changed before this correction could be reserved.')
         }
@@ -289,10 +304,12 @@ export class AnalysisCorrectionService {
       nextAttemptAt: proposal.createdAt, ...(state.correction?.record.published ? { published: state.correction.record.published } : {}),
       ...(state.correction?.record.history ? { history: state.correction.record.history } : {}),
     }
+    const acceptedSettings = await admittedProcessingSettings(this.settings, proposal.processingSettings)
+    if (acceptedSettings) record.processingSettings = acceptedSettings
     parseAnalysisEntity(record)
     for (let race = 0; race < 8; race++) {
       state = await this.context(workspaceId, runId, comparisonId)
-      await this.writable(state)
+      await this.writable(state, false)
       const winner = replay()
       if (winner) return winner
       if (state.etag !== headEtag || state.current.result?.sha256 !== input.resultSha256) {

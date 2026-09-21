@@ -51,7 +51,7 @@ export function gradeLadderLink(ladderId: string, grade?: number, versionId?: st
   return `/grade-ladders/${encodeURIComponent(ladderId)}${query.size ? `?${query}` : ''}`
 }
 
-export function parseSelectedPages(value: string, limit = GRADE_LADDER_LIMITS.maxPdfPages): number[] {
+export function parseSelectedPages(value: string, limit: number = GRADE_LADDER_LIMITS.maxPdfPages): number[] {
   if (!value.trim()) return []
   const pages = new Set<number>()
   for (const part of value.split(',')) {

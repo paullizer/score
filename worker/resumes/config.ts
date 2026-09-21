@@ -1,4 +1,5 @@
 import type { RealResumesConfig } from '../../server/resumes/store'
+import { workerSettingsContainer } from '../settings-store'
 
 export interface ResumeWorkerConfig {
   stores: RealResumesConfig
@@ -13,6 +14,7 @@ export interface ResumeWorkerConfig {
   rendererUrl: string
   maxItems: number
   budgetMilliseconds: number
+  settingsContainer?: string
 }
 
 function required(environment: NodeJS.ProcessEnv, key: string): string {
@@ -105,5 +107,6 @@ export function loadResumeWorkerConfig(environment: NodeJS.ProcessEnv): ResumeWo
     modelName, reasoningEffort, rendererUrl: renderer.origin,
     maxItems: integer(environment, 'RESUME_WORKER_MAX_ITEMS', 5, 1, 20),
     budgetMilliseconds: integer(environment, 'RESUME_WORKER_BUDGET_MS', 660_000, 1000, 660_000),
+    settingsContainer: workerSettingsContainer(environment),
   }
 }

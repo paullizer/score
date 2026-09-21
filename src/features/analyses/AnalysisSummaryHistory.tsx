@@ -1,12 +1,14 @@
 import { useCallback, useEffect, useId, useRef, useState } from 'react'
 import { History, LoaderCircle, RotateCcw } from 'lucide-react'
 import { useRealAnalyses } from '../../app/real-analyses-context'
+import { usePublicSettings } from '../../app/public-settings-context'
+import { useWorkspace } from '../../app/workspace-context'
 import { Badge, Button, InlineError } from '../../components/ui'
 import { useLifecycleAccess } from '../../components/lifecycle/useLifecycleAccess'
 import { getRealAnalysisSummaryHistory, getRealAnalysisSummarySubject } from '../../services/realAnalyses'
 import type { RealAnalysisCandidateNarrativeSummary, RealAnalysisTargetNarrativeSummary } from '../../domain/analysis-narratives'
 import {
-  SUMMARY_LIMITS, summaryIssueDisclosures,
+  summaryIssueDisclosures,
   type AnalysisSummaryHistoryEntry, type AnalysisSummaryHistoryPage, type AnalysisSummaryIssue,
   type AnalysisSummaryPublicationMetadata,
 } from '../../domain/analysis-summary-history'
@@ -110,6 +112,10 @@ function matchingPublished(entry: AnalysisSummaryHistoryEntry, narrative: Summar
 
 function SummaryHistory({ runId, narrative, label, resultRevisionId }: Props) {
   const api = useRealAnalyses()
+  const { settings } = usePublicSettings()
+  const { cloud } = useWorkspace()
+  const role = cloud?.workspaces.find(item => item.id === api?.workspaceId)?.role
+  const publicationAllowed = settings?.summaries.allowManualPublication !== false && (settings?.summaries.manualPublicationRoles !== 'owner' || role === 'owner')
   const lifecycle = useLifecycleAccess({ kind: 'analysis', id: runId })
   const subject = { kind: narrative.kind, subjectId: narrative.kind === 'candidate' ? narrative.comparisonId : narrative.targetId }
   const context = useRef({ api, runId, subject, resultRevisionId })
@@ -189,7 +195,7 @@ function SummaryHistory({ runId, narrative, label, resultRevisionId }: Props) {
 
   function selectable(entry: AnalysisSummaryHistoryEntry): boolean {
     // Matching published text can be an accepted request whose acknowledgement was interrupted.
-    return Boolean(page?.capabilities.canPublish && entry.scopeId === 'final' && entry.draft?.kind === subject.kind &&
+    return Boolean(publicationAllowed && page?.capabilities.canPublish && entry.scopeId === 'final' && entry.draft?.kind === subject.kind &&
       entry.outputSha256 && entry.inputFingerprint === page.inputFingerprint)
   }
 
@@ -212,7 +218,7 @@ function SummaryHistory({ runId, narrative, label, resultRevisionId }: Props) {
       setSelectedId(null)
       setSuccess(action === 'publish'
         ? 'Manual publication acknowledged. Known issues remain disclosed; saved scores and evidence are unchanged.'
-        : 'Retry acknowledged for this summary only. Up to three rounds will run; scoring was not retried.')
+        : 'Retry acknowledged for this summary only. Its captured review budget applies; scoring was not retried.')
       void load()
     } catch (caught) {
       if (stamp === lifetime.current) setMutationError(caught instanceof Error ? caught.message : 'This summary action could not be acknowledged.')
@@ -223,7 +229,9 @@ function SummaryHistory({ runId, narrative, label, resultRevisionId }: Props) {
 
   return <>
     <h3 className="font-semibold">Private summary history · {label}</h3>
-    <p className="text-muted">Owners and editors only. Opening history does not generate model work. Drafts and reviewer findings are not accepted summaries.</p>
+    <p className="text-muted">{settings?.summaries.historyRoles === 'owner' ? 'Workspace owners only.' : 'Workspace owners and editors only.'} Opening history does not generate model work. Drafts and reviewer findings are not accepted summaries.</p>
+    {settings && <p className="text-muted">The server returns up to {settings.summaries.historyPageSize} checkpoints per page under current policy. Older checkpoints remain available through pagination.</p>}
+    {!publicationAllowed && <p className="text-muted" role="status">Manual publication is disabled for your role by application policy. Published text and authorized history are unchanged.</p>}
     {resultRevisionId && <p>This assessment revision is read-only. Its drafts cannot replace the current assessment summary.</p>}
     {narrative.published && <p>{resultRevisionId ? 'Historical published version' : narrative.status === 'ready' ? 'Current published version' : 'Previous published version'}: {narrative.published.publishedAt}
       {' · '}{narrative.published.approval?.kind === 'manual' ? 'Manually approved' : narrative.published.approval?.kind === 'automatic'
@@ -232,7 +240,7 @@ function SummaryHistory({ runId, narrative, label, resultRevisionId }: Props) {
       Manual approver: {narrative.published.approval.approvedBy} · {narrative.published.approval.approvedAt}
     </p>}
     {narrative.published && <SummaryApprovalDisclosure publication={narrative.published} />}
-    {narrative.summaryRound !== undefined && <p>Summary progress: round {narrative.summaryRound} of {SUMMARY_LIMITS.rounds}.</p>}
+    {narrative.summaryRound !== undefined && <p>Summary progress: round {narrative.summaryRound} under its captured review budget.</p>}
     {loading && <p role="status" className="flex items-center gap-2"><LoaderCircle size={14} className="animate-spin" aria-hidden="true" />Loading private summary history...</p>}
     {loadError && <InlineError>{loadError.message} <Button size="sm" disabled={pending || loading} onClick={() => void load(loadError.cursor)}>Retry loading history</Button></InlineError>}
     {page && !entries.length && <p>History was not recorded for this summary. Older discarded drafts cannot be recovered; this does not mean an automated review passed.</p>}
@@ -242,7 +250,7 @@ function SummaryHistory({ runId, narrative, label, resultRevisionId }: Props) {
       const published = matchingPublished(entry, narrative)
       return <article key={entry.id} className="space-y-3 rounded-lg border p-3" aria-label={`Summary checkpoint ${entry.id}`}>
         <div className="flex flex-wrap items-center gap-2">
-          <h4 className="font-semibold">Round {entry.round} of {SUMMARY_LIMITS.rounds} · {entry.phase}</h4>
+          <h4 className="font-semibold">Round {entry.round} · {entry.phase}</h4>
           <Badge tone={published && narrative.status === 'ready' ? 'success' : 'warning'}>
             {published ? narrative.status === 'ready' ? 'Matches current published text' : 'Previous published text' : entry.draft ? 'Unpublished draft' : 'No usable draft recorded'}
           </Badge>
@@ -310,6 +318,6 @@ function SummaryHistory({ runId, narrative, label, resultRevisionId }: Props) {
       {page?.continuationToken && <Button size="sm" disabled={pending || loading} onClick={() => void load(page.continuationToken)}>Load earlier summary history</Button>}
       <Button size="sm" disabled={!allowed || !page?.capabilities.canRetry} onClick={() => void change('retry')}>Retry this summary</Button>
     </div>
-    <p className="text-muted">Retry starts up to three rounds for this summary only, not scoring. A changed candidate publication also refreshes its dependent job / grade overview.</p>
+    <p className="text-muted">Retry retains this summary’s captured review budget, not a new scoring operation. A changed candidate publication also refreshes its dependent job / grade overview.</p>
   </>
 }

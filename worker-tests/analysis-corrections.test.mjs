@@ -6,6 +6,7 @@ import { after, test } from 'node:test'
 import { pathToFileURL } from 'node:url'
 import { build } from 'esbuild'
 import { api, fixture, seedJob, seedResume, citation, clone, ACTOR } from '../server-tests/real-analyses.test-support.mjs'
+import { settingsSnapshot } from './runtime-settings-test-support.mjs'
 
 const bundle = path.resolve('dist-worker', `analysis-corrections-test-${process.pid}-${randomUUID()}.mjs`)
 await mkdir(path.dirname(bundle), { recursive: true })
@@ -170,6 +171,7 @@ async function enqueue(f, criterionIds = ['data-practices', 'statistical-advisin
     resumeSnapshot: proposal.resumeSnapshot, targetSnapshot: proposal.targetSnapshot, criterionIds,
     baseResult: proposal.baseResult, baseAttemptId: proposal.baseAttemptId, ...(proposal.baseRevision ? { baseRevision: proposal.baseRevision } : {}),
     proposal: reference, status: 'queued', attempts: 0, retryCount: previous ? previous.record.retryCount + 1 : 0, nextAttemptAt: f.now,
+    ...(proposal.processingSettings ? { processingSettings: proposal.processingSettings } : {}),
     ...(previous?.record.published ? { published: previous.record.published } : {}),
     ...(previous?.record.history ? { history: previous.record.history } : {}),
   }
@@ -196,9 +198,9 @@ function workerFor(f, handler) {
     model: {
       endpoint: 'https://correction-test.openai.azure.com', deployment: 'synthetic-review', modelName: 'gpt-5-mini',
       getToken: async () => 'SYNTHETIC-PRIVATE-TOKEN',
-      async fetch(_url, init) {
+      async fetch(url, init) {
         const request = JSON.parse(init.body)
-        const call = { kind: request.response_format.json_schema.name, body: JSON.parse(request.messages[1].content), signal: init.signal }
+        const call = { url: String(url), request, kind: request.response_format.json_schema.name, body: JSON.parse(request.messages[1].content), signal: init.signal }
         calls.push(call)
         assert.equal(call.kind, 'resume_rubric_grounding_review', 'Correction work must never call assessment or rewrite scores.')
         const value = await handler?.(call, calls.length) ?? { outcome: 'supported', issues: [] }
@@ -236,6 +238,113 @@ async function cancel(f) {
     { kind: 'replace', record: { ...run.record, updatedAt: f.now }, etag: run.etag },
   ])
 }
+
+test('correction review and replacement narratives retain captured task settings rather than current policy or original scoring settings', async () => {
+  const f = await correctionFixture()
+  const captured = settingsSnapshot(settings => { settings.ai.tasks.assessmentReview.completionTokenLimit = 512 })
+  const changed = settingsSnapshot(settings => {
+    settings.features.summaryGeneration = false
+    settings.ai.tasks.assessmentReview.deploymentId = settings.ai.defaultDeploymentId
+    settings.workers.analyses.maxItemsPerExecution = 1
+  }, 'changed-policy')
+  await enqueue(f, undefined, proposal => { proposal.processingSettings = captured })
+  const worker = workerFor(f)
+  worker.deps.settings = { mode: 'configured', legacy: changed, current: async () => changed }
+  await worker.run()
+  const saved = (await head(f)).record
+  assert.equal(saved.status, 'ready', JSON.stringify(saved.error))
+  assert.deepEqual(saved.processingSettings, captured)
+  assert.equal(worker.calls[0].url, 'https://correction-test.openai.azure.com/openai/v1/chat/completions')
+  assert.equal(worker.calls[0].request.model, 'deployment-assessmentReview')
+  assert.equal(worker.calls[0].request.max_completion_tokens, 512)
+  const review = (await historyEntry(f)).review
+  assert.equal(review.provenance.task, 'assessmentReview')
+  assert.equal(review.provenance.settingsRevision, captured.revision)
+  const narrative = await f.analysis.store.get(f.workspaceId, api.analysisNarrativeId('candidate', f.runId, f.comparisonId, saved.requestId))
+  assert.deepEqual(narrative.record.processingSettings, captured)
+  await assertOriginal(f)
+})
+
+test('correction publication honors captured on-demand summary mode without creating automatic narrative work', async () => {
+  const f = await correctionFixture()
+  const captured = settingsSnapshot(settings => { settings.summaries.generationMode = 'on-demand' })
+  await enqueue(f, undefined, proposal => { proposal.processingSettings = captured })
+  await workerFor(f).run()
+  assert.equal((await head(f)).record.status, 'ready')
+  assert.equal([...f.analysis.store.values.values()].filter(item => item.record.recordType.endsWith('-narrative')).length, 0)
+  await assertOriginal(f)
+})
+
+test('correction review format repairs use the captured shared correction limit', async t => {
+  for (const maximum of [0, 1]) await t.test(String(maximum), async () => {
+    const f = await correctionFixture()
+    const captured = settingsSnapshot(settings => { settings.analyses.maxOutputCorrections = maximum })
+    await enqueue(f, undefined, proposal => { proposal.processingSettings = captured })
+    const worker = workerFor(f, () => ({ outcome: 'supported', issues: 'invalid-review-format' }))
+    await worker.run()
+    const saved = (await head(f)).record
+    assert.equal(saved.status, 'failed')
+    assert.equal(saved.error.code, 'invalid-model-output')
+    assert.equal(worker.calls.length, maximum + 1)
+    await assertOriginal(f)
+  })
+})
+
+test('correction automatic attempts and backoff are bounded by the accepted settings', async () => {
+  const f = await correctionFixture()
+  const captured = settingsSnapshot(settings => {
+    settings.ai.transport.maxAttempts = 1
+    settings.processing.analyses.maxAutomaticAttempts = 2
+    settings.processing.analyses.retryBackoff = { baseMilliseconds: 5000, maxMilliseconds: 5000 }
+  })
+  await enqueue(f, undefined, proposal => { proposal.processingSettings = captured })
+  const worker = workerFor(f, () => new Response('Synthetic provider outage', { status: 503 }))
+  await worker.run()
+  const first = (await head(f)).record
+  assert.equal(first.status, 'queued')
+  assert.equal(first.attempts, 1)
+  assert.equal(Date.parse(first.nextAttemptAt) - Date.parse(first.updatedAt), 5000)
+  f.now = first.nextAttemptAt
+  await worker.run()
+  const final = (await head(f)).record
+  assert.equal(final.status, 'failed')
+  assert.equal(final.attempts, 2)
+  assert.equal(final.nextAttemptAt, undefined)
+  assert.equal(worker.calls.length, 2)
+  await assertOriginal(f)
+})
+
+test('legacy correction proposals adopt immutable legacy settings, and altered proposal pins fail before model work', async t => {
+  for (const legacy of [true, false]) await t.test(legacy ? 'legacy adoption' : 'changed pin', async () => {
+    const f = await correctionFixture()
+    const captured = settingsSnapshot()
+    await enqueue(f, undefined, proposal => { if (!legacy) proposal.processingSettings = captured })
+    const worker = workerFor(f)
+    if (legacy) {
+      const baseline = settingsSnapshot(() => {}, 'legacy-v1')
+      const current = settingsSnapshot(settings => {
+        settings.ai.tasks.assessmentReview.deploymentId = settings.ai.defaultDeploymentId
+        settings.workers.analyses.maxItemsPerExecution = 1
+      }, 'new-policy')
+      worker.deps.settings = { mode: 'configured', legacy: baseline, current: async () => current }
+      await worker.run()
+      assert.equal((await head(f)).record.status, 'ready')
+      assert.deepEqual((await head(f)).record.processingSettings, baseline)
+      assert.equal(worker.calls[0].request.model, 'deployment-assessmentReview')
+    } else {
+      const current = await head(f)
+      const next = { ...current.record, processingSettings: settingsSnapshot(() => {}, 'different-policy') }
+      await assert.rejects(f.analysis.store.replace(next, current.etag), /processing settings are immutable/)
+      // Corrupt storage outside the normal replacement guard to exercise the reader fence.
+      f.analysis.store.values.set(`${f.workspaceId}/${next.id}`, { ...current, record: next })
+      await worker.run()
+      assert.equal((await head(f)).record.status, 'failed')
+      assert.equal((await head(f)).record.error.code, 'snapshot-invalid')
+      assert.equal(worker.calls.length, 0)
+    }
+    await assertOriginal(f)
+  })
+})
 
 test('correction dispatch requires an explicit enabled flag and does not restart completed comparison scoring', async () => {
   const f = await correctionFixture()

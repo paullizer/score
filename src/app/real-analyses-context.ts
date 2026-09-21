@@ -50,6 +50,8 @@ export interface RealAnalysesContextValue {
   pending: (runId?: string) => boolean
   requestKey: (input: CreateRealAnalysisInput) => string
   create: (input: CreateRealAnalysisInput, key: string) => Promise<RealAnalysisRunSummary>
+  hasRetainedCreation: (input: CreateRealAnalysisInput, key: string) => boolean
+  recoverCreation: (input: CreateRealAnalysisInput, key: string) => Promise<RealAnalysisRunSummary>
   retry: (id: string, input: RetryRealAnalysisInput, etag: string) => Promise<RealAnalysisRunSummary>
   cancel: (id: string, etag: string) => Promise<RealAnalysisRunSummary>
   retryComparison: (runId: string, comparisonId: string, etag: string) => Promise<RealAnalysisComparisonSummary>

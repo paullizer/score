@@ -209,8 +209,16 @@ test('browser unavailable real services remain explicit while Samples require de
   t.after(() => fixture.close())
   const { context, page, errors } = await newPage()
   try {
+    const features = await (await fixture.request('/api/features')).json()
+    assert.equal(features.deploymentCapabilities.realResumeImports, false)
+    assert.equal(features.deploymentCapabilities.realAnalyses, false)
+    assert.equal(features.publicSettings.features.resumeImports, false)
+    assert.equal((await fixture.request(`/api/workspaces/${fixture.workspaceId}/resumes`)).status, 503, 'This fixture removes the history service, not merely new admissions')
     await page.goto(`${fixture.origin}/workspaces/${fixture.workspaceId}/resumes?data=real`)
     await visible(page.getByRole('heading', { name: 'Real resume imports are not enabled', exact: true }))
+    await visible(page.getByRole('button', { name: 'Check availability', exact: true }))
+    assert.equal(await page.getByRole('button', { name: 'Add resumes', exact: true }).count(), 0)
+    assert.equal(await page.getByRole('button', { name: 'Add real resumes', exact: true }).count(), 0)
     assert.equal(await page.getByText(/Every candidate is fictional/).count(), 0)
     await page.getByRole('button', { name: /^Samples/ }).click()
     await visible(page.getByText(/Every candidate is fictional/))
@@ -429,11 +437,13 @@ async function seedBrowsingInputs(fixture) {
         criteria: input.rubric.criteria.map((criterion) => ({
           criterionId: criterion.id, score,
           evidenceStatus: score === null ? 'not-assessed' : score === 0 ? 'missing' : 'supported',
-          rationale: score === null ? 'The captured source does not establish the scope needed by this saved criterion.'
+          rationale: score === null ? 'The saved criterion guidance is ambiguous about the required scope of work.'
             : score === 0 ? 'No supporting evidence was assigned to this criterion in this controlled fixture.'
               : 'The quoted passage provides the controlled fixture evidence for this saved criterion.',
           citations: score > 0 ? [work] : [],
-          limitation: score === null ? { code: 'not-assessable', message: 'The captured source scope requires human evidence review.' } : null,
+          limitation: score === null ? {
+            code: 'ambiguous-guidance', message: 'Human review must resolve the ambiguous scope of the saved scoring guidance.',
+          } : null,
         })),
         qualifications: [],
       })
@@ -591,7 +601,8 @@ test('browser legacy and unavailable failures keep source access and discard lat
     const created = await jsonResponse(await fixture.request('/api/workspaces', {
       method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: 'Empty diagnostic workspace' }),
     }), [201])
-    fixture.staleRead(`${scenario.pairPath}/diagnostics`, { attempts: [scenario.diagnostic] }, hold.promise)
+    // A policy refresh can remount the detail; keep every diagnostic response pending until the switch.
+    fixture.staleRead(`${scenario.pairPath}/diagnostics`, { attempts: [scenario.diagnostic] }, hold.promise, 200, { repeat: true })
     scenario.detail = failedComparisonFixture(scenario.accepted, scenario.diagnostic)
     await page.reload()
     await until(() => diagnosticReads > 0, 'The current failed comparison should request its private diagnostic.')
@@ -619,7 +630,8 @@ test('browser comparison browsing searches every page, scopes score sorting, and
   const runPath = `/api/workspaces/${fixture.workspaceId}/analyses/${created.run.id}`
   const pairs = await allPages(fixture, `${runPath}/comparisons`, 'comparisons')
   assert.equal(pairs.length, 8)
-  assert.ok(pairs.every(({ comparison }) => comparison.status === 'complete'))
+  assert.ok(pairs.every(({ comparison }) => comparison.status === 'complete'),
+    JSON.stringify(pairs.map(({ comparison }) => ({ id: comparison.id, status: comparison.status, error: comparison.error }))))
   const recordsBefore = JSON.stringify([...fixture.analyses.store.values.values()])
   const modelCallsBefore = stubs.modelCalls.length
   const requestStart = fixture.requests.length

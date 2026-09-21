@@ -1,5 +1,8 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { z } from 'zod'
+import type { ProcessingSettingsSnapshot } from '../../src/domain/admin-settings'
+import { processingSettingsSnapshotSchema } from '../../src/domain/admin-settings-schema'
+import { urlAllowedBySettings } from '../../src/domain/admin-settings-resolver'
 import {
   GRADE_LADDER_LIMITS as LIMITS, gradeHeadId,
   type GradeEntity, type GradeHeadRecord, type GradeLadderDetail, type GradeLadderRecord,
@@ -28,6 +31,10 @@ import {
 } from './guards'
 import { assertWorkspaceMutationLease } from '../lifecycle/lease'
 import { discardGradePreparation } from './lifecycle'
+import {
+  acceptedProcessingSettings, admittedProcessingSettings, newProcessingSettings, resolveAcceptedProcessingSettings,
+  assertNewWork, newWorkProcessingSettings, type ProcessingSettingsProvider,
+} from '../jobs/policy'
 import {
   addGradeUrlInputSchema, approveGradeInputSchema, blobInGrade, confirmGradeInputSchema,
   createGradeInputSchema, editGradeInputSchema, gradeActionInputSchema, gradeContentHash, gradeIssuesFor, gradeCoverageMatchesContext,
@@ -66,9 +73,11 @@ const creation = (operations: Operations, record: GradeEntity) => operations.set
 const receiptSchema = z.strictObject({
   operation: z.string().min(1).max(50), fingerprint: z.string().regex(/^[a-f0-9]{64}$/),
   createdAt: z.iso.datetime({ precision: 3 }), createdBy: z.string().min(1).max(200),
+  processingSettings: processingSettingsSnapshotSchema.optional(),
 })
 const initializationSchema = z.strictObject({
   inputFingerprint: z.string().regex(/^[a-f0-9]{64}$/), createdBy: z.string().min(1).max(200), seed: z.unknown(),
+  processingSettings: processingSettingsSnapshotSchema.optional(),
 })
 
 function json(blob: GradeBlob): unknown {
@@ -107,6 +116,7 @@ function frozen(source: ReferenceSourceRecord): FrozenReferenceSource {
     ...(source.revision !== undefined ? { revision: source.revision } : {}),
     authorityStatus: source.authorityStatus, coverage: copy(source.coverage), pageCount: source.pageCount,
     selectedPages: [...source.selectedPages], completeness: source.completeness, issues: copy(source.issues),
+    ...(source.processingSettings ? { processingSettingsRevision: source.processingSettings.revision } : {}),
   }
 }
 
@@ -147,7 +157,7 @@ export class GradeService {
   private readonly jobs?: RealJobsDeps
   private readonly clock: () => Date
 
-  constructor(grades: RealGradesDeps, jobs?: RealJobsDeps, now?: () => Date) {
+  constructor(grades: RealGradesDeps, jobs?: RealJobsDeps, now?: () => Date, private readonly settings?: ProcessingSettingsProvider) {
     this.store = grades.store
     this.blobs = guardedGradeBlobs(grades.store, grades.blobs)
     this.jobs = jobs
@@ -155,6 +165,30 @@ export class GradeService {
   }
 
   private now(): string { return this.clock().toISOString() }
+
+  private allowedLevels(snapshot: ProcessingSettingsSnapshot, levels?: number[]): void {
+    if (levels?.some(grade => !snapshot.settings.grades.allowedLevels.includes(grade))) {
+      throw invalidRequest('One or more requested GS levels are disabled by the captured application policy.')
+    }
+  }
+
+  private async admission(levels?: number[]): Promise<ProcessingSettingsSnapshot> {
+    const snapshot = await newWorkProcessingSettings(this.settings)
+    assertNewWork(snapshot, 'gradeLadders')
+    this.allowedLevels(snapshot, levels)
+    return snapshot
+  }
+
+  private referenceLimits(snapshot: ProcessingSettingsSnapshot, sources: GradeSourceSetRecord['sources']): void {
+    const limits = snapshot.settings.grades.references
+    const references = sources.filter(source => source.origin !== 'seed-job')
+    const pdfs = references.filter(source => source.originalBlobName.endsWith('.pdf'))
+    if (references.length > limits.maxSources ||
+      pdfs.some(source => (source.selectedPages.length || source.pageCount) > limits.maxSelectedPages) ||
+      pdfs.reduce((total, source) => total + (source.selectedPages.length || source.pageCount), 0) > limits.maxTotalSelectedPages) {
+      throw invalidRequest('The selected source set exceeds its supporting-reference or total PDF page budget.')
+    }
+  }
 
   private async writable(workspaceId: string, ladderId?: string, grade?: number): Promise<void> {
     try { await assertGradeWritable(this.store, workspaceId, ladderId, grade) } catch (error) {
@@ -237,22 +271,32 @@ export class GradeService {
 
   private async receipt(workspaceId: string, ladderId: string, key: string, operation: string, input: unknown, actor: string) {
     const fingerprint = gradeContentHash({ operation, input })
-    const candidate = { operation, fingerprint, createdAt: this.now(), createdBy: actor }
-    const result = await this.blobs.putImmutable(
-      `${workspaceId}/${ladderId}/requests/${key}.json`, Buffer.from(JSON.stringify(candidate)), 'application/json',
-    )
-    const receipt = receiptSchema.parse(json(result.blob))
-    if (receipt.operation !== operation || receipt.fingerprint !== fingerprint) {
+    const name = `${workspaceId}/${ladderId}/requests/${key}.json`
+    let blob = await this.blobs.read(name)
+    let policySettings: ProcessingSettingsSnapshot | undefined
+    if (!blob) {
+      policySettings = await this.admission()
+      const candidate = { operation, fingerprint, createdAt: this.now(), createdBy: actor,
+        processingSettings: newProcessingSettings(this.settings, policySettings) }
+      blob = (await this.blobs.putImmutable(name, Buffer.from(JSON.stringify(candidate)), 'application/json')).blob
+    }
+    const receipt = receiptSchema.parse(json(blob))
+    if (receipt.operation !== operation || receipt.fingerprint !== fingerprint || receipt.createdBy !== actor) {
       throw conflict('This idempotency key has already been used for a different request.')
     }
-    return receipt
+    const processingSettings = await admittedProcessingSettings(this.settings, receipt.processingSettings)
+    return { ...receipt, processingSettings, policySettings: processingSettings ?? policySettings ?? acceptedProcessingSettings() }
   }
 
-  private work(ladder: GradeLadderRecord, input: GradeWorkRecord['input'], timestamp: string, key: string = randomUUID(), fingerprint?: string): GradeWorkRecord {
+  private work(
+    ladder: GradeLadderRecord, input: GradeWorkRecord['input'], timestamp: string, key: string = randomUUID(),
+    fingerprint?: string, processingSettings?: ProcessingSettingsSnapshot,
+  ): GradeWorkRecord {
     return {
       id: `grade-work-${key}`, recordType: 'grade-work', workspaceId: ladder.workspaceId, ladderId: ladder.id,
       createdAt: timestamp, updatedAt: timestamp, input, status: 'queued', attempts: 0, nextAttemptAt: timestamp,
       ...(fingerprint ? { requestFingerprint: fingerprint } : {}),
+      ...(processingSettings ? { processingSettings } : {}),
     }
   }
 
@@ -428,6 +472,8 @@ export class GradeService {
     }
     const initializationName = `${workspaceId}/${ladderId}/initialization.json`
     let initializationBlob = await this.blobs.read(initializationName)
+    const processingSettings = initializationBlob ? undefined
+      : newProcessingSettings(this.settings, await this.admission(input.grades))
     const previousControl = await this.store.getControl(workspaceId, ladderId)
     if ((initializationBlob && initializationSchema.parse(json(initializationBlob)).inputFingerprint !== fingerprint) ||
       (previousControl?.record.preparation && previousControl.record.preparation.inputFingerprint !== fingerprint)) {
@@ -502,7 +548,7 @@ export class GradeService {
         source: { ...copy(source), originalBlobName: originalName, sha256: original.sha256, bytes: original.bytes.byteLength },
         capturedAt: this.now(),
       }
-      const candidate = { inputFingerprint: fingerprint, createdBy: actor, seed }
+      const candidate = { inputFingerprint: fingerprint, createdBy: actor, seed, processingSettings }
       initializationBlob = (await this.blobs.putImmutable(initializationName, Buffer.from(JSON.stringify(candidate)), 'application/json')).blob
     }
     // The winning Blob is the preparation record. Its timestamp and exact saved version survive
@@ -511,6 +557,7 @@ export class GradeService {
     if (prepared.inputFingerprint !== fingerprint) throw conflict('This idempotency key was used for different ladder input.')
     const seed = this.validateSeed(prepared.seed, workspaceId, ladderId, input)
     const timestamp = seed.capturedAt
+    const capturedSettings = await admittedProcessingSettings(this.settings, prepared.processingSettings)
     await this.immutableJson(`${workspaceId}/${ladderId}/seed.json`, seed)
     const document: ReferenceDocument = {
       ...copy(seed.document), kind: 'reference', sample: false,
@@ -534,6 +581,7 @@ export class GradeService {
       sha256: seed.source.sha256, bytes: seed.source.bytes, capturedAt: timestamp,
       extractionMethod: 'seed-snapshot', extractionVersion: 'grade-seed-v1', completeness: 'complete',
       pageCount: document.pageCount, selectedPages: [], issues: [], inputFingerprint: fingerprint,
+      ...(capturedSettings ? { processingSettings: capturedSettings } : {}),
     }
     const ladder: GradeLadderRecord = {
       id: ladderId, recordType: 'grade-ladder', workspaceId, createdAt: timestamp, updatedAt: timestamp,
@@ -542,9 +590,10 @@ export class GradeService {
       seedJobTitle: seed.job.title, seedBlobName: `${workspaceId}/${ladderId}/seed.json`,
       sourceIds: [source.id], sourceRevision: 1, status: 'discovering', issues: [],
       createdBy: prepared.createdBy, inputFingerprint: fingerprint,
+      ...(capturedSettings ? { processingSettings: capturedSettings } : {}),
     }
     const operations: Operations = new Map()
-    for (const record of [ladder, source, this.work(ladder, { kind: 'discover' }, timestamp, key, fingerprint),
+    for (const record of [ladder, source, this.work(ladder, { kind: 'discover' }, timestamp, key, fingerprint, capturedSettings),
       ...input.grades.map(grade => this.head(ladder, grade, timestamp))]) creation(operations, record)
     await liveSeed(seed.rubric)
     try { await this.commit(workspaceId, operations) } catch (error) {
@@ -562,6 +611,7 @@ export class GradeService {
     const operations: Operations = new Map()
     if (gradeContentHash(current.record.context) !== gradeContentHash(ladder.context) ||
       gradeContentHash(current.record.grades) !== gradeContentHash(ladder.grades)) {
+      await this.admission(ladder.grades)
       await this.invalidate(ladder, operations, ladder.updatedAt)
       if (gradeContentHash(current.record.context) !== gradeContentHash(ladder.context)) delete ladder.discovery
     }
@@ -579,13 +629,15 @@ export class GradeService {
       if (existing.record.requestFingerprint !== receipt.fingerprint) throw conflict('This work key was already used.')
       return this.detail(workspaceId, ladderId)
     }
+    this.allowedLevels(receipt.policySettings, current.record.grades)
     requireMatch(current, etag)
     const ladder = copy(current.record)
     const operations: Operations = new Map()
     await this.invalidate(ladder, operations, receipt.createdAt)
     ladder.status = 'discovering'
     delete ladder.discovery
-    creation(operations, this.work(ladder, { kind: 'discover' }, receipt.createdAt, key, receipt.fingerprint))
+    creation(operations, this.work(ladder, { kind: 'discover' }, receipt.createdAt, key, receipt.fingerprint,
+      receipt.processingSettings))
     replacement(operations, current, ladder)
     try { await this.commit(workspaceId, operations) } catch (error) {
       const published = await this.optional(workspaceId, `grade-work-${key}`, 'grade-work', ladderId)
@@ -611,9 +663,30 @@ export class GradeService {
       if (existing.record.inputFingerprint !== receipt.fingerprint) throw conflict('This source key was already used for different input.')
       return this.detail(workspaceId, ladderId)
     }
+    const policy = receipt.policySettings.settings
+    const limits = policy.grades.references
+    if (input.kind === 'pdf' && !limits.allowAgencyUploads || input.kind === 'url' && !limits.allowAgencyUrls) {
+      throw invalidRequest('This supplemental reference input is disabled by application policy.')
+    }
+    if (input.kind === 'url' && !urlAllowedBySettings(input.url, policy, 'agencyReferences')) {
+      throw invalidRequest('This reference URL is not allowed by the current HTTPS and hostname policy.')
+    }
+    if (input.kind === 'pdf' && input.bytes.byteLength > limits.maxPdfBytes) {
+      throw new HttpError(413, 'invalid_request', `Reference PDFs may not exceed the current ${limits.maxPdfBytes}-byte limit.`)
+    }
+    const selectedPageCount = input.selectedPages.length || (input.kind === 'pdf' ? input.pageCount : 0)
+    if (selectedPageCount > limits.maxSelectedPages) {
+      throw invalidRequest(`Select at most ${limits.maxSelectedPages} pages for each reference under the current policy.`)
+    }
     const sources = await Promise.all(current.record.sourceIds.map(id => this.get(workspaceId, id, 'grade-source', ladderId)))
-    if (sources.filter(value => value.record.origin !== 'seed-job').length >= LIMITS.maxSources) {
-      throw invalidRequest(`A ladder supports at most ${LIMITS.maxSources} supporting references, in addition to its automatic seed.`)
+    if (sources.filter(value => value.record.origin !== 'seed-job').length >= limits.maxSources) {
+      throw invalidRequest(`A ladder supports at most ${limits.maxSources} supporting references, in addition to its automatic seed.`)
+    }
+    const existingPages = sources.filter(value => value.record.origin !== 'seed-job' &&
+      value.record.originalContentType === 'application/pdf').reduce((total, value) =>
+      total + (value.record.selectedPages.length || value.record.pageCount || 0), 0)
+    if (existingPages + (input.kind === 'pdf' ? selectedPageCount : 0) > limits.maxTotalSelectedPages) {
+      throw invalidRequest('This reference would exceed the current total selected PDF-page budget.')
     }
     const timestamp = receipt.createdAt
     const source: ReferenceSourceRecord = {
@@ -628,6 +701,7 @@ export class GradeService {
       },
       authorityStatus: 'supplied', relatedLinks: [], status: 'queued', documentId: `reference-${key}`, documentVersion: 1,
       completeness: 'pending', selectedPages: [...input.selectedPages], issues: [], inputFingerprint: receipt.fingerprint,
+      ...(receipt.processingSettings ? { processingSettings: receipt.processingSettings } : {}),
     }
     if (input.kind === 'pdf') {
       source.originalBlobName = `${workspaceId}/${ladderId}/${sourceId}/original.pdf`
@@ -646,7 +720,8 @@ export class GradeService {
     await this.invalidate(ladder, operations, this.now(), false)
     ladder.sourceIds.push(sourceId)
     creation(operations, source)
-    creation(operations, this.work(ladder, { kind: 'extract-source', sourceId, documentVersion: 1 }, timestamp, key, receipt.fingerprint))
+    creation(operations, this.work(ladder, { kind: 'extract-source', sourceId, documentVersion: 1 }, timestamp, key, receipt.fingerprint,
+      source.processingSettings))
     replacement(operations, current, ladder)
     try { await this.commit(workspaceId, operations) } catch (error) {
       const published = await this.optional(workspaceId, sourceId, 'grade-source', ladderId)
@@ -677,12 +752,26 @@ export class GradeService {
       throw invalidRequest('Page selection is outside the original document or exceeds the selected-page budget.')
     }
     if (gradeContentHash(pages) === gradeContentHash(stored.record.selectedPages)) return this.detail(workspaceId, ladderId)
+    const processingSettings = await this.admission()
+    const limits = processingSettings.settings.grades.references
+    if ((pages.length || stored.record.pageCount || 0) > limits.maxSelectedPages) {
+      throw invalidRequest(`Select at most ${limits.maxSelectedPages} pages for each reference under the current policy.`)
+    }
+    const sources = await this.all(workspaceId, ladderId, 'grade-source')
+    const totalPages = sources.filter(value => current.record.sourceIds.includes(value.record.id) &&
+      value.record.id !== sourceId && value.record.origin !== 'seed-job' &&
+      value.record.originalContentType === 'application/pdf').reduce((sum, value) =>
+      sum + (value.record.selectedPages.length || value.record.pageCount || 0), 0) +
+      (stored.record.originalContentType === 'application/pdf' ? pages.length || stored.record.pageCount || 0 : 0)
+    if (totalPages > limits.maxTotalSelectedPages) throw invalidRequest('This selection exceeds the current total PDF-page budget.')
     const timestamp = this.now()
     const source: ReferenceSourceRecord = {
       ...copy(stored.record), selectedPages: pages, documentVersion: stored.record.documentVersion + 1,
       completeness: 'pending', status: 'queued', updatedAt: timestamp,
       issues: stored.record.issues.filter(issue => !['reference-extraction-warning', 'reference-incomplete'].includes(issue.code)),
+      processingSettings: newProcessingSettings(this.settings, processingSettings),
     }
+    if (!source.processingSettings) delete source.processingSettings
     delete source.documentBlobName
     delete source.extractionMethod
     delete source.extractionVersion
@@ -695,7 +784,8 @@ export class GradeService {
     }
     replacement(operations, stored, source)
     replacement(operations, current, ladder)
-    creation(operations, this.work(ladder, { kind: 'extract-source', sourceId, documentVersion: source.documentVersion }, timestamp))
+    creation(operations, this.work(ladder, { kind: 'extract-source', sourceId, documentVersion: source.documentVersion },
+      timestamp, undefined, undefined, source.processingSettings))
     await this.commit(workspaceId, operations)
     return this.detail(workspaceId, ladderId)
   }
@@ -779,6 +869,9 @@ export class GradeService {
     const receipt = await this.receipt(workspaceId, ladderId, key, 'confirm', { input, etag }, actor)
     const existing = await this.optional(workspaceId, `source-set-${key}`, 'grade-source-set', ladderId)
     if (existing) return this.detail(workspaceId, ladderId)
+    const processingSettings = receipt.policySettings
+    this.allowedLevels(processingSettings, current.record.grades)
+    const limits = processingSettings.settings.grades.references
     requireMatch(current, etag)
     if (!current.record.context.confirmed) throw conflict('Confirm the position context before confirming sources.')
     const sources = await Promise.all(current.record.sourceIds.map(id => this.get(workspaceId, id, 'grade-source', ladderId)))
@@ -797,11 +890,13 @@ export class GradeService {
     })
     const selected = sources.filter(source => decisions.find(decision => decision.sourceId === source.record.id)?.selected)
     const captured = selected.map(source => frozen(source.record))
-    if (captured.filter(source => source.origin !== 'seed-job').length > LIMITS.maxSources ||
-      captured.filter(source => source.origin !== 'seed-job' && source.originalBlobName.endsWith('.pdf')).reduce(
-        (total, source) => total + (source.selectedPages.length || source.pageCount), 0,
-      ) > LIMITS.maxTotalPdfPages) throw invalidRequest('The selected source set exceeds its supporting-reference or total PDF page budget.')
+    this.referenceLimits(processingSettings, captured)
     const documents = await Promise.all(captured.map(source => this.readReference(workspaceId, ladderId, source)))
+    if (documents.some((document, index) => captured[index].origin !== 'seed-job' &&
+      document.paragraphs.reduce((count, paragraph) => count + paragraph.heading.length + paragraph.text.length, 0) >
+      limits.maxSourceCharacters)) {
+      throw invalidRequest('A selected reference exceeds the current normalized-source character limit. Nothing was truncated.')
+    }
     const selectedTargets = selected.map((source, index) => ({ source: source.record, document: documents[index] }))
     const reviewed = selected.map(({ record: source }, index) => {
       let snapshot = captured[index]
@@ -829,6 +924,7 @@ export class GradeService {
       sources: snapshots, decisions: copy(decisions),
       issues: [...copy(current.record.issues), ...reviewed.flatMap(value => value.issue ? [value.issue] : [])],
       contentHash: '', confirmedBy: receipt.createdBy,
+      ...(receipt.processingSettings ? { processingSettings: receipt.processingSettings } : {}),
     }
     for (const decision of decisions) {
       if (!decision.selected) continue
@@ -881,12 +977,25 @@ export class GradeService {
       if (existing.record.requestFingerprint !== receipt.fingerprint) throw conflict('This work key was already used.')
       return this.detail(workspaceId, ladderId)
     }
+    const processingSettings = receipt.policySettings
+    this.allowedLevels(processingSettings, current.record.grades)
     requireMatch(current, etag)
     if (!current.record.sourceSetId) throw conflict('Confirm a source set before generating grade drafts.')
     const sourceSet = (await this.get(workspaceId, current.record.sourceSetId, 'grade-source-set', ladderId)).record
     currentSourceSet(current.record, sourceSet)
+    this.referenceLimits(processingSettings, sourceSet.sources)
+    const documents = await Promise.all(sourceSet.sources.map(source => this.readReference(workspaceId, ladderId, source)))
+    if (documents.some((document, index) => sourceSet.sources[index].origin !== 'seed-job' &&
+      document.paragraphs.reduce((count, paragraph) => count + paragraph.heading.length + paragraph.text.length, 0) >
+      processingSettings.settings.grades.references.maxSourceCharacters)) {
+      throw invalidRequest('A selected reference exceeds the captured normalized-source character limit. Nothing was truncated.')
+    }
     const timestamp = this.now()
-    const ladder: GradeLadderRecord = { ...copy(current.record), generationId: key, status: 'generating', updatedAt: timestamp }
+    const ladder: GradeLadderRecord = {
+      ...copy(current.record), generationId: key, status: 'generating', updatedAt: timestamp,
+      processingSettings: receipt.processingSettings,
+    }
+    if (!ladder.processingSettings) delete ladder.processingSettings
     const operations: Operations = new Map()
     const reviveGrades: number[] = []
     let eligibleGrades = 0
@@ -900,7 +1009,9 @@ export class GradeService {
       const head: GradeHeadRecord = {
         ...copy(currentHead.record), status: 'queued', generationId: key, sourceSetId: sourceSet.id,
         updatedAt: timestamp, issues: gradeIssuesFor(sourceSet.issues, grade),
+        processingSettings: ladder.processingSettings,
       }
+      if (!head.processingSettings) delete head.processingSettings
       delete head.latestReviewId
       delete head.error
       if (head.lifecycle?.deletedAt) {
@@ -911,7 +1022,8 @@ export class GradeService {
       replacement(operations, currentHead, head)
     }
     if (!eligibleGrades) throw conflict('Unarchive a grade rubric before starting a new generation.')
-    creation(operations, this.work(ladder, { kind: 'plan-competencies', sourceSetId: sourceSet.id, generationId: key }, receipt.createdAt, key, receipt.fingerprint))
+    creation(operations, this.work(ladder, { kind: 'plan-competencies', sourceSetId: sourceSet.id, generationId: key },
+      receipt.createdAt, key, receipt.fingerprint, ladder.processingSettings))
     replacement(operations, current, ladder)
     try { await this.commit(workspaceId, operations, { reviveGrades }) } catch (error) {
       const published = await this.optional(workspaceId, `grade-work-${key}`, 'grade-work', ladderId)
@@ -957,10 +1069,12 @@ export class GradeService {
     if (submitted.criteria.some(criterion => old.rubric.criteria.find(previous => previous.id === criterion.id)?.support !== criterion.support)) {
       throw invalidRequest('Criterion support classifications are server-owned and cannot be relabeled by a draft edit.')
     }
+    const processingSettings = await this.admission()
     const timestamp = this.now()
     const versionId = `grade-version-${randomUUID()}`
     const version: GradeRubricVersionRecord = {
       ...copy(old), id: versionId, version: old.version + 1,
+      processingSettings: newProcessingSettings(this.settings, processingSettings),
       createdAt: timestamp, updatedAt: timestamp, createdBy: actor, contentHash: '',
       rubric: {
         ...copy(submitted), id: versionId, version: old.version + 1, createdAt: timestamp,
@@ -972,6 +1086,7 @@ export class GradeService {
       qualifications: copy(input.qualifications),
       issues: old.issues.filter(issue => issue.scope === 'context' || issue.scope === 'source'),
     }
+    if (!version.processingSettings) delete version.processingSettings
     version.contentHash = gradeVersionHash(version)
     const documents = await Promise.all(current.sourceSet.record.sources.map(source => this.readReference(workspaceId, ladderId, source)))
     const errors = validateGradeVersion(version, current.sourceSet.record, documents)
@@ -992,7 +1107,7 @@ export class GradeService {
     creation(operations, version)
     creation(operations, this.work(ladder, {
       kind: 'review-grade', versionId: version.id, grade, sourceSetId: version.sourceSetId, generationId: version.generationId,
-    }, timestamp))
+    }, timestamp, undefined, undefined, version.processingSettings))
     replacement(operations, current.head, head)
     replacement(operations, current.ladder, ladder)
     await this.commit(workspaceId, operations)
@@ -1089,7 +1204,7 @@ export class GradeService {
         if (plan) creation(operations, this.work(current.record, {
           kind: 'generate-grade', grade: input.grade, competencyPlanId: plan.record.id,
           generationId: current.record.generationId, sourceSetId: current.record.sourceSetId,
-        }, timestamp))
+        }, timestamp, undefined, undefined, await resolveAcceptedProcessingSettings(this.settings, plan.record.processingSettings)))
         else if (!work.some(value => value.record.input.kind === 'plan-competencies' && isActive(value.record) &&
           this.workIsCurrent(value.record, current.record))) throw conflict('Retry competency planning before retrying this grade.')
         replacement(operations, head, { ...head.record, status: 'queued', updatedAt: timestamp })
@@ -1128,6 +1243,7 @@ export class GradeService {
           }
         }
         record.status = 'queued'
+        record.processingSettings = await resolveAcceptedProcessingSettings(this.settings, record.processingSettings)
         record.attempts = 0
         record.nextAttemptAt = timestamp
         delete record.error
@@ -1149,6 +1265,7 @@ export class GradeService {
         if (record.input.documentVersion !== undefined && record.input.documentVersion !== source.record.documentVersion) continue
         const updated: ReferenceSourceRecord = {
           ...copy(source.record), status: action === 'retry' ? 'queued' : 'cancelled', updatedAt: timestamp,
+          ...(action === 'retry' ? { processingSettings: await resolveAcceptedProcessingSettings(this.settings, source.record.processingSettings) } : {}),
         }
         delete updated.error
         replacement(operations, source, updated)

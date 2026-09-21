@@ -136,7 +136,10 @@ test('grade feature discovery stays separate from job Word-capability defaults',
       maxSourceCharacters: 180_000, maxBatchFiles: 10, maxUrlLength: 4096, maxCriteria: 20,
     },
   })
-  assert.deepEqual(await client.fetchGradeProcessingFeatures(), { realGradeLadders: true, gradeLimits: { maxSources: 15 } })
+  const available = await client.fetchGradeProcessingFeatures()
+  assert.equal(available.realGradeLadders, true)
+  assert.equal(available.gradeLimits.maxSources, 15)
+  assert.equal(available.gradeLimits.maxPdfPages, 250, 'Missing limits use the compiled ceiling, not undefined')
   globalThis.fetch = async () => json({ realJobImports: true })
   const disabled = await client.fetchGradeProcessingFeatures()
   assert.equal(disabled.realGradeLadders, false)

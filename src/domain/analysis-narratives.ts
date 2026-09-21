@@ -1,4 +1,5 @@
 import { ANALYSIS_LIMITS } from './real-analyses'
+import type { ProcessingSettingsSnapshot } from './admin-settings'
 import type {
   AnalysisEntityBase,
   AnalysisModelProvenance,
@@ -246,6 +247,7 @@ export interface AnalysisNarrativeArtifactBase {
   previousPublication?: AnalysisNarrativePublicationReference
   approval?: AnalysisSummaryApproval
   history?: AnalysisSummaryHistoryReference
+  processingSettings?: ProcessingSettingsSnapshot
 }
 
 export interface RealAnalysisCandidateNarrativeArtifact extends AnalysisNarrativeArtifactBase, AnalysisCandidateNarrativeModelOutput {
@@ -293,6 +295,7 @@ export interface AnalysisNarrativeRecordBase extends AnalysisEntityBase, Analysi
   published?: AnalysisNarrativePublicationReference
   history?: AnalysisSummaryHistoryReference
   summaryRound?: number
+  retryRequestId?: string
 }
 
 export interface RealAnalysisCandidateNarrativeRecord extends AnalysisNarrativeRecordBase {

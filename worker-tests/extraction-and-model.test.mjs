@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import { loadWorker } from './shared-model-loader.mjs'
-
+import { settingsSnapshot } from './runtime-settings-test-support.mjs'
 const {
   analyzePdf,
   documentIntelligenceParagraphs,
@@ -65,6 +65,38 @@ function modelResponse(result, model = 'gpt-5-mini-2026-08-01') {
     choices: [{ message: { content: JSON.stringify(result) } }],
   }), { status: 200, headers: { 'content-type': 'application/json' } })
 }
+
+test('job rubric resolves only its captured task and enforces the frozen criterion and repair limits', async () => {
+  let calls = 0
+  const model = {
+    endpoint: 'https://model.example', deployment: 'old-deployment', modelName: 'gpt-5-mini',
+    getToken: async () => 'test-token',
+    processingSettings: settingsSnapshot(settings => {
+      settings.rubrics.jobs.maxCriteria = 2
+      settings.ai.tasks.jobRubric.reasoningEffort = 'high'
+      settings.ai.tasks.jobRubric.completionTokenLimit = 6000
+    }),
+    fetch: async (_url, init) => {
+      calls++
+      const body = JSON.parse(init.body)
+      assert.equal(body.model, 'deployment-jobRubric')
+      assert.equal(body.reasoning_effort, 'high')
+      assert.equal(body.max_completion_tokens, 6000)
+      assert.equal(body.response_format.json_schema.schema.properties.criteria.maxItems, 2)
+      return modelResponse(validResult)
+    },
+  }
+  assert.equal((await generateGroundedRubric(document, model, () => [], jobId, '2026-09-17T12:00:00.000Z')).rubric.provenance.model, 'gpt-5-mini-2026-08-01')
+  const strict = {
+    ...model, processingSettings: settingsSnapshot(settings => {
+      settings.rubrics.jobs.maxCriteria = 1
+      settings.ai.jobRubric.maxOutputCorrections = 0
+    }),
+    fetch: async () => { calls++; return modelResponse(validResult) },
+  }
+  await assert.rejects(generateGroundedRubric(document, strict, () => [], jobId, '2026-09-17T12:00:00.000Z'))
+  assert.equal(calls, 2)
+})
 
 test('Document Intelligence layout preserves page-aware paragraphs and table rows', () => {
   const paragraphs = documentIntelligenceParagraphs({

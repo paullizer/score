@@ -7,6 +7,7 @@ import { docxFile, legacyDocFile } from './word-fixtures.mjs'
 import {
   createApp, StoreConflictError, parseGradeEntity, gradeContentHash, gradeVersionHash, gradeSourceSetHash, gradeRecordHash,
   parseGradeSeedSnapshot, validateGradeVersion, validateGradeApproval, validateReferenceDocument, loadConfig, WorkspaceRepository,
+  createDefaultAdminSettings, captureProcessingSettings,
 } from '../dist-server/app.mjs'
 import {
   ALLOWED_OID, OTHER_ALLOWED_OID, APP_ORIGIN, TENANT_ID,
@@ -152,13 +153,14 @@ async function start(options = {}) {
   const config = baseConfig({
     realJobs: options.jobs === false ? undefined : JOB_CONFIG,
     realGrades: options.grades === false ? undefined : CONFIG,
+    ...(options.settings ? { settings: { runtimeEnabled: options.runtimeSettingsEnabled ?? true } } : {}),
   })
-  const app = createApp({ config, directory, state, jobs, grades, now: () => now })
+  const app = createApp({ config, directory, state, jobs, grades, now: () => now, settings: options.settings })
   const server = createServer(app)
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve))
   const baseUrl = `http://127.0.0.1:${server.address().port}/api`
   const api = {
-    baseUrl, directory, state, grades, jobs, jobRecords, jobRubrics,
+    baseUrl, directory, state, grades, jobs, jobRecords, jobRubrics, config,
     setNow(value) { now = new Date(value) },
     async close() { await new Promise(resolve => server.close(resolve)) },
     async request(path, method = 'GET', body, extra = {}, oid = ALLOWED_OID) {
@@ -246,6 +248,288 @@ async function create(api, options = {}) {
   if (!options.allowFailure) assert.equal(response.status, 202, JSON.stringify(body))
   return { response, body, detail: body.ladder, seeded, input, key }
 }
+
+test('grade admissions enforce allowed levels, reference/selected-page budgets and live download roles, without rebinding accepted retries', async () => {
+    const value = createDefaultAdminSettings()
+    let outage = false, reads = 0
+    const settings = { async capture() {
+      reads++
+      if (outage) throw new Error('Settings unavailable')
+      return captureProcessingSettings(value, 'grade-policy-one', NOW)
+    } }
+    const api = await start({ settings })
+    try {
+      const seeded = await seed(api)
+      value.features.gradeLadders = false
+      assert.equal((await create(api, { seed: seeded, allowFailure: true })).response.status, 503)
+      value.features.gradeLadders = true
+      value.grades.allowedLevels = [9]
+      assert.equal((await create(api, { seed: seeded, allowFailure: true })).response.status, 400)
+      value.grades.allowedLevels = [9, 12]
+      let { detail, key, input } = await create(api, { seed: seeded })
+      const pin = clone(detail.ladder.processingSettings)
+      assert.equal(pin.revision, 'grade-policy-one')
+      assert.deepEqual(detail.workItems[0].processingSettings, pin)
+      const address = `${api.base}/${detail.ladder.id}`
+      const add = url => api.request(`${address}/sources/url`, 'POST', { url },
+        { 'idempotency-key': randomUUID() })
+      value.grades.references.allowAgencyUrls = false
+      assert.equal((await add('https://agency.example.gov/guide')).status, 400)
+      value.grades.references.allowAgencyUrls = true
+      value.imports.urls.requireHttps = true
+      assert.equal((await add('http://agency.example.gov/guide')).status, 400)
+      value.grades.references.maxSources = 1
+      let response = await add('https://agency.example.gov/guide')
+      assert.equal(response.status, 200, await response.clone().text())
+      detail = (await response.json()).ladder
+      assert.equal((await add('https://agency.example.gov/other')).status, 400)
+      value.grades.references.maxSources = 15
+      const upload = async selectedPages => fetch(`${api.baseUrl}${address}/sources/pdf`, {
+        method: 'POST', headers: writeHeaders({
+          'content-type': 'application/pdf', 'x-file-name': 'reference.pdf',
+          'idempotency-key': randomUUID(), 'x-source-pages': selectedPages,
+        }), body: await pdf(2),
+      })
+      value.grades.references.allowAgencyUploads = false
+      assert.equal((await upload('1')).status, 400)
+      value.grades.references.allowAgencyUploads = true
+      value.grades.references.maxPdfBytes = 10
+      assert.equal((await upload('1')).status, 413)
+      value.grades.references.maxPdfBytes = 20 * 1024 * 1024
+      value.grades.references.maxSelectedPages = 1
+      value.grades.references.pdfChunkPages = 1
+      assert.equal((await upload('1,2')).status, 400)
+      value.grades.references.maxTotalSelectedPages = 1
+      response = await upload('1')
+      assert.equal(response.status, 200, await response.clone().text())
+      detail = (await response.json()).ladder
+      const source = detail.sources.find(source => source.origin === 'upload')
+      assert.ok(source)
+      assert.equal((await upload('1')).status, 400)
+      response = await api.request(`${address}/sources/${source.id}`, 'PATCH', { selectedPages: [1, 2] }, { 'if-match': detail.etag })
+      assert.equal(response.status, 400)
+      value.documents.originalDownloadRoles = ['owner']
+      api.directory._addMembership(api.workspaceId, membershipFor(api.workspaceId, { oid: OTHER_ALLOWED_OID, role: 'viewer' }))
+      assert.equal((await api.request(`${address}/sources/${source.id}/original`, 'GET', undefined, {}, OTHER_ALLOWED_OID)).status, 403)
+      assert.equal((await api.request(address, 'GET', undefined, {}, OTHER_ALLOWED_OID)).status, 200)
+      value.documents.formattedDocxPreviewEnabled = false
+      assert.equal((await api.request(`${address}/sources/${source.id}/original?preview=formatted`)).status, 403)
+      value.features.gradeLadders = false
+      const before = reads
+      assert.equal((await api.request(api.base, 'POST', input, { 'idempotency-key': key })).status, 202)
+      assert.equal(reads, before)
+      outage = true
+      assert.equal((await api.request(address)).status, 200)
+      const work = detail.workItems.find(work => work.input.kind === 'extract-source' && work.input.sourceId === source.id)
+      response = await api.request(`${address}/cancel`, 'POST', { workId: work.id }, { 'if-match': detail.etag })
+      assert.equal(response.status, 200, await response.clone().text())
+      detail = (await response.json()).ladder
+      response = await api.request(`${address}/retry`, 'POST', { workId: work.id }, { 'if-match': detail.etag })
+      assert.equal(response.status, 200, await response.clone().text())
+      assert.deepEqual((await stored(api, work.id)).record.processingSettings, work.processingSettings)
+      assert.equal((await add('https://agency.example.gov/new')).status, 503)
+    } finally { await api.close() }
+})
+
+test('grade reference originals retain their dedicated byte ceiling instead of the generic URL ceiling', async () => {
+  const value = createDefaultAdminSettings()
+  assert.equal(value.grades.references.maxPdfBytes, 20 * 1024 * 1024)
+  assert.equal(value.imports.urls.maxResponseBytes, 12 * 1024 * 1024)
+  const bytes = Buffer.alloc(value.imports.urls.maxResponseBytes + 1, 0x20)
+  bytes.set(await pdf(1))
+  let revision = 'dedicated-reference-bytes'
+  const settings = { async capture() { return captureProcessingSettings(value, revision, NOW) } }
+  const api = await start({ settings })
+  try {
+    const { detail } = await create(api)
+    const address = `${api.base}/${detail.ladder.id}`
+    const upload = () => fetch(`${api.baseUrl}${address}/sources/pdf`, {
+      method: 'POST', headers: writeHeaders({
+        'content-type': 'application/pdf', 'x-file-name': 'large-reference.pdf',
+        'idempotency-key': randomUUID(), 'x-source-pages': '1',
+      }), body: bytes,
+    })
+    let response = await upload()
+    assert.equal(response.status, 200, await response.clone().text())
+    const uploaded = (await response.json()).ladder.sources.find(source => source.origin === 'upload')
+    assert.ok(uploaded)
+    assert.equal(uploaded.bytes, bytes.byteLength)
+    assert.equal(uploaded.sha256, sha(bytes))
+    assert.equal(uploaded.processingSettings.settings.grades.references.maxPdfBytes, 20 * 1024 * 1024)
+    assert.equal(uploaded.processingSettings.settings.imports.urls.maxResponseBytes, 12 * 1024 * 1024)
+
+    response = await api.request(`${address}/sources/url`, 'POST', { url: 'https://agency.example.gov/large-reference.pdf' },
+      { 'idempotency-key': randomUUID() })
+    assert.equal(response.status, 200, await response.clone().text())
+    const admitted = (await response.json()).ladder
+    const urlSource = admitted.sources.find(source => source.requestedUrl === 'https://agency.example.gov/large-reference.pdf')
+    assert.ok(urlSource)
+    assert.deepEqual(urlSource.processingSettings, uploaded.processingSettings)
+    assert.deepEqual(admitted.workItems.find(work => work.input.kind === 'extract-source' &&
+      work.input.sourceId === urlSource.id).processingSettings, urlSource.processingSettings)
+
+    value.grades.references.maxPdfBytes = bytes.byteLength - 1
+    revision = 'lowered-reference-bytes'
+    response = await upload()
+    assert.equal(response.status, 413, await response.clone().text())
+    response = await api.request(`${address}/sources/${uploaded.id}/original`)
+    assert.equal(response.status, 200, await response.clone().text())
+    assert.deepEqual(Buffer.from(await response.arrayBuffer()), bytes)
+    assert.deepEqual((await stored(api, uploaded.id)).record.processingSettings, uploaded.processingSettings)
+  } finally { await api.close() }
+})
+
+test('configured grade rollout blocks new work but recovers accepted preparations and retries without policy reads', async () => {
+  const value = createDefaultAdminSettings()
+  let outage = false
+  const settings = { async capture() {
+    if (outage) throw new Error('Settings unavailable')
+    return captureProcessingSettings(value, 'grade-rollout-policy', NOW)
+  }, async captureLegacy() { throw new Error('An accepted pinned preparation needs no legacy baseline') } }
+  const api = await start({ settings, runtimeSettingsEnabled: false })
+  try {
+    const blocked = await create(api, { allowFailure: true })
+    assert.equal(blocked.response.status, 503)
+    assert.equal(await api.grades.blobs.read(`${api.workspaceId}/ladder-${blocked.key}/initialization.json`), undefined)
+    api.config.settings.runtimeEnabled = true
+    api.grades.store._before(() => { throw new Error('Interrupted pinned admission') })
+    const interrupted = await create(api, { allowFailure: true })
+    assert.equal(interrupted.response.status, 503)
+    api.config.settings.runtimeEnabled = false
+    outage = true
+    const created = (await create(api, { seed: interrupted.seeded, key: interrupted.key })).detail
+    assert.equal(created.ladder.processingSettings.revision, 'grade-rollout-policy')
+    assert.deepEqual(created.workItems[0].processingSettings, created.ladder.processingSettings)
+    assert.ok(created.sources.every(source => source.processingSettings.revision === 'grade-rollout-policy'))
+    const initialization = await api.grades.blobs.read(`${api.workspaceId}/${created.ladder.id}/initialization.json`)
+    assert.deepEqual(JSON.parse(Buffer.from(initialization.bytes).toString()).processingSettings, created.ladder.processingSettings)
+    outage = false
+    api.config.settings.runtimeEnabled = true
+    const accepted = await addSource(api, created)
+    const work = accepted.detail.workItems.find(work => work.input.kind === 'extract-source' && work.input.sourceId === accepted.source.id)
+    assert.equal(work.processingSettings.revision, 'grade-rollout-policy')
+    api.config.settings.runtimeEnabled = false
+    const address = `${api.base}/${created.ladder.id}`
+    let response = await api.request(`${address}/cancel`, 'POST', { workId: work.id }, { 'if-match': accepted.detail.etag })
+    assert.equal(response.status, 200, await response.clone().text())
+    const cancelled = (await response.json()).ladder
+    response = await api.request(`${address}/retry`, 'POST', { workId: work.id }, { 'if-match': cancelled.etag })
+    assert.equal(response.status, 200, await response.clone().text())
+    assert.deepEqual((await stored(api, work.id)).record.processingSettings, work.processingSettings)
+    response = await api.request(`${address}/sources/url`, 'POST', { url: 'https://agency.example.gov/after-rollback' },
+      { 'idempotency-key': randomUUID() })
+    assert.equal(response.status, 503)
+    assert.equal((await create(api, { allowFailure: true })).response.status, 503)
+    outage = true
+    assert.equal((await api.request(address)).status, 200)
+  } finally { await api.close() }
+})
+
+test('new frozen references retain source settings revisions while legacy full pins keep their hashes', async () => {
+  const value = createDefaultAdminSettings()
+  let revision = 'source-processing-policy'
+  const settings = { async capture() { return captureProcessingSettings(value, revision, NOW) } }
+  const api = await start({ settings })
+  try {
+    let { detail } = await create(api)
+    detail = await finishDiscovery(api, detail)
+    const added = await addSource(api, detail)
+    await readySource(api, added.source)
+    detail = await (await api.request(`${api.base}/${detail.ladder.id}`)).json()
+    revision = 'source-set-policy'
+    const response = await api.request(`${api.base}/${detail.ladder.id}/source-set`, 'POST', {
+      decisions: [{ sourceId: added.source.id, selected: true, applicability: 'applicable', reason: 'Captured applicable agency evidence.' }],
+    }, { 'idempotency-key': randomUUID(), 'if-match': detail.etag })
+    assert.equal(response.status, 200, await response.clone().text())
+    detail = (await response.json()).ladder
+    const set = detail.sourceSet
+    assert.equal(set.processingSettings.revision, 'source-set-policy')
+    assert.equal((JSON.stringify(set).match(/"processingSettings":/g) ?? []).length, 1)
+    const legacy = clone(set)
+    for (const source of legacy.sources) {
+      assert.equal(source.processingSettingsRevision, 'source-processing-policy')
+      assert.equal(source.processingSettings, undefined)
+      const original = (await stored(api, source.sourceId)).record
+      assert.equal(original.processingSettings.revision, 'source-processing-policy')
+      source.processingSettings = original.processingSettings
+      delete source.processingSettingsRevision
+    }
+    legacy.contentHash = gradeSourceSetHash(legacy)
+    const readLegacy = parseGradeEntity(JSON.parse(JSON.stringify(legacy)))
+    assert.deepEqual(readLegacy, legacy)
+    assert.equal(gradeSourceSetHash(readLegacy), legacy.contentHash)
+    assert.ok(readLegacy.sources.every(source => !Object.hasOwn(source, 'processingSettingsRevision')))
+    const mismatched = clone(legacy)
+    mismatched.sources[0].processingSettingsRevision = 'unrelated-policy'
+    mismatched.contentHash = gradeSourceSetHash(mismatched)
+    assert.throws(() => parseGradeEntity(mismatched), /settings revision mismatch/)
+    const changed = clone(set)
+    changed.sources[0].processingSettingsRevision = 'unrelated-policy'
+    assert.throws(() => parseGradeEntity(changed), /source-set hash mismatch/)
+    revision = 'generation-policy'
+    const generation = await api.request(`${api.base}/${detail.ladder.id}/generate`, 'POST', {},
+      { 'idempotency-key': randomUUID(), 'if-match': detail.etag })
+    assert.equal(generation.status, 200, await generation.clone().text())
+    const generated = (await generation.json()).ladder
+    const work = generated.workItems.find(work => work.input.kind === 'plan-competencies')
+    assert.equal(work.processingSettings.revision, 'generation-policy')
+    assert.deepEqual(generated.sourceSet, set)
+  } finally { await api.close() }
+})
+
+test('full-size reference sets do not multiply large accepted settings beyond the immutable record ceiling', async () => {
+  const value = createDefaultAdminSettings()
+  const deployment = value.ai.deployments[0]
+  deployment.id = 'd'.repeat(128)
+  deployment.deploymentName = 'n'.repeat(128)
+  deployment.modelVersion = 'v'.repeat(100)
+  value.ai.defaultDeploymentId = deployment.id
+  for (const task of Object.values(value.ai.tasks)) task.deploymentId = null
+  while (Buffer.byteLength(JSON.stringify(value)) < 15_800) {
+    const index = value.imports.urls.jobs.blockedHosts.length
+    value.imports.urls.jobs.blockedHosts.push({
+      hostname: `blocked${index}.${'a'.repeat(60)}.${'b'.repeat(60)}.${'c'.repeat(60)}.example`,
+      includeSubdomains: true,
+    })
+  }
+  const pin = captureProcessingSettings(value, 'large-source-policy', NOW)
+  const settings = { async capture() { return pin } }
+  const api = await start({ settings })
+  try {
+    let { detail } = await create(api)
+    detail = await finishDiscovery(api, detail)
+    const decisions = []
+    for (let index = 0; index < value.grades.references.maxSources; index++) {
+      const added = await addSource(api, detail, { url: `https://agency.example.gov/reference-${index}` })
+      const title = `Reference ${index} ${'T'.repeat(470)}`
+      await readySource(api, { ...added.source, title }, {
+        title, publisher: 'P'.repeat(300), finalUrl: `https://agency.example.gov/${index}/${'p'.repeat(3500)}`,
+        intendedSection: 'S'.repeat(2000), revision: 'R'.repeat(1000),
+        coverage: { series: ['0801'], grades: [9, 12], functions: [], state: 'confirmed', explanation: 'E'.repeat(2000) },
+      })
+      detail = added.detail
+      decisions.push({ sourceId: added.source.id, selected: true, applicability: 'applicable', reason: 'Captured applicable agency evidence.' })
+    }
+    detail = await (await api.request(`${api.base}/${detail.ladder.id}`)).json()
+    const response = await api.request(`${api.base}/${detail.ladder.id}/source-set`, 'POST', { decisions },
+      { 'idempotency-key': randomUUID(), 'if-match': detail.etag })
+    assert.equal(response.status, 200, await response.clone().text())
+    const set = (await response.json()).ladder.sourceSet
+    assert.equal(set.sources.length, 16)
+    assert.deepEqual(set.processingSettings, pin)
+    assert.ok(set.sources.every(source => source.processingSettingsRevision === pin.revision && source.processingSettings === undefined))
+    assert.ok(Buffer.byteLength(JSON.stringify(set)) < 512 * 1024)
+    assert.equal(parseGradeEntity(JSON.parse(JSON.stringify(set))).contentHash, set.contentHash)
+    const expanded = clone(set)
+    for (const source of expanded.sources) {
+      source.processingSettings = pin
+      delete source.processingSettingsRevision
+    }
+    expanded.contentHash = gradeSourceSetHash(expanded)
+    assert.ok(Buffer.byteLength(JSON.stringify(expanded)) > 512 * 1024)
+    assert.throws(() => parseGradeEntity(expanded), /payload is too large/)
+  } finally { await api.close() }
+})
 
 async function stored(api, id) {
   const value = await api.grades.store.get(api.workspaceId, id)

@@ -1,6 +1,8 @@
 import { z } from 'zod'
 import type { AnalysisModelProvenance } from './real-analyses'
 import { ANALYSIS_DIAGNOSTIC_REASONS } from './analysis-diagnostics'
+import { processingSettingsSnapshotSchema } from './admin-settings-schema'
+import { MODEL_TASK_IDS } from './admin-settings-tasks'
 
 export const SUMMARY_PIPELINE_VERSION = 'score-analysis-summaries-v2'
 export const SUMMARY_LIMITS = {
@@ -55,6 +57,7 @@ export const summaryDraftSchema = z.discriminatedUnion('kind', [
 export const summaryModelProvenanceSchema = z.strictObject({
   model: id, deployment: id, promptVersion: id, schemaVersion: id,
   startedAt: timestamp, completedAt: timestamp, inputCharacters: z.number().int().min(0),
+  settingsRevision: id.optional(), task: z.enum(MODEL_TASK_IDS).optional(),
 })
 export const summaryReviewSchema = summaryReviewOutputSchema.extend({
   id: z.string().uuid(), modelCallId: z.string().uuid(),
@@ -92,6 +95,7 @@ export const summaryHistoryEntrySchema = summaryStepSchema.extend({
   generationId: z.string().uuid(), attemptId: z.string().uuid(),
   inputFingerprint: hash, manifestSha256: hash, createdAt: timestamp,
   previous: summaryHistoryReferenceSchema.optional(),
+  processingSettings: processingSettingsSnapshotSchema.optional(),
 })
 export const summaryHistoryPageSchema = z.strictObject({
   schemaVersion: z.literal(1), workspaceId: id, runId: id,

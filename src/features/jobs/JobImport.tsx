@@ -1,6 +1,9 @@
 import { useEffect, useRef, useState } from 'react'
 import { Check, ChevronLeft, ChevronRight, FileText, Globe2, Link2, LoaderCircle, RotateCcw, ScanSearch, UploadCloud } from 'lucide-react'
 import { useWorkspace } from '../../app/workspace-context'
+import { clientAdmissionReason, usePublicSettings } from '../../app/public-settings-context'
+import { useGradeLeaveGuard } from '../../app/grade-navigation-context'
+import { effectiveFormats, requireImportBatch, requireImportFile, requireImportUrl } from '../../services/publicSettings'
 import type { ImportCandidate, SourceKind } from '../../domain/types'
 import { supportedUploadFormats, uploadAccept, type UploadFormat } from '../../domain/document-formats'
 import { selectedUploadFormat, uploadFileByteLimit, uploadFormatNames, uploadPickerLabel, validateUploadFile } from '../../services/documentUploads'
@@ -31,12 +34,14 @@ type RealImportItem = {
 
 function RealJobImport({ onClose }: { onClose: () => void }) {
   const { cloud } = useWorkspace()
+  const policy = usePublicSettings()
   if (!cloud) throw new Error('Real job imports require a cloud workspace.')
   const realJobs = cloud.realJobs
   const limits = realJobs.features?.limits
-  const formats = supportedUploadFormats({
+  const formats = effectiveFormats(supportedUploadFormats({
     markdownJobImports: realJobs.features?.markdownJobImports, wordDocumentImports: realJobs.features?.wordDocumentImports,
-  })
+  }), policy.settings, 'jobs')
+  const urlsAllowed = policy.settings?.imports.jobs.allowUrls !== false
   const wordEnabled = formats.includes('docx')
   const markdownEnabled = formats.includes('markdown')
   const [mode, setMode] = useState<'file' | 'url'>('file')
@@ -51,7 +56,10 @@ function RealJobImport({ onClose }: { onClose: () => void }) {
   const failed = items.filter((item) => item.state === 'error').length
   const invalid = items.filter((item) => item.state === 'invalid').length
   const pending = items.filter((item) => item.state === 'pending').length
-  const unavailable = realJobs.phase !== 'ready' || !realJobs.features?.realJobImports
+  const policyReason = clientAdmissionReason(policy, 'jobImports')
+  const unavailable = realJobs.phase !== 'ready' || !realJobs.features?.realJobImports || Boolean(policyReason)
+  const guard = useGradeLeaveGuard(items.some(item => item.state !== 'queued') || Boolean(urls.trim() && !locked), active, 'Unsubmitted job import sources')
+  const close = () => { void guard.close(onClose) }
 
   function chooseFiles(list: FileList | File[]) {
     if (submitting.current || locked || unavailable) return
@@ -78,6 +86,8 @@ function RealJobImport({ onClose }: { onClose: () => void }) {
     if (submitting.current || locked || unavailable) return
     if (!limits) { setError('Import limits are still loading. Try again in a moment.'); return }
     const lines = urls.split(/\n/).map((line) => line.trim()).filter(Boolean)
+    try { lines.forEach(url => requireImportUrl(url, 'jobs', policy.settings)) }
+    catch (caught) { setError(caught instanceof Error ? caught.message : 'This URL is not allowed.'); return }
     if (!lines.length) { setItems([]); setError('Enter at least one direct job posting URL.'); return }
     if (lines.length > limits.maxBatchFiles) { setItems([]); setError(`Enter no more than ${limits.maxBatchFiles} direct URLs in one batch.`); return }
     const invalid = lines.find((line) => line.length > limits.maxUrlLength || !URL.canParse(line) || !['http:', 'https:'].includes(new URL(line).protocol))
@@ -126,7 +136,14 @@ function RealJobImport({ onClose }: { onClose: () => void }) {
   }
 
   async function submit(selected = items.filter((item) => item.state === 'pending' || item.state === 'error')) {
-    if (submitting.current || !selected.length) return
+    if (submitting.current || !selected.length || unavailable) return
+    try {
+      requireImportBatch(items.length, 'jobs', policy.settings)
+      for (const item of selected) {
+        if (item.file) requireImportFile(item.file, 'jobs', policy.settings)
+        if (item.url) requireImportUrl(item.url, 'jobs', policy.settings)
+      }
+    } catch (caught) { setError(caught instanceof Error ? caught.message : 'Current policy does not allow this batch. Your selection is retained.'); return }
     submitting.current = true
     setLocked(true)
     setError('')
@@ -137,17 +154,19 @@ function RealJobImport({ onClose }: { onClose: () => void }) {
     }
   }
 
-  return <Modal open onOpenChange={(open) => { if (!open) onClose() }} title="Import real job descriptions" description="Score privately reads each source and prepares a source-grounded rubric." drawer
+  return <Modal open onOpenChange={(open) => { if (!open) close() }} title="Import real job descriptions" description="Score privately reads each source and prepares a source-grounded rubric." drawer
     footer={<>
       <span className="mr-auto text-[11px] text-muted">{active ? 'Uploading sources…' : queued || failed ? `${queued} queued / ${failed} unacknowledged` : `${pending} ready`}{invalid > 0 && ` / ${invalid} invalid`}</span>
-      {queued > 0 && failed === 0 && <Button onClick={onClose}>Done</Button>}
+      {queued > 0 && failed === 0 && <Button onClick={close}>Done</Button>}
       {failed > 0 && <Button icon={RotateCcw} disabled={active || unavailable} onClick={() => void submit(items.filter((item) => item.state === 'error'))}>Retry failed</Button>}
       {queued === 0 && <Button variant="primary" icon={active ? LoaderCircle : UploadCloud} disabled={active || unavailable || !pending} onClick={() => void submit()}>
         {active ? 'Uploading…' : `Import ${pending || ''} ${pending === 1 ? 'job' : 'jobs'}`}
       </Button>}
     </>}>
     {realJobs.phase === 'loading' && <div className="info-callout mb-5"><LoaderCircle size={18} className="animate-spin" /><div><strong>Checking import availability</strong><p>Score is loading this deployment's limits.</p></div></div>}
-    {unavailable && realJobs.phase !== 'loading' && <div className="mb-5"><InlineError>{realJobs.error ?? 'Real job imports are unavailable in this deployment.'}</InlineError></div>}
+    {unavailable && realJobs.phase !== 'loading' && <div className="mb-5"><InlineError>{policyReason ?? realJobs.error ?? 'Real job imports are unavailable in this deployment.'}</InlineError></div>}
+    {!formats.length && <p role="status" className="field-hint">New job file uploads are disabled by application policy. Existing jobs and captured evidence remain available.</p>}
+    {!urlsAllowed && <p role="status" className="field-hint">New public job URL imports are disabled by application policy.</p>}
     {!unavailable && !markdownEnabled && <p className="mb-4 text-[11px] text-muted" role="status">Markdown imports are not enabled in this deployment. Advertised file formats and direct HTML/PDF URL imports remain available.</p>}
     <SegmentedControl value={mode} onChange={(value) => {
       if (locked || submitting.current) { setError('Submitted inputs are locked so retries keep their original keys and bytes. Close this panel to start a separate batch.'); return }
@@ -159,7 +178,7 @@ function RealJobImport({ onClose }: { onClose: () => void }) {
           <UploadCloud size={32} strokeWidth={1.4} /><strong>Drop job description {uploadPickerLabel(formats, ' or ')} files here</strong>
           <span>Up to {limits?.maxBatchFiles ?? 10} files. {formats.map((format) => `${uploadFormatNames([format])}: ${uploadFileByteLimit(format, limits) / 1024 / 1024} MiB`).join(' · ')}. PDFs only: {limits?.maxPdfPages ?? 50} printed pages.</span>
           <span>Each source may contain up to {(limits?.maxSourceCharacters ?? JOB_IMPORT_LIMITS.maxSourceCharacters).toLocaleString()} normalized characters.</span>
-          <input type="file" multiple accept={uploadAccept(formats)} className="sr-only" aria-label={`Choose real job ${uploadPickerLabel(formats, ' or ')} files`} disabled={active || locked || unavailable} onChange={(event) => {
+          <input type="file" multiple accept={uploadAccept(formats)} className="sr-only" aria-label={`Choose real job ${uploadPickerLabel(formats, ' or ')} files`} disabled={active || locked || unavailable || !formats.length} onChange={(event) => {
             const files = Array.from(event.currentTarget.files ?? [])
             event.currentTarget.value = ''
             if (files.length) chooseFiles(files)
@@ -169,11 +188,11 @@ function RealJobImport({ onClose }: { onClose: () => void }) {
         {wordEnabled && <p className="field-hint mt-3">Word 97–2003 DOC and DOCX only, not DOCM, RTF or templates. Word citations use captured sections, not printed pages. Embedded images are not extracted as evidence; use PDF/OCR for image-only documents. All sources are limited to {limits?.maxSourceCharacters.toLocaleString() ?? '180,000'} normalized characters.</p>}
       </> : <label className="field">
         <span className="field-label flex items-center gap-2"><Link2 size={15} />Direct job posting URLs</span>
-        <textarea className="input" rows={6} value={urls} disabled={active || locked || unavailable} maxLength={(limits?.maxUrlLength ?? 4096) * (limits?.maxBatchFiles ?? 10)}
+        <textarea className="input" rows={6} value={urls} disabled={active || locked || unavailable || !urlsAllowed} maxLength={(limits?.maxUrlLength ?? 4096) * (limits?.maxBatchFiles ?? 10)}
           onChange={(event) => { setUrls(event.target.value); setItems([]); setError('') }}
           placeholder={'https://agency.example/jobs/program-manager\nhttps://agency.example/jobs/data-analyst'} />
-        <span className="field-hint">One public HTML or PDF http/https posting per line. Markdown and Word URLs are not supported. Whole-site discovery is deferred in real import mode.</span>
-        <Button size="sm" className="mt-3" disabled={active || locked || unavailable} onClick={prepareUrls}>Review URLs</Button>
+        <span className="field-hint">One public HTML or PDF {policy.settings?.imports.requireHttps ? 'HTTPS' : 'HTTP(S)'} posting per line. Markdown and Word URLs are not supported. Whole-site discovery is deferred in real import mode.</span>
+        <Button size="sm" className="mt-3" disabled={active || locked || unavailable || !urlsAllowed} onClick={prepareUrls}>Review URLs</Button>
       </label>}
     </div>
     {items.length > 0 && <div className="import-items" aria-live="polite">{items.map((item) => <div className="import-item items-start" key={item.key}>

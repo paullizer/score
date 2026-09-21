@@ -23,14 +23,14 @@ hooks:
     run: |
       node scripts\azure-before-deploy.mjs
       if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-      node scripts\azure-worker.mjs disable-word
+      node scripts\azure-worker.mjs prepare-web-deploy
       if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
   preprovision:
     shell: pwsh
     run: |
       node scripts\azure-auth.mjs prepare
       if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-      node scripts\azure-worker.mjs disable-word --if-provisioned
+      node scripts\azure-worker.mjs disable-admission --if-provisioned
       if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
   postprovision:
     shell: pwsh

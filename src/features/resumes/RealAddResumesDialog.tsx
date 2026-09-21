@@ -2,6 +2,8 @@ import { useId, useRef, useState } from 'react'
 import { Check, FileText, Link2, LoaderCircle, Plus, RotateCcw, UploadCloud, X } from 'lucide-react'
 import { Link } from 'react-router-dom'
 import { useRealResumes } from '../../app/real-resumes-context'
+import { clientAdmissionReason, usePublicSettings } from '../../app/public-settings-context'
+import { effectiveFormats } from '../../services/publicSettings'
 import { Badge, Button, EmptyState, InlineError, Modal, SegmentedControl } from '../../components/ui'
 import { RESUME_IMPORT_LIMITS } from '../../domain/real-resumes'
 import { supportedUploadFormats, uploadAccept } from '../../domain/document-formats'
@@ -10,6 +12,7 @@ import { resumeErrorMessage, resumeFileInput, resumeUrlLines, type RealResumeImp
 
 export function RealAddResumesDialog({ open, onOpenChange }: { open: boolean; onOpenChange: (open: boolean) => void }) {
   const api = useRealResumes()
+  const policy = usePublicSettings()
   const [mode, setMode] = useState<'file' | 'url'>('file')
   const [urls, setUrls] = useState('')
   const [error, setError] = useState('')
@@ -21,11 +24,13 @@ export function RealAddResumesDialog({ open, onOpenChange }: { open: boolean; on
   const accepted = items.filter((item) => item.state === 'accepted').length
   const valid = items.filter((item) => item.state === 'pending' || item.state === 'unconfirmed').length
   const limits = api?.features?.resumeLimits ?? RESUME_IMPORT_LIMITS
-  const formats = supportedUploadFormats({
+  const formats = effectiveFormats(supportedUploadFormats({
     markdownResumeImports: api?.features?.markdownResumeImports, wordDocumentImports: api?.features?.wordDocumentImports,
-  })
+  }), policy.settings, 'resumes')
+  const urlsAllowed = policy.settings?.imports.resumes.allowUrls !== false
   const wordEnabled = formats.includes('docx')
-  const unavailable = !api || api.phase !== 'ready' || !api.canWrite
+  const policyReason = clientAdmissionReason(policy, 'resumeImports')
+  const unavailable = !api || api.phase !== 'ready' || !api.canWrite || !api.features?.realResumeImports || Boolean(policyReason)
   const locked = batch?.inputCount !== null && batch?.inputCount !== undefined
   const markdownEnabled = api?.features?.markdownResumeImports === true
 
@@ -55,6 +60,9 @@ export function RealAddResumesDialog({ open, onOpenChange }: { open: boolean; on
     {!api ? <EmptyState title="A cloud workspace is required" description="Real imports are never sent through the sample workflow or stored in your browser." /> : <>
       {api.phase !== 'ready' && <div className="mb-4"><InlineError>{api.error ?? 'Checking private import availability…'} <Button size="sm" onClick={() => void api.refresh()}>Check service</Button></InlineError></div>}
       {!api.canWrite && <div className="mb-4"><InlineError>This workspace is read-only. An owner or editor can import resumes.</InlineError></div>}
+      {policyReason && <InlineError>{policyReason}</InlineError>}
+      {!formats.length && <p className="field-hint" role="status">New resume file uploads are disabled by application policy. Existing resumes remain readable.</p>}
+      {!urlsAllowed && <p className="field-hint" role="status">New public resume URL imports are disabled by application policy.</p>}
       {error && <div className="mb-4"><InlineError>{error}</InlineError></div>}
       <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
         <SegmentedControl value={mode} onChange={setMode} label="Resume source type" options={[{ value: 'file', label: `${uploadPickerLabel(formats)} files` }, { value: 'url', label: 'Public URLs' }]} />
@@ -70,22 +78,22 @@ export function RealAddResumesDialog({ open, onOpenChange }: { open: boolean; on
         <p id={hintId} className="text-[11px] text-muted">{formats.map((format) => `${uploadFormatNames([format])}: ${uploadFileByteLimit(format, limits) / 1024 / 1024} MiB`).join(' · ')}. PDFs only: {limits.maxPdfPages} printed pages. The server validates actual bytes, readability and the {(limits.maxSourceCharacters ?? RESUME_IMPORT_LIMITS.maxSourceCharacters).toLocaleString()} normalized-character limit. Different files may have the same filename.</p>
         {wordEnabled && <p className="text-[11px] text-muted">DOC means Word 97–2003, not DOCM, RTF or templates. Word citations use captured sections, not printed pages. Embedded images are not extracted as evidence; use PDF/OCR for image-only resumes. Up to {limits.maxSourceCharacters.toLocaleString()} normalized characters per source.</p>}
         <input ref={fileInput} type="file" accept={uploadAccept(formats)} multiple className="sr-only" tabIndex={-1}
-          aria-label={`Choose resume ${uploadPickerLabel(formats, ' or ')} files`} aria-describedby={hintId} disabled={unavailable || locked || uploading}
+          aria-label={`Choose resume ${uploadPickerLabel(formats, ' or ')} files`} aria-describedby={hintId} disabled={unavailable || locked || uploading || !formats.length}
           onChange={(event) => {
             const files = Array.from(event.currentTarget.files ?? [])
             event.currentTarget.value = ''
             if (files.length) stage(files.map(resumeFileInput))
           }} />
-        <Button icon={Plus} disabled={unavailable || locked || uploading} onClick={() => fileInput.current?.click()}>{formats.length > 1 ? 'Choose files' : 'Choose PDFs'}</Button>
+        <Button icon={Plus} disabled={unavailable || locked || uploading || !formats.length} onClick={() => fileInput.current?.click()}>{formats.length > 1 ? 'Choose files' : formats[0] === 'pdf' ? 'Choose PDFs' : `Choose ${uploadPickerLabel(formats) || 'files'}`}</Button>
         {markdownEnabled && <p className="text-[11px] text-muted">Markdown (.md / .markdown) has no printed-page limit. Files are uploaded locally. Links and images in them are not fetched; evidence is shown as normalized text, not a rendered Markdown preview.</p>}
       </div> : <div className="space-y-3">
         <label className="field"><span className="field-label">Public resume or profile URLs</span>
-          <textarea className="input" rows={5} value={urls} disabled={unavailable || locked || uploading}
+          <textarea className="input" rows={5} value={urls} disabled={unavailable || locked || uploading || !urlsAllowed}
             onChange={(event) => setUrls(event.target.value)}
             placeholder={'https://example.org/resume.pdf\nhttps://www.linkedin.com/in/public-profile'} />
-          <span className="field-hint">One public HTML or PDF URL per line, at most {limits.maxUrlLength} characters each. Markdown and Word URLs are not supported. Public LinkedIn profiles are supported only when accessible without sign-in.</span>
+          <span className="field-hint">One public HTML or PDF {policy.settings?.imports.requireHttps ? 'HTTPS ' : ''}URL per line, at most {limits.maxUrlLength} characters each. Markdown and Word URLs are not supported. Public LinkedIn profiles are supported only when accessible without sign-in.</span>
         </label>
-        <Button icon={Plus} disabled={unavailable || locked || uploading || !urls.trim()}
+        <Button icon={Plus} disabled={unavailable || locked || uploading || !urlsAllowed || !urls.trim()}
           onClick={() => stage(resumeUrlLines(urls).map((url) => ({ kind: 'url', url })))}>Add URLs to batch</Button>
         <p className="text-[11px] text-muted">A public profile can be sparse compared with a full resume. Missing evidence is not invented. Nonpublic or blocked URLs cannot be processed; there is no sign-in or access-control workaround.</p>
       </div>}

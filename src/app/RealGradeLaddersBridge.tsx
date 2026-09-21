@@ -2,6 +2,8 @@ import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } fro
 import { useLocation } from 'react-router-dom'
 import type { GradeLadderDetail, GradeLadderSummary, GradeProcessingFeatures, GradeRubricVersionRecord } from '../domain/real-grades'
 import * as api from '../services/gradeLadders'
+import { assertClientAdmission, clientAdmissionReason, usePublicSettings } from './public-settings-context'
+import { boundedPollingInterval, gradeFeaturesWithPolicy } from '../services/publicSettings'
 import { CloudApiError, CloudConflictError, LifecycleOperationError } from '../services/cloudWorkspace'
 import { gradeSummaryStamp, gradeWorkActive, projectRealGrades } from '../features/grade-ladders/gradeUi'
 import { GradeLaddersContext, type GradeLaddersContextValue, type GradeLoadState } from './grade-ladders-context'
@@ -13,6 +15,8 @@ import { isEntityArchived, lifecycleIsRemoved, type LifecycleAction, type Lifecy
 type PendingGradeLifecycle = PendingLifecycleChange & { ladderId: string; grade?: number; etag?: string }
 
 export function RealGradeLaddersBridge({ workspaceId, children }: { workspaceId: string; children: ReactNode }) {
+  const policy = usePublicSettings()
+  const pollingInterval = boundedPollingInterval(policy.settings)
   const parent = useWorkspace()
   const location = useLocation()
   const alive = useRef(true)
@@ -77,8 +81,7 @@ export function RealGradeLaddersBridge({ workspaceId, children }: { workspaceId:
   }, [putDetail])
 
   const ensureDetail = useCallback(async (id: string, force = false) => {
-    if (!featuresRef.current?.realGradeLadders) return
-    if (!force && ((detailRef.current[id] && detailRef.current[id].state !== 'idle') || reads.current.has(id))) return
+    if (!force && ((detailRef.current[id] && !['idle', 'loading'].includes(detailRef.current[id].state)) || reads.current.has(id))) return
     if (mutating.current) return
     reads.current.get(id)?.abort()
     const controller = new AbortController()
@@ -93,7 +96,10 @@ export function RealGradeLaddersBridge({ workspaceId, children }: { workspaceId:
       if (!remember(detail, sequence) && detailRef.current[id]?.state === 'loading' && reads.current.get(id) === controller) putDetail(id, { state: 'idle' })
     } catch (caught) {
       if (!alive.current || controller.signal.aborted || started !== epoch.current) return
-      if ((acceptedSequence.current.get(id) ?? authoritativeSequence.current) > sequence) return
+      if ((acceptedSequence.current.get(id) ?? authoritativeSequence.current) > sequence) {
+        if (detailRef.current[id]?.state === 'loading' && reads.current.get(id) === controller) putDetail(id, { state: 'idle' })
+        return
+      }
       const message = caught instanceof Error ? caught.message : 'The grade ladder could not be loaded.'
       if (caught instanceof CloudApiError && caught.status === 404) {
         acceptedSequence.current.set(id, sequence)
@@ -115,15 +121,10 @@ export function RealGradeLaddersBridge({ workspaceId, children }: { workspaceId:
     reads.current.set('$list', controller)
     const request = (async () => {
       try {
-        const available = await api.fetchGradeProcessingFeatures(controller.signal)
+        const available = await api.fetchGradeProcessingFeatures(controller.signal).catch(() => null)
         if (!alive.current || controller.signal.aborted || started !== epoch.current) return
         setFeatures(available)
         featuresRef.current = available
-        if (!available.realGradeLadders) {
-          setPhase('unavailable')
-          setError('Real GS ladders are not enabled in this deployment. No samples are substituted.')
-          return
-        }
         const items = await api.listAllGradeLadders(workspaceId, controller.signal)
         if (!alive.current || controller.signal.aborted || started !== epoch.current) return
         authoritativeSequence.current = sequence
@@ -180,9 +181,11 @@ export function RealGradeLaddersBridge({ workspaceId, children }: { workspaceId:
       for (const [id, entry] of Object.entries(detailRef.current)) {
         if (entry.state === 'ready' && !entry.error && gradeWorkActive(entry.value) && !reads.current.has(id)) void ensureDetail(id, true)
       }
-    }, 3000)
+    }, pollingInterval)
     return () => window.clearInterval(timer)
-  }, [details, ensureDetail, phase, refresh, summaries])
+  }, [details, ensureDetail, phase, pollingInterval, refresh, summaries])
+
+  useEffect(() => { void refresh() }, [policy.settings?.revision, refresh])
 
   useEffect(() => {
     const focus = () => { void refresh() }
@@ -191,16 +194,15 @@ export function RealGradeLaddersBridge({ workspaceId, children }: { workspaceId:
   }, [refresh])
 
   useEffect(() => {
-    if (!features?.realGradeLadders) return
     const parts = location.pathname.split('/').filter(Boolean)
     const id = parts[0] === 'grade-ladders' && parts[1] !== 'new' ? parts[1] : new URLSearchParams(location.search).get('ladder')
     if (id) void ensureDetail(id)
-  }, [ensureDetail, features?.realGradeLadders, location.pathname, location.search])
+  }, [ensureDetail, location.pathname, location.search])
 
   async function mutate(operation: () => Promise<GradeLadderDetail>, id?: string, grade?: number): Promise<GradeLadderDetail> {
     if (!canWrite) throw new Error('This workspace is read-only. An owner or editor must make grade-ladder changes.')
     if (id && !canEdit(id, grade)) throw new Error('Archived or removed content cannot be edited or processed. Unarchive the parent and grade first.')
-    if (!features?.realGradeLadders) throw new Error('Real grade ladders are not available in this deployment.')
+    if (phase !== 'ready') throw new Error('The saved grade library is not available. Refresh before making changes.')
     if (mutating.current) throw new Error('Wait for the current grade request before making another change.')
     mutating.current = true
     mutationGuard.hold()
@@ -374,8 +376,14 @@ export function RealGradeLaddersBridge({ workspaceId, children }: { workspaceId:
     return work && 'grade' in work.input ? work.input.grade : undefined
   }
 
+  function admit<T>(operation: () => Promise<T>): Promise<T> {
+    assertClientAdmission(policy, 'gradeLadders')
+    if (!features?.realGradeLadders) throw new Error('New GS ladder processing is unavailable. Saved versions and evidence remain readable.')
+    return operation()
+  }
+
   const value: GradeLaddersContextValue = {
-    workspaceId, canWrite, canEdit, phase, features, error, summaries, mutationPending: pending,
+    workspaceId, canWrite, canEdit, phase, features: features ? { ...gradeFeaturesWithPolicy(features, policy.settings), realGradeLadders: features.realGradeLadders && !clientAdmissionReason(policy, 'gradeLadders') } : null, error, summaries, mutationPending: pending,
     detail: (id) => details[id] ?? { state: 'idle' }, ensureDetail, refresh,
     create: (input, key) => {
       const job = workspace.jobs.find((item) => item.id === input.jobId)
@@ -384,18 +392,28 @@ export function RealGradeLaddersBridge({ workspaceId, children }: { workspaceId:
         isEntityArchived(workspace, { kind: 'job', id: job.id }) || isEntityArchived(workspace, { kind: 'rubric', id: rubric.groupId })) {
         return Promise.reject(new Error('A ladder requires an active, ready real job and an active saved rubric. Archived or removed seeds are not accepted.'))
       }
-      return mutate(() => api.createGradeLadder(workspaceId, input, key))
+      return admit(() => mutate(() => api.createGradeLadder(workspaceId, input, key, policy.settings)))
     },
-    update: (id, input, etag) => mutate(() => api.updateGradeLadder(workspaceId, id, input, etag), id),
-    discover: (id, etag, key) => mutate(() => api.discoverGradeSources(workspaceId, id, etag, key), id),
-    uploadPdf: (id, file, key, pages) => mutate(() => api.uploadGradeSourcePdf(workspaceId, id, file, key, pages), id),
-    addUrl: (id, input, key) => mutate(() => api.addGradeSourceUrl(workspaceId, id, input, key), id),
+    update: (id, input, etag) => {
+      const retained = summaries.find(item => item.ladder.id === id)?.levels.map(item => item.head.grade) ?? []
+      const operation = () => mutate(() => api.updateGradeLadder(workspaceId, id, input, etag, policy.settings, retained), id)
+      return input.grades?.some(grade => !retained.includes(grade)) ? admit(operation) : operation()
+    },
+    discover: (id, etag, key) => admit(() => mutate(() => api.discoverGradeSources(workspaceId, id, etag, key, policy.settings), id)),
+    uploadPdf: (id, file, key, pages) => admit(() => mutate(() => api.uploadGradeSourcePdf(workspaceId, id, file, key, pages, policy.settings), id)),
+    addUrl: (id, input, key) => admit(() => mutate(() => api.addGradeSourceUrl(workspaceId, id, input, key, policy.settings), id)),
     updateSource: (id, sourceId, input, etag) => mutate(() => api.updateGradeSource(workspaceId, id, sourceId, input, etag), id),
     confirmSources: (id, input, etag, key) => mutate(() => api.confirmGradeSources(workspaceId, id, input, etag, key), id),
-    generate: (id, etag, key) => mutate(() => api.generateGradeLadder(workspaceId, id, etag, key), id),
+    generate: (id, etag, key) => admit(() => mutate(() => api.generateGradeLadder(workspaceId, id, etag, key, policy.settings), id)),
     retry: (id, input, etag) => mutate(() => api.retryGradeWork(workspaceId, id, input, etag), id, input.grade ?? workGrade(id, input.workId)),
     cancel: (id, input, etag) => mutate(() => api.cancelGradeWork(workspaceId, id, input, etag), id, input.grade ?? workGrade(id, input.workId)),
-    saveDraft: (id, grade, input, etag) => mutate(() => api.saveGradeDraft(workspaceId, id, grade, input, etag), id, grade),
+    saveDraft: (id, grade, input, etag) => {
+      const maximum = Math.min(20, policy.settings?.grades.maxCriteria ?? features?.gradeLimits.maxCriteria ?? 20)
+      const detail = detailRef.current[id]
+      const previous = detail?.state === 'ready' ? detail.value.levels.find(level => level.head.grade === grade)?.version?.rubric.criteria : undefined
+      if (input.rubric.criteria.length > maximum && input.rubric.criteria.some(criterion => !previous?.some(item => item.id === criterion.id))) throw new Error(`New grade criteria are limited to ${maximum}. Existing saved criteria remain editable.`)
+      return mutate(() => api.saveGradeDraft(workspaceId, id, grade, input, etag), id, grade)
+    },
     approve: (id, grade, input, etag) => mutate(() => api.approveGrade(workspaceId, id, grade, input, etag), id, grade),
     versions: async (id, grade, signal) => {
       const started = epoch.current

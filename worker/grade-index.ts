@@ -13,6 +13,7 @@ import { createRemoteRenderer, invokeStructuredModel } from './runtime'
 import { loadGradeWorkerConfig, type GradeWorkerConfig } from './grades/config'
 import { draftGradeRubric, planGradeCompetencies, reviewGradeRubric } from './grades/model'
 import { GradeWorkerError, runGradeWorker, type GradeWorkerDependencies } from './grades/runtime'
+import { createAzureWorkerSettings } from './settings-store'
 
 export { loadGradeWorkerConfig } from './grades/config'
 export { runGradeWorker } from './grades/runtime'
@@ -32,6 +33,7 @@ export function createGradeWorkerDependencies(config: GradeWorkerConfig, credent
     getToken: (scope: string) => getToken(credential, scope),
   }
   return {
+    settings: createAzureWorkerSettings(config, credential, model),
     store: createAzureGradeStore(config.stores, credential),
     blobs: createAzureGradeBlobStore(config.stores, credential),
     discover: discoverOpmSources,

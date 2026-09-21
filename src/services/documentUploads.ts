@@ -16,7 +16,7 @@ export function uploadFormatNames(formats: readonly UploadFormat[]): string {
 }
 
 export function uploadPickerLabel(formats: readonly UploadFormat[], separator = ' / '): string {
-  return ['PDF', ...(formats.includes('markdown') ? ['Markdown'] : []),
+  return [...(formats.includes('pdf') ? ['PDF'] : []), ...(formats.includes('markdown') ? ['Markdown'] : []),
     ...(formats.some((format) => format === 'docx' || format === 'doc') ? ['Word'] : [])].join(separator)
 }
 
@@ -33,6 +33,7 @@ export function validateUploadFile(
   formats: readonly UploadFormat[] = ['pdf'],
   maxBytes: number = WORD_DOCUMENT_LIMITS.maxFileBytes,
 ): string | undefined {
+  if (!formats.length) return 'New file uploads are disabled by application policy. Existing documents remain readable.'
   const format = selectedUploadFormat(file)
   if (!file.name.trim() || !format) return `Choose a supported file: ${uploadFormatNames(formats)}. Other formats cannot be processed.`
   if (!formats.includes(format)) return `${uploadFormatNames([format])} uploads are not enabled in this deployment. Choose ${uploadFormatNames(formats)} files.`
@@ -44,8 +45,8 @@ export function validateUploadFile(
   return undefined
 }
 
-export function requireUploadFile(file: File, formats: readonly UploadFormat[] = UPLOAD_FORMATS): UploadFormat {
-  const error = validateUploadFile(file, formats)
+export function requireUploadFile(file: File, formats: readonly UploadFormat[] = UPLOAD_FORMATS, maxBytes = WORD_DOCUMENT_LIMITS.maxFileBytes): UploadFormat {
+  const error = validateUploadFile(file, formats, Math.min(maxBytes, WORD_DOCUMENT_LIMITS.maxFileBytes))
   if (error) throw new Error(error)
   return selectedUploadFormat(file)!
 }

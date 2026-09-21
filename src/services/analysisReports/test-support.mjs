@@ -20,6 +20,8 @@ export async function loadReportFoundation() {
         export * from './src/services/analysisReports/sample';
         export * from './src/services/analysisReports/narratives';
         export * from './src/services/analysisReports/narrative-schemas';
+        export * from './src/services/analysisReports/policy';
+        export { createDefaultAdminSettings, LEGACY_SETTINGS_REVISION } from './src/domain/admin-settings-defaults';
         export { createInitialWorkspace, createFixtureWorkspace } from './src/data/fixtures';
         export { snapshotAnalysisRun, evaluateComparison } from './src/services/scoring';
       ` },

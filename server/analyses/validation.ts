@@ -1,5 +1,7 @@
 import { createHash } from 'node:crypto'
 import { z } from 'zod'
+import { processingSettingsSnapshotSchema } from '../../src/domain/admin-settings-schema'
+import { MODEL_TASK_IDS } from '../../src/domain/admin-settings-tasks'
 import { REPORT_LIMITS } from '../../src/domain/analysis-reports'
 import {
   ANALYSIS_CORRECTION_POLICY_VERSION, type RealAnalysisCorrectionRecord,
@@ -155,7 +157,10 @@ const work = {
   lease: z.strictObject({ owner: text(200), expiresAt: timestamp, heartbeatAt: timestamp }).optional(),
   error: errorSchema.optional(),
 }
-const base = { workspaceId: workspace, dataKind: z.literal('real'), createdAt: timestamp, updatedAt: timestamp, ...work }
+const base = {
+  workspaceId: workspace, dataKind: z.literal('real'), createdAt: timestamp, updatedAt: timestamp, ...work,
+  processingSettings: processingSettingsSnapshotSchema.optional(),
+}
 const progressSchema = z.strictObject({
   total: count, initialized: count, queued: count, running: count, complete: count,
   failed: count, cancelled: count, scored: count, unscored: count,
@@ -215,7 +220,7 @@ const comparisonSchema = z.strictObject({
   completedAt: timestamp.optional(), cancelledAt: timestamp.optional(),
   failureDiagnostic: analysisFailureDiagnosticReferenceSchema.optional(),
   diagnosticCapture: z.strictObject({
-    attemptId: z.string().uuid(), status: z.enum(['saved', 'unavailable']), pipelineVersion: text(200),
+    attemptId: z.string().uuid(), status: z.enum(['saved', 'unavailable', 'disabled']), pipelineVersion: text(200),
   }).optional(),
   resultRevision: analysisResultRevisionSchema.optional(),
 })
@@ -250,6 +255,7 @@ const narrativeBase = {
   published: narrativePublicationSchema.optional(),
   history: summaryHistoryReferenceSchema.optional(),
   summaryRound: z.number().int().min(1).max(SUMMARY_LIMITS.rounds).optional(),
+  retryRequestId: z.string().uuid().optional(),
   error: z.strictObject({
     code: z.enum([...errorSchema.shape.code.options, 'dependency-failed']),
     stage: z.enum(['dependencies', 'candidate-generation', 'target-generation', 'grounding', 'publication']),
@@ -277,6 +283,7 @@ const entitySchema = z.discriminatedUnion('recordType', [
 ])
 const manifestSchema = z.strictObject({
   schemaVersion: z.literal(1), dataKind: z.literal('real'), workspaceId: workspace, runId,
+  processingSettings: processingSettingsSnapshotSchema.optional(),
   createdAt: timestamp, createdBy: text(200), inputFingerprint: hash, request: createAnalysisInputSchema,
   resumes: z.array(resumeReferenceSchema).min(1).max(ANALYSIS_LIMITS.maxComparisons),
   targets: z.array(targetReferenceSchema).min(1).max(ANALYSIS_LIMITS.maxComparisons),
@@ -836,6 +843,7 @@ export const analysisAssessmentOutputSchema = z.strictObject({
 const modelProvenanceSchema = z.strictObject({
   model: text(300), deployment: text(300), promptVersion: text(200), schemaVersion: text(200),
   startedAt: timestamp, completedAt: timestamp, inputCharacters: z.number().int().min(1).max(10_000_000),
+  settingsRevision: text(128).optional(), task: z.enum(MODEL_TASK_IDS).optional(),
 })
 const groundingReviewSchema = z.strictObject({
   id: identifier, outcome: z.enum(['supported', 'needs-correction', 'unsupported']),

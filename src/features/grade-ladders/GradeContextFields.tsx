@@ -1,4 +1,5 @@
 import type { GradeContext, GradeFunction } from '../../domain/real-grades'
+import { usePublicSettings } from '../../app/public-settings-context'
 
 export function GradeContextFields({ name, context, grades, onName, onContext, onGrades, disabled = false, retainedGrades = [] }: {
   name: string
@@ -10,6 +11,8 @@ export function GradeContextFields({ name, context, grades, onName, onContext, o
   disabled?: boolean
   retainedGrades?: number[]
 }) {
+  const { settings } = usePublicSettings()
+  const allowedLevels = settings?.grades.allowedLevels ?? Array.from({ length: 15 }, (_, index) => index + 1)
   function patch(next: Partial<GradeContext>) { onContext({ ...context, ...next, confirmed: false }) }
   return <fieldset disabled={disabled} className="grade-context-fields">
     <label className="field"><span className="field-label">Ladder family name</span>
@@ -19,7 +22,7 @@ export function GradeContextFields({ name, context, grades, onName, onContext, o
         <input className="input" aria-label="GS occupational series" inputMode="numeric" value={context.series} maxLength={4} pattern="[0-9]{4}" required onChange={(event) => patch({ series: event.target.value.replace(/\D/g, '') })} placeholder="Four digits, e.g. 0801" />
         <span className="field-hint">Any GS series. Confirm from evidence; a title is not a series determination.</span></label>
       <label className="field"><span className="field-label">Agency / organization</span>
-        <input className="input" value={context.agency} maxLength={240} onChange={(event) => patch({ agency: event.target.value })} placeholder="Name the relevant agency" /></label>
+        <input className="input" value={context.agency} maxLength={300} onChange={(event) => patch({ agency: event.target.value })} placeholder="Name the relevant agency" /></label>
     </div>
     <div className="grade-form-grid">
       <label className="field"><span className="field-label">Agency applicability</span>
@@ -39,11 +42,11 @@ export function GradeContextFields({ name, context, grades, onName, onContext, o
     {Object.entries(context.answers).map(([key, value]) => <label className="field" key={key}><span className="field-label">{key}</span><textarea className="input" aria-label={key} maxLength={2000} value={value} onChange={(event) => patch({ answers: { ...context.answers, [key]: event.target.value } })} /></label>)}
     <fieldset><legend className="field-label">Grades to prepare</legend><div className="grade-picker">
       {Array.from({ length: 15 }, (_, index) => index + 1).map((grade) => <label key={grade} className={grades.includes(grade) ? 'is-selected' : ''}>
-        <input type="checkbox" checked={grades.includes(grade)} disabled={retainedGrades.includes(grade)} title={retainedGrades.includes(grade) ? 'Existing grades are retained so their saved versions stay accessible. Add grades without removing history.' : undefined} onChange={() => {
+        <input type="checkbox" checked={grades.includes(grade)} disabled={retainedGrades.includes(grade) || (!allowedLevels.includes(grade) && !grades.includes(grade))} title={retainedGrades.includes(grade) ? 'Existing grades are retained so their saved versions stay accessible. Add grades without removing history.' : !allowedLevels.includes(grade) ? 'This level is not allowed for new requests by application policy.' : undefined} onChange={() => {
           onGrades(grades.includes(grade) ? grades.filter((item) => item !== grade) : [...grades, grade].sort((a, b) => a - b))
           onContext({ ...context, confirmed: false })
         }} /><span>GS-{grade}</span></label>)}
-    </div><p className="field-hint">Each grade gets a separate draft. Unsupported distinctions remain visible gaps, never interpolated expectations.{retainedGrades.length > 0 && ' Existing grades remain in the family to keep their history accessible; you can add more grades.'}</p></fieldset>
+    </div><p className="field-hint">Each grade gets a separate draft. Unsupported distinctions remain visible gaps, never interpolated expectations.{retainedGrades.length > 0 && ' Existing grades remain in the family to keep their history accessible; you can add more grades.'}{settings && ` Allowed new levels: ${allowedLevels.map(grade => `GS-${grade}`).join(', ')}.`}</p></fieldset>
     <label className="check-label grade-context-confirm"><input type="checkbox" checked={context.confirmed} onChange={(event) => onContext({ ...context, confirmed: event.target.checked })} />
       <span>I confirm the requested series, grades, and position context. Unknown coverage remains unresolved; this is not an official classification decision.</span></label>
   </fieldset>

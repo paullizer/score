@@ -8,6 +8,7 @@ import type {
   AnalysisTargetSnapshotReference, RealAnalysisComparisonRecord, RealAnalysisNarrativeRequestRecord, RealAnalysisRunRecord,
 } from '../../src/domain/real-analyses'
 import { analysisHash, analysisNarrativeId, assertAnalysis } from './validation'
+import type { ProcessingSettingsSnapshot } from '../../src/domain/admin-settings'
 
 export function analysisNarrativeCanWork(
   run: RealAnalysisRunRecord, record?: RealAnalysisNarrativeRecord | RealAnalysisNarrativeRequestRecord,
@@ -86,6 +87,7 @@ export interface NarrativeRequestIdentity {
   requestedAt: string
   requestedBy: string | null
   reason: AnalysisNarrativeGenerationReason
+  processingSettings?: ProcessingSettingsSnapshot
 }
 
 export function newCandidateNarrative(
@@ -95,6 +97,8 @@ export function newCandidateNarrative(
   request = { ...request, requestedAt: request.requestedAt < (previous?.updatedAt ?? '') ? previous!.updatedAt : request.requestedAt }
   const binding = candidateNarrativeBinding(run, comparison)
   const id = analysisNarrativeId('candidate', run.id, comparison.id, comparison.resultRevision?.id)
+  const processingSettings = Object.hasOwn(request, 'processingSettings')
+    ? request.processingSettings : run.processingSettings ?? comparison.processingSettings
   assertAnalysis(!previous || previous.id === id && previous.resultSha256 === comparison.result?.sha256,
     'A new result revision requires its own narrative history.')
   return {
@@ -105,6 +109,7 @@ export function newCandidateNarrative(
     id, recordType: 'analysis-candidate-narrative', schemaVersion: 1, dataKind: 'real',
     createdAt: previous?.createdAt ?? request.requestedAt, updatedAt: request.requestedAt,
     ...request, generationId: narrativeGenerationId(request.requestId, id), status: 'queued',
+    ...(processingSettings ? { processingSettings } : {}),
     inputFingerprint: analysisHash(binding), attempts: 0, retryCount: previous ? previous.retryCount + 1 : 0,
     nextAttemptAt: request.requestedAt, ...(previous?.published ? { published: previous.published } : {}),
     ...(previous?.history ? { history: previous.history } : {}),
@@ -117,12 +122,15 @@ export function newTargetNarrative(
 ): RealAnalysisTargetNarrativeRecord {
   request = { ...request, requestedAt: request.requestedAt < (previous?.updatedAt ?? '') ? previous!.updatedAt : request.requestedAt }
   const id = analysisNarrativeId('target', run.id, target.summary.id)
+  const processingSettings = Object.hasOwn(request, 'processingSettings')
+    ? request.processingSettings : run.processingSettings ?? previous?.processingSettings
   return {
     id, recordType: 'analysis-target-narrative', schemaVersion: 1, dataKind: 'real', workspaceId: run.workspaceId,
     runId: run.id, manifestSha256: run.manifest.sha256, targetId: target.summary.id,
     targetSnapshot: { snapshotId: target.snapshotId, sha256: target.blob.sha256 },
     createdAt: previous?.createdAt ?? request.requestedAt, updatedAt: request.requestedAt,
     ...request, generationId: narrativeGenerationId(request.requestId, id),
+    ...(processingSettings ? { processingSettings } : {}),
     status: 'waiting', inputFingerprint: null, waitingFor: 'scoring', attempts: 0,
     retryCount: previous ? previous.retryCount + 1 : 0, nextAttemptAt: request.requestedAt,
     ...(previous?.published ? { published: previous.published } : {}),

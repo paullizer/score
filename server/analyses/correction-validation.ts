@@ -1,4 +1,6 @@
 import { z } from 'zod'
+import { processingSettingsSnapshotSchema } from '../../src/domain/admin-settings-schema'
+import { preservesProcessingSettings } from '../jobs/policy'
 import {
   ANALYSIS_CORRECTION_POLICY_VERSION, type AnalysisCorrectionHistoryEntry, type AnalysisCorrectionInput,
   type AnalysisCorrectionProposal, type RealAnalysisCorrectionRecord,
@@ -30,6 +32,7 @@ export const analysisCorrectionInputSchema = z.strictObject({
   resultSha256: hash, criterionIds: analysisCorrectionCriterionIdsSchema, reason: text(1000),
 })
 const proposalSchema = z.strictObject({
+  processingSettings: processingSettingsSnapshotSchema.optional(),
   ...identity, requestFingerprint: hash, manifestSha256: hash, expectedEtag: text(1024),
   originalResultSha256: hash, baseResult: analysisJsonReferenceSchema, baseAttemptId: z.string().uuid(),
   baseRevision: analysisResultRevisionSchema.optional(),
@@ -83,6 +86,7 @@ export function assertAnalysisCorrectionProposalBinding(
     analysisHash(proposal.targetSnapshot) === analysisHash(record.targetSnapshot) &&
     proposal.provenance.requestedBy === record.requestedBy && proposal.provenance.reason === record.reason &&
     proposal.provenance.policyVersion === record.policyVersion &&
+    preservesProcessingSettings(proposal.processingSettings, record.processingSettings) &&
     analysisHash(proposal.provenance.criterionIds) === analysisHash(record.criterionIds),
   'Correction proposal does not match the accepted work.')
 }

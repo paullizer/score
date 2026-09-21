@@ -1,5 +1,7 @@
 import { PDFDocument } from 'pdf-lib'
 import { z } from 'zod'
+import type { ProcessingSettingsSnapshot } from '../../src/domain/admin-settings'
+import { processingSettingsSnapshotSchema } from '../../src/domain/admin-settings-schema'
 import {
   RESUME_IMPORT_LIMITS as LIMITS,
   type ImmutableBlobReference, type ImmutableJsonBlobReference, type RealResumeDetail, type RealResumeDocument,
@@ -15,6 +17,10 @@ import { assertWorkspaceMutationLease } from '../lifecycle/lease'
 import { parseDisplayNameMetadata } from '../jobs/validation'
 import { originalExtension, UPLOAD_CONTENT_TYPES, uploadFormatFromFilename, type UploadContentType, type UploadFormat } from '../../src/domain/document-formats'
 import { validateWordUpload } from '../documents/upload'
+import {
+  admittedProcessingSettings, newProcessingSettings, resolveAcceptedProcessingSettings,
+  assertImportPolicy, newWorkProcessingSettings, type ProcessingSettingsProvider,
+} from '../jobs/policy'
 import type { RealResumesDeps, ResumeBlob, ResumeTransaction } from './store'
 import { assertResumeWritable, prepareResumeImport, putResumeBlob, resumeIsRemoved } from './guards'
 import {
@@ -49,6 +55,7 @@ interface ImportReceipt extends ResumeImportRequest {
   pdfSha256?: string
   fileSha256?: string
   markdownSha256?: string
+  processingSettings?: ProcessingSettingsSnapshot
 }
 
 const receiptShape = {
@@ -58,6 +65,7 @@ const receiptShape = {
   inputCount: z.number().int().min(1).max(LIMITS.maxBatchItems), createdBy: z.string().min(1).max(200),
   createdAt: z.iso.datetime({ precision: 3 }), source: z.unknown(),
   inputFingerprint: z.string().regex(/^[a-f0-9]{64}$/),
+  processingSettings: processingSettingsSnapshotSchema.optional(),
 }
 const receiptSchema = z.discriminatedUnion('schemaVersion', [
   z.strictObject({
@@ -109,7 +117,7 @@ function validateRequest(workspaceId: string, input: ResumeImportRequest): void 
   if (!input.createdBy || input.createdBy.trim() !== input.createdBy || input.createdBy.length > 200) throw new Error('Invalid import actor.')
 }
 
-async function validatePdf(bytes: Uint8Array): Promise<void> {
+async function validatePdf(bytes: Uint8Array): Promise<number> {
   if (!(bytes instanceof Uint8Array) || !bytes.byteLength) throw invalidRequest('The PDF body must not be empty.')
   if (bytes.byteLength > LIMITS.maxPdfBytes) throw new HttpError(413, 'invalid_request', 'Resume PDFs may not exceed 10 MiB.')
   if (Buffer.from(bytes.subarray(0, 1024)).indexOf(Buffer.from('%PDF-')) < 0) {
@@ -125,6 +133,7 @@ async function validatePdf(bytes: Uint8Array): Promise<void> {
   }
   if (!pages) throw invalidRequest('The PDF has no readable pages. Export a PDF containing at least one page.')
   if (pages > LIMITS.maxPdfPages) throw invalidRequest(`Resume PDFs may contain at most ${LIMITS.maxPdfPages} pages. Upload a shorter PDF.`)
+  return pages
 }
 
 export class RealResumeService {
@@ -132,7 +141,7 @@ export class RealResumeService {
   private readonly blobs: RealResumesDeps['blobs']
   private readonly clock: () => Date
 
-  constructor(resumes: RealResumesDeps, now?: () => Date) {
+  constructor(resumes: RealResumesDeps, now?: () => Date, private readonly settings?: ProcessingSettingsProvider) {
     this.store = resumes.store
     this.blobs = resumes.blobs
     this.clock = now ?? (() => new Date())
@@ -246,6 +255,7 @@ export class RealResumeService {
       throw unavailable('The saved resume capture manifest is unavailable or invalid.')
     }
     if (manifest.workspaceId !== record.workspaceId || manifest.resumeId !== record.id ||
+      manifest.processingSettings && !same(manifest.processingSettings, record.processingSettings) ||
       manifest.inputFingerprint !== record.inputFingerprint || !same(manifest.source, record.source) || !same(manifest.capture, record.capture)) {
       throw unavailable('The saved resume capture manifest does not match this import.')
     }
@@ -386,11 +396,11 @@ export class RealResumeService {
       !same(stored.source, candidate.source)) {
       throw unavailable('The saved resume import receipt does not match its immutable request binding.')
     }
-    return { ...candidate, createdAt: stored.createdAt }
+    return { ...candidate, createdAt: stored.createdAt, processingSettings: stored.processingSettings }
   }
 
   private async import(
-    workspaceId: string, input: ResumeImportRequest, source: RealResumeSource, file?: Uint8Array,
+    workspaceId: string, input: ResumeImportRequest, source: RealResumeSource, file?: Uint8Array, pages?: number,
   ): Promise<ResumeImportResult> {
     const word = source.kind === 'docx' || source.kind === 'doc'
     const fileHash = file ? resumeSha256(file) : undefined
@@ -410,6 +420,18 @@ export class RealResumeService {
       this.checkBatch(currentBatch.record, input)
       if (currentBatch.record.items.length + (currentBatch.record.removedCount ?? 0) >= input.inputCount) throw conflict('This import batch has already accepted its declared number of inputs. Start a new batch.')
     }
+    const reserved = await this.blobs.read(resumeImportReceiptBlobName(workspaceId, candidate.resumeId))
+    if (reserved) {
+      let stored: z.infer<typeof receiptSchema>
+      try { stored = receiptSchema.parse(parseJson(reserved)) } catch { throw unavailable('The saved resume import receipt is invalid.') }
+      candidate.processingSettings = stored.processingSettings
+    } else {
+      const processingSettings = await newWorkProcessingSettings(this.settings)
+      candidate.processingSettings = newProcessingSettings(this.settings, processingSettings)
+      assertImportPolicy(processingSettings, 'resumes', source.kind, {
+        bytes: file?.byteLength, pages, count: input.inputCount, ...(source.kind === 'url' ? { url: source.url } : {}),
+      })
+    }
     try { await prepareResumeImport(this.store, workspaceId, candidate.resumeId, inputFingerprint) } catch (error) {
       if (error instanceof StoreConflictError) throw conflict(error.message)
       throw error
@@ -425,6 +447,7 @@ export class RealResumeService {
       },
       source, batchId: input.batchId, idempotencyKey: input.idempotencyKey, inputFingerprint, createdBy: receipt.createdBy,
       attempts: 0, retryCount: 0, nextAttemptAt: timestamp, warnings: [], duplicates: [],
+      processingSettings: await admittedProcessingSettings(this.settings, receipt.processingSettings),
     }
     if (file) {
       if (source.kind === 'url') throw invalidRequest('URL inputs cannot contain uploaded bytes.')
@@ -440,6 +463,7 @@ export class RealResumeService {
       const manifest: ResumeCaptureManifest = {
         schemaVersion: 1, dataKind: 'real', workspaceId, resumeId: record.id, inputFingerprint, source,
         capture: { original: { ...original, contentType }, capturedAt: receipt.createdAt, redirects: [] },
+        ...(receipt.processingSettings ? { processingSettings: receipt.processingSettings } : {}),
       }
       const manifestName = resumeCaptureBlobName(workspaceId, record.id)
       const captured = await putResumeBlob(this.store, this.blobs, manifestName, Buffer.from(JSON.stringify(manifest)), 'application/json')
@@ -473,6 +497,7 @@ export class RealResumeService {
         id: resumeBatchRecordId(receipt.batchId), recordType: 'resume-batch', dataKind: 'real',
         workspaceId, createdAt: admittedAt, updatedAt: admittedAt, batchId: receipt.batchId,
         createdBy: receipt.createdBy, inputCount: receipt.inputCount, items: [admission],
+        processingSettings: record.processingSettings,
       }
       const nextRecord = { ...record, updatedAt: admittedAt, duplicates: await this.duplicates(record) }
       parseResumeEntity(nextRecord)
@@ -510,7 +535,8 @@ export class RealResumeService {
     if (!isSafeResumeFilename(filename, kind)) throw invalidRequest(`X-File-Name must be a safe ${label} basename.`)
     if (!(bytes instanceof Uint8Array)) throw invalidRequest(`The request must contain raw ${label} bytes.`)
     const body = Buffer.from(bytes)
-    if (kind === 'pdf') await validatePdf(body)
+    let pages: number | undefined
+    if (kind === 'pdf') pages = await validatePdf(body)
     else if (kind === 'markdown') {
       try { decodeMarkdown(body, LIMITS.maxMarkdownBytes) } catch (error) {
         if (error instanceof MarkdownInputError) {
@@ -522,7 +548,7 @@ export class RealResumeService {
       if (body.byteLength > LIMITS.maxFileBytes) throw new HttpError(413, 'invalid_request', 'Resume files may not exceed 10 MiB.')
       await validateWordUpload(body, kind)
     }
-    return this.import(workspaceId, input, { kind, displayName: filename, fileName: filename }, body)
+    return this.import(workspaceId, input, { kind, displayName: filename, fileName: filename }, body, pages)
   }
 
   async importPdf(workspaceId: string, input: ResumeImportRequest, filename: string, bytes: Uint8Array): Promise<ResumeImportResult> {
@@ -579,6 +605,7 @@ export class RealResumeService {
     const timestamp = [this.now(), current.record.updatedAt].sort().at(-1)!
     const record: RealResumeRecord = {
       ...current.record, resume: { ...current.record.resume, status: 'queued' }, updatedAt: timestamp,
+      processingSettings: await resolveAcceptedProcessingSettings(this.settings, current.record.processingSettings),
       attempts: 0, retryCount: current.record.retryCount + 1, nextAttemptAt: timestamp,
     }
     delete record.lease

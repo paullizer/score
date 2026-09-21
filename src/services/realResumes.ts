@@ -12,6 +12,8 @@ import type { LifecycleAction, LifecycleImpact, LifecycleOperation } from '../do
 import { UPLOAD_CONTENT_TYPES, type UploadFormat } from '../domain/document-formats'
 import { requireUploadFile, uploadFileByteLimit } from './documentUploads'
 import { normalizeDisplayName } from '../domain/displayNames'
+import type { PublicSettings, SettingsDeploymentCapabilities } from '../domain/admin-settings'
+import { fetchPublicFeatures, resumeFeaturesWithPolicy, requireImportBatch, requireImportFile, requireImportUrl } from './publicSettings'
 
 const uuid = /^[\da-f]{8}-[\da-f]{4}-[\da-f]{4}-[\da-f]{4}-[\da-f]{12}$/i
 
@@ -35,9 +37,14 @@ function importHeaders(key: string, batchId: string, inputCount: number): Record
   return { 'Idempotency-Key': key, 'X-Import-Batch': batchId, 'X-Import-Count': String(inputCount) }
 }
 
-export async function fetchResumeProcessingFeatures(signal?: AbortSignal): Promise<ResumeProcessingFeatures> {
-  const features = await cloudJsonRequest<Partial<ResumeProcessingFeatures>>('/features', { method: 'GET', signal })
-  return {
+export interface ResumeServiceFeatures extends ResumeProcessingFeatures {
+  /** Missing deployment metadata is unknown, not a disabled historical reader. */
+  deploymentCapabilities?: Pick<SettingsDeploymentCapabilities, 'realResumeImports'>
+}
+
+export async function fetchResumeProcessingFeatures(signal?: AbortSignal): Promise<ResumeServiceFeatures> {
+  const features = await fetchPublicFeatures(signal)
+  const processing = resumeFeaturesWithPolicy({
     realResumeImports: features.realResumeImports === true,
     markdownResumeImports: features.realResumeImports === true && features.markdownResumeImports === true,
     wordDocumentImports: features.realResumeImports === true && features.wordDocumentImports === true,
@@ -46,7 +53,9 @@ export async function fetchResumeProcessingFeatures(signal?: AbortSignal): Promi
       ...features.resumeLimits,
       maxFileBytes: Math.min(features.resumeLimits?.maxFileBytes ?? RESUME_IMPORT_LIMITS.maxFileBytes, RESUME_IMPORT_LIMITS.maxFileBytes),
     },
-  }
+  }, features.publicSettings)
+  const deployed = features.deploymentCapabilities?.realResumeImports
+  return { ...processing, ...(typeof deployed === 'boolean' ? { deploymentCapabilities: { realResumeImports: deployed } } : {}) }
 }
 
 export async function listAllRealResumes(workspaceId: string, signal?: AbortSignal): Promise<RealResumeSummary[]> {
@@ -78,8 +87,10 @@ export async function getRealResume(workspaceId: string, resumeId: string, signa
 }
 
 async function importRealResumeUpload(
-  workspaceId: string, file: File, kind: UploadFormat, key: string, batchId: string, inputCount: number, signal?: AbortSignal,
+  workspaceId: string, file: File, kind: UploadFormat, key: string, batchId: string, inputCount: number, signal?: AbortSignal, settings?: PublicSettings | null,
 ): Promise<RealResumeSummary> {
+  requireImportFile(file, 'resumes', settings)
+  requireImportBatch(inputCount, 'resumes', settings)
   const label = kind === 'markdown' ? 'Markdown' : kind.toUpperCase()
   if (uploadedFileKind(file) !== kind || !isSafeUploadedFilename(file.name, kind)) {
     throw new Error(`${uploadedFileKind(file)?.toUpperCase() ?? 'Unsupported'} uploads are not enabled for this method. Choose a ${label} file with a safe ${kind === 'markdown' ? '.md or .markdown' : `.${kind}`} filename.`)
@@ -100,28 +111,30 @@ async function importRealResumeUpload(
 }
 
 export function importRealResumePdf(
-  workspaceId: string, file: File, key: string, batchId: string, inputCount: number, signal?: AbortSignal,
+  workspaceId: string, file: File, key: string, batchId: string, inputCount: number, signal?: AbortSignal, settings?: PublicSettings | null,
 ): Promise<RealResumeSummary> {
-  return importRealResumeUpload(workspaceId, file, 'pdf', key, batchId, inputCount, signal)
+  return importRealResumeUpload(workspaceId, file, 'pdf', key, batchId, inputCount, signal, settings)
 }
 
 export function importRealResumeMarkdown(
-  workspaceId: string, file: File, key: string, batchId: string, inputCount: number, signal?: AbortSignal,
+  workspaceId: string, file: File, key: string, batchId: string, inputCount: number, signal?: AbortSignal, settings?: PublicSettings | null,
 ): Promise<RealResumeSummary> {
-  return importRealResumeUpload(workspaceId, file, 'markdown', key, batchId, inputCount, signal)
+  return importRealResumeUpload(workspaceId, file, 'markdown', key, batchId, inputCount, signal, settings)
 }
 
 export async function importRealResumeFile(
-  workspaceId: string, file: File, key: string, batchId: string, inputCount: number, signal?: AbortSignal,
+  workspaceId: string, file: File, key: string, batchId: string, inputCount: number, signal?: AbortSignal, settings?: PublicSettings | null,
 ): Promise<RealResumeSummary> {
   const kind = uploadedFileKind(file)
   if (!kind) throw new Error('Choose a supported file: PDF, Markdown (.md or .markdown), DOCX or DOC. Other file types are not supported.')
-  return importRealResumeUpload(workspaceId, file, kind, key, batchId, inputCount, signal)
+  return importRealResumeUpload(workspaceId, file, kind, key, batchId, inputCount, signal, settings)
 }
 
 export async function importRealResumeUrl(
-  workspaceId: string, url: string, key: string, batchId: string, inputCount: number, signal?: AbortSignal,
+  workspaceId: string, url: string, key: string, batchId: string, inputCount: number, signal?: AbortSignal, settings?: PublicSettings | null,
 ): Promise<RealResumeSummary> {
+  requireImportUrl(url, 'resumes', settings)
+  requireImportBatch(inputCount, 'resumes', settings)
   const result = await cloudJsonRequest<ResumeMutationResponse>(`${base(workspaceId)}/url`, {
     method: 'POST', headers: importHeaders(key, batchId, inputCount), body: JSON.stringify({ url }), signal,
   })

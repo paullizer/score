@@ -1,19 +1,8 @@
 import assert from 'node:assert/strict'
-import { after, before, test } from 'node:test'
-import path from 'node:path'
-import { mkdtemp, rm } from 'node:fs/promises'
-import { pathToFileURL } from 'node:url'
-import { build } from 'esbuild'
+import { test } from 'node:test'
+import { loadWorker } from './shared-model-loader.mjs'
 
-let loadGradeWorkerConfig
-let directory
-before(async () => {
-  directory = await mkdtemp(path.join(process.cwd(), 'node_modules', '.tmp', 'grade-config-'))
-  const outfile = path.join(directory, 'config.mjs')
-  await build({ entryPoints: ['worker/grades/config.ts'], outfile, bundle: true, platform: 'node', format: 'esm', packages: 'external' })
-  ;({ loadGradeWorkerConfig } = await import(pathToFileURL(outfile)))
-})
-after(async () => { if (directory) await rm(directory, { recursive: true, force: true }) })
+const { loadGradeWorkerConfig } = await loadWorker('../worker/grades/config.ts')
 
 function config(overrides = {}) {
   return {
@@ -39,6 +28,15 @@ test('hosted grade worker uses dedicated stores and private renderer', () => {
   assert.equal(result.maxItems, 5)
   assert.equal(result.localDevelopment, false)
   assert.equal(result.budgetMilliseconds, 660000)
+})
+
+test('grade configuration accepts the dedicated settings reader without widening its processing stores', () => {
+  const shared = { SCORE_SETTINGS_CONTAINER: 'application-settings' }
+  assert.equal(loadGradeWorkerConfig(config(shared)).settingsContainer, 'application-settings')
+  for (const value of ['', 'job-records', 'grade-records', 'workspace-state']) {
+    assert.throws(() => loadGradeWorkerConfig(config({ SCORE_SETTINGS_CONTAINER: value })), /dedicated application-settings/)
+  }
+  assert.throws(() => loadGradeWorkerConfig(config({ ...shared, JOB_RECORDS_CONTAINER: 'job-records' })), /must not be configured/)
 })
 
 test('grade identity configuration cannot be pointed at legacy or job stores', () => {

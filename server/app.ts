@@ -1,7 +1,7 @@
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import express, { type Express, type NextFunction, type Request, type Response } from 'express'
-import { HttpError, invalidRequest, notFound, toCloudApiError, unavailable } from './errors'
+import { HttpError, forbidden, invalidRequest, notFound, toCloudApiError, unavailable } from './errors'
 import { createHealthCheck } from './health'
 import { createAuthMiddleware, createCsrfMiddleware } from './middleware'
 import { getPrincipal } from './request-context'
@@ -14,10 +14,11 @@ import { createRealResumesRouter } from './resumes/routes'
 import { createRealAnalysesRouter } from './analyses/routes'
 import type { RealResumesDeps } from './resumes/store'
 import type { RealAnalysesDeps } from './analyses/store'
-import { JOB_IMPORT_LIMITS } from '../src/domain/real-jobs'
-import { GRADE_LADDER_LIMITS } from '../src/domain/real-grades'
-import { RESUME_IMPORT_LIMITS } from '../src/domain/real-resumes'
-import { ANALYSIS_LIMITS } from '../src/domain/real-analyses'
+import { isApplicationAdmin } from './auth'
+import { createAdminSettingsRouter } from './settings/routes'
+import type { AdminSettingsService } from './settings/service'
+import { attachSettingsContext, getAdmissionSettings, getCurrentSettings } from './settings/request-context'
+import { effectiveFeatures } from './settings/features'
 import type { DirectoryStore, StateStore } from './store'
 import { createLifecycleDependencies } from './lifecycle/dependencies'
 import { WorkspaceLifecycleService } from './lifecycle/service'
@@ -56,6 +57,18 @@ export { RealAnalysisTargets } from './analyses/targets'
 export { RealAnalysisService } from './analyses/service'
 export { ConfigError, loadConfig } from './config'
 export { defaultPersonalWorkspaceId, isValidWorkspaceId, membershipIdFor, principalKeyFor } from './ids'
+export { isApplicationAdmin } from './auth'
+export { AdminSettingsService } from './settings/service'
+export { createSettingsStoreFromContainer, createAzureSettingsStore, createSettingsReaderFromContainer, createAzureSettingsReader } from './settings/azure-store'
+export { createAzureSettingsModelAdapter } from './settings/models'
+export {
+  attachSettingsContext, getAdmissionSettings, getCurrentSettings, getPinnedAdmissionSettings,
+  getSettingsForAcceptedWork, runtimeSettingsEnabled, assertNewProcessingAllowed, getProcessingAdmissionSettings,
+  getRuntimeSettingsReadiness,
+} from './settings/request-context'
+export { getRequestSettings } from './request-context'
+export { effectiveFeatures } from './settings/features'
+export * from '../src/domain/admin-settings'
 
 const currentDir = path.dirname(fileURLToPath(import.meta.url))
 const DEFAULT_DIST_DIR = path.join(currentDir, '..', 'dist')
@@ -70,6 +83,7 @@ export interface AppDeps {
   readonly grades?: RealGradesDeps
   readonly resumes?: RealResumesDeps
   readonly analyses?: RealAnalysesDeps
+  readonly settings?: AdminSettingsService
   /** Overridable so tests don't depend on a real build of dist/. */
   readonly distDir?: string
   /** Injectable clock for deterministic tests. */
@@ -146,6 +160,7 @@ export function createApp(deps: AppDeps): Express {
 
   const app = express()
   app.locals.reconcileLifecycle = () => workspaceLifecycle.reconcile()
+  app.locals.bootstrapSettings = async () => deps.settings?.current()
   app.disable('x-powered-by')
   app.use(telemetryRequests)
   const parseJson = express.json({ limit: MAX_JSON_BODY })
@@ -164,24 +179,37 @@ export function createApp(deps: AppDeps): Express {
   api.use(noStore)
   api.use(telemetryMiddleware('score.auth', createAuthMiddleware(config)))
   api.use(telemetryMiddleware('score.csrf', createCsrfMiddleware(config)))
-  api.get('/features', (_req, res) => {
-    res.json({
-      realJobImports: Boolean(jobs), markdownJobImports: Boolean(jobs), limits: JOB_IMPORT_LIMITS,
-      realGradeLadders: Boolean(grades), gradeLimits: GRADE_LADDER_LIMITS,
-      realResumeImports: Boolean(resumes), markdownResumeImports: Boolean(resumes), resumeLimits: RESUME_IMPORT_LIMITS,
-      realAnalyses: canCreateAnalyses, analysisLimits: ANALYSIS_LIMITS,
-      analysisSummaryGeneration: Boolean(analyses),
+  api.use(attachSettingsContext(config, deps.settings))
+  api.use(createAdminSettingsRouter(config, deps.settings))
+  api.get('/features', async (req, res) => {
+    const snapshot = await getAdmissionSettings(req)
+    res.json(effectiveFeatures({
+      realJobImports: Boolean(jobs), realGradeLadders: Boolean(grades), realResumeImports: Boolean(resumes),
+      realAnalyses: canCreateAnalyses, analysisSummaryGeneration: Boolean(analyses),
       analysisEvidenceCorrections: Boolean(analyses?.evidenceCorrectionsEnabled),
       wordDocumentImports: wordDocumentImports && Boolean(jobs || resumes),
-    })
+    }, snapshot, config.settings?.runtimeEnabled === true, Boolean(config.settings || deps.settings)))
   })
   api.use(createRealJobsRouter({ repository, jobs, lifecycle, now: deps.now, wordDocumentImports }))
   api.use(createRealGradesRouter({ repository, grades, jobs, lifecycle, now: deps.now }))
   api.use(createRealResumesRouter({ repository, resumes, lifecycle, now: deps.now, wordDocumentImports }))
   api.use(createRealAnalysesRouter({ repository, analyses, resumes, jobs, grades, now: deps.now }))
 
+  api.get('/session/identity', (req, res) => {
+    const principal = getPrincipal(req)
+    res.json({
+      mode: 'cloud',
+      user: { id: principal.oid, tenantId: principal.tenantId, name: principal.name, email: principal.email },
+      capabilities: { applicationAdmin: isApplicationAdmin(principal, config) },
+    })
+  })
   api.get('/session', async (req, res) => {
-    res.json(await repository.getSession(getPrincipal(req)))
+    const principal = getPrincipal(req)
+    const session = await repository.getSession(principal, {
+      bootstrap: req.query.bootstrap !== 'false',
+      allowCreation: async () => (await getCurrentSettings(req)).workspaces.allowCreation,
+    })
+    res.json({ ...session, capabilities: { applicationAdmin: isApplicationAdmin(principal, config) } })
   })
 
   api.get('/workspaces', async (req, res) => {
@@ -190,6 +218,7 @@ export function createApp(deps: AppDeps): Express {
 
   api.post('/workspaces', async (req, res) => {
     const name = pickAllowedField(req.body, 'name', ['name'])
+    if (!(await getCurrentSettings(req)).workspaces.allowCreation) throw forbidden('New workspace creation is disabled by application policy.')
     const workspace = await repository.createWorkspace(getPrincipal(req), name)
     res.status(201).json({ workspace })
   })

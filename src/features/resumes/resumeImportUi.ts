@@ -1,4 +1,6 @@
-import { RESUME_IMPORT_LIMITS, type RealResumeSummary } from '../../domain/real-resumes'
+import { RESUME_IMPORT_LIMITS, type RealResumeSummary, type ResumeProcessingFeatures } from '../../domain/real-resumes'
+import type { PublicSettings } from '../../domain/admin-settings'
+import { requireImportFile, requireImportUrl } from '../../services/publicSettings'
 import type { UploadFormat } from '../../domain/document-formats'
 import { isSafeUploadedFilename, uploadedFileKind, type UploadedSourceKind } from '../../domain/source-files'
 import { uploadFileByteLimit, uploadFormatNames, validateUploadFile } from '../../services/documentUploads'
@@ -32,7 +34,11 @@ export function resumeFileInput(file: File): RealResumeImportSource {
   return resumeFileSource(file)
 }
 
-export function validateResumeInput(source: RealResumeImportSource, limits = RESUME_IMPORT_LIMITS, formats: readonly UploadFormat[] | boolean = ['pdf']): string | undefined {
+export function validateResumeInput(source: RealResumeImportSource, limits: ResumeProcessingFeatures['resumeLimits'] = RESUME_IMPORT_LIMITS, formats: readonly UploadFormat[] | boolean = ['pdf'], settings?: PublicSettings | null): string | undefined {
+  try {
+    if (source.kind === 'url') requireImportUrl(source.url, 'resumes', settings)
+    else requireImportFile(source.file, 'resumes', settings)
+  } catch (caught) { return caught instanceof Error ? caught.message : 'This input is not allowed by current application policy.' }
   const available: readonly UploadFormat[] = typeof formats === 'boolean' ? formats ? ['pdf', 'markdown'] : ['pdf'] : formats
   if (source.kind !== 'url') {
     if (source.kind === 'unsupported' || uploadedFileKind(source.file) !== source.kind) return `Choose a supported file: ${uploadFormatNames(available)}. Other file types are not supported.`
@@ -55,14 +61,14 @@ export function resumeUrlLines(text: string): string[] {
   return text.split(/\r?\n/).map((line) => line.trim()).filter(Boolean)
 }
 
-export function appendResumeInputs(batch: RealResumeImportBatch, inputs: RealResumeImportSource[], limits = RESUME_IMPORT_LIMITS, formats: readonly UploadFormat[] | boolean = ['pdf']): RealResumeImportBatch {
+export function appendResumeInputs(batch: RealResumeImportBatch, inputs: RealResumeImportSource[], limits: ResumeProcessingFeatures['resumeLimits'] = RESUME_IMPORT_LIMITS, formats: readonly UploadFormat[] | boolean = ['pdf'], settings?: PublicSettings | null): RealResumeImportBatch {
   if (batch.inputCount !== null) throw new Error('This batch has already been submitted. Retry its unchanged items, or explicitly start another batch.')
   if (batch.items.length + inputs.length > limits.maxBatchItems) {
     throw new Error(`A batch can contain at most ${limits.maxBatchItems} total files and URLs. Nothing was truncated; your existing selection is unchanged.`)
   }
   const existingUrls = new Set(batch.items.flatMap((item) => item.source.kind === 'url' ? [item.source.url] : []))
   const items = inputs.map((source): RealResumeImportItem => {
-    const error = validateResumeInput(source, limits, formats)
+    const error = validateResumeInput(source, limits, formats, settings)
     const repeated = source.kind === 'url' && existingUrls.has(source.url)
     if (source.kind === 'url') existingUrls.add(source.url)
     return {

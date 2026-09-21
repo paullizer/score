@@ -1,11 +1,13 @@
 import assert from 'node:assert/strict'
 import { once } from 'node:events'
 import { test } from 'node:test'
-import {
+import { loadWorker } from '../worker-tests/shared-model-loader.mjs'
+import { settingsSnapshot } from '../worker-tests/runtime-settings-test-support.mjs'
+const {
   assertCredentialFreeEnvironment,
   createRendererApp,
   RendererError,
-} from '../dist-renderer/app.mjs'
+} = await loadWorker('../renderer/app.ts')
 
 const unusedFetcher = async () => {
   throw new Error('fetcher should not be called')
@@ -76,7 +78,7 @@ test('health is anonymous while render enforces the internal worker interface gu
   })
 })
 
-test('render validates the exact JSON schema and enforces the 16 KB body limit', async () => {
+test('render validates the exact JSON schema and enforces the 64 KB bounded policy envelope', async () => {
   let renderCalls = 0
   const app = createRendererApp({
     fetcher: unusedFetcher,
@@ -94,11 +96,45 @@ test('render validates the exact JSON schema and enforces the 16 KB body limit',
     assert.equal(extraField.status, 400)
     assert.equal((await extraField.json()).error.code, 'invalid_request')
 
-    const oversized = await renderRequest(baseUrl, { url: `https://jobs.example/${'a'.repeat(17_000)}` })
+    const longUrl = await renderRequest(baseUrl, { url: `https://jobs.example/${'a'.repeat(4096)}` })
+    assert.equal(longUrl.status, 400)
+    const oversized = await renderRequest(baseUrl, { url: `https://jobs.example/${'a'.repeat(66_000)}` })
     assert.equal(oversized.status, 413)
     assert.equal((await oversized.json()).error.code, 'request_too_large')
     assert.equal(renderCalls, 0)
   })
+})
+
+test('renderer validates its bounded host-policy envelope independently of application snapshots', async () => {
+  const settings = settingsSnapshot().settings
+  const rules = prefix => Array.from({ length: 100 }, (_, index) => ({
+    hostname: `${prefix}${index}.${'a'.repeat(60)}.${'b'.repeat(60)}.${'c'.repeat(60)}.example`,
+    includeSubdomains: true,
+  }))
+  const policy = { rendering: { ...settings.rendering, maxRequests: 3, settleMilliseconds: 0 }, urls: {
+    allowedHosts: rules('allowed'), blockedHosts: rules('blocked'), requireHttps: true, timeoutMilliseconds: 30_000,
+    maxResponseBytes: 12 * 1024 * 1024, maxRedirects: 2,
+  } }
+  assert.ok(Buffer.byteLength(JSON.stringify(policy)) > 16_000)
+  let calls = 0
+  const app = createRendererApp({
+    fetcher: unusedFetcher,
+    render: async (url, _signal, received) => {
+      calls++
+      assert.deepEqual(received, policy)
+      return { html: '<html></html>', finalUrl: url }
+    },
+  })
+  await withServer(app, async baseUrl => {
+    assert.equal((await renderRequest(baseUrl, { url: 'https://jobs.example/role', policy })).status, 200)
+    for (const invalid of [
+      { ...policy, rendering: { ...policy.rendering, maxRequests: 81 } },
+      { ...policy, rendering: { ...policy.rendering, maxAggregateBytes: 8 * 1024 * 1024 + 1 } },
+      { ...policy, urls: { ...policy.urls, maxRedirects: 6 } },
+      { ...policy, endpoint: 'https://untrusted.example' },
+    ]) assert.equal((await renderRequest(baseUrl, { url: 'https://jobs.example/role', policy: invalid })).status, 400)
+  })
+  assert.equal(calls, 1)
 })
 
 test('render maps safe public transport and rendering failures to stable envelopes', async () => {

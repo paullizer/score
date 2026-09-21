@@ -18,7 +18,7 @@ await build({
     resolveDir: root,
     contents: [
       'service', 'routes', 'validation', 'snapshots', 'diagnostics', 'paging', 'lifecycle', 'library-lifecycle', 'guards', 'azure-store',
-      'narratives', 'narrative-records', 'narrative-artifacts', 'narrative-scheduling', 'summary-history', 'summary-actions',
+      'narratives', 'narrative-records', 'narrative-artifacts', 'narrative-scheduling', 'summary-history', 'summary-actions', 'reports',
       'corrections', 'current-results', 'correction-actions', 'correction-validation',
     ].map(name => `export * from './server/analyses/${name}.ts';`).join('\n') +
       "\nexport * from './server/errors.ts'; export * from './server/store.ts';" +
@@ -27,6 +27,8 @@ await build({
       "\nexport * from './src/domain/analysis-diagnostics.ts';" +
       "\nexport * from './src/domain/analysis-corrections.ts';" +
       "\nexport { WorkspaceRepository } from './server/repository.ts';" +
+      "\nexport * from './server/settings/request-context.ts'; export * from './src/domain/admin-settings.ts';" +
+      "\nexport { createJobStoreFromContainer } from './server/jobs/azure-store.ts';" +
       "\nexport { parseGradeEntity, parseGradeSeedSnapshot, gradeContentHash, gradeVersionHash, gradeSourceSetHash, validateGradeApproval } from './server/grades/validation.ts';" +
       "\nexport { createGradeBlobStoreFromContainer } from './server/grades/azure-store.ts';" +
       "\nexport { parseResumeEntity } from './server/resumes/validation.ts';" +
@@ -627,7 +629,7 @@ const VIEWER = '00000000-0000-4000-8000-000000000003'
 const STRANGER = '00000000-0000-4000-8000-000000000004'
 const EDITOR = '00000000-0000-4000-8000-000000000005'
 const ORIGIN = 'https://score.example.test'
-export async function startHttp(f, enabled = true) {
+export async function startHttp(f, enabled = true, settings, runtimeEnabled = true) {
   const memberships = new Map([['owner', OWNER], ['editor', EDITOR], ['viewer', VIEWER]].map(([role, oid]) => {
     const principalId = api.principalKeyFor(TENANT, oid)
     const member = { id: api.membershipIdFor(principalId), workspaceId: f.workspaceId, principalId, principalType: 'user', role }
@@ -659,12 +661,14 @@ export async function startHttp(f, enabled = true) {
     },
   }
   const repository = new api.WorkspaceRepository({ directory, state, now: () => new Date(f.now) })
-  const config = { authMode: 'easyauth', tenantId: TENANT, allowedUserIds: new Set([OWNER, EDITOR, VIEWER, STRANGER]), appOrigin: ORIGIN }
+  const config = { authMode: 'easyauth', tenantId: TENANT, allowedUserIds: new Set([OWNER, EDITOR, VIEWER, STRANGER]), appOrigin: ORIGIN,
+    ...(settings ? { settings: { runtimeEnabled } } : {}) }
   const app = express()
   app.use(express.json())
   const router = express.Router()
   router.use((_req, res, next) => { res.setHeader('Cache-Control', 'no-store'); next() })
   router.use(api.createAuthMiddleware(config), api.createCsrfMiddleware(config))
+  router.use(api.attachSettingsContext(config, settings))
   router.use(api.createRealAnalysesRouter({
     repository, analyses: enabled ? f.analysis : undefined, resumes: f.resumes, jobs: f.jobs, grades: f.grades, now: () => new Date(f.now),
   }))
@@ -678,7 +682,7 @@ export async function startHttp(f, enabled = true) {
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve))
   const base = `http://127.0.0.1:${server.address().port}/api/workspaces/${f.workspaceId}/analyses`
   return {
-    base,
+    base, config,
     async close() { await new Promise(resolve => server.close(resolve)) },
     async request(suffix = '', method = 'GET', body, options = {}) {
       const oid = options.role === 'viewer' ? VIEWER : options.role === 'editor' ? EDITOR : options.role === 'stranger' ? STRANGER : OWNER

@@ -25,6 +25,7 @@ import { createAnalysisEvidenceCatalog, type AnalysisEvidenceCatalog } from './e
 import {
   analysisResponseRequestId, emitAnalysisTelemetry, type AnalysisTelemetryEvent, type AnalysisTelemetrySink,
 } from './telemetry'
+import { modelProcessingSettings, taskModelOptions } from '../settings'
 
 export {
   AnalysisModelError, ANALYSIS_WEIGHT_TOLERANCE, ANALYSIS_CALCULATION_VERSION,
@@ -194,6 +195,10 @@ function serviceError(error: unknown, stage: AnalysisModelStage): AnalysisModelE
   if (error instanceof AnalysisModelError) return error
   const upstream = record(error) ? error : {}
   const status = error instanceof Response ? error.status : typeof upstream.status === 'number' ? upstream.status : undefined
+  if (upstream.code === 'model-context-limit') return new AnalysisModelError('context-limit',
+    'The complete source or model request exceeds its captured budget; no evidence was omitted.', { stage, reason: 'context-budget' })
+  if (upstream.code === 'settings-invalid') return new AnalysisModelError('invalid-input',
+    'The captured model settings are invalid; no substitute model was used.', { stage })
   if (upstream.code === 'request-timeout' || upstream.name === 'TimeoutError') {
     return new AnalysisModelError('timeout', 'The analysis model request timed out; retry the comparison.', { stage, retryable: true })
   }
@@ -214,6 +219,11 @@ export async function invokeAnalysisModel(
   versions: { promptVersion: string; schemaVersion: string } =
     { promptVersion: ANALYSIS_MODEL_PROMPT_VERSIONS[stage], schemaVersion: ANALYSIS_MODEL_SCHEMA_VERSIONS[stage] },
 ): Promise<ModelCallResult> {
+  const taskId = request.taskId ?? (stage === 'grounding' ? 'assessmentReview' : 'assessment')
+  options = { ...options, model: taskModelOptions(options.model, taskId) }
+  const processingSettings = modelProcessingSettings(options.model)
+  const task = processingSettings?.tasks[taskId]
+  request = { ...request, taskId, maxCompletionTokens: task?.completionTokenLimit ?? request.maxCompletionTokens }
   checkCancelled(options.signal, stage)
   const inputCharacters = requestCharacters(request)
   const startedAt = clock.now().toISOString()
@@ -308,6 +318,7 @@ export async function invokeAnalysisModel(
       content: response.content, callId,
       provenance: {
         model: actualModel, deployment: options.model.deployment,
+        ...(processingSettings ? { settingsRevision: processingSettings.revision, task: taskId } : {}),
         promptVersion: versions.promptVersion,
         schemaVersion: versions.schemaVersion,
         startedAt, completedAt: clock.now().toISOString(), inputCharacters,
@@ -379,6 +390,7 @@ function modelOutputControl(
     options: AnalysisAssessmentOptions; frozen: RealAnalysisAssessmentInput; clock: Clock; catalog: AnalysisEvidenceCatalog
   },
 ) {
+  const maxCorrections = modelProcessingSettings(options.model)?.settings.analyses.maxOutputCorrections ?? ANALYSIS_LIMITS.maxOutputCorrections
   let correctionCount = 0
   const outputEvent = (
     response: ModelCallResult, stage: AnalysisModelStage, event: 'validation-failed' | 'correction' | 'citations-resolved',
@@ -396,9 +408,9 @@ function modelOutputControl(
     })
     const diagnostic = correctionDiagnostic(error)
     if (!diagnostic) throw error
-    if (correctionCount >= ANALYSIS_LIMITS.maxOutputCorrections) {
+    if (correctionCount >= maxCorrections) {
       throw new AnalysisModelError(diagnostic.code,
-        `${diagnostic.message} The ${ANALYSIS_LIMITS.maxOutputCorrections}-correction limit was reached; no result was published.`,
+        `${diagnostic.message} The ${maxCorrections}-correction limit was reached; no result was published.`,
         { stage, correctable: true, reason: diagnostic.reason,
           citationDiagnostics: diagnostic.citationDiagnostics, schemaDiagnostics: diagnostic.schemaDiagnostics })
     }
@@ -413,6 +425,7 @@ function modelOutputControl(
     }
   }
   return {
+    maxCorrections,
     get correctionCount() { return correctionCount },
     nextCorrection: () => { correctionCount += 1 },
     outputEvent, repairValidation,
@@ -424,8 +437,10 @@ function groundingRequest(
   correction: Record<string, unknown> | undefined,
 ): StructuredModelRequest {
   return {
+    taskId: 'assessmentReview',
     name: 'resume_rubric_grounding_review',
     schema: context.groundingSchema, system: GROUNDING_SYSTEM,
+    source: JSON.stringify({ input: context.modelInput, assessment }),
     user: JSON.stringify({
       input: context.modelInput, assessment,
       ...(correction ? { correction } : {}),
@@ -500,7 +515,7 @@ export async function assessResumeAgainstTarget(
   emitEvidenceCatalog(context, 'assessment')
   const assessmentSchema = analysisStructuredSchema(assessmentSelectionSchemaForInput(frozen, catalog.passages.length))
   const control = modelOutputControl(context)
-  const { outputEvent, repairValidation } = control
+  const { outputEvent, repairValidation, maxCorrections } = control
   const groundingReviews: RealAnalysisGroundingReview[] = []
   let assessmentCorrection: Record<string, unknown> | undefined
   let reviewCorrection: Record<string, unknown> | undefined
@@ -511,8 +526,10 @@ export async function assessResumeAgainstTarget(
     checkCancelled(options.signal, assessed ? 'grounding' : 'assessment')
     if (!assessed) {
       const response = await invokeAnalysisModel({
+        taskId: 'assessment',
         name: 'resume_rubric_assessment',
-        schema: assessmentSchema, system: ASSESSMENT_SYSTEM,
+        schema: assessmentSchema, system: ASSESSMENT_SYSTEM.replace(`at most ${ANALYSIS_LIMITS.maxOutputCorrections} corrections`, `at most ${maxCorrections} corrections`),
+        source: JSON.stringify({ input: modelInput }),
         user: JSON.stringify({ input: modelInput, ...(assessmentCorrection ? { correction: assessmentCorrection } : {}) }),
         maxCompletionTokens: ANALYSIS_MODEL_LIMITS.assessmentCompletionTokens,
       }, 'assessment', options, clock, control.correctionCount)
@@ -563,9 +580,9 @@ export async function assessResumeAgainstTarget(
     }
     const reviewDiagnostics = groundingDisagreement(savedReview)
     outputEvent(response, 'grounding', 'validation-failed', reviewDiagnostics)
-    if (control.correctionCount >= ANALYSIS_LIMITS.maxOutputCorrections) {
+    if (control.correctionCount >= maxCorrections) {
       throw new AnalysisModelError('grounding-failed',
-        `Independent analysis review could not support this comparison after ${ANALYSIS_LIMITS.maxOutputCorrections} allowed corrections; no result was published.`,
+        `Independent analysis review could not support this comparison after ${maxCorrections} allowed corrections; no result was published.`,
         { stage: 'grounding', reason: 'grounding-disagreement' })
     }
     control.nextCorrection()

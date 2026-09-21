@@ -221,3 +221,42 @@ test('aborted or invalid-file downloads create no object URL or anchor', () => {
   assert.throws(() => api.downloadAnalysisReport(csvBytes(), report, 'pdf', new AbortController().signal), /invalid file/)
   assert.equal(downloads.length, 0)
 })
+
+test('one worker generation pins a value copy before awaiting fonts, regardless of subsequent settings changes', async () => {
+  const mutable = structuredClone(report)
+  mutable.capture.settings = { revision: 'captured-policy', policy: {
+    ...mutable.capture.settings.policy, title: 'Captured report title', maxOutputBytes: 2048,
+  } }
+  const pending = []
+  globalThis.fetch = () => new Promise(resolve => pending.push(resolve))
+  behavior = (worker, request) => queueMicrotask(() => worker.onmessage({
+    data: { type: 'complete', requestId: request.requestId, bytes: pdfBytes() },
+  }))
+  const generation = api.generateReportInWorker(mutable, 'pdf', { signal: new AbortController().signal, links })
+  assert.equal(pending.length, 2)
+  mutable.capture.settings.revision = 'later-policy'
+  mutable.capture.settings.policy.title = 'A later title'
+  mutable.capture.settings.policy.enabledFormats = []
+  mutable.capture.settings.policy.maxOutputBytes = 1
+  pending.forEach(resolve => resolve(new Response(Uint8Array.of(0, 1, 0, 0, 1, 2, 3))))
+  await generation
+  assert.equal(workers[0].request.report.capture.settings.revision, 'captured-policy')
+  assert.equal(workers[0].request.report.capture.settings.policy.title, 'Captured report title')
+  assert.equal(workers[0].request.report.capture.settings.policy.maxOutputBytes, 2048)
+  assert.ok(workers[0].request.report.capture.settings.policy.enabledFormats.includes('pdf'))
+})
+
+test('format and output restrictions are enforced before worker startup and again before an object URL is created', async () => {
+  const disabled = structuredClone(report)
+  disabled.capture.settings.policy.enabledFormats = ['csv']
+  disabled.capture.settings.policy.defaultFormat = 'csv'
+  await assert.rejects(api.generateReportInWorker(disabled, 'pdf', { signal: new AbortController().signal, links }), /disabled/)
+  assert.throws(() => api.downloadAnalysisReport(pdfBytes(), disabled, 'pdf', new AbortController().signal), /disabled/)
+  assert.equal(workers.length, 0)
+  const bounded = structuredClone(report)
+  bounded.capture.settings.policy.maxOutputBytes = 4
+  await assert.rejects(api.generateReportInWorker(bounded, 'csv', { signal: new AbortController().signal, links }), /too large/)
+  assert.throws(() => api.downloadAnalysisReport(csvBytes(), bounded, 'csv', new AbortController().signal), /too large/)
+  assert.equal(workers[0].terminated, 1)
+  assert.equal(downloads.length, 0)
+})

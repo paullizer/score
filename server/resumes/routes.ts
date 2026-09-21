@@ -4,7 +4,8 @@ import { UPLOAD_CONTENT_TYPES, uploadFormatFromContentType, type UploadFormat } 
 import { HttpError, invalidRequest, notFound, preconditionRequired, unavailable } from '../errors'
 import type { WorkspaceRepository } from '../repository'
 import type { LifecycleDependencies } from '../lifecycle/contracts'
-import { getPrincipal } from '../request-context'
+import { getPrincipal, getRequestSettings } from '../request-context'
+import { assertOriginalDownload, requestProcessingSettings } from '../jobs/policy'
 import { RealResumeService, type ResumeImportRequest } from './service'
 import type { RealResumesDeps } from './store'
 import { isResumeUuid, isSafeResumeFilename, isValidResumeId } from './validation'
@@ -100,9 +101,9 @@ export function createRealResumesRouter(deps: RealResumesRouterDeps): Router {
   const base = '/workspaces/:workspaceId/resumes'
   const service = deps.resumes ? new RealResumeService(deps.resumes, deps.now) : undefined
   const lifecycle = deps.resumes ? new ResumeLifecycleService(deps.resumes, deps.lifecycle, deps.now) : undefined
-  const requireService = () => {
+  const requireService = (req?: Request) => {
     if (!service) throw unavailable('Real resume imports are not enabled for this deployment.')
-    return service
+    return req ? new RealResumeService(deps.resumes!, deps.now, requestProcessingSettings(req)) : service
   }
   const authorize: RequestHandler = async (req, res, next) => {
     res.setHeader('Cache-Control', 'private, no-store')
@@ -145,6 +146,8 @@ export function createRealResumesRouter(deps: RealResumesRouterDeps): Router {
     }),
   )
   router.get(`${base}/:resumeId/original`, async (req, res) => {
+    const role = await deps.repository.authorizeWorkspace(getPrincipal(req), param(req, 'workspaceId'), 'read')
+    assertOriginalDownload(await getRequestSettings(req), role, req.query.preview === 'formatted')
     const original = await requireService().original(param(req, 'workspaceId'), resumeId(req))
     res.setHeader('Content-Type', original.contentType)
     res.setHeader('Content-Disposition', attachmentHeader(original.filename))
@@ -227,7 +230,7 @@ export function createRealResumesRouter(deps: RealResumesRouterDeps): Router {
       mutate('write', async (req: Request, res: Response) => {
         const kind = fileKind(req)
         if (!Buffer.isBuffer(req.body)) throw invalidRequest('The request must contain raw document bytes.')
-        const result = await requireService().importFile(
+        const result = await requireService(req).importFile(
           param(req, 'workspaceId'), importRequest(req), filename(req, kind), req.body, UPLOAD_CONTENT_TYPES[kind],
         )
         res.setHeader('ETag', result.resume.etag)
@@ -254,7 +257,7 @@ export function createRealResumesRouter(deps: RealResumesRouterDeps): Router {
         Object.keys(req.body).length !== 1 || !Object.hasOwn(req.body, 'url')) {
         throw invalidRequest('A URL import body must contain only a url field.')
       }
-      const result = await requireService().importUrl(param(req, 'workspaceId'), importRequest(req), req.body.url)
+      const result = await requireService(req).importUrl(param(req, 'workspaceId'), importRequest(req), req.body.url)
       res.setHeader('ETag', result.resume.etag)
       res.status(result.created ? 202 : 200).json({ resume: result.resume })
     }),
@@ -267,7 +270,7 @@ export function createRealResumesRouter(deps: RealResumesRouterDeps): Router {
       express.raw({ type: () => true, limit: '1kb', inflate: false }),
       mutate('write', async (req, res) => {
         emptyBody(req.body)
-        const value = await requireService()[action](param(req, 'workspaceId'), resumeId(req), etag(req))
+        const value = await requireService(req)[action](param(req, 'workspaceId'), resumeId(req), etag(req))
         res.setHeader('ETag', value.etag)
         res.json({ resume: value })
       }),

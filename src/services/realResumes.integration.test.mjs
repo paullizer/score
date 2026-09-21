@@ -88,6 +88,7 @@ before(async () => {
       export * from './src/features/resumes/resumeImportUi';
       export { RealRequestScope } from './src/app/real-request-scope';
       export { WorkspaceContext, useWorkspace } from './src/app/workspace-context';
+      export { PublicSettingsContext } from './src/app/public-settings-context';
       export { RealResumesBridge } from './src/app/RealResumesBridge';
       export { RealResumesContext, useRealResumes } from './src/app/real-resumes-context';
       export { DocumentViewer } from './src/components/documents/DocumentViewer';
@@ -96,6 +97,8 @@ before(async () => {
       export { RealComparisonReview } from './src/features/analyses/RealComparisonReview';
       export { RealAnalysesContext } from './src/app/real-analyses-context';
       export { RESUME_IMPORT_LIMITS } from './src/domain/real-resumes';
+      export { createDefaultAdminSettings, captureProcessingSettings } from './src/domain/admin-settings';
+      export { effectiveFeatures } from './server/settings/features';
       export { supportedUploadFormats } from './src/domain/document-formats';
       export { uploadFileByteLimit } from './src/services/documentUploads';
       export { MemoryRouter } from 'react-router-dom';
@@ -143,6 +146,32 @@ test('features are additive and missing resume support fails closed', async () =
   assert.equal(word.wordDocumentImports, true)
   assert.equal(word.resumeLimits.maxFileBytes, 10 * 1024 * 1024)
   assert.equal(ui.uploadFileByteLimit('pdf', word.resumeLimits), 8 * 1024 * 1024)
+})
+
+function effectiveResumeFeatures({ deployed = true, imports = false, runtimeEnabled = true } = {}) {
+  const settings = ui.createDefaultAdminSettings()
+  settings.features.resumeImports = imports
+  return ui.effectiveFeatures({
+    realJobImports: true, realGradeLadders: true, realResumeImports: deployed, realAnalyses: true,
+    analysisSummaryGeneration: true, wordDocumentImports: true,
+  }, ui.captureProcessingSettings(settings, 'resume-readiness-policy', timestamp), runtimeEnabled, true)
+}
+
+test('resume feature client keeps explicit historical deployment readiness separate from new-admission flags', async () => {
+  for (const deployed of [true, false]) {
+    globalThis.fetch = async () => json(effectiveResumeFeatures({ deployed }))
+    const result = await client.fetchResumeProcessingFeatures()
+    assert.equal(result.realResumeImports, false)
+    assert.equal(result.deploymentCapabilities.realResumeImports, deployed)
+  }
+  globalThis.fetch = async () => json(effectiveResumeFeatures({ imports: true, runtimeEnabled: false }))
+  const paused = await client.fetchResumeProcessingFeatures()
+  assert.equal(paused.realResumeImports, false)
+  assert.equal(paused.deploymentCapabilities.realResumeImports, true)
+  const unknown = effectiveResumeFeatures()
+  delete unknown.deploymentCapabilities
+  globalThis.fetch = async () => json(unknown)
+  assert.equal((await client.fetchResumeProcessingFeatures()).deploymentCapabilities, undefined, 'Absent capability remains unknown, not false')
 })
 
 test('Markdown resume capability must be advertised explicitly with real resume support', async () => {
@@ -509,9 +538,11 @@ function markdownComparison(kind) {
 
 test('frozen Markdown resume, job and grade-seed evidence keep section labels and exact citations', async () => {
   root = createRoot(dom.window.document.getElementById('root'))
+  const content = (detail, key) => React.createElement(ui.WorkspaceContext.Provider, { value: frontendWorkspaceContext() },
+    React.createElement(ui.RealComparisonReview, { key, detail }))
   for (const kind of ['job', 'grade']) {
     const saved = markdownComparison(kind)
-    await act(async () => root.render(React.createElement(ui.RealComparisonReview, { key: kind, detail: saved })))
+    await act(async () => root.render(content(saved, kind)))
     assert.match(dom.window.document.querySelector('.document-viewer').textContent, /Markdown section 1 of 1/)
     await act(async () => dom.window.document.querySelector('button[aria-label^="View resume evidence"]').click())
     await settle(() => dom.window.document.querySelector('.document-viewer mark')?.textContent === 'accessible project documentation')
@@ -524,7 +555,7 @@ test('frozen Markdown resume, job and grade-seed evidence keep section labels an
   }
   const mismatched = markdownComparison('job')
   mismatched.result.criteria[0].requirementCitations[0].quote = 'An absent quotation'
-  await act(async () => root.render(React.createElement(ui.RealComparisonReview, { key: 'invalid', detail: mismatched })))
+  await act(async () => root.render(content(mismatched, 'invalid')))
   await act(async () => dom.window.document.querySelector('button[aria-label^="View requirement evidence"]').click())
   await settle(() => dom.window.document.querySelector('[role="alert"]')?.textContent.includes('does not exactly match'))
   assert.equal(dom.window.document.querySelector('.document-viewer mark'), null)
@@ -539,10 +570,11 @@ test('copied frozen Markdown seed references use their captured MIME and the exa
     document: { documentId: reference.id, documentVersion: reference.version },
   }]
   const calls = []
-  const api = { document: async (...args) => { calls.push(args); return reference } }
+  const api = { phase: 'unavailable', summaries: [], document: async (...args) => { calls.push(args); return reference } }
   root = createRoot(dom.window.document.getElementById('root'))
-  await act(async () => root.render(React.createElement(ui.RealAnalysesContext.Provider, { value: api },
-    React.createElement(ui.RealComparisonReview, { detail: saved }))))
+  await act(async () => root.render(React.createElement(ui.WorkspaceContext.Provider, { value: frontendWorkspaceContext() },
+    React.createElement(ui.RealAnalysesContext.Provider, { value: api },
+      React.createElement(ui.RealComparisonReview, { detail: saved })))))
   await act(async () => dom.window.document.querySelector('button[aria-label^="View requirement evidence"]').click())
   await settle(() => dom.window.document.querySelector('.document-viewer mark')?.textContent === 'documented engineering projects')
   assert.equal(calls.length, 1)
@@ -642,6 +674,109 @@ async function mount(workspaceId = 'workspace-one', showProbe = true, role = 'ow
 async function settle(predicate) {
   for (let index = 0; index < 30 && !predicate(); index++) await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)) })
   assert.equal(Boolean(predicate()), true, 'Expected asynchronous UI state was reached')
+}
+
+for (const change of ['same-revision projection', 'failed policy refresh']) {
+  test(`public ${change} rechecks resume deployment readiness without dropping history`, async () => {
+    let features = effectiveResumeFeatures({ deployed: false })
+    let failed = false
+    let policy = { cloud: true, phase: 'ready', settings: features.publicSettings, error: null, refresh: async () => {} }
+    globalThis.fetch = async (url, init) => {
+      requests.push({ url, init })
+      if (url === '/api/features') return failed
+        ? json({ error: { code: 'unavailable', message: 'Current policy refresh failed.' } }, 503)
+        : json(features)
+      if (url.endsWith('/resumes')) return json({ resumes: [summary()] })
+      throw new Error(`Unexpected resume refresh request: ${url}`)
+    }
+    const render = async () => {
+      root ??= createRoot(dom.window.document.getElementById('root'))
+      await act(async () => {
+        root.render(React.createElement(ui.PublicSettingsContext.Provider, { value: policy }, tree('workspace-one')))
+        await new Promise(resolve => setTimeout(resolve, 0))
+      })
+    }
+    await render()
+    await settle(() => current?.phase === 'unavailable')
+    const revision = policy.settings.revision
+    features = effectiveResumeFeatures({ deployed: true })
+    failed = change === 'failed policy refresh'
+    policy = { ...policy, settings: failed ? policy.settings : features.publicSettings,
+      phase: failed ? 'error' : 'ready', error: failed ? 'Current policy refresh failed.' : null }
+    assert.equal(policy.settings.revision, revision)
+    await render()
+    await settle(() => current?.phase === 'ready')
+    assert.equal(current.summaries.length, 1)
+    assert.equal(current.features?.deploymentCapabilities.realResumeImports, failed ? undefined : true)
+    if (failed) assert.match(current.error, /Current policy refresh failed/)
+  })
+}
+
+test('known absent resume deployment is unavailable without listing, and a later feature failure does not retain that historical gate', async () => {
+  let deployed = false
+  let featuresFail = false
+  globalThis.fetch = async (url, init) => {
+    requests.push({ url, init })
+    if (url === '/api/features') return featuresFail
+      ? json({ error: { code: 'unavailable', message: 'Current policy is unavailable.' } }, 503)
+      : json(effectiveResumeFeatures({ deployed }))
+    if (url.endsWith('/resumes')) return deployed
+      ? json({ resumes: [summary()] })
+      : json({ error: { code: 'unavailable', message: 'Resume storage is not configured.' } }, 503)
+    if (url.endsWith('/resumes/resume-one')) return json(detail())
+    throw new Error(`Unexpected historical readiness request: ${url}`)
+  }
+  await mount()
+  await settle(() => current?.phase !== 'loading')
+  assert.equal(current.phase, 'unavailable')
+  assert.equal(current.features.deploymentCapabilities.realResumeImports, false)
+  assert.match(current.error, /not configured/)
+  assert.equal(requests.filter(request => request.url.endsWith('/resumes')).length, 0, 'An explicit missing reader is not treated as a failed library request')
+  assert.throws(() => current.newBatch(), /saved resume service is unavailable/i)
+
+  deployed = true
+  featuresFail = true
+  await act(async () => { await current.refresh() })
+  assert.equal(current.phase, 'ready', 'A failed current feature read cannot reuse an old false capability')
+  assert.equal(current.features, null)
+  assert.equal(current.summaries.length, 1)
+  assert.match(current.error, /Current policy is unavailable/)
+  await act(async () => { await current.ensureDetail('resume-one') })
+  assert.equal(current.detail('resume-one').state, 'ready')
+  assert.throws(() => current.newBatch(), /unavailable|not enabled/i)
+
+  featuresFail = false
+  await act(async () => { await current.refresh() })
+  assert.equal(current.phase, 'ready')
+  assert.equal(current.features.deploymentCapabilities.realResumeImports, true)
+  assert.equal(current.features.realResumeImports, false)
+  assert.equal(current.error, null)
+  assert.equal(current.detail('resume-one').state, 'ready')
+})
+
+for (const condition of ['policy disabled', 'inactive rollout', 'features unavailable', 'capability omitted']) {
+  test(`saved resume lists and details stay readable with ${condition}`, async () => {
+    const features = effectiveResumeFeatures({ imports: condition === 'inactive rollout', runtimeEnabled: condition !== 'inactive rollout' })
+    if (condition === 'capability omitted') delete features.deploymentCapabilities
+    globalThis.fetch = async (url, init) => {
+      requests.push({ url, init })
+      if (url === '/api/features') return condition === 'features unavailable'
+        ? json({ error: { code: 'unavailable', message: 'Feature policy could not be read.' } }, 503)
+        : json(features)
+      if (url.endsWith('/resumes')) return json({ resumes: [summary()] })
+      if (url.endsWith('/resumes/resume-one')) return json(detail())
+      throw new Error(`Unexpected saved-resume request: ${url}`)
+    }
+    await mount()
+    await settle(() => current?.phase === 'ready')
+    assert.equal(current.summaries.length, 1)
+    await act(async () => { await current.ensureDetail('resume-one') })
+    assert.equal(current.detail('resume-one').state, 'ready')
+    assert.equal(current.detail('resume-one').value.document.paragraphs[0].text, 'Prepared accessible project documentation.')
+    assert.ok(requests.some(request => request.url.endsWith('/resumes') && request.init.method === 'GET'))
+    assert.throws(() => current.newBatch(), /unavailable|not enabled/i)
+    assert.ok(requests.every(request => request.init.method === 'GET'), 'Current history access never opens new import admission')
+  })
 }
 
 test('resume rename retains ready source details and never promotes a custom label to stated identity', async () => {

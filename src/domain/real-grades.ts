@@ -2,6 +2,7 @@ import type { Citation, Criterion, DocumentParagraph, Job, Rubric, SourceDocumen
 import type { RealJobSource } from './real-jobs'
 import type { LifecycleMetadata, LifecycleOperation } from './lifecycle'
 import type { OriginalContentType } from './document-formats'
+import type { ProcessingSettingsSnapshot } from './admin-settings'
 
 export const GRADE_LADDER_LIMITS = {
   maxSources: 15,
@@ -69,6 +70,7 @@ export interface GradeEntityBase {
   workspaceId: string
   createdAt: string
   updatedAt: string
+  processingSettings?: ProcessingSettingsSnapshot
 }
 
 export type LadderStatus = 'draft' | 'discovering' | 'sources-ready' | 'generating' | 'review' | 'incomplete' | 'approved' | 'error' | 'cancelled'
@@ -234,6 +236,9 @@ export interface FrozenReferenceSource {
   completeness: ReferenceDocument['completeness']
   issues: GradeIssue[]
   issueResolutions?: ReferenceIssueResolution[]
+  processingSettingsRevision?: string
+  // Retained for previously frozen references; new references store revision-only provenance.
+  processingSettings?: ProcessingSettingsSnapshot
 }
 
 export interface GradeSourceSetRecord extends GradeEntityBase {
@@ -407,7 +412,7 @@ export interface GradeLaddersPage {
 
 export interface GradeProcessingFeatures {
   realGradeLadders: boolean
-  gradeLimits: typeof GRADE_LADDER_LIMITS
+  gradeLimits: { [K in keyof typeof GRADE_LADDER_LIMITS]: number }
 }
 
 export interface CreateGradeLadderInput {

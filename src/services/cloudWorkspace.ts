@@ -1,5 +1,5 @@
 import type { Workspace } from '../domain/types'
-import type { CloudSession, CloudWorkspaceSnapshot, WorkspaceSummary } from '../domain/cloud'
+import type { CloudSession, CloudSessionIdentity, CloudWorkspaceSnapshot, WorkspaceSummary } from '../domain/cloud'
 import type { LifecycleAction, LifecycleImpact, LifecycleOperation } from '../domain/lifecycle'
 
 /**
@@ -211,6 +211,10 @@ export function cloudLifecycleRequest<T>(path: string, init: RequestInit = {}): 
 
 export async function fetchSession(signal?: AbortSignal): Promise<CloudSession> {
   return cloudJsonRequest<CloudSession>('/session', { method: 'GET', signal })
+}
+
+export function fetchSessionIdentity(signal?: AbortSignal): Promise<CloudSessionIdentity> {
+  return cloudJsonRequest<CloudSessionIdentity>('/session/identity', { method: 'GET', signal })
 }
 
 export async function listWorkspaces(signal?: AbortSignal): Promise<WorkspaceSummary[]> {

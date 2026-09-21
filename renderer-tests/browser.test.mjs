@@ -1,6 +1,18 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { renderJobPage } from '../dist-renderer/app.mjs'
+import { loadWorker } from '../worker-tests/shared-model-loader.mjs'
+import { settingsSnapshot } from '../worker-tests/runtime-settings-test-support.mjs'
+const { renderJobPage } = await loadWorker('../renderer/browser.ts')
+
+function renderPolicy(change = () => {}) {
+  const { settings } = settingsSnapshot(change)
+  return {
+    rendering: settings.rendering,
+    urls: { ...settings.imports.urls.jobs, requireHttps: settings.imports.urls.requireHttps,
+      timeoutMilliseconds: settings.imports.urls.timeoutMilliseconds,
+      maxResponseBytes: settings.imports.urls.maxResponseBytes, maxRedirects: settings.imports.urls.maxRedirects },
+  }
+}
 
 function response(url, body, status = 200, headers = { 'content-type': 'text/html' }) {
   return {
@@ -230,6 +242,85 @@ test('redirect targets are fetched and validated before a redirect response is f
       < events.indexOf('fulfill https://cdn.example/start.js'),
   )
   assert.equal(fake.state.continued, 0)
+})
+
+test('captured URL rules apply to subresources and every redirect, including HTTPS and blocked subdomains', async () => {
+  const policy = renderPolicy(settings => {
+    settings.imports.urls.requireHttps = true
+    settings.imports.urls.jobs.allowedHosts = [{ hostname: 'example.com', includeSubdomains: true }]
+    settings.imports.urls.jobs.blockedHosts = [{ hostname: 'blocked.example.com', includeSubdomains: true }]
+  })
+  for (const forbidden of ['https://external.example/app.js', 'https://child.blocked.example.com/app.js', 'http://cdn.example.com/app.js']) {
+    const fetched = []
+    const fake = createFakeBrowser({ onGoto: ({ dispatch }) => dispatch(forbidden) })
+    await assert.rejects(renderJobPage('https://jobs.example.com/role', new AbortController().signal, {
+      policy, launchBrowser: async () => fake.browser,
+      fetcher: async url => { fetched.push(url); return response(url, '<html>Job</html>') },
+    }), error => error.code === 'unsafe_url')
+    assert.deepEqual(fetched, ['https://jobs.example.com/role'])
+    assert.equal(fake.state.browserClosed, 1)
+  }
+  let requests = 0
+  await assert.rejects(renderJobPage('https://jobs.example.com/role', new AbortController().signal, {
+    policy, launchBrowser: async () => assert.fail('forbidden redirects cannot launch the browser'),
+    fetcher: async url => { requests++; return response(url, '', 302, { location: 'https://blocked.example.com/role' }) },
+  }), error => error.code === 'unsafe_url')
+  assert.equal(requests, 1)
+})
+
+test('lower captured request, response, aggregate and DOM budgets fail without returning partial evidence', async () => {
+  for (const [change, html, onGoto] of [
+    [settings => { settings.rendering.maxRequests = 1 }, '<html></html>', ({ dispatch }) => dispatch('https://jobs.example/extra.js')],
+    [settings => { settings.imports.urls.maxResponseBytes = 8 }, '<html>too large</html>'],
+    [settings => { settings.rendering.maxAggregateBytes = 8; settings.rendering.maxDomBytes = 8 }, '<html>too large</html>'],
+    [settings => { settings.rendering.maxDomBytes = 8 }, '<html>too large</html>'],
+  ]) {
+    const fake = createFakeBrowser({ onGoto })
+    await assert.rejects(renderJobPage('https://jobs.example/role', new AbortController().signal, {
+      policy: renderPolicy(change), launchBrowser: async () => fake.browser,
+      fetcher: async url => response(url, html),
+    }), error => error.code === 'limit_exceeded')
+  }
+})
+
+test('concurrent subresources cannot reuse the same captured aggregate-byte allowance', async () => {
+  const budgets = []
+  const fake = createFakeBrowser({
+    onGoto: ({ dispatch }) => Promise.all([dispatch('https://jobs.example/one.js'), dispatch('https://jobs.example/two.js')]),
+  })
+  await assert.rejects(renderJobPage('https://jobs.example/role', new AbortController().signal, {
+    policy: renderPolicy(settings => {
+      settings.rendering.maxAggregateBytes = 10
+      settings.rendering.maxDomBytes = 10
+    }),
+    launchBrowser: async () => fake.browser,
+    fetcher: async (url, options) => {
+      if (!url.endsWith('.js')) return response(url, 'x')
+      budgets.push(options.maxBytes)
+      await new Promise(resolve => setTimeout(resolve, 1))
+      return response(url, '123456')
+    },
+  }), error => error.code === 'limit_exceeded')
+  assert.deepEqual(budgets, [9, 3])
+})
+
+test('zero settle is bounded and never disables the websocket guard', async () => {
+  const fake = createFakeBrowser({ waitForLoadState: async () => assert.fail('zero settle cannot become an infinite Playwright timeout') })
+  await renderJobPage('https://jobs.example/role', new AbortController().signal, {
+    policy: renderPolicy(settings => { settings.rendering.settleMilliseconds = 0 }),
+    launchBrowser: async () => fake.browser, fetcher: async url => response(url, '<html>Job</html>'),
+  })
+  assert.equal(fake.state.webSocketsClosed, 1)
+})
+
+test('a captured zero redirect allowance rejects before contacting the destination', async () => {
+  const fetched = []
+  await assert.rejects(renderJobPage('https://jobs.example/role', new AbortController().signal, {
+    policy: renderPolicy(settings => { settings.imports.urls.maxRedirects = 0 }),
+    launchBrowser: async () => assert.fail('redirect budget was exhausted before browser launch'),
+    fetcher: async url => { fetched.push(url); return response(url, '', 302, { location: '/next' }) },
+  }), error => error.code === 'render_failed')
+  assert.deepEqual(fetched, ['https://jobs.example/role'])
 })
 
 test('network and DOM limits fail closed and always clean up the browser', async () => {

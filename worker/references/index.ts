@@ -4,6 +4,8 @@ import { WorkerError } from '../runtime'
 import { extractReferenceHtml } from './html'
 import { extractReferencePdf, referenceHash, REFERENCE_EXTRACTION_VERSION } from './pdf'
 import { checkCancellation, fetchOriginalUrl, referenceUrl } from './transport'
+import { fetchSettings } from '../settings'
+import { urlMatchesPolicy } from '../../renderer/request-policy'
 
 export type { DiscoveryOptions, ReferenceOriginal, ReferenceExtractionOptions, ReferenceExtraction } from './contracts'
 export { getReferenceIssueTarget, reconcileReferenceIssues } from './issue-lifecycle'
@@ -17,7 +19,8 @@ export const fetchReferenceOriginal: FetchReferenceOriginal = async (source, opt
 
 const extractDocument: ExtractReferenceDocument = async (source, original, options) => {
   checkCancellation(options.signal)
-  if (original.bytes.byteLength > GRADE_LADDER_LIMITS.maxPdfBytes) throw new WorkerError('reference-too-large', 'A reference cannot exceed 20 MiB.', false, 'parsing')
+  const limits = options.processingSettings?.settings.grades.references
+  if (original.bytes.byteLength > (limits?.maxPdfBytes ?? GRADE_LADDER_LIMITS.maxPdfBytes)) throw new WorkerError('reference-too-large', 'The reference exceeds its captured byte limit.', false, 'parsing')
   if ((source.sha256 !== undefined && source.sha256 !== referenceHash(original.bytes)) ||
     (source.bytes !== undefined && source.bytes !== original.bytes.byteLength) ||
     (source.originalContentType !== undefined && source.originalContentType !== original.contentType)) {
@@ -46,18 +49,20 @@ const extractDocument: ExtractReferenceDocument = async (source, original, optio
   }
   const url = referenceUrl(original.finalUrl ?? source.finalUrl ?? source.requestedUrl ?? 'https://reference.invalid/').href
   const intendedSection = source.intendedSection || (source.requestedUrl ? new URL(source.requestedUrl).hash.replace(/^#/, '') : '') || undefined
-  let extracted = extractReferenceHtml(Buffer.from(original.bytes).toString('utf8'), url, source.title, intendedSection)
+  let extracted = extractReferenceHtml(Buffer.from(original.bytes).toString('utf8'), url, source.title, intendedSection, limits)
   let method: 'html' | 'browser' = 'html'
   if (extracted.thin && options.browser) {
-    const rendered = await options.browser.render(referenceUrl(source.requestedUrl ?? url, undefined, source.origin === 'opm').href, {
-      signal: options.signal, maxBytes: GRADE_LADDER_LIMITS.maxPdfBytes,
-    })
+    const renderOptions = options.processingSettings
+      ? fetchSettings({ signal: options.signal }, options.processingSettings, source.origin === 'opm' ? 'opm' : 'agencyReferences')
+      : { signal: options.signal, maxBytes: GRADE_LADDER_LIMITS.maxPdfBytes }
+    const rendered = await options.browser.render(referenceUrl(source.requestedUrl ?? url, undefined, source.origin === 'opm').href, renderOptions)
     checkCancellation(options.signal)
     const finalUrl = referenceUrl(rendered.finalUrl, undefined, source.origin === 'opm').href
-    if (Buffer.byteLength(rendered.html, 'utf8') > GRADE_LADDER_LIMITS.maxPdfBytes) {
-      throw new WorkerError('reference-too-large', 'The rendered reference exceeds 20 MiB.', false, 'parsing')
+    if (!urlMatchesPolicy(finalUrl, renderOptions.urlPolicy)) throw new WorkerError('unsafe-url', 'The rendered reference is disallowed by its captured URL policy.', false, 'download')
+    if (Buffer.byteLength(rendered.html, 'utf8') > (limits?.maxPdfBytes ?? GRADE_LADDER_LIMITS.maxPdfBytes)) {
+      throw new WorkerError('reference-too-large', 'The rendered reference exceeds its captured byte limit.', false, 'parsing')
     }
-    extracted = extractReferenceHtml(rendered.html, finalUrl, source.title, intendedSection)
+    extracted = extractReferenceHtml(rendered.html, finalUrl, source.title, intendedSection, limits)
     extracted.warnings.push('Text was obtained from the injected isolated renderer; the immutable original retains the initially fetched HTML.')
     method = 'browser'
   }

@@ -1,6 +1,7 @@
 import { Link } from 'react-router-dom'
 import { ArrowRight, Layers3, LoaderCircle, Plus, RotateCcw } from 'lucide-react'
 import { useGradeLadders } from '../../app/grade-ladders-context'
+import { clientAdmissionReason, usePublicSettings } from '../../app/public-settings-context'
 import { Badge, Button, EmptyState, InlineError } from '../../components/ui'
 import { gradeLadderLink } from './gradeUi'
 import { GradeDisclaimer, GradeStatus } from './GradeShared'
@@ -11,6 +12,8 @@ import { ApprovedGradeAnalysis } from './ApprovedGradeAnalysis'
 
 export function GradeLadderLibrary({ search = '', archiveFilter = 'default' }: { search?: string; archiveFilter?: ArchiveFilter }) {
   const api = useGradeLadders()
+  const policy = usePublicSettings()
+  const reason = clientAdmissionReason(policy, 'gradeLadders')
   const { workspace } = useWorkspace()
   if (!api) return null
   const visible = api.summaries.filter(({ ladder, levels }) => !ladder.lifecycle?.deletedAt &&
@@ -19,8 +22,8 @@ export function GradeLadderLibrary({ search = '', archiveFilter = 'default' }: {
     `${ladder.name} ${ladder.context.series} ${ladder.context.agency} ${ladder.seedJobTitle} ${ladder.grades.map((grade) => `GS-${grade}`).join(' ')}`.toLowerCase().includes(search.trim().toLowerCase()))
   return <div className="grade-library">
     <div className="grade-library-intro"><div><h2>Real, source-grounded GS ladders</h2><p>Each family keeps a frozen seed, captured reference sets, and independent grade versions. Identical names never merge families.</p></div>
-      {api.canWrite ? <Link to="/grade-ladders/new" className="button button-primary button-md"><Plus size={16} aria-hidden="true" />Create grade ladder</Link>
-        : <p className="text-[11px] text-muted">Read-only workspace · an owner or editor can create a ladder.</p>}
+      {api.canWrite && api.features?.realGradeLadders && !reason ? <Link to="/grade-ladders/new" className="button button-primary button-md"><Plus size={16} aria-hidden="true" />Create grade ladder</Link>
+        : <p className="text-[11px] text-muted">{reason ?? (api.canWrite ? 'New ladder generation is unavailable. Saved families remain readable.' : 'Read-only workspace · an owner or editor can create a ladder.')}</p>}
     </div>
     {api.error && <InlineError>{api.error} <Button size="sm" icon={RotateCcw} onClick={() => void api.refresh()}>Retry service</Button></InlineError>}
     {api.phase === 'loading' && <EmptyState icon={LoaderCircle} title="Loading private grade families" description="Reading every page from the real grade service. No sample content is substituted." />}
@@ -43,7 +46,7 @@ export function GradeLadderLibrary({ search = '', archiveFilter = 'default' }: {
     </article>)}</div>}
     {!visible.length && api.phase === 'ready' && <EmptyState icon={Layers3} title={search ? 'No matching real ladders' : 'Prepare your first real GS ladder'}
       description={search ? 'Search a family name, occupational series, agency, seed job, or GS grade.' : 'Choose a ready real job and an exact saved rubric version. Confirm context, review captured sources, then generate distinct supported grade expectations.'}
-      action={api.canWrite && !search ? <Link to="/grade-ladders/new" className="button button-secondary button-md">Create grade ladder</Link> : undefined} />}
+      action={api.canWrite && api.features?.realGradeLadders && !reason && !search ? <Link to="/grade-ladders/new" className="button button-secondary button-md">Create grade ladder</Link> : undefined} />}
     <GradeDisclaimer />
   </div>
 }

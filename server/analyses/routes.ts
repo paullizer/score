@@ -3,13 +3,16 @@ import type { WorkspaceRepository } from '../repository'
 import type { RealJobsDeps } from '../jobs/routes'
 import type { RealGradesDeps } from '../grades/service'
 import type { RealResumesDeps } from '../resumes/store'
-import { getPrincipal } from '../request-context'
+import { getPrincipal, getRequestSettings, runtimeSettingsEnabled } from '../request-context'
+import { canUseSummaryRole, requestProcessingSettings } from '../jobs/policy'
 import { traceOperation } from '../telemetry-operations'
 import { forbidden, invalidRequest, notFound, preconditionRequired, unavailable } from '../errors'
 import { isUuid } from '../jobs/validation'
 import type { RealAnalysesDeps } from './store'
 import { RealAnalysisService } from './service'
 import { AnalysisLibraryLifecycleService } from './library-lifecycle'
+import { AnalysisReportCaptures } from './reports'
+import { REPORT_FORMATS, type AnalysisReportFormat } from '../../src/domain/analysis-reports'
 import { analysisCorrectionInputSchema } from './correction-validation'
 import { publishSummaryDraftInputSchema, type AnalysisSummarySubject } from '../../src/domain/analysis-summary-history'
 import {
@@ -123,9 +126,10 @@ export function createRealAnalysesRouter(deps: RealAnalysesRouterDeps): Router {
   const base = '/workspaces/:workspaceId/analyses'
   const service = deps.analyses ? new RealAnalysisService(deps.analyses, deps, deps.now) : undefined
   const lifecycle = deps.analyses ? new AnalysisLibraryLifecycleService(deps.analyses, deps.now) : undefined
-  const requireService = () => {
+  const reportCaptures = new AnalysisReportCaptures(deps.now)
+  const requireService = (req?: Request) => {
     if (!service) throw unavailable('Real analysis is not enabled for this deployment.')
-    return service
+    return req ? new RealAnalysisService(deps.analyses!, deps, deps.now, requestProcessingSettings(req)) : service
   }
   const authorize: RequestHandler = async (req, res, next) => {
     res.setHeader('Cache-Control', 'no-store')
@@ -152,7 +156,7 @@ export function createRealAnalysesRouter(deps: RealAnalysesRouterDeps): Router {
   })
   router.post(base, mutate('write', async (req, res) => {
     query(req, [])
-    const run = await requireService().create(param(req, 'workspaceId'), key(req), body(createAnalysisInputSchema, req.body), getPrincipal(req).principalKey)
+    const run = await requireService(req).create(param(req, 'workspaceId'), key(req), body(createAnalysisInputSchema, req.body), getPrincipal(req).principalKey)
     res.setHeader('ETag', run.etag)
     res.status(202).json({ run })
   }))
@@ -203,7 +207,7 @@ export function createRealAnalysesRouter(deps: RealAnalysesRouterDeps): Router {
   }))
   router.post(`${base}/:runId/summaries`, mutate('write', async (req, res) => {
     query(req, [])
-    const result = await requireService().generateSummaries(param(req, 'workspaceId'), recordId(req, 'run'),
+    const result = await requireService(req).generateSummaries(param(req, 'workspaceId'), recordId(req, 'run'),
       body(generateAnalysisSummariesInputSchema, req.body), key(req), match(req), getPrincipal(req).principalKey)
     res.setHeader('ETag', result.summaries.etag)
     res.status(202).json(result)
@@ -220,19 +224,30 @@ export function createRealAnalysesRouter(deps: RealAnalysesRouterDeps): Router {
     if (!['owner', 'editor'].includes(res.locals.analysisWorkspaceRole)) {
       throw forbidden('Only workspace owners and editors may inspect unpublished summary history.')
     }
+    const policy = (await getRequestSettings(req)).settings.summaries
+    if (!canUseSummaryRole(policy.historyRoles, res.locals.analysisWorkspaceRole)) {
+      throw forbidden('Application policy restricts unpublished summary history to workspace owners.')
+    }
     query(req, ['continuationToken', 'resultRevisionId'])
     const token = req.query.continuationToken
     if (token !== undefined && (typeof token !== 'string' || !token || token.length > 16 * 1024)) {
       throw invalidRequest('continuationToken must be a single valid summary history token.')
     }
-    const history = await requireService().summaryHistory(param(req, 'workspaceId'), recordId(req, 'run'), summarySubject(req), token, signal, summaryResultRevision(req, res))
+    const history = await requireService().summaryHistory(param(req, 'workspaceId'), recordId(req, 'run'), summarySubject(req), token,
+      signal, summaryResultRevision(req, res), policy.historyPageSize)
     signal.throwIfAborted()
+    history.capabilities.canPublish &&= policy.allowManualPublication &&
+      canUseSummaryRole(policy.manualPublicationRoles, res.locals.analysisWorkspaceRole)
     res.setHeader('ETag', history.etag)
     res.json(history)
   }))
   router.post(`${summaryBase}/publish`, mutate('write', async (req, res) => {
     query(req, [])
-    const result = await requireService().publishSummary(param(req, 'workspaceId'), recordId(req, 'run'), summarySubject(req),
+    const policy = (await getRequestSettings(req)).settings.summaries
+    if (!policy.allowManualPublication || !canUseSummaryRole(policy.manualPublicationRoles, res.locals.analysisWorkspaceRole)) {
+      throw forbidden('Application policy does not allow your workspace role to manually publish summaries.')
+    }
+    const result = await requireService(req).publishSummary(param(req, 'workspaceId'), recordId(req, 'run'), summarySubject(req),
       body(publishSummaryDraftInputSchema, req.body), key(req), match(req), getPrincipal(req).principalKey)
     res.setHeader('ETag', result.summaries.etag)
     res.json(result)
@@ -240,21 +255,59 @@ export function createRealAnalysesRouter(deps: RealAnalysesRouterDeps): Router {
   router.post(`${summaryBase}/retry`, mutate('write', async (req, res) => {
     query(req, [])
     body(emptyAnalysisInputSchema, actionBody(req))
-    const result = await requireService().retrySummary(param(req, 'workspaceId'), recordId(req, 'run'), summarySubject(req),
+    const result = await requireService(req).retrySummary(param(req, 'workspaceId'), recordId(req, 'run'), summarySubject(req),
       key(req), match(req), getPrincipal(req).principalKey)
     res.setHeader('ETag', result.summaries.etag)
     res.status(202).json(result)
   }))
+  router.get(`${base}/:runId/report-capture`, read(async (req, res, signal) => {
+    query(req, ['format', 'targetId'])
+    if (typeof req.query.format !== 'string' || !Object.hasOwn(REPORT_FORMATS, req.query.format)) {
+      throw invalidRequest('Choose a supported report format.')
+    }
+    const targetId = req.query.targetId === undefined ? undefined : body(analysisNarrativeTargetIdSchema, req.query.targetId)
+    const capture = await requireService(req).captureReport(
+      reportCaptures, param(req, 'workspaceId'), recordId(req, 'run'), getPrincipal(req).principalKey,
+      res.locals.analysisWorkspaceRole, req.query.format as AnalysisReportFormat, targetId, signal,
+    )
+    signal.throwIfAborted()
+    res.json(capture)
+  }))
   router.get(`${base}/:runId/report-comparisons`, read(async (req, res, signal) => {
-    query(req, ['comparisonId'])
+    query(req, ['comparisonId', 'format', 'settingsRevision', 'targetId', 'captureToken'])
     body(emptyAnalysisInputSchema, actionBody(req))
     const ids = req.query.comparisonId
     const comparisonIds = body(reportComparisonIdsSchema, typeof ids === 'string' ? [ids] : ids)
-    const report = await requireService().reportComparisons(
-      param(req, 'workspaceId'), recordId(req, 'run'), comparisonIds, signal,
+    for (const name of ['format', 'settingsRevision', 'targetId', 'captureToken']) {
+      if (req.query[name] !== undefined && typeof req.query[name] !== 'string') throw invalidRequest('Report capture parameters must be single values.')
+    }
+    let captureToken = req.query.captureToken as string | undefined
+    if (!captureToken) {
+      if (runtimeSettingsEnabled(req)) throw invalidRequest('Capture the current report policy before requesting official export data.')
+      const compatibility = await requireService(req).captureReport(
+        reportCaptures, param(req, 'workspaceId'), recordId(req, 'run'), getPrincipal(req).principalKey,
+        res.locals.analysisWorkspaceRole, 'csv', undefined, signal,
+      )
+      captureToken = compatibility.captureToken
+    }
+    const capture = reportCaptures.begin(
+      captureToken, param(req, 'workspaceId'), recordId(req, 'run'), getPrincipal(req).principalKey,
+      res.locals.analysisWorkspaceRole, comparisonIds, {
+        format: req.query.format as string | undefined, settingsRevision: req.query.settingsRevision as string | undefined,
+        targetId: req.query.targetId as string | undefined,
+      },
     )
-    signal.throwIfAborted()
-    res.json(report)
+    try {
+      const report = await requireService().reportComparisons(
+        param(req, 'workspaceId'), recordId(req, 'run'), comparisonIds, signal,
+        capture.settings, capture.manifestSha256,
+      )
+      signal.throwIfAborted()
+      capture.finish(report)
+      res.json(report)
+    } finally {
+      capture.finish()
+    }
   }))
   router.get(`${base}/:runId/comparisons/:comparisonId`, read(async (req, res, signal) => {
     query(req, [])
@@ -307,7 +360,7 @@ export function createRealAnalysesRouter(deps: RealAnalysesRouterDeps): Router {
   }))
   router.post(correctionBase, mutate('write', async (req, res) => {
     query(req, [])
-    const result = await requireService().requestCorrection(
+    const result = await requireService(req).requestCorrection(
       param(req, 'workspaceId'), recordId(req, 'run'), recordId(req, 'comparison'),
       body(analysisCorrectionInputSchema, req.body), key(req), match(req), getPrincipal(req).principalKey,
     )
@@ -335,7 +388,7 @@ export function createRealAnalysesRouter(deps: RealAnalysesRouterDeps): Router {
   }))
   router.post(`${base}/:runId/retry`, mutate('write', async (req, res) => {
     query(req, [])
-    const run = await requireService().retry(param(req, 'workspaceId'), recordId(req, 'run'), body(retryAnalysisInputSchema, actionBody(req)), match(req))
+    const run = await requireService(req).retry(param(req, 'workspaceId'), recordId(req, 'run'), body(retryAnalysisInputSchema, actionBody(req)), match(req))
     res.setHeader('ETag', run.etag)
     res.json({ run })
   }))
@@ -350,7 +403,7 @@ export function createRealAnalysesRouter(deps: RealAnalysesRouterDeps): Router {
     router.post(`${base}/:runId/comparisons/:comparisonId/${action}`, mutate('write', async (req, res) => {
       query(req, [])
       body(emptyAnalysisInputSchema, actionBody(req))
-      const comparison = await requireService().comparisonAction(
+      const comparison = await requireService(req).comparisonAction(
         param(req, 'workspaceId'), recordId(req, 'run'), recordId(req, 'comparison'), action, match(req),
       )
       res.setHeader('ETag', comparison.etag)

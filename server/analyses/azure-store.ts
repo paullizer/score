@@ -1,4 +1,5 @@
 import { CosmosClient, type Container, type JSONObject, type OperationInput, type SqlParameter } from '@azure/cosmos'
+import { preservesProcessingSettings } from '../jobs/policy'
 import { BlobServiceClient, type BlockBlobClient, type ContainerClient } from '@azure/storage-blob'
 import type { TokenCredential } from '@azure/identity'
 import { WORD_DOCUMENT_LIMITS, isWordContentType, storedDocumentContentType } from '../../src/domain/document-formats'
@@ -70,6 +71,8 @@ export function assertAnalysisReplacement(previous: AnalysisEntity, next: Analys
   assertAnalysis(previous.id === next.id && previous.workspaceId === next.workspaceId && previous.recordType === next.recordType &&
     previous.createdAt === next.createdAt && next.updatedAt >= previous.updatedAt, 'Record identity and creation time are immutable.')
   if (previous.recordType === 'analysis-run' && next.recordType === 'analysis-run') {
+    assertAnalysis(preservesProcessingSettings(previous.processingSettings, next.processingSettings),
+      'Accepted run processing settings are immutable.')
     for (const key of ['manifest', 'name', 'createdBy', 'idempotencyKey', 'inputFingerprint'] as const) {
       assertAnalysis(analysisHash(previous[key]) === analysisHash(next[key]), 'Accepted run inputs and manifest are immutable.')
     }
@@ -89,6 +92,8 @@ export function assertAnalysisReplacement(previous: AnalysisEntity, next: Analys
     assertAnalysis(!previous.narrativeCancelledAt || Boolean(next.narrativeCancelledAt &&
       next.narrativeCancelledAt >= previous.narrativeCancelledAt), 'Narrative cancellation cannot move backwards.')
   } else if (previous.recordType === 'analysis-comparison' && next.recordType === 'analysis-comparison') {
+    assertAnalysis(preservesProcessingSettings(previous.processingSettings, next.processingSettings),
+      'Accepted comparison processing settings are immutable.')
     assertAnalysis(previous.runId === next.runId && previous.index === next.index &&
       analysisHash(previous.resume) === analysisHash(next.resume) && analysisHash(previous.target) === analysisHash(next.target),
     'Comparison frozen inputs are immutable.')
@@ -104,6 +109,8 @@ export function assertAnalysisReplacement(previous: AnalysisEntity, next: Analys
       assertAnalysis(analysisHash(previous[key]) === analysisHash(next[key]), 'Correction ancestry and frozen inputs are immutable.')
     }
     if (previous.requestId === next.requestId) {
+      assertAnalysis(preservesProcessingSettings(previous.processingSettings, next.processingSettings),
+        'Accepted correction processing settings are immutable.')
       for (const key of ['requestFingerprint', 'requestedAt', 'requestedBy', 'reason', 'policyVersion', 'criterionIds',
         'baseResult', 'baseAttemptId', 'baseRevision', 'proposal'] as const) {
         assertAnalysis(analysisHash(previous[key] ?? null) === analysisHash(next[key] ?? null),
@@ -131,6 +138,8 @@ export function assertAnalysisReplacement(previous: AnalysisEntity, next: Analys
       next.published?.revision.id === next.requestId && next.published.result.sha256 !== next.baseResult.sha256,
     'A correction must retain the previous result until the exact leased replacement is ready.')
   } else if (previous.recordType === 'analysis-narrative-request' && next.recordType === 'analysis-narrative-request') {
+    assertAnalysis(preservesProcessingSettings(previous.processingSettings, next.processingSettings),
+      'Accepted summary scheduling settings are immutable.')
     for (const key of ['runId', 'manifestSha256', 'requestId', 'requestedBy', 'mode', 'targetId', 'scopeRevision', 'plan', 'scheduled'] as const) {
       assertAnalysis(analysisHash(previous[key]) === analysisHash(next[key]), 'Accepted narrative request inputs are immutable.')
     }
@@ -154,14 +163,23 @@ export function assertAnalysisReplacement(previous: AnalysisEntity, next: Analys
       'Summary history cannot be erased or an immutable checkpoint replaced.')
     }
     if (previous.generationId === next.generationId) {
-      assertAnalysis(previous.requestId === next.requestId && previous.requestedAt === next.requestedAt &&
+      const waitingRetry = next.recordType === 'analysis-target-narrative' && next.status === 'waiting' &&
+        !previous.inputFingerprint && !next.inputFingerprint && next.waitingFor === 'candidate-narratives'
+      const manualRetry = ['failed', 'cancelled'].includes(previous.status) && (next.status === 'queued' || waitingRetry) &&
+        next.retryCount === previous.retryCount + 1 && next.attempts === 0 && !next.attemptId && !next.lease &&
+        !next.error && Boolean(next.nextAttemptAt) && Boolean(next.retryRequestId) &&
+        next.retryRequestId !== previous.retryRequestId && next.requestedAt >= previous.requestedAt
+      assertAnalysis(preservesProcessingSettings(previous.processingSettings, next.processingSettings),
+        'An accepted summary generation cannot change processing settings.')
+      assertAnalysis(previous.requestId === next.requestId && (previous.requestedAt === next.requestedAt || manualRetry) &&
         previous.requestedBy === next.requestedBy && previous.reason === next.reason &&
         (!previous.inputFingerprint || previous.inputFingerprint === next.inputFingerprint) &&
-        next.attempts >= previous.attempts && next.retryCount === previous.retryCount,
+        (manualRetry || next.attempts >= previous.attempts && next.retryCount === previous.retryCount &&
+          previous.retryRequestId === next.retryRequestId),
       'A narrative generation cannot change its accepted inputs.')
       assertAnalysis(previous.status !== 'ready' || analysisHash(previous) === analysisHash(next),
         'Published narrative generations are immutable.')
-      assertAnalysis(!['failed', 'cancelled'].includes(previous.status) || next.status === previous.status,
+      assertAnalysis(!['failed', 'cancelled'].includes(previous.status) || next.status === previous.status || manualRetry,
         'Stopped narrative generations require a fresh explicit or dependent generation.')
       assertAnalysis(!previous.summaryRound || (next.summaryRound ?? 0) >= previous.summaryRound,
         'A summary generation cannot reset its durable round budget.')

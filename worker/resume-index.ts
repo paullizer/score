@@ -6,6 +6,7 @@ import { createAzureResumeBlobStore, createAzureResumeStore } from '../server/re
 import { createRemoteRenderer } from './runtime'
 import { loadResumeWorkerConfig, type ResumeWorkerConfig } from './resumes/config'
 import { ResumeWorkerError, runResumeWorker, type ResumeWorkerDependencies } from './resumes/runtime'
+import { createAzureWorkerSettings } from './settings-store'
 
 export { loadResumeWorkerConfig } from './resumes/config'
 export { processClaimedResume, runResumeWorker } from './resumes/runtime'
@@ -18,6 +19,9 @@ async function getToken(credential: TokenCredential, scope: string): Promise<str
 
 export function createResumeWorkerDependencies(config: ResumeWorkerConfig, credential: TokenCredential): ResumeWorkerDependencies {
   return {
+    settings: createAzureWorkerSettings(config, credential, {
+      deployment: config.modelDeployment, modelName: config.modelName, reasoningEffort: config.reasoningEffort,
+    }),
     store: createAzureResumeStore(config.stores, credential),
     blobs: createAzureResumeBlobStore(config.stores, credential),
     documentIntelligence: {

@@ -26,13 +26,13 @@ import {
   citationMatchesDocument, parseAnalysisEntity, parseAnalysisResult, validateAnalysisAssessment,
 } from '../../server/analyses/validation'
 import { systemClock, type Clock } from '../runtime'
+import { operationSettings, retryBackoff, RuntimeSettingsError, safeSettingsMetadata } from '../settings'
 import { AnalysisModelError, reviewAnalysisAssessment } from './model'
 import type { AnalysisWorkerDependencies } from './runtime'
 import { emitAnalysisTelemetry } from './telemetry'
 
 const LEASE_MS = 90_000
 const HEARTBEAT_MS = 25_000
-const BACKOFF_MS = 30_000
 const RUN_BUDGET_MS = 660_000
 const FAILURE_BUDGET_MS = 10_000
 const FENCE_ATTEMPTS = 8
@@ -67,6 +67,7 @@ function requestBinding(record: RealAnalysisCorrectionRecord): string {
     baseResult: record.baseResult, baseAttemptId: record.baseAttemptId, baseRevision: record.baseRevision,
     resumeSnapshot: record.resumeSnapshot, targetSnapshot: record.targetSnapshot, policyVersion: record.policyVersion,
     criterionIds: record.criterionIds, requestedAt: record.requestedAt, requestedBy: record.requestedBy, reason: record.reason,
+    processingSettings: record.processingSettings ?? null,
   })
 }
 function owns(record: RealAnalysisCorrectionRecord, claimed: RealAnalysisCorrectionRecord, now: string): boolean {
@@ -80,6 +81,10 @@ function failureFor(error: unknown, stage: Stage, inputs = false): AnalysisProce
   if (error instanceof AnalysisModelError) return {
     code: error.code, stage: error.stage, retryable: error.retryable,
     message: 'The independent grounding review could not complete safely. The previous result was retained.',
+  }
+  if (error instanceof RuntimeSettingsError) return {
+    code: error.code === 'model-context-limit' ? 'context-limit' : 'snapshot-invalid',
+    stage, retryable: false, message: error.message,
   }
   if (error instanceof Error && (error.name === 'ZodError' || error.message.startsWith('Invalid analysis data:'))) return {
     code: inputs ? 'snapshot-invalid' : 'invalid-model-output', stage, retryable: false,
@@ -250,12 +255,14 @@ async function claim(
     if (!run || !current || !original || original.record.status !== 'complete' || !analysisCorrectionCanWork(run.record, current.record) ||
       requestBinding(current.record) !== requestBinding(candidate.record) || !['queued', 'running'].includes(current.record.status) ||
       !due(current.record, clock.now().toISOString()) || !await workspaceActive(deps.store, run.record.workspaceId)) return
-    const attemptLimitReached = current.record.attempts >= ANALYSIS_LIMITS.maxAutomaticAttempts
+    const snapshot = operationSettings(current.record, deps)
+    const attemptLimitReached = current.record.attempts >= snapshot.settings.processing.analyses.maxAutomaticAttempts
     const now = timestamp(clock, run.record, current.record)
     const record: RealAnalysisCorrectionRecord = {
       ...structuredClone(current.record), status: 'running', attemptId, updatedAt: now,
       attempts: Math.min(current.record.attempts + 1, ANALYSIS_LIMITS.maxAutomaticAttempts),
       lease: { owner, heartbeatAt: now, expiresAt: new Date(Date.parse(now) + LEASE_MS).toISOString() },
+      ...(current.record.processingSettings || deps.settings ? { processingSettings: snapshot } : {}),
     }
     delete record.error
     delete record.nextAttemptAt
@@ -368,6 +375,11 @@ export async function processClaimedCorrection(
   options: { deadline?: number; signal?: AbortSignal; attemptLimitReached?: boolean } = {},
 ): Promise<boolean> {
   if (deps.correctionsEnabled !== true || deps.owner && deps.owner !== claimed.record.lease?.owner) return false
+  const pinned = claimed.record.processingSettings ?? deps.settings?.legacy
+  const snapshot = operationSettings({ processingSettings: pinned }, deps)
+  deps = { ...deps, model: { ...deps.model, ...(pinned ? { processingSettings: snapshot } : {}) } }
+  if (pinned) console.info('Score operation settings:', safeSettingsMetadata(snapshot, 'assessmentReview'))
+  const maxAttempts = snapshot.settings.processing.analyses.maxAutomaticAttempts
   const clock = deps.clock ?? systemClock
   const lease = new CorrectionLease(claimed, deps, clock, options.deadline ?? clock.now().getTime() + RUN_BUDGET_MS, options.signal)
   let stage: Stage = 'grounding'
@@ -378,7 +390,7 @@ export async function processClaimedCorrection(
     const { run, correction, original } = await lease.check()
     if (options.attemptLimitReached) throw new CorrectionWorkFailure({
       code: 'timeout', stage, retryable: true,
-      message: 'Correction review stopped after three attempts. A manual retry preserves the same saved evidence.',
+      message: `Correction review stopped after ${maxAttempts} attempts. A manual retry preserves the same saved evidence.`,
     })
     const reader = inputBlobs(deps.blobs)
     const snapshots = await lease.control.wait(() => readAnalysisSnapshots(reader, run.record, original.record))
@@ -464,14 +476,14 @@ export async function processClaimedCorrection(
         if (failure.code !== 'grounding-failed') failure = captureFailure
       }
       await lease.atomic((record, now) => {
-        const retry = failure.retryable && record.attempts < ANALYSIS_LIMITS.maxAutomaticAttempts
+        const retry = failure.retryable && record.attempts < maxAttempts
         const next: RealAnalysisCorrectionRecord = {
           ...record, status: retry ? 'queued' : 'failed', updatedAt: now, error: failure,
           ...(history ? { history } : {}),
         }
         delete next.lease
         delete next.nextAttemptAt
-        if (retry) next.nextAttemptAt = new Date(Date.parse(now) + BACKOFF_MS * 2 ** Math.max(0, record.attempts - 1)).toISOString()
+        if (retry) next.nextAttemptAt = new Date(Date.parse(now) + retryBackoff(snapshot, 'analyses', record.attempts)).toISOString()
         return next
       }, true, cleanup)
       logFailure(claimed.record, failure)

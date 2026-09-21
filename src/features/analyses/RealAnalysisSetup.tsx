@@ -4,6 +4,7 @@ import { ArrowLeft, ArrowRight, BriefcaseBusiness, Check, Layers3, LoaderCircle,
 import { useRealAnalyses } from '../../app/real-analyses-context'
 import { useRealResumes } from '../../app/real-resumes-context'
 import { useWorkspace } from '../../app/workspace-context'
+import { useGradeLeaveGuard } from '../../app/grade-navigation-context'
 import { isEntityArchived, isEntityRemoved, matchesArchiveFilter, type ArchiveFilter } from '../../domain/lifecycle'
 import { ArchivedBadge, ArchiveStateFilter, LifecycleBanner } from '../../components/lifecycle/LifecycleControls'
 import { useLifecycleAccess } from '../../components/lifecycle/useLifecycleAccess'
@@ -76,6 +77,7 @@ function RealAnalysisBuilder({ previous, params, fragment, transferred }: {
   const [error, setError] = useState('')
   const [attempt, setAttempt] = useState<{ input: CreateRealAnalysisInput; key: string } | null>(null)
   const [starting, setStarting] = useState(false)
+  const leaveGuard = useGradeLeaveGuard(Boolean(name.trim() || draft.resumes.length || draft.targets.length || attempt), starting, 'Unsubmitted analysis selection')
   const inFlight = useRef(false)
   const alive = useRef(true)
   useEffect(() => { alive.current = true; return () => { alive.current = false } }, [])
@@ -95,6 +97,8 @@ function RealAnalysisBuilder({ previous, params, fragment, transferred }: {
   const targetIssues = draft.targets.map((item) => targetSelectionIssue(item, currentTargets, workspace))
   const invalid = draft.errors.length > 0 || duplicateInputs || resumeIssues.some(Boolean) || targetIssues.some(Boolean)
   const unavailable = !api.features?.realAnalyses || api.phase !== 'ready' || resumeApi.phase !== 'ready' || api.targets.state !== 'ready' || Boolean(api.targets.error)
+  const retainedAttempt = Boolean(attempt && api.hasRetainedCreation(attempt.input, attempt.key))
+  const submissionUnavailable = attempt ? !retainedAttempt || api.phase !== 'ready' : unavailable
   const locked = starting || Boolean(attempt)
   const jobs = draft.targets.filter((target) => target.selection?.kind === 'job').length
   const grades = draft.targets.filter((target) => target.selection?.kind === 'grade').length
@@ -117,7 +121,7 @@ function RealAnalysisBuilder({ previous, params, fragment, transferred }: {
   }
 
   async function run() {
-    if (inFlight.current || !canEdit || !api.canWrite || unavailable) return
+    if (inFlight.current || !canEdit || !api.canWrite || submissionUnavailable) return
     setError('')
     let request = attempt
     if (!request) {
@@ -135,14 +139,21 @@ function RealAnalysisBuilder({ previous, params, fragment, transferred }: {
     }
     inFlight.current = true
     setStarting(true)
+    leaveGuard.hold()
+    let acknowledged = false
     try {
-      const result = await api.create(request.input, request.key)
+      const result = attempt ? await api.recoverCreation(request.input, request.key) : await api.create(request.input, request.key)
+      acknowledged = true
+      leaveGuard.release()
       if (alive.current) navigate(`/analyses/${encodeURIComponent(result.run.id)}?data=real`)
     } catch (caught) {
-      if (alive.current) setError(caught instanceof Error ? caught.message : 'The analysis request could not be acknowledged.')
+      if (alive.current) {
+        setError(caught instanceof Error ? caught.message : 'The analysis request could not be acknowledged.')
+        if (!api.hasRetainedCreation(request.input, request.key)) setAttempt(null)
+      }
     } finally {
       inFlight.current = false
-      if (alive.current) setStarting(false)
+      if (alive.current) { setStarting(false); if (!acknowledged) leaveGuard.settle() }
     }
   }
 
@@ -211,7 +222,9 @@ function RealAnalysisBuilder({ previous, params, fragment, transferred }: {
           </div>
         </section>
         {(draft.resumes.length > 0 || draft.targets.length > 0) && <section className="panel" aria-label="Review exact selected inputs">
-          <div className="section-heading"><div><h2>Review your exact selection</h2><p>Unknown, mixed, or changed inputs block submission. Refresh never silently changes these selections.</p></div></div>
+          <div className="section-heading"><div><h2>Review your exact selection</h2><p>{retainedAttempt
+            ? 'These exact inputs were already submitted. Current input availability applies to a different request; unchanged recovery never substitutes newer versions.'
+            : 'Unknown, mixed, or changed inputs block submission. Refresh never silently changes these selections.'}</p></div></div>
           <ul className="divide-y">{draft.resumes.map((choice, index) => {
             const issue = resumeIssues[index]
             const current = resumeApi.summaries.find((item) => item.resume.id === choice.id && resumeReady(item))
@@ -251,14 +264,14 @@ function RealAnalysisBuilder({ previous, params, fragment, transferred }: {
             onChange={(event) => setName(event.target.value)} placeholder={attempt?.input.name ?? suggestedName} /></label>
           <p className="break-words text-[11px] text-muted">{attempt ? `This submission keeps the name “${attempt.input.name}”, the same inputs, and the same request key on retry.` : `Leave blank to use “${suggestedName}”. Your own name will not change when selections change.`}</p>
           <div className="space-y-3 border-y py-4"><div className="metric-line"><span>Real resumes</span><strong>{draft.resumes.length}</strong></div><div className="metric-line"><span>Job rubrics</span><strong>{jobs}</strong></div><div className="metric-line"><span>Approved GS versions</span><strong>{grades}</strong></div></div>
-          <div className="comparison-count" aria-live="polite"><strong>{count}</strong><span>individual comparisons<small>Maximum {limit}. No truncation.</small></span></div>
-          {count > limit && <InlineError>{count} comparisons exceeds the {limit}-comparison limit. Remove resumes or targets explicitly before running.</InlineError>}
+          <div className="comparison-count" aria-live="polite"><strong>{count}</strong><span>individual comparisons<small>{retainedAttempt ? 'Original submitted count. No truncation.' : `Maximum ${limit}. No truncation.`}</small></span></div>
+          {!retainedAttempt && count > limit && <InlineError>{count} comparisons exceeds the {limit}-comparison limit. Remove resumes or targets explicitly before running.</InlineError>}
           <p className="text-[11px] text-muted">Each pair is independent. Saved documents, versions, approvals, and source sets are frozen. Criterion assessments use real evidence; limited coverage can withhold the total. There is no cross-job ranking.</p>
           {error && <InlineError>{error}</InlineError>}
-          {attempt && !starting && <div className="space-y-3 text-[11px] text-muted"><p>Acceptance was not confirmed. A lost response can still represent a saved run. Retrying sends the same complete request and UUID; it never binds newer input versions.</p>
+          {attempt && !starting && <div className="space-y-3 text-[11px] text-muted"><p>Acceptance was not confirmed. A lost response can still represent an accepted manifest or saved run. Retrying sends the same complete request and UUID; it never binds newer input versions. The server recovers any prior acceptance or applies current policy if this request was never accepted.</p>
             <Button size="sm" disabled={starting} onClick={() => { setAttempt(null); setError(''); void api.refresh(); void api.refreshTargets() }}>Review selections before a different request</Button></div>}
           <Button variant="primary" icon={starting ? LoaderCircle : ArrowRight} className="w-full"
-            disabled={starting || !canEdit || !api.canWrite || unavailable || (!attempt && (invalid || !draft.resumes.length || !draft.targets.length || count > limit))}
+            disabled={starting || !canEdit || !api.canWrite || submissionUnavailable || (!attempt && (invalid || !draft.resumes.length || !draft.targets.length || count > limit))}
             onClick={() => void run()}>{starting ? 'Awaiting server acceptance…' : attempt ? 'Retry unchanged submission' : 'Run analysis'}</Button>
           <div className="flex items-start gap-2 text-[10px] text-muted"><ShieldCheck size={15} className="shrink-0" aria-hidden="true" /><p>Human review only. Evidence gaps are not proof of missing skills. GS qualifications stay unscored and are not official eligibility decisions.</p></div>
         </div>

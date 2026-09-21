@@ -22,6 +22,7 @@ new RealAnalysisService(
   analyses: RealAnalysesDeps,
   sources?: { resumes?: RealResumesDeps; jobs?: RealJobsDeps; grades?: RealGradesDeps },
   now?: () => Date,
+  settings?: ProcessingSettingsProvider,
 )
 
 createRealAnalysesRouter({
@@ -79,7 +80,7 @@ All paths below have prefix `/api/workspaces/:workspaceId/analyses`:
 | `POST /:runId/summaries` with `{mode: "missing" \| "all", targetId?}` | `RealAnalysisSummariesMutationResponse` with durable request ID, scheduled counts, and summary state |
 | `GET /:runId/summaries/:kind/:subjectId/history?continuationToken=...` | Owner/editor-only `AnalysisSummaryHistoryPage`, up to 12 private checkpoint events and the narrative record ETag |
 | `POST /:runId/summaries/:kind/:subjectId/publish` with `{generationId, round, outputSha256}` | `{summaries}` for the subject's exact target; explicit manual approval of a persisted final draft |
-| `POST /:runId/summaries/:kind/:subjectId/retry` with `{}` | HTTP 202 `{summaries}` for the subject's exact target; a fresh three-round generation |
+| `POST /:runId/summaries/:kind/:subjectId/retry` with `{}` | HTTP 202 `{summaries}` for the subject's exact target; resumes the captured generation and remaining review budget |
 | `POST /:runId/retry` with `{comparisonIds?}` | `{run: RealAnalysisRunSummary}` |
 | `POST /:runId/cancel` with `{}` | `{run: RealAnalysisRunSummary}` |
 | `POST /:runId/comparisons/:comparisonId/retry` or `/cancel` with `{}` | `{comparison: RealAnalysisComparisonSummary}` |
@@ -142,6 +143,17 @@ correction provenance. Failed, cancelled, expired, or superseded work cannot
 replace the last publication. Publication atomically fences the correction head,
 run counts, lifecycle/cancellation state, and revision-bound summary scheduling.
 Replay cannot double-count the recovered score.
+
+New correction proposals capture application processing settings independently of
+the original assessment. They require processing admission and respect maintenance
+pauses, but do not require live source services or new-run admission. The independent
+review uses the captured `assessmentReview` deployment, input/output budgets,
+correction limit, automatic attempts, and retry backoff. Accepted proposal replay
+and automatic retries retain that policy; historical reads and cancellation do not
+require new-work admission. Unpinned legacy proposals use the immutable legacy
+policy, never the current revision. Automatic replacement summaries use the
+correction's captured summary mode and model bindings, without changing the
+original comparison's processing settings.
 
 All current readers resolve this head, including list/detail, report batches, and
 summary inputs. `comparison.resultRevision` is a read projection and must never be

@@ -1,14 +1,18 @@
 import { setTimeout as delay } from 'node:timers/promises'
 import { execFileSync } from 'node:child_process'
 import { fileURLToPath, pathToFileURL } from 'node:url'
+import { isDeepStrictEqual } from 'node:util'
 import { client, environment, identifier, request, required, setEnvironment } from './azure-common.mjs'
 
 export const WORD_WORKER_CAPABILITY = 'word-document-imports-v1'
 export const WORD_WORKER_EXTRACTION_VERSION = 'score-word-extraction-v1'
+export const RUNTIME_SETTINGS_VERSION = 'score-runtime-settings-v1'
+export const SETTINGS_WORKER_RUNTIMES = ['runtime.mjs', 'grade-runtime.mjs', 'resume-runtime.mjs', 'analysis-runtime.mjs']
 export const WORD_WORKER_ARTIFACTS = [
   'worker.mjs', 'runtime.mjs', 'grade-worker.mjs', 'grade-runtime.mjs',
   'resume-worker.mjs', 'resume-runtime.mjs', 'analysis-worker.mjs', 'analysis-runtime.mjs', 'word-parser.mjs',
 ]
+const TERMINAL_EXECUTION_STATUSES = new Set(['Succeeded', 'Failed', 'Stopped', 'Cancelled', 'Canceled'])
 
 export const WORKER_DEFINITIONS = [
   {
@@ -66,6 +70,13 @@ export function wordWorkerVerificationArgs(definition) {
     "const runtime = await import('./dist-worker/runtime.mjs');",
     `if (runtime.WORD_EXTRACTION_VERSION !== ${JSON.stringify(WORD_WORKER_EXTRACTION_VERSION)})`,
     "throw new Error('The worker extraction runtime does not provide the required Word extraction version.');",
+    `if (manifest.runtimeSettingsVersion !== ${JSON.stringify(RUNTIME_SETTINGS_VERSION)})`,
+    "throw new Error('The worker manifest does not certify runtime settings support.');",
+    `for (const name of ${JSON.stringify(SETTINGS_WORKER_RUNTIMES)}) {`,
+    "const reader = await import('./dist-worker/' + name);",
+    `if (reader.RUNTIME_SETTINGS_VERSION !== ${JSON.stringify(RUNTIME_SETTINGS_VERSION)})`,
+    "throw new Error('The worker does not provide the required runtime settings reader: ' + name);",
+    '}',
     // A normal child invocation preserves entry-point guards and parser-thread execArgv.
     `const child = spawn(process.execPath, [${JSON.stringify(definition.entryPoint)}], { stdio: 'inherit' });`,
     "for (const signal of ['SIGTERM', 'SIGINT']) process.once(signal, () => child.kill(signal));",
@@ -103,6 +114,7 @@ export function validateWorkerTemplate(env, existing, definition) {
     AZURE_TENANT_ID: required(env, 'AZURE_TENANT_ID'),
     COSMOS_ENDPOINT: required(env, 'AZURE_COSMOS_ENDPOINT'),
     COSMOS_DATABASE: 'score',
+    SCORE_SETTINGS_CONTAINER: 'application-settings',
     STORAGE_ACCOUNT_URL: required(env, 'AZURE_STORAGE_ACCOUNT_URL'),
     [recordsSetting]: records,
     [sourcesSetting]: sources,
@@ -313,6 +325,125 @@ export async function disableWordAdmission(env, credential, hooks = {}) {
   await updateWordAdmission(env, credential, false, hooks)
 }
 
+async function updateRuntimeSettingsAdmission(env, credential, enabled, hooks, verifiedImage) {
+  const send = hooks.request ?? request
+  const endpoint = appSettingsEndpoint(env)
+  const listUrl = `${endpoint}/list?api-version=2024-11-01`
+  const settings = await send(credential, 'https://management.azure.com', listUrl, 'POST')
+  if (!settings?.properties) throw new Error('App Service settings are unavailable; runtime settings activation is blocked.')
+  if (enabled && (settings.properties.SCORE_SETTINGS_CONTAINER !== 'application-settings' || !verifiedImage)) {
+    throw new Error('Runtime settings require the isolated settings store and four verified worker readers.')
+  }
+  const properties = {
+    ...settings.properties,
+    SCORE_RUNTIME_SETTINGS_ENABLED: enabled ? 'true' : 'false',
+    SCORE_RUNTIME_SETTINGS_WORKER_VERSION: enabled ? RUNTIME_SETTINGS_VERSION : '',
+    SCORE_RUNTIME_SETTINGS_VERIFIED_IMAGE: enabled ? verifiedImage : '',
+    SCORE_RUNTIME_SETTINGS_VERIFIED_AT: enabled ? new Date().toISOString() : '',
+  }
+  if (Object.keys(properties).some(key => settings.properties[key] !== properties[key])) {
+    await send(credential, 'https://management.azure.com', `${endpoint}?api-version=2024-11-01`, 'PUT', { properties })
+  }
+  const saved = await send(credential, 'https://management.azure.com', listUrl, 'POST')
+  for (const name of ['SCORE_RUNTIME_SETTINGS_ENABLED', 'SCORE_RUNTIME_SETTINGS_WORKER_VERSION', 'SCORE_RUNTIME_SETTINGS_VERIFIED_IMAGE', 'SCORE_RUNTIME_SETTINGS_VERIFIED_AT']) {
+    if (saved?.properties?.[name] !== properties[name]) {
+      throw new Error(`App Service did not confirm runtime settings ${enabled ? 'enabled' : 'disabled'}; rollout is blocked.`)
+    }
+  }
+}
+
+export async function disableRuntimeSettingsAdmission(env, credential, hooks = {}) {
+  await updateRuntimeSettingsAdmission(env, credential, false, hooks)
+}
+
+async function visitActiveWorkerExecutions(credential, workerBase, send, visit) {
+  let next = `${workerBase}/executions?api-version=2024-03-01`
+  for (let page = 0; next && page < 100; page++) {
+    const executions = await send(credential, 'https://management.azure.com', next)
+    if (!Array.isArray(executions?.value)) throw new Error('Worker execution history is unavailable; rollout is blocked.')
+    for (const execution of executions.value) {
+      if (!TERMINAL_EXECUTION_STATUSES.has(execution?.properties?.status)) visit(execution)
+    }
+    next = executions.nextLink
+    if (next) {
+      if (typeof next !== 'string' || !URL.canParse(next)) throw new Error('Unexpected worker execution continuation; rollout is blocked.')
+      const continuation = new URL(next)
+      if (continuation.origin !== 'https://management.azure.com' || continuation.username || continuation.password ||
+        continuation.hash || continuation.pathname.toLowerCase() !== new URL(`${workerBase}/executions`).pathname.toLowerCase()) {
+        throw new Error('Unexpected worker execution continuation; rollout is blocked.')
+      }
+    }
+  }
+  if (next) throw new Error('Worker execution history exceeded the bounded readiness check; rollout is blocked.')
+}
+
+export async function prepareWebDeployment(env, credential, hooks = {}) {
+  requireProvisionedWorkers(env)
+  const send = hooks.request ?? request
+  const wait = hooks.delay ?? delay
+  await disableWordAdmission(env, credential, hooks)
+  await disableRuntimeSettingsAdmission(env, credential, hooks)
+  const workers = []
+  for (const definition of WORKER_DEFINITIONS) {
+    const workerBase = `https://management.azure.com${required(env, definition.idKey)}`
+    const endpoint = `${workerBase}?api-version=2024-03-01`
+    const existing = await send(credential, 'https://management.azure.com', endpoint)
+    const { identityId } = validateWorkerTemplate(env, existing, definition)
+    if (existing.properties.provisioningState !== 'Succeeded' ||
+      !['Manual', 'Schedule'].includes(existing.properties.configuration.triggerType)) {
+      throw new Error(`The ${definition.containerName} is not ready to pause; web deployment is blocked.`)
+    }
+    workers.push({ definition, workerBase, endpoint, existing, identityId })
+  }
+  function verifyPaused(worker, current) {
+    const { identityId } = validateWorkerTemplate(env, current, worker.definition)
+    if (current.properties.provisioningState !== 'Succeeded' ||
+      current.properties.configuration.triggerType !== 'Manual' ||
+      identityId.toLowerCase() !== worker.identityId.toLowerCase() ||
+      current.properties.environmentId?.toLowerCase() !== worker.existing.properties.environmentId?.toLowerCase() ||
+      !isDeepStrictEqual(current.properties.template, worker.existing.properties.template)) {
+      throw new Error(`The ${worker.definition.containerName} pause or unchanged reader template could not be verified; web deployment is blocked.`)
+    }
+  }
+  for (const worker of workers) {
+    const { existing, identityId, endpoint, definition } = worker
+    if (existing.properties.configuration.triggerType === 'Manual') continue
+    const { scheduleTriggerConfig: _schedule, eventTriggerConfig: _event, ...configuration } = existing.properties.configuration
+    await send(credential, 'https://management.azure.com', endpoint, 'PUT', {
+      location: existing.location, tags: existing.tags,
+      identity: { type: 'UserAssigned', userAssignedIdentities: { [identityId]: {} } },
+      properties: {
+        environmentId: existing.properties.environmentId,
+        ...(existing.properties.workloadProfileName ? { workloadProfileName: existing.properties.workloadProfileName } : {}),
+        configuration: { ...configuration, triggerType: 'Manual', manualTriggerConfig: { parallelism: 1, replicaCompletionCount: 1 } },
+        template: existing.properties.template,
+      },
+    })
+    let paused = false
+    for (let attempt = 0; attempt < 36; attempt++) {
+      const current = await send(credential, 'https://management.azure.com', endpoint)
+      if (current.properties?.provisioningState === 'Failed') throw new Error(`The ${definition.containerName} pause failed; web deployment is blocked.`)
+      if (current.properties?.provisioningState === 'Succeeded') {
+        verifyPaused(worker, current)
+        paused = true
+        break
+      }
+      await wait(5000)
+    }
+    if (!paused) throw new Error(`The ${definition.containerName} pause did not finish; web deployment is blocked.`)
+  }
+  // Legacy retries can add reader fields even while admission is closed.
+  for (const worker of workers) {
+    await visitActiveWorkerExecutions(credential, worker.workerBase, send, execution => {
+      throw new Error(`The ${worker.definition.containerName} still has an execution with status ${execution?.properties?.status ?? 'unknown'}. Let it finish, then retry web deployment; no execution was cancelled.`)
+    })
+  }
+  for (const worker of workers) {
+    verifyPaused(worker, await send(credential, 'https://management.azure.com', worker.endpoint))
+  }
+  console.log('All four worker schedules are paused and executions drained before replacing the API; verified worker rollout must restore processing.')
+}
+
 export async function verifyWordWorkerReadiness(env, credential, image, verified, hooks = {}) {
   const send = hooks.request ?? request
   validateWorkerImage(env, image)
@@ -338,23 +469,7 @@ export async function verifyWordWorkerReadiness(env, credential, image, verified
     validateWordExecution(execution, definition, image, true)
 
     // Updating a template does not stop a previous image's in-flight execution.
-    let next = `${workerBase}/executions?api-version=2024-03-01`
-    for (let page = 0; next && page < 100; page++) {
-      const executions = await send(credential, 'https://management.azure.com', next)
-      if (!Array.isArray(executions?.value)) throw new Error('Worker execution history is unavailable; Word admission stays disabled.')
-      for (const active of executions.value) {
-        if (!['Succeeded', 'Failed', 'Stopped', 'Cancelled', 'Canceled'].includes(active.properties?.status)) {
-          validateWordExecution(active, definition, image)
-        }
-      }
-      next = executions.nextLink
-      if (next && (typeof next !== 'string' ||
-        new URL(next).origin !== 'https://management.azure.com' ||
-        new URL(next).pathname.toLowerCase() !== new URL(`${workerBase}/executions`).pathname.toLowerCase())) {
-        throw new Error('Unexpected worker execution continuation; Word admission stays disabled.')
-      }
-    }
-    if (next) throw new Error('Worker execution history exceeded the bounded readiness check; Word admission stays disabled.')
+    await visitActiveWorkerExecutions(credential, workerBase, send, active => validateWordExecution(active, definition, image))
   }
 }
 
@@ -373,6 +488,12 @@ async function validatePrivateServices(env, credential, hooks) {
   const base = `https://management.azure.com/subscriptions/${subscription}/resourceGroups/${group}/providers`
   const cosmos = `${base}/Microsoft.DocumentDB/databaseAccounts/${required(env, 'AZURE_COSMOS_ACCOUNT_NAME')}`
   const storage = `${base}/Microsoft.Storage/storageAccounts/${required(env, 'AZURE_STORAGE_ACCOUNT_NAME')}`
+  const settings = await send(credential, 'https://management.azure.com',
+    `${cosmos}/sqlDatabases/score/containers/application-settings?api-version=2024-11-15`)
+  if (settings.properties?.resource?.id !== 'application-settings' ||
+    JSON.stringify(settings.properties.resource.partitionKey?.paths) !== JSON.stringify(['/applicationId'])) {
+    throw new Error('Provision application-settings with the /applicationId partition before deploying workers.')
+  }
   for (const definition of WORKER_DEFINITIONS.filter(worker => worker.kind === 'resume' || worker.kind === 'analysis')) {
     const records = await send(credential, 'https://management.azure.com',
       `${cosmos}/sqlDatabases/score/containers/${definition.records}?api-version=2024-11-15`)
@@ -460,6 +581,7 @@ export async function configureWorkerDeployment(env, credential, { image, render
 
   // This also covers renderer-only/failed rollouts: no shared consumer changes while Word is admitted.
   await disableWordAdmission(env, credential, hooks)
+  await disableRuntimeSettingsAdmission(env, credential, hooks)
   try {
     const workerIdentities = new Set()
     const workerEnvironments = new Set()
@@ -476,7 +598,7 @@ export async function configureWorkerDeployment(env, credential, { image, render
     }
     await configureRenderer(env, credential, rendererImage, workerIdentities, rendererOnly ? undefined : workerEnvironments, hooks)
     if (rendererOnly) {
-      console.log('The isolated renderer is deployed; worker configuration is unchanged and Word admission remains disabled.')
+      console.log('The isolated renderer is deployed; worker configuration is unchanged and Word/runtime-settings admission remains disabled.')
       return
     }
     const privateWorkers = WORKER_DEFINITIONS.filter(worker => worker.kind === 'resume' || worker.kind === 'analysis')
@@ -487,13 +609,20 @@ export async function configureWorkerDeployment(env, credential, { image, render
       if (definition.feature) await updateFeatures(env, credential, [definition], true, hooks)
     }
     await verifyWordWorkerReadiness(env, credential, image, verified, hooks)
+    await updateRuntimeSettingsAdmission(env, credential, true, hooks, image)
     await updateWordAdmission(env, credential, true, hooks)
-    console.log('Word admission enabled after all four workers verified the same Word-capable build and older executions drained.')
+    console.log('Word and runtime-settings admission enabled after all four worker readers verified the same build and older executions drained.')
   } catch (error) {
-    try {
-      await updateWordAdmission(env, credential, false, hooks)
-    } catch (disableError) {
-      throw new AggregateError([error, disableError], 'Worker rollout failed and Word admission could not be confirmed disabled. Check App Service settings before retrying.')
+    const failures = [error]
+    for (const disable of [disableRuntimeSettingsAdmission, disableWordAdmission]) {
+      try {
+        await disable(env, credential, hooks)
+      } catch (disableError) {
+        failures.push(disableError)
+      }
+    }
+    if (failures.length > 1) {
+      throw new AggregateError(failures, 'Worker rollout failed and admission gates could not be confirmed disabled. Check App Service settings before retrying.')
     }
     throw error
   }
@@ -502,14 +631,20 @@ export async function configureWorkerDeployment(env, credential, { image, render
 async function main() {
   const env = environment()
   const mode = process.argv[2]
-  if (mode === 'disable-word') {
+  if (mode === 'prepare-web-deploy') {
+    if (process.argv[3]) throw new Error('Usage: node scripts\\azure-worker.mjs prepare-web-deploy')
+    await prepareWebDeployment(env, client(env))
+    return
+  }
+  if (mode === 'disable-word' || mode === 'disable-admission') {
     if (process.argv[3] === '--if-provisioned' && !env.AZURE_APP_SERVICE_NAME) {
       console.log('No provisioned App Service is recorded; new infrastructure keeps Word admission disabled.')
       return
     }
-    if (process.argv[3] && process.argv[3] !== '--if-provisioned') throw new Error('Usage: node scripts\\azure-worker.mjs disable-word [--if-provisioned]')
+    if (process.argv[3] && process.argv[3] !== '--if-provisioned') throw new Error('Usage: node scripts\\azure-worker.mjs disable-admission [--if-provisioned]')
     await disableWordAdmission(env, client(env))
-    console.log('Word admission is disabled before updating shared application and processing consumers.')
+    if (mode === 'disable-admission') await disableRuntimeSettingsAdmission(env, client(env))
+    console.log('Requested admission gates are disabled before updating shared application and processing consumers.')
     return
   }
   if (mode === 'context') {
@@ -527,7 +662,7 @@ async function main() {
     }))
     return
   }
-  if (mode !== 'configure' && mode !== 'configure-renderer') throw new Error('Usage: node scripts\\azure-worker.mjs context|disable-word [--if-provisioned]|configure <worker-image> <renderer-image>|configure-renderer <renderer-image>')
+  if (mode !== 'configure' && mode !== 'configure-renderer') throw new Error('Usage: node scripts\\azure-worker.mjs context|prepare-web-deploy|disable-admission [--if-provisioned]|configure <worker-image> <renderer-image>|configure-renderer <renderer-image>')
   const rendererOnly = mode === 'configure-renderer'
   const image = rendererOnly ? undefined : process.argv[3]
   if (!rendererOnly) {

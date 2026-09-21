@@ -68,6 +68,109 @@ async function requestCorrection(context, requestId = randomUUID()) {
   return { preview, response, requestId }
 }
 
+function settingsFor(f, change = () => {}, revision = 'correction-policy-v1') {
+  const settings = api.createDefaultAdminSettings()
+  change(settings)
+  return api.captureProcessingSettings(settings, revision, f.now)
+}
+
+test('correction admissions enforce maintenance, inactive rollout, and unavailable settings without blocking frozen reads', async t => {
+  for (const mode of ['maintenance', 'inactive', 'unavailable']) await t.test(mode, async t => {
+    const { f, runId, comparisonId } = await setup()
+    const snapshot = settingsFor(f, settings => { settings.maintenance.pauseNewWork = mode === 'maintenance' })
+    let policyReads = 0
+    const http = await startHttp(f, true, {
+      async capture() {
+        policyReads++
+        if (mode === 'unavailable') throw api.unavailable('Settings store unavailable.')
+        return snapshot
+      },
+    }, mode !== 'inactive')
+    t.after(http.close)
+    const path = `/${runId}/comparisons/${comparisonId}/corrections`
+    const preview = await (await http.request(`${path}/preview`)).json()
+    const records = clone([...f.analysis.store.values]), blobs = clone([...f.analysis.blobs.values])
+    const response = await http.request(path, 'POST', input(preview), {
+      headers: { 'If-Match': preview.etag, 'Idempotency-Key': randomUUID() },
+    })
+    assert.equal(response.status, 503)
+    assert.deepEqual([...f.analysis.store.values], records)
+    assert.deepEqual([...f.analysis.blobs.values], blobs)
+    assert.equal((await http.request(`${path}/history`)).status, 200)
+    assert.equal((await http.request(`/${runId}/comparisons/${comparisonId}`)).status, 200)
+    assert.equal(policyReads, mode === 'inactive' ? 0 : 1)
+  })
+})
+
+test('accepted corrections retain their own policy and replay or cancel after new processing and settings reads close', async t => {
+  const { f, runId, comparisonId } = await setup()
+  const snapshot = settingsFor(f, settings => {
+    settings.features.newAnalyses = false
+    settings.ai.deployments[0].deploymentName = 'captured-correction-review'
+  })
+  let unavailable = false, policyReads = 0
+  const http = await startHttp(f, true, {
+    async capture() {
+      policyReads++
+      if (unavailable) throw api.unavailable('Current settings unavailable.')
+      return snapshot
+    },
+  })
+  t.after(http.close)
+  const path = `/${runId}/comparisons/${comparisonId}/corrections`
+  const preview = await (await http.request(`${path}/preview`)).json()
+  const headers = { 'If-Match': preview.etag, 'Idempotency-Key': randomUUID() }
+  assert.equal((await http.request(path, 'POST', input(preview), { headers })).status, 202)
+  const accepted = await api.loadAnalysisCorrection(f.analysis.store, f.workspaceId, runId, comparisonId)
+  const run = await api.loadAnalysisRun(f.analysis.store, f.workspaceId, runId)
+  const proposal = await api.readAnalysisCorrectionProposal(f.analysis.blobs, run.record, accepted.record)
+  assert.deepEqual(accepted.record.processingSettings, snapshot)
+  assert.deepEqual(proposal.processingSettings, snapshot)
+  assert.notEqual(run.record.processingSettings.revision, snapshot.revision)
+  unavailable = true
+  http.config.settings.runtimeEnabled = false
+  f.analysis.evidenceCorrectionsEnabled = false
+  assert.equal((await http.request(path, 'POST', input(preview), { headers })).status, 202)
+  assert.deepEqual(await api.loadAnalysisCorrection(f.analysis.store, f.workspaceId, runId, comparisonId), accepted)
+  assert.equal((await http.request(`${path}/history`)).status, 200)
+  assert.equal((await http.request(`${path}/cancel`, 'POST', {}, { headers: { 'If-Match': accepted.etag } })).status, 200)
+  assert.equal(policyReads, 1)
+})
+
+test('a reserved correction proposal resumes with its captured settings after an unacknowledged scheduling failure', async t => {
+  const { f, runId, comparisonId } = await setup()
+  const snapshot = settingsFor(f)
+  let policyReads = 0
+  const http = await startHttp(f, true, {
+    async capture() {
+      policyReads++
+      if (policyReads > 1) throw api.unavailable('Current policy must not replace an accepted proposal.')
+      return snapshot
+    },
+  })
+  t.after(http.close)
+  const path = `/${runId}/comparisons/${comparisonId}/corrections`
+  const preview = await (await http.request(`${path}/preview`)).json()
+  const headers = { 'If-Match': preview.etag, 'Idempotency-Key': randomUUID() }
+  const transact = f.analysis.store.transact.bind(f.analysis.store)
+  f.analysis.store.transact = async (workspaceId, operations, options) => {
+    if (operations.some(item => item.record.recordType === 'analysis-correction')) throw new Error('Synthetic scheduling outage.')
+    return transact(workspaceId, operations, options)
+  }
+  assert.equal((await http.request(path, 'POST', input(preview), { headers })).status, 503)
+  assert.equal(await api.loadAnalysisCorrection(f.analysis.store, f.workspaceId, runId, comparisonId), undefined)
+  const name = api.analysisCorrectionProposalBlobName(f.workspaceId, runId, comparisonId, headers['Idempotency-Key'])
+  const reserved = clone(f.analysis.blobs.values.get(name))
+  assert.ok(reserved)
+  f.analysis.store.transact = transact
+  http.config.settings.runtimeEnabled = false
+  assert.equal((await http.request(path, 'POST', input(preview), { headers })).status, 202)
+  const accepted = await api.loadAnalysisCorrection(f.analysis.store, f.workspaceId, runId, comparisonId)
+  assert.deepEqual(accepted.record.processingSettings, snapshot)
+  assert.deepEqual(f.analysis.blobs.values.get(name), reserved)
+  assert.equal(policyReads, 1)
+})
+
 test('read-only preview treats contextual non-support as a zero proposal without changing original evidence or weights', async () => {
   const { f, runId, comparisonId, original } = await setup()
   const records = clone([...f.analysis.store.values])

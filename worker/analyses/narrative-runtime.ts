@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto'
 import {
-  ANALYSIS_NARRATIVE_LIMITS, analysisNarrativeIsCurrent, analysisTargetNarrativeCanGenerate,
+  analysisNarrativeIsCurrent, analysisTargetNarrativeCanGenerate,
   type AnalysisCandidateNarrativeModelInput, type AnalysisNarrativeProcessingError, type AnalysisTargetNarrativeModelInput,
   type RealAnalysisNarrativeArtifact, type RealAnalysisNarrativeRecord, type RealAnalysisTargetNarrativeRecord,
 } from '../../src/domain/analysis-narratives'
@@ -36,6 +36,7 @@ import { NarrativeModelError } from './narrative-model'
 import { generateCandidateSummary, generateTargetSummary } from './summary-model'
 import { emitSummaryTelemetry, logSummaryTelemetry, type SummaryTelemetryEvent } from './summary-telemetry'
 import type { AnalysisWorkerDependencies } from './runtime'
+import { operationSettings, retryBackoff, RuntimeSettingsError, safeSettingsMetadata } from '../settings'
 
 const LEASE_MS = 90_000
 const HEARTBEAT_MS = 25_000
@@ -69,6 +70,7 @@ function failureFor(error: unknown, stage: Stage, inputs: boolean): AnalysisNarr
     code: error.code, stage: error.stage, message: error.message, retryable: error.retryable,
     ...(error.diagnostic ? { diagnostic: error.diagnostic } : {}),
   }
+  if (error instanceof RuntimeSettingsError) return { code: 'invalid-input', stage, retryable: false, message: error.message }
   if (error instanceof AnalysisNarrativeValidationError) return { code: error.code, stage, message: error.message, retryable: false }
   if (inputs && error instanceof HttpError && error.code === 'invalid_request') return {
     code: 'context-limit', stage, retryable: false,
@@ -289,11 +291,15 @@ async function reconcileTarget(
     if (current.record.inputFingerprint === fingerprint && current.record.status !== 'waiting') return { worked: false, ready: true }
     const timestamp = narrativeTimestamp(inventory.run.record, clock.now().toISOString())
     const operations: AnalysisTransaction[] = []
+    const pinned = current.record.processingSettings !== undefined || deps.settings
+      ? operationSettings(current.record, deps) : undefined
     let next: RealAnalysisTargetNarrativeRecord = current.record.inputFingerprint
       ? newTargetNarrative(inventory.run.record, target.target, {
         requestId: randomUUID(), requestedAt: timestamp, requestedBy: null, reason: 'comparison-changed',
+        processingSettings: pinned,
       }, current.record)
       : { ...current.record, updatedAt: timestamp }
+    if (pinned) next.processingSettings = pinned
     const pendingScoring = inventory.comparisons.some(pair => !pair.comparison || pair.status === 'queued' || pair.status === 'running' || pair.correctionPending)
     let bytes = Buffer.byteLength(JSON.stringify(next)) + Buffer.byteLength(JSON.stringify(inventory.run.record)) + 8192
     for (const pair of inventory.comparisons) {
@@ -304,6 +310,7 @@ async function reconcileTarget(
       assertAnalysis(!previous || previous.record.recordType === 'analysis-candidate-narrative', 'Candidate prerequisite identity is invalid.')
       const child = newCandidateNarrative(inventory.run.record, pair.comparison, {
         requestId: next.requestId, requestedAt: timestamp, requestedBy: next.requestedBy, reason: next.reason,
+        processingSettings: next.processingSettings,
       }, previous?.record.recordType === 'analysis-candidate-narrative' ? previous.record : undefined)
       const operation: AnalysisTransaction = previous ? { kind: 'replace', record: child, etag: previous.etag } : { kind: 'create', record: child }
       const size = Buffer.byteLength(JSON.stringify(operation))
@@ -372,11 +379,14 @@ async function claim(
       !['queued', 'running'].includes(current.record.status) || !current.record.inputFingerprint ||
       !due(current.record, clock.now().toISOString()) || run.record.narrativeRequestId ||
       !analysisNarrativeCanWork(run.record, current.record) || !await workspaceActive(deps, run.record.workspaceId)) return
-    const attemptLimitReached = current.record.attempts >= ANALYSIS_NARRATIVE_LIMITS.maxAutomaticAttempts
+    const snapshot = operationSettings(current.record, deps)
+    const maxAttempts = snapshot.settings.processing.analyses.maxAutomaticAttempts
+    const attemptLimitReached = current.record.attempts >= maxAttempts
     const timestamp = narrativeTimestamp(run.record, clock.now().toISOString())
     const record: RealAnalysisNarrativeRecord = {
       ...current.record, status: 'running', updatedAt: timestamp, attemptId,
-      attempts: Math.min(current.record.attempts + 1, ANALYSIS_NARRATIVE_LIMITS.maxAutomaticAttempts),
+      ...(current.record.processingSettings !== undefined || deps.settings ? { processingSettings: snapshot } : {}),
+      attempts: Math.min(current.record.attempts + 1, maxAttempts),
       lease: { owner, heartbeatAt: timestamp, expiresAt: new Date(Date.parse(timestamp) + LEASE_MS).toISOString() },
     }
     delete record.error
@@ -410,6 +420,13 @@ export async function processClaimedNarrative(
   options: { deadline?: number; signal?: AbortSignal; attemptLimitReached?: boolean } = {},
 ): Promise<boolean> {
   if (deps.owner && deps.owner !== claimed.record.lease?.owner) return false
+  // An explicit unpinned generation must not inherit an older scoring run's policy.
+  const snapshot = operationSettings(claimed.record, deps)
+  const pinned = claimed.record.processingSettings !== undefined || Boolean(deps.settings)
+  deps = { ...deps, model: { ...deps.model, ...(pinned ? { processingSettings: snapshot } : {}) } }
+  const maxAttempts = snapshot.settings.processing.analyses.maxAutomaticAttempts
+  if (pinned) console.info('Score operation settings:', safeSettingsMetadata(snapshot,
+    claimed.record.recordType === 'analysis-candidate-narrative' ? 'candidateSummary' : 'targetSummary'))
   const clock = deps.clock ?? systemClock
   const started = clock.now().getTime()
   const lease = new NarrativeLease(claimed, deps, clock, options.deadline ?? started + RUN_BUDGET_MS, options.signal)
@@ -445,7 +462,7 @@ export async function processClaimedNarrative(
     const { run, narrative } = await lease.check()
     if (options.attemptLimitReached) throw new NarrativeWorkFailure({
       code: 'timeout', stage, retryable: true,
-      message: 'Summary generation stopped after three attempts. Generate missing summaries to retry without changing the assessment.',
+      message: `Summary generation stopped after ${maxAttempts} attempts. Generate missing summaries to retry without changing the assessment.`,
     })
     const inventory = await lease.control.wait(() => readAnalysisNarrativeInventory(deps, run.record.workspaceId, run.record.id, narrative.record.targetId))
     const comparisonId = narrative.record.recordType === 'analysis-candidate-narrative' ? narrative.record.comparisonId : undefined
@@ -486,6 +503,7 @@ export async function processClaimedNarrative(
       approval: { kind: 'automatic' }, history: current.narrative.record.history,
       createdAt: narrativeTimestamp(current.run.record, clock.now().toISOString()), humanReviewRequired: true,
       generationId: narrative.record.generationId, requestId: narrative.record.requestId,
+      ...(narrative.record.processingSettings ? { processingSettings: narrative.record.processingSettings } : {}),
       ...(narrative.record.published ? { previousPublication: narrative.record.published } : {}),
     })
     validateSaved(artifact, input)
@@ -504,6 +522,7 @@ export async function processClaimedNarrative(
     validateSaved(saved, input)
     assertAnalysis(saved.generationId === narrative.record.generationId && saved.requestId === narrative.record.requestId &&
       saved.provenance.attemptId === narrative.record.attemptId &&
+      analysisHash(saved.processingSettings ?? null) === analysisHash(narrative.record.processingSettings ?? null) &&
       analysisHash(saved.previousPublication ?? null) === analysisHash(narrative.record.published ?? null),
     'Saved narrative version does not match its publication attempt.')
     const published = {
@@ -532,12 +551,12 @@ export async function processClaimedNarrative(
     try {
       let outcome: 'queued' | 'failed' = 'failed'
       await lease.atomic((record, timestamp) => {
-        const retry = failure.retryable && record.attempts < ANALYSIS_NARRATIVE_LIMITS.maxAutomaticAttempts
+        const retry = failure.retryable && record.attempts < maxAttempts
         outcome = retry ? 'queued' : 'failed'
         const next = { ...record, status: outcome, updatedAt: timestamp, error: failure }
         delete next.lease
         delete next.nextAttemptAt
-        if (retry) next.nextAttemptAt = new Date(Date.parse(timestamp) + BACKOFF_MS * 2 ** Math.max(0, record.attempts - 1)).toISOString()
+        if (retry) next.nextAttemptAt = new Date(Date.parse(timestamp) + retryBackoff(snapshot, 'analyses', record.attempts)).toISOString()
         return next
       }, true)
       emit(outcome, failure)

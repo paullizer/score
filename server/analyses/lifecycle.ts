@@ -8,6 +8,8 @@ import { assertComparisonManifestBinding, readAnalysisManifest } from './snapsho
 import { analysisCancellationNeedsRetry, analysisHash, assertAnalysis, MAX_ANALYSIS_TRANSACTION_BYTES, parseAnalysisEntity } from './validation'
 import { analysisIsLocked, analysisIsRemoved } from './guards'
 import { assertWorkspaceMutationLease } from '../lifecycle/lease'
+import { acceptedProcessingSettings } from '../jobs/policy'
+import type { ProcessingSettingsSnapshot } from '../../src/domain/admin-settings'
 
 export async function loadAnalysisRun(
   store: AnalysisStore, workspaceId: string, runId: string, signal?: AbortSignal,
@@ -87,6 +89,7 @@ export function applyAnalysisComparisonTransition(
 
 export function analysisComparisonFromPlan(
   manifest: RealAnalysisInitializationManifest, index: number, timestamp: string, cancelled = false,
+  legacySettings?: ProcessingSettingsSnapshot,
 ): RealAnalysisComparisonRecord {
   const pair = manifest.comparisons[index]
   assertAnalysis(pair, 'Comparison index is not in the manifest.')
@@ -97,6 +100,7 @@ export function analysisComparisonFromPlan(
     id: pair.id, recordType: 'analysis-comparison', workspaceId: manifest.workspaceId, dataKind: 'real',
     createdAt: manifest.createdAt, updatedAt: timestamp, runId: manifest.runId, index,
     status: cancelled ? 'cancelled' : 'queued', resume, target, attempts: 0, retryCount: 0,
+    processingSettings: manifest.processingSettings ?? legacySettings,
     ...(cancelled ? { cancelledAt: timestamp } : { nextAttemptAt: timestamp }),
   }
 }
@@ -112,6 +116,7 @@ export function retryAnalysisComparisonRecord(record: RealAnalysisComparisonReco
   assertAnalysis(record.status === 'failed' || record.status === 'cancelled', 'Only failed or cancelled comparisons can be retried.')
   const updated: RealAnalysisComparisonRecord = {
     ...structuredClone(record), status: 'queued', updatedAt: timestamp, attempts: 0,
+    processingSettings: acceptedProcessingSettings(record.processingSettings),
     retryCount: record.retryCount + 1, nextAttemptAt: timestamp,
   }
   delete updated.lease
@@ -179,7 +184,7 @@ export async function advanceAnalysisRun(
         }
       } else {
         assertAnalysis(cursor >= run.progress.initialized, 'A previously initialized comparison is missing.')
-        const comparison = analysisComparisonFromPlan(manifest, cursor, timestamp, cancelling)
+        const comparison = analysisComparisonFromPlan(manifest, cursor, timestamp, cancelling, run.processingSettings)
         candidate = applyAnalysisComparisonTransition(updated, undefined, comparison, timestamp)
         operation = { kind: 'create', record: comparison }
       }

@@ -12,7 +12,7 @@ import {
 } from './narratives'
 import {
   assertXmlText, criterionScoreLabel, evidenceStatusLabel, formatReportWeight, overallScoreLabel,
-  REPORT_FONT_FAMILY, REPORT_PALETTE, REPORT_TITLE, reportTitle,
+  REPORT_FONT_FAMILY, REPORT_PALETTE, REPORT_SAMPLE_NOTICE, reportTitle,
 } from './presentation'
 import { readableAnalysisDate, readableCandidateName, readableCompletionNotice, selectKeyCriteria } from './readable'
 import type { ReadableCriterion } from './readable'
@@ -20,6 +20,7 @@ import {
   assertPptxBox, keepPptxParagraphEndWordsTogether, measurePptxText, paginatePptxBlocks, PPTX_LAYOUT, takePptxText,
 } from './pptx-layout'
 import type { PptxBox, PptxFlowBlock } from './pptx-layout'
+import { reportGenerationPolicy, reportLimits, reportPolicyTitle, snapshotReportPolicy } from './policy'
 
 const C = REPORT_PALETTE
 const BODY_WIDTH = PPTX_LAYOUT.width - 2 * PPTX_LAYOUT.margin
@@ -100,10 +101,11 @@ function sectionReference(group: ReportGroup, groupIndex: number): string {
 
 class ReportDeck {
   readonly presentation = new PptxGenJS()
-  private readonly startedAt = Date.now()
+  readonly limits: ReturnType<typeof reportLimits>
   slideCount = 0
 
-  constructor(readonly report: AnalysisReport, readonly options?: ReportGenerationOptions) {
+  constructor(readonly report: AnalysisReport, readonly options: ReportGenerationOptions | undefined, private readonly startedAt: number) {
+    this.limits = reportLimits(reportGenerationPolicy(report, 'pptx'))
     this.presentation.layout = 'LAYOUT_WIDE'
     this.presentation.author = 'Score'
     this.presentation.subject = 'Analysis evidence for human review'
@@ -115,14 +117,14 @@ class ReportDeck {
   }
 
   checkBudget(): void {
-    if (Date.now() - this.startedAt > REPORT_LIMITS.maxGenerationMilliseconds) {
+    if (Date.now() - this.startedAt > this.limits.maxGenerationMilliseconds) {
       throw new Error(`PowerPoint generation exceeded the time limit. ${LIMIT_MESSAGE}`)
     }
   }
 
   slide(title: string, reference = '', name = 'slide-title', fontSize = 36): PptxGenJS.Slide {
     this.checkBudget()
-    if (this.slideCount >= Math.min(REPORT_LIMITS.maxSlides, REPORT_LIMITS.maxPages)) {
+    if (this.slideCount >= Math.min(this.limits.maxSlides, REPORT_LIMITS.maxPages)) {
       throw new Error(`PowerPoint exceeds the slide/page limit. ${LIMIT_MESSAGE}`)
     }
     const slide = this.presentation.addSlide()
@@ -178,7 +180,10 @@ function coverGraphic(slide: PptxGenJS.Slide, x: number, y: number, index: numbe
 
 function opening(deck: ReportDeck): void {
   const completed = deck.report.groups.flatMap(group => group.comparisons).filter(item => item.status === 'complete')
-  const slide = deck.slide(REPORT_TITLE)
+  const title = reportPolicyTitle(deck.report)
+  const titleFits = fits(title, BODY_WIDTH, 0.9, 36)
+  if (!titleFits) reportNotice(deck, 'Report title', [{ key: 'configured-report-title', text: title }])
+  const slide = deck.slide(titleFits ? title : 'Saved analysis')
   const name = deck.report.run.name
   text(slide, fits(name, 6.5, 0.3, 11) ? name : 'View analysis title', {
     x: 2.25, y: 0.615, w: 6.5, h: 0.3,
@@ -210,6 +215,18 @@ function opening(deck: ReportDeck): void {
   text(slide, `Analysis date: ${readableAnalysisDate(latest) || 'Not recorded'}`, {
     x: 0.6, y: 6.13, w: BODY_WIDTH, h: 0.35,
   }, 14, { color: C.muted, objectName: 'analysis-date' })
+}
+
+function reportNotice(deck: ReportDeck, title: string, blocks: PptxFlowBlock[]): void {
+  const pages = paginatePptxBlocks(blocks, BODY_WIDTH, CONTENT_BOTTOM - PPTX_LAYOUT.bodyY)
+  pages.forEach((page, pageIndex) => {
+    const slide = deck.slide(`${title}${pageIndex ? ' (continued)' : ''}`)
+    for (const [index, fragment] of page.fragments.entries()) {
+      text(slide, fragment.text, {
+        x: PPTX_LAYOUT.margin, y: PPTX_LAYOUT.bodyY + fragment.y, w: BODY_WIDTH, h: fragment.height,
+      }, fragment.fontSize, { objectName: `${fragment.key}-${pageIndex}-${index}`, ...summaryLeading(fragment.fontSize) })
+    }
+  })
 }
 
 interface AgendaEntry {
@@ -978,10 +995,14 @@ function featuredReview(deck: ReportDeck, group: ReportGroup, comparison: Report
 }
 
 export async function generatePptxReport(report: AnalysisReport, options?: ReportGenerationOptions): Promise<Uint8Array> {
-  assertReportResourceLimits(report)
+  const startedAt = Date.now()
+  report = snapshotReportPolicy(report)
+  const policy = reportGenerationPolicy(report, 'pptx')
+  const limits = reportLimits(policy)
+  assertReportResourceLimits(report, limits.maxInputBytes)
   requireReportNarratives(report)
   validatedReportLinkContext(report, options)
-  const deck = new ReportDeck(report, options)
+  const deck = new ReportDeck(report, options, startedAt)
   opening(deck)
   const agenda = reserveAgenda(deck)
   const contentsByTarget = new Map(agenda.flatMap(page => page.entries.map(entry => [entry.group.target.id, page.number] as const)))
@@ -1002,11 +1023,16 @@ export async function generatePptxReport(report: AnalysisReport, options?: Repor
     overview(deck, group, groupIndex, candidateOverviews)
   })
   finishAgenda(deck, agenda, destinations)
+  if (policy.additionalFooter) reportNotice(deck, 'Additional report notice', [
+    ...(report.dataKind === 'sample' ? [{ key: 'footer-sample-disclosure', text: REPORT_SAMPLE_NOTICE }] : []),
+    { key: 'footer-human-review', text: HUMAN_REVIEW },
+    { key: 'additional-footer', text: policy.additionalFooter },
+  ])
   deck.checkBudget()
   const result = await deck.presentation.write({ outputType: 'arraybuffer', compression: true })
   deck.checkBudget()
   if (!(result instanceof ArrayBuffer)) throw new Error('PowerPoint generation did not produce binary report data.')
   const bytes = new Uint8Array(result)
-  if (bytes.byteLength > REPORT_LIMITS.maxOutputBytes) throw new Error(`PowerPoint exceeds the output byte limit. ${LIMIT_MESSAGE}`)
+  if (bytes.byteLength > limits.maxOutputBytes) throw new Error(`PowerPoint exceeds the output byte limit. ${LIMIT_MESSAGE}`)
   return bytes
 }

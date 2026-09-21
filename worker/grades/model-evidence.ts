@@ -377,6 +377,7 @@ export function boundModelContext(
   evidence: ModelEvidence,
   input: Record<string, unknown>,
   requiredCitations: Citation[] = [],
+  maxCharacters: number = GRADE_LADDER_LIMITS.maxModelCharacters,
 ): BoundedModelContext {
   const pinned = new Set([...requiredCitations, ...evidence.issues.flatMap(value => value.citations ?? [])].map(citationKey))
   const passages: Passage[] = []
@@ -419,7 +420,7 @@ export function boundModelContext(
       sections,
     }
   })
-  const limit = GRADE_LADDER_LIMITS.maxModelCharacters - request.name.length - request.system.length -
+  const limit = Math.min(maxCharacters, GRADE_LADDER_LIMITS.maxModelCharacters) - request.name.length - request.system.length -
     JSON.stringify(request.schema).length - REPAIR_CONTEXT_RESERVE
   const serialize = (issues: GradeIssue[]) => JSON.stringify({
     input,

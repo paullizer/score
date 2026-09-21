@@ -8,6 +8,7 @@ import type {
   RealAnalysisTargetNarrative,
 } from './analysis-narratives'
 import type { RealAnalysisTargetSelection } from './real-analyses'
+import type { AdminSettings } from './admin-settings'
 
 export const ANALYSIS_REPORT_SCHEMA_VERSION = 1 as const
 
@@ -40,6 +41,22 @@ export const REPORT_LIMITS = {
 } as const
 
 export type AnalysisReportFormat = keyof typeof REPORT_FORMATS
+export type ReportPolicy = AdminSettings['reports']
+export interface ReportSettingsCapture {
+  revision: string
+  policy: ReportPolicy
+}
+
+export interface RealReportCaptureResponse {
+  schemaVersion: typeof ANALYSIS_REPORT_SCHEMA_VERSION
+  dataKind: 'real'
+  workspaceId: string
+  runId: string
+  format: AnalysisReportFormat
+  settings: ReportSettingsCapture
+  captureToken: string
+}
+
 export type ReportDataKind = 'real' | 'sample'
 export type ReportComparisonStatus = 'queued' | 'running' | 'complete' | 'failed' | 'cancelled'
 export type ReportCompletion = 'assessed' | 'limited'
@@ -241,6 +258,7 @@ export interface ReportGroup {
   highlightedComparisonIds: string[]
   cutoffScore: number | null
   additionalCutoffTies: number
+  highlightLimit: number
 }
 
 export interface ReportRun {
@@ -254,6 +272,8 @@ export interface ReportCaptureInterval {
   completedAt: string
   // Required and current for real PDF/Word/PPTX, optional for CSV payloads.
   summaries?: AnalysisNarrativeReportCapture
+  // Absent only on pre-settings input snapshots; newly built reports always capture a value copy.
+  settings?: ReportSettingsCapture
 }
 
 export interface AnalysisReportInput {
@@ -280,7 +300,7 @@ export interface AnalysisReport {
   dataKind: ReportDataKind
   workspaceId?: string
   run: ReportRun
-  capture: ReportCaptureInterval
+  capture: ReportCaptureInterval & { settings: ReportSettingsCapture }
   generatedAt: string
   scope: { targetId: string | null }
   candidateCount: number
@@ -298,6 +318,7 @@ export interface RealReportBatchResponse {
   targets: RealReportTarget[]
   comparisons: RealReportComparison[]
   summaries?: RealAnalysisNarrativeReportCapture
+  settings?: ReportSettingsCapture
 }
 
 export interface ReportFontData {

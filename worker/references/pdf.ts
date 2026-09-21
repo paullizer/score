@@ -11,6 +11,8 @@ import type { ReferenceExtractionOptions } from './contracts'
 import { enforceReferenceCharacters, referenceRelation } from './html'
 import { checkCancellation, pdfSignature, referenceUrl } from './transport'
 import { referenceTableRows } from './tables'
+import type { AdminSettings } from '../../src/domain/admin-settings'
+import { extractionSettings } from '../settings'
 
 export const REFERENCE_EXTRACTION_VERSION = 'score-reference-layout-v1'
 const MAX_CACHE_BYTES = 32 * 1024 * 1024
@@ -23,9 +25,9 @@ function pdfString(value: unknown): string | undefined {
   return value instanceof PDFString || value instanceof PDFHexString ? value.decodeText() : undefined
 }
 
-export async function inspectReferencePdf(bytes: Uint8Array, baseUrl?: string) {
-  if (bytes.byteLength > GRADE_LADDER_LIMITS.maxPdfBytes) {
-    throw new WorkerError('reference-pdf-too-large', 'Reference PDFs cannot exceed 20 MiB.', false, 'parsing')
+export async function inspectReferencePdf(bytes: Uint8Array, baseUrl?: string, limits?: AdminSettings['grades']['references']) {
+  if (bytes.byteLength > (limits?.maxPdfBytes ?? GRADE_LADDER_LIMITS.maxPdfBytes)) {
+    throw new WorkerError('reference-pdf-too-large', 'The reference PDF exceeds its captured file-size limit.', false, 'parsing')
   }
   if (!pdfSignature(bytes)) throw new WorkerError('invalid-pdf', 'The reference has no PDF signature.', false, 'parsing')
   let pdf: PDFDocument
@@ -57,7 +59,7 @@ export async function inspectReferencePdf(bytes: Uint8Array, baseUrl?: string) {
         const url = referenceUrl(uri, baseUrl).href
         const key = `${index + 1}:${url}`
         if (seen.has(key)) continue
-        if (links.length >= 2_000) throw new WorkerError('reference-link-budget', 'The PDF contains more than 2,000 URI links; select a narrower source.', false, 'parsing')
+        if (links.length >= (limits?.maxLinks ?? GRADE_LADDER_LIMITS.maxReferenceLinks)) throw new WorkerError('reference-link-budget', 'The PDF exceeds its captured URI-link budget; select a narrower source.', false, 'parsing')
         seen.add(key)
         const label = normalizeText(pdfString(annotation.lookup(PDFName.of('Contents'))) ?? '') || url
         links.push({ url, label, relation: referenceRelation(label, url), page: index + 1 })
@@ -70,13 +72,13 @@ export async function inspectReferencePdf(bytes: Uint8Array, baseUrl?: string) {
   return { pdf, pageCount, links, warnings: [...new Set(warnings)], title: pdf.getTitle() }
 }
 
-export function selectedReferencePages(selection: number[], pageCount: number): number[] {
-  if (selection.length > GRADE_LADDER_LIMITS.maxPdfPages) {
-    throw new WorkerError('reference-too-many-selected-pages', 'Select at most 250 pages per reference PDF.', false, 'parsing')
+export function selectedReferencePages(selection: number[], pageCount: number, maxPages: number = GRADE_LADDER_LIMITS.maxPdfPages): number[] {
+  if (selection.length > maxPages) {
+    throw new WorkerError('reference-too-many-selected-pages', `Select at most ${maxPages} pages per reference PDF.`, false, 'parsing')
   }
   if (selection.length === 0) {
-    if (pageCount > GRADE_LADDER_LIMITS.maxPdfPages) {
-      throw new WorkerError('reference-page-selection-required', `This PDF has ${pageCount} pages. Explicitly select at most 250; no pages were sent for extraction.`, false, 'parsing')
+    if (pageCount > maxPages) {
+      throw new WorkerError('reference-page-selection-required', `This PDF has ${pageCount} pages. Explicitly select at most ${maxPages}; no pages were sent for extraction.`, false, 'parsing')
     }
     return Array.from({ length: pageCount }, (_, index) => index + 1)
   }
@@ -96,6 +98,7 @@ interface ChunkIdentity {
   originalHash: string
   pages: number[]
   endpoint: string
+  extractionPolicy?: { pdfChunkPages: number; maxAttempts: number; pollTimeoutMilliseconds: number }
 }
 
 interface ChunkArtifact {
@@ -149,6 +152,13 @@ async function chunkAnalysis(
   options: ReferenceExtractionOptions,
 ): Promise<DocumentIntelligenceResult> {
   checkCancellation(options.signal)
+  const extractionPolicy = {
+    pdfChunkPages: options.processingSettings?.settings.grades.references.pdfChunkPages ?? GRADE_LADDER_LIMITS.pdfChunkPages,
+    maxAttempts: options.processingSettings?.settings.extraction.transport.maxAttempts ?? options.documentIntelligence.maxAttempts ?? 3,
+    pollTimeoutMilliseconds: options.processingSettings?.settings.extraction.pollTimeoutMilliseconds ?? options.documentIntelligence.pollTimeoutMilliseconds ?? 240_000,
+  }
+  const defaultPolicy = extractionPolicy.pdfChunkPages === 50 && extractionPolicy.maxAttempts === 3 &&
+    extractionPolicy.pollTimeoutMilliseconds === 240_000
   const identity: ChunkIdentity = {
     version: REFERENCE_EXTRACTION_VERSION,
     workspaceId: source.workspaceId,
@@ -159,11 +169,13 @@ async function chunkAnalysis(
     originalHash,
     pages,
     endpoint: options.documentIntelligence.endpoint.replace(/\/+$/, ''),
+    ...(!defaultPolicy ? { extractionPolicy } : {}),
   }
   const key = `ref-${referenceHash(JSON.stringify(identity))}`
   const cached = await cachedArtifact(`${key}-result`, identity, 'result', options)
   if (cached?.result) return cached.result
-  const client = { ...options.documentIntelligence, signal: options.signal }
+  const client = { ...(options.processingSettings
+    ? extractionSettings(options.documentIntelligence, options.processingSettings) : options.documentIntelligence), signal: options.signal }
   for (let attempt = 1; attempt <= 3; attempt += 1) {
     checkCancellation(options.signal)
     const operationKey = `${key}-operation-${attempt}`
@@ -174,8 +186,8 @@ async function chunkAnalysis(
       const copied = await copy.copyPages(pdf, pages.map(page => page - 1))
       for (const page of copied) copy.addPage(page)
       const bytes = await copy.save()
-      if (bytes.byteLength > GRADE_LADDER_LIMITS.maxPdfBytes) {
-        throw new WorkerError('reference-chunk-too-large', 'A reference page-copy chunk exceeds 20 MiB; explicitly select a smaller page range.', false, 'parsing')
+      if (bytes.byteLength > (options.processingSettings?.settings.grades.references.maxPdfBytes ?? GRADE_LADDER_LIMITS.maxPdfBytes)) {
+        throw new WorkerError('reference-chunk-too-large', 'A reference page-copy chunk exceeds its captured byte limit; explicitly select a smaller page range.', false, 'parsing')
       }
       checkCancellation(options.signal)
       const operationUrl = await submitPdfLayout(bytes, client)
@@ -286,23 +298,25 @@ function layoutBlocks(result: DocumentIntelligenceResult, pages: number[], chunk
 
 export async function extractReferencePdf(bytes: Uint8Array, source: ReferenceSourceRecord, options: ReferenceExtractionOptions) {
   checkCancellation(options.signal)
-  const metadata = await inspectReferencePdf(bytes, source.finalUrl ?? source.requestedUrl)
+  const limits = options.processingSettings?.settings.grades.references
+  const metadata = await inspectReferencePdf(bytes, source.finalUrl ?? source.requestedUrl, limits)
   checkCancellation(options.signal)
-  const selectedPages = selectedReferencePages(source.selectedPages, metadata.pageCount)
+  const selectedPages = selectedReferencePages(source.selectedPages, metadata.pageCount, limits?.maxSelectedPages)
   const originalHash = referenceHash(bytes)
   const blocks: LayoutBlock[] = []
   const warnings = [...metadata.warnings]
   const reported = new Set<number>()
   if (!options.readChunk || !options.writeChunk) warnings.push('Durable chunk recovery is unavailable because both immutable readChunk and writeChunk callbacks were not provided.')
-  for (let index = 0; index < selectedPages.length; index += GRADE_LADDER_LIMITS.pdfChunkPages) {
-    const pages = selectedPages.slice(index, index + GRADE_LADDER_LIMITS.pdfChunkPages)
+  const chunkPages = limits?.pdfChunkPages ?? GRADE_LADDER_LIMITS.pdfChunkPages
+  for (let index = 0; index < selectedPages.length; index += chunkPages) {
+    const pages = selectedPages.slice(index, index + chunkPages)
     const result = await chunkAnalysis(metadata.pdf, source, originalHash, pages, options)
-    const layout = layoutBlocks(result, pages, index / GRADE_LADDER_LIMITS.pdfChunkPages + 1)
+    const layout = layoutBlocks(result, pages, index / chunkPages + 1)
     blocks.push(...layout.blocks)
     warnings.push(...layout.warnings)
     for (const page of layout.reported) reported.add(page)
-    if (blocks.reduce((sum, block) => sum + block.text.length, 0) > GRADE_LADDER_LIMITS.maxSourceCharacters) {
-      throw new WorkerError('reference-too-long', 'The reference exceeds 2,000,000 extracted characters. No content was silently truncated; select fewer pages.', false, 'parsing')
+    if (blocks.reduce((sum, block) => sum + block.text.length, 0) > (limits?.maxSourceCharacters ?? GRADE_LADDER_LIMITS.maxSourceCharacters)) {
+      throw new WorkerError('reference-too-long', 'The reference exceeds its captured character limit. No content was silently truncated; select fewer pages.', false, 'parsing')
     }
   }
   blocks.sort((left, right) => left.page - right.page || left.offset - right.offset || left.order - right.order)
@@ -324,7 +338,7 @@ export async function extractReferencePdf(bytes: Uint8Array, source: ReferenceSo
       ...(block.sectionId ? { sectionId: block.sectionId } : {}),
     })
   }
-  enforceReferenceCharacters(paragraphs)
+  enforceReferenceCharacters(paragraphs, limits?.maxSourceCharacters)
   if (paragraphs.length === 0) throw new WorkerError('reference-empty', 'The selected reference pages contain no readable text. No grading evidence was extracted.', false, 'parsing')
   const missing = selectedPages.filter(page => !reported.has(page) || !perPage.has(page))
   if (missing.length) warnings.push(`Extraction is incomplete: no attributable readable layout was returned for original pages ${missing.join(', ')}. These pages may be blank or require another extraction.`)

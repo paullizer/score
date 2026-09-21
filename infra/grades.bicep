@@ -131,6 +131,7 @@ resource worker 'Microsoft.App/jobs@2024-03-01' = {
           { name: 'AZURE_TENANT_ID', value: tenantId }
           { name: 'COSMOS_ENDPOINT', value: cosmos.properties.documentEndpoint }
           { name: 'COSMOS_DATABASE', value: 'score' }
+          { name: 'SCORE_SETTINGS_CONTAINER', value: 'application-settings' }
           { name: 'GRADE_RECORDS_CONTAINER', value: 'grade-records' }
           { name: 'STORAGE_ACCOUNT_URL', value: storage.properties.primaryEndpoints.blob }
           { name: 'GRADE_SOURCE_CONTAINER', value: 'grade-sources' }

@@ -8,6 +8,7 @@ import { ANALYSIS_LIMITS } from '../../src/domain/real-analyses'
 import { invalidRequest } from '../errors'
 import { traceOperation } from '../telemetry-operations'
 import { validateGradeApproval, validateReferenceDocument } from '../grades/validation'
+import { preservesProcessingSettings } from '../jobs/policy'
 import type { AnalysisBlob, AnalysisBlobStore } from './store'
 import {
   analysisBlobInRun, analysisBytesHash, analysisHash, assertAnalysis, assertAnalysisResultBinding,
@@ -95,7 +96,8 @@ export async function readAnalysisManifest(
     assertAnalysis(manifest.workspaceId === run.workspaceId && manifest.runId === run.id &&
       manifest.createdAt === run.createdAt && manifest.createdBy === run.createdBy &&
       manifest.inputFingerprint === run.inputFingerprint && manifest.request.name === run.name &&
-      manifest.comparisons.length === run.progress.total, 'Manifest does not belong to this run.')
+      manifest.comparisons.length === run.progress.total &&
+      preservesProcessingSettings(manifest.processingSettings, run.processingSettings), 'Manifest does not belong to this run.')
     return manifest
   })
 }
@@ -108,7 +110,9 @@ export function assertComparisonManifestBinding(
   const target = manifest.targets.find(item => item.snapshotId === pair?.targetSnapshotId)
   assertAnalysis(comparison.runId === manifest.runId && comparison.workspaceId === manifest.workspaceId &&
     pair?.id === comparison.id && analysisHash(resume ?? null) === analysisHash(comparison.resume) &&
-    analysisHash(target ?? null) === analysisHash(comparison.target), 'Comparison does not match its immutable plan.')
+    analysisHash(target ?? null) === analysisHash(comparison.target) &&
+    preservesProcessingSettings(manifest.processingSettings, comparison.processingSettings),
+  'Comparison does not match its immutable plan.')
 }
 
 async function validatedReferenceDocument(

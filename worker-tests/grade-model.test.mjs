@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import { build } from 'esbuild'
+import { settingsSnapshot } from './runtime-settings-test-support.mjs'
 
 const bundled = await build({
   entryPoints: ['worker\\grades\\model.ts'],
@@ -12,6 +13,78 @@ const {
 } = await import(`data:text/javascript;base64,${Buffer.from(moduleText).toString('base64')}`)
 
 const timestamp = '2026-09-17T20:00:00.000Z'
+
+test('competency planning, drafting and mandatory grounding review keep distinct captured task bindings', async () => {
+  const f = fixture()
+  const processingSettings = settingsSnapshot(settings => { settings.grades.maxCriteria = 1 })
+  const planner = invoker({ competencies: f.competencies, issues: [] })
+  await planGradeCompetencies({ seed: f.seed, sourceSet: f.sourceSet, documents: f.documents, processingSettings }, planner.invoke)
+  const drafter = invoker(draftOutput(f))
+  const generated = await draftGradeRubric({ ...draftInput(f), processingSettings }, drafter.invoke)
+  const reviewer = invoker({ outcome: 'supported', issues: [] })
+  await reviewGradeRubric({ ...reviewInput(f, versionRecord(f, generated)), processingSettings }, reviewer.invoke)
+  for (const [model, taskId] of [[planner, 'gradeCompetencies'], [drafter, 'gradeDraft'], [reviewer, 'gradeReview']]) {
+    const request = model.calls[0].request
+    assert.equal(request.taskId, taskId)
+    assert.equal(request.processingSettings.revision, processingSettings.revision)
+    assert.equal(request.maxCompletionTokens, processingSettings.tasks[taskId].completionTokenLimit)
+    assert.equal(request.processingSettings.tasks[taskId].deploymentName, `deployment-${taskId}`)
+  }
+  assert.equal(planner.calls[0].request.schema.properties.competencies.maxItems, 1)
+})
+
+test('GS prompts exclude settings policy metadata without omitting any frozen source facts', async () => {
+  const f = fixture()
+  const processingSettings = settingsSnapshot(() => {}, 'private-policy-metadata-not-evidence')
+  for (let index = 0; index < 14; index++) {
+    const document = structuredClone(f.grading)
+    document.id = `document-additional-${index}`
+    document.paragraphs[0].text += ' The source documentation uses the literal term processingSettingsRevision.'
+    const source = frozenSource(document)
+    f.documents.push(document)
+    f.sourceSet.sources.push(source)
+    f.sourceSet.decisions.push(selected(source))
+  }
+  f.sourceSet.processingSettings = processingSettings
+  f.ladder.processingSettings = processingSettings
+  for (const [index, source] of f.sourceSet.sources.entries()) {
+    source.revision = 'Captured 2026 source edition'
+    if (index === 0) source.processingSettingsRevision = processingSettings.revision
+    else source.processingSettings = processingSettings
+  }
+  assert.equal(f.sourceSet.sources.length, 16)
+  assert.ok(JSON.stringify(f.sourceSet).length > processingSettings.tasks.gradeDraft.inputBudget.maxInput)
+  const planner = invoker({ competencies: f.competencies, issues: [] })
+  await planGradeCompetencies({ seed: f.seed, sourceSet: f.sourceSet, documents: f.documents, processingSettings }, planner.invoke)
+  const drafter = invoker(draftOutput(f))
+  const generated = await draftGradeRubric({ ...draftInput(f), processingSettings }, drafter.invoke)
+  const version = { ...versionRecord(f, generated), processingSettings }
+  const reviewer = invoker({ outcome: 'supported', issues: [] })
+  await reviewGradeRubric({ ...reviewInput(f, version), processingSettings }, reviewer.invoke)
+  for (const model of [planner, drafter, reviewer]) {
+    const request = model.calls[0].request
+    assert.deepEqual(request.processingSettings, processingSettings)
+    assert.doesNotMatch(request.user, /"(?:processingSettings|processingSettingsRevision|settingsRevision)":/)
+    assert.equal(request.user.includes(processingSettings.revision), false)
+    const body = JSON.parse(request.user)
+    assert.equal(body.sources.length, f.documents.length)
+    for (const document of f.documents) {
+      const source = body.sources.find(source => source.documentId === document.id)
+      assert.ok(source)
+      assert.equal(source.revision, 'Captured 2026 source edition')
+      assert.ok(source.sections.every(section => section.included))
+      assert.deepEqual(source.sections.flatMap(section => section.paragraphs), document.paragraphs)
+    }
+  }
+})
+
+test('a captured zero GS correction budget never invokes an unapproved extra repair', async () => {
+  const f = fixture()
+  const processingSettings = settingsSnapshot(settings => { settings.ai.grades.maxOutputCorrections = 0 })
+  const planner = invoker('{invalid')
+  await assert.rejects(planGradeCompetencies({ seed: f.seed, sourceSet: f.sourceSet, documents: f.documents, processingSettings }, planner.invoke))
+  assert.equal(planner.calls.length, 1)
+})
 const guidance = '0: No demonstrated work evidence; 1: Identifies a basic method with close assistance; 2: Applies a method with frequent review; 3: Demonstrates the cited work scope; 4: Explains sound choices within the cited scope; 5: Demonstrates consistently sound choices with clear supporting evidence.'
 
 function citation(document, paragraphId) {

@@ -1,6 +1,6 @@
 import { z } from 'zod'
 import {
-  REPORT_LIMITS, type AnalysisReport, type RealReportComparison, type RealReportTarget,
+  REPORT_LIMITS, type AnalysisReport, type AnalysisReportFormat, type RealReportComparison, type RealReportTarget,
 } from '../../domain/analysis-reports'
 import type { RealAnalysisNarrativeReportCapture, RealAnalysisSummariesResponse } from '../../domain/analysis-narratives'
 import { cloudJsonRequest } from '../cloudWorkspace'
@@ -10,6 +10,9 @@ import { realAnalysisSummariesResponseSchema } from './narrative-schemas'
 import { requireReportNarratives } from './narratives'
 import { unavailableOverallScore } from './presentation'
 import { getDisplayName } from '../../domain/displayNames'
+import {
+  assertReportFormat, captureReportSettings, realReportCaptureResponseSchema, reportGenerationPolicy, reportLimits,
+} from './policy'
 
 const id = z.string().min(1).max(1024).refine(value => value === value.trim())
 const text = z.string().max(REPORT_LIMITS.maxTextCharacters)
@@ -290,44 +293,83 @@ export async function assertRealAnalysisReportNarrativesCurrent(
 ): Promise<void> {
   id.parse(workspaceId)
   id.parse(runId)
-  const bounded = AbortSignal.any([AbortSignal.timeout(REPORT_LIMITS.maxGenerationMilliseconds), ...(signal ? [signal] : [])])
+  const limits = reportLimits(reportGenerationPolicy(report))
+  const bounded = AbortSignal.any([AbortSignal.timeout(limits.maxGenerationMilliseconds), ...(signal ? [signal] : [])])
   bounded.throwIfAborted()
-  assertReportResourceLimits(report)
-  await recheckNarratives(workspaceId, runId, report, bounded)
+  assertReportResourceLimits(report, limits.maxInputBytes)
+  let inputBytes = new TextEncoder().encode(JSON.stringify(report)).byteLength
+  await recheckNarratives(workspaceId, runId, report, bounded, bytes => {
+    inputBytes += bytes
+    if (inputBytes > limits.maxInputBytes) {
+      throw new Error('The final summary verification exceeds the captured input byte budget. Narrow the export to one exact job/grade target; no file was downloaded.')
+    }
+  })
 }
 
 export async function loadRealAnalysisReport(
   workspaceId: string, runId: string,
-  options: { targetId?: string; requireSummaries?: boolean; signal?: AbortSignal; onProgress?: (completed: number, total: number) => void } = {},
+  options: {
+    targetId?: string; format?: AnalysisReportFormat; requireSummaries?: boolean;
+    signal?: AbortSignal; onProgress?: (completed: number, total: number) => void
+  } = {},
 ): Promise<AnalysisReport> {
   id.parse(workspaceId)
   id.parse(runId)
   if (options.targetId !== undefined) id.parse(options.targetId)
   if (options.requireSummaries !== undefined) z.boolean().parse(options.requireSummaries)
+  const format = z.enum(['csv', 'pdf', 'docx', 'pptx']).parse(options.format ?? (options.requireSummaries ? 'pdf' : 'csv'))
+  const requireSummaries = format !== 'csv'
   const cancellation = new AbortController()
   const signal = AbortSignal.any([
     cancellation.signal, AbortSignal.timeout(REPORT_LIMITS.maxGenerationMilliseconds),
     ...(options.signal ? [options.signal] : []),
   ])
   signal.throwIfAborted()
+  const captureStarted = Date.now()
   const startedAt = new Date().toISOString()
+  let timer: ReturnType<typeof setTimeout> | undefined
   try {
+    const captureQuery = new URLSearchParams({ format, ...(options.targetId === undefined ? {} : { targetId: options.targetId }) })
+    const rawCapture = await cloudJsonRequest<unknown>(
+      `/workspaces/${encodeURIComponent(workspaceId)}/analyses/${encodeURIComponent(runId)}/report-capture?${captureQuery}`,
+      { method: 'GET', signal },
+    )
+    signal.throwIfAborted()
+    const metadata = realReportCaptureResponseSchema.parse(rawCapture)
+    requireSaved(metadata.workspaceId === workspaceId && metadata.runId === runId && metadata.format === format,
+      'The report policy capture belongs to a different workspace, analysis, or format.')
+    const settings = captureReportSettings(metadata.settings)
+    assertReportFormat(settings.policy, format)
+    const limits = reportLimits(settings.policy)
+    const checkTime = () => {
+      if (Date.now() - captureStarted > limits.maxGenerationMilliseconds) {
+        throw new DOMException('Report capture exceeded its time limit', 'TimeoutError')
+      }
+    }
+    checkTime()
+    timer = setTimeout(() => cancellation.abort(new DOMException('Report capture exceeded its time limit', 'TimeoutError')),
+      Math.max(0, limits.maxGenerationMilliseconds - (Date.now() - captureStarted)))
     let receivedBytes = 0
     const accountBytes = (bytes: number) => {
+      checkTime()
       receivedBytes += bytes
-      if (receivedBytes > REPORT_LIMITS.maxInputBytes) {
+      if (receivedBytes > limits.maxInputBytes) {
         throw new Error('The report responses exceed the input byte budget. Narrow the export to one exact job/grade target; no comparisons, summaries, or evidence were omitted.')
       }
     }
-    const summaries = options.requireSummaries
+    accountBytes(new TextEncoder().encode(JSON.stringify(rawCapture)).byteLength)
+    const summaries = requireSummaries
       ? await readReadySummaries(workspaceId, runId, options.targetId ?? null, signal, accountBytes) : undefined
     const rawDetail = await getRealAnalysis(workspaceId, runId, signal)
     signal.throwIfAborted()
-    assertReportResourceLimits(rawDetail)
+    assertReportResourceLimits(rawDetail, limits.maxInputBytes)
+    accountBytes(new TextEncoder().encode(JSON.stringify(rawDetail)).byteLength)
     const detail = capturedRun.parse(rawDetail)
-    const inventory = (await listAllRealAnalysisComparisons(workspaceId, runId, signal, {
-      maxItems: REPORT_LIMITS.maxComparisons, maxPages: REPORT_LIMITS.maxComparisons, maxBytes: REPORT_LIMITS.maxInputBytes,
-    })).map(value => capturedComparison.parse(value.comparison))
+    const rawInventory = await listAllRealAnalysisComparisons(workspaceId, runId, signal, {
+      maxItems: REPORT_LIMITS.maxComparisons, maxPages: REPORT_LIMITS.maxComparisons, maxBytes: Math.max(1, limits.maxInputBytes - receivedBytes),
+    })
+    accountBytes(new TextEncoder().encode(JSON.stringify(rawInventory)).byteLength)
+    const inventory = rawInventory.map(value => capturedComparison.parse(value.comparison))
     signal.throwIfAborted()
     const completedAt = new Date().toISOString()
     validateInventory(detail, inventory, workspaceId, runId, summaries ? options.targetId : undefined)
@@ -335,6 +377,9 @@ export async function loadRealAnalysisReport(
       'The selected exact target is not in this saved analysis.')
     const selected = inventory.filter(comparison => options.targetId === undefined || comparison.target.summary.id === options.targetId)
       .sort((left, right) => left.index - right.index)
+    if (selected.length > limits.maxComparisons) {
+      throw new Error(`This export exceeds the ${limits.maxComparisons}-comparison report limit. Narrow the export to one exact job/grade target; no comparisons have been omitted.`)
+    }
     if (summaries) validateSummaryInventory(summaries, detail, selected)
     if (!selected.some(comparison => comparison.status === 'complete')) {
       throw new Error('At least one comparison in the selected scope must be complete before exporting. Completed results with withheld scores are eligible.')
@@ -343,8 +388,8 @@ export async function loadRealAnalysisReport(
     const targets = new Map<string, RealReportTarget>()
     const comparisons = new Map<string, RealReportComparison>()
     const batches: CapturedComparison[][] = []
-    for (let index = 0; index < selected.length; index += REPORT_LIMITS.batchComparisons) {
-      batches.push(selected.slice(index, index + REPORT_LIMITS.batchComparisons))
+    for (let index = 0; index < selected.length; index += limits.batchComparisons) {
+      batches.push(selected.slice(index, index + limits.batchComparisons))
     }
     let nextBatch = 0
     let loaded = 0
@@ -356,6 +401,10 @@ export async function loadRealAnalysisReport(
         signal.throwIfAborted()
         const batch = batches[nextBatch++]
         const query = new URLSearchParams(batch.map(comparison => ['comparisonId', comparison.id]))
+        query.set('format', format)
+        query.set('settingsRevision', settings.revision)
+        query.set('captureToken', metadata.captureToken)
+        if (options.targetId !== undefined) query.set('targetId', options.targetId)
         const payload = await cloudJsonRequest<unknown>(
           `/workspaces/${encodeURIComponent(workspaceId)}/analyses/${encodeURIComponent(runId)}/report-comparisons?${query}`,
           { method: 'GET', signal },
@@ -365,6 +414,8 @@ export async function loadRealAnalysisReport(
         accountBytes(new TextEncoder().encode(JSON.stringify(payload)).byteLength)
         requireSaved(response.workspaceId === workspaceId && response.runId === runId && response.comparisons.length === batch.length,
           'A report batch belongs to a different workspace/run or is missing requested comparisons.')
+        requireSaved(response.settings && same(response.settings, settings),
+          'A report batch omitted or changed the captured settings revision or report policy.')
         if (summaries && response.summaries) requireSaved(sameCapture(summaries.capture, response.summaries),
           'A report batch carries different summary revisions or selected-scope pins.')
         const requested = new Map(batch.map(comparison => [comparison.id, comparison]))
@@ -395,7 +446,7 @@ export async function loadRealAnalysisReport(
           }
           comparisons.set(normalized.id, normalized)
           inputBytes += new TextEncoder().encode(JSON.stringify(normalized)).byteLength
-          if (inputBytes > REPORT_LIMITS.maxInputBytes) {
+          if (inputBytes > limits.maxInputBytes) {
             throw new Error('The saved report exceeds the input byte budget. Narrow the export to one exact job/grade target; no comparisons or evidence were omitted.')
           }
         }
@@ -404,12 +455,12 @@ export async function loadRealAnalysisReport(
         options.onProgress?.(loaded, selected.length)
       }
     }
-    await Promise.all(Array.from({ length: Math.min(REPORT_LIMITS.maxConcurrentBatches, batches.length) }, load))
+    await Promise.all(Array.from({ length: Math.min(limits.maxConcurrentBatches, batches.length) }, load))
     signal.throwIfAborted()
     requireSaved(comparisons.size === selected.length, 'Required report comparisons are missing.')
     const report = buildAnalysisReport({
       dataKind: 'real', workspaceId, run: { id: detail.run.id, name: getDisplayName(detail.run, detail.run.name), createdAt: detail.run.createdAt },
-      capture: { startedAt, completedAt, ...(summaries ? { summaries: summaries.capture } : {}) }, generatedAt: new Date().toISOString(),
+      capture: { startedAt, completedAt, settings, ...(summaries ? { summaries: summaries.capture } : {}) }, generatedAt: new Date().toISOString(),
       targets: detail.targets.filter(target => targets.has(target.id)).map(target => targets.get(target.id)!),
       comparisons: selected.map(comparison => comparisons.get(comparison.id)!),
     }, { targetId: options.targetId })
@@ -419,9 +470,12 @@ export async function loadRealAnalysisReport(
       report.generatedAt = report.capture.completedAt
     }
     signal.throwIfAborted()
+    checkTime()
     return report
   } catch (error) {
     cancellation.abort(error)
     throw error
+  } finally {
+    if (timer !== undefined) clearTimeout(timer)
   }
 }

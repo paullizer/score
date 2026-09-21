@@ -24,28 +24,31 @@ export function GradeNavigationProtectionProvider({ workspaceId, routePrefix = `
   const popPending = useRef(false)
   const authorizedAction = useRef<true | readonly string[] | null>(null)
   const decisionIds = useRef<readonly string[] | undefined>(undefined)
-  const matchingBlockers = useCallback((ids?: readonly string[]) => [...blockers.current].filter(([id, blocker]) =>
-    (!ids || ids.includes(id)) && (blocker.pending || !(authorizedAction.current === true || authorizedAction.current?.includes(id))),
+  const decisionIncludesWorkspace = useRef(false)
+  const matchingBlockers = useCallback((ids?: readonly string[], includeWorkspaceDrafts = false) => [...blockers.current].filter(([id, blocker]) =>
+    (!ids || ids.includes(id)) && (!blocker.workspaceOnly || includeWorkspaceDrafts || ids?.includes(id) || blocker.pending) &&
+    (blocker.pending || !(authorizedAction.current === true || authorizedAction.current?.includes(id))),
   ).map(([, blocker]) => blocker), [])
 
   const setBlocker = useCallback((id: string, blocker: GradeLeaveBlocker | null) => {
     if (blocker) blockers.current.set(id, blocker)
     else blockers.current.delete(id)
-    setVisibleBlockers(matchingBlockers(decisionIds.current))
+    setVisibleBlockers(matchingBlockers(decisionIds.current, decisionIncludesWorkspace.current))
   }, [matchingBlockers])
 
-  const confirmLeave = useCallback((ids?: readonly string[]): Promise<boolean> => {
-    const relevant = matchingBlockers(ids)
+  const confirmLeave = useCallback((ids?: readonly string[], includeWorkspaceDrafts = false): Promise<boolean> => {
+    const relevant = matchingBlockers(ids, includeWorkspaceDrafts)
     if (!relevant.length) return Promise.resolve(true)
     if (decision.current) return Promise.resolve(false)
     decisionIds.current = ids
+    decisionIncludesWorkspace.current = includeWorkspaceDrafts
     setVisibleBlockers(relevant)
     setOpen(true)
     return new Promise((resolve) => { decision.current = resolve })
   }, [matchingBlockers])
 
   function resolveDecision(allowed: boolean) {
-    if (allowed && matchingBlockers(decisionIds.current).some((blocker) => blocker.pending)) return
+    if (allowed && matchingBlockers(decisionIds.current, decisionIncludesWorkspace.current).some((blocker) => blocker.pending)) return
     const resolve = decision.current
     decision.current = null
     setOpen(false)
@@ -81,7 +84,7 @@ export function GradeNavigationProtectionProvider({ workspaceId, routePrefix = `
       if (allowPop.current) { allowPop.current = false; return }
       const prefix = routePrefix.endsWith('/') ? routePrefix : `${routePrefix}/`
       // Cross-workspace navigation is held by CloudApplication before its persistent provider leaves.
-      if (!(window.location.pathname === routePrefix || window.location.pathname.startsWith(prefix)) || !blockers.current.size) return
+      if (!(window.location.pathname === routePrefix || window.location.pathname.startsWith(prefix)) || !matchingBlockers().length) return
       event.stopImmediatePropagation()
       if (popPending.current) return
       popPending.current = true
@@ -109,7 +112,7 @@ export function GradeNavigationProtectionProvider({ workspaceId, routePrefix = `
       window.removeEventListener('beforeunload', warn)
       window.removeEventListener('popstate', onPop, { capture: true })
     }
-  }, [confirmLeave, routePrefix])
+  }, [confirmLeave, matchingBlockers, routePrefix])
 
   const value = useMemo(() => ({ confirmLeave, setBlocker, recordLocation, releaseForLeave, runAuthorized }), [confirmLeave, setBlocker, recordLocation, releaseForLeave, runAuthorized])
   const pending = visibleBlockers.some((blocker) => blocker.pending)

@@ -1,6 +1,7 @@
 import { Link, useNavigate, useSearchParams } from 'react-router-dom'
 import { ArrowUpRight, BarChart3, Clock3, Plus } from 'lucide-react'
 import { useWorkspace } from '../../app/workspace-context'
+import { usePublicSettings } from '../../app/public-settings-context'
 import { useLibraryViewState } from '../../app/library-view-state'
 import { dateLabel, runStatus } from '../../domain/selectors'
 import { Avatar, Badge, Button, DemoNote, EmptyState, PageHeader, SearchField, SegmentedControl } from '../../components/ui'
@@ -21,13 +22,14 @@ export { AnalysisDetail } from './AnalysisDetail'
 
 export function AnalysesPage() {
   const { workspace, cloud } = useWorkspace()
+  const { settings } = usePublicSettings()
   const real = useRealAnalyses()
   const [params] = useSearchParams()
   const navigate = useNavigate()
   const mode = dataMode(params, Boolean(cloud))
   if (mode === 'invalid') return <EmptyState title="Unknown analysis mode" description="Choose real analyses or the explicitly fictional Samples history." action={<Button onClick={() => navigate('/analyses')}>Open analyses</Button>} />
   return <>
-    {cloud && <div className="library-kind-switcher mb-5 rounded-xl border"><SegmentedControl label="Choose real analyses or samples" value={mode}
+    {cloud && settings?.features.samplesVisible !== false && <div className="library-kind-switcher mb-5 rounded-xl border"><SegmentedControl label="Choose real analyses or samples" value={mode}
       onChange={(value) => navigate(`/analyses?data=${value}`)} options={[{ value: 'real', label: 'Real analyses', count: real?.summaries.length ?? 0 }, { value: 'samples', label: 'Samples', count: workspace.runs.length }]} />
       <span>{mode === 'real' ? 'Durable private results · real evidence' : 'Fictional inputs · simulated scoring'}</span></div>}
     {mode === 'real' ? <RealAnalysesPage /> : <RenameEntityProvider key={cloud?.currentWorkspaceId ?? 'standalone'}><SampleAnalysesPage /></RenameEntityProvider>}

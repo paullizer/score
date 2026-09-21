@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import { createRequire } from 'node:module'
 import test from 'node:test'
 import { build } from 'esbuild'
+import { settingsSnapshot } from './runtime-settings-test-support.mjs'
 
 async function loadModule(entryPoint) {
   const bundled = await build({
@@ -26,6 +27,25 @@ const { parseRealResumeProfile, validateRealResumeProfile } = validationModule
 
 const now = '2026-09-18T02:00:00.000Z'
 const actualModel = 'gpt-5-mini-2025-08-07'
+
+test('resume extraction uses its dedicated frozen model and correction limit rather than rubric settings', async () => {
+  const run = invocation()
+  run.options.model.processingSettings = settingsSnapshot(settings => {
+    settings.ai.resumeProfile.maxOutputCorrections = 0
+    settings.ai.tasks.resumeProfile.reasoningEffort = 'medium'
+  })
+  const result = await extractResumeProfile(fixture(), run.options)
+  assert.equal(run.requests[0].model, 'deployment-resumeProfile')
+  assert.equal(run.requests[0].reasoning_effort, 'medium')
+  assert.equal(result.profile.provenance.model, actualModel)
+  assert.equal(result.profile.provenance.deployment, 'deployment-resumeProfile')
+  assert.equal(result.profile.provenance.task, 'resumeProfile')
+  assert.equal(result.profile.provenance.settingsRevision, run.options.model.processingSettings.revision)
+  const invalid = invocation(() => responseContent('{invalid'))
+  invalid.options.model.processingSettings = run.options.model.processingSettings
+  await assert.rejects(extractResumeProfile(fixture(), invalid.options), error => error.code === 'invalid-model-output')
+  assert.equal(invalid.requests.length, 1)
+})
 const sha256 = 'a'.repeat(64)
 const resumeId = 'resume-11111111-1111-4111-8111-111111111111'
 const documentId = 'document-11111111-1111-4111-8111-111111111111'

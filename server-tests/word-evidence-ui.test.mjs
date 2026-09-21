@@ -68,7 +68,11 @@ for (const format of ['docx', 'doc']) {
     const comparison = [...f.analysis.store.values.values()].find(value => value.record.recordType === 'analysis-comparison').record
     await publishResult(f, created.run.id, comparison.id)
     const detail = await f.service.comparisonDetail(f.workspaceId, created.run.id, comparison.id)
-    const comparisonMarkup = renderToStaticMarkup(createElement(ui.RealComparisonReview, { detail }))
+    const comparisonMarkup = renderToStaticMarkup(createElement(StaticRouter, { location: '/' },
+      createElement(ui.WorkspaceContext.Provider, {
+        value: { workspace: { schemaVersion: 1, jobs: [], documents: [], rubrics: [], resumes: [], runs: [] }, notify: () => {} },
+      }, createElement(ui.RealComparisonReview, { detail })),
+    ))
     assert.match(comparisonMarkup, /Captured source section 1 of 1/)
     assert.doesNotMatch(comparisonMarkup, /Original page|Captured HTML/)
     const jobMarkup = renderToStaticMarkup(createElement(ui.DocumentViewer, {

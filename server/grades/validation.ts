@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto'
 import { z } from 'zod'
+import { processingSettingsSnapshotSchema } from '../../src/domain/admin-settings-schema'
 import {
   GRADE_LADDER_LIMITS as LIMITS, gradeHeadId,
   type GradeEntity, type GradeIssue, type GradeRubricVersionRecord, type GradeSourceSetRecord,
@@ -80,6 +81,7 @@ const relatedLink = z.strictObject({
 })
 const base = {
   id: identifier, workspaceId: z.string().regex(WORKSPACE_ID_PATTERN), createdAt: timestamp, updatedAt: timestamp,
+  processingSettings: processingSettingsSnapshotSchema.optional(),
 }
 const lifecycle = z.strictObject({
   archivedAt: timestamp.optional(), deletingAt: timestamp.optional(), deletedAt: timestamp.optional(),
@@ -122,6 +124,8 @@ const frozenSource = z.strictObject({
   revision: text(1000).optional(), authorityStatus: authority, coverage,
   pageCount: z.number().int().min(1).max(100_000), selectedPages: pages, completeness, issues,
   issueResolutions: issueResolutions.optional(),
+  processingSettingsRevision: z.string().min(1).max(128).regex(/^[A-Za-z0-9][A-Za-z0-9._-]*$/).optional(),
+  processingSettings: processingSettingsSnapshotSchema.optional(),
 })
 const ladderSchema = z.strictObject({
   ...base, id: id('ladder'), recordType: z.literal('grade-ladder'),
@@ -469,6 +473,8 @@ export function parseGradeEntity(value: unknown): GradeEntity {
       (count, source) => count + (source.selectedPages.length || source.pageCount), 0,
     ) <= LIMITS.maxTotalPdfPages, 'Frozen source set exceeds the total selected PDF page budget.')
     for (const source of record.sources) {
+      assert(source.processingSettingsRevision === undefined || source.processingSettings === undefined ||
+        source.processingSettingsRevision === source.processingSettings.revision, 'Frozen reference settings revision mismatch.')
       assertSourceAuthority(source)
       assertSourceBinding(source, record.workspaceId, record.ladderId)
       const decision = record.decisions.find(item => item.sourceId === source.sourceId)

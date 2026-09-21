@@ -11,6 +11,10 @@ import { isUuid, parseDisplayNameMetadata } from '../jobs/validation'
 import { WORKSPACE_ID_PATTERN } from '../ids'
 import { StoreConflictError, StoreNotFoundError } from '../store'
 import { assertWorkspaceMutationLease } from '../lifecycle/lease'
+import {
+  admittedProcessingSettings, newProcessingSettings, resolveAcceptedProcessingSettings,
+  assertNewWork, currentProcessingSettings, newWorkProcessingSettings, type ProcessingSettingsProvider,
+} from '../jobs/policy'
 import { traceOperation } from '../telemetry-operations'
 import type { AnalysisTransaction, RealAnalysesDeps } from './store'
 import {
@@ -26,6 +30,9 @@ import {
 import { RealAnalysisTargets, resolveAnalysisResume, copyAnalysisTargetEvidence, type AnalysisSourceDeps } from './targets'
 import { analysisPageCursor, analysisPageToken, validateAnalysisPage } from './paging'
 import { readAnalysisReportComparisons } from './reports'
+import type { AnalysisReportCaptures } from './reports'
+import type { AnalysisReportFormat, ReportSettingsCapture } from '../../src/domain/analysis-reports'
+import type { WorkspaceRole } from '../../src/domain/cloud'
 import { generateAnalysisSummaries, readAnalysisNarrativeInventory, readAnalysisSummaries, readAnalysisSummarySubject } from './narratives'
 import type { GenerateRealAnalysisSummariesInput } from '../../src/domain/analysis-narratives'
 import type { AnalysisSummarySubject, PublishSummaryDraftInput } from '../../src/domain/analysis-summary-history'
@@ -77,10 +84,13 @@ export class RealAnalysisService {
   private readonly clock: () => Date
   private readonly corrections: AnalysisCorrectionService
 
-  constructor(private readonly deps: RealAnalysesDeps, private readonly sources: AnalysisSourceDeps = {}, now?: () => Date) {
+  constructor(
+    private readonly deps: RealAnalysesDeps, private readonly sources: AnalysisSourceDeps = {}, now?: () => Date,
+    private readonly settings?: ProcessingSettingsProvider,
+  ) {
     this.targets = new RealAnalysisTargets(sources)
     this.clock = now ?? (() => new Date())
-    this.corrections = new AnalysisCorrectionService(deps, this.clock)
+    this.corrections = new AnalysisCorrectionService(deps, this.clock, settings)
   }
   private now(): string { return this.clock().toISOString() }
   private async run(workspaceId: string, runId: string, recovery = false, signal?: AbortSignal) {
@@ -150,6 +160,11 @@ export class RealAnalysisService {
     const blobs = fencedAnalysisBlobs(this.deps, workspaceId, runId)
     let blob = await this.deps.blobs.read(name)
     if (!blob) {
+      const processingSettings = await newWorkProcessingSettings(this.settings)
+      assertNewWork(processingSettings, 'newAnalyses')
+      if (request.resumes.length * request.targets.length > processingSettings.settings.analyses.maxComparisons) {
+        throw invalidRequest(`New analysis runs may contain at most ${processingSettings.settings.analyses.maxComparisons} resume/target comparisons.`)
+      }
       const createdAt = this.now()
       const resumes: AnalysisResumeSnapshotReference[] = []
       const targets: AnalysisTargetSnapshotReference[] = []
@@ -176,6 +191,7 @@ export class RealAnalysisService {
       }
       const manifest = parseAnalysisInitializationManifest({
         schemaVersion: 1, dataKind: 'real', workspaceId, runId, createdAt, createdBy: actor,
+        processingSettings: newProcessingSettings(this.settings, processingSettings),
         inputFingerprint: fingerprint, request, resumes, targets,
         comparisons: resumes.flatMap((resume, resumeIndex) => targets.map((target, targetIndex) => {
           const index = resumeIndex * targets.length + targetIndex
@@ -216,6 +232,7 @@ export class RealAnalysisService {
         id: runId, recordType: 'analysis-run', workspaceId, dataKind: 'real', name: prepared.manifest.request.name,
         createdAt: timestamp, updatedAt: timestamp, createdBy: prepared.manifest.createdBy, idempotencyKey: key,
         inputFingerprint: fingerprint, status: 'initializing', manifest: prepared.reference,
+        processingSettings: await admittedProcessingSettings(this.settings, prepared.manifest.processingSettings),
         initialization: { nextComparisonIndex: 0 }, attempts: 0, retryCount: 0, nextAttemptAt: timestamp,
         progress: {
           total: prepared.manifest.comparisons.length, initialized: 0, queued: 0, running: 0,
@@ -336,19 +353,22 @@ export class RealAnalysisService {
     return this.corrections.cancel(workspaceId, runId, comparisonId, expected)
   }
   generateSummaries(workspaceId: string, runId: string, input: GenerateRealAnalysisSummariesInput, requestId: string, expected: string, actor: string) {
-    return generateAnalysisSummaries(this.deps, workspaceId, runId, input, requestId, expected, actor, this.clock)
+    return generateAnalysisSummaries(this.deps, workspaceId, runId, input, requestId, expected, actor, this.clock, this.settings)
   }
-  summaryHistory(workspaceId: string, runId: string, subject: AnalysisSummarySubject, continuationToken?: string, signal?: AbortSignal, resultRevisionId?: string) {
-    return readAnalysisSummaryHistory(this.deps, workspaceId, runId, subject, continuationToken, signal, resultRevisionId)
+  summaryHistory(
+    workspaceId: string, runId: string, subject: AnalysisSummarySubject, continuationToken?: string,
+    signal?: AbortSignal, resultRevisionId?: string, pageSize?: number,
+  ) {
+    return readAnalysisSummaryHistory(this.deps, workspaceId, runId, subject, continuationToken, signal, resultRevisionId, pageSize)
   }
   publishSummary(
     workspaceId: string, runId: string, subject: AnalysisSummarySubject, input: PublishSummaryDraftInput,
     requestId: string, expected: string, actor: string,
   ) {
-    return publishAnalysisSummaryDraft(this.deps, workspaceId, runId, subject, input, requestId, expected, actor, this.clock)
+    return publishAnalysisSummaryDraft(this.deps, workspaceId, runId, subject, input, requestId, expected, actor, this.clock, this.settings)
   }
   retrySummary(workspaceId: string, runId: string, subject: AnalysisSummarySubject, requestId: string, expected: string, actor: string) {
-    return retryAnalysisSummary(this.deps, workspaceId, runId, subject, requestId, expected, actor, this.clock)
+    return retryAnalysisSummary(this.deps, workspaceId, runId, subject, requestId, expected, actor, this.clock, this.settings)
   }
   async diagnostics(workspaceId: string, runId: string, comparisonId: string, continuationToken?: string, signal?: AbortSignal) {
     const [run, comparison] = await Promise.all([
@@ -358,10 +378,26 @@ export class RealAnalysisService {
     await this.run(workspaceId, runId, false, signal)
     return page
   }
-  async reportComparisons(workspaceId: string, runId: string, comparisonIds: string[], signal?: AbortSignal) {
+  async captureReport(
+    captures: AnalysisReportCaptures, workspaceId: string, runId: string, actor: string, role: WorkspaceRole,
+    format: AnalysisReportFormat, targetId?: string, signal?: AbortSignal,
+  ) {
+    const run = await this.run(workspaceId, runId, false, signal)
+    const manifest = await readAnalysisManifest(this.deps.blobs, run.record, signal)
+    const settings = await currentProcessingSettings(this.settings)
+    signal?.throwIfAborted()
+    return captures.capture(settings, role, actor, run.record, manifest, format, targetId)
+  }
+  async reportComparisons(
+    workspaceId: string, runId: string, comparisonIds: string[], signal?: AbortSignal,
+    settings?: ReportSettingsCapture, manifestSha256?: string,
+  ) {
     comparisonIds = input(reportComparisonIdsSchema, comparisonIds)
     signal?.throwIfAborted()
     const run = await this.run(workspaceId, runId, false, signal)
+    if (manifestSha256 !== undefined && manifestSha256 !== run.record.manifest.sha256) {
+      throw conflict('This report capture does not match the saved analysis manifest.')
+    }
     const comparisons: VersionedAnalysisEntity<RealAnalysisComparisonRecord>[] = []
     for (const id of comparisonIds) {
       signal?.throwIfAborted()
@@ -369,7 +405,7 @@ export class RealAnalysisService {
     }
     const current = await resolveAnalysisComparisons(this.deps.store, run.record, comparisons, signal)
     signal?.throwIfAborted()
-    return readAnalysisReportComparisons(this.deps.blobs, run.record, current.map(value => value.record), signal)
+    return readAnalysisReportComparisons(this.deps.blobs, run.record, current.map(value => value.record), signal, settings)
   }
   async document(
     workspaceId: string, runId: string, comparisonId: string, documentId: string, version: number, signal?: AbortSignal,
@@ -448,6 +484,7 @@ export class RealAnalysisService {
       }
       const updated: RealAnalysisRunRecord = {
         ...structuredClone(current.record), updatedAt: timestamp, attempts: 0,
+        processingSettings: await resolveAcceptedProcessingSettings(this.settings, current.record.processingSettings),
         retryCount: current.record.retryCount + 1, nextAttemptAt: timestamp,
       }
       delete updated.error
@@ -464,6 +501,7 @@ export class RealAnalysisService {
       await this.validateSelections(workspaceId, manifest.request, runId)
       const updated: RealAnalysisRunRecord = {
         ...structuredClone(current.record), status: 'initializing', updatedAt: timestamp, attempts: 0,
+        processingSettings: await resolveAcceptedProcessingSettings(this.settings, current.record.processingSettings ?? manifest.processingSettings),
         retryCount: current.record.retryCount + 1, nextAttemptAt: timestamp,
       }
       delete updated.error
@@ -499,6 +537,7 @@ export class RealAnalysisService {
     while (offset < selected.length) {
       const batchTimestamp = new Date(Math.max(Date.parse(timestamp), Date.parse(current.record.updatedAt))).toISOString()
       let updated = structuredClone(current.record)
+      updated.processingSettings = await resolveAcceptedProcessingSettings(this.settings, updated.processingSettings ?? manifest.processingSettings)
       if (updated.cancellation && !updated.cancellation.completedAt) throw conflict('A new cancellation prevented this retry.')
       delete updated.cancellation
       delete updated.error
@@ -508,7 +547,10 @@ export class RealAnalysisService {
       let bytes = 0
       while (offset < selected.length && operations.length < Math.floor(ANALYSIS_LIMITS.initializationChunkSize / 2)) {
         const previous = selected[offset]
-        const next = retryAnalysisComparisonRecord(previous.record, batchTimestamp)
+        const next = retryAnalysisComparisonRecord({
+          ...previous.record, processingSettings: await resolveAcceptedProcessingSettings(this.settings,
+            previous.record.processingSettings ?? updated.processingSettings),
+        }, batchTimestamp)
         const operation: AnalysisTransaction = { kind: 'replace', record: next, etag: previous.etag }
         const size = Buffer.byteLength(JSON.stringify(operation))
         if (bytes + size + Buffer.byteLength(JSON.stringify(updated)) + 64 * 1024 > MAX_ANALYSIS_TRANSACTION_BYTES) break
@@ -549,7 +591,11 @@ export class RealAnalysisService {
       delete parent.error
       delete parent.completedAt
       parent.retryCount++
-      updated = retryAnalysisComparisonRecord(comparison.record, timestamp)
+      parent.processingSettings = await resolveAcceptedProcessingSettings(this.settings, parent.processingSettings ?? manifest.processingSettings)
+      updated = retryAnalysisComparisonRecord({
+        ...comparison.record, processingSettings: await resolveAcceptedProcessingSettings(this.settings,
+          comparison.record.processingSettings ?? parent.processingSettings),
+      }, timestamp)
     } else {
       if (!['queued', 'running'].includes(comparison.record.status)) throw conflict('Only queued or running comparisons can be cancelled. Completed evidence is immutable.')
       updated = cancelAnalysisComparisonRecord(comparison.record, timestamp)

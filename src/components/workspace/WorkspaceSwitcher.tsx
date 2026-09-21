@@ -4,6 +4,7 @@ import type { CloudWorkspaceStatus } from '../../app/workspace-context'
 import { Badge, Button, EmptyState, InlineError, Modal, SearchField } from '../ui'
 import { matchesArchiveFilter, type ArchiveFilter } from '../../domain/lifecycle'
 import { ArchiveStateFilter, LifecycleActions } from '../lifecycle/LifecycleControls'
+import { usePublicSettings } from '../../app/public-settings-context'
 
 export type WorkspaceDirectoryActions = Pick<CloudWorkspaceStatus, 'workspaces' | 'currentWorkspaceId' | 'switchWorkspace' | 'createWorkspace' | 'renameWorkspace' | 'refreshWorkspaces' | 'getWorkspaceLifecycleImpact' | 'changeWorkspaceLifecycle'>
 
@@ -14,6 +15,8 @@ export type WorkspaceDirectoryActions = Pick<CloudWorkspaceStatus, 'workspaces' 
  * Used both from the desktop sidebar and from the mobile navigation drawer.
  */
 export function WorkspaceSwitcher({ cloud, empty = false }: { cloud: WorkspaceDirectoryActions; empty?: boolean }) {
+  const policy = usePublicSettings()
+  const creationAllowed = policy.settings?.workspaces.allowCreation !== false && (!policy.cloud || policy.phase === 'ready')
   const [open, setOpen] = useState(false)
   const [busyId, setBusyId] = useState<string | null>(null)
   const [error, setError] = useState('')
@@ -50,6 +53,7 @@ export function WorkspaceSwitcher({ cloud, empty = false }: { cloud: WorkspaceDi
   }
 
   async function handleCreate() {
+    if (!creationAllowed) { setError(policy.error ?? 'New workspace creation is disabled by application policy.'); return }
     setBusyId('__create__'); setError('')
     const result = await cloud.createWorkspace(createValue)
     setBusyId(null)
@@ -114,9 +118,10 @@ export function WorkspaceSwitcher({ cloud, empty = false }: { cloud: WorkspaceDi
       {!visible.length && <EmptyState title={query ? 'No matching workspaces' : 'No active workspaces'} description="Create a workspace, search archived workspaces, or choose Archived only to unarchive an existing one." />}
       {creating ? <form className="workspace-switcher-create" onSubmit={(event) => { event.preventDefault(); void handleCreate() }}>
         <input className="input" autoFocus placeholder="Workspace name" value={createValue} maxLength={80} onChange={(event) => setCreateValue(event.target.value)} aria-label="New workspace name" />
-        <Button size="sm" type="submit" variant="primary" icon={busyId === '__create__' ? Loader2 : Plus} disabled={busyId === '__create__' || !createValue.trim()}>Create</Button>
+        <Button size="sm" type="submit" variant="primary" icon={busyId === '__create__' ? Loader2 : Plus} disabled={busyId === '__create__' || !createValue.trim() || !creationAllowed}>Create</Button>
         <Button size="sm" type="button" variant="ghost" className="icon-button" aria-label="Cancel new workspace" icon={X} disabled={busyId !== null} onClick={() => { setCreating(false); setCreateValue('') }} />
-      </form> : <Button className="mt-4" icon={Plus} disabled={busyId !== null} onClick={() => { setCreating(true); setCreateValue(''); setError('') }}>New workspace</Button>}
+      </form> : <Button className="mt-4" icon={Plus} disabled={busyId !== null || !creationAllowed} onClick={() => { setCreating(true); setCreateValue(''); setError('') }}>New workspace</Button>}
+      {!creationAllowed && <p className="mt-3 text-[11px] text-muted" role="status">{policy.error ?? 'Creating new workspaces is disabled by application policy. Existing workspace history and application-administrator access are unchanged.'}</p>}
   </>
 
   if (empty) return <section className="workspace-directory" aria-label="My workspaces">{contents}</section>

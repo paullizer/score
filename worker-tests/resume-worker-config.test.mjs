@@ -68,6 +68,15 @@ test('resume worker defaults are bounded and use only its dedicated stores and m
   assert.equal(config.rendererUrl, 'https://render.internal.example.northcentralus.azurecontainerapps.io')
 })
 
+test('resume configuration accepts the dedicated settings reader without widening its processing stores', () => {
+  const shared = { SCORE_SETTINGS_CONTAINER: 'application-settings' }
+  assert.equal(loadResumeWorkerConfig(environment(shared)).settingsContainer, 'application-settings')
+  for (const value of ['', 'resume-records', 'analysis-records', 'workspace-state']) {
+    assert.throws(() => loadResumeWorkerConfig(environment({ SCORE_SETTINGS_CONTAINER: value })), /dedicated application-settings/)
+  }
+  assert.throws(() => loadResumeWorkerConfig(environment({ ...shared, JOB_RECORDS_CONTAINER: 'job-records' })), /must not be configured/)
+})
+
 test('resume identity cannot be pointed at job, grade, analysis, legacy, or arbitrary stores', () => {
   for (const key of ['RESUME_RECORDS_CONTAINER', 'RESUME_SOURCE_CONTAINER']) {
     for (const name of ['job-records', 'grade-sources', 'analysis-records', 'workspace-state', 'alternate']) {

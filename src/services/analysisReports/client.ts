@@ -5,6 +5,7 @@ import {
 import { assertReportResourceLimits } from './model'
 import { safeReportFilename } from './presentation'
 import { validatedReportLinkContext } from './links'
+import { captureReportSettings, reportGenerationPolicy, reportLimits } from './policy'
 
 const MAX_FONT_BYTES = 4 * 1024 * 1024
 
@@ -48,8 +49,8 @@ async function reportFonts(signal: AbortSignal): Promise<ReportFontData> {
   return { regular, bold }
 }
 
-export function assertReportFile(bytes: ArrayBuffer, format: AnalysisReportFormat): void {
-  if (!bytes.byteLength || bytes.byteLength > REPORT_LIMITS.maxOutputBytes) {
+export function assertReportFile(bytes: ArrayBuffer, format: AnalysisReportFormat, maxOutputBytes: number = REPORT_LIMITS.maxOutputBytes): void {
+  if (!bytes.byteLength || bytes.byteLength > Math.min(maxOutputBytes, REPORT_LIMITS.maxOutputBytes)) {
     throw new Error('The generated report is empty or too large. Export one job or grade at a time; no partial file was downloaded.')
   }
   const prefix = new Uint8Array(bytes, 0, Math.min(bytes.byteLength, 5))
@@ -65,11 +66,18 @@ export async function generateReportInWorker(
   options: { signal: AbortSignal; onProgress?: (message: string) => void; links?: ReportLinkContext },
 ): Promise<ArrayBuffer> {
   options.signal.throwIfAborted()
-  assertReportResourceLimits(report)
-  const links = validatedReportLinkContext(report, options)
+  const startedAt = Date.now()
+  const policy = reportGenerationPolicy(report, format)
+  const limits = reportLimits(policy)
+  assertReportResourceLimits(report, limits.maxInputBytes)
+  const snapshot = structuredClone(report)
+  snapshot.capture.settings = captureReportSettings(report.capture.settings)
+  const links = validatedReportLinkContext(snapshot, options)
   const lifetime = new AbortController()
   const signal = AbortSignal.any([options.signal, lifetime.signal])
-  const timer = setTimeout(() => lifetime.abort(new DOMException('Report generation timed out', 'TimeoutError')), REPORT_LIMITS.maxGenerationMilliseconds)
+  const remaining = limits.maxGenerationMilliseconds - (Date.now() - startedAt)
+  if (remaining < 0) throw new DOMException('Report generation timed out', 'TimeoutError')
+  const timer = setTimeout(() => lifetime.abort(new DOMException('Report generation timed out', 'TimeoutError')), remaining)
   try {
     let fonts: ReportFontData | undefined
     if (format === 'pdf' || format === 'docx') {
@@ -77,9 +85,12 @@ export async function generateReportInWorker(
       fonts = await reportFonts(signal)
     }
     signal.throwIfAborted()
-    return await runWorker(report, format, signal, options.onProgress, {
+    const bytes = await runWorker(snapshot, format, signal, options.onProgress, {
       ...(links ? { links } : {}), ...(fonts ? { fonts } : {}),
     })
+    signal.throwIfAborted()
+    if (Date.now() - startedAt > limits.maxGenerationMilliseconds) throw new DOMException('Report generation timed out', 'TimeoutError')
+    return bytes
   } finally {
     clearTimeout(timer)
     lifetime.abort()
@@ -120,7 +131,7 @@ function runWorker(
         } else if (data.type === 'error' && typeof data.message === 'string' && data.message.length > 0) {
           fail(new Error(data.message))
         } else if (data.type === 'complete' && data.bytes instanceof ArrayBuffer) {
-          assertReportFile(data.bytes, format)
+          assertReportFile(data.bytes, format, report.capture.settings.policy.maxOutputBytes)
           settled = true
           cleanup()
           resolve(data.bytes)
@@ -138,7 +149,8 @@ function runWorker(
 
 export function downloadAnalysisReport(bytes: ArrayBuffer, report: AnalysisReport, format: AnalysisReportFormat, signal: AbortSignal): string {
   signal.throwIfAborted()
-  assertReportFile(bytes, format)
+  const limits = reportLimits(reportGenerationPolicy(report, format))
+  assertReportFile(bytes, format, limits.maxOutputBytes)
   const filename = safeReportFilename(`${report.dataKind === 'sample' ? 'Sample - ' : ''}${report.run.name}`, format)
   const url = URL.createObjectURL(new Blob([bytes], { type: REPORT_FORMATS[format].mimeType }))
   const anchor = document.createElement('a')

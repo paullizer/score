@@ -1,6 +1,7 @@
 import { useEffect, useId, useRef, useState } from 'react'
 import { LoaderCircle, RefreshCw, RotateCcw } from 'lucide-react'
 import { useRealAnalyses } from '../../app/real-analyses-context'
+import { clientAdmissionReason, usePublicSettings } from '../../app/public-settings-context'
 import type {
   AnalysisNarrativeCounts, AnalysisNarrativeGenerationMode, RealAnalysisCandidateNarrativeSummary,
   RealAnalysisSummariesResponse, RealAnalysisTargetNarrativeSummary,
@@ -63,7 +64,7 @@ export function AnalysisSummaryStatus({ summaries }: { summaries: RealAnalysisSu
   return <div className="space-y-4" aria-label="Summary readiness" aria-live="polite">
     <SummaryCounts label="Candidate summaries" counts={summaries.counts.candidates} />
     <SummaryCounts label="Job / grade overviews" counts={summaries.counts.targets} />
-    {rounds.length > 0 && <p className="text-[12px] text-muted">Summary checks: {rounds.sort().map(round => `round ${round} of 3`).join(' · ')}.</p>}
+    {rounds.length > 0 && <p className="text-[12px] text-muted">Summary checks: {rounds.sort().map(round => `round ${round}`).join(' · ')}. Each operation retains its captured review budget.</p>}
     {pending > 0 && <p className="text-[12px] text-muted">{pending} {pending === 1 ? 'comparison is' : 'comparisons are'} still awaiting or undergoing scoring in this scope. Overviews wait for selected scoring and candidate summaries to finish.</p>}
     {uninitialized > 0 && <p className="text-[11px] text-muted">Not initialized yet: {uninitialized} (included in the waiting count).</p>}
     {(scoring.failed > 0 || scoring.cancelled > 0) && <p className="text-[11px] text-muted">{scoring.failed} failed and {scoring.cancelled} cancelled comparisons remain unassessed, not unsuccessful candidates.</p>}
@@ -82,6 +83,7 @@ export function ManageAnalysisSummaries({ detail, open, initialTargetId, onOpenC
   detail: RealAnalysisRunDetail; open: boolean; initialTargetId?: string; onOpenChange: (open: boolean) => void
 }) {
   const api = useRealAnalyses()
+  const policy = usePublicSettings()
   const { canEdit, archived, inherited, deleting, removed } = useLifecycleAccess({ kind: 'analysis', id: detail.run.id })
   const fieldId = useId()
   const [targetId, setTargetId] = useState(initialTargetId ?? '')
@@ -102,8 +104,8 @@ export function ManageAnalysisSummaries({ detail, open, initialTargetId, onOpenC
   const permission = deleting || removed ? capabilityReasons.deleting
     : archived || inherited ? capabilityReasons.archived
     : !api?.canWrite || !canEdit ? capabilityReasons['read-only']
-    : api.features?.analysisSummaryGeneration !== true ? capabilityReasons['service-unavailable']
-    : summaries?.capabilities.reason ? capabilityReasons[summaries.capabilities.reason] : ''
+    : clientAdmissionReason(policy, 'summaryGeneration') ?? (api.features?.analysisSummaryGeneration !== true ? capabilityReasons['service-unavailable']
+    : summaries?.capabilities.reason ? capabilityReasons[summaries.capabilities.reason] : '')
   const allowed = Boolean(api?.phase === 'ready' && summaries?.capabilities.canGenerate && canEdit && api.canWrite &&
     !loadingError && !permission && !pending && !generating && summaries.scoring.complete > 0)
   useEffect(() => {
@@ -164,6 +166,7 @@ export function ManageAnalysisSummaries({ detail, open, initialTargetId, onOpenC
         <p className="mt-2 text-[11px] text-muted">Only this saved run or one exact job / grade is included. Candidate searches and table filters do not limit summary generation.</p>
       </div>
       <p className="text-[12px]">Only narratives change. Scores, criteria, citations, and frozen documents never change. Generate missing preserves current candidate versions, fills missing or failed summaries, and updates outdated dependent overviews. Missing includes any summary without a current usable version.</p>
+      {policy.settings && <p className="text-[12px]">New-summary policy: {policy.settings.summaries.generationMode === 'on-demand' ? 'on demand — use these explicit controls after scoring.' : 'automatic after completed assessments; these controls also support explicit generation and regeneration.'} Published summaries remain readable.</p>}
       {summaries ? <AnalysisSummaryStatus summaries={summaries} /> : !loadingError && <p className="flex items-center gap-2 text-[12px]" role="status">
         <LoaderCircle size={15} className="animate-spin" aria-hidden="true" />Loading saved summary status...</p>}
       {permission && <p className="text-[12px]" role="status">{permission}</p>}
@@ -178,7 +181,7 @@ export function ManageAnalysisSummaries({ detail, open, initialTargetId, onOpenC
             {' '}Retry summary work, not scoring.</InlineError>
           <details><summary className="cursor-pointer text-[12px] font-semibold">Show affected summaries and history ({items.length})</summary>
             <ul className="mt-3 space-y-3">{items.map(item => <li key={`${targetId}:${item.kind}:${item.kind === 'candidate' ? item.comparisonId : item.targetId}`} className="space-y-2">
-              <p className="text-[12px]">{summaryLabel(item)}{item.summaryRound !== undefined ? ` · round ${item.summaryRound} of 3` : ''}</p>
+              <p className="text-[12px]">{summaryLabel(item)}{item.summaryRound !== undefined ? ` · round ${item.summaryRound}` : ''}</p>
               <SummaryHistoryControl runId={detail.run.id} narrative={item} label={summaryLabel(item)} />
             </li>)}</ul>
           </details>
@@ -212,6 +215,7 @@ export function ManageAnalysisSummaries({ detail, open, initialTargetId, onOpenC
 function NarrativeContent({ runId, narrative, loadError }: {
   runId: string; narrative: RealAnalysisCandidateNarrativeSummary | RealAnalysisTargetNarrativeSummary; loadError?: string
 }) {
+  const { settings } = usePublicSettings()
   const updating = ['waiting', 'queued', 'running'].includes(narrative.status)
   const ready = narrative.status === 'ready' && !loadError
   const label = loadError ? 'Current status unavailable' : ({
@@ -220,7 +224,7 @@ function NarrativeContent({ runId, narrative, loadError }: {
   })[narrative.status]
   return <div className="space-y-3">
     <Badge tone={ready ? 'success' : narrative.status === 'failed' ? 'danger' : 'warning'}>{label}</Badge>
-    {narrative.summaryRound !== undefined && !ready && <p className="text-[12px]">Summary progress: round {narrative.summaryRound} of 3.</p>}
+    {narrative.summaryRound !== undefined && !ready && <p className="text-[12px]">Summary progress: round {narrative.summaryRound}{settings ? '. The captured operation budget applies.' : ' of 3.'}</p>}
     {narrative.published ? <>
       {!ready && <p className="text-[12px] font-semibold" role="status">Previous published summary - {updating && !loadError ? 'updating' : 'outdated'}. It is not current for PDF, Word, or PowerPoint export.</p>}
       <SummaryApprovalDisclosure publication={narrative.published} />

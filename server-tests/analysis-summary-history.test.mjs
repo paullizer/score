@@ -1,7 +1,9 @@
 import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
 import test from 'node:test'
-import { api, fixture, createRun, publishResult, startHttp, ACTOR, clone, sha } from './real-analyses.test-support.mjs'
+import {
+  api, fixture, createRun, seedResume, seedJob, publishResult, startHttp, ACTOR, clone, sha,
+} from './real-analyses.test-support.mjs'
 
 const issue = { code: 'unsupported-claim', message: '<script>Private reviewer finding</script>',
   field: 'text', paragraphIndex: null }
@@ -20,6 +22,29 @@ async function setup(resumes = 1, targets = 1) {
   for (const pair of comparisons) await publishResult(f, created.run.id, pair.record.id)
   const subject = { kind: 'candidate', subjectId: comparisons[0].record.id }
   return { f, runId: created.run.id, subject, comparisons }
+}
+
+async function setupUnconfigured() {
+  const f = fixture(), resume = await seedResume(f), target = await seedJob(f), http = await startHttp(f)
+  let run
+  try {
+    assert.equal(http.config.settings, undefined)
+    const response = await http.request('', 'POST', {
+      name: 'Unconfigured summary checkpoints', resumes: [resume.selection], targets: [target.selection],
+    }, { headers: { 'idempotency-key': randomUUID() } })
+    assert.equal(response.status, 202, await response.clone().text())
+    run = (await response.json()).run.run
+  } finally { await http.close() }
+  assert.equal(run.processingSettings, undefined)
+  assert.equal((await api.readAnalysisManifest(f.analysis.blobs, run)).processingSettings, undefined)
+  const comparison = [...f.analysis.store.values.values()].find(value =>
+    value.record.recordType === 'analysis-comparison' && value.record.runId === run.id)
+  assert.equal(comparison.record.processingSettings, undefined)
+  await publishResult(f, run.id, comparison.record.id)
+  return { f, runId: run.id, subjects: [
+    { kind: 'candidate', subjectId: comparison.record.id },
+    { kind: 'target', subjectId: comparison.record.target.summary.id },
+  ] }
 }
 
 async function save(f, runId, record, etag) {
@@ -82,7 +107,92 @@ async function rounds(f, runId, subject, count = 3, review = true) {
 }
 const selection = (record, step) => ({ generationId: record.generationId, round: step.round, outputSha256: step.outputSha256 })
 
-test('all three generated drafts and exact reviews survive failure, scoped pagination, and a fresh retry', async () => {
+test('unconfigured legacy candidate and target checkpoints retain absent pins and survive accepted retry', async () => {
+  const { f, runId, subjects } = await setupUnconfigured()
+  assert.throws(() => api.analysisHash(undefined), /JSON-serializable content/)
+  for (const subject of subjects) {
+    const state = await api.readSummarySubject(f.analysis, f.workspaceId, runId, subject)
+    assert.equal(state.current.record.processingSettings, undefined)
+    const { current } = await rounds(f, runId, subject, 1)
+    assert.equal(current.record.processingSettings, undefined)
+    const page = await api.readAnalysisSummaryHistory(f.analysis, f.workspaceId, runId, subject)
+    assert.deepEqual(page.entries.map(entry => entry.phase), ['reviewed', 'generated', 'started'])
+    assert.ok(page.entries.every(entry => !Object.hasOwn(entry, 'processingSettings')))
+    assert.equal(current.record.summaryRound, 1)
+    const history = clone(current.record.history)
+    await api.retryAnalysisSummary(f.analysis, f.workspaceId, runId, subject,
+      randomUUID(), page.etag, ACTOR, clock(f))
+    const retried = await f.analysis.store.get(f.workspaceId, current.record.id)
+    assert.equal(retried.record.processingSettings.revision, api.LEGACY_SETTINGS_REVISION)
+    assert.equal(retried.record.generationId, current.record.generationId)
+    assert.equal(retried.record.summaryRound, 1)
+    assert.deepEqual(retried.record.history, history)
+    assert.equal((await api.readSummaryGeneration(f.analysis, retried.record)).steps.length, 3)
+  }
+})
+
+test('checkpoint guards reject absent-to-present and present-to-absent pin changes before writes', async () => {
+  const { f, runId, subjects } = await setupUnconfigured()
+  const current = await claim(f, runId, subjects[0])
+  const pin = api.captureProcessingSettings(api.createDefaultAdminSettings(),
+    api.LEGACY_SETTINGS_REVISION, api.LEGACY_SETTINGS_CAPTURED_AT)
+  const step = { scopeId: 'final', sourceFingerprint: current.record.inputFingerprint,
+    round: 1, phase: 'started', modelCallId: randomUUID() }
+  const before = f.analysis.blobs.values.size
+  await assert.rejects(api.writeSummaryCheckpoint(f.analysis, { ...current.record, processingSettings: pin }, step,
+    { createdAt: advance(f), assertActive: async () => {} }), { name: 'StoreConflictError' })
+  assert.equal(f.analysis.blobs.values.size, before)
+  f.analysis.store.save({ ...current.record, processingSettings: pin })
+  await assert.rejects(api.writeSummaryCheckpoint(f.analysis, current.record, step,
+    { createdAt: advance(f), assertActive: async () => {} }), { name: 'StoreConflictError' })
+  assert.equal(f.analysis.blobs.values.size, before)
+})
+
+test('pinned history, publications and manifests reject missing record pins without hashing undefined', async () => {
+  const { f, runId, subject, comparisons } = await setup()
+  const { current, entries } = await rounds(f, runId, subject, 1)
+  const pinless = clone(current.record)
+  delete pinless.processingSettings
+  await assert.rejects(api.readSummaryHistoryEntry(f.analysis, pinless, current.record.history),
+    /Summary checkpoint changed its accepted generation settings/)
+  const run = (await f.analysis.store.get(f.workspaceId, runId)).record
+  const manifest = await api.readAnalysisManifest(f.analysis.blobs, run)
+  const pinlessRun = clone(run)
+  delete pinlessRun.processingSettings
+  await assert.rejects(api.readAnalysisManifest(f.analysis.blobs, pinlessRun), /Manifest does not belong to this run/)
+  const pinlessComparison = clone(comparisons[0].record)
+  delete pinlessComparison.processingSettings
+  assert.throws(() => api.assertComparisonManifestBinding(manifest, pinlessComparison),
+    /Comparison does not match its immutable plan/)
+  await api.publishAnalysisSummaryDraft(f.analysis, f.workspaceId, runId, subject,
+    selection(current.record, entries[0]), randomUUID(), current.etag, ACTOR, clock(f))
+  const published = clone((await f.analysis.store.get(f.workspaceId, current.record.id)).record)
+  delete published.processingSettings
+  await assert.rejects(api.readAnalysisNarrativePublication(f.analysis.blobs, published),
+    /Narrative publication changed its accepted generation settings/)
+})
+
+test('legacy immutable history and manifests cannot be rebound to newer policy', async () => {
+  const { f, runId, subjects } = await setupUnconfigured()
+  const { current } = await rounds(f, runId, subjects[0], 1)
+  const run = (await f.analysis.store.get(f.workspaceId, runId)).record
+  const manifest = await api.readAnalysisManifest(f.analysis.blobs, run)
+  const comparison = (await f.analysis.store.get(f.workspaceId, subjects[0].subjectId)).record
+  const baseline = api.captureProcessingSettings(api.createDefaultAdminSettings(),
+    api.LEGACY_SETTINGS_REVISION, api.LEGACY_SETTINGS_CAPTURED_AT)
+  const newer = api.captureProcessingSettings(api.createDefaultAdminSettings(), 'newer-policy', f.now)
+  await api.readSummaryHistoryEntry(f.analysis, { ...current.record, processingSettings: baseline }, current.record.history)
+  await api.readAnalysisManifest(f.analysis.blobs, { ...run, processingSettings: baseline })
+  assert.doesNotThrow(() => api.assertComparisonManifestBinding(manifest, { ...comparison, processingSettings: baseline }))
+  await assert.rejects(api.readSummaryHistoryEntry(f.analysis, { ...current.record, processingSettings: newer }, current.record.history),
+    /Summary checkpoint changed its accepted generation settings/)
+  await assert.rejects(api.readAnalysisManifest(f.analysis.blobs, { ...run, processingSettings: newer }),
+    /Manifest does not belong to this run/)
+  assert.throws(() => api.assertComparisonManifestBinding(manifest, { ...comparison, processingSettings: newer }),
+    /Comparison does not match its immutable plan/)
+})
+
+test('all three drafts and reviews survive a pinned retry; only explicit regeneration receives a fresh round budget', async () => {
   const { f, runId, subject } = await setup()
   let result = await rounds(f, runId, subject)
   const firstGeneration = result.current.record.generationId
@@ -97,14 +207,20 @@ test('all three generated drafts and exact reviews survive failure, scoped pagin
   const key = randomUUID()
   const retry = await api.retryAnalysisSummary(f.analysis, f.workspaceId, runId, subject, key, page.etag, ACTOR, clock(f))
   assert.equal(retry.summaries.comparisons[0].status, 'queued')
-  assert.notEqual(retry.summaries.comparisons[0].generationId, firstGeneration)
-  assert.equal(retry.summaries.comparisons[0].summaryRound, undefined)
+  assert.equal(retry.summaries.comparisons[0].generationId, firstGeneration)
+  assert.equal(retry.summaries.comparisons[0].summaryRound, 3)
   const next = await f.analysis.store.get(f.workspaceId, result.current.record.id)
   assert.deepEqual(next.record.history, originalHistory)
   const resumed = await api.readSummaryGeneration(f.analysis, next.record)
-  assert.deepEqual(resumed.steps, [])
-  assert.equal(resumed.seed.round, 3)
-  assert.equal(resumed.seed.review.issues[0].message, issue.message)
+  assert.equal(resumed.steps.length, 9)
+  assert.equal(resumed.seed, undefined)
+  assert.deepEqual(next.record.processingSettings, result.current.record.processingSettings)
+  const summaries = await f.service.summaries(f.workspaceId, runId)
+  const fresh = await f.service.generateSummaries(f.workspaceId, runId, { mode: 'all' }, randomUUID(), summaries.etag, ACTOR)
+  await api.advanceAnalysisNarrativeRequest(f.analysis, f.workspaceId, runId, fresh.requestId, clock(f))
+  const regenerated = await f.analysis.store.get(f.workspaceId, result.current.record.id)
+  assert.notEqual(regenerated.record.generationId, firstGeneration)
+  assert.equal(regenerated.record.summaryRound, undefined)
   result = await rounds(f, runId, subject)
   page = await api.readAnalysisSummaryHistory(f.analysis, f.workspaceId, runId, subject)
   assert.equal(page.entries.length, 12)
@@ -353,10 +469,89 @@ test('manual publication races fail closed and cannot overwrite a newly requeste
     selection(result.current.record, result.entries[0]), randomUUID(), history.etag, ACTOR, clock(f)), { status: 409 })
   assert.equal(raced, true)
   const current = await f.analysis.store.get(f.workspaceId, result.current.record.id)
-  assert.equal(current.record.requestId, retryKey)
+  assert.equal(current.record.retryRequestId, retryKey)
+  assert.equal(current.record.generationId, result.current.record.generationId)
   assert.equal(current.record.status, 'queued')
   assert.equal(current.record.published, undefined)
   assert.equal([...f.analysis.blobs.values.keys()].some(name => name.includes('/narratives/candidate/')), false)
+})
+
+test('publishing an older exact draft keeps its processing pin while a newly admitted dependent target captures current policy', async () => {
+  const { f, runId, subject } = await setup()
+  const older = await rounds(f, runId, subject, 1)
+  const settings = api.createDefaultAdminSettings()
+  settings.summaries.maxRounds = 1
+  const currentPolicy = api.captureProcessingSettings(settings, 'new-summary-policy', f.now)
+  const supplier = async () => currentPolicy
+  const summaries = await f.service.summaries(f.workspaceId, runId)
+  const requested = await api.generateAnalysisSummaries(f.analysis, f.workspaceId, runId,
+    { mode: 'all' }, randomUUID(), summaries.etag, ACTOR, clock(f), supplier)
+  await api.advanceAnalysisNarrativeRequest(f.analysis, f.workspaceId, runId, requested.requestId, clock(f))
+  await rounds(f, runId, subject, 1)
+  const state = await api.readSummarySubject(f.analysis, f.workspaceId, runId, subject)
+  assert.equal(state.current.record.processingSettings.revision, 'new-summary-policy')
+  await api.publishAnalysisSummaryDraft(f.analysis, f.workspaceId, runId, subject,
+    selection(older.current.record, older.entries[0]), randomUUID(), state.etag, ACTOR, clock(f), supplier)
+  const published = await f.analysis.store.get(f.workspaceId, older.current.record.id)
+  const artifact = await api.readAnalysisNarrativePublication(f.analysis.blobs, published.record)
+  assert.deepEqual(published.record.processingSettings, older.current.record.processingSettings)
+  assert.deepEqual(artifact.processingSettings, older.current.record.processingSettings)
+  const target = [...f.analysis.store.values.values()].find(value => value.record.recordType === 'analysis-target-narrative')
+  assert.deepEqual(target.record.processingSettings, currentPolicy)
+})
+
+test('configured rollout inactivity permits authorized manual publication without admitting a new dependent generation', async () => {
+  const { f, runId, subject } = await setup()
+  const saved = await rounds(f, runId, subject, 1)
+  const value = api.createDefaultAdminSettings()
+  value.summaries.historyRoles = 'owner'
+  value.summaries.manualPublicationRoles = 'owner'
+  const settings = { async capture() { return api.captureProcessingSettings(value, 'publication-access-policy', f.now) } }
+  const http = await startHttp(f, true, settings, false)
+  const target = clone([...f.analysis.store.values.values()].find(value => value.record.recordType === 'analysis-target-narrative'))
+  const history = await api.readAnalysisSummaryHistory(f.analysis, f.workspaceId, runId, subject)
+  const path = `/${runId}/summaries/candidate/${subject.subjectId}`
+  const selected = selection(saved.current.record, saved.entries[0])
+  try {
+    assert.equal((await http.request(`${path}/history`, 'GET', undefined, { role: 'editor' })).status, 403)
+    assert.equal((await http.request(`${path}/history`)).status, 200)
+    const denied = await http.request(`${path}/publish`, 'POST', selected, {
+      role: 'editor', headers: { 'idempotency-key': randomUUID(), 'if-match': history.etag },
+    })
+    assert.equal(denied.status, 403)
+    const response = await http.request(`${path}/publish`, 'POST', selected,
+      { headers: { 'idempotency-key': randomUUID(), 'if-match': history.etag } })
+    assert.equal(response.status, 200, await response.clone().text())
+    const published = await f.analysis.store.get(f.workspaceId, saved.current.record.id)
+    assert.equal(published.record.status, 'ready')
+    assert.deepEqual(published.record.processingSettings, saved.current.record.processingSettings)
+    assert.deepEqual(await f.analysis.store.get(f.workspaceId, target.record.id), target)
+    const scope = await f.service.summaries(f.workspaceId, runId)
+    assert.equal((await http.request(`/${runId}/summaries`, 'POST', { mode: 'all' },
+      { headers: { 'idempotency-key': randomUUID(), 'if-match': scope.etag } })).status, 503)
+  } finally { await http.close() }
+})
+
+test('configured rollout inactivity and settings outage cannot rebind an accepted summary retry or reset its round budget', async () => {
+  const { f, runId, subject } = await setup()
+  const saved = await rounds(f, runId, subject)
+  let reads = 0
+  const settings = { async capture() { reads++; throw api.unavailable('Current settings unavailable') } }
+  const http = await startHttp(f, true, settings, false)
+  const history = await api.readAnalysisSummaryHistory(f.analysis, f.workspaceId, runId, subject)
+  const target = clone([...f.analysis.store.values.values()].find(value => value.record.recordType === 'analysis-target-narrative'))
+  try {
+    const response = await http.request(`/${runId}/summaries/candidate/${subject.subjectId}/retry`, 'POST', {},
+      { headers: { 'idempotency-key': randomUUID(), 'if-match': history.etag } })
+    assert.equal(response.status, 202, await response.clone().text())
+    assert.equal(reads, 0)
+    const retried = await f.analysis.store.get(f.workspaceId, saved.current.record.id)
+    assert.equal(retried.record.generationId, saved.current.record.generationId)
+    assert.equal(retried.record.summaryRound, 3)
+    assert.deepEqual(retried.record.processingSettings, saved.current.record.processingSettings)
+    assert.deepEqual(retried.record.history, saved.current.record.history)
+    assert.deepEqual(await f.analysis.store.get(f.workspaceId, target.record.id), target)
+  } finally { await http.close() }
 })
 
 test('run deletion drains history writers and removes linked checkpoints, orphan checkpoints, and action reservations', async () => {
@@ -510,6 +705,9 @@ test('legacy v1 publications remain hash-stable and use legacy provenance/prose 
   assert.deepEqual((await f.service.summarySubject(f.workspaceId, runId, subject)).narrative, summaries.comparisons[0])
   assert.equal(sha(f.analysis.blobs.values.get(name).bytes), blob.sha256)
   assert.equal((await api.readAnalysisNarrativePublication(f.analysis.blobs, record)).provenance.outputSha256, api.analysisHash(output))
+  const newer = api.captureProcessingSettings(api.createDefaultAdminSettings(), 'newer-publication-policy', f.now)
+  await assert.rejects(api.readAnalysisNarrativePublication(f.analysis.blobs, { ...record, processingSettings: newer }),
+    /Narrative publication changed its accepted generation settings/)
   const invalid = clone(artifact); invalid.provenance.groundingReviews = []
   assert.throws(() => api.parseAnalysisNarrativeArtifact(invalid))
 })

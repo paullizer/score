@@ -12,6 +12,8 @@ import { isSafeUploadedFilename, uploadedFileKind } from '../domain/source-files
 import { UPLOAD_CONTENT_TYPES, type UploadFormat } from '../domain/document-formats'
 import { requireUploadFile, uploadFileByteLimit } from './documentUploads'
 import { normalizeDisplayName } from '../domain/displayNames'
+import type { PublicSettings } from '../domain/admin-settings'
+import { fetchPublicFeatures, jobFeaturesWithPolicy, requireImportFile, requireImportUrl } from './publicSettings'
 
 type RealJobWireSummary = RealJobSummary
 
@@ -29,8 +31,8 @@ function normalizeSummary(summary: RealJobWireSummary): RealJobSummary {
 }
 
 export async function fetchJobProcessingFeatures(signal?: AbortSignal): Promise<JobProcessingFeatures> {
-  const features = await cloudJsonRequest<Partial<JobProcessingFeatures>>('/features', { method: 'GET', signal })
-  return {
+  const features = await fetchPublicFeatures(signal)
+  return jobFeaturesWithPolicy({
     realJobImports: features.realJobImports === true,
     markdownJobImports: features.realJobImports === true && features.markdownJobImports === true,
     wordDocumentImports: features.realJobImports === true && features.wordDocumentImports === true,
@@ -39,7 +41,7 @@ export async function fetchJobProcessingFeatures(signal?: AbortSignal): Promise<
       ...features.limits,
       maxFileBytes: Math.min(features.limits?.maxFileBytes ?? JOB_IMPORT_LIMITS.maxFileBytes, JOB_IMPORT_LIMITS.maxFileBytes),
     },
-  }
+  }, features.publicSettings)
 }
 
 export async function listAllRealJobs(workspaceId: string, signal?: AbortSignal): Promise<RealJobSummary[]> {
@@ -77,7 +79,9 @@ async function importRealJobUpload(
   idempotencyKey: string,
   batchId?: string,
   signal?: AbortSignal,
+  settings?: PublicSettings | null,
 ): Promise<RealJobSummary> {
+  requireImportFile(file, 'jobs', settings)
   const label = kind === 'markdown' ? 'Markdown' : kind.toUpperCase()
   const actualKind = uploadedFileKind(file)
   // Only legacy job PDF calls leave malformed PDF basenames to the server.
@@ -107,23 +111,23 @@ async function importRealJobUpload(
 }
 
 export function importRealJobPdf(
-  workspaceId: string, file: File, idempotencyKey: string, batchId?: string, signal?: AbortSignal,
+  workspaceId: string, file: File, idempotencyKey: string, batchId?: string, signal?: AbortSignal, settings?: PublicSettings | null,
 ): Promise<RealJobSummary> {
-  return importRealJobUpload(workspaceId, file, 'pdf', idempotencyKey, batchId, signal)
+  return importRealJobUpload(workspaceId, file, 'pdf', idempotencyKey, batchId, signal, settings)
 }
 
 export function importRealJobMarkdown(
-  workspaceId: string, file: File, idempotencyKey: string, batchId?: string, signal?: AbortSignal,
+  workspaceId: string, file: File, idempotencyKey: string, batchId?: string, signal?: AbortSignal, settings?: PublicSettings | null,
 ): Promise<RealJobSummary> {
-  return importRealJobUpload(workspaceId, file, 'markdown', idempotencyKey, batchId, signal)
+  return importRealJobUpload(workspaceId, file, 'markdown', idempotencyKey, batchId, signal, settings)
 }
 
 export async function importRealJobFile(
-  workspaceId: string, file: File, idempotencyKey: string, batchId?: string, signal?: AbortSignal,
+  workspaceId: string, file: File, idempotencyKey: string, batchId?: string, signal?: AbortSignal, settings?: PublicSettings | null,
 ): Promise<RealJobSummary> {
   const kind = uploadedFileKind(file) ?? (file.type === 'application/pdf' ? 'pdf' : undefined)
   if (!kind) throw new Error('Choose a supported file: PDF, Markdown (.md or .markdown), DOCX or DOC. Other formats are not supported.')
-  return importRealJobUpload(workspaceId, file, kind, idempotencyKey, batchId, signal)
+  return importRealJobUpload(workspaceId, file, kind, idempotencyKey, batchId, signal, settings)
 }
 
 export async function importRealJobUrl(
@@ -132,7 +136,9 @@ export async function importRealJobUrl(
   idempotencyKey: string,
   batchId?: string,
   signal?: AbortSignal,
+  settings?: PublicSettings | null,
 ): Promise<RealJobSummary> {
+  requireImportUrl(url, 'jobs', settings)
   const headers = new Headers({ 'Idempotency-Key': idempotencyKey })
   const response = await cloudJsonRequest<{ job: RealJobWireSummary }>(`${jobsPath(workspaceId)}/url`, {
     method: 'POST',

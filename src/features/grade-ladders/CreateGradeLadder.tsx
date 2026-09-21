@@ -2,6 +2,9 @@ import { useEffect, useRef, useState, type FormEvent } from 'react'
 import { Link, useNavigate, useSearchParams } from 'react-router-dom'
 import { Layers3, LoaderCircle } from 'lucide-react'
 import { useWorkspace } from '../../app/workspace-context'
+import { clientAdmissionReason, usePublicSettings } from '../../app/public-settings-context'
+import { initialGradeContext, initialGradeLevels } from './gradeDefaults'
+import { requireGradeLevels } from '../../services/gradeLadders'
 import { useGradeLadders } from '../../app/grade-ladders-context'
 import { useGradeLeaveGuard } from '../../app/grade-navigation-context'
 import { Badge, Button, EmptyState, InlineError, Modal, PageHeader } from '../../components/ui'
@@ -13,10 +16,11 @@ import { useGradeRequestKey } from './grade-request-hooks'
 import { isEntityArchived } from '../../domain/lifecycle'
 import { LifecycleBanner } from '../../components/lifecycle/LifecycleControls'
 
-const blankContext: GradeContext = { series: '', agency: '', agencyType: 'unknown', supervision: 'unknown', functions: [], specialty: '', confirmed: false, answers: {} }
-
 export function CreateGradeLadder() {
   const { workspace, cloud } = useWorkspace()
+  const policy = usePublicSettings()
+  const defaults = useRef(policy.settings)
+  const policyReason = clientAdmissionReason(policy, 'gradeLadders')
   const api = useGradeLadders()
   const navigate = useNavigate()
   const [params] = useSearchParams()
@@ -24,8 +28,8 @@ export function CreateGradeLadder() {
   const [rubricId, setRubricId] = useState(params.get('rubric') ?? '')
   const [rubricVersion, setRubricVersion] = useState(Number(params.get('rubricVersion')) || 0)
   const [name, setName] = useState('')
-  const [context, setContext] = useState<GradeContext>(blankContext)
-  const [grades, setGrades] = useState<number[]>([])
+  const [context, setContext] = useState<GradeContext>(() => initialGradeContext(defaults.current))
+  const [grades, setGrades] = useState<number[]>(() => initialGradeLevels(defaults.current))
   const [seedConfirmed, setSeedConfirmed] = useState(false)
   const [dirty, setDirty] = useState(false)
   const [saving, setSaving] = useState(false)
@@ -48,7 +52,7 @@ export function CreateGradeLadder() {
     if (!job || appliedJob.current === job.id) return
     appliedJob.current = job.id
     setName(`${job.title} · GS ladder`.slice(0, 160))
-    setContext({ ...blankContext, series: /^\d{4}$/.test(job.series) ? job.series : '', agency: job.organization })
+    setContext(initialGradeContext(defaults.current, job))
     setSeedConfirmed(false)
   }, [job])
 
@@ -56,6 +60,8 @@ export function CreateGradeLadder() {
     event.preventDefault()
     if (submitted.current || !api || !api.canWrite) return
     const errors = contextErrors(name, context, grades)
+    if (policyReason) errors.unshift(policyReason)
+    try { requireGradeLevels(grades, policy.settings) } catch (caught) { errors.push(caught instanceof Error ? caught.message : 'Review the allowed GS levels.') }
     if (!job || !selectedRubric || !seedConfirmed) errors.unshift('Select a ready real job and confirm its exact saved rubric version.')
     if (errors.length) { setError(errors.join(' ')); return }
     submitted.current = true
@@ -78,7 +84,7 @@ export function CreateGradeLadder() {
   }
 
   if (!api || api.phase === 'unavailable') return <EmptyState icon={Layers3} title="Real grade ladders are unavailable" description="Open an authenticated workspace with grade processing enabled. The Samples view is separate and is not a replacement for real sources." action={<Link className="button button-secondary button-md" to="/rubrics?kind=grade">Back to rubrics</Link>} />
-  const disabled = !api.canWrite || saving || api.mutationPending || api.phase !== 'ready'
+  const disabled = !api.canWrite || saving || api.mutationPending || api.phase !== 'ready' || !api.features?.realGradeLadders || Boolean(policyReason)
   const close = () => { void guard.close(() => navigate('/rubrics?kind=grade&data=real', { replace: true })) }
   return <>
     <PageHeader eyebrow="PRIVATE GS GRADE LIBRARY" title="Create a grade ladder" description="Start from a saved real job, not a sample or an inferred occupational series." />
@@ -87,6 +93,7 @@ export function CreateGradeLadder() {
     <Modal open onOpenChange={(open) => { if (!open) close() }} title="Create grade ladder" description="Capture a seed job and saved rubric version. Automatic OPM discovery continues durably on the server." wide
       footer={<><Button onClick={close}>Cancel</Button><Button variant="primary" type="submit" form="create-grade-ladder" icon={saving ? LoaderCircle : Layers3} disabled={disabled || !job || !selectedRubric}>{saving ? 'Capturing seed…' : 'Create and discover sources'}</Button></>}>
       {!api.canWrite && <InlineError>This workspace is read-only. An owner or editor can create a ladder.</InlineError>}
+      {policyReason && <InlineError>{policyReason}</InlineError>}
       {api.error && <InlineError>{api.error} <button className="underline" onClick={() => void api.refresh()}>Retry availability</button></InlineError>}
       {jobId && !job && <InlineError>The requested seed is archived, missing, or has no active rubric. Choose an active, ready real job. Archived selections from old links are not accepted.</InlineError>}
       <form id="create-grade-ladder" onSubmit={submit} noValidate className="space-y-5">

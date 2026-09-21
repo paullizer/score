@@ -3,7 +3,7 @@ import { ANALYSIS_REPORT_SCHEMA_VERSION, REPORT_LIMITS } from '../../domain/anal
 import type {
   AnalysisReport, AnalysisReportBuildOptions, AnalysisReportInput, RealReportBatchResponse,
   ReportCitation, ReportCitationSource, ReportComparison, ReportDataKind, ReportGroup,
-  ReportStatusCounts, ReportTarget,
+  ReportPolicy, ReportStatusCounts, ReportTarget,
 } from '../../domain/analysis-reports'
 import type { Citation } from '../../domain/types'
 import { buildReportNotices, citationLocator } from './presentation'
@@ -14,6 +14,7 @@ import {
 } from './narrative-schemas'
 import { requireReportNarratives } from './narratives'
 import { normalizeDisplayName } from '../../domain/displayNames'
+import { captureReportSettings, reportLimits, reportSettingsCaptureSchema } from './policy'
 
 const id = z.string().min(1).max(1024).refine(value => value === value.trim(), 'Identity must not contain surrounding whitespace.')
 const text = z.string().max(REPORT_LIMITS.maxTextCharacters)
@@ -288,7 +289,7 @@ export function assertReportResourceLimits(value: unknown, maxBytes: number = RE
   try { serialized = JSON.stringify(value) } catch { throw new Error('Report data must be JSON-serializable without circular references.') }
   if (serialized === undefined) throw new Error('Report data must be a JSON-serializable value.')
   if (serialized.length > maxBytes || new TextEncoder().encode(serialized).byteLength > maxBytes) {
-    throw new Error(`Report data exceeds the ${Math.floor(maxBytes / 1024 / 1024)} MiB resource limit. Narrow the export to one exact job/grade target; no comparisons or evidence have been omitted.`)
+    throw new Error(`Report data exceeds the ${maxBytes.toLocaleString('en-US')}-byte resource limit. Narrow the export to one exact job/grade target; no comparisons or evidence have been omitted.`)
   }
 }
 
@@ -304,9 +305,13 @@ export const realReportBatchResponseSchema: z.ZodType<RealReportBatchResponse> =
   targets: z.array(realTargetSchema).min(1).max(REPORT_LIMITS.batchComparisons),
   comparisons: z.array(realComparisonSchema).min(1).max(REPORT_LIMITS.batchComparisons),
   summaries: realNarrativeReportCaptureSchema.optional(),
+  settings: reportSettingsCaptureSchema.optional(),
 }).superRefine((response, context) => {
   validateCollection(response.targets, response.comparisons, 'real', context)
   validateResources(response, REPORT_LIMITS.maxBatchBytes, context)
+  if (response.settings && response.comparisons.length > response.settings.policy.batchComparisons) {
+    issue(context, 'The report response exceeds the captured comparison batch limit.')
+  }
 })
 
 export function parseRealReportBatchResponse(value: unknown): RealReportBatchResponse {
@@ -318,7 +323,10 @@ const reportInputSchema: z.ZodType<AnalysisReportInput> = z.strictObject({
   dataKind: z.enum(['real', 'sample']),
   workspaceId: id.optional(),
   run: z.strictObject({ id, name: label, createdAt: timestamp }),
-  capture: z.strictObject({ startedAt: timestamp, completedAt: timestamp, summaries: reportNarrativeCaptureSchema.optional() }),
+  capture: z.strictObject({
+    startedAt: timestamp, completedAt: timestamp,
+    summaries: reportNarrativeCaptureSchema.optional(), settings: reportSettingsCaptureSchema.optional(),
+  }),
   generatedAt: timestamp,
   targets: z.array(reportTargetSchema).min(1).max(REPORT_LIMITS.maxTargets),
   comparisons: z.array(reportComparisonSchema).min(1).max(REPORT_LIMITS.maxComparisons),
@@ -356,7 +364,7 @@ export function countReportStatuses(comparisons: readonly Pick<ReportComparison,
   return counts
 }
 
-function buildGroup(target: ReportTarget, comparisons: ReportComparison[]): ReportGroup {
+function buildGroup(target: ReportTarget, comparisons: ReportComparison[], policy: ReportPolicy): ReportGroup {
   const ordered = [...comparisons].sort((left, right) => {
     const leftScore = left.status === 'complete' && left.overall.status === 'available' ? left.overall.score : null
     const rightScore = right.status === 'complete' && right.overall.status === 'available' ? right.overall.score : null
@@ -365,10 +373,10 @@ function buildGroup(target: ReportTarget, comparisons: ReportComparison[]): Repo
     return rightScore - leftScore || left.index - right.index
   })
   const scored = ordered.filter(comparison => comparison.status === 'complete' && comparison.overall.status === 'available')
-  const cutoff = scored[Math.min(REPORT_LIMITS.highlightCount, scored.length) - 1]
+  const cutoff = scored[Math.min(policy.highlightCount, scored.length) - 1]
   const cutoffScore = cutoff?.overall.status === 'available' ? cutoff.overall.score : null
   const eligible = scored.filter(comparison => comparison.overall.status === 'available' && cutoffScore !== null && comparison.overall.score >= cutoffScore)
-  const highlightedComparisonIds = eligible.slice(0, REPORT_LIMITS.maxHighlights).map(comparison => comparison.id)
+  const highlightedComparisonIds = eligible.slice(0, policy.maxHighlights).map(comparison => comparison.id)
   const highlighted = new Set(highlightedComparisonIds)
   let lastScore: number | null = null
   let lastRank = 0
@@ -389,6 +397,7 @@ function buildGroup(target: ReportTarget, comparisons: ReportComparison[]): Repo
     highlightedComparisonIds,
     cutoffScore,
     additionalCutoffTies: Math.max(0, eligible.length - highlightedComparisonIds.length),
+    highlightLimit: policy.maxHighlights,
   }
 }
 
@@ -399,6 +408,12 @@ export function buildAnalysisReport(input: AnalysisReportInput, options: Analysi
   if (filter.targetId && !source.targets.some(target => target.id === filter.targetId)) throw new Error('The selected exact target is not in this saved analysis.')
   const targets = source.targets.filter(target => !filter.targetId || target.id === filter.targetId)
   const comparisons = source.comparisons.filter(comparison => !filter.targetId || comparison.targetId === filter.targetId)
+  const settings = captureReportSettings(source.capture.settings)
+  const limits = reportLimits(settings.policy)
+  if (comparisons.length > limits.maxComparisons) {
+    throw new Error(`This export exceeds the ${limits.maxComparisons}-comparison report limit. Narrow the export to one exact job/grade target; no comparisons have been omitted.`)
+  }
+  assertReportResourceLimits({ ...source, targets, comparisons, capture: { ...source.capture, settings } }, limits.maxInputBytes)
   const counts = countReportStatuses(comparisons)
   if (!counts.complete) throw new Error('At least one comparison in the selected scope must be complete before exporting. A completed result with a withheld score is eligible.')
   const report: AnalysisReport = {
@@ -406,16 +421,16 @@ export function buildAnalysisReport(input: AnalysisReportInput, options: Analysi
     dataKind: source.dataKind,
     ...(source.workspaceId === undefined ? {} : { workspaceId: source.workspaceId }),
     run: source.run,
-    capture: source.capture,
+    capture: { ...source.capture, settings },
     generatedAt: source.generatedAt,
     scope: { targetId: filter.targetId ?? null },
     candidateCount: new Set(comparisons.map(comparison => comparison.candidate.id)).size,
     counts,
     partial: counts.complete !== counts.total,
-    notices: buildReportNotices(source.dataKind, counts),
-    groups: targets.map(target => buildGroup(target, comparisons.filter(comparison => comparison.targetId === target.id))),
+    notices: buildReportNotices(source.dataKind, counts, settings.policy.additionalFooter),
+    groups: targets.map(target => buildGroup(target, comparisons.filter(comparison => comparison.targetId === target.id), settings.policy)),
   }
-  assertReportResourceLimits(report)
+  assertReportResourceLimits(report, limits.maxInputBytes)
   if (report.capture.summaries !== undefined) requireReportNarratives(report)
   return report
 }
