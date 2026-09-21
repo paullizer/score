@@ -11,7 +11,7 @@ import tailwindcss from 'tailwindcss'
 import autoprefixer from 'autoprefixer'
 import tailwindConfig from '../../tailwind.config.js'
 import {
-  analysisSummaryFixture, candidateNarrativeText, summaryHistoryFixture, summaryResponse, summaryRunId, summaryTimestamp, summaryWorkspaceId,
+  analysisSummaryFixture, candidateNarrativeText, summaryHistoryFixture, summaryResponse, summarySubjectResponse, summaryRunId, summaryTimestamp, summaryWorkspaceId,
 } from './analysisSummaries.test-support.mjs'
 
 const output = resolve(`.summary-browser-tests-${randomUUID()}`)
@@ -41,17 +41,33 @@ before(async () => {
     stdin: { resolveDir: process.cwd(), loader: 'tsx', contents: `
       import React, { useState } from 'react'
       import { createRoot } from 'react-dom/client'
-      import { MemoryRouter } from 'react-router-dom'
+      import { MemoryRouter, useLocation, useNavigate } from 'react-router-dom'
       import { RealAnalysesBridge } from './src/app/RealAnalysesBridge'
       import { useRealAnalyses } from './src/app/real-analyses-context'
+      import { RealResumesContext } from './src/app/real-resumes-context'
       import { WorkspaceContext } from './src/app/workspace-context'
       import { RealAnalysisDetail } from './src/features/analyses/RealAnalysisDetail'
+      import { AnalysisSetup } from './src/features/analyses/AnalysisSetup'
       import { AnalysisReportExport } from './src/features/analyses/AnalysisReportExport'
       import { frontendWorkspaceContext } from './src/services/frontend.test-support.mjs'
       import { createInitialWorkspace } from './src/data/fixtures'
       function Probe() {
         const api = useRealAnalyses()
-        return <button onClick={() => void api.refresh()}>Refresh fixture history</button>
+        const navigate = useNavigate()
+        return <>
+          <button onClick={() => void api.refresh()}>Refresh fixture history</button>
+          <button onClick={() => navigate('/analyses?data=real')}>Return fixture library</button>
+          <button onClick={() => navigate('/analyses/run-one?data=real')}>Open fixture analysis</button>
+          <button onClick={() => navigate('/analyses/new?data=real')}>Open fixture real setup</button>
+          <button onClick={() => navigate('/analyses/new?data=samples')}>Open fixture sample setup</button>
+        </>
+      }
+      function SavedAnalysis() {
+        const location = useLocation()
+        if (location.pathname === '/analyses/new') return <RealResumesContext.Provider value={{
+          phase: 'ready', summaries: [], refresh: async () => {},
+        }}><AnalysisSetup key={location.key} /></RealResumesContext.Provider>
+        return location.pathname === '/analyses/run-one' ? <RealAnalysisDetail id="run-one" /> : <h1>Fixture analysis library</h1>
       }
       function Harness() {
         const [workspaceId, setWorkspaceId] = useState('workspace-one')
@@ -63,7 +79,7 @@ before(async () => {
           <WorkspaceContext.Provider value={context}>
             <button onClick={() => setWorkspaceId('workspace-two')}>Switch fixture workspace</button>
             {sample ? <AnalysisReportExport source={{ kind: 'sample', run: createInitialWorkspace().runs[0], available: true }} />
-              : <RealAnalysesBridge workspaceId={workspaceId}><Probe /><RealAnalysisDetail id="run-one" /></RealAnalysesBridge>}
+              : <RealAnalysesBridge workspaceId={workspaceId}><Probe /><SavedAnalysis /></RealAnalysesBridge>}
           </WorkspaceContext.Provider>
         </MemoryRouter>
       }
@@ -141,6 +157,7 @@ after(async () => {
 async function setup(t, {
   role = 'owner', archived = false, secondStatus = 'complete', summaryOptions = {}, result = false, sample = false,
   features = { realAnalyses: false, analysisSummaryGeneration: true },
+  beforeSubjectGet = null,
 } = {}) {
   const context = await browser.newContext({ viewport: { width: 1440, height: 1100 } })
   t.after(() => context.close())
@@ -148,6 +165,9 @@ async function setup(t, {
     window.fixtureRole = role
     const interval = window.setInterval.bind(window)
     window.setInterval = (callback, delay, ...args) => interval(callback, delay === 3000 ? 150 : delay, ...args)
+    const now = Date.now.bind(Date)
+    const started = now()
+    Date.now = () => started + (now() - started) * 20
   }, { role })
   const page = await context.newPage()
   page.setDefaultTimeout(15_000)
@@ -156,7 +176,7 @@ async function setup(t, {
   t.after(() => assert.deepEqual(errors, []))
   const fixture = analysisSummaryFixture({ archived, secondStatus })
   const state = {
-    fixture, requests: [], options: { ...summaryOptions }, beforeGet: null, onPost: null,
+    fixture, liveTargets: structuredClone(fixture.targets), requests: [], options: { ...summaryOptions }, beforeGet: null, beforeSubjectGet, onPost: null,
     histories: new Map(), acknowledged: new Map(), beforeHistoryGet: null, onSummaryAction: null, summaryActions: 0,
     history(subject) {
       const key = `${subject.kind}:${subject.subjectId}`
@@ -189,17 +209,27 @@ async function setup(t, {
     const record = { path: url.pathname, targetId: url.searchParams.get('targetId'), cursor: url.searchParams.get('continuationToken'), method: request.method(),
       headers: request.headers(), body: request.postData() ? request.postDataJSON() : null }
     state.requests.push(record)
-    const respond = (body, status = 200) => route.fulfill({ status, contentType: 'application/json', body: JSON.stringify(body) })
+    const respond = (body, status = 200) => route.fulfill({
+      status, contentType: 'application/json', body: JSON.stringify(body), ...(body?.etag ? { headers: { ETag: body.etag } } : {}),
+    })
     if (url.pathname === '/api/features') return respond(features)
     if (url.pathname.startsWith('/api/workspaces/workspace-two/')) {
       return url.pathname.endsWith('/analyses') ? respond({ runs: [] }) : respond({ error: { code: 'not_found', message: 'No saved analysis in the new workspace.' } }, 404)
     }
     const base = `/api/workspaces/${summaryWorkspaceId}/analyses`
+    if (url.pathname === `${base}/targets`) return respond({ targets: state.liveTargets })
     if (url.pathname === base) return respond({ runs: [fixture.summary] })
     if (url.pathname === `${base}/${summaryRunId}`) return respond({ ...fixture.detail, ...fixture.summary })
     if (url.pathname === `${base}/${summaryRunId}/comparisons`) return respond({ comparisons: fixture.details })
     const comparison = fixture.details.find(({ comparison }) => url.pathname === `${base}/${summaryRunId}/comparisons/${comparison.id}`)
     if (comparison) return respond(comparison)
+    const subjectRead = url.pathname.match(/\/summaries\/(candidate|target)\/([^/]+)$/)
+    if (subjectRead && record.method === 'GET') {
+      const subject = { kind: subjectRead[1], subjectId: decodeURIComponent(subjectRead[2]) }
+      const value = summarySubjectResponse(fixture, subject, state.options)
+      const custom = await state.beforeSubjectGet?.(record, subject)
+      return respond(custom?.body ?? value, custom?.status ?? 200)
+    }
     const historyAction = url.pathname.match(/\/summaries\/(candidate|target)\/([^/]+)\/(history|publish|retry)$/)
     if (historyAction) {
       if (role === 'viewer') return respond({ error: { code: 'forbidden', message: 'Only owners and editors can review summary history.' } }, 403)
@@ -278,6 +308,8 @@ async function setup(t, {
 const manager = (page) => page.getByRole('dialog', { name: 'Manage summaries', exact: true })
 const exporter = (page) => page.getByRole('dialog', { name: 'Export analysis report', exact: true })
 const posts = (state) => state.requests.filter((request) => request.method !== 'GET')
+const subjectReads = (state) => state.requests.filter((request) => request.method === 'GET' && /\/summaries\/(candidate|target)\/[^/]+$/.test(request.path))
+const scopeReads = (state) => state.requests.filter((request) => request.method === 'GET' && request.path.endsWith('/summaries'))
 async function openManager(page) {
   await page.getByRole('button', { name: 'Manage summaries', exact: true }).click()
   const dialog = await visible(manager(page))
@@ -310,10 +342,11 @@ test('summary management uses explicit saved-run or exact-grade scope, not table
   assert.notEqual(posts(state)[0].headers['if-match'], state.fixture.summary.etag)
   assert.equal(JSON.stringify(state.fixture.details), before, 'Generating narrative text never changes frozen scores or comparisons.')
   assert.equal(await dialog.getByRole('button', { name: 'Generate missing summaries', exact: true }).isDisabled(), true)
+  const readsBeforeClose = scopeReads(state).length
   await dialog.getByRole('button', { name: 'Close', exact: true }).click()
   assert.equal(await page.getByLabel('Search comparisons', { exact: true }).inputValue(), 'Jordan')
   assert.equal(await page.getByLabel('Comparison target', { exact: true }).inputValue(), 'grade:ladder-one:9:approved-v2:2')
-  await until(() => state.requests.filter((request) => request.path.endsWith('/summaries')).length > 3, 'Acknowledged summary work keeps polling after the dialog closes.')
+  await until(() => scopeReads(state).length > readsBeforeClose, 'Acknowledged summary work keeps polling after the dialog closes.')
   assert.deepEqual(errors, [])
 })
 
@@ -389,7 +422,7 @@ test('an obsolete status read cannot replace acknowledged regeneration with a pr
   assert.equal(posts(state).length, 1)
 })
 
-test('completed comparisons refresh full narratives without changing pair ETags, source evidence, or score displays', async (t) => {
+test('completed comparisons refresh subject narratives without changing pair ETags, source evidence, or score displays', async (t) => {
   const { page, state, fixture, errors } = await setup(t, { result: true, summaryOptions: {
     candidateStatus: 'ready', targetStatus: 'ready',
     states: { 'comparison-1': { status: 'running', previous: true }, 'target-job-v1': { status: 'waiting', previous: true } },
@@ -413,6 +446,226 @@ test('completed comparisons refresh full narratives without changing pair ETags,
   assert.equal(posts(state).length, 0, 'Opening a completed comparison never enqueues model work.')
   assert.equal(await page.evaluate(() => Object.values(localStorage).some((value) => value.includes('engineering methods'))), false)
   assert.deepEqual(errors, [])
+})
+
+test('late subject replies cannot restore old readiness after acknowledged regeneration', async (t) => {
+  const { page, state } = await setup(t, { result: true, summaryOptions: { candidateStatus: 'ready', targetStatus: 'ready' } })
+  const candidate = page.getByRole('region', { name: 'Saved candidate assessment summary', exact: true })
+  await visible(candidate.getByText('Current summary', { exact: true }))
+  const gate = deferred()
+  t.after(() => gate.resolve())
+  let held = 0
+  state.beforeSubjectGet = async () => { held++; await gate.promise }
+  await page.evaluate(() => window.dispatchEvent(new Event('focus')))
+  await until(() => held === 2, 'Both old subject publications were captured before the mutation.')
+  const dialog = await openManager(page)
+  state.beforeSubjectGet = null
+  await dialog.getByRole('button', { name: 'Regenerate all summaries', exact: true }).click()
+  await dialog.getByRole('button', { name: 'Confirm regenerate all', exact: true }).click()
+  await visible(dialog.getByText(/^Summary request acknowledged:/))
+  await dialog.getByRole('button', { name: 'Close', exact: true }).click()
+  await visible(candidate.getByText('Queued', { exact: true }))
+  gate.resolve()
+  await page.waitForTimeout(300)
+  assert.equal(await candidate.getByText('Current summary', { exact: true }).count(), 0)
+  await visible(candidate.getByText(/^Previous published summary - updating/))
+  assert.equal(posts(state).length, 1)
+})
+
+test('delayed and failed subject summaries never block saved scores, criteria or frozen source navigation', async (t) => {
+  const candidateGate = deferred()
+  const targetGate = deferred()
+  t.after(() => { candidateGate.resolve(); targetGate.resolve() })
+  const { page, state } = await setup(t, {
+    result: true, summaryOptions: { candidateStatus: 'ready', targetStatus: 'ready' },
+    beforeSubjectGet: async (_request, subject) => {
+      if (subject.kind === 'candidate') { await candidateGate.promise; return }
+      await targetGate.promise
+      return { status: 503, body: { error: { code: 'unavailable', message: 'Overview publication is temporarily unavailable.' } } }
+    },
+  })
+  const candidate = page.getByRole('region', { name: 'Saved candidate assessment summary', exact: true })
+  const target = page.getByRole('region', { name: 'Saved job or grade overview', exact: true })
+  await visible(candidate.getByText('Loading saved candidate summary...', { exact: true }))
+  await visible(target.getByText('Loading saved overview...', { exact: true }))
+  await visible(page.getByText('Original immutable scoring explanation.', { exact: true }))
+  await visible(page.getByRole('region', { name: 'Real criterion assessments', exact: true }))
+  await visible(page.getByRole('region', { name: 'Saved real source evidence', exact: true }))
+  assert.match(await page.locator('.overall-score').innerText(), /60/)
+  await page.getByRole('button', { name: 'Job description', exact: true }).click()
+  await visible(page.getByRole('heading', { name: 'Full saved job description', exact: true }))
+  await page.getByRole('button', { name: 'Resume evidence', exact: true }).click()
+  await visible(page.getByRole('heading', { name: 'Full saved resume', exact: true }))
+  assert.equal(scopeReads(state).length, 0, 'Opening one comparison never fetches full-scope published candidate text.')
+  assert.deepEqual(new Set(subjectReads(state).map((request) => request.path.split('/summaries/')[1])),
+    new Set(['candidate/comparison-1', 'target/target-job-v1']))
+  candidateGate.resolve()
+  await visible(candidate.getByText(candidateNarrativeText, { exact: true }))
+  assert.equal(await target.getByText('Loading saved overview...', { exact: true }).count(), 1,
+    'Candidate publication does not wait for the overview.')
+  targetGate.resolve()
+  await visible(target.getByRole('alert').getByText(/Overview publication is temporarily unavailable/))
+  assert.equal(await candidate.getByText('Current summary', { exact: true }).count(), 1)
+  state.beforeSubjectGet = null
+  await target.getByRole('button', { name: 'Retry overview', exact: true }).click()
+  await visible(target.getByText('Current summary', { exact: true }))
+  assert.equal(scopeReads(state).length, 0)
+  assert.equal(posts(state).length, 0)
+})
+
+test('ready publications keep refreshing independently of scoring ETags and preserve approved replacements', async (t) => {
+  const { page, state, fixture } = await setup(t, { result: true, summaryOptions: { candidateStatus: 'ready', targetStatus: 'ready' } })
+  const candidate = page.getByRole('region', { name: 'Saved candidate assessment summary', exact: true })
+  await visible(candidate.getByText(candidateNarrativeText, { exact: true }))
+  const immutable = JSON.stringify(fixture.details)
+  const replacement = 'An independently approved replacement uses the saved engineering evidence. Scoring and immutable citations stay unchanged.'
+  state.options.states = { 'comparison-1': {
+    status: 'ready', text: replacement, summaryVersion: 2,
+    approval: { kind: 'manual', approvedAt: summaryTimestamp, approvedBy: 'workspace-editor', reviewOutcome: 'not-reviewed', issues: [] },
+  } }
+  await visible(candidate.getByText(replacement, { exact: true }))
+  await visible(candidate.getByText('Manually approved', { exact: true }))
+  assert.equal(JSON.stringify(fixture.details), immutable)
+  assert.equal(state.requests.filter((request) => request.path.endsWith('/comparisons/comparison-1')).length, 1)
+  assert.equal(scopeReads(state).length, 0)
+})
+
+test('inactive overview and management scopes stop polling and are not refreshed on focus', async (t) => {
+  const { page, state } = await setup(t, { summaryOptions: { candidateStatus: 'ready', targetStatus: 'ready' } })
+  await page.getByLabel('Comparison target', { exact: true }).selectOption('job:job-one:rubric-job:1')
+  const target = page.getByRole('region', { name: 'Saved job or grade overview', exact: true })
+  await visible(target.getByText('Current summary', { exact: true }))
+  const dialog = await openManager(page)
+  await dialog.getByLabel('Summary scope', { exact: true }).selectOption('target-grade-v2')
+  await visible(dialog.getByRole('heading', { name: 'Candidate summaries: 1 / 1 current and ready', exact: true }))
+  await dialog.getByRole('button', { name: 'Close', exact: true }).click()
+  await page.getByLabel('Comparison target', { exact: true }).selectOption('grade:ladder-one:9:approved-v2:2')
+  await visible(target.getByText('Current summary', { exact: true }))
+  const inactiveJobReads = () => subjectReads(state).filter((request) => request.path.endsWith('/target/target-job-v1')).length
+  const oldJobCount = inactiveJobReads()
+  const oldScopeCount = scopeReads(state).length
+  const gradeCount = subjectReads(state).filter((request) => request.path.endsWith('/target/target-grade-v2')).length
+  await page.waitForTimeout(500)
+  await page.evaluate(() => window.dispatchEvent(new Event('focus')))
+  await until(() => subjectReads(state).filter((request) => request.path.endsWith('/target/target-grade-v2')).length > gradeCount,
+    'The displayed overview remains subscribed.')
+  assert.equal(inactiveJobReads(), oldJobCount)
+  assert.equal(scopeReads(state).length, oldScopeCount)
+})
+
+test('saved comparison navigation never discovers live new-run targets; actual setup and explicit refresh do', async (t) => {
+  const { page, state } = await setup(t, {
+    result: true, features: { realAnalyses: true, analysisSummaryGeneration: true },
+    summaryOptions: { candidateStatus: 'ready', targetStatus: 'ready' },
+  })
+  const targetReads = () => state.requests.filter((request) => request.path.endsWith('/analyses/targets')).length
+  await visible(page.getByText('Original immutable scoring explanation.', { exact: true }))
+  assert.equal(targetReads(), 0)
+  await page.getByRole('link', { name: 'All saved comparisons', exact: true }).click()
+  await page.getByRole('button', { name: /^Review comparison 2:/ }).click()
+  await visible(page.getByText('Original immutable scoring explanation.', { exact: true }))
+  await page.getByRole('button', { name: 'Refresh fixture history', exact: true }).click()
+  await page.evaluate(() => window.dispatchEvent(new Event('focus')))
+  await page.waitForTimeout(200)
+  assert.equal(targetReads(), 0, 'Features, history refreshes, focus and comparison location keys cannot fan out to live source validation.')
+  await page.getByRole('button', { name: 'Open fixture real setup', exact: true }).click()
+  await visible(page.getByRole('heading', { name: 'Build a real analysis', exact: true }))
+  assert.equal(targetReads(), 1)
+  state.liveTargets[0].displayName = 'Latest live job option'
+  await page.getByRole('button', { name: 'Refresh available inputs', exact: true }).click()
+  await visible(page.getByText('Latest live job option', { exact: true }))
+  assert.equal(targetReads(), 2)
+  await page.getByRole('button', { name: 'Open fixture analysis', exact: true }).click()
+  await visible(page.getByRole('heading', { name: 'Saved narrative review', exact: true }))
+  await page.evaluate(() => window.dispatchEvent(new Event('focus')))
+  await page.getByRole('button', { name: 'Open fixture sample setup', exact: true }).click()
+  await page.waitForTimeout(200)
+  assert.equal(targetReads(), 2, 'Neither historical navigation nor a Samples setup subscribes to private live target discovery.')
+  state.liveTargets[0].displayName = 'Revalidated live job option'
+  await page.getByRole('button', { name: 'Open fixture real setup', exact: true }).click()
+  await visible(page.getByText('Revalidated live job option', { exact: true }))
+  assert.equal(targetReads(), 3, 'A newly opened setup must revalidate live eligibility rather than reuse inactive cached targets.')
+  assert.equal(posts(state).length, 0)
+})
+
+test('acknowledged current-analysis summary work progresses after closure but stops polling when leaving that analysis', async (t) => {
+  const { page, state } = await setup(t)
+  const dialog = await openManager(page)
+  await dialog.getByRole('button', { name: 'Generate missing summaries', exact: true }).click()
+  await visible(dialog.getByText(/^Summary request acknowledged:/))
+  await dialog.getByRole('button', { name: 'Close', exact: true }).click()
+  const acknowledged = scopeReads(state).length
+  await until(() => scopeReads(state).length > acknowledged, 'The current analysis continues observing acknowledged work.')
+  await page.getByRole('button', { name: 'Return fixture library', exact: true }).click()
+  await visible(page.getByRole('heading', { name: 'Fixture analysis library', exact: true }))
+  const afterLeaving = scopeReads(state).length
+  await page.waitForTimeout(500)
+  await page.evaluate(() => window.dispatchEvent(new Event('focus')))
+  await page.waitForTimeout(200)
+  assert.equal(scopeReads(state).length, afterLeaving, 'An old analysis never keeps a background full-scope subscription.')
+  assert.equal(posts(state).length, 1, 'Polling and navigation never restart server generation.')
+})
+
+test('summary polling is single-flight, pauses when hidden, and refreshes each active subject once on return', async (t) => {
+  const { page, state } = await setup(t, { result: true, summaryOptions: { candidateStatus: 'ready', targetStatus: 'ready' } })
+  const candidate = page.getByRole('region', { name: 'Saved candidate assessment summary', exact: true })
+  await visible(candidate.getByText(candidateNarrativeText, { exact: true }))
+  await visible(page.getByRole('region', { name: 'Saved job or grade overview', exact: true }).getByText('Current summary', { exact: true }))
+  const gate = deferred()
+  t.after(() => gate.resolve())
+  state.beforeSubjectGet = async () => { await gate.promise }
+  const countByPath = () => Object.fromEntries([...new Set(subjectReads(state).map((request) => request.path))]
+    .map((path) => [path, subjectReads(state).filter((request) => request.path === path).length]))
+  const before = countByPath()
+  await page.evaluate(() => { window.dispatchEvent(new Event('focus')); window.dispatchEvent(new Event('focus')) })
+  await until(() => Object.entries(countByPath()).every(([path, count]) => count === before[path] + 1), 'Both active subject reads started.')
+  await page.waitForTimeout(500)
+  assert.deepEqual(countByPath(), Object.fromEntries(Object.entries(before).map(([path, count]) => [path, count + 1])),
+    'Unchanged ticks cannot overlap an outstanding read of the same subject.')
+  await page.evaluate(() => {
+    Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'hidden' })
+    document.dispatchEvent(new Event('visibilitychange'))
+    window.dispatchEvent(new Event('focus'))
+  })
+  state.beforeSubjectGet = null
+  gate.resolve()
+  await page.waitForTimeout(500)
+  const hiddenCounts = countByPath()
+  assert.deepEqual(hiddenCounts, Object.fromEntries(Object.entries(before).map(([path, count]) => [path, count + 1])))
+  await page.evaluate(() => {
+    Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'visible' })
+    document.dispatchEvent(new Event('visibilitychange'))
+    window.dispatchEvent(new Event('focus'))
+  })
+  await until(() => Object.entries(countByPath()).every(([path, count]) => count === hiddenCounts[path] + 1),
+    'Visibility and focus share a single refresh for each currently displayed subject.')
+  assert.equal(scopeReads(state).length, 0)
+})
+
+test('summary read failures retain disclosed previous text, offer independent retry, and clear inaccessible publications', async (t) => {
+  const { page, state } = await setup(t, { result: true, summaryOptions: { candidateStatus: 'ready', targetStatus: 'ready' } })
+  const candidate = page.getByRole('region', { name: 'Saved candidate assessment summary', exact: true })
+  await visible(candidate.getByText(candidateNarrativeText, { exact: true }))
+  let status = 503
+  state.beforeSubjectGet = (_request, subject) => subject.kind === 'candidate'
+    ? { status, body: { error: { code: status === 503 ? 'unavailable' : status === 404 ? 'not_found' : 'forbidden', message: 'Candidate publication could not be read.' } } }
+    : undefined
+  await page.evaluate(() => window.dispatchEvent(new Event('focus')))
+  await visible(candidate.getByText('Current status unavailable', { exact: true }))
+  await visible(candidate.getByText(/^Previous published summary - outdated/))
+  await visible(candidate.getByText(candidateNarrativeText, { exact: true }))
+  for (status of [401, 403, 404]) {
+    await candidate.getByRole('button', { name: 'Retry candidate summary', exact: true }).click()
+    await until(() => candidate.getByText(candidateNarrativeText, { exact: true }).count().then((count) => count === 0),
+      'Access failures must discard the cached private publication.')
+    await visible(candidate.getByRole('alert').getByText(/Candidate publication could not be read/))
+    await visible(page.getByText('Original immutable scoring explanation.', { exact: true }))
+  }
+  state.beforeSubjectGet = null
+  await candidate.getByRole('button', { name: 'Retry candidate summary', exact: true }).click()
+  await visible(candidate.getByText(candidateNarrativeText, { exact: true }))
+  assert.equal(scopeReads(state).length, 0)
+  assert.equal(posts(state).length, 0)
 })
 
 test('failed replacements retain previous publication and explicit summary errors without degrading the immutable result', async (t) => {
@@ -577,7 +830,7 @@ test('a late summary response cannot repopulate another workspace or an analysis
     } })
     const gate = deferred()
     let started = false
-    state.beforeGet = async () => { started = true; await gate.promise }
+    state.beforeSubjectGet = async () => { started = true; await gate.promise }
     await page.getByLabel('Comparison target', { exact: true }).selectOption('job:job-one:rubric-job:1')
     await until(() => started, 'The selected private summary request should be pending.')
     if (deleting) {

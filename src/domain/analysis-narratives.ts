@@ -400,6 +400,20 @@ export interface RealAnalysisSummariesResponse extends AnalysisNarrativeScopeRev
   targets: RealAnalysisTargetNarrativeSummary[]
 }
 
+export type RealAnalysisSummarySubjectResponse = {
+  schemaVersion: typeof ANALYSIS_NARRATIVE_SCHEMA_VERSION
+  dataKind: 'real'
+  workspaceId: string
+  runId: string
+  subjectId: string
+  // This subject's revision is not the management/export scope revision used for mutations.
+  revision: string
+  etag: string
+} & (
+  | { kind: 'candidate'; narrative: RealAnalysisCandidateNarrativeSummary }
+  | { kind: 'target'; narrative: RealAnalysisTargetNarrativeSummary }
+)
+
 // GET /api/workspaces/:workspaceId/analyses/:runId/summaries is read-only and never enqueues work.
 export interface RealAnalysisSummariesQuery {
   targetId?: string

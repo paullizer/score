@@ -65,7 +65,7 @@ export function blobs() {
   let beforeFencedPut
   const store = {
     values, events,
-    async read(name) { events.push(['read', name]); return clone(values.get(name)) },
+    async read(name, signal) { signal?.throwIfAborted(); events.push(['read', name]); return clone(values.get(name)) },
     async putImmutable(name, bytes, contentType) {
       events.push(['put', name])
       const old = values.get(name)
@@ -134,7 +134,7 @@ export function analysisStore() {
   }
   const store = {
     values, controls, batches, save,
-    async get(workspaceId, id) { return clone(values.get(key(workspaceId, id))) },
+    async get(workspaceId, id, signal) { signal?.throwIfAborted(); return clone(values.get(key(workspaceId, id))) },
     async create(record) {
       if (beforeCreate) await beforeCreate(record)
       assert.equal(record.recordType, 'analysis-run')
@@ -213,10 +213,12 @@ export function analysisStore() {
       if (afterBatch) { const callback = afterBatch; afterBatch = undefined; await callback(operations) }
     },
     async list(workspaceId, options) {
+      options.signal?.throwIfAborted()
       const offset = Number(options.continuationToken ?? 0)
       assert.ok(Number.isInteger(offset) && offset >= 0)
       const all = [...values.values()].filter(({ record }) => record.workspaceId === workspaceId && record.recordType === options.recordType &&
-        (options.runId === undefined || options.runId === record.runId) && (options.status === undefined || record.status === options.status))
+        (options.runId === undefined || options.runId === record.runId) && (options.status === undefined || record.status === options.status) &&
+        (options.targetId === undefined || (record.recordType === 'analysis-comparison' ? record.target.summary.id : record.targetId) === options.targetId))
         .sort((a, b) => options.recordType === 'analysis-comparison' ? a.record.index - b.record.index :
           b.record.createdAt.localeCompare(a.record.createdAt) || a.record.id.localeCompare(b.record.id))
       const items = all.slice(offset, offset + (options.limit ?? 50)).map(clone)
@@ -244,7 +246,7 @@ export function analysisStore() {
           ['analysis-run', 'analysis-comparison', 'analysis-correction', 'analysis-narrative-request', 'analysis-candidate-narrative', 'analysis-target-narrative'].indexOf(b.record.recordType))
         .slice(0, limit).map(clone)
     },
-    async getControl(workspaceId, runId) { return clone(controls.get(key(workspaceId, api.analysisControlId(runId)))) },
+    async getControl(workspaceId, runId, signal) { signal?.throwIfAborted(); return clone(controls.get(key(workspaceId, api.analysisControlId(runId)))) },
     async listControls(workspaceId, token) {
       const all = [...controls.values()].filter(value => value.record.workspaceId === workspaceId)
       const start = Number(token ?? 0)
@@ -682,7 +684,7 @@ export async function startHttp(f, enabled = true) {
       const oid = options.role === 'viewer' ? VIEWER : options.role === 'editor' ? EDITOR : options.role === 'stranger' ? STRANGER : OWNER
       const principal = { auth_typ: 'aad', claims: [{ typ: 'tid', val: TENANT }, { typ: 'oid', val: oid }], name_typ: 'name', role_typ: 'roles' }
       return fetch(`${base}${suffix}`, {
-        method, headers: {
+        method, signal: options.signal, headers: {
           ...(options.noAuth ? {} : { 'x-ms-client-principal': Buffer.from(JSON.stringify(principal)).toString('base64') }),
           ...(method === 'GET' ? {} : {
             origin: ORIGIN, 'x-score-request': 'workspace',

@@ -85,6 +85,12 @@ test('frontend summary services consume actual authorized API envelopes and retr
   assert.equal(initialTarget.scoring.initialized, initializing.scoring.initialized)
   assert.equal(initialTarget.scoring.queued, 1)
   assert.equal(initialTarget.capture.comparisons.length, 1)
+  const initialCandidateSubject = { kind: 'candidate', subjectId: initializing.capture.comparisons[0].comparisonId }
+  const initialCandidate = await client.getRealAnalysisSummarySubject(fixture.workspaceId, runId, initialCandidateSubject)
+  assert.deepEqual(initialCandidate.narrative, initialTarget.comparisons[0])
+  const targetSubject = { kind: 'target', subjectId: initializing.targets[0].targetId }
+  const initialOverview = await client.getRealAnalysisSummarySubject(fixture.workspaceId, runId, targetSubject)
+  assert.deepEqual(initialOverview.narrative, initialTarget.targets[0])
   assert.equal(fixture.analyses.store.values.size, initialRecords, 'Reading pending scoring status does not materialize or enqueue work.')
   assert.equal(stubs.modelCalls.length, initialModelCalls)
   await processAllAnalyses(fixture, stubs)
@@ -95,6 +101,7 @@ test('frontend summary services consume actual authorized API envelopes and retr
   assert.equal(comparisons.length, 1)
   assert.equal(comparisons[0].comparison.status, 'complete', JSON.stringify(comparisons[0].comparison.error))
   const frozen = await client.getRealAnalysisComparison(fixture.workspaceId, runId, comparisons[0].comparison.id)
+  assert.equal(frozen.narrative, undefined, 'Core saved evidence has no eagerly loaded narrative dependency.')
   const modelCalls = stubs.modelCalls.length
   const recordCount = fixture.analyses.store.values.size
   const whole = await client.getRealAnalysisSummaries(fixture.workspaceId, runId)
@@ -103,13 +110,25 @@ test('frontend summary services consume actual authorized API envelopes and retr
   const selected = await client.getRealAnalysisSummaries(fixture.workspaceId, runId, { targetId })
   assert.equal(selected.capture.scope.targetId, targetId)
   assert.equal(selected.scoring.complete, 1)
+  const candidateSubject = { kind: 'candidate', subjectId: comparisons[0].comparison.id }
+  const subjectReadsBefore = requests.length
+  const candidate = await client.getRealAnalysisSummarySubject(fixture.workspaceId, runId, candidateSubject)
+  const overview = await client.getRealAnalysisSummarySubject(fixture.workspaceId, runId, targetSubject)
+  assert.deepEqual(candidate.narrative, selected.comparisons[0])
+  assert.deepEqual(overview.narrative, selected.targets[0])
+  assert.equal(requests.length, subjectReadsBefore + 2, 'Each subject client read issues one GET, without downloading full-scope candidates.')
+  assert.ok(requests.slice(subjectReadsBefore).every((request) => /\/summaries\/(candidate|target)\/[^/]+$/.test(request.url)))
   assert.equal(fixture.analyses.store.values.size, recordCount, 'Summary GET never enqueues work.')
   assert.equal(stubs.modelCalls.length, modelCalls)
   const key = randomUUID()
-  const result = await client.generateRealAnalysisSummaries(fixture.workspaceId, runId, { mode: 'missing', targetId }, selected.etag, key)
+  const result = await client.generateRealAnalysisSummaries(fixture.workspaceId, runId, { mode: 'all', targetId }, selected.etag, key)
   assert.equal(result.requestId, key)
-  const repeated = await client.generateRealAnalysisSummaries(fixture.workspaceId, runId, { mode: 'missing', targetId }, selected.etag, key)
+  const repeated = await client.generateRealAnalysisSummaries(fixture.workspaceId, runId, { mode: 'all', targetId }, selected.etag, key)
   assert.equal(repeated.requestId, key)
+  const updating = await client.getRealAnalysisSummarySubject(fixture.workspaceId, runId, candidateSubject)
+  assert.deepEqual(updating.narrative, repeated.summaries.comparisons[0])
+  assert.ok(['queued', 'running', 'waiting'].includes(updating.narrative.status),
+    'Acknowledged generation is visible independently of the immutable pair ETag.')
   assert.equal(stubs.modelCalls.length, modelCalls, 'HTTP generation requests schedule durable narrative work, not scoring or inline inference.')
   const unchanged = await client.getRealAnalysisComparison(fixture.workspaceId, runId, comparisons[0].comparison.id)
   assert.deepEqual(unchanged.comparison, frozen.comparison)

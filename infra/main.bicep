@@ -23,7 +23,7 @@ param analysisWorkerImage string
 param analysisEvidenceCorrectionsEnabled string = 'false'
 
 @allowed(['B1', 'B2', 'B3', 'S1'])
-param appServiceSku string = 'B1'
+param appServiceSku string = 'B3'
 
 @allowed(['basic', 'standard'])
 param searchSku string = 'basic'

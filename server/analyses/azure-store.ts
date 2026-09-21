@@ -24,7 +24,8 @@ import {
 } from './narrative-records'
 import { analysisCorrectionCanWork, projectAnalysisComparison } from './current-results'
 import {
-  analysisBlobInRun, analysisBytesHash, analysisCancellationNeedsRetry, analysisHash, assertAnalysis, isAnalysisId, isSafeAnalysisBlobName, MAX_ANALYSIS_JSON_BYTES,
+  analysisBlobInRun, analysisBytesHash, analysisCancellationNeedsRetry, analysisHash, analysisNarrativeTargetIdSchema,
+  assertAnalysis, isAnalysisId, isSafeAnalysisBlobName, MAX_ANALYSIS_JSON_BYTES,
   analysisCorrectionId, analysisNarrativeId, isAnalysisRecordId, MAX_ANALYSIS_ORIGINAL_BYTES, MAX_ANALYSIS_TRANSACTION_BYTES, parseAnalysisEntity,
 } from './validation'
 
@@ -225,18 +226,22 @@ export function createAnalysisStoreFromContainer(
     }
   }
   const store: AnalysisStore = {
-    async get(workspaceId, id) {
+    async get(workspaceId, id, signal) {
+      signal?.throwIfAborted()
       scope(workspaceId, id)
       try {
-        const response = await container.item(id, workspaceId).read()
+        const response = await container.item(id, workspaceId).read({ abortSignal: signal })
+        signal?.throwIfAborted()
         if (response.statusCode === 404 || !response.resource) return undefined
         return decode(response.resource, workspaceId, id)
       } catch (error) {
+        signal?.throwIfAborted()
         if (status(error) === 404) return undefined
         throw error
       }
     },
     async list<K extends AnalysisEntity['recordType']>(workspaceId: string, options: import('./store').AnalysisListOptions<K>) {
+      options.signal?.throwIfAborted()
       scope(workspaceId, options.runId)
       const limit = options.limit ?? 50
       assertAnalysis(Number.isInteger(limit) && limit > 0 && limit <= 100 &&
@@ -244,6 +249,9 @@ export function createAnalysisStoreFromContainer(
         (options.runId === undefined || (options.recordType !== 'analysis-run' && isAnalysisId(options.runId, 'run'))) &&
         (options.continuationToken === undefined || (typeof options.continuationToken === 'string' &&
           options.continuationToken.length > 0 && options.continuationToken.length <= 12 * 1024)), 'Invalid analysis query options.')
+      assertAnalysis(options.targetId === undefined || options.runId !== undefined &&
+        ['analysis-comparison', 'analysis-candidate-narrative', 'analysis-target-narrative'].includes(options.recordType) &&
+        analysisNarrativeTargetIdSchema.safeParse(options.targetId).success, 'Invalid exact target filter.')
       const allowed = options.recordType === 'analysis-run'
         ? ['initializing', 'queued', 'running', 'complete', 'partial', 'failed', 'cancelled']
         : options.recordType === 'analysis-comparison' ? ['queued', 'running', 'complete', 'failed', 'cancelled']
@@ -256,13 +264,27 @@ export function createAnalysisStoreFromContainer(
         filters.push(`c.${key} = @${key}`)
         parameters.push({ name: `@${key}`, value: options[key] })
       }
-      const response = await fetchCosmosPage(container.items.query({
+      if (options.targetId !== undefined) {
+        filters.push(`${options.recordType === 'analysis-comparison' ? 'c.target.summary.id' : 'c.targetId'} = @targetId`)
+        parameters.push({ name: '@targetId', value: options.targetId })
+      }
+      const iterator = container.items.query({
         query: `SELECT * FROM c WHERE ${filters.join(' AND ')} ORDER BY c.${options.recordType === 'analysis-comparison' ? 'index ASC' : 'createdAt DESC'}`,
         parameters,
-      }, { partitionKey: workspaceId, maxItemCount: limit, continuationToken: options.continuationToken }))
+      }, { partitionKey: workspaceId, maxItemCount: limit, continuationToken: options.continuationToken, abortSignal: options.signal })
+      const response = await fetchCosmosPage({
+        async fetchNext() {
+          options.signal?.throwIfAborted()
+          const page = await iterator.fetchNext()
+          options.signal?.throwIfAborted()
+          return page
+        },
+      })
       const items = response.resources.map(value => decode(value, workspaceId))
       assertAnalysis(items.length <= limit && items.every(({ record }) => record.recordType === options.recordType &&
         (options.runId === undefined || (record.recordType !== 'analysis-run' && record.runId === options.runId)) &&
+        (options.targetId === undefined || (record.recordType === 'analysis-comparison' ? record.target.summary.id === options.targetId
+          : 'targetId' in record && record.targetId === options.targetId)) &&
         (options.status === undefined || record.status === options.status)), 'Analysis query escaped its scope.')
       return {
         items: items as VersionedAnalysisEntity<Extract<AnalysisEntity, { recordType: K }>>[],
@@ -499,15 +521,17 @@ export function createAnalysisStoreFromContainer(
         : { operationType: 'Replace', id: operation.record.id, resourceBody: operation.record as unknown as JSONObject, ifMatch: operation.etag })
       await batch(workspaceId, pending, controls)
     },
-    async getControl(workspaceId, runId) {
+    async getControl(workspaceId, runId, signal) {
+      signal?.throwIfAborted()
       scope(workspaceId, runId)
       try {
-        const response = await container.item(analysisControlId(runId), workspaceId).read()
+        const response = await container.item(analysisControlId(runId), workspaceId).read({ abortSignal: signal })
+        signal?.throwIfAborted()
         if (response.statusCode === 404 || !response.resource) return undefined
         const value = decodeControl(response.resource, workspaceId, runId)
         assertAnalysis(value.record.runId === runId, 'Analysis lifecycle scope mismatch.')
         return value
-      } catch (error) { if (status(error) === 404) return undefined; throw error }
+      } catch (error) { signal?.throwIfAborted(); if (status(error) === 404) return undefined; throw error }
     },
     async listControls(workspaceId, continuationToken) {
       scope(workspaceId)
@@ -620,7 +644,7 @@ export function createAnalysisStoreFromContainer(
 
 interface AnalysisBlobContainer {
   getBlockBlobClient(name: string): {
-    download(): Promise<Pick<Awaited<ReturnType<BlockBlobClient['download']>>, 'readableStreamBody' | 'contentType' | 'contentLength' | 'etag' | 'metadata'>>
+    download(...args: Parameters<BlockBlobClient['download']>): Promise<Pick<Awaited<ReturnType<BlockBlobClient['download']>>, 'readableStreamBody' | 'contentType' | 'contentLength' | 'etag' | 'metadata'>>
     upload(...args: Parameters<BlockBlobClient['upload']>): Promise<Pick<Awaited<ReturnType<BlockBlobClient['upload']>>, 'etag'>>
     getProperties?: BlockBlobClient['getProperties']
     getBlobLeaseClient?: BlockBlobClient['getBlobLeaseClient']
@@ -642,21 +666,34 @@ function maximum(name: string): number {
   assertAnalysis(contentType === 'application/json', 'Unsupported analysis blob content type.')
   return MAX_ANALYSIS_JSON_BYTES
 }
-async function readBounded(stream: NodeJS.ReadableStream, length: number | undefined, max: number): Promise<Uint8Array> {
+async function readBounded(stream: NodeJS.ReadableStream, length: number | undefined, max: number, signal?: AbortSignal): Promise<Uint8Array> {
+  const destroy = () => { if ('destroy' in stream && typeof stream.destroy === 'function') stream.destroy() }
   if (length !== undefined && length > max) {
-    if ('destroy' in stream && typeof stream.destroy === 'function') stream.destroy()
+    destroy()
     throw new Error('Analysis blob exceeds its bounded size.')
   }
   const chunks: Buffer[] = []
   let size = 0
-  for await (const chunk of stream) {
-    const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)
-    size += bytes.byteLength
-    if (size > max) throw new Error('Analysis blob exceeds its bounded size.')
-    chunks.push(bytes)
+  signal?.addEventListener('abort', destroy, { once: true })
+  try {
+    if (signal?.aborted) { destroy(); signal.throwIfAborted() }
+    for await (const chunk of stream) {
+      signal?.throwIfAborted()
+      const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)
+      size += bytes.byteLength
+      if (size > max) throw new Error('Analysis blob exceeds its bounded size.')
+      chunks.push(bytes)
+    }
+    signal?.throwIfAborted()
+    assertAnalysis(size > 0 && (length === undefined || size === length), 'Analysis blob is empty or truncated.')
+    return Buffer.concat(chunks, size)
+  } catch (error) {
+    destroy()
+    signal?.throwIfAborted()
+    throw error
+  } finally {
+    signal?.removeEventListener('abort', destroy)
   }
-  assertAnalysis(size > 0 && (length === undefined || size === length), 'Analysis blob is empty or truncated.')
-  return Buffer.concat(chunks, size)
 }
 export function createAzureAnalysisBlobStore(config: RealAnalysesConfig, credential: TokenCredential): AnalysisBlobStore {
   return createAnalysisBlobStoreFromContainer(new BlobServiceClient(config.storageAccountUrl, credential, {
@@ -664,10 +701,16 @@ export function createAzureAnalysisBlobStore(config: RealAnalysesConfig, credent
   }).getContainerClient(config.blobContainer))
 }
 export function createAnalysisBlobStoreFromContainer(container: AnalysisBlobContainer): AnalysisBlobStore {
-  async function read(name: string): Promise<AnalysisBlob | undefined> {
+  async function read(name: string, signal?: AbortSignal): Promise<AnalysisBlob | undefined> {
+    signal?.throwIfAborted()
     assertAnalysis(isSafeAnalysisBlobName(name), 'Invalid analysis blob name.')
     try {
-      const response = await container.getBlockBlobClient(name).download()
+      const response = await container.getBlockBlobClient(name).download(0, undefined, { abortSignal: signal })
+      if (signal?.aborted) {
+        const stream = response.readableStreamBody
+        if (stream && 'destroy' in stream && typeof stream.destroy === 'function') stream.destroy()
+        signal.throwIfAborted()
+      }
       if (response.metadata?.scorepreparing === 'true') {
         const stream = response.readableStreamBody
         if (stream && 'destroy' in stream && typeof stream.destroy === 'function') stream.destroy()
@@ -675,9 +718,10 @@ export function createAnalysisBlobStoreFromContainer(container: AnalysisBlobCont
       }
       assertAnalysis(response.readableStreamBody && response.etag && typeof response.contentType === 'string' &&
         response.contentType === mime(name), 'Invalid analysis blob content metadata.')
-      const bytes = await readBounded(response.readableStreamBody, response.contentLength, maximum(name))
+      const bytes = await readBounded(response.readableStreamBody, response.contentLength, maximum(name), signal)
       return { bytes, contentType: response.contentType, sha256: analysisBytesHash(bytes), etag: response.etag }
     } catch (error) {
+      signal?.throwIfAborted()
       if (status(error) === 404) return undefined
       throw error
     }

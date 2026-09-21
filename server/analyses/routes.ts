@@ -4,6 +4,7 @@ import type { RealJobsDeps } from '../jobs/routes'
 import type { RealGradesDeps } from '../grades/service'
 import type { RealResumesDeps } from '../resumes/store'
 import { getPrincipal } from '../request-context'
+import { traceOperation } from '../telemetry-operations'
 import { forbidden, invalidRequest, notFound, preconditionRequired, unavailable } from '../errors'
 import { isUuid } from '../jobs/validation'
 import type { RealAnalysesDeps } from './store'
@@ -81,6 +82,32 @@ function actionBody(req: Request): unknown {
   return {}
 }
 
+function read(callback: (req: Request, res: Response, signal: AbortSignal) => Promise<void>): RequestHandler {
+  return async (req, res) => {
+    const controller = new AbortController()
+    const abort = () => controller.abort()
+    const deadline = setTimeout(() => controller.abort(new DOMException('Analysis read deadline exceeded.', 'TimeoutError')), 30_000)
+    deadline.unref()
+    req.once('aborted', abort)
+    res.once('close', abort)
+    try {
+      if (req.aborted || res.destroyed) controller.abort()
+      controller.signal.throwIfAborted()
+      await callback(req, res, controller.signal)
+    } catch (error) {
+      if (req.aborted || res.destroyed) return
+      if (controller.signal.aborted && controller.signal.reason?.name === 'TimeoutError') {
+        throw unavailable('The saved analysis read timed out. Retry the read; no saved work was changed.')
+      }
+      throw error
+    } finally {
+      clearTimeout(deadline)
+      req.off('aborted', abort)
+      res.off('close', abort)
+    }
+  }
+}
+
 /** Mount beneath the central authenticated, same-origin/CSRF-protected /api router. */
 export function createRealAnalysesRouter(deps: RealAnalysesRouterDeps): Router {
   const router = express.Router()
@@ -94,8 +121,9 @@ export function createRealAnalysesRouter(deps: RealAnalysesRouterDeps): Router {
   const authorize: RequestHandler = async (req, res, next) => {
     res.setHeader('Cache-Control', 'no-store')
     try {
-      res.locals.analysisWorkspaceRole = await deps.repository.authorizeWorkspace(getPrincipal(req), param(req, 'workspaceId'),
-        req.method === 'GET' ? 'read' : req.path.endsWith('/lifecycle') ? 'manage' : 'write')
+      res.locals.analysisWorkspaceRole = await traceOperation('score.analysis.authorize', {}, () =>
+        deps.repository.authorizeWorkspace(getPrincipal(req), param(req, 'workspaceId'),
+          req.method === 'GET' ? 'read' : req.path.endsWith('/lifecycle') ? 'manage' : 'write'))
       requireService()
       next()
     } catch (error) { next(error) }
@@ -149,18 +177,21 @@ export function createRealAnalysesRouter(deps: RealAnalysesRouterDeps): Router {
         ...(result.analysis ? { analysis: result.analysis } : {}) })
     } else res.json(result.deleted ? { deleted: true } : { analysis: result.analysis })
   }))
-  router.get(`${base}/:runId/comparisons`, async (req, res) => {
+  router.get(`${base}/:runId/comparisons`, read(async (req, res, signal) => {
     const options = page(req)
-    res.json(await requireService().comparisons(param(req, 'workspaceId'), recordId(req, 'run'), options.continuationToken, options.limit))
-  })
-  router.get(`${base}/:runId/summaries`, async (req, res) => {
+    const comparisons = await requireService().comparisons(param(req, 'workspaceId'), recordId(req, 'run'), options.continuationToken, options.limit, signal)
+    signal.throwIfAborted()
+    res.json(comparisons)
+  }))
+  router.get(`${base}/:runId/summaries`, read(async (req, res, signal) => {
     query(req, ['targetId'])
     const targetId = req.query.targetId === undefined ? undefined : body(analysisNarrativeTargetIdSchema, req.query.targetId)
-    const summaries = await requireService().summaries(param(req, 'workspaceId'), recordId(req, 'run'), targetId)
+    const summaries = await requireService().summaries(param(req, 'workspaceId'), recordId(req, 'run'), targetId, signal)
+    signal.throwIfAborted()
     if (res.locals.analysisWorkspaceRole === 'viewer') summaries.capabilities = { canGenerate: false, reason: 'read-only' }
     res.setHeader('ETag', summaries.etag)
     res.json(summaries)
-  })
+  }))
   router.post(`${base}/:runId/summaries`, mutate('write', async (req, res) => {
     query(req, [])
     const result = await requireService().generateSummaries(param(req, 'workspaceId'), recordId(req, 'run'),
@@ -169,7 +200,14 @@ export function createRealAnalysesRouter(deps: RealAnalysesRouterDeps): Router {
     res.status(202).json(result)
   }))
   const summaryBase = `${base}/:runId/summaries/:kind/:subjectId`
-  router.get(`${summaryBase}/history`, async (req, res) => {
+  router.get(summaryBase, read(async (req, res, signal) => {
+    query(req, [])
+    const summary = await requireService().summarySubject(param(req, 'workspaceId'), recordId(req, 'run'), summarySubject(req), signal)
+    signal.throwIfAborted()
+    res.setHeader('ETag', summary.etag)
+    res.json(summary)
+  }))
+  router.get(`${summaryBase}/history`, read(async (req, res, signal) => {
     if (!['owner', 'editor'].includes(res.locals.analysisWorkspaceRole)) {
       throw forbidden('Only workspace owners and editors may inspect unpublished summary history.')
     }
@@ -178,10 +216,11 @@ export function createRealAnalysesRouter(deps: RealAnalysesRouterDeps): Router {
     if (token !== undefined && (typeof token !== 'string' || !token || token.length > 16 * 1024)) {
       throw invalidRequest('continuationToken must be a single valid summary history token.')
     }
-    const history = await requireService().summaryHistory(param(req, 'workspaceId'), recordId(req, 'run'), summarySubject(req), token)
+    const history = await requireService().summaryHistory(param(req, 'workspaceId'), recordId(req, 'run'), summarySubject(req), token, signal)
+    signal.throwIfAborted()
     res.setHeader('ETag', history.etag)
     res.json(history)
-  })
+  }))
   router.post(`${summaryBase}/publish`, mutate('write', async (req, res) => {
     query(req, [])
     const result = await requireService().publishSummary(param(req, 'workspaceId'), recordId(req, 'run'), summarySubject(req),
@@ -197,43 +236,36 @@ export function createRealAnalysesRouter(deps: RealAnalysesRouterDeps): Router {
     res.setHeader('ETag', result.summaries.etag)
     res.status(202).json(result)
   }))
-  router.get(`${base}/:runId/report-comparisons`, async (req, res) => {
+  router.get(`${base}/:runId/report-comparisons`, read(async (req, res, signal) => {
     query(req, ['comparisonId'])
     body(emptyAnalysisInputSchema, actionBody(req))
     const ids = req.query.comparisonId
     const comparisonIds = body(reportComparisonIdsSchema, typeof ids === 'string' ? [ids] : ids)
-    const controller = new AbortController()
-    const abort = () => controller.abort()
-    req.once('aborted', abort)
-    res.once('close', abort)
-    try {
-      if (req.aborted) controller.abort()
-      const report = await requireService().reportComparisons(
-        param(req, 'workspaceId'), recordId(req, 'run'), comparisonIds, controller.signal,
-      )
-      controller.signal.throwIfAborted()
-      res.json(report)
-    } finally {
-      req.off('aborted', abort)
-      res.off('close', abort)
-    }
-  })
-  router.get(`${base}/:runId/comparisons/:comparisonId`, async (req, res) => {
+    const report = await requireService().reportComparisons(
+      param(req, 'workspaceId'), recordId(req, 'run'), comparisonIds, signal,
+    )
+    signal.throwIfAborted()
+    res.json(report)
+  }))
+  router.get(`${base}/:runId/comparisons/:comparisonId`, read(async (req, res, signal) => {
     query(req, [])
-    const detail = await requireService().comparisonDetail(param(req, 'workspaceId'), recordId(req, 'run'), recordId(req, 'comparison'))
+    const detail = await requireService().comparisonDetail(param(req, 'workspaceId'), recordId(req, 'run'), recordId(req, 'comparison'), signal)
+    signal.throwIfAborted()
     res.setHeader('ETag', detail.etag)
     res.json(detail)
-  })
-  router.get(`${base}/:runId/comparisons/:comparisonId/diagnostics`, async (req, res) => {
+  }))
+  router.get(`${base}/:runId/comparisons/:comparisonId/diagnostics`, read(async (req, res, signal) => {
     query(req, ['continuationToken'])
     const token = req.query.continuationToken
     if (token !== undefined && (typeof token !== 'string' || !token || token.length > 16 * 1024)) {
       throw invalidRequest('continuationToken must be a single valid diagnostic history token.')
     }
-    res.json(await requireService().diagnostics(
-      param(req, 'workspaceId'), recordId(req, 'run'), recordId(req, 'comparison'), token,
-    ))
-  })
+    const diagnostics = await requireService().diagnostics(
+      param(req, 'workspaceId'), recordId(req, 'run'), recordId(req, 'comparison'), token, signal,
+    )
+    signal.throwIfAborted()
+    res.json(diagnostics)
+  }))
   const correctionBase = `${base}/:runId/comparisons/:comparisonId/corrections`
   const correctionRead = (res: Response) => {
     if (!['owner', 'editor'].includes(res.locals.analysisWorkspaceRole)) {
@@ -277,14 +309,16 @@ export function createRealAnalysesRouter(deps: RealAnalysesRouterDeps): Router {
     res.setHeader('ETag', result.correction.etag)
     res.json(result)
   }))
-  router.get(`${base}/:runId/comparisons/:comparisonId/documents/:documentId`, async (req, res) => {
+  router.get(`${base}/:runId/comparisons/:comparisonId/documents/:documentId`, read(async (req, res, signal) => {
     query(req, ['version'])
     const version = req.query.version
     if (typeof version !== 'string' || !/^(?:[1-9]\d{0,5}|1000000)$/.test(version)) throw invalidRequest('version must identify one exact document version.')
-    res.json(await requireService().document(
-      param(req, 'workspaceId'), recordId(req, 'run'), recordId(req, 'comparison'), param(req, 'documentId'), Number(version),
-    ))
-  })
+    const document = await requireService().document(
+      param(req, 'workspaceId'), recordId(req, 'run'), recordId(req, 'comparison'), param(req, 'documentId'), Number(version), signal,
+    )
+    signal.throwIfAborted()
+    res.json(document)
+  }))
   router.post(`${base}/:runId/retry`, mutate('write', async (req, res) => {
     query(req, [])
     const run = await requireService().retry(param(req, 'workspaceId'), recordId(req, 'run'), body(retryAnalysisInputSchema, actionBody(req)), match(req))

@@ -106,8 +106,10 @@ function RealAnalysisView({ id }: { id: string }) {
   const pairs = api?.comparisons(id)
   const ensure = api?.ensureDetail
   const ensurePairs = api?.ensureComparisons
+  const subscribe = api?.subscribeAnalysis
   const selectedId = params.get('result')
   const sourceView = savedReviewView(params)
+  useEffect(() => subscribe?.(id), [id, subscribe])
   useEffect(() => {
     if (api?.phase !== 'ready') return
     void ensure?.(id)
@@ -224,6 +226,8 @@ function SelectedRealComparison({ runId, comparisonId, initialView }: { runId: s
   const api = useRealAnalyses()!
   const entry = api.comparison(runId, comparisonId)
   const ensure = api.ensureComparison
+  const subscribe = api.subscribeComparison
+  useEffect(() => subscribe?.(runId, comparisonId), [comparisonId, runId, subscribe])
   useEffect(() => { if (api.phase === 'ready') void ensure(runId, comparisonId) }, [api.phase, comparisonId, ensure, entry.state, runId])
   if (entry.state !== 'ready') return <section className="panel mt-5"><EmptyState icon={entry.state === 'error' ? Layers3 : LoaderCircle}
     title={entry.state === 'error' ? 'This comparison could not be opened' : 'Opening exact saved snapshots'}

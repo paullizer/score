@@ -10,3 +10,5 @@ dist-renderer
 *.local
 *.log
 *.tsbuildinfo
+.summary-browser-tests-*
+.telemetry-tests-*

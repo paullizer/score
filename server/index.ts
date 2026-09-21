@@ -9,6 +9,8 @@ import { createAzureJobBlobStore, createAzureJobStore } from './jobs/azure-store
 import { createAzureGradeBlobStore, createAzureGradeStore } from './grades/azure-store'
 import { createAzureResumeBlobStore, createAzureResumeStore } from './resumes/azure-store'
 import { createAzureAnalysisBlobStore, createAzureAnalysisStore } from './analyses/azure-store'
+import { shutdownTelemetry, telemetryPreloaded } from './telemetry-lifecycle'
+import { errorCategory } from './telemetry-schema'
 
 const DEFAULT_PORT = 8080
 
@@ -32,6 +34,11 @@ function readPort(): number {
 }
 
 function main(): void {
+  if (process.env.APPLICATIONINSIGHTS_CONNECTION_STRING?.trim() && !telemetryPreloaded()) {
+    console.error('Score telemetry preload is required. Start the server with npm start or the packaged container command.')
+    process.exitCode = 1
+    return
+  }
   let config: Config
   try {
     config = loadConfig(process.env)
@@ -79,7 +86,7 @@ function main(): void {
   const app = createApp({ config, directory, state, jobs, grades, resumes, analyses })
   const reconcile = app.locals.reconcileLifecycle as () => Promise<void>
   const recoverLifecycle = () => { void reconcile().catch((error: unknown) => {
-    console.error('Lifecycle recovery is unavailable:', { name: error instanceof Error ? error.name : 'UnknownError' })
+    console.error('Lifecycle recovery is unavailable:', { category: errorCategory(error) })
   }) }
   recoverLifecycle()
   const lifecycleTimer = setInterval(recoverLifecycle, 60_000)
@@ -87,9 +94,27 @@ function main(): void {
 
   const port = readPort()
   const host = config.authMode === 'dev-header' ? '127.0.0.1' : '0.0.0.0'
-  app.listen(port, host, () => {
+  const server = app.listen(port, host, () => {
     console.log(`Score server listening on port ${port}.`)
   })
+  let stopping = false
+  const stop = () => {
+    if (stopping) return
+    stopping = true
+    clearInterval(lifecycleTimer)
+    const deadline = setTimeout(() => { server.closeAllConnections(); process.exit(0) }, 8_000)
+    void (async () => {
+      await new Promise<void>((resolve) => {
+        const drainDeadline = setTimeout(() => { server.closeAllConnections(); resolve() }, 4_000)
+        server.close(() => { clearTimeout(drainDeadline); resolve() })
+      })
+      await shutdownTelemetry()
+      clearTimeout(deadline)
+      process.exit(0)
+    })()
+  }
+  process.once('SIGTERM', stop)
+  process.once('SIGINT', stop)
 }
 
 main()

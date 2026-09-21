@@ -47,6 +47,8 @@ The application uses React 18, TypeScript, Vite, Tailwind CSS, React Router, and
 5. **Evidence:** Open a comparison to inspect its saved assessment narrative, criterion assessments, an available weighted 0-100 score, evidence gaps, and exact resume quotations beside the frozen job/GS requirement citations. **Manage summaries** can generate missing narratives or regenerate them without rescoring. Results retain their original documents, rubric versions, and approval provenance even after later edits.
 6. **Reports:** Open a saved analysis and choose **Export report** for CSV, PDF, Word, or PowerPoint. Export the entire group or one exact job/grade. PDF, Word, and PowerPoint require current saved narratives for the selected scope; CSV does not. All formats focus on completed reviews. Word matches PDF's content and section order in an editable document.
 
+Saved comparison scores, criterion assessments, and frozen evidence load independently of candidate summaries and job/grade overviews. Each summary has its own loading, retry, and error state; a slow or failed summary does not hide a valid assessment. Opening one comparison does not download the published narratives of every other candidate. Summary generation and report readiness still use the exact selected scope and saved revisions.
+
 Jobs, Resumes, and Analyses support reversible column sorting and a sorting selector, including on smaller screens. Sort names and labels alphabetically, counts numerically, dates chronologically, or processing status with attention-needed or completed work first. The default-order option restores each view's original order. Sorting does not change selections or saved records; processing completion is not a record of human review.
 
 Use the **Rename** controls in analysis, job, and resume lists or details to organize saved work. Names are trimmed, nonempty, and limited to 160 characters; duplicate labels are allowed. Job display titles and resume labels are separate from extracted titles, stated names, and original filenames. Analysis renaming changes its displayed title and newly generated report names without running another assessment. Future analyses capture the current display labels; existing comparisons keep their captured labels, sources, scores, and citations. Reports distinguish custom labels from source identities; CSV adds separate display-label columns when custom labels are present.
@@ -374,7 +376,7 @@ Explicit local worker testing is separate from the standalone fictional Vite dem
 
 | Service | Configuration and purpose |
 | --- | --- |
-| App Service | One Linux B1 instance serving the React SPA and authenticated workspace API |
+| App Service | One Linux Basic B3 instance (4 vCPUs, 7 GB RAM) serving the React SPA and authenticated workspace API |
 | Container Registry | Basic registry; managed-identity image pulls, no registry administrator password |
 | Cosmos DB | Serverless workspace directory/membership and separate `job-records`, `grade-records`, `resume-records`, and `analysis-records` durable records/work queues, all partitioned by `/workspaceId` |
 | Blob Storage | Private `workspace-state`, `job-sources`, `grade-sources`, `resume-sources`, `analysis-sources`, `documents`, and `knowledge` containers; shared-key access disabled |
@@ -384,11 +386,37 @@ Explicit local worker testing is separate from the standalone fictional Vite dem
 | Internal Container App | Isolated Chromium renderer, 1 CPU / 2 GiB, scale-to-zero, no runtime data credentials |
 | Foundry IQ / AI Search | Basic Search service, extractive knowledge source/base, and explicitly capped free knowledge-retrieval/semantic plans |
 | Key Vault | Easy Auth application credential, accessed through the web app's managed identity |
-| Azure Monitor | App Service diagnostics in Log Analytics; Application Insights provisioned for subsequent tracing integration |
+| Azure Monitor | App Service diagnostics in Log Analytics and privacy-filtered web/API request, dependency, and read-operation telemetry in the existing Application Insights resource |
 
-All regional resources use North Central US, with the US data-zone inference distinction described above. App Service, ACR, and Search have ongoing infrastructure charges even when idle. Foundry inference is token-billed, Document Intelligence is page-billed, and Container Apps execution, storage, Cosmos, and diagnostics have usage-based costs. The rubric deployment reserves 100k tokens/minute of quota; this is throughput capacity, not a spending cap. The free IQ retrieval allowance is not a free Search hosting plan, and it does not cover rubric-model or OCR usage. Paid continuation after that retrieval allowance is not enabled.
+All regional resources use North Central US, with the US data-zone inference distinction described above. App Service, ACR, and Search have ongoing infrastructure charges even when idle. The B3 web tier has a higher recurring cost than B1; it adds headroom without adding instances or automatically parallelizing Node.js application code. Changing the tier can restart the web container. The `appServiceSku` Bicep parameter records the desired tier so later provisioning does not silently return to B1. Foundry inference is token-billed, Document Intelligence is page-billed, and Container Apps execution, storage, Cosmos, and diagnostics have usage-based costs. The rubric deployment reserves 100k tokens/minute of quota; this is throughput capacity, not a spending cap. The free IQ retrieval allowance is not a free Search hosting plan, and it does not cover rubric-model or OCR usage. Paid continuation after that retrieval allowance is not enabled.
 
 The 10-input and 500-comparison limits bound submitted work, **not dollars**. Profiling, assessment, candidate/target narrative generation and regeneration, independent grounding-review calls, output corrections, and retries can each consume inference; OCR is billed separately. Generate missing summaries reuses current narratives, while Regenerate all requests new versions. All workers share the model's throughput budget. Throttling/backoff and cancellation do not refund processing already performed.
+
+### Loading performance and diagnostics
+
+The cloud client retains a 30-second request deadline. A request can time out in the browser even if App Service eventually logs HTTP 200. Loading a saved comparison is separate from loading its candidate summary or exact job/grade overview; complete summary inventories remain available for management and report capture. Reads do not enqueue generation, rerun scoring, or replace missing evidence.
+
+Summary polling follows active views and acknowledged work in the current analysis rather than every previously visited summary scope. Closing **Manage summaries** does not stop its server work. Hidden tabs pause polling and refresh relevant state on return. A timeout is not proof that a mutation failed: use the existing explicit acknowledgement/retry flow, which preserves its original idempotency key, rather than starting another import or generation.
+
+Web/API telemetry uses Azure Monitor OpenTelemetry and the existing `APPLICATIONINSIGHTS_CONNECTION_STRING`. The packaged Node.js ESM startup initializes it before application dependencies. Application telemetry is limited to normalized route/operation names, durations, status/error categories, correlation, and bounded counts. It does not collect request/response bodies, private evidence or narrative text, personal names, credentials, raw database queries, or identifying URL/query/blob paths. Browser injection and automatic console harvesting are disabled; the existing structured worker diagnostics remain separate.
+
+The Application Insights role is `score-api`. Traces use 25% sampling; request and operation counters/duration metrics are not sampled and export every 60 seconds. Their names are `score.http.request.count`, `score.http.request.duration`, `score.operation.count`, and `score.operation.duration`. The trace queue is bounded to 1,024 spans with batches of 128; export and shutdown are bounded so a monitoring outage cannot hold application requests open. Browser injection, console collection, live metrics, Statsbeat, performance counters, and offline persistence remain disabled even when SDK override settings are present.
+
+Telemetry consumes the existing Log Analytics ingestion allowance. The infrastructure retains its 30-day retention and 1 GB daily cap. Missing telemetry configuration intentionally disables the SDK locally; invalid configured values fail startup without printing credentials. An empty Application Insights chart is not proof that the app is fast: check the deployed instrumentation, ingestion availability/cap, time range, and App Service platform logs.
+
+For a recent request overview, use the existing workspace:
+
+```kusto
+AppRequests
+| where TimeGenerated > ago(1h) and AppRoleName == "score-api"
+| summarize Requests=sum(ItemCount),
+    Failed=sumif(ItemCount, Success == false),
+    P95Milliseconds=percentilew(DurationMs, ItemCount, 95)
+    by Name
+| order by P95Milliseconds desc
+```
+
+Correlate slow request operation IDs with `AppDependencies` and the bounded analysis read spans to distinguish storage latency from application work. Compare steady-state requests separately from container startup or resizing. Review App Service plan CPU/memory alongside request timing; a larger tier provides headroom but does not repair serial read amplification. Keep troubleshooting output to sanitized timing/status/correlation metadata, not private candidate documents or model output.
 
 ### Authentication and credential rotation
 

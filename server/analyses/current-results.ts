@@ -12,10 +12,12 @@ export function analysisCorrectionCanWork(run: RealAnalysisRunRecord, record?: R
 }
 
 export async function loadAnalysisCorrection(
-  store: AnalysisStore, workspaceId: string, runId: string, comparisonId: string,
+  store: AnalysisStore, workspaceId: string, runId: string, comparisonId: string, signal?: AbortSignal,
 ): Promise<VersionedAnalysisEntity<RealAnalysisCorrectionRecord> | undefined> {
   const id = analysisCorrectionId(runId, comparisonId)
-  const value = await store.get(workspaceId, id)
+  signal?.throwIfAborted()
+  const value = await store.get(workspaceId, id, signal)
+  signal?.throwIfAborted()
   if (!value) return undefined
   const record = parseAnalysisEntity(value.record)
   assertAnalysis(record.recordType === 'analysis-correction' && record.workspaceId === workspaceId &&
@@ -49,10 +51,11 @@ export function projectAnalysisComparison(
 }
 
 export async function resolveAnalysisComparison(
-  store: AnalysisStore, run: RealAnalysisRunRecord, original: VersionedAnalysisEntity<RealAnalysisComparisonRecord>,
+  store: AnalysisStore, run: RealAnalysisRunRecord, original: VersionedAnalysisEntity<RealAnalysisComparisonRecord>, signal?: AbortSignal,
 ): Promise<VersionedAnalysisEntity<RealAnalysisComparisonRecord>> {
+  signal?.throwIfAborted()
   if (original.record.status !== 'complete') return original
-  const correction = await loadAnalysisCorrection(store, run.workspaceId, run.id, original.record.id)
+  const correction = await loadAnalysisCorrection(store, run.workspaceId, run.id, original.record.id, signal)
   assertAnalysis(!correction || correction.record.manifestSha256 === run.manifest.sha256,
     'Correction belongs to another frozen manifest.')
   return {
@@ -62,14 +65,17 @@ export async function resolveAnalysisComparison(
 }
 
 export async function resolveAnalysisComparisons(
-  store: AnalysisStore, run: RealAnalysisRunRecord, originals: VersionedAnalysisEntity<RealAnalysisComparisonRecord>[],
+  store: AnalysisStore, run: RealAnalysisRunRecord, originals: VersionedAnalysisEntity<RealAnalysisComparisonRecord>[], signal?: AbortSignal,
 ): Promise<VersionedAnalysisEntity<RealAnalysisComparisonRecord>[]> {
+  signal?.throwIfAborted()
   if (!originals.some(value => value.record.status === 'complete')) return originals
   const heads = new Map<string, RealAnalysisCorrectionRecord>()
   const tokens = new Set<string>()
   let continuationToken: string | undefined
   do {
-    const page = await store.list(run.workspaceId, { recordType: 'analysis-correction', runId: run.id, limit: 100, continuationToken })
+    signal?.throwIfAborted()
+    const page = await store.list(run.workspaceId, { recordType: 'analysis-correction', runId: run.id, limit: 100, continuationToken, signal })
+    signal?.throwIfAborted()
     for (const value of page.items) {
       const record = parseAnalysisEntity(value.record)
       assertAnalysis(record.recordType === 'analysis-correction' && record.workspaceId === run.workspaceId &&

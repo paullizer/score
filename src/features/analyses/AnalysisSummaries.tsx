@@ -6,6 +6,7 @@ import type {
   RealAnalysisSummariesResponse, RealAnalysisTargetNarrativeSummary,
 } from '../../domain/analysis-narratives'
 import type { RealAnalysisRunDetail, RealAnalysisTargetSummary } from '../../domain/real-analyses'
+import type { AnalysisSummarySubject } from '../../domain/analysis-summary-history'
 import { dateLabel } from '../../domain/selectors'
 import { getDisplayName } from '../../domain/displayNames'
 import { Badge, Button, InlineError, Modal } from '../../components/ui'
@@ -17,9 +18,28 @@ function useSavedSummaries(runId: string, targetId?: string, enabled = true) {
   const api = useRealAnalyses()
   const entry = api?.narratives?.(runId, targetId)
   const ensure = api?.ensureNarratives
+  const subscribe = api?.subscribeNarratives
   useEffect(() => {
-    if (enabled && api?.phase === 'ready') void ensure?.(runId, targetId)
-  }, [api?.phase, enabled, ensure, entry?.state, runId, targetId])
+    if (!enabled || api?.phase !== 'ready') return
+    const release = subscribe?.(runId, targetId)
+    if (document.visibilityState !== 'hidden') void ensure?.(runId, targetId, true)
+    return release
+  }, [api?.phase, enabled, ensure, runId, subscribe, targetId])
+  return entry
+}
+
+function useSavedSummarySubject(runId: string, kind: AnalysisSummarySubject['kind'], subjectId: string) {
+  const api = useRealAnalyses()
+  const entry = api?.summarySubject?.(runId, { kind, subjectId })
+  const ensure = api?.ensureSummarySubject
+  const subscribe = api?.subscribeSummarySubject
+  useEffect(() => {
+    if (api?.phase !== 'ready') return
+    const subject = { kind, subjectId }
+    const release = subscribe?.(runId, subject)
+    if (document.visibilityState !== 'hidden') void ensure?.(runId, subject, true)
+    return release
+  }, [api?.phase, ensure, kind, runId, subjectId, subscribe])
   return entry
 }
 
@@ -220,30 +240,35 @@ function NarrativeContent({ runId, narrative, loadError }: {
 
 export function RealTargetNarrative({ runId, target }: { runId: string; target: RealAnalysisTargetSummary }) {
   const api = useRealAnalyses()
-  const entry = useSavedSummaries(runId, target.id)
-  if (!api?.narratives) return null
-  const narrative = entry?.state === 'ready' ? entry.value.targets.find((item) => item.targetId === target.id) : undefined
+  const entry = useSavedSummarySubject(runId, 'target', target.id)
+  if (!api?.summarySubject) return null
+  const narrative = entry?.state === 'ready' ? entry.value.narrative : undefined
   const error = entry?.state === 'error' || entry?.state === 'ready' ? entry.error : undefined
   return <section className="panel mt-5 space-y-3 p-5" aria-label="Saved job or grade overview">
     <h2 className="text-[15px] font-semibold">{target.kind === 'grade' ? 'Grade' : 'Job'} overview</h2>
     <p className="text-[11px] text-muted">{getDisplayName(target, target.label)} · {targetVersionLabel(target.selection)}. This exact target only, across all its saved comparisons.</p>
     {target.displayName !== undefined && <p className="text-[11px] text-muted">Source title: {target.label}</p>}
     {narrative ? <NarrativeContent runId={runId} narrative={narrative} loadError={error} /> : !error && <p className="text-[12px]" role="status">Loading saved overview...</p>}
-    {error && <InlineError>{error}</InlineError>}
+    {entry?.state === 'ready' && entry.refreshing && <p className="text-[11px] text-muted" role="status">Refreshing saved overview...</p>}
+    {error && <InlineError>{error} <Button size="sm" disabled={api.pending(runId)}
+      onClick={() => void api.ensureSummarySubject(runId, { kind: 'target', subjectId: target.id }, true)}>Retry overview</Button></InlineError>}
   </section>
 }
 
 export function RealCandidateNarrative({ runId, comparisonId, targetId }: { runId: string; comparisonId: string; targetId: string }) {
   const api = useRealAnalyses()
-  const entry = useSavedSummaries(runId, targetId)
-  if (!api?.narratives) return null
-  const narrative = entry?.state === 'ready' ? entry.value.comparisons.find((item) => item.comparisonId === comparisonId) : undefined
+  const entry = useSavedSummarySubject(runId, 'candidate', comparisonId)
+  if (!api?.summarySubject) return null
+  const loaded = entry?.state === 'ready' ? entry.value.narrative : undefined
+  const narrative = loaded?.kind === 'candidate' && loaded.comparisonId === comparisonId && loaded.targetId === targetId ? loaded : undefined
   const error = entry?.state === 'error' || entry?.state === 'ready'
-    ? entry.error ?? (entry.state === 'ready' && !narrative ? 'The summary response omitted this saved comparison. Refresh summaries before continuing.' : undefined)
+    ? entry.error ?? (entry.state === 'ready' && !narrative ? 'The summary response did not match this saved comparison and exact target. Retry this summary before continuing.' : undefined)
     : undefined
   return <section className="panel mt-5 space-y-3 p-5" aria-label="Saved candidate assessment summary">
     <h2 className="text-[15px] font-semibold">Candidate assessment summary</h2>
     {narrative ? <NarrativeContent runId={runId} narrative={narrative} loadError={error} /> : !error && <p className="text-[12px]" role="status">Loading saved candidate summary...</p>}
-    {error && <InlineError>{error}</InlineError>}
+    {entry?.state === 'ready' && entry.refreshing && <p className="text-[11px] text-muted" role="status">Refreshing saved candidate summary...</p>}
+    {error && <InlineError>{error} <Button size="sm" disabled={api.pending(runId)}
+      onClick={() => void api.ensureSummarySubject(runId, { kind: 'candidate', subjectId: comparisonId }, true)}>Retry candidate summary</Button></InlineError>}
   </section>
 }
