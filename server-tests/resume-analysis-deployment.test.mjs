@@ -558,7 +558,10 @@ test('infrastructure composes private stores and identities without new model/se
   assert.match(module, /triggerType: deployed \? 'Schedule' : 'Manual'/)
   assert.match(module, /score-worker:resume-analysis-/)
   assert.ok(module.includes("args: ['dist-worker/${kind}-worker.mjs']"))
-  assert.match(module, /isResume \? \[[\s\S]*?DOCUMENT_INTELLIGENCE_ENDPOINT[\s\S]*?JOB_RENDERER_URL[\s\S]*?\] : \[\]/)
+  const branches = module.match(/isResume \? \[([\s\S]*?DOCUMENT_INTELLIGENCE_ENDPOINT[\s\S]*?JOB_RENDERER_URL[\s\S]*?)\] : \[([\s\S]*?)\]/)
+  assert.ok(branches, 'Resume extraction endpoints must remain in the resume-only environment branch.')
+  assert.match(branches[2], /name: 'ANALYSIS_EVIDENCE_CORRECTIONS_ENABLED', value: analysisEvidenceCorrectionsEnabled/)
+  assert.doesNotMatch(branches[2], /DOCUMENT_INTELLIGENCE_ENDPOINT|JOB_RENDERER_URL/)
   assert.doesNotMatch(module, /(?:JOB|GRADE|WORKSPACE)_(?:RECORDS|SOURCE|BLOB)_CONTAINER/)
   assert.doesNotMatch(module, /Microsoft\.Search|Microsoft\.CognitiveServices\/accounts\/deployments/)
   for (const [kind, stem] of [['resume', 'resumes'], ['analysis', 'analyses']]) {
@@ -589,5 +592,8 @@ test('worker build and shared container packaging include both new entry points 
   assert.ok(docker.includes('word-imports.json'))
   assert.ok(docker.includes(WORD_WORKER_CAPABILITY))
   const serverDocker = readFileSync(new URL('../Dockerfile', import.meta.url), 'utf8')
-  assert.ok(serverDocker.includes("accessSync('dist-server/word-parser.mjs')"))
+  const requiredBundles = serverDocker.match(/for \(const file of (\[[^\]]+\])\) accessSync\('dist-server\/' \+ file\)/)?.[1]
+  assert.ok(requiredBundles?.includes("'word-parser.mjs'"))
+  assert.ok(requiredBundles?.includes("'telemetry.mjs'"))
+  assert.ok(serverDocker.includes('/app/dist-server ./dist-server'))
 })

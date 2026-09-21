@@ -13,6 +13,7 @@ import tailwindConfig from '../../tailwind.config.js'
 import {
   correctionFixture, correctionPreview, correctionSummary, correctionHistory, publishCorrectionFixture,
 } from './analysisCorrections.synthetic.test-support.mjs'
+import { summarySubjectResponse, summaryHistoryFixture } from './analysisSummaries.test-support.mjs'
 
 const output = resolve(`.correction-browser-tests-${randomUUID()}`)
 let browser, server, origin
@@ -171,7 +172,8 @@ async function setup(t, { fixture = correctionFixture(), role = 'owner', feature
     const request = route.request()
     const url = new URL(request.url())
     const record = { path: url.pathname, method: request.method(), headers: request.headers(),
-      body: request.postData() ? request.postDataJSON() : null, cursor: url.searchParams.get('continuationToken') }
+      body: request.postData() ? request.postDataJSON() : null, cursor: url.searchParams.get('continuationToken'),
+      resultRevisionId: url.searchParams.get('resultRevisionId') }
     state.requests.push(record)
     const respond = (body, status = 200) => route.fulfill({ status, contentType: 'application/json', body: JSON.stringify(body) })
     if (url.pathname === base) return respond({ ...fixture.detail, ...fixture.summary })
@@ -180,6 +182,18 @@ async function setup(t, { fixture = correctionFixture(), role = 'owner', feature
         code: 'unavailable', message: 'Synthetic current scores unavailable.',
       } }, 503)
       return respond({ comparisons: fixture.details.map(({ comparison, etag }) => ({ comparison, etag })) })
+    }
+    const historical = url.pathname.match(/\/summaries\/candidate\/([^/]+)(\/history)?$/)
+    if (historical && record.resultRevisionId === 'original') {
+      const subjectId = historical[1]
+      if (historical[2]) return respond({
+        ...summaryHistoryFixture(fixture, { subjectId }), resultRevisionId: 'original', capabilities: { canPublish: false, canRetry: false },
+      })
+      const value = { ...summarySubjectResponse(fixture, { kind: 'candidate', subjectId }, {
+        candidateStatus: 'ready', text: 'Historical original synthetic narrative, retained without changing the current assessment.',
+      }), resultRevisionId: 'original' }
+      value.narrative.resultSha256 = fixture.details.find(item => item.comparison.id === subjectId).comparison.result.sha256
+      return route.fulfill({ status: 200, contentType: 'application/json', headers: { ETag: value.etag }, body: JSON.stringify(value) })
     }
     const match = url.pathname.match(/\/comparisons\/([^/]+)(.*)$/)
     if (!match) return respond({ error: { code: 'invalid_request', message: 'Unexpected synthetic fixture request.' } }, 400)
@@ -335,6 +349,23 @@ test('only verified publication refreshes the run, pair list and affected detail
   assert.match(await history.innerText(), /Original requirement evidence — not applicant evidence/)
   assert.equal((await history.innerText()).includes('private/frozen.json'), false)
   assert.equal(postRequests(state).length, 1)
+})
+
+test('the original assessment narrative and its draft history load lazily and cannot publish over the current revision', async t => {
+  const { page, state } = await setup(t, { result: true, feature: false })
+  await page.getByRole('button', { name: 'Original result and correction history', exact: true }).click()
+  await page.getByRole('button', { name: 'View original assessment narrative', exact: true }).waitFor()
+  assert.equal(state.requests.some(item => item.path.includes('/summaries/')), false)
+  await page.getByRole('button', { name: 'View original assessment narrative', exact: true }).click()
+  const history = page.getByRole('region', { name: 'original assessment narrative', exact: true })
+  await history.getByText('Historical original synthetic narrative, retained without changing the current assessment.', { exact: true }).waitFor()
+  await history.getByRole('button', { name: 'History: original assessment narrative', exact: true }).click()
+  await history.getByText('This assessment revision is read-only. Its drafts cannot replace the current assessment summary.', { exact: true }).waitFor()
+  const actions = history.getByRole('button', { name: /select.*draft|publish|retry this summary/i })
+  for (const action of await actions.all()) assert.equal(await action.isEnabled(), false)
+  assert.equal(state.requests.filter(item => item.path.includes('/summaries/')).length, 2)
+  assert.ok(state.requests.filter(item => item.path.includes('/summaries/')).every(item => item.method === 'GET' && item.resultRevisionId === 'original'))
+  assert.equal(state.requests.some(item => item.method === 'POST'), false)
 })
 
 test('a published correction can refresh its score after a transient read failure without replaying the mutation', async t => {

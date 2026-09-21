@@ -11,9 +11,11 @@ import {
 } from '../../src/domain/analysis-summary-history'
 import { conflict, invalidRequest, notFound } from '../errors'
 import { StoreConflictError } from '../store'
+import { isUuid } from '../jobs/validation'
+import { resolveAnalysisComparisonRevision } from './current-results'
 import { analysisIsRemoved, fencedAnalysisBlobs } from './guards'
-import { loadAnalysisRun } from './lifecycle'
-import { analysisNarrativeCanWork } from './narrative-records'
+import { loadAnalysisComparison, loadAnalysisRun } from './lifecycle'
+import { analysisNarrativeCanWork, candidateNarrativeBinding } from './narrative-records'
 import { loadAnalysisNarrative, readAnalysisNarrativeInventory } from './narratives'
 import { analysisPageCursor, analysisPageToken } from './paging'
 import { analysisBlobReference, parseAnalysisJson, readAnalysisBlob } from './snapshots'
@@ -206,7 +208,7 @@ export async function readSummaryGeneration(
 }
 
 export async function readSummarySubject(
-  deps: RealAnalysesDeps, workspaceId: string, runId: string, subject: AnalysisSummarySubject, signal?: AbortSignal,
+  deps: RealAnalysesDeps, workspaceId: string, runId: string, subject: AnalysisSummarySubject, signal?: AbortSignal, resultRevisionId?: string,
 ) {
   if (subject.kind !== 'candidate' && subject.kind !== 'target' ||
     (subject.kind === 'candidate' ? !isAnalysisId(subject.subjectId, 'comparison')
@@ -214,9 +216,18 @@ export async function readSummarySubject(
     throw notFound('The exact saved summary was not found.')
   }
   const inventory = await readAnalysisNarrativeInventory(deps, workspaceId, runId, undefined, signal)
-  const pair = subject.kind === 'candidate' ? inventory.comparisons.find(item => item.id === subject.subjectId) : undefined
+  let pair = subject.kind === 'candidate' ? inventory.comparisons.find(item => item.id === subject.subjectId) : undefined
   const target = inventory.targets.find(item => item.target.summary.id === (pair?.target.summary.id ?? subject.subjectId))
   if (!target || subject.kind === 'candidate' && !pair) throw notFound('The exact saved summary was not found in this run.')
+  if (resultRevisionId !== undefined) {
+    if (subject.kind !== 'candidate' || !pair || resultRevisionId !== 'original' && !isUuid(resultRevisionId)) {
+      throw invalidRequest('Historical summary reads require one original or published candidate result revision.')
+    }
+    const original = await loadAnalysisComparison(deps.store, workspaceId, runId, subject.subjectId, signal)
+    if (!original) throw notFound('The original comparison was not found.')
+    const selected = await resolveAnalysisComparisonRevision(deps, inventory.run.record, original, resultRevisionId, signal)
+    pair = { ...pair, comparison: selected.record, binding: candidateNarrativeBinding(inventory.run.record, selected.record), correctionPending: false }
+  }
   const id = analysisNarrativeId(subject.kind, runId, subject.subjectId, pair?.comparison?.resultRevision?.id)
   const current = await loadAnalysisNarrative(deps.store, workspaceId, id, signal)
   if (current) assertAnalysis(current.record.runId === runId && current.record.targetId === target.target.summary.id &&
@@ -226,6 +237,11 @@ export async function readSummarySubject(
   const binding: AnalysisNarrativeInputBinding | null = subject.kind === 'candidate' ? pair!.binding
     : target.binding.comparisons.some(item => item.status === 'complete') ? target.binding : null
   const inputFingerprint = binding ? analysisHash(binding) : null
+  if (current?.record.recordType === 'analysis-candidate-narrative') assertAnalysis(pair?.binding &&
+    current.record.comparisonId === pair.id && current.record.resultSha256 === pair.binding.resultSha256 &&
+    current.record.inputFingerprint === inputFingerprint &&
+    analysisHash(current.record.resumeSnapshot) === analysisHash(pair.binding.resumeSnapshot),
+  'Historical candidate summary is not bound to the selected assessment revision.')
   const etag = current?.etag ?? `"${analysisHash({ id, missing: true, inputFingerprint, manifestSha256: inventory.run.record.manifest.sha256 })}"`
   return { inventory, current, pair, target, binding, etag, inputFingerprint, recordId: id }
 }
@@ -236,12 +252,13 @@ const historyCursorSchema = z.strictObject({
 
 export async function readAnalysisSummaryHistory(
   deps: RealAnalysesDeps, workspaceId: string, runId: string, subject: AnalysisSummarySubject, continuationToken?: string,
-  signal?: AbortSignal,
+  signal?: AbortSignal, resultRevisionId?: string,
 ): Promise<AnalysisSummaryHistoryPage> {
-  const scope = { workspaceId, runId, kind: 'summary-history' as const, summaryKind: subject.kind, subjectId: subject.subjectId }
+  const scope = { workspaceId, runId, kind: 'summary-history' as const, summaryKind: subject.kind, subjectId: subject.subjectId,
+    ...(resultRevisionId ? { resultRevisionId } : {}) }
   const cursor = analysisPageCursor(scope, continuationToken)
   for (let race = 0; race < 4; race++) {
-    const state = await readSummarySubject(deps, workspaceId, runId, subject, signal)
+    const state = await readSummarySubject(deps, workspaceId, runId, subject, signal, resultRevisionId)
     const record = state.current?.record
     let reference = record?.history
     if (cursor) {
@@ -275,11 +292,12 @@ export async function readAnalysisSummaryHistory(
       throw notFound('The saved analysis is being removed.')
     }
     if (run.etag !== state.inventory.run.etag || latest?.etag !== state.current?.etag) continue
-    const writable = (!workspace || workspace.record.state === 'active') && analysisNarrativeCanWork(run.record) &&
+    const writable = !resultRevisionId && (!workspace || workspace.record.state === 'active') && analysisNarrativeCanWork(run.record) &&
       !run.record.narrativeRequestId && Boolean(state.binding)
     const next = reference ? analysisPageToken(scope, JSON.stringify({ headId: record!.history!.id, next: reference })) : undefined
     return summaryHistoryPageSchema.parse({
       schemaVersion: 1, workspaceId, runId, ...subject, etag: state.etag, inputFingerprint: state.inputFingerprint,
+      ...(resultRevisionId ? { resultRevisionId } : {}),
       entries, ...(next ? { continuationToken: next } : {}),
       capabilities: { canPublish: writable && Boolean(record?.history), canRetry: writable },
     })

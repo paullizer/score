@@ -106,7 +106,8 @@ export function RealComparisonReview({ detail, actions, initialView }: {
       <div className="result-summary"><ShieldCheck size={16} aria-hidden="true" /><div><h3>Evidence-based assessment</h3><p>{result.summary}</p></div></div>
     </section>
     <AnalysisCorrectionDetails detail={detail} />
-    <RealCandidateNarrative runId={comparison.runId} comparisonId={comparison.id} targetId={comparison.target.summary.id} />
+    <RealCandidateNarrative runId={comparison.runId} comparisonId={comparison.id} targetId={comparison.target.summary.id}
+      resultSha256={comparison.result?.sha256} resultRevisionId={comparison.resultRevision?.id} />
     <section className="panel mt-5" aria-label="Evidence coverage and limitations"><div className="section-heading"><div><h2>Completion is separate from evidence coverage</h2>
       <p>{result.coverage.supported} supported · {result.coverage.partial} partial · {result.coverage.missing} missing · {result.coverage.notAssessed} not assessed · {result.coverage.notApplicable} not applicable</p>
       <p>{result.coverage.assessedWeight}% assessed weight / {result.coverage.totalWeight}% total weight. No client-side total or missing-criterion renormalization is used.</p></div></div>

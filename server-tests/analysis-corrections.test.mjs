@@ -5,7 +5,7 @@ import {
   api, fixture, seedResume, seedJob, seedGrade, publishResult, startHttp, citation, clone, ACTOR, guidance, finishInitialization,
 } from './real-analyses.test-support.mjs'
 import { reviewedCorrection as reviewed } from './analysis-corrections.test-support.mjs'
-import { runComparisons, settleNarratives } from './real-analysis-narratives.test-support.mjs'
+import { narrativeRuntime, narrativeWorker, runComparisons, settleNarratives } from './real-analysis-narratives.test-support.mjs'
 
 const status = expected => error => error.status === expected
 const reason = 'Score absent documentary support as zero; preserve original results and evidence.'
@@ -183,13 +183,21 @@ test('a synthetic 412-comparison recovery changes exactly 24 results across thre
   for (const targetId of targets) originalTargets.set(targetId,
     clone(await f.analysis.store.get(f.workspaceId, api.analysisNarrativeId('target', runId, targetId))))
   assert.equal((await f.service.detail(f.workspaceId, runId)).run.progress.unscored, 24)
+  for (const comparisonId of gaps) await requestCorrection({ f, runId, comparisonId })
+  let published = 0
   for (const comparisonId of gaps) {
     const context = { f, runId, comparisonId }
-    const requested = await requestCorrection(context)
-    assert.equal(requested.preview.after.overall.score, 72)
     const accepted = await reviewed(context)
+    assert.equal(accepted.result.overall.score, 72)
     assert.deepEqual(accepted.result.criteria[0], originals.get(comparisonId).result.criteria[0])
     await accepted.publish()
+    if (++published === 1) {
+      const worker = narrativeWorker(f)
+      await (await narrativeRuntime()).runAnalysisWorker({ ...worker.deps, correctionsEnabled: false }, { maxItems: 100 })
+      const waiting = await f.analysis.store.get(f.workspaceId, originalTargets.get(targets[0]).record.id)
+      assert.equal(waiting.record.status, 'waiting')
+      assert.equal(waiting.record.attempts, 0, 'An overview cannot start while the accepted correction cohort still has pending reviews.')
+    }
   }
   const refreshed = await settleNarratives(f, runId)
   assert.equal(refreshed.counts.candidates.ready, 412)
@@ -228,23 +236,34 @@ test('a synthetic 412-comparison recovery changes exactly 24 results across thre
   assert.deepEqual(await f.analysis.store.get(f.workspaceId, originalTargets.get(targets[3]).record.id), originalTargets.get(targets[3]))
 })
 
-test('successive explicit corrections retain both revisions without rebinding old candidate summaries or double-counting progress', async () => {
+test('successive explicit corrections retain read-only historical publications and draft pages without rebinding or double-counting', async t => {
   const context = await setup({ allMissing: true })
   const { f, runId, comparisonId, original } = context
+  const subject = { kind: 'candidate', subjectId: comparisonId }
+  await settleNarratives(f, runId)
+  for (let generation = 0; generation < 4; generation++) {
+    const history = await f.service.summaryHistory(f.workspaceId, runId, subject)
+    await f.service.retrySummary(f.workspaceId, runId, subject, randomUUID(), history.etag, ACTOR)
+    await settleNarratives(f, runId)
+  }
+  const originalNarrative = await f.service.summarySubject(f.workspaceId, runId, subject)
   const firstPreview = await f.service.correctionPreview(f.workspaceId, runId, comparisonId)
   const firstRequest = await f.service.requestCorrection(f.workspaceId, runId, comparisonId,
     { ...input(firstPreview), criterionIds: ['confidentiality'] }, randomUUID(), firstPreview.etag, ACTOR)
   const first = await reviewed(context)
   await first.publish()
+  await settleNarratives(f, runId)
   assert.equal((await f.service.detail(f.workspaceId, runId)).run.progress.unscored, 1)
   const firstNarrativeId = api.analysisNarrativeId('candidate', runId, comparisonId, firstRequest.requestId)
   const firstNarrative = clone(await f.analysis.store.get(f.workspaceId, firstNarrativeId))
+  const firstPublication = await f.service.summarySubject(f.workspaceId, runId, subject)
   const secondRequest = await requestCorrection(context)
   assert.deepEqual(secondRequest.preview.criterionIds, ['engineering'])
   const second = await reviewed(context)
   assert.equal(second.proposal.baseResult.sha256, first.reference.sha256)
   assert.equal(second.proposal.originalResultSha256, original.reference.sha256)
   await second.publish()
+  await settleNarratives(f, runId)
   const run = await f.service.detail(f.workspaceId, runId)
   assert.equal(run.run.progress.scored, 1)
   assert.equal(run.run.progress.unscored, 0)
@@ -258,6 +277,34 @@ test('successive explicit corrections retain both revisions without rebinding ol
   const history = await f.service.correctionHistory(f.workspaceId, runId, comparisonId)
   assert.deepEqual(history.entries.map(entry => entry.requestId), [secondRequest.requestId, firstRequest.requestId])
   assert.deepEqual(history.originalAssessment.criteria, original.result.criteria)
+  const records = clone([...f.analysis.store.values])
+  const old = await f.service.summarySubject(f.workspaceId, runId, subject, undefined, 'original')
+  assert.deepEqual(old.narrative, originalNarrative.narrative)
+  assert.equal(old.resultRevisionId, 'original')
+  const earlier = await f.service.summarySubject(f.workspaceId, runId, subject, undefined, firstRequest.requestId)
+  assert.deepEqual(earlier.narrative, firstPublication.narrative)
+  assert.equal(earlier.narrative.resultSha256, first.reference.sha256)
+  const latest = await f.service.summarySubject(f.workspaceId, runId, subject)
+  assert.equal(latest.narrative.resultSha256, second.reference.sha256)
+  const historicalPage = await f.service.summaryHistory(f.workspaceId, runId, subject, undefined, undefined, 'original')
+  assert.equal(historicalPage.resultRevisionId, 'original')
+  assert.deepEqual(historicalPage.capabilities, { canPublish: false, canRetry: false })
+  assert.equal(historicalPage.entries.length, 12)
+  assert.ok(historicalPage.continuationToken)
+  const nextPage = await f.service.summaryHistory(f.workspaceId, runId, subject, historicalPage.continuationToken, undefined, 'original')
+  assert.ok(nextPage.entries.length > 0)
+  assert.ok(nextPage.entries.every(entry => !historicalPage.entries.some(previous => previous.id === entry.id)))
+  await assert.rejects(f.service.summaryHistory(f.workspaceId, runId, subject, historicalPage.continuationToken), status(400))
+  await assert.rejects(f.service.summarySubject(f.workspaceId, runId, subject, undefined, randomUUID()), status(404))
+  assert.deepEqual([...f.analysis.store.values], records)
+  const http = await startHttp(f)
+  t.after(http.close)
+  const path = `/${runId}/summaries/candidate/${comparisonId}`
+  const draft = historicalPage.entries.find(entry => entry.draft)
+  const body = { generationId: draft.generationId, round: draft.round, outputSha256: draft.outputSha256 }
+  const headers = { 'If-Match': historicalPage.etag, 'Idempotency-Key': randomUUID() }
+  assert.equal((await http.request(`${path}/publish?resultRevisionId=original`, 'POST', body, { headers })).status, 400)
+  assert.equal((await http.request(`${path}/publish`, 'POST', body, { headers })).status, 409)
 })
 
 test('an explicit retry records a terminal storage failure even when its worker could not persist an attempt checkpoint', async () => {
@@ -405,6 +452,14 @@ test('correction routes enforce owner/editor history, normal CSRF, exact ETags, 
   const saved = await response.json()
   assert.equal(saved.correction.status, 'queued')
   assert.equal(saved.correction.requestId, headers['Idempotency-Key'])
+  const historical = `/${runId}/summaries/candidate/${comparisonId}?resultRevisionId=original`
+  const selected = await http.request(historical)
+  assert.equal(selected.status, 200)
+  assert.equal((await selected.json()).resultRevisionId, 'original')
+  assert.equal((await http.request(historical, 'GET', undefined, { role: 'viewer' })).status, 403)
+  assert.equal((await http.request(historical, 'GET', undefined, { role: 'stranger' })).status, 404)
+  assert.equal((await http.request(`${historical}&resultRevisionId=original`)).status, 400)
+  assert.equal((await http.request(historical.replace('original', 'invalid'))).status, 400)
 })
 
 test('GS exclusions and unscored qualification limitations survive a zero correction unchanged', async () => {

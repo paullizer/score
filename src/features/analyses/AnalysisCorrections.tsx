@@ -18,6 +18,7 @@ import {
 } from '../../services/analysisCorrections'
 import { CloudApiError } from '../../services/cloudWorkspace'
 import { realAnalysisCancellationPending, targetVersionLabel } from './realAnalysisUi'
+import { HistoricalCandidateNarrative } from './AnalysisSummaryHistory'
 import {
   availableWithheldComparisons, boundedCorrectionWork, correctionIsActive, correctionPolicyReason, CorrectionRequestJournal,
 } from './analysisCorrectionState'
@@ -97,6 +98,7 @@ function useCorrectionMonitor(access: Access, runId: string, comparisons: RealAn
     })
     if (!changed.length) return
     const api = access.api
+    const opened = changed.filter(value => api.comparison(runId, value.comparisonId).state === 'ready')
     const reader = Symbol()
     for (const value of changed) publicationReads.current.set(value.comparisonId, reader)
     try {
@@ -104,9 +106,8 @@ function useCorrectionMonitor(access: Access, runId: string, comparisons: RealAn
       if (signal.aborted || !current.current.access.readable) return
       const latest = current.current.access.api
       for (const view of [latest?.detail(runId), latest?.comparisons(runId)]) {
-        if (view?.state === 'error') throw new Error(view.error)
+        if (view && 'error' in view && view.error) throw new Error(view.error)
       }
-      const opened = changed.filter(value => api.comparison(runId, value.comparisonId).state === 'ready')
       await boundedCorrectionWork(opened, async value => {
         if (current.current.access.readable) await api.ensureComparison(runId, value.comparisonId, true)
       }, signal)
@@ -672,6 +673,8 @@ function CorrectionHistory({ runId, comparisonId, criterionLabels, originalSha25
           <HistoricalCitations citations={qualification.requirementCitations} label="Original qualification requirement evidence" />
         </article>)}
       </details>
+      <HistoricalCandidateNarrative runId={runId} comparisonId={comparisonId} resultRevisionId="original"
+        resultSha256={page.originalResultSha256} label="original assessment narrative" />
     </div>}
     {page && entries.length === 0 && <p>No correction attempts are recorded. The original result remains unchanged.</p>}
     {entries.map(entry => <article key={entry.id} className="space-y-3 rounded-lg border p-3" aria-label={`Correction checkpoint ${entry.id}`}>
@@ -690,6 +693,8 @@ function CorrectionHistory({ runId, comparisonId, criterionLabels, originalSha25
             </blockquote>)}</li>)}</ul> : <p>No reviewer issues were recorded.</p>}
       </div> : <p>No grounding review was recorded for this proposal. This is not an approval.</p>}
       {entry.error && <InlineError>{entry.error.stage} · {entry.error.code}: {entry.error.message}</InlineError>}
+      {entry.outcome === 'ready' && entry.resultSha256 && <HistoricalCandidateNarrative runId={runId} comparisonId={comparisonId}
+        resultRevisionId={entry.requestId} resultSha256={entry.resultSha256} label="correction revision narrative" />}
       <details><summary className="cursor-pointer font-semibold">Audit identities and immutable hashes</summary>
         <dl className="mt-2 space-y-2 break-all text-[11px]">
           <div><dt>Checkpoint / request</dt><dd>{entry.id} / {entry.requestId}</dd></div>

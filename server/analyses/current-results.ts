@@ -1,9 +1,16 @@
-import type { RealAnalysisCorrectionRecord } from '../../src/domain/analysis-corrections'
+import {
+  ANALYSIS_CORRECTION_LIMITS, type AnalysisCorrectionPublication, type RealAnalysisCorrectionRecord,
+} from '../../src/domain/analysis-corrections'
 import {
   ANALYSIS_LIMITS, type RealAnalysisComparisonRecord, type RealAnalysisRunRecord, type VersionedAnalysisEntity,
 } from '../../src/domain/real-analyses'
-import type { AnalysisStore } from './store'
-import { analysisCorrectionId, analysisHash, assertAnalysis, parseAnalysisEntity } from './validation'
+import { invalidRequest, notFound } from '../errors'
+import { isUuid } from '../jobs/validation'
+import { readAnalysisCorrectionHistoryEntry } from './correction-artifacts'
+import { parseAnalysisCorrectionProposal } from './correction-validation'
+import { parseAnalysisJson, readAnalysisBlob } from './snapshots'
+import type { AnalysisStore, RealAnalysesDeps } from './store'
+import { analysisCorrectionId, analysisHash, assertAnalysis, parseAnalysisEntity, parseAnalysisResult } from './validation'
 
 export function analysisCorrectionCanWork(run: RealAnalysisRunRecord, record?: RealAnalysisCorrectionRecord): boolean {
   return !run.lifecycle?.archivedAt && !run.lifecycle?.deletingAt && !run.lifecycle?.deletedAt &&
@@ -41,13 +48,80 @@ export function projectAnalysisComparison(
     correction.targetSnapshot.sha256 === original.target.blob.sha256,
   'Correction is not bound to this immutable completed comparison.')
   if (!correction.published) return original
-  const { result, summary, revision, attemptId } = correction.published
+  return comparisonWithPublication(original, correction.published)
+}
+
+function comparisonWithPublication(
+  original: RealAnalysisComparisonRecord, publication: AnalysisCorrectionPublication,
+): RealAnalysisComparisonRecord {
+  const { result, summary, revision, attemptId } = publication
   const projected: RealAnalysisComparisonRecord = {
     ...original, result, resultSummary: summary, attemptId, completedAt: revision.correctedAt,
     updatedAt: revision.correctedAt, resultRevision: revision,
   }
   parseAnalysisEntity(projected)
   return projected
+}
+
+export async function resolveAnalysisComparisonRevision(
+  deps: RealAnalysesDeps, run: RealAnalysisRunRecord, original: VersionedAnalysisEntity<RealAnalysisComparisonRecord>,
+  revisionId: string, signal?: AbortSignal,
+): Promise<VersionedAnalysisEntity<RealAnalysisComparisonRecord>> {
+  signal?.throwIfAborted()
+  if (revisionId !== 'original' && !isUuid(revisionId)) throw invalidRequest('Select the original result or one exact published correction revision.')
+  if (original.record.status !== 'complete' || !original.record.result) throw notFound('This comparison has no completed assessment history.')
+  if (revisionId === 'original') return original
+  const head = await loadAnalysisCorrection(deps.store, run.workspaceId, run.id, original.record.id, signal)
+  if (!head) throw notFound('The requested published correction revision was not found.')
+  assertAnalysis(head.record.manifestSha256 === run.manifest.sha256, 'Correction belongs to another frozen manifest.')
+  projectAnalysisComparison(original.record, head.record)
+  const version = (publication: AnalysisCorrectionPublication) => ({
+    record: comparisonWithPublication(original.record, publication),
+    etag: `"${analysisHash({ original: original.etag, revision: publication })}"`,
+  })
+  if (head.record.published?.revision.id === revisionId) return version(head.record.published)
+  let reference = head.record.history, bytes = 0
+  const seen = new Set<string>()
+  while (reference) {
+    signal?.throwIfAborted()
+    assertAnalysis(!seen.has(reference.id) && seen.size < ANALYSIS_CORRECTION_LIMITS.maxHistoryEntries &&
+      (bytes += reference.blob.bytes) <= 128 * 1024 * 1024, 'Published correction history exceeds its bounded read.')
+    seen.add(reference.id)
+    const entry = await readAnalysisCorrectionHistoryEntry(deps.blobs, run.workspaceId, run.id, original.record.id, reference, signal)
+    reference = entry.previous
+    if (entry.outcome !== 'ready' || entry.requestId !== revisionId) continue
+    assertAnalysis(entry.result && entry.attemptId && entry.review?.outcome === 'supported', 'Published correction history has no reviewed result.')
+    assertAnalysis(bytes + entry.result.bytes + entry.proposal.bytes <= 128 * 1024 * 1024, 'Historical result exceeds its bounded read.')
+    const [proposalBytes, resultBytes] = await Promise.all([
+      readAnalysisBlob(deps.blobs, entry.proposal, run.workspaceId, run.id, signal),
+      readAnalysisBlob(deps.blobs, entry.result, run.workspaceId, run.id, signal),
+    ])
+    const proposal = parseAnalysisCorrectionProposal(parseAnalysisJson(proposalBytes))
+    const result = parseAnalysisResult(parseAnalysisJson(resultBytes))
+    assertAnalysis(proposal.workspaceId === run.workspaceId && proposal.runId === run.id &&
+      proposal.comparisonId === original.record.id && proposal.requestId === revisionId &&
+      proposal.manifestSha256 === run.manifest.sha256 && proposal.originalResultSha256 === original.record.result.sha256 &&
+      analysisHash(proposal.resumeSnapshot) === analysisHash(head.record.resumeSnapshot) &&
+      analysisHash(proposal.targetSnapshot) === analysisHash(head.record.targetSnapshot) &&
+      result.workspaceId === run.workspaceId && result.runId === run.id && result.comparisonId === original.record.id &&
+      result.provenance.attemptId === entry.attemptId && result.provenance.manifestSha256 === run.manifest.sha256 &&
+      analysisHash(result.provenance.resumeSnapshot) === analysisHash(proposal.resumeSnapshot) &&
+      analysisHash(result.provenance.targetSnapshot) === analysisHash(proposal.targetSnapshot) &&
+      analysisHash(result.provenance.correction) === analysisHash(proposal.provenance) &&
+      analysisHash(result.provenance.groundingReviews.at(-1)) === analysisHash(entry.review) &&
+      analysisHash({ criteria: result.criteria, qualifications: result.qualifications, summary: result.summary, limitations: result.limitations }) ===
+        analysisHash(proposal.assessment) &&
+      analysisHash({ completion: result.completion, overall: result.overall, coverage: result.coverage }) === analysisHash(proposal.summary),
+    'Historical correction result is not bound to its reviewed proposal and original frozen inputs.')
+    return version({
+      result: entry.result, summary: proposal.summary, attemptId: entry.attemptId,
+      revision: {
+        id: revisionId, policyVersion: proposal.provenance.policyVersion, originalResultSha256: proposal.originalResultSha256,
+        baseResultSha256: proposal.baseResult.sha256, correctedAt: result.createdAt, criterionIds: proposal.provenance.criterionIds,
+      },
+    })
+  }
+  throw notFound('The requested correction did not publish an assessment revision.')
 }
 
 export async function resolveAnalysisComparison(

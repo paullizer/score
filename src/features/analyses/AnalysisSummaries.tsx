@@ -28,7 +28,7 @@ function useSavedSummaries(runId: string, targetId?: string, enabled = true) {
   return entry
 }
 
-function useSavedSummarySubject(runId: string, kind: AnalysisSummarySubject['kind'], subjectId: string) {
+function useSavedSummarySubject(runId: string, kind: AnalysisSummarySubject['kind'], subjectId: string, resultSha256?: string) {
   const api = useRealAnalyses()
   const entry = api?.summarySubject?.(runId, { kind, subjectId })
   const ensure = api?.ensureSummarySubject
@@ -39,7 +39,7 @@ function useSavedSummarySubject(runId: string, kind: AnalysisSummarySubject['kin
     const release = subscribe?.(runId, subject)
     if (document.visibilityState !== 'hidden') void ensure?.(runId, subject, true)
     return release
-  }, [api?.phase, ensure, kind, runId, subjectId, subscribe])
+  }, [api?.phase, ensure, kind, resultSha256, runId, subjectId, subscribe])
   return entry
 }
 
@@ -255,14 +255,19 @@ export function RealTargetNarrative({ runId, target }: { runId: string; target: 
   </section>
 }
 
-export function RealCandidateNarrative({ runId, comparisonId, targetId }: { runId: string; comparisonId: string; targetId: string }) {
+export function RealCandidateNarrative({ runId, comparisonId, targetId, resultSha256, resultRevisionId }: {
+  runId: string; comparisonId: string; targetId: string; resultSha256?: string; resultRevisionId?: string
+}) {
   const api = useRealAnalyses()
-  const entry = useSavedSummarySubject(runId, 'candidate', comparisonId)
+  const entry = useSavedSummarySubject(runId, 'candidate', comparisonId, resultSha256)
   if (!api?.summarySubject) return null
   const loaded = entry?.state === 'ready' ? entry.value.narrative : undefined
   const narrative = loaded?.kind === 'candidate' && loaded.comparisonId === comparisonId && loaded.targetId === targetId ? loaded : undefined
+  const bindingError = narrative && resultSha256 && (narrative.resultSha256 !== undefined
+    ? narrative.resultSha256 !== resultSha256 : Boolean(resultRevisionId))
+    ? 'This summary belongs to a different assessment revision. It is historical, not current for the displayed score. Retry this summary to load the current revision.' : undefined
   const error = entry?.state === 'error' || entry?.state === 'ready'
-    ? entry.error ?? (entry.state === 'ready' && !narrative ? 'The summary response did not match this saved comparison and exact target. Retry this summary before continuing.' : undefined)
+    ? entry.error ?? bindingError ?? (entry.state === 'ready' && !narrative ? 'The summary response did not match this saved comparison and exact target. Retry this summary before continuing.' : undefined)
     : undefined
   return <section className="panel mt-5 space-y-3 p-5" aria-label="Saved candidate assessment summary">
     <h2 className="text-[15px] font-semibold">Candidate assessment summary</h2>

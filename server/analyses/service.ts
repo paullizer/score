@@ -314,18 +314,18 @@ export class RealAnalysisService {
   summaries(workspaceId: string, runId: string, targetId?: string, signal?: AbortSignal) {
     return readAnalysisSummaries(this.deps, workspaceId, runId, targetId, signal)
   }
-  summarySubject(workspaceId: string, runId: string, subject: AnalysisSummarySubject, signal?: AbortSignal) {
+  summarySubject(workspaceId: string, runId: string, subject: AnalysisSummarySubject, signal?: AbortSignal, resultRevisionId?: string) {
     return traceOperation(subject.kind === 'candidate' ? 'score.analysis.summary.candidate' : 'score.analysis.summary.target',
-      { 'score.summary.kind': subject.kind }, () => readAnalysisSummarySubject(this.deps, workspaceId, runId, subject, signal))
+      { 'score.summary.kind': subject.kind }, () => readAnalysisSummarySubject(this.deps, workspaceId, runId, subject, signal, resultRevisionId))
   }
-  correctionPreview(workspaceId: string, runId: string, comparisonId: string) {
-    return this.corrections.preview(workspaceId, runId, comparisonId)
+  correctionPreview(workspaceId: string, runId: string, comparisonId: string, signal?: AbortSignal) {
+    return this.corrections.preview(workspaceId, runId, comparisonId, signal)
   }
-  correctionState(workspaceId: string, runId: string, comparisonId: string) {
-    return this.corrections.state(workspaceId, runId, comparisonId)
+  correctionState(workspaceId: string, runId: string, comparisonId: string, signal?: AbortSignal) {
+    return this.corrections.state(workspaceId, runId, comparisonId, signal)
   }
-  correctionHistory(workspaceId: string, runId: string, comparisonId: string, continuationToken?: string) {
-    return this.corrections.history(workspaceId, runId, comparisonId, continuationToken)
+  correctionHistory(workspaceId: string, runId: string, comparisonId: string, continuationToken?: string, signal?: AbortSignal) {
+    return this.corrections.history(workspaceId, runId, comparisonId, continuationToken, signal)
   }
   requestCorrection(
     workspaceId: string, runId: string, comparisonId: string, input: AnalysisCorrectionInput, requestId: string, expected: string, actor: string,
@@ -338,8 +338,8 @@ export class RealAnalysisService {
   generateSummaries(workspaceId: string, runId: string, input: GenerateRealAnalysisSummariesInput, requestId: string, expected: string, actor: string) {
     return generateAnalysisSummaries(this.deps, workspaceId, runId, input, requestId, expected, actor, this.clock)
   }
-  summaryHistory(workspaceId: string, runId: string, subject: AnalysisSummarySubject, continuationToken?: string, signal?: AbortSignal) {
-    return readAnalysisSummaryHistory(this.deps, workspaceId, runId, subject, continuationToken, signal)
+  summaryHistory(workspaceId: string, runId: string, subject: AnalysisSummarySubject, continuationToken?: string, signal?: AbortSignal, resultRevisionId?: string) {
+    return readAnalysisSummaryHistory(this.deps, workspaceId, runId, subject, continuationToken, signal, resultRevisionId)
   }
   publishSummary(
     workspaceId: string, runId: string, subject: AnalysisSummarySubject, input: PublishSummaryDraftInput,

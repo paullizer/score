@@ -649,6 +649,8 @@ test('malformed scope, result, generation, revision, duplicate, omitted and extr
     body => { body.capture.revision = 'e'.repeat(64) },
     body => { body.capture.ready = false },
     body => { body.capture.comparisons[0].resultSha256 = 'b'.repeat(64) },
+    body => { body.comparisons[0].resultSha256 = 'f'.repeat(64) },
+    body => { body.comparisons[0].resultSha256 = null },
     body => { body.capture.comparisons[0].narrative.revision = 'b'.repeat(64) },
     body => { body.capture.comparisons[0].narrative.inputFingerprint = 'b'.repeat(64) },
     body => { body.capture.targets[0].narrative.revision = 'b'.repeat(64) },

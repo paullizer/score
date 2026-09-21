@@ -8,6 +8,7 @@ import { build } from 'esbuild'
 import {
   correctionFixture, correctionPreview, correctionSummary, correctionHistory, correctionReason,
 } from './analysisCorrections.synthetic.test-support.mjs'
+import { summarySubjectResponse, summaryHistoryFixture } from './analysisSummaries.test-support.mjs'
 
 const output = resolve(`.correction-service-tests-${randomUUID()}`)
 const originalFetch = globalThis.fetch
@@ -23,6 +24,7 @@ before(async () => {
     stdin: { resolveDir: process.cwd(), loader: 'ts', contents: `
       export * from './src/services/analysisCorrections'
       export * as state from './src/features/analyses/analysisCorrectionState'
+      export { getRealAnalysisSummarySubject, getRealAnalysisSummaryHistory } from './src/services/realAnalyses'
       export { CloudApiError } from './src/services/cloudWorkspace'
     ` }, outfile: join(output, 'client.mjs'), bundle: true, packages: 'external', format: 'esm',
     platform: 'node', logLevel: 'silent', define: { 'import.meta.env.VITE_DEPLOYMENT_MODE': '"cloud"' },
@@ -33,6 +35,39 @@ before(async () => {
 })
 afterEach(() => { globalThis.fetch = originalFetch })
 after(async () => { await rm(output, { recursive: true, force: true }) })
+
+test('historical summary reads bind the selected result revision and reject current or writable-history substitutions', async () => {
+  const subject = { kind: 'candidate', subjectId: comparisonId }
+  const selected = { ...summarySubjectResponse(fixture, subject, { candidateStatus: 'ready' }), resultRevisionId: 'original' }
+  selected.narrative.resultSha256 = fixture.details[0].comparison.result.sha256
+  const requests = []
+  globalThis.fetch = async (url, init) => {
+    requests.push({ url, init })
+    return Response.json(selected, { headers: { ETag: selected.etag } })
+  }
+  const value = await client.getRealAnalysisSummarySubject(workspaceId, runId, subject, undefined, 'original')
+  assert.equal(value.narrative.resultSha256, selected.narrative.resultSha256)
+  assert.match(requests[0].url, /\/summaries\/candidate\/synthetic-comparison-1\?resultRevisionId=original$/)
+  assert.equal(requests[0].init.method, 'GET')
+  for (const mutate of [
+    value => { delete value.resultRevisionId },
+    value => { value.resultRevisionId = randomUUID() },
+    value => { delete value.narrative.resultSha256 },
+    value => { value.narrative.resultSha256 = 'invalid' },
+  ]) {
+    const invalid = structuredClone(selected)
+    mutate(invalid)
+    globalThis.fetch = async () => Response.json(invalid, { headers: { ETag: invalid.etag } })
+    await assert.rejects(client.getRealAnalysisSummarySubject(workspaceId, runId, subject, undefined, 'original'))
+  }
+  const history = { ...summaryHistoryFixture(fixture, { subjectId: comparisonId }), resultRevisionId: 'original',
+    capabilities: { canPublish: false, canRetry: false } }
+  globalThis.fetch = async () => Response.json(history)
+  assert.equal((await client.getRealAnalysisSummaryHistory(workspaceId, runId, subject, undefined, undefined, 'original')).entries.length, 6)
+  await assert.rejects(client.getRealAnalysisSummaryHistory(workspaceId, runId, subject), /does not match/)
+  globalThis.fetch = async () => Response.json({ ...history, capabilities: { canPublish: true, canRetry: false } })
+  await assert.rejects(client.getRealAnalysisSummaryHistory(workspaceId, runId, subject, undefined, undefined, 'original'), /does not match/)
+})
 
 test('correction preview is an exact, abortable, read-only request and preserves a server-calculated zero', async () => {
   const requests = []

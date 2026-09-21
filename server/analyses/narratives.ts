@@ -19,7 +19,10 @@ import { StoreConflictError } from '../store'
 import { traceOperation } from '../telemetry-operations'
 import { analysisIsRemoved, assertAnalysisRunWritable, assertAnalysisWorkspaceActive, fencedAnalysisBlobs } from './guards'
 import { loadAnalysisComparison, loadAnalysisRun } from './lifecycle'
-import { analysisCorrectionCanWork, loadAnalysisCorrection, projectAnalysisComparison, resolveAnalysisComparison } from './current-results'
+import {
+  analysisCorrectionCanWork, loadAnalysisCorrection, projectAnalysisComparison,
+  resolveAnalysisComparison, resolveAnalysisComparisonRevision,
+} from './current-results'
 import { ANALYSIS_CORRECTION_LIMITS, type RealAnalysisCorrectionRecord } from '../../src/domain/analysis-corrections'
 import { readAnalysisNarrativePublication } from './narrative-artifacts'
 import {
@@ -353,6 +356,7 @@ async function candidateSummary(
   assertAnalysis(!artifact || artifact.kind === 'candidate', 'Candidate summary has the wrong artifact kind.')
   return {
     kind: 'candidate', comparisonId: pair.id, comparisonStatus: pair.status, targetId: pair.target.summary.id,
+    resultSha256: pair.binding?.resultSha256 ?? null,
     ...pair.state, ...workSummary(pair.narrative, pair.state),
     published: artifact?.kind === 'candidate' && pair.narrative?.published ? {
       ...narrativePublicationVersion(pair.narrative.published), dataKind: 'real', text: artifact.text, overview: artifact.overview,
@@ -422,7 +426,7 @@ function subjectRevision(
   })
 }
 async function readSubjectInventory(
-  deps: RealAnalysesDeps, workspaceId: string, runId: string, subject: AnalysisSummarySubject, signal?: AbortSignal,
+  deps: RealAnalysesDeps, workspaceId: string, runId: string, subject: AnalysisSummarySubject, signal?: AbortSignal, resultRevisionId?: string,
 ): Promise<SubjectInventory> {
   if (subject.kind === 'target') {
     const inventory = await readAnalysisNarrativeInventory(deps, workspaceId, runId, subject.subjectId, signal)
@@ -433,46 +437,54 @@ async function readSubjectInventory(
     const [manifest, original, correction] = await Promise.all([
       readAnalysisManifest(deps.blobs, run, signal),
       loadAnalysisComparison(deps.store, workspaceId, runId, subject.subjectId, signal),
-      loadAnalysisCorrection(deps.store, workspaceId, runId, subject.subjectId, signal),
+      resultRevisionId ? undefined : loadAnalysisCorrection(deps.store, workspaceId, runId, subject.subjectId, signal),
     ])
     const pair = manifest.comparisons.find(pair => pair.id === subject.subjectId)
     if (!pair) throw notFound('This exact saved comparison is not part of the analysis.')
     assertAnalysis(!correction || original && correction.record.manifestSha256 === run.manifest.sha256,
       'Correction lookup is not bound to this frozen manifest and comparison.')
-    const comparison = original ? projectAnalysisComparison(original.record, correction?.record) : undefined
+    const comparison = original ? resultRevisionId
+      ? (await resolveAnalysisComparisonRevision(deps, run, original, resultRevisionId, signal)).record
+      : projectAnalysisComparison(original.record, correction?.record) : undefined
+    if (resultRevisionId && !comparison) throw notFound('This comparison has no completed assessment history.')
     const narrative = await loadAnalysisNarrative(deps.store, workspaceId,
       analysisNarrativeId('candidate', runId, subject.subjectId, comparison?.resultRevision?.id), signal)
     assertAnalysis(!narrative || narrative.record.recordType === 'analysis-candidate-narrative', 'Candidate lookup returned a different kind.')
     const target = manifest.targets.find(target => target.snapshotId === pair.targetSnapshotId)!
     return inventoryComparison(run, manifest, pair, target, comparison,
-      narrative?.record as RealAnalysisCandidateNarrativeRecord | undefined, await pendingNarratives(deps, run, manifest, signal), correction?.record)
+      narrative?.record as RealAnalysisCandidateNarrativeRecord | undefined,
+      resultRevisionId ? { cancelled: false } : await pendingNarratives(deps, run, manifest, signal), correction?.record)
   }, signal)
   return { kind: 'candidate', run, selected, revision: subjectRevision(subject, run.record, selected) }
 }
 
 /** Read only the requested publication; candidate metadata uses point reads, never a run inventory. */
 export async function readAnalysisSummarySubject(
-  deps: RealAnalysesDeps, workspaceId: string, runId: string, subject: AnalysisSummarySubject, signal?: AbortSignal,
+  deps: RealAnalysesDeps, workspaceId: string, runId: string, subject: AnalysisSummarySubject, signal?: AbortSignal, resultRevisionId?: string,
 ): Promise<RealAnalysisSummarySubjectResponse> {
   requireScope(workspaceId, runId)
   if (subject.kind !== 'candidate' && subject.kind !== 'target' ||
     (subject.kind === 'candidate' ? !isAnalysisId(subject.subjectId, 'comparison')
       : !analysisNarrativeTargetIdSchema.safeParse(subject.subjectId).success)) throw notFound('The exact saved summary was not found.')
+  if (resultRevisionId !== undefined && (subject.kind !== 'candidate' || resultRevisionId !== 'original' && !isUuid(resultRevisionId))) {
+    throw invalidRequest('Historical summary reads require one original or published candidate result revision.')
+  }
   deps = immutableReadDeps(deps)
   for (let attempt = 0; attempt < 4; attempt++) {
-    const inventory = await readSubjectInventory(deps, workspaceId, runId, subject, signal)
+    const inventory = await readSubjectInventory(deps, workspaceId, runId, subject, signal, resultRevisionId)
     try {
       const narrative = inventory.kind === 'candidate' ? await candidateSummary(deps.blobs, inventory.selected, signal)
         : await targetSummary(deps.blobs, inventory.selected, signal)
       const latest = await readableRun(deps, workspaceId, runId, signal)
       if (latest.etag !== inventory.run.etag) {
-        const current = await readSubjectInventory(deps, workspaceId, runId, subject, signal)
+        const current = await readSubjectInventory(deps, workspaceId, runId, subject, signal, resultRevisionId)
         if (current.revision !== inventory.revision) continue
       }
       await readableWorkspace(deps, workspaceId, signal)
       const response = {
         schemaVersion: ANALYSIS_NARRATIVE_SCHEMA_VERSION, dataKind: 'real' as const, workspaceId, runId,
         subjectId: subject.subjectId, revision: inventory.revision, etag: `"${inventory.revision}"`,
+        ...(resultRevisionId ? { resultRevisionId } : {}),
       }
       return narrative.kind === 'candidate' ? { ...response, kind: 'candidate', narrative } : { ...response, kind: 'target', narrative }
     } catch (error) {

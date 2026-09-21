@@ -26,6 +26,7 @@ import {
 } from './correction-validation'
 import { analysisCorrectionCanWork, loadAnalysisCorrection, projectAnalysisComparison } from './current-results'
 import { analysisCorrectionSummary } from './corrections'
+import { readAnalysisCorrectionHistoryEntry } from './correction-artifacts'
 
 function exactEtag(value: string): void {
   if (!value) throw preconditionRequired('Use the exact ETag returned by the correction preview or current correction.')
@@ -47,12 +48,12 @@ function scope(workspaceId: string, runId: string, comparisonId: string): void {
 export class AnalysisCorrectionService {
   constructor(private readonly deps: RealAnalysesDeps, private readonly now: () => Date = () => new Date()) {}
 
-  private async context(workspaceId: string, runId: string, comparisonId: string) {
+  private async context(workspaceId: string, runId: string, comparisonId: string, signal?: AbortSignal) {
     scope(workspaceId, runId, comparisonId)
     const [run, original, correction] = await Promise.all([
-      loadAnalysisRun(this.deps.store, workspaceId, runId),
-      loadAnalysisComparison(this.deps.store, workspaceId, runId, comparisonId),
-      loadAnalysisCorrection(this.deps.store, workspaceId, runId, comparisonId),
+      loadAnalysisRun(this.deps.store, workspaceId, runId, signal),
+      loadAnalysisComparison(this.deps.store, workspaceId, runId, comparisonId, signal),
+      loadAnalysisCorrection(this.deps.store, workspaceId, runId, comparisonId, signal),
     ])
     if (!run || analysisIsRemoved(run.record.lifecycle) || !original) throw notFound('The saved comparison is unavailable or being removed.')
     assertAnalysis(!correction || correction.record.manifestSha256 === run.record.manifest.sha256,
@@ -73,16 +74,16 @@ export class AnalysisCorrectionService {
     if (!analysisCorrectionCanWork(state.run.record)) throw conflict('Finish cancellation or pending summary scheduling before requesting a correction.')
   }
 
-  async state(workspaceId: string, runId: string, comparisonId: string) {
-    const state = await this.context(workspaceId, runId, comparisonId)
+  async state(workspaceId: string, runId: string, comparisonId: string, signal?: AbortSignal) {
+    const state = await this.context(workspaceId, runId, comparisonId, signal)
     return { correction: state.correction ? analysisCorrectionSummary(state.correction, state.run.record) : null }
   }
 
-  async preview(workspaceId: string, runId: string, comparisonId: string): Promise<AnalysisCorrectionPreview> {
-    const state = await this.context(workspaceId, runId, comparisonId)
+  async preview(workspaceId: string, runId: string, comparisonId: string, signal?: AbortSignal): Promise<AnalysisCorrectionPreview> {
+    const state = await this.context(workspaceId, runId, comparisonId, signal)
     if (!state.current.result || !state.original.record.result) throw conflict('Only a successfully completed saved assessment can be reviewed for evidence gaps.')
-    const snapshots = await readAnalysisSnapshots(this.deps.blobs, state.run.record, state.current)
-    const result = await readAnalysisResult(this.deps.blobs, state.run.record, state.current, snapshots)
+    const snapshots = await readAnalysisSnapshots(this.deps.blobs, state.run.record, state.current, signal)
+    const result = await readAnalysisResult(this.deps.blobs, state.run.record, state.current, snapshots, signal)
     assertAnalysis(result, 'The completed assessment is missing.')
     const target = snapshots.targetSnapshot
     const rubric = target.kind === 'job' ? target.rubric : target.version.rubric
@@ -98,7 +99,7 @@ export class AnalysisCorrectionService {
     })
     const criterionIds = criteria.filter(row => row.eligible).map(row => row.criterionId)
     const proposed = criterionIds.length ? buildEvidenceCorrectionAssessment(result, target, criterionIds) : null
-    const latest = await this.context(workspaceId, runId, comparisonId)
+    const latest = await this.context(workspaceId, runId, comparisonId, signal)
     if (latest.etag !== state.etag || latest.current.result?.sha256 !== state.current.result.sha256) {
       throw conflict('This result changed while its preview was being prepared. Reload the preview.')
     }
@@ -112,16 +113,9 @@ export class AnalysisCorrectionService {
   }
 
   private async historyEntry(
-    workspaceId: string, runId: string, comparisonId: string, reference: AnalysisCorrectionHistoryReference,
+    workspaceId: string, runId: string, comparisonId: string, reference: AnalysisCorrectionHistoryReference, signal?: AbortSignal,
   ): Promise<AnalysisCorrectionHistoryEntry> {
-    const parts = reference.blob.blobName.split('/')
-    assertAnalysis(reference.blob.blobName === analysisCorrectionHistoryBlobName(workspaceId, runId, comparisonId, parts[4], reference.id),
-      'Correction history belongs to another comparison.')
-    const entry = parseAnalysisCorrectionHistoryEntry(parseAnalysisJson(await readAnalysisBlob(this.deps.blobs, reference.blob, workspaceId, runId)))
-    assertAnalysis(entry.id === reference.id && entry.createdAt === reference.createdAt && entry.workspaceId === workspaceId &&
-      entry.runId === runId && entry.comparisonId === comparisonId && entry.requestId === parts[4],
-    'Correction history ownership or checkpoint binding mismatch.')
-    return entry
+    return readAnalysisCorrectionHistoryEntry(this.deps.blobs, workspaceId, runId, comparisonId, reference, signal)
   }
 
   private async close(
@@ -325,10 +319,10 @@ export class AnalysisCorrectionService {
     throw conflict('This analysis changed too often. Reload before requesting a correction.')
   }
 
-  async history(workspaceId: string, runId: string, comparisonId: string, continuationToken?: string): Promise<AnalysisCorrectionHistoryPage> {
-    const state = await this.context(workspaceId, runId, comparisonId)
+  async history(workspaceId: string, runId: string, comparisonId: string, continuationToken?: string, signal?: AbortSignal): Promise<AnalysisCorrectionHistoryPage> {
+    const state = await this.context(workspaceId, runId, comparisonId, signal)
     if (!state.original.record.result) throw conflict('This comparison has no completed assessment history.')
-    const original = await readAnalysisResult(this.deps.blobs, state.run.record, state.original.record)
+    const original = await readAnalysisResult(this.deps.blobs, state.run.record, state.original.record, undefined, signal)
     assertAnalysis(original, 'The original assessment is missing.')
     const head = state.correction?.record.history
     const revision = analysisHash({ workspaceId, runId, comparisonId, history: head ?? null })
@@ -349,11 +343,11 @@ export class AnalysisCorrectionService {
       assertAnalysis(!seen.has(reference.id) && index < ANALYSIS_CORRECTION_LIMITS.maxHistoryEntries &&
         (bytes += reference.blob.bytes) <= 128 * 1024 * 1024, 'Correction history is cyclic or exceeds its bounded read; no entries were silently omitted.')
       seen.add(reference.id)
-      const entry = await this.historyEntry(workspaceId, runId, comparisonId, reference)
+      const entry = await this.historyEntry(workspaceId, runId, comparisonId, reference, signal)
       reference = entry.previous
       if (index++ < offset) continue
       assertAnalysis((bytes += entry.proposal.bytes) <= 128 * 1024 * 1024, 'Correction history proposals exceed the bounded read budget.')
-      const proposal = parseAnalysisCorrectionProposal(parseAnalysisJson(await readAnalysisBlob(this.deps.blobs, entry.proposal, workspaceId, runId)))
+      const proposal = parseAnalysisCorrectionProposal(parseAnalysisJson(await readAnalysisBlob(this.deps.blobs, entry.proposal, workspaceId, runId, signal)))
       assertAnalysis(proposal.workspaceId === workspaceId && proposal.runId === runId && proposal.comparisonId === comparisonId &&
         proposal.requestId === entry.requestId && proposal.manifestSha256 === state.run.record.manifest.sha256 &&
         proposal.originalResultSha256 === state.original.record.result.sha256, 'Correction history proposal belongs to other saved inputs.')
@@ -366,7 +360,7 @@ export class AnalysisCorrectionService {
       })
     }
     if (offset > index) throw invalidRequest('Correction history page is outside this saved history.')
-    const latest = await this.context(workspaceId, runId, comparisonId)
+    const latest = await this.context(workspaceId, runId, comparisonId, signal)
     if (analysisHash(latest.correction?.record.history ?? null) !== analysisHash(head ?? null)) {
       throw conflict('Correction history changed while it was read. Reload its first page.')
     }

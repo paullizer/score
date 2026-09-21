@@ -44,6 +44,15 @@ function summarySubject(req: Request): AnalysisSummarySubject {
   }
   return { kind, subjectId }
 }
+function summaryResultRevision(req: Request, res: Response): string | undefined {
+  const revision = req.query.resultRevisionId
+  if (revision === undefined) return undefined
+  if (!['owner', 'editor'].includes(res.locals.analysisWorkspaceRole)) throw forbidden('Only owners and editors may inspect historical result summaries.')
+  if (param(req, 'kind') !== 'candidate' || typeof revision !== 'string' || revision !== 'original' && !isUuid(revision)) {
+    throw invalidRequest('resultRevisionId must identify the original or one published candidate correction.')
+  }
+  return revision
+}
 function match(req: Request): string {
   const value = req.header('If-Match')
   if (!value) throw preconditionRequired('An If-Match header containing the current record ETag is required.')
@@ -201,8 +210,8 @@ export function createRealAnalysesRouter(deps: RealAnalysesRouterDeps): Router {
   }))
   const summaryBase = `${base}/:runId/summaries/:kind/:subjectId`
   router.get(summaryBase, read(async (req, res, signal) => {
-    query(req, [])
-    const summary = await requireService().summarySubject(param(req, 'workspaceId'), recordId(req, 'run'), summarySubject(req), signal)
+    query(req, ['resultRevisionId'])
+    const summary = await requireService().summarySubject(param(req, 'workspaceId'), recordId(req, 'run'), summarySubject(req), signal, summaryResultRevision(req, res))
     signal.throwIfAborted()
     res.setHeader('ETag', summary.etag)
     res.json(summary)
@@ -211,12 +220,12 @@ export function createRealAnalysesRouter(deps: RealAnalysesRouterDeps): Router {
     if (!['owner', 'editor'].includes(res.locals.analysisWorkspaceRole)) {
       throw forbidden('Only workspace owners and editors may inspect unpublished summary history.')
     }
-    query(req, ['continuationToken'])
+    query(req, ['continuationToken', 'resultRevisionId'])
     const token = req.query.continuationToken
     if (token !== undefined && (typeof token !== 'string' || !token || token.length > 16 * 1024)) {
       throw invalidRequest('continuationToken must be a single valid summary history token.')
     }
-    const history = await requireService().summaryHistory(param(req, 'workspaceId'), recordId(req, 'run'), summarySubject(req), token, signal)
+    const history = await requireService().summaryHistory(param(req, 'workspaceId'), recordId(req, 'run'), summarySubject(req), token, signal, summaryResultRevision(req, res))
     signal.throwIfAborted()
     res.setHeader('ETag', history.etag)
     res.json(history)
@@ -272,25 +281,30 @@ export function createRealAnalysesRouter(deps: RealAnalysesRouterDeps): Router {
       throw forbidden('Only workspace owners and editors may review correction proposals and history.')
     }
   }
-  router.get(correctionBase, async (req, res) => {
+  router.get(correctionBase, read(async (req, res, signal) => {
     query(req, [])
     correctionRead(res)
-    res.json(await requireService().correctionState(param(req, 'workspaceId'), recordId(req, 'run'), recordId(req, 'comparison')))
-  })
-  router.get(`${correctionBase}/preview`, async (req, res) => {
+    const state = await requireService().correctionState(param(req, 'workspaceId'), recordId(req, 'run'), recordId(req, 'comparison'), signal)
+    signal.throwIfAborted()
+    res.json(state)
+  }))
+  router.get(`${correctionBase}/preview`, read(async (req, res, signal) => {
     query(req, [])
     correctionRead(res)
-    const preview = await requireService().correctionPreview(param(req, 'workspaceId'), recordId(req, 'run'), recordId(req, 'comparison'))
+    const preview = await requireService().correctionPreview(param(req, 'workspaceId'), recordId(req, 'run'), recordId(req, 'comparison'), signal)
+    signal.throwIfAborted()
     res.setHeader('ETag', preview.etag)
     res.json(preview)
-  })
-  router.get(`${correctionBase}/history`, async (req, res) => {
+  }))
+  router.get(`${correctionBase}/history`, read(async (req, res, signal) => {
     query(req, ['continuationToken'])
     correctionRead(res)
     const token = req.query.continuationToken
     if (token !== undefined && (typeof token !== 'string' || !token || token.length > 2048)) throw invalidRequest('Invalid correction history token.')
-    res.json(await requireService().correctionHistory(param(req, 'workspaceId'), recordId(req, 'run'), recordId(req, 'comparison'), token))
-  })
+    const history = await requireService().correctionHistory(param(req, 'workspaceId'), recordId(req, 'run'), recordId(req, 'comparison'), token, signal)
+    signal.throwIfAborted()
+    res.json(history)
+  }))
   router.post(correctionBase, mutate('write', async (req, res) => {
     query(req, [])
     const result = await requireService().requestCorrection(
