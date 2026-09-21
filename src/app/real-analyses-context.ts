@@ -7,6 +7,7 @@ import type { RealAnalysisDiagnosticsPage } from '../domain/analysis-diagnostics
 import type { RealLoadState } from './real-request-scope'
 import type {
   GenerateRealAnalysisSummariesInput, RealAnalysisSummariesMutationResponse, RealAnalysisSummariesResponse,
+  RealAnalysisSummarySubjectResponse,
 } from '../domain/analysis-narratives'
 import type {
   AnalysisSummaryHistoryPage, AnalysisSummarySubject, PublishSummaryDraftInput,
@@ -25,14 +26,21 @@ export interface RealAnalysesContextValue {
   targets: RealLoadState<RealAnalysisTargetSummary[]>
   refresh: () => Promise<void>
   refreshTargets: () => Promise<void>
+  subscribeTargets: () => () => void
   detail: (id: string) => RealLoadState<RealAnalysisRunDetail>
   ensureDetail: (id: string, force?: boolean) => Promise<void>
   comparisons: (id: string) => RealLoadState<RealAnalysisComparisonSummary[]>
   ensureComparisons: (id: string, force?: boolean) => Promise<void>
   comparison: (runId: string, comparisonId: string) => RealLoadState<RealAnalysisComparisonDetail>
   ensureComparison: (runId: string, comparisonId: string, force?: boolean) => Promise<void>
+  subscribeAnalysis: (runId: string) => () => void
+  subscribeComparison: (runId: string, comparisonId: string) => () => void
   narratives: (runId: string, targetId?: string) => RealLoadState<RealAnalysisSummariesResponse>
   ensureNarratives: (runId: string, targetId?: string, force?: boolean) => Promise<void>
+  subscribeNarratives: (runId: string, targetId?: string) => () => void
+  summarySubject: (runId: string, subject: AnalysisSummarySubject) => RealLoadState<RealAnalysisSummarySubjectResponse>
+  ensureSummarySubject: (runId: string, subject: AnalysisSummarySubject, force?: boolean) => Promise<void>
+  subscribeSummarySubject: (runId: string, subject: AnalysisSummarySubject) => () => void
   generateSummaries: (runId: string, input: GenerateRealAnalysisSummariesInput, etag: string) => Promise<RealAnalysisSummariesMutationResponse>
   summaryHistory: (runId: string, subject: AnalysisSummarySubject, cursor?: string, signal?: AbortSignal) => Promise<AnalysisSummaryHistoryPage>
   publishSummaryDraft: (runId: string, subject: AnalysisSummarySubject, input: PublishSummaryDraftInput, etag: string) => Promise<RealAnalysisSummariesResponse>

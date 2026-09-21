@@ -51,6 +51,17 @@ export class CloudPreconditionError extends CloudApiError {
   }
 }
 
+export class CloudTimeoutError extends CloudApiError {
+  readonly acknowledgementUnknown: boolean
+  constructor(mutating: boolean) {
+    super('unavailable', mutating
+      ? 'The request timed out after 30 seconds before Score received an acknowledgement. The change may still have been accepted. Refresh its status before explicitly retrying the same action; do not assume it was saved.'
+      : 'The request timed out after 30 seconds. Try again to load the saved data. This read did not change your saved scores or evidence.', 408)
+    this.name = 'CloudTimeoutError'
+    this.acknowledgementUnknown = mutating
+  }
+}
+
 export class LifecycleOperationError extends Error {
   readonly operation: LifecycleOperation
   constructor(operation: LifecycleOperation) {
@@ -135,46 +146,67 @@ async function unwrap<T>(response: Response): Promise<T> {
   return response.json() as Promise<T>
 }
 
-function cloudRequest(path: string, init: RequestInit = {}): Promise<Response> {
+async function cloudRequest<T>(path: string, init: RequestInit, read: (response: Response) => Promise<T>): Promise<T> {
   const headers = new Headers(init.headers)
   headers.set(SCORE_REQUEST_HEADER, 'workspace')
   if (init.body !== undefined && !headers.has('Content-Type')) headers.set('Content-Type', 'application/json')
-  return fetch(`/api${path}`, {
-    ...init,
-    signal: init.signal ? AbortSignal.any([init.signal, AbortSignal.timeout(30000)]) : AbortSignal.timeout(30000),
-    redirect: 'manual',
-    credentials: 'include',
-    cache: 'no-store',
-    headers,
-  })
+  const deadline = AbortSignal.timeout(30000)
+  const signal = init.signal ? AbortSignal.any([init.signal, deadline]) : deadline
+  try {
+    signal.throwIfAborted()
+    const response = await fetch(`/api${path}`, {
+      ...init, signal, redirect: 'manual', credentials: 'include', cache: 'no-store', headers,
+    })
+    const value = await read(response)
+    signal.throwIfAborted()
+    return value
+  } catch (caught) {
+    // Body streams may reject with AbortError even when the deadline's reason is TimeoutError.
+    const reason: unknown = signal.aborted ? signal.reason : caught
+    if (reason instanceof Error && reason.name === 'TimeoutError') {
+      throw new CloudTimeoutError(!['GET', 'HEAD', 'OPTIONS'].includes((init.method ?? 'GET').toUpperCase()))
+    }
+    if (init.signal?.aborted && signal.reason === init.signal.reason) throw init.signal.reason
+    throw caught
+  }
 }
 
 export function cloudJsonRequest<T>(path: string, init: RequestInit = {}): Promise<T> {
-  return cloudRequest(path, init).then((response) => unwrap<T>(response))
+  return cloudRequest(path, init, unwrap<T>)
 }
 
-export async function cloudLifecycleRequest<T>(path: string, init: RequestInit = {}): Promise<{ value: T; etag?: string }> {
-  const response = await cloudRequest(path, init)
-  const etag = response.headers.get('ETag') ?? undefined
-  if (response.status === 503 && !response.redirected && response.type !== 'opaqueredirect' && response.headers.get('content-type')?.toLowerCase().includes('application/json')) {
-    const body: unknown = await response.clone().json().catch(() => null)
-    if (body && typeof body === 'object' && 'operation' in body) {
-      const operation = body.operation
-      if (operation && typeof operation === 'object' && 'status' in operation && operation.status === 'failed' && 'id' in operation && typeof operation.id === 'string' &&
-        'action' in operation && ['archive', 'unarchive', 'delete'].includes(String(operation.action))) {
-        return { value: body as T, etag }
+export function cloudJsonResponse<T>(path: string, init: RequestInit = {}): Promise<{ value: T; etag?: string }> {
+  return cloudRequest(path, init, async (response) => ({
+    value: await unwrap<T>(response), etag: response.headers.get('ETag') ?? undefined,
+  }))
+}
+
+export function cloudLifecycleRequest<T>(path: string, init: RequestInit = {}): Promise<{ value: T; etag?: string }> {
+  return cloudRequest(path, init, async (response) => {
+    const etag = response.headers.get('ETag') ?? undefined
+    if (response.status === 503 && !response.redirected && response.type !== 'opaqueredirect' && response.headers.get('content-type')?.toLowerCase().includes('application/json')) {
+      const body: unknown = await response.clone().json().catch((error: unknown) => {
+        if (!(error instanceof SyntaxError)) throw error
+        return null
+      })
+      if (body && typeof body === 'object' && 'operation' in body) {
+        const operation = body.operation
+        if (operation && typeof operation === 'object' && 'status' in operation && operation.status === 'failed' && 'id' in operation && typeof operation.id === 'string' &&
+          'action' in operation && ['archive', 'unarchive', 'delete'].includes(String(operation.action))) {
+          return { value: body as T, etag }
+        }
       }
     }
-  }
-  const value = await unwrap<T>(response)
-  if (response.status === 202) {
-    const operation = value && typeof value === 'object' && 'operation' in value ? value.operation : undefined
-    const pending = value && typeof value === 'object' && 'pending' in value && value.pending === true
-    if (!pending && (!operation || typeof operation !== 'object' || !('status' in operation) || !['pending', 'running', 'failed'].includes(String(operation.status)))) {
-      throw new CloudApiError('unavailable', 'The service has not acknowledged a completed lifecycle change or returned a recoverable operation. Refresh status before retrying.', 202)
+    const value = await unwrap<T>(response)
+    if (response.status === 202) {
+      const operation = value && typeof value === 'object' && 'operation' in value ? value.operation : undefined
+      const pending = value && typeof value === 'object' && 'pending' in value && value.pending === true
+      if (!pending && (!operation || typeof operation !== 'object' || !('status' in operation) || !['pending', 'running', 'failed'].includes(String(operation.status)))) {
+        throw new CloudApiError('unavailable', 'The service has not acknowledged a completed lifecycle change or returned a recoverable operation. Refresh status before retrying.', 202)
+      }
     }
-  }
-  return { value, etag }
+    return { value, etag }
+  })
 }
 
 export async function fetchSession(signal?: AbortSignal): Promise<CloudSession> {

@@ -8,9 +8,11 @@ import type { WorkspaceLifecycleState } from '../lifecycle/contracts'
 export interface AnalysisListOptions<K extends AnalysisEntity['recordType'] = AnalysisEntity['recordType']> {
   recordType: K
   runId?: string
+  targetId?: string
   status?: Extract<AnalysisEntity, { recordType: K }>['status']
   continuationToken?: string
   limit?: number
+  signal?: AbortSignal
 }
 
 export type AnalysisTransaction<T extends AnalysisEntity = AnalysisEntity> =
@@ -42,7 +44,7 @@ export interface AnalysisTransactionOptions {
 }
 
 export interface AnalysisStore {
-  get(workspaceId: string, id: string): Promise<VersionedAnalysisEntity | undefined>
+  get(workspaceId: string, id: string, signal?: AbortSignal): Promise<VersionedAnalysisEntity | undefined>
   list<K extends AnalysisEntity['recordType']>(
     workspaceId: string,
     options: AnalysisListOptions<K>,
@@ -51,7 +53,7 @@ export interface AnalysisStore {
   replace<T extends AnalysisEntity>(record: T, etag: string): Promise<VersionedAnalysisEntity<T>>
   // Pair comparison writes with an ETag-fenced run replacement; initialization uses bounded chunks.
   transact(workspaceId: string, operations: AnalysisTransaction[], options?: AnalysisTransactionOptions): Promise<void>
-  getControl(workspaceId: string, runId?: string): Promise<StoredAnalysisControl | undefined>
+  getControl(workspaceId: string, runId?: string, signal?: AbortSignal): Promise<StoredAnalysisControl | undefined>
   listControls(workspaceId: string, continuationToken?: string): Promise<{ items: StoredAnalysisControl[]; continuationToken?: string }>
   pendingLifecycleWorkspaces(limit: number): Promise<string[]>
   // Includes bounded narrative scheduling and due/lease-expired sidecar work.
@@ -69,7 +71,7 @@ export interface AnalysisBlob {
 }
 
 export interface AnalysisBlobStore {
-  read(name: string): Promise<AnalysisBlob | undefined>
+  read(name: string, signal?: AbortSignal): Promise<AnalysisBlob | undefined>
   // On an existing name, return the winning stored bytes and metadata without overwriting them.
   putImmutable(name: string, bytes: Uint8Array, contentType: string): Promise<{ created: boolean; blob: AnalysisBlob }>
   putFenced(name: string, bytes: Uint8Array, contentType: string, fence: AnalysisBlobWriteFence): Promise<{ created: boolean; blob: AnalysisBlob }>

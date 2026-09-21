@@ -60,6 +60,10 @@ test('missing coalesces work, all creates new generations, and durable receipts 
   assert.ok(ready.comparisons[0].published.text.endsWith('.'))
   assert.ok(ready.comparisons[0].published.overview.endsWith('.'))
   assert.ok(ready.targets[0].published.paragraphs.length)
+  assert.deepEqual((await f.service.summarySubject(f.workspaceId, created.run.id,
+    { kind: 'candidate', subjectId: pair.record.id })).narrative, ready.comparisons[0])
+  assert.deepEqual((await f.service.summarySubject(f.workspaceId, created.run.id,
+    { kind: 'target', subjectId: ready.targets[0].targetId })).narrative, ready.targets[0])
   assert.deepEqual((await generate(f, created.run.id)).scheduled, { candidates: 0, targets: 0 })
   const refresh = await generate(f, created.run.id, 'all')
   assert.deepEqual(refresh.scheduled, { candidates: 1, targets: 1 })

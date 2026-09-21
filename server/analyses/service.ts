@@ -11,6 +11,7 @@ import { isUuid, parseDisplayNameMetadata } from '../jobs/validation'
 import { WORKSPACE_ID_PATTERN } from '../ids'
 import { StoreConflictError, StoreNotFoundError } from '../store'
 import { assertWorkspaceMutationLease } from '../lifecycle/lease'
+import { traceOperation } from '../telemetry-operations'
 import type { AnalysisTransaction, RealAnalysesDeps } from './store'
 import {
   analysisBytesHash, analysisCancellationNeedsRetry, analysisDeterministicId, analysisHash, analysisInputFingerprint,
@@ -25,7 +26,7 @@ import {
 import { RealAnalysisTargets, resolveAnalysisResume, copyAnalysisTargetEvidence, type AnalysisSourceDeps } from './targets'
 import { analysisPageCursor, analysisPageToken, validateAnalysisPage } from './paging'
 import { readAnalysisReportComparisons } from './reports'
-import { generateAnalysisSummaries, readAnalysisNarrativeInventory, readAnalysisSummaries } from './narratives'
+import { generateAnalysisSummaries, readAnalysisNarrativeInventory, readAnalysisSummaries, readAnalysisSummarySubject } from './narratives'
 import type { GenerateRealAnalysisSummariesInput } from '../../src/domain/analysis-narratives'
 import type { AnalysisSummarySubject, PublishSummaryDraftInput } from '../../src/domain/analysis-summary-history'
 import { readAnalysisSummaryHistory } from './summary-history'
@@ -77,9 +78,9 @@ export class RealAnalysisService {
     this.clock = now ?? (() => new Date())
   }
   private now(): string { return this.clock().toISOString() }
-  private async run(workspaceId: string, runId: string, recovery = false) {
+  private async run(workspaceId: string, runId: string, recovery = false, signal?: AbortSignal) {
     requireScope(workspaceId, runId)
-    const value = await loadAnalysisRun(this.deps.store, workspaceId, runId)
+    const value = await loadAnalysisRun(this.deps.store, workspaceId, runId, signal)
     if (!value || value.record.lifecycle?.deletedAt || (!recovery && analysisIsRemoved(value.record.lifecycle))) {
       throw notFound('The requested analysis run was not found or is being permanently removed.')
     }
@@ -100,10 +101,10 @@ export class RealAnalysisService {
     for (const selection of request.targets) await this.targets.resolve(workspaceId, selection)
     assertWorkspaceMutationLease(workspaceId)
   }
-  private async comparison(workspaceId: string, runId: string, comparisonId: string) {
+  private async comparison(workspaceId: string, runId: string, comparisonId: string, signal?: AbortSignal) {
     requireScope(workspaceId, runId)
     requireScope(workspaceId, comparisonId, 'comparison')
-    const value = await loadAnalysisComparison(this.deps.store, workspaceId, runId, comparisonId)
+    const value = await loadAnalysisComparison(this.deps.store, workspaceId, runId, comparisonId, signal)
     if (!value) throw notFound('The requested comparison was not found in this run.')
     return value
   }
@@ -268,14 +269,15 @@ export class RealAnalysisService {
     assertWorkspaceMutationLease(workspaceId)
     try { return runSummary(await this.deps.store.replace(record, expected)) } catch (error) { changeError(error) }
   }
-  async comparisons(workspaceId: string, runId: string, continuationToken?: string, limit = 50): Promise<RealAnalysisComparisonsPage> {
-    const run = await this.run(workspaceId, runId)
+  async comparisons(workspaceId: string, runId: string, continuationToken?: string, limit = 50, signal?: AbortSignal): Promise<RealAnalysisComparisonsPage> {
+    const run = await this.run(workspaceId, runId, false, signal)
     validateAnalysisPage(limit, continuationToken)
     const scope = { workspaceId, kind: 'comparisons' as const, runId }
     const [manifest, page] = await Promise.all([
-      readAnalysisManifest(this.deps.blobs, run.record),
-      this.deps.store.list(workspaceId, { recordType: 'analysis-comparison', runId, limit, continuationToken: analysisPageCursor(scope, continuationToken) }),
+      readAnalysisManifest(this.deps.blobs, run.record, signal),
+      this.deps.store.list(workspaceId, { recordType: 'analysis-comparison', runId, limit, continuationToken: analysisPageCursor(scope, continuationToken), signal }),
     ])
+    signal?.throwIfAborted()
     assertAnalysis(page.items.length <= limit, 'Comparison page exceeds its limit.')
     const comparisons = page.items.map(value => {
       const record = parseAnalysisEntity(value.record)
@@ -285,21 +287,35 @@ export class RealAnalysisService {
     })
     return { comparisons, ...(page.continuationToken ? { continuationToken: analysisPageToken(scope, page.continuationToken) } : {}) }
   }
-  async comparisonDetail(workspaceId: string, runId: string, comparisonId: string): Promise<RealAnalysisComparisonDetail> {
-    const [run, comparison] = await Promise.all([this.run(workspaceId, runId), this.comparison(workspaceId, runId, comparisonId)])
-    const snapshots = await readAnalysisSnapshots(this.deps.blobs, run.record, comparison.record)
-    const result = await readAnalysisResult(this.deps.blobs, run.record, comparison.record, snapshots)
-    const summaries = await readAnalysisSummaries(this.deps, workspaceId, runId, comparison.record.target.summary.id)
-    return { ...comparisonSummary(comparison), ...snapshots, result, narrative: summaries.comparisons.find(item => item.comparisonId === comparisonId) }
+  async comparisonDetail(workspaceId: string, runId: string, comparisonId: string, signal?: AbortSignal): Promise<RealAnalysisComparisonDetail> {
+    return traceOperation('score.analysis.comparison', { 'score.comparison.count': 1 }, async () => {
+      const [run, comparison] = await Promise.all([
+        this.run(workspaceId, runId, false, signal), this.comparison(workspaceId, runId, comparisonId, signal),
+      ])
+      const snapshots = await traceOperation('score.analysis.snapshot.read', { 'score.comparison.count': 1 },
+        () => readAnalysisSnapshots(this.deps.blobs, run.record, comparison.record, signal))
+      const result = await traceOperation('score.analysis.result.read', { 'score.read.count': comparison.record.result ? 1 : 0 },
+        () => readAnalysisResult(this.deps.blobs, run.record, comparison.record, snapshots, signal))
+      await this.run(workspaceId, runId, false, signal)
+      signal?.throwIfAborted()
+      const workspace = await this.deps.store.getControl(workspaceId, undefined, signal)
+      signal?.throwIfAborted()
+      if (workspace && ['deleting', 'deleted'].includes(workspace.record.state)) throw notFound('The saved analysis is being removed.')
+      return { ...comparisonSummary(comparison), ...snapshots, result }
+    })
   }
-  summaries(workspaceId: string, runId: string, targetId?: string) {
-    return readAnalysisSummaries(this.deps, workspaceId, runId, targetId)
+  summaries(workspaceId: string, runId: string, targetId?: string, signal?: AbortSignal) {
+    return readAnalysisSummaries(this.deps, workspaceId, runId, targetId, signal)
+  }
+  summarySubject(workspaceId: string, runId: string, subject: AnalysisSummarySubject, signal?: AbortSignal) {
+    return traceOperation(subject.kind === 'candidate' ? 'score.analysis.summary.candidate' : 'score.analysis.summary.target',
+      { 'score.summary.kind': subject.kind }, () => readAnalysisSummarySubject(this.deps, workspaceId, runId, subject, signal))
   }
   generateSummaries(workspaceId: string, runId: string, input: GenerateRealAnalysisSummariesInput, requestId: string, expected: string, actor: string) {
     return generateAnalysisSummaries(this.deps, workspaceId, runId, input, requestId, expected, actor, this.clock)
   }
-  summaryHistory(workspaceId: string, runId: string, subject: AnalysisSummarySubject, continuationToken?: string) {
-    return readAnalysisSummaryHistory(this.deps, workspaceId, runId, subject, continuationToken)
+  summaryHistory(workspaceId: string, runId: string, subject: AnalysisSummarySubject, continuationToken?: string, signal?: AbortSignal) {
+    return readAnalysisSummaryHistory(this.deps, workspaceId, runId, subject, continuationToken, signal)
   }
   publishSummary(
     workspaceId: string, runId: string, subject: AnalysisSummarySubject, input: PublishSummaryDraftInput,
@@ -310,28 +326,34 @@ export class RealAnalysisService {
   retrySummary(workspaceId: string, runId: string, subject: AnalysisSummarySubject, requestId: string, expected: string, actor: string) {
     return retryAnalysisSummary(this.deps, workspaceId, runId, subject, requestId, expected, actor, this.clock)
   }
-  async diagnostics(workspaceId: string, runId: string, comparisonId: string, continuationToken?: string) {
-    const [run, comparison] = await Promise.all([this.run(workspaceId, runId), this.comparison(workspaceId, runId, comparisonId)])
-    const page = await readAnalysisFailureDiagnostics(this.deps.blobs, run.record, comparison.record, continuationToken)
-    await this.run(workspaceId, runId)
+  async diagnostics(workspaceId: string, runId: string, comparisonId: string, continuationToken?: string, signal?: AbortSignal) {
+    const [run, comparison] = await Promise.all([
+      this.run(workspaceId, runId, false, signal), this.comparison(workspaceId, runId, comparisonId, signal),
+    ])
+    const page = await readAnalysisFailureDiagnostics(this.deps.blobs, run.record, comparison.record, continuationToken, signal)
+    await this.run(workspaceId, runId, false, signal)
     return page
   }
   async reportComparisons(workspaceId: string, runId: string, comparisonIds: string[], signal?: AbortSignal) {
     comparisonIds = input(reportComparisonIdsSchema, comparisonIds)
     signal?.throwIfAborted()
-    const run = await this.run(workspaceId, runId)
+    const run = await this.run(workspaceId, runId, false, signal)
     const comparisons: RealAnalysisComparisonRecord[] = []
     for (const id of comparisonIds) {
       signal?.throwIfAborted()
-      comparisons.push((await this.comparison(workspaceId, runId, id)).record)
+      comparisons.push((await this.comparison(workspaceId, runId, id, signal)).record)
     }
     return readAnalysisReportComparisons(this.deps.blobs, run.record, comparisons, signal)
   }
-  async document(workspaceId: string, runId: string, comparisonId: string, documentId: string, version: number): Promise<RealAnalysisDocumentResponse> {
+  async document(
+    workspaceId: string, runId: string, comparisonId: string, documentId: string, version: number, signal?: AbortSignal,
+  ): Promise<RealAnalysisDocumentResponse> {
     if (typeof documentId !== 'string' || !/^[a-zA-Z0-9][a-zA-Z0-9_.:-]{0,179}$/.test(documentId) ||
       !Number.isInteger(version) || version < 1 || version > 1_000_000) throw invalidRequest('An exact document ID and positive version are required.')
-    const [run, comparison] = await Promise.all([this.run(workspaceId, runId), this.comparison(workspaceId, runId, comparisonId)])
-    const { resumeSnapshot, targetSnapshot } = await readAnalysisSnapshots(this.deps.blobs, run.record, comparison.record)
+    const [run, comparison] = await Promise.all([
+      this.run(workspaceId, runId, false, signal), this.comparison(workspaceId, runId, comparisonId, signal),
+    ])
+    const { resumeSnapshot, targetSnapshot } = await readAnalysisSnapshots(this.deps.blobs, run.record, comparison.record, signal)
     const targetDocument = targetSnapshot.kind === 'job' ? targetSnapshot.document : targetSnapshot.seed.document
     const local = [resumeSnapshot.document, targetDocument].filter(item => item.id === documentId && item.version === version)
     const reference = targetSnapshot.kind === 'grade'
@@ -344,7 +366,7 @@ export class RealAnalysisService {
     }
     if (local[0]) return { document: local[0] }
     if (reference) {
-      const blob = await readAnalysisBlob(this.deps.blobs, reference.document, workspaceId, runId)
+      const blob = await readAnalysisBlob(this.deps.blobs, reference.document, workspaceId, runId, signal)
       return { document: parseAnalysisJson(blob) as RealAnalysisDocumentResponse['document'] }
     }
     throw notFound('This document version is not evidence for the requested comparison.')

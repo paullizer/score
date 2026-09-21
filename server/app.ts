@@ -26,6 +26,8 @@ import { createJobLifecycleParticipant } from './jobs/lifecycle'
 import { createGradeLifecycleParticipant } from './grades/lifecycle'
 import { createResumeLifecycleParticipant } from './resumes/lifecycle'
 import { createAnalysisLifecycleParticipant } from './analyses/library-lifecycle'
+import { recordRequestError, telemetryMiddleware, telemetryRequests } from './telemetry-http'
+import { errorCategory, safeMethod, safeRoute } from './telemetry-schema'
 export { WorkspaceRepository } from './repository'
 export { WorkspaceLifecycleService } from './lifecycle/service'
 export { createLifecycleDependencies } from './lifecycle/dependencies'
@@ -145,6 +147,7 @@ export function createApp(deps: AppDeps): Express {
   const app = express()
   app.locals.reconcileLifecycle = () => workspaceLifecycle.reconcile()
   app.disable('x-powered-by')
+  app.use(telemetryRequests)
   const parseJson = express.json({ limit: MAX_JSON_BODY })
   app.use((req, res, next) => {
     // Even a mislabeled JSON upload must reach authorization before body parsing.
@@ -159,8 +162,8 @@ export function createApp(deps: AppDeps): Express {
 
   const api = express.Router()
   api.use(noStore)
-  api.use(createAuthMiddleware(config))
-  api.use(createCsrfMiddleware(config))
+  api.use(telemetryMiddleware('score.auth', createAuthMiddleware(config)))
+  api.use(telemetryMiddleware('score.csrf', createCsrfMiddleware(config)))
   api.get('/features', (_req, res) => {
     res.json({
       realJobImports: Boolean(jobs), markdownJobImports: Boolean(jobs), limits: JOB_IMPORT_LIMITS,
@@ -226,10 +229,11 @@ export function createApp(deps: AppDeps): Express {
   })
 
   // Every remaining route (the static SPA shell/assets) also requires a valid principal.
-  app.use(createAuthMiddleware(config))
+  app.use(telemetryMiddleware('score.auth', createAuthMiddleware(config)))
   mountStaticSpa(app, distDir)
 
   app.use((err: unknown, req: Request, res: Response, next: NextFunction) => {
+    recordRequestError(err)
     if (res.headersSent) {
       next(err)
       return
@@ -249,9 +253,9 @@ export function createApp(deps: AppDeps): Express {
       }
     }
     console.error('Unhandled server error:', {
-      name: err instanceof Error ? err.name : 'UnknownError',
-      method: req.method,
-      path: req.path,
+      category: errorCategory(err),
+      method: safeMethod(req.method),
+      route: safeRoute(req.originalUrl),
     })
     res.status(503).json(toCloudApiError(unavailable()))
   })

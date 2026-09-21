@@ -70,6 +70,7 @@ All paths below have prefix `/api/workspaces/:workspaceId/analyses`:
 | `GET /:runId/comparisons/:comparisonId/diagnostics?continuationToken=...` | `RealAnalysisDiagnosticsPage`; at most one private failed-attempt artifact per page |
 | `GET /:runId/comparisons/:comparisonId/documents/:documentId?version=N` | `RealAnalysisDocumentResponse` |
 | `GET /:runId/summaries` with optional `targetId` query | `RealAnalysisSummariesResponse`, including selected-scope ETag, status, published narratives, and report capture pins |
+| `GET /:runId/summaries/:kind/:subjectId` | `RealAnalysisSummarySubjectResponse`; one candidate summary or exact target overview, with its own revision and ETag |
 | `POST /:runId/summaries` with `{mode: "missing" \| "all", targetId?}` | `RealAnalysisSummariesMutationResponse` with durable request ID, scheduled counts, and summary state |
 | `GET /:runId/summaries/:kind/:subjectId/history?continuationToken=...` | Owner/editor-only `AnalysisSummaryHistoryPage`, up to 12 private checkpoint events and the narrative record ETag |
 | `POST /:runId/summaries/:kind/:subjectId/publish` with `{generationId, round, outputSha256}` | `{summaries}` for the subject's exact target; explicit manual approval of a persisted final draft |
@@ -111,6 +112,26 @@ summary refresh. Candidate and target work records live in `analysis-records`;
 immutable narrative artifacts live under the owning run in `analysis-sources`.
 Public summary DTOs expose text, state, safe provenance/revision identifiers, and
 capture pins, not private blob names.
+
+Comparison detail returns the validated score and frozen evidence without reading
+summary inventories or publication blobs. Its optional `narrative` field is not
+required for rendering; callers load candidate summaries and target overviews
+independently through the subject GET. `kind` is `candidate` or `target`;
+`subjectId` is the comparison ID or exact saved target ID, respectively. The
+envelope binds `workspaceId`, `runId`, `kind`, `subjectId`, `revision`, `etag`, and
+the matching `narrative`. It does not expose unpublished history to viewers.
+
+Candidate-summary reads use scoped point reads and do not enumerate unrelated
+candidates. Target-overview reads retain the metadata needed to prove their exact
+aggregate revision but do not download other candidates' published text. Complete
+summary reads remain exhaustive for management and report capture, with at most
+four concurrent publication reads. Read cancellation stops further storage work,
+not acknowledged background generation. No private content cache survives a
+request.
+
+The subject GET ETag is a display-read revision, not a substitute for the selected
+summary-scope ETag used by generation or the narrative-record ETag returned by
+private history for publication/retry actions.
 
 Each candidate narrative binds the exact completed result, resume/target snapshots,
 and manifest hashes. Each target narrative binds the exhaustive exact-target

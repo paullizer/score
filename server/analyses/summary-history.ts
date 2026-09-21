@@ -78,12 +78,12 @@ function validateStep(step: AnalysisSummaryStep, kind: AnalysisSummarySubject['k
 }
 
 export async function readSummaryHistoryEntry(
-  deps: RealAnalysesDeps, record: RealAnalysisNarrativeRecord, reference: AnalysisSummaryHistoryReference,
+  deps: RealAnalysesDeps, record: RealAnalysisNarrativeRecord, reference: AnalysisSummaryHistoryReference, signal?: AbortSignal,
 ): Promise<AnalysisSummaryHistoryEntry> {
   const subject = summarySubject(record)
   assertAnalysisSummaryHistoryReference(reference, record.workspaceId, record.runId, subject.kind, subject.subjectId)
   const entry = summaryHistoryEntrySchema.parse(parseAnalysisJson(
-    await readAnalysisBlob(deps.blobs, reference.blob, record.workspaceId, record.runId),
+    await readAnalysisBlob(deps.blobs, reference.blob, record.workspaceId, record.runId, signal),
   ))
   assertAnalysis(entry.id === reference.id && entry.generationId === reference.generationId && entry.createdAt === reference.createdAt &&
     entry.workspaceId === record.workspaceId && entry.runId === record.runId && entry.targetId === record.targetId &&
@@ -206,19 +206,19 @@ export async function readSummaryGeneration(
 }
 
 export async function readSummarySubject(
-  deps: RealAnalysesDeps, workspaceId: string, runId: string, subject: AnalysisSummarySubject,
+  deps: RealAnalysesDeps, workspaceId: string, runId: string, subject: AnalysisSummarySubject, signal?: AbortSignal,
 ) {
   if (subject.kind !== 'candidate' && subject.kind !== 'target' ||
     (subject.kind === 'candidate' ? !isAnalysisId(subject.subjectId, 'comparison')
       : !analysisNarrativeTargetIdSchema.safeParse(subject.subjectId).success)) {
     throw notFound('The exact saved summary was not found.')
   }
-  const inventory = await readAnalysisNarrativeInventory(deps, workspaceId, runId)
+  const inventory = await readAnalysisNarrativeInventory(deps, workspaceId, runId, undefined, signal)
   const pair = subject.kind === 'candidate' ? inventory.comparisons.find(item => item.id === subject.subjectId) : undefined
   const target = inventory.targets.find(item => item.target.summary.id === (pair?.target.summary.id ?? subject.subjectId))
   if (!target || subject.kind === 'candidate' && !pair) throw notFound('The exact saved summary was not found in this run.')
   const id = analysisNarrativeId(subject.kind, runId, subject.subjectId)
-  const current = await loadAnalysisNarrative(deps.store, workspaceId, id)
+  const current = await loadAnalysisNarrative(deps.store, workspaceId, id, signal)
   if (current) assertAnalysis(current.record.runId === runId && current.record.targetId === target.target.summary.id &&
     current.record.manifestSha256 === inventory.run.record.manifest.sha256 &&
     analysisHash(current.record.targetSnapshot) === analysisHash({ snapshotId: target.target.snapshotId, sha256: target.target.blob.sha256 }),
@@ -236,11 +236,12 @@ const historyCursorSchema = z.strictObject({
 
 export async function readAnalysisSummaryHistory(
   deps: RealAnalysesDeps, workspaceId: string, runId: string, subject: AnalysisSummarySubject, continuationToken?: string,
+  signal?: AbortSignal,
 ): Promise<AnalysisSummaryHistoryPage> {
   const scope = { workspaceId, runId, kind: 'summary-history' as const, summaryKind: subject.kind, subjectId: subject.subjectId }
   const cursor = analysisPageCursor(scope, continuationToken)
   for (let race = 0; race < 4; race++) {
-    const state = await readSummarySubject(deps, workspaceId, runId, subject)
+    const state = await readSummarySubject(deps, workspaceId, runId, subject, signal)
     const record = state.current?.record
     let reference = record?.history
     if (cursor) {
@@ -260,15 +261,16 @@ export async function readAnalysisSummaryHistory(
     while (reference && entries.length < SUMMARY_LIMITS.historyPageSize) {
       assertAnalysis(!seen.has(reference.id), 'Summary history contains a repeated checkpoint.')
       seen.add(reference.id)
-      const entry = await readSummaryHistoryEntry(deps, record!, reference)
+      const entry = await readSummaryHistoryEntry(deps, record!, reference, signal)
       entries.push(entry)
       reference = entry.previous
     }
     const [run, latest, workspace] = await Promise.all([
-      loadAnalysisRun(deps.store, workspaceId, runId),
-      loadAnalysisNarrative(deps.store, workspaceId, analysisNarrativeId(subject.kind, runId, subject.subjectId)),
-      deps.store.getControl(workspaceId),
+      loadAnalysisRun(deps.store, workspaceId, runId, signal),
+      loadAnalysisNarrative(deps.store, workspaceId, analysisNarrativeId(subject.kind, runId, subject.subjectId), signal),
+      deps.store.getControl(workspaceId, undefined, signal),
     ])
+    signal?.throwIfAborted()
     if (!run || analysisIsRemoved(run.record.lifecycle) || workspace && ['deleting', 'deleted'].includes(workspace.record.state)) {
       throw notFound('The saved analysis is being removed.')
     }

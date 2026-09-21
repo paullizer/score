@@ -27,9 +27,17 @@ export function RealAnalysisSetup() {
   const previousId = navigation.error ? null : navigation.params.get('from')
   const previous = previousId ? api?.detail(previousId) : undefined
   const ensure = api?.ensureDetail
+  const subscribeTargets = api?.subscribeTargets
   const [prepared, setPrepared] = useState(false)
-  const available = !navigation.error && resumes?.phase === 'ready' && api?.phase === 'ready' && api.features?.realAnalyses && api.targets.state === 'ready'
+  const [targetsSubscribed, setTargetsSubscribed] = useState(false)
+  const available = (!subscribeTargets || targetsSubscribed) && !navigation.error && resumes?.phase === 'ready' && api?.phase === 'ready' && api.features?.realAnalyses && api.targets.state === 'ready'
     && (!previousId || previous?.state === 'ready')
+  useEffect(() => {
+    if (navigation.error) { setTargetsSubscribed(false); return }
+    const release = subscribeTargets?.()
+    setTargetsSubscribed(true)
+    return release
+  }, [navigation.error, subscribeTargets])
   useEffect(() => { if (previousId && api?.phase === 'ready') void ensure?.(previousId) }, [api?.phase, ensure, previous?.state, previousId])
   useEffect(() => { if (available) setPrepared(true) }, [available])
   if (!api || !resumes) return <EmptyState title="Real analyses require a cloud workspace" description="The standalone preview only evaluates fictional fixtures. Real inputs are not sent to the sample scorer." />

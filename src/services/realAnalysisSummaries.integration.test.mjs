@@ -5,7 +5,7 @@ import { mkdir, rm } from 'node:fs/promises'
 import { join, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { build } from 'esbuild'
-import { analysisSummaryFixture, summaryHistoryFixture, summaryResponse, summaryRunId, summaryTimestamp, summaryWorkspaceId } from './analysisSummaries.test-support.mjs'
+import { analysisSummaryFixture, summaryHistoryFixture, summaryResponse, summarySubjectResponse, summaryRunId, summaryTimestamp, summaryWorkspaceId } from './analysisSummaries.test-support.mjs'
 
 const output = resolve(`.summary-service-tests-${randomUUID()}`)
 const originalFetch = globalThis.fetch
@@ -75,6 +75,78 @@ test('initializing summary scopes include every queued manifest pair without tre
   globalThis.fetch = async () => json(malformed)
   await assert.rejects(client.getRealAnalysisSummaries(summaryWorkspaceId, summaryRunId), /mismatched/,
     'A running comparison must already have an initialized work record.')
+})
+
+test('subject reads request only one exact candidate or target and retain legacy and approved v2 publications', async () => {
+  const requests = []
+  for (const subject of [
+    { kind: 'candidate', subjectId: fixture.details[0].comparison.id },
+    { kind: 'target', subjectId: fixture.targets[1].id },
+  ]) {
+    for (const summaryVersion of [undefined, 2]) {
+      const approval = { kind: 'manual', approvedAt: summaryTimestamp, approvedBy: 'workspace-editor',
+        reviewOutcome: 'needs-correction', issues: summaryHistoryFixture(fixture, subject).entries[0].review.issues }
+      const value = summarySubjectResponse(fixture, subject, { candidateStatus: 'ready', targetStatus: 'ready', summaryVersion, approval })
+      globalThis.fetch = async (url, init) => {
+        requests.push({ url, init })
+        return Response.json(value, { headers: { ETag: value.etag } })
+      }
+      const result = await client.getRealAnalysisSummarySubject(summaryWorkspaceId, summaryRunId, subject)
+      assert.deepEqual(result, value)
+      assert.equal(result.narrative.published.summaryVersion, summaryVersion)
+      assert.equal(result.comparisons, undefined, 'A subject response contains no unrelated candidate text.')
+      const request = requests.at(-1)
+      assert.equal(request.url, `/api/workspaces/${summaryWorkspaceId}/analyses/${summaryRunId}/summaries/${subject.kind}/${subject.subjectId}`)
+      assert.equal(request.init.method, 'GET')
+      assert.equal(request.init.cache, 'no-store')
+      assert.equal(request.init.body, undefined)
+    }
+  }
+  assert.equal(requests.length, 4)
+})
+
+test('subject reads reject mismatched identities, kinds, exact revisions, header ETags and false current publications', async () => {
+  const subject = { kind: 'candidate', subjectId: fixture.details[0].comparison.id }
+  const ready = summarySubjectResponse(fixture, subject, { candidateStatus: 'ready' })
+  for (const edit of [
+    value => { value.workspaceId = 'foreign' },
+    value => { value.runId = 'foreign' },
+    value => { value.kind = 'target' },
+    value => { value.subjectId = 'comparison-2' },
+    value => { value.narrative.comparisonId = 'comparison-2' },
+    value => { value.narrative.kind = 'target' },
+    value => { value.etag = '"foreign"' },
+    value => { value.revision = 'b'.repeat(64) },
+    value => { value.narrative.published.dataKind = 'sample' },
+    value => { value.narrative.published.inputFingerprint = 'b'.repeat(64) },
+    value => { value.narrative.published.generationId = 'older' },
+    value => { value.narrative.comparisonStatus = 'failed' },
+    value => { value.narrative.published = null },
+    value => { value.narrative.published.summaryVersion = 2 },
+  ]) {
+    const invalid = structuredClone(ready)
+    edit(invalid)
+    globalThis.fetch = async () => Response.json(invalid, { headers: { ETag: invalid.etag } })
+    await assert.rejects(client.getRealAnalysisSummarySubject(summaryWorkspaceId, summaryRunId, subject), /invalid saved-summary|mismatched/)
+  }
+  for (const etag of [undefined, '"different-revision"']) {
+    globalThis.fetch = async () => Response.json(ready, { headers: etag ? { ETag: etag } : {} })
+    await assert.rejects(client.getRealAnalysisSummarySubject(summaryWorkspaceId, summaryRunId, subject), /mismatched/)
+  }
+  const target = { kind: 'target', subjectId: fixture.targets[0].id }
+  const invalidTarget = summarySubjectResponse(fixture, target, { targetStatus: 'ready' })
+  invalidTarget.narrative.targetId = fixture.targets[1].id
+  globalThis.fetch = async () => Response.json(invalidTarget, { headers: { ETag: invalidTarget.etag } })
+  await assert.rejects(client.getRealAnalysisSummarySubject(summaryWorkspaceId, summaryRunId, target), /mismatched/)
+  for (const status of ['running', 'failed', 'stale', 'cancelled']) {
+    const value = summarySubjectResponse(fixture, subject, { candidateStatus: status, previous: true })
+    globalThis.fetch = async () => Response.json(value, { headers: { ETag: value.etag } })
+    assert.equal((await client.getRealAnalysisSummarySubject(summaryWorkspaceId, summaryRunId, subject)).narrative.status, status,
+      'Prior publications remain readable, with their real status rather than fabricated readiness.')
+  }
+  const controller = new AbortController()
+  globalThis.fetch = async () => { controller.abort(); return Response.json(ready, { headers: { ETag: ready.etag } }) }
+  await assert.rejects(client.getRealAnalysisSummarySubject(summaryWorkspaceId, summaryRunId, subject, controller.signal), { name: 'AbortError' })
 })
 
 test('summary envelopes reject foreign identities, implicit scopes, malformed counts, missing capture and false readiness', async () => {
