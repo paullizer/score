@@ -21,6 +21,8 @@ import {
 } from './narrative-model-input'
 import { NARRATIVE_MODEL_LIMITS } from './narrative-model-schema'
 import { emitSummaryTelemetry, summaryTransportTelemetry, type SummaryTelemetrySink, type SummaryTelemetryEvent } from './summary-telemetry'
+import { modelProcessingSettings, taskModelOptions } from '../settings'
+import type { ModelTaskId } from '../../src/domain/admin-settings'
 
 export interface SummaryModelOptions {
   model: RubricModelOptions
@@ -116,23 +118,30 @@ class SummarySession {
   private readonly timer: ReturnType<typeof setTimeout>
   private readonly steps = new Map<string, AnalysisSummaryStep>()
   private calls = 0
+  readonly maxRounds: number
+  private readonly deadlineAt: number
 
   constructor(readonly options: SummaryModelOptions, readonly stage: Stage) {
     this.options = { ...options, model: { ...options.model }, seed: options.seed ? summaryStepSchema.parse(options.seed) : undefined }
     this.clock = options.clock ?? options.model.clock ?? systemClock
+    const policy = modelProcessingSettings(options.model)?.settings.summaries
+    this.maxRounds = policy?.maxRounds ?? SUMMARY_LIMITS.rounds
+    const duration = policy?.operationTimeoutMilliseconds ?? NARRATIVE_MODEL_LIMITS.operationTimeoutMilliseconds
+    this.deadlineAt = this.clock.now().getTime() + duration
     this.signal = options.signal ? AbortSignal.any([options.signal, this.deadline.signal]) : this.deadline.signal
     for (const value of options.steps ?? []) {
       const step = summaryStepSchema.parse(value)
       const key = `${step.scopeId}:${step.round}`
       if (!this.steps.has(key)) this.steps.set(key, step)
     }
-    this.timer = setTimeout(() => this.deadline.abort(), NARRATIVE_MODEL_LIMITS.operationTimeoutMilliseconds)
+    this.timer = setTimeout(() => this.deadline.abort(), duration)
     this.timer.unref()
   }
 
   stop(): void { clearTimeout(this.timer) }
 
   check(stage = this.stage): void {
+    if (this.clock.now().getTime() >= this.deadlineAt) this.deadline.abort()
     if (this.signal.aborted) {
       throw new NarrativeModelError('timeout', 'Summary processing was interrupted; saved drafts remain available.', stage,
         { retryable: !this.options.signal?.aborted, cancelled: Boolean(this.options.signal?.aborted) })
@@ -155,12 +164,16 @@ class SummarySession {
 
   async call(request: StructuredModelRequest, stage: Stage, step: AnalysisSummaryStep) {
     this.check(stage)
+    const taskId = request.taskId!
+    const model = taskModelOptions(this.options.model, taskId)
+    const task = modelProcessingSettings(model)?.tasks[taskId]
+    request = { ...request, maxCompletionTokens: task?.completionTokenLimit ?? request.maxCompletionTokens }
     const requestBytes = narrativeJsonBytes({
-      model: this.options.model.deployment,
+      model: model.deployment,
       messages: [{ role: 'system', content: request.system }, { role: 'user', content: request.user }],
       response_format: { type: 'json_schema', json_schema: { name: request.name, strict: true, schema: request.schema } },
       max_completion_tokens: request.maxCompletionTokens,
-      ...(this.options.model.reasoningEffort ? { reasoning_effort: this.options.model.reasoningEffort } : {}),
+      ...(model.reasoningEffort ? { reasoning_effort: model.reasoningEffort } : {}),
     })
     if (requestBytes > NARRATIVE_MODEL_LIMITS.maxRequestBytes || this.calls >= NARRATIVE_MODEL_LIMITS.maxModelCalls) {
       this.emit({ event: 'model-failed', stage, scopeId: step.scopeId, round: step.round, requestBytes,
@@ -178,7 +191,7 @@ class SummarySession {
     }, { stage, round: step.round, scopeId: step.scopeId })
     try {
       return await invokeAnalysisModel(request, stage === 'grounding' ? 'grounding' : 'assessment', {
-        model: this.options.model, signal: AbortSignal.any([this.signal, timeout.signal]), onEvent,
+        model, signal: AbortSignal.any([this.signal, timeout.signal]), onEvent,
       }, this.clock, step.round - 1, {
         promptVersion: stage === 'grounding' ? `${SUMMARY_PIPELINE_VERSION}-factual-review` : SUMMARY_PIPELINE_VERSION,
         schemaVersion: 'analysis-summary-v2',
@@ -225,7 +238,7 @@ class SummarySession {
 
   async generate(kind: Kind, source: object, sourceFingerprint: string, scopeId = 'final'): Promise<AnalysisSummaryGenerated> {
     let lastFailure: NarrativeModelError | undefined
-    for (let round = 1; round <= SUMMARY_LIMITS.rounds; round++) {
+    for (let round = 1; round <= this.maxRounds; round++) {
       this.check()
       let step = this.steps.get(`${scopeId}:${round}`)
       if (step && step.sourceFingerprint !== sourceFingerprint) {
@@ -234,7 +247,7 @@ class SummarySession {
       if (step?.review?.outcome === 'supported') return this.completed(step)
       if (step?.review) {
         lastFailure = new NarrativeModelError('grounding-failed',
-          'The saved factual reviews still identify issues after three rounds. Review the drafts or retry this summary.', 'grounding',
+          `The saved factual reviews still identify issues after ${this.maxRounds} rounds. Review the drafts or start a new summary generation.`, 'grounding',
           { diagnostic: { reason: 'factual-review', round, modelCallId: step.review.modelCallId, issueCount: step.review.issues.length } })
         continue
       }
@@ -248,6 +261,8 @@ class SummarySession {
           await this.checkpoint(step)
           if (round > 1) this.emit({ event: 'summary-revision', scopeId, round, correctionCount: round - 1 })
           const response = await this.call({
+            taskId: kind === 'candidate' ? 'candidateSummary' : kind === 'target' ? 'targetSummary' : 'summaryReduction',
+            source: JSON.stringify(source),
             name: kind === 'candidate' ? 'analysis_candidate_narrative'
               : kind === 'target' ? 'analysis_target_narrative' : 'analysis_narrative_synthesis',
             schema: analysisStructuredSchema(kind === 'candidate' ? summaryCandidateContentSchema : summaryTargetContentSchema),
@@ -269,6 +284,7 @@ class SummarySession {
         let review: AnalysisSummaryReview | undefined
         for (let repair = 0; repair < 2; repair++) {
           const response = await this.call({
+            taskId: 'summaryReview', source: JSON.stringify(source),
             name: 'analysis_narrative_grounding_review', schema: analysisStructuredSchema(summaryReviewOutputSchema),
             system: REVIEW,
             user: JSON.stringify({
@@ -305,7 +321,7 @@ class SummarySession {
         })
         if (review.outcome === 'supported') return this.completed(step)
         lastFailure = new NarrativeModelError('grounding-failed',
-          'Factual issues remain after three summary rounds. Review the saved drafts or retry this summary.', 'grounding',
+          `Factual issues remain after ${this.maxRounds} summary rounds. Review the saved drafts or start a new summary generation.`, 'grounding',
           { diagnostic: { reason: 'factual-review', round, modelCallId: review.modelCallId, issueCount: review.issues.length } })
       } catch (error) {
         if (!(error instanceof NarrativeModelError) || error.cancelled || this.signal.aborted) throw error
@@ -324,8 +340,14 @@ class SummarySession {
       }
     }
     throw lastFailure ?? new NarrativeModelError('grounding-failed',
-      'All three saved summary rounds have unresolved issues. Review their history or retry this summary.', 'grounding',
-      { diagnostic: { reason: 'factual-review', round: SUMMARY_LIMITS.rounds } })
+      `All ${this.maxRounds} saved summary rounds have unresolved issues. Review their history or start a new summary generation.`, 'grounding',
+      { diagnostic: { reason: 'factual-review', round: this.maxRounds } })
+  }
+
+  sourceLimit(...tasks: ModelTaskId[]): number {
+    const settings = modelProcessingSettings(this.options.model)
+    return Math.min(NARRATIVE_MODEL_LIMITS.maxContextBytes,
+      ...tasks.map(task => settings?.tasks[task].inputBudget.maxInput ?? NARRATIVE_MODEL_LIMITS.maxContextBytes))
   }
 }
 
@@ -381,16 +403,16 @@ async function targetSource(input: AnalysisTargetNarrativeModelInput, session: S
   for (let level = 0; level <= NARRATIVE_MODEL_LIMITS.maxSynthesisLevels; level++) {
     const source = frame(units)
     const before = narrativeJsonBytes(source)
-    if (before <= NARRATIVE_MODEL_LIMITS.maxContextBytes) return source
+    if (before <= session.sourceLimit('targetSummary', 'summaryReview')) return source
     if (level === NARRATIVE_MODEL_LIMITS.maxSynthesisLevels) break
     const groups: TargetUnit[][] = []
     let group: TargetUnit[] = []
     for (const unit of units) {
-      if (narrativeJsonBytes(frame([unit])) > NARRATIVE_MODEL_LIMITS.maxContextBytes) {
+      if (narrativeJsonBytes(frame([unit])) > session.sourceLimit('summaryReduction', 'summaryReview')) {
         throw new NarrativeModelError('context-limit', 'One saved analysis exceeds the bounded summary context; no evidence was omitted.', 'target-generation',
           { diagnostic: { reason: 'context-budget' } })
       }
-      if (group.length && narrativeJsonBytes(frame([...group, unit])) > NARRATIVE_MODEL_LIMITS.maxContextBytes) {
+      if (group.length && narrativeJsonBytes(frame([...group, unit])) > session.sourceLimit('summaryReduction', 'summaryReview')) {
         groups.push(group)
         group = []
       }

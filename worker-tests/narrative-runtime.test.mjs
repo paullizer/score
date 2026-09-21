@@ -6,9 +6,17 @@ import {
   drainNarrativeRequest, narrativeRuntime, narrativeWorker, runComparisons, settleNarratives,
 } from '../server-tests/real-analysis-narratives.test-support.mjs'
 import { loadWorker } from './shared-model-loader.mjs'
+import { settingsSnapshot } from './runtime-settings-test-support.mjs'
 
 const { runAnalysisWorker, processClaimedNarrative } = await narrativeRuntime()
 async function summaries(f, runId, targetId) { return api.readAnalysisSummaries(f.analysis, f.workspaceId, runId, targetId) }
+async function assertPublishedSettings(f, id, expected) {
+  const { record } = await f.analysis.store.get(f.workspaceId, id)
+  assert.deepEqual(record.processingSettings, expected)
+  const blob = await f.analysis.blobs.read(record.published.blob.blobName)
+  assert.ok(blob)
+  assert.deepEqual(JSON.parse(Buffer.from(blob.bytes).toString('utf8')).processingSettings, expected)
+}
 async function generate(f, runId, mode = 'missing', targetId) {
   const before = await summaries(f, runId, targetId)
   return f.service.generateSummaries(f.workspaceId, runId, { mode, ...(targetId ? { targetId } : {}) },
@@ -46,7 +54,7 @@ test('new completion atomically queues independent narrative work and target pub
   assert.deepEqual(runComparisons(f, created.run.id), before)
   for (const [name, blob] of oldBlobs) assert.deepEqual(f.analysis.blobs.values.get(name), blob)
   assert.equal(ready.capture.comparisons.every(pair => pair.narrative?.revision && pair.resultSha256), true)
-  assert.doesNotMatch(JSON.stringify(mock.events), /fake-private-token|submitted document|rubric|paragraphs|blobName/)
+  assert.doesNotMatch(JSON.stringify(mock.events), /fake-private-token|submitted document|"rubric":|"paragraphs":|"blobName":/)
 })
 
 test('a newly completed old-run pair backfills missing prerequisites but history reads never do', async () => {
@@ -256,6 +264,17 @@ test('three failed factual rounds retain history and manual approval unblocks th
   assert.ok(reviewed.every(step => step.review.issues.length === 1 && step.draft.text))
   assert.deepEqual(runComparisons(f, created.run.id), scored)
   assert.doesNotMatch(JSON.stringify(mock.events), /overstates the supplied|Saved candidate draft|fake-private-token/)
+  const retryHistory = await api.readAnalysisSummaryHistory(f.analysis, f.workspaceId, created.run.id,
+    { kind: 'candidate', subjectId: pair.record.id })
+  await f.service.retrySummary(f.workspaceId, created.run.id,
+    { kind: 'candidate', subjectId: pair.record.id }, randomUUID(), retryHistory.etag, ACTOR)
+  const retried = (await f.analysis.store.get(f.workspaceId, record.id)).record
+  assert.equal(retried.generationId, record.generationId)
+  assert.equal(retried.processingSettings.revision, 'legacy-v1')
+  assert.equal(retried.summaryRound, 3)
+  const legacyRetry = narrativeWorker(f)
+  assert.equal((await settleNarratives(f, created.run.id, legacyRetry)).comparisons[0].status, 'failed')
+  assert.equal(legacyRetry.calls.length, 0, 'Unpinned legacy history cannot reset its consumed rounds.')
   const page = await api.readAnalysisSummaryHistory(f.analysis, f.workspaceId, created.run.id,
     { kind: 'candidate', subjectId: pair.record.id })
   const selected = reviewed.find(step => step.round === 1)
@@ -272,6 +291,280 @@ test('three failed factual rounds retain history and manual approval unblocks th
   assert.ok(remaining.calls.every(call => call.kind !== 'analysis_candidate_narrative'))
   assert.doesNotMatch(JSON.stringify(remaining.calls.map(call => call.body.source)), /Saved candidate draft|overstates the supplied/)
   assert.deepEqual(runComparisons(f, created.run.id), scored)
+})
+
+test('explicit summaries pin an independent policy and manual retries retain its consumed rounds while regeneration adopts new settings', async () => {
+  const f = fixture()
+  const legacy = settingsSnapshot(() => {}, 'legacy-v1')
+  let current = settingsSnapshot(settings => { settings.summaries.generationMode = 'on-demand' }, 'accepted-scoring-policy')
+  f.service = new api.RealAnalysisService(f.analysis, { resumes: f.resumes, jobs: f.jobs, grades: f.grades },
+    () => new Date(f.now), async () => current)
+  const created = await createRun(f)
+  const pair = runComparisons(f, created.run.id)[0]
+  await publishResult(f, created.run.id, pair.record.id)
+  assert.equal((await summaries(f, created.run.id)).counts.candidates.missing, 1)
+  assert.equal([...f.analysis.store.values.values()].filter(value => value.record.recordType.includes('narrative')).length, 0)
+
+  current = settingsSnapshot(settings => { settings.summaries.maxRounds = 1 }, 'independent-summary-policy')
+  const requested = await generate(f, created.run.id, 'all')
+  await drainNarrativeRequest(f, created.run.id, requested.requestId)
+  const mock = narrativeWorker(f, ({ kind }) => kind === 'analysis_narrative_grounding_review' ? {
+    outcome: 'needs-correction',
+    issues: [{ code: 'unsupported-claim', message: 'The draft overstates the supplied analysis.', field: 'text', paragraphIndex: null }],
+  } : undefined)
+  mock.deps.settings = { legacy, current: async () => current }
+  const failed = await settleNarratives(f, created.run.id, mock)
+  assert.equal(failed.comparisons[0].status, 'failed')
+  assert.equal(failed.comparisons[0].summaryRound, 1)
+  assert.equal(mock.calls.length, 2)
+  const id = api.analysisNarrativeId('candidate', created.run.id, pair.record.id)
+  const accepted = (await f.analysis.store.get(f.workspaceId, id)).record
+  assert.equal(accepted.processingSettings.revision, 'independent-summary-policy')
+  assert.equal((await f.analysis.store.get(f.workspaceId, created.run.id)).record.processingSettings.revision, 'accepted-scoring-policy')
+
+  current = settingsSnapshot(settings => {
+    for (const deployment of settings.ai.deployments) deployment.deploymentName = `new-${deployment.id}`
+  }, 'new-summary-policy')
+  const subject = { kind: 'candidate', subjectId: pair.record.id }
+  const page = await api.readAnalysisSummaryHistory(f.analysis, f.workspaceId, created.run.id, subject)
+  await f.service.retrySummary(f.workspaceId, created.run.id, subject, randomUUID(), page.etag, ACTOR)
+  const retried = (await f.analysis.store.get(f.workspaceId, id)).record
+  assert.equal(retried.generationId, accepted.generationId)
+  assert.equal(retried.processingSettings.revision, 'independent-summary-policy')
+  assert.equal(retried.summaryRound, 1)
+  assert.ok(accepted.history)
+  assert.deepEqual(retried.history, accepted.history)
+  const resumed = narrativeWorker(f)
+  resumed.deps.settings = { legacy, current: async () => current }
+  const exhausted = await settleNarratives(f, created.run.id, resumed)
+  assert.equal(exhausted.comparisons[0].status, 'failed')
+  assert.equal(exhausted.comparisons[0].summaryRound, 1)
+  assert.equal(resumed.calls.length, 0, 'A retry cannot buy more rounds by reading the newer default.')
+
+  const regenerate = await generate(f, created.run.id, 'all')
+  await drainNarrativeRequest(f, created.run.id, regenerate.requestId)
+  const fresh = (await f.analysis.store.get(f.workspaceId, id)).record
+  assert.notEqual(fresh.generationId, accepted.generationId)
+  assert.equal(fresh.processingSettings.revision, 'new-summary-policy')
+  const final = narrativeWorker(f)
+  final.deps.settings = { legacy, current: async () => current }
+  assert.equal((await settleNarratives(f, created.run.id, final)).ready, true)
+  assert.ok(final.calls.some(call => call.request.model === 'new-candidateSummary'))
+  assert.ok(final.calls.some(call => call.request.model === 'new-targetSummary'))
+  assert.ok(final.calls.filter(call => call.kind === 'analysis_narrative_grounding_review')
+    .every(call => call.request.model === 'new-summaryReview'))
+  await assertPublishedSettings(f, id, current)
+  await assertPublishedSettings(f, api.analysisNarrativeId('target', created.run.id, pair.record.target.summary.id), current)
+})
+
+test('an immutable summary winner with different captured settings cannot be published as the accepted generation', async () => {
+  const f = fixture()
+  const accepted = settingsSnapshot(settings => {
+    settings.processing.analyses.maxAutomaticAttempts = 1
+  }, 'accepted-summary-policy')
+  const changed = settingsSnapshot(settings => {
+    settings.processing.analyses.maxAutomaticAttempts = 1
+    settings.summaries.maxRounds = 2
+  }, accepted.revision)
+  f.service = new api.RealAnalysisService(f.analysis, { resumes: f.resumes, jobs: f.jobs, grades: f.grades },
+    () => new Date(f.now), async () => accepted)
+  const created = await createRun(f)
+  const pair = runComparisons(f, created.run.id)[0]
+  await publishResult(f, created.run.id, pair.record.id)
+  const put = f.analysis.blobs.putImmutable.bind(f.analysis.blobs)
+  let corrupted = false
+  f.analysis.blobs.putImmutable = async (name, bytes, contentType, options) => {
+    if (name.includes('/narratives/')) {
+      const artifact = JSON.parse(Buffer.from(bytes).toString('utf8'))
+      if (artifact.kind === 'candidate') {
+        bytes = Buffer.from(JSON.stringify({ ...artifact, processingSettings: changed }))
+        corrupted = true
+      }
+    }
+    return put(name, bytes, contentType, options)
+  }
+  const mock = narrativeWorker(f)
+  mock.deps.settings = { legacy: settingsSnapshot(() => {}, 'legacy-v1'), current: async () => accepted }
+  const result = await settleNarratives(f, created.run.id, mock)
+  const id = api.analysisNarrativeId('candidate', created.run.id, pair.record.id)
+  const { record } = await f.analysis.store.get(f.workspaceId, id)
+  assert.equal(corrupted, true)
+  assert.equal(result.ready, false)
+  assert.equal(record.status, 'failed')
+  assert.equal(record.error.stage, 'publication')
+  assert.equal(record.published, undefined)
+  assert.deepEqual(record.processingSettings, accepted)
+})
+
+test('closed configured admissions preserve accepted automatic summaries and their captured retry policy', async () => {
+  const f = fixture()
+  const legacy = settingsSnapshot(() => {}, 'legacy-v1')
+  const accepted = settingsSnapshot(settings => {
+    for (const deployment of settings.ai.deployments) deployment.deploymentName = `accepted-${deployment.id}`
+    settings.processing.analyses.maxAutomaticAttempts = 2
+  }, 'accepted-run-policy')
+  let current = accepted
+  let ready = true
+  let admissions = 0
+  const closed = new Error('New processing is closed until worker rollout is verified.')
+  const provider = Object.assign(async () => current, {
+    admission: async () => { admissions++; if (!ready) throw closed; return current },
+    newProcessingAllowed: () => ready,
+    pinNewAdmissions: true,
+    accepted: async snapshot => snapshot ?? legacy,
+  })
+  f.service = new api.RealAnalysisService(f.analysis, { resumes: f.resumes, jobs: f.jobs, grades: f.grades },
+    () => new Date(f.now), provider)
+  const created = await createRun(f)
+  const pair = runComparisons(f, created.run.id)[0]
+  ready = false
+  provider.pinNewAdmissions = false
+  current = settingsSnapshot(settings => {
+    for (const deployment of settings.ai.deployments) deployment.deploymentName = `current-${deployment.id}`
+    settings.summaries.generationMode = 'on-demand'
+    settings.processing.analyses.maxAutomaticAttempts = 1
+  }, 'current-policy')
+  await publishResult(f, created.run.id, pair.record.id)
+  await assert.rejects(generate(f, created.run.id, 'all'), error => error === closed)
+  const admissionReads = admissions
+  const mock = narrativeWorker(f, ({ kind, call }) =>
+    kind === 'analysis_candidate_narrative' && call <= 2 ? new Response('Unavailable', { status: 503 }) : undefined)
+  mock.deps.settings = { legacy, current: async () => current }
+  assert.equal((await settleNarratives(f, created.run.id, mock)).ready, true)
+  assert.ok(mock.calls.every(call => call.request.model.startsWith('accepted-')))
+  assert.equal(admissions, admissionReads, 'Accepted continuations must not ask for new processing admission.')
+  const candidateId = api.analysisNarrativeId('candidate', created.run.id, pair.record.id)
+  const targetId = api.analysisNarrativeId('target', created.run.id, pair.record.target.summary.id)
+  assert.equal((await f.analysis.store.get(f.workspaceId, candidateId)).record.attempts, 2)
+  for (const id of [candidateId, targetId]) await assertPublishedSettings(f, id, accepted)
+})
+
+test('unconfigured legacy-mode unpinned regeneration uses canonical legacy rather than inheriting the old run or current policy', async () => {
+  const f = fixture()
+  const policy = (prefix, revision, attempts = 3) => settingsSnapshot(settings => {
+    for (const deployment of settings.ai.deployments) deployment.deploymentName = `${prefix}-${deployment.id}`
+    settings.processing.analyses.maxAutomaticAttempts = attempts
+  }, revision)
+  const legacy = policy('legacy', 'legacy-v1')
+  let current = policy('run', 'accepted-run-policy', 1)
+  const provider = Object.assign(async () => current, {
+    // No configured-service readiness hook: this models legacy/test admissions, not configured rollout-off.
+    pinNewAdmissions: true,
+    accepted: async snapshot => snapshot ?? legacy,
+  })
+  f.service = new api.RealAnalysisService(f.analysis, { resumes: f.resumes, jobs: f.jobs, grades: f.grades },
+    () => new Date(f.now), provider)
+  const created = await createRun(f)
+  const pair = runComparisons(f, created.run.id)[0]
+  await publishResult(f, created.run.id, pair.record.id)
+  const automatic = narrativeWorker(f)
+  automatic.deps.settings = { legacy, current: async () => current }
+  assert.equal((await settleNarratives(f, created.run.id, automatic)).ready, true)
+  assert.ok(automatic.calls.some(call => call.request.model === 'run-candidateSummary'))
+  assert.ok(automatic.calls.some(call => call.request.model === 'run-targetSummary'))
+  const candidateId = api.analysisNarrativeId('candidate', created.run.id, pair.record.id)
+  const targetId = api.analysisNarrativeId('target', created.run.id, pair.record.target.summary.id)
+  for (const id of [candidateId, targetId]) await assertPublishedSettings(f, id, current)
+
+  current = policy('current', 'later-current-policy', 1)
+  provider.pinNewAdmissions = false
+  const request = await generate(f, created.run.id, 'all')
+  await drainNarrativeRequest(f, created.run.id, request.requestId)
+  const candidate = (await f.analysis.store.get(f.workspaceId, candidateId)).record
+  assert.equal(candidate.processingSettings, undefined)
+  assert.equal((await f.analysis.store.get(f.workspaceId, targetId)).record.processingSettings, undefined)
+  const crashedAt = new Date(Math.max(Date.parse(f.now), Date.parse(candidate.updatedAt))).toISOString()
+  const expiredAt = new Date(Date.parse(crashedAt) + 90_000).toISOString()
+  const crashed = {
+    ...candidate, status: 'running', attempts: 1, attemptId: randomUUID(), updatedAt: crashedAt,
+    lease: { owner: 'expired-summary-worker', heartbeatAt: crashedAt, expiresAt: expiredAt },
+  }
+  delete crashed.nextAttemptAt
+  f.analysis.store.save(crashed)
+  f.now = new Date(Date.parse(expiredAt) + 1).toISOString()
+  const regenerated = narrativeWorker(f)
+  regenerated.deps.settings = { legacy, current: async () => current }
+  assert.equal((await settleNarratives(f, created.run.id, regenerated)).ready, true)
+  assert.ok(regenerated.calls.some(call => call.request.model === 'legacy-candidateSummary'))
+  assert.ok(regenerated.calls.some(call => call.request.model === 'legacy-targetSummary'))
+  assert.ok(regenerated.calls.every(call => call.request.model.startsWith('legacy-')))
+  for (const id of [candidateId, targetId]) {
+    await assertPublishedSettings(f, id, legacy)
+  }
+  assert.equal((await f.analysis.store.get(f.workspaceId, candidateId)).record.attempts, 2)
+  assert.equal((await f.analysis.store.get(f.workspaceId, created.run.id)).record.processingSettings.revision, 'accepted-run-policy')
+})
+
+test('resuming a candidate does not reset a failed dependent target and explicit target retry retains its accepted policy', async () => {
+  const f = fixture()
+  const accepted = settingsSnapshot(settings => {
+    settings.summaries.maxRounds = 1
+    settings.processing.analyses.maxAutomaticAttempts = 1
+    settings.ai.transport.maxAttempts = 1
+  }, 'accepted-target-policy')
+  let current = accepted
+  f.service = new api.RealAnalysisService(f.analysis, { resumes: f.resumes, jobs: f.jobs, grades: f.grades },
+    () => new Date(f.now), async () => current)
+  const created = await createRun(f)
+  const pair = runComparisons(f, created.run.id)[0]
+  await publishResult(f, created.run.id, pair.record.id)
+  const first = narrativeWorker(f, ({ kind }) =>
+    kind === 'analysis_narrative_grounding_review' ? new Response('', { status: 503 }) : undefined)
+  first.deps.settings = { legacy: accepted, current: async () => current }
+  const failed = await settleNarratives(f, created.run.id, first)
+  assert.equal(failed.comparisons[0].status, 'failed')
+  assert.equal(failed.targets[0].error.code, 'dependency-failed')
+  const targetId = api.analysisNarrativeId('target', created.run.id, failed.targets[0].targetId)
+  const targetBefore = await f.analysis.store.get(f.workspaceId, targetId)
+  assert.equal(targetBefore.record.inputFingerprint, null)
+  assert.equal(targetBefore.record.attempts, 0)
+  assert.equal(targetBefore.record.history, undefined)
+  assert.equal(targetBefore.record.summaryRound, undefined)
+
+  current = settingsSnapshot(settings => {
+    for (const deployment of settings.ai.deployments) deployment.deploymentName = `new-${deployment.id}`
+  }, 'later-target-policy')
+  const candidateSubject = { kind: 'candidate', subjectId: pair.record.id }
+  const candidateHistory = await api.readAnalysisSummaryHistory(f.analysis, f.workspaceId, created.run.id, candidateSubject)
+  await f.service.retrySummary(f.workspaceId, created.run.id, candidateSubject, randomUUID(), candidateHistory.etag, ACTOR)
+  assert.deepEqual(await f.analysis.store.get(f.workspaceId, targetId), targetBefore)
+  const candidateRetry = narrativeWorker(f)
+  candidateRetry.deps.settings = { legacy: accepted, current: async () => current }
+  await runAnalysisWorker(candidateRetry.deps)
+  assert.equal(candidateRetry.calls.length, 1)
+  assert.equal(candidateRetry.calls[0].request.model, 'deployment-summaryReview')
+  assert.equal((await summaries(f, created.run.id)).comparisons[0].status, 'ready')
+  assert.deepEqual(await f.analysis.store.get(f.workspaceId, targetId), targetBefore)
+
+  const targetSubject = { kind: 'target', subjectId: failed.targets[0].targetId }
+  const targetHistory = await api.readAnalysisSummaryHistory(f.analysis, f.workspaceId, created.run.id, targetSubject)
+  const retryRequestId = randomUUID()
+  await f.service.retrySummary(f.workspaceId, created.run.id, targetSubject, retryRequestId, targetHistory.etag, ACTOR)
+  const queued = (await f.analysis.store.get(f.workspaceId, targetId)).record
+  assert.equal(queued.status, 'waiting')
+  assert.equal(queued.waitingFor, 'candidate-narratives')
+  assert.equal(queued.inputFingerprint, null)
+  assert.equal(queued.generationId, targetBefore.record.generationId)
+  assert.equal(queued.requestId, targetBefore.record.requestId)
+  assert.equal(queued.retryRequestId, retryRequestId)
+  assert.equal(queued.summaryRound, targetBefore.record.summaryRound)
+  assert.deepEqual(queued.history, targetBefore.record.history)
+  assert.deepEqual(queued.processingSettings, targetBefore.record.processingSettings)
+  assert.throws(() => api.assertAnalysisReplacement({ ...targetBefore.record, inputFingerprint: 'f'.repeat(64) }, queued),
+    /cannot change its accepted inputs/)
+  assert.throws(() => api.assertAnalysisReplacement(targetBefore.record, { ...queued, processingSettings: current }),
+    /cannot change processing settings/)
+  const targetRetry = narrativeWorker(f)
+  targetRetry.deps.settings = { legacy: accepted, current: async () => current }
+  assert.equal((await settleNarratives(f, created.run.id, targetRetry)).ready, true)
+  assert.deepEqual(targetRetry.calls.map(call => call.request.model), ['deployment-targetSummary', 'deployment-summaryReview'])
+  const completed = (await f.analysis.store.get(f.workspaceId, targetId)).record
+  assert.equal(completed.generationId, targetBefore.record.generationId)
+  assert.equal(completed.requestId, targetBefore.record.requestId)
+  assert.equal(completed.retryRequestId, retryRequestId)
+  assert.match(completed.inputFingerprint, /^[a-f0-9]{64}$/)
+  assert.equal(completed.summaryRound, 1)
+  await assertPublishedSettings(f, targetId, accepted)
 })
 
 test('automatic retry resumes a persisted draft after a transient review failure without another generation', async () => {

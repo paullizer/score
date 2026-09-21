@@ -2,6 +2,7 @@ import { useState } from 'react'
 import { Link, useNavigate, useParams, useSearchParams } from 'react-router-dom'
 import { ArrowLeft, ArrowRight, BriefcaseBusiness, FileText, MapPin, Plus, Users, X } from 'lucide-react'
 import { useWorkspace } from '../../app/workspace-context'
+import { usePublicSettings } from '../../app/public-settings-context'
 import { useLibraryViewState } from '../../app/library-view-state'
 import { DocumentViewer } from '../../components/documents/DocumentViewer'
 import { Avatar, Badge, Button, DemoNote, EmptyState, InlineError, PageHeader, SearchField, SegmentedControl } from '../../components/ui'
@@ -256,13 +257,14 @@ function ResumeDetail({ id }: { id: string }) {
 export function ResumesPage() {
   const { id } = useParams<{ id: string }>()
   const { workspace, cloud } = useWorkspace()
+  const { settings } = usePublicSettings()
   const real = useRealResumes()
   const [params] = useSearchParams()
   const navigate = useNavigate()
   const mode = dataMode(params, Boolean(cloud), Boolean(id && workspace.resumes.some((resume) => resume.id === id)))
   if (mode === 'invalid') return <EmptyState title="Unknown resume mode" description="Choose real resumes or the explicitly fictional Samples view." action={<Button onClick={() => navigate('/resumes')}>Open resume library</Button>} />
   return <>
-    {cloud && !id && <div className="library-kind-switcher mb-5 rounded-xl border"><SegmentedControl label="Choose real resumes or samples" value={mode}
+    {cloud && !id && settings?.features.samplesVisible !== false && <div className="library-kind-switcher mb-5 rounded-xl border"><SegmentedControl label="Choose real resumes or samples" value={mode}
       onChange={(value) => navigate(`/resumes?data=${value}`)} options={[{ value: 'real', label: 'Real resumes', count: real?.summaries.length ?? 0 }, { value: 'samples', label: 'Samples', count: workspace.resumes.length }]} />
       <span>{mode === 'real' ? 'Actual private sources · manual analysis' : 'Fictional profiles · filenames only · simulated scoring'}</span></div>}
     {mode === 'real' ? <RealResumesPage id={id} /> : <RenameEntityProvider key={`${cloud?.currentWorkspaceId ?? 'local'}:${id ?? 'library'}`}>

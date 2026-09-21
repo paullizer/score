@@ -6,6 +6,7 @@ import { createAzureAnalysisBlobStore, createAzureAnalysisStore } from '../serve
 import { loadAnalysisWorkerConfig, type AnalysisWorkerConfig } from './analyses/config'
 import { runAnalysisWorker, type AnalysisWorkerDependencies } from './analyses/runtime'
 import { logAnalysisTelemetry } from './analyses/telemetry'
+import { createAzureWorkerSettings } from './settings-store'
 
 export { loadAnalysisWorkerConfig } from './analyses/config'
 export { runAnalysisWorker } from './analyses/runtime'
@@ -14,6 +15,9 @@ export function createAnalysisWorkerDependencies(
   config: AnalysisWorkerConfig, credential: TokenCredential,
 ): AnalysisWorkerDependencies {
   return {
+    settings: createAzureWorkerSettings(config, credential, {
+      deployment: config.modelDeployment, modelName: config.modelName, reasoningEffort: config.reasoningEffort,
+    }),
     store: createAzureAnalysisStore(config.stores, credential),
     blobs: createAzureAnalysisBlobStore(config.stores, credential),
     onEvent: logAnalysisTelemetry,

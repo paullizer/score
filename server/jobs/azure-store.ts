@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { isDeepStrictEqual } from 'node:util'
+import { preservesProcessingSettings } from './policy'
 import { CosmosClient, ErrorResponse } from '@azure/cosmos'
 import type { Container, JSONObject, OperationInput, OperationResponse } from '@azure/cosmos'
 import { BlobServiceClient, RestError } from '@azure/storage-blob'
@@ -21,6 +22,7 @@ import {
   isJobBlobInScope,
   isSafeJobBlobName,
   isValidJobId,
+  isUuid,
   jobBlobPrefix,
   jobBlobContentType,
   validateRealJobRecord,
@@ -54,6 +56,16 @@ interface JobTombstone {
 
 interface BlobWriterRecord extends JobBlobWriter {
   recordType: 'blob-writer'
+}
+
+interface JobBatchAdmission {
+  id: string
+  workspaceId: string
+  recordType: 'job-batch'
+  batchId: string
+  createdBy: string
+  maxItems: number
+  jobIds: string[]
 }
 
 const LIST_PAGE_SIZE = 50
@@ -231,6 +243,41 @@ export function createJobStoreFromContainer(container: Pick<Container, 'items' |
     return current
   }
 
+  function validateBatch(stored: CosmosDoc<JobBatchAdmission>, workspaceId: string, batchId = stored.batchId): void {
+    if (!isUuid(batchId) || stored.id !== `job-batch-${batchId}` || stored.workspaceId !== workspaceId ||
+      stored.recordType !== 'job-batch' || stored.batchId !== batchId || typeof stored._etag !== 'string' || !stored.createdBy ||
+      !Number.isInteger(stored.maxItems) || stored.maxItems < 1 || stored.maxItems > JOB_IMPORT_LIMITS.maxBatchFiles ||
+      !Array.isArray(stored.jobIds) || stored.jobIds.length > stored.maxItems ||
+      new Set(stored.jobIds).size !== stored.jobIds.length || stored.jobIds.some(id => !isValidJobId(id))) {
+      throw new Error('Stored job import batch has invalid admission metadata.')
+    }
+  }
+
+  async function batchAdmission(record: RealJobRecord): Promise<OperationInput[]> {
+    const batchId = record.job.batchId
+    if (!batchId) return []
+    if (!isUuid(batchId)) throw new Error('Invalid job import batch identity.')
+    const id = `job-batch-${batchId}`
+    const stored = await read<JobBatchAdmission>(record.workspaceId, id)
+    const limit = record.processingSettings?.settings.imports.jobs.maxBatchItems ?? JOB_IMPORT_LIMITS.maxBatchFiles
+    if (stored) validateBatch(stored, record.workspaceId, batchId)
+    if (stored && stored.createdBy !== record.createdBy) {
+      throw new StoreConflictError('Every item in a job import batch must belong to the same importing user.')
+    }
+    if (stored?.jobIds.includes(record.id)) throw new StoreConflictError('This job batch slot was already consumed and cannot be reused.')
+    const maxItems = Math.min(stored?.maxItems ?? limit, limit)
+    if ((stored?.jobIds.length ?? 0) >= maxItems) {
+      throw new StoreConflictError(`This job import batch has reached its ${maxItems}-item limit. Start a new batch.`)
+    }
+    const next: JobBatchAdmission = {
+      id, workspaceId: record.workspaceId, recordType: 'job-batch', batchId, createdBy: record.createdBy,
+      maxItems: stored?.maxItems ?? limit, jobIds: [...(stored?.jobIds ?? []), record.id],
+    }
+    return [stored
+      ? { operationType: 'Replace', id, resourceBody: next as unknown as JSONObject, ifMatch: stored._etag }
+      : { operationType: 'Create', resourceBody: next as unknown as JSONObject }]
+  }
+
   function replacement(record: RealJobRecord, etag: string): OperationInput {
     validateWriteRecord(record)
     return { operationType: 'Replace', id: record.id, resourceBody: record as unknown as JSONObject, ifMatch: etag }
@@ -266,7 +313,7 @@ export function createJobStoreFromContainer(container: Pick<Container, 'items' |
   }
 
   function recordsQuery(workspaceId: string, types: string[], jobId?: string, continuationToken?: string) {
-    return container.items.query<CosmosDoc<RubricVersionRecord | BlobWriterRecord | RealJobRecord>>({
+    return container.items.query<CosmosDoc<RubricVersionRecord | BlobWriterRecord | RealJobRecord | JobBatchAdmission>>({
       query: `SELECT * FROM c WHERE ARRAY_CONTAINS(@types, c.recordType)
         ${jobId === undefined ? '' : 'AND c.jobId = @jobId'} ORDER BY c.id ASC`,
       parameters: [
@@ -300,7 +347,8 @@ export function createJobStoreFromContainer(container: Pick<Container, 'items' |
           else if (value.recordType === 'blob-writer') {
             const writer = writerRecord(value, workspaceId, jobId)
             if (Date.parse(writer.expiresAt) > Date.now()) throw new StoreConflictError('Job Blob writers have not drained.')
-          } else throw new Error('Refusing to purge an unexpected job record.')
+          } else if (value.recordType === 'job-batch' && jobId === undefined) validateBatch(value, workspaceId)
+          else throw new Error('Refusing to purge an unexpected job record.')
         }
         return {
           operations: resources.map(value => ({ operationType: 'Delete' as const, id: value.id })),
@@ -344,8 +392,9 @@ export function createJobStoreFromContainer(container: Pick<Container, 'items' |
           assertJobWritable(value.record)
           return { operations: [], result: () => ({ created: false, value }) }
         }
+        const admissions = await batchAdmission(record)
         return {
-          operations: [{ operationType: 'Create', resourceBody: record as unknown as JSONObject }],
+          operations: [{ operationType: 'Create', resourceBody: record as unknown as JSONObject }, ...admissions],
           result: results => ({ created: true, value: written(record, results) }),
         }
       })
@@ -357,6 +406,9 @@ export function createJobStoreFromContainer(container: Pick<Container, 'items' |
         const current = await currentJob(record.workspaceId, record.id, expectedEtag)
         assertJobWritable(current.record)
         assertJobWritable(record)
+        if (!preservesProcessingSettings(current.record.processingSettings, record.processingSettings)) {
+          throw new StoreConflictError('Accepted job processing settings are immutable.')
+        }
         if (JSON.stringify(record.lifecycle) !== JSON.stringify(current.record.lifecycle) ||
           JSON.stringify(record.rubricLifecycle) !== JSON.stringify(current.record.rubricLifecycle) ||
           record.job.rubricDeletedAt !== current.record.job.rubricDeletedAt) {
@@ -498,6 +550,9 @@ export function createJobStoreFromContainer(container: Pick<Container, 'items' |
         const current = await currentJob(record.workspaceId, record.id, expectedEtag)
         assertJobWritable(current.record)
         assertJobWritable(record)
+        if (!preservesProcessingSettings(current.record.processingSettings, record.processingSettings)) {
+          throw new StoreConflictError('Accepted job processing settings are immutable.')
+        }
         if (JSON.stringify(record.lifecycle) !== JSON.stringify(current.record.lifecycle) ||
           JSON.stringify(record.rubricLifecycle) !== JSON.stringify(current.record.rubricLifecycle) ||
           record.job.rubricDeletedAt !== current.record.job.rubricDeletedAt ||
@@ -624,11 +679,11 @@ export function createJobStoreFromContainer(container: Pick<Container, 'items' |
     },
 
     async purgeWorkspaceRecords(workspaceId, timestamp) {
-      await deleteRecords(workspaceId, ['rubric-version', 'blob-writer'])
+      await deleteRecords(workspaceId, ['rubric-version', 'blob-writer', 'job-batch'])
       for (;;) {
         const removed = await guarded(workspaceId, false, async control => {
           await cleanupAllowed(workspaceId, undefined, control)
-          const remaining = await cleanupPage(workspaceId, ['rubric-version', 'blob-writer'])
+          const remaining = await cleanupPage(workspaceId, ['rubric-version', 'blob-writer', 'job-batch'])
           if (remaining.length) throw new StoreConflictError('Workspace job cleanup has not completed.')
           const records = await cleanupPage(workspaceId, ['job'])
           const operations: OperationInput[] = records.map(raw => {

@@ -72,6 +72,51 @@ test('diagnostic history is immutable, paginated one attempt at a time and prese
   assert.throws(() => api.assertAnalysisReplacement(latest.record, changed), /immutable attempt replaced/)
 })
 
+test('disabled private diagnostic capture persists without an artifact and remains readable through retry', async () => {
+  const f = fixture()
+  const settings = api.createDefaultAdminSettings()
+  settings.diagnostics.capturePrivateFailures = false
+  f.service = new api.RealAnalysisService(f.analysis, f, () => new Date(f.now),
+    async () => api.captureProcessingSettings(settings, 'private-capture-disabled', f.now))
+  const created = await createRun(f)
+  const [pair] = comparisons(f, created.run.id)
+  const run = await f.analysis.store.get(f.workspaceId, created.run.id)
+  const attemptId = randomUUID()
+  const failed = {
+    ...pair.record, status: 'failed', attemptId, attempts: 1,
+    error: { code: 'invalid-model-output', stage: 'assessment', retryable: false, message: 'The model did not return valid JSON. No score was published.' },
+    diagnosticCapture: { attemptId, status: 'disabled', pipelineVersion: api.ANALYSIS_PIPELINE_VERSION },
+  }
+  delete failed.nextAttemptAt
+  assert.equal(api.parseAnalysisEntity(failed).diagnosticCapture.status, 'disabled')
+  const serialized = JSON.stringify(failed)
+  const decoded = api.parseAnalysisEntity(JSON.parse(serialized))
+  assert.deepEqual(decoded, api.parseAnalysisEntity(failed))
+  assert.equal(decoded.failureDiagnostic, undefined)
+  assert.equal(api.parseAnalysisEntity({
+    ...JSON.parse(serialized), diagnosticCapture: { ...failed.diagnosticCapture, status: 'unavailable' },
+  }).diagnosticCapture.status, 'unavailable')
+  const legacy = JSON.parse(serialized)
+  delete legacy.diagnosticCapture
+  assert.equal(api.parseAnalysisEntity(legacy).diagnosticCapture, undefined)
+  assert.throws(() => api.parseAnalysisEntity({
+    ...failed, diagnosticCapture: { ...failed.diagnosticCapture, status: 'saved' },
+  }), /immutable artifact/)
+  assert.throws(() => api.parseAnalysisEntity({ ...failed, diagnosticCapture: { ...failed.diagnosticCapture, rawOutput: 'private' } }))
+  await f.analysis.store.transact(f.workspaceId, [
+    { kind: 'replace', record: failed, etag: pair.etag },
+    { kind: 'replace', record: api.applyAnalysisComparisonTransition(run.record, pair.record, failed, f.now), etag: run.etag },
+  ])
+  assert.deepEqual(await f.service.diagnostics(f.workspaceId, created.run.id, pair.record.id), { attempts: [] })
+  assert.ok([...f.analysis.blobs.values.keys()].every(name => !name.includes('/diagnostics/')))
+  const current = await f.analysis.store.get(f.workspaceId, pair.record.id)
+  assert.deepEqual(api.parseAnalysisEntity(JSON.parse(JSON.stringify(current.record))).diagnosticCapture, failed.diagnosticCapture)
+  await f.service.comparisonAction(f.workspaceId, created.run.id, pair.record.id, 'retry', current.etag)
+  const retried = await f.analysis.store.get(f.workspaceId, pair.record.id)
+  assert.deepEqual(retried.record.diagnosticCapture, failed.diagnosticCapture)
+  assert.deepEqual(retried.record.processingSettings, failed.processingSettings)
+})
+
 test('renaming a failed analysis preserves private diagnostics and frozen inputs', async () => {
   const f = fixture()
   const created = await createRun(f)

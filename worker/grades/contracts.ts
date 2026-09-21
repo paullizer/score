@@ -2,14 +2,10 @@ import type {
   GradeCompetency, GradeIssue, GradeLadderRecord, GradeQualification, GradeRubric,
   GradeRubricVersionRecord, GradeSeedSnapshot, GradeSourceSetRecord, ReferenceDocument,
 } from '../../src/domain/real-grades'
+import type { ProcessingSettingsSnapshot } from '../../src/domain/admin-settings'
+import type { StructuredModelRequest } from '../runtime'
 
-export interface GradeModelRequest {
-  name: string
-  schema: Record<string, unknown>
-  system: string
-  user: string
-  maxCompletionTokens?: number
-}
+export type GradeModelRequest = StructuredModelRequest
 
 export type GradeModelInvoker = (
   request: GradeModelRequest,
@@ -17,6 +13,7 @@ export type GradeModelInvoker = (
 ) => Promise<{ content: string; model: string }>
 
 export interface CompetencyModelInput {
+  processingSettings?: ProcessingSettingsSnapshot
   seed: GradeSeedSnapshot
   sourceSet: GradeSourceSetRecord
   documents: ReferenceDocument[]
@@ -30,6 +27,7 @@ export interface CompetencyModelResult {
 }
 
 export interface GradeDraftModelInput {
+  processingSettings?: ProcessingSettingsSnapshot
   ladder: GradeLadderRecord
   sourceSet: GradeSourceSetRecord
   documents: ReferenceDocument[]
@@ -49,6 +47,7 @@ export interface GradeDraftModelResult {
 }
 
 export interface GradeReviewModelInput {
+  processingSettings?: ProcessingSettingsSnapshot
   version: GradeRubricVersionRecord
   sourceSet: GradeSourceSetRecord
   documents: ReferenceDocument[]

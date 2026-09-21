@@ -5,6 +5,8 @@ import {
   type GradeSourceSetRecord, type ReferenceDocument,
 } from '../../src/domain/real-grades'
 import type { Citation } from '../../src/domain/types'
+import type { ModelTaskId, ProcessingSettingsSnapshot } from '../../src/domain/admin-settings'
+import { validateProcessingSettings } from '../settings'
 import type {
   CompetencyModelInput, DraftGradeRubric, GradeDraftModelInput, GradeModelInvoker,
   GradeModelRequest, PlanGradeCompetencies, ReviewGradeRubric,
@@ -208,16 +210,21 @@ async function invokeOnce(request: GradeModelRequest, invoke: GradeModelInvoker,
 }
 
 async function structuredOutput<T>(
-  specification: { name: string; system: string; schema: z.ZodType<T>; maxCompletionTokens: number },
+  specification: { name: string; taskId: ModelTaskId; system: string; schema: z.ZodType<T>; maxCompletionTokens: number },
   evidence: ModelEvidence, input: Record<string, unknown>, requiredCitations: Citation[],
   validate: (value: T, context: BoundedModelContext) => Validation,
-  invoke: GradeModelInvoker, signal?: AbortSignal,
+  invoke: GradeModelInvoker, signal?: AbortSignal, snapshot?: ProcessingSettingsSnapshot,
 ): Promise<{ value: T; model: string; issues: GradeIssue[] }> {
   checkCancelled(signal)
-  const request = { ...specification, schema: structuredSchema(specification.schema) }
-  const context = boundModelContext(request, evidence, input, requiredCitations)
+  const settings = snapshot ? validateProcessingSettings(snapshot) : undefined
+  const task = settings?.tasks[specification.taskId]
+  const request = { ...specification, schema: structuredSchema(specification.schema),
+    ...(settings ? { processingSettings: settings, maxCompletionTokens: task!.completionTokenLimit } : {}) }
+  const context = boundModelContext(request, evidence, input, requiredCitations, task
+    ? Math.min(task.inputBudget.maxInput, task.inputBudget.maxRequest) : undefined)
   let errors: string[] = []
-  for (let attempt = 0; attempt < 2; attempt += 1) {
+  const corrections = settings?.settings.ai.grades.maxOutputCorrections ?? 1
+  for (let attempt = 0; attempt <= corrections; attempt += 1) {
     checkCancelled(signal)
     const diagnostics: string[] = []
     let diagnosticSize = 0
@@ -237,7 +244,7 @@ async function structuredOutput<T>(
         previousResponseOmitted: 'Invalid response text is not evidence and is deliberately not echoed.',
       },
     })
-    const response = await invokeOnce({ ...request, user }, invoke, signal)
+    const response = await invokeOnce({ ...request, user, source: context.user }, invoke, signal)
     let parsed: unknown
     errors = []
     if (response.content.length > GRADE_LADDER_LIMITS.maxModelCharacters) {
@@ -259,7 +266,7 @@ async function structuredOutput<T>(
       }
     }
   }
-  throw new GradeModelError('invalid-model-output', 'The model returned invalid schema, citations, or content after one bounded repair; no successful fallback was produced.', {
+  throw new GradeModelError('invalid-model-output', `The model returned invalid schema, citations, or content after ${corrections} allowed repairs; no successful fallback was produced.`, {
     details: errors, issues: context.issues,
   })
 }
@@ -269,8 +276,11 @@ export const planGradeCompetencies: PlanGradeCompetencies = async (input, invoke
   const seed = seedEvidence(input)
   const evidence = inputEvidence(input.sourceSet, seed.documents, seed.issues)
   const seedIds = new Set(input.seed.rubric.criteria.map(value => value.id))
+  const maxCriteria = input.processingSettings?.settings.grades.maxCriteria ?? GRADE_LADDER_LIMITS.maxCriteria
   const generated = await structuredOutput({
-    name: 'score_grade_competencies_v2', system: PLAN_SYSTEM, schema: planSchema, maxCompletionTokens: 12_000,
+    taskId: 'gradeCompetencies', name: 'score_grade_competencies_v2',
+    system: PLAN_SYSTEM.replace(`1–${GRADE_LADDER_LIMITS.maxCriteria}`, `1–${maxCriteria}`),
+    schema: planSchema.extend({ competencies: competencySchema.array().min(1).max(maxCriteria) }), maxCompletionTokens: 12_000,
   }, evidence, {
     operation: 'plan-competencies',
     seed: {
@@ -281,7 +291,7 @@ export const planGradeCompetencies: PlanGradeCompetencies = async (input, invoke
       },
       evidenceUse: 'Captured role context only; neither job grades nor seed rubric weights establish other GS levels.',
     },
-  }, [], (value, context) => validatePlan(value, seedIds, evidence, context.included), invoke, signal)
+  }, [], (value, context) => validatePlan(value, seedIds, evidence, context.included), invoke, signal, input.processingSettings)
   return {
     competencies: generated.value.competencies, issues: generated.issues,
     model: generated.model, promptVersion: GRADE_MODEL_PROMPT_VERSIONS.competencies,
@@ -293,9 +303,12 @@ export const draftGradeRubric: DraftGradeRubric = async (input, invoke, signal) 
   checkDraftInput(input)
   const evidence = inputEvidence(input.sourceSet, input.documents, input.ladder.issues, input.grade)
   checkCompetencies(input.competencies, evidence)
+  if (input.competencies.length > (input.processingSettings?.settings.grades.maxCriteria ?? GRADE_LADDER_LIMITS.maxCriteria)) {
+    invalidInput('The frozen competency plan exceeds its captured criterion limit. No competencies were removed.')
+  }
   const eligibleGradingDocumentIds = gradingDocumentIds(evidence)
   const generated = await structuredOutput({
-    name: 'score_grade_draft_v3', system: DRAFT_SYSTEM, schema: draftSchemaForDocuments(eligibleGradingDocumentIds, {
+    taskId: 'gradeDraft', name: 'score_grade_draft_v3', system: DRAFT_SYSTEM, schema: draftSchemaForDocuments(eligibleGradingDocumentIds, {
       sourceIds: [...evidence.bindings.values()].filter(binding => binding.selected).map(binding => binding.source.sourceId),
       criterionIds: input.competencies.map(competency => competency.id), grade: input.grade,
     }), maxCompletionTokens: 24_000,
@@ -305,7 +318,7 @@ export const draftGradeRubric: DraftGradeRubric = async (input, invoke, signal) 
     eligibleGradingDocumentIds,
     version: { id: input.versionId, version: input.version, createdAt: input.createdAt },
   }, input.competencies.flatMap(value => value.citations),
-  (value, context) => validateDraft(value, input.competencies, evidence, context.included), invoke, signal)
+  (value, context) => validateDraft(value, input.competencies, evidence, context.included), invoke, signal, input.processingSettings)
   const rubric: GradeRubric = {
     id: input.versionId, groupId: gradeHeadId(input.ladder.id, input.grade),
     kind: 'grade', dataKind: 'real', ladder: input.ladder.name, grade: gradeLabel(input.grade),
@@ -369,7 +382,7 @@ export const reviewGradeRubric: ReviewGradeRubric = async (input, invoke, signal
   }
   evidence.issues = mergeIssues(evidence.issues, deterministic.issues)
   const generated = await structuredOutput({
-    name: 'score_grade_review_v2', system: REVIEW_SYSTEM, schema: reviewSchemaForScope({
+    taskId: 'gradeReview', name: 'score_grade_review_v2', system: REVIEW_SYSTEM, schema: reviewSchemaForScope({
       sourceIds: [...evidence.bindings.values()].filter(binding => binding.selected).map(binding => binding.source.sourceId),
       criterionIds: competencies.map(competency => competency.id), grade: version.grade,
     }), maxCompletionTokens: 16_000,
@@ -385,7 +398,7 @@ export const reviewGradeRubric: ReviewGradeRubric = async (input, invoke, signal
     const result = validateModelIssues(value.issues, evidence, context.included, new Set(competencies.map(value => value.id)))
     result.errors.push(...value.issues.flatMap(value => authorityClaimErrors(value.message)))
     return result
-  }, invoke, signal)
+  }, invoke, signal, input.processingSettings)
   const issues = generated.issues
   if (generated.value.outcome === 'needs-sources' && !issues.some(value => value.severity === 'blocker')) {
     issues.push(issue('grounding-support-missing', 'Independent semantic review could not establish sufficient source support. Add or clarify applicable evidence before this grade can progress.', {

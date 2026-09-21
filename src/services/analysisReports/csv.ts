@@ -1,7 +1,9 @@
-import { REPORT_LIMITS, type AnalysisReport, type ReportGenerationOptions } from '../../domain/analysis-reports'
+import type { AnalysisReport, ReportGenerationOptions } from '../../domain/analysis-reports'
 import { reportReviewLinks } from './links'
 import { assertReportResourceLimits } from './model'
 import { assessmentSummary, readableAnalysisDate, readableCandidateSourceName, readableTargetSourceLabel } from './readable'
+import { reportGenerationPolicy, reportLimits, snapshotReportPolicy } from './policy'
+import { buildReportNotices, REPORT_TITLE, reportTitle } from './presentation'
 
 type Cell = string | number | null
 
@@ -16,8 +18,12 @@ function csvCell(value: Cell): string {
 }
 
 export function generateCsvReport(report: AnalysisReport, options?: ReportGenerationOptions): Uint8Array {
-  assertReportResourceLimits(report)
   const startedAt = Date.now()
+  report = snapshotReportPolicy(report)
+  const policy = reportGenerationPolicy(report, 'csv')
+  const limits = reportLimits(policy)
+  assertReportResourceLimits(report, limits.maxInputBytes)
+  const customized = policy.title !== REPORT_TITLE || policy.additionalFooter !== ''
   const displayLabels = report.groups.some(group => group.target.displayName || group.comparisons.some(comparison => comparison.candidate.displayName))
   const criterionCount = Math.max(0, ...report.groups.map(group => group.target.criteria.length))
   const header: Cell[] = [
@@ -26,17 +32,21 @@ export function generateCsvReport(report: AnalysisReport, options?: ReportGenera
     ...Array.from({ length: criterionCount }, (_, index) => `C${index + 1}`),
     'Analysis date', 'Source', 'Analysis link', 'Resume link', 'Job/grade link',
     ...(displayLabels ? ['Candidate display label', 'Job/grade display title'] : []),
+    ...(customized ? ['Report title', 'Report disclosures'] : []),
   ]
   const encoder = new TextEncoder()
   const chunks: Uint8Array[] = [Uint8Array.of(0xef, 0xbb, 0xbf)]
   let bytes = 3
-  function append(cells: Cell[]) {
-    if (Date.now() - startedAt > REPORT_LIMITS.maxGenerationMilliseconds) {
+  function checkTime() {
+    if (Date.now() - startedAt > limits.maxGenerationMilliseconds) {
       throw new Error('CSV generation exceeded its time limit. Export one job or grade at a time; no file was downloaded.')
     }
+  }
+  function append(cells: Cell[]) {
+    checkTime()
     const chunk = encoder.encode(`${cells.map(csvCell).join(',')}\r\n`)
     bytes += chunk.byteLength
-    if (bytes > REPORT_LIMITS.maxOutputBytes) {
+    if (bytes > limits.maxOutputBytes) {
       throw new Error('This CSV exceeds the report download size limit. Export one job or grade at a time; no rows were omitted.')
     }
     chunks.push(chunk)
@@ -66,6 +76,7 @@ export function generateCsvReport(report: AnalysisReport, options?: ReportGenera
         readableAnalysisDate(comparison.analyzedAt), comparison.candidate.sourceLabel,
         links.analysis, links.resume, links.target,
         ...(displayLabels ? [comparison.candidate.displayName ?? null, target.displayName ?? null] : []),
+        ...(customized ? [reportTitle(report), buildReportNotices(report.dataKind, report.counts, policy.additionalFooter).join('\n\n')] : []),
       ])
       rows++
       completed++
@@ -80,5 +91,6 @@ export function generateCsvReport(report: AnalysisReport, options?: ReportGenera
   const result = new Uint8Array(bytes)
   let offset = 0
   for (const chunk of chunks) { result.set(chunk, offset); offset += chunk.byteLength }
+  checkTime()
   return result
 }

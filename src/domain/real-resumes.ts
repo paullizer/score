@@ -2,6 +2,7 @@ import type { Citation, SourceDocument } from './types'
 import type { DocumentPagination, OriginalContentType, UploadContentType, UploadFormat, WordImportFeatures } from './document-formats'
 import { MAX_MARKDOWN_BYTES } from './source-files'
 import type { LifecycleMetadata, LifecycleOperation } from './lifecycle'
+import type { ModelTaskId, ProcessingSettingsSnapshot } from './admin-settings'
 
 export const RESUME_IMPORT_LIMITS = {
   maxFileBytes: 10 * 1024 * 1024,
@@ -65,6 +66,7 @@ export interface ResumeCaptureManifest {
   inputFingerprint: string
   source: RealResumeSource
   capture: ResumeSourceCapture
+  processingSettings?: ProcessingSettingsSnapshot
 }
 
 export interface ResumeExtractionProvenance {
@@ -86,6 +88,9 @@ export interface ResumeProfileProvenance {
   promptVersion: string
   schemaVersion: string
   extractedAt: string
+  settingsRevision?: string
+  task?: ModelTaskId
+  deployment?: string
 }
 
 export interface RealResumeProfile {
@@ -131,6 +136,7 @@ export interface ResumeEntityBase {
   dataKind: 'real'
   createdAt: string
   updatedAt: string
+  processingSettings?: ProcessingSettingsSnapshot
 }
 
 export interface RealResumeRecord extends ResumeEntityBase {
@@ -218,7 +224,7 @@ export interface RealResumesPage {
 export interface ResumeProcessingFeatures extends WordImportFeatures {
   realResumeImports: boolean
   markdownResumeImports: boolean
-  resumeLimits: typeof RESUME_IMPORT_LIMITS
+  resumeLimits: { [K in keyof typeof RESUME_IMPORT_LIMITS]: number }
 }
 
 // Both import routes require UUID keys and the same declared count for every item in a batch.

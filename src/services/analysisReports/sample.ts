@@ -10,6 +10,7 @@ import { unavailableOverallScore } from './presentation'
 import { sampleCandidateNarrative, sampleNarrativeCapture, sampleReportFixtureId, sampleTargetNarrative } from './sample-narratives'
 import { reportNarrativeCaptureSchema } from './narrative-schemas'
 import { getDisplayName } from '../../domain/displayNames'
+import { reportSettingsCaptureSchema } from './policy'
 
 const id = z.string().min(1).max(1024)
 const text = z.string().max(REPORT_LIMITS.maxTextCharacters)
@@ -195,7 +196,10 @@ export function buildSampleAnalysisReport(run: AnalysisRun, options: SampleAnaly
   })
   const parsedOptions = z.strictObject({
     targetId: id.optional(), generatedAt: timestamp.optional(),
-    capture: z.strictObject({ startedAt: timestamp, completedAt: timestamp, summaries: reportNarrativeCaptureSchema.optional() }).optional(),
+    capture: z.strictObject({
+      startedAt: timestamp, completedAt: timestamp,
+      summaries: reportNarrativeCaptureSchema.optional(), settings: reportSettingsCaptureSchema.optional(),
+    }).optional(),
   }).parse(options)
   const generatedAt = parsedOptions.generatedAt ?? new Date().toISOString()
   const fixtureId = sampleReportFixtureId(saved.id)

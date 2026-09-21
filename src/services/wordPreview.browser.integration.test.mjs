@@ -9,7 +9,7 @@ import {
 let runtime, browser
 const previousTemp = { TEMP: process.env.TEMP, TMP: process.env.TMP }
 const visible = async (locator) => { await locator.waitFor({ state: 'visible' }); return locator }
-const originalRequests = (fixture) => fixture.requests.filter((request) => request.url.endsWith('/original'))
+const originalRequests = (fixture) => fixture.requests.filter((request) => new URL(request.url, fixture.origin).pathname.endsWith('/original'))
 const uploads = (fixture) => fixture.requests.filter((request) => request.method === 'POST')
 const frame = (page) => page.frameLocator('iframe[title="Approximate formatted Word preview"]')
 
@@ -78,6 +78,7 @@ test('real job DOCX preview is lazy, private, semantic, sandboxed, and citation 
   assert.match(await page.locator('.docx-preview-frame').getAttribute('srcdoc'), /default-src 'none'.*connect-src 'none'.*form-action 'none'/)
   assert.match(originalRequests(fixture)[0].headers.cookie, /private-session=authorized/)
   assert.equal(originalRequests(fixture)[0].headers['x-score-request'], 'workspace')
+  assert.equal(new URL(originalRequests(fixture)[0].url, fixture.origin).search, '?preview=formatted')
   assert.equal(await page.evaluate(() => window.__previewXss), undefined)
   assert.deepEqual(external, [], 'No linked image, script, font or navigation may reach the network.')
   const citation = page.getByRole('button', { name: /^View exact source/ })
@@ -113,6 +114,29 @@ test('resume DOCX preview remains readable with admission disabled; legacy DOC s
   const response = await legacy.context.request.get(`${legacy.fixture.origin}${url}`)
   assert.equal(response.headers()['content-type'], docType)
   assert.deepEqual(await response.body(), legacy.fixture.bytes)
+})
+
+test('formatted preview requests recheck server policy without changing raw original download links', { timeout: 30_000 }, async (t) => {
+  const { page, context, fixture } = await open(t)
+  fixture.controls.original = (req, res) => {
+    if (new URL(req.url, fixture.origin).searchParams.get('preview') !== 'formatted') return false
+    res.writeHead(403, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' })
+    res.end(JSON.stringify({ error: { code: 'forbidden', message: 'Formatted preview is disabled by current application policy.' } }))
+    return true
+  }
+  await page.getByRole('button', { name: 'Formatted Word preview', exact: true }).click()
+  await visible(page.getByText(/The private original could not be loaded\. Check your access or session, then retry\./))
+  const href = await page.getByRole('link', { name: 'Download Word original', exact: true }).getAttribute('href')
+  const original = new URL(href, fixture.origin)
+  assert.equal(original.search, '')
+  assert.equal(originalRequests(fixture).length, 1)
+  assert.equal(new URL(originalRequests(fixture)[0].url, fixture.origin).search, '?preview=formatted')
+  assert.equal(await page.evaluate(() => window.previewWorkers.started), 0, 'Denied preview bytes never reach a conversion worker.')
+  assert.equal(await page.locator('.docx-preview-frame').count(), 0)
+  const downloaded = await context.request.get(original.href)
+  assert.equal(downloaded.status(), 200, 'Raw downloads remain a separate server-authorized action.')
+  assert.deepEqual(await downloaded.body(), fixture.bytes)
+  assert.equal(new URL(originalRequests(fixture)[1].url, fixture.origin).search, '')
 })
 
 test('safe formatted Word text and tables do not produce false content-removal warnings', { timeout: 30_000 }, async (t) => {
@@ -171,7 +195,7 @@ test('bounded private fetch rejects oversized streams, wrong MIME, mismatched si
   assert.match(await rejection({ bytes: 3 }), /saved file size/)
   fixture.controls.original = (_req, res) => { res.writeHead(302, { Location: 'https://external.invalid/preview' }); res.end(); return true }
   assert.notEqual(await rejection(), 'unexpected success')
-  for (const value of ['https://external.invalid/original', `${fixture.origin}/public.docx`, `${url}?redirect=elsewhere`]) {
+  for (const value of ['https://external.invalid/original', `${fixture.origin}/public.docx`, `${url}?redirect=elsewhere`, `${url}?preview=formatted`]) {
     const before = fixture.requests.length
     const result = await page.evaluate(async (value) => {
       try { await window.wordTest.fetchOriginal(value, {}); return 'unexpected success' } catch (error) { return error.message }

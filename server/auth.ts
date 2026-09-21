@@ -10,6 +10,12 @@ export interface AuthenticatedPrincipal {
   readonly email: string
 }
 
+/** Application designation is tenant-scoped and independent of every workspace role. */
+export function isApplicationAdmin(principal: AuthenticatedPrincipal, config: Config): boolean {
+  return principal.tenantId === config.tenantId && config.allowedUserIds.has(principal.oid) &&
+    config.adminUserIds?.has(principal.oid) === true
+}
+
 export type AuthErrorKind = 'unauthenticated' | 'forbidden'
 
 export class AuthError extends Error {

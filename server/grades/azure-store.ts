@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto'
+import { preservesProcessingSettings } from '../jobs/policy'
 import { CosmosClient } from '@azure/cosmos'
 import type { Container, JSONObject, OperationInput, SqlParameter } from '@azure/cosmos'
 import { BlobServiceClient } from '@azure/storage-blob'
@@ -79,8 +80,14 @@ function checkReplacement(current: VersionedGradeEntity | undefined, record: Gra
     throw new Error('Grade head identity is immutable.')
   }
   if (old.recordType === 'grade-work' && record.recordType === 'grade-work' &&
-    (gradeContentHash(old.input) !== gradeContentHash(record.input) || old.requestFingerprint !== record.requestFingerprint)) {
+    (gradeContentHash(old.input) !== gradeContentHash(record.input) || old.requestFingerprint !== record.requestFingerprint ||
+      !preservesProcessingSettings(old.processingSettings, record.processingSettings))) {
     throw new Error('Grade work input is immutable.')
+  }
+  if (old.recordType === 'grade-source' && record.recordType === 'grade-source' &&
+    old.documentVersion === record.documentVersion &&
+    !preservesProcessingSettings(old.processingSettings, record.processingSettings)) {
+    throw new Error('Accepted reference extraction settings are immutable for this document version.')
   }
 }
 

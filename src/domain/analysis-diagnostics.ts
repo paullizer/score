@@ -142,7 +142,7 @@ export interface AnalysisFailureDiagnosticReference {
 
 export interface AnalysisDiagnosticCapture {
   attemptId: string
-  status: 'saved' | 'unavailable'
+  status: 'saved' | 'unavailable' | 'disabled'
   pipelineVersion: string
 }
 

@@ -1,5 +1,6 @@
 import { createContext, useContext } from 'react'
-import type { RealResumeDetail, RealResumeSummary, ResumeProcessingFeatures } from '../domain/real-resumes'
+import type { RealResumeDetail, RealResumeSummary } from '../domain/real-resumes'
+import type { ResumeServiceFeatures } from '../services/realResumes'
 import type { RealResumeImportBatch, RealResumeImportSource } from '../features/resumes/resumeImportUi'
 import type { RealLoadState } from './real-request-scope'
 
@@ -7,7 +8,7 @@ export interface RealResumesContextValue {
   workspaceId: string
   canWrite: boolean
   phase: 'loading' | 'ready' | 'unavailable' | 'error'
-  features: ResumeProcessingFeatures | null
+  features: ResumeServiceFeatures | null
   error: string | null
   summaries: RealResumeSummary[]
   refresh: () => Promise<void>

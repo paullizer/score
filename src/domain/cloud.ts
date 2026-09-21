@@ -28,6 +28,13 @@ export interface CloudSession {
   mode: 'cloud'
   user: CloudUser
   workspaces: WorkspaceSummary[]
+  capabilities?: { applicationAdmin: boolean }
+}
+
+export interface CloudSessionIdentity {
+  mode: 'cloud'
+  user: CloudUser
+  capabilities: { applicationAdmin: boolean }
 }
 
 export interface CloudWorkspaceSnapshot {
@@ -39,5 +46,6 @@ export interface CloudApiError {
   error: {
     code: 'unauthorized' | 'forbidden' | 'not_found' | 'conflict' | 'precondition_required' | 'invalid_request' | 'unavailable'
     message: string
+    fields?: { path: string; message: string }[]
   }
 }

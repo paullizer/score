@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { randomUUID } from 'node:crypto'
+import { randomBytes, randomUUID } from 'node:crypto'
 import { mkdir, rm } from 'node:fs/promises'
 import { join, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
@@ -11,7 +11,7 @@ import { realReportFixture, reportSummariesFixture, version2ReportFixture, withR
 const output = resolve(`.analysis-report-real-tests-${randomUUID()}`)
 const originalFetch = globalThis.fetch
 const storageDescriptors = new Map()
-let loadRealAnalysisReport, assertRealAnalysisReportNarrativesCurrent, requests
+let loadRealAnalysisReport, assertRealAnalysisReportNarrativesCurrent, requests, defaultSettings
 const clone = value => structuredClone(value)
 const json = (value, status = 200) => new Response(JSON.stringify(value), { status, headers: { 'Content-Type': 'application/json' } })
 const reference = (name, sha256 = REPORT_TEST_HASH) => ({ blobName: name, sha256, bytes: 1024, contentType: 'application/json' })
@@ -60,7 +60,7 @@ function fixture(options = {}) {
     if (comparison.status === 'complete') progress[comparison.resultSummary.overall.status === 'available' ? 'scored' : 'unscored']++
   }
   return {
-    report, inventory,
+    report, inventory, settings: clone(defaultSettings), captureToken: randomBytes(32).toString('base64url'),
     detail: {
       etag: '"saved-run"',
       run: { ...clone(run), recordType: 'analysis-run', workspaceId, dataKind: 'real',
@@ -76,15 +76,20 @@ function batch(f, ids) {
   const comparisons = ids.map(id => clone(f.report.comparisons.find(comparison => comparison.id === id)))
   const targetIds = new Set(comparisons.map(comparison => comparison.targetId))
   return { schemaVersion: 1, dataKind: 'real', workspaceId: f.report.workspaceId, runId: f.report.run.id,
-    targets: clone(f.report.targets.filter(target => targetIds.has(target.id))), comparisons }
+    targets: clone(f.report.targets.filter(target => targetIds.has(target.id))), comparisons, settings: clone(f.settings) }
 }
 
-function serve(f, { pageSize = 50, page, report, detail, summaries } = {}) {
+function serve(f, { pageSize = 50, page, report, detail, summaries, capture } = {}) {
   globalThis.fetch = async (url, init) => {
     requests.push({ url, init })
     assert.equal(init.method, 'GET', 'Export must not create analyses or invoke models.')
     assert.equal(init.cache, 'no-store')
     const parsed = new URL(url, 'https://score.test')
+    if (parsed.pathname.endsWith('/report-capture')) {
+      const body = { schemaVersion: 1, dataKind: 'real', workspaceId: f.report.workspaceId, runId: f.report.run.id,
+        format: parsed.searchParams.get('format'), settings: clone(f.settings), captureToken: f.captureToken }
+      return capture ? capture(body, init, parsed) : json(body)
+    }
     if (parsed.pathname.endsWith('/summaries')) {
       const body = reportSummariesFixture(f.report, { targetId: parsed.searchParams.get('targetId') })
       return summaries ? summaries(body, init, parsed) : json(body)
@@ -93,6 +98,9 @@ function serve(f, { pageSize = 50, page, report, detail, summaries } = {}) {
       const ids = parsed.searchParams.getAll('comparisonId')
       assert.ok(ids.length >= 1 && ids.length <= 25)
       assert.equal(new Set(ids).size, ids.length)
+      assert.equal(parsed.searchParams.get('settingsRevision'), f.settings.revision)
+      assert.equal(parsed.searchParams.get('captureToken'), f.captureToken)
+      assert.ok(['csv', 'pdf', 'docx', 'pptx'].includes(parsed.searchParams.get('format')))
       return report ? report(ids, init, parsed) : json(batch(f, ids))
     }
     if (parsed.pathname.endsWith('/comparisons')) {
@@ -154,11 +162,16 @@ function addDisplayLabels(f) {
 before(async () => {
   await mkdir(output)
   await build({
-    entryPoints: [join('src', 'services', 'analysisReports', 'real.ts')], outfile: join(output, 'real.mjs'),
+    stdin: { resolveDir: process.cwd(), loader: 'ts', contents: `
+      export * from './src/services/analysisReports/real';
+      export { createDefaultAdminSettings } from './src/domain/admin-settings-defaults';
+    ` }, outfile: join(output, 'real.mjs'),
     bundle: true, packages: 'external', platform: 'node', format: 'esm', logLevel: 'silent',
     define: { 'import.meta.env.VITE_DEPLOYMENT_MODE': '"cloud"' },
   })
-  ;({ loadRealAnalysisReport, assertRealAnalysisReportNarrativesCurrent } = await import(pathToFileURL(join(output, 'real.mjs')).href))
+  const api = await import(pathToFileURL(join(output, 'real.mjs')).href)
+  ;({ loadRealAnalysisReport, assertRealAnalysisReportNarrativesCurrent } = api)
+  defaultSettings = { revision: 'reports-test-v1', policy: api.createDefaultAdminSettings().reports }
   for (const name of ['localStorage', 'sessionStorage', 'indexedDB']) {
     storageDescriptors.set(name, Object.getOwnPropertyDescriptor(globalThis, name))
     Object.defineProperty(globalThis, name, { configurable: true, get() { throw new Error('Report data must never access browser persistence.') } })
@@ -225,7 +238,7 @@ test('500 comparisons consume the complete inventory and bounded concurrent 25-I
   assert.equal(requests.filter(request => /\/comparisons(?:\?|$)/.test(request.url)).length, 10)
   assert.equal(reportRequests().length, 20)
   assert.ok(maximum > 1 && maximum <= 3)
-  assert.equal(requests.length, 31)
+  assert.equal(requests.length, 32)
   assert.deepEqual(progress[0], [0, 500])
   assert.deepEqual(progress.at(-1), [500, 500])
   assert.ok(progress.every((value, index) => !index || value[0] > progress[index - 1][0]))
@@ -443,7 +456,7 @@ test('target definitions cannot change between batches and oversized response pa
     response.comparisons[0].summary = 'x'.repeat(8 * 1024 * 1024)
     return json(response)
   } })
-  await assert.rejects(load(large), /8 MiB resource limit.*Narrow/)
+  await assert.rejects(load(large), /8,388,608-byte resource limit.*Narrow/)
 })
 
 test('cancellation before reads and during pagination prevents further private requests', async () => {
@@ -456,7 +469,7 @@ test('cancellation before reads and during pagination prevents further private r
   const during = new AbortController()
   serve(f, { pageSize: 1, page: body => { during.abort(); return json(body) } })
   await assert.rejects(load(f, { signal: during.signal }), error => error.name === 'AbortError')
-  assert.equal(requests.length, 2)
+  assert.equal(requests.length, 3)
   assert.equal(reportRequests().length, 0)
 })
 
@@ -503,7 +516,7 @@ test('every new export reauthorizes and reloads private data rather than returni
   const firstCount = requests.length
   serve(f, { detail: () => json({ error: { code: 'forbidden', message: 'Workspace membership ended.' } }, 403) })
   await assert.rejects(load(f), /Workspace membership ended/)
-  assert.equal(requests.length, firstCount + 1)
+  assert.equal(requests.length, firstCount + 2)
 })
 
 test('ready narrative capture pins the exhaustive scope, attaches exact saved prose, and rechecks without model or document calls', async () => {
@@ -512,7 +525,8 @@ test('ready narrative capture pins the exhaustive scope, attaches exact saved pr
   const report = await load(f, { requireSummaries: true })
   const summaries = reportSummariesFixture(f.report)
   assert.equal(summaryRequests().length, 2)
-  assert.ok(requests[0].url.endsWith('/summaries'))
+  assert.ok(requests[0].url.includes('/report-capture?format=pdf'))
+  assert.ok(requests[1].url.endsWith('/summaries'))
   assert.ok(requests.at(-1).url.endsWith('/summaries'))
   assert.deepEqual(report.capture.summaries, summaries.capture)
   assert.equal(report.counts.total, 8)
@@ -578,7 +592,7 @@ test('missing, stale, failed, waiting and active summaries reject preflight with
     const f = narrativeFixture()
     serve(f, { summaries: body => json(summaryState(body, kind, status)) })
     await assert.rejects(load(f, { requireSummaries: true }), /summaries|summary/i, `${kind}:${status}`)
-    assert.equal(requests.length, 1)
+    assert.equal(requests.length, 2)
     assert.equal(reportRequests().length, 0)
   }
   const f = narrativeFixture({ scores: [80, 60], statuses: ['complete', 'running'] })
@@ -771,13 +785,13 @@ test('ready archived and read-only scopes remain exportable, but summary read fa
     requests = []
     serve(f, { summaries: () => json({ error: { code: 'unavailable', message: 'The saved summaries are not accessible.' } }, status) })
     await assert.rejects(load(f, { requireSummaries: true }), /not accessible/)
-    assert.equal(requests.length, 1)
+    assert.equal(requests.length, 2)
   }
   const controller = new AbortController()
   requests = []
   serve(f, { summaries: body => { controller.abort(); return json(body) } })
   await assert.rejects(load(f, { requireSummaries: true, signal: controller.signal }), error => error.name === 'AbortError')
-  assert.equal(requests.length, 1)
+  assert.equal(requests.length, 2)
 })
 
 test('ready narrative capture retains the full 500-comparison bound and unchanged batch concurrency limits', async () => {
@@ -797,4 +811,123 @@ test('ready narrative capture retains the full 500-comparison bound and unchange
   assert.equal(reportRequests().length, 20)
   assert.equal(summaryRequests().length, 2)
   assert.ok(maximum > 1 && maximum <= 3)
+})
+
+test('a report captures server policy once and applies its lower batch size, concurrency and exact-target report limit', async () => {
+  const f = fixture({ scores: Array(12).fill(80), targetCount: 2 })
+  f.settings = { revision: 'nondefault-report-policy', policy: {
+    ...f.settings.policy, batchComparisons: 2, maxConcurrentBatches: 1, maxComparisons: 12, highlightCount: 1, maxHighlights: 2,
+  } }
+  let active = 0, maximum = 0, captures = 0
+  serve(f, {
+    capture: body => { captures++; return json(body) },
+    report: async (ids, _init, url) => {
+      assert.ok(ids.length <= 2)
+      assert.equal(url.searchParams.get('format'), 'csv')
+      assert.equal(url.searchParams.get('targetId'), f.report.targets[1].id)
+      active++; maximum = Math.max(maximum, active)
+      await delay(1)
+      active--
+      return json(batch(f, ids))
+    },
+  })
+  const value = await load(f, { format: 'csv', targetId: f.report.targets[1].id })
+  assert.equal(captures, 1)
+  assert.equal(maximum, 1)
+  assert.equal(reportRequests().length, 6)
+  assert.equal(value.counts.total, 12)
+  assert.equal(value.groups[0].highlightedComparisonIds.length, 2)
+  assert.deepEqual(value.capture.settings, f.settings)
+  assert.ok(Object.isFrozen(value.capture.settings.policy))
+  requests = []
+  serve(f)
+  await assert.rejects(load(f, { format: 'csv' }), /12-comparison report limit.*Narrow/)
+  assert.equal(reportRequests().length, 0)
+})
+
+test('official captures fail closed for unauthorized formats or roles and mismatched or missing revision metadata', async () => {
+  for (const code of [403, 409, 503]) {
+    const f = fixture()
+    requests = []
+    serve(f, { capture: () => json({ error: { code: 'forbidden', message: 'Report policy denied this capture.' } }, code) })
+    await assert.rejects(load(f), /Report policy denied/)
+    assert.equal(requests.length, 1)
+  }
+  for (const mutate of [
+    body => { body.workspaceId = 'another-workspace' },
+    body => { body.runId = 'another-run' },
+    body => { body.format = 'docx' },
+    body => { body.settings.policy.enabledFormats = []; body.settings.policy.defaultFormat = null },
+    body => { body.settings.policy.allowedRoles = [] },
+    body => { delete body.settings },
+    body => { delete body.captureToken },
+    body => { body.captureToken = 'invalid-token' },
+  ]) {
+    const f = fixture()
+    requests = []
+    serve(f, { capture: body => { mutate(body); return json(body) } })
+    await assert.rejects(load(f))
+    assert.equal(requests.length, 1)
+  }
+  for (const mutate of [
+    body => { delete body.settings },
+    body => { body.settings.revision = 'new-active-revision' },
+    body => { body.settings.policy.title = 'New active report title' },
+  ]) {
+    const f = fixture()
+    serve(f, { report: ids => { const body = batch(f, ids); mutate(body); return json(body) } })
+    await assert.rejects(load(f), /omitted or changed the captured settings/)
+  }
+})
+
+test('CSV does not read summaries; PDF, Word and PowerPoint require pinned current summaries from explicit format admission', async () => {
+  for (const format of ['csv', 'pdf', 'docx', 'pptx']) {
+    const f = narrativeFixture()
+    requests = []
+    serve(f)
+    const value = await load(f, { format, requireSummaries: format === 'csv' })
+    assert.equal(Boolean(value.capture.summaries), format !== 'csv')
+    assert.equal(summaryRequests().length, format === 'csv' ? 0 : 2)
+    assert.ok(requests[0].url.includes(`format=${format}`))
+    assert.ok(reportRequests().every(request => new URL(request.url, 'https://score.test').searchParams.get('format') === format))
+  }
+})
+
+test('captured input budget includes capture metadata and prevents private evidence reads when already exhausted', async () => {
+  const f = fixture()
+  f.settings.policy.maxInputBytes = 1
+  serve(f)
+  await assert.rejects(load(f), /input byte budget/)
+  assert.equal(requests.length, 1)
+  assert.equal(reportRequests().length, 0)
+})
+
+test('an expired policy capture fails before any evidence reads even when the timeout callback has not run', async () => {
+  const f = fixture()
+  f.settings.policy.maxGenerationMilliseconds = 1000
+  const originalNow = Date.now
+  const startedAt = originalNow()
+  let elapsed = 0
+  Date.now = () => startedAt + elapsed
+  try {
+    serve(f, { capture: body => { elapsed = 1001; return json(body) } })
+    await assert.rejects(load(f), error => error.name === 'TimeoutError')
+    assert.equal(requests.length, 1)
+    assert.equal(reportRequests().length, 0)
+  } finally { Date.now = originalNow }
+})
+
+test('the final narrative check applies the captured input budget to the report and its current summary response', async () => {
+  const f = narrativeFixture({ scores: [80] })
+  serve(f)
+  const value = clone(await load(f, { format: 'pdf' }))
+  const byteLength = input => new TextEncoder().encode(JSON.stringify(input)).byteLength
+  const summaryBytes = byteLength(reportSummariesFixture(f.report, { targetId: null }))
+  for (let pass = 0; pass < 3; pass++) {
+    value.capture.settings.policy.maxInputBytes = byteLength(value) + summaryBytes
+  }
+  await assertRealAnalysisReportNarrativesCurrent(f.report.workspaceId, f.report.run.id, value)
+  value.capture.settings.policy.maxInputBytes--
+  await assert.rejects(assertRealAnalysisReportNarrativesCurrent(f.report.workspaceId, f.report.run.id, value),
+    /final summary verification exceeds the captured input byte budget/)
 })

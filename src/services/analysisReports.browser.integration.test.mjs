@@ -39,9 +39,13 @@ async function newPage() {
 async function download(page, format) {
   const dialog = page.getByRole('dialog', { name: 'Export analysis report', exact: true })
   await dialog.getByLabel('Report format', { exact: true }).selectOption(format)
-  const pending = page.waitForEvent('download', { timeout: 90_000 })
-  await dialog.getByRole('button', { name: /^Download / }).click()
-  const result = await pending
+  const [result] = await Promise.all([
+    page.waitForEvent('download', { timeout: 90_000 }),
+    dialog.getByRole('button', { name: /^Download / }).click(),
+  ]).catch(async (cause) => {
+    const state = await dialog.innerText().catch(() => 'The report dialog is no longer available.')
+    throw new Error(`${format.toUpperCase()} download failed:\n${state}`, { cause })
+  })
   assert.equal(await result.failure(), null)
   const stream = await result.createReadStream()
   const chunks = []
@@ -277,6 +281,10 @@ test('a read-only reviewer downloads genuine CSV, PDF, Word and PowerPoint files
   const { fixture, stubs, runId, pairs } = await completedFixture()
   const { context, page, errors } = await newPage()
   try {
+    const summaries = await jsonResponse(await fixture.request(`/api/workspaces/${fixture.workspaceId}/analyses/${runId}/summaries`))
+    assert.equal(summaries.ready, true, JSON.stringify([...fixture.analyses.store.values.values()]
+      .filter(({ record }) => record.recordType.includes('narrative'))
+      .map(({ record }) => ({ recordType: record.recordType, status: record.status, error: record.error }))))
     const detail = await jsonResponse(await fixture.request(`/api/workspaces/${fixture.workspaceId}/analyses/${runId}`))
     const archived = await jsonResponse(await fixture.request(`/api/workspaces/${fixture.workspaceId}/analyses/${runId}/lifecycle`, {
       method: 'POST', headers: { 'Content-Type': 'application/json', 'If-Match': detail.etag },
@@ -561,6 +569,7 @@ test('export permission failures are visible and cancelling a delayed evidence r
     release.resolve()
     await finished.promise
     await page.getByRole('button', { name: 'Export report', exact: true }).click()
+    await dialog.getByLabel('Report format', { exact: true }).selectOption('csv')
     await visible(page.getByRole('button', { name: 'Download CSV', exact: true }))
     assert.equal(downloads.length, 0)
     assert.deepEqual(errors, [])
@@ -786,10 +795,29 @@ test('generated saved source links preserve workspace, access, missing-result, a
     await visible(page.getByText('Saved analysis access denied.', { exact: true }).first())
     assert.equal(await page.locator('.document-viewer').count(), 0)
     await page.unroute(`**/api/workspaces/${fixture.workspaceId}/analyses**`)
-    const detail = await jsonResponse(await fixture.request(`/api/workspaces/${fixture.workspaceId}/analyses/${runId}`))
-    const removed = await jsonResponse(await fixture.request(`/api/workspaces/${fixture.workspaceId}/analyses/${runId}/lifecycle`, {
-      method: 'POST', headers: { 'Content-Type': 'application/json', 'If-Match': detail.etag }, body: JSON.stringify({ action: 'delete' }),
-    }))
+    const runPath = `/api/workspaces/${fixture.workspaceId}/analyses/${runId}`
+    const detail = await jsonResponse(await fixture.request(runPath))
+    const deleteRun = async (etag) => jsonResponse(await fixture.request(`${runPath}/lifecycle`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json', 'If-Match': etag }, body: JSON.stringify({ action: 'delete' }),
+    }), [200, 202])
+    let removed = await deleteRun(detail.etag)
+    if (removed.deleted !== true) {
+      const operationId = removed.operation.id
+      assert.equal(removed.operation.action, 'delete')
+      assert.equal(removed.operation.status, 'pending')
+      assert.ok(removed.analysis.lifecycle.deletingAt)
+      assert.deepEqual([removed.analysis.resumes, removed.analysis.targets], [[], []])
+      await page.goto(row['Resume link'])
+      await visible(page.getByRole('heading', { name: 'Analysis cleanup or removal', exact: true }))
+      assert.equal(await page.locator('.document-viewer').count(), 0)
+      assert.equal(await page.getByRole('button', { name: 'Export report', exact: true }).count(), 0)
+      for (let pass = 0; pass < 40 && removed.deleted !== true; pass++) {
+        assert.equal(removed.operation.id, operationId)
+        assert.equal(removed.operation.action, 'delete')
+        assert.equal(removed.operation.status, 'pending')
+        removed = await deleteRun(removed.etag)
+      }
+    }
     assert.equal(removed.deleted, true)
     await page.goto(row['Resume link'])
     await visible(page.getByRole('heading', { name: 'This real analysis could not be opened', exact: true }))

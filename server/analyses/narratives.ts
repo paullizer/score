@@ -1,4 +1,9 @@
 import { z } from 'zod'
+import { processingSettingsSnapshotSchema } from '../../src/domain/admin-settings-schema'
+import {
+  admittedProcessingSettings, newProcessingSettings, preservesProcessingSettings,
+  assertNewWork, newWorkProcessingSettings, type ProcessingSettingsProvider,
+} from '../jobs/policy'
 import {
   ANALYSIS_NARRATIVE_SCHEMA_VERSION, analysisNarrativeIsCurrent, type AnalysisCandidateNarrativeInputBinding,
   type AnalysisNarrativeCounts, type AnalysisNarrativeCurrentState,
@@ -65,6 +70,7 @@ const requestPlanSchema = z.strictObject({
   mode: z.enum(['missing', 'all']), targetId: analysisNarrativeTargetIdSchema.nullable(), scopeRevision: z.string().regex(/^[a-f0-9]{64}$/),
   comparisonIds: z.array(z.string().refine(value => isAnalysisId(value, 'comparison'))).max(ANALYSIS_LIMITS.maxComparisons),
   targetIds: z.array(analysisNarrativeTargetIdSchema).max(ANALYSIS_LIMITS.maxComparisons),
+  processingSettings: processingSettingsSnapshotSchema.optional(),
 })
 type RequestPlan = z.infer<typeof requestPlanSchema>
 function assertPlanScope(plan: RequestPlan, manifest: RealAnalysisInitializationManifest): void {
@@ -110,6 +116,7 @@ async function planFor(deps: RealAnalysesDeps, run: RealAnalysisRunRecord, reque
     plan.requestId === request.requestId && plan.requestedBy === request.requestedBy && plan.mode === request.mode &&
     plan.targetId === request.targetId && plan.scopeRevision === request.scopeRevision && plan.createdAt === request.createdAt &&
     plan.comparisonIds.length === request.scheduled.candidates && plan.targetIds.length === request.scheduled.targets &&
+    preservesProcessingSettings(plan.processingSettings, request.processingSettings) &&
     new Set(plan.comparisonIds).size === plan.comparisonIds.length && new Set(plan.targetIds).size === plan.targetIds.length,
   'Narrative scheduling plan does not match its durable receipt.')
   return plan
@@ -175,6 +182,7 @@ export async function readAnalysisNarrativeInventory(
     }
     const requestIdentity = pending ? {
       requestId: pending.requestId, requestedAt: pending.createdAt, requestedBy: pending.requestedBy, reason: pending.mode,
+      processingSettings: pending.processingSettings,
     } : undefined
     const comparisons: AnalysisNarrativeInventoryComparison[] = []
     for (const pair of manifest.comparisons) {
@@ -344,6 +352,7 @@ function verifyRequest(request: RealAnalysisNarrativeRequestRecord, input: Gener
 export async function generateAnalysisSummaries(
   deps: RealAnalysesDeps, workspaceId: string, runId: string, input: GenerateRealAnalysisSummariesInput,
   requestId: string, expected: string, actor: string, now: () => Date = () => new Date(),
+  settings?: ProcessingSettingsProvider,
 ): Promise<RealAnalysisSummariesMutationResponse> {
   requireScope(workspaceId, runId, input.targetId)
   const parsed = generateAnalysisSummariesInputSchema.safeParse(input)
@@ -365,6 +374,10 @@ export async function generateAnalysisSummaries(
       verifyRequest(existing.record, input, actor, expected)
       return { requestId, scheduled: existing.record.scheduled, summaries: await readAnalysisSummaries(deps, workspaceId, runId, input.targetId) }
     }
+    const name = analysisNarrativeRequestBlobName(workspaceId, runId, requestId)
+    let winning = await deps.blobs.read(name)
+    const processingSettings = winning ? undefined : await newWorkProcessingSettings(settings)
+    if (processingSettings) assertNewWork(processingSettings, 'summaryGeneration')
     if (`"${inventory.revision}"` !== expected) throw conflict('The selected summary scope changed. Reload its summaries before starting a new request.')
     const selected = selectedForGeneration(inventory, input.mode)
     if (inventory.run.record.narrativeRequestId && selected.comparisonIds.length + selected.targetIds.length > 0) {
@@ -380,9 +393,8 @@ export async function generateAnalysisSummaries(
       schemaVersion: 1, workspaceId, runId, manifestSha256: inventory.run.record.manifest.sha256,
       requestId, requestedBy: actor, mode: input.mode, targetId: input.targetId ?? null,
       scopeRevision: inventory.revision, createdAt: timestamp, ...selected,
+      processingSettings: processingSettings ? newProcessingSettings(settings, processingSettings) : undefined,
     }
-    const name = analysisNarrativeRequestBlobName(workspaceId, runId, requestId)
-    let winning = await deps.blobs.read(name)
     if (!winning) {
       try {
         winning = (await fencedAnalysisBlobs(deps, workspaceId, runId).putImmutable(name, Buffer.from(JSON.stringify(plan)), 'application/json')).blob
@@ -403,6 +415,7 @@ export async function generateAnalysisSummaries(
     }
     const reference = analysisBlobReference(name, winning)
     Object.assign(plan, winner)
+    plan.processingSettings = winner.processingSettings
     const scheduled = { candidates: plan.comparisonIds.length, targets: plan.targetIds.length }
     const complete = scheduled.candidates + scheduled.targets === 0
     const record: RealAnalysisNarrativeRequestRecord = {
@@ -411,6 +424,7 @@ export async function generateAnalysisSummaries(
       manifestSha256: plan.manifestSha256, requestId, requestedBy: actor, mode: input.mode, targetId: input.targetId ?? null,
       scopeRevision: plan.scopeRevision, plan: reference, status: complete ? 'complete' : 'queued',
       nextIndex: 0, scheduled, attempts: 0, retryCount: 0,
+      processingSettings: await admittedProcessingSettings(settings, plan.processingSettings),
     }
     const parent = { ...inventory.run.record, updatedAt: timestamp > plan.createdAt ? timestamp : plan.createdAt,
       ...(complete ? {} : { narrativeRequestId: requestId }) }
@@ -447,7 +461,10 @@ export async function advanceAnalysisNarrativeRequest(
     const entries = [...plan.comparisonIds.map(id => ({ kind: 'candidate' as const, id })),
       ...plan.targetIds.map(id => ({ kind: 'target' as const, id }))]
     const timestamp = narrativeTimestamp(run.record, now().toISOString())
-    const request = { requestId, requestedAt: timestamp, requestedBy: plan.requestedBy, reason: plan.mode }
+    const request = {
+      requestId, requestedAt: timestamp, requestedBy: plan.requestedBy, reason: plan.mode,
+      processingSettings: current.record.processingSettings ?? plan.processingSettings,
+    }
     const operations: AnalysisTransaction[] = []
     let cursor = current.record.nextIndex
     let bytes = Buffer.byteLength(JSON.stringify(run.record)) + Buffer.byteLength(JSON.stringify(current.record)) + 8192

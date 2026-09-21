@@ -11,6 +11,8 @@ param resourceGroupName string = 'rg-${environmentName}-ncus'
 param authClientId string
 param tenantId string
 param allowedUserId string
+@description('Explicit comma-separated Entra object IDs for application administrators. Empty grants no administrator access.')
+param adminUserIds string = ''
 param operatorPrincipalId string
 param containerImage string
 param workerImage string
@@ -18,6 +20,24 @@ param rendererImage string
 param gradeWorkerImage string
 param resumeWorkerImage string
 param analysisWorkerImage string
+
+@sealed()
+type AdditionalModelDeployment = {
+  @minLength(1)
+  @maxLength(64)
+  name: string
+  @minLength(1)
+  modelName: string
+  @minLength(1)
+  modelVersion: string
+  sku: 'DataZoneStandard' | 'Standard'
+  @minValue(1)
+  capacity: int
+  versionUpgradeOption: 'NoAutoUpgrade' | 'OnceCurrentVersionExpired' | 'OnceNewDefaultVersionAvailable'
+}
+
+@description('Additional model deployments in the existing Score AI account. Settings select these deployments but never provision them. Do not repeat the reserved job-rubric deployment.')
+param additionalModelDeployments AdditionalModelDeployment[] = []
 
 @allowed(['B1', 'B2', 'B3', 'S1'])
 param appServiceSku string = 'B1'
@@ -48,6 +68,7 @@ module resources 'resources.bicep' = {
     authClientId: authClientId
     tenantId: tenantId
     allowedUserId: allowedUserId
+    adminUserIds: adminUserIds
     operatorPrincipalId: operatorPrincipalId
     containerImage: containerImage
     workerImage: workerImage
@@ -55,6 +76,7 @@ module resources 'resources.bicep' = {
     gradeWorkerImage: gradeWorkerImage
     resumeWorkerImage: resumeWorkerImage
     analysisWorkerImage: analysisWorkerImage
+    additionalModelDeployments: additionalModelDeployments
     appServiceSku: appServiceSku
     searchSku: searchSku
   }

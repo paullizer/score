@@ -49,6 +49,8 @@ before(async () => {
         "export * from './server/store';",
         "export * from './server/ids';",
         "export * from './server/middleware';",
+        "export * from './server/settings/request-context';",
+        "export * from './src/domain/admin-settings';",
         "export {WorkspaceRepository} from './server/repository';",
       ].join('\n'),
       resolveDir: process.cwd(), loader: 'ts',
@@ -356,6 +358,7 @@ async function fixture(options = {}) {
   const repository = new api.WorkspaceRepository({ directory, state, now })
   const config = {
     authMode: 'easyauth', tenantId: TENANT, allowedUserIds: new Set([OWNER, VIEWER, OUTSIDER]), appOrigin: ORIGIN,
+    ...(options.settings ? { settings: { runtimeEnabled: options.runtimeSettingsEnabled ?? true } } : {}),
   }
   const app = express()
   app.disable('x-powered-by')
@@ -363,6 +366,7 @@ async function fixture(options = {}) {
   const router = express.Router()
   router.use((_req, res, next) => { res.setHeader('Cache-Control', 'no-store'); next() })
   router.use(api.createAuthMiddleware(config), api.createCsrfMiddleware(config))
+  router.use(api.attachSettingsContext(config, options.settings))
   router.use(api.createRealResumesRouter({ repository, resumes: options.disabled ? undefined : resumes.deps, now,
     lifecycle: options.lifecycle, wordDocumentImports: options.wordDocumentImports }))
   app.use('/api', router)
@@ -377,7 +381,7 @@ async function fixture(options = {}) {
   await new Promise((resolve, reject) => { server.once('error', reject); server.listen(0, '127.0.0.1', resolve) })
   const base = `http://127.0.0.1:${server.address().port}/api/workspaces`
   return {
-    ...resumes, errors, now, base, service: new api.RealResumeService(resumes.deps, now),
+    ...resumes, errors, now, base, config, service: new api.RealResumeService(resumes.deps, now),
     advance(value) { clock = value },
     directory, memberships, state, repository,
     path(workspaceId = WORKSPACE) { return `${base}/${workspaceId}/resumes` },
@@ -442,6 +446,89 @@ async function bodyOf(response, expectedStatus) {
   assert.equal(response.status, expectedStatus, JSON.stringify(body))
   return body
 }
+
+test('resume admissions enforce live lower bounds and source policy; accepted retries and captures retain the original pin during outage', async () => {
+  const value = api.createDefaultAdminSettings()
+  let outage = false, reads = 0
+  const settings = { async capture() {
+    reads++
+    if (outage) throw api.unavailable('Settings unavailable')
+    return api.captureProcessingSettings(value, 'resume-policy-one', NOW)
+  } }
+  const server = await fixture({ settings })
+  try {
+    value.features.resumeImports = false
+    assert.equal((await importPdf(server)).status, 503)
+    value.features.resumeImports = true
+    value.imports.resumes.maxBatchItems = 1
+    assert.equal((await importPdf(server, { input: { inputCount: 2 } })).status, 400)
+    value.imports.resumes.maxFileBytes = 10
+    assert.equal((await importMarkdown(server)).status, 413)
+    value.imports.resumes.maxFileBytes = MAX_PDF
+    value.imports.resumes.maxPdfPages = 1
+    assert.equal((await importPdf(server, { bytes: await pdf(2) })).status, 400)
+    value.imports.resumes.allowedFormats = ['pdf']
+    assert.equal((await importMarkdown(server)).status, 403)
+    value.imports.resumes.allowUrls = false
+    assert.equal((await importUrl(server)).status, 403)
+    value.imports.resumes.allowUrls = true
+    value.imports.urls.requireHttps = true
+    assert.equal((await importUrl(server, { url: 'http://example.com/resume' })).status, 400)
+    const request = input()
+    const accepted = (await bodyOf(await importPdf(server, { input: request }), 202)).resume
+    const current = await server.store.get(WORKSPACE, accepted.resume.id)
+    assert.equal(current.record.processingSettings.revision, 'resume-policy-one')
+    const manifest = JSON.parse(Buffer.from((await server.blobs.read(current.record.captureManifest.blobName)).bytes).toString())
+    assert.deepEqual(manifest.processingSettings, current.record.processingSettings)
+    const batch = await server.store.get(WORKSPACE, `resume-batch-${request.batchId}`)
+    assert.deepEqual(batch.record.processingSettings, current.record.processingSettings)
+    value.documents.originalDownloadRoles = ['owner']
+    const path = `${server.path()}/${accepted.resume.id}`
+    assert.equal((await fetch(`${path}/original`, { headers: auth(VIEWER) })).status, 403)
+    assert.equal((await fetch(path, { headers: auth(VIEWER) })).status, 200)
+    value.documents.formattedDocxPreviewEnabled = false
+    assert.equal((await fetch(`${path}/original?preview=formatted`, { headers: auth() })).status, 403)
+    value.features.resumeImports = false
+    const before = reads
+    await bodyOf(await importPdf(server, { input: request }), 200)
+    assert.equal(reads, before)
+    outage = true
+    assert.equal((await importPdf(server)).status, 503)
+    assert.equal((await fetch(path, { headers: auth() })).status, 200)
+    const cancelled = (await bodyOf(await action(server, accepted.resume.id, 'cancel', current.etag), 200)).resume
+    await bodyOf(await action(server, accepted.resume.id, 'retry', cancelled.etag), 200)
+    assert.deepEqual((await server.store.get(WORKSPACE, accepted.resume.id)).record.processingSettings, current.record.processingSettings)
+  } finally { await server.close() }
+})
+
+test('configured resume rollout blocks new captures and keeps saved access policy and accepted pins', async () => {
+  const value = api.createDefaultAdminSettings()
+  value.documents.originalDownloadRoles = ['owner']
+  const settings = { async capture() { return api.captureProcessingSettings(value, 'resume-rollout-policy', NOW) } }
+  const server = await fixture({ settings, runtimeSettingsEnabled: false })
+  try {
+    const request = input()
+    await bodyOf(await importPdf(server, { input: request }), 503)
+    await bodyOf(await importUrl(server), 503)
+    assert.equal(await server.blobs.read(api.resumeImportReceiptBlobName(WORKSPACE, api.resumeIdForKey(request.idempotencyKey))), undefined)
+    server.config.settings.runtimeEnabled = true
+    const accepted = (await bodyOf(await importPdf(server, { input: request }), 202)).resume
+    const pinned = await server.store.get(WORKSPACE, accepted.resume.id)
+    assert.equal(pinned.record.processingSettings.revision, 'resume-rollout-policy')
+    const manifest = JSON.parse(Buffer.from((await server.blobs.read(pinned.record.captureManifest.blobName)).bytes).toString())
+    assert.deepEqual(manifest.processingSettings, pinned.record.processingSettings)
+    assert.deepEqual((await server.store.get(WORKSPACE, `resume-batch-${request.batchId}`)).record.processingSettings, pinned.record.processingSettings)
+    server.config.settings.runtimeEnabled = false
+    const path = `${server.path()}/${accepted.resume.id}`
+    assert.equal((await fetch(`${path}/original`, { headers: auth(VIEWER) })).status, 403)
+    assert.equal((await fetch(path, { headers: auth(VIEWER) })).status, 200)
+    await bodyOf(await importPdf(server, { input: request }), 200)
+    const cancelled = (await bodyOf(await action(server, accepted.resume.id, 'cancel', pinned.etag), 200)).resume
+    await bodyOf(await action(server, accepted.resume.id, 'retry', cancelled.etag), 200)
+    assert.deepEqual((await server.store.get(WORKSPACE, accepted.resume.id)).record.processingSettings, pinned.record.processingSettings)
+    await bodyOf(await importPdf(server), 503)
+  } finally { await server.close() }
+})
 
 test('resume metadata PATCH preserves ready profile/source bindings and requires strict names, exact ETags and write access', async () => {
   const server = await fixture({ lifecycle: noDependencies })

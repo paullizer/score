@@ -2,7 +2,6 @@ import { createHash, randomUUID } from 'node:crypto'
 import { lookup as dnsLookup } from 'node:dns/promises'
 import http from 'node:http'
 import https from 'node:https'
-import { setTimeout as delay } from 'node:timers/promises'
 import { Readability } from '@mozilla/readability'
 import ipaddr from 'ipaddr.js'
 import { JSDOM } from 'jsdom'
@@ -20,6 +19,20 @@ import {
 import { hasOleSignature, hasZipSignature, parseWordFile, WordDocumentError } from '../server/documents/word'
 import { MarkdownInputError } from '../server/documents/markdown'
 import { extractMarkdownBlocks } from './markdown'
+import type { ModelTaskId, ProcessingSettingsSnapshot } from '../src/domain/admin-settings'
+import {
+  assertSourceKind, assertSourcePolicy, executionSettings, extractionSettings, fetchSettings, modelProcessingSettings, operationSettings,
+  retryBackoff, RuntimeSettingsError, safeSettingsMetadata, sourcePolicy,
+  type WorkerSettingsDependencies,
+} from './settings'
+import { renderRequestPolicySchema, urlMatchesPolicy, type RenderRequestPolicy, type RuntimeUrlPolicy } from '../renderer/request-policy'
+import { systemClock, type Clock } from './clock'
+import { WorkerError } from './errors'
+import { invokeStructuredModel } from './model-transport'
+export { systemClock, type Clock } from './clock'
+export { WorkerError } from './errors'
+export { invokeStructuredModel } from './model-transport'
+export { RUNTIME_SETTINGS_VERSION } from '../src/domain/admin-settings'
 
 const COGNITIVE_SCOPE = 'https://cognitiveservices.azure.com/.default'
 const DOCUMENT_API_VERSION = '2024-11-30'
@@ -36,30 +49,6 @@ const MAX_REDIRECTS = 5
 const REQUEST_TIMEOUT_MILLISECONDS = 30_000
 const AZURE_REQUEST_TIMEOUT_MILLISECONDS = 60_000
 const JOB_SECTION_HEADING = /^(?:responsibilities|duties|requirements|required qualifications|minimum qualifications|preferred qualifications|desired qualifications|qualifications|about the role|what you will do):?$/i
-
-export interface Clock {
-  now(): Date
-  sleep(milliseconds: number, signal?: AbortSignal): Promise<void>
-}
-
-export const systemClock: Clock = {
-  now: () => new Date(),
-  sleep: (milliseconds, signal) => delay(milliseconds, undefined, { signal }),
-}
-
-export class WorkerError extends Error {
-  readonly code: string
-  readonly retryable: boolean
-  readonly stage: 'download' | 'parsing' | 'rubric'
-
-  constructor(code: string, message: string, retryable: boolean, stage: 'download' | 'parsing' | 'rubric', options?: ErrorOptions) {
-    super(message, options)
-    this.name = 'WorkerError'
-    this.code = code
-    this.retryable = retryable
-    this.stage = stage
-  }
-}
 
 export interface SafeResponse {
   status: number
@@ -95,6 +84,8 @@ export interface SafeFetchOptions {
   method?: 'GET' | 'POST'
   body?: Uint8Array
   headers?: Record<string, string>
+  urlPolicy?: RuntimeUrlPolicy
+  renderPolicy?: RenderRequestPolicy
 }
 
 function abortError(message: string): WorkerError {
@@ -105,7 +96,8 @@ function withTimeout(parent: AbortSignal | undefined, milliseconds: number): { s
   const controller = new AbortController()
   const timer = setTimeout(() => controller.abort(new Error('Request timed out.')), milliseconds)
   const onAbort = () => controller.abort(parent?.reason)
-  parent?.addEventListener('abort', onAbort, { once: true })
+  if (parent?.aborted) onAbort()
+  else parent?.addEventListener('abort', onAbort, { once: true })
   return {
     signal: controller.signal,
     dispose: () => {
@@ -115,14 +107,26 @@ function withTimeout(parent: AbortSignal | undefined, milliseconds: number): { s
   }
 }
 
+async function untilAborted<T>(operation: Promise<T>, signal: AbortSignal): Promise<T> {
+  let onAbort: (() => void) | undefined
+  const aborted = new Promise<never>((_resolve, reject) => {
+    onAbort = () => reject(abortError('Operation was cancelled.'))
+    if (signal.aborted) onAbort()
+    else signal.addEventListener('abort', onAbort, { once: true })
+  })
+  try { return await Promise.race([operation, aborted]) }
+  finally { if (onAbort) signal.removeEventListener('abort', onAbort) }
+}
+
 async function timedFetch(
   fetchImpl: typeof fetch,
   input: string,
   init: RequestInit,
   parent: AbortSignal | undefined,
   stage: 'parsing' | 'rubric',
+  milliseconds = AZURE_REQUEST_TIMEOUT_MILLISECONDS,
 ): Promise<Response> {
-  const timeout = withTimeout(parent, AZURE_REQUEST_TIMEOUT_MILLISECONDS)
+  const timeout = withTimeout(parent, milliseconds)
   try {
     return await fetchImpl(input, { ...init, signal: timeout.signal })
   } catch (error) {
@@ -259,6 +263,11 @@ export async function safeFetch(input: string, options: SafeFetchOptions = {}): 
   const transport = options.transport ?? nodePinnedTransport
   const maxBytes = options.maxBytes ?? MAX_HTTP_BYTES
   const maxRedirects = options.maxRedirects ?? MAX_REDIRECTS
+  const timeoutMilliseconds = options.timeoutMilliseconds ?? REQUEST_TIMEOUT_MILLISECONDS
+  if (!Number.isSafeInteger(maxBytes) || maxBytes < 1 || !Number.isSafeInteger(maxRedirects) || maxRedirects < 0 ||
+    !Number.isSafeInteger(timeoutMilliseconds) || timeoutMilliseconds < 1) {
+    throw new WorkerError('invalid-source', 'The public source request has invalid transport limits.', false, 'download')
+  }
   let remainingBytes = maxBytes
   let current = validatePublicUrl(input)
   const redirects: string[] = []
@@ -270,26 +279,40 @@ export async function safeFetch(input: string, options: SafeFetchOptions = {}): 
 
   for (let redirect = 0; redirect <= maxRedirects; redirect += 1) {
     if (options.signal?.aborted) throw abortError('Source retrieval was cancelled.')
-    let addresses: string[]
-    const hostname = current.hostname.replace(/^\[|\]$/g, '')
+    if (!urlMatchesPolicy(current.href, options.urlPolicy)) {
+      throw new WorkerError('unsafe-url', 'The URL is disallowed by the captured source policy.', false, 'download')
+    }
+    const timeout = withTimeout(options.signal, timeoutMilliseconds)
+    let response: Omit<SafeResponse, 'url' | 'redirects'>
     try {
-      addresses = ipaddr.isValid(hostname) ? [hostname] : await resolver(hostname)
+      let addresses: string[]
+      const hostname = current.hostname.replace(/^\[|\]$/g, '')
+      try {
+        addresses = ipaddr.isValid(hostname) ? [hostname] : await untilAborted(resolver(hostname), timeout.signal)
+      } catch (error) {
+        if (timeout.signal.aborted) throw error
+        throw new WorkerError('dns-failed', 'The source host could not be resolved.', true, 'download', { cause: error })
+      }
+      if (addresses.length === 0 || addresses.some(address => !isPublicAddress(address))) {
+        throw new WorkerError('unsafe-url', 'The source host does not resolve exclusively to public addresses.', false, 'download')
+      }
+      response = await untilAborted(transport({
+        url: current,
+        address: addresses[0],
+        method,
+        headers: safeRequestHeaders(options.headers),
+        body,
+        maxBytes: remainingBytes,
+        timeoutMilliseconds,
+        signal: timeout.signal,
+      }), timeout.signal)
     } catch (error) {
-      throw new WorkerError('dns-failed', 'The source host could not be resolved.', true, 'download', { cause: error })
+      if (options.signal?.aborted) throw abortError('Source retrieval was cancelled.')
+      if (timeout.signal.aborted) throw new WorkerError('source-timeout', 'The public source request timed out.', true, 'download')
+      throw error
+    } finally {
+      timeout.dispose()
     }
-    if (addresses.length === 0 || addresses.some(address => !isPublicAddress(address))) {
-      throw new WorkerError('unsafe-url', 'The source host does not resolve exclusively to public addresses.', false, 'download')
-    }
-    const response = await transport({
-      url: current,
-      address: addresses[0],
-      method,
-      headers: safeRequestHeaders(options.headers),
-      body,
-      maxBytes: remainingBytes,
-      timeoutMilliseconds: options.timeoutMilliseconds ?? REQUEST_TIMEOUT_MILLISECONDS,
-      signal: options.signal,
-    })
     remainingBytes -= response.body.byteLength
     if (remainingBytes < 0) throw new WorkerError('source-too-large', `Remote responses exceed ${maxBytes} aggregate bytes.`, false, 'download')
     if ([301, 302, 303, 307, 308].includes(response.status)) {
@@ -520,14 +543,18 @@ export function createRemoteRenderer(
   return {
     async render(url, options) {
       if (options.signal?.aborted) throw abortError('Source rendering was cancelled.')
-      const timeout = localHttp ? withTimeout(options.signal, AZURE_REQUEST_TIMEOUT_MILLISECONDS) : undefined
+      const policy = options.renderPolicy ? renderRequestPolicySchema.parse(options.renderPolicy) : undefined
+      if (!urlMatchesPolicy(url, options.urlPolicy ?? policy?.urls)) {
+        throw new WorkerError('unsafe-url', 'The URL is disallowed by the captured source policy.', false, 'download')
+      }
+      const timeout = withTimeout(options.signal, policy?.rendering.timeoutMilliseconds ?? AZURE_REQUEST_TIMEOUT_MILLISECONDS)
       try {
-        const response = await timedFetch(fetchImpl, renderUrl, {
+        const response = await untilAborted(timedFetch(fetchImpl, renderUrl, {
           method: 'POST',
-          ...(localHttp ? { redirect: 'error' as const } : {}),
+          redirect: 'error',
           headers: { 'content-type': 'application/json', 'x-score-worker': 'job-ingestion' },
-          body: JSON.stringify({ url: targetUrl(url) }),
-        }, timeout?.signal ?? options.signal, 'parsing')
+          body: JSON.stringify({ url: targetUrl(url), ...(policy ? { policy } : {}) }),
+        }, timeout.signal, 'parsing'), timeout.signal)
         if (response.status === 429 || response.status >= 500) {
           throw new WorkerError('renderer-unavailable', `The secure renderer returned HTTP ${response.status}.`, true, 'download')
         }
@@ -535,17 +562,17 @@ export function createRemoteRenderer(
           throw new WorkerError('browser-render-failed', `The secure renderer rejected the source with HTTP ${response.status}.`, false, 'download')
         }
         let bytes: Uint8Array
-        if (localHttp && response.body) {
+        if (response.body) {
           const reader = response.body.getReader()
           const chunks: Uint8Array[] = []
           let length = 0
           const cancel = () => { void reader.cancel().catch(() => {}) }
-          timeout?.signal.addEventListener('abort', cancel, { once: true })
+          timeout.signal.addEventListener('abort', cancel, { once: true })
           try {
             while (true) {
-              if (timeout?.signal.aborted) throw abortError('Source rendering was cancelled.')
-              const result = await reader.read()
-              if (timeout?.signal.aborted) throw abortError('Source rendering was cancelled.')
+              if (timeout.signal.aborted) throw abortError('Source rendering was cancelled.')
+              const result = await untilAborted(reader.read(), timeout.signal)
+              if (timeout.signal.aborted) throw abortError('Source rendering was cancelled.')
               if (result.done) break
               length += result.value.byteLength
               if (length > 2 * 1024 * 1024) {
@@ -555,12 +582,12 @@ export function createRemoteRenderer(
               chunks.push(result.value)
             }
           } finally {
-            timeout?.signal.removeEventListener('abort', cancel)
+            timeout.signal.removeEventListener('abort', cancel)
             reader.releaseLock()
           }
           bytes = Buffer.concat(chunks, length)
         } else {
-          bytes = new Uint8Array(await response.arrayBuffer())
+          bytes = new Uint8Array(await untilAborted(response.arrayBuffer(), timeout.signal))
         }
         if (bytes.byteLength > 2 * 1024 * 1024) {
           throw new WorkerError('source-too-large', 'The rendered document exceeded its output limit.', false, 'download')
@@ -579,20 +606,25 @@ export function createRemoteRenderer(
         let finalUrl: string
         try {
           finalUrl = targetUrl((payload as { finalUrl: string }).finalUrl)
+          if (!urlMatchesPolicy(finalUrl, options.urlPolicy ?? policy?.urls)) throw new WorkerError('unsafe-url', 'The rendered destination is disallowed by the captured source policy.', false, 'download')
         } catch (error) {
           if (!localHttp) throw error
           throw new WorkerError('renderer-invalid-response', 'The secure renderer returned an invalid public destination.', true, 'download')
         }
-        return { html: (payload as { html: string }).html, finalUrl }
+        const html = (payload as { html: string }).html
+        if (Buffer.byteLength(html, 'utf8') > (policy?.rendering.maxDomBytes ?? 2 * 1024 * 1024)) {
+          throw new WorkerError('source-too-large', 'The rendered document exceeded its captured output limit.', false, 'download')
+        }
+        return { html, finalUrl }
       } catch (error) {
         if (options.signal?.aborted) throw abortError('Source rendering was cancelled.')
-        if (timeout?.signal.aborted) throw new WorkerError('renderer-unavailable', 'The secure renderer request timed out.', true, 'download')
+        if (timeout.signal.aborted) throw new WorkerError('renderer-unavailable', 'The secure renderer request timed out.', true, 'download')
         if (localHttp && !(error instanceof WorkerError)) {
           throw new WorkerError('renderer-invalid-response', 'The secure renderer response could not be read.', true, 'download')
         }
         throw error
       } finally {
-        timeout?.dispose()
+        timeout.dispose()
       }
     },
   }
@@ -607,6 +639,7 @@ interface BrowserBudget {
   remaining: number
   requests: number
   queue: Promise<void>
+  failure?: unknown
 }
 
 async function fulfillRouteNow(route: Route, options: SafeFetchOptions, budget: BrowserBudget): Promise<void> {
@@ -623,7 +656,15 @@ async function fulfillRouteNow(route: Route, options: SafeFetchOptions, budget: 
   }
   const bodyBuffer = rawMethod === 'POST' ? request.postDataBuffer() ?? undefined : undefined
   const body = bodyBuffer ? new Uint8Array(bodyBuffer) : undefined
-  if (budget.requests >= MAX_BROWSER_REQUESTS || (body?.byteLength ?? 0) > budget.remaining) {
+  let redirects = 0
+  for (let previous = request.redirectedFrom?.(); previous; previous = previous.redirectedFrom()) redirects++
+  if (redirects > (options.maxRedirects ?? options.renderPolicy?.urls.maxRedirects ?? MAX_REDIRECTS)) {
+    budget.failure = new WorkerError('too-many-redirects', 'The rendered source exceeded its captured redirect limit.', false, 'download')
+    await route.abort('blockedbyclient')
+    return
+  }
+  if (budget.requests >= (options.renderPolicy?.rendering.maxRequests ?? MAX_BROWSER_REQUESTS) || (body?.byteLength ?? 0) > budget.remaining) {
+    budget.failure = new WorkerError('source-too-large', 'Rendered source exceeded its captured network budget.', false, 'download')
     await route.abort('blockedbyclient')
     return
   }
@@ -648,7 +689,8 @@ async function fulfillRouteNow(route: Route, options: SafeFetchOptions, budget: 
       headers: browserResponseHeaders(response.headers),
       body: Buffer.from(response.body),
     })
-  } catch {
+  } catch (error) {
+    budget.failure = error
     await route.abort('blockedbyclient')
   }
 }
@@ -670,49 +712,70 @@ export async function createPlaywrightRenderer(
 ): Promise<BrowserRenderer> {
   return {
     async render(url, options) {
-      const browser = await launchBrowser({
-        chromiumSandbox: true,
-        env: sanitizedBrowserEnvironment(environment),
-        args: [
-          '--disable-background-networking',
-          '--disable-component-update',
-          '--disable-dns-prefetch',
-          '--disable-domain-reliability',
-          '--disable-pings',
-          '--disable-sync',
-          '--disable-webrtc',
-          '--disable-features=WebRtcHideLocalIpsWithMdns,WebRtcAllowInputVolumeAdjustment',
-          '--force-webrtc-ip-handling-policy=disable_non_proxied_udp',
-        ],
-      })
+      const policy = options.renderPolicy ? renderRequestPolicySchema.parse(options.renderPolicy) : undefined
+      const rendering = policy?.rendering
+      const parentSignal = options.signal
+      const urlPolicy = policy?.urls ?? options.urlPolicy
+      if (!urlMatchesPolicy(url, urlPolicy)) throw new WorkerError('unsafe-url', 'The source is disallowed by its captured URL policy.', false, 'download')
+      const timeout = withTimeout(parentSignal, rendering?.timeoutMilliseconds ?? options.timeoutMilliseconds ?? REQUEST_TIMEOUT_MILLISECONDS)
+      options = { ...options, signal: timeout.signal, urlPolicy }
+      let browser: Browser | undefined
       let context: BrowserContext | undefined
       try {
-        context = await browser.newContext({
+        const launch = launchBrowser({
+          chromiumSandbox: true,
+          env: sanitizedBrowserEnvironment(environment),
+          args: [
+            '--disable-background-networking',
+            '--disable-component-update',
+            '--disable-dns-prefetch',
+            '--disable-domain-reliability',
+            '--disable-pings',
+            '--disable-sync',
+            '--disable-webrtc',
+            '--disable-features=WebRtcHideLocalIpsWithMdns,WebRtcAllowInputVolumeAdjustment',
+            '--force-webrtc-ip-handling-policy=disable_non_proxied_udp',
+          ],
+        })
+        void launch.then(async value => { if (timeout.signal.aborted && browser !== value) await value.close() }).catch(() => undefined)
+        browser = await untilAborted(launch, timeout.signal)
+        context = await untilAborted(browser.newContext({
           acceptDownloads: false,
           serviceWorkers: 'block',
           javaScriptEnabled: true,
-        })
-        const budget: BrowserBudget = { remaining: MAX_BROWSER_BYTES, requests: 0, queue: Promise.resolve() }
-        await context.route('**/*', route => fulfillRoute(route, options, budget))
+        }), timeout.signal)
+        const budget: BrowserBudget = { remaining: rendering?.maxAggregateBytes ?? MAX_BROWSER_BYTES, requests: 0, queue: Promise.resolve() }
+        await untilAborted(context.route('**/*', route => fulfillRoute(route, options, budget)), timeout.signal)
         if ('routeWebSocket' in context) {
-          await context.routeWebSocket(/.*/, socket => socket.close())
+          await untilAborted(context.routeWebSocket(/.*/, socket => socket.close()), timeout.signal)
         }
-        const page = await context.newPage()
+        const page = await untilAborted(context.newPage(), timeout.signal)
         context.on('page', popup => {
           if (popup !== page) void popup.close()
         })
-        await page.goto(validatePublicUrl(url).href, {
+        await untilAborted(page.goto(validatePublicUrl(url).href, {
           waitUntil: 'domcontentloaded',
-          timeout: options.timeoutMilliseconds ?? REQUEST_TIMEOUT_MILLISECONDS,
-        })
-        await page.waitForLoadState('networkidle', { timeout: 10_000 }).catch(() => undefined)
-        return { html: await page.content(), finalUrl: validatePublicUrl(page.url()).href }
+          timeout: rendering?.timeoutMilliseconds ?? options.timeoutMilliseconds ?? REQUEST_TIMEOUT_MILLISECONDS,
+        }), timeout.signal)
+        const settle = rendering?.settleMilliseconds ?? 10_000
+        if (settle) await untilAborted(page.waitForLoadState('networkidle', { timeout: settle }).catch(() => undefined), timeout.signal)
+        await untilAborted(budget.queue, timeout.signal)
+        const html = await untilAborted(page.content(), timeout.signal)
+        if (budget.failure) throw budget.failure
+        if (Buffer.byteLength(html, 'utf8') > (rendering?.maxDomBytes ?? MAX_BROWSER_BYTES)) {
+          throw new WorkerError('source-too-large', 'Rendered source exceeded its captured DOM budget.', false, 'download')
+        }
+        if (!urlMatchesPolicy(page.url(), options.urlPolicy)) throw new WorkerError('unsafe-url', 'The rendered destination is disallowed by its captured URL policy.', false, 'download')
+        return { html, finalUrl: validatePublicUrl(page.url()).href }
       } catch (error) {
+        if (parentSignal?.aborted) throw abortError('Source rendering was cancelled.')
+        if (timeout.signal.aborted) throw new WorkerError('renderer-unavailable', 'The secure renderer request timed out.', true, 'download')
         if (error instanceof WorkerError) throw error
         throw new WorkerError('browser-render-failed', 'The source could not be rendered safely; it may require login or block automated access.', false, 'download', { cause: error })
       } finally {
-        await context?.close()
-        await browser.close()
+        timeout.dispose()
+        await context?.close().catch(() => undefined)
+        await browser?.close().catch(() => undefined)
       }
     },
   }
@@ -758,6 +821,7 @@ export interface DocumentIntelligenceClientOptions {
   clock?: Clock
   signal?: AbortSignal
   pollTimeoutMilliseconds?: number
+  maxAttempts?: number
 }
 
 async function retryTransient<T>(operation: () => Promise<T>, clock: Clock, signal: AbortSignal | undefined, attempts = 3): Promise<T> {
@@ -922,7 +986,7 @@ async function submitDocumentLayout(
     }, options.signal, 'parsing')
     if ([429, 502, 503, 504].includes(value.status)) throw value
     return value
-  }, clock, options.signal)
+  }, clock, options.signal, options.maxAttempts ?? 3)
   if (!response.ok) {
     const body = await response.text()
     const protectedPdf = /password|encrypted/i.test(body)
@@ -947,6 +1011,25 @@ export async function pollPdfLayout(
 async function pollDocumentLayout(
   operationUrl: string, options: DocumentIntelligenceClientOptions, recoverableOperation: boolean, format: 'pdf' | 'docx',
 ): Promise<DocumentIntelligenceResult> {
+  const budget = withTimeout(options.signal, options.pollTimeoutMilliseconds ?? 240_000)
+  let onAbort: (() => void) | undefined
+  try {
+    return await new Promise<DocumentIntelligenceResult>((resolve, reject) => {
+      onAbort = () => reject(options.signal?.aborted ? abortError('Document extraction was cancelled.')
+        : new WorkerError('ocr-timeout', 'Document extraction exceeded its captured poll deadline.', true, 'parsing'))
+      budget.signal.addEventListener('abort', onAbort, { once: true })
+      if (budget.signal.aborted) { onAbort(); return }
+      pollDocumentLayoutWithinBudget(operationUrl, { ...options, signal: budget.signal }, recoverableOperation, format).then(resolve, reject)
+    })
+  } finally {
+    if (onAbort) budget.signal.removeEventListener('abort', onAbort)
+    budget.dispose()
+  }
+}
+
+async function pollDocumentLayoutWithinBudget(
+  operationUrl: string, options: DocumentIntelligenceClientOptions, recoverableOperation: boolean, format: 'pdf' | 'docx',
+): Promise<DocumentIntelligenceResult> {
   const operationLocation = validatedOperationUrl(operationUrl, options.endpoint)
   const clock = options.clock ?? systemClock
   const fetchImpl = options.fetch ?? fetch
@@ -955,11 +1038,12 @@ async function pollDocumentLayout(
   while (clock.now().getTime() - started < timeout) {
     if (options.signal?.aborted) throw abortError('Document extraction was cancelled.')
     await clock.sleep(1_000, options.signal)
+    if (clock.now().getTime() - started >= timeout) break
     const pollToken = await options.getToken(COGNITIVE_SCOPE)
     const poll = await timedFetch(fetchImpl, operationLocation, {
       headers: { authorization: `Bearer ${pollToken}` },
       redirect: 'error',
-    }, options.signal, 'parsing')
+    }, options.signal, 'parsing', Math.min(AZURE_REQUEST_TIMEOUT_MILLISECONDS, timeout - (clock.now().getTime() - started)))
     if ([429, 502, 503, 504].includes(poll.status)) continue
     if (recoverableOperation && [404, 410].includes(poll.status)) throw new WorkerError('ocr-operation-expired', 'The saved Document Intelligence operation expired.', true, 'parsing')
     if (!poll.ok) throw new WorkerError('ocr-poll-failed', `Document Intelligence polling returned HTTP ${poll.status}.`, poll.status >= 500, 'parsing')
@@ -973,7 +1057,7 @@ async function pollDocumentLayout(
         throw new WorkerError('ocr-failed', 'Document Intelligence could not extract the DOCX. Save a new DOCX or export a readable PDF.', false, 'parsing')
       }
       throw new WorkerError(protectedPdf ? 'password-protected-pdf' : 'ocr-failed',
-        protectedPdf ? 'Password-protected PDFs are not supported.' : message, false, 'parsing')
+        protectedPdf ? 'Password-protected PDFs are not supported.' : 'Document Intelligence could not extract this document. Provide a readable PDF.', false, 'parsing')
     }
   }
   throw new WorkerError('ocr-timeout', 'Document extraction exceeded its time limit.', true, 'parsing')
@@ -1112,6 +1196,7 @@ export interface RubricModelOptions {
   getToken: (scope: string) => Promise<string>
   fetch?: typeof fetch
   clock?: Clock
+  processingSettings?: ProcessingSettingsSnapshot
 }
 
 export interface GeneratedRubric {
@@ -1131,10 +1216,18 @@ async function invokeModel(
   correction?: string[],
   signal?: AbortSignal,
 ): Promise<{ content: string; model: string }> {
+  const settings = modelProcessingSettings(options)
+  const maxCriteria = settings?.settings.rubrics.jobs.maxCriteria ?? JOB_IMPORT_LIMITS.maxCriteria
+  const schema = {
+    ...RUBRIC_JSON_SCHEMA.schema,
+    properties: { ...RUBRIC_JSON_SCHEMA.schema.properties, criteria: { ...RUBRIC_JSON_SCHEMA.schema.properties.criteria, maxItems: maxCriteria } },
+  }
   return invokeStructuredModel(options, {
+    taskId: 'jobRubric',
     name: RUBRIC_JSON_SCHEMA.name,
-    schema: RUBRIC_JSON_SCHEMA.schema,
-    system: SYSTEM_INSTRUCTIONS,
+    schema,
+    system: SYSTEM_INSTRUCTIONS.replace('1 to 20', `1 to ${maxCriteria}`),
+    source: modelSource(document),
     user: `${correction ? `The prior result was invalid. Correct all of these errors:\n${correction.join('\n')}\n\n` : ''}SOURCE DOCUMENT:\n${modelSource(document)}`,
     maxCompletionTokens: 8192,
   }, signal)
@@ -1147,67 +1240,21 @@ export interface StructuredModelRequest {
   user: string
   maxCompletionTokens?: number
   operation?: 'rubric' | 'resume' | 'analysis'
-}
-
-export async function invokeStructuredModel(
-  options: RubricModelOptions,
-  request: StructuredModelRequest,
-  signal?: AbortSignal,
-): Promise<{ content: string; model: string }> {
-  if (signal?.aborted) throw abortError('Operation was cancelled.')
-  const fetchImpl = options.fetch ?? fetch
-  const clock = options.clock ?? systemClock
-  const endpoint = options.endpoint.replace(/\/+$/, '')
-  const context = {
-    rubric: { action: 'Rubric generation', result: 'a rubric', noun: 'rubric' },
-    resume: { action: 'Resume profiling', result: 'a resume profile', noun: 'resume profile' },
-    analysis: { action: 'Resume analysis', result: 'an analysis', noun: 'analysis' },
-  }[request.operation ?? 'rubric']
-  const token = await options.getToken(COGNITIVE_SCOPE)
-  const messages = [
-    { role: 'system', content: request.system },
-    { role: 'user', content: request.user },
-  ]
-  const body: Record<string, unknown> = {
-    model: options.deployment,
-    messages,
-    response_format: { type: 'json_schema', json_schema: { name: request.name, strict: true, schema: request.schema } },
-    max_completion_tokens: request.maxCompletionTokens ?? 8192,
-  }
-  if (options.reasoningEffort) body.reasoning_effort = options.reasoningEffort
-  const response = await retryTransient(async () => {
-    const value = await timedFetch(fetchImpl, `${endpoint}/openai/v1/chat/completions`, {
-      method: 'POST',
-      headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
-      body: JSON.stringify(body),
-    }, signal, 'rubric')
-    if ([429, 502, 503, 504].includes(value.status)) throw value
-    return value
-  }, clock, signal, 2)
-  if (!response.ok) {
-    throw new WorkerError('model-request-failed', `${context.action} returned HTTP ${response.status}.`, response.status >= 500 || response.status === 429, 'rubric')
-  }
-  const payload = await response.json() as {
-    model?: string
-    choices?: Array<{ message?: { content?: string; refusal?: string } }>
-  }
-  const refusal = payload.choices?.[0]?.message?.refusal
-  if (refusal) throw new WorkerError('model-refused', `The model could not produce ${context.result} for this source.`, false, 'rubric')
-  const content = payload.choices?.[0]?.message?.content
-  if (!content) throw new WorkerError('model-empty-response', `The model returned no ${context.noun}.`, true, 'rubric')
-  return { content, model: payload.model || options.modelName }
+  taskId?: ModelTaskId
+  source?: string
+  processingSettings?: ProcessingSettingsSnapshot
 }
 
 const PROTECTED_CRITERION = /\b(age|race|racial|ethnicity|ethnic|religion|religious|sex|gender|pregnan|disab|marital|national origin|citizenship|sexual orientation|veteran|genetic)\b/i
 
-export function validateModelRubric(value: unknown, document: SourceDocument): string[] {
+export function validateModelRubric(value: unknown, document: SourceDocument, maxCriteria: number = JOB_IMPORT_LIMITS.maxCriteria): string[] {
   const errors: string[] = []
   if (!value || typeof value !== 'object' || Array.isArray(value)) return ['Result must be an object.']
   const result = value as Partial<ModelRubricResult>
   if (typeof result.isJobPosting !== 'boolean') errors.push('isJobPosting must be a boolean.')
   if (result.rejectionReason !== null && typeof result.rejectionReason !== 'string') errors.push('rejectionReason must be a string or null.')
-  if (!Array.isArray(result.criteria) || result.criteria.length < 1 || result.criteria.length > JOB_IMPORT_LIMITS.maxCriteria) {
-    return [`Rubric must contain 1 to ${JOB_IMPORT_LIMITS.maxCriteria} criteria.`]
+  if (!Array.isArray(result.criteria) || result.criteria.length < 1 || result.criteria.length > maxCriteria) {
+    return [`Rubric must contain 1 to ${maxCriteria} criteria.`]
   }
   const paragraphs = new Map(document.paragraphs.map(paragraph => [paragraph.id, paragraph]))
   let total = 0
@@ -1263,14 +1310,16 @@ export async function generateGroundedRubric(
   signal?: AbortSignal,
 ): Promise<{ rubric: Rubric; metadata: ModelRubricResult; warnings: string[] }> {
   let correction: string[] | undefined
-  for (let attempt = 0; attempt < 2; attempt += 1) {
+  const settings = modelProcessingSettings(options)
+  const corrections = settings?.settings.ai.jobRubric.maxOutputCorrections ?? 1
+  for (let attempt = 0; attempt <= corrections; attempt += 1) {
     const response = await invokeModel(document, options, correction, signal)
     let parsed: unknown
     try {
       parsed = JSON.parse(response.content)
     } catch {
       correction = ['Response was not valid JSON.']
-      if (attempt === 0) continue
+      if (attempt < corrections) continue
       break
     }
     if (parsed && typeof parsed === 'object' && (parsed as Partial<ModelRubricResult>).isJobPosting === false) {
@@ -1279,10 +1328,10 @@ export async function generateGroundedRubric(
         typeof reason === 'string' && reason.trim() ? normalizeText(reason) : 'The source is not one actual job posting.',
         false, 'rubric')
     }
-    const errors = validateModelRubric(parsed, document)
+    const errors = validateModelRubric(parsed, document, settings?.settings.rubrics.jobs.maxCriteria)
     if (errors.length > 0) {
       correction = errors
-      if (attempt === 0) continue
+      if (attempt < corrections) continue
       break
     }
     const result = parsed as ModelRubricResult
@@ -1325,7 +1374,7 @@ export async function generateGroundedRubric(
     const domainErrors = validate(rubric, document)
     if (domainErrors.length > 0) {
       correction = domainErrors
-      if (attempt === 0) continue
+      if (attempt < corrections) continue
       break
     }
     return { rubric, metadata: result, warnings: result.warnings.map(normalizeText).filter(Boolean) }
@@ -1486,7 +1535,7 @@ class LeaseController {
   }
 }
 
-export interface WorkerDependencies {
+export interface WorkerDependencies extends WorkerSettingsDependencies {
   store: RealJobStore
   blobs: JobBlobStore
   documentIntelligence: Omit<DocumentIntelligenceClientOptions, 'signal'>
@@ -1509,6 +1558,7 @@ async function claimJob(
   candidate: VersionedRealJob,
   owner: string,
   clock: Clock,
+  maxAttempts: number,
 ): Promise<VersionedRealJob | undefined> {
   const now = clock.now()
   const record = candidate.record
@@ -1517,7 +1567,7 @@ async function claimJob(
   if (['ready', 'cancelled', 'error'].includes(record.job.status)) return undefined
   if (record.nextAttemptAt && new Date(record.nextAttemptAt).getTime() > now.getTime()) return undefined
   if (record.lease && new Date(record.lease.expiresAt).getTime() > now.getTime()) return undefined
-  if (record.attempts >= 3) {
+  if (record.attempts >= maxAttempts) {
     try {
       await store.replace({
         ...record,
@@ -1526,14 +1576,14 @@ async function claimJob(
         updatedAt,
         error: {
           code: 'attempt-limit-reached',
-          message: 'The worker stopped after three automatic attempts.',
+          message: `The worker stopped after ${maxAttempts} automatic attempts.`,
           retryable: true,
         },
         job: {
           ...record.job,
           status: 'error',
           errorStage: record.job.status === 'generating' ? 'rubric' : 'parsing',
-          error: 'The worker stopped after three automatic attempts.',
+          error: `The worker stopped after ${maxAttempts} automatic attempts.`,
         },
       }, candidate.etag)
     } catch (error) {
@@ -1578,11 +1628,13 @@ async function saveOriginal(
   clock: Clock,
   store: RealJobStore,
   owner: string,
+  maxFileBytes = JOB_IMPORT_LIMITS.maxPdfBytes as number,
 ): Promise<{ bytes: Uint8Array; contentType: OriginalContentType; source: RealJobSource }> {
   if (record.source.originalBlobName) {
     const saved = await blobs.read(record.source.originalBlobName)
     if (!saved) throw new WorkerError('source-blob-missing', 'The saved original source is missing.', false, 'download')
     const type = saved.contentType
+    if (saved.bytes.byteLength > maxFileBytes) throw new WorkerError('source-too-large', 'The original exceeds its captured file-size limit.', false, 'parsing')
     if (!isOriginalContentType(type) || (record.source.originalContentType && record.source.originalContentType !== type) ||
       (record.source.sha256 && sha256(saved.bytes) !== record.source.sha256) ||
       (record.source.bytes !== undefined && record.source.bytes !== saved.bytes.byteLength) ||
@@ -1611,6 +1663,7 @@ async function saveOriginal(
     const candidateName = sourceBlobNames(record, candidateType).original
     const existing = await blobs.read(candidateName)
     if (existing) {
+      if (existing.bytes.byteLength > maxFileBytes) throw new WorkerError('source-too-large', 'The original exceeds its captured file-size limit.', false, 'parsing')
       return {
         bytes: existing.bytes,
         contentType: candidateType,
@@ -1643,12 +1696,12 @@ async function saveOriginal(
   const type: 'application/pdf' | 'text/html' = contentType(fetched) === 'application/pdf' || looksLikePdf(bytes) ? 'application/pdf' : 'text/html'
   let finalUrl = fetched.url
   let extractionMethod: RealJobSource['extractionMethod'] = type === 'application/pdf' ? 'document-intelligence' : 'html'
-  if (bytes.byteLength > JOB_IMPORT_LIMITS.maxPdfBytes) {
+  if (bytes.byteLength > maxFileBytes) {
     throw new WorkerError(
       type === 'application/pdf' ? 'pdf-too-large' : 'source-too-large',
       type === 'application/pdf'
-        ? `PDF exceeds the ${JOB_IMPORT_LIMITS.maxPdfBytes}-byte limit.`
-        : `Source exceeds the ${JOB_IMPORT_LIMITS.maxPdfBytes}-byte storage limit.`,
+        ? `PDF exceeds the ${maxFileBytes}-byte limit.`
+        : `Source exceeds the ${maxFileBytes}-byte storage limit.`,
       false,
       type === 'application/pdf' ? 'parsing' : 'download',
     )
@@ -1674,8 +1727,8 @@ async function saveOriginal(
       extractionMethod = 'browser'
     }
   }
-  if (bytes.byteLength > JOB_IMPORT_LIMITS.maxPdfBytes) {
-    throw new WorkerError('source-too-large', `Source exceeds the ${JOB_IMPORT_LIMITS.maxPdfBytes}-byte storage limit.`, false, 'download')
+  if (bytes.byteLength > maxFileBytes) {
+    throw new WorkerError('source-too-large', `Source exceeds the ${maxFileBytes}-byte storage limit.`, false, 'download')
   }
   const names = sourceBlobNames(record, type)
   const capturedAt = clock.now().toISOString()
@@ -1701,11 +1754,17 @@ async function loadOrExtract(
   dependencies: WorkerDependencies,
 ): Promise<{ document: SourceDocument; source: RealJobSource }> {
   await controller.check()
+  const snapshot = operationSettings(initial, dependencies)
+  const policy = sourcePolicy(snapshot, 'jobs')
+  if (initial.source.bytes !== undefined && initial.source.bytes > policy.maxFileBytes) {
+    throw new WorkerError('source-too-large', 'The original exceeds its captured file-size limit.', false, 'parsing')
+  }
   const names = sourceBlobNames(initial)
   const cachedName = initial.extractedBlobName ?? names.extracted
   const cached = await dependencies.blobs.read(cachedName)
   if (cached) {
     const document = decodeDocument(cached.bytes, initial.source.originalContentType)
+    assertSourcePolicy(document.paragraphs, snapshot, 'jobs', initial.source.originalContentType === 'application/pdf')
     const expectedDocumentId = `document-${initial.id.replace(/^job-/, '')}`
     if (document.id !== expectedDocumentId) {
       throw new WorkerError('invalid-extraction-cache', 'The saved extraction does not belong to this job.', false, 'parsing')
@@ -1724,7 +1783,7 @@ async function loadOrExtract(
   const original = await saveOriginal(initial, dependencies.blobs, dependencies.browser, {
     ...dependencies.safeFetchOptions,
     signal: controller.signal,
-  }, dependencies.clock ?? systemClock, dependencies.store, controller.owner)
+  }, dependencies.clock ?? systemClock, dependencies.store, controller.owner, policy.maxFileBytes)
   await controller.update(record => ({
     ...record,
     source: original.source,
@@ -1740,15 +1799,15 @@ async function loadOrExtract(
       ...dependencies.documentIntelligence,
       signal: controller.signal,
     })
-    paragraphs = documentIntelligenceParagraphs(analysis)
+    paragraphs = documentIntelligenceParagraphs(analysis, { maxPages: policy.maxPdfPages, maxCharacters: policy.maxSourceCharacters })
   } else if (isWordContentType(original.contentType)) {
     const extracted = await extractWordDocument(original.bytes, original.contentType === UPLOAD_CONTENT_TYPES.doc ? 'doc' : 'docx', {
       ...dependencies.documentIntelligence, signal: controller.signal,
-    })
+    }, { maxCharacters: policy.maxSourceCharacters })
     paragraphs = extracted.paragraphs
     sourceWarnings = extracted.warnings
   } else if (original.contentType === 'text/markdown') {
-    const extracted = extractMarkdown(original.bytes, { defaultHeading: 'Job description' })
+    const extracted = extractMarkdown(original.bytes, { defaultHeading: 'Job description', maxCharacters: policy.maxSourceCharacters })
     title = extracted.title ?? title
     paragraphs = extracted.paragraphs
   } else {
@@ -1765,6 +1824,7 @@ async function loadOrExtract(
       paragraphs,
       sample: false,
   }
+  assertSourcePolicy(document.paragraphs, snapshot, 'jobs', original.contentType === 'application/pdf')
   const documentBytes = encodeDocument(document)
   await controller.check()
   const savedDocument = await putJobBlob(
@@ -1772,6 +1832,7 @@ async function loadOrExtract(
     names.extracted, documentBytes, 'application/json', { owner: controller.owner, signal: controller.signal },
   )
   const durableDocument = decodeDocument(savedDocument.blob.bytes, original.contentType)
+  assertSourcePolicy(durableDocument.paragraphs, snapshot, 'jobs', original.contentType === 'application/pdf')
   const expectedDocumentId = `document-${initial.id.replace(/^job-/, '')}`
   if (durableDocument.id !== expectedDocumentId) {
     throw new WorkerError('invalid-extraction-cache', 'The saved extraction does not belong to this job.', false, 'parsing')
@@ -1791,18 +1852,16 @@ function cleanMetadata(value: string | null): string {
   return value ? normalizeText(value) : ''
 }
 
-function backoffMilliseconds(attempts: number): number {
-  return Math.min(5 * 60_000, 15_000 * 2 ** Math.max(0, attempts - 1))
-}
-
-async function recordFailure(controller: LeaseController, error: unknown, clock: Clock): Promise<void> {
+async function recordFailure(controller: LeaseController, error: unknown, clock: Clock, snapshot: ProcessingSettingsSnapshot): Promise<void> {
   const workerError = error instanceof WorkerError
     ? error
+    : error instanceof RuntimeSettingsError
+      ? new WorkerError(error.code, error.message, false, error.code === 'source-policy-limit' ? 'parsing' : 'rubric')
     : new WorkerError('worker-failed', 'The worker encountered an unexpected processing error.', true, 'rubric', { cause: error })
   if (workerError.code === 'cancelled') return
   try {
     await controller.updateAfterAbort(record => {
-      const retry = workerError.retryable && record.attempts < 3
+      const retry = workerError.retryable && record.attempts < snapshot.settings.processing.jobs.maxAutomaticAttempts
       const message = workerError.retryable && !retry
         ? `${workerError.message} Automatic retry limit reached.`
         : workerError.message
@@ -1810,7 +1869,7 @@ async function recordFailure(controller: LeaseController, error: unknown, clock:
         ...record,
         lease: undefined,
         updatedAt: clock.now().toISOString(),
-        nextAttemptAt: retry ? new Date(clock.now().getTime() + backoffMilliseconds(record.attempts)).toISOString() : undefined,
+        nextAttemptAt: retry ? new Date(clock.now().getTime() + retryBackoff(snapshot, 'jobs', record.attempts)).toISOString() : undefined,
         error: { code: workerError.code, message, retryable: workerError.retryable },
         job: {
           ...record.job,
@@ -1832,10 +1891,20 @@ export async function processClaimedJob(
   deadlineAt?: number,
 ): Promise<void> {
   if (!dependencies.store.getWorkspaceLifecycle) throw new Error('Job workspace lifecycle fencing is unavailable.')
+  const snapshot = operationSettings(claimed.record, dependencies)
+  const pinned = claimed.record.processingSettings ?? dependencies.settings?.legacy
+  dependencies = {
+    ...dependencies,
+    model: { ...dependencies.model, ...(pinned ? { processingSettings: snapshot } : {}) },
+    documentIntelligence: extractionSettings(dependencies.documentIntelligence, snapshot),
+    safeFetchOptions: fetchSettings(dependencies.safeFetchOptions, snapshot, 'jobs'),
+  }
+  if (pinned) console.info('Score operation settings:', safeSettingsMetadata(snapshot, 'jobRubric'))
   const clock = dependencies.clock ?? systemClock
   const controller = new LeaseController(dependencies.store, claimed.record.workspaceId, claimed.record.id, owner, clock)
   controller.start(deadlineAt)
   try {
+    assertSourceKind(snapshot, 'jobs', claimed.record.source.kind)
     const artifact = await loadOrExtract(controller, claimed.record, dependencies)
     await controller.check()
     const generated = await generateGroundedRubric(
@@ -1876,7 +1945,7 @@ export async function processClaimedJob(
     }))
   } catch (error) {
     const failure = controller.signal.reason instanceof WorkerError ? controller.signal.reason : error
-    await recordFailure(controller, failure, clock)
+    await recordFailure(controller, failure, clock, snapshot)
   } finally {
     await controller.stop()
   }
@@ -1886,14 +1955,19 @@ export async function runWorker(dependencies: WorkerDependencies, options: RunWo
   if (!dependencies.store.getWorkspaceLifecycle) throw new Error('Job workspace lifecycle fencing is unavailable.')
   const clock = dependencies.clock ?? systemClock
   const owner = dependencies.owner ?? `worker-${randomUUID()}`
-  const deadline = clock.now().getTime() + (options.budgetMilliseconds ?? DEFAULT_RUN_BUDGET_MILLISECONDS)
-  const maxJobs = options.maxJobs ?? DEFAULT_MAX_JOBS
+  const tuning = await executionSettings(dependencies, 'jobs', {
+    maxItems: options.maxJobs ?? DEFAULT_MAX_JOBS, budgetMilliseconds: options.budgetMilliseconds ?? DEFAULT_RUN_BUDGET_MILLISECONDS,
+  })
+  if (tuning.pauseClaiming) return { claimed: 0, completed: 0 }
+  const deadline = clock.now().getTime() + tuning.budgetMilliseconds
+  const maxJobs = tuning.maxItemsPerExecution
   const candidates = await dependencies.store.listPending(clock.now().toISOString(), options.pendingLimit ?? maxJobs * 3)
   let claimedCount = 0
   let completed = 0
   for (const candidate of candidates) {
     if (claimedCount >= maxJobs || clock.now().getTime() >= deadline) break
-    const claimed = await claimJob(dependencies.store, candidate, owner, clock)
+    const snapshot = operationSettings(candidate.record, dependencies)
+    const claimed = await claimJob(dependencies.store, candidate, owner, clock, snapshot.settings.processing.jobs.maxAutomaticAttempts)
     if (!claimed) continue
     claimedCount += 1
     await processClaimedJob(claimed, dependencies, owner, deadline)

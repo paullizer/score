@@ -20,6 +20,8 @@ import {
 } from '../domain/real-grades'
 import { cloudJsonRequest, cloudLifecycleRequest } from './cloudWorkspace'
 import type { LifecycleAction, LifecycleImpact, LifecycleOperation } from '../domain/lifecycle'
+import type { PublicSettings } from '../domain/admin-settings'
+import { fetchPublicFeatures, gradeFeaturesWithPolicy, requireAdmission, requireImportUrl } from './publicSettings'
 
 // Real job rubric IDs survive edits; selecting a seed requires its saved version as well.
 export type GradeLadderCreationRequest = CreateGradeLadderInput
@@ -48,8 +50,8 @@ async function mutate(path: string, method: string, body: unknown, headers: Reco
 }
 
 export async function fetchGradeProcessingFeatures(signal?: AbortSignal): Promise<GradeProcessingFeatures> {
-  const result = await cloudJsonRequest<Partial<GradeProcessingFeatures>>('/features', { method: 'GET', signal })
-  return { realGradeLadders: result.realGradeLadders === true, gradeLimits: result.gradeLimits ?? GRADE_LADDER_LIMITS }
+  const result = await fetchPublicFeatures(signal)
+  return gradeFeaturesWithPolicy({ realGradeLadders: result.realGradeLadders === true, gradeLimits: result.gradeLimits ?? GRADE_LADDER_LIMITS }, result.publicSettings)
 }
 
 async function collectPages<T>(path: string, field: 'ladders' | 'versions', signal?: AbortSignal): Promise<T[]> {
@@ -79,20 +81,35 @@ export function getGradeLadder(workspaceId: string, ladderId: string, signal?: A
   return cloudJsonRequest(base(workspaceId, ladderId), { method: 'GET', signal })
 }
 
-export function createGradeLadder(workspaceId: string, input: GradeLadderCreationRequest, key: string): Promise<GradeLadderDetail> {
-  return mutate(base(workspaceId), 'POST', input, idempotency(key))
+export function createGradeLadder(workspaceId: string, input: GradeLadderCreationRequest, key: string, settings?: PublicSettings | null): Promise<GradeLadderDetail> {
+  const headers = idempotency(key)
+  requireAdmission(settings, 'gradeLadders')
+  requireGradeLevels(input.grades, settings)
+  return mutate(base(workspaceId), 'POST', input, headers)
 }
 
-export function updateGradeLadder(workspaceId: string, ladderId: string, input: UpdateGradeLadderInput, etag: string): Promise<GradeLadderDetail> {
+export function requireGradeLevels(grades: number[], settings?: PublicSettings | null, retained: number[] = []) {
+  if (!Array.isArray(grades) || !grades.length || grades.some(grade => !Number.isInteger(grade) || grade < 1 || grade > 15)) throw new Error('Choose one or more valid GS levels from 1 through 15.')
+  const allowed = settings?.grades.allowedLevels ?? Array.from({ length: 15 }, (_, index) => index + 1)
+  if (grades.some(grade => !retained.includes(grade) && !allowed.includes(grade))) throw new Error(`New GS levels must be allowed by application policy: ${allowed.map(grade => `GS-${grade}`).join(', ')}. Saved levels are retained.`)
+}
+
+export function updateGradeLadder(workspaceId: string, ladderId: string, input: UpdateGradeLadderInput, etag: string, settings?: PublicSettings | null, retained: number[] = []): Promise<GradeLadderDetail> {
+  if (input.grades) requireGradeLevels(input.grades, settings, retained)
   return mutate(base(workspaceId, ladderId), 'PATCH', input, concurrency(etag))
 }
 
-export function discoverGradeSources(workspaceId: string, ladderId: string, etag: string, key: string): Promise<GradeLadderDetail> {
+export function discoverGradeSources(workspaceId: string, ladderId: string, etag: string, key: string, settings?: PublicSettings | null): Promise<GradeLadderDetail> {
+  requireAdmission(settings, 'gradeLadders')
   return mutate(`${base(workspaceId, ladderId)}/discover`, 'POST', {}, { ...concurrency(etag), ...idempotency(key) })
 }
 
-export async function uploadGradeSourcePdf(workspaceId: string, ladderId: string, file: File, key: string, selectedPages: number[] = []): Promise<GradeLadderDetail> {
-  if (!file.size || file.size > GRADE_LADDER_LIMITS.maxPdfBytes) throw new Error('Choose a nonempty PDF no larger than 20 MiB.')
+export async function uploadGradeSourcePdf(workspaceId: string, ladderId: string, file: File, key: string, selectedPages: number[] = [], settings?: PublicSettings | null): Promise<GradeLadderDetail> {
+  requireAdmission(settings, 'gradeLadders')
+  if (settings?.grades.references.allowAgencyUploads === false) throw new Error('New agency-reference uploads are disabled by application policy.')
+  const maximum = Math.min(GRADE_LADDER_LIMITS.maxPdfBytes, settings?.grades.references.maxPdfBytes ?? GRADE_LADDER_LIMITS.maxPdfBytes)
+  if (!file.size || file.size > maximum) throw new Error(`Choose a nonempty PDF no larger than ${maximum / 1024 / 1024} MiB.`)
+  if (selectedPages.length > Math.min(GRADE_LADDER_LIMITS.maxPdfPages, settings?.grades.references.maxSelectedPages ?? GRADE_LADDER_LIMITS.maxPdfPages)) throw new Error('The selected PDF pages exceed the current reference policy. Nothing was truncated.')
   const headers = {
     ...idempotency(key),
     'Content-Type': 'application/pdf',
@@ -104,7 +121,8 @@ export async function uploadGradeSourcePdf(workspaceId: string, ladderId: string
   return result.ladder
 }
 
-export function addGradeSourceUrl(workspaceId: string, ladderId: string, input: AddGradeSourceUrlInput, key: string): Promise<GradeLadderDetail> {
+export function addGradeSourceUrl(workspaceId: string, ladderId: string, input: AddGradeSourceUrlInput, key: string, settings?: PublicSettings | null): Promise<GradeLadderDetail> {
+  requireImportUrl(input.url, 'agencyReferences', settings)
   return mutate(`${base(workspaceId, ladderId)}/sources/url`, 'POST', input, idempotency(key))
 }
 
@@ -116,7 +134,8 @@ export function confirmGradeSources(workspaceId: string, ladderId: string, input
   return mutate(`${base(workspaceId, ladderId)}/source-set`, 'POST', input, { ...concurrency(etag), ...idempotency(key) })
 }
 
-export function generateGradeLadder(workspaceId: string, ladderId: string, etag: string, key: string): Promise<GradeLadderDetail> {
+export function generateGradeLadder(workspaceId: string, ladderId: string, etag: string, key: string, settings?: PublicSettings | null): Promise<GradeLadderDetail> {
+  requireAdmission(settings, 'gradeLadders')
   return mutate(`${base(workspaceId, ladderId)}/generate`, 'POST', {}, { ...concurrency(etag), ...idempotency(key) })
 }
 

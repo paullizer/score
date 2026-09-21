@@ -9,6 +9,7 @@ param logWorkspaceId string
 param tenantId string
 param workerImage string
 param rendererImage string
+param additionalModelDeployments array = []
 
 resource cosmos 'Microsoft.DocumentDB/databaseAccounts@2024-11-15' existing = {
   name: cosmosAccountName
@@ -63,6 +64,17 @@ resource model 'Microsoft.CognitiveServices/accounts/deployments@2025-06-01' = {
     versionUpgradeOption: 'OnceCurrentVersionExpired'
   }
 }
+
+resource additionalModels 'Microsoft.CognitiveServices/accounts/deployments@2025-06-01' = [for deployment in additionalModelDeployments: {
+  parent: foundry
+  name: deployment.name
+  sku: { name: deployment.sku, capacity: deployment.capacity }
+  properties: {
+    model: { format: 'OpenAI', name: deployment.modelName, version: deployment.modelVersion }
+    raiPolicyName: 'Microsoft.DefaultV2'
+    versionUpgradeOption: deployment.versionUpgradeOption
+  }
+}]
 
 resource documentIntelligence 'Microsoft.CognitiveServices/accounts@2025-06-01' = {
   name: 'doc-score-${token}'
@@ -220,6 +232,7 @@ resource worker 'Microsoft.App/jobs@2024-03-01' = {
           { name: 'AZURE_TENANT_ID', value: tenantId }
           { name: 'COSMOS_ENDPOINT', value: cosmos.properties.documentEndpoint }
           { name: 'COSMOS_DATABASE', value: 'score' }
+          { name: 'SCORE_SETTINGS_CONTAINER', value: 'application-settings' }
           { name: 'JOB_RECORDS_CONTAINER', value: 'job-records' }
           { name: 'STORAGE_ACCOUNT_URL', value: storage.properties.primaryEndpoints.blob }
           { name: 'JOB_SOURCE_CONTAINER', value: 'job-sources' }

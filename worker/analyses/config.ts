@@ -1,4 +1,5 @@
 import type { RealAnalysesConfig } from '../../server/analyses/store'
+import { workerSettingsContainer } from '../settings-store'
 
 export interface AnalysisWorkerConfig {
   stores: RealAnalysesConfig
@@ -11,6 +12,7 @@ export interface AnalysisWorkerConfig {
   reasoningEffort?: string
   maxItems: number
   budgetMilliseconds: number
+  settingsContainer?: string
 }
 
 function required(environment: NodeJS.ProcessEnv, key: string): string {
@@ -99,5 +101,6 @@ export function loadAnalysisWorkerConfig(environment: NodeJS.ProcessEnv): Analys
     modelDeployment, modelName, reasoningEffort,
     maxItems: integer(environment, 'ANALYSIS_WORKER_MAX_ITEMS', 2, 1, 100),
     budgetMilliseconds: integer(environment, 'ANALYSIS_WORKER_BUDGET_MS', 660_000, 1000, 660_000),
+    settingsContainer: workerSettingsContainer(environment),
   }
 }

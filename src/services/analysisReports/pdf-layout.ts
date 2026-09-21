@@ -3,7 +3,7 @@ import {
   rgb, setFillingColor, setFontAndSize, setTextMatrix, showText,
 } from 'pdf-lib'
 import type { Color, PDFDocument, PDFFont, PDFPage } from 'pdf-lib'
-import { REPORT_LIMITS } from '../../domain/analysis-reports'
+import { REPORT_LIMITS, type ReportPolicy } from '../../domain/analysis-reports'
 import { REPORT_PALETTE } from './presentation'
 import { DOCUMENT_REPORT_PAGE, DOCUMENT_REPORT_WIDTH, documentMetadataText } from './document-layout'
 import type {
@@ -116,6 +116,7 @@ export class PdfReportLayout implements DocumentReportLayout<Color> {
     readonly document: PDFDocument,
     readonly fonts: PdfReportFonts,
     private readonly designation: string,
+    private readonly limits: Pick<ReportPolicy, 'maxPages' | 'maxGenerationMilliseconds'> = REPORT_LIMITS,
   ) {
     for (const font of Object.values(fonts)) {
       this.characters.set(font, new Set(font.getCharacterSet()))
@@ -161,15 +162,15 @@ export class PdfReportLayout implements DocumentReportLayout<Color> {
   }
 
   checkTime(): void {
-    if (Date.now() - this.startedAt > REPORT_LIMITS.maxGenerationMilliseconds) {
+    if (Date.now() - this.startedAt > this.limits.maxGenerationMilliseconds) {
       throw new Error('PDF generation exceeded the report time limit. Narrow the export to one exact job/grade target; no comparisons or evidence have been omitted.')
     }
   }
 
   private newPage(): void {
     this.checkTime()
-    if (this.document.getPageCount() >= REPORT_LIMITS.maxPages) {
-      throw new Error(`PDF exceeds the ${REPORT_LIMITS.maxPages}-page resource limit. Narrow the export to one exact job/grade target; no comparisons or evidence have been omitted.`)
+    if (this.document.getPageCount() >= this.limits.maxPages) {
+      throw new Error(`PDF exceeds the ${this.limits.maxPages}-page resource limit. Narrow the export to one exact job/grade target; no comparisons or evidence have been omitted.`)
     }
     this.page = this.document.addPage([PDF_REPORT_PAGE.width, PDF_REPORT_PAGE.height])
     this.y = PDF_REPORT_PAGE.bodyTop
@@ -338,7 +339,7 @@ export class PdfReportLayout implements DocumentReportLayout<Color> {
     this.ensureSpace(height <= bodyHeight ? height : 58)
     const baseline = this.y - this.fonts.bold.heightAtSize(10, { descender: false })
     if (this.measure(entry.label, this.fonts.bold, 10) +
-      this.measure(`Page ${REPORT_LIMITS.maxPages}`, this.fonts.regular, 10) + 24 > PDF_REPORT_WIDTH) {
+      this.measure(`Page ${this.limits.maxPages}`, this.fonts.regular, 10) + 24 > PDF_REPORT_WIDTH) {
       throw new Error('PDF contents labels must leave space for their final page references.')
     }
     this.drawText(entry.label, PDF_REPORT_PAGE.margin, baseline, 10, this.fonts.bold,

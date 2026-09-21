@@ -27,6 +27,7 @@ import type { Citation, Job, Rubric, SourceDocument } from './types'
 import type { LifecycleMetadata, LifecycleOperation } from './lifecycle'
 import type { RealAnalysisCandidateNarrativeSummary, RealAnalysisNarrativeRecord } from './analysis-narratives'
 import type { AnalysisDiagnosticCapture, AnalysisFailureDiagnosticReference } from './analysis-diagnostics'
+import type { ModelTaskId, ProcessingSettingsSnapshot } from './admin-settings'
 
 export type {
   RealAnalysisCandidateNarrativeRecord,
@@ -217,6 +218,7 @@ export interface RealAnalysisInitializationManifest {
   resumes: AnalysisResumeSnapshotReference[]
   targets: AnalysisTargetSnapshotReference[]
   comparisons: AnalysisComparisonPlan[]
+  processingSettings?: ProcessingSettingsSnapshot
 }
 
 export type RealAnalysisRunStatus = 'initializing' | 'queued' | 'running' | 'complete' | 'partial' | 'failed' | 'cancelled'
@@ -240,6 +242,7 @@ export interface AnalysisEntityBase {
   dataKind: 'real'
   createdAt: string
   updatedAt: string
+  processingSettings?: ProcessingSettingsSnapshot
 }
 
 export interface AnalysisWorkState {
@@ -363,6 +366,8 @@ export interface AnalysisModelProvenance {
   startedAt: string
   completedAt: string
   inputCharacters: number
+  settingsRevision?: string
+  task?: ModelTaskId
 }
 
 export interface AnalysisGroundingIssue {
@@ -494,7 +499,7 @@ export interface RealAnalysisDocumentQuery {
 
 export interface AnalysisProcessingFeatures {
   realAnalyses: boolean
-  analysisLimits: typeof ANALYSIS_LIMITS
+  analysisLimits: { [K in keyof typeof ANALYSIS_LIMITS]: number }
   // Independent of new-run/source-service readiness; historical summary reads do not require it.
   analysisSummaryGeneration?: boolean
 }

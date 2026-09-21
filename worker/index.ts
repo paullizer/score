@@ -6,6 +6,7 @@ import { createAzureJobBlobStore, createAzureJobStore } from '../server/jobs/azu
 import type { RealJobsConfig } from '../server/jobs/store'
 import { validateRealRubric } from '../server/jobs/validation'
 import { createPlaywrightRenderer, createRemoteRenderer, runWorker, WorkerError } from './runtime'
+import { createAzureWorkerSettings, workerSettingsContainer } from './settings-store'
 
 interface WorkerConfig {
   stores: RealJobsConfig
@@ -19,6 +20,7 @@ interface WorkerConfig {
   rubricModelReasoningEffort?: string
   rendererUrl?: string
   maxJobs: number
+  settingsContainer?: string
 }
 
 function required(environment: NodeJS.ProcessEnv, name: string): string {
@@ -56,6 +58,7 @@ export function loadWorkerConfig(environment: NodeJS.ProcessEnv): WorkerConfig {
     rubricModelReasoningEffort: reasoning,
     rendererUrl,
     maxJobs,
+    settingsContainer: workerSettingsContainer(environment),
   }
 }
 
@@ -83,6 +86,10 @@ async function main(): Promise<void> {
       browser = createRemoteRenderer(config.rendererUrl)
     }
     const result = await runWorker({
+      settings: createAzureWorkerSettings(config, credential, {
+        deployment: config.rubricModelDeployment, modelName: config.rubricModelName,
+        reasoningEffort: config.rubricModelReasoningEffort,
+      }),
       store: createAzureJobStore(config.stores, credential),
       blobs: createAzureJobBlobStore(config.stores, credential),
       browser,

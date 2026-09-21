@@ -5,6 +5,7 @@ import { analysisNarrativeId, assertAnalysis, parseAnalysisEntity } from './vali
 import {
   analysisNarrativeCanWork, narrativeGenerationId, narrativeTimestamp, newCandidateNarrative, newTargetNarrative,
 } from './narrative-records'
+import { acceptedProcessingSettings } from '../jobs/policy'
 
 /** Append these writes to the scoring CAS. Advance its mutable next-run timestamp to fence every new generation. */
 export async function prepareAnalysisNarrativeTransitions(
@@ -12,6 +13,9 @@ export async function prepareAnalysisNarrativeTransitions(
   transitions: readonly { previous: RealAnalysisComparisonRecord; next: RealAnalysisComparisonRecord }[], now: string,
 ): Promise<AnalysisTransaction[]> {
   if (!analysisNarrativeCanWork(run)) return []
+  const processingSettings = run.processingSettings ?? transitions.find(value => value.next.processingSettings)?.next.processingSettings
+  const policy = acceptedProcessingSettings(processingSettings).settings
+  if (!policy.features.summaryGeneration || policy.summaries.generationMode !== 'automatic') return []
   const timestamp = narrativeTimestamp(run, now)
   const operations: AnalysisTransaction[] = []
   const targets = new Map<string, { comparison: RealAnalysisComparisonRecord; completion: boolean }>()
@@ -28,6 +32,7 @@ export async function prepareAnalysisNarrativeTransitions(
     const requestId = next.attemptId!
     const record = newCandidateNarrative(run, next, {
       requestId, requestedAt: timestamp, requestedBy: null, reason: 'comparison-completed',
+      ...(processingSettings ? { processingSettings } : {}),
     })
     operations.push({ kind: 'create', record })
   }
@@ -49,6 +54,7 @@ export async function prepareAnalysisNarrativeTransitions(
       `${comparison.id}:${comparison.status}:${comparison.retryCount}:${comparison.attempts}`)
     const record = newTargetNarrative(run, comparison.target, {
       requestId, requestedAt: timestamp, requestedBy: null, reason: completion ? 'comparison-completed' : 'comparison-changed',
+      ...(processingSettings ? { processingSettings } : {}),
     }, previous)
     operations.push(existing ? { kind: 'replace', record, etag: existing.etag } : { kind: 'create', record })
   }

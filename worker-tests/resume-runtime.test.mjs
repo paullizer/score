@@ -4,6 +4,7 @@ import { createRequire } from 'node:module'
 import { setImmediate as flush, setTimeout as sleep } from 'node:timers/promises'
 import test from 'node:test'
 import { build } from 'esbuild'
+import { settingsSnapshot } from './runtime-settings-test-support.mjs'
 import { PDFDocument, PDFName } from 'pdf-lib'
 
 const bundled = await build({
@@ -983,6 +984,34 @@ test('overlong redirect URLs and invalid fetch overrides never weaken the public
   }
 })
 
+test('accepted resume attempts and PDF limits stay frozen even when current settings would permit more work', async () => {
+  const accepted = settingsSnapshot(settings => {
+    settings.processing.resumes.maxAutomaticAttempts = 1
+    settings.ai.transport.maxAttempts = 1
+    settings.imports.resumes.maxPdfPages = 1
+  })
+  const current = settingsSnapshot(() => {}, 'newer-resume-policy')
+  const run = fixture({ modelFetch: async () => new Response('', { status: 503 }) })
+  const id = await run.url()
+  run.store.save({ ...await run.record(id), processingSettings: accepted })
+  run.deps.settings = { legacy: accepted, current: async () => current }
+  await runResumeWorker(run.deps)
+  const failed = await run.record(id)
+  assert.equal(failed.resume.status, 'error')
+  assert.equal(failed.attempts, 1)
+  assert.equal(failed.nextAttemptAt, undefined)
+  assert.equal(run.requests.model.length, 1)
+  assert.equal(run.requests.model[0].body.model, 'deployment-resumeProfile')
+
+  const pdfRun = fixture()
+  const pdfId = await pdfRun.upload(await pdf(2))
+  pdfRun.store.save({ ...await pdfRun.record(pdfId), processingSettings: accepted })
+  pdfRun.deps.settings = { legacy: accepted, current: async () => current }
+  await runResumeWorker(pdfRun.deps)
+  assert.equal((await pdfRun.record(pdfId)).error.code, 'pdf-too-many-pages')
+  assert.equal(pdfRun.requests.ocr.length, 0)
+})
+
 test('50-page PDFs succeed while oversized, encrypted, malformed, and 51-page sources fail before OCR', async () => {
   const valid = fixture({ pages: 50 })
   const accepted = await valid.upload(await pdf(50))
@@ -1324,7 +1353,7 @@ test('expired claims recover with a new attempt ID, while three expired attempts
       assert.equal(record.resume.status, 'error')
       assert.equal(record.attempts, 3)
       assert.equal(record.lease, undefined)
-      assert.match(record.error.message, /three automatic attempts/)
+      assert.match(record.error.message, /3 automatic attempts/)
       assert.equal(run.requests.public.length, 0)
     }
   }

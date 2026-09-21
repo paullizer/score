@@ -7,7 +7,6 @@ import {
   TabStopType, TextRun, UnderlineType, VerticalAlign, WidthType,
 } from 'docx'
 import type { IContext, IParagraphOptions, IRunOptions, IStylesOptions, IXmlableObject, ParagraphChild } from 'docx'
-import { REPORT_LIMITS } from '../../domain/analysis-reports'
 import type { AnalysisReport, ReportGenerationOptions } from '../../domain/analysis-reports'
 import {
   assertReportXmlText, REPORT_FONT_FAMILY, REPORT_HUMAN_REVIEW_NOTICE, REPORT_PALETTE, reportTitle,
@@ -20,6 +19,7 @@ import type {
   DocumentContentsEntry, DocumentPageIdentity, DocumentReportLayout, DocumentReportLink,
   DocumentTableCell, DocumentTextLink, DocumentTextStyle,
 } from './document-layout'
+import { reportGenerationPolicy, reportLimits, snapshotReportPolicy } from './policy'
 
 type Content = Paragraph | Table
 type EmbeddedFonts = NonNullable<ConstructorParameters<typeof Document>[0]['fonts']>
@@ -98,9 +98,14 @@ class WordReportLayout implements DocumentReportLayout<string> {
   private readonly destinations = new Set<string>()
   private pendingDestinations: string[] = []
   private bookmarkId = 0
-  private readonly startedAt = Date.now()
+  private pageCount = 0
+  private remainingHeight = 0
 
-  constructor(private readonly report: AnalysisReport, private readonly fonts: ReturnType<typeof fontInputs>) {}
+  constructor(
+    private readonly report: AnalysisReport, private readonly fonts: ReturnType<typeof fontInputs>,
+    private readonly limits: ReturnType<typeof reportLimits>,
+    private readonly startedAt: number,
+  ) {}
 
   private get children(): Content[] {
     const section = this.sections.at(-1)
@@ -109,7 +114,7 @@ class WordReportLayout implements DocumentReportLayout<string> {
   }
 
   private checkTime(): void {
-    if (Date.now() - this.startedAt > REPORT_LIMITS.maxGenerationMilliseconds) {
+    if (Date.now() - this.startedAt > this.limits.maxGenerationMilliseconds) {
       throw new Error('Word generation exceeded the report time limit. Narrow the export to one exact job/grade target; no comparisons or evidence have been omitted.')
     }
   }
@@ -118,6 +123,53 @@ class WordReportLayout implements DocumentReportLayout<string> {
     const font = bold ? this.fonts.bold : this.fonts.regular
     return font.layout(value, { liga: false, clig: false }).glyphs
       .reduce((sum, glyph) => sum + glyph.advanceWidth, 0) * size / font.unitsPerEm
+  }
+
+  private newBudgetPage(): void {
+    if (this.pageCount >= this.limits.maxPages) {
+      throw new Error('The Word report exceeds the section/page resource limit. Narrow the export to one exact job/grade target; no text was omitted.')
+    }
+    this.pageCount++
+    this.remainingHeight = DOCUMENT_REPORT_PAGE.bodyTop - DOCUMENT_REPORT_PAGE.bodyBottom
+  }
+
+  private measuredLines(value: string, bold: boolean, size: number, width: number): number {
+    let lines = 1, used = 0
+    const advances = new Map<string, number>()
+    for (const token of value.match(/\S+|[^\S\r\n]+/gu) ?? []) {
+      const advance = this.width(token.replace(/\t/g, '    '), bold, size)
+      if (used && used + advance > width) { lines++; used = 0 }
+      if (advance > width) {
+        for (const character of token) {
+          let characterWidth = advances.get(character)
+          if (characterWidth === undefined) { characterWidth = this.width(character, bold, size); advances.set(character, characterWidth) }
+          if (used && used + characterWidth > width) { lines++; used = 0 }
+          used += characterWidth
+        }
+      } else used += advance
+    }
+    return lines
+  }
+
+  // Word repaginates in the reader's editor. Count all flowing body text conservatively, not just section openers.
+  private budgetParagraph(value: string, style: DocumentTextStyle<string> & { keepLines?: boolean }): void {
+    const size = style.size ?? 10
+    const leading = style.leading ?? Math.ceil(size * 1.5)
+    const padding = style.padding ?? 0
+    const width = DOCUMENT_REPORT_WIDTH - padding * 2 - (value.startsWith('\u2022 ') ? 12 : 0)
+    const lines = this.measuredLines(value, Boolean(style.bold), size, width)
+    const before = (style.before ?? 0) + padding
+    const after = (style.after ?? 8) + padding
+    const height = lines * leading + before + after
+    const bodyHeight = DOCUMENT_REPORT_PAGE.bodyTop - DOCUMENT_REPORT_PAGE.bodyBottom
+    const reserve = style.keepLines && height <= bodyHeight ? height : before + Math.min(lines, 2) * leading
+    if (this.remainingHeight < Math.min(bodyHeight, reserve + (style.keepWithNext ?? 0))) this.newBudgetPage()
+    this.remainingHeight -= before
+    for (let line = 0; line < lines; line++) {
+      if (this.remainingHeight < leading) this.newBudgetPage()
+      this.remainingHeight -= leading
+    }
+    this.remainingHeight -= after
   }
 
   private bookmarkName(destination: string): string {
@@ -158,9 +210,7 @@ class WordReportLayout implements DocumentReportLayout<string> {
   startSection(identity: DocumentPageIdentity): void {
     this.checkTime()
     if (this.pendingDestinations.length) throw new Error('A Word destination has no content.')
-    if (this.sections.length >= REPORT_LIMITS.maxPages) {
-      throw new Error('The Word report exceeds the section/page resource limit. Narrow the export to one exact job/grade target.')
-    }
+    this.newBudgetPage()
     const primaryFits = !/[\r\n\t\u0085\u2028\u2029]/u.test(identity.primary) &&
       Array.from(identity.primary).every(character => this.fonts.bold.hasGlyphForCodePoint(character.codePointAt(0)!)) &&
       this.width(identity.primary, true, 9.5) <= DOCUMENT_REPORT_WIDTH
@@ -189,6 +239,9 @@ class WordReportLayout implements DocumentReportLayout<string> {
       ? { style: BorderStyle.SINGLE, color: style.background, size: 1, space: padding } : undefined
     const headings = [HeadingLevel.HEADING_1, HeadingLevel.HEADING_2, HeadingLevel.HEADING_3]
     lines.forEach((line, index) => {
+      this.budgetParagraph(line, {
+        ...style, before: index === 0 ? style.before : 0, after: index === lines.length - 1 ? style.after : 0,
+      })
       const bullet = line.startsWith('\u2022 ')
       const options: IParagraphOptions = {
         widowControl: true, keepLines: style.keepLines ?? false,
@@ -237,6 +290,7 @@ class WordReportLayout implements DocumentReportLayout<string> {
 
   links(links: readonly DocumentReportLink[]): void {
     if (!links.length) return
+    this.budgetParagraph(links.map(link => link.text).join('    '), { size: 10, leading: 17, bold: true, after: 9 })
     this.children.push(new Paragraph({
       widowControl: true, keepLines: false,
       spacing: { after: 180, line: 340, lineRule: LineRuleType.EXACT },
@@ -249,6 +303,7 @@ class WordReportLayout implements DocumentReportLayout<string> {
 
   contentsEntry(entry: DocumentContentsEntry): void {
     const anchor = this.bookmarkName(entry.destination)
+    this.budgetParagraph(`${entry.label}\tPage ${this.limits.maxPages}`, { size: 10, leading: 14, after: 6, keepWithNext: 28 })
     this.children.push(new Paragraph({
       keepNext: true, keepLines: true, widowControl: true,
       spacing: { after: 120, line: 280, lineRule: LineRuleType.EXACT },
@@ -273,6 +328,29 @@ class WordReportLayout implements DocumentReportLayout<string> {
     if (headers.length !== widths.length || widths.some(width => !Number.isFinite(width) || width <= 14) ||
       Math.abs(widths.reduce((sum, width) => sum + width, 0) - DOCUMENT_REPORT_WIDTH) > 0.01 ||
       rows.some(row => row.length !== headers.length)) throw new Error('Invalid Word report table layout.')
+    const lineCount = (values: DocumentTableCell[], header: boolean) => Math.max(...values.map((value, column) =>
+      lineParts(typeof value === 'string' ? value : value.text).reduce((sum, line) =>
+        sum + this.measuredLines(line, header, 9.5, widths[column] - 14), 0)))
+    const headerHeight = lineCount(headers, true) * 14 + 14
+    const bodyHeight = DOCUMENT_REPORT_PAGE.bodyTop - DOCUMENT_REPORT_PAGE.bodyBottom
+    if (headerHeight + 42 > bodyHeight) throw new Error('The Word table heading exceeds the readable page budget. No text was omitted.')
+    const continueTable = () => { this.newBudgetPage(); this.remainingHeight -= headerHeight }
+    if (this.remainingHeight < headerHeight + 42) this.newBudgetPage()
+    this.remainingHeight -= headerHeight
+    for (const row of rows) {
+      this.checkTime()
+      let lines = lineCount(row, false)
+      if (lines * 14 + 14 <= bodyHeight - headerHeight && lines * 14 + 14 > this.remainingHeight) continueTable()
+      while (lines > 0) {
+        const capacity = Math.floor((this.remainingHeight - 14) / 14)
+        if (capacity < Math.min(2, lines)) { continueTable(); continue }
+        const taken = Math.min(capacity, lines)
+        this.remainingHeight -= taken * 14 + 14
+        lines -= taken
+        if (lines) continueTable()
+      }
+    }
+    this.remainingHeight -= 10
     const border = { style: BorderStyle.SINGLE, size: 4, color: palette.border }
     const noBorder = { style: BorderStyle.NONE, size: 0, color: palette.paper }
     const cells = (values: DocumentTableCell[], header: boolean, index = 0) => values.map((value, column) => {
@@ -391,18 +469,23 @@ class WordReportLayout implements DocumentReportLayout<string> {
 </w:fonts>`
     const blob = await Packer.toBlob(document, undefined, [{ path: 'word/fontTable.xml', data: fontTable }])
     this.checkTime()
-    if (blob.size > REPORT_LIMITS.maxOutputBytes) {
+    if (blob.size > this.limits.maxOutputBytes) {
       throw new Error('The Word report exceeds the output size limit. Narrow the export to one exact job/grade target; no comparisons or evidence have been omitted.')
     }
-    return new Uint8Array(await blob.arrayBuffer())
+    const bytes = new Uint8Array(await blob.arrayBuffer())
+    this.checkTime()
+    return bytes
   }
 }
 
 export async function generateDocxReport(report: AnalysisReport, options?: ReportGenerationOptions): Promise<Uint8Array> {
-  assertReportResourceLimits(report)
+  const startedAt = Date.now()
+  report = snapshotReportPolicy(report)
+  const limits = reportLimits(reportGenerationPolicy(report, 'docx'))
+  assertReportResourceLimits(report, limits.maxInputBytes)
   requireReportNarratives(report)
   assertReportXmlText(report)
-  const layout = new WordReportLayout(report, fontInputs(options))
+  const layout = new WordReportLayout(report, fontInputs(options), limits, startedAt)
   writeDocumentReport(layout, report, options)
   return layout.finish()
 }

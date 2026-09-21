@@ -21,8 +21,8 @@ export const REPORT_PALETTE = {
   border: 'D8D0C7',
 } as const
 
-export function reportTitle(report: Pick<AnalysisReport, 'dataKind' | 'run'>): string {
-  return `${report.dataKind === 'sample' ? 'Sample ' : ''}${REPORT_TITLE} — ${report.run.name}`
+export function reportTitle(report: Pick<AnalysisReport, 'dataKind' | 'run' | 'capture'>): string {
+  return `${report.dataKind === 'sample' ? 'Sample ' : ''}${report.capture.settings.policy.title} — ${report.run.name}`
 }
 
 export function comparisonStatusLabel(status: ReportComparisonStatus): string {
@@ -94,19 +94,20 @@ export function reportStatusNotice(counts: ReportStatusCounts): string {
     `Partial report: ${description}; ${counts.queued} queued; ${counts.running} running; ${counts.failed} failed; ${counts.cancelled} cancelled.`
 }
 
-export function buildReportNotices(dataKind: ReportDataKind, counts: ReportStatusCounts): string[] {
+export function buildReportNotices(dataKind: ReportDataKind, counts: ReportStatusCounts, additionalFooter = ''): string[] {
   return [
     ...(dataKind === 'sample' ? [REPORT_SAMPLE_NOTICE] : []),
     REPORT_HUMAN_REVIEW_NOTICE,
     reportStatusNotice(counts),
     REPORT_CAPTURE_NOTICE,
+    ...(additionalFooter ? [additionalFooter] : []),
   ]
 }
 
 export function highlightNotice(group: ReportGroup): string {
   if (!group.highlightedComparisonIds.length) return 'No scored highlights are available for this exact target. Completed assessments with withheld totals remain in the details.'
   const prefix = `Highest evidence matches within this exact target only (${group.highlightedComparisonIds.length} highlighted). Equal saved scores share the same competition rank.`
-  return group.additionalCutoffTies ? `${prefix} The highlight list is capped at ${REPORT_LIMITS.maxHighlights}; ${group.additionalCutoffTies} additional candidates tied at ${group.cutoffScore} / 100 appear in the full details. Original order determines display order within a tie, not an evidence advantage.` : prefix
+  return group.additionalCutoffTies ? `${prefix} The highlight list is capped at ${group.highlightLimit ?? REPORT_LIMITS.maxHighlights}; ${group.additionalCutoffTies} additional candidates tied at ${group.cutoffScore} / 100 appear in the full details. Original order determines display order within a tie, not an evidence advantage.` : prefix
 }
 
 export function summaryExcerpt(summary: string, maxCharacters = 240): { text: string; shortened: boolean } {

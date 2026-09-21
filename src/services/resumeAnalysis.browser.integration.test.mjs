@@ -209,8 +209,16 @@ test('browser unavailable real services remain explicit while Samples require de
   t.after(() => fixture.close())
   const { context, page, errors } = await newPage()
   try {
+    const features = await (await fixture.request('/api/features')).json()
+    assert.equal(features.deploymentCapabilities.realResumeImports, false)
+    assert.equal(features.deploymentCapabilities.realAnalyses, false)
+    assert.equal(features.publicSettings.features.resumeImports, false)
+    assert.equal((await fixture.request(`/api/workspaces/${fixture.workspaceId}/resumes`)).status, 503, 'This fixture removes the history service, not merely new admissions')
     await page.goto(`${fixture.origin}/workspaces/${fixture.workspaceId}/resumes?data=real`)
     await visible(page.getByRole('heading', { name: 'Real resume imports are not enabled', exact: true }))
+    await visible(page.getByRole('button', { name: 'Check availability', exact: true }))
+    assert.equal(await page.getByRole('button', { name: 'Add resumes', exact: true }).count(), 0)
+    assert.equal(await page.getByRole('button', { name: 'Add real resumes', exact: true }).count(), 0)
     assert.equal(await page.getByText(/Every candidate is fictional/).count(), 0)
     await page.getByRole('button', { name: /^Samples/ }).click()
     await visible(page.getByText(/Every candidate is fictional/))
@@ -591,7 +599,8 @@ test('browser legacy and unavailable failures keep source access and discard lat
     const created = await jsonResponse(await fixture.request('/api/workspaces', {
       method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: 'Empty diagnostic workspace' }),
     }), [201])
-    fixture.staleRead(`${scenario.pairPath}/diagnostics`, { attempts: [scenario.diagnostic] }, hold.promise)
+    // A policy refresh can remount the detail; keep every diagnostic response pending until the switch.
+    fixture.staleRead(`${scenario.pairPath}/diagnostics`, { attempts: [scenario.diagnostic] }, hold.promise, 200, { repeat: true })
     scenario.detail = failedComparisonFixture(scenario.accepted, scenario.diagnostic)
     await page.reload()
     await until(() => diagnosticReads > 0, 'The current failed comparison should request its private diagnostic.')

@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react'
 import { Link, Navigate, useNavigate, useParams, useSearchParams } from 'react-router-dom'
 import { ArrowLeft, ArrowRight, BriefcaseBusiness, FileSearch, Layers3, LoaderCircle } from 'lucide-react'
 import { useWorkspace } from '../../app/workspace-context'
+import { usePublicSettings } from '../../app/public-settings-context'
 import { useLibraryViewState } from '../../app/library-view-state'
 import { DocumentViewer } from '../../components/documents/DocumentViewer'
 import { Badge, Button, DemoNote, EmptyState, InlineError, Modal, PageHeader, SearchField, SegmentedControl } from '../../components/ui'
@@ -37,6 +38,7 @@ function rubricLink(rubric: Rubric): string {
 
 function RubricsLibrary() {
   const { workspace, cloud, notify } = useWorkspace()
+  const { settings } = usePublicSettings()
   const navigate = useNavigate()
   const [params, setParams] = useSearchParams()
   const gradeLadders = useGradeLadders()
@@ -123,7 +125,7 @@ function RubricsLibrary() {
     />
 
     <section className="panel">
-      {cloud && <div className="library-kind-switcher"><SegmentedControl label="Choose real rubrics or samples" value={libraryKind}
+      {cloud && settings?.features.samplesVisible !== false && <div className="library-kind-switcher"><SegmentedControl label="Choose real rubrics or samples" value={libraryKind}
         onChange={(value) => { choose([]); setParams({ kind, data: value }, { replace: true }) }} options={[{ value: 'real', label: 'Real rubrics' }, { value: 'samples', label: 'Samples' }]} />
         <span>{libraryKind === 'real' ? 'Private evidence · exact saved versions for real analysis' : 'Fictional job and grade fixtures for demo analysis only.'}</span></div>}
       <div className="library-toolbar">

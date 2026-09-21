@@ -10,6 +10,7 @@ import {
   type AnalysisSummaryStep, type AnalysisSummarySubject,
 } from '../../src/domain/analysis-summary-history'
 import { conflict, invalidRequest, notFound } from '../errors'
+import { preservesProcessingSettings } from '../jobs/policy'
 import { StoreConflictError } from '../store'
 import { analysisIsRemoved, fencedAnalysisBlobs } from './guards'
 import { loadAnalysisRun } from './lifecycle'
@@ -94,6 +95,10 @@ export async function readSummaryHistoryEntry(
   if (subject.kind === 'candidate' || entry.generationId === record.generationId) {
     assertAnalysis(entry.inputFingerprint === record.inputFingerprint, 'Summary checkpoint changed its saved generation input.')
   }
+  if (entry.generationId === record.generationId) {
+    assertAnalysis(preservesProcessingSettings(entry.processingSettings, record.processingSettings),
+      'Summary checkpoint changed its accepted generation settings.')
+  }
   validateStep(entry, subject.kind, entry.inputFingerprint, entry.createdAt)
   if (entry.previous) {
     assertAnalysisSummaryHistoryReference(entry.previous, record.workspaceId, record.runId, subject.kind, subject.subjectId)
@@ -119,6 +124,7 @@ export async function writeSummaryCheckpoint(
     targetId: record.targetId, ...subject, generationId: record.generationId, attemptId: record.attemptId,
     inputFingerprint: record.inputFingerprint, manifestSha256: record.manifestSha256, createdAt: options.createdAt,
     ...(record.history ? { previous: record.history } : {}),
+    ...(record.processingSettings ? { processingSettings: record.processingSettings } : {}),
   })
   assertAnalysis(entry.createdAt >= record.updatedAt, 'Summary checkpoint cannot precede its current work state.')
   const name = analysisSummaryHistoryBlobName(record.workspaceId, record.runId, subject.kind, subject.subjectId,
@@ -132,6 +138,7 @@ export async function writeSummaryCheckpoint(
     if (!current || current.record.status !== 'running' || current.record.generationId !== record.generationId ||
       current.record.attemptId !== record.attemptId || current.record.lease?.owner !== record.lease?.owner ||
       current.record.inputFingerprint !== record.inputFingerprint ||
+      analysisHash(current.record.processingSettings ?? null) !== analysisHash(record.processingSettings ?? null) ||
       analysisHash(current.record.history ?? null) !== analysisHash(record.history ?? null)) {
       throw new StoreConflictError('Summary checkpoint lost its worker generation, attempt, or history head.')
     }
@@ -236,7 +243,11 @@ const historyCursorSchema = z.strictObject({
 
 export async function readAnalysisSummaryHistory(
   deps: RealAnalysesDeps, workspaceId: string, runId: string, subject: AnalysisSummarySubject, continuationToken?: string,
+  pageSize: number = SUMMARY_LIMITS.historyPageSize,
 ): Promise<AnalysisSummaryHistoryPage> {
+  if (!Number.isInteger(pageSize) || pageSize < 1 || pageSize > SUMMARY_LIMITS.historyPageSize) {
+    throw invalidRequest('Summary history page size exceeds its supported resource bound.')
+  }
   const scope = { workspaceId, runId, kind: 'summary-history' as const, summaryKind: subject.kind, subjectId: subject.subjectId }
   const cursor = analysisPageCursor(scope, continuationToken)
   for (let race = 0; race < 4; race++) {
@@ -257,7 +268,7 @@ export async function readAnalysisSummaryHistory(
     }
     const entries: AnalysisSummaryHistoryEntry[] = []
     const seen = new Set<string>()
-    while (reference && entries.length < SUMMARY_LIMITS.historyPageSize) {
+    while (reference && entries.length < pageSize) {
       assertAnalysis(!seen.has(reference.id), 'Summary history contains a repeated checkpoint.')
       seen.add(reference.id)
       const entry = await readSummaryHistoryEntry(deps, record!, reference)

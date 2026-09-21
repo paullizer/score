@@ -1,8 +1,9 @@
 import express, { type Express, type NextFunction, type Request, type Response } from 'express'
 import { renderJobPage, RendererError } from './browser'
 import type { PublicFetcher, RenderedJobPage } from '../src/domain/rendering'
+import { renderRequestPolicySchema, type RenderRequestPolicy } from './request-policy'
 
-const MAX_JSON_BODY = '16kb'
+const MAX_JSON_BODY = '64kb'
 const DEFAULT_MAX_CONCURRENCY = 1
 const DEFAULT_MAX_QUEUE = 1
 const WORKER_HEADER = 'job-ingestion'
@@ -27,7 +28,7 @@ const FORBIDDEN_CREDENTIAL_ENV_NAMES = [
   'MSI_SECRET',
 ] as const
 
-type RenderFunction = (url: string, signal: AbortSignal) => Promise<RenderedJobPage>
+type RenderFunction = (url: string, signal: AbortSignal, policy?: RenderRequestPolicy) => Promise<RenderedJobPage>
 
 export interface RendererAppDeps {
   readonly fetcher: PublicFetcher
@@ -127,18 +128,23 @@ function errorEnvelope(code: string, message: string): ErrorEnvelope {
   return { error: { code, message } }
 }
 
-function validateRenderBody(body: unknown): string {
+function validateRenderBody(body: unknown): { url: string; policy?: RenderRequestPolicy } {
   if (typeof body !== 'object' || body === null || Array.isArray(body)) {
     throw new HttpError(400, 'invalid_request', 'The request body must be a JSON object.')
   }
   const record = body as Record<string, unknown>
-  if (Object.keys(record).length !== 1 || !Object.hasOwn(record, 'url')) {
-    throw new HttpError(400, 'invalid_request', 'The request body must contain only url.')
+  if (Object.keys(record).some(key => !['url', 'policy'].includes(key)) || !Object.hasOwn(record, 'url')) {
+    throw new HttpError(400, 'invalid_request', 'The request body must contain url and optional bounded policy.')
   }
-  if (typeof record.url !== 'string' || record.url.trim() === '') {
-    throw new HttpError(400, 'invalid_request', 'url must be a non-empty string.')
+  if (typeof record.url !== 'string' || record.url.trim() === '' || record.url.length > 4096) {
+    throw new HttpError(400, 'invalid_request', 'url must be a non-empty string of at most 4096 characters.')
   }
-  return record.url
+  if (record.policy !== undefined) {
+    const policy = renderRequestPolicySchema.safeParse(record.policy)
+    if (!policy.success) throw new HttpError(400, 'invalid_request', 'The render policy must contain valid lower budgets and URL rules.')
+    return { url: record.url, policy: policy.data }
+  }
+  return { url: record.url }
 }
 
 function noStore(_req: Request, res: Response, next: NextFunction): void {
@@ -184,7 +190,7 @@ export function createRendererApp(deps: RendererAppDeps): Express {
     throw new Error('Renderer concurrency must be 1 or 2 and maxQueue must be a non-negative integer.')
   }
   const gate = new RenderGate(maxConcurrency, maxQueue)
-  const render = deps.render ?? ((url, signal) => renderJobPage(url, signal, { fetcher: deps.fetcher }))
+  const render: RenderFunction = deps.render ?? ((url, signal, policy) => renderJobPage(url, signal, { fetcher: deps.fetcher, policy }))
   const app = express()
   app.disable('x-powered-by')
   app.use(noStore)
@@ -213,9 +219,9 @@ export function createRendererApp(deps: RendererAppDeps): Express {
 
     let release: (() => void) | undefined
     try {
-      const url = validateRenderBody(req.body)
+      const { url, policy } = validateRenderBody(req.body)
       release = await gate.acquire(controller.signal)
-      const rendered = await render(url, controller.signal)
+      const rendered = await render(url, controller.signal, policy)
       if (!controller.signal.aborted) res.json(rendered)
     } catch (error) {
       next(error)

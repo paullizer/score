@@ -1,7 +1,8 @@
 import type { DiscoveryOptions, ReferenceOriginal } from './contracts'
 import { GRADE_LADDER_LIMITS } from '../../src/domain/real-grades'
-import { safePublicFetch } from '../public-http'
-import { validatePublicUrl, WorkerError } from '../runtime'
+import { safeFetch, validatePublicUrl, WorkerError } from '../runtime'
+import { fetchSettings } from '../settings'
+import { urlMatchesPolicy } from '../../renderer/request-policy'
 
 export function checkCancellation(signal?: AbortSignal): void {
   if (signal?.aborted) throw new WorkerError('cancelled', 'Reference processing was cancelled.', false, 'parsing')
@@ -49,25 +50,33 @@ export async function fetchOriginalUrl(
   options: DiscoveryOptions = {},
   opmOnly = false,
 ): Promise<ReferenceOriginal> {
-  const fetcher = options.fetcher ?? safePublicFetch
+  const policy = options.processingSettings
+  const tuning = policy ? fetchSettings(undefined, policy, opmOnly ? 'opm' : 'agencyReferences') : {}
+  const fetcher = options.fetcher ?? ((url, request) => safeFetch(url, { ...tuning, ...request }))
   let url = referenceUrl(input, undefined, opmOnly)
   url.hash = ''
   const redirects: string[] = []
   const visited = new Set<string>()
-  let remainingBytes = GRADE_LADDER_LIMITS.maxPdfBytes
-  for (let hop = 0; hop <= 5; hop += 1) {
+  // Reference originals keep their dedicated 20 MiB ceiling, separate from job/profile static retrieval.
+  let remainingBytes = policy?.settings.grades.references.maxPdfBytes ?? GRADE_LADDER_LIMITS.maxPdfBytes
+  const maxRedirects = policy?.settings.imports.urls.maxRedirects ?? 5
+  for (let hop = 0; hop <= maxRedirects; hop += 1) {
     checkCancellation(options.signal)
     if (visited.has(url.href)) throw new WorkerError('reference-redirect-loop', 'The reference returned a redirect loop.', false, 'download')
     visited.add(url.href)
+    if (!urlMatchesPolicy(url.href, tuning.urlPolicy)) throw new WorkerError('unsafe-url', 'The reference URL is disallowed by the captured source policy.', false, 'download')
+    const signal = policy ? AbortSignal.any([
+      ...(options.signal ? [options.signal] : []), AbortSignal.timeout(policy.settings.imports.urls.timeoutMilliseconds),
+    ]) : options.signal
     const response = await fetcher(url.href, {
-      signal: options.signal,
+      signal,
       followRedirects: false,
       maxBytes: remainingBytes,
       headers: { accept: 'text/html,application/xhtml+xml,application/pdf', 'user-agent': 'ScoreReferenceImporter/1.0' },
     })
     checkCancellation(options.signal)
     remainingBytes -= response.body.byteLength
-    if (remainingBytes < 0) throw new WorkerError('reference-too-large', 'Reference downloads exceed the 20 MiB per-document limit.', false, 'download')
+    if (remainingBytes < 0) throw new WorkerError('reference-too-large', 'Reference downloads exceed the captured per-document byte limit.', false, 'download')
     const responseUrl = referenceUrl(response.url || url.href, undefined, opmOnly)
     if (responseUrl.href !== url.href) {
       throw new WorkerError('reference-opaque-redirect', 'The reference transport followed an unrecorded redirect.', false, 'download')
@@ -75,7 +84,7 @@ export async function fetchOriginalUrl(
     if ([301, 302, 303, 307, 308].includes(response.status)) {
       const location = header(response.headers, 'location')
       if (!location) throw new WorkerError('invalid-redirect', 'The reference redirect has no destination.', false, 'download')
-      if (hop === 5) throw new WorkerError('too-many-redirects', 'The reference exceeded five redirects.', false, 'download')
+      if (hop === maxRedirects) throw new WorkerError('too-many-redirects', `The reference exceeded ${maxRedirects} redirects.`, false, 'download')
       const destination = referenceUrl(location, url.href, opmOnly)
       redirects.push(destination.href)
       destination.hash = ''

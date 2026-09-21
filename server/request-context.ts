@@ -1,5 +1,10 @@
 import type { Request } from 'express'
 import type { AuthenticatedPrincipal } from './auth'
+export {
+  getAdmissionSettings as getRequestSettings, getCurrentSettings, getPinnedAdmissionSettings,
+  getSettingsForAcceptedWork, runtimeSettingsEnabled, assertNewProcessingAllowed, getProcessingAdmissionSettings,
+  getRuntimeSettingsReadiness,
+} from './settings/request-context'
 
 /** Augments Express's Request with the principal the auth middleware attaches after validation. */
 export interface PrincipalRequest extends Request {

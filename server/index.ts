@@ -9,6 +9,11 @@ import { createAzureJobBlobStore, createAzureJobStore } from './jobs/azure-store
 import { createAzureGradeBlobStore, createAzureGradeStore } from './grades/azure-store'
 import { createAzureResumeBlobStore, createAzureResumeStore } from './resumes/azure-store'
 import { createAzureAnalysisBlobStore, createAzureAnalysisStore } from './analyses/azure-store'
+import { createAzureSettingsStore } from './settings/azure-store'
+import { AdminSettingsService } from './settings/service'
+import { createAzureSettingsModelAdapter } from './settings/models'
+import type { StoredSettings } from './settings/store'
+import { RUNTIME_SETTINGS_VERSION } from '../src/domain/admin-settings'
 
 const DEFAULT_PORT = 8080
 
@@ -75,7 +80,34 @@ function main(): void {
         blobs: createAzureAnalysisBlobStore(analysisStorage, credential),
       }
     : undefined
-  const app = createApp({ config, directory, state, jobs, grades, resumes, analyses })
+  const settings = config.settings ? new AdminSettingsService({
+    config, store: createAzureSettingsStore(config.settings, credential),
+    ...(config.settings.model ? {
+      models: createAzureSettingsModelAdapter({
+        resource: config.settings.model,
+        credential: new ManagedIdentityCredential({ clientId: config.managedIdentityClientId }),
+      }),
+    } : {}),
+  }) : undefined
+  const app = createApp({ config, directory, state, jobs, grades, resumes, analyses, settings })
+  const bootstrapSettings = app.locals.bootstrapSettings as () => Promise<StoredSettings | undefined>
+  const initializeSettings = (): void => {
+    void bootstrapSettings().then(current => {
+      if (current) console.info('Application settings store initialized:', {
+        revision: current.revision.revision, runtimeSettingsVersion: RUNTIME_SETTINGS_VERSION,
+        runtimeEnabled: config.settings?.runtimeEnabled === true,
+      })
+    }, (error: unknown) => {
+      console.error('Application settings initialization is unavailable; settings-driven admissions remain fail-closed:', {
+        name: error instanceof Error ? error.name : 'UnknownError',
+      })
+      const retry = setTimeout(initializeSettings, 60_000)
+      retry.unref()
+    })
+  }
+  // Initialize using the API's write identity even before runtime activation. Historical reads
+  // stay available if this independent store is down; workers only ever read the published data.
+  initializeSettings()
   const reconcile = app.locals.reconcileLifecycle as () => Promise<void>
   const recoverLifecycle = () => { void reconcile().catch((error: unknown) => {
     console.error('Lifecycle recovery is unavailable:', { name: error instanceof Error ? error.name : 'UnknownError' })

@@ -2,10 +2,68 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import { PDFDocument, PDFName } from 'pdf-lib'
 import { loadWorker } from './shared-model-loader.mjs'
+import { settingsSnapshot } from './runtime-settings-test-support.mjs'
 import { fakeDi, immutableCache, pdfFixture, source } from './reference-fixtures.mjs'
 
 const { extractReferenceDocument } = await loadWorker('../worker/references/index.ts')
 const { inspectReferencePdf } = await loadWorker('../worker/references/pdf.ts')
+
+test('captured reference page selection, chunk and byte limits preserve original-page evidence and cache identity', async () => {
+  const original = await pdfFixture(5)
+  const di = fakeDi()
+  const cache = immutableCache()
+  const snapshot = settingsSnapshot(settings => {
+    settings.grades.references.pdfChunkPages = 2
+    settings.grades.references.maxSelectedPages = 5
+  })
+  const options = { documentIntelligence: di.options, ...cache, processingSettings: snapshot }
+  const result = await extractReferenceDocument(source(), original, options)
+  assert.deepEqual(di.submissions, [[1, 2], [3, 4], [5]])
+  assert.deepEqual(result.document.paragraphs.map(paragraph => paragraph.page), [1, 2, 3, 4, 5])
+  await extractReferenceDocument(source(), original, options)
+  assert.equal(di.submissions.length, 3)
+  await extractReferenceDocument(source(), original, {
+    ...options, processingSettings: settingsSnapshot(settings => { settings.grades.references.pdfChunkPages = 3 }),
+  })
+  assert.deepEqual(di.submissions.slice(3), [[1, 2, 3], [4, 5]])
+  for (const [change, code] of [
+    [settings => { settings.grades.references.maxSelectedPages = 2; settings.grades.references.pdfChunkPages = 2 }, 'reference-page-selection-required'],
+    [settings => { settings.grades.references.maxPdfBytes = 128 }, 'reference-too-large'],
+  ]) {
+    await assert.rejects(extractReferenceDocument(source(), original, {
+      ...options, processingSettings: settingsSnapshot(change),
+    }), error => error.code === code)
+  }
+  assert.equal(di.submissions.length, 5)
+})
+
+test('the explicit legacy baseline reuses verified pre-settings default chunk checkpoints', async () => {
+  const original = await pdfFixture(2)
+  const di = fakeDi()
+  di.options.pollTimeoutMilliseconds = 240_000
+  const cache = immutableCache()
+  await extractReferenceDocument(source(), original, { documentIntelligence: di.options, ...cache })
+  await extractReferenceDocument(source(), original, {
+    documentIntelligence: di.options, ...cache, processingSettings: settingsSnapshot(() => {}, 'legacy-v1'),
+  })
+  assert.equal(di.submissions.length, 1)
+})
+
+test('captured reference link and character limits fail explicitly instead of dropping evidence', async () => {
+  const di = fakeDi()
+  const linked = await pdfFixture(2, [
+    { page: 1, url: 'https://agency.example/one' }, { page: 2, url: 'https://agency.example/two' },
+  ])
+  await assert.rejects(extractReferenceDocument(source(), linked, {
+    documentIntelligence: di.options,
+    processingSettings: settingsSnapshot(settings => { settings.grades.references.maxLinks = 1 }),
+  }), error => error.code === 'reference-link-budget')
+  assert.equal(di.submissions.length, 0)
+  await assert.rejects(extractReferenceDocument(source(), await pdfFixture(1), {
+    documentIntelligence: di.options,
+    processingSettings: settingsSnapshot(settings => { settings.grades.references.maxSourceCharacters = 12 }),
+  }), error => error.code === 'reference-too-long')
+})
 
 test('177-page standards use bounded page-copy chunks, absolute original numbering and immutable recovery', async () => {
   const original = await pdfFixture(177)

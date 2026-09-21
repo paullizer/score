@@ -85,8 +85,11 @@ export class WorkspaceRepository {
   }
 
   /** GET /api/session: bootstraps a default personal workspace, then lists everything the user can see. */
-  async getSession(principal: AuthenticatedPrincipal): Promise<CloudSession> {
-    await this.ensureDefaultWorkspace(principal)
+  async getSession(
+    principal: AuthenticatedPrincipal,
+    options: { bootstrap?: boolean; allowCreation?: () => Promise<boolean> } = {},
+  ): Promise<CloudSession> {
+    if (options.bootstrap !== false) await this.ensureDefaultWorkspace(principal, options.allowCreation)
     const workspaces = await this.listWorkspaces(principal)
     return {
       mode: 'cloud',
@@ -122,7 +125,7 @@ export class WorkspaceRepository {
    * derived from the principal so concurrent first-time requests converge on exactly one workspace
    * instead of racing to create duplicates.
    */
-  private async ensureDefaultWorkspace(principal: AuthenticatedPrincipal): Promise<void> {
+  private async ensureDefaultWorkspace(principal: AuthenticatedPrincipal, allowCreation?: () => Promise<boolean>): Promise<void> {
     const workspaceId = defaultPersonalWorkspaceId(principal.principalKey)
     if (await this.directory.getMetadata(workspaceId)) {
       await this.initializeDefaultWorkspace(principal, false)
@@ -131,7 +134,7 @@ export class WorkspaceRepository {
     // A stale first-use request must not prepare new state after another tab deletes the default.
     for (let attempt = 0; attempt < 100; attempt++) {
       try {
-        await withWorkspaceMutationLease(this.state, workspaceId, () => this.initializeDefaultWorkspace(principal, true))
+        await withWorkspaceMutationLease(this.state, workspaceId, () => this.initializeDefaultWorkspace(principal, true, allowCreation))
         return
       } catch (error) {
         if (!(error instanceof StoreConflictError)) throw error
@@ -145,7 +148,9 @@ export class WorkspaceRepository {
     throw unavailable('Workspace initialization is still in progress. Retry shortly; no existing content has been replaced.')
   }
 
-  private async initializeDefaultWorkspace(principal: AuthenticatedPrincipal, allowCreation: boolean): Promise<void> {
+  private async initializeDefaultWorkspace(
+    principal: AuthenticatedPrincipal, allowCreation: boolean, checkCreationPolicy?: () => Promise<boolean>,
+  ): Promise<void> {
     const workspaceId = defaultPersonalWorkspaceId(principal.principalKey)
     const membershipId = membershipIdFor(principal.principalKey)
     const existingMetadata = await this.directory.getMetadata(workspaceId)
@@ -167,6 +172,7 @@ export class WorkspaceRepository {
       return
     }
     if (!allowCreation) throw unavailable('The workspace directory changed during initialization. Retry without recreating saved content.')
+    if (checkCreationPolicy && !await checkCreationPolicy()) return
 
     const timestamp = this.now()
     const metadata: WorkspaceMetadataDoc = {

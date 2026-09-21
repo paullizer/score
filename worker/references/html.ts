@@ -5,6 +5,7 @@ import { normalizeText, WorkerError } from '../runtime'
 import { isOpmUrl, referenceUrl } from './transport'
 import { referenceTableRows } from './tables'
 import type { ReferenceCell } from './tables'
+import type { AdminSettings } from '../../src/domain/admin-settings'
 
 const BLOCKS = new Set(['P', 'LI', 'DT', 'DD', 'PRE', 'BLOCKQUOTE', 'FIGCAPTION'])
 const IGNORED = 'script,style,noscript,template,svg,canvas,iframe,object,embed,base,nav,header,footer,aside,form,[role="navigation"],.usa-sidenav,.usa-breadcrumb,.opm-breadcrumbs,.breadcrumb,.back-to-top,.print-controls'
@@ -19,7 +20,7 @@ export function referenceRelation(label: string, url: string, context = ''): Ref
   return 'background'
 }
 
-export function referenceLinks(root: Element, url: string): { links: ReferenceLink[]; warnings: string[] } {
+export function referenceLinks(root: Element, url: string, maxLinks = 2_000): { links: ReferenceLink[]; warnings: string[] } {
   const links: ReferenceLink[] = []
   const warnings: string[] = []
   const seen = new Set<string>()
@@ -31,7 +32,7 @@ export function referenceLinks(root: Element, url: string): { links: ReferenceLi
       const label = normalizeText(anchor.textContent ?? '') || target
       const key = `${target}\n${label}`
       if (seen.has(key)) continue
-      if (links.length >= 2_000) throw new WorkerError('reference-link-budget', 'The source contains more than 2,000 links; select a narrower section.', false, 'parsing')
+      if (links.length >= maxLinks) throw new WorkerError('reference-link-budget', `The source contains more than ${maxLinks} links; select a narrower section.`, false, 'parsing')
       seen.add(key)
       links.push({
         url: target,
@@ -144,14 +145,14 @@ function htmlTable(table: HTMLTableElement) {
   return rows.length && columns ? referenceTableRows(cells, rows.length, columns) : []
 }
 
-export function enforceReferenceCharacters(paragraphs: ReferenceParagraph[]): void {
+export function enforceReferenceCharacters(paragraphs: ReferenceParagraph[], maxCharacters: number = GRADE_LADDER_LIMITS.maxSourceCharacters): void {
   const characters = paragraphs.reduce((sum, paragraph) => sum + paragraph.text.length + paragraph.heading.length, 0)
-  if (characters > GRADE_LADDER_LIMITS.maxSourceCharacters) {
-    throw new WorkerError('reference-too-long', 'Reference extraction exceeds 2,000,000 characters. Select fewer pages or a narrower section; no text was silently truncated.', false, 'parsing')
+  if (characters > maxCharacters) {
+    throw new WorkerError('reference-too-long', `Reference extraction exceeds ${maxCharacters} characters. Select fewer pages or a narrower section; no text was silently truncated.`, false, 'parsing')
   }
 }
 
-export function extractReferenceHtml(html: string, url: string, title: string, intendedSection?: string): {
+export function extractReferenceHtml(html: string, url: string, title: string, intendedSection?: string, limits?: AdminSettings['grades']['references']): {
   paragraphs: ReferenceParagraph[]
   links: ReferenceLink[]
   warnings: string[]
@@ -160,7 +161,7 @@ export function extractReferenceHtml(html: string, url: string, title: string, i
   const dom = new JSDOM(html, { url })
   try {
     const root = referenceContent(dom.window.document, url, intendedSection)
-    const { links, warnings } = referenceLinks(root, url)
+    const { links, warnings } = referenceLinks(root, url, limits?.maxLinks)
     const paragraphs: ReferenceParagraph[] = []
     const headings: string[] = [title]
     let sectionId = intendedSection?.replace(/^#/, '')
@@ -217,7 +218,7 @@ export function extractReferenceHtml(html: string, url: string, title: string, i
       flush()
     }
     walk(root)
-    enforceReferenceCharacters(paragraphs)
+    enforceReferenceCharacters(paragraphs, limits?.maxSourceCharacters)
     const text = paragraphs.map(paragraph => paragraph.text).join('\n')
     if (/\b(?:draft|insert (?:date|link)|TBD|placeholder|XX\/XX|MONTH DD)\b/i.test(text)) {
       warnings.push('This source contains draft or placeholder language; reconcile it with the linked issuance/effective-version evidence before relying on it.')

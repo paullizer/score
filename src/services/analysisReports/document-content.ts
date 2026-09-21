@@ -13,6 +13,7 @@ import {
 import type { ReadableCriterion } from './readable'
 import { reportReviewLinks, validatedReportLinkContext } from './links'
 import { assertReportResourceLimits } from './model'
+import { reportGenerationPolicy, reportLimits, reportPolicyTitle } from './policy'
 import {
   candidateNarrativeDisclosures, candidateNarrativeOverview, candidateNarrativeText, reportTargetPresentation,
   requireReportNarratives, targetNarrativeDisclosures, targetNarrativeParagraphs,
@@ -29,8 +30,9 @@ interface TargetSection {
 }
 
 function writeIntroduction<Color>(layout: DocumentReportLayout<Color>, report: AnalysisReport, sections: TargetSection[]): void {
-  layout.startSection({ section: 'Introduction', primary: REPORT_TITLE, secondary: 'Saved analysis scope' })
-  layout.paragraph(REPORT_TITLE, { size: 23, bold: true, leading: 32, after: 8, headingLevel: 1 })
+  const title = reportPolicyTitle(report)
+  layout.startSection({ section: 'Introduction', primary: title, primaryFallback: REPORT_TITLE, secondary: 'Saved analysis scope' })
+  layout.paragraph(title, { size: 23, bold: true, leading: 32, after: 8, headingLevel: 1 })
   layout.paragraph(report.run.name, { size: 13, leading: 18, bold: true, after: 8 })
   if (report.dataKind === 'sample') {
     layout.paragraph(REPORT_SAMPLE_NOTICE, { size: 9.5, leading: 14, bold: true, color: layout.colors.accent, after: 7 })
@@ -239,7 +241,8 @@ function writeComparison<Color>(
 export function writeDocumentReport<Color>(
   layout: DocumentReportLayout<Color>, report: AnalysisReport, options?: ReportGenerationOptions,
 ): void {
-  assertReportResourceLimits(report)
+  const policy = reportGenerationPolicy(report)
+  assertReportResourceLimits(report, reportLimits(policy).maxInputBytes)
   requireReportNarratives(report)
   validatedReportLinkContext(report, options)
   const sections = report.groups.filter(group => group.comparisons.some(comparison => comparison.status === 'complete'))
@@ -254,5 +257,9 @@ export function writeDocumentReport<Color>(
     writeTargetOverview(layout, report, section, options)
     highlightedComparisons(section.group).forEach((comparison, index) => writeComparison(layout, report, section, comparison, index, options))
     writeCandidatesAtAGlance(layout, report, section, options)
+  }
+  if (policy.additionalFooter) {
+    layout.heading('Additional report notice', 13)
+    layout.paragraph(policy.additionalFooter, { size: 9.5, leading: 14, color: layout.colors.muted, after: 8 })
   }
 }

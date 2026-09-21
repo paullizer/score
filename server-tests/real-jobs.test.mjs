@@ -3,7 +3,8 @@ import { createHash, randomUUID } from 'node:crypto'
 import { createServer } from 'node:http'
 import test from 'node:test'
 import { gzipSync } from 'node:zlib'
-import { createApp, StoreConflictError } from '../dist-server/app.mjs'
+import { createApp, StoreConflictError, createDefaultAdminSettings, captureProcessingSettings } from '../dist-server/app.mjs'
+import { PDFDocument } from 'pdf-lib'
 import {
   ALLOWED_OID,
   APP_ORIGIN,
@@ -31,16 +32,17 @@ function clone(value) {
   return structuredClone(value)
 }
 
-async function startRealJobsServer() {
+async function startRealJobsServer(settings, runtimeEnabled = true) {
   const directory = createFakeDirectoryStore()
   const state = createFakeStateStore()
   const jobs = createFakeRealJobs()
-  const config = baseConfig({ realJobs: REAL_JOBS_CONFIG })
+  const config = baseConfig({ realJobs: REAL_JOBS_CONFIG, ...(settings ? { settings: { runtimeEnabled } } : {}) })
   const app = createApp({
     config,
     directory,
     state,
     jobs: { store: jobs.store, blobs: jobs.blobs },
+    settings,
     now: () => new Date('2026-09-17T14:00:00.000Z'),
   })
   const server = createServer(app)
@@ -54,11 +56,105 @@ async function startRealJobsServer() {
     directory,
     state,
     jobs,
+    config,
     async close() {
       await new Promise((resolve) => server.close(resolve))
     },
   }
 }
+
+test('job policy rejects direct feature/format/URL/size/page bypass and restricts original bytes without granting workspace access', async () => {
+    let value = createDefaultAdminSettings(), outage = false, reads = 0
+    const settings = { async capture() {
+      reads++
+      if (outage) throw new Error('Settings unavailable')
+      return captureProcessingSettings(value, 'job-policy-one', '2026-09-17T14:00:00.000Z')
+    } }
+    const server = await startRealJobsServer(settings)
+    try {
+      const workspace = await bootstrap(server)
+      value.features.jobImports = false
+      assert.equal((await importPdf(server, workspace.id)).status, 503)
+      value.features.jobImports = true
+      value.maintenance.pauseNewWork = true
+      assert.equal((await importMarkdown(server, workspace.id)).status, 503)
+      value.maintenance.pauseNewWork = false
+      value.imports.jobs.allowedFormats = ['pdf']
+      assert.equal((await importMarkdown(server, workspace.id)).status, 403)
+      value.imports.jobs.allowUrls = false
+      assert.equal((await importUrl(server, workspace.id, 'https://example.com/role')).status, 403)
+      value.imports.jobs.allowUrls = true
+      value.imports.urls.requireHttps = true
+      assert.equal((await importUrl(server, workspace.id, 'http://example.com/role')).status, 400)
+      value.imports.urls.jobs.blockedHosts = [{ hostname: 'example.com', includeSubdomains: true }]
+      assert.equal((await importUrl(server, workspace.id, 'https://sub.example.com/role')).status, 400)
+      value = createDefaultAdminSettings()
+      value.imports.jobs.maxFileBytes = 10
+      assert.equal((await importPdf(server, workspace.id)).status, 413)
+      value.imports.jobs.maxFileBytes = 10 * 1024 * 1024
+      value.imports.jobs.maxPdfPages = 1
+      const pdf = await PDFDocument.create()
+      pdf.addPage(); pdf.addPage()
+      assert.equal((await importPdf(server, workspace.id, { bytes: await pdf.save() })).status, 400)
+      value.imports.jobs.maxPdfPages = 50
+      const key = randomUUID()
+      const response = await importPdf(server, workspace.id, { key })
+      assert.equal(response.status, 202, await response.clone().text())
+      const accepted = (await response.json()).job
+      const current = await server.jobs.store.get(workspace.id, accepted.job.id)
+      assert.equal(current.record.processingSettings.revision, 'job-policy-one')
+      const path = `${server.baseUrl}/api/workspaces/${workspace.id}/jobs/${accepted.job.id}`
+      value.documents.originalDownloadRoles = ['owner']
+      assert.equal((await fetch(`${path}/original`, { headers: authHeaders({ oid: OTHER_ALLOWED_OID }) })).status, 404)
+      server.directory._addMembership(workspace.id, membershipFor(workspace.id, { oid: OTHER_ALLOWED_OID, role: 'viewer' }))
+      assert.equal((await fetch(`${path}/original`, { headers: authHeaders({ oid: OTHER_ALLOWED_OID }) })).status, 403)
+      assert.equal((await fetch(path, { headers: authHeaders({ oid: OTHER_ALLOWED_OID }) })).status, 200)
+      value.documents.formattedDocxPreviewEnabled = false
+      assert.equal((await fetch(`${path}/original?preview=formatted`, { headers: authHeaders() })).status, 403)
+      assert.equal((await fetch(`${path}/original`, { headers: authHeaders() })).status, 200)
+      value.features.jobImports = false
+      const before = reads
+      assert.equal((await importPdf(server, workspace.id, { key })).status, 200)
+      assert.equal(reads, before)
+      outage = true
+      assert.equal((await importPdf(server, workspace.id)).status, 503)
+      assert.equal((await fetch(path, { headers: authHeaders() })).status, 200)
+      assert.equal((await fetch(`${path}/original`, { headers: authHeaders() })).status, 503)
+      assert.equal((await fetch(`${path}/cancel`, { method: 'POST', headers: writeHeaders() })).status, 200)
+      assert.equal((await fetch(`${path}/retry`, { method: 'POST', headers: writeHeaders() })).status, 200)
+      assert.deepEqual((await server.jobs.store.get(workspace.id, accepted.job.id)).record.processingSettings, current.record.processingSettings)
+    } finally { await server.close() }
+})
+
+test('configured job rollout blocks new admissions without weakening saved download policy or accepted retries', async () => {
+  const value = createDefaultAdminSettings()
+  value.documents.originalDownloadRoles = ['owner']
+  value.documents.formattedDocxPreviewEnabled = false
+  const settings = { async capture() { return captureProcessingSettings(value, 'job-rollout-policy', '2026-09-17T14:00:00.000Z') } }
+  const server = await startRealJobsServer(settings, false)
+  try {
+    const workspace = await bootstrap(server)
+    assert.equal((await importPdf(server, workspace.id)).status, 503)
+    assert.equal((await importUrl(server, workspace.id, 'https://example.com/role')).status, 503)
+    server.config.settings.runtimeEnabled = true
+    const key = randomUUID()
+    const pinned = (await (await importPdf(server, workspace.id, { key })).json()).job
+    const captured = (await server.jobs.store.get(workspace.id, pinned.job.id)).record.processingSettings
+    assert.equal(captured.revision, 'job-rollout-policy')
+    server.config.settings.runtimeEnabled = false
+    const path = `${server.baseUrl}/api/workspaces/${workspace.id}/jobs/${pinned.job.id}`
+    server.directory._addMembership(workspace.id, membershipFor(workspace.id, { oid: OTHER_ALLOWED_OID, role: 'viewer' }))
+    assert.equal((await fetch(`${path}/original`, { headers: authHeaders({ oid: OTHER_ALLOWED_OID }) })).status, 403)
+    assert.equal((await fetch(`${path}/original?preview=formatted`, { headers: authHeaders() })).status, 403)
+    assert.equal((await fetch(`${path}/original`, { headers: authHeaders() })).status, 200)
+    assert.equal((await fetch(path, { headers: authHeaders({ oid: OTHER_ALLOWED_OID }) })).status, 200)
+    assert.equal((await importPdf(server, workspace.id, { key })).status, 200)
+    assert.equal((await fetch(`${path}/cancel`, { method: 'POST', headers: writeHeaders() })).status, 200)
+    assert.equal((await fetch(`${path}/retry`, { method: 'POST', headers: writeHeaders() })).status, 200)
+    assert.deepEqual((await server.jobs.store.get(workspace.id, pinned.job.id)).record.processingSettings, captured)
+    assert.equal((await importPdf(server, workspace.id)).status, 503)
+  } finally { await server.close() }
+})
 
 async function bootstrap(server, oid = ALLOWED_OID) {
   const response = await fetch(`${server.baseUrl}/api/session`, { headers: authHeaders({ oid }) })
@@ -663,7 +759,12 @@ test('a URL source resolved as PDF downloads as a PDF attachment without changin
 })
 
 test('rubric edits require grounded citations and append an immutable version under job ETag CAS', async () => {
-  const server = await startRealJobsServer()
+  const policy = createDefaultAdminSettings()
+  let outage = false
+  const server = await startRealJobsServer({ async capture() {
+    if (outage) throw new Error('Settings unavailable')
+    return captureProcessingSettings(policy, 'rubric-policy', '2026-09-17T14:00:00.000Z')
+  } })
   try {
     const workspace = await bootstrap(server)
     const imported = await importPdf(server, workspace.id)
@@ -758,6 +859,25 @@ test('rubric edits require grounded citations and append an immutable version un
     })
     assert.equal(stale.status, 409)
     assert.equal((await server.jobs.store.listRubrics(workspace.id, jobId)).length, 2)
+    const update = (rubric, etag) => fetch(`${server.baseUrl}/api/workspaces/${workspace.id}/jobs/${jobId}/rubric`, {
+      method: 'PUT', headers: writeHeaders(ALLOWED_OID, { 'content-type': 'application/json', 'if-match': etag }),
+      body: JSON.stringify({ rubric }),
+    })
+    const larger = { ...detail.rubric, criteria: [
+      { ...detail.rubric.criteria[0], weight: 50 },
+      { ...detail.rubric.criteria[0], id: 'criterion-2', label: 'Additional supported criterion', weight: 50 },
+    ] }
+    const expanded = await update(larger, detail.etag)
+    assert.equal(expanded.status, 200, await expanded.clone().text())
+    const existingLarger = (await expanded.json()).job
+    policy.rubrics.jobs.maxCriteria = 1
+    const addition = { ...existingLarger.rubric, criteria: [
+      ...existingLarger.rubric.criteria.map(criterion => ({ ...criterion, weight: 33 })),
+      { ...existingLarger.rubric.criteria[0], id: 'criterion-3', label: 'New criterion', weight: 34 },
+    ] }
+    assert.equal((await update(addition, existingLarger.etag)).status, 400)
+    outage = true
+    assert.equal((await update({ ...existingLarger.rubric, name: 'Historical larger rubric edit' }, existingLarger.etag)).status, 200)
   } finally {
     await server.close()
   }

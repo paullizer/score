@@ -1,6 +1,8 @@
 import { createHash } from 'node:crypto'
 import ipaddr from 'ipaddr.js'
 import { z } from 'zod'
+import { processingSettingsSnapshotSchema } from '../../src/domain/admin-settings-schema'
+import { MODEL_TASK_IDS } from '../../src/domain/admin-settings-tasks'
 import {
   RESUME_IMPORT_LIMITS as LIMITS,
   type ImmutableBlobReference, type RealResumeDocument, type RealResumeProfile, type RealResumeRecord,
@@ -224,7 +226,10 @@ const processingError = z.strictObject({
 const duplicate = z.strictObject({
   kind: z.enum(['exact-content', 'same-source']), resumeId, message: text(1000),
 })
-const base = { workspaceId, dataKind: z.literal('real'), createdAt: timestamp, updatedAt: timestamp }
+const base = {
+  workspaceId, dataKind: z.literal('real'), createdAt: timestamp, updatedAt: timestamp,
+  processingSettings: processingSettingsSnapshotSchema.optional(),
+}
 const resumeRecord = z.strictObject({
   ...base, id: resumeId, recordType: z.literal('resume'),
   displayName: z.string().refine(isNormalizedDisplayName, 'Invalid normalized display name.').optional(),
@@ -396,7 +401,10 @@ const profileSchema = z.strictObject({
   schemaVersion: z.literal(1), dataKind: z.literal('real'), workspaceId, resumeId, documentId,
   documentVersion: version, documentSha256: sha256,
   name: profileField, role: profileField, location: profileField, experience: profileField,
-  provenance: z.strictObject({ model: text(300), promptVersion: text(200), schemaVersion: text(200), extractedAt: timestamp }),
+  provenance: z.strictObject({
+    model: text(300), promptVersion: text(200), schemaVersion: text(200), extractedAt: timestamp,
+    settingsRevision: text(128).optional(), task: z.enum(MODEL_TASK_IDS).optional(), deployment: text(200).optional(),
+  }),
 })
 
 export function parseRealResumeProfile(value: unknown): RealResumeProfile {
@@ -440,6 +448,7 @@ export function validateRealResumeProfile(
 
 const captureManifestSchema = z.strictObject({
   schemaVersion: z.literal(1), dataKind: z.literal('real'), workspaceId, resumeId, inputFingerprint: sha256, source, capture,
+  processingSettings: processingSettingsSnapshotSchema.optional(),
 })
 
 export function parseResumeCaptureManifest(value: unknown): ResumeCaptureManifest {

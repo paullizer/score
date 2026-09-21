@@ -1,4 +1,6 @@
 import { z } from 'zod'
+import { processingSettingsSnapshotSchema } from '../../src/domain/admin-settings-schema'
+import { MODEL_TASK_IDS } from '../../src/domain/admin-settings-tasks'
 import {
   ANALYSIS_NARRATIVE_LIMITS, type AnalysisCandidateNarrativeModelInput, type AnalysisNarrativePublicationReference,
   type AnalysisTargetNarrativeModelInput, type RealAnalysisCandidateNarrativeArtifact,
@@ -19,6 +21,7 @@ import {
   isAnalysisId, MAX_ANALYSIS_JSON_BYTES,
 } from './validation'
 import { WORKSPACE_ID_PATTERN } from '../ids'
+import { preservesProcessingSettings } from '../jobs/policy'
 
 const timestamp = z.iso.datetime({ precision: 3 })
 const hash = z.string().regex(/^[a-f0-9]{64}$/)
@@ -54,6 +57,7 @@ const targetBinding = z.strictObject({
 const modelProvenance = z.strictObject({
   model: text, deployment: text, promptVersion: text, schemaVersion: text,
   startedAt: timestamp, completedAt: timestamp, inputCharacters: z.number().int().min(0),
+  settingsRevision: text.optional(), task: z.enum(MODEL_TASK_IDS).optional(),
 })
 const provenance = z.strictObject({
   attemptId: z.string().uuid(), outputSha256: hash, generation: modelProvenance,
@@ -70,6 +74,7 @@ const artifactBase = {
   schemaVersion: z.literal(1), dataKind: z.literal('real'), createdAt: timestamp,
   generationId: z.string().uuid(), requestId: z.string().uuid(), inputFingerprint: hash,
   humanReviewRequired: z.literal(true), provenance, previousPublication: publication.optional(),
+  processingSettings: processingSettingsSnapshotSchema.optional(),
 }
 const legacyArtifactSchema = z.discriminatedUnion('kind', [
   z.strictObject({ ...artifactBase, kind: z.literal('candidate'), binding: candidateBinding, ...candidateNarrativeOutputSchema.shape }),
@@ -229,6 +234,10 @@ export async function readAnalysisNarrativePublication(
     (!artifact.previousPublication || referenceMatches(artifact.previousPublication) &&
       artifact.previousPublication.generationId !== artifact.generationId && artifact.previousPublication.publishedAt <= artifact.createdAt),
   'Narrative publication crossed its frozen identity or generation.')
+  if (artifact.generationId === record.generationId) {
+    assertAnalysis(preservesProcessingSettings(artifact.processingSettings, record.processingSettings),
+      'Narrative publication changed its accepted generation settings.')
+  }
   if (record.recordType === 'analysis-candidate-narrative') assertAnalysis(artifact.kind === 'candidate' &&
     artifact.binding.comparisonId === record.comparisonId && artifact.binding.resultSha256 === record.resultSha256 &&
     analysisHash(artifact.binding.resumeSnapshot) === analysisHash(record.resumeSnapshot), 'Narrative publication has a different candidate result.')

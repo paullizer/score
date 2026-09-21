@@ -1,20 +1,122 @@
+import { randomBytes } from 'node:crypto'
 import {
   ANALYSIS_REPORT_SCHEMA_VERSION, REPORT_LIMITS,
+  type AnalysisReportFormat, type ReportSettingsCapture,
   type RealReportBatchResponse, type RealReportComparison, type RealReportTarget,
   type ReportCitation, type ReportCitationSource, type ReportFact,
 } from '../../src/domain/analysis-reports'
 import { documentPagination } from '../../src/domain/document-formats'
 import type {
-  FrozenRealAnalysisTargetSnapshot, RealAnalysisComparisonRecord, RealAnalysisResult, RealAnalysisRunRecord,
+  FrozenRealAnalysisTargetSnapshot, RealAnalysisComparisonRecord, RealAnalysisInitializationManifest,
+  RealAnalysisResult, RealAnalysisRunRecord,
 } from '../../src/domain/real-analyses'
+import type { ProcessingSettingsSnapshot } from '../../src/domain/admin-settings'
+import type { WorkspaceRole } from '../../src/domain/cloud'
 import type { Citation } from '../../src/domain/types'
 import { gradeSourcePagination } from '../../src/features/grade-ladders/gradeUi'
 import { createReportCitation, parseRealReportBatchResponse } from '../../src/services/analysisReports/model'
 import { unavailableOverallScore } from '../../src/services/analysisReports/presentation'
-import { invalidRequest } from '../errors'
+import { forbidden, invalidRequest, notFound, unavailable } from '../errors'
 import { createAnalysisSnapshotReader, type AnalysisSnapshots } from './snapshots'
 import type { AnalysisBlobStore } from './store'
 import { analysisHash, assertAnalysis, reportComparisonIdsSchema } from './validation'
+
+interface ReportCaptureOperation {
+  workspaceId: string
+  runId: string
+  manifestSha256: string
+  actor: string
+  format: AnalysisReportFormat
+  targetId: string | null
+  settings: ReportSettingsCapture
+  comparisonIds: Set<string>
+  expiresAt: number
+  activeBatches: number
+  bytes: number
+  delivered: Set<string>
+}
+
+/** Short-lived local exports are not scoring work; a restart explicitly requires a new capture. */
+export class AnalysisReportCaptures {
+  private readonly operations = new Map<string, ReportCaptureOperation>()
+  constructor(private readonly clock: () => Date = () => new Date()) {}
+
+  capture(
+    snapshot: ProcessingSettingsSnapshot, role: WorkspaceRole, actor: string,
+    run: RealAnalysisRunRecord, manifest: RealAnalysisInitializationManifest,
+    format: AnalysisReportFormat, targetId?: string,
+  ) {
+    const policy = structuredClone(snapshot.settings.reports)
+    if (!policy.allowedRoles.includes(role)) throw forbidden('Application policy does not allow your workspace role to export reports.')
+    if (!policy.enabledFormats.includes(format)) throw forbidden('This report format is disabled by application policy.')
+    const target = targetId === undefined ? undefined : manifest.targets.find(target => target.summary.id === targetId)
+    if (targetId !== undefined && !target) throw invalidRequest('Select an exact target in this saved analysis.')
+    const selected = manifest.comparisons.filter(pair => !target || pair.targetSnapshotId === target.snapshotId)
+    if (selected.length > policy.maxComparisons) {
+      throw invalidRequest(`This export exceeds the ${policy.maxComparisons}-comparison report limit. Select a narrower exact target; no evidence was omitted.`)
+    }
+    const now = this.clock().getTime()
+    for (const [key, value] of this.operations) if (value.expiresAt <= now && value.activeBatches === 0) this.operations.delete(key)
+    if (this.operations.size >= 256) throw unavailable('The report capture service is busy. Retry after an active export finishes.')
+    const captureToken = randomBytes(32).toString('base64url')
+    const settings = { revision: snapshot.revision, policy }
+    this.operations.set(captureToken, {
+      workspaceId: run.workspaceId, runId: run.id, manifestSha256: run.manifest.sha256, actor, format,
+      targetId: targetId ?? null, settings, comparisonIds: new Set(selected.map(pair => pair.id)),
+      expiresAt: now + policy.maxGenerationMilliseconds, activeBatches: 0, bytes: 0, delivered: new Set(),
+    })
+    return {
+      schemaVersion: ANALYSIS_REPORT_SCHEMA_VERSION, dataKind: 'real' as const,
+      workspaceId: run.workspaceId, runId: run.id, format, settings, captureToken,
+    }
+  }
+
+  begin(
+    captureToken: string, workspaceId: string, runId: string, actor: string, role: WorkspaceRole,
+    comparisonIds: readonly string[], query: { format?: string; settingsRevision?: string; targetId?: string } = {},
+  ) {
+    const operation = this.operations.get(captureToken)
+    if (!operation || operation.workspaceId !== workspaceId || operation.runId !== runId || operation.actor !== actor) {
+      throw invalidRequest('The report capture is unavailable or belongs to a different export. Start a new export.')
+    }
+    if (operation.expiresAt <= this.clock().getTime()) throw invalidRequest('The report operation expired. Start a new export.')
+    if (!operation.settings.policy.allowedRoles.includes(role)) {
+      throw forbidden('Your current workspace role is not authorized by this export policy.')
+    }
+    if (query.format !== undefined && query.format !== operation.format ||
+      query.settingsRevision !== undefined && query.settingsRevision !== operation.settings.revision ||
+      query.targetId !== undefined && query.targetId !== operation.targetId) {
+      throw invalidRequest('The report request changed its captured format, settings revision, or selected target.')
+    }
+    if (comparisonIds.length > operation.settings.policy.batchComparisons) throw invalidRequest('The requested report batch exceeds its captured size.')
+    if (comparisonIds.some(id => !operation.comparisonIds.has(id))) throw notFound('The comparison is not in this captured report scope.')
+    if (operation.activeBatches >= operation.settings.policy.maxConcurrentBatches) {
+      throw unavailable('This export already has its allowed number of report batches in progress.')
+    }
+    operation.activeBatches++
+    let finished = false
+    return {
+      settings: structuredClone(operation.settings),
+      manifestSha256: operation.manifestSha256,
+      finish: (response?: RealReportBatchResponse) => {
+        if (finished) return
+        finished = true
+        operation.activeBatches--
+        if (!response) return
+        if (operation.expiresAt <= this.clock().getTime()) throw invalidRequest('The report operation expired. Start a new export.')
+        const key = [...comparisonIds].sort().join(',')
+        if (!operation.delivered.has(key)) {
+          const bytes = Buffer.byteLength(JSON.stringify(response))
+          if (operation.bytes + bytes > operation.settings.policy.maxInputBytes) {
+            throw invalidRequest('This export exceeds its captured input-byte budget. Select a narrower exact target; no evidence was omitted.')
+          }
+          operation.bytes += bytes
+          operation.delivered.add(key)
+        }
+      },
+    }
+  }
+}
 
 function targetFacts(target: FrozenRealAnalysisTargetSnapshot): ReportFact[] {
   const rubric = target.kind === 'job' ? target.rubric : target.version.rubric
@@ -188,16 +290,19 @@ function reportComparison(
 export async function readAnalysisReportComparisons(
   blobs: Pick<AnalysisBlobStore, 'read'>, run: RealAnalysisRunRecord,
   comparisons: readonly RealAnalysisComparisonRecord[], signal?: AbortSignal,
+  settings?: ReportSettingsCapture,
 ): Promise<RealReportBatchResponse> {
   assertAnalysis(reportComparisonIdsSchema.safeParse(comparisons.map(comparison => comparison.id)).success,
     'A report batch requires distinct, bounded comparison IDs.')
   const reader = createAnalysisSnapshotReader(blobs, run, {
-    maxComparisons: REPORT_LIMITS.batchComparisons, maxBytes: REPORT_LIMITS.maxOutputBytes, signal,
+    maxComparisons: settings?.policy.batchComparisons ?? REPORT_LIMITS.batchComparisons,
+    maxBytes: settings?.policy.maxInputBytes ?? REPORT_LIMITS.maxOutputBytes, signal,
   })
   const targets = new Map<string, RealReportTarget>()
   const response: RealReportBatchResponse = {
     schemaVersion: ANALYSIS_REPORT_SCHEMA_VERSION, dataKind: 'real', workspaceId: run.workspaceId, runId: run.id,
     targets: [], comparisons: [],
+    ...(settings ? { settings } : {}),
   }
   let outputBytes = Buffer.byteLength(JSON.stringify(response))
   // Sequential pairs cap live result/source allocations; the two snapshot reads can overlap.
@@ -215,7 +320,7 @@ export async function readAnalysisReportComparisons(
     }
     const normalized = reportComparison(comparison, snapshots, result)
     outputBytes += Buffer.byteLength(JSON.stringify(normalized)) + 1
-    if (outputBytes > REPORT_LIMITS.maxBatchBytes) {
+    if (outputBytes > Math.min(REPORT_LIMITS.maxBatchBytes, settings?.policy.maxInputBytes ?? REPORT_LIMITS.maxInputBytes)) {
       throw invalidRequest('The saved evidence exceeds the report batch output limit. Narrow the export to one exact job/grade target; no comparisons or quotations were omitted.')
     }
     response.comparisons.push(normalized)

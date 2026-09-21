@@ -8,7 +8,8 @@ import { HttpError, invalidRequest, notFound, preconditionRequired, unavailable 
 import type { RealJobsDeps } from '../jobs/routes'
 import { isUuid } from '../jobs/validation'
 import type { WorkspaceRepository } from '../repository'
-import { getPrincipal } from '../request-context'
+import { getPrincipal, getRequestSettings } from '../request-context'
+import { assertOriginalDownload, requestProcessingSettings } from '../jobs/policy'
 import { GradeService, requireGradePathId, type RealGradesDeps } from './service'
 import type { LifecycleDependencies } from '../lifecycle/contracts'
 import { GradeLifecycleService } from './lifecycle'
@@ -130,9 +131,9 @@ export function createRealGradesRouter(deps: GradeRouterDeps): Router {
   const base = '/workspaces/:workspaceId/grade-ladders'
   const service = deps.grades ? new GradeService(deps.grades, deps.jobs, deps.now) : undefined
   const lifecycle = deps.grades ? new GradeLifecycleService(deps.grades, deps.lifecycle, deps.now) : undefined
-  const requireService = () => {
+  const requireService = (req?: Request) => {
     if (!service) throw unavailable('Real grade ladders are not enabled for this deployment.')
-    return service
+    return req ? new GradeService(deps.grades!, deps.jobs, deps.now, requestProcessingSettings(req)) : service
   }
   const authorize: RequestHandler = async (req, _res, next) => {
     try {
@@ -153,7 +154,7 @@ export function createRealGradesRouter(deps: GradeRouterDeps): Router {
   const mutation = (
     callback: (service: GradeService, req: Request) => ReturnType<GradeService['detail']>, status = 200,
   ): RequestHandler => mutating('write', async (req, res) => {
-    const detail = await callback(requireService(), req)
+    const detail = await callback(requireService(req), req)
     res.setHeader('ETag', detail.etag)
     res.status(status).json({ ladder: detail })
   })
@@ -286,6 +287,8 @@ export function createRealGradesRouter(deps: GradeRouterDeps): Router {
     res.json(await requireService().document(workspaceId(req), ladderId(req), sourceId(req), historicalSourceSet(req)))
   })
   router.get(`${base}/:ladderId/sources/:sourceId/original`, async (req, res) => {
+    const role = await deps.repository.authorizeWorkspace(getPrincipal(req), workspaceId(req), 'read')
+    assertOriginalDownload(await getRequestSettings(req), role, req.query.preview === 'formatted')
     const blob = await requireService().original(workspaceId(req), ladderId(req), sourceId(req), historicalSourceSet(req))
     if (!isOriginalContentType(blob.contentType)) throw unavailable('The source original has invalid content metadata.')
     res.setHeader('Content-Type', blob.contentType)

@@ -1,12 +1,14 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { useLocation } from 'react-router-dom'
 import type {
-  AnalysisProcessingFeatures, RealAnalysisComparisonDetail, RealAnalysisComparisonSummary, RealAnalysisRunDetail,
+  AnalysisProcessingFeatures, CreateRealAnalysisInput, RealAnalysisComparisonDetail, RealAnalysisComparisonSummary, RealAnalysisRunDetail,
   RealAnalysisRunSummary, RealAnalysisTargetSummary,
 } from '../domain/real-analyses'
 import type { RealAnalysisSummariesResponse } from '../domain/analysis-narratives'
 import type { AnalysisSummaryHistoryPage, AnalysisSummarySubject, PublishSummaryDraftInput } from '../domain/analysis-summary-history'
 import * as api from '../services/realAnalyses'
+import { assertClientAdmission, clientAdmissionReason, usePublicSettings } from './public-settings-context'
+import { analysisFeaturesWithPolicy, boundedPollingInterval } from '../services/publicSettings'
 import { CloudApiError, CloudConflictError, LifecycleOperationError } from '../services/cloudWorkspace'
 import { lifecycleIsRemoved, isEntityArchived, isEntityRemoved, type LifecycleAction, type LifecycleTarget } from '../domain/lifecycle'
 import { WorkspaceContext, useWorkspace, type PendingLifecycleChange, type RenameEntityTarget } from './workspace-context'
@@ -29,6 +31,10 @@ export function RealAnalysesBridge({ workspaceId, children }: { workspaceId: str
 }
 
 function RealAnalysesProvider({ workspaceId, children }: { workspaceId: string; children: ReactNode }) {
+  const policy = usePublicSettings()
+  const policyRef = useRef(policy)
+  policyRef.current = policy
+  const pollingInterval = boundedPollingInterval(policy.settings)
   const parent = useWorkspace()
   const parentRef = useRef(parent)
   parentRef.current = parent
@@ -58,6 +64,7 @@ function RealAnalysesProvider({ workspaceId, children }: { workspaceId: string; 
   const summaryHistoryScopes = useRef(new Map<string, Pick<AnalysisSummaryHistoryPage, 'etag' | 'capabilities'> & { runId: string; targetId: string }>())
   const pairSummaries = useRef(new Map<string, RealAnalysisComparisonSummary>())
   const createKeys = useRef(new Map<string, string>())
+  const createSubmissions = useRef(new Map<string, { fingerprint: string; retry: () => Promise<RealAnalysisRunSummary> }>())
   const [pendingCount, setPendingCount] = useState(0)
   const [pendingLifecycle, setPendingLifecycleState] = useState<PendingLifecycleChange[]>([])
   const pendingLifecycleRef = useRef(pendingLifecycle)
@@ -68,7 +75,9 @@ function RealAnalysesProvider({ workspaceId, children }: { workspaceId: string; 
   const canWrite = realWorkspaceWritable(parent, workspaceId)
   const mayReviewSummaries = () => {
     const role = parentRef.current.cloud?.workspaces.find(item => item.id === workspaceId)?.role
-    return parentRef.current.cloud?.currentWorkspaceId === workspaceId && (role === 'owner' || role === 'editor')
+    const current = policyRef.current
+    return parentRef.current.cloud?.currentWorkspaceId === workspaceId && (!current.cloud || current.phase === 'ready') &&
+      (role === 'owner' || (role === 'editor' && current.settings?.summaries.historyRoles !== 'owner'))
   }
   const canReviewSummaries = mayReviewSummaries()
   const leaveGuard = useGradeLeaveGuard(false, pendingCount > 0, 'Analysis request (not yet acknowledged)')
@@ -367,6 +376,8 @@ function RealAnalysesProvider({ workspaceId, children }: { workspaceId: string; 
     return () => scope.close()
   }, [refresh, scope])
 
+  useEffect(() => { void refresh() }, [policy.settings?.revision, refresh])
+
   useEffect(() => {
     void refreshTargets()
   }, [location.key, features?.realAnalyses, refreshTargets])
@@ -393,9 +404,9 @@ function RealAnalysesProvider({ workspaceId, children }: { workspaceId: string; 
           if (summary) void ensureComparison(summary.comparison.runId, summary.comparison.id, true)
         }
       }
-    }, 3000)
+    }, pollingInterval)
     return () => window.clearInterval(timer)
-  }, [comparisons, ensureComparison, ensureComparisons, ensureDetail, phase, refresh, summaries])
+  }, [comparisons, ensureComparison, ensureComparisons, ensureDetail, phase, pollingInterval, refresh, summaries])
 
   const scoringRevision = summaries.map((item) => `${item.run.id}:${item.etag}`).join('|')
   useEffect(() => {
@@ -413,9 +424,9 @@ function RealAnalysesProvider({ workspaceId, children }: { workspaceId: string; 
           void ensureNarratives(selected.runId, selected.targetId, true)
         }
       }
-    }, 3000)
+    }, pollingInterval)
     return () => window.clearInterval(timer)
-  }, [ensureNarratives, narratives, phase])
+  }, [ensureNarratives, narratives, phase, pollingInterval])
 
   useEffect(() => {
     const focus = () => {
@@ -476,6 +487,32 @@ function RealAnalysesProvider({ workspaceId, children }: { workspaceId: string; 
     }
   }
 
+  async function submitCreation(input: CreateRealAnalysisInput, key: string, recoveryOnly = false): Promise<RealAnalysisRunSummary> {
+    const fingerprint = JSON.stringify(input)
+    const retained = createSubmissions.current.get(key)
+    if (retained && retained.fingerprint !== fingerprint) {
+      throw new Error('A retained submission can only be retried with its unchanged original name, inputs, and request key. Review selections before making a different request.')
+    }
+    if (recoveryOnly && !retained) throw new Error('No submitted request is retained for this exact input and key. Review the selections before starting a new analysis.')
+    const currentPolicy = policyRef.current
+    if (!retained) {
+      assertClientAdmission(currentPolicy, 'newAnalyses')
+      if (!featuresRef.current?.realAnalyses) throw new Error(creationError ?? 'New analyses are unavailable. Restore source readiness before creating a run; saved runs are unchanged.')
+      const workspace = parentRef.current.workspace
+      if (input.resumes.some((item) => isEntityArchived(workspace, { kind: 'resume', id: item.resumeId }) || isEntityRemoved(workspace, { kind: 'resume', id: item.resumeId }))
+        || input.targets.some((item) => !realTargetAvailable(workspace, item))) throw new Error('Archived or removed inputs cannot start a new analysis. Review all selections; nothing was skipped.')
+    }
+    const result = await mutate(undefined, () => {
+      if (retained) return retained.retry()
+      const submission = api.startRealAnalysisSubmission(workspaceId, input, key, currentPolicy.settings)
+      createSubmissions.current.set(key, { fingerprint, retry: submission.retry })
+      return submission.result
+    }, rememberRun)
+    createSubmissions.current.delete(key)
+    if (createKeys.current.get(fingerprint) === key) createKeys.current.delete(fingerprint)
+    return result
+  }
+
   function commitPair(summary: RealAnalysisComparisonSummary, sequence: number) {
     rememberPair(summary, sequence)
     const current = comparisonsRef.current[summary.comparison.runId]
@@ -488,6 +525,12 @@ function RealAnalysesProvider({ workspaceId, children }: { workspaceId: string; 
     runId: string, subject: AnalysisSummarySubject, action: 'publish' | 'retry', etag: string, input?: PublishSummaryDraftInput,
   ): Promise<RealAnalysisSummariesResponse> {
     if (!mayReviewSummaries()) throw new Error('Only workspace owners and editors can review or change private summary drafts.')
+    if (action === 'publish') {
+      const role = parentRef.current.cloud?.workspaces.find(item => item.id === workspaceId)?.role
+      if (policyRef.current.settings?.summaries.allowManualPublication === false || (policyRef.current.settings?.summaries.manualPublicationRoles === 'owner' && role !== 'owner')) {
+        throw new Error('Manual summary publication is not permitted for your role by current application policy. Published summaries remain readable.')
+      }
+    }
     const historyKey = summaryHistoryKey(runId, subject)
     const history = summaryHistoryScopes.current.get(historyKey)
     const fingerprint = JSON.stringify([runId, subject.kind, subject.subjectId, action, input ?? null])
@@ -520,12 +563,17 @@ function RealAnalysesProvider({ workspaceId, children }: { workspaceId: string; 
   }
 
   const value: RealAnalysesContextValue = {
-    workspaceId, canWrite, canReviewSummaries, phase, features, error, creationError, summaries, targets, refresh, refreshTargets, ensureDetail, ensureComparisons, ensureComparison, ensureNarratives,
+    workspaceId, canWrite, canReviewSummaries, phase, features: features ? {
+      ...analysisFeaturesWithPolicy(features, policy.settings),
+      realAnalyses: features.realAnalyses && !clientAdmissionReason(policy, 'newAnalyses'),
+      analysisSummaryGeneration: features.analysisSummaryGeneration === true && !clientAdmissionReason(policy, 'summaryGeneration'),
+    } : null, error, creationError: clientAdmissionReason(policy, 'newAnalyses') ?? creationError, summaries, targets, refresh, refreshTargets, ensureDetail, ensureComparisons, ensureComparison, ensureNarratives,
     detail: (id) => details[id] ?? { state: 'idle' },
     comparisons: (id) => comparisons[id] ?? { state: 'idle' },
     comparison: (runId, id) => results[pairKey(runId, id)] ?? { state: 'idle' },
     narratives: (runId, targetId) => narratives[narrativeKey(runId, targetId)] ?? { state: 'idle' },
     generateSummaries: async (runId, input, etag) => {
+      assertClientAdmission(policy, 'summaryGeneration')
       if (featuresRef.current?.analysisSummaryGeneration !== true) throw new Error('Summary generation is unavailable. Saved summaries, scores, and frozen evidence remain separate from new-run readiness.')
       const cached = narrativesRef.current[narrativeKey(runId, input.targetId)]
       if (cached?.state !== 'ready' || cached.error || cached.value.etag !== etag) throw new Error('Refresh the selected summary scope before generating summaries.')
@@ -591,15 +639,9 @@ function RealAnalysesProvider({ workspaceId, children }: { workspaceId: string; 
       createKeys.current.set(fingerprint, key)
       return key
     },
-    create: async (input, key) => {
-      if (!featuresRef.current?.realAnalyses) throw new Error(creationError ?? 'New analyses are unavailable. Restore source readiness before creating a run; saved runs are unchanged.')
-      const workspace = parentRef.current.workspace
-      if (input.resumes.some((item) => isEntityArchived(workspace, { kind: 'resume', id: item.resumeId }) || isEntityRemoved(workspace, { kind: 'resume', id: item.resumeId }))
-        || input.targets.some((item) => !realTargetAvailable(workspace, item))) throw new Error('Archived or removed inputs cannot start a new analysis. Review all selections; nothing was skipped.')
-      const result = await mutate(undefined, () => api.createRealAnalysis(workspaceId, input, key), rememberRun)
-      if (createKeys.current.get(JSON.stringify(input)) === key) createKeys.current.delete(JSON.stringify(input))
-      return result
-    },
+    create: (input, key) => submitCreation(input, key),
+    hasRetainedCreation: (input, key) => createSubmissions.current.get(key)?.fingerprint === JSON.stringify(input),
+    recoverCreation: (input, key) => submitCreation(input, key, true),
     retry: (id, input, etag) => mutate(id, () => api.retryRealAnalysis(workspaceId, id, input, etag), (summary, sequence) => { invalidateNarratives(id); rememberRun(summary, sequence) }),
     cancel: (id, etag) => mutate(id, () => api.cancelRealAnalysis(workspaceId, id, etag), (summary, sequence) => { invalidateNarratives(id); rememberRun(summary, sequence) }),
     retryComparison: (runId, id, etag) => mutate(runId, () => api.retryRealAnalysisComparison(workspaceId, runId, id, etag), (summary, sequence) => { invalidateNarratives(runId, summary.comparison.target.summary.id); commitPair(summary, sequence) }),

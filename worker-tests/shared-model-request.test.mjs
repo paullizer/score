@@ -32,7 +32,7 @@ test('shared structured model uses exact injected prompts, schema, model setting
   assert.deepEqual(result, { content: '{"supported":true}', model: 'actual-model' })
 })
 
-test('shared model retains bounded transient retries and model-name fallback', async () => {
+test('shared model retains bounded transient retries and actual response-model provenance', async () => {
   let calls = 0
   const sleeps = []
   const result = await invokeStructuredModel({
@@ -41,12 +41,12 @@ test('shared model retains bounded transient retries and model-name fallback', a
     fetch: async (_url, init) => {
       assert.equal(JSON.parse(init.body).max_completion_tokens, 8192)
       calls += 1
-      return calls === 1 ? new Response('', { status: 429 }) : Response.json({ choices: [{ message: { content: '{}' } }] })
+      return calls === 1 ? new Response('', { status: 429 }) : Response.json({ model: 'actual-model', choices: [{ message: { content: '{}' } }] })
     },
   }, { ...request, maxCompletionTokens: undefined })
   assert.equal(calls, 2)
   assert.deepEqual(sleeps, [500])
-  assert.equal(result.model, 'configured-model')
+  assert.equal(result.model, 'actual-model')
   calls = 0
   await assert.rejects(invokeStructuredModel({
     ...options,

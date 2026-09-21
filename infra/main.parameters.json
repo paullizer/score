@@ -8,6 +8,8 @@
     "tenantId": { "value": "${AZURE_TENANT_ID}" },
     "authClientId": { "value": "${AZURE_AUTH_CLIENT_ID}" },
     "allowedUserId": { "value": "${AZURE_ALLOWED_USER_ID}" },
+    "adminUserIds": { "value": "${AZURE_ADMIN_USER_IDS}" },
+    "additionalModelDeployments": { "value": [] },
     "operatorPrincipalId": { "value": "${AZURE_PRINCIPAL_ID}" },
     "containerImage": { "value": "${AZURE_CONTAINER_IMAGE}" },
     "workerImage": { "value": "${AZURE_WORKER_CONTAINER_IMAGE}" },

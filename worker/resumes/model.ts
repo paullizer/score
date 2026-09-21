@@ -15,6 +15,7 @@ import {
   invokeStructuredModel, systemClock, WorkerError,
   type Clock, type RubricModelOptions, type StructuredModelRequest,
 } from '../runtime'
+import { modelProcessingSettings, RuntimeSettingsError } from '../settings'
 
 export const RESUME_PROFILE_MODEL_VERSIONS = {
   prompt: 'score-resume-profile-v1',
@@ -243,7 +244,7 @@ function groundingErrors(result: ModelProfile, paragraphs: Map<string, DocumentP
 function boundedRequest(user: string): StructuredModelRequest {
   const request: StructuredModelRequest = {
     name: 'resume_profile', schema: JSON_SCHEMA, system: SYSTEM, user,
-    operation: 'resume',
+    operation: 'resume', taskId: 'resumeProfile',
     maxCompletionTokens: RESUME_PROFILE_MODEL_LIMITS.maxCompletionTokens,
   }
   // A byte per token is a conservative upper bound for the deployed GPT tokenizer, including non-ASCII source text.
@@ -345,6 +346,10 @@ async function invokeProfileModel(
     checkCancelled(options.signal)
     if (problem) throw problem
     if (error instanceof ResumeProfileError) throw error
+    if (error instanceof RuntimeSettingsError) {
+      if (error.code === 'model-context-limit') throw contextLimit()
+      throw new ResumeProfileError('invalid-model-output', error.message, false)
+    }
     if (error instanceof WorkerError) {
       if (error.code === 'cancelled') throw new DOMException('Resume profile extraction was cancelled.', 'AbortError')
       if (error.code === 'request-timeout') {
@@ -398,7 +403,9 @@ export async function extractResumeProfile(
   }
   const source = { paragraphs: [...paragraphs.values()].map(paragraph => ({ paragraphId: paragraph.id, text: paragraph.text })) }
   let errors: string[] = []
-  for (let attempt = 0; attempt < 2; attempt += 1) {
+  const processingSettings = modelProcessingSettings(options.model)
+  const corrections = processingSettings?.settings.ai.resumeProfile.maxOutputCorrections ?? 1
+  for (let attempt = 0; attempt <= corrections; attempt += 1) {
     checkCancelled(options.signal)
     const request = boundedRequest(JSON.stringify({
       source,
@@ -410,6 +417,7 @@ export async function extractResumeProfile(
         },
       }),
     }))
+    request.source = JSON.stringify(source)
     const response = await invokeProfileModel(options, request)
     let value: unknown
     try {
@@ -449,6 +457,10 @@ export async function extractResumeProfile(
       experience: savedField(result.experience, capturedDocument, paragraphs),
       provenance: {
         model: response.model,
+        ...(processingSettings ? {
+          settingsRevision: processingSettings.revision, task: processingSettings.tasks.resumeProfile.taskId,
+          deployment: processingSettings.tasks.resumeProfile.deploymentName,
+        } : {}),
         promptVersion: RESUME_PROFILE_MODEL_VERSIONS.prompt,
         schemaVersion: RESUME_PROFILE_MODEL_VERSIONS.schema,
         extractedAt,

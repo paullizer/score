@@ -1,11 +1,44 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import { loadWorker } from './shared-model-loader.mjs'
+import { settingsSnapshot } from './runtime-settings-test-support.mjs'
 import { context, fixture, htmlResponse, OPM_CATALOGS, pdfResponse, qualificationUrl, urls } from './opm-fixtures.mjs'
 import { pdfFixture } from './reference-fixtures.mjs'
 
 const { discoverOpmSources, OPM_CATALOG_VERSION } = await loadWorker('../worker/opm/index.ts')
 const allIssues = result => [...result.issues, ...result.candidates.flatMap(candidate => candidate.issues)]
+
+test('agency business-domain rules do not rewrite the fixed OPM authority scope', async () => {
+  const publicSources = await fixture()
+  const result = await discoverOpmSources(context('1515'), {
+    ...publicSources,
+    processingSettings: settingsSnapshot(settings => {
+      settings.imports.urls.agencyReferences.allowedHosts = [{ hostname: 'agency.example', includeSubdomains: false }]
+    }),
+  })
+  assert.equal(result.seriesStatus, 'listed')
+  assert.ok(result.candidates.some(candidate => candidate.url === urls.math))
+})
+
+test('captured discovery request, document and aggregate-byte limits stop rather than claiming complete coverage', async () => {
+  for (const [change, code] of [
+    [settings => { settings.grades.discovery.maxRequests = 1 }, 'opm-network-budget-exhausted'],
+    [settings => { settings.grades.discovery.maxDocuments = 1 }, 'opm-document-budget-exhausted'],
+    [settings => { settings.grades.discovery.maxBytes = 1 }, 'opm-network-budget-exhausted'],
+  ]) {
+    await assert.rejects(discoverOpmSources(context('1515'), {
+      ...await fixture(), processingSettings: settingsSnapshot(change),
+    }), error => error.code === code)
+  }
+})
+
+test('a captured shorter traversal keeps visible unresolved outgoing-reference issues', async () => {
+  const result = await discoverOpmSources(context('0340'), {
+    ...await fixture(), processingSettings: settingsSnapshot(settings => { settings.grades.discovery.maxHops = 1 }),
+  })
+  assert.ok(allIssues(result).some(issue => issue.code === 'opm-traversal-limit'))
+  assert.ok(result.candidates.every(candidate => candidate.discoveryPath.length <= 2))
+})
 
 test('arbitrary series discovery expands actual family lists instead of relying on demonstration-series mappings', async () => {
   const publicSources = await fixture()

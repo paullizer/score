@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import { Link, useNavigate, useParams, useSearchParams } from 'react-router-dom'
 import { ArrowLeft, Layers3, LoaderCircle, Pencil, Play, RotateCcw, X } from 'lucide-react'
 import { useGradeLadders } from '../../app/grade-ladders-context'
+import { clientAdmissionReason, usePublicSettings } from '../../app/public-settings-context'
 import { useGradeLeaveGuard } from '../../app/grade-navigation-context'
 import type { GradeLadderDetail, GradeLevelDetail, GradeWorkRecord } from '../../domain/real-grades'
 import { Badge, Button, EmptyState, InlineError, PageHeader, SegmentedControl } from '../../components/ui'
@@ -47,6 +48,8 @@ export function GradeLadderPage({ ladderId: givenId }: { ladderId?: string }) {
 
 function GradeLadderWorkspace({ detail, loadError }: { detail: GradeLadderDetail; loadError?: string }) {
   const api = useGradeLadders()!
+  const policy = usePublicSettings()
+  const newWorkReason = clientAdmissionReason(policy, 'gradeLadders') ?? (!api.features?.realGradeLadders ? 'New grade processing is unavailable; saved versions and evidence remain available.' : '')
   const navigate = useNavigate()
   const editable = api.canEdit(detail.ladder.id)
   const analyses = useRealAnalyses()
@@ -109,7 +112,7 @@ function GradeLadderWorkspace({ detail, loadError }: { detail: GradeLadderDetail
     return run(() => api.approve(detail.ladder.id, level.head.grade, { versionId: level.version!.id, reviewId: level.review!.id }, level.etag), `GS-${level.head.grade} version ${level.version.version} was reviewer approved. Its captured evidence remains immutable.`)
       .then(() => { void analyses?.refreshTargets() })
   }
-  const generationBlocked = !editable ? 'Archived or read-only ladder: unarchive it and its workspace before generation.' : sourceDirty ? 'Confirm or discard unsaved source decisions first.' : !detail.sourceSet || detail.sourceSet.id !== detail.ladder.sourceSetId ? 'Review sources and confirm a current frozen source set first.' : active ? 'Wait for current discovery, extraction, generation, or review to finish, or cancel that work.' : ''
+  const generationBlocked = newWorkReason || (!editable ? 'Archived or read-only ladder: unarchive it and its workspace before generation.' : sourceDirty ? 'Confirm or discard unsaved source decisions first.' : !detail.sourceSet || detail.sourceSet.id !== detail.ladder.sourceSetId ? 'Review sources and confirm a current frozen source set first.' : active ? 'Wait for current discovery, extraction, generation, or review to finish, or cancel that work.' : '')
 
   return <>
     <Link className="back-link" to="/rubrics?kind=grade&data=real"><ArrowLeft size={14} aria-hidden="true" />Back to real grade families</Link>
@@ -139,7 +142,7 @@ function GradeLadderWorkspace({ detail, loadError }: { detail: GradeLadderDetail
     }}>{[...new Set([...detail.ladder.grades, ...detail.levels.map((level) => level.head.grade)])].sort((a, b) => a - b).map((item) => <option key={item} value={item}>GS-{item}</option>)}</select></label>
       <GradeVersionHistory detail={detail} grade={grade} requestedVersion={params.get('version') ?? undefined} onSource={setSource} /></>}
     <section className="panel grade-work-items"><div className="section-heading"><div><h2>Durable processing progress</h2><p>Background work survives browser close after request acknowledgement. Failures are separate from evidence gaps.</p></div>
-      <Button size="sm" icon={RotateCcw} disabled={!editable || busy || sourceDirty || active} title={sourceDirty ? 'Finish source decisions first.' : active ? 'Wait for or cancel current work before rediscovery.' : 'Discover a new source proposal without overwriting historical captures.'}
+      <Button size="sm" icon={RotateCcw} disabled={!editable || busy || sourceDirty || active || Boolean(newWorkReason)} title={newWorkReason || (sourceDirty ? 'Finish source decisions first.' : active ? 'Wait for or cancel current work before rediscovery.' : 'Discover a new source proposal without overwriting historical captures.')}
         onClick={() => execute(() => api.discover(detail.ladder.id, detail.etag, keyFor('discover', [detail.ladder.id, detail.etag])), 'OPM discovery accepted. New proposals will preserve all earlier captured source versions.')}>Rediscover OPM sources</Button></div>
       <div className="grade-work-list">{detail.workItems.length ? [...detail.workItems].sort((a, b) => b.createdAt.localeCompare(a.createdAt)).map((work) => <article key={work.id}>
         <div><strong>{workLabel(work)}</strong><span>{work.status} · attempt {work.attempts}{work.nextAttemptAt ? ` · next ${work.nextAttemptAt}` : ''}</span>{work.error && <p>{work.error.code}: {work.error.message}</p>}</div>

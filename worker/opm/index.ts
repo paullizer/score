@@ -112,16 +112,19 @@ function publicHtml(snapshot: Snapshot, code: string): string {
 
 function discoveryTransport(options: DiscoveryOptions) {
   const base = options.fetcher ?? safePublicFetch
+  const policy = options.processingSettings?.settings.grades.discovery
+  const maxRequests = policy?.maxRequests ?? MAX_DISCOVERY_REQUESTS
+  const maxBytes = policy?.maxBytes ?? MAX_DISCOVERY_BYTES
   let requests = 0
   let bytes = 0
   const fetcher: PublicFetcher = async (url, request = {}) => {
     checkCancellation(options.signal)
-    if (++requests > MAX_DISCOVERY_REQUESTS || bytes >= MAX_DISCOVERY_BYTES) {
+    if (++requests > maxRequests || bytes >= maxBytes) {
       throw new WorkerError('opm-network-budget-exhausted', 'OPM discovery exhausted its bounded public-request/byte budget. No fallback registry was used.', false, 'download')
     }
-    const response = await base(url, { ...request, maxBytes: Math.min(request.maxBytes ?? MAX_DISCOVERY_BYTES, MAX_DISCOVERY_BYTES - bytes) })
+    const response = await base(url, { ...request, maxBytes: Math.min(request.maxBytes ?? maxBytes, maxBytes - bytes) })
     bytes += response.body.byteLength
-    if (bytes > MAX_DISCOVERY_BYTES) throw new WorkerError('opm-network-budget-exhausted', 'OPM discovery exceeded 64 MiB of public responses.', false, 'download')
+    if (bytes > maxBytes) throw new WorkerError('opm-network-budget-exhausted', 'OPM discovery exceeded its captured aggregate response-byte budget.', false, 'download')
     return response
   }
   return fetcher
@@ -134,6 +137,10 @@ export const discoverOpmSources: DiscoverOpmSources = async (context, options = 
   }
   checkCancellation(options.signal)
   const retrievedAt = new Date().toISOString()
+  const limits = options.processingSettings?.settings.grades.references
+  const discovery = options.processingSettings?.settings.grades.discovery
+  const maxSources = limits?.maxSources ?? GRADE_LADDER_LIMITS.maxSources
+  const maxHops = discovery?.maxHops ?? GRADE_LADDER_LIMITS.maxDiscoveryHops
   const fetcher = discoveryTransport(options)
   const snapshots = new Map<string, Snapshot>()
   const issues: GradeIssue[] = []
@@ -147,10 +154,15 @@ export const discoverOpmSources: DiscoverOpmSources = async (context, options = 
     const key = noFragment(referenceUrl(url, undefined, true).href)
     const saved = snapshots.get(key)
     if (saved) return saved
-    if (snapshots.size >= MAX_DISCOVERY_DOCUMENTS) {
-      throw new WorkerError('opm-document-budget-exhausted', 'OPM discovery reached its 35-document inspection budget; the remaining graph is unresolved.', false, 'parsing')
+    if (snapshots.size >= (discovery?.maxDocuments ?? MAX_DISCOVERY_DOCUMENTS)) {
+      throw new WorkerError('opm-document-budget-exhausted', 'OPM discovery reached its captured document-inspection budget; the remaining graph is unresolved.', false, 'parsing')
     }
     const original = await fetchOriginalUrl(url, { ...options, fetcher }, true)
+    if (original.contentType === 'text/html' && limits) {
+      const dom = new JSDOM(Buffer.from(original.bytes).toString('utf8'), { url: original.finalUrl ?? url })
+      try { referenceLinks(referenceContent(dom.window.document, original.finalUrl ?? url), original.finalUrl ?? url, limits.maxLinks) }
+      finally { dom.window.close() }
+    }
     const snapshot = { original, hash: referenceHash(original.bytes) }
     snapshots.set(key, snapshot)
     return snapshot
@@ -199,8 +211,12 @@ export const discoverOpmSources: DiscoverOpmSources = async (context, options = 
     }
     const existing = workByKey.get(sourceKey(candidate))
     if (existing) return existing
-    if (queue.length >= GRADE_LADDER_LIMITS.maxSources) {
-      addIssue(issues, issue('opm-source-budget-exhausted', `More than ${GRADE_LADDER_LIMITS.maxSources} relevant supporting sources were found (the seed is not counted). Discovery is partial; narrow the context or explicitly select additional references.`, {}, link.url))
+    if (depth > maxHops) {
+      addIssue(issues, issue('opm-traversal-limit', `A relevant reference remains beyond the captured ${maxHops}-hop discovery budget. Coverage is incomplete.`, {}, link.url))
+      return undefined
+    }
+    if (queue.length >= maxSources) {
+      addIssue(issues, issue('opm-source-budget-exhausted', `More than ${maxSources} relevant supporting sources were found (the seed is not counted). Discovery is partial; narrow the context or explicitly select additional references.`, {}, link.url))
       return undefined
     }
     const work = { candidate, depth }
@@ -274,7 +290,7 @@ export const discoverOpmSources: DiscoverOpmSources = async (context, options = 
     const dom = new JSDOM(publicHtml(policyRoot.snapshot, 'opm-policy-series-changed'))
     try {
       const root = referenceContent(dom.window.document, policyRoot.snapshot.original.finalUrl ?? policyRoot.link.url)
-      const links = referenceLinks(root, policyRoot.snapshot.original.finalUrl ?? policyRoot.link.url).links
+      const links = referenceLinks(root, policyRoot.snapshot.original.finalUrl ?? policyRoot.link.url, limits?.maxLinks).links
       const standards = links.filter(link => /classification standard|qualification standard/i.test(link.label) && !/job aid|memorand|issuance/i.test(link.label) &&
         !/\.(?:docx?|xlsx?)(?:[?#]|$)/i.test(link.url))
       if (!standards.some(link => /classification standard/i.test(link.label)) || !standards.some(link => /qualification standard/i.test(link.label))) {
@@ -376,7 +392,7 @@ export const discoverOpmSources: DiscoverOpmSources = async (context, options = 
     if (bridge) {
       const snapshot = await load(bridge.url)
       if (snapshot.original.contentType !== 'application/pdf') throw new WorkerError('opm-version-bridge-changed', 'The reviewed OPM version-reference bridge is no longer a PDF.', false, 'parsing')
-      const metadata = await inspectReferencePdf(snapshot.original.bytes, snapshot.original.finalUrl ?? bridge.url)
+      const metadata = await inspectReferencePdf(snapshot.original.bytes, snapshot.original.finalUrl ?? bridge.url, limits)
       const legacy = metadata.links.find(link => /(?:gs0343\.pdf|series[, -]+0343)/i.test(`${link.url} ${link.label}`))
       if (legacy) {
         legacy343 = add({ ...legacy, label: 'Management and Program Analysis Series, 0343 — linked legacy revision' },
@@ -481,7 +497,7 @@ export const discoverOpmSources: DiscoverOpmSources = async (context, options = 
     let text = ''
     let pageCount: number | undefined
     if (snapshot.original.contentType === 'application/pdf') {
-      const metadata = await inspectReferencePdf(snapshot.original.bytes, snapshot.original.finalUrl ?? candidate.url)
+      const metadata = await inspectReferencePdf(snapshot.original.bytes, snapshot.original.finalUrl ?? candidate.url, limits)
       links = metadata.links
       pageCount = metadata.pageCount
       candidate.revision ??= statedRevision(metadata.title ?? '')
@@ -492,7 +508,7 @@ export const discoverOpmSources: DiscoverOpmSources = async (context, options = 
       const html = publicHtml(snapshot, 'opm-source-structure-changed')
       let extracted: ReturnType<typeof extractReferenceHtml>
       try {
-        extracted = extractReferenceHtml(html, snapshot.original.finalUrl ?? candidate.url, candidate.title, candidate.intendedSection)
+        extracted = extractReferenceHtml(html, snapshot.original.finalUrl ?? candidate.url, candidate.title, candidate.intendedSection, limits)
       } catch (error) {
         if (!(error instanceof WorkerError) || error.code !== 'reference-section-not-found') throw error
         candidate.authorityStatus = 'unknown'
@@ -514,6 +530,9 @@ export const discoverOpmSources: DiscoverOpmSources = async (context, options = 
     }
     sourceAssertions(work, text, pageCount)
     candidate.relatedLinks = [...links, ...(catalogLinks.get(sourceKey(candidate)) ?? [])].map(link => relevantLink(link, work))
+    if (candidate.relatedLinks.length > (limits?.maxLinks ?? GRADE_LADDER_LIMITS.maxReferenceLinks)) {
+      throw new WorkerError('reference-link-budget', 'The complete discovery relationships exceed the captured link budget. No relationship was silently removed.', false, 'parsing')
+    }
     const noGroup = /there (?:is|are) no (?:associated )?group coverage qualification standard/i.test(text)
     for (const related of candidate.relatedLinks) {
       if (!isOpmUrl(related.url)) continue
@@ -533,10 +552,10 @@ export const discoverOpmSources: DiscoverOpmSources = async (context, options = 
       }
       const guide = guideFor(related)
       if (guide) {
-        if (work.depth < GRADE_LADDER_LIMITS.maxDiscoveryHops || workByKey.has(sourceKey({ url: guide.url }))) {
+        if (work.depth < maxHops || workByKey.has(sourceKey({ url: guide.url }))) {
           addGuide(guide, candidate.discoveryPath, work.depth + 1, work)
         } else {
-          addIssue(candidate.issues, issue('opm-traversal-limit', `The outgoing functional reference ${related.url} remains beyond the two-hop discovery budget. This issue concerns that target, not this source's own extraction. Capture the exact target before relying on it; applicability still requires review.`, {}, related.url))
+          addIssue(candidate.issues, issue('opm-traversal-limit', `The outgoing functional reference ${related.url} remains beyond the ${maxHops}-hop discovery budget. This issue concerns that target, not this source's own extraction. Capture the exact target before relying on it; applicability still requires review.`, {}, related.url))
         }
         continue
       }
@@ -555,8 +574,8 @@ export const discoverOpmSources: DiscoverOpmSources = async (context, options = 
         qualificationSnapshot.original.finalUrl, groupSnapshot.original.finalUrl,
       ].some(url => url && noFragment(url) === relatedBase)) continue
       if (workByKey.has(sourceKey({ url: related.url, intendedSection: section }))) continue
-      if (work.depth >= GRADE_LADDER_LIMITS.maxDiscoveryHops) {
-        addIssue(candidate.issues, issue('opm-traversal-limit', `The outgoing reference ${related.url} remains beyond the two-hop discovery budget. This issue concerns that target and intended section, not this source's own extraction. Capture the exact target before relying on it; applicability still requires review.`, {}, related.url))
+      if (work.depth >= maxHops) {
+        addIssue(candidate.issues, issue('opm-traversal-limit', `The outgoing reference ${related.url} remains beyond the ${maxHops}-hop discovery budget. This issue concerns that target and intended section, not this source's own extraction. Capture the exact target before relying on it; applicability still requires review.`, {}, related.url))
         continue
       }
       const relatedGrades = /^Qualification-index exception\/policy:/i.test(related.label)

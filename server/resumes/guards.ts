@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto'
+import { preservesProcessingSettings } from '../jobs/policy'
 import type { LifecycleMetadata } from '../../src/domain/lifecycle'
 import type { RealResumeRecord, ResumeEntity, VersionedResumeEntity } from '../../src/domain/real-resumes'
 import { WORKSPACE_ID_PATTERN } from '../ids'
@@ -94,6 +95,9 @@ export function checkResumeReplacement(
     throw new Error('Resume identity, ownership, batch, and creation metadata are immutable.')
   }
   if (record.updatedAt < previous.updatedAt) throw new Error('Resume update timestamps cannot move backwards.')
+  if (!preservesProcessingSettings(previous.processingSettings, record.processingSettings)) {
+    throw new Error('Accepted resume processing settings are immutable.')
+  }
   if (previous.recordType === 'resume-batch' && record.recordType === 'resume-batch') {
     const retained = previous.items.filter(item => record.items.some(next => same(item, next)))
     if (previous.inputCount !== record.inputCount || (lifecycle

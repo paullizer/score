@@ -1,4 +1,6 @@
 import { z } from 'zod'
+import type { PublicSettings } from '../domain/admin-settings'
+import { analysisFeaturesWithPolicy, fetchPublicFeatures, requireAdmission } from './publicSettings'
 import {
   ANALYSIS_LIMITS,
   type AnalysisModelProvenance,
@@ -225,7 +227,9 @@ export async function getRealAnalysisSummaryHistory(
   if (continuationToken !== undefined && (!continuationToken || continuationToken.length > 16 * 1024)) {
     throw new Error('The summary history cursor is invalid. Reopen the latest history.')
   }
-  const suffix = continuationToken ? `?continuationToken=${encodeURIComponent(continuationToken)}` : ''
+  const query = new URLSearchParams()
+  if (continuationToken) query.set('continuationToken', continuationToken)
+  const suffix = query.size ? `?${query}` : ''
   const result = await cloudJsonRequest<unknown>(`${path}/history${suffix}`, { method: 'GET', signal })
   signal?.throwIfAborted()
   const parsed = summaryHistoryPageSchema.safeParse(result)
@@ -282,9 +286,9 @@ export function retryRealAnalysisSummary(
 
 export async function fetchAnalysisProcessingFeatures(signal?: AbortSignal): Promise<AnalysisProcessingFeatures> {
   // realAnalyses indicates new-run readiness; historical reads have their own authorized endpoints.
-  const result = await cloudJsonRequest<Partial<AnalysisProcessingFeatures>>('/features', { method: 'GET', signal })
-  return { realAnalyses: result.realAnalyses === true, analysisLimits: result.analysisLimits ?? ANALYSIS_LIMITS,
-    analysisSummaryGeneration: result.analysisSummaryGeneration === true }
+  const result = await fetchPublicFeatures(signal)
+  return analysisFeaturesWithPolicy({ realAnalyses: result.realAnalyses === true, analysisLimits: result.analysisLimits ?? ANALYSIS_LIMITS,
+    analysisSummaryGeneration: result.analysisSummaryGeneration === true }, result.publicSettings)
 }
 
 export interface RealAnalysisCollectionLimits {
@@ -486,11 +490,22 @@ export async function getRealAnalysisDiagnostics(
   return page
 }
 
-export async function createRealAnalysis(workspaceId: string, input: CreateRealAnalysisInput, key: string): Promise<RealAnalysisRunSummary> {
+export interface RealAnalysisSubmission {
+  readonly result: Promise<RealAnalysisRunSummary>
+  readonly retry: () => Promise<RealAnalysisRunSummary>
+}
+
+export async function createRealAnalysis(workspaceId: string, input: CreateRealAnalysisInput, key: string, settings?: PublicSettings | null): Promise<RealAnalysisRunSummary> {
+  return startRealAnalysisSubmission(workspaceId, input, key, settings).result
+}
+
+export function startRealAnalysisSubmission(workspaceId: string, input: CreateRealAnalysisInput, key: string, settings?: PublicSettings | null): RealAnalysisSubmission {
+  requireAdmission(settings, 'newAnalyses')
   if (!/^[\da-f]{8}-[\da-f]{4}-[\da-f]{4}-[\da-f]{4}-[\da-f]{12}$/i.test(key)) throw new Error('A stable UUID idempotency key is required for an analysis.')
   if (!input.resumes.length || !input.targets.length) throw new Error('Select at least one ready real resume and one eligible real target.')
-  if (input.resumes.length * input.targets.length > ANALYSIS_LIMITS.maxComparisons) {
-    throw new Error(`An analysis can contain at most ${ANALYSIS_LIMITS.maxComparisons} comparisons. Nothing was truncated.`)
+  const maximum = Math.min(ANALYSIS_LIMITS.maxComparisons, settings?.analyses.maxComparisons ?? ANALYSIS_LIMITS.maxComparisons)
+  if (input.resumes.length * input.targets.length > maximum) {
+    throw new Error(`An analysis can contain at most ${maximum} comparisons. Nothing was truncated.`)
   }
   const hash = (value: string) => /^[\da-f]{64}$/i.test(value)
   const positive = (value: number) => Number.isInteger(value) && value > 0
@@ -518,10 +533,15 @@ export async function createRealAnalysis(workspaceId: string, input: CreateRealA
       : `grade:${item.ladderId}:${item.grade}:${item.versionId}:${item.version}`)).size !== targets.length) {
     throw new Error('Select each real resume and target only once. Duplicates were not silently removed.')
   }
-  const result = await cloudJsonRequest<RealAnalysisMutationResponse>(base(workspaceId), {
-    method: 'POST', headers: { 'Idempotency-Key': key }, body: JSON.stringify({ name: input.name, resumes, targets }),
-  })
-  return checkedRun(result.run, workspaceId)
+  const body = JSON.stringify({ name: input.name, resumes, targets })
+  const send = async () => {
+    const result = await cloudJsonRequest<RealAnalysisMutationResponse>(base(workspaceId), {
+      method: 'POST', headers: { 'Idempotency-Key': key }, body,
+    })
+    return checkedRun(result.run, workspaceId)
+  }
+  // Only a started, validated request exposes recovery; the server decides whether it was already accepted.
+  return { result: send(), retry: send }
 }
 
 export async function retryRealAnalysis(workspaceId: string, runId: string, input: RetryRealAnalysisInput, etag: string): Promise<RealAnalysisRunSummary> {

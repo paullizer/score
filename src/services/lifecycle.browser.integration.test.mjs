@@ -35,7 +35,7 @@ before(async () => {
     loader: { '.css': 'empty' }, define: { 'import.meta.env.VITE_DEPLOYMENT_MODE': JSON.stringify(mode), 'process.env.NODE_ENV': '"development"' }, logLevel: 'silent',
   })))
   await build({
-    stdin: { contents: "export * from './src/data/fixtures'; export * from './src/domain/lifecycle'; export { gradeHeadId } from './src/domain/real-grades';", resolveDir: process.cwd(), loader: 'ts' },
+    stdin: { contents: "export * from './src/data/fixtures'; export * from './src/domain/lifecycle'; export { gradeHeadId } from './src/domain/real-grades'; export { createDefaultAdminSettings } from './src/domain/admin-settings-defaults'; export { captureProcessingSettings, projectPublicSettings } from './src/domain/admin-settings-resolver';", resolveDir: process.cwd(), loader: 'ts' },
     outfile: join(directory, 'domain.mjs'), bundle: true, platform: 'node', format: 'esm', logLevel: 'silent',
   })
   domain = await import(pathToFileURL(join(directory, 'domain.mjs')).href)
@@ -336,7 +336,8 @@ function cloudFixture(workspace = emptyState(), summaries = []) {
       state.requests.push([method, path])
       if (method !== 'GET') state.mutations.push({ method, path, body, etag: request.headers()['if-match'] })
       if (path === '/api/session') return response(route, { mode: 'cloud', user, workspaces: clone(state.summaries) })
-      if (path === '/api/features') return response(route, { realJobImports: true, realGradeLadders: true })
+      if (path === '/api/features') return response(route, { realJobImports: true, realGradeLadders: true,
+        publicSettings: domain.projectPublicSettings(domain.captureProcessingSettings(domain.createDefaultAdminSettings(), 'legacy-v1', timestamp), false) })
       if (path === '/api/workspaces' && method === 'GET') return response(route, { workspaces: clone(state.summaries) })
       if (path === '/api/workspaces' && method === 'POST') {
         const created = workspaceSummary(`created-${revision++}`, body.name)

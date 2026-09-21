@@ -2,6 +2,8 @@ import { useEffect, useState } from 'react'
 import { Link, useNavigate, useParams } from 'react-router-dom'
 import { ArrowLeft, ArrowRight, ArrowUpRight, BarChart3, BriefcaseBusiness, Building2, ChevronRight, Download, FileText, Globe2, Layers3, Link2, LoaderCircle, MapPin, Plus, RotateCcw, ScanLine, ShieldCheck, Sparkles, X } from 'lucide-react'
 import { useWorkspace } from '../../app/workspace-context'
+import { clientAdmissionReason, originalDownloadReason, usePublicSettings } from '../../app/public-settings-context'
+import { effectiveFormats } from '../../services/publicSettings'
 import { useLibraryViewState } from '../../app/library-view-state'
 import type { Citation, Criterion, Job, SourceKind } from '../../domain/types'
 import { documentPagination } from '../../domain/source-files'
@@ -41,14 +43,19 @@ const defaultJobSort: TableSort<JobSortKey> = { key: 'added', direction: 'desc' 
 
 export function JobsPage() {
   const { cloud } = useWorkspace()
+  const { settings } = usePublicSettings()
   const [libraryKind, setLibraryKind] = useLibraryViewState<'real' | 'samples'>('jobs:mode', () => cloud ? 'real' : 'samples')
-  return <RenameEntityProvider key={`${cloud?.currentWorkspaceId ?? 'local'}:${libraryKind}`}><JobsLibrary libraryKind={libraryKind} onLibraryKindChange={setLibraryKind} /></RenameEntityProvider>
+  const visibleKind = cloud && settings?.features.samplesVisible === false ? 'real' : libraryKind
+  return <RenameEntityProvider key={`${cloud?.currentWorkspaceId ?? 'local'}:${visibleKind}`}><JobsLibrary libraryKind={visibleKind} onLibraryKindChange={setLibraryKind} /></RenameEntityProvider>
 }
 
 function JobsLibrary({ libraryKind, onLibraryKindChange }: {
   libraryKind: 'real' | 'samples'; onLibraryKindChange: (kind: 'real' | 'samples') => void
 }) {
   const { workspace, cancelJob, retryJob, cloud } = useWorkspace()
+  const policy = usePublicSettings()
+  const importReason = cloud ? clientAdmissionReason(policy, 'jobImports') : null
+  const canImport = !cloud || Boolean(cloud.realJobs.features?.realJobImports && !importReason)
   const navigate = useNavigate()
   const analyses = useRealAnalyses()
   const [query, setQuery] = useLibraryViewState(`jobs:${libraryKind}:query`, '')
@@ -64,7 +71,7 @@ function JobsLibrary({ libraryKind, onLibraryKindChange }: {
   const libraryJobs = workspace.jobs.filter((job) => libraryKind === 'real' ? job.dataKind === 'real' : job.dataKind !== 'real')
   const wordFilters = libraryKind === 'real' && (cloud?.realJobs.features?.wordDocumentImports || libraryJobs.some((job) => job.source === 'docx' || job.source === 'doc'))
   const markdownFilter = libraryKind === 'real' && (cloud?.realJobs.features?.markdownJobImports || libraryJobs.some((job) => job.source === 'markdown'))
-  const formats = supportedUploadFormats({ markdownJobImports: cloud?.realJobs.features?.markdownJobImports, wordDocumentImports: cloud?.realJobs.features?.wordDocumentImports })
+  const formats = effectiveFormats(supportedUploadFormats({ markdownJobImports: cloud?.realJobs.features?.markdownJobImports, wordDocumentImports: cloud?.realJobs.features?.wordDocumentImports }), policy.settings, 'jobs')
   const activeJobs = libraryJobs.filter((job) => !isEntityArchived(workspace, { kind: 'job', id: job.id }) && !isEntityRemoved(workspace, { kind: 'job', id: job.id }))
   const scopedCount = libraryJobs.filter((job) => matchesArchiveFilter(isEntityArchived(workspace, { kind: 'job', id: job.id }), query, archiveFilter)).length
   const previewRun = workspace.runs.find((run) => !isEntityArchived(workspace, { kind: 'analysis', id: run.id }))
@@ -116,7 +123,8 @@ function JobsLibrary({ libraryKind, onLibraryKindChange }: {
 
   return <>
     <PageHeader eyebrow="A CLEARER STARTING POINT" title="Your jobs" description="Bring the roles together. Define what a great match looks like."
-      actions={<><Button icon={Layers3} onClick={() => navigate('/rubrics')}>Rubric library</Button><Button variant="primary" icon={Plus} disabled={!canEdit} onClick={() => setImportOpen(true)}>Add jobs</Button></>} />
+      actions={<><Button icon={Layers3} onClick={() => navigate('/rubrics')}>Rubric library</Button><Button variant="primary" icon={Plus} disabled={!canEdit || !canImport} title={importReason ?? undefined} onClick={() => setImportOpen(true)}>Add jobs</Button></>} />
+    {cloud && !canImport && <p className="mb-4 text-[12px] text-muted" role="status">{importReason ?? 'New job imports are unavailable.'} Saved jobs, rubrics, and evidence remain available.</p>}
     <div className="welcome-panel">
       <div className="flex items-center"><span className="welcome-symbol"><ScanLine size={25} strokeWidth={1.4} /></span><div><h2>Good matches start with clear criteria.</h2><p>Every job gets its own rubric. Every score leads back to evidence. Nothing important stays a black box.</p></div></div>
       <div className="welcome-action"><div className="mini-path" aria-hidden="true"><span><BriefcaseBusiness size={16} /></span><ChevronRight size={11} /><span><Layers3 size={16} /></span><ChevronRight size={11} /><span><BarChart3 size={16} /></span></div>
@@ -124,7 +132,7 @@ function JobsLibrary({ libraryKind, onLibraryKindChange }: {
       </div>
     </div>
     <section className="panel" aria-label="Job library">
-      {cloud && <div className="library-kind-switcher"><SegmentedControl label="Choose real jobs or samples" value={libraryKind} onChange={onLibraryKindChange} options={[
+      {cloud && policy.settings?.features.samplesVisible !== false && <div className="library-kind-switcher"><SegmentedControl label="Choose real jobs or samples" value={libraryKind} onChange={onLibraryKindChange} options={[
         { value: 'real', label: 'Real jobs', count: workspace.jobs.filter((job) => job.dataKind === 'real' && !isEntityArchived(workspace, { kind: 'job', id: job.id }) && !isEntityRemoved(workspace, { kind: 'job', id: job.id })).length },
         { value: 'samples', label: 'Samples', count: workspace.jobs.filter((job) => job.dataKind !== 'real' && !isEntityArchived(workspace, { kind: 'job', id: job.id }) && !isEntityRemoved(workspace, { kind: 'job', id: job.id })).length },
       ]} /><span>{libraryKind === 'real' ? 'Private source imports and generated rubrics' : 'Fictional examples for the simulated preview'}</span></div>}
@@ -189,7 +197,7 @@ function JobsLibrary({ libraryKind, onLibraryKindChange }: {
       </table></div> : libraryKind === 'real' && cloud?.realJobs.phase === 'loading'
         ? <EmptyState icon={LoaderCircle} title="Loading real jobs" description="Score is retrieving every page of server-owned job records for this workspace." />
         : libraryKind === 'real' && cloud && cloud.realJobs.phase !== 'ready'
-          ? <EmptyState icon={BriefcaseBusiness} title="Real job imports are unavailable" description={cloud.realJobs.error ?? 'This deployment does not have real job processing enabled. Samples remain available in their separate view.'} action={<Button onClick={() => onLibraryKindChange('samples')}>View samples</Button>} />
+          ? <EmptyState icon={BriefcaseBusiness} title="Real job imports are unavailable" description={cloud.realJobs.error ?? 'This deployment does not have real job processing enabled. Saved history is not replaced by samples.'} action={policy.settings?.features.samplesVisible !== false ? <Button onClick={() => onLibraryKindChange('samples')}>View samples</Button> : undefined} />
           : <EmptyState icon={BriefcaseBusiness} title={libraryJobs.length ? 'No jobs match these filters' : libraryKind === 'real' ? 'Import your first real job' : cloud ? 'Explore the sample jobs' : 'Your next great match starts here'} description={libraryJobs.length ? 'Try another search or choose All jobs to see the rest of your library.' : libraryKind === 'real' ? `Upload an actual ${uploadFormatNames(formats)} file or enter a direct HTML/PDF posting URL. Score will create a durable queued job and source-grounded rubric.` : cloud ? 'Fictional examples remain available for the simulated workflow.' : 'Add a PDF, a job URL, or a collection of roles from a website.'}
             action={<>{libraryJobs.length > 0 && <Button onClick={() => { setQuery(''); setFilter('all'); setSource('all'); setArchiveFilter('default') }}>Clear filters</Button>}
               <Button disabled={!canEdit && !libraryJobs.length && libraryKind === 'real'} onClick={() => { if (!libraryJobs.length && libraryKind === 'real') setImportOpen(true); else { setQuery(''); setFilter('all'); setSource('all'); setArchiveFilter('all') } }}>{libraryJobs.length ? 'Show active and archived' : libraryKind === 'real' ? 'Import a real job' : 'Show all samples'}</Button></>} />}
@@ -209,6 +217,8 @@ export function JobDetail() {
 function JobDetailView() {
   const { id } = useParams()
   const { workspace, retryJob, cancelJob, notify, cloud } = useWorkspace()
+  const policy = usePublicSettings()
+  const downloadReason = originalDownloadReason(policy, cloud?.workspaces.find(item => item.id === cloud.currentWorkspaceId)?.role)
   const navigate = useNavigate()
   const gradeLadders = useGradeLadders()
   const analyses = useRealAnalyses()
@@ -297,7 +307,8 @@ function JobDetailView() {
         <div className="source-footer"><span className="min-w-0">{source?.kind === 'url' && (source.finalUrl || source.url) ? <ExternalSource url={source.finalUrl ?? source.url!}>{source.displayName}</ExternalSource> : <span className="source-label">{source?.displayName ?? job.sourceLabel}</span>}</span><span>{real ? 'Private source' : 'Demo'} / {sourceNames[job.source]}</span></div>
         {real && source && !deleting && <div className="source-provenance">
           <div><strong>Source provenance</strong><span>{source.capturedAt ? `Captured ${dateLabel(source.capturedAt)}` : `Added ${dateLabel(job.createdAt)}`}</span>{source.bytes !== undefined && <span>{new Intl.NumberFormat('en', { style: 'unit', unit: 'byte', notation: 'compact' }).format(source.bytes)}</span>}{source.sha256 && <code title={source.sha256}>SHA-256 {source.sha256.slice(0, 12)}…</code>}{summary && <span>{summary.attempts} processing {summary.attempts === 1 ? 'attempt' : 'attempts'}</span>}</div>
-          <a className="button button-secondary button-sm" href={cloud?.realJobs.originalUrl(job.id)} download={source.displayName}><Download size={14} />View original</a>
+          {downloadReason ? <span className="text-[11px] text-muted" role="status">{downloadReason}</span>
+            : <a className="button button-secondary button-sm" href={cloud?.realJobs.originalUrl(job.id)} download={source.displayName}><Download size={14} />View original</a>}
         </div>}
       </section>
       <section className={`detail-panel ${pane !== 'rubric' ? 'mobile-pane-hidden' : ''}`} aria-label="Associated job rubric">

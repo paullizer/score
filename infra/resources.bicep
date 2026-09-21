@@ -4,6 +4,7 @@ param tags object
 param authClientId string
 param tenantId string
 param allowedUserId string
+param adminUserIds string
 param operatorPrincipalId string
 param containerImage string
 param workerImage string
@@ -13,6 +14,7 @@ param resumeWorkerImage string
 param analysisWorkerImage string
 param appServiceSku string
 param searchSku string
+param additionalModelDeployments array
 
 var acrPullRole = subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '7f951dda-4ed3-4680-a7ca-43fe172d538d')
 var blobContributorRole = subscriptionResourceId('Microsoft.Authorization/roleDefinitions', 'ba92f5b4-2d11-453d-a403-e96b0029c9fe')
@@ -148,6 +150,23 @@ resource directoryContainer 'Microsoft.DocumentDB/databaseAccounts/sqlDatabases/
   }
 }
 
+resource settingsContainer 'Microsoft.DocumentDB/databaseAccounts/sqlDatabases/containers@2024-11-15' = {
+  parent: database
+  name: 'application-settings'
+  properties: {
+    resource: {
+      id: 'application-settings'
+      partitionKey: { paths: ['/applicationId'], kind: 'Hash', version: 2 }
+      indexingPolicy: {
+        automatic: true
+        indexingMode: 'consistent'
+        includedPaths: [{ path: '/*' }]
+        excludedPaths: [{ path: '/"_etag"/?' }]
+      }
+    }
+  }
+}
+
 resource cosmosAccess 'Microsoft.DocumentDB/databaseAccounts/sqlRoleAssignments@2024-11-15' = {
   parent: cosmos
   name: guid(cosmos.id, runtimeIdentity.id, 'score-data-contributor')
@@ -247,6 +266,7 @@ module ingestion 'ingestion.bicep' = {
     tenantId: tenantId
     workerImage: workerImage
     rendererImage: rendererImage
+    additionalModelDeployments: additionalModelDeployments
   }
   dependsOn: [database]
 }
@@ -310,6 +330,24 @@ module analyses 'private-processing.bicep' = {
   }
 }
 
+var settingsReaderKinds = ['job', 'grade', 'resume', 'analysis']
+var settingsReaderPrincipals = [
+  ingestion.outputs.workerPrincipalId
+  grades.outputs.workerPrincipalId
+  resumes.outputs.workerPrincipalId
+  analyses.outputs.workerPrincipalId
+]
+
+resource settingsReadAccess 'Microsoft.DocumentDB/databaseAccounts/sqlRoleAssignments@2024-11-15' = [for (kind, index) in settingsReaderKinds: {
+  parent: cosmos
+  name: guid(cosmos.id, kind, 'score-settings-reader')
+  properties: {
+    roleDefinitionId: '${cosmos.id}/sqlRoleDefinitions/00000000-0000-0000-0000-000000000001'
+    principalId: settingsReaderPrincipals[index]
+    scope: '${cosmos.id}/dbs/${database.name}/colls/${settingsContainer.name}'
+  }
+}]
+
 resource plan 'Microsoft.Web/serverfarms@2024-11-01' = {
   name: 'asp-score-${token}'
   location: location
@@ -367,6 +405,18 @@ resource appSettings 'Microsoft.Web/sites/config@2024-11-01' = {
     AZURE_TENANT_ID: tenantId
     WEBSITE_AUTH_AAD_ALLOWED_TENANTS: tenantId
     SCORE_ALLOWED_USER_IDS: allowedUserId
+    SCORE_ADMIN_USER_IDS: adminUserIds
+    SCORE_SETTINGS_CONTAINER: settingsContainer.name
+    SCORE_RUNTIME_SETTINGS_ENABLED: 'false'
+    SCORE_MODEL_RESOURCE_ID: ai.outputs.accountResourceId
+    RUBRIC_MODEL_ENDPOINT: ingestion.outputs.modelEndpoint
+    RUBRIC_MODEL_DEPLOYMENT: ingestion.outputs.modelDeploymentName
+    RUBRIC_MODEL_NAME: 'gpt-5-mini'
+    RUBRIC_MODEL_REASONING_EFFORT: 'low'
+    WORKER_MAX_JOBS: '5'
+    GRADE_WORKER_MAX_ITEMS: '5'
+    RESUME_WORKER_MAX_ITEMS: '5'
+    ANALYSIS_WORKER_MAX_ITEMS: '2'
     AZURE_CLIENT_ID: runtimeIdentity.properties.clientId
     COSMOS_ENDPOINT: cosmos.properties.documentEndpoint
     COSMOS_DATABASE: database.name

@@ -30,6 +30,12 @@ import {
 } from './extraction'
 import { extractResumeProfile, ResumeProfileError } from './model'
 import { MARKDOWN_EXTRACTION_VERSION } from '../markdown'
+import type { ProcessingSettingsSnapshot } from '../../src/domain/admin-settings'
+import {
+  assertSourceKind, assertSourcePolicy, executionSettings, extractionSettings, fetchSettings, operationSettings,
+  retryBackoff, RuntimeSettingsError, safeSettingsMetadata, sourcePolicy, type WorkerSettingsDependencies,
+} from '../settings'
+export { RUNTIME_SETTINGS_VERSION } from '../../src/domain/admin-settings'
 
 const LEASE_MILLISECONDS = 90_000
 const HEARTBEAT_MILLISECONDS = 25_000
@@ -42,7 +48,7 @@ const PROFILE_FIELDS = ['name', 'role', 'location', 'experience'] as const
 const ACTIVE = new Set(['parsing', 'profiling'])
 const same = (left: unknown, right: unknown): boolean => resumeContentHash(left) === resumeContentHash(right)
 
-export interface ResumeWorkerDependencies {
+export interface ResumeWorkerDependencies extends WorkerSettingsDependencies {
   store: ResumeStore
   blobs: ResumeBlobStore
   documentIntelligence: Omit<DocumentIntelligenceClientOptions, 'signal'>
@@ -118,6 +124,10 @@ function failure(code: ResumeProcessingErrorCode, retryable = false, stage: Resu
 function processingError(
   error: unknown, stage: ResumeProcessingError['stage'], contentType?: ResumeSourceCapture['original']['contentType'],
 ): ResumeProcessingError {
+  if (error instanceof RuntimeSettingsError) return {
+    code: error.code === 'source-policy-limit' ? 'source-too-large' : 'invalid-model-output',
+    stage, retryable: false, message: error.message,
+  }
   const message = (code: ResumeProcessingErrorCode): string =>
     code === 'unreadable-document' && contentType === 'application/pdf' ? UNREADABLE_PDF_MESSAGE
       : code === 'unreadable-document' && isWordContentType(contentType)
@@ -402,8 +412,8 @@ function pdfSignature(bytes: Uint8Array): boolean {
   return Buffer.from(bytes.subarray(0, 1024)).indexOf(Buffer.from('%PDF-')) >= 0
 }
 
-async function pdfPageCount(bytes: Uint8Array): Promise<number> {
-  if (bytes.byteLength > LIMITS.maxPdfBytes) throw failure('pdf-too-large', false, 'parsing')
+async function pdfPageCount(bytes: Uint8Array, maxBytes: number = LIMITS.maxPdfBytes, maxPages: number = LIMITS.maxPdfPages): Promise<number> {
+  if (bytes.byteLength > maxBytes) throw failure('pdf-too-large', false, 'parsing')
   if (!pdfSignature(bytes)) throw failure('unreadable-document', false, 'parsing')
   let count: number
   try {
@@ -412,7 +422,7 @@ async function pdfPageCount(bytes: Uint8Array): Promise<number> {
     count = pdf.getPageCount()
   } catch { throw failure('unreadable-document', false, 'parsing') }
   if (count < 1) throw failure('unreadable-document', false, 'parsing')
-  if (count > LIMITS.maxPdfPages) throw failure('pdf-too-many-pages', false, 'parsing')
+  if (count > maxPages) throw new ResumeWorkerError('pdf-too-many-pages', `The PDF exceeds its captured ${maxPages}-page limit.`, false, 'parsing')
   return count
 }
 
@@ -710,11 +720,14 @@ async function extractSource(
   dependencies: ResumeWorkerDependencies, lease: ResumeLease, original: CapturedSource,
 ): Promise<RealResumeDocument> {
   const { record } = await lease.check()
+  const snapshot = operationSettings(record, dependencies)
+  const policy = sourcePolicy(snapshot, 'resumes')
   const pdf = original.blob.contentType === 'application/pdf'
   const word = isWordContentType(original.blob.contentType)
   const wordFormat = original.blob.contentType === UPLOAD_CONTENT_TYPES.doc ? 'doc' : 'docx'
   const markdown = original.blob.contentType === 'text/markdown'
-  const pageCount = pdf ? await pdfPageCount(original.blob.bytes) : null
+  if (original.blob.bytes.byteLength > policy.maxFileBytes) throw new ResumeWorkerError('file-too-large', 'The original exceeds its captured file-size limit.', false, 'parsing')
+  const pageCount = pdf ? await pdfPageCount(original.blob.bytes, policy.maxFileBytes, policy.maxPdfPages) : null
   const name = resumeDocumentBlobName(record.workspaceId, record.id, record.resume.documentVersion)
   let blob = await readBlob(dependencies.blobs, name, record.extraction?.document)
   let sourceWarnings: string[] = word ? wordSourceWarnings(wordFormat) : []
@@ -747,7 +760,7 @@ async function extractSource(
     } else if (word) {
       const extracted = await extractWordDocument(original.blob.bytes, wordFormat, {
         ...dependencies.documentIntelligence, clock: dependencies.documentIntelligence.clock ?? lease.clock, signal: lease.signal,
-      }, { ...RESUME_PARAGRAPH_OPTIONS, sectionHeadingPattern: RESUME_SECTIONS })
+      }, { ...RESUME_PARAGRAPH_OPTIONS, maxCharacters: policy.maxSourceCharacters, sectionHeadingPattern: RESUME_SECTIONS })
       await lease.check()
       sourceWarnings = extracted.warnings
       document = {
@@ -757,7 +770,7 @@ async function extractSource(
       }
     } else if (markdown) {
       const extracted = extractMarkdown(original.blob.bytes, {
-        defaultHeading: 'Resume', maxCharacters: LIMITS.maxSourceCharacters,
+        defaultHeading: 'Resume', maxCharacters: policy.maxSourceCharacters,
         emptySourceMessage: 'The Markdown file did not contain readable resume text.',
       })
       document = {
@@ -772,7 +785,7 @@ async function extractSource(
         title: normalizeText(extracted.title).slice(0, 500) || 'Imported resume', paragraphs: extracted.paragraphs,
       }
     }
-    if (characterCount(document) > LIMITS.maxSourceCharacters) throw failure('source-too-large', false, 'parsing')
+    assertSourcePolicy(document.paragraphs, snapshot, 'resumes', pdf)
     if (validateRealResumeDocument(document).length) throw failure('invalid-source', false, 'parsing')
     blob = await saveBlob(lease, dependencies.blobs, name, Buffer.from(JSON.stringify(document)), 'application/json')
   } else if (original.blob.contentType === 'text/html') {
@@ -780,6 +793,7 @@ async function extractSource(
     sourceWarnings = extractResumeHtml(decodeHtml(original.blob.bytes), original.capture.finalUrl!).warnings
   }
   const document = documentFromBlob(blob, record)
+  assertSourcePolicy(document.paragraphs, snapshot, 'resumes', pdf)
   const extraction: ResumeExtractionProvenance = record.extraction ?? {
     method: original.method, version: word ? WORD_EXTRACTION_VERSION : markdown ? MARKDOWN_EXTRACTION_VERSION : EXTRACTION_VERSION, extractedAt: updatedAt(record, lease.clock),
     pagination: documentPagination(original.capture.original.contentType), pageCount, normalizedCharacters: characterCount(document),
@@ -845,16 +859,16 @@ async function profileSource(dependencies: ResumeWorkerDependencies, lease: Resu
   }))
 }
 
-async function recordFailure(lease: ResumeLease, error: unknown): Promise<void> {
+async function recordFailure(lease: ResumeLease, error: unknown, snapshot: ProcessingSettingsSnapshot): Promise<void> {
   if (error instanceof LostResumeWork) return
   const problem = processingError(error, lease.stage, lease.contentType)
   try {
     await lease.update(record => {
-      const retry = problem.retryable && record.attempts < LIMITS.maxAutomaticAttempts
+      const retry = problem.retryable && record.attempts < snapshot.settings.processing.resumes.maxAutomaticAttempts
       const time = updatedAt(record, lease.clock)
       return {
         ...record, updatedAt: time, lease: undefined,
-        nextAttemptAt: retry ? new Date(Date.parse(time) + 15_000 * 2 ** (record.attempts - 1)).toISOString() : undefined,
+        nextAttemptAt: retry ? new Date(Date.parse(time) + retryBackoff(snapshot, 'resumes', record.attempts)).toISOString() : undefined,
         completedAt: retry ? undefined : time,
         error: {
           ...problem, message: problem.retryable && !retry ? `${problem.message} Automatic retry limit reached.` : problem.message,
@@ -881,13 +895,14 @@ async function claim(
     (record.nextAttemptAt && Date.parse(record.nextAttemptAt) > time.getTime()) ||
     (record.lease && Date.parse(record.lease.expiresAt) > time.getTime())) return undefined
   const timestamp = updatedAt(record, clock)
-  const exhausted = record.attempts >= LIMITS.maxAutomaticAttempts
+  const maxAttempts = operationSettings(record, dependencies).settings.processing.resumes.maxAutomaticAttempts
+  const exhausted = record.attempts >= maxAttempts
   const expiresAt = new Date(Date.parse(timestamp) + LEASE_MILLISECONDS).toISOString()
   const next: RealResumeRecord = exhausted ? {
     ...record, updatedAt: timestamp, lease: undefined, nextAttemptAt: undefined, completedAt: timestamp,
     error: {
       code: 'timeout', retryable: true, stage: record.extraction ? 'profiling' : 'parsing',
-      message: 'Resume processing stopped after three automatic attempts. Retry to start a new attempt cycle.',
+      message: `Resume processing stopped after ${maxAttempts} automatic attempts. Retry to start a new attempt cycle.`,
     },
     resume: { ...record.resume, status: 'error' },
   } : {
@@ -916,17 +931,27 @@ export async function processClaimedResume(
   deadlineAt?: number,
   signal?: AbortSignal,
 ): Promise<boolean> {
+  const snapshot = operationSettings(claimed.record, dependencies)
+  const pinned = claimed.record.processingSettings ?? dependencies.settings?.legacy
+  dependencies = {
+    ...dependencies,
+    model: { ...dependencies.model, ...(pinned ? { processingSettings: snapshot } : {}) },
+    documentIntelligence: extractionSettings(dependencies.documentIntelligence, snapshot),
+    safeFetchOptions: fetchSettings(dependencies.safeFetchOptions, snapshot, 'resumes'),
+  }
+  if (pinned) console.info('Score operation settings:', safeSettingsMetadata(snapshot, 'resumeProfile'))
   const lease = new ResumeLease(claimed, dependencies, owner, dependencies.clock ?? systemClock, deadlineAt, signal)
   lease.start()
   try {
     await lease.run(async () => {
+      assertSourceKind(snapshot, 'resumes', claimed.record.source.kind)
       const original = await captureSource(dependencies, lease)
       const document = await extractSource(dependencies, lease, original)
       await profileSource(dependencies, lease, document)
     })
     return true
   } catch (error) {
-    await recordFailure(lease, lease.signal.aborted ? lease.signal.reason : error)
+    await recordFailure(lease, lease.signal.aborted ? lease.signal.reason : error, snapshot)
     return lease.completed
   } finally {
     await lease.stop()
@@ -944,8 +969,12 @@ export async function runResumeWorker(
   const clock = dependencies.clock ?? systemClock
   const owner = dependencies.owner ?? `resume-worker-${randomUUID()}`
   if (!owner.trim() || owner.length > 200) throw new Error('Invalid resume worker lease owner.')
-  const maxItems = bounded(options.maxItems ?? 5, 1, 20)
-  const budget = bounded(options.budgetMilliseconds ?? RUN_BUDGET_MILLISECONDS, 1, RUN_BUDGET_MILLISECONDS)
+  const tuning = await executionSettings(dependencies, 'resumes', {
+    maxItems: options.maxItems ?? 5, budgetMilliseconds: options.budgetMilliseconds ?? RUN_BUDGET_MILLISECONDS,
+  })
+  if (tuning.pauseClaiming) return { claimed: 0, completed: 0 }
+  const maxItems = bounded(tuning.maxItemsPerExecution, 1, 20)
+  const budget = bounded(tuning.budgetMilliseconds, 1, RUN_BUDGET_MILLISECONDS)
   const pendingLimit = bounded(options.pendingLimit ?? maxItems * 3, 1, 100)
   const deadline = clock.now().getTime() + budget
   if (options.signal?.aborted) return { claimed: 0, completed: 0 }

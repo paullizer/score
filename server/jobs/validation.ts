@@ -1,4 +1,5 @@
 import { JOB_IMPORT_LIMITS } from '../../src/domain/real-jobs'
+import { processingSettingsSnapshotSchema } from '../../src/domain/admin-settings-schema'
 import type { RealJobRecord } from '../../src/domain/real-jobs'
 import { isSafeUploadedFilename } from '../../src/domain/source-files'
 import type { Citation, Rubric, SourceDocument } from '../../src/domain/types'
@@ -277,7 +278,7 @@ export function validateStoredRealRubric(value: unknown): value is Rubric {
 export function validateRealJobRecord(value: unknown): value is RealJobRecord {
   if (!isRecord(value) || !hasOnlyKeys(value, [
     'id', 'workspaceId', 'recordType', 'displayName', 'job', 'source', 'inputFingerprint', 'createdBy', 'updatedAt', 'attempts',
-    'nextAttemptAt', 'lease', 'extractedBlobName', 'error', 'warnings', 'lifecycle', 'rubricLifecycle',
+    'nextAttemptAt', 'lease', 'extractedBlobName', 'error', 'warnings', 'lifecycle', 'rubricLifecycle', 'processingSettings',
   ]) || value.recordType !== 'job' || typeof value.id !== 'string' || !isValidJobId(value.id) ||
     typeof value.workspaceId !== 'string' || !isValidWorkspaceId(value.workspaceId) || !isRecord(value.job) ||
     !hasOnlyKeys(value.job, [
@@ -297,6 +298,7 @@ export function validateRealJobRecord(value: unknown): value is RealJobRecord {
     return false
   }
   if (value.displayName !== undefined && !isNormalizedDisplayName(value.displayName)) return false
+  if (value.processingSettings !== undefined && !processingSettingsSnapshotSchema.safeParse(value.processingSettings).success) return false
   if (value.source.originalBlobName !== undefined) {
     if (typeof value.source.originalBlobName !== 'string' ||
       !isOriginalContentType(value.source.originalContentType) ||

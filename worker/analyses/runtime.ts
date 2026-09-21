@@ -29,14 +29,18 @@ import { systemClock, type Clock, type RubricModelOptions } from '../runtime'
 import { AnalysisModelError, assessResumeAgainstTarget } from './model'
 import { emitAnalysisTelemetry, type AnalysisTelemetrySink } from './telemetry'
 import { runAnalysisNarrativeWork, type AnalysisNarrativeTelemetryEvent } from './narrative-runtime'
+import {
+  executionSettings, operationSettings, retryBackoff, RuntimeSettingsError, safeSettingsMetadata,
+  type WorkerSettingsDependencies,
+} from '../settings'
+export { RUNTIME_SETTINGS_VERSION } from '../../src/domain/admin-settings'
 
 const LEASE_MS = 90_000
 const HEARTBEAT_MS = 25_000
-const BACKOFF_MS = 30_000
 const RUN_BUDGET_MS = 660_000
 const FENCE_ATTEMPTS = 8
 
-export interface AnalysisWorkerDependencies {
+export interface AnalysisWorkerDependencies extends WorkerSettingsDependencies {
   store: AnalysisStore
   blobs: AnalysisBlobStore
   model: RubricModelOptions
@@ -82,6 +86,10 @@ function failureFor(error: unknown, stage: Stage, snapshots = false): AnalysisPr
   if (error instanceof AnalysisWorkFailure) return error.failure
   if (error instanceof AnalysisModelError) {
     return { code: error.code, stage: error.stage, message: error.message, retryable: error.retryable }
+  }
+  if (error instanceof RuntimeSettingsError) return {
+    code: error.code === 'model-context-limit' ? 'context-limit' : 'snapshot-invalid',
+    stage, retryable: false, message: error.message,
   }
   if (isInvalidData(error)) {
     return {
@@ -137,10 +145,6 @@ function liveLease(record: RealAnalysisRunRecord | RealAnalysisComparisonRecord,
   return Boolean(record.attemptId && record.attemptId === claimed.record.attemptId &&
     record.attempts === claimed.record.attempts && record.retryCount === claimed.record.retryCount &&
     record.lease?.owner === claimed.record.lease?.owner && record.lease && record.lease.expiresAt > now)
-}
-
-function retryAt(clock: Clock, attempts: number): string {
-  return new Date(clock.now().getTime() + BACKOFF_MS * 2 ** Math.max(0, attempts - 1)).toISOString()
 }
 
 class WorkDeadline {
@@ -283,11 +287,14 @@ async function claimComparison(
     if (signal?.aborted || clock.now().getTime() >= deadline) return
     if (!run || !current || !canScore(run.record) || !['queued', 'running'].includes(current.record.status) || !due(current.record, now)) return
     if (!await workspaceAllowsWork(deps.store, run.record.workspaceId)) return
-    const attemptLimitReached = current.record.attempts >= ANALYSIS_LIMITS.maxAutomaticAttempts
+    const maxAttempts = operationSettings({
+      processingSettings: current.record.processingSettings ?? run.record.processingSettings,
+    }, deps).settings.processing.analyses.maxAutomaticAttempts
+    const attemptLimitReached = current.record.attempts >= maxAttempts
     const timestamp = timeAfter(clock, run.record, current.record)
     const record: RealAnalysisComparisonRecord = {
       ...structuredClone(current.record), status: 'running', attemptId,
-      attempts: Math.min(ANALYSIS_LIMITS.maxAutomaticAttempts, current.record.attempts + 1), updatedAt: timestamp,
+      attempts: Math.min(maxAttempts, current.record.attempts + 1), updatedAt: timestamp,
       lease: { owner, heartbeatAt: timestamp, expiresAt: new Date(Date.parse(timestamp) + LEASE_MS).toISOString() },
     }
     delete record.nextAttemptAt
@@ -395,6 +402,13 @@ export async function processClaimedComparison(
   options: { deadline?: number; signal?: AbortSignal; attemptLimitReached?: boolean } = {},
 ): Promise<boolean> {
   if (deps.owner && deps.owner !== claimed.record.lease?.owner) return false
+  const parent = claimed.record.processingSettings ? undefined : await loadAnalysisRun(deps.store, claimed.record.workspaceId, claimed.record.runId)
+  const pinned = claimed.record.processingSettings ?? parent?.record.processingSettings ?? deps.settings?.legacy
+  const snapshot = operationSettings({ processingSettings: pinned }, deps)
+  deps = { ...deps, model: { ...deps.model, ...(pinned ? { processingSettings: snapshot } : {}) } }
+  if (pinned) console.info('Score operation settings:', safeSettingsMetadata(snapshot, 'assessment'))
+  const maxAttempts = snapshot.settings.processing.analyses.maxAutomaticAttempts
+  const captureDiagnostics = snapshot.settings.diagnostics.capturePrivateFailures
   const clock = deps.clock ?? systemClock
   const lease = new ComparisonLease(claimed, deps.store, clock, options.deadline ?? clock.now().getTime() + RUN_BUDGET_MS, options.signal)
   const startedAt = clock.now().getTime()
@@ -412,8 +426,10 @@ export async function processClaimedComparison(
     stage = event.stage
     correctionCount = event.correctionCount ?? correctionCount
     emitAnalysisTelemetry(safe => {
-      if (events.length < ANALYSIS_DIAGNOSTIC_LIMITS.maxEvents) events.push(structuredClone(safe))
-      else omittedEvents += 1
+      if (captureDiagnostics) {
+        if (events.length < ANALYSIS_DIAGNOSTIC_LIMITS.maxEvents) events.push(structuredClone(safe))
+        else omittedEvents += 1
+      }
       emitAnalysisTelemetry(deps.onEvent, safe)
     }, { ...event, ...context })
   }
@@ -436,7 +452,7 @@ export async function processClaimedComparison(
   try {
     const { run, comparison } = await lease.check()
     if (options.attemptLimitReached) throw new AnalysisWorkFailure('timeout', stage,
-      'Analysis stopped after three processing attempts. A manual retry preserves the original inputs.', true)
+      `Analysis stopped after ${maxAttempts} processing attempts. A manual retry preserves the original inputs.`, true)
     const snapshots = await lease.control.wait(() => readAnalysisSnapshots(inputBlobs(deps.blobs, stage), run.record, comparison.record))
     captured = snapshots
     readingInputs = false
@@ -450,10 +466,11 @@ export async function processClaimedComparison(
     }, {
       model: deps.model, clock, signal: lease.control.signal, onEvent,
       onDiagnostic(diagnostic) {
+        if (!captureDiagnostics) return
         const index = assessments.findIndex(item => item.modelCallId === diagnostic.modelCallId)
         if (index >= 0) assessments[index] = diagnostic
         else {
-          if (assessments.length >= ANALYSIS_LIMITS.maxOutputCorrections + 1) {
+          if (assessments.length >= snapshot.settings.analyses.maxOutputCorrections + 1) {
             throw new AnalysisModelError('internal-error', 'Analysis diagnostic capture exceeded the bounded correction history.')
           }
           assessments.push(diagnostic)
@@ -499,7 +516,7 @@ export async function processClaimedComparison(
     const failure = failureFor(error, stage, readingInputs)
     let diagnostic: AnalysisFailureDiagnosticReference | undefined
     try {
-      diagnostic = await storeFailureDiagnostic(deps, lease, clock, {
+      if (captureDiagnostics) diagnostic = await storeFailureDiagnostic(deps, lease, clock, {
         error: failure, correctionCount, events, omittedEvents, assessments,
         ...(error instanceof AnalysisModelError ? {
           reason: error.reason, citationDiagnostics: error.citationDiagnostics, schemaDiagnostics: error.schemaDiagnostics,
@@ -515,16 +532,16 @@ export async function processClaimedComparison(
     try {
       let status: 'queued' | 'failed' = 'failed'
       await lease.atomic((record, timestamp) => {
-        const retry = failure.retryable && record.attempts < ANALYSIS_LIMITS.maxAutomaticAttempts
+        const retry = failure.retryable && record.attempts < maxAttempts
         status = retry ? 'queued' : 'failed'
         const next: RealAnalysisComparisonRecord = {
           ...record, status, updatedAt: timestamp, error: failure,
           ...(diagnostic ? { failureDiagnostic: diagnostic } : {}),
-          diagnosticCapture: { attemptId: record.attemptId!, status: diagnostic ? 'saved' : 'unavailable', pipelineVersion: ANALYSIS_PIPELINE_VERSION },
+          diagnosticCapture: { attemptId: record.attemptId!, status: !captureDiagnostics ? 'disabled' : diagnostic ? 'saved' : 'unavailable', pipelineVersion: ANALYSIS_PIPELINE_VERSION },
         }
         delete next.lease
         delete next.nextAttemptAt
-        if (retry) next.nextAttemptAt = retryAt(clock, record.attempts)
+        if (retry) next.nextAttemptAt = new Date(clock.now().getTime() + retryBackoff(snapshot, 'analyses', record.attempts)).toISOString()
         return next
       }, true)
       outcome(status, failure)
@@ -546,16 +563,17 @@ async function claimRun(
     const current = await loadAnalysisRun(deps.store, candidate.record.workspaceId, candidate.record.id)
     if (signal?.aborted || clock.now().getTime() >= deadline) return
     if (!current || !runNeedsWork(current.record) || !due(current.record, clock.now().toISOString())) return
+    const maxAttempts = operationSettings(current.record, deps).settings.processing.analyses.maxAutomaticAttempts
     if (!await workspaceAllowsWork(deps.store, current.record.workspaceId, Boolean(current.record.cancellation))) return
     if (current.record.cancellation && current.record.error &&
-      (!current.record.error.retryable || current.record.attempts >= ANALYSIS_LIMITS.maxAutomaticAttempts)) return
+      (!current.record.error.retryable || current.record.attempts >= maxAttempts)) return
     // A new cancellation is a different work cycle from the completed initializer.
     const previousAttempts = current.record.cancellation && !current.record.lease && !current.record.error ? 0 : current.record.attempts
-    const attemptLimitReached = previousAttempts >= ANALYSIS_LIMITS.maxAutomaticAttempts
+    const attemptLimitReached = previousAttempts >= maxAttempts
     const timestamp = timeAfter(clock, current.record)
     const record: RealAnalysisRunRecord = {
       ...structuredClone(current.record), updatedAt: timestamp, attemptId,
-      attempts: Math.min(ANALYSIS_LIMITS.maxAutomaticAttempts, previousAttempts + 1),
+      attempts: Math.min(maxAttempts, previousAttempts + 1),
       lease: { owner, heartbeatAt: timestamp, expiresAt: new Date(Date.parse(timestamp) + LEASE_MS).toISOString() },
     }
     delete record.nextAttemptAt
@@ -621,8 +639,12 @@ async function processRun(
     },
   }
   try {
+    const snapshot = operationSettings(claimed.record, deps)
+    if (!claimed.record.cancellation && claimed.record.progress.total > snapshot.settings.analyses.maxComparisons) {
+      throw new AnalysisWorkFailure('invalid-input', 'initialization', 'The accepted analysis manifest exceeds its captured comparison limit. No comparisons were scored.', false)
+    }
     if (attemptLimitReached) throw new AnalysisWorkFailure('timeout', 'initialization',
-      'Analysis initialization stopped after three processing attempts. Retry preserves the accepted manifest.', true)
+      `Analysis initialization stopped after ${operationSettings(claimed.record, deps).settings.processing.analyses.maxAutomaticAttempts} processing attempts. Retry preserves the accepted manifest.`, true)
     for (let chunk = 0; chunk < ANALYSIS_LIMITS.maxComparisons; chunk++) {
       control.check()
       await control.wait(() => runChange(deps, claimed, clock, (record, timestamp) => {
@@ -647,11 +669,12 @@ async function processRun(
     const failure = failureFor(error, 'initialization', true)
     try {
       await runChange(deps, claimed, clock, (record, timestamp) => {
-        const retry = failure.retryable && record.attempts < ANALYSIS_LIMITS.maxAutomaticAttempts
+        const snapshot = operationSettings(claimed.record, deps)
+        const retry = failure.retryable && record.attempts < snapshot.settings.processing.analyses.maxAutomaticAttempts
         const next = { ...record, updatedAt: timestamp, error: failure }
         delete next.lease
         delete next.nextAttemptAt
-        if (retry) next.nextAttemptAt = retryAt(clock, record.attempts)
+        if (retry) next.nextAttemptAt = new Date(clock.now().getTime() + retryBackoff(snapshot, 'analyses', record.attempts)).toISOString()
         else if (!record.cancellation) next.status = 'failed'
         return next
       })
@@ -672,9 +695,13 @@ function boundedInteger(value: number, min: number, max: number, label: string):
 export async function runAnalysisWorker(
   dependencies: AnalysisWorkerDependencies, options: AnalysisWorkerOptions = {},
 ): Promise<{ claimed: number; completed: number }> {
-  const maxItems = boundedInteger(options.maxItems ?? 2, 1, 100, 'Analysis worker maxItems')
+  const tuning = await executionSettings(dependencies, 'analyses', {
+    maxItems: options.maxItems ?? 2, budgetMilliseconds: options.budgetMilliseconds ?? RUN_BUDGET_MS,
+  })
+  if (tuning.pauseClaiming) return { claimed: 0, completed: 0 }
+  const maxItems = boundedInteger(tuning.maxItemsPerExecution, 1, 100, 'Analysis worker maxItems')
   const pendingLimit = boundedInteger(options.pendingLimit ?? 100, 1, 100, 'Analysis worker pendingLimit')
-  const budget = boundedInteger(options.budgetMilliseconds ?? RUN_BUDGET_MS, 1, RUN_BUDGET_MS, 'Analysis worker budgetMilliseconds')
+  const budget = boundedInteger(tuning.budgetMilliseconds, 1, RUN_BUDGET_MS, 'Analysis worker budgetMilliseconds')
   const clock = dependencies.clock ?? systemClock
   const owner = dependencies.owner ?? `analysis-worker-${randomUUID()}`
   if (!owner.trim() || owner.length > 200) throw new Error('The analysis worker owner must be a bounded nonempty identifier.')

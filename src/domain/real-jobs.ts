@@ -2,6 +2,7 @@ import type { Job, Rubric, SourceDocument } from './types'
 import type { LifecycleMetadata } from './lifecycle'
 import type { OriginalContentType, UploadFormat, WordImportFeatures } from './document-formats'
 import { MAX_MARKDOWN_BYTES } from './source-files'
+import type { ProcessingSettingsSnapshot } from './admin-settings'
 
 export const JOB_IMPORT_LIMITS = {
   maxFileBytes: 10 * 1024 * 1024,
@@ -51,6 +52,7 @@ export interface RealJobRecord {
   warnings: string[]
   lifecycle?: LifecycleMetadata
   rubricLifecycle?: LifecycleMetadata
+  processingSettings?: ProcessingSettingsSnapshot
 }
 
 export interface VersionedRealJob {
@@ -85,7 +87,7 @@ export interface RealJobsPage {
 export interface JobProcessingFeatures extends WordImportFeatures {
   realJobImports: boolean
   markdownJobImports: boolean
-  limits: typeof JOB_IMPORT_LIMITS
+  limits: { [K in keyof typeof JOB_IMPORT_LIMITS]: number }
 }
 
 export function isRealJob(job: Job): boolean {

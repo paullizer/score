@@ -1,6 +1,8 @@
 import { useEffect, useRef, useState } from 'react'
 import { Download, FileSearch, LoaderCircle } from 'lucide-react'
 import { useGradeLadders } from '../../app/grade-ladders-context'
+import { useWorkspace } from '../../app/workspace-context'
+import { originalDownloadReason, usePublicSettings } from '../../app/public-settings-context'
 import type { Citation } from '../../domain/types'
 import type { FrozenReferenceSource, ReferenceDocument, ReferenceSourceRecord } from '../../domain/real-grades'
 import { DocumentViewer } from '../../components/documents/DocumentViewer'
@@ -50,6 +52,10 @@ export function GradeSourceProvenance({ source }: { source: ReferenceSourceRecor
 
 export function GradeSourceInspector({ ladderId, selection, onClose }: { ladderId: string; selection: GradeSourceSelection; onClose: () => void }) {
   const api = useGradeLadders()
+  const policy = usePublicSettings()
+  const { cloud } = useWorkspace()
+  const role = cloud?.workspaces.find(item => item.id === cloud.currentWorkspaceId)?.role
+  const downloadReason = originalDownloadReason(policy, role)
   const service = useRef(api)
   service.current = api
   const [loaded, setLoaded] = useState<{ document: ReferenceDocument; source: ReferenceSourceRecord | FrozenReferenceSource; sourceSetId?: string; capturedAt?: string } | null>(null)
@@ -97,7 +103,8 @@ export function GradeSourceInspector({ ladderId, selection, onClose }: { ladderI
   const resolvedSourceId = loaded ? ('sourceId' in loaded.source ? loaded.source.sourceId : loaded.source.id) : undefined
   return <Modal open onOpenChange={(open) => { if (!open) onClose() }} drawer title={loaded?.source.title ?? 'Captured source inspector'}
     description={sourceSetId ? 'The exact source version frozen for this grade version. Current extractions are never substituted.' : 'Current captured source proposal. Generated versions open their own immutable source set.'}
-    footer={<><Button onClick={onClose}>Close source</Button>{loaded && resolvedSourceId && <a className="button button-secondary button-md" download href={api?.originalUrl(ladderId, resolvedSourceId, loaded.sourceSetId)}><Download size={15} aria-hidden="true" />Captured original</a>}</>}>
+    footer={<><Button onClick={onClose}>Close source</Button>{loaded && resolvedSourceId && !downloadReason && <a className="button button-secondary button-md" download href={api?.originalUrl(ladderId, resolvedSourceId, loaded.sourceSetId)}><Download size={15} aria-hidden="true" />Captured original</a>}
+      {downloadReason && <span className="text-[11px] text-muted" role="status">{downloadReason}</span>}</>}>
     {error && <InlineError>{error} <button className="underline" onClick={() => setRetry((value) => value + 1)}>Retry source</button></InlineError>}
     {!loaded && !error && <EmptyState icon={LoaderCircle} title="Opening the private reference" description="Retrieving the authorized captured document and its immutable source metadata." />}
     {loaded && <>

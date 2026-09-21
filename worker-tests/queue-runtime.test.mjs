@@ -1,7 +1,9 @@
 import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
 import test from 'node:test'
-import { runWorker, sourceBlobNames } from '../dist-worker/runtime.mjs'
+import { loadWorker } from './shared-model-loader.mjs'
+import { settingsSnapshot } from './runtime-settings-test-support.mjs'
+const { runWorker, sourceBlobNames } = await loadWorker('../worker/runtime.ts')
 
 const workspaceId = '22222222-2222-4222-8222-222222222222'
 const jobId = 'job-11111111-1111-4111-8111-111111111111'
@@ -226,6 +228,52 @@ function successfulModel(result = modelResult) {
     choices: [{ message: { content: JSON.stringify(result) } }],
   }), { status: 200 })
 }
+
+test('durable job retries retain accepted task, attempt cap and backoff after current settings change', async () => {
+  const accepted = settingsSnapshot(settings => {
+    settings.processing.jobs.maxAutomaticAttempts = 2
+    settings.processing.jobs.retryBackoff.baseMilliseconds = 7_000
+    settings.ai.transport.maxAttempts = 1
+  })
+  const newer = settingsSnapshot(settings => {
+    settings.ai.tasks.jobRubric.deploymentId = 'gradeDraft'
+    settings.processing.jobs.maxAutomaticAttempts = 1
+    settings.workers.jobs.maxItemsPerExecution = 1
+  }, 'new-current-revision')
+  const store = fakeStore(record({ processingSettings: accepted }))
+  const bodies = []
+  const deps = dependencies(store, fakeBlobs(), async (_url, init) => {
+    bodies.push(JSON.parse(init.body))
+    return bodies.length === 1 ? new Response('', { status: 503 }) : successfulModel()
+  })
+  let reads = 0
+  let timestamp = now
+  deps.clock = deps.model.clock = { now: () => new Date(timestamp), sleep: async () => {} }
+  deps.settings = { legacy: accepted, current: async () => { reads++; return newer } }
+  await runWorker(deps)
+  assert.equal(store.state().job.status, 'queued')
+  assert.equal(Date.parse(store.state().nextAttemptAt) - Date.parse(now), 7_000)
+  timestamp = store.state().nextAttemptAt
+  await runWorker(deps)
+  assert.equal(store.state().job.status, 'ready')
+  assert.equal(store.state().attempts, 2)
+  assert.equal(store.state().processingSettings.revision, accepted.revision)
+  assert.deepEqual(bodies.map(body => body.model), ['deployment-jobRubric', 'deployment-jobRubric'])
+  assert.equal(reads, 2)
+})
+
+test('cached job evidence cannot bypass the accepted byte or complete-source character limits', async () => {
+  for (const change of [
+    settings => { settings.imports.jobs.maxFileBytes = 1024 },
+    settings => { settings.imports.jobs.maxSourceCharacters = 20 },
+  ]) {
+    const store = fakeStore(record({ source: { ...record().source, bytes: 2048 }, processingSettings: settingsSnapshot(change) }))
+    await runWorker(dependencies(store, fakeBlobs(), async () => assert.fail('oversized cached evidence cannot call a model')))
+    assert.equal(store.state().job.status, 'error')
+    assert.match(store.state().error.code, /source-(?:policy-limit|too-large)/)
+    assert.equal(store.state().attempts, 1)
+  }
+})
 
 test('job metadata edits during processing and conditional publication preserve aliases without retrying model work', async () => {
   let updateRaced = false

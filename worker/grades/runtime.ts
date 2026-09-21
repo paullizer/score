@@ -2,7 +2,7 @@ import { createHash, randomUUID } from 'node:crypto'
 import { setTimeout as delay } from 'node:timers/promises'
 import { PDFDocument } from 'pdf-lib'
 import {
-  GRADE_LADDER_LIMITS, gradeHeadId, gradeRecordIs,
+  gradeHeadId, gradeRecordIs,
   type GradeCompetencyPlanRecord, type GradeEntity, type GradeHeadRecord,
   type GradeIssue, type GradeLadderRecord, type GradeProcessingError, type GradeReviewRecord,
   type GradeRubricVersionRecord, type GradeSeedSnapshot, type GradeSourceSetRecord,
@@ -22,11 +22,16 @@ import type { DocumentIntelligenceClientOptions } from '../runtime'
 import { GradeModelError } from './model-errors'
 import { reconcileReferenceIssues } from '../references/issue-lifecycle'
 import { assertGradeWritable, gradeIsLocked, guardedGradeBlobs } from '../../server/grades/guards'
+import type { ProcessingSettingsSnapshot } from '../../src/domain/admin-settings'
+import {
+  executionSettings, extractionSettings, operationSettings, retryBackoff, safeSettingsMetadata, type WorkerSettingsDependencies,
+} from '../settings'
+import { enforceReferenceCharacters } from '../references/html'
+export { RUNTIME_SETTINGS_VERSION } from '../../src/domain/admin-settings'
 
 const LEASE_MS = 120_000
 const HEARTBEAT_MS = 25_000
 const RUN_BUDGET_MS = 11 * 60_000
-const MAX_ATTEMPTS = 3
 
 export class GradeWorkerError extends Error {
   constructor(readonly code: string, message: string, readonly retryable = false, options?: ErrorOptions) {
@@ -43,7 +48,7 @@ class DeferredGradeWork extends Error {
   constructor() { super('Processing will resume in the next worker execution.'); this.name = 'DeferredGradeWork' }
 }
 
-export interface GradeWorkerDependencies {
+export interface GradeWorkerDependencies extends WorkerSettingsDependencies {
   store: GradeStore
   blobs: GradeBlobStore
   discover: DiscoverOpmSources
@@ -138,10 +143,12 @@ function uniqueIssues(issues: GradeIssue[]): GradeIssue[] {
 
 function workRecord(
   ladder: GradeLadderRecord, id: string, input: GradeWorkInput, now: string,
+  processingSettings?: ProcessingSettingsSnapshot,
 ): GradeWorkRecord {
   return {
     id, workspaceId: ladder.workspaceId, ladderId: ladder.id, recordType: 'grade-work',
     input, status: 'queued', attempts: 0, nextAttemptAt: now, createdAt: now, updatedAt: now,
+    ...(processingSettings ? { processingSettings } : {}),
   }
 }
 
@@ -277,6 +284,15 @@ async function loadSourceSet(
     throw new GradeWorkerError('source-set-integrity', 'The confirmed source set no longer matches its recorded inputs.')
   }
   const documents: ReferenceDocument[] = []
+  const gradePolicy = operationSettings(work, deps).settings.grades
+  const limits = gradePolicy.references
+  if (sourceSet.grades.some(grade => !gradePolicy.allowedLevels.includes(grade))) {
+    throw new GradeWorkerError('grade-level-policy', 'The frozen generation contains a grade outside its captured allowed levels.')
+  }
+  if (sourceSet.sources.filter(source => source.origin !== 'seed-job').length > limits.maxSources) {
+    throw new GradeWorkerError('reference-limit-reached', 'The frozen source set exceeds its captured supporting-source limit. No sources were dropped.')
+  }
+  let pages = 0
   for (const source of sourceSet.sources) {
     const blob = await deps.blobs.read(source.documentBlobName)
     if (!blob) throw new GradeWorkerError('reference-document-missing', 'A captured reference document is unavailable.')
@@ -286,6 +302,17 @@ async function loadSourceSet(
     }
     if (document.id !== source.documentId || document.version !== source.documentVersion) {
       throw new GradeWorkerError('reference-version-mismatch', 'A captured reference does not match the confirmed document version.')
+    }
+    if (source.origin !== 'seed-job') {
+      enforceReferenceCharacters(document.paragraphs, limits.maxSourceCharacters)
+      if (source.originalContentType === 'application/pdf' ||
+        (!source.originalContentType && (document.pageCount > 1 || source.originalBlobName.endsWith('.pdf')))) {
+        const selectedPages = document.selectedPages.length || document.pageCount
+        pages += selectedPages
+        if (selectedPages > limits.maxSelectedPages || pages > limits.maxTotalSelectedPages) {
+          throw new GradeWorkerError('reference-page-budget', 'The frozen source set exceeds its captured selected-page budget. No pages were dropped.')
+        }
+      }
     }
     documents.push(document)
   }
@@ -341,7 +368,7 @@ async function discoverSources(deps: GradeWorkerDependencies, lease: GradeLease,
       if (record.origin === 'opm') removed.add(sourceId)
       else retained.push(record)
     }
-    const available = Math.max(0, GRADE_LADDER_LIMITS.maxSources - retained.filter(source => source.origin !== 'seed-job').length)
+    const available = Math.max(0, operationSettings(work, deps).settings.grades.references.maxSources - retained.filter(source => source.origin !== 'seed-job').length)
     const candidateMap = new Map(discovered.candidates.map(candidate => [
       `${candidate.url}\0${candidate.intendedSection ?? ''}\0${candidate.purpose}`, candidate,
     ]))
@@ -358,6 +385,7 @@ async function discoverSources(deps: GradeWorkerDependencies, lease: GradeLease,
     for (const [index, candidate] of candidates.slice(0, available).entries()) {
       const sourceId = derivedId('source', `${work.id}:${index}:${candidate.url}:${candidate.intendedSection ?? ''}`)
       const source: ReferenceSourceRecord = {
+        ...(work.processingSettings ?? deps.settings?.legacy ? { processingSettings: work.processingSettings ?? deps.settings?.legacy } : {}),
         id: sourceId, workspaceId: work.workspaceId, ladderId: work.ladderId, recordType: 'grade-source',
         createdAt: capturedAt, updatedAt: capturedAt, origin: 'opm', purpose: candidate.purpose,
         title: candidate.title, publisher: candidate.publisher, requestedUrl: candidate.url,
@@ -371,7 +399,7 @@ async function discoverSources(deps: GradeWorkerDependencies, lease: GradeLease,
       sourceIds.push(sourceId)
       operations.push({ kind: 'create', record: source }, {
         kind: 'create',
-        record: workRecord(current.record, derivedId('grade-work', `${work.id}:${sourceId}`), { kind: 'extract-source', sourceId, documentVersion: 1 }, capturedAt),
+        record: workRecord(current.record, derivedId('grade-work', `${work.id}:${sourceId}`), { kind: 'extract-source', sourceId, documentVersion: 1 }, capturedAt, work.processingSettings ?? deps.settings?.legacy),
       })
     }
     if (removed.size) {
@@ -487,10 +515,17 @@ async function extractSource(deps: GradeWorkerDependencies, lease: GradeLease, n
   const currentLadder = await activeLadder(deps, work)
   const initial = await requireRecord(deps.store, work.workspaceId, sourceId, 'grade-source')
   ensureSourceInLadder(initial.record, currentLadder.record)
+  const policy = operationSettings(work, deps).settings.grades.references
+  if (initial.record.origin === 'upload' ? !policy.allowAgencyUploads
+    : initial.record.origin !== 'opm' && initial.record.origin !== 'seed-job' && !policy.allowAgencyUrls) {
+    throw new GradeWorkerError('reference-policy', 'This supplemental source is not allowed by its captured reference policy.')
+  }
   if (initial.record.origin === 'seed-job') throw new GradeWorkerError('seed-not-extractable', 'The captured seed context must not be re-extracted as a reference.')
   const documentVersion = initial.record.documentVersion
   if (work.input.documentVersion !== undefined && work.input.documentVersion !== documentVersion) throw new LostGradeWork()
   const { original, capture } = await captureOriginal(deps, initial.record, lease, now)
+  const limits = operationSettings(work, deps).settings.grades.references
+  if (original.bytes.byteLength > limits.maxPdfBytes) throw new GradeWorkerError('reference-too-large', 'The original exceeds its captured reference byte limit.')
   let pageCount: number | undefined
   if (original.contentType === 'application/pdf') {
     try { pageCount = (await PDFDocument.load(original.bytes, { updateMetadata: false })).getPageCount() } catch (error) {
@@ -515,8 +550,8 @@ async function extractSource(deps: GradeWorkerDependencies, lease: GradeLease, n
   }, 'running')
   if (pageCount !== undefined) {
     const selectedCount = source.selectedPages.length || pageCount
-    if (selectedCount > GRADE_LADDER_LIMITS.maxPdfPages) {
-      throw new GradeWorkerError('reference-pages-required', `This reference has ${pageCount} pages. Select at most ${GRADE_LADDER_LIMITS.maxPdfPages} relevant pages before retrying.`)
+    if (selectedCount > limits.maxSelectedPages) {
+      throw new GradeWorkerError('reference-pages-required', `This reference has ${pageCount} pages. Select at most ${limits.maxSelectedPages} relevant pages before retrying.`)
     }
     await lease.atomic(async () => {
       const ladder = await activeLadder(deps, work)
@@ -528,8 +563,8 @@ async function extractSource(deps: GradeWorkerDependencies, lease: GradeLease, n
           total += record.selectedPages.length || record.pageCount || 0
         }
       }
-      if (total > GRADE_LADDER_LIMITS.maxTotalPdfPages) {
-        throw new GradeWorkerError('reference-page-budget', `The active reference selections exceed ${GRADE_LADDER_LIMITS.maxTotalPdfPages} PDF pages. Reduce page selections before retrying.`)
+      if (total > limits.maxTotalSelectedPages) {
+        throw new GradeWorkerError('reference-page-budget', `The active reference selections exceed ${limits.maxTotalSelectedPages} PDF pages. Reduce page selections before retrying.`)
       }
       return [{ kind: 'replace', etag: ladder.etag, record: { ...ladder.record, updatedAt: now().toISOString() } }]
     }, 'running')
@@ -548,6 +583,8 @@ async function extractSource(deps: GradeWorkerDependencies, lease: GradeLease, n
   })
   await lease.check()
   const document = deps.parseDocument(extraction.document)
+  enforceReferenceCharacters(document.paragraphs, limits.maxSourceCharacters)
+  if (extraction.links.length > limits.maxLinks) throw new GradeWorkerError('reference-link-budget', 'The reference exceeds its captured link budget. No links were silently dropped.')
   if (document.id !== source.documentId || document.version !== documentVersion) {
     throw new GradeWorkerError('extracted-version-mismatch', 'Reference extraction returned an unexpected document identity.')
   }
@@ -573,6 +610,7 @@ async function extractSource(deps: GradeWorkerDependencies, lease: GradeLease, n
       relatedLinks: [...new Map([...fresh.record.relatedLinks, ...extraction.links].map(link => [`${link.url}:${link.relation}`, link])).values()],
       issues: uniqueIssues([...fresh.record.issues, ...warnings]), error: undefined, updatedAt: now().toISOString(),
     }
+    if (ready.relatedLinks.length > limits.maxLinks) throw new GradeWorkerError('reference-link-budget', 'The combined reference links exceed their captured budget. No links were silently dropped.')
     ready.issueResolutions = reconcileReferenceIssues(ready, extraction).resolved
     return [
       { kind: 'replace', etag: fresh.etag, record: ready },
@@ -587,10 +625,15 @@ async function planCompetencies(deps: GradeWorkerDependencies, lease: GradeLease
   const { sourceSetId, generationId } = work.input
   const input = await loadSourceSet(deps, work, sourceSetId, generationId)
   const seed = await loadSeed(deps, input.ladder)
-  const result = await deps.planCompetencies({ seed, sourceSet: input.sourceSet, documents: input.documents }, deps.invokeModel, lease.signal)
+  const result = await deps.planCompetencies({ seed, sourceSet: input.sourceSet, documents: input.documents,
+    processingSettings: work.processingSettings ?? deps.settings?.legacy }, deps.invokeModel, lease.signal)
+  if (result.competencies.length > operationSettings(work, deps).settings.grades.maxCriteria) {
+    throw new GradeWorkerError('grade-criteria-limit', 'The generated competency plan exceeds its captured criterion limit. No competencies were removed.')
+  }
   await lease.check()
   const createdAt = now().toISOString()
   const plan: GradeCompetencyPlanRecord = {
+    ...(work.processingSettings ?? deps.settings?.legacy ? { processingSettings: work.processingSettings ?? deps.settings?.legacy } : {}),
     id: derivedId('competency-plan', work.id), workspaceId: work.workspaceId, ladderId: work.ladderId,
     recordType: 'grade-competency-plan', createdAt, updatedAt: createdAt, sourceSetId, generationId,
     competencies: result.competencies, issues: result.issues, model: result.model, promptVersion: result.promptVersion,
@@ -607,7 +650,7 @@ async function planCompetencies(deps: GradeWorkerDependencies, lease: GradeLease
         kind: 'create',
         record: workRecord(ladder.record, derivedId('grade-work', `${work.id}:${grade}`), {
           kind: 'generate-grade', sourceSetId, generationId, competencyPlanId: plan.id, grade,
-        }, createdAt),
+        }, createdAt, work.processingSettings ?? deps.settings?.legacy),
       }, {
         kind: 'replace', etag: head.etag,
         record: { ...head.record, status: 'queued', issues: scopedIssues(result.issues, grade), error: undefined, updatedAt: createdAt },
@@ -649,9 +692,14 @@ async function generateGrade(deps: GradeWorkerDependencies, lease: GradeLease, n
   const createdAt = now().toISOString()
   const result = await deps.draftGrade({
     ...input, competencies: plan.competencies, grade, versionId, version: versionNumber, createdAt,
+    processingSettings: work.processingSettings ?? deps.settings?.legacy,
   }, deps.invokeModel, lease.signal)
+  if (result.rubric.criteria.length > operationSettings(work, deps).settings.grades.maxCriteria) {
+    throw new GradeWorkerError('grade-criteria-limit', 'The generated grade exceeds its captured criterion limit. No criteria were removed.')
+  }
   await lease.check()
   const version: GradeRubricVersionRecord = {
+    ...(work.processingSettings ?? deps.settings?.legacy ? { processingSettings: work.processingSettings ?? deps.settings?.legacy } : {}),
     id: versionId, workspaceId: work.workspaceId, ladderId: work.ladderId, recordType: 'grade-version',
     grade, version: versionNumber, generationId, sourceSetId, rubric: result.rubric, qualifications: result.qualifications,
     issues: uniqueIssues([...scopedIssues(plan.issues, grade), ...result.issues]),
@@ -672,7 +720,7 @@ async function generateGrade(deps: GradeWorkerDependencies, lease: GradeLease, n
         kind: 'create',
         record: workRecord(ladder.record, derivedId('grade-work', `${work.id}:review`), {
           kind: 'review-grade', grade, sourceSetId, generationId, versionId,
-        }, now().toISOString()),
+        }, now().toISOString(), work.processingSettings ?? deps.settings?.legacy),
       },
       {
         kind: 'replace', etag: fresh.etag,
@@ -697,7 +745,8 @@ async function reviewGrade(deps: GradeWorkerDependencies, lease: GradeLease, now
   const currentHead = await requireRecord(deps.store, work.workspaceId, gradeHeadId(work.ladderId, grade), 'grade-head')
   ensureHeadGeneration(currentHead.record, sourceSetId, generationId)
   if (currentHead.record.latestVersionId !== versionId) throw new LostGradeWork()
-  const result = await deps.reviewGrade({ version, sourceSet: input.sourceSet, documents: input.documents }, deps.invokeModel, lease.signal)
+  const result = await deps.reviewGrade({ version, sourceSet: input.sourceSet, documents: input.documents,
+    processingSettings: work.processingSettings ?? deps.settings?.legacy }, deps.invokeModel, lease.signal)
   await lease.check()
   const validationIssues: GradeIssue[] = deps.validateVersion(version, input.sourceSet, input.documents).map((message, index) => ({
     id: `validation-${versionId}-${index}`, code: 'grade-validation', severity: 'blocker', scope: 'grade', grade, message,
@@ -718,6 +767,7 @@ async function reviewGrade(deps: GradeWorkerDependencies, lease: GradeLease, now
   })
   const createdAt = now().toISOString()
   const review: GradeReviewRecord = {
+    ...(work.processingSettings ?? deps.settings?.legacy ? { processingSettings: work.processingSettings ?? deps.settings?.legacy } : {}),
     id: derivedId('grade-review', work.id), workspaceId: work.workspaceId, ladderId: work.ladderId, recordType: 'grade-review',
     grade, versionId, versionHash: version.contentHash, sourceSetId, outcome: supported ? 'supported' : 'needs-sources',
     issues, model: result.model, promptVersion: result.promptVersion, createdAt, updatedAt: createdAt,
@@ -759,13 +809,15 @@ function processingError(error: unknown): GradeProcessingError {
 }
 
 async function recordFailure(deps: GradeWorkerDependencies, lease: GradeLease, error: unknown, now: () => Date): Promise<void> {
+  const snapshot = operationSettings(lease.claimed.record, deps)
+  const maxAttempts = snapshot.settings.processing.grades.maxAutomaticAttempts
   const failure = processingError(error)
   const deferred = error instanceof DeferredGradeWork
   const stale = error instanceof LostGradeWork
   await lease.atomic(async work => {
     if (stale) return []
     const ladder = await requireRecord(deps.store, work.workspaceId, work.ladderId, 'grade-ladder')
-    const terminal = !deferred && (!failure.retryable || work.attempts >= MAX_ATTEMPTS)
+    const terminal = !deferred && (!failure.retryable || work.attempts >= maxAttempts)
     const sourceGap = error instanceof GradeModelError && error.code === 'model-context-limit'
     const modelIssues = error instanceof GradeModelError ? [...error.issues] : []
     const operations: GradeTransaction[] = []
@@ -810,12 +862,12 @@ async function recordFailure(deps: GradeWorkerDependencies, lease: GradeLease, e
       })
     }
     return operations
-  }, stale ? 'cancelled' : deferred || (failure.retryable && lease.claimed.record.attempts < MAX_ATTEMPTS) ? 'queued' : 'failed', {
+  }, stale ? 'cancelled' : deferred || (failure.retryable && lease.claimed.record.attempts < maxAttempts) ? 'queued' : 'failed', {
     error: deferred || stale ? undefined : failure,
     attempts: deferred ? Math.max(0, lease.claimed.record.attempts - 1) : lease.claimed.record.attempts,
     nextAttemptAt: deferred ? new Date(now().getTime() + 5000).toISOString() :
-      !stale && failure.retryable && lease.claimed.record.attempts < MAX_ATTEMPTS
-        ? new Date(now().getTime() + 30_000 * 2 ** (lease.claimed.record.attempts - 1)).toISOString() : undefined,
+      !stale && failure.retryable && lease.claimed.record.attempts < maxAttempts
+        ? new Date(now().getTime() + retryBackoff(snapshot, 'grades', lease.claimed.record.attempts)).toISOString() : undefined,
   }, true)
 }
 
@@ -827,7 +879,7 @@ async function claim(
     (candidate.record.lease && Date.parse(candidate.record.lease.expiresAt) > time.getTime()) ||
     (candidate.record.nextAttemptAt && Date.parse(candidate.record.nextAttemptAt) > time.getTime())) return
   const record: GradeWorkRecord = {
-    ...candidate.record, status: 'running', attempts: Math.min(candidate.record.attempts + 1, MAX_ATTEMPTS),
+    ...candidate.record, status: 'running', attempts: Math.min(candidate.record.attempts + 1, operationSettings(candidate.record, deps).settings.processing.grades.maxAutomaticAttempts),
     lease: { owner, expiresAt: new Date(time.getTime() + LEASE_MS).toISOString() },
     nextAttemptAt: new Date(time.getTime() + LEASE_MS).toISOString(), error: undefined, updatedAt: time.toISOString(),
   }
@@ -847,13 +899,24 @@ export async function processGradeWork(
   claimed: VersionedGradeEntity<GradeWorkRecord>, deps: GradeWorkerDependencies,
   options: { owner: string; deadline: number; signal?: AbortSignal; attemptLimitReached?: boolean },
 ): Promise<'succeeded' | 'failed' | 'deferred' | 'cancelled'> {
-  deps = { ...deps, blobs: guardedGradeBlobs(deps.store, deps.blobs) }
+  const snapshot = operationSettings(claimed.record, deps)
+  const pinned = claimed.record.processingSettings ?? deps.settings?.legacy
+  const invoke = deps.invokeModel
+  deps = { ...deps, blobs: guardedGradeBlobs(deps.store, deps.blobs),
+    documentIntelligence: extractionSettings(deps.documentIntelligence, snapshot),
+    sourceOptions: { ...deps.sourceOptions, ...(pinned ? { processingSettings: snapshot } : {}) },
+    invokeModel: (request, signal) => invoke({ ...request, ...(pinned ? { processingSettings: snapshot } : {}) }, signal),
+  }
+  if (pinned) console.info('Score operation settings:', safeSettingsMetadata(snapshot,
+    claimed.record.input.kind === 'plan-competencies' ? 'gradeCompetencies'
+      : claimed.record.input.kind === 'generate-grade' ? 'gradeDraft'
+        : claimed.record.input.kind === 'review-grade' ? 'gradeReview' : undefined))
   const now = deps.now ?? (() => new Date())
   const lease = new GradeLease(claimed, deps.store, options.owner, now, options.deadline, options.signal)
   lease.start()
   try {
     await lease.check()
-    if (options.attemptLimitReached) throw new GradeWorkerError('grade-attempt-limit', 'The stage stopped after three processing attempts.')
+    if (options.attemptLimitReached) throw new GradeWorkerError('grade-attempt-limit', `The stage stopped after ${snapshot.settings.processing.grades.maxAutomaticAttempts} processing attempts.`)
     switch (claimed.record.input.kind) {
       case 'discover': await discoverSources(deps, lease, now); break
       case 'extract-source': await extractSource(deps, lease, now); break
@@ -896,12 +959,16 @@ export async function processGradeWork(
 export async function runGradeWorker(
   deps: GradeWorkerDependencies, options: GradeWorkerOptions = {},
 ): Promise<{ claimed: number; succeeded: number; failed: number; deferred: number; cancelled: number }> {
-  const maxItems = options.maxItems ?? 5
+  const tuning = await executionSettings(deps, 'grades', {
+    maxItems: options.maxItems ?? 5, budgetMilliseconds: options.budgetMilliseconds ?? RUN_BUDGET_MS,
+  })
+  const maxItems = tuning.maxItemsPerExecution
   if (!Number.isInteger(maxItems) || maxItems < 1 || maxItems > 20) throw new GradeWorkerError('invalid-worker-limit', 'Grade worker maxItems must be between 1 and 20.')
   const now = deps.now ?? (() => new Date())
-  const deadline = now().getTime() + (options.budgetMilliseconds ?? RUN_BUDGET_MS)
+  const deadline = now().getTime() + tuning.budgetMilliseconds
   const owner = options.owner ?? `grade-worker-${randomUUID()}`
   const results = { claimed: 0, succeeded: 0, failed: 0, deferred: 0, cancelled: 0 }
+  if (tuning.pauseClaiming) return results
   const candidates = await deps.store.listPending(now().toISOString(), maxItems * 3)
   for (const candidate of candidates) {
     if (options.signal?.aborted || now().getTime() >= deadline || results.claimed >= maxItems) break
@@ -909,7 +976,7 @@ export async function runGradeWorker(
     if (!claimed) continue
     results.claimed++
     const outcome = await processGradeWork(claimed, deps, {
-      owner, deadline, signal: options.signal, attemptLimitReached: candidate.record.attempts >= MAX_ATTEMPTS,
+      owner, deadline, signal: options.signal, attemptLimitReached: candidate.record.attempts >= operationSettings(candidate.record, deps).settings.processing.grades.maxAutomaticAttempts,
     })
     results[outcome]++
     if (outcome === 'deferred') break

@@ -1,6 +1,7 @@
 import { useId, useRef, useState, type FormEvent } from 'react'
 import { Plus, Save, Trash2 } from 'lucide-react'
 import { useWorkspace } from '../../app/workspace-context'
+import { usePublicSettings } from '../../app/public-settings-context'
 import { useGradeLeaveGuard } from '../../app/grade-navigation-context'
 import { Badge, Button, DemoNote, InlineError, Modal } from '../../components/ui'
 import type { Criterion, Rubric } from '../../domain/types'
@@ -14,6 +15,7 @@ export function RubricEditor({ rubric, onClose, onSaved }: {
   onSaved: (id: string) => void
 }) {
   const { workspace, saveRubric, cloud } = useWorkspace()
+  const { settings } = usePublicSettings()
   const { canEdit } = useLifecycleAccess({ kind: 'rubric', id: rubric.groupId })
   const [draft, setDraft] = useState<Rubric>(() => structuredClone(rubric))
   const [initialDraft] = useState(() => JSON.stringify(rubric))
@@ -29,7 +31,7 @@ export function RubricEditor({ rubric, onClose, onSaved }: {
   const real = rubric.dataKind === 'real'
   const job = workspace.jobs.find((item) => item.id === rubric.jobId)
   const document = workspace.documents.find((item) => item.id === job?.documentId)
-  const maxCriteria = cloud?.realJobs.features?.limits.maxCriteria ?? 20
+  const maxCriteria = Math.min(20, settings?.rubrics.jobs.maxCriteria ?? cloud?.realJobs.features?.limits.maxCriteria ?? 20)
   const realErrors = real ? draft.criteria.flatMap((criterion, index) => {
     const label = `Criterion ${index + 1}`
     const result: string[] = []
@@ -43,7 +45,7 @@ export function RubricEditor({ rubric, onClose, onSaved }: {
     }
     return result
   }) : []
-  if (real && draft.criteria.length > maxCriteria) realErrors.push(`Real job rubrics may contain no more than ${maxCriteria} criteria.`)
+  if (real && draft.criteria.length > maxCriteria && draft.criteria.some(criterion => !rubric.criteria.some(previous => previous.id === criterion.id))) realErrors.push(`Adding new criteria is limited to ${maxCriteria}. Existing saved criteria remain editable.`)
   const errors = [...validateRubric(draft), ...realErrors]
   const total = draft.criteria.reduce((sum, criterion) => sum + criterion.weight, 0)
   const balanced = Number.isFinite(total) && Math.abs(total - 100) <= 0.000001
@@ -293,7 +295,7 @@ export function RubricEditor({ rubric, onClose, onSaved }: {
         <div>
           <Button icon={Plus} size="sm" onClick={addCriterion} disabled={real && draft.criteria.length >= maxCriteria}>Add criterion</Button>
           <p className="mt-2 text-[11px] text-muted">
-            {real ? `New criteria require a required/preferred classification and an exact quotation from this source. Maximum ${maxCriteria}.` : 'New criteria are custom. The demo cannot assess them and will not invent supporting evidence.'}
+            {real ? `New criteria require a required/preferred classification and an exact quotation from this source. Maximum ${maxCriteria} when adding criteria; larger saved versions remain readable and editable without additions.` : 'New criteria are custom. The demo cannot assess them and will not invent supporting evidence.'}
           </p>
         </div>
 

@@ -23,8 +23,9 @@ import { getDisplayName } from '../domain/displayNames'
 import { uploadedFileKind } from '../domain/source-files'
 import { projectRealJobs } from './realJobsProjection'
 import { isEntityArchived, isEntityRemoved, type LifecycleAction, type LifecycleTarget } from '../domain/lifecycle'
+import { assertClientAdmission, clientAdmissionReason, usePublicSettings } from './public-settings-context'
+import { boundedPollingInterval, jobFeaturesWithPolicy } from '../services/publicSettings'
 
-const POLL_INTERVAL_MS = 2000
 const ACTIVE_STATUSES = new Set(['queued', 'parsing', 'generating'])
 
 type DetailEntry =
@@ -58,6 +59,8 @@ export function RealJobsBridge({
   cloud: Omit<CloudWorkspaceStatus, 'realJobs'>
   children: ReactNode
 }) {
+  const policy = usePublicSettings()
+  const pollingInterval = boundedPollingInterval(policy.settings, true)
   const location = useLocation()
   const aliveRef = useRef(true)
   const listControllerRef = useRef<AbortController | null>(null)
@@ -117,8 +120,12 @@ export function RealJobsBridge({
     const readSequence = ++sequence.current
     listControllerRef.current?.abort()
     listControllerRef.current = controller
-    const request = listAllRealJobs(workspaceId, controller.signal).then((items) => {
+    const request = Promise.all([
+      listAllRealJobs(workspaceId, controller.signal),
+      fetchJobProcessingFeatures(controller.signal).catch(() => null),
+    ]).then(([items, available]) => {
       if (!aliveRef.current || controller.signal.aborted || started !== epoch.current) return
+      setFeatures(available)
       authoritativeSequence.current = readSequence
       const present = new Set(items.map((item) => item.job.id))
       const fresh = items.filter((item) => (accepted.current.get(item.job.id) ?? 0) <= readSequence)
@@ -159,24 +166,13 @@ export function RealJobsBridge({
     setFeatures(null)
     setSummaries([])
     setDetails({})
-    void fetchJobProcessingFeatures(controller.signal).then((value) => {
-      if (!aliveRef.current || controller.signal.aborted) return
-      setFeatures(value)
-      if (!value.realJobImports) {
-        setPhase('unavailable')
-        setListError('Real job imports are not available in this deployment.')
-        return
-      }
-      void refresh()
-    }).catch((error: unknown) => {
-      if (!aliveRef.current || controller.signal.aborted) return
-      setListError(errorMessage(error, 'Score could not check whether real job imports are available.'))
-      setPhase('error')
-    })
+    void refresh()
     return () => {
       aliveRef.current = false
       controller.abort()
       listControllerRef.current?.abort()
+      listControllerRef.current = null
+      refreshPromiseRef.current = null
       detailControllers.forEach((item) => item.abort())
       detailControllers.clear()
     }
@@ -184,17 +180,19 @@ export function RealJobsBridge({
 
   useEffect(() => {
     if (phase !== 'ready' || !summaries.some((item) => ACTIVE_STATUSES.has(item.job.status))) return
-    const timer = window.setInterval(() => { void refresh() }, POLL_INTERVAL_MS)
+    const timer = window.setInterval(() => { void refresh() }, pollingInterval)
     return () => window.clearInterval(timer)
-  }, [phase, refresh, summaries])
+  }, [phase, pollingInterval, refresh, summaries])
+
+  useEffect(() => { void refresh() }, [policy.settings?.revision, refresh])
 
   useEffect(() => {
     const onFocus = () => {
-      if (features?.realJobImports) void refresh()
+      void refresh()
     }
     window.addEventListener('focus', onFocus)
     return () => window.removeEventListener('focus', onFocus)
-  }, [features?.realJobImports, refresh])
+  }, [refresh])
 
   const ensureDetail = useCallback(async (jobId: string, force = false) => {
     if (mutating.current) return
@@ -290,11 +288,18 @@ export function RealJobsBridge({
   }
 
   function importPdf(file: File, idempotencyKey: string, batchId?: string) {
-    return mutate(() => importRealJobPdf(workspaceId, file, idempotencyKey, batchId), remember)
+    assertNewImports()
+    return mutate(() => importRealJobPdf(workspaceId, file, idempotencyKey, batchId, undefined, policy.settings), remember)
   }
 
   function importUrl(url: string, idempotencyKey: string, batchId?: string) {
-    return mutate(() => importRealJobUrl(workspaceId, url, idempotencyKey, batchId), remember)
+    assertNewImports()
+    return mutate(() => importRealJobUrl(workspaceId, url, idempotencyKey, batchId, undefined, policy.settings), remember)
+  }
+
+  function assertNewImports() {
+    assertClientAdmission(policy, 'jobImports')
+    if (!features?.realJobImports || phase !== 'ready') throw new Error('New job imports are unavailable. Saved jobs and evidence remain readable.')
   }
 
   function assertMarkdownAvailable() {
@@ -304,16 +309,18 @@ export function RealJobsBridge({
   }
 
   async function importMarkdown(file: File, idempotencyKey: string, batchId?: string) {
+    assertNewImports()
     assertMarkdownAvailable()
-    return mutate(() => importRealJobMarkdown(workspaceId, file, idempotencyKey, batchId), remember)
+    return mutate(() => importRealJobMarkdown(workspaceId, file, idempotencyKey, batchId, undefined, policy.settings), remember)
   }
 
   async function importFile(file: File, idempotencyKey: string, batchId?: string) {
+    assertNewImports()
     if (uploadedFileKind(file) === 'markdown') assertMarkdownAvailable()
     if (['docx', 'doc'].includes(uploadedFileKind(file) ?? '') && (!features?.realJobImports || !features.wordDocumentImports)) {
       throw new Error('Word document imports are not enabled in this deployment.')
     }
-    return mutate(() => importRealJobFile(workspaceId, file, idempotencyKey, batchId), remember)
+    return mutate(() => importRealJobFile(workspaceId, file, idempotencyKey, batchId, undefined, policy.settings), remember)
   }
 
   async function cancelJob(id: string) {
@@ -346,6 +353,10 @@ export function RealJobsBridge({
     if (!jobId) throw new Error('This real rubric is missing its linked job.')
     const summary = summaries.find((item) => item.job.id === jobId)
     if (!summary) throw new Error('Refresh this job before saving its rubric.')
+    const maximum = Math.min(20, policy.settings?.rubrics.jobs.maxCriteria ?? features?.limits.maxCriteria ?? 20)
+    if (rubric.criteria.length > maximum && rubric.criteria.some(criterion => !summary.rubric?.criteria.some(previous => previous.id === criterion.id))) {
+      throw new Error(`Application policy allows at most ${maximum} criteria when adding new criteria. Existing saved criteria can still be reviewed and edited.`)
+    }
     if (summary.job.rubricDeletedAt || summary.rubricLifecycle?.deletingAt || summary.rubricLifecycle?.deletedAt) throw new Error('This logical rubric was permanently removed or is awaiting cleanup. Saving an older draft cannot restore it.')
     try {
       const detail = await mutate(() => saveRealJobRubric(workspaceId, jobId, rubric, summary.etag), remember, { kind: 'rubric', id: rubric.groupId })
@@ -443,7 +454,7 @@ export function RealJobsBridge({
 
   const realJobs: CloudWorkspaceStatus['realJobs'] = {
     phase,
-    features,
+    features: features ? { ...jobFeaturesWithPolicy(features, policy.settings), realJobImports: features.realJobImports && !clientAdmissionReason(policy, 'jobImports') } : null,
     summaries,
     error: listError,
     detail: (jobId) => details[jobId] ?? { state: 'idle' },

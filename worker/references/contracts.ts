@@ -2,8 +2,10 @@ import type { GradeContext, OpmDiscoveryResult, ReferenceDocument, ReferenceLink
 import type { GradeBlob } from '../../server/grades/store'
 import type { BrowserRenderer, DocumentIntelligenceClientOptions } from '../runtime'
 import type { PublicFetcher } from '../../src/domain/rendering'
+import type { ProcessingSettingsSnapshot } from '../../src/domain/admin-settings'
 
 export interface DiscoveryOptions {
+  processingSettings?: ProcessingSettingsSnapshot
   fetcher?: PublicFetcher
   browser?: BrowserRenderer
   signal?: AbortSignal

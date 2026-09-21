@@ -16,6 +16,8 @@ import { realAnalysisLink, realResumeSelection } from '../analyses/realAnalysisU
 import { readyRealResume, resumeErrorMessage, resumeName, resumeStatedName, resumeWorkActive } from './resumeImportUi'
 import { RealAddResumesDialog } from './RealAddResumesDialog'
 import { useWorkspace } from '../../app/workspace-context'
+import { clientAdmissionReason, originalDownloadReason, usePublicSettings } from '../../app/public-settings-context'
+import { effectiveFormats } from '../../services/publicSettings'
 import { useLibraryViewState } from '../../app/library-view-state'
 import { isEntityArchived, isEntityRemoved, matchesArchiveFilter, type ArchiveFilter } from '../../domain/lifecycle'
 import { ArchivedBadge, ArchiveStateFilter, EntityLifecycleActions, LifecycleBanner } from '../../components/lifecycle/LifecycleControls'
@@ -79,6 +81,9 @@ function RealResumesView({ id }: { id?: string }) {
 
 function RealResumesLibrary() {
   const api = useRealResumes()!
+  const policy = usePublicSettings()
+  const importReason = clientAdmissionReason(policy, 'resumeImports')
+  const importsUnavailable = !api.features?.realResumeImports || Boolean(importReason)
   const { workspace } = useWorkspace()
   const { canEdit } = useLifecycleAccess()
   const analyses = useRealAnalyses()
@@ -106,7 +111,7 @@ function RealResumesLibrary() {
   const allVisibleSelected = readyVisible.length > 0 && readyVisible.every((item) => selected.some((choice) => choice.resumeId === item.resume.id))
   const hidden = selected.filter((choice) => !visible.some((item) => item.resume.id === choice.resumeId)).length
   const importsOpen = adding || params.get('imports') === 'open'
-  const formats = supportedUploadFormats({ markdownResumeImports: api.features?.markdownResumeImports, wordDocumentImports: api.features?.wordDocumentImports })
+  const formats = effectiveFormats(supportedUploadFormats({ markdownResumeImports: api.features?.markdownResumeImports, wordDocumentImports: api.features?.wordDocumentImports }), policy.settings, 'resumes')
 
   function openImports(open: boolean) {
     setAdding(open)
@@ -124,7 +129,8 @@ function RealResumesLibrary() {
           const link = realAnalysisLink({ resumes: selected }, api.workspaceId)
           navigate(link.to, { state: link.state })
         }}>Build analysis{selected.length ? ` (${selected.length})` : ''}</Button>
-        <Button variant="primary" icon={Plus} disabled={!canEdit || !api.canWrite || api.phase !== 'ready'} onClick={() => setAdding(true)}>Add resumes</Button></>} />
+        <Button variant="primary" icon={Plus} disabled={!canEdit || !api.canWrite || api.phase !== 'ready' || importsUnavailable} title={importReason ?? undefined} onClick={() => setAdding(true)}>Add resumes</Button></>} />
+    {importsUnavailable && <p className="mb-4 text-[12px] text-muted" role="status">{importReason ?? 'New resume imports are unavailable.'} Saved resumes and evidence remain available.</p>}
     {invalidSelection && <InlineError>A selected resume is archived, removed, or no longer ready. Clear it or explicitly choose active inputs; nothing will be silently skipped.</InlineError>}
     {api.error && <div className="mb-5"><InlineError>{api.error} <Button size="sm" onClick={() => void api.refresh()}>Retry resume service</Button></InlineError></div>}
     {!api.canWrite && <p className="mb-5 text-[12px] text-muted">Read-only workspace. You can inspect private resumes and sources; an owner or editor can import or analyze them.</p>}
@@ -172,10 +178,11 @@ function RealResumesLibrary() {
           </tr>
         })}</tbody>
       </table></div> : <EmptyState icon={api.phase === 'loading' ? LoaderCircle : Users}
-        title={api.phase === 'loading' ? 'Loading private resumes' : api.phase === 'error' ? 'Resume service unavailable' : search ? 'No matching real resumes' : 'Import your first real resume'}
+        title={api.phase === 'loading' ? 'Loading private resumes' : api.phase === 'error' ? 'Resume service unavailable' : search ? 'No matching real resumes' : importsUnavailable ? 'No saved real resumes' : 'Import your first real resume'}
         description={api.phase === 'loading' ? 'Loading every page of authorized resume summaries.' : api.phase === 'error' ? 'No samples are substituted. Retry the service when available.'
-          : search ? 'Try a stated name, role, or source label. Hidden selections are retained.' : `Choose actual ${uploadFormatNames(formats)} files or public HTML/PDF URLs. Inaccessible inputs get individual errors; successful imports remain available.`}
-        action={search || api.summaries.length ? <Button onClick={() => { setSearch(''); setArchiveFilter('all') }}>Show active and archived</Button> : <Button disabled={!canEdit || !api.canWrite || api.phase !== 'ready'} icon={Plus} onClick={() => setAdding(true)}>Add real resumes</Button>} />}
+          : search ? 'Try a stated name, role, or source label. Hidden selections are retained.' : importsUnavailable ? 'This real library is empty. New imports are unavailable under current policy or deployment support; samples are never substituted.'
+            : `Choose actual ${uploadFormatNames(formats)} files or public HTML/PDF URLs. Inaccessible inputs get individual errors; successful imports remain available.`}
+        action={search || api.summaries.length ? <Button onClick={() => { setSearch(''); setArchiveFilter('all') }}>Show active and archived</Button> : <Button disabled={!canEdit || !api.canWrite || api.phase !== 'ready' || importsUnavailable} title={importReason ?? undefined} icon={Plus} onClick={() => setAdding(true)}>Add real resumes</Button>} />}
       <div className="table-bottom"><span>{visible.length} of {api.summaries.length} real sources</span><span>Private server records · no sample autosave</span></div>
     </section>
     <div className="info-callout mt-5"><ShieldCheck size={18} aria-hidden="true" /><div><strong>Evidence about a document, not a judgment about a person.</strong>
@@ -186,12 +193,15 @@ function RealResumesLibrary() {
 
 function RealResumeDetail({ id }: { id: string }) {
   const api = useRealResumes()!
+  const policy = usePublicSettings()
+  const { cloud } = useWorkspace()
+  const downloadReason = originalDownloadReason(policy, cloud?.workspaces.find(item => item.id === cloud.currentWorkspaceId)?.role)
   const analyses = useRealAnalyses()
   const navigate = useNavigate()
   const entry = api.detail(id)
   const { canEdit, deleting, removed } = useLifecycleAccess({ kind: 'resume', id })
   const ensure = api.ensureDetail
-  useEffect(() => { if (api.features?.realResumeImports) void ensure(id) }, [api.features?.realResumeImports, ensure, entry.state, id])
+  useEffect(() => { if (api.phase === 'ready') void ensure(id) }, [api.phase, ensure, entry.state, id])
   const back = <Link className="back-link" to="/resumes?data=real"><ArrowLeft size={14} aria-hidden="true" />Back to real resumes</Link>
   if (deleting || (removed && entry.state === 'ready')) return <>{back}<LifecycleBanner target={{ kind: 'resume', id }} /><EmptyState title="Resume cleanup or removal" description="Only recovery metadata remains available. Cached documents and original downloads are hidden. Retry the lifecycle operation above if cleanup is incomplete." /></>
   if (entry.state !== 'ready') return <>{back}<EmptyState icon={entry.state === 'error' || api.phase === 'error' ? FileText : LoaderCircle}
@@ -240,7 +250,8 @@ function RealResumeDetail({ id }: { id: string }) {
             {detail.capture?.finalUrl && <div><p className="text-muted">Captured URL</p><ExternalSource url={detail.capture.finalUrl}>{detail.capture.finalUrl}</ExternalSource></div>}
             <p>{detail.capture ? `Captured ${dateLabel(detail.capture.capturedAt)} · ${detail.capture.original.contentType} · ${detail.capture.original.bytes.toLocaleString()} bytes` : 'No source capture has been acknowledged yet.'}</p>
             {detail.capture && <><code className="block break-all text-[10px]">Original SHA-256 {detail.capture.original.sha256}</code>
-              <a className="button button-secondary button-sm" download href={api.originalUrl(id)}><Download size={14} aria-hidden="true" />Download captured original</a></>}
+              {downloadReason ? <p className="text-muted" role="status">{downloadReason}</p>
+                : <a className="button button-secondary button-sm" download href={api.originalUrl(id)}><Download size={14} aria-hidden="true" />Download captured original</a>}</>}
             {detail.extraction && <p>{detail.extraction.method} · parser {detail.extraction.version} · {detail.extraction.pagination === 'pdf-pages' ? `${detail.extraction.pageCount ?? 'Unknown'} PDF pages` : detail.extraction.pagination === 'markdown-sections' ? 'Markdown sections, not PDF pages' : detail.extraction.pagination === 'captured-sections' ? 'Captured source sections, not printed pages' : 'Captured HTML sections, not PDF pages'}</p>}
             {detail.documentRef && <div><p>Saved document v{detail.documentRef.documentVersion}</p><code className="block break-all text-[10px]">{detail.documentRef.documentId}<br />SHA-256 {detail.documentRef.sha256}</code></div>}
             <p>Processing attempt {summary.attempts} · {summary.retryCount} manual retries</p>

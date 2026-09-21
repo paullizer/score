@@ -1,6 +1,8 @@
 import { useEffect, useRef, useState, type FormEvent } from 'react'
 import { FileUp, Link2, LoaderCircle } from 'lucide-react'
 import { useGradeLadders } from '../../app/grade-ladders-context'
+import { clientAdmissionReason, usePublicSettings } from '../../app/public-settings-context'
+import { requireImportUrl } from '../../services/publicSettings'
 import { useGradeLeaveGuard } from '../../app/grade-navigation-context'
 import type { GradeLadderDetail } from '../../domain/real-grades'
 import { GRADE_LADDER_LIMITS } from '../../domain/real-grades'
@@ -10,6 +12,8 @@ import { useGradeRequestKey } from './grade-request-hooks'
 
 export function GradeSourceUpload({ detail, onClose }: { detail: GradeLadderDetail; onClose: () => void }) {
   const api = useGradeLadders()
+  const policy = usePublicSettings()
+  const policyReason = clientAdmissionReason(policy, 'gradeLadders')
   const editable = api?.canEdit(detail.ladder.id) ?? false
   const limits = api?.features?.gradeLimits ?? GRADE_LADDER_LIMITS
   const [kind, setKind] = useState<'pdf' | 'url'>('pdf')
@@ -36,9 +40,11 @@ export function GradeSourceUpload({ detail, onClose }: { detail: GradeLadderDeta
     setError('')
     const sequence = ++selectedFile.current
     if (!next) { setReading(false); return }
-    if (!next.name.toLowerCase().endsWith('.pdf') || !next.size || next.size > limits.maxPdfBytes) { setError('Choose a nonempty PDF no larger than 20 MiB.'); return }
+    if (!next.name.toLowerCase().endsWith('.pdf') || !next.size || next.size > limits.maxPdfBytes) { setError(`Choose a nonempty PDF no larger than ${limits.maxPdfBytes / 1024 / 1024} MiB.`); return }
     setReading(true)
     try {
+      if (policyReason) throw new Error(policyReason)
+      if (kind === 'pdf' && policy.settings?.grades.references.allowAgencyUploads === false) throw new Error('New supporting PDF uploads are disabled by application policy.')
       const { PDFDocument } = await import('pdf-lib')
       const bytes = await next.arrayBuffer()
       const [document, digest] = await Promise.all([PDFDocument.load(bytes, { updateMetadata: false }), crypto.subtle.digest('SHA-256', bytes)])
@@ -68,6 +74,7 @@ export function GradeSourceUpload({ detail, onClose }: { detail: GradeLadderDeta
           .reduce((total, source) => total + (source.selectedPages.length || source.pageCount || 0), 0)
         if (existingPages + (selectedPages.length || pageCount) > limits.maxTotalPdfPages) throw new Error(`This would exceed ${limits.maxTotalPdfPages} selected PDF pages. Narrow page selections in the source library first.`)
       } else {
+        requireImportUrl(url.trim(), 'agencyReferences', policy.settings)
         const parsed = new URL(url.trim())
         if (!['http:', 'https:'].includes(parsed.protocol) || parsed.username || parsed.password || url.trim().length > limits.maxUrlLength) {
           throw new Error('Use a direct public HTTP(S) URL without credentials.')
@@ -92,19 +99,21 @@ export function GradeSourceUpload({ detail, onClose }: { detail: GradeLadderDeta
   }
 
   const sourceLimit = detail.sources.filter((source) => source.origin !== 'seed-job' && source.status !== 'cancelled').length >= limits.maxSources
-  const disabled = !editable || saving || reading || api?.mutationPending || sourceLimit
+  const intakeDisabled = Boolean(policyReason) || !api?.features?.realGradeLadders || (kind === 'pdf' ? policy.settings?.grades.references.allowAgencyUploads === false : policy.settings?.grades.references.allowAgencyUrls === false)
+  const disabled = !editable || saving || reading || api?.mutationPending || sourceLimit || intakeDisabled
   return <Modal open onOpenChange={(open) => { if (!open) close() }} title="Add supporting evidence" description="Upload actual PDF bytes or request a public URL. Documents are private, versioned references — not job imports."
     footer={<><Button onClick={close}>Cancel</Button><Button type="submit" form="grade-source-upload" variant="primary" icon={saving ? LoaderCircle : kind === 'pdf' ? FileUp : Link2} disabled={disabled}>{saving ? 'Submitting source…' : 'Capture supporting source'}</Button></>}>
     <form id="grade-source-upload" onSubmit={submit} className="space-y-5">
       <SegmentedControl label="Supporting source type" value={kind} onChange={(value) => { if (!saving && !reading) setKind(value) }} options={[{ value: 'pdf', label: 'Actual PDF' }, { value: 'url', label: 'Public URL' }]} />
-      <fieldset disabled={saving || reading || !editable} className="space-y-4">
+      <fieldset disabled={saving || reading || !editable || intakeDisabled} className="space-y-4">
         {kind === 'pdf' ? <label className="field"><span className="field-label">Supporting PDF</span><input className="input" aria-label="Supporting PDF" type="file" accept=".pdf,application/pdf" onChange={(event) => void chooseFile(event.target.files?.[0] ?? null)} />
           {file && <span className="field-hint">{file.name} · {(file.size / (1024 * 1024)).toFixed(2)} MiB · {reading ? 'Reading page metadata…' : pageCount === null ? 'Page count unavailable' : `${pageCount} original pages`}</span>}</label>
           : <label className="field"><span className="field-label">Direct public reference URL</span><input className="input" aria-label="Direct public reference URL" type="url" value={url} maxLength={limits.maxUrlLength} onChange={(event) => setUrl(event.target.value)} placeholder="https://agency.gov/published-standard.pdf" /><span className="field-hint">Public PDF or substantive HTML page, including an intended section fragment. The server validates every redirect; private or credentialed URLs are not accepted.</span></label>}
         <label className="field"><span className="field-label">Original PDF pages (optional)</span><input className="input" aria-label="Original PDF pages (optional)" value={pages} onChange={(event) => setPages(event.target.value)} placeholder="1-12, 18, 25-30" />
           <span className="field-hint">Blank requests the whole PDF. Larger manuals require explicit selection; omitted pages are not treated as examined. HTML sources do not use PDF page ranges.</span></label>
       </fieldset>
-      <p className="text-[11px] text-muted">Up to {limits.maxSources} supporting sources, plus the automatically captured seed. Each PDF: 20 MiB and {limits.maxPdfPages} selected pages; source set: {limits.maxTotalPdfPages} selected PDF pages. OCR and model processing incur service consumption.</p>
+      <p className="text-[11px] text-muted">Up to {limits.maxSources} supporting sources, plus the automatically captured seed. Each PDF: {limits.maxPdfBytes / 1024 / 1024} MiB and {limits.maxPdfPages} selected pages; source set: {limits.maxTotalPdfPages} selected PDF pages. OCR and model processing incur service consumption.</p>
+      {intakeDisabled && <p role="status" className="field-hint">{policyReason ?? 'New sources of this type are disabled by current application policy. Saved references remain readable.'}</p>}
       <p className="text-[11px] text-muted">Supplied documents are supporting evidence, not automatically verified OPM authority. Scope and version conflicts remain review blockers.</p>
       {sourceLimit && <InlineError>The supporting-source limit is reached. The seed does not count toward this limit.</InlineError>}
       {error && <InlineError>{error}</InlineError>}
