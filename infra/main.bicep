@@ -20,9 +20,6 @@ param rendererImage string
 param gradeWorkerImage string
 param resumeWorkerImage string
 param analysisWorkerImage string
-@description('Enable reviewed evidence corrections only after compatible API and analysis workers are deployed and older workers have drained.')
-@allowed(['false', 'true'])
-param analysisEvidenceCorrectionsEnabled string = 'false'
 
 @sealed()
 type AdditionalModelDeployment = {
@@ -80,7 +77,6 @@ module resources 'resources.bicep' = {
     resumeWorkerImage: resumeWorkerImage
     analysisWorkerImage: analysisWorkerImage
     additionalModelDeployments: additionalModelDeployments
-    analysisEvidenceCorrectionsEnabled: analysisEvidenceCorrectionsEnabled
     appServiceSku: appServiceSku
     searchSku: searchSku
   }

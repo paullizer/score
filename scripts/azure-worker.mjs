@@ -44,6 +44,13 @@ export const WORKER_DEFINITIONS = [
   },
 ]
 
+const ANALYSIS_WORKER = WORKER_DEFINITIONS.find(worker => worker.kind === 'analysis')
+
+function analysisCorrectionEnvironment(container, enabled) {
+  const name = 'ANALYSIS_EVIDENCE_CORRECTIONS_ENABLED'
+  return [...container.env.filter(setting => setting.name !== name), { name, value: enabled ? 'true' : 'false' }]
+}
+
 export function validateWorkerImage(env, image) {
   const prefix = `${required(env, 'AZURE_CONTAINER_REGISTRY_ENDPOINT')}/score-worker:resume-analysis-word-v1-`
   if (!image?.startsWith(prefix) || !/^[a-zA-Z0-9_.-]+$/.test(image.slice(prefix.length))) {
@@ -165,6 +172,10 @@ function validateWordExecution(execution, definition, image, initial = false) {
       (initial || !hasNodeArgs(container, [definition.entryPoint])))) {
     throw new Error(`The ${definition.containerName} execution is not bound to the verified Word image and entry point; keep Word admission disabled until older executions have finished.`)
   }
+  if (initial && definition.kind === 'analysis' &&
+    container.env?.find(setting => setting.name === 'ANALYSIS_EVIDENCE_CORRECTIONS_ENABLED')?.value !== 'false') {
+    throw new Error('The analysis-worker initial execution must keep evidence correction claims disabled until reader verification completes.')
+  }
 }
 
 export function validateRendererTemplate(renderer, workerIdentities = new Set(), workerEnvironments) {
@@ -225,7 +236,8 @@ export async function configureScheduledWorker(env, credential, definition, imag
       },
       template: {
         containers: [{
-          name: containerName, image, resources: container.resources, env: container.env,
+          name: containerName, image, resources: container.resources,
+          env: definition.kind === 'analysis' ? analysisCorrectionEnvironment(container, false) : container.env,
           command: ['node'], args: wordWorkerVerificationArgs(definition),
         }],
       },
@@ -238,7 +250,9 @@ export async function configureScheduledWorker(env, credential, definition, imag
       if (current.properties.provisioningState === 'Failed') throw new Error(`${containerName} configuration failed in Azure.`)
       if (current.properties.provisioningState === 'Succeeded' &&
         current.properties.template.containers[0].image === image &&
-        current.properties.configuration.triggerType === payload.properties.configuration.triggerType) {
+        current.properties.configuration.triggerType === payload.properties.configuration.triggerType &&
+        (definition.kind !== 'analysis' || current.properties.template.containers[0].env?.find(setting =>
+          setting.name === 'ANALYSIS_EVIDENCE_CORRECTIONS_ENABLED')?.value === 'false')) {
         validateWorkerTemplate(env, current, definition)
         return
       }
@@ -356,6 +370,77 @@ export async function disableRuntimeSettingsAdmission(env, credential, hooks = {
   await updateRuntimeSettingsAdmission(env, credential, false, hooks)
 }
 
+async function updateEvidenceCorrectionAdmission(env, credential, enabled, hooks, force = false) {
+  const send = hooks.request ?? request
+  const endpoint = appSettingsEndpoint(env)
+  const listUrl = `${endpoint}/list?api-version=2024-11-01`
+  const settings = await send(credential, 'https://management.azure.com', listUrl, 'POST')
+  if (!settings?.properties) throw new Error('App Service settings are unavailable; evidence correction rollout is blocked.')
+  if (enabled) {
+    validateFeatureSettings(settings.properties, ANALYSIS_WORKER)
+    if (settings.properties.REAL_ANALYSES_ENABLED !== 'true' ||
+      settings.properties.SCORE_SETTINGS_CONTAINER !== 'application-settings' ||
+      settings.properties.SCORE_RUNTIME_SETTINGS_ENABLED !== 'false') {
+      throw new Error('Evidence correction activation requires the configured analysis API and paused runtime-settings admission.')
+    }
+  }
+  const properties = { ...settings.properties, ANALYSIS_EVIDENCE_CORRECTIONS_ENABLED: enabled ? 'true' : 'false' }
+  if (force || settings.properties.ANALYSIS_EVIDENCE_CORRECTIONS_ENABLED !== properties.ANALYSIS_EVIDENCE_CORRECTIONS_ENABLED) {
+    await send(credential, 'https://management.azure.com', `${endpoint}?api-version=2024-11-01`, 'PUT', { properties })
+  }
+  const saved = await send(credential, 'https://management.azure.com', listUrl, 'POST')
+  if (saved?.properties?.ANALYSIS_EVIDENCE_CORRECTIONS_ENABLED !== properties.ANALYSIS_EVIDENCE_CORRECTIONS_ENABLED) {
+    throw new Error(`App Service did not confirm evidence correction admission ${enabled ? 'enabled' : 'disabled'}; rollout is blocked.`)
+  }
+}
+
+export async function disableEvidenceCorrectionAdmission(env, credential, hooks = {}) {
+  await updateEvidenceCorrectionAdmission(env, credential, false, hooks)
+}
+
+async function updateEvidenceCorrectionClaims(env, credential, enabled, hooks, { verifiedImage, force = false } = {}) {
+  const send = hooks.request ?? request
+  const wait = hooks.delay ?? delay
+  const endpoint = `https://management.azure.com${required(env, ANALYSIS_WORKER.idKey)}?api-version=2024-03-01`
+  const existing = await send(credential, 'https://management.azure.com', endpoint)
+  const { identityId, container } = validateWorkerTemplate(env, existing, ANALYSIS_WORKER)
+  if (enabled && (existing.properties.provisioningState !== 'Succeeded' ||
+    existing.properties.configuration.triggerType !== 'Schedule' || container.image !== verifiedImage ||
+    !hasNodeArgs(container, [ANALYSIS_WORKER.entryPoint]))) {
+    throw new Error('The analysis worker no longer uses the verified scheduled build; evidence corrections remain disabled.')
+  }
+  const template = {
+    ...existing.properties.template,
+    containers: [{ ...container, env: analysisCorrectionEnvironment(container, enabled) }],
+  }
+  if (force || !isDeepStrictEqual(existing.properties.template, template)) {
+    await send(credential, 'https://management.azure.com', endpoint, 'PUT', {
+      location: existing.location, tags: existing.tags,
+      identity: { type: 'UserAssigned', userAssignedIdentities: { [identityId]: {} } },
+      properties: {
+        environmentId: existing.properties.environmentId,
+        ...(existing.properties.workloadProfileName ? { workloadProfileName: existing.properties.workloadProfileName } : {}),
+        configuration: existing.properties.configuration,
+        template,
+      },
+    })
+  }
+  for (let attempt = 0; attempt < 36; attempt++) {
+    const current = await send(credential, 'https://management.azure.com', endpoint)
+    if (current.properties?.provisioningState === 'Failed') throw new Error('Analysis-worker evidence correction configuration failed in Azure.')
+    if (current.properties?.provisioningState === 'Succeeded') {
+      const { identityId: currentIdentityId } = validateWorkerTemplate(env, current, ANALYSIS_WORKER)
+      if (currentIdentityId.toLowerCase() === identityId.toLowerCase() &&
+        current.properties.environmentId?.toLowerCase() === existing.properties.environmentId?.toLowerCase() &&
+        current.properties.workloadProfileName === existing.properties.workloadProfileName &&
+        isDeepStrictEqual(current.properties.configuration, existing.properties.configuration) &&
+        isDeepStrictEqual(current.properties.template, template)) return
+    }
+    await wait(5000)
+  }
+  throw new Error(`The analysis worker did not confirm evidence correction claims ${enabled ? 'enabled' : 'disabled'}; rollout is blocked.`)
+}
+
 async function visitActiveWorkerExecutions(credential, workerBase, send, visit) {
   let next = `${workerBase}/executions?api-version=2024-03-01`
   for (let page = 0; next && page < 100; page++) {
@@ -383,6 +468,7 @@ export async function prepareWebDeployment(env, credential, hooks = {}) {
   const wait = hooks.delay ?? delay
   await disableWordAdmission(env, credential, hooks)
   await disableRuntimeSettingsAdmission(env, credential, hooks)
+  await disableEvidenceCorrectionAdmission(env, credential, hooks)
   const workers = []
   for (const definition of WORKER_DEFINITIONS) {
     const workerBase = `https://management.azure.com${required(env, definition.idKey)}`
@@ -579,9 +665,10 @@ export async function configureWorkerDeployment(env, credential, { image, render
     throw new Error('The renderer image must be tagged in the Score registry.')
   }
 
-  // This also covers renderer-only/failed rollouts: no shared consumer changes while Word is admitted.
+  // Admission stays closed through renderer-only and failed rollouts as well.
   await disableWordAdmission(env, credential, hooks)
   await disableRuntimeSettingsAdmission(env, credential, hooks)
+  await disableEvidenceCorrectionAdmission(env, credential, hooks)
   try {
     const workerIdentities = new Set()
     const workerEnvironments = new Set()
@@ -598,7 +685,7 @@ export async function configureWorkerDeployment(env, credential, { image, render
     }
     await configureRenderer(env, credential, rendererImage, workerIdentities, rendererOnly ? undefined : workerEnvironments, hooks)
     if (rendererOnly) {
-      console.log('The isolated renderer is deployed; worker configuration is unchanged and Word/runtime-settings admission remains disabled.')
+      console.log('The isolated renderer is deployed; worker configuration is unchanged and Word/runtime-settings/evidence-correction admission remains disabled.')
       return
     }
     const privateWorkers = WORKER_DEFINITIONS.filter(worker => worker.kind === 'resume' || worker.kind === 'analysis')
@@ -609,20 +696,28 @@ export async function configureWorkerDeployment(env, credential, { image, render
       if (definition.feature) await updateFeatures(env, credential, [definition], true, hooks)
     }
     await verifyWordWorkerReadiness(env, credential, image, verified, hooks)
+    await updateEvidenceCorrectionClaims(env, credential, true, hooks, { verifiedImage: image })
+    await updateEvidenceCorrectionAdmission(env, credential, true, hooks)
     await updateRuntimeSettingsAdmission(env, credential, true, hooks, image)
     await updateWordAdmission(env, credential, true, hooks)
-    console.log('Word and runtime-settings admission enabled after all four worker readers verified the same build and older executions drained.')
+    console.log('Word, runtime-settings, and evidence-correction admission enabled after all four worker readers verified the same build and older executions drained.')
   } catch (error) {
     const failures = [error]
-    for (const disable of [disableRuntimeSettingsAdmission, disableWordAdmission]) {
+    // A stale read after ambiguous activation must not suppress the closing write.
+    for (const disable of [
+      () => updateEvidenceCorrectionAdmission(env, credential, false, hooks, true),
+      () => disableRuntimeSettingsAdmission(env, credential, hooks),
+      () => disableWordAdmission(env, credential, hooks),
+      ...(!rendererOnly ? [() => updateEvidenceCorrectionClaims(env, credential, false, hooks, { force: true })] : []),
+    ]) {
       try {
-        await disable(env, credential, hooks)
+        await disable()
       } catch (disableError) {
         failures.push(disableError)
       }
     }
     if (failures.length > 1) {
-      throw new AggregateError(failures, 'Worker rollout failed and admission gates could not be confirmed disabled. Check App Service settings before retrying.')
+      throw new AggregateError(failures, 'Worker rollout failed and admission or correction-claim gates could not be confirmed disabled. Check App Service and analysis-worker settings before retrying.')
     }
     throw error
   }
@@ -638,12 +733,15 @@ async function main() {
   }
   if (mode === 'disable-word' || mode === 'disable-admission') {
     if (process.argv[3] === '--if-provisioned' && !env.AZURE_APP_SERVICE_NAME) {
-      console.log('No provisioned App Service is recorded; new infrastructure keeps Word admission disabled.')
+      console.log('No provisioned App Service is recorded; new infrastructure keeps admission gates disabled.')
       return
     }
     if (process.argv[3] && process.argv[3] !== '--if-provisioned') throw new Error('Usage: node scripts\\azure-worker.mjs disable-admission [--if-provisioned]')
     await disableWordAdmission(env, client(env))
-    if (mode === 'disable-admission') await disableRuntimeSettingsAdmission(env, client(env))
+    if (mode === 'disable-admission') {
+      await disableRuntimeSettingsAdmission(env, client(env))
+      await disableEvidenceCorrectionAdmission(env, client(env))
+    }
     console.log('Requested admission gates are disabled before updating shared application and processing consumers.')
     return
   }
