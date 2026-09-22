@@ -116,6 +116,8 @@ beforeEach(() => {
       workspaces.push(created)
       return json({ workspace: created })
     }
+    const counts = /^\/api\/workspaces\/([^/]+)\/summary$/.exec(path)
+    if (counts) return json({ workspaceId: counts[1], jobs: { status: 'ready', count: 2 }, resumes: { status: 'ready', count: 3 }, analyses: { status: 'ready', count: 1 } })
     if (path === '/api/admin/users' || path.endsWith('/share-candidates')) {
       if (parsed.searchParams.get('query')) return json({ users: [preLogin] })
       return json(parsed.searchParams.has('continuation') ? { users: [preLogin, adminPerson] } : { users: [firstPerson], continuation: 'page-two' })
@@ -136,6 +138,11 @@ beforeEach(() => {
       members = {
         members: [...members.members.filter(value => value.id !== id), ...(role ? [{ id, name: person.name, email: person.email, role }] : [])],
         etag: `"members-${Number(members.etag.match(/\d+/)[0]) + 1}"`,
+      }
+      if (id === user.id && !capabilities.applicationAdmin) {
+        const workspaceId = path.split('/')[3]
+        workspaces = role ? workspaces.map(item => item.id === workspaceId ? { ...item, role } : item)
+          : workspaces.filter(item => item.id !== workspaceId)
       }
       return json(members)
     }
@@ -281,11 +288,101 @@ test('archived workspace state and application creation stop remain distinct fro
   workspaces = [{ ...metadata, archivedAt: '2026-01-02' }]
   settings.workspaces.allowCreation = false
   await render(element(ui.CloudApplication))
-  await until(() => document.body.textContent.includes('Open an archived workspace'), 'Archived-only empty state')
+  await until(() => document.querySelector('.workspace-home-card'), 'Archived-only home')
+  assert.match(document.body.textContent, /Archived.*read only/)
+  assert.equal(requests.filter(item => item.path.endsWith('/summary')).length, 0)
   assert.equal(button('New workspace').disabled, true)
   assert.match(document.body.textContent, /disabled by application policy/)
   assert.ok(button('Manage access to Shared workspace'))
   assert.equal(writes('/api/workspaces').length, 0)
+})
+
+test('home shares the access-aware directory, uses real counts, and exposes administration without selecting a workspace', async () => {
+  workspaces = [metadata]
+  settings.workspaces.allowCreation = false
+  localStorage.setItem('score-cloud-last-workspace:tenant:owner-user', metadata.id)
+  await render(element(ui.CloudApplication))
+  await until(() => document.querySelector('.workspace-card-counts dd')?.textContent === '2', 'Real counts load on home')
+  assert.equal(location.pathname, '/')
+  assert.equal(document.querySelector('.app-layout'), null)
+  assert.equal(button('New workspace').disabled, true)
+  assert.ok(button('Manage access to Shared workspace'))
+  assert.ok(!document.body.textContent.includes('Users / user access'))
+  assert.ok(!requests.some(item => /\/(?:state|jobs|resumes|analyses|grade-ladders)$/.test(item.path)))
+  capabilities = { applicationAdmin: true, canCreateWorkspaces: true }
+  workspaces = [{ ...metadata, accessSource: 'application-admin' }]
+  await focus()
+  await until(() => document.body.textContent.includes('Users / user access'), 'Admin navigation is exposed by the refreshed capability')
+  assert.match(document.querySelector('.workspace-home-card').textContent, /Application administrator/)
+  assert.equal(button('New workspace').disabled, true, 'Global policy still applies to an implicit creation grant.')
+  await click(button('Users / user access'))
+  await until(() => document.querySelector('#admin-users-content'), 'User access opens directly from home')
+  assert.equal(location.pathname, '/admin/users')
+})
+
+test('home sharing protects unfinished choices on browser history and clears revoked cards, counts and recents after self-removal', async () => {
+  const other = { ...metadata, id: 'workspace-two', name: 'Other workspace' }
+  workspaces = [metadata, other]
+  members.members.push({ ...firstPerson, role: 'owner' })
+  const recentKey = 'score-cloud-recent-workspaces:tenant:owner-user'
+  localStorage.setItem(recentKey, JSON.stringify({ version: 1, entries: [
+    { id: metadata.id, lastOpenedAt: '2026-01-02T00:00:00.000Z' },
+    { id: other.id, lastOpenedAt: '2026-01-01T00:00:00.000Z' },
+  ] }))
+  dom.window.history.replaceState(null, '', '/admin/users')
+  dom.window.history.pushState(null, '', '/')
+  await render(element(ui.CloudApplication))
+  await until(() => document.querySelectorAll('.workspace-home-card').length === 2, 'Home lists both accessible workspaces')
+  await click(button('Manage access to Shared workspace'))
+  await until(() => [...document.querySelectorAll('button')].some(item => item.textContent === 'Load more people'), 'Sharing candidates load')
+  await click(button('Load more people'))
+  await until(() => document.body.textContent.includes('Select New Reader'), 'An eligible non-member is available')
+  await click(button('Select New Reader'))
+  await act(async () => { window.history.back(); await pause(30) })
+  await until(() => dialog('Unsaved changes'), 'Home membership choices protect cross-scope history')
+  await click(button('Stay here', dialog('Unsaved changes')))
+  assert.equal(location.pathname, '/')
+  assert.ok(document.querySelector('[aria-label="New member role"]'))
+  await click(button('Cancel selection'))
+  await click(button('Remove Current owner'))
+  await click(button('Remove membership', dialog('Remove workspace member?')))
+  await until(() => document.querySelectorAll('.workspace-home-card').length === 1, 'Self-removal prunes the home directory')
+  assert.match(dialog('Manage access').textContent, /no longer has permission to manage/)
+  assert.deepEqual(JSON.parse(localStorage.getItem(recentKey)).entries.map(item => item.id), [other.id])
+  assert.equal(document.querySelector('[aria-label="Manage access to Shared workspace"]'), null)
+  assert.equal(button('New workspace').disabled, true)
+  const oldRequests = requests.filter(item => item.path.startsWith('/api/workspaces/workspace-one/')).length
+  await assert.rejects(ui.loadWorkspaceState(metadata.id), /no longer available/)
+  await focus()
+  assert.equal(requests.filter(item => item.path.startsWith('/api/workspaces/workspace-one/')).length, oldRequests)
+  assert.equal(document.querySelector('.app-layout'), null)
+})
+
+test('home count authentication failures suspend access without discarding an unfinished membership choice', async () => {
+  workspaces = [metadata]
+  const pendingCounts = deferred()
+  let expired = false
+  override = path => path.endsWith('/summary') ? pendingCounts.promise.then(response => response.clone())
+    : path === '/api/session' && expired ? json({ error: { code: 'unauthorized', message: 'Sign in again to refresh access.' } }, 401) : undefined
+  await render(element(ui.CloudApplication))
+  await until(() => document.querySelector('.workspace-home-card'), 'Home loads while counts are pending')
+  await click(button('Manage access to Shared workspace'))
+  await until(() => document.body.textContent.includes('Select Pat Eligible'), 'A membership choice is available')
+  await click(button('Select Pat Eligible'))
+  expired = true
+  await act(async () => {
+    pendingCounts.resolve(json({ error: { code: 'unauthorized', message: 'Sign in again to refresh access.' } }, 401))
+    await pause()
+  })
+  await until(() => dialog('Manage access')?.textContent.includes('no longer has permission to manage'), 'Access is suspended')
+  assert.ok(document.querySelector('.workspace-home'), 'The draft-owning home remains mounted.')
+  assert.equal(requests.filter(item => item.method === 'PUT').length, 0)
+  override = null
+  await focus()
+  await until(() => document.querySelector('[aria-label="New member role"]'), 'Reauthentication restores the same unsaved choice')
+  assert.equal(document.querySelector('[aria-label="New member role"]').value, 'viewer')
+  assert.match(dialog('Manage access').textContent, /Pat Eligible/)
+  assert.equal(requests.filter(item => item.method === 'PUT').length, 0)
 })
 
 test('owner is not application admin; direct user access is reachable for admins with no workspace', async () => {

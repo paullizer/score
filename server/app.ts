@@ -6,6 +6,7 @@ import { createHealthCheck } from './health'
 import { createAuthMiddleware, createCsrfMiddleware } from './middleware'
 import { getPrincipal } from './request-context'
 import { WorkspaceRepository } from './repository'
+import { getWorkspaceCounts } from './workspace-summary'
 import { mountStaticSpa } from './static'
 import type { Config } from './config'
 import { createRealJobsRouter, type RealJobsDeps } from './jobs/routes'
@@ -41,7 +42,7 @@ export { createAnalysisRun } from '../src/services/mockWorkspace'
 export { StoreConflictError, StoreNotFoundError } from './store'
 export { createStateStoreFromContainer } from './azure-state-store'
 export { createDirectoryStoreFromContainer } from './azure-directory-store'
-export { createJobBlobStoreFromContainer } from './jobs/azure-store'
+export { createJobStoreFromContainer, createJobBlobStoreFromContainer } from './jobs/azure-store'
 export {
   createAzureGradeStore, createAzureGradeBlobStore, createGradeStoreFromContainer, createGradeBlobStoreFromContainer,
 } from './grades/azure-store'
@@ -244,6 +245,12 @@ export function createApp(deps: AppDeps): Express {
     const name = pickAllowedField(req.body, 'name', ['name'])
     const workspace = await repository.renameWorkspace(getPrincipal(req), req.params.id, name, readIfMatch(req))
     res.json({ workspace })
+  })
+
+  api.get('/workspaces/:id/summary', async (req, res) => {
+    res.json(await getWorkspaceCounts({
+      repository, jobs: deps.jobs?.store, resumes: deps.resumes?.store, analyses: deps.analyses?.store,
+    }, getPrincipal(req), req.params.id))
   })
 
   api.get('/workspaces/:id/lifecycle', async (req, res) => {

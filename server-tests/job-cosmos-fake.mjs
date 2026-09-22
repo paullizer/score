@@ -24,6 +24,7 @@ export function fakeJobCosmos() {
   function queryRows(spec, options = {}) {
     const params = Object.fromEntries((spec.parameters ?? []).map(p => [p.name, p.value]))
     let rows = [...records.values()].filter(value => !options.partitionKey || value.workspaceId === options.partitionKey)
+    if (params['@workspaceId']) rows = rows.filter(value => value.workspaceId === params['@workspaceId'])
     if (params['@recordType']) rows = rows.filter(value => value.recordType === params['@recordType'])
     if (params['@types']) rows = rows.filter(value => params['@types'].includes(value.recordType))
     if (params['@jobId']) rows = rows.filter(value => value.jobId === params['@jobId'])
@@ -37,16 +38,21 @@ export function fakeJobCosmos() {
       rows = rows.filter(value => value.lifecycle?.deletingAt || value.rubricLifecycle?.deletingAt)
     }
     if (spec.query.includes('NOT IS_DEFINED(c.lifecycle.archivedAt)')) {
-      rows = rows.filter(value => !value.lifecycle?.archivedAt && !value.lifecycle?.deletingAt && !value.lifecycle?.deletedAt &&
-        !value.rubricLifecycle?.archivedAt && !value.rubricLifecycle?.deletingAt && !value.rubricLifecycle?.deletedAt &&
-        !value.job.rubricDeletedAt)
+      rows = rows.filter(value => !value.lifecycle?.archivedAt && !value.lifecycle?.deletingAt && !value.lifecycle?.deletedAt)
     }
+    if (spec.query.includes('NOT IS_DEFINED(c.rubricLifecycle.archivedAt)')) {
+      rows = rows.filter(value => !value.rubricLifecycle?.archivedAt && !value.rubricLifecycle?.deletingAt &&
+        !value.rubricLifecycle?.deletedAt && !value.job.rubricDeletedAt)
+    }
+    if (spec.query.includes("c.job.dataKind = 'real'")) rows = rows.filter(value => value.job?.dataKind === 'real')
+    if (spec.query.includes("c.state != 'active'")) rows = rows.filter(value => value.state !== 'active')
     if (spec.query.includes('ORDER BY c.id ASC')) rows.sort((a, b) => a.id.localeCompare(b.id))
     else if (spec.query.includes('ORDER BY c.updatedAt DESC')) rows.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))
     else if (spec.query.includes('ORDER BY c.version')) rows.sort((a, b) => (a.version - b.version) * (spec.query.includes('DESC') ? -1 : 1))
     if (spec.query.startsWith('SELECT DISTINCT')) rows = [...new Set(rows.map(value => value.workspaceId))]
     if (params['@limit']) rows = rows.slice(0, params['@limit'])
     if (spec.query.includes('TOP 1 ')) rows = rows.slice(0, 1)
+    if (spec.query.startsWith('SELECT VALUE COUNT(1)')) return [rows.length]
     return rows
   }
   const container = {

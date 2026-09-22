@@ -16,7 +16,7 @@ import { isValidWorkspaceId } from '../ids'
 import { StoreConflictError } from '../store'
 import type { JobBlob, JobBlobStore, JobBlobWriter, JobBlobWriteFence, RealJobsConfig, RealJobStore } from './store'
 import { assertJobWritable, cancelJobWork, isJobReadOnly } from './guards'
-import { fetchCosmosPage } from '../cosmos-query'
+import { fetchCosmosCount, fetchCosmosPage } from '../cosmos-query'
 import {
   isBlobInJobPrefix,
   isJobBlobInScope,
@@ -379,6 +379,23 @@ export function createJobStoreFromContainer(container: Pick<Container, 'items' |
         jobs,
         ...(response.continuationToken ? { continuationToken: response.continuationToken } : {}),
       }
+    },
+
+    async countActive(workspaceId) {
+      if (!isValidWorkspaceId(workspaceId)) throw new Error('Invalid job workspace.')
+      const blocked = await fetchCosmosCount(container.items.query({
+        query: `SELECT VALUE COUNT(1) FROM c WHERE c.workspaceId = @workspaceId
+          AND c.recordType = @recordType AND c.state != 'active'`,
+        parameters: [{ name: '@workspaceId', value: workspaceId }, { name: '@recordType', value: 'workspace-lifecycle' }],
+      }, { partitionKey: workspaceId }))
+      if (blocked) throw new StoreConflictError('Job workspace lifecycle is not active.')
+      return fetchCosmosCount(container.items.query({
+        query: `SELECT VALUE COUNT(1) FROM c WHERE c.workspaceId = @workspaceId
+          AND c.recordType = @recordType AND c.job.dataKind = 'real'
+          AND NOT IS_DEFINED(c.lifecycle.archivedAt)
+          AND NOT IS_DEFINED(c.lifecycle.deletingAt) AND NOT IS_DEFINED(c.lifecycle.deletedAt)`,
+        parameters: [{ name: '@workspaceId', value: workspaceId }, { name: '@recordType', value: 'job' }],
+      }, { partitionKey: workspaceId }))
     },
 
     async create(record) {

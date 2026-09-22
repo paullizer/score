@@ -23,6 +23,8 @@ export interface JobBlobWriteFence {
 export interface RealJobStore {
   get(workspaceId: string, jobId: string): Promise<VersionedRealJob | undefined>
   list(workspaceId: string, continuationToken?: string): Promise<{ jobs: VersionedRealJob[]; continuationToken?: string }>
+  /** Metadata aggregate only; fails while the workspace's job lifecycle is not active. */
+  countActive(workspaceId: string): Promise<number>
   create(record: RealJobRecord): Promise<{ created: boolean; value: VersionedRealJob }>
   replace(record: RealJobRecord, expectedEtag: string): Promise<VersionedRealJob>
   listPending(now: string, limit: number): Promise<VersionedRealJob[]>

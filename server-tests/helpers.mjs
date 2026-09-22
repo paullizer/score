@@ -88,12 +88,14 @@ export function createFakeDirectoryStore() {
   const partitions = new Map()
   const clone = value => structuredClone(value)
   let etagCounter = 0
+  let metadataReadCount = 0
   let accessError = null
   let transactionError = null
   const nextEtag = () => `"dir-etag-${(etagCounter += 1)}"`
 
   return {
     async getMetadata(workspaceId) {
+      metadataReadCount++
       const entry = partitions.get(workspaceId)?.get('workspace')
       return entry ? { metadata: clone(entry.doc), etag: entry.etag } : undefined
     },
@@ -228,6 +230,9 @@ export function createFakeDirectoryStore() {
     },
     _workspaceCount() {
       return [...partitions.values()].filter(partition => partition.has('workspace')).length
+    },
+    _metadataReadCount() {
+      return metadataReadCount
     },
   }
 }

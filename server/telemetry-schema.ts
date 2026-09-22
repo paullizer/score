@@ -42,7 +42,7 @@ const routeTemplates = [
   '/healthz', '/api/features', '/api/session', '/api/session/identity', '/api/workspaces', workspace,
   '/api/admin/users', '/api/admin/users/:userId/workspace-creation',
   `${workspace}/members`, `${workspace}/members/:userId`, `${workspace}/share-candidates`,
-  `${workspace}/state`, `${workspace}/lifecycle`,
+  `${workspace}/state`, `${workspace}/lifecycle`, `${workspace}/summary`,
   analyses, `${analyses}/targets`, run, `${run}/metadata`, `${run}/lifecycle`,
   `${run}/comparisons`, `${run}/summaries`, summary, `${summary}/history`,
   `${summary}/publish`, `${summary}/retry`, `${run}/report-comparisons`,

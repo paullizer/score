@@ -11,7 +11,7 @@ const module = { exports: {} }
 new Function('require', 'module', 'exports', compiled.outputFiles[0].text)(
   createRequire(import.meta.url), module, module.exports,
 )
-const { fetchCosmosPage } = module.exports
+const { fetchCosmosPage, fetchCosmosCount } = module.exports
 
 function iterator(pages) {
   let index = 0
@@ -67,6 +67,59 @@ test('a query that never advances fails explicitly at its bounded progress limit
   let calls = 0
   await assert.rejects(fetchCosmosPage({
     async fetchNext() { calls++; return { resources: undefined, hasMoreResults: true } },
+  }), /progress-page limit/)
+  assert.equal(calls, 100)
+})
+
+test('aggregate counts require one finite safe nonnegative integer, including an explicit zero', async () => {
+  for (const count of [0, 137, Number.MAX_SAFE_INTEGER]) {
+    const source = iterator([{ resources: [count], hasMoreResults: false }])
+    assert.equal(await fetchCosmosCount(source), count)
+    assert.equal(source.calls(), 1)
+  }
+})
+
+test('aggregate counts consume progress-only and empty continuation pages on the same iterator', async () => {
+  const source = iterator([
+    { resources: undefined, hasMoreResults: true },
+    { resources: [], hasMoreResults: true },
+    { resources: [], hasMoreResults: true, continuationToken: 'first' },
+    { resources: undefined, hasMoreResults: true, continuationToken: 'second' },
+    { resources: [137], hasMoreResults: false },
+  ])
+  assert.equal(await fetchCosmosCount(source), 137)
+  assert.equal(source.calls(), 5)
+})
+
+test('aggregate counts never substitute zero for missing, malformed, partial or ambiguous output', async () => {
+  const values = [NaN, Infinity, -Infinity, -1, 0.5, Number.MAX_SAFE_INTEGER + 1, '12', null, {}, [], true]
+  const pages = [
+    ...values.map(value => ({ resources: [value], hasMoreResults: false })),
+    { resources: [] }, { resources: undefined, hasMoreResults: false },
+    { resources: null }, { resources: {} }, { resources: 12 },
+    { resources: [1, 2] }, { resources: [12], hasMoreResults: true },
+    { resources: [12], continuationToken: 'partial' },
+    { resources: [12], hasMoreResults: false, continuationToken: 'contradictory' },
+    { resources: [12], hasMoreResults: 'false' }, { resources: [12], continuationToken: {} },
+    { resources: [], hasMoreResults: true, continuationToken: 'a'.repeat(16 * 1024 + 1) },
+  ]
+  for (const page of pages) await assert.rejects(fetchCosmosCount(iterator([page])), /Cosmos returned/)
+  const error = new Error('A controlled aggregate storage failure')
+  await assert.rejects(fetchCosmosCount(iterator([error])), value => value === error)
+})
+
+test('aggregate progress is bounded and repeated continuation tokens cannot produce a count', async () => {
+  for (const resources of [[], undefined]) {
+    const source = iterator([
+      { resources, hasMoreResults: true, continuationToken: 'repeat' },
+      { resources, hasMoreResults: true, continuationToken: 'repeat' },
+    ])
+    await assert.rejects(fetchCosmosCount(source), /continuation did not advance/)
+    assert.equal(source.calls(), 2)
+  }
+  let calls = 0
+  await assert.rejects(fetchCosmosCount({
+    async fetchNext() { calls++; return { resources: [], hasMoreResults: true } },
   }), /progress-page limit/)
   assert.equal(calls, 100)
 })

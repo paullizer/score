@@ -222,6 +222,7 @@ class CorrectionLease {
       const guarded: AnalysisStore = {
         get: (workspaceId, id) => store.get(workspaceId, id),
         list: (workspaceId, options) => store.list(workspaceId, options),
+        countActive: workspaceId => store.countActive(workspaceId),
         create: record => store.create(record),
         replace: (record, etag) => store.replace(record, etag),
         listPending: (now, limit) => store.listPending(now, limit),

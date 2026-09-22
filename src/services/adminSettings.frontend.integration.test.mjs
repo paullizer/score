@@ -122,6 +122,8 @@ beforeEach(() => {
     if (path === '/api/session/identity') return json({ mode: 'cloud', user, capabilities: { applicationAdmin: admin } })
     if (path === '/api/session') return json({ mode: 'cloud', user, capabilities: { applicationAdmin: admin }, workspaces })
     if (path === '/api/workspaces') return json({ workspaces })
+    const workspaceCounts = /^\/api\/workspaces\/([^/]+)\/summary$/.exec(path)
+    if (workspaceCounts) return json({ workspaceId: workspaceCounts[1], jobs: { status: 'ready', count: 0 }, resumes: { status: 'ready', count: 0 }, analyses: { status: 'ready', count: 0 } })
     if (path.endsWith('/state')) return method === 'PUT' ? json({ etag: '"workspace-2"' }) : json({ workspace, etag: '"workspace-1"' })
     if (path.endsWith('/jobs')) return json({ jobs: [] })
     if (path.endsWith('/resumes')) return json({ resumes: [] })
@@ -212,6 +214,24 @@ test('a workspace owner without explicit application capability cannot read the 
   await until(() => document.body.textContent.includes('Application administrator access required'), 'Non-admin denial is visible')
   assert.match(document.body.textContent, /Owning a workspace does not grant access/)
   assert.ok(!requests.some(item => item.path.startsWith('/api/admin')))
+})
+
+test('returning from direct administration loads a directory instead of presenting a failed read as an empty account', async () => {
+  workspaces = [metadata]
+  override = path => path === '/api/session' ? json({ error: { code: 'unavailable', message: 'Directory temporarily unavailable.' } }, 503) : undefined
+  await render(element(ui.CloudApplication))
+  await until(() => document.querySelector('.settings-savebar'), 'Direct settings route loads')
+  await click(button('Back to workspaces'))
+  await until(() => document.body.textContent.includes('The workspace list is unavailable.'), 'Unread directory is explicit')
+  assert.equal(document.querySelector('.workspace-directory'), null)
+  assert.doesNotMatch(document.body.textContent, /Your first workspace starts here/)
+  assert.equal(button('New workspace').disabled, true)
+  assert.equal(button('Application settings').disabled, false)
+  override = null
+  await click(button('Retry workspace list'))
+  await until(() => document.querySelector('.workspace-directory'), 'Retry loads actual workspaces')
+  assert.ok(button(metadata.name))
+  assert.ok(!requests.some(item => item.path.endsWith('/state')))
 })
 
 for (const archived of [false, true]) test(`admin navigation remains reachable with ${archived ? 'only an archived workspace' : 'no workspaces'}`, async () => {
