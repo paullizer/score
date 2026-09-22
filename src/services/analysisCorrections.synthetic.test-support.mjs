@@ -4,6 +4,12 @@ import { analysisSummaryFixture, summaryTimestamp } from './analysisSummaries.te
 export const correctionTime = summaryTimestamp
 export const correctionReason = 'Apply the reviewed missing-evidence policy without changing existing numeric scores or source evidence.'
 export const correctionHash = value => createHash('sha256').update(value).digest('hex')
+export const correctionLegacyPolicy = 'missing-evidence-zero-v1'
+export const correctionPolicy = 'missing-evidence-zero-v2'
+export const correctionEvidence = {
+  documentId: 'resume-document', documentVersion: 1, paragraphId: 'resume-p1',
+  page: 1, heading: 'Experience', quote: 'Applied engineering methods independently.',
+}
 export const correctionBefore = {
   completion: 'limited',
   overall: { status: 'withheld', score: null, reason: 'no-assessable-weight', message: 'The professional criterion was not assessed in this synthetic result.' },
@@ -68,12 +74,13 @@ export function correctionSummary(fixture, comparisonId, options = {}) {
     workspaceId: pair.workspaceId, runId: pair.runId, comparisonId, etag: `"correction-${requestId}-${status}"`,
     status, requestId, requestedAt: correctionTime, requestedBy: 'synthetic-editor',
     reason: options.reason ?? correctionReason, criterionIds: ['criterion-one'],
+    ...(options.policyVersion === undefined ? {} : { policyVersion: options.policyVersion }),
     attempts: status === 'queued' ? 0 : 1, nextAttemptAt: null,
     error: status === 'failed' ? {
       code: 'grounding-failed', stage: 'grounding', message: 'Synthetic independent reviewer retained a genuine interpretation blocker.', retryable: false,
     } : null,
     revision: status === 'ready' ? {
-      id: requestId, policyVersion: 'missing-evidence-zero-v1',
+      id: requestId, policyVersion: options.policyVersion ?? correctionLegacyPolicy,
       originalResultSha256: options.originalHash ?? pair.result.sha256,
       baseResultSha256: options.baseHash ?? pair.result.sha256,
       correctedAt: correctionTime, criterionIds: ['criterion-one'],
@@ -82,14 +89,14 @@ export function correctionSummary(fixture, comparisonId, options = {}) {
   }
 }
 
-export function correctionPreview(fixture, comparisonId, { correction = null, blocked = false } = {}) {
+export function correctionPreview(fixture, comparisonId, { correction = null, blocked = false, policyVersion = correctionLegacyPolicy } = {}) {
   const detail = fixture.details.find(item => item.comparison.id === comparisonId)
   const withheld = detail.comparison.resultSummary.overall.status === 'withheld'
   return {
     dataKind: 'real', workspaceId: fixture.workspaceId, runId: detail.comparison.runId, comparisonId,
     etag: correction?.etag ?? detail.etag, resultSha256: detail.comparison.result.sha256,
     originalResultSha256: correction?.revision?.originalResultSha256 ?? detail.comparison.result.sha256,
-    policyVersion: 'missing-evidence-zero-v1',
+    policyVersion,
     before: structuredClone(detail.comparison.resultSummary), after: blocked || !withheld ? null : structuredClone(correctionAfter),
     criterionIds: blocked || !withheld ? [] : ['criterion-one'],
     criteria: withheld ? [{
@@ -102,9 +109,31 @@ export function correctionPreview(fixture, comparisonId, { correction = null, bl
   }
 }
 
-export function correctionHistory(fixture, comparisonId, { status = 'failed', correction, requestId = randomUUID() } = {}) {
+export function correctionGapReview(decisions = [{
+  criterionId: 'criterion-one', outcome: 'blocked', blockerCode: 'ambiguous-guidance',
+  message: 'The synthetic requirement needs human interpretation.', citations: [],
+}]) {
+  const issues = decisions.filter(decision => decision.outcome !== 'confirmed-missing').map(decision => ({
+    code: decision.outcome === 'evidence-found' ? 'omitted-evidence'
+      : decision.blockerCode === 'restricted-personal-characteristic' ? 'prohibited-inference' : 'insufficient-context',
+    criterionId: decision.criterionId, message: decision.message, citations: structuredClone(decision.citations),
+  }))
+  return {
+    outcome: issues.length ? 'needs-correction' : 'supported', issues,
+    scope: {
+      kind: 'evidence-gaps', baseAssessmentSha256: correctionHash('synthetic-base-assessment'),
+      criterionIds: decisions.map(decision => decision.criterionId), decisions: structuredClone(decisions),
+    },
+  }
+}
+
+export function correctionHistory(fixture, comparisonId, {
+  status = 'failed', correction, requestId = randomUUID(), policyVersion, decisions,
+} = {}) {
   const detail = fixture.details.find(item => item.comparison.id === comparisonId)
-  const summary = correction ?? correctionSummary(fixture, comparisonId, { status, requestId })
+  const summary = correction ?? correctionSummary(fixture, comparisonId, { status, requestId, policyVersion })
+  const scoped = (summary.policyVersion ?? summary.revision?.policyVersion) === correctionPolicy
+  const ready = summary.status === 'ready'
   return {
     dataKind: 'real', workspaceId: fixture.workspaceId, runId: detail.comparison.runId, comparisonId,
     originalResultSha256: summary.revision?.originalResultSha256 ?? detail.comparison.result.sha256,
@@ -120,13 +149,16 @@ export function correctionHistory(fixture, comparisonId, { status = 'failed', co
       requestedBy: summary.requestedBy, reason: summary.reason, criterionIds: ['criterion-one'],
       beforeResultSha256: summary.revision?.baseResultSha256 ?? detail.comparison.result.sha256,
       after: structuredClone(correctionAfter),
-      review: {
-        outcome: status === 'ready' ? 'supported' : 'needs-correction',
-        issues: status === 'ready' ? [] : [{
+      review: scoped ? correctionGapReview(decisions ?? (ready ? [{
+        criterionId: 'criterion-one', outcome: 'confirmed-missing',
+        message: 'The selected criterion has no supporting professional evidence in the readable saved source.', citations: [],
+      }] : undefined)) : {
+        outcome: ready ? 'supported' : 'needs-correction',
+        issues: ready ? [] : [{
           code: 'interpretation-blocker', message: 'The synthetic requirement needs human interpretation.', criterionId: 'criterion-one', citations: [],
         }],
       },
-      error: summary.error, resultSha256: status === 'ready' ? correctionHash(`${comparisonId}:published`) : null,
+      error: summary.error, resultSha256: ready ? correctionHash(`${comparisonId}:published`) : null,
     }],
   }
 }
@@ -140,11 +172,21 @@ export function publishCorrectionFixture(fixture, correction) {
   Object.assign(result, structuredClone(correctionAfter))
   result.limitations = []
   result.provenance.correction = {
-    requestId: correction.requestId, policyVersion: 'missing-evidence-zero-v1',
+    requestId: correction.requestId, policyVersion: correction.revision.policyVersion,
     originalResultSha256: correction.revision.originalResultSha256, baseResultSha256: correction.revision.baseResultSha256,
     baseAssessmentSha256: correctionHash('synthetic-base-assessment'), criterionIds: ['criterion-one'],
     requestedBy: correction.requestedBy, requestedAt: correction.requestedAt, reason: correction.reason,
   }
+  if (correction.revision.policyVersion === correctionPolicy) result.provenance.groundingReviews.push({
+    ...correctionGapReview([{
+      criterionId: 'criterion-one', outcome: 'confirmed-missing',
+      message: 'The selected criterion has no supporting professional evidence in the readable saved source.', citations: [],
+    }]),
+    id: `gap-review-${correction.requestId}`, assessmentSha256: result.provenance.assessmentSha256,
+    resumeSnapshotSha256: result.provenance.resumeSnapshot.sha256,
+    targetSnapshotSha256: result.provenance.targetSnapshot.sha256,
+    provenance: { ...result.provenance.assessment, promptVersion: 'synthetic-evidence-gap-review-v2' },
+  })
   detail.comparison.resultSummary = structuredClone(correctionAfter)
   detail.comparison.resultRevision = structuredClone(correction.revision)
   detail.comparison.result.sha256 = correctionHash(`${correction.comparisonId}:published`)

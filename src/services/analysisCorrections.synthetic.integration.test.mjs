@@ -7,6 +7,7 @@ import { pathToFileURL } from 'node:url'
 import { build } from 'esbuild'
 import {
   correctionFixture, correctionPreview, correctionSummary, correctionHistory, correctionReason,
+  correctionPolicy, correctionLegacyPolicy, correctionGapReview, correctionEvidence,
 } from './analysisCorrections.synthetic.test-support.mjs'
 import { summarySubjectResponse, summaryHistoryFixture } from './analysisSummaries.test-support.mjs'
 
@@ -129,6 +130,56 @@ test('preview guards reject foreign ownership, incorrect score shapes, incomplet
   await assert.rejects(client.getAnalysisCorrectionPreview(workspaceId, runId, comparisonId), /mismatched/)
 })
 
+test('both policy versions remain readable and unusable-source blockers never become selectable missing evidence', async () => {
+  for (const policyVersion of [correctionLegacyPolicy, correctionPolicy]) {
+    const preview = correctionPreview(fixture, comparisonId, { policyVersion })
+    globalThis.fetch = async () => Response.json(preview)
+    assert.equal((await client.getAnalysisCorrectionPreview(workspaceId, runId, comparisonId)).policyVersion, policyVersion)
+    for (const status of ['queued', 'running', 'ready', 'failed', 'cancelled']) {
+      const correction = correctionSummary(fixture, comparisonId, { status, policyVersion })
+      globalThis.fetch = async () => Response.json({ correction })
+      assert.deepEqual(await client.getAnalysisCorrection(workspaceId, runId, comparisonId), correction)
+    }
+  }
+  for (const policyVersion of [undefined, 'missing-evidence-zero-v3']) {
+    globalThis.fetch = async () => Response.json({ ...correctionPreview(fixture, comparisonId), policyVersion })
+    await assert.rejects(client.getAnalysisCorrectionPreview(workspaceId, runId, comparisonId), /invalid preview/)
+  }
+  const blocked = correctionPreview(fixture, comparisonId, { blocked: true, policyVersion: correctionPolicy })
+  blocked.criteria[0].limitation.code = 'not-assessable'
+  blocked.criteria[0].limitation.blockerCode = 'ambiguous-guidance'
+  globalThis.fetch = async () => Response.json(blocked)
+  assert.equal((await client.getAnalysisCorrectionPreview(workspaceId, runId, comparisonId)).criteria[0].limitation.blockerCode, 'ambiguous-guidance')
+  for (const blockerCode of ['unusable-source', 'unknown']) {
+    const invalid = correctionPreview(fixture, comparisonId, { policyVersion: correctionPolicy })
+    invalid.criteria[0].limitation.blockerCode = blockerCode
+    globalThis.fetch = async () => Response.json(invalid)
+    await assert.rejects(client.getAnalysisCorrectionPreview(workspaceId, runId, comparisonId), /invalid|mismatched/)
+  }
+})
+
+test('v2 may independently verify a legacy row-level source-quality label, but v1 and hard source-processing blockers stay unselectable', async () => {
+  for (const policyVersion of [correctionLegacyPolicy, correctionPolicy]) {
+    for (const code of ['source-quality', 'context-limit']) {
+      for (const blockerCode of [undefined, 'unusable-source', 'ambiguous-guidance']) {
+        const preview = correctionPreview(fixture, comparisonId, { policyVersion })
+        preview.criteria[0].limitation = { ...preview.criteria[0].limitation, code, ...(blockerCode ? { blockerCode } : {}) }
+        globalThis.fetch = async () => Response.json(preview)
+        if (policyVersion === correctionPolicy && code === 'source-quality' && blockerCode !== 'unusable-source') {
+          const value = await client.getAnalysisCorrectionPreview(workspaceId, runId, comparisonId)
+          assert.deepEqual(value.criteria[0], preview.criteria[0])
+          assert.equal(value.criteria[0].eligible, true)
+          assert.equal(value.after.overall.score, 0)
+          assert.equal(value.before.overall.status, 'withheld')
+          assert.equal(value.correction, null)
+        } else {
+          await assert.rejects(client.getAnalysisCorrectionPreview(workspaceId, runId, comparisonId), /mismatched preview/)
+        }
+      }
+    }
+  }
+})
+
 test('each correction sends only a reviewed hash, criteria and reason with its stable key and original If-Match', async () => {
   const key = randomUUID()
   const preview = correctionPreview(fixture, comparisonId)
@@ -155,6 +206,69 @@ test('each correction sends only a reviewed hash, criteria and reason with its s
   await assert.rejects(client.requestAnalysisCorrection(workspaceId, runId, comparisonId, input, preview.etag, 'unstable'), /stable UUID/)
   await assert.rejects(client.requestAnalysisCorrection(workspaceId, runId, comparisonId, { ...input, reason: 'yes' }, preview.etag, key), /meaningful/)
   assert.equal(requests.length, 2)
+})
+
+test('v2 requests bind the reviewed policy and reject policy-switched acknowledgements without altering their replay key', async () => {
+  const journal = new state.CorrectionRequestJournal()
+  const preview = correctionPreview(fixture, comparisonId, { policyVersion: correctionPolicy })
+  const saved = journal.prepare(comparisonId, preview, correctionReason)
+  const requests = []
+  let acknowledgedPolicy = correctionLegacyPolicy
+  globalThis.fetch = async (url, init) => {
+    requests.push({ url, init })
+    return Response.json({ requestId: saved.key, correction: correctionSummary(fixture, comparisonId, {
+      requestId: saved.key, policyVersion: acknowledgedPolicy,
+    }) }, { status: 202 })
+  }
+  assert.equal(saved.input.policyVersion, correctionPolicy)
+  assert.equal(journal.prepare(comparisonId, { ...preview, policyVersion: correctionLegacyPolicy }, 'Do not replace the retained input.'), saved)
+  await assert.rejects(client.requestAnalysisCorrection(workspaceId, runId, comparisonId, saved.input, saved.etag, saved.key), /reviewed policy/)
+  assert.equal(journal.get(comparisonId), saved)
+  assert.throws(() => journal.acknowledge(comparisonId, correctionSummary(fixture, comparisonId, {
+    requestId: saved.key, policyVersion: correctionLegacyPolicy,
+  })), /retained request policy/)
+  assert.equal(journal.get(comparisonId), saved)
+  acknowledgedPolicy = correctionPolicy
+  const response = await client.requestAnalysisCorrection(workspaceId, runId, comparisonId, saved.input, saved.etag, saved.key)
+  journal.acknowledge(comparisonId, response.correction)
+  assert.equal(journal.get(comparisonId), undefined)
+  for (const { init } of requests) {
+    assert.equal(init.headers.get('Idempotency-Key'), saved.key)
+    assert.equal(init.headers.get('If-Match'), preview.etag)
+    assert.deepEqual(JSON.parse(init.body), { policyVersion: correctionPolicy, resultSha256: preview.resultSha256,
+      criterionIds: preview.criterionIds, reason: correctionReason })
+  }
+  await assert.rejects(client.requestAnalysisCorrection(workspaceId, runId, comparisonId,
+    { ...saved.input, policyVersion: 'missing-evidence-zero-v3' }, saved.etag, saved.key), /Review the exact saved policy version/)
+  assert.equal(requests.length, 2)
+})
+
+test('unversioned legacy requests replay without being silently upgraded by new previews or acknowledgements', async () => {
+  const journal = new state.CorrectionRequestJournal()
+  const preview = correctionPreview(fixture, comparisonId)
+  const retained = journal.prepare(comparisonId, preview, correctionReason)
+  delete retained.input.policyVersion
+  assert.equal(journal.prepare(comparisonId, { ...preview, policyVersion: correctionPolicy }, 'New text cannot replace a legacy request.'), retained)
+  let lastBody
+  let policyVersion = correctionPolicy
+  globalThis.fetch = async (_url, init) => {
+    lastBody = JSON.parse(init.body)
+    return Response.json({ requestId: retained.key, correction: correctionSummary(fixture, comparisonId, {
+      requestId: retained.key, policyVersion,
+    }) })
+  }
+  await assert.rejects(client.requestAnalysisCorrection(workspaceId, runId, comparisonId,
+    retained.input, retained.etag, retained.key), /reviewed policy/)
+  assert.equal(Object.hasOwn(lastBody, 'policyVersion'), false)
+  assert.throws(() => journal.acknowledge(comparisonId, correctionSummary(fixture, comparisonId, {
+    requestId: retained.key, policyVersion: correctionPolicy,
+  })), /retained request policy/)
+  policyVersion = correctionLegacyPolicy
+  const legacy = await client.requestAnalysisCorrection(workspaceId, runId, comparisonId, retained.input, retained.etag, retained.key)
+  journal.acknowledge(comparisonId, legacy.correction)
+  assert.equal(journal.get(comparisonId), undefined)
+  assert.equal(Object.hasOwn(lastBody, 'policyVersion'), false)
+  assert.throws(() => journal.prepare(comparisonId, { ...preview, policyVersion: undefined }, correctionReason), /fresh selectable preview/)
 })
 
 test('unacknowledged IDs, foreign corrections and altered request/hash/criteria bindings do not become successes', async () => {
@@ -272,6 +386,150 @@ test('history keeps the immutable original, proposed zero and failed review dist
   await assert.rejects(client.getAnalysisCorrectionHistory(workspaceId, runId, comparisonId, undefined, undefined, 'f'.repeat(64)), /mismatched/)
 })
 
+test('scoped history preserves each selected decision, citations and genuine blocker while legacy whole-review history stays readable', async () => {
+  const decisions = [
+    { criterionId: 'criterion-one', outcome: 'evidence-found', message: 'A saved passage supports the selected requirement.', citations: [correctionEvidence] },
+    ...['unusable-source', 'ambiguous-guidance', 'restricted-personal-characteristic'].map(blockerCode => ({
+      criterionId: 'criterion-one', outcome: 'blocked', blockerCode, message: `The saved criterion is blocked by ${blockerCode}.`, citations: [],
+    })),
+  ]
+  for (const decision of decisions) {
+    const history = correctionHistory(fixture, comparisonId, { policyVersion: correctionPolicy, decisions: [decision] })
+    history.originalAssessment.criteria[0].limitation.blockerCode = 'ambiguous-guidance'
+    globalThis.fetch = async () => Response.json(history)
+    const value = await client.getAnalysisCorrectionHistory(workspaceId, runId, comparisonId)
+    assert.deepEqual(value.entries[0].review.scope.decisions, [decision])
+    assert.deepEqual(value.entries[0].review.issues, correctionGapReview([decision]).issues)
+    assert.equal(value.originalAssessment.criteria[0].limitation.blockerCode, 'ambiguous-guidance')
+    assert.equal(value.entries[0].resultSha256, null)
+  }
+  for (const policyVersion of [undefined, correctionLegacyPolicy, correctionPolicy]) {
+    const published = correctionHistory(fixture, comparisonId, { status: 'ready', policyVersion })
+    globalThis.fetch = async () => Response.json(published)
+    const saved = await client.getAnalysisCorrectionHistory(workspaceId, runId, comparisonId)
+    assert.equal(saved.entries[0].outcome, 'ready')
+    assert.equal(Boolean(saved.entries[0].review.scope), policyVersion === correctionPolicy)
+  }
+})
+
+test('scoped history rejects missing fields, duplicate or foreign decisions, unsupported zeros and inconsistent issue summaries', async () => {
+  const found = { criterionId: 'criterion-one', outcome: 'evidence-found', message: 'Supporting professional evidence exists.', citations: [correctionEvidence] }
+  const blocked = { criterionId: 'criterion-one', outcome: 'blocked', blockerCode: 'ambiguous-guidance', message: 'The saved requirement has contradictory guidance.', citations: [] }
+  const edits = [
+    value => { delete value.entries[0].review.scope },
+    value => { delete value.correction.policyVersion; delete value.entries[0].review.scope },
+    value => { value.entries[0].review.scope.kind = 'full-assessment' },
+    value => { delete value.entries[0].review.scope.baseAssessmentSha256 },
+    value => { value.entries[0].review.scope.baseAssessmentSha256 = 'not-a-hash' },
+    value => { value.entries[0].review.scope.criterionIds = [] },
+    value => { value.entries[0].review.scope.criterionIds.push('criterion-one') },
+    value => { value.entries[0].review.scope.criterionIds = ['foreign-criterion'] },
+    value => { value.entries[0].review.scope.decisions = [] },
+    value => { value.entries[0].review.scope.decisions.push(value.entries[0].review.scope.decisions[0]) },
+    value => { value.entries[0].review.scope.decisions[0].criterionId = 'foreign-criterion' },
+    value => { delete value.entries[0].review.scope.decisions[0].outcome },
+    value => { delete value.entries[0].review.scope.decisions[0].message },
+    value => { delete value.entries[0].review.scope.decisions[0].citations },
+    value => { value.entries[0].review.scope.decisions[0].citations = [correctionEvidence] },
+    value => { value.entries[0].review.scope.decisions[0].blockerCode = 'ambiguous-guidance' },
+    value => { value.entries[0].review.outcome = 'unsupported' },
+    value => { value.entries[0].review = correctionGapReview([found]) },
+    value => { value.entries[0].review = correctionGapReview([blocked]) },
+  ]
+  for (const edit of edits) {
+    const invalid = correctionHistory(fixture, comparisonId, { status: 'ready', policyVersion: correctionPolicy })
+    edit(invalid)
+    globalThis.fetch = async () => Response.json(invalid)
+    await assert.rejects(client.getAnalysisCorrectionHistory(workspaceId, runId, comparisonId), /history|publication/)
+  }
+  for (const edit of [
+    review => { review.scope.decisions[0].citations = [] },
+    review => { review.outcome = 'supported' },
+    review => { review.issues = [] },
+    review => { review.issues[0].criterionId = 'unchanged-numeric-criterion' },
+    review => { review.issues[0].message = 'A different unsupported reason.' },
+    review => { review.issues[0].citations = [] },
+    review => { review.issues.push(review.issues[0]) },
+    review => { review.scope.decisions[0] = { ...blocked, blockerCode: 'unknown' } },
+    review => { review.scope.decisions[0] = { ...blocked, blockerCode: undefined } },
+    review => {
+      review.scope.criterionIds = ['unselected-criterion']
+      review.scope.decisions[0].criterionId = 'unselected-criterion'
+      review.issues[0].criterionId = 'unselected-criterion'
+    },
+  ]) {
+    const invalid = correctionHistory(fixture, comparisonId, { policyVersion: correctionPolicy, decisions: [found] })
+    edit(invalid.entries[0].review)
+    globalThis.fetch = async () => Response.json(invalid)
+    await assert.rejects(client.getAnalysisCorrectionHistory(workspaceId, runId, comparisonId), /history|publication/)
+  }
+})
+
+test('multi-criterion scope must cover the exact selection once, irrespective of decision order', async () => {
+  const history = correctionHistory(fixture, comparisonId, { policyVersion: correctionPolicy })
+  const original = history.originalAssessment.criteria[0]
+  original.weight = 40
+  history.originalAssessment.criteria.push({
+    ...structuredClone(original), criterionId: 'criterion-two', weight: 60,
+    limitation: { ...original.limitation, criterionId: 'criterion-two' },
+  })
+  history.original.coverage.totalCriteria = 2
+  history.original.coverage.notAssessed = 2
+  history.correction.criterionIds = ['criterion-one', 'criterion-two']
+  const entry = history.entries[0]
+  entry.criterionIds = ['criterion-one', 'criterion-two']
+  entry.after.coverage.totalCriteria = 2
+  entry.after.coverage.missing = 2
+  entry.review = correctionGapReview([
+    { criterionId: 'criterion-two', outcome: 'blocked', blockerCode: 'ambiguous-guidance',
+      message: 'The second selected requirement has conflicting saved guidance.', citations: [] },
+    { criterionId: 'criterion-one', outcome: 'confirmed-missing', message: 'No supporting evidence exists for the first selected criterion.', citations: [] },
+  ])
+  entry.review.scope.criterionIds.reverse()
+  globalThis.fetch = async () => Response.json(history)
+  assert.deepEqual((await client.getAnalysisCorrectionHistory(workspaceId, runId, comparisonId)).entries[0].review, entry.review)
+  for (const edit of [
+    value => { value.entries[0].review.scope.decisions.pop() },
+    value => { value.entries[0].review.scope.decisions.push(value.entries[0].review.scope.decisions[0]) },
+    value => {
+      value.entries[0].review.scope.decisions[1].criterionId = 'criterion-two'
+    },
+    value => {
+      value.entries[0].review.scope.criterionIds = ['criterion-one']
+      value.entries[0].review = correctionGapReview([value.entries[0].review.scope.decisions[1]])
+    },
+  ]) {
+    const invalid = structuredClone(history)
+    edit(invalid)
+    globalThis.fetch = async () => Response.json(invalid)
+    await assert.rejects(client.getAnalysisCorrectionHistory(workspaceId, runId, comparisonId), /history|publication/)
+  }
+})
+
+test('failure selection uses only the latest checkpoint of the exact failed request and never substitutes unrelated history', () => {
+  const history = correctionHistory(fixture, comparisonId, { policyVersion: correctionPolicy })
+  const latest = history.entries[0]
+  const older = { ...structuredClone(latest), id: randomUUID(), createdAt: '2026-09-19T14:00:00.000Z' }
+  older.review = correctionGapReview([{ criterionId: 'criterion-one', outcome: 'evidence-found',
+    message: 'An older checkpoint must not replace the latest blocker.', citations: [correctionEvidence] }])
+  const unrelated = { ...structuredClone(latest), id: randomUUID(), requestId: randomUUID(), createdAt: '2026-09-19T16:00:00.000Z' }
+  history.entries = [older, unrelated, latest]
+  assert.equal(state.latestCorrectionFailure(history, history.correction), latest)
+  assert.equal(state.latestCorrectionFailure({ ...history, entries: [unrelated] }, history.correction), null)
+  for (const edit of [
+    value => { value.correction.requestId = randomUUID() },
+    value => { value.correction.status = 'running' },
+    value => { value.workspaceId = 'foreign' },
+    value => { value.entries[2].reason = 'This belongs to a different retained reason.' },
+    value => { value.entries[2].criterionIds = ['foreign-criterion'] },
+    value => { value.entries[2].outcome = 'ready' },
+  ]) {
+    const invalid = structuredClone(history)
+    edit(invalid)
+    assert.throws(() => state.latestCorrectionFailure(invalid, history.correction), /request|criteria/)
+  }
+})
+
 test('request journal replays immutable input after ambiguity; known rejection or terminal acknowledgement needs a fresh request', () => {
   const journal = new state.CorrectionRequestJournal()
   const preview = correctionPreview(fixture, comparisonId)
@@ -281,6 +539,7 @@ test('request journal replays immutable input after ambiguity; known rejection o
   assert.equal(journal.reject(comparisonId, new CloudApiError('unavailable', 'Busy.', 503)), false)
   assert.equal(journal.prepare(comparisonId, edited, 'Edited reason must not replace pending input.'), first)
   assert.equal(first.input.resultSha256, preview.resultSha256)
+  assert.equal(first.input.policyVersion, correctionLegacyPolicy)
   assert.equal(first.etag, preview.etag)
   journal.acknowledge(comparisonId, correctionSummary(fixture, comparisonId))
   assert.equal(journal.get(comparisonId), first)

@@ -16,7 +16,7 @@ import {
 } from './validation'
 import { parseAnalysisJson, readAnalysisBlob, readAnalysisResult, readAnalysisSnapshots } from './snapshots'
 import {
-  assertAnalysisCorrectionProposalBinding, assertEvidenceCorrectionAssessment,
+  assertAnalysisCorrectionProposalBinding, assertCorrectionReviewBinding, assertEvidenceCorrectionAssessment,
   parseAnalysisCorrectionHistoryEntry, parseAnalysisCorrectionProposal,
 } from './correction-validation'
 import { analysisCorrectionCanWork, loadAnalysisCorrection, projectAnalysisComparison } from './current-results'
@@ -42,6 +42,7 @@ export function analysisCorrectionSummary(
     criterionIds: record.criterionIds, attempts: record.attempts,
     nextAttemptAt: stopped ? null : record.nextAttemptAt ?? null, error: record.error ?? null,
     revision: record.published?.revision ?? null, hasHistory: Boolean(record.history),
+    policyVersion: record.policyVersion,
   }
 }
 
@@ -105,6 +106,7 @@ export async function publishAnalysisCorrection(
     const base = await readAnalysisResult(deps.blobs, run.record, before, snapshots)
     assertAnalysis(base, 'Correction base result is unavailable.')
     assertEvidenceCorrectionAssessment(proposal, base, snapshots.targetSnapshot)
+    for (const review of result.provenance.groundingReviews) assertCorrectionReviewBinding(review, proposal)
     assertAnalysis(analysisHash(result.provenance.assessment) === analysisHash(base.provenance.assessment) &&
       result.provenance.groundingReviews.every(review => review.provenance.startedAt >= claimed.requestedAt &&
         review.provenance.completedAt <= result.createdAt && !base.provenance.groundingReviews.some(old => old.id === review.id)),

@@ -1,6 +1,9 @@
 import { z } from 'zod'
 import type { RealAnalysisAssessmentInput } from '../../src/domain/real-analyses'
 import { ANALYSIS_DIAGNOSTIC_LIMITS, ANALYSIS_REVIEW_ISSUE_CODES } from '../../src/domain/analysis-diagnostics'
+import { ANALYSIS_CRITERION_BLOCKER_CODES } from '../../src/domain/analysis-evidence-policy'
+
+export { ANALYSIS_CRITERION_BLOCKER_CODES } from '../../src/domain/analysis-evidence-policy'
 
 export const ANALYSIS_MODEL_LIMITS = {
   maxContextCharacters: 240_000,
@@ -24,11 +27,8 @@ export const ANALYSIS_MODEL_LIMITS = {
 export const ANALYSIS_MODEL_SCHEMA_VERSIONS = {
   assessment: 'score-analysis-assessment-v3',
   grounding: 'score-analysis-grounding-v2',
+  evidenceGaps: 'score-analysis-evidence-gaps-v1',
 } as const
-
-export const ANALYSIS_CRITERION_BLOCKER_CODES = [
-  'unusable-source', 'ambiguous-guidance', 'restricted-personal-characteristic',
-] as const
 
 const identifier = z.string().min(1).max(200).regex(/\S/)
 const nonblank = (max: number) => z.string().min(1).max(max).regex(/\S/)
@@ -133,7 +133,7 @@ const criterionResult = z.strictObject({
   score: z.number().int().min(0).max(5).nullable(),
   rationale: nonblank(ANALYSIS_MODEL_LIMITS.maxRationaleCharacters),
   citations: z.array(resumeQuote).max(ANALYSIS_MODEL_LIMITS.maxCitations),
-  limitation: limitation.nullable(),
+  limitation: limitation.extend({ blockerCode: z.enum(ANALYSIS_CRITERION_BLOCKER_CODES).optional() }).nullable(),
 })
 const qualificationResult = z.strictObject({
   qualificationId: identifier,
@@ -220,6 +220,23 @@ export function groundingSelectionSchemaForInput(input: RealAnalysisAssessmentIn
       qualificationId: input.qualifications.length ? z.enum(input.qualifications.map(value => value.id)).nullable() : z.null(),
       citations: passageSelections(passageCount),
     })).max(ANALYSIS_MODEL_LIMITS.maxReviewIssues),
+  })
+}
+
+export function evidenceGapSelectionSchemaForInput(criterionIds: string[], passageCount: number) {
+  const base = {
+    criterionId: z.enum(criterionIds),
+    message: nonblank(ANALYSIS_MODEL_LIMITS.maxLimitationCharacters),
+  }
+  const citations = passageSelections(passageCount)
+  return z.strictObject({
+    decisions: z.array(z.discriminatedUnion('outcome', [
+      z.strictObject({ ...base, outcome: z.literal('confirmed-missing'), citations: citations.length(0), blockerCode: z.null() }),
+      z.strictObject({ ...base, outcome: z.literal('evidence-found'), citations: citations.min(1), blockerCode: z.null() }),
+      z.strictObject({
+        ...base, outcome: z.literal('blocked'), blockerCode: z.enum(ANALYSIS_CRITERION_BLOCKER_CODES), citations,
+      }),
+    ])).length(criterionIds.length),
   })
 }
 

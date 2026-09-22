@@ -1,9 +1,11 @@
 import { z } from 'zod'
 import {
-  ANALYSIS_CORRECTION_LIMITS, ANALYSIS_CORRECTION_POLICY_VERSION,
+  ANALYSIS_CORRECTION_LIMITS, ANALYSIS_CORRECTION_POLICY_VERSION, ANALYSIS_CORRECTION_POLICY_VERSIONS,
+  ANALYSIS_LEGACY_CORRECTION_POLICY_VERSION,
   type AnalysisCorrectionHistoryPage, type AnalysisCorrectionInput, type AnalysisCorrectionPreview,
   type AnalysisCorrectionResponse, type AnalysisCorrectionSummary,
 } from '../domain/analysis-corrections'
+import { ANALYSIS_CRITERION_BLOCKER_CODES, evidenceGapReviewIssues } from '../domain/analysis-evidence-policy'
 import type { RealAnalysisAssessmentOutput, RealAnalysisResultSummary, RealCriterionResult } from '../domain/real-analyses'
 import { cloudJsonRequest } from './cloudWorkspace'
 
@@ -17,6 +19,7 @@ const weight = z.number().min(0).max(100)
 const criterionIds = z.array(id).max(ANALYSIS_CORRECTION_LIMITS.maxCriteria)
   .refine(values => new Set(values).size === values.length)
 const selectedCriteria = criterionIds.refine(values => values.length > 0)
+const policyVersion = z.enum(ANALYSIS_CORRECTION_POLICY_VERSIONS)
 const savedReason = z.string().min(1).max(1000).refine(value => value.trim().length > 0)
 const reason = z.string().min(10).max(1000).refine(value => value === value.trim())
 const processingError = z.object({
@@ -28,6 +31,7 @@ const processingError = z.object({
 const limitation = z.object({
   code: z.enum(['sparse-source', 'not-assessable', 'context-limit', 'source-quality']),
   message: text, criterionId: id.optional(), qualificationId: id.optional(),
+  blockerCode: z.enum(ANALYSIS_CRITERION_BLOCKER_CODES).optional(),
 })
 const citation = z.object({
   documentId: id, documentVersion: z.number().int().positive(), paragraphId: id,
@@ -54,12 +58,36 @@ const originalAssessment: z.ZodType<RealAnalysisAssessmentOutput> = z.object({
   summary: text, limitations: z.array(limitation).max(100),
 }).refine(value => new Set(value.criteria.map(item => item.criterionId)).size === value.criteria.length &&
   new Set(value.qualifications.map(item => item.qualificationId)).size === value.qualifications.length)
+const decisionBase = z.strictObject({ criterionId: id, message: text })
+const evidenceGapScope = z.strictObject({
+  kind: z.literal('evidence-gaps'), baseAssessmentSha256: hash, criterionIds: selectedCriteria,
+  decisions: z.array(z.discriminatedUnion('outcome', [
+    decisionBase.extend({ outcome: z.literal('confirmed-missing'), citations: z.tuple([]) }),
+    decisionBase.extend({
+      outcome: z.literal('evidence-found'),
+      citations: z.tuple([citation]).rest(citation).refine(values => values.length <= 100),
+    }),
+    decisionBase.extend({
+      outcome: z.literal('blocked'), blockerCode: z.enum(ANALYSIS_CRITERION_BLOCKER_CODES),
+      citations: z.array(citation).max(100),
+    }),
+  ])).min(1).max(ANALYSIS_CORRECTION_LIMITS.maxCriteria),
+}).refine(value => new Set(value.decisions.map(item => item.criterionId)).size === value.decisions.length &&
+  sameCriteria(value.criterionIds, value.decisions.map(item => item.criterionId)))
 const review = z.object({
   outcome: z.enum(['supported', 'needs-correction', 'unsupported']),
   issues: z.array(z.object({
     code: id, message: text, criterionId: id.optional(), qualificationId: id.optional(),
     citations: z.array(citation).max(100),
   })).max(100),
+  scope: evidenceGapScope.optional(),
+}).refine(value => {
+  if (!value.scope) return true
+  const issues = evidenceGapReviewIssues(value.scope.decisions)
+  return (value.outcome === 'supported') === (issues.length === 0) &&
+    value.issues.length === issues.length && issues.every(expected => value.issues.some(issue =>
+      issue.code === expected.code && issue.message === expected.message && issue.criterionId === expected.criterionId &&
+      issue.qualificationId === undefined && JSON.stringify(issue.citations) === JSON.stringify(expected.citations)))
 })
 const resultSummary: z.ZodType<RealAnalysisResultSummary> = z.object({
   completion: z.enum(['assessed', 'limited']),
@@ -82,7 +110,7 @@ const resultSummary: z.ZodType<RealAnalysisResultSummary> = z.object({
     ? coverage.assessedWeight === 0 : coverage.assessedWeight > 0 && coverage.notAssessed > 0)) &&
   (overall.status !== 'available' || coverage.assessedWeight > 0))
 const revision = z.object({
-  id, policyVersion: z.literal(ANALYSIS_CORRECTION_POLICY_VERSION),
+  id, policyVersion,
   originalResultSha256: hash, baseResultSha256: hash, correctedAt: timestamp, criterionIds: selectedCriteria,
 })
 const correctionSchema: z.ZodType<AnalysisCorrectionSummary> = z.object({
@@ -90,13 +118,14 @@ const correctionSchema: z.ZodType<AnalysisCorrectionSummary> = z.object({
   status: z.enum(['queued', 'running', 'ready', 'failed', 'cancelled']),
   requestId: z.uuid(), requestedAt: timestamp, requestedBy: id, reason: savedReason,
   criterionIds: selectedCriteria, attempts: z.number().int().min(0), nextAttemptAt: timestamp.nullable(),
-  error: processingError.nullable(), revision: revision.nullable(), hasHistory: z.boolean(),
+  error: processingError.nullable(), revision: revision.nullable(), hasHistory: z.boolean(), policyVersion: policyVersion.optional(),
 }).refine(value => (value.status !== 'failed' || value.error !== null) &&
   (value.status !== 'ready' || (value.revision !== null && value.error === null &&
-    value.revision.id === value.requestId && sameCriteria(value.revision.criterionIds, value.criterionIds))))
+    value.revision.id === value.requestId && sameCriteria(value.revision.criterionIds, value.criterionIds) &&
+    (value.policyVersion === undefined || value.policyVersion === value.revision.policyVersion))))
 const previewSchema: z.ZodType<AnalysisCorrectionPreview> = z.object({
   dataKind: z.literal('real'), workspaceId: id, runId: id, comparisonId: id, etag,
-  resultSha256: hash, originalResultSha256: hash, policyVersion: z.literal(ANALYSIS_CORRECTION_POLICY_VERSION),
+  resultSha256: hash, originalResultSha256: hash, policyVersion,
   before: resultSummary, after: resultSummary.nullable(), criterionIds,
   criteria: z.array(z.object({
     criterionId: id, label: text, weight, rationale: text, limitation,
@@ -114,7 +143,9 @@ const historySchema: z.ZodType<AnalysisCorrectionHistoryPage> = z.object({
   })).max(ANALYSIS_CORRECTION_LIMITS.historyPageSize),
   continuationToken: z.string().min(1).max(16 * 1024).optional(),
 })
-const inputSchema: z.ZodType<AnalysisCorrectionInput> = z.object({ resultSha256: hash, criterionIds: selectedCriteria, reason })
+const inputSchema: z.ZodType<AnalysisCorrectionInput> = z.object({
+  resultSha256: hash, criterionIds: selectedCriteria, reason, policyVersion: policyVersion.optional(),
+})
 const responseSchema = z.object({ requestId: z.uuid(), correction: correctionSchema })
 
 interface Scope { workspaceId: string; runId: string; comparisonId: string }
@@ -164,7 +195,8 @@ export async function getAnalysisCorrectionPreview(
     value.criteria.length !== value.before.coverage.notAssessed ||
     !sameCriteria(value.criterionIds, value.criteria.filter(item => item.eligible).map(item => item.criterionId)) ||
     value.criteria.some(item => item.eligible ? item.blockedReason !== null || item.weight <= 0 ||
-      ['source-quality', 'context-limit'].includes(item.limitation.code) : !item.blockedReason) ||
+      item.limitation.blockerCode === 'unusable-source' || item.limitation.code === 'context-limit' ||
+      (value.policyVersion === ANALYSIS_LEGACY_CORRECTION_POLICY_VERSION && item.limitation.code === 'source-quality') : !item.blockedReason) ||
     (value.criterionIds.length > 0) !== (value.after !== null) ||
     (value.after && (value.before.overall.status !== 'withheld' ||
       value.after.coverage.totalCriteria !== value.before.coverage.totalCriteria ||
@@ -213,6 +245,16 @@ export async function getAnalysisCorrectionHistory(
     (continuationToken !== undefined && value.continuationToken === continuationToken) ||
     value.entries.some(entry => entry.criterionIds.some(criterionId =>
       !value.originalAssessment.criteria.some(item => item.criterionId === criterionId && item.evidenceStatus === 'not-assessed' && item.weight > 0))) ||
+    value.entries.some(entry => entry.review?.scope && !sameCriteria(entry.review.scope.criterionIds, entry.criterionIds)) ||
+    value.entries.some(entry => {
+      const current = value.correction?.requestId === entry.requestId ? value.correction : null
+      const published = value.correction?.revision?.id === entry.requestId ? value.correction.revision : null
+      const policy = current?.policyVersion ?? published?.policyVersion
+      return (current && (current.reason !== entry.reason || current.requestedBy !== entry.requestedBy ||
+        !sameCriteria(current.criterionIds, entry.criterionIds))) ||
+        (entry.review !== null && policy !== undefined &&
+          (policy === ANALYSIS_CORRECTION_POLICY_VERSION) !== Boolean(entry.review.scope))
+    }) ||
     value.entries.some(entry => entry.outcome === 'ready'
       ? !entry.resultSha256 || entry.resultSha256 === entry.beforeResultSha256 || entry.review?.outcome !== 'supported' ||
         entry.review.issues.length > 0 || entry.error !== null
@@ -228,7 +270,7 @@ export async function requestAnalysisCorrection(
 ): Promise<AnalysisCorrectionResponse> {
   const scope = { workspaceId, runId, comparisonId }
   const parsedInput = inputSchema.safeParse(input)
-  if (!parsedInput.success) throw new Error('Review the exact saved result hash, selected criteria, and a meaningful correction reason (10–1000 characters).')
+  if (!parsedInput.success) throw new Error('Review the exact saved policy version, result hash, selected criteria, and a meaningful correction reason (10–1000 characters).')
   if (!z.uuid().safeParse(key).success) throw new Error('A stable UUID request key is required for each comparison correction.')
   const payload = await cloudJsonRequest<unknown>(path(scope), {
     method: 'POST', signal, headers: { ...concurrency(previewEtag), 'Idempotency-Key': key },
@@ -241,11 +283,14 @@ export async function requestAnalysisCorrection(
   }
   const value = parsed.data
   checkedCorrection(value.correction, scope)
+  const requestedPolicy = parsedInput.data.policyVersion ?? ANALYSIS_LEGACY_CORRECTION_POLICY_VERSION
   if (!sameCriteria(value.correction.criterionIds, parsedInput.data.criterionIds) ||
     value.correction.reason !== parsedInput.data.reason ||
+    (value.correction.policyVersion !== undefined && value.correction.policyVersion !== requestedPolicy) ||
     (value.correction.status === 'ready' && (value.correction.revision?.baseResultSha256 !== parsedInput.data.resultSha256 ||
+      value.correction.revision.policyVersion !== requestedPolicy ||
       !sameCriteria(value.correction.revision.criterionIds, parsedInput.data.criterionIds)))) {
-    throw new Error('The correction acknowledgement does not match the reviewed hash, criteria, or reason. Check status before retrying the same request.')
+    throw new Error('The correction acknowledgement does not match the reviewed policy, hash, criteria, or reason. Check status before retrying the same request.')
   }
   return value
 }
@@ -268,8 +313,10 @@ export async function cancelAnalysisCorrection(
     throw new Error('Cancellation was not acknowledged for the current request. Check correction status before trying again.')
   }
   checkedCorrection(parsed.data.correction, scope)
-  if (!sameCriteria(parsed.data.correction.criterionIds, checked.data.criterionIds) || parsed.data.correction.reason !== checked.data.reason) {
-    throw new Error('Cancellation returned different correction criteria or reason. Check correction status.')
+  if (!sameCriteria(parsed.data.correction.criterionIds, checked.data.criterionIds) || parsed.data.correction.reason !== checked.data.reason ||
+    (parsed.data.correction.policyVersion !== undefined &&
+      parsed.data.correction.policyVersion !== (checked.data.policyVersion ?? ANALYSIS_LEGACY_CORRECTION_POLICY_VERSION))) {
+    throw new Error('Cancellation returned a different correction policy, criteria, or reason. Check correction status.')
   }
   return parsed.data
 }

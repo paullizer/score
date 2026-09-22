@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto'
 import { z } from 'zod'
 import {
-  ANALYSIS_CORRECTION_LIMITS, ANALYSIS_CORRECTION_POLICY_VERSION,
+  ANALYSIS_CORRECTION_LIMITS, ANALYSIS_CORRECTION_POLICY_VERSION, ANALYSIS_LEGACY_CORRECTION_POLICY_VERSION,
   type AnalysisCorrectionHistoryEntry, type AnalysisCorrectionHistoryPage, type AnalysisCorrectionHistoryReference,
   type AnalysisCorrectionInput, type AnalysisCorrectionPreview, type AnalysisCorrectionProposal,
   type AnalysisCorrectionResponse, type RealAnalysisCorrectionRecord,
@@ -25,7 +25,7 @@ import {
   analysisHash, assertAnalysis, calculateAnalysisSummary, isAnalysisId, parseAnalysisEntity,
 } from './validation'
 import {
-  analysisCorrectionFingerprint, analysisCorrectionInputSchema, buildEvidenceCorrectionAssessment,
+  analysisCorrectionFingerprint, analysisCorrectionInputSchema, assertCorrectionReviewBinding, buildEvidenceCorrectionAssessment,
   correctionBlockedReason, parseAnalysisCorrectionHistoryEntry, parseAnalysisCorrectionProposal,
 } from './correction-validation'
 import { analysisCorrectionCanWork, loadAnalysisCorrection, projectAnalysisComparison } from './current-results'
@@ -98,14 +98,14 @@ export class AnalysisCorrectionService {
       if (row.evidenceStatus !== 'not-assessed') return []
       const definition = rubric.criteria.find(item => item.id === row.criterionId)
       assertAnalysis(definition, 'The saved criterion has no frozen definition.')
-      const blockedReason = correctionBlockedReason(result, target, row)
+      const blockedReason = correctionBlockedReason(result, target, row, ANALYSIS_CORRECTION_POLICY_VERSION)
       return [{
         criterionId: row.criterionId, label: definition.label, weight: row.weight, rationale: row.rationale,
         limitation: row.limitation, eligible: blockedReason === null, blockedReason,
       }]
     })
     const criterionIds = criteria.filter(row => row.eligible).map(row => row.criterionId)
-    const proposed = criterionIds.length ? buildEvidenceCorrectionAssessment(result, target, criterionIds) : null
+    const proposed = criterionIds.length ? buildEvidenceCorrectionAssessment(result, target, criterionIds, ANALYSIS_CORRECTION_POLICY_VERSION) : null
     const latest = await this.context(workspaceId, runId, comparisonId, signal)
     if (latest.etag !== state.etag || latest.current.result?.sha256 !== state.current.result.sha256) {
       throw conflict('This result changed while its preview was being prepared. Reload the preview.')
@@ -204,6 +204,7 @@ export class AnalysisCorrectionService {
     const parsed = analysisCorrectionInputSchema.safeParse(input)
     if (!parsed.success) throw invalidRequest('Provide one saved result hash, unique criterion IDs, and a correction reason.')
     input = parsed.data
+    const policyVersion = input.policyVersion ?? ANALYSIS_LEGACY_CORRECTION_POLICY_VERSION
     requestId = requestId.toLowerCase()
     const fingerprint = analysisCorrectionFingerprint(workspaceId, runId, comparisonId, input, actor)
     let state = await this.context(workspaceId, runId, comparisonId)
@@ -248,11 +249,11 @@ export class AnalysisCorrectionService {
       assertAnalysis(result && state.current.result && state.original.record.result && state.current.attemptId, 'Correction needs its exact completed result.')
       const blocked = input.criterionIds.map(id => {
         const row = result.criteria.find(criterion => criterion.criterionId === id)
-        return row ? correctionBlockedReason(result, snapshots.targetSnapshot, row) : 'The criterion is absent from this result.'
+        return row ? correctionBlockedReason(result, snapshots.targetSnapshot, row, policyVersion) : 'The criterion is absent from this result.'
       }).find(reason => reason !== null)
       if (blocked) throw invalidRequest(blocked)
       const criterionIds = result.criteria.filter(row => input.criterionIds.includes(row.criterionId)).map(row => row.criterionId)
-      const proposed = buildEvidenceCorrectionAssessment(result, snapshots.targetSnapshot, criterionIds)
+      const proposed = buildEvidenceCorrectionAssessment(result, snapshots.targetSnapshot, criterionIds, policyVersion)
       const timestamp = narrativeTimestamp(state.run.record, [this.now().toISOString(), state.correction?.record.updatedAt ?? ''].sort().at(-1)!)
       proposal = parseAnalysisCorrectionProposal({
         schemaVersion: 1, dataKind: 'real', workspaceId, runId, comparisonId, requestId, createdAt: timestamp,
@@ -263,7 +264,7 @@ export class AnalysisCorrectionService {
         resumeSnapshot: { snapshotId: state.current.resume.snapshotId, sha256: state.current.resume.blob.sha256 },
         targetSnapshot: { snapshotId: state.current.target.snapshotId, sha256: state.current.target.blob.sha256 },
         provenance: {
-          requestId, policyVersion: ANALYSIS_CORRECTION_POLICY_VERSION, originalResultSha256: state.original.record.result.sha256,
+          requestId, policyVersion, originalResultSha256: state.original.record.result.sha256,
           baseResultSha256: state.current.result.sha256, baseAssessmentSha256: result.provenance.assessmentSha256,
           criterionIds, requestedBy: actor, requestedAt: timestamp, reason: input.reason,
         },
@@ -297,7 +298,7 @@ export class AnalysisCorrectionService {
       manifestSha256: proposal.manifestSha256, originalResult: state.original.record.result!,
       resumeSnapshot: proposal.resumeSnapshot, targetSnapshot: proposal.targetSnapshot,
       status: 'queued', requestId, requestFingerprint: fingerprint, requestedAt: proposal.createdAt,
-      requestedBy: actor, reason: input.reason, policyVersion: ANALYSIS_CORRECTION_POLICY_VERSION,
+      requestedBy: actor, reason: input.reason, policyVersion,
       criterionIds: proposal.provenance.criterionIds, baseResult: proposal.baseResult, baseAttemptId: proposal.baseAttemptId,
       ...(proposal.baseRevision ? { baseRevision: proposal.baseRevision } : {}),
       proposal: analysisBlobReference(name, blob), attempts: 0, retryCount: state.correction ? state.correction.record.retryCount + 1 : 0,
@@ -368,11 +369,13 @@ export class AnalysisCorrectionService {
       assertAnalysis(proposal.workspaceId === workspaceId && proposal.runId === runId && proposal.comparisonId === comparisonId &&
         proposal.requestId === entry.requestId && proposal.manifestSha256 === state.run.record.manifest.sha256 &&
         proposal.originalResultSha256 === state.original.record.result.sha256, 'Correction history proposal belongs to other saved inputs.')
+      if (entry.review) assertCorrectionReviewBinding(entry.review, proposal)
       entries.push({
         id: entry.id, createdAt: entry.createdAt, requestId: entry.requestId, outcome: entry.outcome,
         requestedBy: proposal.provenance.requestedBy, reason: proposal.provenance.reason, criterionIds: proposal.provenance.criterionIds,
         beforeResultSha256: proposal.baseResult.sha256, after: proposal.summary,
-        review: entry.review ? { outcome: entry.review.outcome, issues: entry.review.issues } : null,
+        review: entry.review ? { outcome: entry.review.outcome, issues: entry.review.issues,
+          ...(entry.review.scope ? { scope: entry.review.scope } : {}) } : null,
         error: entry.error ?? null, resultSha256: entry.result?.sha256 ?? null,
       })
     }

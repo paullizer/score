@@ -29,6 +29,7 @@ import type { RealAnalysisCandidateNarrativeSummary, RealAnalysisNarrativeRecord
 import type { AnalysisDiagnosticCapture, AnalysisFailureDiagnosticReference } from './analysis-diagnostics'
 import type { ModelTaskId, ProcessingSettingsSnapshot } from './admin-settings'
 import type { AnalysisCorrectionProvenance, AnalysisResultRevision, RealAnalysisCorrectionRecord } from './analysis-corrections'
+import type { AnalysisCriterionBlockerCode, AnalysisEvidenceGapReviewScope } from './analysis-evidence-policy'
 
 export type {
   RealAnalysisCandidateNarrativeRecord,
@@ -294,6 +295,7 @@ export interface AnalysisLimitation {
   message: string
   criterionId?: string
   qualificationId?: string
+  blockerCode?: AnalysisCriterionBlockerCode
 }
 
 export interface RealCriterionResultBase {
@@ -390,6 +392,7 @@ export interface RealAnalysisGroundingReview extends RealAnalysisGroundingReview
   resumeSnapshotSha256: string
   targetSnapshotSha256: string
   provenance: AnalysisModelProvenance
+  scope?: AnalysisEvidenceGapReviewScope
 }
 
 export interface RealAnalysisResultProvenance {

@@ -12,6 +12,7 @@ import autoprefixer from 'autoprefixer'
 import tailwindConfig from '../../tailwind.config.js'
 import {
   correctionFixture, correctionPreview, correctionSummary, correctionHistory, publishCorrectionFixture,
+  correctionPolicy, correctionLegacyPolicy, correctionGapReview, correctionEvidence,
 } from './analysisCorrections.synthetic.test-support.mjs'
 import { summarySubjectResponse, summaryHistoryFixture } from './analysisSummaries.test-support.mjs'
 
@@ -47,6 +48,7 @@ before(async () => {
         current.current = fixture
         window.switchFixtureWorkspace = () => setSwitched(true)
         window.disableFixtureCorrections = () => setEnabled(false)
+        window.revokeFixtureEditorAccess = () => setRole('viewer')
         const ensureDetail = useCallback(async (runId, force) => {
           if (!force) return
           window.refreshCalls.push({ kind: 'run', runId })
@@ -143,7 +145,10 @@ after(async () => {
   await rm(output, { recursive: true, force: true })
 })
 
-async function setup(t, { fixture = correctionFixture(), role = 'owner', feature = true, result = false, initialCorrectionStatus } = {}) {
+async function setup(t, {
+  fixture = correctionFixture(), role = 'owner', feature = true, result = false,
+  initialCorrectionStatus, initialCorrectionPolicy = correctionLegacyPolicy, policyVersion = correctionPolicy,
+} = {}) {
   const context = await browser.newContext({ viewport: { width: 1440, height: 1100 } })
   t.after(() => context.close())
   await context.addInitScript(({ fixture, role, feature }) => {
@@ -161,11 +166,11 @@ async function setup(t, { fixture = correctionFixture(), role = 'owner', feature
   const state = {
     fixture, requests: [], heads: new Map(), histories: new Map(), blocked: new Set(), previewFailures: new Set(),
     beforePreview: null, onPost: null, onStatus: null, activePreviews: 0, maxPreviews: 0, activePosts: 0, maxPosts: 0,
-    comparisonReadFailures: 0,
+    comparisonReadFailures: 0, policyVersion, onHistory: null, activeHistories: 0, maxHistories: 0,
   }
   if (initialCorrectionStatus) {
     const id = fixture.details[0].comparison.id
-    state.heads.set(id, correctionSummary(fixture, id, { status: initialCorrectionStatus }))
+    state.heads.set(id, correctionSummary(fixture, id, { status: initialCorrectionStatus, policyVersion: initialCorrectionPolicy }))
   }
   const base = `/api/workspaces/${fixture.workspaceId}/analyses/${fixture.summary.run.id}`
   await page.route('**/api/**', async route => {
@@ -205,7 +210,9 @@ async function setup(t, { fixture = correctionFixture(), role = 'owner', feature
       try {
         if (state.beforePreview) await state.beforePreview(comparisonId)
         if (state.previewFailures.has(comparisonId)) return await respond({ error: { code: 'unavailable', message: 'Synthetic preview unavailable; this comparison was not skipped.' } }, 503)
-        return await respond(correctionPreview(fixture, comparisonId, { correction: state.heads.get(comparisonId), blocked: state.blocked.has(comparisonId) }))
+        return await respond(correctionPreview(fixture, comparisonId, {
+          correction: state.heads.get(comparisonId), blocked: state.blocked.has(comparisonId), policyVersion: state.policyVersion,
+        }))
       } finally { state.activePreviews-- }
     }
     if (suffix === '/corrections' && record.method === 'GET') {
@@ -218,7 +225,9 @@ async function setup(t, { fixture = correctionFixture(), role = 'owner', feature
       try {
         if (state.onPost && await state.onPost({ route, record, comparisonId, respond })) return
         const key = record.headers['idempotency-key']
-        const correction = correctionSummary(fixture, comparisonId, { requestId: key, reason: record.body.reason })
+        const correction = correctionSummary(fixture, comparisonId, {
+          requestId: key, reason: record.body.reason, policyVersion: record.body.policyVersion,
+        })
         state.heads.set(comparisonId, correction)
         return await respond({ requestId: key, correction }, 202)
       } finally { state.activePosts-- }
@@ -230,9 +239,16 @@ async function setup(t, { fixture = correctionFixture(), role = 'owner', feature
       state.heads.set(comparisonId, correction)
       return respond({ requestId: correction.requestId, correction })
     }
-    if (suffix === '/corrections/history') return respond(state.histories.get(comparisonId) ?? {
-      ...correctionHistory(fixture, comparisonId), correction: state.heads.get(comparisonId) ?? null, entries: [],
-    })
+    if (suffix === '/corrections/history') {
+      state.activeHistories++
+      state.maxHistories = Math.max(state.maxHistories, state.activeHistories)
+      try {
+        if (state.onHistory && await state.onHistory({ route, record, comparisonId, respond })) return
+        return await respond(state.histories.get(comparisonId) ?? {
+          ...correctionHistory(fixture, comparisonId), correction: state.heads.get(comparisonId) ?? null, entries: [],
+        })
+      } finally { state.activeHistories-- }
+    }
     return respond({ error: { code: 'invalid_request', message: 'Unexpected synthetic endpoint.' } }, 400)
   })
   await page.goto(`${origin}/${result ? '?result=1' : ''}`)
@@ -241,6 +257,7 @@ async function setup(t, { fixture = correctionFixture(), role = 'owner', feature
 }
 
 const postRequests = state => state.requests.filter(request => request.method === 'POST' && request.path.endsWith('/corrections'))
+const historyRequests = state => state.requests.filter(request => request.path.endsWith('/corrections/history'))
 async function openReview(page, single = false) {
   await page.getByRole('button', { name: single ? /^(Review this withheld score|Manage current correction)$/ : /^Review withheld scores \(/ }).click()
   const dialog = page.getByRole('dialog', { name: 'Review withheld scores', exact: true })
@@ -266,6 +283,9 @@ test('run action reviews all available withheld comparisons beyond 25, limits pr
   assert.equal(state.requests.filter(item => item.path.endsWith('/preview')).length, 31)
   assert.equal(state.maxPreviews, 2)
   assert.equal(postRequests(state).length, 0)
+  assert.equal(historyRequests(state).length, 0)
+  assert.match(await dialog.innerText(), /AI verifies only the selected evidence gaps/)
+  assert.match(await dialog.innerText(), /server automatically publishes zeros at their original weights/)
   assert.match(await dialog.innerText(), /genuine source-quality blocker/)
   assert.match(await dialog.innerText(), /Synthetic preview unavailable; this comparison was not skipped/)
   assert.equal(await dialog.getByRole('button', { name: 'Confirm review for 29 comparisons', exact: true }).isEnabled(), false)
@@ -286,8 +306,10 @@ test('ambiguous single requests retain exact key, ETag and reason across closing
   await confirm(dialog, 1)
   await dialog.getByRole('button', { name: 'Retry same request', exact: true }).waitFor()
   const original = postRequests(state)[0]
+  assert.equal(original.body.policyVersion, correctionPolicy)
   assert.equal(await page.locator('.overall-score strong').first().innerText(), 'Score withheld')
   await dialog.getByRole('button', { name: 'Close', exact: true }).click()
+  state.policyVersion = correctionLegacyPolicy
   dialog = await openReview(page, true)
   await dialog.getByLabel('Reason recorded in the audit history').fill('An edited reason must not replace the immutable interrupted request.')
   await dialog.getByRole('button', { name: 'Retry same request', exact: true }).click()
@@ -314,7 +336,7 @@ test('only verified publication refreshes the run, pair list and affected detail
     if (!previous || !['queued', 'running'].includes(previous.status)) return
     polls++
     const next = correctionSummary(state.fixture, id, {
-      requestId: previous.requestId, reason: previous.reason, status: polls < 3 ? 'running' : 'ready',
+      requestId: previous.requestId, reason: previous.reason, policyVersion: previous.policyVersion, status: polls < 3 ? 'running' : 'ready',
     })
     state.heads.set(id, next)
     if (next.status === 'ready') {
@@ -331,6 +353,9 @@ test('only verified publication refreshes the run, pair list and affected detail
   await page.getByText('Current reviewed correction revision', { exact: true }).waitFor()
   assert.equal(await page.locator('.overall-score .score strong').innerText(), '0')
   assert.equal(await page.locator('.criterion-score strong').first().innerText(), '0')
+  await page.getByText('Processing provenance and immutable identities', { exact: true }).click()
+  assert.match(await page.locator('details').filter({ has: page.getByText('Recorded AI review scope', { exact: true }) }).innerText(),
+    /Selected evidence-gap verification only \(criterion-one\)[\s\S]*not independently reapproved/)
   assert.deepEqual(state.fixture.details.slice(1), untouched)
   const refreshes = await page.evaluate(() => window.refreshCalls)
   assert.deepEqual(refreshes.map(item => item.kind).sort(), ['detail', 'pairs', 'run'])
@@ -343,6 +368,8 @@ test('only verified publication refreshes the run, pair list and affected detail
   assert.match(await history.innerText(), /Original saved score[\s\S]*Score withheld/)
   assert.match(await history.innerText(), new RegExp(originalHash))
   assert.match(await history.innerText(), /Published server total[\s\S]*0/)
+  assert.match(await history.innerText(), /Selected evidence-gap verification: supported/)
+  assert.match(await history.innerText(), /Missing evidence confirmed/)
   await history.getByText('Full original rationale and saved evidence', { exact: true }).click()
   assert.match(await history.innerText(), /Original immutable scoring explanation/)
   assert.match(await history.innerText(), /The reviewed synthetic source does not document the required professional practice/)
@@ -374,7 +401,9 @@ test('a published correction can refresh its score after a transient read failur
   state.onStatus = async id => {
     const previous = state.heads.get(id)
     if (previous?.status !== 'queued') return
-    const correction = correctionSummary(state.fixture, id, { status: 'ready', requestId: previous.requestId, reason: previous.reason })
+    const correction = correctionSummary(state.fixture, id, {
+      status: 'ready', requestId: previous.requestId, reason: previous.reason, policyVersion: previous.policyVersion,
+    })
     state.heads.set(id, correction)
     publishCorrectionFixture(state.fixture, correction)
   }
@@ -469,7 +498,9 @@ test('partial scheduling reports exact per-item outcomes; a known failed review 
   state.onStatus = async id => {
     const previous = state.heads.get(id)
     if (previous?.status === 'queued') {
-      const failed = correctionSummary(state.fixture, id, { status: 'failed', requestId: previous.requestId, reason: previous.reason })
+      const failed = correctionSummary(state.fixture, id, {
+        status: 'failed', requestId: previous.requestId, reason: previous.reason, policyVersion: previous.policyVersion,
+      })
       state.heads.set(id, failed)
       state.histories.set(id, correctionHistory(state.fixture, id, { correction: failed }))
     }
@@ -491,6 +522,225 @@ test('partial scheduling reports exact per-item outcomes; a known failed review 
   assert.notEqual(postRequests(state)[3].headers['idempotency-key'], firstKey)
   assert.equal(state.fixture.details[0].comparison.resultSummary.overall.status, 'withheld')
   assert.deepEqual(await page.evaluate(() => window.refreshCalls), [])
+})
+
+test('all 21 withheld requests retain visible server outcomes while private findings are exact, lazy and never part of status polling', async t => {
+  const fixture = correctionFixture({ withheld: 21, numeric: 3, failed: 0 })
+  const untouched = structuredClone(fixture.details.slice(21))
+  const { page, state } = await setup(t, { fixture })
+  state.onStatus = async id => {
+    const previous = state.heads.get(id)
+    if (previous?.status !== 'queued') return
+    const index = Number(id.split('-').at(-1))
+    const status = index <= 10 ? 'failed' : index <= 14 ? 'running' : index <= 18 ? 'queued' : 'cancelled'
+    if (status === 'queued') return
+    const correction = correctionSummary(fixture, id, {
+      status, requestId: previous.requestId, reason: previous.reason, policyVersion: previous.policyVersion,
+    })
+    state.heads.set(id, correction)
+    if (status !== 'failed') return
+    const decision = index % 2 ? {
+      criterionId: 'criterion-one', outcome: 'blocked', blockerCode: 'ambiguous-guidance',
+      message: `${id} requires clarification of the saved professional scoring guidance.`, citations: [],
+    } : {
+      criterionId: 'criterion-one', outcome: 'evidence-found',
+      message: `${id} has a saved engineering passage supporting this selected requirement.`, citations: [correctionEvidence],
+    }
+    const history = correctionHistory(fixture, id, { correction, decisions: [decision] })
+    const older = { ...structuredClone(history.entries[0]), id: randomUUID(), createdAt: '2026-09-19T14:00:00.000Z',
+      review: correctionGapReview([{ ...decision, message: 'An older finding must not replace the latest saved decision.' }]) }
+    const unrelated = { ...structuredClone(history.entries[0]), id: randomUUID(), requestId: randomUUID(), createdAt: '2026-09-19T16:00:00.000Z',
+      review: correctionGapReview([{ ...decision, message: 'An unrelated request must never be substituted.' }]) }
+    history.entries = [older, unrelated, ...history.entries]
+    state.histories.set(id, history)
+  }
+  let dialog = await openReview(page)
+  assert.match(await dialog.innerText(), /Exact scope: 21 currently available withheld comparisons/)
+  assert.match(await dialog.innerText(), /I authorize AI verification of only the selected evidence gaps and automatic server publication/)
+  await confirm(dialog, 21)
+  const persisted = 'Saved server status: 4 queued · 4 running · 0 published · 10 failed · 3 cancelled.'
+  await dialog.getByText(persisted, { exact: true }).waitFor()
+  assert.equal(postRequests(state).length, 21)
+  assert.equal(new Set(postRequests(state).map(item => item.headers['idempotency-key'])).size, 21)
+  assert.ok(postRequests(state).every(item => item.body.policyVersion === correctionPolicy && item.body.criterionIds.join() === 'criterion-one'))
+  assert.equal(historyRequests(state).length, 0)
+  assert.equal(await dialog.getByRole('button', { name: 'View failure findings', exact: true }).count(), 10)
+  assert.deepEqual(fixture.details.slice(21), untouched)
+  const second = dialog.locator('section[aria-label^="Correction review: Synthetic source 2 "]')
+  await second.getByRole('button', { name: 'View failure findings', exact: true }).click()
+  let findings = second.getByRole('region', { name: 'Private correction failure findings', exact: true })
+  await findings.getByText('Supporting evidence found — proposed zero not approved', { exact: true }).waitFor()
+  assert.match(await findings.innerText(), /Synthetic professional practice · criterion-one/)
+  assert.match(await findings.innerText(), /synthetic-comparison-2 has a saved engineering passage/)
+  assert.match(await findings.innerText(), /Applied engineering methods independently/)
+  assert.match(await findings.innerText(), new RegExp(state.heads.get('synthetic-comparison-2').requestId))
+  assert.doesNotMatch(await findings.innerText(), /An older finding|An unrelated request/)
+  assert.equal(historyRequests(state).length, 1)
+  const first = dialog.locator('section[aria-label^="Correction review: Synthetic source 1 "]')
+  await first.getByRole('button', { name: 'View failure findings', exact: true }).click()
+  findings = first.getByRole('region', { name: 'Private correction failure findings', exact: true })
+  await findings.getByText('Blocked — ambiguous-guidance', { exact: true }).waitFor()
+  assert.match(await findings.innerText(), /synthetic-comparison-1 requires clarification/)
+  assert.equal(await dialog.getByRole('region', { name: 'Private correction failure findings', exact: true }).count(), 1)
+  assert.equal(state.maxHistories, 1)
+  await first.getByRole('button', { name: 'Check correction status', exact: true }).click()
+  await pause(450)
+  assert.equal(historyRequests(state).length, 2)
+  assert.ok(historyRequests(state).every(item => item.method === 'GET' && item.cursor === null))
+  assert.equal(postRequests(state).length, 21)
+  await dialog.getByRole('button', { name: 'Close', exact: true }).click()
+  dialog = await openReview(page)
+  await dialog.getByText(persisted, { exact: true }).waitFor()
+  assert.equal(await dialog.locator('section[aria-label^="Correction review:"]').count(), 21)
+  assert.equal(historyRequests(state).length, 2)
+  assert.equal(postRequests(state).length, 21)
+  assert.deepEqual(fixture.details.slice(21), untouched)
+})
+
+test('all 21 verified gap corrections become published server revisions without a second confirmation or any private-history fanout', async t => {
+  const fixture = correctionFixture({ withheld: 21, numeric: 3, failed: 0 })
+  const untouched = structuredClone(fixture.details.slice(21))
+  const { page, state } = await setup(t, { fixture })
+  state.onStatus = async id => {
+    const previous = state.heads.get(id)
+    if (previous?.status !== 'queued') return
+    const ready = correctionSummary(fixture, id, {
+      status: 'ready', requestId: previous.requestId, reason: previous.reason, policyVersion: previous.policyVersion,
+    })
+    state.heads.set(id, ready)
+    publishCorrectionFixture(fixture, ready)
+  }
+  const dialog = await openReview(page)
+  assert.equal(postRequests(state).length, 0)
+  assert.ok(fixture.details.slice(0, 21).every(item => item.result.overall.status === 'withheld'))
+  await confirm(dialog, 21)
+  await dialog.getByText('Saved server status: 0 queued · 0 running · 21 published · 0 failed · 0 cancelled.', { exact: true }).waitFor()
+  assert.equal(postRequests(state).length, 21)
+  assert.ok(postRequests(state).every(item => item.body.policyVersion === correctionPolicy))
+  assert.ok(fixture.details.slice(0, 21).every(item => item.comparison.resultRevision.policyVersion === correctionPolicy &&
+    item.result.overall.status === 'available' && item.result.overall.score === 0 && item.result.criteria[0].weight === 100))
+  assert.equal(fixture.summary.run.progress.scored, 24)
+  assert.equal(fixture.summary.run.progress.unscored, 0)
+  assert.deepEqual(fixture.details.slice(21), untouched)
+  assert.equal(historyRequests(state).length, 0)
+  await dialog.getByRole('button', { name: 'Close', exact: true }).click()
+  await page.getByRole('button', { name: 'Review withheld scores (0)', exact: true }).waitFor()
+  assert.equal(await page.getByRole('button', { name: 'Review withheld scores (0)', exact: true }).isEnabled(), false)
+})
+
+async function failedReview(t, { legacy = false, result = false } = {}) {
+  const { page, state } = await setup(t, {
+    fixture: correctionFixture({ withheld: 1, numeric: 0, failed: 0 }), result, initialCorrectionStatus: 'failed',
+    initialCorrectionPolicy: legacy ? correctionLegacyPolicy : correctionPolicy,
+  })
+  const id = state.fixture.details[0].comparison.id
+  state.histories.set(id, correctionHistory(state.fixture, id, { correction: state.heads.get(id) }))
+  const dialog = await openReview(page, result)
+  const row = dialog.locator('section[aria-label^="Correction review:"]').first()
+  return { page, state, id, dialog, row }
+}
+
+test('failed rows show actionable read errors and explicit retries, not silent approval or blind correction retries', async t => {
+  for (const status of [503, 403]) await t.test(`private history read returns ${status}`, async child => {
+    const { state, dialog, row } = await failedReview(child)
+    let fail = true
+    state.onHistory = async ({ respond }) => {
+      if (!fail) return false
+      await respond({ error: { code: status === 403 ? 'forbidden' : 'unavailable', message: 'Synthetic private findings unavailable.' } }, status)
+      return true
+    }
+    await row.getByRole('button', { name: 'View failure findings', exact: true }).click()
+    const findings = row.getByRole('region', { name: 'Private correction failure findings', exact: true })
+    await findings.getByRole('button', { name: 'Retry loading failure findings', exact: true }).waitFor()
+    assert.match(await findings.innerText(), status === 403 ? /Access to private correction findings was denied/ : /Synthetic private findings unavailable/)
+    assert.equal(historyRequests(state).length, 1)
+    assert.equal(postRequests(state).length, 0)
+    assert.equal(await findings.getByText('No reviewer issues were recorded.', { exact: true }).count(), 0)
+    fail = false
+    await findings.getByRole('button', { name: 'Retry loading failure findings', exact: true }).click()
+    await findings.getByText('Blocked — ambiguous-guidance', { exact: true }).waitFor()
+    assert.equal(historyRequests(state).length, 2)
+    assert.match(await dialog.innerText(), /Correction failed — not published/)
+    assert.equal(postRequests(state).length, 0)
+  })
+})
+
+test('latest findings cannot be substituted when the request changes, and a missing checkpoint is explicitly disclosed', async t => {
+  const { state, id, row } = await failedReview(t)
+  const next = correctionSummary(state.fixture, id, { status: 'failed', policyVersion: correctionPolicy })
+  state.heads.set(id, next)
+  state.histories.set(id, correctionHistory(state.fixture, id, { correction: next }))
+  await row.getByRole('button', { name: 'View failure findings', exact: true }).click()
+  let findings = row.getByRole('region', { name: 'Private correction failure findings', exact: true })
+  await findings.getByText(/The current correction request changed while loading findings/).waitFor()
+  assert.doesNotMatch(await findings.innerText(), /Blocked — ambiguous-guidance/)
+  await row.getByRole('button', { name: 'Check correction status', exact: true }).click()
+  await row.getByRole('button', { name: 'View failure findings', exact: true }).waitFor()
+  assert.equal(await row.getByRole('region', { name: 'Private correction failure findings', exact: true }).count(), 0)
+  state.histories.get(id).entries = []
+  await row.getByRole('button', { name: 'View failure findings', exact: true }).click()
+  findings = row.getByRole('region', { name: 'Private correction failure findings', exact: true })
+  await findings.getByText(/No checkpoint for this exact request was found on the latest history page/).waitFor()
+  assert.match(await findings.innerText(), new RegExp(next.requestId))
+  assert.equal(historyRequests(state).length, 2)
+  assert.equal(postRequests(state).length, 0)
+})
+
+test('private findings abort on explicit cancellation, stale request changes and access revocation without leaking late results', async t => {
+  for (const action of ['cancel', 'new-request', 'revoke']) await t.test(action, async child => {
+    const { page, state, id, dialog, row } = await failedReview(child)
+    let release
+    const held = new Promise(resolve => { release = resolve })
+    state.onHistory = async () => { await held; return false }
+    await row.getByRole('button', { name: 'View failure findings', exact: true }).click()
+    await row.getByRole('button', { name: 'Cancel loading findings', exact: true }).waitFor()
+    await until(() => state.activeHistories === 1, 'The explicit private history read must start.')
+    if (action === 'cancel') await row.getByRole('button', { name: 'Cancel loading findings', exact: true }).click()
+    else if (action === 'new-request') {
+      const next = correctionSummary(state.fixture, id, { status: 'failed', policyVersion: correctionPolicy })
+      state.heads.set(id, next)
+      state.histories.set(id, correctionHistory(state.fixture, id, { correction: next }))
+      await row.getByRole('button', { name: 'Check correction status', exact: true }).click()
+      await row.getByRole('button', { name: 'View failure findings', exact: true }).waitFor()
+    } else {
+      await page.evaluate(() => window.revokeFixtureEditorAccess())
+      await until(async () => await page.getByRole('dialog').count() === 0, 'Revocation must close private correction review.')
+    }
+    release()
+    await until(() => state.activeHistories === 0, 'The held history response must complete without a stale render.')
+    await pause(100)
+    assert.equal(await page.getByRole('region', { name: 'Private correction failure findings', exact: true }).count(), 0)
+    assert.equal(await page.getByText('Blocked — ambiguous-guidance', { exact: true }).count(), 0)
+    assert.equal(historyRequests(state).length, 1)
+    assert.equal(postRequests(state).length, 0)
+    if (action !== 'revoke') {
+      state.onHistory = null
+      await row.getByRole('button', { name: 'View failure findings', exact: true }).click()
+      await dialog.getByText('Blocked — ambiguous-guidance', { exact: true }).waitFor()
+      assert.equal(historyRequests(state).length, 2)
+    }
+  })
+})
+
+test('legacy failures remain visibly full-assessment reviews, separate from a new scoped preview and never silently reinterpreted', async t => {
+  const { page, state, id, row, dialog } = await failedReview(t, { legacy: true })
+  const history = state.histories.get(id)
+  history.entries[0].review.issues[0].message = 'The legacy whole-assessment reviewer rejected an unchanged score rationale.'
+  await row.getByRole('button', { name: 'View failure findings', exact: true }).click()
+  const findings = row.getByRole('region', { name: 'Private correction failure findings', exact: true })
+  await findings.getByText('Legacy full-assessment grounding review: needs-correction', { exact: true }).waitFor()
+  assert.match(await findings.innerText(), /legacy whole-assessment reviewer rejected an unchanged score rationale/)
+  assert.match(await findings.innerText(), /Selected criteria: Synthetic professional practice \(criterion-one\)/)
+  assert.match(await row.innerText(), /Preview policy: missing-evidence-zero-v2/)
+  assert.match(await row.innerText(), /Legacy full-assessment grounding review: the entire proposal/)
+  assert.equal(postRequests(state).length, 0)
+  await dialog.getByRole('button', { name: 'Close', exact: true }).click()
+  state.policyVersion = correctionLegacyPolicy
+  const legacyDialog = await openReview(page)
+  assert.match(await legacyDialog.innerText(), /legacy proposal requires a fresh full-assessment grounding review/)
+  await confirm(legacyDialog, 1)
+  await legacyDialog.getByText('Correction queued', { exact: true }).waitFor()
+  assert.equal(postRequests(state)[0].body.policyVersion, correctionLegacyPolicy)
 })
 
 test('closing a run modal stops status timers; a workspace change aborts previews and prevents queued work from leaking', async t => {

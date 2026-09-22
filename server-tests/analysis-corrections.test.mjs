@@ -9,7 +9,7 @@ import { narrativeRuntime, narrativeWorker, runComparisons, settleNarratives } f
 
 const status = expected => error => error.status === expected
 const reason = 'Score absent documentary support as zero; preserve original results and evidence.'
-const input = preview => ({ resultSha256: preview.resultSha256, criterionIds: preview.criterionIds, reason })
+const input = preview => ({ policyVersion: preview.policyVersion, resultSha256: preview.resultSha256, criterionIds: preview.criterionIds, reason })
 
 function professionalJobOptions(personal = false) {
   return {
@@ -30,7 +30,7 @@ function professionalJobOptions(personal = false) {
   }
 }
 
-async function setup({ blocked, personal = false, globalBlock = false, allMissing = false, enabled = true, unaffected = false } = {}) {
+async function setup({ blocked, blockerCode, personal = false, globalBlock = false, allMissing = false, enabled = true, unaffected = false } = {}) {
   const f = fixture()
   f.analysis.evidenceCorrectionsEnabled = enabled
   const resume = await seedResume(f)
@@ -49,7 +49,8 @@ async function setup({ blocked, personal = false, globalBlock = false, allMissin
           ...row, evidenceStatus: 'not-assessed', score: null,
           rationale: 'The successfully reviewed source does not describe this required work.',
           citations: [citation(snapshots.resumeSnapshot.document)],
-          limitation: { code: blocked ?? 'not-assessable', message: 'No supporting work is documented.', criterionId: row.criterionId },
+          limitation: { code: blocked ?? 'not-assessable', message: 'No supporting work is documented.', criterionId: row.criterionId,
+            ...(blockerCode ? { blockerCode } : {}) },
         }
       })
       assessment.limitations = assessment.criteria.filter(row => row.evidenceStatus === 'not-assessed').map(row => row.limitation)
@@ -61,10 +62,10 @@ async function setup({ blocked, personal = false, globalBlock = false, allMissin
   return { f, runId, comparisonId, original, unchanged }
 }
 
-async function requestCorrection(context, requestId = randomUUID()) {
+async function requestCorrection(context, requestId = randomUUID(), policyVersion = api.ANALYSIS_CORRECTION_POLICY_VERSION) {
   const { f, runId, comparisonId } = context
   const preview = await f.service.correctionPreview(f.workspaceId, runId, comparisonId)
-  const response = await f.service.requestCorrection(f.workspaceId, runId, comparisonId, input(preview), requestId, preview.etag, ACTOR)
+  const response = await f.service.requestCorrection(f.workspaceId, runId, comparisonId, { ...input(preview), policyVersion }, requestId, preview.etag, ACTOR)
   return { preview, response, requestId }
 }
 
@@ -209,6 +210,8 @@ test('supported publication preserves original bytes and unrelated results, proj
   assert.deepEqual(detail.result.criteria[1].citations, [])
   assert.deepEqual(detail.result.criteria[1].requirementCitations, original.result.criteria[1].requirementCitations)
   assert.equal(detail.result.provenance.groundingReviews[0].assessmentSha256, detail.result.provenance.assessmentSha256)
+  assert.equal(detail.result.provenance.groundingReviews[0].scope.baseAssessmentSha256, original.result.provenance.assessmentSha256)
+  assert.deepEqual(detail.result.provenance.groundingReviews[0].scope.criterionIds, ['confidentiality'])
   assert.notEqual(detail.result.provenance.assessmentSha256, original.result.provenance.assessmentSha256)
   const run = await f.service.detail(f.workspaceId, runId)
   assert.equal(run.run.progress.scored, 2)
@@ -231,6 +234,7 @@ test('supported publication preserves original bytes and unrelated results, proj
   assert.equal(history.entries[0].outcome, 'ready')
   assert.equal(history.entries[0].after.overall.score, 72)
   assert.equal(history.entries[0].resultSha256, accepted.reference.sha256)
+  assert.deepEqual(history.entries[0].review.scope, detail.result.provenance.groundingReviews[0].scope)
 })
 
 test('all missing evidence yields an available numeric zero with all original weight assessed', async () => {
@@ -244,7 +248,77 @@ test('all missing evidence yields an available numeric zero with all original we
   assert.equal((await f.service.comparisonDetail(f.workspaceId, runId, comparisonId)).result.overall.score, 0)
 })
 
-test('a synthetic 412-comparison recovery changes exactly 24 results across three targets and preserves all 388 unaffected publications', async () => {
+test('unversioned requests retain legacy fingerprints and cannot be replayed as scoped consent', async () => {
+  const context = await setup()
+  const { f, runId, comparisonId } = context
+  const preview = await f.service.correctionPreview(f.workspaceId, runId, comparisonId)
+  assert.equal(preview.policyVersion, api.ANALYSIS_CORRECTION_POLICY_VERSION)
+  const body = { resultSha256: preview.resultSha256, criterionIds: preview.criterionIds, reason }
+  const key = randomUUID()
+  const accepted = await f.service.requestCorrection(f.workspaceId, runId, comparisonId, body, key, preview.etag, ACTOR)
+  assert.equal(accepted.correction.policyVersion, api.ANALYSIS_LEGACY_CORRECTION_POLICY_VERSION)
+  const expected = api.analysisHash({
+    workspaceId: f.workspaceId, runId, comparisonId, actor: ACTOR,
+    policyVersion: 'missing-evidence-zero-v1', input: { ...body, criterionIds: [...body.criterionIds].sort() },
+  })
+  assert.equal(api.analysisCorrectionFingerprint(f.workspaceId, runId, comparisonId, body, ACTOR), expected)
+  await assert.rejects(f.service.requestCorrection(f.workspaceId, runId, comparisonId,
+    { ...body, policyVersion: api.ANALYSIS_CORRECTION_POLICY_VERSION }, key, preview.etag, ACTOR), status(409))
+  const publication = await reviewed(context)
+  await publication.publish()
+  assert.equal(publication.result.provenance.groundingReviews[0].scope, undefined)
+  const replay = await f.service.requestCorrection(f.workspaceId, runId, comparisonId, body, key, preview.etag, ACTOR)
+  assert.equal(replay.correction.revision.policyVersion, api.ANALYSIS_LEGACY_CORRECTION_POLICY_VERSION)
+})
+
+test('scoped publication binds its exact selection and base without substituting for full assessment review', async () => {
+  const context = await setup()
+  await requestCorrection(context)
+  const publication = await reviewed(context)
+  const valid = publication.result
+  for (const mutate of [
+    result => { delete result.provenance.groundingReviews[0].scope },
+    result => { result.provenance.correction.policyVersion = api.ANALYSIS_LEGACY_CORRECTION_POLICY_VERSION },
+    result => { result.provenance.groundingReviews[0].scope.baseAssessmentSha256 = 'f'.repeat(64) },
+    result => { result.provenance.groundingReviews[0].scope.criterionIds = ['another-criterion'] },
+    result => { result.provenance.groundingReviews[0].scope.decisions = [] },
+    result => { result.provenance.groundingReviews[0].scope.decisions.push(result.provenance.groundingReviews[0].scope.decisions[0]) },
+    result => { result.provenance.groundingReviews[0].scope.decisions[0].outcome = 'evidence-found' },
+  ]) {
+    const tampered = clone(valid)
+    mutate(tampered)
+    assert.throws(() => api.parseAnalysisResult(tampered))
+  }
+  const ordinary = clone(context.original.result)
+  ordinary.provenance.groundingReviews[0].scope = clone(valid.provenance.groundingReviews[0].scope)
+  assert.throws(() => api.parseAnalysisResult(ordinary), /ordinary assessments require full review/)
+  await publication.publish()
+  const detail = await context.f.service.comparisonDetail(context.f.workspaceId, context.runId, context.comparisonId)
+  assert.deepEqual(detail.result.provenance.groundingReviews[0].scope, valid.provenance.groundingReviews[0].scope)
+})
+
+test('a scoped correction can inherit a legacy corrected base without altering its approved numeric rows', async () => {
+  const context = await setup({ allMissing: true })
+  const { f, runId, comparisonId } = context
+  const first = await f.service.correctionPreview(f.workspaceId, runId, comparisonId)
+  await f.service.requestCorrection(f.workspaceId, runId, comparisonId, {
+    ...input(first), policyVersion: api.ANALYSIS_LEGACY_CORRECTION_POLICY_VERSION,
+    criterionIds: [first.criterionIds[0]],
+  }, randomUUID(), first.etag, ACTOR)
+  const legacy = await reviewed(context)
+  await legacy.publish()
+  await requestCorrection(context)
+  const scoped = await reviewed(context)
+  assert.equal(scoped.result.provenance.groundingReviews[0].scope.baseAssessmentSha256, legacy.result.provenance.assessmentSha256)
+  assert.deepEqual(scoped.result.criteria[0], legacy.result.criteria[0])
+  await scoped.publish()
+  assert.equal(scoped.result.overall.score, 0)
+  const history = await f.service.correctionHistory(f.workspaceId, runId, comparisonId)
+  assert.equal(history.entries[0].review.scope.kind, 'evidence-gaps')
+  assert.equal(history.entries[1].review.scope, undefined)
+})
+
+test('a 412-comparison recovery publishes 21 scoped corrections and preserves three legacy corrections and 388 unaffected results', async () => {
   const f = fixture()
   f.analysis.evidenceCorrectionsEnabled = true
   const resumes = [], jobs = []
@@ -286,9 +360,20 @@ test('a synthetic 412-comparison recovery changes exactly 24 results across thre
   for (const targetId of targets) originalTargets.set(targetId,
     clone(await f.analysis.store.get(f.workspaceId, api.analysisNarrativeId('target', runId, targetId))))
   assert.equal((await f.service.detail(f.workspaceId, runId)).run.progress.unscored, 24)
-  for (const comparisonId of gaps) await requestCorrection({ f, runId, comparisonId })
+  const legacy = new Map()
+  for (const comparisonId of [...gaps].slice(0, 3)) {
+    const context = { f, runId, comparisonId }
+    await requestCorrection(context, randomUUID(), api.ANALYSIS_LEGACY_CORRECTION_POLICY_VERSION)
+    const accepted = await reviewed(context)
+    await accepted.publish()
+    assert.equal(accepted.result.provenance.groundingReviews[0].scope, undefined)
+    legacy.set(comparisonId, clone((await f.service.comparisonDetail(f.workspaceId, runId, comparisonId)).comparison))
+  }
+  assert.equal((await f.service.detail(f.workspaceId, runId)).run.progress.unscored, 21)
+  const remaining = [...gaps].filter(id => !legacy.has(id))
+  for (const comparisonId of remaining) await requestCorrection({ f, runId, comparisonId })
   let published = 0
-  for (const comparisonId of gaps) {
+  for (const comparisonId of remaining) {
     const context = { f, runId, comparisonId }
     const accepted = await reviewed(context)
     assert.equal(accepted.result.overall.score, 72)
@@ -302,6 +387,7 @@ test('a synthetic 412-comparison recovery changes exactly 24 results across thre
       assert.equal(waiting.record.attempts, 0, 'An overview cannot start while the accepted correction cohort still has pending reviews.')
     }
   }
+  assert.equal(published, 21)
   const refreshed = await settleNarratives(f, runId)
   assert.equal(refreshed.counts.candidates.ready, 412)
   assert.equal(refreshed.counts.targets.ready, 4)
@@ -335,6 +421,7 @@ test('a synthetic 412-comparison recovery changes exactly 24 results across thre
       assert.deepEqual(refreshed.comparisons.find(item => item.comparisonId === comparison.id),
         before.comparisons.find(item => item.comparisonId === comparison.id))
     }
+    if (legacy.has(comparison.id)) assert.deepEqual(comparison, legacy.get(comparison.id))
   }
   assert.deepEqual(await f.analysis.store.get(f.workspaceId, originalTargets.get(targets[3]).record.id), originalTargets.get(targets[3]))
 })
@@ -446,7 +533,21 @@ test('switching off admission still allows authorized cancellation of already ac
   assert.equal(history.original.overall.status, 'withheld')
 })
 
-for (const options of [{ blocked: 'source-quality' }, { blocked: 'context-limit' }, { personal: true }, { globalBlock: true }]) {
+test('a generic legacy source-quality label requires scoped verification rather than proving an unusable source', async () => {
+  const context = await setup({ blocked: 'source-quality' })
+  const { f, runId, comparisonId } = context
+  const preview = await f.service.correctionPreview(f.workspaceId, runId, comparisonId)
+  assert.equal(preview.criteria[0].eligible, true)
+  assert.equal(preview.after.overall.score, 72)
+  await assert.rejects(f.service.requestCorrection(f.workspaceId, runId, comparisonId,
+    { ...input(preview), policyVersion: api.ANALYSIS_LEGACY_CORRECTION_POLICY_VERSION }, randomUUID(), preview.etag, ACTOR), status(400))
+  await requestCorrection(context)
+  const verified = await reviewed(context)
+  await verified.publish()
+  assert.equal(verified.result.criteria[1].score, 0)
+})
+
+for (const options of [{ blocked: 'source-quality', blockerCode: 'unusable-source' }, { blocked: 'context-limit' }, { personal: true }, { globalBlock: true }]) {
   test(`genuine blocker is not silently made zero: ${JSON.stringify(options)}`, async () => {
     const { f, runId, comparisonId } = await setup(options)
     const preview = await f.service.correctionPreview(f.workspaceId, runId, comparisonId)
@@ -465,7 +566,10 @@ test('request keys bind exact source, criteria, and actor, replay ambiguous ackn
   const { preview, requestId, response } = await requestCorrection(context)
   const replay = await f.service.requestCorrection(f.workspaceId, runId, comparisonId, input(preview), requestId, preview.etag, ACTOR)
   assert.equal(replay.correction.etag, response.correction.etag)
-  for (const [body, actor] of [[{ ...input(preview), reason: 'Different reason' }, ACTOR], [input(preview), 'another-actor']]) {
+  for (const [body, actor] of [
+    [{ ...input(preview), reason: 'Different reason' }, ACTOR], [input(preview), 'another-actor'],
+    [{ ...input(preview), policyVersion: api.ANALYSIS_LEGACY_CORRECTION_POLICY_VERSION }, ACTOR],
+  ]) {
     await assert.rejects(f.service.requestCorrection(f.workspaceId, runId, comparisonId, body, requestId, preview.etag, actor), status(409))
   }
   const cancelled = await f.service.cancelCorrection(f.workspaceId, runId, comparisonId, response.correction.etag)
@@ -495,7 +599,7 @@ test('tampered existing numeric rows and reused old assessment content cannot be
   const { f, runId, comparisonId, original } = context
   await requestCorrection(context)
   const changed = await reviewed(context, assessment => { assessment.criteria[0].score = 5 })
-  await assert.rejects(changed.publish(), /differs from the accepted deterministic proposal/)
+  await assert.rejects(changed.publish(), /differs from the accepted deterministic proposal|does not bind the exact proposed assessment/)
   assert.deepEqual((await f.service.comparisonDetail(f.workspaceId, runId, comparisonId)).result, original.result)
   assert.equal((await f.service.detail(f.workspaceId, runId)).run.progress.unscored, 1)
 })

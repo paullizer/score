@@ -4,8 +4,9 @@ import { processingSettingsSnapshotSchema } from '../../src/domain/admin-setting
 import { MODEL_TASK_IDS } from '../../src/domain/admin-settings-tasks'
 import { REPORT_LIMITS } from '../../src/domain/analysis-reports'
 import {
-  ANALYSIS_CORRECTION_POLICY_VERSION, type RealAnalysisCorrectionRecord,
+  ANALYSIS_CORRECTION_POLICY_VERSION, ANALYSIS_CORRECTION_POLICY_VERSIONS, type RealAnalysisCorrectionRecord,
 } from '../../src/domain/analysis-corrections'
+import { ANALYSIS_CRITERION_BLOCKER_CODES, evidenceGapReviewIssues } from '../../src/domain/analysis-evidence-policy'
 import type { RealAnalysisNarrativeRecord } from '../../src/domain/analysis-narratives'
 import {
   SUMMARY_LIMITS, summaryDiagnosticSchema, summaryHistoryReferenceSchema, type AnalysisSummaryHistoryReference,
@@ -181,13 +182,14 @@ const resultSummarySchema = z.strictObject({
   completion: z.enum(['assessed', 'limited']), overall: overallSchema, coverage: coverageSchema,
 })
 export const analysisCorrectionCriterionIdsSchema = z.array(identifier).min(1).max(20).refine(unique)
+export const analysisCorrectionPolicySchema = z.enum(ANALYSIS_CORRECTION_POLICY_VERSIONS)
 export const analysisResultRevisionSchema = z.strictObject({
-  id: z.string().uuid(), policyVersion: z.literal(ANALYSIS_CORRECTION_POLICY_VERSION),
+  id: z.string().uuid(), policyVersion: analysisCorrectionPolicySchema,
   originalResultSha256: hash, baseResultSha256: hash, correctedAt: timestamp,
   criterionIds: analysisCorrectionCriterionIdsSchema,
 })
 export const analysisCorrectionProvenanceSchema = z.strictObject({
-  requestId: z.string().uuid(), policyVersion: z.literal(ANALYSIS_CORRECTION_POLICY_VERSION),
+  requestId: z.string().uuid(), policyVersion: analysisCorrectionPolicySchema,
   originalResultSha256: hash, baseResultSha256: hash, baseAssessmentSha256: hash,
   criterionIds: analysisCorrectionCriterionIdsSchema, requestedBy: text(200), requestedAt: timestamp, reason: text(1000),
 })
@@ -231,7 +233,7 @@ const correctionSchema = z.strictObject({
   resumeSnapshot: narrativeIdentity, targetSnapshot: narrativeIdentity,
   status: z.enum(['queued', 'running', 'ready', 'failed', 'cancelled']),
   requestId: z.string().uuid(), requestFingerprint: hash, requestedAt: timestamp, requestedBy: text(200),
-  reason: text(1000), policyVersion: z.literal(ANALYSIS_CORRECTION_POLICY_VERSION),
+  reason: text(1000), policyVersion: analysisCorrectionPolicySchema,
   criterionIds: analysisCorrectionCriterionIdsSchema,
   baseResult: jsonReferenceSchema, baseAttemptId: z.string().uuid(), baseRevision: analysisResultRevisionSchema.optional(),
   proposal: jsonReferenceSchema,
@@ -543,6 +545,7 @@ function validateCorrectionRecord(record: RealAnalysisCorrectionRecord): void {
   }
   if (record.status === 'ready') assertAnalysis(record.published && record.history && !record.error &&
     record.published.revision.id === record.requestId && record.published.attemptId === record.attemptId &&
+    record.published.revision.policyVersion === record.policyVersion &&
     record.published.revision.baseResultSha256 === record.baseResult.sha256 &&
     analysisHash(record.published.revision.criterionIds) === analysisHash(record.criterionIds),
   'Ready corrections require the exact reviewed request and immutable history.')
@@ -823,6 +826,7 @@ export function parseFrozenTargetSnapshot(value: unknown): FrozenRealAnalysisTar
 const limitationSchema = z.strictObject({
   code: z.enum(['sparse-source', 'not-assessable', 'context-limit', 'source-quality']), message: text(4000),
   criterionId: identifier.optional(), qualificationId: identifier.optional(),
+  blockerCode: z.enum(ANALYSIS_CRITERION_BLOCKER_CODES).optional(),
 })
 const criterionBase = { criterionId: identifier, weight: z.number().finite().min(0).max(100), rationale: text(8000), requirementCitations: citations }
 const criterionResultSchema = z.discriminatedUnion('evidenceStatus', [
@@ -845,13 +849,28 @@ const modelProvenanceSchema = z.strictObject({
   startedAt: timestamp, completedAt: timestamp, inputCharacters: z.number().int().min(1).max(10_000_000),
   settingsRevision: text(128).optional(), task: z.enum(MODEL_TASK_IDS).optional(),
 })
+const evidenceGapDecisionBase = { criterionId: identifier, message: text(8000) }
+export const analysisEvidenceGapScopeSchema = z.strictObject({
+  kind: z.literal('evidence-gaps'), baseAssessmentSha256: hash,
+  criterionIds: analysisCorrectionCriterionIdsSchema,
+  decisions: z.array(z.discriminatedUnion('outcome', [
+    z.strictObject({ ...evidenceGapDecisionBase, outcome: z.literal('confirmed-missing'), citations: z.tuple([]) }),
+    z.strictObject({ ...evidenceGapDecisionBase, outcome: z.literal('evidence-found'), citations: z.tuple([citationSchema]).rest(citationSchema).refine(values => values.length <= 100) }),
+    z.strictObject({ ...evidenceGapDecisionBase, outcome: z.literal('blocked'), blockerCode: z.enum(ANALYSIS_CRITERION_BLOCKER_CODES), citations }),
+  ])).min(1).max(20),
+}).refine(scope => unique(scope.decisions.map(row => row.criterionId)) &&
+  scope.decisions.length === scope.criterionIds.length &&
+  scope.decisions.every(row => scope.criterionIds.includes(row.criterionId)))
 const groundingReviewSchema = z.strictObject({
   id: identifier, outcome: z.enum(['supported', 'needs-correction', 'unsupported']),
   issues: z.array(z.strictObject({
     code: identifier, message: text(8000), criterionId: identifier.optional(), qualificationId: identifier.optional(), citations,
   })).max(100),
   assessmentSha256: hash, resumeSnapshotSha256: hash, targetSnapshotSha256: hash, provenance: modelProvenanceSchema,
-})
+  scope: analysisEvidenceGapScopeSchema.optional(),
+}).refine(review => !review.scope || analysisHash(review.issues) === analysisHash(evidenceGapReviewIssues(review.scope.decisions)) &&
+  (review.outcome === 'supported' ? review.scope.decisions.every(row => row.outcome === 'confirmed-missing')
+    : review.scope.decisions.some(row => row.outcome !== 'confirmed-missing')))
 const diagnosticNumber = z.number().int().min(0).max(Number.MAX_SAFE_INTEGER)
 const citationDiagnosticsSchema = z.strictObject({
   findings: z.array(z.strictObject({
@@ -908,7 +927,7 @@ const failureDiagnosticSchema = z.strictObject({
   assessments: z.array(z.strictObject({
     modelCallId: z.string().uuid(), correctionCount: z.number().int().min(0).max(ANALYSIS_LIMITS.maxOutputCorrections),
     assessmentSha256: hash, assessment: analysisAssessmentOutputSchema, provenance: modelProvenanceSchema,
-    review: groundingReviewSchema.extend({
+    review: groundingReviewSchema.safeExtend({
       issues: z.array(groundingReviewSchema.shape.issues.element.extend({ code: z.enum(ANALYSIS_REVIEW_ISSUE_CODES) })).max(64),
     }).optional(),
   })).max(ANALYSIS_LIMITS.maxOutputCorrections + 1),
@@ -1050,6 +1069,12 @@ export function parseAnalysisResult(value: unknown): RealAnalysisResult {
   const final = provenance.groundingReviews.at(-1)!
   assertAnalysis(final.outcome === 'supported' && final.issues.length === 0 && final.assessmentSha256 === provenance.assessmentSha256 &&
     provenance.groundingReviews.length <= provenance.correctionCount + 1, 'A supported review of this exact assessment is required.')
+  const scoped = provenance.correction?.policyVersion === ANALYSIS_CORRECTION_POLICY_VERSION
+  assertAnalysis(scoped ? Boolean(final.scope &&
+    final.scope.baseAssessmentSha256 === provenance.correction!.baseAssessmentSha256 &&
+    analysisHash([...final.scope.criterionIds].sort()) === analysisHash([...provenance.correction!.criterionIds].sort()))
+    : provenance.groundingReviews.every(review => !review.scope),
+  'Scoped approval requires an exact versioned correction base and selection; ordinary assessments require full review.')
   for (const review of provenance.groundingReviews) {
     assertAnalysis(review.resumeSnapshotSha256 === provenance.resumeSnapshot.sha256 &&
       review.targetSnapshotSha256 === provenance.targetSnapshot.sha256 &&
