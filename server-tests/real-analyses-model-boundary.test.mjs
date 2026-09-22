@@ -5,7 +5,7 @@ import path from 'node:path'
 import { after, test } from 'node:test'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { build } from 'esbuild'
-import { assertLosslessModelInput, passageSelection } from '../worker-tests/analysis-selection-test-support.mjs'
+import { assertLosslessModelInput, assertLosslessResume, passageSelection } from '../worker-tests/analysis-selection-test-support.mjs'
 import {
   api, fixture, seedResume, seedJob, seedGrade, createRun, publishResult, ACTOR, NOW, LATER, clone, citation,
 } from './real-analyses.test-support.mjs'
@@ -96,6 +96,18 @@ async function realModelPublication(f, resume, target, options = {}) {
         const request = JSON.parse(init.body)
         const payload = JSON.parse(request.messages.find(item => item.role === 'user').content)
         calls.push({ request, payload })
+        if (request.response_format.json_schema.name === 'resume_evidence_gap_review') {
+          assertLosslessResume(payload.input.resume, input.resume)
+          assert.deepEqual(payload.input.rubric.criteria.map(row => row.id), payload.scope.criterionIds)
+          assert.equal(payload.assessment, undefined)
+          return response({ decisions: payload.scope.criterionIds.map(criterionId => options.confirmMissingGaps ? {
+            criterionId, outcome: 'confirmed-missing', citations: [], blockerCode: null,
+            message: 'The complete usable source has no qualifying evidence for this professional criterion.',
+          } : {
+            criterionId, outcome: 'blocked', blockerCode: 'unusable-source', citations: [],
+            message: 'The merged source does not allow reliable work attribution; source repair is needed.',
+          }) }, 'actual-boundary-gap-reviewer')
+        }
         assertLosslessModelInput(payload.input, model.validateAnalysisAssessmentInput(input))
         if (!payload.assessment) {
           assessed++
@@ -338,4 +350,33 @@ test('actual partly unassessed model output withholds the total instead of norma
   assert.equal(published.result.overall.reason, 'unassessed-weighted-criteria')
   assert.equal(published.result.coverage.totalWeight, 100)
   assert.equal(published.result.coverage.assessedWeight, 40)
+})
+
+test('verified missing evidence reaches persisted zero and unchanged-weight totals through the full model/API boundary', async t => {
+  for (const all of [true, false]) await t.test(all ? 'all missing is zero' : 'four scored plus one missing', async () => {
+    const f = fixture()
+    const resume = await seedResume(f)
+    const target = await seedJob(f)
+    target.rubric.criteria = Array.from({ length: 5 }, (_, index) => ({
+      ...clone(target.rubric.criteria[0]), id: `professional-${index}`, weight: 20,
+    }))
+    target.selection.rubricHash = api.analysisHash(target.rubric)
+    const published = await realModelPublication(f, resume, target, {
+      scores: [4], unassessed: all, unassessedIds: all ? [] : ['professional-4'], confirmMissingGaps: true,
+    })
+    assert.deepEqual(published.result.overall, { status: 'available', score: all ? 0 : 64 })
+    assert.equal(published.result.coverage.assessedWeight, 100)
+    assert.equal(published.result.coverage.totalWeight, 100)
+    assert.equal(published.result.coverage.notAssessed, 0)
+    assert.equal(published.result.criteria[4].evidenceStatus, 'missing')
+    assert.equal(published.result.criteria[4].score, 0)
+    assert.deepEqual(published.result.criteria[4].citations, [])
+    assert.deepEqual(published.result.limitations, [])
+    assert.equal(published.calls.length, 3)
+    assert.ok(published.result.provenance.groundingReviews.every(review => !review.scope))
+    assert.equal(published.result.provenance.groundingReviews.at(-1).assessmentSha256, published.result.provenance.assessmentSha256)
+    const current = await f.service.detail(f.workspaceId, published.run.record.id)
+    assert.equal(current.run.progress.scored, 1)
+    assert.equal(current.run.progress.unscored, 0)
+  })
 })

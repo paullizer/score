@@ -116,7 +116,7 @@ function backedFixture(original, correctionsEnabled = false) {
   return { f, store, container }
 }
 
-test('Cosmos correction publication atomically preserves original evidence, changes effective counts, and binds new summary identities', async () => {
+for (const policyVersion of api.ANALYSIS_CORRECTION_POLICY_VERSIONS) test(`Cosmos ${policyVersion} correction publication preserves original evidence and atomically binds counts and summaries`, async () => {
   const initial = fixture()
   initial.analysis.evidenceCorrectionsEnabled = true
   const created = await createRun(initial)
@@ -126,7 +126,7 @@ test('Cosmos correction publication atomically preserves original evidence, chan
   const original = await store.get(f.workspaceId, comparisonId)
   const preview = await f.service.correctionPreview(f.workspaceId, created.run.id, comparisonId)
   const response = await f.service.requestCorrection(f.workspaceId, created.run.id, comparisonId, {
-    resultSha256: preview.resultSha256, criterionIds: preview.criterionIds, reason: 'Synthetic reviewed evidence gap.',
+    policyVersion, resultSha256: preview.resultSha256, criterionIds: preview.criterionIds, reason: 'Synthetic reviewed evidence gap.',
   }, randomUUID(), preview.etag, ACTOR)
   const accepted = await api.loadAnalysisCorrection(store, f.workspaceId, created.run.id, comparisonId)
   const runFence = await store.get(f.workspaceId, created.run.id)
@@ -151,6 +151,7 @@ test('Cosmos correction publication atomically preserves original evidence, chan
   const current = await f.service.comparisonDetail(f.workspaceId, created.run.id, comparisonId)
   assert.equal(current.result.overall.score, 0)
   assert.equal(current.comparison.resultRevision.id, response.requestId)
+  assert.equal(Boolean(current.result.provenance.groundingReviews[0].scope), policyVersion === api.ANALYSIS_CORRECTION_POLICY_VERSION)
   const parent = await store.get(f.workspaceId, created.run.id)
   assert.equal(parent.record.progress.scored, 1)
   assert.equal(parent.record.progress.unscored, 0)
@@ -163,6 +164,42 @@ test('Cosmos correction publication atomically preserves original evidence, chan
     { kind: 'replace', record: { ...original.record, ...current.comparison }, etag: original.etag },
     { kind: 'replace', record: parent.record, etag: parent.etag },
   ]), /projections|Completed evidence/)
+})
+
+test('Cosmos permits a fresh scoped request after a failed legacy review without rewriting its history or original result', async () => {
+  const initial = fixture()
+  initial.analysis.evidenceCorrectionsEnabled = true
+  const created = await createRun(initial)
+  const runId = created.run.id
+  const comparisonId = (await initial.service.comparisons(initial.workspaceId, runId)).comparisons[0].comparison.id
+  await publishResult(initial, runId, comparisonId, true)
+  const { f, store } = backedFixture(initial, true)
+  const original = clone(await store.get(f.workspaceId, comparisonId))
+  const preview = await f.service.correctionPreview(f.workspaceId, runId, comparisonId)
+  const body = { resultSha256: preview.resultSha256, criterionIds: preview.criterionIds, reason: 'Review the absent evidence only.' }
+  await f.service.requestCorrection(f.workspaceId, runId, comparisonId, body, randomUUID(), preview.etag, ACTOR)
+  const legacy = await api.loadAnalysisCorrection(store, f.workspaceId, runId, comparisonId)
+  const run = await store.get(f.workspaceId, runId)
+  const failed = { ...legacy.record, status: 'failed', attempts: 1, attemptId: randomUUID(),
+    error: { code: 'grounding-failed', stage: 'grounding', retryable: false, message: 'The legacy full review rejected the proposal.' } }
+  delete failed.nextAttemptAt
+  await store.transact(f.workspaceId, [
+    { kind: 'replace', record: failed, etag: legacy.etag },
+    { kind: 'replace', record: run.record, etag: run.etag },
+  ])
+  const fresh = await f.service.correctionPreview(f.workspaceId, runId, comparisonId)
+  const accepted = await f.service.requestCorrection(f.workspaceId, runId, comparisonId,
+    { ...body, policyVersion: fresh.policyVersion }, randomUUID(), fresh.etag, ACTOR)
+  assert.equal(accepted.correction.policyVersion, api.ANALYSIS_CORRECTION_POLICY_VERSION)
+  const prepared = await reviewedCorrection({ f, runId, comparisonId })
+  await prepared.publish()
+  const history = await f.service.correctionHistory(f.workspaceId, runId, comparisonId)
+  assert.deepEqual(history.entries.map(entry => entry.outcome), ['ready', 'failed'])
+  assert.equal(history.entries[1].requestId, legacy.record.requestId)
+  assert.equal(history.entries[1].error.message, failed.error.message)
+  assert.equal(history.entries[0].review.scope.kind, 'evidence-gaps')
+  assert.deepEqual(await store.get(f.workspaceId, comparisonId), original)
+  assert.equal((await f.service.detail(f.workspaceId, runId)).run.progress.scored, 1)
 })
 
 test('Cosmos publishes automatic sidecars and selected refreshes with exact root/control CAS while completed comparisons remain immutable', async () => {

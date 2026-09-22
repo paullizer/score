@@ -26,6 +26,13 @@ export async function reviewedCorrection(context, mutate) {
     id: `review-${randomUUID()}`, outcome: 'supported', issues: [], assessmentSha256: hash,
     resumeSnapshotSha256: record.resumeSnapshot.sha256, targetSnapshotSha256: record.targetSnapshot.sha256,
     provenance: { ...base.provenance.assessment, model: 'synthetic-independent-review', startedAt: f.now, completedAt: f.now },
+    ...(record.policyVersion === api.ANALYSIS_CORRECTION_POLICY_VERSION ? { scope: {
+      kind: 'evidence-gaps', baseAssessmentSha256: base.provenance.assessmentSha256,
+      criterionIds: record.criterionIds,
+      decisions: record.criterionIds.map(criterionId => ({
+        criterionId, outcome: 'confirmed-missing', message: 'No supporting professional evidence occurs in the complete source.', citations: [],
+      })),
+    } } : {}),
   }
   const result = api.parseAnalysisResult({
     ...base, ...assessment, ...api.calculateAnalysisSummary(assessment.criteria, assessment.qualifications, assessment.limitations),

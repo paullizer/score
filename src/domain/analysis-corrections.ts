@@ -5,12 +5,17 @@ import type {
 import type { ImmutableJsonBlobReference } from './real-resumes'
 import type { ProcessingSettingsSnapshot } from './admin-settings'
 
-export const ANALYSIS_CORRECTION_POLICY_VERSION = 'missing-evidence-zero-v1' as const
+export const ANALYSIS_LEGACY_CORRECTION_POLICY_VERSION = 'missing-evidence-zero-v1' as const
+export const ANALYSIS_CORRECTION_POLICY_VERSION = 'missing-evidence-zero-v2' as const
+export const ANALYSIS_CORRECTION_POLICY_VERSIONS = [
+  ANALYSIS_LEGACY_CORRECTION_POLICY_VERSION, ANALYSIS_CORRECTION_POLICY_VERSION,
+] as const
+export type AnalysisCorrectionPolicyVersion = typeof ANALYSIS_CORRECTION_POLICY_VERSIONS[number]
 export const ANALYSIS_CORRECTION_LIMITS = { maxCriteria: 20, historyPageSize: 12, maxHistoryEntries: 1000 } as const
 
 export interface AnalysisResultRevision {
   id: string
-  policyVersion: typeof ANALYSIS_CORRECTION_POLICY_VERSION
+  policyVersion: AnalysisCorrectionPolicyVersion
   originalResultSha256: string
   baseResultSha256: string
   correctedAt: string
@@ -19,7 +24,7 @@ export interface AnalysisResultRevision {
 
 export interface AnalysisCorrectionProvenance {
   requestId: string
-  policyVersion: typeof ANALYSIS_CORRECTION_POLICY_VERSION
+  policyVersion: AnalysisCorrectionPolicyVersion
   originalResultSha256: string
   baseResultSha256: string
   baseAssessmentSha256: string
@@ -56,7 +61,7 @@ export interface RealAnalysisCorrectionRecord extends AnalysisEntityBase, Analys
   requestedAt: string
   requestedBy: string
   reason: string
-  policyVersion: typeof ANALYSIS_CORRECTION_POLICY_VERSION
+  policyVersion: AnalysisCorrectionPolicyVersion
   criterionIds: string[]
   baseResult: ImmutableJsonBlobReference
   baseAttemptId: string
@@ -108,6 +113,7 @@ export interface AnalysisCorrectionHistoryEntry {
 }
 
 export interface AnalysisCorrectionInput {
+  policyVersion?: AnalysisCorrectionPolicyVersion
   resultSha256: string
   criterionIds: string[]
   reason: string
@@ -129,6 +135,7 @@ export interface AnalysisCorrectionSummary {
   error: AnalysisProcessingError | null
   revision: AnalysisResultRevision | null
   hasHistory: boolean
+  policyVersion?: AnalysisCorrectionPolicyVersion
 }
 
 export interface AnalysisCorrectionPreview {
@@ -139,7 +146,7 @@ export interface AnalysisCorrectionPreview {
   etag: string
   resultSha256: string
   originalResultSha256: string
-  policyVersion: typeof ANALYSIS_CORRECTION_POLICY_VERSION
+  policyVersion: AnalysisCorrectionPolicyVersion
   before: RealAnalysisResultSummary
   after: RealAnalysisResultSummary | null
   criterionIds: string[]
@@ -174,7 +181,7 @@ export interface AnalysisCorrectionHistoryPage {
     criterionIds: string[]
     beforeResultSha256: string
     after: RealAnalysisResultSummary
-    review: { outcome: RealAnalysisGroundingReview['outcome']; issues: RealAnalysisGroundingReview['issues'] } | null
+    review: Pick<RealAnalysisGroundingReview, 'outcome' | 'issues' | 'scope'> | null
     error: AnalysisProcessingError | null
     resultSha256: string | null
   }[]

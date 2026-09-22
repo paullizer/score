@@ -6,7 +6,7 @@ import { usePublicSettings } from '../../app/public-settings-context'
 import { useLifecycleAccess } from '../../components/lifecycle/useLifecycleAccess'
 import { Badge, Button, InlineError, Modal, Score } from '../../components/ui'
 import {
-  ANALYSIS_CORRECTION_LIMITS,
+  ANALYSIS_CORRECTION_LIMITS, ANALYSIS_CORRECTION_POLICY_VERSION, ANALYSIS_LEGACY_CORRECTION_POLICY_VERSION,
   type AnalysisCorrectionHistoryPage, type AnalysisCorrectionPreview, type AnalysisCorrectionSummary,
 } from '../../domain/analysis-corrections'
 import type { RealAnalysisComparisonDetail, RealAnalysisComparisonSummary, RealAnalysisResultSummary } from '../../domain/real-analyses'
@@ -23,6 +23,7 @@ import { realAnalysisCancellationPending, targetVersionLabel } from './realAnaly
 import { HistoricalCandidateNarrative } from './AnalysisSummaryHistory'
 import {
   availableWithheldComparisons, boundedCorrectionWork, correctionIsActive, correctionPolicyReason, CorrectionRequestJournal,
+  latestCorrectionFailure,
 } from './analysisCorrectionState'
 
 // The bridge callback scopes in-memory replay keys to this authenticated workspace lifetime, not browser storage.
@@ -234,11 +235,15 @@ function SummaryValue({ summary }: { summary: RealAnalysisResultSummary }) {
 }
 
 function CorrectionStatus({ correction }: { correction: AnalysisCorrectionSummary }) {
-  const status = { queued: 'Correction queued', running: 'Grounding review running', ready: 'Correction published',
+  const scoped = correction.policyVersion === ANALYSIS_CORRECTION_POLICY_VERSION ||
+    (correction.status === 'ready' && correction.revision?.policyVersion === ANALYSIS_CORRECTION_POLICY_VERSION)
+  const status = { queued: 'Correction queued', running: scoped ? 'Evidence-gap verification running' : 'Full-assessment grounding review running', ready: 'Correction published',
     failed: 'Correction failed — not published', cancelled: 'Correction cancelled — not published' }[correction.status]
   return <div className="space-y-2 text-[12px]">
     <Badge tone={correction.status === 'ready' ? 'success' : correction.status === 'failed' ? 'danger' : 'warning'}>{status}</Badge>
     <p>Requested {dateLabel(correction.requestedAt)} · processing attempts {correction.attempts}</p>
+    <p>{scoped ? 'Selected evidence gaps only: unchanged numeric scores are not re-reviewed. The server publishes automatically only after every selected gap is verified as missing.'
+      : 'Legacy full-assessment grounding review: the entire proposal, including unchanged scores, must pass before publication.'}</p>
     {correction.nextAttemptAt && <p className="text-muted">Next server attempt: {dateLabel(correction.nextAttemptAt)}</p>}
     {correction.error && <InlineError>{correction.error.stage} · {correction.error.code}: {correction.error.message}</InlineError>}
     {['failed', 'cancelled'].includes(correction.status) && <p>The original or last published result remains current. Load a fresh preview before requesting another review.</p>}
@@ -247,6 +252,8 @@ function CorrectionStatus({ correction }: { correction: AnalysisCorrectionSummar
         <div><dt>Request ID</dt><dd className="break-all">{correction.requestId}</dd></div>
         <div><dt>Requested by</dt><dd>{correction.requestedBy}</dd></div>
         <div><dt>Reason</dt><dd>{correction.reason}</dd></div>
+        <div><dt>Request policy</dt><dd>{correction.policyVersion ??
+          (correction.status === 'ready' ? correction.revision?.policyVersion : undefined) ?? `${ANALYSIS_LEGACY_CORRECTION_POLICY_VERSION} (legacy record)`}</dd></div>
         <div><dt>Selected criteria</dt><dd>{correction.criterionIds.join(', ')}</dd></div>
       </dl>
     </details>
@@ -297,6 +304,7 @@ function CorrectionReviewDialog({ runId, comparisons, initialCorrection, onClose
   const [submitting, setSubmitting] = useState(false)
   const batch = useRef(false)
   const [message, setMessage] = useState('')
+  const [findingsKey, setFindingsKey] = useState<string | null>(null)
   const lifetime = useRef<AbortController | null>(null)
   const operations = useRef(new Map<string, AbortController>())
 
@@ -376,6 +384,9 @@ function CorrectionReviewDialog({ runId, comparisons, initialCorrection, onClose
     monitor.states[row.summary.comparison.id]?.correction?.requestId === row.requestId).length
   const ambiguous = rows.filter(row => access.journal.get(row.summary.comparison.id)).length
   const blocked = rows.filter(row => row.preview && row.preview.criterionIds.length === 0).length
+  const savedStatuses = rows.map(row => (monitor.states[row.summary.comparison.id]?.correction ?? row.preview?.correction)?.status)
+  const scopedSelection = selected.some(row => row.preview?.policyVersion === ANALYSIS_CORRECTION_POLICY_VERSION)
+  const legacySelection = selected.some(row => row.preview?.policyVersion === ANALYSIS_LEGACY_CORRECTION_POLICY_VERSION)
   const canSubmit = access.writable && !submitting && !awaitingPreview && selected.length > 0 && confirmed &&
     reason.trim().length >= 10 && reason.trim().length <= 1000
 
@@ -446,7 +457,7 @@ function CorrectionReviewDialog({ runId, comparisons, initialCorrection, onClose
   }
 
   return <Modal open onOpenChange={open => { if (!open) onClose() }} wide title="Review withheld scores"
-    description="Review server-calculated missing-evidence proposals before explicitly requesting independent grounding review."
+    description="Review read-only server totals, then authorize the verification and publication policy shown for each comparison."
     footer={<><Button onClick={onClose}>Close</Button><Button variant="primary" icon={submitting ? LoaderCircle : ShieldCheck}
       disabled={!canSubmit} onClick={() => void submit()}>Confirm review for {selected.length} {selected.length === 1 ? 'comparison' : 'comparisons'}</Button></>}>
     <div className="space-y-5">
@@ -454,10 +465,15 @@ function CorrectionReviewDialog({ runId, comparisons, initialCorrection, onClose
         {' '}This saved selection does not follow table search or target filters. Numeric results and processing failures are excluded. Every selected comparison has its own request; no 25-item truncation is applied.</p>
       <p className="text-[12px]">Only missing professional evidence in a successfully reviewed source may become <strong>0 / 5</strong>.
         {' '}Unreadable sources, protected traits, failed processing, and genuine interpretation blockers must remain unscored. Existing numeric scores and weights are unchanged.</p>
-      <p className="text-[12px]">Opening this preview applies nothing. The original scores, rationale, source evidence, and history are retained. A fresh model grounding review may refuse the proposal; only an accepted review can publish a new current revision. Summary failures are separate and are not repaired by substituting scores.</p>
+      <p className="text-[12px]">Opening this preview applies nothing. The original scores, rationale, source evidence, and history are retained.
+        {' '}For {ANALYSIS_CORRECTION_POLICY_VERSION}, AI verifies <strong>only the selected evidence gaps</strong>, not the whole assessment or unchanged numeric scores.
+        {' '}Once every selected gap is confirmed missing, the server automatically publishes zeros at their original weights.
+        {' '}Supporting evidence, genuine blockers, or processing and publication failures still prevent publication. Legacy requests retain full-assessment grounding review.</p>
+      <p className="text-[11px] text-muted">Summary failures are separate and are not repaired by substituting scores. Private failure findings load only when opened, one comparison at a time.</p>
       <div className="space-y-2 text-[12px]" role="status" aria-live="polite">
         <p>{selected.length} selected · {awaitingPreview} loading previews · {blocked} without selectable criteria · {rejected} with errors</p>
         <p>{acknowledged} requests acknowledged in this review · {ambiguous} awaiting acknowledgement. Server work continues after this dialog closes.</p>
+        <p>Saved server status: {savedStatuses.filter(status => status === 'queued').length} queued · {savedStatuses.filter(status => status === 'running').length} running · {savedStatuses.filter(status => status === 'ready').length} published · {savedStatuses.filter(status => status === 'failed').length} failed · {savedStatuses.filter(status => status === 'cancelled').length} cancelled.</p>
         {message && <p>{message}</p>}
         {monitor.paused && <p>Automatic status checks are paused after 40 bounded checks. Use Check correction status to continue; no request will be retried automatically.</p>}
       </div>
@@ -466,7 +482,7 @@ function CorrectionReviewDialog({ runId, comparisons, initialCorrection, onClose
         <textarea id={`${fieldId}-reason`} className="w-full rounded-lg border bg-[var(--cp-surface)] p-3 text-[12px] text-[var(--cp-text)]"
           rows={4} minLength={10} maxLength={1000} value={reason} disabled={submitting}
           onChange={event => { setReason(event.target.value); setConfirmed(false) }} />
-        <p className="mt-1 text-[11px] text-muted">10–1000 characters. An interrupted request keeps its original reason, result hash, ETag, criteria, and key.</p>
+        <p className="mt-1 text-[11px] text-muted">10–1000 characters. An interrupted request keeps its original policy version, reason, result hash, ETag, criteria, and key.</p>
       </div>
       <div className="space-y-4">{rows.map(row => {
         const pair = row.summary.comparison
@@ -476,6 +492,7 @@ function CorrectionReviewDialog({ runId, comparisons, initialCorrection, onClose
         const source = getDisplayName(pair.resume.summary, pair.resume.summary.name?.trim() || 'Name not stated')
         const target = getDisplayName(pair.target.summary, pair.target.summary.label)
         const busy = row.loading || row.phase === 'submitting'
+        const failureKey = correction ? JSON.stringify([pair.id, correction.requestId]) : null
         return <section key={pair.id} className="space-y-3 rounded-xl border p-4 text-[12px]" aria-label={`Correction review: ${source} against ${target}`}>
           <label className="flex items-start gap-3"><input type="checkbox" className="mt-1" checked={row.selected && selectable(row)}
             disabled={!selectable(row) || submitting || !access.writable}
@@ -486,6 +503,10 @@ function CorrectionReviewDialog({ runId, comparisons, initialCorrection, onClose
           </label>
           {row.loading && <p role="status" className="flex items-center gap-2"><LoaderCircle size={14} className="animate-spin" aria-hidden="true" />Loading read-only preview…</p>}
           {row.preview && <>
+            <p><strong>Preview policy: {row.preview.policyVersion}.</strong>{' '}
+              {row.preview.policyVersion === ANALYSIS_CORRECTION_POLICY_VERSION
+                ? 'Confirming authorizes selected-gap AI verification, then automatic server publication if every gap is confirmed missing. Existing numeric scores are not reapproved.'
+                : 'This legacy proposal requires a fresh full-assessment grounding review before it can publish.'}</p>
             <div className="grid gap-4 sm:grid-cols-2"><div><h3 className="mb-2 font-semibold">Current saved result before this request</h3><SummaryValue summary={row.preview.before} /></div>
               <div><h3 className="mb-2 font-semibold">Server preview — not published</h3>{row.preview.after
                 ? <SummaryValue summary={row.preview.after} /> : <p>No selectable missing-evidence correction.</p>}</div></div>
@@ -502,11 +523,23 @@ function CorrectionReviewDialog({ runId, comparisons, initialCorrection, onClose
             </details>
           </>}
           {correction && <CorrectionStatus correction={correction} />}
+          {correction?.status === 'failed' && access.reviewer && <>
+            <Button size="sm" icon={History} aria-expanded={findingsKey === failureKey}
+              onClick={() => setFindingsKey(findingsKey === failureKey ? null : failureKey)}>
+              {findingsKey === failureKey ? 'Hide failure findings' : 'View failure findings'}
+            </Button>
+            {findingsKey === failureKey && <CorrectionFailureFindings key={failureKey} access={access} runId={runId}
+              correction={correction} originalSha256={originalResultHash(row.summary)}
+              criterionLabels={Object.fromEntries(row.preview?.criteria.map(item => [item.criterionId, item.label]) ?? [])}
+              onClose={() => setFindingsKey(null)} />}
+          </>}
           {row.phase === 'submitting' && <p role="status">Waiting for acknowledgement…</p>}
           {(row.error || state?.error) && <InlineError>{row.error || state?.error}</InlineError>}
           {pending && row.phase !== 'submitting' && <div className="space-y-2">
             <p>Publication is not confirmed. Check status or explicitly replay this same request; a new key will not be created.</p>
             <p className="break-all text-[11px]">Retained request: {pending.key}</p><p className="text-[11px]">Retained reason: {pending.input.reason}</p>
+            <p className="text-[11px]">Retained policy: {pending.input.policyVersion ?? `${ANALYSIS_LEGACY_CORRECTION_POLICY_VERSION} (unversioned legacy request)`}.
+              {' '}{pending.input.policyVersion === ANALYSIS_CORRECTION_POLICY_VERSION ? 'Selected evidence-gap verification only.' : 'Full-assessment grounding review.'}</p>
             <Button size="sm" disabled={!access.writable || submitting || busy} onClick={() => void send(row, true)}>Retry same request</Button>
           </div>}
           <div className="flex flex-wrap gap-2">
@@ -524,7 +557,9 @@ function CorrectionReviewDialog({ runId, comparisons, initialCorrection, onClose
         checked={confirmed} disabled={!access.writable || submitting || awaitingPreview > 0 || selected.length === 0}
         onChange={event => setConfirmed(event.target.checked)} />
         <span>I reviewed all {selected.length} selected comparisons, their affected criteria, blocked reasons, and server preview totals.
-          {' '}I authorize fresh grounding review, not automatic publication or replacement of original evidence.</span>
+          {scopedSelection && <> I authorize AI verification of only the selected evidence gaps and automatic server publication after every selected gap is confirmed missing, at original weights and without changing existing numeric scores.</>}
+          {legacySelection && <> For selected legacy proposals, I authorize full-assessment grounding review; only a supported full review may publish.</>}
+          {' '}Original source evidence and history must be retained. Confirmation or acknowledgement alone is not publication.</span>
       </label>
     </div>
   </Modal>
@@ -542,6 +577,7 @@ function ComparisonCorrectionDetails({ detail }: { detail: RealAnalysisCompariso
   const [reviewOpen, setReviewOpen] = useState(false)
   const monitor = useCorrectionMonitor({ ...access, readable: access.readable && !reviewOpen }, comparison.runId, [detail], true)
   const [historyOpen, setHistoryOpen] = useState(false)
+  const [failureRequestId, setFailureRequestId] = useState<string | null>(null)
   const historyId = useId()
   const state = monitor.states[comparison.id]
   const revision = comparison.resultRevision
@@ -555,12 +591,25 @@ function ComparisonCorrectionDetails({ detail }: { detail: RealAnalysisCompariso
     {revision ? <div className="space-y-2 text-[12px]">
       <Badge tone="accent">Current reviewed correction revision</Badge>
       <p>Published {dateLabel(revision.correctedAt)} under policy {revision.policyVersion}. Only the selected missing-evidence criteria changed; existing numeric scores, weights, and frozen sources are retained.</p>
+      <p>{revision.policyVersion === ANALYSIS_CORRECTION_POLICY_VERSION
+        ? 'This revision verified selected evidence gaps only. It did not independently reapprove unchanged numeric scores or the full assessment.'
+        : 'This legacy revision passed a full-assessment grounding review before publication.'}</p>
       <p className="break-all text-[11px]">Revision: {revision.id}</p>
       <p className="break-all text-[11px]">Original result SHA-256: {revision.originalResultSha256}</p>
       <p className="break-all text-[11px]">Reviewed base SHA-256: {revision.baseResultSha256}</p>
     </div> : <p className="text-[12px]">The original saved result is shown. A reviewed correction publishes a separate current revision; it never overwrites the original result or source evidence.</p>}
     <p className="text-[11px] text-muted">Missing professional evidence in a successfully reviewed source can be 0/5. Processing failures, unreadable sources, protected traits, and genuine assessment blockers are not zeros. Narrative-summary failures are separate from score withholding.</p>
     {state?.correction && <CorrectionStatus correction={state.correction} />}
+    {state?.correction?.status === 'failed' && access.reviewer && <div className="space-y-3">
+      <Button size="sm" icon={History} aria-expanded={failureRequestId === state.correction.requestId}
+        onClick={() => setFailureRequestId(failureRequestId === state.correction!.requestId ? null : state.correction!.requestId)}>
+        {failureRequestId === state.correction.requestId ? 'Hide failure findings' : 'View failure findings'}
+      </Button>
+      {failureRequestId === state.correction.requestId && <CorrectionFailureFindings key={state.correction.requestId}
+        access={access} runId={comparison.runId} correction={state.correction} originalSha256={originalResultHash(detail)}
+        criterionLabels={Object.fromEntries((detail.targetSnapshot.kind === 'job' ? detail.targetSnapshot.rubric : detail.targetSnapshot.version.rubric)
+          .criteria.map(item => [item.id, item.label]))} onClose={() => setFailureRequestId(null)} />}
+    </div>}
     {state?.loading && <p className="text-[12px]" role="status">Checking saved correction status…</p>}
     {state?.error && <InlineError>{state.error}</InlineError>}
     {monitor.paused && <p className="text-[12px]" role="status">Automatic status checks paused. Check correction status to resume bounded polling.</p>}
@@ -593,6 +642,97 @@ function HistoricalCitations({ citations, label }: { citations: Citation[]; labe
     ? citations.map((citation, index) => <blockquote key={index} className="border-l pl-3">
       <q>{citation.quote}</q><p className="mt-1 text-[11px] text-muted">{citation.heading} · document v{citation.documentVersion} · page {citation.page}</p>
     </blockquote>) : <p className="text-muted">No quotation was saved for this row.</p>}</div>
+}
+
+function CorrectionReviewFindings({ review, criterionLabels }: {
+  review: NonNullable<AnalysisCorrectionHistoryPage['entries'][number]['review']>; criterionLabels: Record<string, string>
+}) {
+  const scope = review.scope
+  return <div className="space-y-3">
+    <h4 className="font-semibold">{scope ? 'Selected evidence-gap verification' : 'Legacy full-assessment grounding review'}: {review.outcome}</h4>
+    {scope ? <>
+      <p>Only these selected gaps were verified. Unchanged numeric scores and the full assessment were not independently reapproved.</p>
+      <ul className="space-y-3">{scope.decisions.map(decision => <li key={decision.criterionId} className="space-y-2 rounded-lg border p-3">
+        <h5 className="font-semibold">{criterionLabels[decision.criterionId] ?? decision.criterionId} · {decision.criterionId}</h5>
+        <p><strong>{decision.outcome === 'confirmed-missing' ? 'Missing evidence confirmed'
+          : decision.outcome === 'evidence-found' ? 'Supporting evidence found — proposed zero not approved'
+            : `Blocked — ${decision.blockerCode}`}</strong></p>
+        <p className="whitespace-pre-wrap">{decision.message}</p>
+        {decision.citations.length > 0 && <HistoricalCitations citations={decision.citations} label="Saved verification evidence" />}
+      </li>)}</ul>
+      <details><summary className="cursor-pointer font-semibold">Verification scope and base assessment</summary>
+        <p className="mt-2">Selected criterion IDs: {scope.criterionIds.join(', ')}</p>
+        <p className="mt-2 break-all">Base assessment SHA-256: {scope.baseAssessmentSha256}</p>
+      </details>
+    </> : <>
+      <p>This legacy review checked the whole proposal, including unchanged scores and separate qualifications; its findings are not limited to the selected gaps.</p>
+      {review.issues.length ? <ul className="list-disc space-y-3 pl-5">{review.issues.map((issue, index) =>
+        <li key={index}><strong>{issue.code}{issue.criterionId ? ` · ${criterionLabels[issue.criterionId] ?? issue.criterionId} (${issue.criterionId})` : ''}{issue.qualificationId ? ` · qualification ${issue.qualificationId}` : ''}: </strong>{issue.message}
+          {issue.citations.length > 0 && <HistoricalCitations citations={issue.citations} label="Saved review evidence" />}
+        </li>)}</ul> : <p>No reviewer issues were recorded. Publication is a separate status.</p>}
+    </>}
+  </div>
+}
+
+function CorrectionFailureFindings({ access, runId, correction, originalSha256, criterionLabels, onClose }: {
+  access: Access; runId: string; correction: AnalysisCorrectionSummary; originalSha256?: string
+  criterionLabels: Record<string, string>; onClose: () => void
+}) {
+  const current = useRef({ access, correction })
+  current.current = { access, correction }
+  const [entry, setEntry] = useState<AnalysisCorrectionHistoryPage['entries'][number] | null>(null)
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState('')
+  const controller = useRef<AbortController | null>(null)
+  const comparisonId = correction.comparisonId
+  const requestId = correction.requestId
+  const accessIdentity = access.identity
+
+  const load = useCallback(async () => {
+    const { access, correction } = current.current
+    if (!access.api || !access.reviewer || access.identity !== accessIdentity || controller.current) return
+    const request = new AbortController()
+    controller.current = request
+    setLoading(true)
+    setEntry(null)
+    setError('')
+    try {
+      const page = await getAnalysisCorrectionHistory(access.api.workspaceId, runId, comparisonId, undefined, request.signal, originalSha256)
+      request.signal.throwIfAborted()
+      if (!current.current.access.reviewer || current.current.access.identity !== accessIdentity ||
+        current.current.correction.requestId !== requestId) return
+      setEntry(latestCorrectionFailure(page, correction))
+    } catch (caught) {
+      if (!request.signal.aborted) setError(caught instanceof CloudApiError && [401, 403].includes(caught.status)
+        ? 'Access to private correction findings was denied. Only an authorized workspace owner or editor can read them. No findings or approval are inferred.'
+        : caught instanceof Error ? caught.message : 'Private failure findings could not be loaded. No findings or approval are inferred.')
+    } finally {
+      if (controller.current === request) { controller.current = null; setLoading(false) }
+    }
+  }, [accessIdentity, comparisonId, originalSha256, requestId, runId])
+
+  useEffect(() => {
+    void load()
+    return () => { controller.current?.abort(); controller.current = null }
+  }, [load])
+
+  return <section className="space-y-3 rounded-xl border p-4 text-[12px]" aria-label="Private correction failure findings">
+    <h3 className="font-semibold">Latest saved findings for this failed request · not published</h3>
+    <p className="break-all text-[11px]">Request ID: {requestId}</p>
+    <p>Selected criteria: {correction.criterionIds.map(id => `${criterionLabels[id] ?? id} (${id})`).join(', ')}</p>
+    {loading && <><p role="status">Loading private correction findings…</p>
+      <Button size="sm" onClick={onClose}>Cancel loading findings</Button></>}
+    {error && <InlineError>{error}<div className="mt-2"><Button size="sm" disabled={loading} onClick={() => void load()}>Retry loading failure findings</Button></div></InlineError>}
+    {!loading && !error && !entry && <p>No checkpoint for this exact request was found on the latest history page.
+      {' '}No approval is implied. The saved processing error above remains the failure reason; check correction status before requesting another review.</p>}
+    {entry && <>
+      <p>Checkpoint saved {dateLabel(entry.createdAt)} · {entry.id}</p>
+      {entry.review ? <CorrectionReviewFindings review={entry.review} criterionLabels={criterionLabels} />
+        : <p>No AI review findings were saved for this request. Processing stopped without a recorded review; this is not an approval.</p>}
+      {entry.error && <InlineError>{entry.error.stage} · {entry.error.code}: {entry.error.message}</InlineError>}
+    </>}
+    <p className="text-[11px] text-muted">Only the latest bounded history page was read. This view does not retry, rescore, or publish anything.</p>
+  </section>
 }
 
 function CorrectionHistory({ runId, comparisonId, criterionLabels, originalSha256 }: {
@@ -688,13 +828,8 @@ function CorrectionHistory({ runId, comparisonId, criterionLabels, originalSha25
       <p>Selected criteria: {entry.criterionIds.join(', ')}</p>
       <div><h4 className="mb-2 font-semibold">{entry.outcome === 'ready' ? 'Published server total' : 'Proposed server total — never published by this attempt'}</h4>
         <SummaryValue summary={entry.after} /></div>
-      {entry.review ? <div className="space-y-2"><h4 className="font-semibold">Fresh grounding review: {entry.review.outcome}</h4>
-        {entry.review.issues.length ? <ul className="list-disc space-y-2 pl-5">{entry.review.issues.map((issue, index) =>
-          <li key={index}><strong>{issue.code}{issue.criterionId ? ` · ${issue.criterionId}` : ''}{issue.qualificationId ? ` · ${issue.qualificationId}` : ''}: </strong>{issue.message}
-            {issue.citations.map((citation, citationIndex) => <blockquote key={citationIndex} className="mt-2 border-l pl-3">
-              <q>{citation.quote}</q><p className="mt-1 text-[11px] text-muted">{citation.heading} · document v{citation.documentVersion} · page {citation.page}</p>
-            </blockquote>)}</li>)}</ul> : <p>No reviewer issues were recorded.</p>}
-      </div> : <p>No grounding review was recorded for this proposal. This is not an approval.</p>}
+      {entry.review ? <CorrectionReviewFindings review={entry.review} criterionLabels={criterionLabels} />
+        : <p>No AI verification or grounding review was recorded for this proposal. This is not an approval.</p>}
       {entry.error && <InlineError>{entry.error.stage} · {entry.error.code}: {entry.error.message}</InlineError>}
       {entry.outcome === 'ready' && entry.resultSha256 && <HistoricalCandidateNarrative runId={runId} comparisonId={comparisonId}
         resultRevisionId={entry.requestId} resultSha256={entry.resultSha256} label="correction revision narrative" />}

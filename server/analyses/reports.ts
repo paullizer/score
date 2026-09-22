@@ -227,7 +227,9 @@ function provenanceFacts(result: RealAnalysisResult, snapshots: AnalysisSnapshot
       { label: 'Corrected criteria', value: correction.criterionIds.join(', ') },
       { label: 'Correction reason', value: correction.reason },
       { label: 'Correction requested', value: correction.requestedAt },
-      { label: 'Correction provenance', value: 'Deterministic evidence-gap correction; the assessment model above produced the original assessment. A fresh grounding review approved this revision.' },
+      { label: 'Correction provenance', value: provenance.groundingReviews.at(-1)?.scope
+        ? 'Deterministic evidence-gap correction. AI verified only the selected missing-evidence criteria; previously approved numeric scores were retained, not reassessed.'
+        : 'Deterministic evidence-gap correction; the assessment model above produced the original assessment. A fresh full grounding review approved this revision.' },
     )
   }
   for (const [index, review] of provenance.groundingReviews.entries()) {
@@ -236,6 +238,10 @@ function provenanceFacts(result: RealAnalysisResult, snapshots: AnalysisSnapshot
       { label: `Grounding model ${index + 1}`, value: `${review.provenance.model} · ${review.provenance.deployment}` },
       { label: `Grounding prompt ${index + 1}`, value: review.provenance.promptVersion },
       { label: `Grounding completed ${index + 1}`, value: review.provenance.completedAt },
+    )
+    if (review.scope) facts.push(
+      { label: `Grounding scope ${index + 1}`, value: `Missing-evidence criteria: ${review.scope.criterionIds.join(', ')}` },
+      { label: `Reviewed base assessment ${index + 1}`, value: review.scope.baseAssessmentSha256 },
     )
   }
   return facts

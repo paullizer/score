@@ -2,17 +2,17 @@ import { z } from 'zod'
 import { processingSettingsSnapshotSchema } from '../../src/domain/admin-settings-schema'
 import { preservesProcessingSettings } from '../jobs/policy'
 import {
-  ANALYSIS_CORRECTION_POLICY_VERSION, type AnalysisCorrectionHistoryEntry, type AnalysisCorrectionInput,
-  type AnalysisCorrectionProposal, type RealAnalysisCorrectionRecord,
+  ANALYSIS_CORRECTION_POLICY_VERSION, ANALYSIS_LEGACY_CORRECTION_POLICY_VERSION, type AnalysisCorrectionHistoryEntry, type AnalysisCorrectionInput,
+  type AnalysisCorrectionPolicyVersion, type AnalysisCorrectionProposal, type RealAnalysisCorrectionRecord,
 } from '../../src/domain/analysis-corrections'
-import { isPersonalTraitCriterion } from '../../src/domain/analysis-evidence-policy'
+import { isPersonalTraitCriterion, missingEvidenceCriterion } from '../../src/domain/analysis-evidence-policy'
 import type {
-  FrozenRealAnalysisTargetSnapshot, RealAnalysisAssessmentOutput, RealAnalysisResult, RealCriterionResult,
+  FrozenRealAnalysisTargetSnapshot, RealAnalysisAssessmentOutput, RealAnalysisGroundingReview, RealAnalysisResult, RealCriterionResult,
 } from '../../src/domain/real-analyses'
 import { WORKSPACE_ID_PATTERN } from '../ids'
 import {
   analysisAssessmentOutputSchema, analysisCorrectionCriterionIdsSchema, analysisCorrectionHistoryBlobName,
-  analysisCorrectionHistoryReferenceSchema, analysisCorrectionProvenanceSchema, analysisGroundingReviewSchema,
+  analysisCorrectionHistoryReferenceSchema, analysisCorrectionPolicySchema, analysisCorrectionProvenanceSchema, analysisGroundingReviewSchema,
   analysisHash, analysisJsonReferenceSchema, analysisProcessingErrorSchema, analysisResultRevisionSchema,
   analysisResultSummarySchema, analysisSnapshotIdentitySchema, assertAnalysis, calculateAnalysisSummary,
   isAnalysisId, MAX_ANALYSIS_JSON_BYTES, parseAnalysisAssessmentOutput,
@@ -29,6 +29,7 @@ const identity = {
   createdAt: timestamp, requestId: z.string().uuid(),
 }
 export const analysisCorrectionInputSchema = z.strictObject({
+  policyVersion: analysisCorrectionPolicySchema.optional(),
   resultSha256: hash, criterionIds: analysisCorrectionCriterionIdsSchema, reason: text(1000),
 })
 const proposalSchema = z.strictObject({
@@ -50,9 +51,10 @@ const historySchema = z.strictObject({
 export function analysisCorrectionFingerprint(
   workspaceId: string, runId: string, comparisonId: string, input: AnalysisCorrectionInput, actor: string,
 ): string {
+  const { policyVersion = ANALYSIS_LEGACY_CORRECTION_POLICY_VERSION, ...request } = input
   return analysisHash({
-    workspaceId, runId, comparisonId, actor, policyVersion: ANALYSIS_CORRECTION_POLICY_VERSION,
-    input: { ...input, criterionIds: [...input.criterionIds].sort() },
+    workspaceId, runId, comparisonId, actor, policyVersion,
+    input: { ...request, criterionIds: [...request.criterionIds].sort() },
   })
 }
 
@@ -65,6 +67,7 @@ export function parseAnalysisCorrectionProposal(value: unknown): AnalysisCorrect
     proposal.originalResultSha256 === proposal.provenance.originalResultSha256 &&
     proposal.baseResult.sha256 === proposal.provenance.baseResultSha256 &&
     proposal.requestFingerprint === analysisCorrectionFingerprint(proposal.workspaceId, proposal.runId, proposal.comparisonId, {
+      policyVersion: proposal.provenance.policyVersion,
       resultSha256: proposal.baseResult.sha256, criterionIds: proposal.provenance.criterionIds, reason: proposal.provenance.reason,
     }, proposal.provenance.requestedBy), 'Correction proposal has inconsistent request bindings.')
   assertAnalysis(analysisHash(proposal.summary) === analysisHash(calculateAnalysisSummary(
@@ -108,17 +111,35 @@ export function parseAnalysisCorrectionHistoryEntry(value: unknown): AnalysisCor
   return entry
 }
 
+export function assertCorrectionReviewBinding(
+  review: RealAnalysisGroundingReview, proposal: AnalysisCorrectionProposal,
+): void {
+  analysisGroundingReviewSchema.parse(review)
+  assertAnalysis(review.assessmentSha256 === analysisHash(proposal.assessment) &&
+    review.resumeSnapshotSha256 === proposal.resumeSnapshot.sha256 &&
+    review.targetSnapshotSha256 === proposal.targetSnapshot.sha256,
+  'Correction review does not bind the exact proposed assessment and frozen inputs.')
+  assertAnalysis(proposal.provenance.policyVersion === ANALYSIS_CORRECTION_POLICY_VERSION
+    ? Boolean(review.scope && review.scope.baseAssessmentSha256 === proposal.provenance.baseAssessmentSha256 &&
+      analysisHash([...review.scope.criterionIds].sort()) === analysisHash([...proposal.provenance.criterionIds].sort()))
+    : !review.scope, 'Correction review scope differs from the explicitly requested policy, base, or criteria.')
+}
+
 export function correctionBlockedReason(
   result: RealAnalysisAssessmentOutput, target: FrozenRealAnalysisTargetSnapshot, criterion: RealCriterionResult,
+  policyVersion: AnalysisCorrectionPolicyVersion = ANALYSIS_LEGACY_CORRECTION_POLICY_VERSION,
 ): string | null {
   if (criterion.evidenceStatus !== 'not-assessed' || criterion.weight <= 0) return 'Only unassessed, positively weighted criteria can be proposed.'
   const rubric = target.kind === 'job' ? target.rubric : target.version.rubric
   const definition = rubric.criteria.find(row => row.id === criterion.criterionId)
   assertAnalysis(definition, 'Correction criterion is absent from its frozen rubric.')
   if (isPersonalTraitCriterion(definition.label, definition.description)) return 'Personal-trait safeguards cannot be replaced with a zero score.'
-  if (['source-quality', 'context-limit'].includes(criterion.limitation.code) ||
+  if (criterion.limitation.code === 'context-limit' || criterion.limitation.blockerCode === 'unusable-source' ||
+    policyVersion === ANALYSIS_LEGACY_CORRECTION_POLICY_VERSION && criterion.limitation.code === 'source-quality' ||
     result.limitations.some(item => ['source-quality', 'context-limit'].includes(item.code) &&
-      (!item.criterionId && !item.qualificationId || item.criterionId === criterion.criterionId))) {
+      (!item.criterionId && !item.qualificationId || item.criterionId === criterion.criterionId &&
+        (item.code === 'context-limit' || item.blockerCode === 'unusable-source' ||
+          policyVersion === ANALYSIS_LEGACY_CORRECTION_POLICY_VERSION)))) {
     return 'A source-quality or processing limitation must be resolved; missing evidence cannot be assumed.'
   }
   return null
@@ -126,16 +147,13 @@ export function correctionBlockedReason(
 
 export function buildEvidenceCorrectionAssessment(
   base: RealAnalysisAssessmentOutput, target: FrozenRealAnalysisTargetSnapshot, criterionIds: string[],
+  policyVersion: AnalysisCorrectionPolicyVersion = ANALYSIS_LEGACY_CORRECTION_POLICY_VERSION,
 ): RealAnalysisAssessmentOutput {
   analysisCorrectionCriterionIdsSchema.parse(criterionIds)
   const selected = new Set(criterionIds)
   assertAnalysis(criterionIds.every(id => base.criteria.some(row => row.criterionId === id &&
-    correctionBlockedReason(base, target, row) === null)), 'Correction contains an ineligible criterion.')
-  const criteria = base.criteria.map((row): RealCriterionResult => selected.has(row.criterionId) ? {
-    criterionId: row.criterionId, weight: row.weight, evidenceStatus: 'missing', score: 0, citations: [],
-    requirementCitations: structuredClone(row.requirementCitations),
-    rationale: 'No supporting evidence for this criterion was identified in the successfully reviewed source. Missing evidence is scored 0/5; this does not establish a lack of ability or experience.',
-  } : structuredClone(row))
+    correctionBlockedReason(base, target, row, policyVersion) === null)), 'Correction contains an ineligible criterion.')
+  const criteria = base.criteria.map(row => selected.has(row.criterionId) ? missingEvidenceCriterion(row) : structuredClone(row))
   const qualifications = structuredClone(base.qualifications)
   const limitations = base.limitations.filter(item => !item.criterionId || !selected.has(item.criterionId) || item.qualificationId)
     .map(item => structuredClone(item))
@@ -151,5 +169,6 @@ export function assertEvidenceCorrectionAssessment(
   assertAnalysis(proposal.provenance.baseAssessmentSha256 === base.provenance.assessmentSha256 &&
     analysisHash(proposal.assessment) === analysisHash(buildEvidenceCorrectionAssessment(
       base, target, proposal.provenance.criterionIds,
+      proposal.provenance.policyVersion,
     )), 'Correction changed an unrelated score, weight, qualification, evidence citation, or limitation.')
 }

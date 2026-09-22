@@ -174,7 +174,12 @@ export function RealComparisonReview({ detail, actions, initialView }: {
       <dl className="mt-4 space-y-3 break-words">
         <div><dt className="text-muted">Assessment model / deployment</dt><dd>{result.provenance.assessment.model} · {result.provenance.assessment.deployment}</dd></div>
         <div><dt className="text-muted">Prompt / schema / calculation version</dt><dd>{result.provenance.assessment.promptVersion} · {result.provenance.assessment.schemaVersion} · {result.provenance.calculationVersion}</dd></div>
-        <div><dt className="text-muted">Independent grounding review</dt><dd>{result.provenance.groundingReviews.map((review) => `${review.outcome} · ${review.provenance.model} · ${review.provenance.promptVersion}`).join('; ') || 'No grounding review record returned. Human review is required.'}</dd></div>
+        <div><dt className="text-muted">Recorded AI review scope</dt><dd>{result.provenance.groundingReviews.length
+          ? <ul className="space-y-2">{result.provenance.groundingReviews.map(review => <li key={review.id}>
+            {review.scope ? `Selected evidence-gap verification only (${review.scope.criterionIds.join(', ')})` : 'Full-assessment grounding review'}
+            {' · '}{review.outcome} · {review.provenance.model} · {review.provenance.promptVersion}
+            {review.scope && <p>Unchanged numeric scores and the full assessment were not independently reapproved by this scoped review.</p>}
+          </li>)}</ul> : 'No grounding review record returned. Human review is required.'}</dd></div>
         <div><dt className="text-muted">Corrections / completed</dt><dd>{result.provenance.correctionCount} bounded corrections · {result.createdAt}</dd></div>
         <div><dt className="text-muted">Resume snapshot / SHA-256</dt><dd className="break-all"><code>{result.provenance.resumeSnapshot.snapshotId} · {result.provenance.resumeSnapshot.sha256}</code></dd></div>
         <div><dt className="text-muted">Target snapshot / SHA-256</dt><dd className="break-all"><code>{result.provenance.targetSnapshot.snapshotId} · {result.provenance.targetSnapshot.sha256}</code></dd></div>

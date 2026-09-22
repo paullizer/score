@@ -71,7 +71,7 @@ All paths below have prefix `/api/workspaces/:workspaceId/analyses`:
 | `GET /:runId/comparisons/:comparisonId/diagnostics?continuationToken=...` | `RealAnalysisDiagnosticsPage`; at most one private failed-attempt artifact per page |
 | `GET /:runId/comparisons/:comparisonId/corrections/preview` | Owner/editor-only `AnalysisCorrectionPreview`; read-only before/after totals, exact ETag and result hashes |
 | `GET /:runId/comparisons/:comparisonId/corrections` | Owner/editor-only `{correction}`; cheap status without loading evidence blobs |
-| `POST /:runId/comparisons/:comparisonId/corrections` with `{resultSha256, criterionIds, reason}` | HTTP 202 `AnalysisCorrectionResponse`; exact preview `If-Match` and UUID `Idempotency-Key` |
+| `POST /:runId/comparisons/:comparisonId/corrections` with `{policyVersion, resultSha256, criterionIds, reason}` | HTTP 202 `AnalysisCorrectionResponse`; exact preview policy, `If-Match`, and UUID `Idempotency-Key`; omitted policy retains legacy v1 semantics |
 | `POST /:runId/comparisons/:comparisonId/corrections/cancel` with `{}` | `AnalysisCorrectionResponse`; exact correction-head `If-Match` |
 | `GET /:runId/comparisons/:comparisonId/corrections/history?continuationToken=...` | Owner/editor-only immutable original assessment and up to 12 correction checkpoints |
 | `GET /:runId/comparisons/:comparisonId/documents/:documentId?version=N` | `RealAnalysisDocumentResponse` |
@@ -130,19 +130,59 @@ Completed comparisons and original result bytes remain immutable. An
 `analysis-correction:<runId>:<comparisonId>` head stores a separately guarded
 current publication and durable worker state. Every explicit request binds its
 actor, reason, selected criterion IDs, exact base/original result hashes, frozen
-snapshots, manifest, and `missing-evidence-zero-v1` policy. Its immutable proposal
+snapshots, manifest, and explicit correction policy. New previews use
+`missing-evidence-zero-v2`. Its immutable proposal
 only changes selected unassessed evidence-gap rows, related limitations/coverage,
 and the deterministic explanation and total. Contextual citations alone do not
 establish support or determine correction eligibility.
 
-Preview eligibility means eligible for a fresh semantic review, not guaranteed
-publication. The worker reviews the exact deterministic proposal without rescoring
-other criteria, then publishes new immutable result and history artifacts. The
-result retains original assessor attribution while recording fresh review and
-correction provenance. Failed, cancelled, expired, or superseded work cannot
+Preview eligibility means eligible for evidence-gap verification, not guaranteed
+publication. The preview total is hypothetical, and HTTP 202 acknowledges queued
+work rather than a published score. The v2 worker inspects the complete frozen
+resume against only the selected requirements, not the unchanged numeric scores.
+Each selected criterion must receive an exact, source-bound decision:
+
+- `confirmed-missing`: successfully reviewed source contains no qualifying
+  support; deterministic code assigns zero at the original weight.
+- `evidence-found`: exact supporting passages were identified; do not substitute
+  zero or silently rescore an unrelated criterion.
+- `blocked`: a concrete unusable-source, ambiguous-guidance, or
+  restricted-personal-characteristic reason prevents the conversion.
+
+Only an all-confirmed-missing selection can publish its exact proposal. Service
+outages, incomplete output, refusals, and context exhaustion are failed work, not
+missing evidence. Private history retains decisions and source-bound findings;
+the correction workflow exposes these findings without loading full histories
+on every status poll.
+
+An old criterion-level `source-quality` label without a structured blocker may
+enter v2 verification; that generic historical label alone does not prove the
+source was unusable. Explicit unusable-source blockers, processing/context
+limitations, global source failures, and protected-trait safeguards still prevent
+automatic correction. V1 eligibility remains unchanged.
+
+The result retains original assessor attribution and explicitly records scoped
+review provenance, its base assessment hash, and selected criteria. A scoped
+review does not claim to reapprove unchanged scores and cannot replace full
+grounding review for an ordinary assessment. Publication validates the approved
+base and the exact unchanged-field transformation. Failed, cancelled, expired, or superseded work cannot
 replace the last publication. Publication atomically fences the correction head,
 run counts, lifecycle/cancellation state, and revision-bound summary scheduling.
 Replay cannot double-count the recovered score.
+
+Existing `missing-evidence-zero-v1` results, histories, proposals, and request
+fingerprints remain readable and valid. Omitted request policy means v1, not an
+implicit upgrade. Accepted v1 work retains its original full-assessment review;
+a fresh preview and new explicit v2 request are needed to change review scope.
+Reusing a v1 key with v2 consent is a conflict. The v1 workflow's full reviewer
+could reject unrelated saved scores, while its immutable proposal could not
+repair them; this is why a calculated preview did not guarantee publication.
+
+New assessment drafts use the same scoped gap/blocker distinction before their
+ordinary full grounding review. Confirmed absence is normalized to zero; actual
+support returns to bounded assessment repair, and genuine blockers retain a
+machine-readable `blockerCode` alongside legacy limitation codes. A processing
+failure never becomes a completed zero.
 
 New correction proposals capture application processing settings independently of
 the original assessment. They require processing admission and respect maintenance
@@ -167,10 +207,19 @@ results.
 `ANALYSIS_EVIDENCE_CORRECTIONS_ENABLED` defaults to `false` in the API, worker, and
 deployment templates. The UI capability is `analysisEvidenceCorrections`. The gate
 controls new requests and worker discovery, not historical reads or authorized
-cancellation of accepted work. Deploy compatible readers/workers and drain older
-workers before deliberately enabling it. Turning the gate off does not reinterpret
+cancellation of accepted work. Pause admission/claiming while upgrading a deployment
+that already enables v1. Deploy compatible readers/workers and drain older
+workers before deliberately enabling v2 writes. Turning the gate off does not reinterpret
 already-published revisions. Production deployment and a historical repair batch
 require separate approval and exact-hash scope verification.
+
+Before recovering a historical cohort, inventory actual correction statuses and
+findings rather than assuming every withheld result has the same cause. Preserve
+already-published revisions as controls; use one approved v2 canary and then
+bounded fresh requests for the remaining eligible results. Verify persisted
+scores, counters, current reader hashes, and revision-bound narratives, not just
+acknowledgements. Report each remaining genuine blocker or technical failure.
+After v2 publication, rollback must retain v2-compatible readers.
 
 ## Saved narrative summaries
 

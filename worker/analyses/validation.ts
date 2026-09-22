@@ -8,12 +8,14 @@ import type {
   RealAnalysisGroundingReviewOutput, RealAnalysisResultSummary, RealCriterionResult, RealQualificationAssessment,
 } from '../../src/domain/real-analyses'
 import type { AnalysisDiagnosticReason, AnalysisSchemaDiagnostics } from '../../src/domain/analysis-diagnostics'
-import { isPersonalTraitCriterion } from '../../src/domain/analysis-evidence-policy'
+import {
+  isPersonalTraitCriterion, type AnalysisEvidenceGapDecision,
+} from '../../src/domain/analysis-evidence-policy'
 import { RESUME_IMPORT_LIMITS } from '../../src/domain/real-resumes'
 import type { Citation } from '../../src/domain/types'
 import {
   assessmentInputSchema, assessmentSchemaForInput, groundingSchemaForInput,
-  assessmentSelectionSchemaForInput, groundingSelectionSchemaForInput,
+  assessmentSelectionSchemaForInput, groundingSelectionSchemaForInput, evidenceGapSelectionSchemaForInput,
   type ModelResumeQuote,
 } from './model-schema'
 import {
@@ -192,16 +194,16 @@ function requirementCitations(input: RealAnalysisAssessmentInput, kind: 'criteri
   return evidence.citations.map(citation => ({ ...citation }))
 }
 
-function checkAssessmentLanguage(value: string): void {
+function checkAssessmentLanguage(value: string, stage: AnalysisModelStage = 'assessment'): void {
   if (/\b(?:context (?:window|limit)|token (?:budget|limit)|model refus(?:ed|al)|service unavailable|processing failed)\b/i.test(value)) {
-    invalidOutput('A model or processing failure must not be reported as a completed document-evidence assessment.')
+    invalidOutput('A model or processing failure must not be reported as a completed document-evidence assessment.', stage)
   }
   if (/\b(?:recommend|recommendation)\b.{0,60}\b(?:hiring|hire|reject|shortlist)\b/i.test(value) ||
     /\b(?:hire|reject|shortlist)\s+(?:this|the)\s+(?:candidate|applicant|person)\b/i.test(value) ||
     /\b(?:candidate|applicant|person|they|he|she)\s+(?:lacks?|cannot|can't|is unable|is incapable)\b/i.test(value) ||
     /\b(?:candidate|applicant|person|they|he|she)\s+(?:is|are|meets?)\s+(?:(?:officially|all|the|minimum)\s+)*(?:eligible|ineligible|qualified|unqualified|qualifications|eligibility)\b/i.test(value)) {
     invalidOutput('Analysis must describe document evidence, not personal ability, a hiring recommendation, or official eligibility.',
-      'assessment', false, 'policy-language')
+      stage, false, 'policy-language')
   }
 }
 
@@ -251,6 +253,7 @@ export function validateAnalysisAssessmentSelections(
         ...row, citations: row.citations.map(item => resolve(item.passageId)),
         limitation: row.limitation ? {
           code: row.limitation.code === 'unusable-source' ? 'source-quality' : 'not-assessable',
+          blockerCode: row.limitation.code,
           message: row.limitation.message,
         } : null,
       })),
@@ -338,6 +341,41 @@ export function validateAnalysisGroundingSelections(
       ...parsed.data,
       issues: parsed.data.issues.map(row => ({ ...row, citations: row.citations.map(item => resolve(item.passageId)) })),
     }, input)
+  })
+}
+
+export function validateAnalysisEvidenceGapSelections(
+  value: unknown, input: RealAnalysisAssessmentInput, catalog: AnalysisEvidenceCatalog, criterionIds: string[],
+): AnalysisEvidenceGapDecision[] {
+  // Reuse bounded grounding citation diagnostics; their row indexes refer to decisions here.
+  const decisions = value !== null && typeof value === 'object' && 'decisions' in value ? value.decisions : undefined
+  return withPassageSelections({ issues: decisions }, input, catalog, 'grounding', resolve => {
+    const parsed = evidenceGapSelectionSchemaForInput(criterionIds, catalog.passages.length).safeParse(value)
+    if (!parsed.success) {
+      invalidSchema('The evidence-gap review requires exactly the selected decisions and bounded source-passage selections, with no unrelated findings.',
+        parsed.error.issues, 'grounding')
+    }
+    if (!unique(parsed.data.decisions.map(row => row.criterionId))) {
+      invalidOutput('Evidence-gap review requires exactly one unique decision for every selected criterion, without omissions or additional findings.',
+        'grounding')
+    }
+    return criterionIds.map((criterionId): AnalysisEvidenceGapDecision => {
+      const decision = parsed.data.decisions.find(row => row.criterionId === criterionId)!
+      checkAssessmentLanguage(decision.message, 'grounding')
+      const criterion = input.rubric.criteria.find(row => row.id === criterionId)!
+      if (isPersonalTraitCriterion(criterion.label, criterion.description) &&
+        (decision.outcome !== 'blocked' || decision.blockerCode !== 'restricted-personal-characteristic')) {
+        invalidOutput('A personal-characteristic requirement must remain blocked and unscored; it cannot be confirmed as missing professional evidence.',
+          'grounding', false, 'policy-language')
+      }
+      const citations = buildAnalysisResumeCitations(decision.citations.map(item => resolve(item.passageId)), input, 'grounding')
+      const base = { criterionId: decision.criterionId, message: decision.message }
+      if (decision.outcome === 'confirmed-missing') return { ...base, outcome: decision.outcome, citations: [] }
+      if (decision.outcome === 'evidence-found') {
+        return { ...base, outcome: decision.outcome, citations: citations as [Citation, ...Citation[]] }
+      }
+      return { ...decision, citations }
+    })
   })
 }
 

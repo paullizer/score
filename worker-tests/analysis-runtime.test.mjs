@@ -413,16 +413,49 @@ test('substantive ready resumes with every display metadata field unavailable ar
 test('a valid limited assessment withholds the score without becoming a processing failure', async () => {
   const f = fixture()
   const created = await createRun(f)
-  const mock = modelFor(f, ({ kind, body }) => kind === 'resume_rubric_assessment' ? modelAssessment(body.input, { limited: true }) : undefined)
+  const mock = modelFor(f, ({ kind, body }) => {
+    if (kind === 'resume_rubric_assessment') return modelAssessment(body.input, { limited: true })
+    if (kind === 'resume_evidence_gap_review') return {
+      decisions: body.scope.criterionIds.map(criterionId => ({
+        criterionId, outcome: 'blocked', blockerCode: 'unusable-source', citations: [],
+        message: 'The merged source is ambiguous about whose work is described and needs source repair.',
+      })),
+    }
+  })
   assert.deepEqual(await runAnalysisWorker(mock.deps), { claimed: 2, completed: 1 })
   const comparison = comparisons(f, created.run.id)[0]
   const detail = await f.service.comparisonDetail(f.workspaceId, created.run.id, comparison.record.id)
   assert.equal(detail.result.completion, 'limited')
   assert.equal(detail.result.overall.status, 'withheld')
   assert.equal(detail.result.overall.score, null)
+  assert.equal(detail.result.criteria[0].limitation.blockerCode, 'unusable-source')
   assert.equal(comparison.record.error, undefined)
   const run = await f.analysis.store.get(f.workspaceId, created.run.id)
   assert.deepEqual([run.record.progress.complete, run.record.progress.scored, run.record.progress.unscored, run.record.progress.failed], [1, 0, 1, 0])
+})
+
+test('a completed missing-evidence verification publishes a new assessment as zero rather than withheld', async () => {
+  const f = fixture()
+  const created = await createRun(f)
+  const mock = modelFor(f, ({ kind, body }) => {
+    if (kind === 'resume_rubric_assessment') return modelAssessment(body.input, { limited: true })
+    if (kind === 'resume_evidence_gap_review') return {
+      decisions: body.scope.criterionIds.map(criterionId => ({
+        criterionId, outcome: 'confirmed-missing', citations: [], blockerCode: null,
+        message: 'The complete source is usable; the absence of supporting practice is an evidence gap.',
+      })),
+    }
+  })
+  assert.deepEqual(await runAnalysisWorker(mock.deps), { claimed: 2, completed: 1 })
+  const comparison = comparisons(f, created.run.id)[0]
+  const detail = await f.service.comparisonDetail(f.workspaceId, created.run.id, comparison.record.id)
+  assert.deepEqual(detail.result.overall, { status: 'available', score: 0 })
+  assert.equal(detail.result.coverage.assessedWeight, 100)
+  assert.equal(detail.result.coverage.notAssessed, 0)
+  assert.equal(detail.result.criteria[0].evidenceStatus, 'missing')
+  assert.ok(detail.result.provenance.groundingReviews.every(review => !review.scope))
+  const run = await f.analysis.store.get(f.workspaceId, created.run.id)
+  assert.deepEqual([run.record.progress.complete, run.record.progress.scored, run.record.progress.unscored, run.record.progress.failed], [1, 1, 0, 0])
 })
 
 test('approved GS exclusions and qualifications stay separate in frozen model inputs and results', async () => {

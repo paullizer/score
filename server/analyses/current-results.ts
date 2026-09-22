@@ -7,7 +7,7 @@ import {
 import { invalidRequest, notFound } from '../errors'
 import { isUuid } from '../jobs/validation'
 import { readAnalysisCorrectionHistoryEntry } from './correction-artifacts'
-import { parseAnalysisCorrectionProposal } from './correction-validation'
+import { assertCorrectionReviewBinding, parseAnalysisCorrectionProposal } from './correction-validation'
 import { parseAnalysisJson, readAnalysisBlob } from './snapshots'
 import type { AnalysisStore, RealAnalysesDeps } from './store'
 import { analysisCorrectionId, analysisHash, assertAnalysis, parseAnalysisEntity, parseAnalysisResult } from './validation'
@@ -98,6 +98,7 @@ export async function resolveAnalysisComparisonRevision(
     ])
     const proposal = parseAnalysisCorrectionProposal(parseAnalysisJson(proposalBytes))
     const result = parseAnalysisResult(parseAnalysisJson(resultBytes))
+    assertCorrectionReviewBinding(entry.review, proposal)
     assertAnalysis(proposal.workspaceId === run.workspaceId && proposal.runId === run.id &&
       proposal.comparisonId === original.record.id && proposal.requestId === revisionId &&
       proposal.manifestSha256 === run.manifest.sha256 && proposal.originalResultSha256 === original.record.result.sha256 &&
