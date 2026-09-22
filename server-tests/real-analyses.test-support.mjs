@@ -661,7 +661,7 @@ export async function startHttp(f, enabled = true, settings, runtimeEnabled = tr
     },
   }
   const repository = new api.WorkspaceRepository({ directory, state, now: () => new Date(f.now) })
-  const config = { authMode: 'easyauth', tenantId: TENANT, allowedUserIds: new Set([OWNER, EDITOR, VIEWER, STRANGER]), appOrigin: ORIGIN,
+  const config = { authMode: 'easyauth', tenantId: TENANT, appOrigin: ORIGIN,
     ...(settings ? { settings: { runtimeEnabled } } : {}) }
   const app = express()
   app.use(express.json())
@@ -686,7 +686,10 @@ export async function startHttp(f, enabled = true, settings, runtimeEnabled = tr
     async close() { await new Promise(resolve => server.close(resolve)) },
     async request(suffix = '', method = 'GET', body, options = {}) {
       const oid = options.role === 'viewer' ? VIEWER : options.role === 'editor' ? EDITOR : options.role === 'stranger' ? STRANGER : OWNER
-      const principal = { auth_typ: 'aad', claims: [{ typ: 'tid', val: TENANT }, { typ: 'oid', val: oid }], name_typ: 'name', role_typ: 'roles' }
+      const principal = { auth_typ: 'aad', claims: [
+        { typ: 'tid', val: TENANT }, { typ: 'oid', val: oid },
+        ...(options.roles ?? ['Score.User']).map(role => ({ typ: 'roles', val: role })),
+      ], name_typ: 'name', role_typ: 'roles' }
       return fetch(`${base}${suffix}`, {
         method, signal: options.signal, headers: {
           ...(options.noAuth ? {} : { 'x-ms-client-principal': Buffer.from(JSON.stringify(principal)).toString('base64') }),

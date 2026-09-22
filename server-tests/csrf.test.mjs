@@ -1,9 +1,9 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { APP_ORIGIN, CSRF_HEADER, authHeaders, startTestServer } from './helpers.mjs'
+import { ALLOWED_OID, APP_ORIGIN, CSRF_HEADER, authHeaders, createFakeAccessStore, startTestServer } from './helpers.mjs'
 
 test('POST /api/workspaces without an Origin header is rejected (CSRF)', async () => {
-  const server = await startTestServer()
+  const server = await startTestServer({ accessStore: createFakeAccessStore([{ userId: ALLOWED_OID }]) })
   try {
     const response = await fetch(`${server.baseUrl}/api/workspaces`, {
       method: 'POST',
@@ -19,7 +19,7 @@ test('POST /api/workspaces without an Origin header is rejected (CSRF)', async (
 })
 
 test('POST /api/workspaces with a mismatched Origin header is rejected (CSRF)', async () => {
-  const server = await startTestServer()
+  const server = await startTestServer({ accessStore: createFakeAccessStore([{ userId: ALLOWED_OID }]) })
   try {
     const response = await fetch(`${server.baseUrl}/api/workspaces`, {
       method: 'POST',
@@ -33,7 +33,7 @@ test('POST /api/workspaces with a mismatched Origin header is rejected (CSRF)', 
 })
 
 test('POST /api/workspaces with the correct Origin but no X-Score-Request header is rejected (CSRF)', async () => {
-  const server = await startTestServer()
+  const server = await startTestServer({ accessStore: createFakeAccessStore([{ userId: ALLOWED_OID }]) })
   try {
     const response = await fetch(`${server.baseUrl}/api/workspaces`, {
       method: 'POST',
@@ -47,7 +47,7 @@ test('POST /api/workspaces with the correct Origin but no X-Score-Request header
 })
 
 test('POST /api/workspaces succeeds with a matching Origin and the X-Score-Request header', async () => {
-  const server = await startTestServer()
+  const server = await startTestServer({ accessStore: createFakeAccessStore([{ userId: ALLOWED_OID }]) })
   try {
     const response = await fetch(`${server.baseUrl}/api/workspaces`, {
       method: 'POST',

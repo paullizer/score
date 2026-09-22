@@ -8,6 +8,30 @@ let runtime
 before(async () => { runtime = await buildGradeTestRuntime() })
 after(async () => { globalThis.fetch = nativeFetch; await runtime?.close() })
 
+test('grade feature fixtures seed explicitly while the non-admin owner has no creation grant and session reads stay pure', async () => {
+  const fixture = await startGradeFixture(runtime)
+  try {
+    assert.deepEqual(fixture.session.capabilities, { applicationAdmin: false, canCreateWorkspaces: false })
+    assert.deepEqual(fixture.session.workspaces.map(workspace => workspace.id), [fixture.workspaceId])
+    assert.equal(fixture.session.workspaces[0].role, 'owner')
+    const metadata = structuredClone([...fixture.directory.metadata])
+    const states = structuredClone([...fixture.state.states])
+    const refreshed = await fixture.request('/api/session')
+    assert.equal(refreshed.status, 200)
+    assert.deepEqual(await refreshed.json(), fixture.session)
+    const created = await fixture.request('/api/workspaces', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: 'No implicit owner grant' }),
+    })
+    assert.equal(created.status, 403)
+    assert.deepEqual([...fixture.directory.metadata], metadata)
+    assert.deepEqual([...fixture.state.states], states)
+    fixture.setRole('viewer')
+    assert.equal((await fixture.directory.getMetadata(fixture.workspaceId)).metadata.ownerCount, 0)
+    fixture.setRole('owner')
+    assert.equal((await fixture.directory.getMetadata(fixture.workspaceId)).metadata.ownerCount, 1)
+  } finally { await fixture.close() }
+})
+
 test('frontend workspace fakes enforce conditional metadata, idempotent cleanup, and exclusive mutation leases', async () => {
   const fixture = await startGradeFixture(runtime)
   try {
@@ -194,9 +218,7 @@ test('viewer and cross-workspace API boundaries authorize before reference mutat
   let restoreFetch
   try {
     const { detail, source } = await seededLadder(fixture)
-    const created = await fixture.request('/api/workspaces', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: 'Other private workspace' }) })
-    assert.equal(created.status, 201)
-    const other = (await created.json()).workspace
+    const other = await fixture.seedWorkspace('Other private workspace')
     restoreFetch = fixture.installClientFetch()
     const cross = await fixture.request(`/api/workspaces/${other.id}/grade-ladders/${detail.ladder.id}/sources/${source.id}/original?sourceSetId=${detail.sourceSet.id}`)
     assert.equal(cross.status, 404)

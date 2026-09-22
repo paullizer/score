@@ -178,9 +178,7 @@ test('browser workspace switching ignores a late private resume response from th
   await processAllResumes(fixture, processingStubs(fixture))
   const oldPath = `/api/workspaces/${fixture.workspaceId}/resumes/${imported.summary.resume.id}`
   const oldDetail = await jsonResponse(await fixture.request(oldPath))
-  const created = await jsonResponse(await fixture.request('/api/workspaces', {
-    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: 'Empty evidence workspace' }),
-  }), [201])
+  const other = await fixture.seedWorkspace('Empty evidence workspace')
   const hold = deferred()
   const { context, page, errors } = await newPage()
   try {
@@ -192,7 +190,7 @@ test('browser workspace switching ignores a late private resume response from th
     await page.locator('.workspace-switcher-trigger').first().click()
     const switcher = await visible(page.getByRole('dialog', { name: 'My workspaces', exact: true }))
     await switcher.getByRole('button', { name: 'Empty evidence workspace', exact: true }).click()
-    await page.waitForURL((url) => url.pathname.startsWith(`/workspaces/${created.workspace.id}/`))
+    await page.waitForURL((url) => url.pathname.startsWith(`/workspaces/${other.id}/`))
     hold.resolve()
     await page.getByRole('link', { name: /^Resumes/ }).first().click()
     await visible(page.getByRole('heading', { name: 'Import your first real resume', exact: true }))
@@ -598,9 +596,7 @@ test('browser legacy and unavailable failures keep source access and discard lat
     assert.equal(diagnosticReads, 0, 'an older artifact is not automatically displayed as a newer failure')
     await visible(source.getByText(resumeParagraphs[4].text, { exact: true }))
 
-    const created = await jsonResponse(await fixture.request('/api/workspaces', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: 'Empty diagnostic workspace' }),
-    }), [201])
+    const other = await fixture.seedWorkspace('Empty diagnostic workspace')
     // A policy refresh can remount the detail; keep every diagnostic response pending until the switch.
     fixture.staleRead(`${scenario.pairPath}/diagnostics`, { attempts: [scenario.diagnostic] }, hold.promise, 200, { repeat: true })
     scenario.detail = failedComparisonFixture(scenario.accepted, scenario.diagnostic)
@@ -610,7 +606,7 @@ test('browser legacy and unavailable failures keep source access and discard lat
     await page.locator('.workspace-switcher-trigger').first().click()
     const switcher = await visible(page.getByRole('dialog', { name: 'My workspaces', exact: true }))
     await switcher.getByRole('button', { name: 'Empty diagnostic workspace', exact: true }).click()
-    await page.waitForURL((url) => url.pathname.startsWith(`/workspaces/${created.workspace.id}/`))
+    await page.waitForURL((url) => url.pathname.startsWith(`/workspaces/${other.id}/`))
     hold.resolve()
     await page.getByRole('link', { name: /^Resumes/ }).first().click()
     await visible(page.getByRole('heading', { name: 'Import your first real resume', exact: true }))

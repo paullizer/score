@@ -2,7 +2,7 @@ import type {
   AdminSettings, AdminSettingsPatch, AdminSettingsResponse, DeploymentInventory, ModelConfigurationTestRequest, ModelTaskId, ModelTestResult,
   SettingsExport, SettingsFieldError, SettingsHistoryResponse, SettingsImportPreview, SettingsRevision,
 } from '../domain/admin-settings'
-import { CloudApiError, CloudAuthError } from './cloudWorkspace'
+import { cloudAccessRequestSignal, CloudApiError, CloudAuthError, reportCloudAccessFailure } from './cloudWorkspace'
 
 export class SettingsRequestError extends CloudApiError {
   readonly fields: SettingsFieldError[]
@@ -14,18 +14,27 @@ export class SettingsRequestError extends CloudApiError {
 }
 
 async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
+  const accessSignal = cloudAccessRequestSignal(path, init)
   const headers = new Headers(init.headers)
   headers.set('X-Score-Request', 'workspace')
   if (init.body !== undefined) headers.set('Content-Type', 'application/json')
-  const response = await fetch(`/api${path}`, {
-    ...init, headers, credentials: 'same-origin', mode: 'same-origin', cache: 'no-store', redirect: 'manual',
-    signal: init.signal ? AbortSignal.any([init.signal, AbortSignal.timeout(90_000)]) : AbortSignal.timeout(90_000),
-  })
-  if (response.redirected || response.type === 'opaqueredirect' || response.status === 401) throw new CloudAuthError('Sign in again to manage application settings. Your draft has not been discarded.')
-  if (!response.headers.get('content-type')?.toLowerCase().includes('application/json')) throw new SettingsRequestError(response.status, 'The settings service did not return API data. No changes have been acknowledged.')
-  const body = await response.json()
-  if (!response.ok) throw new SettingsRequestError(response.status, body?.error?.message ?? `Settings request failed (HTTP ${response.status}).`, Array.isArray(body?.error?.fields) ? body.error.fields : [])
-  return body as T
+  const signal = AbortSignal.any([...(init.signal ? [init.signal] : []), ...(accessSignal ? [accessSignal] : []), AbortSignal.timeout(90_000)])
+  try {
+    signal.throwIfAborted()
+    const response = await fetch(`/api${path}`, {
+      ...init, headers, credentials: 'same-origin', mode: 'same-origin', cache: 'no-store', redirect: 'manual', signal,
+    })
+    if (response.redirected || response.type === 'opaqueredirect' || response.status === 401) throw new CloudAuthError('Sign in again to manage application settings. Your draft has not been discarded.')
+    if (!response.headers.get('content-type')?.toLowerCase().includes('application/json')) throw new SettingsRequestError(response.status, 'The settings service did not return API data. No changes have been acknowledged.')
+    const body = await response.json()
+    signal.throwIfAborted()
+    if (!response.ok) throw new SettingsRequestError(response.status, body?.error?.message ?? `Settings request failed (HTTP ${response.status}).`, Array.isArray(body?.error?.fields) ? body.error.fields : [])
+    return body as T
+  } catch (caught) {
+    if (accessSignal?.aborted) throw accessSignal.reason
+    reportCloudAccessFailure(path, caught)
+    throw caught
+  }
 }
 
 export function readAdminSettings(signal?: AbortSignal): Promise<AdminSettingsResponse> {

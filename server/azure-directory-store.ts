@@ -81,6 +81,65 @@ export function createDirectoryStoreFromContainer(container: Pick<Container, 'it
       return resources.map((resource) => omitEtag(resource))
     },
 
+    async listMetadataForTenant(tenantId) {
+      const { resources } = await container.items.query<CosmosDoc<WorkspaceMetadataDoc>>({
+        query: "SELECT * FROM c WHERE c.id = 'workspace' AND c.tenantId = @tenantId",
+        parameters: [{ name: '@tenantId', value: tenantId }],
+      }).fetchAll()
+      return resources.map(resource => {
+        if (!resource._etag) throw new Error('Workspace metadata is missing its ETag.')
+        return { metadata: omitEtag(resource), etag: resource._etag }
+      })
+    },
+
+    async listWorkspaceMemberships(workspaceId) {
+      const { resources } = await container.items.query<CosmosDoc<MembershipDoc>>({
+        query: 'SELECT * FROM c WHERE c.principalType = @type',
+        parameters: [{ name: '@type', value: 'user' }],
+      }, { partitionKey: workspaceId }).fetchAll()
+      return resources.map(resource => {
+        if (!resource._etag || resource.workspaceId !== workspaceId) throw new Error('Membership scope or concurrency metadata is invalid.')
+        return { membership: omitEtag(resource), etag: resource._etag }
+      })
+    },
+
+    async changeMembership(change) {
+      const { metadata, expectedMetadataEtag, memberId, membership, expectedMemberEtag, audit } = change
+      if (!expectedMetadataEtag || expectedMetadataEtag === '*' || (!membership && !expectedMemberEtag)) {
+        throw new StoreConflictError('Current access revisions are required.')
+      }
+      const { lifecycleOperation, ...fields } = metadata
+      const operations: OperationInput[] = [{
+        operationType: 'Replace', id: 'workspace', ifMatch: expectedMetadataEtag,
+        resourceBody: { ...fields, ...(lifecycleOperation ? { lifecycleOperation: { ...lifecycleOperation } } : {}) },
+      }]
+      if (membership) {
+        operations.push(expectedMemberEtag
+          ? { operationType: 'Replace', id: memberId, ifMatch: expectedMemberEtag, resourceBody: { ...membership } }
+          : { operationType: 'Create', resourceBody: { ...membership } })
+      } else {
+        const remove: DeleteOperation = { operationType: 'Delete', id: memberId, ifMatch: expectedMemberEtag }
+        operations.push(remove)
+      }
+      operations.push({ operationType: 'Create', resourceBody: { ...audit, workspaceId: metadata.workspaceId } })
+      try {
+        const response = await container.items.batch(operations, metadata.workspaceId)
+        const results = response.result ?? []
+        if (results.length !== operations.length || results.some(item => item.statusCode < 200 || item.statusCode >= 300) ||
+          (response.code !== undefined && (response.code < 200 || response.code >= 300))) {
+          const code = results.find(item => item.statusCode >= 400 && item.statusCode !== 424)?.statusCode ?? response.code
+          if ([404, 409, 412, 424].includes(code ?? 0)) throw new StoreConflictError('Workspace access changed. Reload members before trying again.')
+          throw new Error('The workspace access transaction did not succeed.')
+        }
+        const etag = results[0]?.eTag
+        if (!etag) throw new Error('Workspace access transaction returned no metadata ETag.')
+        return { metadata, etag }
+      } catch (error) {
+        if ([404, 409, 412].includes(statusCodeOf(error) ?? 0)) throw new StoreConflictError()
+        throw error
+      }
+    },
+
     async createWorkspace(metadata, membership) {
       const { lifecycleOperation, ...fields } = metadata
       const response = await container.items.batch(
@@ -122,7 +181,8 @@ export function createDirectoryStoreFromContainer(container: Pick<Container, 'it
       if (!expectedEtag || expectedEtag === '*') throw new StoreConflictError('The current metadata ETag is required.')
       try {
         if (metadata.deletedAt && metadata.lifecycleOperation?.action === 'delete' && metadata.lifecycleOperation.status === 'complete') {
-          const ownerId = membershipIdFor(metadata.ownerId)
+          const recoveryPrincipalId = metadata.deletionRecoveryPrincipalId ?? metadata.ownerId
+          const ownerId = membershipIdFor(recoveryPrincipalId)
           let owner: CosmosDoc<MembershipDoc> | undefined
           try {
             const response = await container.item(ownerId, metadata.workspaceId).read<CosmosDoc<MembershipDoc>>()
@@ -137,7 +197,7 @@ export function createDirectoryStoreFromContainer(container: Pick<Container, 'it
           }]
           if (owner) {
             if (!owner._etag || owner.id !== ownerId || owner.workspaceId !== metadata.workspaceId ||
-              owner.principalId !== metadata.ownerId || owner.principalType !== 'user') {
+              owner.principalId !== recoveryPrincipalId || owner.principalType !== 'user') {
               throw new Error('The final workspace membership has invalid ownership or concurrency metadata.')
             }
             const removeOwner: DeleteOperation = { operationType: 'Delete', id: ownerId, ifMatch: owner._etag }
@@ -175,7 +235,7 @@ export function createDirectoryStoreFromContainer(container: Pick<Container, 'it
         throw new StoreNotFoundError('Workspace ownership is unavailable during membership cleanup.')
       }
       // Keep recovery discoverable until the tombstone and owner removal commit together.
-      const ownerId = membershipIdFor(metadata.resource.ownerId)
+      const ownerId = membershipIdFor(metadata.resource.deletionRecoveryPrincipalId ?? metadata.resource.ownerId)
       for (;;) {
         const response = await container.items.query<CosmosDoc<MembershipDoc>>({
           query: 'SELECT TOP 100 * FROM c WHERE c.principalType = @type AND c.id != @ownerId',

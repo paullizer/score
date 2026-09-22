@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto'
 import type { LifecycleAction, LifecycleImpact, LifecycleOperation } from '../../src/domain/lifecycle'
 import { setWorkspaceArchive } from '../../src/domain/lifecycle'
 import type { WorkspaceSummary } from '../../src/domain/cloud'
-import type { AuthenticatedPrincipal } from '../auth'
+import { isApplicationAdmin, type AuthenticatedPrincipal } from '../auth'
 import { conflict, forbidden, HttpError, invalidRequest, notFound, preconditionRequired, unavailable } from '../errors'
 import { isValidWorkspaceId } from '../ids'
 import { decodeWorkspace, toSummary, type WorkspaceRepository } from '../repository'
@@ -38,10 +38,6 @@ export class WorkspaceLifecycleService {
     if (!isValidWorkspaceId(id)) throw notFound()
     const stored = await this.deps.directory.getMetadata(id)
     if (!stored || stored.metadata.tenantId !== principal.tenantId) throw notFound()
-    const pendingDelete = stored.metadata.lifecycleOperation?.action === 'delete' &&
-      stored.metadata.lifecycleOperation.status !== 'complete'
-    if (pendingDelete && stored.metadata.lifecycleStage === 'memberships' &&
-      stored.metadata.ownerId === principal.principalKey) return stored
     const role = await this.deps.repository.authorizeWorkspace(principal, id, 'read')
     if (owner && role !== 'owner') throw forbidden('Only the workspace owner can archive, unarchive, or delete it.')
     return stored
@@ -80,9 +76,8 @@ export class WorkspaceLifecycleService {
 
   async impact(principal: AuthenticatedPrincipal, id: string) {
     const stored = await this.metadata(principal, id, false)
-    const role = stored.metadata.ownerId === principal.principalKey ? 'owner' :
-      await this.deps.repository.authorizeWorkspace(principal, id, 'read')
-    return { impact: await this.savedImpact(stored), workspace: toSummary(stored.metadata, stored.etag, role) }
+    const role = await this.deps.repository.authorizeWorkspace(principal, id, 'read')
+    return { impact: await this.savedImpact(stored), workspace: toSummary(stored.metadata, stored.etag, role, isApplicationAdmin(principal)) }
   }
 
   async change(
@@ -102,14 +97,22 @@ export class WorkspaceLifecycleService {
         const previous = stored.metadata.lifecycleOperation
         if (previous && previous.status !== 'complete') {
           if (previous.action !== action) throw conflict('Retry the unfinished workspace lifecycle operation before choosing another action.')
-          return this.execute(stored)
+          return this.forPrincipal(principal, await this.execute(stored))
         }
         if ((action === 'archive' && stored.metadata.archivedAt) || (action === 'unarchive' && !stored.metadata.archivedAt)) {
-          return { workspace: toSummary(stored.metadata, stored.etag, 'owner') }
+          return { workspace: toSummary(stored.metadata, stored.etag, 'owner', isApplicationAdmin(principal)) }
         }
+        let recoveryPrincipalId: string | undefined
         if (action === 'delete') {
           const impact = await this.savedImpact(stored)
           if (impact.blockers.length) throw conflict(`Delete ${impact.blockers.length} associated ${impact.blockers.length === 1 ? 'analysis' : 'analyses'} first, including archived analyses.`)
+          const owners = (await this.deps.directory.listWorkspaceMemberships(id))
+            .map(entry => entry.membership).filter(member => member.role === 'owner' &&
+              member.workspaceId === id && member.principalType === 'user' &&
+              member.principalId.startsWith(`${principal.tenantId}:`))
+          recoveryPrincipalId = owners.find(member => member.principalId === principal.principalKey)?.principalId ??
+            owners.sort((a, b) => a.id.localeCompare(b.id))[0]?.principalId
+          if (!recoveryPrincipalId) throw conflict('Assign an explicit workspace owner before deleting this workspace.')
         }
         const timestamp = this.timestamp()
         const operation: LifecycleOperation = { id: randomUUID(), action, status: 'pending', updatedAt: timestamp }
@@ -117,13 +120,20 @@ export class WorkspaceLifecycleService {
         stored = await this.deps.directory.replaceMetadata({
           ...stored.metadata, updatedAt: timestamp, lifecycleOperation: operation,
           ...(action === 'archive' ? { archivedAt: timestamp } : {}),
+          ...(recoveryPrincipalId ? { deletionRecoveryPrincipalId: recoveryPrincipalId } : {}),
         }, stored.etag)
-        return this.execute(stored)
+        return this.forPrincipal(principal, await this.execute(stored))
       })
     } catch (error) {
       if (error instanceof StoreConflictError) throw conflict(error.message)
       throw error
     }
+  }
+
+  private forPrincipal(principal: AuthenticatedPrincipal, result: WorkspaceLifecycleResponse): WorkspaceLifecycleResponse {
+    return result.workspace ? {
+      ...result, workspace: { ...result.workspace, accessSource: isApplicationAdmin(principal) ? 'application-admin' : 'membership' },
+    } : result
   }
 
   private async execute(initial: StoredMetadata): Promise<WorkspaceLifecycleResponse> {

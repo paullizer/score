@@ -273,10 +273,8 @@ test('real resume access is authorized before raw uploads and every original rem
   try {
     const imported = await importResumePdf(fixture, await resumePdf())
     const path = `/api/workspaces/${fixture.workspaceId}/resumes/${imported.summary.resume.id}`
-    const created = await jsonResponse(await fixture.request('/api/workspaces', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: 'Another private workspace' }),
-    }), [201])
-    assert.equal((await fixture.request(`/api/workspaces/${created.workspace.id}/resumes/${imported.summary.resume.id}/original`)).status, 404)
+    const other = await fixture.seedWorkspace('Another private workspace')
+    assert.equal((await fixture.request(`/api/workspaces/${other.id}/resumes/${imported.summary.resume.id}/original`)).status, 404)
 
     fixture.setRole('viewer')
     assert.equal((await fixture.request(path)).status, 200)

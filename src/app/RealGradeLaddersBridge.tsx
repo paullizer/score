@@ -4,7 +4,7 @@ import type { GradeLadderDetail, GradeLadderSummary, GradeProcessingFeatures, Gr
 import * as api from '../services/gradeLadders'
 import { assertClientAdmission, clientAdmissionReason, usePublicSettings } from './public-settings-context'
 import { boundedPollingInterval, gradeFeaturesWithPolicy } from '../services/publicSettings'
-import { CloudApiError, CloudConflictError, LifecycleOperationError } from '../services/cloudWorkspace'
+import { CloudAccessChangedError, CloudApiError, CloudConflictError, LifecycleOperationError, workspaceAccessStamp } from '../services/cloudWorkspace'
 import { gradeSummaryStamp, gradeWorkActive, projectRealGrades } from '../features/grade-ladders/gradeUi'
 import { GradeLaddersContext, type GradeLaddersContextValue, type GradeLoadState } from './grade-ladders-context'
 import { useGradeLeaveGuard } from './grade-navigation-context'
@@ -48,6 +48,13 @@ export function RealGradeLaddersBridge({ workspaceId, children }: { workspaceId:
   const metadata = parent.cloud?.workspaces.find((workspace) => workspace.id === workspaceId)
   const canManage = Boolean(metadata && metadata.role !== 'viewer' && !metadata.deletedAt)
   const canWrite = canManage && !metadata?.archivedAt && (!metadata?.lifecycleOperation || metadata.lifecycleOperation.status === 'complete')
+  const accessStamp = workspaceAccessStamp(metadata)
+  const accessRef = useRef({ stamp: accessStamp, canManage, canWrite, readable: Boolean(metadata && !metadata.deletedAt) })
+  if (accessRef.current.stamp !== accessStamp) {
+    ++epoch.current
+    reads.current.forEach(controller => controller.abort()); reads.current.clear(); listPromise.current = null
+  }
+  accessRef.current = { stamp: accessStamp, canManage, canWrite, readable: Boolean(metadata && !metadata.deletedAt) }
   const mutationGuard = useGradeLeaveGuard(false, pending, 'A grade-ladder change')
 
   useEffect(() => {
@@ -81,6 +88,7 @@ export function RealGradeLaddersBridge({ workspaceId, children }: { workspaceId:
   }, [putDetail])
 
   const ensureDetail = useCallback(async (id: string, force = false) => {
+    if (!accessRef.current.readable) return
     if (!force && ((detailRef.current[id] && !['idle', 'loading'].includes(detailRef.current[id].state)) || reads.current.has(id))) return
     if (mutating.current) return
     reads.current.get(id)?.abort()
@@ -113,6 +121,7 @@ export function RealGradeLaddersBridge({ workspaceId, children }: { workspaceId:
   }, [putDetail, remember, workspaceId])
 
   const refresh = useCallback(async () => {
+    if (!accessRef.current.readable) return
     if (listPromise.current) return listPromise.current
     if (mutating.current) return
     const started = epoch.current
@@ -186,6 +195,7 @@ export function RealGradeLaddersBridge({ workspaceId, children }: { workspaceId:
   }, [details, ensureDetail, phase, pollingInterval, refresh, summaries])
 
   useEffect(() => { void refresh() }, [policy.settings?.revision, refresh])
+  useEffect(() => { void refresh() }, [accessStamp, refresh])
 
   useEffect(() => {
     const focus = () => { void refresh() }
@@ -200,11 +210,12 @@ export function RealGradeLaddersBridge({ workspaceId, children }: { workspaceId:
   }, [ensureDetail, location.pathname, location.search])
 
   async function mutate(operation: () => Promise<GradeLadderDetail>, id?: string, grade?: number): Promise<GradeLadderDetail> {
-    if (!canWrite) throw new Error('This workspace is read-only. An owner or editor must make grade-ladder changes.')
+    if (!accessRef.current.canWrite) throw new Error('This workspace is read-only. An Owner or Editor must make grade-ladder changes.')
     if (id && !canEdit(id, grade)) throw new Error('Archived or removed content cannot be edited or processed. Unarchive the parent and grade first.')
     if (phase !== 'ready') throw new Error('The saved grade library is not available. Refresh before making changes.')
     if (mutating.current) throw new Error('Wait for the current grade request before making another change.')
     mutating.current = true
+    const accessStarted = accessRef.current.stamp
     mutationGuard.hold()
     epoch.current++
     const sequence = ++readSequence.current
@@ -224,6 +235,7 @@ export function RealGradeLaddersBridge({ workspaceId, children }: { workspaceId:
       // Mutations intentionally have no unmount AbortSignal: acceptance may precede navigation.
       const detail = await operation()
       if (!alive.current) throw new Error('The workspace changed before the server response arrived. Reopen this ladder to check its saved state.')
+      if (accessStarted !== accessRef.current.stamp) throw new CloudAccessChangedError()
       remember(detail, sequence)
       return detail
     } catch (caught) {
@@ -235,7 +247,10 @@ export function RealGradeLaddersBridge({ workspaceId, children }: { workspaceId:
       throw caught
     } finally {
       mutating.current = false
-      if (alive.current) { setPending(false); mutationGuard.release(); void parent.cloud?.refreshWorkspaces().catch(() => undefined) }
+      if (alive.current) {
+        setPending(false); mutationGuard.release()
+        void parent.cloud?.refreshWorkspaces().catch(caught => setError(`Workspace access refresh failed: ${caught instanceof Error ? caught.message : 'Try refreshing access again.'}`))
+      }
     }
   }
 
@@ -284,13 +299,15 @@ export function RealGradeLaddersBridge({ workspaceId, children }: { workspaceId:
     const match = locateTarget(target)
     const previousOperation = pendingLifecycleRef.current.find((item) => item.target.kind === target.kind && item.target.id === target.id)
     if (!match && !previousOperation) return parent.changeLifecycle(target, action)
-    if (!canManage) throw new Error('Only owners and editors can manage grade lifecycle.')
+    if (!accessRef.current.canManage) throw new Error('Only Owners and Editors can manage grade lifecycle.')
     if (mutating.current) throw new Error('Wait for the current grade request.')
     if (previousOperation && action !== previousOperation.operation.action) throw new Error('Finish the incomplete lifecycle operation before choosing another action.')
     let authorized = false
     await mutationGuard.leave(() => { authorized = true })
     if (!authorized) throw new Error('Lifecycle change cancelled to preserve unsaved grade changes.')
     await parent.cloud?.flushSave()
+    if (!accessRef.current.canManage) throw new Error('Your workspace access changed. Grade lifecycle changes are stopped.')
+    const accessStarted = accessRef.current.stamp
     const id = previousOperation?.ladderId ?? match!.family.ladder.id
     const grade = previousOperation ? previousOperation.grade : match!.grade
     const name = previousOperation?.name ?? (grade === undefined ? match!.family.ladder.name : `${match!.family.ladder.name} · GS-${grade}`)
@@ -308,12 +325,14 @@ export function RealGradeLaddersBridge({ workspaceId, children }: { workspaceId:
       }
     }
     if (!etag) throw new Error('The current lifecycle ETag is unavailable. Refresh this operation before retrying.')
+    if (accessStarted !== accessRef.current.stamp) throw new CloudAccessChangedError()
     mutating.current = true; mutationGuard.hold(); setPending(true); epoch.current++
     const sequence = ++readSequence.current
     reads.current.forEach((controller) => controller.abort()); reads.current.clear(); listPromise.current = null
     try {
       const result = await api.changeGradeLifecycle(workspaceId, id, action, etag, grade)
       if (!alive.current) throw new Error('The workspace changed before the lifecycle response. Reopen it to verify the result.')
+      if (accessStarted !== accessRef.current.stamp) throw new CloudAccessChangedError()
       if (result.pending || (result.operation && result.operation.status !== 'complete')) {
         const operation = result.operation ?? { id: target.id, action, status: 'pending' as const, updatedAt: new Date().toISOString() }
         setPendingLifecycle((current) => [...current.filter((item) => !(item.ladderId === id && item.grade === grade)), {
@@ -356,11 +375,13 @@ export function RealGradeLaddersBridge({ workspaceId, children }: { workspaceId:
       mutating.current = false
       if (alive.current) {
         setPending(false); mutationGuard.release()
-        void refresh(); void parent.cloud?.refreshWorkspaces().catch(() => undefined)
+        void refresh()
+        void parent.cloud?.refreshWorkspaces().catch(caught => setError(`Workspace access refresh failed: ${caught instanceof Error ? caught.message : 'Try refreshing access again.'}`))
       }
     }
   }
   async function guardedRead<T>(id: string, load: () => Promise<T>, signal?: AbortSignal): Promise<T> {
+    if (!accessRef.current.readable) throw new Error('Workspace access is no longer available.')
     const started = epoch.current
     const sequence = ++readSequence.current
     const result = await load()
@@ -416,6 +437,7 @@ export function RealGradeLaddersBridge({ workspaceId, children }: { workspaceId:
     },
     approve: (id, grade, input, etag) => mutate(() => api.approveGrade(workspaceId, id, grade, input, etag), id, grade),
     versions: async (id, grade, signal) => {
+      if (!accessRef.current.readable) throw new Error('Workspace access is no longer available.')
       const started = epoch.current
       const sequence = ++readSequence.current
       const records = await api.listAllGradeVersions(workspaceId, id, grade, signal)

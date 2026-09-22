@@ -841,7 +841,9 @@ for (const kind of ['job', 'resume', 'reference']) {
           element(ui.RealResumesContext.Provider, { value: resumes },
             element(ui.GradeLaddersContext.Provider, { value: grades },
               element(ui.MemoryRouter, { initialEntries: [route], future: { v7_startTransition: true, v7_relativeSplatPath: true } }, view))))))
-      await until(() => document.body.textContent.includes(evidence), `${kind} extracted evidence stays readable`)
+      if (kind === 'resume' && !role) {
+        await until(() => !document.body.textContent.includes(evidence), 'A removed workspace membership hides cached resume evidence')
+      } else await until(() => document.body.textContent.includes(evidence), `${kind} extracted evidence stays readable for current members`)
     }
     await show('viewer')
     assert.equal(document.querySelector('a[download]'), null, 'An owner role in another workspace cannot authorize this source')

@@ -55,7 +55,7 @@ async function features(t, config, dependencies) {
 
 const headers = {
   'x-ms-client-principal': Buffer.from(JSON.stringify({
-    auth_typ: 'aad', claims: [{ typ: 'tid', val: tenant }, { typ: 'oid', val: user }],
+    auth_typ: 'aad', claims: [{ typ: 'tid', val: tenant }, { typ: 'oid', val: user }, { typ: 'roles', val: 'Score.User' }],
   })).toString('base64'),
 }
 const configured = { container: 'records', blobContainer: 'sources' }

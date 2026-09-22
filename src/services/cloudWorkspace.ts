@@ -62,6 +62,80 @@ export class CloudTimeoutError extends CloudApiError {
   }
 }
 
+export class CloudAccessChangedError extends CloudApiError {
+  constructor() {
+    super('forbidden', 'Workspace access changed while this request was in progress. Its result was not applied to this tab. A submitted change may already have been accepted; refresh saved access and content before explicitly retrying.', 403)
+    this.name = 'CloudAccessChangedError'
+  }
+}
+
+export const CLOUD_ACCESS_REFRESH_EVENT = 'score-cloud-access-refresh'
+
+export function workspaceAccessStamp(workspace?: WorkspaceSummary): string {
+  return JSON.stringify([workspace?.id, workspace?.role, workspace?.accessSource, workspace?.archivedAt, workspace?.deletedAt, workspace?.lifecycleOperation])
+}
+
+type AccessEntry = { workspace: WorkspaceSummary; stamp: string; controller: AbortController }
+let sessionAccess: { identity: string; applicationAdmin: boolean; canCreateWorkspaces: boolean } | null = null
+let capabilityController = new AbortController()
+let workspaceAccess = new Map<string, AccessEntry>()
+const accessRefreshRequired = new Set<string>()
+
+/** Installed only by the authenticated app. Local samples and isolated service consumers are unchanged. */
+export function setCloudSessionAccess(session: CloudSession | null): void {
+  const identity = session ? JSON.stringify([session.user.tenantId, session.user.id]) : ''
+  const sameIdentity = sessionAccess?.identity === identity
+  if (!sameIdentity || sessionAccess?.applicationAdmin !== (session?.capabilities?.applicationAdmin === true) ||
+    sessionAccess?.canCreateWorkspaces !== (session?.capabilities?.canCreateWorkspaces === true)) {
+    capabilityController.abort(new CloudAccessChangedError())
+    capabilityController = new AbortController()
+  }
+  const next = new Map<string, AccessEntry>()
+  for (const workspace of session?.workspaces ?? []) {
+    if (workspace.deletedAt) continue
+    const existing = sameIdentity ? workspaceAccess.get(workspace.id) : undefined
+    const stamp = workspaceAccessStamp(workspace)
+    next.set(workspace.id, existing?.stamp === stamp ? existing : { workspace, stamp, controller: new AbortController() })
+  }
+  for (const [id, entry] of workspaceAccess) {
+    if (next.get(id) !== entry) entry.controller.abort(new CloudAccessChangedError())
+  }
+  workspaceAccess = next
+  accessRefreshRequired.clear()
+  sessionAccess = session ? {
+    identity, applicationAdmin: session.capabilities?.applicationAdmin === true,
+    canCreateWorkspaces: session.capabilities?.canCreateWorkspaces === true,
+  } : null
+}
+
+export function cloudAccessRequestSignal(path: string, init: RequestInit = {}): AbortSignal | undefined {
+  if (!sessionAccess) return
+  const mutating = !['GET', 'HEAD', 'OPTIONS'].includes((init.method ?? 'GET').toUpperCase())
+  if (path.startsWith('/admin/') && !sessionAccess.applicationAdmin) throw new CloudApiError('forbidden', 'Application administrator access is required. Workspace ownership does not grant application administration.', 403)
+  if (path === '/workspaces' && mutating && !sessionAccess.canCreateWorkspaces) throw new CloudApiError('forbidden', 'An application administrator must grant you permission to create workspaces. Existing workspace access is unchanged.', 403)
+  if (path.startsWith('/admin/') || (path === '/workspaces' && mutating)) return capabilityController.signal
+  const match = /^\/workspaces\/([^/?]+)(\/[^?]*)?(?:\?|$)/.exec(path)
+  if (!match) return
+  const id = decodeURIComponent(match[1])
+  const entry = workspaceAccess.get(id)
+  if (!entry) throw new CloudApiError('not_found', 'This workspace is no longer available to your account. Refresh access or contact a workspace owner or application administrator.', 404)
+  const ownerOnly = /^\/(?:members|share-candidates)(?:\/|$)/.test(match[2] ?? '') ||
+    (mutating && (!match[2] || match[2] === '/lifecycle'))
+  if (ownerOnly && entry.workspace.role !== 'owner') throw new CloudApiError('forbidden', 'Only a workspace Owner or application administrator can manage workspace access and lifecycle.', 403)
+  if (mutating && (entry.workspace.role === 'viewer' || accessRefreshRequired.has(id))) {
+    throw new CloudApiError('forbidden', 'Workspace changes are paused. Reader access cannot save edits; refresh current access before continuing. Unsaved drafts remain in this tab.', 403)
+  }
+  return entry.controller.signal
+}
+
+export function reportCloudAccessFailure(path: string, error: unknown) {
+  if (!sessionAccess || !(error instanceof CloudApiError) || error instanceof CloudAccessChangedError || ![401, 403, 404].includes(error.status)) return
+  const match = /^\/workspaces\/([^/?]+)/.exec(path)
+  if (!match && !(path.startsWith('/admin/') && error.status !== 404)) return
+  if (match && error.status !== 404) accessRefreshRequired.add(decodeURIComponent(match[1]))
+  if (typeof window !== 'undefined') window.dispatchEvent(new window.Event(CLOUD_ACCESS_REFRESH_EVENT))
+}
+
 export class LifecycleOperationError extends Error {
   readonly operation: LifecycleOperation
   constructor(operation: LifecycleOperation) {
@@ -147,11 +221,12 @@ async function unwrap<T>(response: Response): Promise<T> {
 }
 
 async function cloudRequest<T>(path: string, init: RequestInit, read: (response: Response) => Promise<T>): Promise<T> {
+  const accessSignal = cloudAccessRequestSignal(path, init)
   const headers = new Headers(init.headers)
   headers.set(SCORE_REQUEST_HEADER, 'workspace')
   if (init.body !== undefined && !headers.has('Content-Type')) headers.set('Content-Type', 'application/json')
   const deadline = AbortSignal.timeout(30000)
-  const signal = init.signal ? AbortSignal.any([init.signal, deadline]) : deadline
+  const signal = AbortSignal.any([...(init.signal ? [init.signal] : []), ...(accessSignal ? [accessSignal] : []), deadline])
   try {
     signal.throwIfAborted()
     const response = await fetch(`/api${path}`, {
@@ -166,7 +241,9 @@ async function cloudRequest<T>(path: string, init: RequestInit, read: (response:
     if (reason instanceof Error && reason.name === 'TimeoutError') {
       throw new CloudTimeoutError(!['GET', 'HEAD', 'OPTIONS'].includes((init.method ?? 'GET').toUpperCase()))
     }
+    if (accessSignal?.aborted) throw accessSignal.reason
     if (init.signal?.aborted && signal.reason === init.signal.reason) throw init.signal.reason
+    reportCloudAccessFailure(path, caught)
     throw caught
   }
 }

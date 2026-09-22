@@ -1,6 +1,7 @@
-import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
+import { useCallback, useContext, useEffect, useRef, useState, type ReactNode } from 'react'
 import { LoaderCircle } from 'lucide-react'
 import { useRealAnalyses } from '../../app/real-analyses-context'
+import { WorkspaceContext } from '../../app/workspace-context'
 import type { AnalysisAssessmentDiagnostic, AnalysisFailureDiagnostic, RealAnalysisDiagnosticsPage } from '../../domain/analysis-diagnostics'
 import type { RealAnalysisComparisonDetail } from '../../domain/real-analyses'
 import type { Citation } from '../../domain/types'
@@ -14,7 +15,10 @@ interface DiagnosticProps {
 
 export function RealComparisonDiagnostics(props: DiagnosticProps) {
   const api = useRealAnalyses()
+  const cloud = useContext(WorkspaceContext)?.cloud
+  const role = cloud?.workspaces.find(item => item.id === cloud.currentWorkspaceId)?.role
   const { comparison } = props.detail
+  if (cloud && role !== 'owner' && role !== 'editor') return null
   if (!comparison.error && comparison.status !== 'failed' && !comparison.failureDiagnostic && !comparison.diagnosticCapture) return null
   const identity = JSON.stringify([
     api?.workspaceId, comparison.workspaceId, comparison.runId, comparison.id, comparison.status, comparison.attemptId,

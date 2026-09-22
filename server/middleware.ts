@@ -7,21 +7,27 @@ import type { PrincipalRequest } from './request-context'
 const MUTATING_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE'])
 const CSRF_HEADER_NAME = 'x-score-request'
 const CSRF_HEADER_VALUE = 'workspace'
+export const APPLICATION_ADMISSION_VERSION = 'entra-roles-v1'
 
 /**
  * Validates the caller's identity on every request it guards and attaches it to `req.principal`.
  * In `easyauth` mode (the only mode allowed in production/App Service) this trusts App Service Easy
  * Auth to have authenticated the request at the ingress edge, and independently validates the
- * platform-injected `x-ms-client-principal` header's content (tenant, allow-listed object ID).
+ * platform-injected `x-ms-client-principal` header's content (tenant, user ID, application roles).
  */
 export function createAuthMiddleware(config: Config): RequestHandler {
-  return (req: Request, _res: Response, next: NextFunction) => {
+  if (config.authMode === 'dev-header' && (config.isProduction || config.isAppService)) {
+    throw new Error('Developer authentication is prohibited in production or on App Service.')
+  }
+  return (req: Request, res: Response, next: NextFunction) => {
     try {
       const principal =
         config.authMode === 'dev-header'
           ? parseDevHeaderPrincipal(req.header('x-score-dev-principal'), config)
           : parseEasyAuthPrincipal(req.header('x-ms-client-principal'), req.header('x-ms-client-principal-id'), config)
       ;(req as PrincipalRequest).principal = principal
+      res.setHeader('X-Score-Admission-Version', APPLICATION_ADMISSION_VERSION)
+      res.setHeader('X-Score-Application-Roles', principal.applicationRoles!.join(','))
       next()
     } catch (error) {
       if (error instanceof AuthError) {

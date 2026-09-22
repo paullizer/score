@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import { ArrowLeft, Download, History, Layers3, LoaderCircle, RefreshCw, Save, Search, ShieldCheck, Upload } from 'lucide-react'
+import { ArrowLeft, Download, History, Layers3, LoaderCircle, RefreshCw, Save, Search, ShieldCheck, Upload, Users } from 'lucide-react'
 import type {
   AdminSettings, AdminSettingsResponse, DeploymentInventory, ModelTaskId, ModelTestResult,
   SettingsChange, SettingsFieldError, SettingsRevision, SettingsSection,
@@ -14,7 +14,7 @@ import { ThemeControl } from '../../app/ThemeControl'
 import { Badge, Button, InlineError, Modal, PageHeader, SearchField } from '../../components/ui'
 import { ModelSettingsEditor } from './ModelSettingsEditor'
 import { SettingsField } from './SettingsField'
-import { describeValue, rebaseSettingsDraft, updateSetting } from './settingsForm'
+import { describeSettingValue, rebaseSettingsDraft, updateSetting } from './settingsForm'
 
 const sections: { id: SettingsSection; title: string }[] = [
   { id: 'ai', title: 'AI deployments & tasks' }, { id: 'intake', title: 'Features & intake' }, { id: 'grades', title: 'GS ladders & references' },
@@ -29,12 +29,12 @@ function Changes({ changes, label }: { changes: SettingsChange[]; label: string 
   return <div className="settings-diff" aria-label={label}>
     {changes.length ? <table><thead><tr><th scope="col">Setting</th><th scope="col">Before</th><th scope="col">After</th></tr></thead>
       <tbody>{changes.map(change => <tr key={change.path}><th scope="row"><code>{change.path}</code></th>
-        <td><pre>{describeValue(change.before)}</pre></td><td><pre>{describeValue(change.after)}</pre></td></tr>)}</tbody></table>
+        <td><pre>{describeSettingValue(change.path, change.before)}</pre></td><td><pre>{describeSettingValue(change.path, change.after)}</pre></td></tr>)}</tbody></table>
       : <p>No settings differ.</p>}
   </div>
 }
 
-export function AdminSettingsPage({ onLeave }: { onLeave: () => void }) {
+export function AdminSettingsPage({ onLeave, onOpenUsers }: { onLeave: () => void; onOpenUsers?: () => Promise<void> }) {
   const policy = usePublicSettings()
   const [base, setBase] = useState<AdminSettingsResponse | null>(null)
   const [draft, setDraft] = useState<AdminSettings | null>(null)
@@ -188,6 +188,7 @@ export function AdminSettingsPage({ onLeave }: { onLeave: () => void }) {
     <header className="settings-header">
       <span className="cloud-gate-brand"><Layers3 size={20} />{appearance.applicationTitle}</span>
       <div className="flex flex-wrap items-center gap-3"><Badge tone="accent"><ShieldCheck size={13} />Application administrator</Badge><ThemeControl />
+        {onOpenUsers && <Button icon={Users} onClick={() => void onOpenUsers()}>Users / user access</Button>}
         <Button icon={ArrowLeft} onClick={() => { void guard.leave(onLeave) }}>Back to workspaces</Button></div>
     </header>
     <main id="admin-settings-content" className="settings-main">

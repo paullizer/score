@@ -304,7 +304,7 @@ ContainerAppConsoleLogs
 
 ### Analysis report exports
 
-Choose **Export report** from a real or sample analysis, including while inspecting an individual comparison. The default is the **entire grouped analysis**, not just the open comparison. A multi-target run can be narrowed to one exact saved job or grade. Workspace viewers can export the history they are authorized to read; new-run readiness and Word-upload admission do not control historical exports.
+Choose **Export report** from a real or sample analysis, including while inspecting an individual comparison. The default is the **entire grouped analysis**, not just the open comparison. A multi-target run can be narrowed to one exact saved job or grade. Workspace Readers can export the history they are authorized to read, subject to application export policy; new-run readiness and Word-upload admission do not control historical exports.
 
 Archived analyses remain exportable for authorized readers. Analyses being permanently deleted or already removed cannot be exported; deletion or loss of read access cancels an open export rather than downloading stale cached evidence. Table search and sort controls do not silently narrow the report's explicit export scope.
 
@@ -345,7 +345,9 @@ This release retains private immutable captures and results until an authorized 
 
 ## Application administration
 
-Cloud deployments expose **Admin settings** at `/admin/settings` to explicitly designated application administrators. Workspace ownership and ordinary sign-in admission do not grant this role. Administration does not grant access to anybody else's private workspaces or documents. The route is application-wide and can be used without an active workspace; the standalone sample application does not save cloud configuration.
+Cloud deployments expose **Admin settings** at `/admin/settings` to users whose trusted Entra claims contain `Score.Admin`. Workspace ownership and `Score.User` admission do not grant this role. Application administrators have Owner-equivalent access to every workspace in the deployment's tenant, even without an explicit membership; an explicit Reader membership does not reduce that access. Administration is application-wide and can be used without an active workspace; the standalone sample application does not save cloud configuration.
+
+**User access** manages explicit, per-person workspace-creation grants independently of Admin settings. Every non-admin, including an existing workspace owner, needs such a grant before creating another workspace. Administrators may create without an individual grant, but `workspaces.allowCreation=false` stops creation for everyone, including administrators. Revoking a creation grant does not remove existing memberships. Application administrators remain an Entra designation, not a setting that Score can assign to itself.
 
 The page groups task models, intake and feature admission, GS references, processing and summaries, reports and appearance, access policies, and operational history. Fields explain their units, bounds, prerequisites, and activation. Current limits elsewhere in this README describe the initial defaults and immutable implementation ceilings; an administrator can choose a lower operating policy without making older records unreadable.
 
@@ -359,7 +361,7 @@ The page groups task models, intake and feature admission, GS references, proces
 | Presentation | Application title, theme default, initial page, announcement, help links, sample visibility, and polling defaults do not overwrite saved personal theme preferences or explicit deep links. |
 | Workspace and summary permissions | Workspace creation and the existing summary-history/manual-publication actions can be restricted. Published evidence and required human-review disclosures are not optional. |
 
-Azure resource IDs/endpoints, the administrator roster, credentials, regional capacity, worker scheduling, and safety boundaries are deployment-controlled, not arbitrary editable URLs or secret fields. The application uses managed identity. Deployment inventory refresh discovers models; it does **not** provision them. Explicit synthetic model tests may incur Azure charges, contain no private workspace evidence, and do not save a draft. An API-side test is not proof that every worker identity is healthy.
+Azure resource IDs/endpoints, Entra role assignments, credentials, regional capacity, worker scheduling, and safety boundaries are deployment-controlled, not arbitrary editable URLs or secret fields. The application uses managed identity. Deployment inventory refresh discovers models; it does **not** provision them. Explicit synthetic model tests may incur Azure charges, contain no private workspace evidence, and do not save a draft. An API-side test is not proof that every worker identity is healthy.
 
 The trusted adapter catalog fails closed for unknown model names/versions rather than enabling every GPT model by prefix. Luna's explicitly supported `2026-07-09` profile follows the published [Azure model capabilities](https://learn.microsoft.com/en-us/azure/foundry/foundry-models/concepts/models-sold-directly-by-azure#gpt-56) and [reasoning API support](https://learn.microsoft.com/en-us/azure/foundry/openai/how-to/reasoning#api-and-feature-support). Its model limits do not raise Score's per-task implementation budgets. The existing structured-output Chat Completions path uses no function tools; supported reasoning choices remain the app's low/medium/high subset, not unsupported `minimal` or newly exposed parameter modes.
 
@@ -375,14 +377,14 @@ New nested GS reference entries retain source-settings revision IDs rather than 
 
 ### Granting administrators and provisioning models
 
-`SCORE_ADMIN_USER_IDS` is an explicit comma-separated list of Entra **object IDs**, scoped to the configured tenant and contained within the application's sign-in allowlist. Empty means no administrators. The supplied deployment currently admits one sign-in user, so its administrator list can contain that user or be empty.
+Assign `Score.Admin` to explicitly selected tenant users or groups in the Score Enterprise Application. The deployment bootstrap requires at least one explicit **user object ID**; it never infers that the deployment operator or everyone on a previous allowlist is an administrator. `Score.Admin` alone admits a user; adding `Score.User` is not required.
 
 ```powershell
-.\scripts\deploy.ps1 -ProvisionOnly -AdminUserIds @('<allowed-user-object-id>')
+.\scripts\deploy.ps1 -ProvisionOnly -BootstrapAdminUserIds @('<explicit-admin-object-id>')
 .\scripts\deploy.ps1 -DeployOnly
 ```
 
-The script preserves a previously configured `AZURE_ADMIN_USER_IDS` when `-AdminUserIds` is omitted. Explicit `-AdminUserIds @()` removes grants at the next provisioning step. Read failures do not clear the saved roster. This is a deployment operation, not self-service promotion.
+The script preserves `AZURE_BOOTSTRAP_ADMIN_USER_IDS` when that parameter is omitted. The old `-AdminUserIds` parameter remains an explicit-input alias, but saved `AZURE_ADMIN_USER_IDS` is **not** silently migrated. Empty bootstrap administrator lists fail. Optional `-ScoreUserIds`, `-ScoreUserGroupIds`, and `-ScoreAdminGroupIds` assign their named roles. Group IDs grant application admission/administration, not group workspace membership. Provisioning adds missing assignments idempotently and preserves existing assignment IDs; removing an ID from a bootstrap input does not revoke its Entra assignment. To revoke a bootstrap admin deliberately, first replace the saved bootstrap roster, then remove the corresponding assignment in Entra. Score's runtime has no permission to assign these roles.
 
 `infra\main.parameters.json` includes an initially empty `additionalModelDeployments` array. Operators may add entries with `name`, `modelName`, `modelVersion`, `sku` (`DataZoneStandard` or regional `Standard`), positive `capacity`, and `versionUpgradeOption` (`NoAutoUpgrade`, `OnceCurrentVersionExpired`, or `OnceNewDefaultVersionAvailable`). Use distinct deployment names and do not repeat the reserved `job-rubric` deployment. Availability/quota, model capability, and processing boundaries must be checked before provisioning. All entries are children of the existing Score AI account; there is no second provider or arbitrary endpoint. After provisioning, refresh the admin deployment inventory and assign compatible deployments to tasks.
 
@@ -395,10 +397,10 @@ Sign in to the intended Microsoft Entra tenant with both tools, then run:
 ```powershell
 az login
 azd auth login
-.\scripts\deploy.ps1
+.\scripts\deploy.ps1 -BootstrapAdminUserIds @('<explicit-admin-object-id>')
 ```
 
-The script defaults to subscription `9698dd71-9367-49c2-bede-fd0deecfad62`, location `northcentralus`, environment `score-demo`, resource group `rg-score-demo-ncus`, and application user `paullizer@retroburn.cloud`. It does not change the Azure CLI's global subscription selection. Deployment requires resource/RBAC provisioning rights and directory permissions to create the application registration, assign its user role, and grant that user basic sign-in consent.
+The script defaults to subscription `9698dd71-9367-49c2-bede-fd0deecfad62`, location `northcentralus`, environment `score-demo`, resource group `rg-score-demo-ncus`, and initial guarded-ingress user `paullizer@retroburn.cloud`. It does not change the Azure CLI's global subscription selection. Deployment requires resource/RBAC provisioning rights and privileged Entra administration to maintain the application registration, assign user/group roles, grant basic tenant sign-in consent, and approve the API managed identity's read-only Graph application permissions. These are explicit operator operations, not permissions granted to the running app.
 
 For separate provisioning or application updates:
 
@@ -415,7 +417,33 @@ azd deploy web --environment score-demo --no-prompt
 azd env get-value AZURE_APP_SERVICE_URL --environment score-demo
 ```
 
-`azure.yaml` and `infra\` define the deployment. The pre-deployment gate refuses to publish an application unless HTTPS, required Easy Auth, the configured tenant/user restriction, and the Key Vault authentication reference are active. Only `/healthz` bypasses sign-in, and it reports no user data.
+`azure.yaml` and `infra\` define the deployment. The pre-deployment gate validates HTTPS, tenant-specific issuer/audience validation, required Easy Auth, the explicit guarded/released ingress stage, the assignment-required Enterprise Application, both stable Score roles, explicit bootstrap admins, read-only Graph consent, the isolated tenant-partitioned access container, and the Key Vault authentication reference. It also runs an offline contract check against the current API/SPA auth middleware. Only `/healthz` bypasses sign-in, and it reports no user data. Neither provisioning nor deployment automatically releases the legacy ingress guard.
+
+### Safe workspace-sharing rollout and rollback
+
+Repository changes do **not** imply that live Azure/Entra configuration or existing users have been migrated. Serialize this rollout with all other deployments; preserve current image pins, role assignments, and storage.
+
+1. **Prepare under the guard.** Run `deploy.ps1 -ProvisionOnly -BootstrapAdminUserIds @('<explicit-admin-object-id>')` with an authorized operator. Existing `Score.User` UUID `e859daa1-e9fa-426a-b79d-6d136d459222` and all assignment IDs are preserved. Provisioning adds stable `Score.Admin` UUID `156757cb-0797-409c-931b-c711ccc8bdde`, requires Enterprise Application assignment, creates `application-access`, and grants only the API identity the approved Graph permissions. `AZURE_SCORE_ADMISSION_STAGE=guarded` retains the original single-user Easy Auth restriction. The old runtime allowlist setting is retained only for the still-running legacy image; new code ignores it. No existing owner is given an implicit creation grant.
+2. **Deploy role-aware readers first.** Run `deploy.ps1 -DeployOnly` and let all existing worker/readiness gates finish. API and SPA must now enforce `Score.User` or `Score.Admin`; keep the ingress restriction in place. Inspect actual mapped role claims using a fresh Easy Auth login. Verify User-only, Admin-only, both, missing/unknown roles, wrong tenant, and a directly assigned group in a controlled environment. Entra assignment changes require normal session/claim refresh. Subscription access is not application access.
+3. **Verify the guarded live build.** The HTTPS `/healthz` response must be 200, report `ok`/`ready`, and carry `X-Score-Access-Control: entra-roles-v1`; legacy builds or developer-auth deployments cannot pass that marker check. Then use the guarded user's current Easy Auth session for both `/api/session` and `/`. Responses must contain `X-Score-Admission-Version: entra-roles-v1` and exact `X-Score-Application-Roles` values. The script verifies explicit bootstrap Admin assignments independently in Graph; the guarded verification identity itself may have either Score role. Confirm admin access, first-login empty state, eligible pre-login recipients, and normal existing-workspace reads before widening ingress.
+4. **Release explicitly.** Supply the cookie only in the operator process, never in saved azd values, source files, screenshots, or logs. The cookie is a temporary deployment-verification credential, not a Graph token. After completing the role checks, run:
+
+   ```powershell
+   $cookie = Read-Host 'Current AppServiceAuthSession cookie (name=value)' -AsSecureString
+   $env:SCORE_ROLE_VERIFICATION_COOKIE = [System.Net.NetworkCredential]::new('', $cookie).Password
+   try {
+     node scripts\azure-auth.mjs release-ingress --verified-role-claims
+     if ($LASTEXITCODE -ne 0) { throw 'Ingress release was not verified.' }
+   } finally {
+     Remove-Item Env:\SCORE_ROLE_VERIFICATION_COOKIE -ErrorAction SilentlyContinue
+     $cookie = $null
+   }
+   ```
+
+   Release revalidates Entra, runtime settings, role-aware health/readiness, and successful role-bearing API **and** SPA responses before changing Easy Auth. It rereads the resulting ingress configuration and saves `AZURE_SCORE_ADMISSION_STAGE=roles` plus the verified image/timestamp. Do not manually set these markers. Subsequent provisioning preserves the released stage instead of silently restoring the single-user restriction. Subsequent full deployments require a fresh process-only verification cookie: predeploy checks the currently verified image and postdeploy verifies the new image before updating its proof. Failed/expired verification blocks completion; it is not permission to bypass the gate. Interrupted marker saves can be recovered by rerunning the explicit verification/release command against the current role-aware image.
+5. **Check after release.** Confirm the intended direct users, direct group members, and Admin-only users can sign in; unassigned users and nested-group-only users must not. Check Graph paging/consent and individually managed creation/sharing permissions. Graph propagation and normal Entra claim refresh are not instant global revocation.
+
+**Rollback ordering is mandatory:** first run `node scripts\azure-auth.mjs restore-guard` and confirm it restored the configured single-user ingress restriction. This clears the release markers. While guarded, restore the legacy image's required runtime settings, including its exact `SCORE_ALLOWED_USER_IDS` and, only if needed and explicitly approved, its previous `SCORE_ADMIN_USER_IDS`. Only then deploy a compatible prior image using a separately reviewed rollback procedure; the new deployment hook deliberately refuses a legacy parser. Never put a legacy image behind released role-based ingress. Retain the new containers, assignments, and current workspace data; there is no reverse content migration. If an ARM update or verification is ambiguous, inspect/restore the guard and do not proceed with a legacy deployment until it is confirmed.
 
 Provisioning creates separate job/grade/resume/analysis Cosmos and private Blob stores, dedicated worker identities, and the existing shared Document Intelligence/model/isolated-renderer services. No extra model, Search index, or LinkedIn resource is introduced for resumes. The postdeploy hook builds the renderer and one shared worker image containing four independent worker entry points, waits for the renderer's latest revision, and validates the registry, identities, store boundaries, and processing-service configuration.
 
@@ -453,7 +481,7 @@ Serialize provisioning and deployments; do not reuse or overwrite fresh image ta
 
 Absent environment flags disable the corresponding gated real feature. `/api/features` reports configured availability and authoritative import/analysis limits without a sample fallback; its `realAnalyses` field indicates readiness for **new runs**, not the existence of saved history. `markdownJobImports` and `markdownResumeImports` follow the availability of their respective real services without a new global flag. `wordDocumentImports` is true only when the explicit Word flag and at least one real job/resume service are available. Missing or false format-capability fields disable their respective uploads; older APIs lacking all of them remain **PDF-only**. The Word gate controls new Word admissions, never stored source/schema support or Markdown availability. Disabling a source feature does not disable authorized historical analysis operations when the analysis API itself remains enabled.
 
-Cosmos and Blob names must be distinct across all five workspace/job/grade/resume/analysis stores, including inactive-feature defaults. The API uses `COSMOS_ENDPOINT`, `COSMOS_DATABASE`, and `STORAGE_ACCOUNT_URL`; workers receive only their own store names and dedicated managed identity. All workers reuse `RUBRIC_MODEL_ENDPOINT`, `RUBRIC_MODEL_DEPLOYMENT`, `RUBRIC_MODEL_NAME`, and `RUBRIC_MODEL_REASONING_EFFORT`. Only extraction workers receive `DOCUMENT_INTELLIGENCE_ENDPOINT` and internal `JOB_RENDERER_URL`. New execution bounds are `RESUME_WORKER_MAX_ITEMS=5` and `ANALYSIS_WORKER_MAX_ITEMS=2`, with a 900-second job timeout, one replica, and no platform retry loop; durable item-level backoff handles transient failures and shared-model throttling.
+Cosmos names must be distinct across workspace/job/grade/resume/analysis, application settings, and application access stores, including inactive-feature defaults; content Blob names must likewise be distinct. The API uses `COSMOS_ENDPOINT`, `COSMOS_DATABASE`, and `STORAGE_ACCOUNT_URL`; workers receive only their own store names and dedicated managed identity. The API-only pair `SCORE_ACCESS_CONTAINER=application-access` and `SCORE_ENTRA_SERVICE_PRINCIPAL_ID=<Score-enterprise-app-object-id>` must be configured together. The ID is the Score **service principal object ID**, not its client ID or the API managed identity ID. All workers reuse `RUBRIC_MODEL_ENDPOINT`, `RUBRIC_MODEL_DEPLOYMENT`, `RUBRIC_MODEL_NAME`, and `RUBRIC_MODEL_REASONING_EFFORT`. Only extraction workers receive `DOCUMENT_INTELLIGENCE_ENDPOINT` and internal `JOB_RENDERER_URL`. New execution bounds are `RESUME_WORKER_MAX_ITEMS=5` and `ANALYSIS_WORKER_MAX_ITEMS=2`, with a 900-second job timeout, one replica, and no platform retry loop; durable item-level backoff handles transient failures and shared-model throttling.
 
 Deploy matching web/API and analysis-worker builds when changing the comparison limit. Both validate saved runs and manifests; a frontend-only update does not enable larger analyses.
 
@@ -463,7 +491,7 @@ Explicit local worker testing is separate from the standalone fictional Vite dem
 | --- | --- |
 | App Service | One Linux Basic B3 instance (4 vCPUs, 7 GB RAM) serving the React SPA and authenticated workspace API |
 | Container Registry | Basic registry; managed-identity image pulls, no registry administrator password |
-| Cosmos DB | Serverless workspace directory/membership and separate `job-records`, `grade-records`, `resume-records`, and `analysis-records` durable records/work queues, all partitioned by `/workspaceId` |
+| Cosmos DB | Serverless workspace directory/membership and feature records partitioned by `/workspaceId`; separate settings partitioned by `/applicationId` and API-only `application-access` grants/audit records partitioned by `/tenantId` |
 | Blob Storage | Private `workspace-state`, `job-sources`, `grade-sources`, `resume-sources`, `analysis-sources`, `documents`, and `knowledge` containers; shared-key access disabled |
 | Microsoft Foundry | AI Services account/project, GPT-5 mini rubric deployment, and managed-identity Search/Blob connections |
 | Document Intelligence | Existing S0 resource for PDF layout/text extraction and OCR, plus DOCX text extraction (not Word image OCR) |
@@ -505,9 +533,31 @@ Correlate slow request operation IDs with `AppDependencies` and the bounded anal
 
 ### Authentication and credential rotation
 
-The Entra application is tenant-only and requires an assigned `Score.User` application role. The configured user is assigned that role and granted only basic `openid`, `profile`, and `email` sign-in consent for that user. Easy Auth and the API independently restrict access using immutable object/tenant IDs, not email addresses. Workspace membership is checked server-side on every operation.
+The Entra application is tenant-only, **requires Enterprise Application assignment**, and admits exact `Score.User` **or** `Score.Admin` application-role claims. Admin alone works. Basic `openid`, `profile`, and `email` sign-in consent covers assigned users; it is not directory write consent. Easy Auth validates issuer/audience/HTTPS, and the shared API/SPA middleware independently validates tenant, immutable object ID, and standard/mapped role claims. Missing/unrecognized roles, inconsistent identity claims, wrong tenants, and app-only identities are rejected. Names and email addresses identify people in the UI; they are never authorization keys.
 
-Choose `paullizer@retroburn.cloud` at the browser account picker. Other cached accounts, including a Microsoft work account, are not automatically granted access merely because they can manage the Azure subscription. Azure CLI application-token consent is separate from browser sign-in and is not enabled by this deployment.
+Users can receive application roles directly or through a directly assigned Entra group. Group assignment requires the applicable [Entra ID P1/P2 license](https://learn.microsoft.com/en-us/entra/identity/enterprise-apps/assign-user-or-group-access-portal); nested-group membership does not confer the assigned application's role. Existing tenant guests are eligible only when they already have Score admission. Score does not invite guests, assign Entra roles, or turn groups into workspace recipients.
+
+`SCORE_ALLOWED_USER_IDS` and `SCORE_ADMIN_USER_IDS` are no longer runtime authorization inputs. Existing values are ignored by the role-aware configuration during the staged upgrade; provisioning removes the retired administrator setting. Role and group changes follow **normal Entra session/token refresh**, not a live Graph check on every content request. Refresh/re-authenticate after a change. Current Score memberships and individual creation grants are instead rechecked on subsequent relevant requests. Revocation cannot recall files or text already delivered.
+
+For explicit local API development only, set `SCORE_AUTH_MODE=dev-header` and `SCORE_DEV_USER_ROLES` to a JSON map such as `{"<tenant-user-object-id>":["Score.User"],"<other-object-id>":["Score.Admin"]}`. Send `X-Score-Dev-Principal: <configured-tenant-id>:<configured-user-object-id>`. Roles come from that local configuration, never the request header. There is no fallback to a production allowlist; `dev-header` is rejected in production and on App Service. Standalone Vite samples need none of these identities.
+
+#### Eligible-user directory and Graph consent
+
+Directory lookup is server-only, using the API's managed identity. The read-only adapter enumerates assignments to this Score service principal, merges duplicate direct/group-derived roles, expands **direct user members only**, and retrieves just ID, display name, mail, and UPN for identification. Recipients need not have signed in before. Unrelated roles/applications, groups as recipients, and service principals are excluded. Search is restricted to eligible profiles; application administrators may browse creation-grant recipients, and workspace Owners/Admins may browse sharing recipients. Readers/Editors do not receive unrestricted directory access. Grant/add/promotion operations revalidate the selected immutable object ID rather than trusting the browser's search result.
+
+The privileged post-provision operation `node scripts\azure-auth.mjs consent-directory` resolves and grants these exact **application** permissions on the API managed identity:
+
+| Permission | Operation and reference |
+| --- | --- |
+| `Application.Read.All` | Score role definitions and [service-principal application-role assignments](https://learn.microsoft.com/en-us/graph/api/serviceprincipal-list-approleassignedto?view=graph-rest-1.0) |
+| `GroupMember.ReadBasic.All` | [Direct assigned-group member enumeration](https://learn.microsoft.com/en-us/graph/api/group-list-members?view=graph-rest-1.0), using the current documented least-privileged permission |
+| `User.Read.All` | [Selected eligible user-profile fields](https://learn.microsoft.com/en-us/graph/api/user-get?view=graph-rest-1.0) |
+
+No `Directory.Read.All`, broad/write fallback, or role-assignment permission is requested. Unsupported permission definitions, unapproved existing Graph grants, or failed consent stop provisioning. Hidden-membership groups additionally require a separate explicit approval via `deploy.ps1 -ConsentHiddenGroupMembership` (`AZURE_SCORE_CONSENT_HIDDEN_MEMBERSHIP=true`) for `Member.Read.Hidden`; ordinary provisioning never silently adds it. Missing consent or a denied group page is an error, not an incomplete eligible-user list. Application workers and the renderer receive neither these Graph grants nor access-store permissions.
+
+All Graph pages are followed with strict HTTPS origin/resource validation, redirects disabled, bounded timeouts, and bounded `Retry-After` handling. An incomplete lookup fails explicitly. Application results are paged without a user/member quota; opaque, query-bound five-minute cursors keep Graph continuation URLs server-side. A changed/expired cursor requires a new search. Fresh grant-time lookups bypass those snapshots. Directory changes can have Graph replication delays. Graph outages may prevent searching or verifying a new grant, but must not block independently authorized existing content reads or revocation of an existing Score grant/membership. Graph tokens never reach the browser.
+
+The `application-access` Cosmos container keeps per-user creation grants and minimal access-change audit data out of settings import/export and worker-readable content. It uses `/tenantId` partitioning; only the API runtime identity is granted access. Provisioning preserves existing content, memberships, role UUIDs, and assignment IDs.
 
 The login credential is generated in memory and written directly to Key Vault; it is never printed, put into azd environment values, or committed. Credentials last 180 days. Provisioning reuses valid credentials and rotates them when fewer than 30 days remain. To rotate proactively:
 
@@ -517,17 +567,28 @@ node scripts\azure-auth.mjs configure --rotate
 
 This refreshes App Service's versionless Key Vault reference. `.azure\` and local environment files are excluded from Git and the Docker build context. Do not publish those files or paste token/secret output into logs.
 
-### Cloud workspaces and future groups
+### Cloud workspaces and individual sharing
 
-The cloud build uses `VITE_DEPLOYMENT_MODE=cloud`. It never falls back to local fixtures if authentication or cloud storage fails. Each user can create, rename, switch, archive, unarchive, and delete personal workspaces. Cloud links include `/workspaces/<id>/` so a bookmark cannot silently resolve against a different selected workspace.
+The cloud build uses `VITE_DEPLOYMENT_MODE=cloud`. It never falls back to local fixtures if authentication or cloud storage fails. Signing in or refreshing a session does **not** create a personal workspace. Users see assigned workspaces, an explicit creation action when permitted, or a no-access empty state directing them to an Owner for sharing or an application Admin for creation rights. Existing workspaces and memberships remain intact, but existing non-admin owners do not automatically receive creation grants. Cloud links include `/workspaces/<id>/` so a bookmark cannot silently resolve against a different selected workspace.
 
 Cosmos stores directory and membership documents together under the `/workspaceId` partition key. Legacy sample workspace state is stored in a private Blob rather than a single Cosmos item, avoiding Cosmos's per-item size limit. Sample saves require the current Blob ETag; metadata renames require the metadata ETag. Real job, grade, resume, and analysis mutations use separate versioned APIs and Cosmos ETags. Concurrent edits produce an explicit conflict instead of silently overwriting another session.
 
-Initialization prepares state before atomically publishing directory metadata and membership. A failed or ambiguous publication does not delete another initializer's work. Retried default-workspace creation can reuse prepared state without replacing it with samples.
+Explicit creation prepares state before atomically publishing directory metadata and the creator's Owner membership. A failed or ambiguous publication does not delete another initializer's work. Ordinary session reads are side-effect-free and never recreate a missing/deleted workspace or replace saved content with samples.
 
 Cloud mode keeps document state in memory, not browser local storage. Only theme and the last-selected workspace ID are remembered locally, with the latter scoped to tenant and user. Writes are queued and acknowledged before showing a saved state. Switching or signing out flushes pending changes and pauses browser-only demo simulations. Save failures retain the newest edits; conflict recovery is explicit.
 
-The data model reserves `group` workspaces and `owner`/`editor`/`viewer` memberships. Group creation, sharing administration, and Entra group resolution are deliberately not enabled yet. They must use these same server-side membership boundaries rather than client-side filters.
+Owners and application Admins use **Manage access** to add eligible **individual people**, change their workspace role, or remove membership. Sharing takes effect directly; there is no invitation acceptance, notification service, public link, or anonymous access. An authenticated workspace link can be copied without making its contents public. Group workspace memberships and group creation grants are not supported, even when a person receives their application role from an Entra group.
+
+| Workspace role | Capabilities (subject to application policy and lifecycle state) |
+| --- | --- |
+| Reader | Read accessible content and published evidence; download originals/export when policy permits; no editing, private diagnostics, or unpublished history |
+| Editor | Reader capabilities plus import, edit, rename content, analyze, generate summaries, and archive/restore/delete individual content |
+| Owner | Editor capabilities plus workspace rename/lifecycle and individual membership management |
+| Application Admin | Owner-equivalent effective access to all tenant workspaces, independent of explicit membership; may manage creation grants and application settings |
+
+**Reader** is the label for the existing stored/wire value `viewer`; saved memberships and role-policy settings keep their meaning without rewrites. Co-owners are peers: the original creator has no permanent privilege and may be removed or demoted once another explicit Owner remains. Membership mutations cannot remove/demote the last explicit Owner, including concurrent attempts. Implicit application Admin access is not an explicit Owner membership; an Admin can repair access when an Owner loses Entra admission. Archived workspaces still allow access management, but a conflicting pending workspace lifecycle operation freezes membership mutations.
+
+Workspace access is checked server-side, not inferred from visible buttons. The browser refreshes access on focus, directory opening, permission changes, and authorization errors, and stops unauthorized writes on downgrade/removal. Existing accepted work remains workspace-owned: removing its submitter neither cancels others' processing nor deletes results. The same membership boundaries apply to authenticated sample state; standalone fictional samples remain separate.
 
 ### Archive, search, and permanent deletion
 
@@ -546,9 +607,9 @@ Delete requires a confirmation describing the affected content. Existing analyse
 | Ladder | Removes its grade histories, approvals, reference captures, and processing artifacts, but not its independent seed job. |
 | Analysis | Removes the run, comparisons, correction heads/history, narratives, and saved input/evidence snapshots. |
 
-Workspace lifecycle changes are owner-only. Owners and editors can manage individual items; viewers can search and inspect archived content. You may archive or delete the last active workspace: the workspace picker offers creation and restoration instead of automatically rebuilding deleted samples. Standalone browser mode remains a single local demo with lifecycle controls for its sample entities, not a separate local workspace directory.
+Workspace lifecycle changes require Owner or application Admin access. Owners and Editors can manage individual items; Readers can search and inspect archived content. You may archive or delete the last active workspace: the picker offers creation only when authorized and restoration when permitted, instead of automatically rebuilding deleted samples. Standalone browser mode remains a single local demo with lifecycle controls for its sample entities, not a separate local workspace directory.
 
-Cloud changes are version-checked and coordinated with saves, imports, and workers. An interrupted cleanup remains protected and reports its pending or failed state; retry finishes the same operation instead of restoring half-deleted data. Pending workspace deletions remain discoverable by their owner until finalization commits. Server recovery also resumes unfinished workspace operations and individual deletions after the browser closes. Minimal non-content deletion markers prevent old requests, saved tabs, and default initialization from bringing deleted identities back.
+Cloud changes are version-checked and coordinated with saves, imports, and workers. An interrupted cleanup remains protected and reports its pending or failed state; retry finishes the same operation instead of restoring half-deleted data. Pending workspace deletions retain a current Owner's recovery access and remain recoverable by application Admins until finalization commits; immutable creator provenance is not a recovery privilege. Server recovery also resumes unfinished workspace operations and individual deletions after the browser closes. Minimal non-content deletion markers prevent old requests, saved tabs, and initialization from bringing deleted identities back.
 
 **Permanent deletion is irreversible through Score, not a promise of immediate physical erasure from infrastructure backups.** The existing Azure Blob policy retains service-level soft-deleted blobs for seven days. This feature does not change that account-wide retention policy or touch shared knowledge content. Archive retains the original content and is the appropriate choice when it may be needed again.
 

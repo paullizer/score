@@ -1,31 +1,35 @@
 import { setTimeout as delay } from 'node:timers/promises'
-import { client, environment, identifier, request, required } from './azure-common.mjs'
+import { client, environment, graph, identifier, request, required } from './azure-common.mjs'
+import { admissionStage, validateEasyAuth, validateRuntimeAccessSettings, verifyRoleAwareDeployment } from './azure-access.mjs'
+import { verifyEntraProvisioning } from './azure-auth.mjs'
+import { verifyAdmissionCode } from './verify-admission.mjs'
 
 async function main() {
   const env = environment()
   const credential = client(env)
   const subscription = identifier(required(env, 'AZURE_SUBSCRIPTION_ID'), 'Subscription')
-  const tenant = identifier(required(env, 'AZURE_TENANT_ID'), 'Tenant')
-  const allowedUser = identifier(required(env, 'AZURE_ALLOWED_USER_ID'), 'Allowed user')
-  const clientId = identifier(required(env, 'AZURE_AUTH_CLIENT_ID'), 'Application')
+  const stage = admissionStage(env)
   const siteId = `/subscriptions/${subscription}/resourceGroups/${required(env, 'AZURE_RESOURCE_GROUP')}/providers/Microsoft.Web/sites/${required(env, 'AZURE_APP_SERVICE_NAME')}`
   const base = `https://management.azure.com${siteId}`
   const auth = await request(credential, 'https://management.azure.com', `${base}/config/authsettingsV2?api-version=2024-11-01`)
-  const settings = auth.properties
-  const provider = settings?.identityProviders?.azureActiveDirectory
-  const principals = provider?.validation?.defaultAuthorizationPolicy?.allowedPrincipals
-  if (settings?.platform?.enabled !== true || settings?.globalValidation?.requireAuthentication !== true ||
-    settings?.httpSettings?.requireHttps !== true || provider?.enabled !== true ||
-    provider?.registration?.clientId !== clientId ||
-    provider?.registration?.openIdIssuer?.replace(/\/$/, '') !== `https://login.microsoftonline.com/${tenant}/v2.0` ||
-    provider?.registration?.clientSecretSettingName !== 'MICROSOFT_PROVIDER_AUTHENTICATION_SECRET' ||
-    principals?.identities?.length !== 1 || principals.identities[0].toLowerCase() !== allowedUser.toLowerCase() ||
-    (principals?.groups?.length ?? 0) > 0) {
-    throw new Error('Refusing to publish the application: the required tenant-specific Easy Auth/user allowlist configuration is not active.')
+  validateEasyAuth(env, auth.properties)
+  const appSettings = await request(credential, 'https://management.azure.com', `${base}/config/appsettings/list?api-version=2024-11-01`, 'POST')
+  validateRuntimeAccessSettings(env, appSettings.properties)
+  await verifyEntraProvisioning(env, path => graph(credential, path))
+  const container = await request(credential, 'https://management.azure.com',
+    `https://management.azure.com/subscriptions/${subscription}/resourceGroups/${encodeURIComponent(required(env, 'AZURE_RESOURCE_GROUP'))}/providers/Microsoft.DocumentDB/databaseAccounts/${encodeURIComponent(required(env, 'AZURE_COSMOS_ACCOUNT_NAME'))}/sqlDatabases/score/containers/application-access?api-version=2024-11-15`)
+  const partition = container.properties?.resource?.partitionKey?.paths
+  if (!Array.isArray(partition) || partition.length !== 1 || partition[0] !== '/tenantId') {
+    throw new Error('The dedicated application-access container must be provisioned with /tenantId partitioning.')
   }
-  const exclusions = settings.globalValidation.excludedPaths ?? []
-  if (exclusions.length !== 1 || exclusions[0] !== '/healthz') {
-    throw new Error('Refusing to deploy with unexpected unauthenticated paths. Only /healthz may bypass Easy Auth.')
+  await verifyAdmissionCode()
+  if (stage === 'roles') {
+    const web = await request(credential, 'https://management.azure.com', `${base}/config/web?api-version=2024-11-01`)
+    const image = web.properties?.linuxFxVersion?.replace(/^DOCKER\|/, '')
+    if (image !== env.AZURE_SCORE_ROLE_VERIFIED_IMAGE) {
+      throw new Error('The released deployment image changed without verification. Verify that deployment or restore the ingress guard before proceeding.')
+    }
+    await verifyRoleAwareDeployment(env, image)
   }
   for (let attempt = 0; attempt < 25; attempt++) {
     const references = await request(credential, 'https://management.azure.com',
@@ -34,7 +38,7 @@ async function main() {
       item.name === 'MICROSOFT_PROVIDER_AUTHENTICATION_SECRET' ||
       item.id?.endsWith('/MICROSOFT_PROVIDER_AUTHENTICATION_SECRET'))
     if (reference?.properties?.status === 'Resolved') {
-      console.log('Deployment gate passed: Easy Auth is required, the intended user is allowed, and the Key Vault authentication secret resolves.')
+      console.log(`Deployment gate passed: ${stage} ingress, assignment-required Entra roles, read-only API Graph consent, tenant-partitioned access storage, and the Key Vault secret are verified.`)
       return
     }
     if (attempt === 24) throw new Error(`The Easy Auth Key Vault reference is not resolved (${reference?.properties?.status ?? 'missing status'}). Application deployment is blocked.`)

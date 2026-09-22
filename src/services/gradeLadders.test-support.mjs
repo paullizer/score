@@ -15,7 +15,7 @@ export const userId = '1d6312bd-3eaa-4586-8b74-e90eee126f78'
 export const auth = {
   'x-ms-client-principal': Buffer.from(JSON.stringify({ auth_typ: 'aad', claims: [
     { typ: 'tid', val: tenantId }, { typ: 'oid', val: userId }, { typ: 'name', val: 'Grade integration reviewer' },
-    { typ: 'preferred_username', val: 'grade-reviewer@example.test' },
+    { typ: 'preferred_username', val: 'grade-reviewer@example.test' }, { typ: 'roles', val: 'Score.User' },
   ], name_typ: 'name', role_typ: 'roles' })).toString('base64'),
 }
 const nativeFetch = globalThis.fetch
@@ -44,7 +44,11 @@ export async function buildGradeTestRuntime({ browser = false, productionBrowser
       format: 'esm', jsx: 'automatic', define: { 'import.meta.env.VITE_DEPLOYMENT_MODE': '"cloud"' }, logLevel: 'silent',
     })))
     await build({
-      entryPoints: [join('server-tests', 'job-lifecycle-fakes.mjs')], outfile: join(directory, 'job-fakes.mjs'), bundle: true,
+      stdin: {
+        contents: "export * from './server-tests/job-lifecycle-fakes.mjs'\nexport { createFakeAccessStore } from './server-tests/helpers.mjs'",
+        resolveDir: resolve('.'), loader: 'js',
+      },
+      outfile: join(directory, 'job-fakes.mjs'), bundle: true,
       packages: 'external', platform: 'node', format: 'esm', logLevel: 'silent',
       plugins: [{
         name: 'share-integration-server-errors',
@@ -75,7 +79,7 @@ export async function buildGradeTestRuntime({ browser = false, productionBrowser
       await writeFile(join(directory, 'index.html'), html)
     }
     const [api, client, jobsClient, fixtures, jobFakes] = await Promise.all(['server', 'client', 'jobs', 'fixtures', 'job-fakes'].map((name) => import(pathToFileURL(join(directory, `${name}.mjs`)).href)))
-    return { directory, api, client, jobsClient, fixtures, jobFakes, async close() {
+    return { directory, api, client, jobsClient, fixtures, jobFakes, createFakeAccessStore: jobFakes.createFakeAccessStore, async close() {
       try { stop() } finally { await rm(directory, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 }) }
     } }
   } catch (error) {
@@ -181,14 +185,14 @@ function memoryWorkspace(api) {
       const value = { metadata: clone(record), etag: `"directory-${++counter}"` }
       metadata.set(record.workspaceId, value)
       if (record.deletedAt && record.lifecycleOperation?.action === 'delete' && record.lifecycleOperation.status === 'complete') {
-        memberships.delete(`${record.workspaceId}/${api.membershipIdFor(record.ownerId)}`)
+        memberships.delete(`${record.workspaceId}/${api.membershipIdFor(record.deletionRecoveryPrincipalId ?? record.ownerId)}`)
       }
       return clone(value)
     },
     async deleteMemberships(id) {
       const current = metadata.get(id)
       if (!current) throw new api.StoreNotFoundError()
-      const ownerId = api.membershipIdFor(current.metadata.ownerId)
+      const ownerId = api.membershipIdFor(current.metadata.deletionRecoveryPrincipalId ?? current.metadata.ownerId)
       for (const [key, membership] of memberships) {
         if (membership.workspaceId === id && membership.id !== ownerId) memberships.delete(key)
       }
@@ -233,11 +237,19 @@ function memoryWorkspace(api) {
 export async function startGradeFixture(runtime, { injectAuth = false, resumes, analyses, configOverrides = {} } = {}) {
   const { api } = runtime
   const grades = memoryGrades(api), jobs = memoryJobs(runtime.jobFakes), { directory, state } = memoryWorkspace(api)
+  const accessStore = runtime.createFakeAccessStore()
+  let clock = Math.max(Date.now(), Date.parse('2026-09-17T19:00:00.000Z'))
+  const now = () => new Date(++clock)
+  const repository = new api.WorkspaceRepository({ directory, state, now })
+  const principal = {
+    tenantId, oid: userId, principalKey: api.principalKeyFor(tenantId, userId),
+    name: 'Grade integration reviewer', email: 'grade-reviewer@example.test', applicationRoles: ['Score.User'],
+  }
+  const seedWorkspace = (name = 'Grade integration workspace') => repository.createWorkspace(principal, name)
+  const workspace = await seedWorkspace()
   const server = createServer()
   await new Promise((resolve, reject) => { server.once('error', reject); server.listen(0, '127.0.0.1', resolve) })
   const origin = `http://127.0.0.1:${server.address().port}`
-  let clock = Math.max(Date.now(), Date.parse('2026-09-17T19:00:00.000Z'))
-  const now = () => new Date(++clock)
   const serviceConfig = { cosmosEndpoint: 'https://test.documents.azure.com', database: 'score', storageAccountUrl: 'https://test.blob.core.windows.net' }
   const config = {
     authMode: 'easyauth', tenantId, allowedUserIds: new Set([userId]), appOrigin: origin, isProduction: false, isAppService: false,
@@ -246,7 +258,7 @@ export async function startGradeFixture(runtime, { injectAuth = false, resumes, 
     realGrades: { ...serviceConfig, container: 'grade-records', blobContainer: 'grade-sources' },
     ...configOverrides,
   }
-  const app = api.createApp({ config, directory, state, jobs, grades, resumes, analyses, now, distDir: runtime.directory })
+  const app = api.createApp({ config, directory, state, accessStore, jobs, grades, resumes, analyses, now, distDir: runtime.directory })
   const requests = []
   const pendingRequests = new Set()
   let holdNextMutation
@@ -288,9 +300,9 @@ export async function startGradeFixture(runtime, { injectAuth = false, resumes, 
     assert.equal(sessionResponse.status, 200, await sessionResponse.text())
   }
   const session = await sessionResponse.json()
-  const workspaceId = session.workspaces[0].id
+  const workspaceId = workspace.id
   return {
-    runtime, origin, server, api, config, grades, jobs, resumes, analyses, directory, state, session, workspaceId, requests, now,
+    runtime, origin, server, api, config, grades, jobs, resumes, analyses, directory, state, accessStore, session, workspaceId, requests, now, seedWorkspace,
     advanceClock(milliseconds) { clock += milliseconds },
     request,
     installClientFetch() {
@@ -304,6 +316,10 @@ export async function startGradeFixture(runtime, { injectAuth = false, resumes, 
       const principalId = api.principalKeyFor(tenantId, userId)
       const memberKey = `${workspaceId}/${api.membershipIdFor(principalId)}`
       directory.memberships.set(memberKey, { ...directory.memberships.get(memberKey), role })
+      const current = directory.metadata.get(workspaceId)
+      directory.metadata.set(workspaceId, { ...current, metadata: { ...current.metadata,
+        ownerCount: [...directory.memberships.values()].filter(member => member.workspaceId === workspaceId && member.role === 'owner').length,
+      } })
     },
     async close() {
       disposed = true

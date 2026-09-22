@@ -4,7 +4,7 @@ import { supportedUploadFormats } from '../domain/document-formats'
 import * as api from '../services/realResumes'
 import { assertClientAdmission, clientAdmissionReason, usePublicSettings } from './public-settings-context'
 import { boundedPollingInterval, effectiveFormats, requireImportBatch, resumeFeaturesWithPolicy } from '../services/publicSettings'
-import { CloudApiError, CloudConflictError, LifecycleOperationError } from '../services/cloudWorkspace'
+import { CloudApiError, CloudConflictError, LifecycleOperationError, workspaceAccessStamp } from '../services/cloudWorkspace'
 import { lifecycleIsRemoved, type LifecycleAction, type LifecycleTarget } from '../domain/lifecycle'
 import { appendResumeInputs, resumeWorkActive, type RealResumeImportBatch, type RealResumeImportSource } from '../features/resumes/resumeImportUi'
 import { WorkspaceContext, useWorkspace, type PendingLifecycleChange, type RenameEntityTarget } from './workspace-context'
@@ -25,6 +25,9 @@ function RealResumesProvider({ workspaceId, children }: { workspaceId: string; c
   const parentRef = useRef(parent)
   parentRef.current = parent
   const [scope] = useState(() => new RealRequestScope())
+  const metadata = parent.cloud?.workspaces.find(item => item.id === workspaceId)
+  const accessStamp = workspaceAccessStamp(metadata)
+  scope.updateAccess(accessStamp, Boolean(metadata && !metadata.deletedAt))
   const [features, setFeatures] = useState<api.ResumeServiceFeatures | null>(null)
   const featuresRef = useRef(features)
   const [phase, setPhase] = useState<RealResumesContextValue['phase']>('loading')
@@ -163,6 +166,7 @@ function RealResumesProvider({ workspaceId, children }: { workspaceId: string; c
   }, [ensureDetail, phase, pollingInterval, refresh, summaries])
 
   useEffect(() => { void refresh() }, [policy.settings, policy.phase, refresh])
+  useEffect(() => { void refresh() }, [accessStamp, refresh])
 
   useEffect(() => {
     const focus = () => { void refresh() }
@@ -201,12 +205,12 @@ function RealResumesProvider({ workspaceId, children }: { workspaceId: string; c
       }
       throw caught
     } finally {
-      const current = scope.mutationCurrent(ticket)
+      const current = scope.mutationOwned(ticket)
       scope.finishMutation(ticket)
       if (current) {
         setPendingCount((value) => value - 1)
         if (!scope.busy) { leaveGuard.release(); void refresh() }
-        void parentRef.current.cloud?.refreshWorkspaces().catch(() => undefined)
+        void parentRef.current.cloud?.refreshWorkspaces().catch(caught => setError(`Workspace access refresh failed: ${realRequestError(caught, 'Try refreshing access again.')}`))
       }
     }
   }
@@ -336,6 +340,7 @@ function RealResumesProvider({ workspaceId, children }: { workspaceId: string; c
     if (pending && pending.operation.action !== action) throw new Error('Finish the incomplete resume lifecycle operation before choosing another action.')
     const result = await mutate(`resume:${target.id}`, async () => {
       const fresh = await api.getRealResume(workspaceId, target.id)
+      assertRealLifecyclePermission(parentRef.current, workspaceId)
       return api.changeRealResumeLifecycle(workspaceId, target.id, action, fresh.etag)
     }, (response, sequence) => {
       if (response.resume) {

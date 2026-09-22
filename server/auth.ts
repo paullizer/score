@@ -1,5 +1,6 @@
 import type { Config } from './config'
 import { GUID_PATTERN, principalKeyFor } from './ids'
+import type { ApplicationRole } from '../src/domain/access'
 
 /** A validated caller identity: immutable tenant + object ID, plus best-effort display fields. */
 export interface AuthenticatedPrincipal {
@@ -8,12 +9,13 @@ export interface AuthenticatedPrincipal {
   readonly principalKey: string
   readonly name: string
   readonly email: string
+  readonly applicationRoles?: readonly ApplicationRole[]
 }
 
 /** Application designation is tenant-scoped and independent of every workspace role. */
-export function isApplicationAdmin(principal: AuthenticatedPrincipal, config: Config): boolean {
-  return principal.tenantId === config.tenantId && config.allowedUserIds.has(principal.oid) &&
-    config.adminUserIds?.has(principal.oid) === true
+export function isApplicationAdmin(principal: AuthenticatedPrincipal, config?: Config): boolean {
+  return (!config || principal.tenantId === config.tenantId) &&
+    principal.applicationRoles?.includes('Score.Admin') === true
 }
 
 export type AuthErrorKind = 'unauthenticated' | 'forbidden'
@@ -45,6 +47,8 @@ const MAX_CLAIMS = 200
 
 const TENANT_CLAIM_TYPES = ['tid', 'http://schemas.microsoft.com/identity/claims/tenantid']
 const OBJECT_ID_CLAIM_TYPES = ['oid', 'http://schemas.microsoft.com/identity/claims/objectidentifier']
+const ROLE_CLAIM_TYPES = ['roles', 'role', 'http://schemas.microsoft.com/ws/2008/06/identity/claims/role']
+const IDENTITY_TYPE_CLAIM_TYPES = ['idtyp', 'http://schemas.microsoft.com/identity/claims/identitytype']
 const NAME_CLAIM_TYPES = ['name', 'http://schemas.xmlsoap.org/ws/2005/05/identity/claims/name']
 const EMAIL_CLAIM_TYPES = [
   'preferred_username',
@@ -58,6 +62,14 @@ function firstClaimValue(claims: EasyAuthClaim[], types: string[]): string | und
     if (claim && claim.val.length > 0) return claim.val
   }
   return undefined
+}
+
+function identityClaim(claims: EasyAuthClaim[], types: string[], label: string): string {
+  const values = claims.filter(claim => types.includes(claim.typ)).map(claim => claim.val.toLowerCase())
+  if (!values.length || values.some(value => !GUID_PATTERN.test(value)) || new Set(values).size !== 1) {
+    throw new AuthError(`Identity header has missing or inconsistent ${label} claims.`)
+  }
+  return values[0]
 }
 
 function decodeBase64Strict(value: string): string {
@@ -89,7 +101,7 @@ function parseEasyAuthClaims(principal: EasyAuthPrincipal): EasyAuthClaim[] {
  * Easy Auth strips any client-supplied copy of this header at the ingress edge and replaces it with
  * the platform's own validated token claims, so this function trusts the header's presence but still
  * fully validates its *content*: well-formed base64 JSON, `auth_typ === 'aad'`, an immutable tenant ID
- * claim matching the configured tenant, and an object ID claim present in the configured allow-list.
+ * claim matching the configured tenant, an immutable object ID, and a recognized application role.
  * Display fields (name/email/UPN) are extracted for UI purposes only and are never used to authorize.
  */
 export function parseEasyAuthPrincipal(
@@ -112,10 +124,8 @@ export function parseEasyAuthPrincipal(
   if (principal.auth_typ !== 'aad') throw new AuthError('Identity header is not an Azure AD principal.')
 
   const claims = parseEasyAuthClaims(principal)
-  const tenantId = firstClaimValue(claims, TENANT_CLAIM_TYPES)?.toLowerCase()
-  const oid = firstClaimValue(claims, OBJECT_ID_CLAIM_TYPES)?.toLowerCase()
-  if (!tenantId || !GUID_PATTERN.test(tenantId)) throw new AuthError('Identity header is missing a valid tenant ID claim.')
-  if (!oid || !GUID_PATTERN.test(oid)) throw new AuthError('Identity header is missing a valid object ID claim.')
+  const tenantId = identityClaim(claims, TENANT_CLAIM_TYPES, 'tenant ID')
+  const oid = identityClaim(claims, OBJECT_ID_CLAIM_TYPES, 'object ID')
 
   // x-ms-client-principal-id, when present, is Easy Auth's own summary of the principal's ID.
   // A mismatch against the token claim indicates a tampered or inconsistent request; refuse it.
@@ -124,7 +134,12 @@ export function parseEasyAuthPrincipal(
   }
 
   if (tenantId !== config.tenantId) throw new AuthError('This tenant is not authorized for this deployment.', 'forbidden')
-  if (!config.allowedUserIds.has(oid)) throw new AuthError('This user is not authorized for this deployment.', 'forbidden')
+  if (claims.some(claim => IDENTITY_TYPE_CLAIM_TYPES.includes(claim.typ) && claim.val !== 'user')) {
+    throw new AuthError('Only user identities can access this application.', 'forbidden')
+  }
+  const applicationRoles = (['Score.Admin', 'Score.User'] as const).filter(role =>
+    claims.some(claim => ROLE_CLAIM_TYPES.includes(claim.typ) && claim.val === role))
+  if (!applicationRoles.length) throw new AuthError('A Score.User or Score.Admin application role is required.', 'forbidden')
 
   return {
     tenantId,
@@ -132,6 +147,7 @@ export function parseEasyAuthPrincipal(
     principalKey: principalKeyFor(tenantId, oid),
     name: firstClaimValue(claims, NAME_CLAIM_TYPES) ?? 'Signed-in user',
     email: firstClaimValue(claims, EMAIL_CLAIM_TYPES) ?? '',
+    applicationRoles,
   }
 }
 
@@ -142,18 +158,26 @@ export function parseEasyAuthPrincipal(
  * the two cannot be confused with each other.
  */
 export function parseDevHeaderPrincipal(devPrincipalHeader: string | undefined, config: Config): AuthenticatedPrincipal {
+  if (config.authMode !== 'dev-header' || config.isProduction || config.isAppService) {
+    throw new AuthError('Developer authentication is only available in explicit local development mode.', 'forbidden')
+  }
   if (!devPrincipalHeader) throw new AuthError('Missing identity header.')
-  const [tenantId, oid] = devPrincipalHeader.split(':').map((value) => value.trim().toLowerCase())
-  if (!tenantId || !oid || !GUID_PATTERN.test(tenantId) || !GUID_PATTERN.test(oid)) {
+  const parts = devPrincipalHeader.split(':').map((value) => value.trim().toLowerCase())
+  const [tenantId, oid] = parts
+  if (parts.length !== 2 || !tenantId || !oid || !GUID_PATTERN.test(tenantId) || !GUID_PATTERN.test(oid)) {
     throw new AuthError('X-Score-Dev-Principal must be "<tenantId>:<objectId>" with GUID values.')
   }
   if (tenantId !== config.tenantId) throw new AuthError('This tenant is not authorized for this deployment.', 'forbidden')
-  if (!config.allowedUserIds.has(oid)) throw new AuthError('This user is not authorized for this deployment.', 'forbidden')
+  const applicationRoles = config.devUserRoles?.get(oid)
+  if (!applicationRoles?.length || applicationRoles.some(role => role !== 'Score.User' && role !== 'Score.Admin')) {
+    throw new AuthError('This developer identity has no configured Score application role.', 'forbidden')
+  }
   return {
     tenantId,
     oid,
     principalKey: principalKeyFor(tenantId, oid),
     name: 'Local developer',
     email: '',
+    applicationRoles: [...applicationRoles],
   }
 }

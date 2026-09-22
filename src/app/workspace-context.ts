@@ -25,9 +25,10 @@ export type RealJobDetailLoadState =
 
 export interface CloudWorkspaceStatus {
   user: CloudUser
-  /** Personal workspaces this user can switch between (group workspaces are not supported yet). */
+  /** Workspaces accessible through individual membership or application administration. */
   workspaces: WorkspaceSummary[]
   currentWorkspaceId: string
+  canCreateWorkspaces: boolean
   saveState: CloudSaveState
   syncingState?: boolean
   /** Present when saveState is 'error': a human explanation for the retry banner. */

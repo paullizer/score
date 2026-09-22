@@ -11,9 +11,11 @@ import {
   OTHER_ALLOWED_OID,
   authHeaders,
   baseConfig,
+  createFakeAccessStore,
   createFakeDirectoryStore,
   createFakeStateStore,
   membershipFor,
+  seedWorkspace,
   startTestServer,
 } from './helpers.mjs'
 import { createFakeRealJobs } from './job-lifecycle-fakes.mjs'
@@ -41,6 +43,7 @@ async function startRealJobsServer(settings, runtimeEnabled = true) {
     config,
     directory,
     state,
+    accessStore: createFakeAccessStore(),
     jobs: { store: jobs.store, blobs: jobs.blobs },
     settings,
     now: () => new Date('2026-09-17T14:00:00.000Z'),
@@ -72,7 +75,7 @@ test('job policy rejects direct feature/format/URL/size/page bypass and restrict
     } }
     const server = await startRealJobsServer(settings)
     try {
-      const workspace = await bootstrap(server)
+      const workspace = await seedWorkspace(server)
       value.features.jobImports = false
       assert.equal((await importPdf(server, workspace.id)).status, 503)
       value.features.jobImports = true
@@ -133,7 +136,7 @@ test('configured job rollout blocks new admissions without weakening saved downl
   const settings = { async capture() { return captureProcessingSettings(value, 'job-rollout-policy', '2026-09-17T14:00:00.000Z') } }
   const server = await startRealJobsServer(settings, false)
   try {
-    const workspace = await bootstrap(server)
+    const workspace = await seedWorkspace(server)
     assert.equal((await importPdf(server, workspace.id)).status, 503)
     assert.equal((await importUrl(server, workspace.id, 'https://example.com/role')).status, 503)
     server.config.settings.runtimeEnabled = true
@@ -156,15 +159,52 @@ test('configured job rollout blocks new admissions without weakening saved downl
   } finally { await server.close() }
 })
 
-async function bootstrap(server, oid = ALLOWED_OID) {
-  const response = await fetch(`${server.baseUrl}/api/session`, { headers: authHeaders({ oid }) })
-  assert.equal(response.status, 200)
-  return (await response.json()).workspaces[0]
-}
-
 function writeHeaders(oid = ALLOWED_OID, extra = {}) {
   return { ...authHeaders({ oid }), ...CSRF, ...extra }
 }
+
+test('revoking the submitter does not cancel or delete an accepted workspace-owned import', async t => {
+  const server = await startRealJobsServer()
+  t.after(() => server.close())
+  const workspace = await seedWorkspace(server)
+  server.directory._addMembership(workspace.id, membershipFor(workspace.id, { oid: OTHER_ALLOWED_OID, role: 'editor' }))
+  const imported = await importPdf(server, workspace.id, { oid: OTHER_ALLOWED_OID })
+  assert.equal(imported.status, 202)
+  const job = (await imported.json()).job
+  const before = await server.jobs.store.get(workspace.id, job.job.id)
+  const root = `${server.baseUrl}/api/workspaces/${workspace.id}`
+  const memberList = await fetch(`${root}/members`, { headers: authHeaders() })
+  assert.equal(memberList.status, 200)
+  const removal = await fetch(`${root}/members/${OTHER_ALLOWED_OID}`, {
+    method: 'DELETE', headers: writeHeaders(ALLOWED_OID, { 'If-Match': (await memberList.json()).etag }),
+  })
+  assert.equal(removal.status, 200)
+  assert.equal((await fetch(`${root}/jobs/${job.job.id}`, { headers: authHeaders({ oid: OTHER_ALLOWED_OID }) })).status, 404)
+  assert.equal((await fetch(`${root}/jobs/${job.job.id}`, { headers: authHeaders() })).status, 200)
+  assert.equal((await fetch(`${root}/jobs/${job.job.id}/original`, { headers: authHeaders() })).status, 200)
+  assert.deepEqual(await server.jobs.store.get(workspace.id, job.job.id), before)
+})
+
+test('application Admin original-download policy is owner-equivalent with no membership or an explicit viewer membership', async t => {
+  const policy = createDefaultAdminSettings()
+  policy.documents.originalDownloadRoles = ['owner']
+  const server = await startRealJobsServer({
+    async capture() { return captureProcessingSettings(policy, 'owner-downloads', '2026-09-22T13:00:00.000Z') },
+  })
+  t.after(() => server.close())
+  const workspace = await seedWorkspace(server)
+  const imported = await importPdf(server, workspace.id)
+  assert.equal(imported.status, 202)
+  const job = (await imported.json()).job
+  const path = `${server.baseUrl}/api/workspaces/${workspace.id}/jobs/${job.job.id}/original`
+  const admin = authHeaders({ oid: OTHER_ALLOWED_OID, roles: ['Score.Admin'] })
+  assert.equal((await fetch(path, { headers: authHeaders({ oid: OTHER_ALLOWED_OID }) })).status, 404)
+  assert.equal((await fetch(path, { headers: admin })).status, 200)
+  server.directory._addMembership(workspace.id, membershipFor(workspace.id, { oid: OTHER_ALLOWED_OID, role: 'viewer' }))
+  assert.equal((await fetch(path, { headers: authHeaders({ oid: OTHER_ALLOWED_OID }) })).status, 403)
+  assert.equal((await fetch(path, { headers: admin })).status, 200)
+  assert.equal((await server.directory.getMembership(workspace.id, membershipFor(workspace.id, { oid: OTHER_ALLOWED_OID, role: 'viewer' }).id)).role, 'viewer')
+})
 
 async function importPdf(server, workspaceId, options = {}) {
   const key = options.key ?? randomUUID()
@@ -209,7 +249,7 @@ async function importUrl(server, workspaceId, url, options = {}) {
 test('job metadata PATCH validates strict aliases, authorization and exact ETags without changing source or worker state', async () => {
   const server = await startRealJobsServer()
   try {
-    const workspace = await bootstrap(server)
+    const workspace = await seedWorkspace(server)
     const imported = (await (await importPdf(server, workspace.id)).json()).job
     const initial = await server.jobs.store.get(workspace.id, imported.job.id)
     const leased = await server.jobs.store.replace({
@@ -292,7 +332,7 @@ test('features are authenticated and remain disabled when job dependencies are a
 test('PDF ingestion authenticates before raw parsing, validates input, persists bytes first, and is idempotent', async () => {
   const server = await startRealJobsServer()
   try {
-    const workspace = await bootstrap(server)
+    const workspace = await seedWorkspace(server)
     const unauthorized = await fetch(`${server.baseUrl}/api/workspaces/${workspace.id}/jobs/pdf`, {
       method: 'POST',
       headers: { 'content-type': 'application/pdf', 'x-file-name': 'x.pdf', 'idempotency-key': randomUUID() },
@@ -338,7 +378,7 @@ test('PDF ingestion authenticates before raw parsing, validates input, persists 
 test('legacy PDF job basenames remain valid for import, immutable fingerprint replay, stored reads, and downloads', async () => {
   const server = await startRealJobsServer()
   try {
-    const workspace = await bootstrap(server)
+    const workspace = await seedWorkspace(server)
     const bytes = Buffer.from('%PDF-1.7\nlegacy basename source\n', 'ascii')
     for (const filename of [
       'Role: engineer.pdf', 'CON.pdf', 'Role| lead.pdf', ' role.pdf', 'Role? draft*.PDF', 'Role "engineer".pdf',
@@ -376,7 +416,7 @@ test('legacy PDF job basenames remain valid for import, immutable fingerprint re
 test('gzip PDF job uploads retain legacy inflation, original bytes, idempotency, and the inflated 10 MiB limit', async () => {
   const server = await startRealJobsServer()
   try {
-    const workspace = await bootstrap(server)
+    const workspace = await seedWorkspace(server)
     const key = randomUUID()
     const bytes = Buffer.from('%PDF-1.7\ncompressed real job source\n', 'ascii')
     const response = await importPdf(server, workspace.id, {
@@ -413,7 +453,7 @@ test('gzip PDF job uploads retain legacy inflation, original bytes, idempotency,
 test('Markdown job imports accept both extensions case-insensitively and preserve exact original bytes, hashes, and safe attachment names', async () => {
   const server = await startRealJobsServer()
   try {
-    const workspace = await bootstrap(server)
+    const workspace = await seedWorkspace(server)
     const features = await (await fetch(`${server.baseUrl}/api/features`, { headers: authHeaders() })).json()
     assert.equal(features.realJobImports, true)
     assert.equal(features.markdownJobImports, true)
@@ -455,7 +495,7 @@ test('Markdown job imports accept both extensions case-insensitively and preserv
 test('Markdown job metadata and strict UTF-8 validation reject unsafe, compressed, empty, binary, and over-limit inputs without publishing', async () => {
   const server = await startRealJobsServer()
   try {
-    const workspace = await bootstrap(server)
+    const workspace = await seedWorkspace(server)
     for (const filename of [
       '../job.md', 'x\\job.markdown', 'job.pdf', 'job.md.exe', 'job:one.md', 'CON.md', 'job\u0085.md', ' job.md', 'job.md ',
       'x'.repeat(256) + '.md',
@@ -490,7 +530,7 @@ test('Markdown job metadata and strict UTF-8 validation reject unsafe, compresse
 test('Markdown jobs authenticate, authorize, check CSRF and service availability before upload parsing', async () => {
   const server = await startRealJobsServer()
   try {
-    const workspace = await bootstrap(server)
+    const workspace = await seedWorkspace(server)
     const large = Buffer.alloc(MAX_MARKDOWN + 1, 'x')
     const path = `${server.baseUrl}/api/workspaces/${workspace.id}/jobs/markdown`
     assert.equal((await fetch(path, { method: 'POST', headers: { 'content-type': 'text/markdown' }, body: large })).status, 401)
@@ -507,7 +547,7 @@ test('Markdown jobs authenticate, authorize, check CSRF and service availability
   } finally { await server.close() }
   const disabled = await startTestServer()
   try {
-    const workspace = await bootstrap(disabled)
+    const workspace = await seedWorkspace(disabled)
     const response = await importMarkdown(disabled, workspace.id, { bytes: Buffer.alloc(MAX_MARKDOWN + 1, 'x') })
     assert.equal(response.status, 503)
   } finally { await disabled.close() }
@@ -516,7 +556,7 @@ test('Markdown jobs authenticate, authorize, check CSRF and service availability
 test('Markdown job idempotency preserves the winner and rejects changed bytes, filename, batch, or source kind', async () => {
   const server = await startRealJobsServer()
   try {
-    const workspace = await bootstrap(server)
+    const workspace = await seedWorkspace(server)
     const key = randomUUID()
     const batchId = randomUUID()
     const first = await importMarkdown(server, workspace.id, { key, batchId })
@@ -549,7 +589,7 @@ test('Markdown job idempotency preserves the winner and rejects changed bytes, f
 test('Markdown job downloads fail closed for corrupt content metadata and URL Markdown captures', async () => {
   const server = await startRealJobsServer()
   try {
-    const workspace = await bootstrap(server)
+    const workspace = await seedWorkspace(server)
     const { job } = await (await importMarkdown(server, workspace.id)).json()
     const saved = await server.jobs.store.get(workspace.id, job.job.id)
     const url = `${server.baseUrl}/api/workspaces/${workspace.id}/jobs/${job.job.id}/original`
@@ -572,7 +612,7 @@ test('Markdown job downloads fail closed for corrupt content metadata and URL Ma
 test('URL ingestion rejects unsafe inputs and publishes a truthful queued record without fetching', async () => {
   const server = await startRealJobsServer()
   try {
-    const workspace = await bootstrap(server)
+    const workspace = await seedWorkspace(server)
     for (const url of [
       'ftp://example.com/job',
       'http://user:password@example.com/job',
@@ -602,7 +642,7 @@ test('URL ingestion rejects unsafe inputs and publishes a truthful queued record
 test('job records are membership-isolated and never enter the legacy workspace snapshot', async () => {
   const server = await startRealJobsServer()
   try {
-    const workspace = await bootstrap(server, ALLOWED_OID)
+    const workspace = await seedWorkspace(server, { oid: ALLOWED_OID })
     const imported = await importUrl(server, workspace.id, 'https://example.com/jobs/isolated')
     assert.equal(imported.status, 202)
     const jobId = (await imported.json()).job.job.id
@@ -627,7 +667,7 @@ test('job records are membership-isolated and never enter the legacy workspace s
 test('cancel and retry use CAS, clear leases, and prevent a stale worker publication', async () => {
   const server = await startRealJobsServer()
   try {
-    const workspace = await bootstrap(server)
+    const workspace = await seedWorkspace(server)
     const imported = await importUrl(server, workspace.id, 'https://example.com/jobs/retry')
     const jobId = (await imported.json()).job.job.id
     const before = await server.jobs.store.get(workspace.id, jobId)
@@ -686,7 +726,7 @@ test('cancel and retry use CAS, clear leases, and prevent a stale worker publica
 test('pending polling recovers active jobs whose lease expired after nextAttemptAt was cleared', async () => {
   const server = await startRealJobsServer()
   try {
-    const workspace = await bootstrap(server)
+    const workspace = await seedWorkspace(server)
     const imported = await importUrl(server, workspace.id, 'https://example.com/jobs/lease-recovery')
     const jobId = (await imported.json()).job.job.id
     const queued = await server.jobs.store.get(workspace.id, jobId)
@@ -707,7 +747,7 @@ test('pending polling recovers active jobs whose lease expired after nextAttempt
 test('original source download is authorized, no-store, nosniff, and an attachment', async () => {
   const server = await startRealJobsServer()
   try {
-    const workspace = await bootstrap(server)
+    const workspace = await seedWorkspace(server)
     const imported = await importPdf(server, workspace.id, { filename: 'Résumé role.pdf' })
     const { job } = await imported.json()
     const response = await fetch(`${server.baseUrl}/api/workspaces/${workspace.id}/jobs/${job.job.id}/original`, {
@@ -727,7 +767,7 @@ test('original source download is authorized, no-store, nosniff, and an attachme
 test('a URL source resolved as PDF downloads as a PDF attachment without changing source kind', async () => {
   const server = await startRealJobsServer()
   try {
-    const workspace = await bootstrap(server)
+    const workspace = await seedWorkspace(server)
     const imported = await importUrl(server, workspace.id, 'https://jobs.example.com/posting/42')
     const jobId = (await imported.json()).job.job.id
     const current = await server.jobs.store.get(workspace.id, jobId)
@@ -766,7 +806,7 @@ test('rubric edits require grounded citations and append an immutable version un
     return captureProcessingSettings(policy, 'rubric-policy', '2026-09-17T14:00:00.000Z')
   } })
   try {
-    const workspace = await bootstrap(server)
+    const workspace = await seedWorkspace(server)
     const imported = await importPdf(server, workspace.id)
     const initialSummary = (await imported.json()).job
     const jobId = initialSummary.job.id
