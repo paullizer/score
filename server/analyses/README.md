@@ -164,13 +164,25 @@ prior candidate narrative publication remain available in private correction
 history; rejected proposals and failed review findings are distinct from published
 results.
 
-`ANALYSIS_EVIDENCE_CORRECTIONS_ENABLED` defaults to `false` in the API, worker, and
-deployment templates. The UI capability is `analysisEvidenceCorrections`. The gate
-controls new requests and worker discovery, not historical reads or authorized
-cancellation of accepted work. Deploy compatible readers/workers and drain older
-workers before deliberately enabling it. Turning the gate off does not reinterpret
-already-published revisions. Production deployment and a historical repair batch
-require separate approval and exact-hash scope verification.
+Successful application/worker deployment automatically writes
+`ANALYSIS_EVIDENCE_CORRECTIONS_ENABLED=true` to both the API and analysis worker.
+There is no deployment opt-in; a saved azd value of `false` is not honored as an
+opt-out. Provisioning stages both flags as `false`, and deployment preparation
+closes correction API admission. The replacement analysis worker keeps correction
+claims disabled during initial verification. After compatible-reader checks pass
+and incompatible executions have drained, deployment confirms worker activation,
+then API activation, before reopening runtime-settings admission. `-ProvisionOnly`
+must be followed by `-DeployOnly`; complete worker-only rollout also enables the
+feature. Failed activation attempts close both flags with readback, reporting any
+unconfirmed state. Renderer-only rollout leaves API admission closed and worker
+configuration unchanged. Missing flags still default off in runtime configuration.
+
+The UI capability is `analysisEvidenceCorrections`. The gate controls new requests
+and worker discovery, not historical reads or authorized cancellation of accepted
+work. Turning the gate off does not reinterpret already-published revisions, but
+the next successful deployment enables it again. Maintenance and role checks
+remain in force. Deployment does not create correction requests: a historical
+repair batch remains a separate approved action with exact-hash scope verification.
 
 ## Saved narrative summaries
 
