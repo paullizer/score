@@ -517,6 +517,7 @@ test('model refusals, empty responses, missing provenance and malformed envelope
 test('transient model transport retries stay bounded; service errors never become private-page errors', async () => {
   for (const status of [429, 503]) {
     const run = invocation(() => new Response('private-marker service response', { status }))
+    run.options.model.retryRandom = () => 1
     await assert.rejects(extractResumeProfile(fixture(), run.options), profileError('service-unavailable', true))
     assert.equal(run.requests.length, 2)
     assert.deepEqual(run.sleeps, [500])
@@ -626,7 +627,10 @@ test('cancellation immediately before publication also withholds the profile', a
   const run = invocation()
   const controller = new AbortController()
   run.options.signal = controller.signal
-  run.options.clock.now = () => { controller.abort(); return new Date(now) }
+  run.options.clock.now = () => {
+    if (run.requests.length) controller.abort()
+    return new Date(now)
+  }
   await assert.rejects(extractResumeProfile(fixture(), run.options), error => error.name === 'AbortError')
   assert.equal(run.requests.length, 1)
 })

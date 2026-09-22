@@ -391,7 +391,7 @@ test('successive explicit corrections retain read-only historical publications a
   assert.equal(latest.narrative.resultSha256, second.reference.sha256)
   const historicalPage = await f.service.summaryHistory(f.workspaceId, runId, subject, undefined, undefined, 'original')
   assert.equal(historicalPage.resultRevisionId, 'original')
-  assert.deepEqual(historicalPage.capabilities, { canPublish: false, canRetry: false })
+  assert.deepEqual(historicalPage.capabilities, { canPublish: false, canRetry: false, canResume: false, canRestart: false })
   assert.equal(historicalPage.entries.length, 12)
   assert.ok(historicalPage.continuationToken)
   const nextPage = await f.service.summaryHistory(f.workspaceId, runId, subject, historicalPage.continuationToken, undefined, 'original')

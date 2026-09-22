@@ -14,7 +14,7 @@ import { AnalysisLibraryLifecycleService } from './library-lifecycle'
 import { AnalysisReportCaptures } from './reports'
 import { REPORT_FORMATS, type AnalysisReportFormat } from '../../src/domain/analysis-reports'
 import { analysisCorrectionInputSchema } from './correction-validation'
-import { publishSummaryDraftInputSchema, type AnalysisSummarySubject } from '../../src/domain/analysis-summary-history'
+import { publishSummaryDraftInputSchema, restartSummaryInputSchema, type AnalysisSummarySubject } from '../../src/domain/analysis-summary-history'
 import {
   analysisLifecycleInputSchema, createAnalysisInputSchema, emptyAnalysisInputSchema,
   analysisNarrativeTargetIdSchema, generateAnalysisSummariesInputSchema, isAnalysisId, reportComparisonIdsSchema, retryAnalysisInputSchema,
@@ -257,6 +257,13 @@ export function createRealAnalysesRouter(deps: RealAnalysesRouterDeps): Router {
     body(emptyAnalysisInputSchema, actionBody(req))
     const result = await requireService(req).retrySummary(param(req, 'workspaceId'), recordId(req, 'run'), summarySubject(req),
       key(req), match(req), getPrincipal(req).principalKey)
+    res.setHeader('ETag', result.summaries.etag)
+    res.status(202).json(result)
+  }))
+  router.post(`${summaryBase}/restart`, mutate('write', async (req, res) => {
+    query(req, [])
+    const result = await requireService(req).restartSummary(param(req, 'workspaceId'), recordId(req, 'run'), summarySubject(req),
+      body(restartSummaryInputSchema, req.body), key(req), match(req), getPrincipal(req).principalKey)
     res.setHeader('ETag', result.summaries.etag)
     res.status(202).json(result)
   }))

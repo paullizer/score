@@ -145,7 +145,7 @@ test('100 resumes / 500 comparisons use constant candidate reads, no comparison 
   assert.equal(observed.calls.get.length, 6, 'One constant correction-head lookup selects the current assessment revision.')
   assert.equal(observed.calls.get.filter(id => id.startsWith('analysis-correction:')).length, 1)
   assert.equal(observed.calls.controls.length, 1)
-  assert.doesNotMatch(JSON.stringify(selected), /blobName|provenance|lease|requestedBy/)
+  assert.doesNotMatch(JSON.stringify(selected), /blobName|provenance|"lease"|leaseOwner|requestedBy|processingSettings/)
 
   observed.reset()
   const overview = await readSubject(f, runId, target(pair.target.summary.id))
@@ -257,6 +257,180 @@ test('subject revisions ignore independent target work and heartbeats but target
   assert.notEqual(stale.revision, overview.revision)
   assert.deepEqual(stale.narrative.published, overview.narrative.published)
   assert.equal((await readSubject(f, runId, subject)).etag, before.etag)
+})
+
+test('summary work health observes lease expiry without writes and excludes heartbeats from readiness and polling revisions', async t => {
+  const { f, runId, pairs } = await readyFixture(1, 2)
+  t.mock.timers.enable({ apis: ['Date'], now: new Date(f.now) })
+  const run = (await f.analysis.store.get(f.workspaceId, runId)).record
+  const pair = pairs[0].record
+  const previous = await f.analysis.store.get(f.workspaceId, api.analysisNarrativeId('candidate', runId, pair.id))
+  const leased = {
+    ...api.newCandidateNarrative(run, pair, { requestId: randomUUID(), requestedAt: f.now, requestedBy: ACTOR, reason: 'all' }, previous.record),
+    status: 'running', attemptId: randomUUID(), attempts: 1,
+    lease: { owner: 'private-worker-identity', heartbeatAt: f.now, expiresAt: new Date(Date.parse(f.now) + 90_000).toISOString() },
+  }
+  delete leased.nextAttemptAt
+  f.analysis.store.save(leased)
+  const subject = candidate(pair.id)
+  const before = await readSubject(f, runId, subject)
+  const scope = await f.service.summaries(f.workspaceId, runId)
+  assert.equal(before.narrative.workHealth.state, 'running')
+  assert.equal(before.narrative.workHealth.attempt, 1)
+  assert.equal(before.narrative.workHealth.lastActivityAt, f.now)
+  assert.deepEqual(before.narrative.workHealth.capturedSettings, { revision: 'legacy-v1', modelName: 'gpt-5-mini', reasoningEffort: 'low' })
+  assert.doesNotMatch(JSON.stringify(before), /private-worker-identity|leaseOwner|processingSettings|retryBackoff/)
+
+  t.mock.timers.tick(25_000)
+  const heartbeat = new Date().toISOString()
+  leased.updatedAt = heartbeat
+  leased.lease = { ...leased.lease, heartbeatAt: heartbeat, expiresAt: new Date(Date.now() + 90_000).toISOString() }
+  f.analysis.store.save(leased)
+  const renewed = await readSubject(f, runId, subject)
+  assert.equal(renewed.narrative.workHealth.state, 'running')
+  assert.equal(renewed.narrative.workHealth.lastActivityAt, heartbeat)
+  assert.equal(renewed.narrative.workHealth.leaseExpiresAt, leased.lease.expiresAt)
+  assert.equal(renewed.revision, before.revision)
+  assert.equal(renewed.etag, before.etag)
+  assert.equal(renewed.workRevision, before.workRevision, 'Lease renewal is not a reason to refetch immutable content or reset poll backoff.')
+  const renewedScope = await f.service.summaries(f.workspaceId, runId)
+  assert.equal(renewedScope.workRevision, scope.workRevision)
+  assert.equal(renewedScope.etag, scope.etag)
+  assert.deepEqual(renewedScope.capture, scope.capture)
+
+  const records = clone([...f.analysis.store.values]), blobs = clone([...f.analysis.blobs.values])
+  t.mock.timers.tick(89_999)
+  assert.equal((await readSubject(f, runId, subject)).narrative.workHealth.state, 'running')
+  t.mock.timers.tick(1)
+  const interrupted = await readSubject(f, runId, subject)
+  assert.equal(interrupted.narrative.status, 'running', 'Health must not rewrite persisted status or publication readiness.')
+  assert.equal(interrupted.narrative.workHealth.state, 'interrupted')
+  assert.equal(interrupted.narrative.workHealth.nextEligibleAt, leased.lease.expiresAt)
+  assert.notEqual(interrupted.workRevision, before.workRevision)
+  assert.equal(interrupted.revision, before.revision)
+  assert.equal(interrupted.etag, before.etag)
+  assert.deepEqual(interrupted.narrative.published, before.narrative.published)
+  const expiredScope = await f.service.summaries(f.workspaceId, runId)
+  assert.notEqual(expiredScope.workRevision, scope.workRevision)
+  assert.equal(expiredScope.etag, scope.etag)
+  assert.deepEqual(expiredScope.capture, scope.capture)
+  assert.equal(expiredScope.targets[1].status, 'ready')
+  assert.deepEqual([...f.analysis.store.values], records)
+  assert.deepEqual([...f.analysis.blobs.values], blobs)
+  const legacy = { ...leased }
+  delete legacy.processingSettings
+  f.analysis.store.save(legacy)
+  const legacyResponse = await readSubject(f, runId, subject)
+  assert.deepEqual(legacyResponse.narrative.workHealth.capturedSettings, { revision: 'legacy-v1', modelName: null, reasoningEffort: null })
+  assert.equal(legacyResponse.etag, before.etag)
+})
+
+test('summary work health distinguishes provider cooldown, future retry, due queue and terminal failure without treating age as an outage', async t => {
+  const { f, runId, pairs } = await readyFixture(1, 3)
+  t.mock.timers.enable({ apis: ['Date'], now: new Date(f.now) })
+  const run = (await f.analysis.store.get(f.workspaceId, runId)).record
+  const retryAt = new Date(Date.now() + 120_000).toISOString()
+  const pending = pairs.map(({ record: pair }, index) => {
+    const record = api.newCandidateNarrative(run, pair, { requestId: randomUUID(), requestedAt: f.now, requestedBy: ACTOR, reason: 'all' })
+    return { ...record, attempts: 1, attemptId: randomUUID(), nextAttemptAt: retryAt,
+      error: { code: 'service-unavailable', stage: 'candidate-generation', message: 'The summary provider asked for a later retry.', retryable: true,
+        ...(index === 0 ? { diagnostic: { httpStatus: 429, retryAt } } : {}) } }
+  })
+  for (const item of pending) f.analysis.store.save(item)
+  const first = await f.service.summaries(f.workspaceId, runId)
+  assert.deepEqual(first.comparisons.map(item => item.workHealth.state), ['throttled', 'retry-scheduled', 'retry-scheduled'])
+  assert.equal(first.comparisons[0].workHealth.nextEligibleAt, retryAt)
+  const records = clone([...f.analysis.store.values])
+  t.mock.timers.tick(120_000)
+  const due = await f.service.summaries(f.workspaceId, runId)
+  assert.ok(due.comparisons.every(item => item.workHealth.state === 'awaiting-worker'))
+  assert.equal(due.comparisons[0].error.diagnostic.httpStatus, 429, 'A previous provider error is context, not a terminal queued state.')
+  assert.equal(due.etag, first.etag)
+  assert.deepEqual(due.capture, first.capture)
+  assert.notEqual(due.workRevision, first.workRevision)
+  t.mock.timers.tick(7 * 24 * 60 * 60 * 1000)
+  const old = await f.service.summaries(f.workspaceId, runId)
+  assert.ok(old.comparisons.every(item => item.workHealth.state === 'awaiting-worker'))
+  assert.equal(old.workRevision, due.workRevision)
+  assert.deepEqual([...f.analysis.store.values], records)
+  const failed = { ...pending[2], status: 'failed', error: { ...pending[2].error, retryable: false } }
+  delete failed.nextAttemptAt
+  f.analysis.store.save(failed)
+  const terminal = await readSubject(f, runId, candidate(pairs[2].record.id))
+  assert.equal(terminal.narrative.workHealth.state, 'failed')
+  assert.equal(terminal.narrative.workHealth.nextEligibleAt, null)
+})
+
+test('summary work health identifies actual prerequisite waits and an eligible target still waiting for worker promotion', async t => {
+  const { f, runId, pairs } = await readyFixture()
+  t.mock.timers.enable({ apis: ['Date'], now: new Date(f.now) })
+  const run = (await f.analysis.store.get(f.workspaceId, runId)).record
+  const pair = pairs[0].record
+  const original = await f.analysis.store.get(f.workspaceId, api.analysisNarrativeId('candidate', runId, pair.id))
+  const inventory = await api.readAnalysisNarrativeInventory(f.analysis, f.workspaceId, runId)
+  const waiting = api.newTargetNarrative(run, inventory.targets[0].target,
+    { requestId: randomUUID(), requestedAt: f.now, requestedBy: ACTOR, reason: 'all' })
+  f.analysis.store.save(waiting)
+  f.analysis.store.save(api.newCandidateNarrative(run, pair,
+    { requestId: randomUUID(), requestedAt: f.now, requestedBy: ACTOR, reason: 'all' }, original.record))
+  const pending = await readSubject(f, runId, target(waiting.targetId))
+  assert.equal(pending.narrative.status, 'waiting')
+  assert.equal(pending.narrative.workHealth.state, 'waiting-prerequisites')
+  assert.equal(pending.narrative.waitingFor, 'candidate-narratives')
+  assert.equal(pending.narrative.workHealth.nextEligibleAt, null)
+  f.analysis.store.save(original.record)
+  const eligible = await readSubject(f, runId, target(waiting.targetId))
+  assert.equal(eligible.narrative.status, 'waiting')
+  assert.equal(eligible.narrative.waitingFor, null)
+  assert.equal(eligible.narrative.workHealth.state, 'awaiting-worker')
+  assert.equal(eligible.narrative.workHealth.nextEligibleAt, f.now)
+  const other = await createRun(f, 2)
+  const comparisons = runComparisons(f, other.run.id)
+  await publishResult(f, other.run.id, comparisons[0].record.id)
+  const scoring = await f.service.summaries(f.workspaceId, other.run.id)
+  assert.equal(scoring.targets[0].waitingFor, 'scoring')
+  assert.equal(scoring.targets[0].workHealth.state, 'waiting-prerequisites')
+})
+
+test('summary work health reproduces 412 ready candidates and two ready, one queued, one interrupted overview without readiness churn', async t => {
+  const { f, runId } = await readyFixture(103, 4)
+  t.mock.timers.enable({ apis: ['Date'], now: new Date(f.now) })
+  const inventory = await api.readAnalysisNarrativeInventory(f.analysis, f.workspaceId, runId)
+  const ready = await f.service.summaries(f.workspaceId, runId)
+  const { run } = inventory
+  for (const [index, item] of inventory.targets.entries()) {
+    if (index < 2) continue
+    const next = { ...api.newTargetNarrative(run.record, item.target,
+      { requestId: randomUUID(), requestedAt: f.now, requestedBy: ACTOR, reason: 'all' }),
+      status: index === 2 ? 'queued' : 'running', inputFingerprint: api.analysisHash(item.binding) }
+    delete next.waitingFor
+    if (index === 3) {
+      next.attemptId = randomUUID()
+      next.attempts = 1
+      next.lease = { owner: 'abandoned-worker', heartbeatAt: f.now, expiresAt: new Date(Date.now() + 90_000).toISOString() }
+      delete next.nextAttemptAt
+    }
+    f.analysis.store.save(next)
+  }
+  const active = await f.service.summaries(f.workspaceId, runId)
+  const records = clone([...f.analysis.store.values]), blobs = clone([...f.analysis.blobs.values])
+  t.mock.timers.tick(3_600_000)
+  const screenshot = await f.service.summaries(f.workspaceId, runId)
+  assert.equal(screenshot.counts.candidates.total, 412)
+  assert.equal(screenshot.counts.candidates.ready, 412)
+  assert.equal(screenshot.counts.targets.total, 4)
+  assert.equal(screenshot.counts.targets.ready, 2)
+  assert.equal(screenshot.counts.targets.queued, 1)
+  assert.equal(screenshot.counts.targets.running, 1)
+  assert.deepEqual(screenshot.targets.map(item => item.workHealth.state), ['inactive', 'inactive', 'awaiting-worker', 'interrupted'])
+  assert.equal(screenshot.ready, false)
+  assert.equal(screenshot.etag, active.etag)
+  assert.deepEqual(screenshot.capture, active.capture)
+  assert.notEqual(screenshot.workRevision, active.workRevision)
+  assert.deepEqual(screenshot.comparisons.map(item => item.published), ready.comparisons.map(item => item.published))
+  assert.deepEqual(screenshot.targets.slice(0, 2).map(item => item.published), ready.targets.slice(0, 2).map(item => item.published))
+  assert.deepEqual([...f.analysis.store.values], records)
+  assert.deepEqual([...f.analysis.blobs.values], blobs)
 })
 
 test('a coordinator finishing between root and receipt reads retries the run fence without accepting partial desired generations', async () => {

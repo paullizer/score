@@ -16,6 +16,7 @@ export interface SummaryTelemetryEvent extends Omit<AnalysisTelemetryEvent, 'eve
   code?: AnalysisNarrativeProcessingError['code']
   reason?: AnalysisSummaryDiagnostic['reason']
   issueCodes?: string[]
+  retryAt?: string
 }
 
 export type SummaryTelemetrySink = (event: SummaryTelemetryEvent) => void
@@ -24,6 +25,7 @@ export function emitSummaryTelemetry(sink: SummaryTelemetrySink | undefined, eve
   if (!sink) return
   const diagnostic = summaryDiagnosticSchema.safeParse({
     reason: event.reason, round: event.round, modelCallId: event.modelCallId,
+    httpStatus: event.httpStatus, retryAt: event.retryAt,
   })
   const safe: SummaryTelemetryEvent = {
     event: event.event, timestamp: event.timestamp, stage: event.stage,
@@ -33,7 +35,7 @@ export function emitSummaryTelemetry(sink: SummaryTelemetrySink | undefined, eve
     scopeId: event.scopeId && /^(?:final|reduction-[a-f0-9]{64})$/.test(event.scopeId) ? event.scopeId : undefined,
     ...(diagnostic.success ? diagnostic.data : {}),
     deployment: event.deployment, model: event.model, promptVersion: event.promptVersion, schemaVersion: event.schemaVersion,
-    transportAttempt: event.transportAttempt, httpStatus: event.httpStatus, requestId: event.requestId,
+    transportAttempt: event.transportAttempt, requestId: event.requestId,
     durationMilliseconds: event.durationMilliseconds, inputCharacters: event.inputCharacters,
     requestBytes: event.requestBytes,
     contextCharacterLimit: event.contextCharacterLimit, completionTokenLimit: event.completionTokenLimit,

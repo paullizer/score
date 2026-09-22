@@ -248,9 +248,13 @@ function mockModel(values) {
   const calls = []
   const sleeps = []
   let now = Date.parse(timestamp)
-  const clock = { now: () => new Date(now += 1_000), sleep: async milliseconds => { sleeps.push(milliseconds) } }
+  const clock = {
+    now: () => new Date(now),
+    sleep: async (milliseconds, signal) => { signal?.throwIfAborted(); sleeps.push(milliseconds); now += milliseconds },
+  }
   const model = {
     endpoint: 'https://analysis-model.example/', deployment: 'configured-analysis-deployment', modelName: 'configured-model-fallback',
+    retryRandom: () => 1,
     getToken: async scope => { assert.equal(scope, 'https://cognitiveservices.azure.com/.default'); return 'test-token' },
     fetch: async (url, init) => {
       const request = JSON.parse(init.body)

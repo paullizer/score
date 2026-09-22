@@ -13,6 +13,8 @@ export const WORD_WORKER_ARTIFACTS = [
   'resume-worker.mjs', 'resume-runtime.mjs', 'analysis-worker.mjs', 'analysis-runtime.mjs', 'word-parser.mjs',
 ]
 const TERMINAL_EXECUTION_STATUSES = new Set(['Succeeded', 'Failed', 'Stopped', 'Cancelled', 'Canceled'])
+// Infrastructure bootstrap is stable; Admin settings own live task bindings and captured work keeps its policy.
+const WORKER_MODEL_BOOTSTRAP = Object.freeze({ modelName: 'gpt-5-mini', reasoningEffort: 'low' })
 
 export const WORKER_DEFINITIONS = [
   {
@@ -108,6 +110,12 @@ export function validateWorkerTemplate(env, existing, definition) {
   }
   const container = containers[0]
   const settings = new Map((container.env ?? []).map(setting => [setting.name, setting.value]))
+  const expectedModel = {
+    RUBRIC_MODEL_ENDPOINT: required(env, 'AZURE_RUBRIC_MODEL_ENDPOINT'),
+    RUBRIC_MODEL_DEPLOYMENT: required(env, 'AZURE_RUBRIC_MODEL_DEPLOYMENT'),
+    RUBRIC_MODEL_NAME: WORKER_MODEL_BOOTSTRAP.modelName,
+    RUBRIC_MODEL_REASONING_EFFORT: WORKER_MODEL_BOOTSTRAP.reasoningEffort,
+  }
   const expected = {
     NODE_ENV: 'production',
     AZURE_CLIENT_ID: identities[identityId].clientId,
@@ -118,21 +126,25 @@ export function validateWorkerTemplate(env, existing, definition) {
     STORAGE_ACCOUNT_URL: required(env, 'AZURE_STORAGE_ACCOUNT_URL'),
     [recordsSetting]: records,
     [sourcesSetting]: sources,
-    RUBRIC_MODEL_ENDPOINT: required(env, 'AZURE_RUBRIC_MODEL_ENDPOINT'),
-    RUBRIC_MODEL_DEPLOYMENT: required(env, 'AZURE_RUBRIC_MODEL_DEPLOYMENT'),
-    RUBRIC_MODEL_NAME: 'gpt-5-mini',
-    RUBRIC_MODEL_REASONING_EFFORT: 'low',
     ...(usesExtraction ? {
       DOCUMENT_INTELLIGENCE_ENDPOINT: required(env, 'AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT'),
       JOB_RENDERER_URL: required(env, 'AZURE_JOB_RENDERER_URL'),
     } : {}),
   }
-  const allowed = new Set([...Object.keys(expected), maxItemsSetting,
+  const allowed = new Set([...Object.keys(expected), ...Object.keys(expectedModel), maxItemsSetting,
     ...(kind === 'analysis' ? ['ANALYSIS_EVIDENCE_CORRECTIONS_ENABLED'] : [])])
-  if (settings.size !== container.env?.length ||
-    container.env.some(setting => !allowed.has(setting.name) || typeof setting.value !== 'string' || setting.secretRef) ||
+  const boundarySettings = (container.env ?? []).filter(setting => !Object.hasOwn(expectedModel, setting.name))
+  if (!Array.isArray(container.env) || new Set(boundarySettings.map(setting => setting.name)).size !== boundarySettings.length ||
+    boundarySettings.some(setting => !allowed.has(setting.name) || typeof setting.value !== 'string' || setting.secretRef) ||
     Object.entries(expected).some(([name, value]) => !value || settings.get(name) !== value)) {
     throw new Error(`The ${containerName} must use only its dedicated ${records}/${sources} stores, identity, and configured processing services.`)
+  }
+  const modelDrift = Object.entries(expectedModel).find(([name, value]) => {
+    const entries = container.env.filter(setting => setting.name === name)
+    return entries.length !== 1 || !value || entries[0].value !== value || entries[0].secretRef
+  })
+  if (modelDrift) {
+    throw new Error(`The ${containerName} has model/bootstrap drift in ${modelDrift[0]}. Restore the declared infrastructure bootstrap; choose live task deployments and reasoning in Admin settings. Saved and accepted processing policies must not be rewritten.`)
   }
   if (settings.has('ANALYSIS_EVIDENCE_CORRECTIONS_ENABLED') &&
     !['false', 'true'].includes(settings.get('ANALYSIS_EVIDENCE_CORRECTIONS_ENABLED'))) {
@@ -155,6 +167,16 @@ export function validateWorkerTemplate(env, existing, definition) {
     throw new Error(`The ${containerName} must use its ${entryPoint} entry point.`)
   }
   return { identityId, container }
+}
+
+export function validateWorkerModelDeployment(env, deployment) {
+  if (deployment?.properties?.provisioningState !== 'Succeeded') {
+    throw new Error('The bootstrap model deployment must finish provisioning before deploying workers.')
+  }
+  if (deployment.name !== required(env, 'AZURE_RUBRIC_MODEL_DEPLOYMENT') ||
+    deployment.properties.model?.name !== WORKER_MODEL_BOOTSTRAP.modelName) {
+    throw new Error('The bootstrap deployment/model pairing does not match the declared infrastructure model. Check the ARM deployment metadata and RUBRIC_MODEL_DEPLOYMENT/RUBRIC_MODEL_NAME; changing a descriptive model name does not select another deployment. Live task model selection belongs in Admin settings.')
+  }
 }
 
 function validateWordExecution(execution, definition, image, initial = false) {
@@ -509,10 +531,11 @@ async function validatePrivateServices(env, credential, hooks) {
   }
   const model = await send(credential, 'https://management.azure.com',
     `${base}/Microsoft.CognitiveServices/accounts/${required(env, 'AZURE_AI_ACCOUNT_NAME')}/deployments/${required(env, 'AZURE_RUBRIC_MODEL_DEPLOYMENT')}?api-version=2025-06-01`)
+  validateWorkerModelDeployment(env, model)
   const extraction = await send(credential, 'https://management.azure.com',
     `${base}/Microsoft.CognitiveServices/accounts/${required(env, 'AZURE_DOCUMENT_INTELLIGENCE_NAME')}?api-version=2025-06-01`)
-  if (model.properties?.provisioningState !== 'Succeeded' || extraction.properties?.provisioningState !== 'Succeeded') {
-    throw new Error('The existing Foundry model and Document Intelligence services must finish provisioning before deploying workers.')
+  if (extraction.properties?.provisioningState !== 'Succeeded') {
+    throw new Error('The existing Document Intelligence service must finish provisioning before deploying workers.')
   }
 }
 

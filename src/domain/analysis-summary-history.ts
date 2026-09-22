@@ -70,6 +70,14 @@ export const summaryHistoryReferenceSchema = z.strictObject({
     sha256: hash, bytes: z.number().int().min(1).max(SUMMARY_LIMITS.checkpointBytes),
   }),
 })
+export const summaryDiagnosticSchema = z.strictObject({
+  reason: z.enum([...ANALYSIS_DIAGNOSTIC_REASONS, 'factual-review', 'history-write-failed']).optional(),
+  round: z.number().int().min(1).max(SUMMARY_LIMITS.rounds).optional(),
+  modelCallId: z.string().uuid().optional(),
+  issueCount: z.number().int().min(0).max(SUMMARY_LIMITS.issues).optional(),
+  httpStatus: z.number().int().min(100).max(599).optional(),
+  retryAt: timestamp.optional(),
+})
 export const summaryStepSchema = z.strictObject({
   scopeId: z.string().regex(/^(?:final|reduction-[a-f0-9]{64})$/),
   sourceFingerprint: hash,
@@ -85,7 +93,7 @@ export const summaryStepSchema = z.strictObject({
       'invalid-model-output', 'invalid-citation', 'grounding-failed', 'service-unavailable', 'storage-error',
       'timeout', 'internal-error', 'dependency-failed']),
     stage: z.enum(['dependencies', 'candidate-generation', 'target-generation', 'grounding', 'publication']),
-    message: nonempty(2_000), retryable: z.boolean(),
+    message: nonempty(2_000), retryable: z.boolean(), diagnostic: summaryDiagnosticSchema.optional(),
   }).optional(),
 })
 export const summaryHistoryEntrySchema = summaryStepSchema.extend({
@@ -104,18 +112,18 @@ export const summaryHistoryPageSchema = z.strictObject({
   etag: z.string().min(1).max(1_024), inputFingerprint: hash.nullable(),
   entries: z.array(summaryHistoryEntrySchema).max(SUMMARY_LIMITS.historyPageSize),
   continuationToken: z.string().min(1).max(16 * 1024).optional(),
-  capabilities: z.strictObject({ canPublish: z.boolean(), canRetry: z.boolean() }),
+  capabilities: z.strictObject({
+    canPublish: z.boolean(), canRetry: z.boolean(),
+    canResume: z.boolean().optional(), canRestart: z.boolean().optional(),
+  }),
 })
 export const publishSummaryDraftInputSchema = z.strictObject({
   generationId: z.string().uuid(),
   round: z.number().int().min(1).max(SUMMARY_LIMITS.rounds),
   outputSha256: hash,
 })
-export const summaryDiagnosticSchema = z.strictObject({
-  reason: z.enum([...ANALYSIS_DIAGNOSTIC_REASONS, 'factual-review', 'history-write-failed']).optional(),
-  round: z.number().int().min(1).max(SUMMARY_LIMITS.rounds).optional(),
-  modelCallId: z.string().uuid().optional(),
-  issueCount: z.number().int().min(0).max(SUMMARY_LIMITS.issues).optional(),
+export const restartSummaryInputSchema = z.strictObject({
+  confirmRestart: z.literal(true),
 })
 
 export type AnalysisSummaryIssue = z.infer<typeof summaryIssueSchema>
@@ -127,6 +135,7 @@ export type AnalysisSummaryHistoryReference = z.infer<typeof summaryHistoryRefer
 export type AnalysisSummaryHistoryEntry = z.infer<typeof summaryHistoryEntrySchema>
 export type AnalysisSummaryHistoryPage = z.infer<typeof summaryHistoryPageSchema>
 export type PublishSummaryDraftInput = z.infer<typeof publishSummaryDraftInputSchema>
+export type RestartSummaryInput = z.infer<typeof restartSummaryInputSchema>
 export type AnalysisSummarySubject = { kind: 'candidate' | 'target'; subjectId: string }
 export type AnalysisSummaryDiagnostic = z.infer<typeof summaryDiagnosticSchema>
 

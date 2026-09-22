@@ -9,6 +9,7 @@ import {
   ANALYSIS_LIMITS, type RealAnalysisAssessmentInput, type RealAnalysisRunRecord, type VersionedAnalysisEntity,
 } from '../../src/domain/real-analyses'
 import type { ImmutableJsonBlobReference } from '../../src/domain/real-resumes'
+import type { ProcessingSettingsSnapshot } from '../../src/domain/admin-settings'
 import { StoreConflictError } from '../../server/store'
 import { HttpError } from '../../server/errors'
 import { fencedAnalysisBlobs } from '../../server/analyses/guards'
@@ -25,7 +26,9 @@ import {
 import {
   analysisBlobReference, createAnalysisSnapshotReader, parseAnalysisJson, putAnalysisJson, readAnalysisBlob,
 } from '../../server/analyses/snapshots'
-import { readSummaryGeneration, SummaryHistoryCaptureError, writeSummaryCheckpoint } from '../../server/analyses/summary-history'
+import {
+  readSummaryGeneration, readSummaryHistoryEntry, SummaryHistoryCaptureError, writeSummaryCheckpoint,
+} from '../../server/analyses/summary-history'
 import type { AnalysisSummaryStep } from '../../src/domain/analysis-summary-history'
 import type { AnalysisTransaction } from '../../server/analyses/store'
 import {
@@ -90,6 +93,35 @@ function failureFor(error: unknown, stage: Stage, inputs: boolean): AnalysisNarr
     code: 'storage-error', stage, retryable: true,
     message: 'The private summary stores could not finish this operation. Retry preserves the saved assessment and previous narrative.',
   }
+}
+
+function failedNarrative(
+  record: RealAnalysisNarrativeRecord, timestamp: string, failure: AnalysisNarrativeProcessingError,
+  snapshot: ProcessingSettingsSnapshot,
+): RealAnalysisNarrativeRecord {
+  const maxAttempts = snapshot.settings.processing.analyses.maxAutomaticAttempts
+  const retry = failure.retryable && record.attempts < maxAttempts
+  const exhausted = `Automatic attempts are exhausted (${maxAttempts}); review the saved work and resume explicitly after resolving the failure.`
+  const message = `${failure.message} ${exhausted}`
+  const next = {
+    ...record, status: retry ? 'queued' as const : 'failed' as const, updatedAt: timestamp,
+    error: !retry && failure.retryable ? {
+      ...failure,
+      message: message.length <= 2_000 ? message : `${exhausted} The saved history retains the last failure details.`,
+    } : failure,
+  }
+  delete next.lease
+  delete next.nextAttemptAt
+  if (retry) next.nextAttemptAt = new Date(Math.max(
+    Date.parse(timestamp) + retryBackoff(snapshot, 'analyses', record.attempts),
+    failure.diagnostic?.retryAt ? Date.parse(failure.diagnostic.retryAt) : 0,
+  )).toISOString()
+  return next
+}
+
+function savedRetryFailure(steps: readonly AnalysisSummaryStep[]): AnalysisNarrativeProcessingError | undefined {
+  const failure = steps[0]?.error
+  return failure?.retryable && failure.diagnostic?.retryAt ? failure : undefined
 }
 
 class NarrativeDeadline {
@@ -367,7 +399,7 @@ async function reconcileTarget(
 
 async function claim(
   deps: AnalysisWorkerDependencies, candidate: Narrative, clock: Clock, owner: string, deadline: number, signal?: AbortSignal,
-): Promise<(Narrative & { attemptLimitReached: boolean }) | undefined> {
+): Promise<(Narrative & { attemptLimitReached: boolean; previousFailure?: AnalysisNarrativeProcessingError }) | { deferred: true } | undefined> {
   const attemptId = randomUUID()
   for (let race = 0; race < 8; race++) {
     if (signal?.aborted || clock.now().getTime() >= deadline) return
@@ -382,7 +414,43 @@ async function claim(
     const snapshot = operationSettings(current.record, deps)
     const maxAttempts = snapshot.settings.processing.analyses.maxAutomaticAttempts
     const attemptLimitReached = current.record.attempts >= maxAttempts
+    let previousFailure = current.record.error
+    let recoveryFailed = false
+    if (current.record.status === 'running' && current.record.history?.generationId === current.record.generationId) {
+      try {
+        previousFailure = savedRetryFailure([await readSummaryHistoryEntry(deps, current.record, current.record.history, signal)])
+      } catch (error) {
+        previousFailure = failureFor(error, 'dependencies', true)
+        recoveryFailed = true
+      }
+    }
     const timestamp = narrativeTimestamp(run.record, clock.now().toISOString())
+    // A worker may disappear during transport backoff, after saving the cooldown but before releasing its lease.
+    if (previousFailure && (recoveryFailed ||
+      previousFailure.diagnostic?.retryAt && Date.parse(previousFailure.diagnostic.retryAt) > clock.now().getTime())) {
+      const deferred = failedNarrative(recoveryFailed ? {
+        ...current.record, attemptId, attempts: Math.min(current.record.attempts + 1, maxAttempts),
+      } : current.record, timestamp, previousFailure, snapshot)
+      if (signal?.aborted || clock.now().getTime() >= deadline) return
+      parseAnalysisEntity(deferred)
+      try {
+        await deps.store.transact(deferred.workspaceId, [
+          { kind: 'replace', record: deferred, etag: current.etag },
+          { kind: 'replace', record: { ...run.record, updatedAt: timestamp }, etag: run.etag },
+        ])
+        emitSummaryTelemetry(deps.onNarrativeEvent ?? logSummaryTelemetry, {
+          event: 'narrative-outcome', timestamp, workspaceId: deferred.workspaceId, runId: deferred.runId,
+          targetId: deferred.targetId, generationId: deferred.generationId, attemptId: deferred.attemptId,
+          stage: previousFailure.stage, outcome: deferred.status === 'queued' ? 'queued' : 'failed',
+          code: previousFailure.code, retryable: previousFailure.retryable,
+          httpStatus: previousFailure.diagnostic?.httpStatus, retryAt: previousFailure.diagnostic?.retryAt,
+        })
+        return { deferred: true }
+      } catch (error) {
+        if (!isConflict(error)) throw error
+        continue
+      }
+    }
     const record: RealAnalysisNarrativeRecord = {
       ...current.record, status: 'running', updatedAt: timestamp, attemptId,
       ...(current.record.processingSettings !== undefined || deps.settings ? { processingSettings: snapshot } : {}),
@@ -400,12 +468,12 @@ async function claim(
       ])
     } catch (error) {
       const latest = await loadAnalysisNarrative(deps.store, record.workspaceId, record.id)
-      if (latest && owns(latest.record, record, clock.now().toISOString())) return { ...latest, attemptLimitReached }
+      if (latest && owns(latest.record, record, clock.now().toISOString())) return { ...latest, attemptLimitReached, previousFailure }
       if (!isConflict(error)) throw error
       continue
     }
     const latest = await loadAnalysisNarrative(deps.store, record.workspaceId, record.id)
-    if (latest && owns(latest.record, record, clock.now().toISOString())) return { ...latest, attemptLimitReached }
+    if (latest && owns(latest.record, record, clock.now().toISOString())) return { ...latest, attemptLimitReached, previousFailure }
     return
   }
 }
@@ -417,23 +485,26 @@ function validateSaved(artifact: RealAnalysisNarrativeArtifact, input: AnalysisC
 }
 export async function processClaimedNarrative(
   claimed: Narrative, deps: AnalysisWorkerDependencies,
-  options: { deadline?: number; signal?: AbortSignal; attemptLimitReached?: boolean } = {},
+  options: {
+    deadline?: number; signal?: AbortSignal; attemptLimitReached?: boolean; previousFailure?: AnalysisNarrativeProcessingError
+  } = {},
 ): Promise<boolean> {
   if (deps.owner && deps.owner !== claimed.record.lease?.owner) return false
   // An explicit unpinned generation must not inherit an older scoring run's policy.
   const snapshot = operationSettings(claimed.record, deps)
   const pinned = claimed.record.processingSettings !== undefined || Boolean(deps.settings)
   deps = { ...deps, model: { ...deps.model, ...(pinned ? { processingSettings: snapshot } : {}) } }
-  const maxAttempts = snapshot.settings.processing.analyses.maxAutomaticAttempts
   if (pinned) console.info('Score operation settings:', safeSettingsMetadata(snapshot,
     claimed.record.recordType === 'analysis-candidate-narrative' ? 'candidateSummary' : 'targetSummary'))
   const clock = deps.clock ?? systemClock
   const started = clock.now().getTime()
-  const lease = new NarrativeLease(claimed, deps, clock, options.deadline ?? started + RUN_BUDGET_MS, options.signal)
+  const deadline = options.deadline ?? started + RUN_BUDGET_MS
+  const lease = new NarrativeLease(claimed, deps, clock, deadline, options.signal)
   let stage: Stage = claimed.record.recordType === 'analysis-candidate-narrative' ? 'candidate-generation' : 'target-generation'
   let inputs = true
   let reference: ImmutableJsonBlobReference | undefined
   let round = claimed.record.summaryRound
+  let knownFailure = options.previousFailure
   const onEvent = (event: SummaryTelemetryEvent) => {
     stage = event.stage
     if (event.scopeId === 'final' && event.round !== undefined) round = event.round
@@ -453,6 +524,7 @@ export async function processClaimedNarrative(
       generationId: record.generationId, attemptId: record.attemptId, stage: failure?.stage ?? stage, outcome,
       ...(failure ? { code: failure.code, retryable: failure.retryable } : {}),
       round, reason: failure?.diagnostic?.reason, modelCallId: failure?.diagnostic?.modelCallId,
+      httpStatus: failure?.diagnostic?.httpStatus, retryAt: failure?.diagnostic?.retryAt,
       reviewIssueCount: failure?.diagnostic?.issueCount,
       durationMilliseconds: Math.max(0, clock.now().getTime() - started),
     }
@@ -460,9 +532,9 @@ export async function processClaimedNarrative(
   }
   try {
     const { run, narrative } = await lease.check()
-    if (options.attemptLimitReached) throw new NarrativeWorkFailure({
+    if (options.attemptLimitReached) throw new NarrativeWorkFailure(knownFailure ?? {
       code: 'timeout', stage, retryable: true,
-      message: `Summary generation stopped after ${maxAttempts} attempts. Generate missing summaries to retry without changing the assessment.`,
+      message: 'Summary processing was interrupted before its last attempt completed. Saved drafts and assessments are retained.',
     })
     const inventory = await lease.control.wait(() => readAnalysisNarrativeInventory(deps, run.record.workspaceId, run.record.id, narrative.record.targetId))
     const comparisonId = narrative.record.recordType === 'analysis-candidate-narrative' ? narrative.record.comparisonId : undefined
@@ -474,10 +546,12 @@ export async function processClaimedNarrative(
     await lease.check()
     onEvent({ event: 'narrative-started', timestamp: clock.now().toISOString(), stage, round })
     const resume = await lease.control.wait(() => readSummaryGeneration(deps, narrative.record))
+    knownFailure = savedRetryFailure(resume.steps)
     const modelOptions = {
-      model: deps.model, clock, signal: lease.control.signal, attemptId: narrative.record.attemptId!,
+      model: deps.model, clock, signal: lease.control.signal, deadlineAt: deadline, attemptId: narrative.record.attemptId!,
       ...resume, onEvent,
       async onCheckpoint(step: AnalysisSummaryStep) {
+        knownFailure = step.error?.diagnostic?.retryAt ? step.error : undefined
         const current = await lease.check()
         const history = await lease.control.wait(() => writeSummaryCheckpoint(deps, current.narrative.record, step, {
           createdAt: narrativeTimestamp(current.run.record, clock.now().toISOString()),
@@ -547,16 +621,18 @@ export async function processClaimedNarrative(
       return true
     }
     if (error instanceof LostNarrativeWork) { emit('abandoned'); return false }
-    const failure = failureFor(error, stage, inputs)
+    let failure = failureFor(error, stage, inputs)
+    if (knownFailure?.diagnostic?.retryAt) {
+      if (failure.code === 'timeout') failure = knownFailure
+      else if (failure.code === 'storage-error') {
+        failure = { ...failure, diagnostic: { ...knownFailure.diagnostic, ...failure.diagnostic } }
+      }
+    }
     try {
       let outcome: 'queued' | 'failed' = 'failed'
       await lease.atomic((record, timestamp) => {
-        const retry = failure.retryable && record.attempts < maxAttempts
-        outcome = retry ? 'queued' : 'failed'
-        const next = { ...record, status: outcome, updatedAt: timestamp, error: failure }
-        delete next.lease
-        delete next.nextAttemptAt
-        if (retry) next.nextAttemptAt = new Date(Date.parse(timestamp) + retryBackoff(snapshot, 'analyses', record.attempts)).toISOString()
+        const next = failedNarrative(record, timestamp, failure, snapshot)
+        outcome = next.status === 'queued' ? 'queued' : 'failed'
         return next
       }, true)
       emit(outcome, failure)
@@ -589,6 +665,9 @@ export async function runAnalysisNarrativeWork(
   if (!current) return prepared.worked
   const claimed = await claim(deps, current, clock, deps.owner ?? `analysis-narrative-worker-${randomUUID()}`, options.deadline, options.signal)
   if (!claimed) return prepared.worked
-  await processClaimedNarrative(claimed, deps, { ...options, attemptLimitReached: claimed.attemptLimitReached })
+  if ('deferred' in claimed) return true
+  await processClaimedNarrative(claimed, deps, {
+    ...options, attemptLimitReached: claimed.attemptLimitReached, previousFailure: claimed.previousFailure,
+  })
   return true
 }

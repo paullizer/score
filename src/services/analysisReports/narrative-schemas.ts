@@ -5,7 +5,9 @@ import {
   type ReadyAnalysisCandidateNarrative, type ReadyAnalysisTargetNarrative, type RealAnalysisSummariesResponse,
 } from '../../domain/analysis-narratives'
 import { REPORT_LIMITS, type ReportTargetPresentation } from '../../domain/analysis-reports'
-import { AnalysisNarrativeValidationError, narrativeSentences, validateNarrativeProse } from '../../domain/analysis-narrative-validation'
+import {
+  AnalysisNarrativeValidationError, analysisNarrativeWorkHealthSchema, narrativeSentences, validateNarrativeProse,
+} from '../../domain/analysis-narrative-validation'
 import {
   SUMMARY_LIMITS, summaryApprovalSchema, summaryCandidateContentSchema, summaryDiagnosticSchema, summaryTargetContentSchema,
 } from '../../domain/analysis-summary-history'
@@ -139,6 +141,7 @@ const summaryState = {
   attempts: z.number().int().min(0), retryCount: z.number().int().min(0),
   nextAttemptAt: timestamp.nullable(), updatedAt: timestamp.nullable(),
   hasHistory: z.boolean().optional(), summaryRound: z.number().int().min(1).max(SUMMARY_LIMITS.rounds).optional(),
+  workHealth: analysisNarrativeWorkHealthSchema.optional(),
   error: z.strictObject({
     code: z.enum(['invalid-input', 'stale-input', 'snapshot-unavailable', 'snapshot-invalid', 'context-limit', 'invalid-model-output',
       'invalid-citation', 'grounding-failed', 'service-unavailable', 'storage-error', 'timeout', 'internal-error', 'dependency-failed']),
@@ -155,6 +158,7 @@ const summaryCounts = z.strictObject({
 export const realAnalysisSummariesResponseSchema: z.ZodType<RealAnalysisSummariesResponse> = z.strictObject({
   schemaVersion: z.literal(ANALYSIS_NARRATIVE_SCHEMA_VERSION), dataKind: z.literal('real'),
   workspaceId: id, runId: id, scope, revision: hash, etag: id, ready: z.boolean(),
+  workRevision: hash.optional(),
   capture: realNarrativeReportCaptureSchema,
   scoring: z.strictObject({ total: count, initialized: count, queued: count, running: count, complete: count, failed: count, cancelled: count }),
   counts: z.strictObject({ candidates: summaryCounts, targets: summaryCounts }),

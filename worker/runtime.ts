@@ -1197,6 +1197,7 @@ export interface RubricModelOptions {
   getToken: (scope: string) => Promise<string>
   fetch?: typeof fetch
   clock?: Clock
+  retryRandom?: () => number
   processingSettings?: ProcessingSettingsSnapshot
 }
 
@@ -1244,6 +1245,10 @@ export interface StructuredModelRequest {
   taskId?: ModelTaskId
   source?: string
   processingSettings?: ProcessingSettingsSnapshot
+  /** Absolute milliseconds on the supplied Clock, shared by authentication, attempts, bodies, and backoff. */
+  deadlineAt?: number
+  /** Complete durable failure capture before the transport sleeps or returns a deferred failure. */
+  onRetry?: (failure: WorkerError) => Promise<void>
 }
 
 const PROTECTED_CRITERION = /\b(age|race|racial|ethnicity|ethnic|religion|religious|sex|gender|pregnan|disab|marital|national origin|citizenship|sexual orientation|veteran|genetic)\b/i

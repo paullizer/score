@@ -88,6 +88,42 @@ export function analysisSummaryFixture({ workspaceId = summaryWorkspaceId, archi
   return { workspaceId, targets, resume, details, summary, detail: { ...summary, targets, resumes: [resume] } }
 }
 
+export function analysisSummaryIncidentFixture() {
+  const fixture = analysisSummaryFixture()
+  const targets = Array.from({ length: 4 }, (_, index) => {
+    const original = fixture.targets[index % 2]
+    return { ...structuredClone(original), id: `target-incident-${index + 1}`, label: `Saved overview ${index + 1}`,
+      selection: original.kind === 'job' ? { ...original.selection, jobId: `incident-job-${index + 1}` }
+        : { ...original.selection, ladderId: `incident-ladder-${index + 1}` } }
+  })
+  const details = targets.flatMap((target, targetIndex) => Array.from({ length: 103 }, (_, index) => {
+    const value = structuredClone(fixture.details[targetIndex % 2])
+    const id = `comparison-${targetIndex * 103 + index + 1}`
+    const snapshotId = `incident-target-snapshot-${targetIndex + 1}`
+    value.comparison.id = id
+    value.comparison.index = targetIndex * 103 + index
+    value.comparison.target = { ...value.comparison.target, snapshotId, summary: target }
+    value.targetSnapshot = { ...value.targetSnapshot, snapshotId, summary: target, selection: target.selection }
+    value.result.comparisonId = id
+    value.result.provenance.targetSnapshot.snapshotId = snapshotId
+    return value
+  }))
+  fixture.summary.run.progress = { ...fixture.summary.run.progress, total: 412, initialized: 412, complete: 412, scored: 412 }
+  fixture.summary.run.initialization.nextComparisonIndex = 412
+  return { ...fixture, targets, details, detail: { ...fixture.detail, targets } }
+}
+
+export function summaryWorkHealthFixture(state, overrides = {}) {
+  return {
+    state, requestedAt: summaryTimestamp, lastActivityAt: summaryTimestamp,
+    leaseExpiresAt: ['running', 'interrupted'].includes(state) ? '2026-09-19T15:01:30.000Z' : null,
+    attempt: 1,
+    nextEligibleAt: ['awaiting-worker', 'retry-scheduled', 'throttled'].includes(state) ? summaryTimestamp : null,
+    capturedSettings: { revision: 'saved-summary-policy', modelName: 'gpt-5-mini', reasoningEffort: 'low' },
+    ...overrides,
+  }
+}
+
 function counts(items) {
   const value = { total: items.length, missing: 0, waiting: 0, queued: 0, running: 0, ready: 0, stale: 0, failed: 0, cancelled: 0, notRequired: 0 }
   for (const item of items) value[item.status === 'not-required' ? 'notRequired' : item.status]++
@@ -104,7 +140,8 @@ export function summaryResponse(fixture, {
   const state = (kind, id, targetId, defaultStatus) => {
     const options = states[id] ?? {}
     const status = options.status ?? defaultStatus
-    const published = status === 'ready' || (options.previous ?? previous)
+    const published = status !== 'ready' && options.previousPublication ? options.previousPublication
+      : status === 'ready' || (options.previous ?? previous)
       ? { dataKind: 'real', revision: createHash('sha256').update(`${id}:${options.text ?? text}:${revisionTag}`).digest('hex'),
         inputFingerprint: hash, generationId: options.generationId ?? `${id}:published`, publishedAt: summaryTimestamp,
         ...(kind === 'candidate' ? { text: options.text ?? text, overview: options.overview ?? 'Documented engineering work is relevant, with limited evidence about breadth.' }
@@ -115,12 +152,13 @@ export function summaryResponse(fixture, {
     return { kind, ...(kind === 'candidate' ? { comparisonId: id } : {}), targetId, status,
       generationId: status === 'ready' ? published.generationId : options.generationId ?? `${id}:requested`,
       inputFingerprint: hash, waitingFor: status === 'waiting' ? (options.waitingFor ?? 'candidate-narratives') : null,
-      attempts: 1, retryCount: 0, nextAttemptAt: null, updatedAt: summaryTimestamp, published,
+      attempts: 1, retryCount: 0, nextAttemptAt: options.nextAttemptAt ?? null, updatedAt: options.updatedAt ?? summaryTimestamp, published,
+      ...(options.workHealth ? { workHealth: options.workHealth } : {}),
       ...((options.hasHistory ?? hasHistory) === undefined ? {} : { hasHistory: options.hasHistory ?? hasHistory }),
       ...((options.summaryRound ?? summaryRound) === undefined ? {} : { summaryRound: options.summaryRound ?? summaryRound }),
-      error: status === 'failed' ? { code: 'grounding-failed', stage: 'grounding',
+      error: options.processingError ?? (status === 'failed' ? { code: 'grounding-failed', stage: 'grounding',
         message: options.error ?? 'Summary grounding needs an explicit retry.', retryable: false,
-        ...(options.diagnostic ? { diagnostic: options.diagnostic } : {}) } : null }
+        ...(options.diagnostic ? { diagnostic: options.diagnostic } : {}) } : null) }
   }
   const comparisons = selected.map(({ comparison }) => ({
     ...state('candidate', comparison.id, comparison.target.summary.id,
@@ -133,11 +171,18 @@ export function summaryResponse(fixture, {
   for (const { comparison } of selected) scoring[comparison.status]++
   const ready = scoring.initialized === scoring.total && scoring.queued + scoring.running === 0 &&
     [...comparisons, ...targets].every((item) => ['ready', 'not-required'].includes(item.status))
-  const revision = createHash('sha256').update(JSON.stringify({ targetId, scoring, comparisons, targets, revisionTag })).digest('hex')
+  const contentState = item => ({
+    kind: item.kind, comparisonId: item.comparisonId, comparisonStatus: item.comparisonStatus, targetId: item.targetId,
+    status: item.status, generationId: item.generationId, inputFingerprint: item.inputFingerprint, published: item.published,
+  })
+  const revision = createHash('sha256').update(JSON.stringify({
+    targetId, scoring, comparisons: comparisons.map(contentState), targets: targets.map(contentState), revisionTag,
+  })).digest('hex')
   const pin = (item) => item.published ? { revision: item.published.revision, inputFingerprint: item.published.inputFingerprint } : null
   return {
     schemaVersion: 1, dataKind: 'real', workspaceId: fixture.workspaceId, runId: summaryRunId,
     scope: { targetId }, revision, etag: `"${revision}"`, ready, scoring,
+    ...summaryWorkRevision([...comparisons, ...targets]),
     counts: { candidates: counts(comparisons), targets: counts(targets) }, comparisons, targets,
     capabilities: { canGenerate, reason },
     capture: { dataKind: 'real', scope: { targetId }, revision, ready,
@@ -145,6 +190,16 @@ export function summaryResponse(fixture, {
         status: item.comparisonStatus, resultSha256: item.comparisonStatus === 'complete' ? hash : null, narrative: pin(item) })),
       targets: targets.map((item) => ({ targetId: item.targetId, narrative: pin(item) })) },
   }
+}
+
+function summaryWorkRevision(items) {
+  if (!items.some(item => item.workHealth)) return {}
+  const work = items.map(item => ({
+    kind: item.kind, subjectId: item.comparisonId ?? item.targetId, error: item.error,
+    state: item.workHealth?.state, attempt: item.attempts, nextEligibleAt: item.workHealth?.nextEligibleAt,
+    capturedSettings: item.workHealth?.capturedSettings,
+  }))
+  return { workRevision: createHash('sha256').update(JSON.stringify(work)).digest('hex') }
 }
 
 export function summarySubjectResponse(fixture, subject, options = {}) {
@@ -155,10 +210,13 @@ export function summarySubjectResponse(fixture, subject, options = {}) {
     ? scope.comparisons.find((item) => item.comparisonId === subject.subjectId)
     : scope.targets.find((item) => item.targetId === subject.subjectId)
   if (!narrative) throw new Error('The summary fixture does not contain this subject.')
-  const revision = createHash('sha256').update(JSON.stringify({ subject, narrative })).digest('hex')
+  const stable = { ...narrative }
+  delete stable.workHealth
+  delete stable.updatedAt
+  const revision = createHash('sha256').update(JSON.stringify({ subject, narrative: stable })).digest('hex')
   return {
     schemaVersion: 1, dataKind: 'real', workspaceId: fixture.workspaceId, runId: fixture.summary.run.id,
-    ...subject, revision, etag: `"${revision}"`, narrative,
+    ...subject, revision, etag: `"${revision}"`, narrative, ...summaryWorkRevision([narrative]),
   }
 }
 

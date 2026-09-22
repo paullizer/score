@@ -7,6 +7,7 @@ import {
   type AnalysisNarrativeClaimLocation,
   type AnalysisNarrativeEvidenceReference,
   type AnalysisNarrativeGroundingReviewOutput,
+  type AnalysisNarrativeWorkHealth,
   type AnalysisTargetNarrativeModelInput,
   type AnalysisTargetNarrativeModelOutput,
 } from './analysis-narratives'
@@ -16,6 +17,24 @@ const identifier = z.string().min(1).max(200).regex(/^[A-Za-z0-9][A-Za-z0-9_.:-]
 const claimId = z.string().regex(/^[A-Za-z][A-Za-z0-9_-]{0,79}$/)
 const text = (maximum: number) => z.string().min(1).max(maximum).regex(/\S/)
 const index = z.number().int().min(0)
+const workHealthTimestamp = z.iso.datetime({ offset: true }).max(40)
+
+export const analysisNarrativeWorkHealthSchema: z.ZodType<AnalysisNarrativeWorkHealth> = z.strictObject({
+  state: z.enum(['waiting-prerequisites', 'awaiting-worker', 'retry-scheduled', 'throttled', 'running', 'interrupted', 'failed', 'inactive']),
+  requestedAt: workHealthTimestamp,
+  lastActivityAt: workHealthTimestamp,
+  leaseExpiresAt: workHealthTimestamp.nullable(),
+  attempt: z.number().int().min(0).max(ANALYSIS_NARRATIVE_LIMITS.maxAutomaticAttempts),
+  nextEligibleAt: workHealthTimestamp.nullable(),
+  capturedSettings: z.strictObject({
+    revision: identifier,
+    modelName: text(200).nullable(),
+    reasoningEffort: z.enum(['minimal', 'low', 'medium', 'high']).nullable(),
+  }),
+}).refine(value => !['running', 'interrupted'].includes(value.state) ||
+  value.leaseExpiresAt !== null && value.attempt > 0, 'Claimed work requires its lease and attempt.')
+  .refine(value => !['awaiting-worker', 'retry-scheduled', 'throttled'].includes(value.state) ||
+    value.nextEligibleAt !== null, 'Queued work requires its eligibility time.')
 
 export const narrativeEvidenceReferenceSchema = z.discriminatedUnion('kind', [
   z.strictObject({ kind: z.literal('criterion'), comparisonId: identifier, criterionId: identifier }),

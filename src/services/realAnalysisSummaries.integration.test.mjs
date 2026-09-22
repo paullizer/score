@@ -290,7 +290,7 @@ test('private summary history GET validates subject identity and keeps complete 
   await assert.rejects(client.getRealAnalysisSummaryHistory(summaryWorkspaceId, summaryRunId, subject, undefined, controller.signal), { name: 'AbortError' })
 })
 
-test('manual publication and single-summary retry send exact immutable selection, original ETag and stable UUID only', async () => {
+test('publication, resume and confirmed restart send exact intent, original ETag and stable UUID only', async () => {
   const history = summaryHistoryFixture(fixture)
   const draft = history.entries[0]
   const subject = { kind: history.kind, subjectId: history.subjectId }
@@ -303,14 +303,35 @@ test('manual publication and single-summary retry send exact immutable selection
     await client.publishRealAnalysisSummaryDraft(summaryWorkspaceId, summaryRunId, subject, input, history.etag, key, draft.targetId)
   }
   await client.retryRealAnalysisSummary(summaryWorkspaceId, summaryRunId, subject, history.etag, key, draft.targetId)
-  assert.deepEqual(requests.map(item => JSON.parse(item.init.body)), [input, input, {}])
+  await client.restartRealAnalysisSummary(summaryWorkspaceId, summaryRunId, subject, history.etag, key, draft.targetId)
+  assert.deepEqual(requests.map(item => JSON.parse(item.init.body)), [input, input, {}, { confirmRestart: true }])
   assert.ok(requests.every(item => item.init.headers.get('If-Match') === history.etag &&
     item.init.headers.get('Idempotency-Key') === key && item.init.method === 'POST'))
   assert.deepEqual(requests.map(item => item.url.split('/').slice(-4).join('/')), [
     'summaries/candidate/comparison-1/publish', 'summaries/candidate/comparison-1/publish', 'summaries/candidate/comparison-1/retry',
+    'summaries/candidate/comparison-1/restart',
   ])
   globalThis.fetch = async () => json({ summaries: summaryResponse(fixture) })
   await assert.rejects(client.retryRealAnalysisSummary(summaryWorkspaceId, summaryRunId, subject, history.etag, key, draft.targetId), /mismatched/)
+  await assert.rejects(client.restartRealAnalysisSummary(summaryWorkspaceId, summaryRunId, subject, history.etag, key, draft.targetId), /mismatched/)
   globalThis.fetch = async () => json({ summaries: { ...summaries, workspaceId: 'foreign' } })
   await assert.rejects(client.publishRealAnalysisSummaryDraft(summaryWorkspaceId, summaryRunId, subject, input, history.etag, key, draft.targetId), /mismatched/)
+})
+
+test('historical summary pages cannot advertise resume or restart capabilities', async () => {
+  const resultRevisionId = randomUUID()
+  const subject = { kind: 'candidate', subjectId: 'comparison-1' }
+  const history = { ...summaryHistoryFixture(fixture), resultRevisionId,
+    capabilities: { canPublish: false, canRetry: false, canResume: false, canRestart: false } }
+  globalThis.fetch = async () => json(history)
+  await client.getRealAnalysisSummaryHistory(summaryWorkspaceId, summaryRunId, subject, undefined, undefined, resultRevisionId)
+  for (const capability of ['canResume', 'canRestart']) {
+    const invalid = structuredClone(history)
+    invalid.capabilities[capability] = true
+    globalThis.fetch = async () => json(invalid)
+    await assert.rejects(
+      client.getRealAnalysisSummaryHistory(summaryWorkspaceId, summaryRunId, subject, undefined, undefined, resultRevisionId),
+      /private (?:summary )?history/,
+    )
+  }
 })

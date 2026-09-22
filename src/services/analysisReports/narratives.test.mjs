@@ -79,6 +79,40 @@ test('v2 report readers preserve full flexible prose and manual approval without
   }
 })
 
+test('optional summary work health is bounded and cannot alter ready report captures or publication hashes', () => {
+  const response = reportSummariesFixture(version2ReportFixture())
+  const legacy = api.realAnalysisSummariesResponseSchema.parse(response)
+  assert.equal(legacy.workRevision, undefined)
+  assert.equal(legacy.comparisons[0].workHealth, undefined)
+  const health = {
+    state: 'inactive', requestedAt: REPORT_TEST_TIMESTAMP, lastActivityAt: REPORT_TEST_TIMESTAMP,
+    leaseExpiresAt: null, attempt: 1, nextEligibleAt: null,
+    capturedSettings: { revision: 'legacy-v1', modelName: null, reasoningEffort: null },
+  }
+  response.workRevision = 'c'.repeat(64)
+  for (const item of [...response.comparisons, ...response.targets]) item.workHealth = structuredClone(health)
+  const current = api.realAnalysisSummariesResponseSchema.parse(response)
+  assert.equal(current.ready, true)
+  assert.equal(current.etag, legacy.etag)
+  assert.equal(current.revision, legacy.revision)
+  assert.deepEqual(current.capture, legacy.capture)
+  assert.deepEqual(current.comparisons.map(item => item.published), legacy.comparisons.map(item => item.published))
+  for (const mutate of [
+    value => { value.workRevision = 'invalid' },
+    value => { value.comparisons[0].workHealth.state = 'outage' },
+    value => { value.comparisons[0].workHealth.attempt = 1_000_000 },
+    value => { value.comparisons[0].workHealth.lastActivityAt = 'yesterday' },
+    value => { value.comparisons[0].workHealth.leaseOwner = 'private-worker' },
+    value => { value.comparisons[0].workHealth.capturedSettings.settings = { privatePolicy: true } },
+    value => { value.comparisons[0].workHealth.capturedSettings.modelName = 'x'.repeat(201) },
+    value => { value.comparisons[0].workHealth.state = 'running' },
+  ]) {
+    const invalid = structuredClone(response)
+    mutate(invalid)
+    assert.equal(api.realAnalysisSummariesResponseSchema.safeParse(invalid).success, false, mutate.toString())
+  }
+})
+
 test('v2 approval is explicit and bounded while unready, foreign, or unpinned manual publications remain ineligible', () => {
   for (const mutate of [
     input => { delete input.comparisons[0].narrative.approval },

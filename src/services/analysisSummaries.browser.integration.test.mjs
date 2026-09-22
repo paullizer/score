@@ -11,7 +11,8 @@ import tailwindcss from 'tailwindcss'
 import autoprefixer from 'autoprefixer'
 import tailwindConfig from '../../tailwind.config.js'
 import {
-  analysisSummaryFixture, candidateNarrativeText, summaryHistoryFixture, summaryResponse, summarySubjectResponse, summaryRunId, summaryTimestamp, summaryWorkspaceId,
+  analysisSummaryFixture, analysisSummaryIncidentFixture, candidateNarrativeText, summaryHistoryFixture, summaryResponse,
+  summarySubjectResponse, summaryRunId, summaryTimestamp, summaryWorkHealthFixture, summaryWorkspaceId,
 } from './analysisSummaries.test-support.mjs'
 
 const output = resolve(`.summary-browser-tests-${randomUUID()}`)
@@ -158,6 +159,7 @@ async function setup(t, {
   role = 'owner', archived = false, secondStatus = 'complete', summaryOptions = {}, result = false, sample = false,
   features = { realAnalyses: false, analysisSummaryGeneration: true },
   beforeSubjectGet = null,
+  fixture: inputFixture,
 } = {}) {
   const context = await browser.newContext({ viewport: { width: 1440, height: 1100 } })
   t.after(() => context.close())
@@ -174,7 +176,7 @@ async function setup(t, {
   const errors = []
   page.on('pageerror', (error) => errors.push(error.message))
   t.after(() => assert.deepEqual(errors, []))
-  const fixture = analysisSummaryFixture({ archived, secondStatus })
+  const fixture = inputFixture ?? analysisSummaryFixture({ archived, secondStatus })
   const state = {
     fixture, liveTargets: structuredClone(fixture.targets), requests: [], options: { ...summaryOptions }, beforeGet: null, beforeSubjectGet, onPost: null,
     histories: new Map(), acknowledged: new Map(), beforeHistoryGet: null, onSummaryAction: null, summaryActions: 0,
@@ -230,7 +232,7 @@ async function setup(t, {
       const custom = await state.beforeSubjectGet?.(record, subject)
       return respond(custom?.body ?? value, custom?.status ?? 200)
     }
-    const historyAction = url.pathname.match(/\/summaries\/(candidate|target)\/([^/]+)\/(history|publish|retry)$/)
+    const historyAction = url.pathname.match(/\/summaries\/(candidate|target)\/([^/]+)\/(history|publish|retry|restart)$/)
     if (historyAction) {
       if (role === 'viewer') return respond({ error: { code: 'forbidden', message: 'Only owners and editors can review summary history.' } }, 403)
       const subject = { kind: historyAction[1], subjectId: decodeURIComponent(historyAction[2]) }
@@ -265,16 +267,19 @@ async function setup(t, {
             reviewOutcome: review?.outcome ?? 'not-reviewed', issues: review?.issues ?? [] },
         }
       } else {
+        if (historyAction[3] === 'restart') assert.deepEqual(record.body, { confirmRestart: true })
         const current = state.summary(targetId)
         const item = subject.kind === 'candidate' ? current.comparisons.find(item => item.comparisonId === subject.subjectId) : current.targets[0]
         state.options.states[subject.subjectId] = {
           ...state.options.states[subject.subjectId], status: 'queued', previous: Boolean(item.published),
-          summaryRound: 1, hasHistory: true, generationId: randomUUID(),
+          previousPublication: item.published, summaryRound: 1, hasHistory: true, generationId: randomUUID(),
         }
         history.capabilities.canRetry = false
+        if (history.capabilities.canResume !== undefined) history.capabilities.canResume = false
       }
       if (subject.kind === 'candidate') {
-        state.options.states[targetId] = { status: 'waiting', previous: Boolean(state.summary(targetId).targets[0].published) }
+        const published = state.summary(targetId).targets[0].published
+        state.options.states[targetId] = { ...state.options.states[targetId], status: 'waiting', previous: Boolean(published), previousPublication: published }
       }
       history.etag = `"summary-record-${state.summaryActions}"`
       const response = { summaries: state.summary(targetId) }
@@ -348,6 +353,83 @@ test('summary management uses explicit saved-run or exact-grade scope, not table
   assert.equal(await page.getByLabel('Comparison target', { exact: true }).inputValue(), 'grade:ladder-one:9:approved-v2:2')
   await until(() => scopeReads(state).length > readsBeforeClose, 'Acknowledged summary work keeps polling after the dialog closes.')
   assert.deepEqual(errors, [])
+})
+
+test('work health shows the 412-ready incident truthfully and keeps interrupted subjects discoverable beside live work', async t => {
+  const fixture = analysisSummaryIncidentFixture()
+  const [, , queued, interrupted] = fixture.targets
+  const { page, state } = await setup(t, { fixture, summaryOptions: {
+    candidateStatus: 'ready', targetStatus: 'ready', hasHistory: true,
+    states: {
+      [queued.id]: { status: 'queued', workHealth: summaryWorkHealthFixture('awaiting-worker') },
+      [interrupted.id]: { status: 'running', workHealth: summaryWorkHealthFixture('interrupted') },
+    },
+  } })
+  const dialog = await openManager(page)
+  await dialog.getByLabel('Summary scope', { exact: true }).selectOption('')
+  await visible(dialog.getByRole('heading', { name: 'Candidate summaries: 412 / 412 current and ready', exact: true }))
+  await visible(dialog.getByRole('heading', { name: 'Job / grade overviews: 2 / 4 current and ready', exact: true }))
+  const overviews = dialog.getByRole('region', { name: 'Job / grade overviews', exact: true })
+  await visible(overviews.getByText(/0 active · 1 queued awaiting worker · 0 cooldown/))
+  await visible(overviews.getByText(/1 interrupted/))
+  await visible(dialog.getByText('Queued - awaiting worker: 1 summary.', { exact: true }))
+  await visible(dialog.getByText('Interrupted - worker lease expired: 1 summary.', { exact: true }))
+  await visible(dialog.getByText(/^Lease expired/))
+  await visible(dialog.getByText(/^Last activity/).first())
+  await visible(dialog.getByRole('button', { name: `History: Overview (${interrupted.label})`, exact: true }))
+  assert.equal(await dialog.getByText(/Summaries are generating|Server work continues|worker outage/).count(), 0)
+  assert.equal(await dialog.getByRole('button', { name: 'Regenerate all summaries', exact: true }).isDisabled(), true)
+  assert.equal(posts(state).length, 0)
+
+  state.options.states[fixture.targets[0].id] = { status: 'running', previous: true, workHealth: summaryWorkHealthFixture('running') }
+  await dialog.getByRole('button', { name: 'Refresh summary status', exact: true }).click()
+  await visible(dialog.getByText(/^1 summary has an active worker lease/))
+  await visible(dialog.getByRole('button', { name: `History: Overview (${interrupted.label})`, exact: true }))
+  await visible(overviews.getByText(/1 active · 1 queued awaiting worker/))
+  assert.equal(await dialog.getByRole('button', { name: 'Regenerate all summaries', exact: true }).isDisabled(), true)
+  assert.equal(posts(state).length, 0)
+})
+
+test('work health polling renders cooldown then eligible queue with the same scope ETag and retained previous HTTP error', async t => {
+  const retryAt = '2026-09-19T15:05:00.000Z'
+  const { page, state } = await setup(t, { summaryOptions: {
+    candidateStatus: 'ready', targetStatus: 'ready', hasHistory: true,
+    states: { 'target-job-v1': {
+      status: 'queued', nextAttemptAt: retryAt,
+      workHealth: summaryWorkHealthFixture('throttled', { nextEligibleAt: retryAt }),
+      processingError: { code: 'service-unavailable', stage: 'target-generation', message: 'The provider requested a later retry.',
+        retryable: true, diagnostic: { httpStatus: 429, retryAt } },
+    } },
+  } })
+  const before = state.summary(null)
+  const dialog = await openManager(page)
+  await dialog.getByLabel('Summary scope', { exact: true }).selectOption('')
+  await visible(dialog.getByText('Rate-limit cooldown: 1 summary.', { exact: true }))
+  await visible(dialog.getByText(/^Next retry no earlier than/))
+  await visible(dialog.getByText(/HTTP 429/))
+  assert.equal(await dialog.getByText(/Summaries are generating/).count(), 0)
+  state.options.states['target-job-v1'].workHealth = summaryWorkHealthFixture('awaiting-worker', { nextEligibleAt: retryAt })
+  const due = state.summary(null)
+  assert.equal(due.etag, before.etag)
+  assert.equal(due.revision, before.revision)
+  assert.notEqual(due.workRevision, before.workRevision)
+  assert.deepEqual(due.capture, before.capture)
+  await visible(dialog.getByText('Queued - awaiting worker: 1 summary.', { exact: true }))
+  await visible(dialog.getByText(/^Eligible since/))
+  await visible(dialog.getByText(/HTTP 429/))
+  assert.equal(await dialog.getByText('Rate-limit cooldown: 1 summary.', { exact: true }).count(), 0)
+  assert.equal(posts(state).length, 0)
+})
+
+test('work health accepts legacy optional fields absent without claiming an unverified running lease is active', async t => {
+  const { page } = await setup(t, { summaryOptions: { candidateStatus: 'ready', targetStatus: 'running' } })
+  const dialog = await openManager(page)
+  await dialog.getByLabel('Summary scope', { exact: true }).selectOption('')
+  await visible(dialog.getByText(/2 running with unverified lease/))
+  await visible(dialog.getByText('Running - lease status unavailable: 2 summaries.', { exact: true }))
+  await visible(dialog.getByText(/^This response has no lease metadata/).first())
+  assert.equal(await dialog.getByText(/an active worker lease/).count(), 0)
+  assert.equal(await dialog.getByRole('button', { name: 'Regenerate all summaries', exact: true }).isDisabled(), true)
 })
 
 test('captured target display names stay consistent across summary management and the saved overview', async (t) => {
@@ -464,7 +546,7 @@ test('late subject replies cannot restore old readiness after acknowledged regen
   await dialog.getByRole('button', { name: 'Confirm regenerate all', exact: true }).click()
   await visible(dialog.getByText(/^Summary request acknowledged:/))
   await dialog.getByRole('button', { name: 'Close', exact: true }).click()
-  await visible(candidate.getByText('Queued', { exact: true }))
+  await visible(candidate.getByText('Queued - awaiting worker', { exact: true }))
   gate.resolve()
   await page.waitForTimeout(300)
   assert.equal(await candidate.getByText('Current summary', { exact: true }).count(), 0)
@@ -972,6 +1054,100 @@ test('editors can manually publish an unreviewed target draft and retry only tha
   assert.equal(JSON.stringify(fixture.details), savedScores)
 })
 
+test('a targeted restart requires confirmation, supersedes active work and leaves completed candidate summaries and other targets unchanged', async (t) => {
+  const { page, state, fixture } = await setup(t, { role: 'editor', result: true,
+    summaryOptions: { candidateStatus: 'ready', targetStatus: 'running', previous: true, hasHistory: true } })
+  const before = state.summary(null)
+  const candidatePublications = JSON.stringify(before.comparisons)
+  const otherTargets = JSON.stringify(before.targets.filter(item => item.targetId !== 'target-job-v1'))
+  const savedScores = JSON.stringify(fixture.details)
+  const recorded = state.history({ kind: 'target', subjectId: 'target-job-v1' })
+  recorded.capabilities = { canPublish: true, canRetry: true, canResume: false, canRestart: true }
+  const overview = await visible(page.getByRole('region', { name: 'Saved job or grade overview', exact: true }))
+  await overview.getByRole('button', { name: 'History: Job / grade overview', exact: true }).click()
+  const history = await visible(overview.getByRole('region', { name: 'Summary history: Job / grade overview', exact: true }))
+  const restart = await visible(history.getByRole('button', { name: 'Restart with current settings', exact: true }))
+  assert.equal(await history.getByRole('button', { name: 'Resume saved attempt', exact: true }).isDisabled(), true)
+  await restart.click()
+  const confirmation = await visible(history.getByRole('region', { name: 'Confirm summary restart', exact: true }))
+  await visible(confirmation.getByText(/Queued or running work for this summary will be superseded/))
+  await visible(confirmation.getByText(/Candidate summaries and other job \/ grade overviews are unchanged/))
+  assert.equal(await confirmation.evaluate(element => element === document.activeElement), true)
+  assert.equal(posts(state).length, 0, 'Opening confirmation must not enqueue paid model work.')
+  await confirmation.getByRole('button', { name: 'Close confirmation', exact: true }).click()
+  assert.equal(await restart.evaluate(element => element === document.activeElement), true)
+  assert.equal(posts(state).length, 0)
+  await restart.click()
+  await confirmation.getByRole('button', { name: 'Confirm restart with current settings', exact: true }).click()
+  await visible(history.getByText(/^Restart acknowledged for this summary only/))
+  assert.deepEqual(posts(state).map(request => request.path.split('/').slice(-4).join('/')), [
+    'summaries/target/target-job-v1/restart',
+  ])
+  assert.deepEqual(posts(state)[0].body, { confirmRestart: true })
+  assert.equal(posts(state)[0].headers['if-match'], '"summary-record-etag"')
+  assert.equal(JSON.stringify(state.summary(null).comparisons), candidatePublications)
+  assert.equal(JSON.stringify(state.summary(null).targets.filter(item => item.targetId !== 'target-job-v1')), otherTargets)
+  assert.deepEqual(state.summary(null).targets.find(item => item.targetId === 'target-job-v1').published,
+    before.targets.find(item => item.targetId === 'target-job-v1').published)
+  assert.equal(JSON.stringify(fixture.details), savedScores)
+  await until(() => history.getByRole('button', { name: 'Refresh summary history', exact: true })
+    .evaluate(element => element === document.activeElement), 'Restart acknowledgement restores focus after history refresh.')
+})
+
+test('resume and restart are distinct intents and an interrupted restart acknowledgement reuses the original request without duplicate work', async (t) => {
+  const { page, state } = await setup(t, { result: true,
+    summaryOptions: { candidateStatus: 'ready', targetStatus: 'failed', previous: true, hasHistory: true } })
+  const candidatePublications = JSON.stringify(state.summary(null).comparisons)
+  const recorded = state.history({ kind: 'target', subjectId: 'target-job-v1' })
+  recorded.capabilities = { canPublish: true, canRetry: true, canResume: true, canRestart: true }
+  const overview = await visible(page.getByRole('region', { name: 'Saved job or grade overview', exact: true }))
+  await overview.getByRole('button', { name: 'History: Job / grade overview', exact: true }).click()
+  const history = await visible(overview.getByRole('region', { name: 'Summary history: Job / grade overview', exact: true }))
+  await history.getByRole('button', { name: 'Resume saved attempt', exact: true }).click()
+  await visible(history.getByText(/^Resume acknowledged for this summary only/))
+  const restart = history.getByRole('button', { name: 'Restart with current settings', exact: true })
+  await until(() => restart.isEnabled(), 'The refreshed subject permits a separate new-generation intent.')
+  const gate = deferred()
+  state.onSummaryAction = async () => {
+    await gate.promise
+    return { commit: true, status: 503, body: { error: { code: 'unavailable', message: 'Summary restart acknowledgement was interrupted.' } } }
+  }
+  await restart.click()
+  const confirmation = await visible(history.getByRole('region', { name: 'Confirm summary restart', exact: true }))
+  const confirm = confirmation.getByRole('button', { name: 'Confirm restart with current settings', exact: true })
+  await confirm.click()
+  await until(() => posts(state).length === 2, 'The explicit restart was sent once.')
+  assert.equal(await confirm.isDisabled(), true)
+  gate.resolve()
+  await visible(history.getByText(/Summary restart acknowledgement was interrupted/))
+  await until(() => confirm.isEnabled(), 'An ambiguous acknowledgement can retry its original intent.')
+  await confirm.click()
+  await visible(history.getByText(/^Restart acknowledged for this summary only/))
+  const requests = posts(state)
+  assert.deepEqual(requests.map(request => request.path.split('/').at(-1)), ['retry', 'restart', 'restart'])
+  assert.deepEqual(requests.map(request => request.body), [{}, { confirmRestart: true }, { confirmRestart: true }])
+  assert.notEqual(requests[0].headers['idempotency-key'], requests[1].headers['idempotency-key'])
+  assert.equal(requests[1].headers['idempotency-key'], requests[2].headers['idempotency-key'])
+  assert.equal(requests[1].headers['if-match'], '"summary-record-1"')
+  assert.equal(requests[1].headers['if-match'], requests[2].headers['if-match'])
+  assert.equal(state.summaryActions, 2)
+  assert.equal(JSON.stringify(state.summary(null).comparisons), candidatePublications)
+})
+
+test('disabled new-summary admission blocks restart but leaves accepted-generation resume available', async (t) => {
+  const { page, state } = await setup(t, { result: true, features: { realAnalyses: false, analysisSummaryGeneration: false },
+    summaryOptions: { candidateStatus: 'failed', targetStatus: 'failed', hasHistory: true } })
+  const recorded = state.history({ kind: 'candidate', subjectId: 'comparison-1' })
+  recorded.capabilities = { canPublish: true, canRetry: true, canResume: true, canRestart: true }
+  const { history } = await openCandidateHistory(page)
+  assert.equal(await history.getByRole('button', { name: 'Restart with current settings', exact: true }).isDisabled(), true)
+  await visible(history.getByText(/The summary generation service is unavailable/))
+  assert.equal(posts(state).length, 0)
+  await history.getByRole('button', { name: 'Resume saved attempt', exact: true }).click()
+  await visible(history.getByText(/^Resume acknowledged for this summary only/))
+  assert.deepEqual(posts(state).map(request => request.path.split('/').at(-1)), ['retry'])
+})
+
 test('private summary pages retain earlier generations and exclude reductions and stale inputs from final selection', async (t) => {
   const { page, state } = await setup(t, { result: true, summaryOptions: { candidateStatus: 'failed', targetStatus: 'failed' } })
   const recorded = state.history({ kind: 'candidate', subjectId: 'comparison-1' })
@@ -1029,6 +1205,7 @@ test('legacy summary failures honestly report unrecorded history and retry one s
   const history = await visible(candidate.getByRole('region', { name: 'Summary history: Candidate summary', exact: true }))
   await visible(history.getByText(/^History was not recorded for this summary/))
   await visible(history.getByText(/Legacy publication · approval metadata was not recorded\./))
+  assert.equal(await history.getByRole('button', { name: 'Restart with current settings', exact: true }).count(), 0)
   assert.equal(posts(state).length, 0)
   const gate = deferred()
   state.onSummaryAction = async () => {

@@ -45,6 +45,7 @@ export interface RealAnalysesContextValue {
   summaryHistory: (runId: string, subject: AnalysisSummarySubject, cursor?: string, signal?: AbortSignal) => Promise<AnalysisSummaryHistoryPage>
   publishSummaryDraft: (runId: string, subject: AnalysisSummarySubject, input: PublishSummaryDraftInput, etag: string) => Promise<RealAnalysisSummariesResponse>
   retrySummary: (runId: string, subject: AnalysisSummarySubject, etag: string) => Promise<RealAnalysisSummariesResponse>
+  restartSummary: (runId: string, subject: AnalysisSummarySubject, etag: string) => Promise<RealAnalysisSummariesResponse>
   document: (runId: string, comparisonId: string, documentId: string, version: number, signal?: AbortSignal) => Promise<RealAnalysisDocumentResponse['document']>
   diagnostics: (runId: string, comparisonId: string, continuationToken?: string, signal?: AbortSignal) => Promise<RealAnalysisDiagnosticsPage>
   pending: (runId?: string) => boolean

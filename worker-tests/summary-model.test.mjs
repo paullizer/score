@@ -205,12 +205,21 @@ test('restart after an unsupported review advances to round two and does not res
   assert.deepEqual(history.steps.filter(step => step.phase === 'generated').map(step => step.round), [2, 3])
 })
 
-test('explicit retry receives earlier findings without consuming its new three-round budget', async () => {
+test('an explicit new generation uses current task settings and earlier findings without consuming its new round budget', async () => {
   const first = mockModel([draft(), finding(), draft(), finding(), draft(), finding()])
   const saved = capture(first)
   await assert.rejects(generateCandidateSummary(candidateFixture(), saved.options))
   const retry = mockModel([draft('Corrected from earlier feedback.'), supportedReview()])
+  const current = settingsSnapshot(settings => {
+    settings.ai.tasks.candidateSummary.reasoningEffort = 'medium'
+    settings.ai.tasks.summaryReview.reasoningEffort = 'medium'
+  }, 'explicit-new-generation')
+  retry.model.processingSettings = current
   const result = await generateCandidateSummary(candidateFixture(), { ...retry.options, seed: saved.steps.at(-1) })
+  assert.deepEqual(retry.calls.map(call => call.request.model), ['deployment-candidateSummary', 'deployment-summaryReview'])
+  assert.ok(retry.calls.every(call => call.request.reasoning_effort === 'medium'))
+  assert.equal(result.provenance.generation.settingsRevision, current.revision)
+  assert.equal(result.provenance.groundingReviews[0].provenance.settingsRevision, current.revision)
   assert.equal(result.provenance.correctionCount, 0)
   assert.equal(retry.calls[0].body.feedback.earlierFindings.length, 1)
   assert.deepEqual(retry.calls[0].body.feedback.previousDraft, saved.steps.at(-1).draft)
@@ -313,4 +322,135 @@ test('summary telemetry allowlists nested data and failure of a sink never masks
   emitSummaryTelemetry(() => { throw new Error('PRIVATE-SINK') }, value)
   assert.equal(errors.length, 1)
   assert.doesNotMatch(JSON.stringify(errors), /PRIVATE/)
+})
+
+test('a throttled review checkpoints provider status and cooldown, then resumes the exact draft only when due', async () => {
+  const input = candidateFixture()
+  const original = structuredClone(input)
+  const retryAt = new Date(Date.parse(NOW) + 300_000).toISOString()
+  const first = mockModel([draft(), new Response('PRIVATE-UPSTREAM', {
+    status: 429, headers: { 'Retry-After': new Date(retryAt).toUTCString() },
+  })])
+  first.clock.now = () => new Date(NOW)
+  const history = capture(first)
+  await assert.rejects(generateCandidateSummary(input, history.options), error => {
+    assert.equal(error.code, 'service-unavailable')
+    assert.equal(error.retryable, true)
+    assert.equal(error.stage, 'grounding')
+    assert.equal(error.diagnostic.httpStatus, 429)
+    assert.equal(error.diagnostic.retryAt, retryAt)
+    assert.equal(error.diagnostic.round, 1)
+    assert.match(error.message, /rate limited/)
+    assert.doesNotMatch(error.message, /PRIVATE/)
+    return true
+  })
+  assert.deepEqual(first.sleeps, [])
+  assert.equal(first.calls.length, 2)
+  const failed = history.steps.at(-1)
+  assert.equal(failed.phase, 'failed')
+  assert.deepEqual(failed.draft, { kind: 'candidate', ...draft() })
+  assert.equal(failed.error.diagnostic.httpStatus, 429)
+  assert.equal(failed.error.diagnostic.retryAt, retryAt)
+  const tooEarly = mockModel([])
+  tooEarly.clock.now = () => new Date(NOW)
+  await assert.rejects(generateCandidateSummary(input, { ...tooEarly.options, steps: history.steps.toReversed() }),
+    error => error.diagnostic.retryAt === retryAt)
+  assert.equal(tooEarly.calls.length, 0)
+  const resumed = mockModel([supportedReview()])
+  resumed.clock.now = () => new Date(retryAt)
+  const result = await generateCandidateSummary(input, { ...resumed.options, steps: history.steps.toReversed() })
+  assert.deepEqual(resumed.calls.map(call => call.kind), ['analysis_narrative_grounding_review'])
+  assert.equal(result.provenance.correctionCount, 0)
+  assert.deepEqual(result.provenance.generation, failed.generation)
+  assert.equal(resumed.calls[0].body.outputSha256, failed.outputSha256)
+  assert.deepEqual(input, original)
+})
+
+test('cancellation at a summary delay boundary retains the provider error and saved review input', async () => {
+  const controller = new AbortController()
+  const first = mockModel([draft(), new Response('PRIVATE-UPSTREAM', { status: 429, headers: { 'retry-after': '2' } })])
+  first.clock.now = () => new Date(NOW)
+  const history = capture(first)
+  first.clock.sleep = async (milliseconds, signal) => {
+    assert.equal(milliseconds, 2_000)
+    assert.equal(history.steps.at(-1).error.diagnostic.httpStatus, 429)
+    assert.ok(history.steps.at(-1).draft)
+    controller.abort(new Error('PRIVATE-INTERRUPTION'))
+    signal.throwIfAborted()
+  }
+  await assert.rejects(generateCandidateSummary(candidateFixture(), { ...history.options, signal: controller.signal }), error => {
+    assert.equal(error.code, 'service-unavailable')
+    assert.equal(error.cancelled, true)
+    assert.equal(error.diagnostic.httpStatus, 429)
+    assert.equal(error.diagnostic.retryAt, new Date(Date.parse(NOW) + 2_000).toISOString())
+    return true
+  })
+  assert.equal(first.calls.length, 2)
+  const resumed = mockModel([supportedReview()])
+  resumed.clock.now = () => new Date(Date.parse(NOW) + 2_000)
+  await generateCandidateSummary(candidateFixture(), { ...resumed.options, steps: history.steps.toReversed() })
+  assert.deepEqual(resumed.calls.map(call => call.kind), ['analysis_narrative_grounding_review'])
+})
+
+test('the remaining worker and captured summary windows defer a long hint without spending another request', async () => {
+  for (const window of ['worker', 'captured-operation']) {
+    const mock = mockModel([new Response('PRIVATE-UPSTREAM', { status: 429, headers: { 'retry-after': '2' } })])
+    mock.clock.now = () => new Date(NOW)
+    if (window === 'captured-operation') {
+      mock.model.processingSettings = settingsSnapshot(settings => {
+        settings.summaries.operationTimeoutMilliseconds = 1_000
+        settings.ai.requestTimeoutMilliseconds = 1_000
+      })
+    }
+    const history = capture(mock)
+    await assert.rejects(generateCandidateSummary(candidateFixture(), {
+      ...history.options, ...(window === 'worker' ? { deadlineAt: Date.parse(NOW) + 1_000 } : {}),
+    }), error => error.code === 'service-unavailable' && error.diagnostic.httpStatus === 429 &&
+      error.diagnostic.retryAt === new Date(Date.parse(NOW) + 2_000).toISOString())
+    assert.equal(mock.calls.length, 1)
+    assert.deepEqual(mock.sleeps, [])
+    assert.equal(history.steps.at(-1).error.diagnostic.httpStatus, 429)
+  }
+})
+
+test('summary failures distinguish nonretryable rejection, authorization, unavailable service and timeout safely', async () => {
+  for (const status of [400, 401, 403, 404, 422, 503]) {
+    const mock = mockModel([new Response('PRIVATE-RESPONSE', {
+      status, ...(status === 503 ? { headers: { 'retry-after': '300' } } : {}),
+    })])
+    const history = capture(mock)
+    await assert.rejects(generateCandidateSummary(candidateFixture(), history.options), error => {
+      assert.equal(error.code, 'service-unavailable')
+      assert.equal(error.retryable, status === 503)
+      assert.equal(error.diagnostic.httpStatus, status)
+      assert.match(error.message, status === 503 ? /unavailable/ : status === 401 || status === 403 ? /authentication or access/ : /rejected/)
+      assert.doesNotMatch(error.message, /PRIVATE/)
+      return true
+    })
+    assert.equal(mock.calls.length, 1)
+    assert.equal(history.steps.at(-1).error.diagnostic.httpStatus, status)
+  }
+  const timeout = mockModel([])
+  timeout.model.getToken = async () => { throw Object.assign(new Error('PRIVATE-TIMEOUT'), { code: 'request-timeout' }) }
+  await assert.rejects(generateCandidateSummary(candidateFixture(), timeout.options),
+    error => error.code === 'timeout' && error.retryable && /timed out/.test(error.message))
+})
+
+test('the captured summary deadline bounds an uncooperative checkpoint callback with a frozen clock', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+  const mock = mockModel([])
+  mock.clock.now = () => new Date(NOW)
+  mock.model.processingSettings = settingsSnapshot(settings => {
+    settings.ai.requestTimeoutMilliseconds = 1_000
+    settings.summaries.operationTimeoutMilliseconds = 1_000
+  })
+  let entered = false
+  const rejection = assert.rejects(generateCandidateSummary(candidateFixture(), {
+    ...mock.options, onCheckpoint: async () => { entered = true; return new Promise(() => {}) },
+  }), error => error.code === 'timeout' && error.retryable)
+  for (let turn = 0; turn < 100 && !entered; turn++) await new Promise(resolve => setImmediate(resolve))
+  assert.equal(entered, true)
+  t.mock.timers.tick(1_000)
+  await rejection
+  assert.equal(mock.calls.length, 0)
 })

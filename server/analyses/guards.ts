@@ -184,7 +184,7 @@ export function fencedAnalysisBlobs(
 }
 
 export interface SummaryActionWriteAuthorization {
-  action: 'publish' | 'retry'
+  action: 'publish' | 'retry' | 'restart'
   kind: 'candidate' | 'target'
   subjectId: string
   recordId: string
@@ -220,7 +220,8 @@ export function fencedSummaryActionBlobs(
   assertCurrent: () => Promise<unknown>,
 ): AnalysisBlobStore {
   assertAnalysis(authorization.recordId === analysisNarrativeId(authorization.kind, runId, authorization.subjectId, authorization.resultRevisionId) &&
-    (authorization.action === 'retry' || authorization.etag && authorization.generationId && authorization.publicationAttemptId),
+    (authorization.action === 'retry' || authorization.action === 'restart' ||
+      authorization.etag && authorization.generationId && authorization.publicationAttemptId),
   'Invalid summary action writer authorization.')
   return fencedBlobs(deps, workspaceId, runId, undefined, assertCurrent, authorization)
 }
