@@ -1,7 +1,8 @@
-import { forwardRef, useRef, type ButtonHTMLAttributes, type ReactNode } from 'react'
+import { forwardRef, useContext, useRef, type ButtonHTMLAttributes, type ReactNode } from 'react'
 import * as Dialog from '@radix-ui/react-dialog'
 import { AlertCircle, ArrowUpRight, Check, FlaskConical, Search, X, type LucideIcon } from 'lucide-react'
 import type { JobStatus } from '../../domain/types'
+import { AccessSuspendedContext } from '../../app/access-suspended-context'
 
 type ButtonProps = ButtonHTMLAttributes<HTMLButtonElement> & {
   variant?: 'primary' | 'secondary' | 'ghost' | 'danger'
@@ -66,7 +67,8 @@ export function Modal({ open, onOpenChange, title, description, children, footer
   dismissDisabled?: boolean; onOpenAutoFocus?: (event: Event) => void; onCloseAutoFocus?: (event: Event) => void
 }) {
   const returnFocus = useRef<HTMLElement | null>(null)
-  return <Dialog.Root open={open} onOpenChange={(next) => { if (next || !dismissDisabled) onOpenChange(next) }}>
+  const accessSuspended = useContext(AccessSuspendedContext)
+  return <Dialog.Root open={open && !accessSuspended} onOpenChange={(next) => { if (next || !dismissDisabled) onOpenChange(next) }}>
     <Dialog.Portal><Dialog.Overlay className="dialog-overlay" />
       <Dialog.Content className={`dialog-content ${wide ? 'dialog-wide' : ''} ${drawer ? 'dialog-drawer' : ''}`}
         onEscapeKeyDown={(event) => { if (dismissDisabled) event.preventDefault() }}

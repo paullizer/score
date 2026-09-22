@@ -7,6 +7,7 @@ import { createAuthMiddleware, createCsrfMiddleware } from './middleware'
 import { getPrincipal } from './request-context'
 import { WorkspaceRepository } from './repository'
 import { createWorkspaceMembersRouter } from './members/routes'
+import { getWorkspaceCounts } from './workspace-summary'
 import { mountStaticSpa } from './static'
 import type { Config } from './config'
 import { createRealJobsRouter, type RealJobsDeps } from './jobs/routes'
@@ -34,6 +35,10 @@ import { createResumeLifecycleParticipant } from './resumes/lifecycle'
 import { createAnalysisLifecycleParticipant } from './analyses/library-lifecycle'
 import { recordRequestError, telemetryMiddleware, telemetryRequests } from './telemetry-http'
 import { errorCategory, safeMethod, safeRoute } from './telemetry-schema'
+import { createAccessRouter } from './access/routes'
+import { CreationAccessService, WorkspaceAccessService } from './access/service'
+import type { AccessStore } from './access/store'
+import type { EligibleUserDirectory } from './access/directory'
 export { WorkspaceRepository } from './repository'
 export { WorkspaceLifecycleService } from './lifecycle/service'
 export { createLifecycleDependencies } from './lifecycle/dependencies'
@@ -42,7 +47,7 @@ export { createAnalysisRun } from '../src/services/mockWorkspace'
 export { StoreConflictError, StoreNotFoundError } from './store'
 export { createStateStoreFromContainer } from './azure-state-store'
 export { createDirectoryStoreFromContainer } from './azure-directory-store'
-export { createJobBlobStoreFromContainer } from './jobs/azure-store'
+export { createJobStoreFromContainer, createJobBlobStoreFromContainer } from './jobs/azure-store'
 export {
   createAzureGradeStore, createAzureGradeBlobStore, createGradeStoreFromContainer, createGradeBlobStoreFromContainer,
 } from './grades/azure-store'
@@ -63,6 +68,8 @@ export { RealAnalysisService } from './analyses/service'
 export { ConfigError, loadConfig } from './config'
 export { defaultPersonalWorkspaceId, isValidWorkspaceId, membershipIdFor, principalKeyFor } from './ids'
 export { isApplicationAdmin } from './auth'
+export { CreationAccessService, WorkspaceAccessService } from './access/service'
+export { createAccessStoreFromContainer } from './access/azure-store'
 export { AdminSettingsService } from './settings/service'
 export { PromptRegistryService, createPromptRegistryService, createCompiledPromptBaseline } from './settings/prompts'
 export { createAzurePromptStore, createAzurePromptReader, createPromptStoreFromContainer } from './settings/prompt-azure-store'
@@ -93,6 +100,8 @@ export interface AppDeps {
   readonly settings?: AdminSettingsService
   readonly prompts?: PromptRegistryService
   readonly qc?: QcDeps
+  readonly accessStore?: AccessStore
+  readonly eligibleUsers?: EligibleUserDirectory
   /** Overridable so tests don't depend on a real build of dist/. */
   readonly distDir?: string
   /** Injectable clock for deterministic tests. */
@@ -146,6 +155,8 @@ export function createApp(deps: AppDeps): Express {
   }
   const distDir = deps.distDir ?? DEFAULT_DIST_DIR
   const repository = new WorkspaceRepository({ directory, state, now: deps.now })
+  const creationAccess = new CreationAccessService(deps.accessStore, deps.eligibleUsers, deps.now)
+  const workspaceAccess = new WorkspaceAccessService(repository, directory, deps.eligibleUsers, deps.now)
   const qc = deps.qc
   const unavailableQc = async (): Promise<never> => {
     throw unavailable('QC storage is unavailable. Analysis lifecycle cleanup cannot skip its private feedback and case packs.')
@@ -194,6 +205,7 @@ export function createApp(deps: AppDeps): Express {
 
   app.get('/healthz', noStore, async (_req, res) => {
     const status = await checkHealth()
+    if (config.authMode === 'easyauth') res.setHeader('X-Score-Access-Control', 'entra-roles-v1')
     res.status(status === 'ready' ? 200 : 503).json({ status })
   })
 
@@ -203,8 +215,9 @@ export function createApp(deps: AppDeps): Express {
   api.use(telemetryMiddleware('score.csrf', createCsrfMiddleware(config)))
   api.use(attachSettingsContext(config, deps.settings))
   api.use(createAdminSettingsRouter(config, deps.settings))
-  api.use(createWorkspaceMembersRouter({ repository, directory, config, now: deps.now }))
+  api.use(createWorkspaceMembersRouter({ repository, directory, config, eligibleUsers: deps.eligibleUsers, now: deps.now }))
   api.use(createQcRouter({ repository, state, config, qc, analyses: analysisStorage, prompts: deps.prompts, now: deps.now }))
+  api.use(createAccessRouter(creationAccess, workspaceAccess, deps.eligibleUsers))
   api.get('/features', async (req, res) => {
     const snapshot = await getAdmissionSettings(req)
     res.json(effectiveFeatures({
@@ -219,21 +232,24 @@ export function createApp(deps: AppDeps): Express {
   api.use(createRealResumesRouter({ repository, resumes, lifecycle, now: deps.now, wordDocumentImports }))
   api.use(createRealAnalysesRouter({ repository, analyses, resumes, jobs, grades, now: deps.now }))
 
-  api.get('/session/identity', (req, res) => {
+  api.get('/session/identity', async (req, res) => {
     const principal = getPrincipal(req)
     res.json({
       mode: 'cloud',
       user: { id: principal.oid, tenantId: principal.tenantId, name: principal.name, email: principal.email },
-      capabilities: { applicationAdmin: isApplicationAdmin(principal, config) },
+      capabilities: {
+        applicationAdmin: isApplicationAdmin(principal, config),
+        canCreateWorkspaces: await creationAccess.canCreate(principal),
+      },
     })
   })
   api.get('/session', async (req, res) => {
     const principal = getPrincipal(req)
-    const session = await repository.getSession(principal, {
-      bootstrap: req.query.bootstrap !== 'false',
-      allowCreation: async () => (await getCurrentSettings(req)).workspaces.allowCreation,
-    })
-    res.json({ ...session, capabilities: { applicationAdmin: isApplicationAdmin(principal, config) } })
+    const session = await repository.getSession(principal)
+    res.json({ ...session, capabilities: {
+      applicationAdmin: isApplicationAdmin(principal, config),
+      canCreateWorkspaces: await creationAccess.canCreate(principal),
+    } })
   })
 
   api.get('/workspaces', async (req, res) => {
@@ -243,7 +259,9 @@ export function createApp(deps: AppDeps): Express {
   api.post('/workspaces', async (req, res) => {
     const name = pickAllowedField(req.body, 'name', ['name'])
     if (!(await getCurrentSettings(req)).workspaces.allowCreation) throw forbidden('New workspace creation is disabled by application policy.')
-    const workspace = await repository.createWorkspace(getPrincipal(req), name)
+    const principal = getPrincipal(req)
+    if (!await creationAccess.canCreate(principal)) throw forbidden('Ask an application administrator for permission to create workspaces.')
+    const workspace = await repository.createWorkspace(principal, name)
     res.status(201).json({ workspace })
   })
 
@@ -251,6 +269,12 @@ export function createApp(deps: AppDeps): Express {
     const name = pickAllowedField(req.body, 'name', ['name'])
     const workspace = await repository.renameWorkspace(getPrincipal(req), req.params.id, name, readIfMatch(req))
     res.json({ workspace })
+  })
+
+  api.get('/workspaces/:id/summary', async (req, res) => {
+    res.json(await getWorkspaceCounts({
+      repository, jobs: deps.jobs?.store, resumes: deps.resumes?.store, analyses: deps.analyses?.store,
+    }, getPrincipal(req), req.params.id))
   })
 
   api.get('/workspaces/:id/lifecycle', async (req, res) => {

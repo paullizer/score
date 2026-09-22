@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { Plus, RotateCcw, Trash2 } from 'lucide-react'
 import type { CloudUser, WorkspaceReviewerAccess, WorkspaceSummary } from '../../domain/cloud'
+import { workspaceQcRole } from '../../domain/workspace-permissions'
 import { addWorkspaceReviewer, CloudApiError, listWorkspaceReviewers, removeWorkspaceReviewer } from '../../services/cloudWorkspace'
 import { Badge, Button, InlineError, Modal } from '../ui'
 
@@ -19,7 +20,7 @@ export function WorkspaceAccessDialog({ workspace, user, refreshWorkspaces, onCl
   const [removing, setRemoving] = useState<string | null>(null)
   const controller = useRef<AbortController | null>(null)
   const inFlight = useRef(false)
-  const owner = workspace.role === 'owner' && !workspace.deletedAt
+  const owner = workspaceQcRole(workspace) === 'owner' && !workspace.deletedAt
   const mutable = owner && (!workspace.lifecycleOperation || workspace.lifecycleOperation.status === 'complete')
   const current = useRef({ owner, mutable, refreshWorkspaces })
   current.current = { owner, mutable, refreshWorkspaces }
@@ -87,8 +88,8 @@ export function WorkspaceAccessDialog({ workspace, user, refreshWorkspaces, onCl
         <code className="break-all text-[12px]">{user.id}</code>
         <p className="mt-1 break-all text-[11px] text-muted">Tenant: {user.tenantId}</p>
       </div>
-      <p className="text-[12px] text-muted">Only the workspace owner can grant or revoke reviewer access. Use an exact same-tenant Entra object ID already admitted to this deployment. This does not invite accounts or grant application-administrator access. Original downloads and exports have separate policies.</p>
-      {!owner ? <InlineError>Only the current workspace owner can inspect or manage reviewer memberships.</InlineError> : <>
+      <p className="text-[12px] text-muted">Any explicit workspace Owner can grant or revoke reviewer access. Use an exact same-tenant Entra object ID assigned Score.User or Score.Admin. This does not invite accounts or grant application-administrator access. Original downloads and exports have separate policies.</p>
+      {!owner ? <InlineError>Only a current explicit workspace Owner can inspect or manage reviewer memberships.</InlineError> : <>
         {!mutable && <p role="status" className="text-[12px] text-muted">Finish or retry the workspace lifecycle operation before changing access.</p>}
         {error && <InlineError>{error}</InlineError>}
         <div className="flex items-center justify-between gap-3">
@@ -96,7 +97,7 @@ export function WorkspaceAccessDialog({ workspace, user, refreshWorkspaces, onCl
           <Button size="sm" icon={RotateCcw} disabled={pending || loading} onClick={() => void refresh()}>Refresh access</Button>
         </div>
         {loading && <p role="status">Loading reviewer access…</p>}
-        {access && !access.reviewers.length && <p className="text-[12px] text-muted">No reviewer memberships. The owner's recovery access is preserved.</p>}
+        {access && !access.reviewers.length && <p className="text-[12px] text-muted">No reviewer memberships. Existing Owner memberships are unchanged.</p>}
         {access && <ul className="space-y-3" aria-label="Workspace reviewers">
           {access.reviewers.map(reviewer => <li key={reviewer.objectId} className="rounded-xl border p-3">
             <div className="flex flex-wrap items-center justify-between gap-2">

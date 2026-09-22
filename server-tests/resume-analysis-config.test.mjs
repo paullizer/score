@@ -4,7 +4,7 @@ import test from 'node:test'
 import { ConfigError, createApp, loadConfig } from '../dist-server/app.mjs'
 import {
   ALLOWED_OID, OTHER_ALLOWED_OID, APP_ORIGIN, TENANT_ID, FIXTURE_DIST_DIR, authHeaders, baseConfig,
-  createFakeDirectoryStore, createFakeStateStore,
+  createFakeAccessStore, createFakeDirectoryStore, createFakeStateStore, seedWorkspace,
 } from './helpers.mjs'
 
 function environment(overrides = {}) {
@@ -65,14 +65,16 @@ test('all workspace/job/grade/resume/analysis containers are pairwise distinct e
   }
 })
 
-async function featureServer(t, config, dependencies = {}) {
+async function featureServer(t, config, dependencies = {}, options = {}) {
+  const directory = createFakeDirectoryStore(), state = createFakeStateStore()
+  if (options.seedWorkspace) await seedWorkspace({ directory, state })
   const app = createApp({
-    config: baseConfig(config), directory: createFakeDirectoryStore(), state: createFakeStateStore(),
+    config: baseConfig(config), directory, state, accessStore: createFakeAccessStore(),
     distDir: FIXTURE_DIST_DIR, ...dependencies,
   })
   const server = createServer(app)
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve))
-  t.after(() => new Promise(resolve => server.close(resolve)))
+  t.after(() => { server.closeAllConnections(); return new Promise(resolve => server.close(resolve)) })
   return `http://127.0.0.1:${server.address().port}/api/features`
 }
 
@@ -154,12 +156,14 @@ test('analysis history remains authorized and available when source services dis
     store: { list: async workspaceId => { reads.push(workspaceId); return { items: [] } } },
     blobs: {},
   }
-  const url = await featureServer(t, { realAnalyses: configured }, { analyses })
+  const url = await featureServer(t, { realAnalyses: configured }, { analyses }, { seedWorkspace: true })
   const features = await (await fetch(url, { headers: authHeaders() })).json()
   assert.equal(features.realAnalyses, false)
   assert.equal(features.analysisSummaryGeneration, true, 'Frozen history supports narratives without live sources or new-run readiness.')
   assert.deepEqual(reads, [], 'feature readiness must not scan workspace records')
-  const session = await (await fetch(url.replace(/features$/, 'session'), { headers: authHeaders() })).json()
+  const responseSession = await fetch(url.replace(/features$/, 'session'), { headers: authHeaders() })
+  assert.equal(responseSession.status, 200)
+  const session = await responseSession.json()
   const workspaceId = session.workspaces[0].id
   const historyUrl = url.replace(/features$/, `workspaces/${workspaceId}/analyses`)
   const response = await fetch(historyUrl, { headers: authHeaders() })
@@ -180,9 +184,11 @@ test('analysis history still requires its own configured store and blob dependen
     [{ realAnalyses: configured }, { store }],
     [{ realAnalyses: configured }, { blobs: {} }],
   ]) {
-    const url = await featureServer(t, config, { analyses })
+    const url = await featureServer(t, config, { analyses }, { seedWorkspace: true })
     assert.equal((await (await fetch(url, { headers: authHeaders() })).json()).analysisSummaryGeneration, false)
-    const session = await (await fetch(url.replace(/features$/, 'session'), { headers: authHeaders() })).json()
+    const responseSession = await fetch(url.replace(/features$/, 'session'), { headers: authHeaders() })
+    assert.equal(responseSession.status, 200)
+    const session = await responseSession.json()
     const historyUrl = url.replace(/features$/, `workspaces/${session.workspaces[0].id}/analyses`)
     assert.equal((await fetch(historyUrl, { headers: authHeaders() })).status, 503)
   }

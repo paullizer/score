@@ -2,9 +2,11 @@ param location string
 param token string
 param tags object
 param authClientId string
+param authServicePrincipalId string
 param tenantId string
 param allowedUserId string
-param adminUserIds string
+@allowed(['guarded', 'roles'])
+param admissionStage string
 param operatorPrincipalId string
 param containerImage string
 param workerImage string
@@ -165,6 +167,33 @@ resource settingsContainer 'Microsoft.DocumentDB/databaseAccounts/sqlDatabases/c
         excludedPaths: [{ path: '/"_etag"/?' }]
       }
     }
+  }
+}
+
+resource accessContainer 'Microsoft.DocumentDB/databaseAccounts/sqlDatabases/containers@2024-11-15' = {
+  parent: database
+  name: 'application-access'
+  properties: {
+    resource: {
+      id: 'application-access'
+      partitionKey: { paths: ['/tenantId'], kind: 'Hash', version: 2 }
+      indexingPolicy: {
+        automatic: true
+        indexingMode: 'consistent'
+        includedPaths: [{ path: '/*' }]
+        excludedPaths: [{ path: '/"_etag"/?' }]
+      }
+    }
+  }
+}
+
+resource applicationAccess 'Microsoft.DocumentDB/databaseAccounts/sqlRoleAssignments@2024-11-15' = {
+  parent: cosmos
+  name: guid(cosmos.id, runtimeIdentity.id, 'score-application-access')
+  properties: {
+    roleDefinitionId: '${cosmos.id}/sqlRoleDefinitions/00000000-0000-0000-0000-000000000002'
+    principalId: runtimeIdentity.properties.principalId
+    scope: '${cosmos.id}/dbs/${database.name}/colls/${accessContainer.name}'
   }
 }
 
@@ -407,7 +436,7 @@ resource web 'Microsoft.Web/sites@2024-11-01' = {
       healthCheckPath: '/healthz'
     }
   }
-  dependsOn: [registryPull, storageAccess, cosmosAccess, secretReader]
+  dependsOn: [registryPull, storageAccess, cosmosAccess, applicationAccess, secretReader]
 }
 
 resource appSettings 'Microsoft.Web/sites/config@2024-11-01' = {
@@ -424,8 +453,10 @@ resource appSettings 'Microsoft.Web/sites/config@2024-11-01' = {
     SCORE_AUTH_MODE: 'easyauth'
     AZURE_TENANT_ID: tenantId
     WEBSITE_AUTH_AAD_ALLOWED_TENANTS: tenantId
-    SCORE_ALLOWED_USER_IDS: allowedUserId
-    SCORE_ADMIN_USER_IDS: adminUserIds
+    // Retained only while upgrading a legacy running image; role-aware code never consults it.
+    SCORE_ALLOWED_USER_IDS: admissionStage == 'guarded' ? allowedUserId : ''
+    SCORE_ACCESS_CONTAINER: accessContainer.name
+    SCORE_ENTRA_SERVICE_PRINCIPAL_ID: authServicePrincipalId
     SCORE_SETTINGS_CONTAINER: settingsContainer.name
     SCORE_RUNTIME_SETTINGS_ENABLED: 'false'
     SCORE_MODEL_RESOURCE_ID: ai.outputs.accountResourceId
@@ -494,9 +525,9 @@ resource auth 'Microsoft.Web/sites/config@2024-11-01' = {
         }
         validation: {
           allowedAudiences: [authClientId, 'api://${authClientId}']
-          defaultAuthorizationPolicy: {
+          defaultAuthorizationPolicy: admissionStage == 'guarded' ? {
             allowedPrincipals: { identities: [allowedUserId] }
-          }
+          } : {}
         }
       }
     }

@@ -52,7 +52,7 @@ test('server policy reads, ordinary patches, imports and restores preserve genui
     },
   }
   const service = new AdminSettingsService({
-    config: { tenantId: admin.tenantId, adminUserIds: new Set([admin.oid]),
+    config: { tenantId: admin.tenantId,
       settings: { runtimeEnabled: true, defaults: api.createDefaultAdminSettings() } },
     store, now: () => new Date('2026-09-22T12:00:00.000Z'), newId: () => `qc-migration-${++nextId}`,
   })

@@ -3,8 +3,8 @@ import test from 'node:test'
 import { applySampleLifecycle, createAnalysisRun, WorkspaceLifecycleService, WorkspaceRepository } from '../dist-server/app.mjs'
 import { createFakeRealJobs } from './job-lifecycle-fakes.mjs'
 import {
-  ALLOWED_OID, APP_ORIGIN, OTHER_ALLOWED_OID, TENANT_ID, authHeaders, createFakeDirectoryStore,
-  createFakeStateStore, membershipFor, principalKeyFor, sampleWorkspaceBody, startTestServer,
+  ALLOWED_OID, APP_ORIGIN, OTHER_ALLOWED_OID, TENANT_ID, authHeaders, createFakeAccessStore, createFakeDirectoryStore,
+  createFakeStateStore, membershipFor, principalKeyFor, sampleWorkspaceBody, seedWorkspace, startTestServer,
 } from './helpers.mjs'
 
 const timestamp = '2026-09-18T15:00:00.000Z'
@@ -40,7 +40,7 @@ function seedRun(server, id, workspace) {
 }
 
 test('workspace archive is inherited, cancels owned work, remains searchable, and restore keeps individual flags', async t => {
-  const server = await startTestServer()
+  const server = await startTestServer({ seedWorkspace: true })
   t.after(() => server.close())
   const workspace = (await session(server)).workspaces[0]
   const initial = await snapshot(server, workspace.id)
@@ -71,7 +71,7 @@ test('workspace archive is inherited, cancels owned work, remains searchable, an
 })
 
 test('archived analyses block workspace deletion until explicitly deleted, including while the workspace is archived', async t => {
-  const server = await startTestServer()
+  const server = await startTestServer({ seedWorkspace: true })
   t.after(() => server.close())
   let workspace = (await session(server)).workspaces[0]
   const { next, run } = seedRun(server, workspace.id, (await snapshot(server, workspace.id)).workspace)
@@ -91,8 +91,8 @@ test('archived analyses block workspace deletion until explicitly deleted, inclu
   assert.equal((await deleted.json()).deleted, true)
 })
 
-test('deleting the default and last workspace does not recreate it at sign-in and permits explicit new creation', async t => {
-  const server = await startTestServer()
+test('deleting the last fixture workspace does not recreate it at sign-in and a granted owner can explicitly create another', async t => {
+  const server = await startTestServer({ seedWorkspace: true, accessStore: createFakeAccessStore([{ userId: ALLOWED_OID }]) })
   t.after(() => server.close())
   const workspace = (await session(server)).workspaces[0]
   server.state._setRawContent(workspace.id, JSON.stringify(sampleWorkspaceBody()))
@@ -112,7 +112,7 @@ test('deleting the default and last workspace does not recreate it at sign-in an
 })
 
 test('workspace lifecycle requires ownership, CSRF, an exact current ETag, and valid fields', async t => {
-  const server = await startTestServer()
+  const server = await startTestServer({ seedWorkspace: true })
   t.after(() => server.close())
   const workspace = (await session(server)).workspaces[0]
   const base = `${server.baseUrl}/api/workspaces/${workspace.id}/lifecycle`
@@ -132,7 +132,7 @@ test('workspace lifecycle requires ownership, CSRF, an exact current ETag, and v
 })
 
 test('partial cleanup is durable, blocks stale writes, and resumes explicitly without a success-shaped response', async t => {
-  const server = await startTestServer()
+  const server = await startTestServer({ seedWorkspace: true })
   t.after(() => server.close())
   const workspace = (await session(server)).workspaces[0]
   server.state._setRawContent(workspace.id, JSON.stringify(sampleWorkspaceBody()))
@@ -157,7 +157,7 @@ test('partial cleanup is durable, blocks stale writes, and resumes explicitly wi
 
 test('failed finalization preserves owner recovery access and reconciliation atomically retires the workspace', async t => {
   let now = new Date(timestamp)
-  const server = await startTestServer({ now: () => now })
+  const server = await startTestServer({ seedWorkspace: true, now: () => now })
   t.after(() => server.close())
   const workspace = (await session(server)).workspaces[0]
   server.state._setRawContent(workspace.id, JSON.stringify(sampleWorkspaceBody()))
@@ -182,7 +182,7 @@ test('failed finalization preserves owner recovery access and reconciliation ato
 
 test('retry after sample cleanup failure preserves terminal real-store deletion fences', async t => {
   const jobs = createFakeRealJobs()
-  const server = await startTestServer({ jobs })
+  const server = await startTestServer({ seedWorkspace: true, jobs })
   t.after(() => server.close())
   const workspace = (await session(server)).workspaces[0]
   server.state._setRawContent(workspace.id, JSON.stringify(sampleWorkspaceBody()))
@@ -206,9 +206,9 @@ test('retry after sample cleanup failure preserves terminal real-store deletion 
 
 test('workspace coordinator fences every store before cancellation and purges ladders before seed jobs', async () => {
   const directory = createFakeDirectoryStore(), state = createFakeStateStore()
-  const principal = { tenantId: TENANT_ID, oid: ALLOWED_OID, principalKey: principalKeyFor(TENANT_ID, ALLOWED_OID), name: 'Owner', email: 'owner@example.test' }
+  const principal = { tenantId: TENANT_ID, oid: ALLOWED_OID, principalKey: principalKeyFor(TENANT_ID, ALLOWED_OID), name: 'Owner', email: 'owner@example.test', applicationRoles: ['Score.User'] }
   const repository = new WorkspaceRepository({ directory, state })
-  const workspace = (await repository.getSession(principal)).workspaces[0]
+  const workspace = await repository.createWorkspace(principal, 'Lifecycle fixture')
   state._setRawContent(workspace.id, JSON.stringify(sampleWorkspaceBody()))
   const calls = []
   const participant = name => ({
@@ -225,7 +225,7 @@ test('workspace coordinator fences every store before cancellation and purges la
 })
 
 test('a held workspace mutation lease rejects another mutation without changing metadata', async t => {
-  const server = await startTestServer()
+  const server = await startTestServer({ seedWorkspace: true })
   t.after(() => server.close())
   const workspace = (await session(server)).workspaces[0]
   const lease = await server.state.acquireMutationLease(workspace.id)
@@ -235,7 +235,7 @@ test('a held workspace mutation lease rejects another mutation without changing 
 })
 
 test('sample autosave cannot forge owner-only root archive or deletion metadata', async t => {
-  const server = await startTestServer()
+  const server = await startTestServer({ seedWorkspace: true })
   t.after(() => server.close())
   const workspace = (await session(server)).workspaces[0]
   const before = await snapshot(server, workspace.id)
@@ -249,21 +249,21 @@ test('sample autosave cannot forge owner-only root archive or deletion metadata'
   }
 })
 
-test('a stale first-use request cannot prepare state after another tab deletes the default workspace', async t => {
+test('a session waiting on membership lookup cannot recreate a workspace deleted by another tab', async t => {
   const directory = createFakeDirectoryStore(), state = createFakeStateStore()
-  const read = directory.getMetadata
+  await seedWorkspace({ directory, state })
+  const read = directory.listMembershipsForPrincipal
   let release, started
   const gate = new Promise(resolve => { release = resolve })
   const waiting = new Promise(resolve => { started = resolve })
   let firstRead = true, creations = 0
-  directory.getMetadata = async id => {
-    const value = await read(id)
+  directory.listMembershipsForPrincipal = async id => {
     if (firstRead) {
       firstRead = false
       started()
       await gate
     }
-    return value
+    return read(id)
   }
   const create = state.createState
   state.createState = async (...args) => { creations++; return create(...args) }
@@ -277,14 +277,14 @@ test('a stale first-use request cannot prepare state after another tab deletes t
   release()
   assert.deepEqual((await stale).workspaces, [])
   assert.equal(await state.getState(workspace.id), undefined)
-  assert.equal(creations, 1)
+  assert.equal(creations, 0)
 })
 
 test('individual cleanup is resumed under the workspace lease even without a workspace operation', async () => {
   const directory = createFakeDirectoryStore(), state = createFakeStateStore()
-  const principal = { tenantId: TENANT_ID, oid: ALLOWED_OID, principalKey: principalKeyFor(TENANT_ID, ALLOWED_OID), name: 'Owner', email: 'owner@example.test' }
+  const principal = { tenantId: TENANT_ID, oid: ALLOWED_OID, principalKey: principalKeyFor(TENANT_ID, ALLOWED_OID), name: 'Owner', email: 'owner@example.test', applicationRoles: ['Score.User'] }
   const repository = new WorkspaceRepository({ directory, state })
-  const workspace = (await repository.getSession(principal)).workspaces[0]
+  const workspace = await repository.createWorkspace(principal, 'Lifecycle fixture')
   let pending = true, resumed = 0
   const participant = {
     async setState() { assert.fail('Individual recovery must not change workspace archive state') },
@@ -309,9 +309,9 @@ test('individual cleanup is resumed under the workspace lease even without a wor
 
 test('real analyses block workspace deletion before any store is fenced or purged', async () => {
   const directory = createFakeDirectoryStore(), state = createFakeStateStore()
-  const principal = { tenantId: TENANT_ID, oid: ALLOWED_OID, principalKey: principalKeyFor(TENANT_ID, ALLOWED_OID), name: 'Owner', email: 'owner@example.test' }
+  const principal = { tenantId: TENANT_ID, oid: ALLOWED_OID, principalKey: principalKeyFor(TENANT_ID, ALLOWED_OID), name: 'Owner', email: 'owner@example.test', applicationRoles: ['Score.User'] }
   const repository = new WorkspaceRepository({ directory, state })
-  const workspace = (await repository.getSession(principal)).workspaces[0]
+  const workspace = await repository.createWorkspace(principal, 'Lifecycle fixture')
   state._setRawContent(workspace.id, JSON.stringify(sampleWorkspaceBody()))
   const untouched = async () => { assert.fail('A retained real analysis must block cleanup before mutation') }
   const participant = {

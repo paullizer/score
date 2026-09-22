@@ -261,8 +261,7 @@ test('workspace/sign-out guards and cross-workspace history retain the outer clo
   const fixture = await startGradeFixture(runtime, { injectAuth: true })
   t.after(() => fixture.close())
   const { detail } = await seededLadder(fixture)
-  const response = await fixture.request('/api/workspaces', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: 'Other review workspace' }) })
-  const other = (await response.json()).workspace
+  const other = await fixture.seedWorkspace('Other review workspace')
   const { context, page, errors } = await newPage(fixture)
   const save = deferred()
   try {

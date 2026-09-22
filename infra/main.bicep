@@ -9,10 +9,12 @@ param environmentName string
 param location string = 'northcentralus'
 param resourceGroupName string = 'rg-${environmentName}-ncus'
 param authClientId string
+param authServicePrincipalId string
 param tenantId string
+@description('Legacy ingress guard retained until an explicitly verified role-aware deployment is released.')
 param allowedUserId string
-@description('Explicit comma-separated Entra object IDs for application administrators. Empty grants no administrator access.')
-param adminUserIds string = ''
+@allowed(['guarded', 'roles'])
+param admissionStage string = 'guarded'
 param operatorPrincipalId string
 param containerImage string
 param workerImage string
@@ -67,9 +69,10 @@ module resources 'resources.bicep' = {
     token: uniqueString(subscription().id, environmentName)
     tags: tags
     authClientId: authClientId
+    authServicePrincipalId: authServicePrincipalId
     tenantId: tenantId
     allowedUserId: allowedUserId
-    adminUserIds: adminUserIds
+    admissionStage: admissionStage
     operatorPrincipalId: operatorPrincipalId
     containerImage: containerImage
     workerImage: workerImage

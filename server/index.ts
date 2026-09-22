@@ -20,6 +20,8 @@ import { RUNTIME_SETTINGS_VERSION } from '../src/domain/admin-settings'
 import { PROMPT_RUNTIME_VERSION } from '../src/domain/prompt-versions'
 import { shutdownTelemetry, telemetryPreloaded } from './telemetry-lifecycle'
 import { errorCategory } from './telemetry-schema'
+import { createAzureAccessStore } from './access/azure-store'
+import { createEntraDirectory } from './access/entra-directory'
 
 const DEFAULT_PORT = 8080
 
@@ -110,7 +112,9 @@ function main(): void {
       }),
     } : {}),
   }) : undefined
-  const app = createApp({ config, directory, state, jobs, grades, resumes, analyses, settings, prompts, qc })
+  const accessStore = config.access ? createAzureAccessStore(config.cosmos, config.access.container, credential) : undefined
+  const eligibleUsers = config.access ? createEntraDirectory(config.access, credential) : undefined
+  const app = createApp({ config, directory, state, jobs, grades, resumes, analyses, settings, prompts, qc, accessStore, eligibleUsers })
   const bootstrapSettings = app.locals.bootstrapSettings as () => Promise<StoredSettings | undefined>
   const initializeSettings = (): void => {
     void bootstrapSettings().then(current => {

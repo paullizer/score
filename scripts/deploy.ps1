@@ -5,7 +5,12 @@ param(
   [ValidateSet('northcentralus')]
   [string]$Location = 'northcentralus',
   [string]$AllowedUser = 'paullizer@retroburn.cloud',
-  [string[]]$AdminUserIds,
+  [Alias('AdminUserIds')]
+  [string[]]$BootstrapAdminUserIds,
+  [string[]]$ScoreUserIds,
+  [string[]]$ScoreUserGroupIds,
+  [string[]]$ScoreAdminGroupIds,
+  [switch]$ConsentHiddenGroupMembership,
   [switch]$ProvisionOnly,
   [switch]$DeployOnly
 )
@@ -61,25 +66,36 @@ try {
   Set-EnvironmentValue 'AZURE_TENANT_ID' $subscription.tenantId
   Set-EnvironmentValue 'AZURE_ALLOWED_USER_ID' $user.id
   Set-EnvironmentValue 'AZURE_PRINCIPAL_ID' $operator.id
-  if ($PSBoundParameters.ContainsKey('AdminUserIds')) {
-    foreach ($adminId in $AdminUserIds) {
+  if ($PSBoundParameters.ContainsKey('BootstrapAdminUserIds')) {
+    if (!$BootstrapAdminUserIds.Count) { throw 'Supply at least one explicit bootstrap administrator object ID.' }
+    foreach ($adminId in $BootstrapAdminUserIds) {
       $parsedId = [guid]::Empty
-      if (![guid]::TryParse($adminId, [ref]$parsedId) -or $parsedId.ToString() -ne $user.id.ToLowerInvariant()) {
-        throw 'Every administrator must be an explicitly allowed application user, identified by Entra object ID.'
+      if (![guid]::TryParseExact($adminId, 'D', [ref]$parsedId)) {
+        throw 'Every bootstrap administrator must be identified explicitly by Entra object ID. The deployer is never inferred as an administrator.'
       }
     }
-    Set-EnvironmentValue 'AZURE_ADMIN_USER_IDS' (($AdminUserIds | ForEach-Object { $_.ToLowerInvariant() } | Select-Object -Unique) -join ',')
+    Set-EnvironmentValue 'AZURE_BOOTSTRAP_ADMIN_USER_IDS' (($BootstrapAdminUserIds | ForEach-Object { $_.ToLowerInvariant() } | Select-Object -Unique) -join ',')
   } else {
-    $environmentValues = & azd env get-values --environment $EnvironmentName
-    if ($LASTEXITCODE -ne 0) { throw 'Could not read the saved administrator roster. Existing grants have not been replaced.' }
-    $savedRosterJson = $environmentValues | & node --input-type=module -e 'import { readFileSync } from "node:fs"; import { parseEnv } from "node:util"; const values = parseEnv(readFileSync(0, "utf8")); console.log(JSON.stringify(Object.hasOwn(values, "AZURE_ADMIN_USER_IDS") ? { ids: values.AZURE_ADMIN_USER_IDS } : {}));'
-    if ($LASTEXITCODE -ne 0) { throw 'Could not parse the saved administrator roster. Existing grants have not been replaced.' }
-    $savedRoster = $savedRosterJson | ConvertFrom-Json -AsHashtable
-    if (!$savedRoster.ContainsKey('ids')) {
-      Set-EnvironmentValue 'AZURE_ADMIN_USER_IDS' ''
-    } elseif (![string]::IsNullOrWhiteSpace($savedRoster['ids']) -and $savedRoster['ids'].Trim().ToLowerInvariant() -ne $user.id.ToLowerInvariant()) {
-      throw 'The saved administrator roster does not match the allowed sign-in user. Supply explicit -AdminUserIds to review this change.'
+    $savedAdmins = & azd env get-value AZURE_BOOTSTRAP_ADMIN_USER_IDS --environment $EnvironmentName 2>$null
+    if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($savedAdmins)) {
+      throw 'Supply -BootstrapAdminUserIds explicitly on the first role-based deployment. Legacy AZURE_ADMIN_USER_IDS and the operator are not migrated implicitly.'
     }
+  }
+  foreach ($setting in @(
+    @{ Parameter = 'ScoreUserIds'; Environment = 'AZURE_SCORE_USER_IDS'; Values = $ScoreUserIds },
+    @{ Parameter = 'ScoreUserGroupIds'; Environment = 'AZURE_SCORE_USER_GROUP_IDS'; Values = $ScoreUserGroupIds },
+    @{ Parameter = 'ScoreAdminGroupIds'; Environment = 'AZURE_SCORE_ADMIN_GROUP_IDS'; Values = $ScoreAdminGroupIds }
+  )) {
+    if ($PSBoundParameters.ContainsKey($setting.Parameter)) {
+      foreach ($objectId in $setting.Values) {
+        $parsedId = [guid]::Empty
+        if (![guid]::TryParseExact($objectId, 'D', [ref]$parsedId)) { throw "$($setting.Parameter) must contain Entra object-ID GUIDs." }
+      }
+      Set-EnvironmentValue $setting.Environment (($setting.Values | ForEach-Object { $_.ToLowerInvariant() } | Select-Object -Unique) -join ',')
+    }
+  }
+  if ($PSBoundParameters.ContainsKey('ConsentHiddenGroupMembership')) {
+    Set-EnvironmentValue 'AZURE_SCORE_CONSENT_HIDDEN_MEMBERSHIP' ($ConsentHiddenGroupMembership.IsPresent.ToString().ToLowerInvariant())
   }
   $image = & azd env get-value AZURE_CONTAINER_IMAGE --environment $EnvironmentName 2>$null
   if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($image)) {
@@ -110,7 +126,8 @@ try {
     Set-EnvironmentValue 'AZURE_QC_WORKER_CONTAINER_IMAGE' 'mcr.microsoft.com/k8se/quickstart-jobs:latest'
   }
   Write-Host "Deploying Score to $Location in subscription $SubscriptionId."
-  Write-Host "Allowed application user: $($user.userPrincipalName). Real resume imports and manual analyses require their independently verified workers."
+  Write-Host "Initial guarded-ingress identity: $($user.userPrincipalName). Entra users/groups receive explicit Score.User or Score.Admin assignments."
+  Write-Host 'Ingress is not released automatically. Follow the README role-verification and explicit release procedure.'
   Write-Host 'Rubric model: GPT-5 mini, US Data Zone Standard, in the existing North Central US Foundry resource.'
   if ($DeployOnly) {
     foreach ($setting in @('AZURE_RESUME_WORKER_ID', 'AZURE_ANALYSIS_WORKER_ID', 'AZURE_QC_WORKER_ID')) {

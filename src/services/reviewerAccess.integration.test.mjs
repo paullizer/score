@@ -48,7 +48,7 @@ before(async () => {
       export { WorkspaceContext } from './src/app/workspace-context'
       export { realWorkspaceWritable, assertRealLifecyclePermission } from './src/app/real-lifecycle'
       export { useLifecycleAccess } from './src/components/lifecycle/useLifecycleAccess'
-      export { WorkspaceSwitcher } from './src/components/workspace/WorkspaceSwitcher'
+      export { WorkspaceAccessDialog } from './src/components/workspace/WorkspaceAccessDialog'
       export { RubricPanel } from './src/features/rubrics/RubricPanel'
       export { MemoryRouter } from 'react-router-dom'
     ` },
@@ -106,7 +106,11 @@ async function render(content) {
   root ??= createRoot(document.getElementById('root'))
   await act(async () => root.render(content))
 }
-async function picker() { await render(element(ui.WorkspaceSwitcher, { cloud, empty: true })) }
+async function accessDialog() {
+  await render(element(ui.WorkspaceAccessDialog, {
+    workspace: cloud.workspaces[0], user, refreshWorkspaces: cloud.refreshWorkspaces, onClose() {},
+  }))
+}
 function button(label) {
   const found = [...document.querySelectorAll('button')].find(item => item.getAttribute('aria-label') === label || item.textContent.trim() === label)
   assert.ok(found, label)
@@ -144,22 +148,23 @@ test('explicit workspace permissions deny undefined and invalid members even to 
   }
 })
 
-test('workspace picker exposes the own account ID while only owners can open reviewer management', async () => {
-  for (const role of ['reviewer', 'editor', 'viewer']) {
-    cloud = { ...cloud, workspaces: [{ ...metadata, role }] }
-    await picker()
+test('reviewer-only compatibility dialog requires explicit ownership, not an implicit Admin designation', async () => {
+  for (const current of [
+    ...['reviewer', 'editor', 'viewer'].map(role => ({ ...metadata, role })),
+    { ...metadata, accessSource: 'application-admin' },
+  ]) {
+    cloud = { ...cloud, workspaces: [current] }
+    await accessDialog()
     assert.match(document.body.textContent, new RegExp(user.id))
     assert.match(document.body.textContent, new RegExp(user.tenantId))
-    assert.equal(document.querySelector('button[aria-label^="Manage reviewer access"]'), null)
-    assert.equal(document.querySelector('button[aria-label^="Rename"]'), null)
-    assert.equal(document.querySelector('button[aria-label^="Archive"]'), null)
+    assert.match(document.body.textContent, /Only a current explicit workspace Owner/)
+    assert.equal(document.querySelector('form'), null)
   }
   assert.equal(requests.length, 0)
 })
 
 test('owners add and explicitly remove reviewers using account IDs, display-only labels, and updated ETags', async () => {
-  await picker()
-  await click('Manage reviewer access for Private workspace')
+  await accessDialog()
   await settle(() => document.body.textContent.includes('No reviewer memberships.'))
   assert.match(document.body.textContent, /does not invite accounts or grant application-administrator/)
   await input('Reviewer account ID', reviewerId)
@@ -168,7 +173,7 @@ test('owners add and explicitly remove reviewers using account IDs, display-only
   await settle(() => Boolean(document.querySelector(`button[aria-label="Remove reviewer ${reviewerId}"]`)))
   assert.equal(document.querySelector('script'), null, 'Labels render only as escaped display text')
   assert.match(document.body.textContent, /Not an administrator/)
-  assert.equal(directoryRefreshes, 2, 'Opening the picker and acknowledging access refresh directory metadata')
+  assert.equal(directoryRefreshes, 1, 'Acknowledging access refreshes directory metadata')
   await click(`Remove reviewer ${reviewerId}`)
   assert.equal(requests.filter(item => item.method === 'DELETE').length, 0, 'Removal requires explicit confirmation')
   await click('Confirm removal')
@@ -183,8 +188,7 @@ test('owners add and explicitly remove reviewers using account IDs, display-only
 
 test('conflicts and authorization failures clear the access list and never auto-replay a membership mutation', async () => {
   savedAccess.reviewers = [{ objectId: reviewerId, role: 'reviewer', label: 'Private display label' }]
-  await picker()
-  await click('Manage reviewer access for Private workspace')
+  await accessDialog()
   await settle(() => document.body.textContent.includes('Private display label'))
   override = async (_path, init) => init.method === 'POST'
     ? Response.json({ error: { code: 'conflict', message: 'Access changed elsewhere.' } }, { status: 409 }) : undefined
@@ -204,21 +208,20 @@ test('conflicts and authorization failures clear the access list and never auto-
   await settle(() => document.body.textContent.includes('Membership no longer available.'))
   assert.equal(document.body.textContent.includes('Private display label'), false)
   assert.equal(requests.filter(item => item.method === 'DELETE').length, 1)
-  assert.equal(directoryRefreshes, 2, 'Access loss refreshes the current directory without retaining a private member list')
+  assert.equal(directoryRefreshes, 1, 'Access loss refreshes the current directory without retaining a private member list')
 })
 
 test('a stale in-flight member list cannot remain visible after owner access is lost', async () => {
   let release
   const response = new Promise(resolve => { release = resolve })
   override = async () => response
-  await picker()
-  await click('Manage reviewer access for Private workspace')
+  await accessDialog()
   await settle(() => requests.length === 1)
   cloud = { ...cloud, workspaces: [{ ...metadata, role: 'reviewer' }] }
-  await picker()
+  await accessDialog()
   await act(async () => release(Response.json({ ...savedAccess, reviewers: [{ objectId: reviewerId, role: 'reviewer', label: 'Private delayed label' }] })))
   assert.equal(document.body.textContent.includes('Private delayed label'), false)
-  assert.equal(document.querySelector('[role="dialog"]'), null)
+  assert.match(document.body.textContent, /Only a current explicit workspace Owner/)
   assert.equal(requests[0].init.signal.aborted, true)
 })
 
@@ -266,7 +269,7 @@ test('cloud reviewer providers reject sample editing and lifecycle calls without
   assert.ok(requests.every(item => item.method === 'GET'))
 })
 
-test('a role downgrade fences queued sample autosave and conflict overwrite before any network write', async () => {
+test('a role downgrade pauses queued sample autosave and conflict overwrite before any network write', async () => {
   const capture = {}, apiRef = { current: null }
   await render(provider({ ...metadata }, capture, apiRef))
   await settle(() => Boolean(capture.value))
@@ -276,7 +279,8 @@ test('a role downgrade fences queued sample autosave and conflict overwrite befo
   })
   await act(async () => { await new Promise(resolve => setTimeout(resolve, 800)) })
   assert.equal(capture.access.canEdit, false)
-  assert.equal(capture.cloud.saveState, 'conflict')
+  assert.equal(capture.cloud.saveState, 'error')
+  assert.match(capture.cloud.saveError, /role is now Reviewer.*Unsaved drafts are kept/)
   assert.equal(apiRef.current.hasPendingChanges(), true, 'Previously editable sample changes are not silently discarded')
   await act(async () => { capture.cloud.retrySave(); await capture.cloud.keepMineAndOverwrite() })
   assert.ok(requests.every(item => item.method === 'GET'), 'No stale autosave or conflict overwrite can issue a write')

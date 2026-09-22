@@ -31,6 +31,9 @@ export interface WorkspaceSummary {
   name: string
   kind: WorkspaceKind
   role: WorkspaceRole
+  accessSource?: 'membership' | 'application-admin'
+  /** Explicit membership for administrators whose ordinary access is tenant-wide. */
+  membershipRole?: WorkspaceRole
   createdAt: string
   updatedAt: string
   etag: string
@@ -43,13 +46,18 @@ export interface CloudSession {
   mode: 'cloud'
   user: CloudUser
   workspaces: WorkspaceSummary[]
-  capabilities?: { applicationAdmin: boolean }
+  capabilities?: CloudCapabilities
+}
+
+export interface CloudCapabilities {
+  applicationAdmin: boolean
+  canCreateWorkspaces: boolean
 }
 
 export interface CloudSessionIdentity {
   mode: 'cloud'
   user: CloudUser
-  capabilities: { applicationAdmin: boolean }
+  capabilities: CloudCapabilities
 }
 
 export interface CloudWorkspaceSnapshot {

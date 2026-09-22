@@ -16,6 +16,7 @@ const at = '2026-09-22T12:00:00.000Z'
 const principal = {
   tenantId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', oid: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb',
   principalKey: 'administrator', name: 'Administrator', email: '',
+  applicationRoles: ['Score.Admin'],
 }
 
 function cosmos() {
@@ -223,6 +224,30 @@ test('private QC candidates are deterministic, independent captures with no glob
   assert.throws(() => registry.createPromptCandidate(baseline, guidance, actor, at, baseline.bundle.bundleId), /new immutable/)
   assert.throws(() => registry.createPromptCandidate(baseline, guidance, { system: 'initialization' }, at, 'pb-private-evaluation'), /attributable/)
   assert.throws(() => registry.createPromptCandidate(baseline, { jobRubric: baseline.revisions.jobRubric.guidance }, actor, at, 'pb-unchanged'), /must change/)
+})
+
+test('production prompt publication requires same-tenant Score.Admin claims, not retired OID rosters', async () => {
+  const f = cosmos(), { baseline, draft } = await candidate(f)
+  const service = new registry.PromptRegistryService({
+    store: f.store, now: () => new Date(at),
+    config: { tenantId: principal.tenantId, allowedUserIds: new Set([principal.oid]), adminUserIds: new Set([principal.oid]) },
+  })
+  const input = activation(baseline, draft)
+  for (const actor of [
+    { ...principal, applicationRoles: undefined },
+    { ...principal, applicationRoles: ['Score.User'] },
+    { ...principal, tenantId: 'cccccccc-cccc-4ccc-8ccc-cccccccccccc' },
+  ]) {
+    await assert.rejects(service.activate(actor, input, baseline.etag), /administrator/)
+    assert.equal((await service.current()).etag, baseline.etag)
+  }
+  const published = await service.activate(principal, input, baseline.etag)
+  assert.equal(published.bundle.bundleId, draft.bundle.bundleId)
+  await assert.rejects(service.restore({ ...principal, applicationRoles: ['Score.User'] },
+    baseline.bundle.bundleId, 'Restore the baseline.', published.etag, 'denied-role-restore'), /administrator/)
+  const restored = await service.restore(principal, baseline.bundle.bundleId, 'Restore the baseline.',
+    published.etag, 'allowed-role-restore')
+  assert.equal(restored.bundle.bundleId, baseline.bundle.bundleId)
 })
 
 test('candidate processing snapshots change only accepted prompt pins and cannot synthesize a missing baseline', () => {
@@ -460,7 +485,7 @@ test('API accepted-work reconstruction retains pins without a current read or le
 test('AdminSettingsService captures configured registry pins, but accepted legacy work and unconfigured callers remain unchanged', async () => {
   const f = cosmos(), settingsStore = createSettingsStoreFromContainer(f.container)
   const config = {
-    tenantId: principal.tenantId, allowedUserIds: new Set([principal.oid]), adminUserIds: new Set([principal.oid]),
+    tenantId: principal.tenantId,
     settings: { defaults: domain.createDefaultAdminSettings(), runtimeEnabled: true },
   }
   const service = new AdminSettingsService({ config, store: settingsStore, prompts: f.service, now: () => new Date(at) })

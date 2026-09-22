@@ -23,7 +23,8 @@ await build({
       "\nexport * from './worker/qc/model.ts'; export * from './worker/qc/config.ts'; export * from './worker/qc/runtime.ts';" +
       "\nexport * from './worker/settings.ts';" +
       "\nexport * from './server/repository.ts'; export * from './server/middleware.ts';" +
-      "\nexport * from './server/settings/request-context.ts'; export * from './server/ids.ts';",
+      "\nexport * from './server/settings/request-context.ts'; export * from './server/ids.ts';" +
+      "\nexport { getPrincipal } from './server/request-context.ts';",
   },
   outfile: output, platform: 'node', format: 'esm', packages: 'external', bundle: true, logLevel: 'silent',
 })
@@ -41,6 +42,7 @@ export const OIDS = {
 }
 export const principal = role => ({
   tenantId: TENANT, oid: OIDS[role], principalKey: `${TENANT}:${OIDS[role]}`, name: `QC ${role}`, email: '',
+  applicationRoles: [role === 'admin' || role === 'stranger' ? 'Score.Admin' : 'Score.User'],
 })
 export function qcMemoryStore() {
   const values = new Map(), transactions = []
@@ -264,6 +266,8 @@ export async function queueAssessmentEvaluation(f) {
   return f.plans.request(f.caller('reviewer'), detail.plan.id, 'evaluation', randomUUID(), detail.etag)
 }
 export async function qcHttp(f, configOverrides = {}) {
+  const roles = new Map(Object.keys(OIDS).map(role => [OIDS[role], principal(role).applicationRoles]))
+  const activePrincipals = new Set()
   const memberships = new Map(Object.keys(OIDS).filter(role => role !== 'stranger').map(role => {
     const id = api.membershipIdFor(principal(role).principalKey)
     return [id, { id, workspaceId: f.workspaceId, principalId: principal(role).principalKey, principalType: 'user', role: f.caller(role).role }]
@@ -287,7 +291,7 @@ export async function qcHttp(f, configOverrides = {}) {
   }
   const repository = new api.WorkspaceRepository({ directory, state })
   const config = {
-    authMode: 'easyauth', tenantId: TENANT, allowedUserIds: new Set(Object.values(OIDS)), adminUserIds: new Set([OIDS.admin, OIDS.stranger]),
+    authMode: 'easyauth', tenantId: TENANT,
     appOrigin: 'https://score.example.test', qcEnabled: true,
     settings: { runtimeEnabled: true },
     ...configOverrides,
@@ -295,6 +299,12 @@ export async function qcHttp(f, configOverrides = {}) {
   const app = express()
   app.use(express.json())
   app.use('/api', api.createAuthMiddleware(config), api.createCsrfMiddleware(config),
+    (req, res, next) => {
+      const actor = api.getPrincipal(req)
+      activePrincipals.add(actor)
+      res.once('close', () => activePrincipals.delete(actor))
+      next()
+    },
     api.attachSettingsContext(config, { capture: async () => clone(f.settings) }),
     api.createQcRouter({ repository, state, config, qc: f.qc, analyses: f.analysis, prompts: f.prompts, now: () => new Date(f.now) }))
   app.use((error, _req, res, _next) => {
@@ -305,11 +315,19 @@ export async function qcHttp(f, configOverrides = {}) {
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve))
   const base = `http://127.0.0.1:${server.address().port}/api/workspaces/${f.workspaceId}/qc`
   return {
-    memberships, beforeLease: hook => { beforeLease = hook }, archive: () => { metadata.archivedAt = f.now },
+    memberships, repository, beforeLease: hook => { beforeLease = hook }, archive: () => { metadata.archivedAt = f.now },
     setAdmissionEnabled: enabled => { config.qcEnabled = enabled },
+    // Fault injection for final guards; real Entra claim changes require token/session refresh.
+    setApplicationRoles(role, applicationRoles) {
+      roles.set(OIDS[role], [...applicationRoles])
+      for (const actor of activePrincipals) {
+        if (actor.oid === OIDS[role]) actor.applicationRoles = [...applicationRoles]
+      }
+    },
     async close() { await new Promise(resolve => server.close(resolve)) },
     async request(suffix, method = 'GET', data, role = 'reviewer', headers = {}) {
-      const identity = { auth_typ: 'aad', claims: [{ typ: 'tid', val: TENANT }, { typ: 'oid', val: OIDS[role] }] }
+      const identity = { auth_typ: 'aad', claims: [{ typ: 'tid', val: TENANT }, { typ: 'oid', val: OIDS[role] },
+        ...roles.get(OIDS[role]).map(value => ({ typ: 'roles', val: value }))] }
       return fetch(`${base}${suffix}`, { method, headers: {
         'x-ms-client-principal': Buffer.from(JSON.stringify(identity)).toString('base64'),
         ...(method === 'GET' ? {} : { origin: config.appOrigin, 'x-score-request': 'workspace', 'content-type': 'application/json', 'Idempotency-Key': randomUUID() }),

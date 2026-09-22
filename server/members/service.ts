@@ -7,11 +7,14 @@ import { GUID_PATTERN, membershipIdFor, principalKeyFor } from '../ids'
 import { assertWorkspaceMutationLease } from '../lifecycle/lease'
 import type { WorkspaceRepository } from '../repository'
 import type { DirectoryStore, MembershipDoc, StoredMetadata } from '../store'
+import type { EligibleUserDirectory } from '../access/directory'
+import { requireEligibleUser } from '../access/service'
 
 export interface WorkspaceMembersDeps {
   repository: WorkspaceRepository
   directory: DirectoryStore
-  config: Pick<Config, 'tenantId' | 'allowedUserIds'>
+  config: Pick<Config, 'tenantId'>
+  eligibleUsers?: EligibleUserDirectory
   now?: () => Date
 }
 
@@ -48,13 +51,11 @@ export class WorkspaceMembersService {
   constructor(private readonly deps: WorkspaceMembersDeps) {}
 
   private async owner(principal: AuthenticatedPrincipal, workspaceId: string): Promise<StoredMetadata> {
-    if (principal.tenantId !== this.deps.config.tenantId || !this.deps.config.allowedUserIds.has(principal.oid) ||
+    if (principal.tenantId !== this.deps.config.tenantId ||
       principal.principalKey !== principalKeyFor(principal.tenantId, principal.oid)) throw notFound()
-    const role = await this.deps.repository.authorizeWorkspace(principal, workspaceId, 'read')
+    const role = await this.deps.repository.authorizeWorkspaceMembership(principal, workspaceId)
     if (role !== 'owner') throw forbidden('Only the workspace owner can manage reviewer access.')
-    const stored = await this.deps.repository.getWorkspaceMetadata(principal, workspaceId)
-    if (stored.metadata.ownerId !== principal.principalKey) throw forbidden('Only the workspace owner can manage reviewer access.')
-    return stored
+    return this.deps.repository.getWorkspaceMetadata(principal, workspaceId)
   }
 
   private reviewer(membership: MembershipDoc, stored: StoredMetadata): WorkspaceReviewer {
@@ -62,7 +63,7 @@ export class WorkspaceMembersService {
     const oid = membership.principalId.slice(metadata.tenantId.length + 1)
     if (membership.workspaceId !== metadata.workspaceId || membership.role !== 'reviewer' ||
       membership.principalType !== 'user' || !membership.principalId.startsWith(`${metadata.tenantId}:`) ||
-      !GUID_PATTERN.test(oid) || membership.id !== membershipIdFor(membership.principalId) || membership.principalId === metadata.ownerId) {
+      !GUID_PATTERN.test(oid) || membership.id !== membershipIdFor(membership.principalId)) {
       throw unavailable('The saved reviewer membership has invalid scope. Nothing has been changed.')
     }
     return { objectId: oid, role: 'reviewer', ...(membership.label ? { label: membership.label } : {}) }
@@ -83,20 +84,20 @@ export class WorkspaceMembersService {
     await this.owner(principal, workspaceId)
     const etag = exactEtag(ifMatch)
     const input = reviewerInput(body)
-    if (!this.deps.config.allowedUserIds.has(input.objectId)) {
-      throw invalidRequest('That object ID is not an admitted account in this deployment. Sharing cannot invite users or change sign-in admission.')
-    }
     const principalId = principalKeyFor(this.deps.config.tenantId, input.objectId)
     return this.deps.repository.withWorkspaceMutation(principal, workspaceId, 'manage', async () => {
       const stored = await this.owner(principal, workspaceId)
       if (stored.etag !== etag) throw conflict('Workspace access changed. Refresh before adding a reviewer.')
-      if (principalId === stored.metadata.ownerId) throw forbidden("The owner's recovery membership cannot be changed.")
       const id = membershipIdFor(principalId)
-      if (await this.deps.directory.getStoredMembership(workspaceId, id)) {
+      const current = await this.deps.directory.getStoredMembership(workspaceId, id)
+      if (current?.membership.role === 'owner') throw forbidden("An owner's membership cannot be changed through reviewer access.")
+      if (current) {
         throw conflict('This account already has workspace access. Existing roles cannot be changed here.')
       }
+      const user = await requireEligibleUser(this.deps.eligibleUsers, input.objectId)
       const timestamp = (this.deps.now?.() ?? new Date()).toISOString()
       const membership = { id, workspaceId, principalId, principalType: 'user' as const, role: 'reviewer' as const,
+        name: user.name, email: user.email,
         ...(input.label ? { label: input.label } : {}) }
       assertWorkspaceMutationLease(workspaceId)
       await this.deps.directory.changeReviewerMembership({
@@ -118,7 +119,6 @@ export class WorkspaceMembersService {
     return this.deps.repository.withWorkspaceMutation(principal, workspaceId, 'manage', async () => {
       const stored = await this.owner(principal, workspaceId)
       if (stored.etag !== etag) throw conflict('Workspace access changed. Refresh before removing a reviewer.')
-      if (principalId === stored.metadata.ownerId) throw forbidden("The owner's recovery membership cannot be removed.")
       const membership = await this.deps.directory.getStoredMembership(workspaceId, membershipIdFor(principalId))
       if (!membership) throw notFound('Reviewer membership not found.')
       if (membership.membership.role !== 'reviewer') throw forbidden('Only reviewer memberships can be removed here. Existing owner, editor, and viewer access is unchanged.')

@@ -38,7 +38,7 @@ Read-only QC workers instead call the pure `createPromptCandidate(baseline, guid
 
 `createPromptCandidateSettings(baselineSettings, guidance, actor, createdAt, bundleId): ProcessingSettingsSnapshot` wraps that construction for a complete candidate evaluation capture. It requires a pinned schema-2 baseline and preserves every captured model/processing setting, revision and capture timestamp exactly, changing only `promptBundle`. It never synthesizes pins for legacy work, resolves current, activates, or writes global records. `guidance` is `PromptGuidanceDraft` (an editable-family map); QC change reasons and private feedback remain outside this map.
 
-`activate(principal, { bundleId, bundleSha256, reason, evaluation, candidate? }, exactEtag, beforePublish?)` requires an application administrator through the configured tenant/admission/admin roster or the explicit authorization callback. It rejects wildcard/weak/list/stale ETags and requires:
+`activate(principal, { bundleId, bundleSha256, reason, evaluation, candidate? }, exactEtag, beforePublish?)` requires the authenticated `Score.Admin` application role in the configured tenant, or the explicit authorization callback. Retired OID allowlists do not authorize publication. It rejects wildcard/weak/list/stale ETags and requires:
 
 - `evaluation.workspaceId`, `planId`, `planRevisionId`, `planSha256`, `evaluationId`, and `evaluationSha256`;
 - `baselineBundleId` / `baselineBundleSha256` matching the unchanged active release;

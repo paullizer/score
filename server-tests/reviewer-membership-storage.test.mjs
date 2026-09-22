@@ -124,6 +124,27 @@ test('stale metadata, changed memberships, and duplicate audits roll back all me
   }
 })
 
+test('Cosmos reviewer transactions authorize equal current co-owners, not the immutable creator', async () => {
+  const f = fixture()
+  const coOwner = `${tenant}:00000000-0000-4000-8000-000000000004`
+  const coOwnerId = membershipIdFor(coOwner)
+  f.records.set(f.key(workspaceId, coOwnerId), {
+    id: coOwnerId, workspaceId, principalId: coOwner, principalType: 'user', role: 'owner', _etag: '"co-owner"',
+  })
+  const addition = f.change()
+  addition.audit.actorId = coOwner
+  await f.store.changeReviewerMembership(addition)
+  assert.ok(await f.store.getStoredMembership(workspaceId, f.membership.id))
+  assert.equal(f.calls[0].operations[2].resourceBody.actorId, coOwner)
+
+  const demoted = fixture()
+  demoted.records.set(demoted.key(workspaceId, demoted.ownerMembership.id), {
+    ...demoted.ownerMembership, role: 'reviewer', _etag: '"demoted-creator"',
+  })
+  await assert.rejects(demoted.store.changeReviewerMembership(demoted.change()), StoreConflictError)
+  assert.equal(demoted.calls.length, 0, 'Creator provenance cannot authorize a transaction after ownership loss')
+})
+
 test('membership store refuses wildcard removals, owner mutations, cross-tenant subjects, and unfinished lifecycle fences', async () => {
   const f = fixture()
   for (const mutate of [

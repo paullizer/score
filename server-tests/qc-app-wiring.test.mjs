@@ -3,7 +3,7 @@ import test from 'node:test'
 import { OTHER_ALLOWED_OID, authHeaders, baseConfig, startTestServer } from './helpers.mjs'
 
 async function start(t, overrides = {}) {
-  const server = await startTestServer(overrides)
+  const server = await startTestServer({ seedWorkspace: true, ...overrides })
   t.after(() => server.close())
   const response = await fetch(`${server.baseUrl}/api/session`, { headers: authHeaders() })
   assert.equal(response.status, 200)

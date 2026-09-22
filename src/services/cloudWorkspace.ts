@@ -1,6 +1,7 @@
 import type { Workspace } from '../domain/types'
 import type { CloudSession, CloudSessionIdentity, CloudWorkspaceSnapshot, WorkspaceReviewerAccess, WorkspaceSummary } from '../domain/cloud'
 import type { LifecycleAction, LifecycleImpact, LifecycleOperation } from '../domain/lifecycle'
+import { workspaceCanEdit, workspaceCanReview, workspaceQcRole } from '../domain/workspace-permissions'
 
 /**
  * True when this build is deployed against the real Azure-hosted API (Docker/production build sets
@@ -60,6 +61,87 @@ export class CloudTimeoutError extends CloudApiError {
     this.name = 'CloudTimeoutError'
     this.acknowledgementUnknown = mutating
   }
+}
+
+export class CloudAccessChangedError extends CloudApiError {
+  constructor() {
+    super('forbidden', 'Workspace access changed while this request was in progress. Its result was not applied to this tab. A submitted change may already have been accepted; refresh saved access and content before explicitly retrying.', 403)
+    this.name = 'CloudAccessChangedError'
+  }
+}
+
+export const CLOUD_ACCESS_REFRESH_EVENT = 'score-cloud-access-refresh'
+
+export function workspaceAccessStamp(workspace?: WorkspaceSummary): string {
+  return JSON.stringify([workspace?.id, workspace?.role, workspace?.accessSource, workspace?.membershipRole, workspace?.archivedAt, workspace?.deletedAt, workspace?.lifecycleOperation])
+}
+
+type AccessEntry = { workspace: WorkspaceSummary; stamp: string; controller: AbortController }
+let sessionAccess: { identity: string; applicationAdmin: boolean; canCreateWorkspaces: boolean } | null = null
+let capabilityController = new AbortController()
+let workspaceAccess = new Map<string, AccessEntry>()
+const accessRefreshRequired = new Set<string>()
+
+/** Installed only by the authenticated app. Local samples and isolated service consumers are unchanged. */
+export function setCloudSessionAccess(session: CloudSession | null): void {
+  const identity = session ? JSON.stringify([session.user.tenantId, session.user.id]) : ''
+  const sameIdentity = sessionAccess?.identity === identity
+  if (!sameIdentity || sessionAccess?.applicationAdmin !== (session?.capabilities?.applicationAdmin === true) ||
+    sessionAccess?.canCreateWorkspaces !== (session?.capabilities?.canCreateWorkspaces === true)) {
+    capabilityController.abort(new CloudAccessChangedError())
+    capabilityController = new AbortController()
+  }
+  const next = new Map<string, AccessEntry>()
+  for (const workspace of session?.workspaces ?? []) {
+    if (workspace.deletedAt) continue
+    const existing = sameIdentity ? workspaceAccess.get(workspace.id) : undefined
+    const stamp = workspaceAccessStamp(workspace)
+    next.set(workspace.id, existing?.stamp === stamp ? existing : { workspace, stamp, controller: new AbortController() })
+  }
+  for (const [id, entry] of workspaceAccess) {
+    if (next.get(id) !== entry) entry.controller.abort(new CloudAccessChangedError())
+  }
+  workspaceAccess = next
+  accessRefreshRequired.clear()
+  sessionAccess = session ? {
+    identity, applicationAdmin: session.capabilities?.applicationAdmin === true,
+    canCreateWorkspaces: session.capabilities?.canCreateWorkspaces === true,
+  } : null
+}
+
+export function cloudAccessRequestSignal(path: string, init: RequestInit = {}): AbortSignal | undefined {
+  if (!sessionAccess) return
+  const mutating = !['GET', 'HEAD', 'OPTIONS'].includes((init.method ?? 'GET').toUpperCase())
+  if (path.startsWith('/admin/') && !sessionAccess.applicationAdmin) throw new CloudApiError('forbidden', 'Application administrator access is required. Workspace ownership does not grant application administration.', 403)
+  if (path === '/workspaces' && mutating && !sessionAccess.canCreateWorkspaces) throw new CloudApiError('forbidden', 'An application administrator must grant you permission to create workspaces. Existing workspace access is unchanged.', 403)
+  if (path.startsWith('/admin/') || (path === '/workspaces' && mutating)) return capabilityController.signal
+  const match = /^\/workspaces\/([^/?]+)(\/[^?]*)?(?:\?|$)/.exec(path)
+  if (!match) return
+  const id = decodeURIComponent(match[1])
+  const entry = workspaceAccess.get(id)
+  if (!entry) throw new CloudApiError('not_found', 'This workspace is no longer available to your account. Refresh access or contact a workspace owner or application administrator.', 404)
+  const qc = /^\/qc(?:\/|$)/.test(match[2] ?? '')
+  if (qc && !workspaceCanReview(workspaceQcRole(entry.workspace), sessionAccess.applicationAdmin)) {
+    throw new CloudApiError('forbidden', 'QC requires an explicit workspace membership and a reviewer, editor, owner, or application-admin role.', 403)
+  }
+  if (/^\/reviewers(?:\/|$)/.test(match[2] ?? '') && workspaceQcRole(entry.workspace) !== 'owner') {
+    throw new CloudApiError('forbidden', 'Only an explicit workspace Owner can use reviewer-only access management.', 403)
+  }
+  const ownerOnly = /^\/(?:members|share-candidates)(?:\/|$)/.test(match[2] ?? '') ||
+    (mutating && (!match[2] || match[2] === '/lifecycle'))
+  if (ownerOnly && entry.workspace.role !== 'owner') throw new CloudApiError('forbidden', 'Only a workspace Owner or application administrator can manage workspace access and lifecycle.', 403)
+  if (mutating && ((!qc && !workspaceCanEdit(entry.workspace.role)) || accessRefreshRequired.has(id))) {
+    throw new CloudApiError('forbidden', 'Workspace changes are paused. Reader and Reviewer access cannot save ordinary edits; refresh current access before continuing. Unsaved drafts remain in this tab.', 403)
+  }
+  return entry.controller.signal
+}
+
+export function reportCloudAccessFailure(path: string, error: unknown) {
+  if (!sessionAccess || !(error instanceof CloudApiError) || error instanceof CloudAccessChangedError || ![401, 403, 404].includes(error.status)) return
+  const match = /^\/workspaces\/([^/?]+)/.exec(path)
+  if (!match && !(path.startsWith('/admin/') && error.status !== 404)) return
+  if (match && error.status !== 404) accessRefreshRequired.add(decodeURIComponent(match[1]))
+  if (typeof window !== 'undefined') window.dispatchEvent(new window.Event(CLOUD_ACCESS_REFRESH_EVENT))
 }
 
 export class LifecycleOperationError extends Error {
@@ -147,11 +229,12 @@ async function unwrap<T>(response: Response): Promise<T> {
 }
 
 async function cloudRequest<T>(path: string, init: RequestInit, read: (response: Response) => Promise<T>): Promise<T> {
+  const accessSignal = cloudAccessRequestSignal(path, init)
   const headers = new Headers(init.headers)
   headers.set(SCORE_REQUEST_HEADER, 'workspace')
   if (init.body !== undefined && !headers.has('Content-Type')) headers.set('Content-Type', 'application/json')
   const deadline = AbortSignal.timeout(30000)
-  const signal = init.signal ? AbortSignal.any([init.signal, deadline]) : deadline
+  const signal = AbortSignal.any([...(init.signal ? [init.signal] : []), ...(accessSignal ? [accessSignal] : []), deadline])
   try {
     signal.throwIfAborted()
     const response = await fetch(`/api${path}`, {
@@ -166,7 +249,9 @@ async function cloudRequest<T>(path: string, init: RequestInit, read: (response:
     if (reason instanceof Error && reason.name === 'TimeoutError') {
       throw new CloudTimeoutError(!['GET', 'HEAD', 'OPTIONS'].includes((init.method ?? 'GET').toUpperCase()))
     }
+    if (accessSignal?.aborted) throw accessSignal.reason
     if (init.signal?.aborted && signal.reason === init.signal.reason) throw init.signal.reason
+    reportCloudAccessFailure(path, caught)
     throw caught
   }
 }
@@ -288,9 +373,8 @@ export function validateWorkspaceName(name: string): string | null {
 }
 
 /**
- * The only two things Score ever keeps in localStorage for cloud mode: the appearance theme (shared,
- * already handled by ThemeControl) and the last-selected workspace id, namespaced per tenant/user so
- * signing in as someone else never leaks or reuses a previous person's workspace choice.
+ * Legacy selection preference, read only as an untimed seed for workspaceRecents.
+ * Cloud preferences contain appearance and account-scoped workspace IDs/times, never document state.
  */
 function lastWorkspaceKey(tenantId: string, userId: string): string {
   return `score-cloud-last-workspace:${tenantId}:${userId}`

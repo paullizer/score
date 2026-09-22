@@ -27,7 +27,7 @@ export function frontendWorkspaceContext(value = {}, { resumes = [], analyses = 
     const id = value.cloud.currentWorkspaceId ?? 'workspace-one'
     result.cloud = {
       user: { id: 'reviewer', tenantId: 'tenant', name: 'Fixture reviewer', email: 'reviewer@example.test' },
-      currentWorkspaceId: id, workspaces: [{ id, name: 'Fixture workspace', role: 'owner', etag: '"workspace"' }],
+      currentWorkspaceId: id, workspaces: [{ id, name: 'Fixture workspace', role: 'owner', etag: '"workspace"' }], canCreateWorkspaces: false,
       saveState: 'saved', saveError: null, conflict: null, syncingState: false,
       retrySave: noop, reloadFromServer: acknowledged, keepMineAndOverwrite: acknowledged,
       refreshWorkspaces: acknowledged, flushSave: acknowledged, signOut: acknowledged,

@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { useLocation } from 'react-router-dom'
 import type { JobProcessingFeatures, RealJobDetail, RealJobSummary } from '../domain/real-jobs'
-import { CloudApiError, CloudConflictError, LifecycleOperationError } from '../services/cloudWorkspace'
+import { CloudAccessChangedError, CloudApiError, CloudConflictError, LifecycleOperationError, workspaceAccessStamp } from '../services/cloudWorkspace'
 import {
   cancelRealJob,
   fetchJobProcessingFeatures,
@@ -81,6 +81,15 @@ export function RealJobsBridge({
   summariesRef.current = summaries
   const currentCloud = useRef(cloud)
   currentCloud.current = cloud
+  const metadata = cloud.workspaces.find(item => item.id === workspaceId)
+  const accessStamp = workspaceAccessStamp(metadata)
+  const accessRef = useRef({ stamp: accessStamp, readable: Boolean(metadata && !metadata.deletedAt) })
+  if (accessRef.current.stamp !== accessStamp) {
+    ++epoch.current
+    listControllerRef.current?.abort(); listControllerRef.current = null; refreshPromiseRef.current = null
+    detailControllersRef.current.forEach(controller => controller.abort()); detailControllersRef.current.clear()
+  }
+  accessRef.current = { stamp: accessStamp, readable: Boolean(metadata && !metadata.deletedAt) }
   const [pendingLifecycle, setPendingLifecycleState] = useState<PendingJobLifecycle[]>([])
   const pendingLifecycleRef = useRef(pendingLifecycle)
   const setPendingLifecycle = useCallback((update: (current: PendingJobLifecycle[]) => PendingJobLifecycle[]) => {
@@ -114,6 +123,7 @@ export function RealJobsBridge({
   }, [])
 
   const refresh = useCallback(async () => {
+    if (!accessRef.current.readable) return
     if (refreshPromiseRef.current) return refreshPromiseRef.current
     if (mutating.current) return
     const controller = new AbortController()
@@ -186,6 +196,7 @@ export function RealJobsBridge({
   }, [phase, pollingInterval, refresh, summaries])
 
   useEffect(() => { void refresh() }, [policy.settings?.revision, refresh])
+  useEffect(() => { void refresh() }, [accessStamp, refresh])
 
   useEffect(() => {
     const onFocus = () => {
@@ -196,6 +207,7 @@ export function RealJobsBridge({
   }, [refresh])
 
   const ensureDetail = useCallback(async (jobId: string, force = false) => {
+    if (!accessRef.current.readable) return
     if (mutating.current) return
     if (!force && detailControllersRef.current.has(jobId)) return
     const current = details[jobId]
@@ -259,6 +271,8 @@ export function RealJobsBridge({
   async function mutate<T>(operation: () => Promise<T>, accept: (result: T, stamp: number) => void, target?: LifecycleTarget, lifecycle = false): Promise<T> {
     requirePermission(target, lifecycle)
     if (lifecycle) await currentCloud.current.flushSave()
+    requirePermission(target, lifecycle)
+    const accessStarted = accessRef.current.stamp
     const stamp = ++sequence.current
     ++epoch.current; mutating.current++
     listControllerRef.current?.abort(); listControllerRef.current = null; refreshPromiseRef.current = null
@@ -267,13 +281,14 @@ export function RealJobsBridge({
     try {
       const result = await operation()
       if (!aliveRef.current) throw new Error('The workspace changed before the response arrived. Reopen the item to verify its saved state.')
+      if (accessStarted !== accessRef.current.stamp) throw new CloudAccessChangedError()
       accept(result, stamp)
       return result
     } finally {
       mutating.current--
       if (aliveRef.current) {
         void refresh()
-        void currentCloud.current.refreshWorkspaces().catch(() => undefined)
+        void currentCloud.current.refreshWorkspaces().catch(caught => setListError(`Workspace access refresh failed: ${errorMessage(caught, 'Try refreshing access again.')}`))
       }
     }
   }

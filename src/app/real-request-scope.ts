@@ -6,6 +6,7 @@ export type RealLoadState<T> =
 interface Ticket {
   lifetime: number
   sequence: number
+  access: number
 }
 
 export interface RealReadTicket extends Ticket {
@@ -24,12 +25,23 @@ export class RealRequestScope {
   private lifetime = 0
   private epoch = 0
   private sequence = 0
+  private access = 0
+  private accessStamp: string | undefined
+  private readable = true
   private reads = new Map<string, RealReadTicket>()
   private mutations = new Map<string, RealMutationTicket>()
   private accepted = new Map<string, number>()
   private authoritative = new Map<string, number>()
 
   activate() { this.alive = true }
+  updateAccess(stamp: string, readable: boolean) {
+    if (this.accessStamp !== undefined && this.accessStamp !== stamp) {
+      this.access++
+      this.invalidateReads()
+    }
+    this.accessStamp = stamp
+    this.readable = readable
+  }
   close() { this.alive = false; this.lifetime++; this.invalidateReads(); this.mutations.clear() }
   get isOpen() { return this.alive }
   get busy() { return this.mutations.size > 0 }
@@ -37,8 +49,8 @@ export class RealRequestScope {
   reading(key: string) { return this.reads.has(key) }
 
   read(key: string): RealReadTicket | null {
-    if (!this.alive || this.busy || this.reads.has(key)) return null
-    const ticket = { key, lifetime: this.lifetime, epoch: this.epoch, sequence: ++this.sequence, controller: new AbortController() }
+    if (!this.alive || !this.readable || this.busy || this.reads.has(key)) return null
+    const ticket = { key, lifetime: this.lifetime, access: this.access, epoch: this.epoch, sequence: ++this.sequence, controller: new AbortController() }
     this.reads.set(key, ticket)
     return ticket
   }
@@ -75,15 +87,19 @@ export class RealRequestScope {
   }
 
   mutate(key: string): RealMutationTicket {
-    if (!this.alive) throw new Error('This workspace is no longer open.')
+    if (!this.alive || !this.readable) throw new Error('This workspace is no longer available.')
     if (this.mutations.has(key)) throw new Error('Wait for this request to be acknowledged before trying it again.')
     this.invalidateReads()
-    const ticket = { key, lifetime: this.lifetime, sequence: ++this.sequence }
+    const ticket = { key, lifetime: this.lifetime, access: this.access, sequence: ++this.sequence }
     this.mutations.set(key, ticket)
     return ticket
   }
 
   mutationCurrent(ticket: RealMutationTicket): boolean {
+    return this.mutationOwned(ticket) && ticket.access === this.access && this.readable
+  }
+
+  mutationOwned(ticket: RealMutationTicket): boolean {
     return this.alive && ticket.lifetime === this.lifetime && this.mutations.get(ticket.key) === ticket
   }
 

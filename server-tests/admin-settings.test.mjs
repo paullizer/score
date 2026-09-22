@@ -11,11 +11,11 @@ import {
 } from '../dist-server/app.mjs'
 import {
   ALLOWED_OID, APP_ORIGIN, CSRF_HEADER, FIXTURE_DIST_DIR, OTHER_ALLOWED_OID, TENANT_ID, authHeaders,
-  baseConfig, createFakeDirectoryStore, createFakeStateStore, membershipFor,
+  baseConfig, createFakeAccessStore, createFakeDirectoryStore, createFakeStateStore, membershipFor, seedWorkspace,
 } from './helpers.mjs'
 
 const now = () => new Date('2026-09-21T12:00:00.000Z')
-const principal = { tenantId: TENANT_ID, oid: ALLOWED_OID, principalKey: `${TENANT_ID}:${ALLOWED_OID}`, name: 'Admin', email: '' }
+const principal = { tenantId: TENANT_ID, oid: ALLOWED_OID, principalKey: `${TENANT_ID}:${ALLOWED_OID}`, name: 'Admin', email: '', applicationRoles: ['Score.Admin'] }
 
 function fakeStore() {
   let current
@@ -68,7 +68,6 @@ function fakeStore() {
 }
 function settingsConfig(runtimeEnabled = true) {
   return baseConfig({
-    adminUserIds: new Set([ALLOWED_OID]),
     settings: {
       cosmosEndpoint: 'https://example.documents.azure.com', database: 'score', container: 'application-settings',
       applicationId: 'score', runtimeEnabled, defaults: createDefaultAdminSettings(),
@@ -83,14 +82,14 @@ async function start(options = {}) {
   const state = options.state ?? createFakeStateStore()
   let id = 0
   const settings = new AdminSettingsService({ config, store, now, newId: () => `test-${++id}`, models: options.models })
-  const app = createApp({ config, directory, state, settings, jobs: options.jobs, distDir: FIXTURE_DIST_DIR, now })
+  const app = createApp({ config, directory, state, settings, accessStore: createFakeAccessStore(), jobs: options.jobs, distDir: FIXTURE_DIST_DIR, now })
   const server = createServer(app)
   await new Promise((resolve, reject) => { server.once('error', reject); server.listen(0, '127.0.0.1', resolve) })
   const base = `http://127.0.0.1:${server.address().port}`
   const request = async (path, options = {}) => {
-    const { oid = ALLOWED_OID, headers, body, ...init } = options
+    const { oid = ALLOWED_OID, roles = oid === ALLOWED_OID ? ['Score.Admin'] : ['Score.User'], headers, body, ...init } = options
     const response = await fetch(`${base}${path}`, {
-      ...init, headers: { ...authHeaders({ oid }), ...CSRF_HEADER, Origin: APP_ORIGIN, ...(body === undefined ? {} : { 'Content-Type': 'application/json' }), ...headers },
+      ...init, headers: { ...authHeaders({ oid, roles }), ...CSRF_HEADER, Origin: APP_ORIGIN, ...(body === undefined ? {} : { 'Content-Type': 'application/json' }), ...headers },
       ...(body === undefined ? {} : { body: JSON.stringify(body) }),
     })
     return { response, body: await response.json() }
@@ -364,6 +363,7 @@ test('settings updates require exact ETags, publish atomic audit/history, and pr
 test('workspace ownership never grants settings access and admin mutations keep the existing CSRF boundary', async () => {
   const server = await start()
   try {
+    await seedWorkspace(server, { oid: OTHER_ALLOWED_OID })
     const owner = await server.request('/api/session', { oid: OTHER_ALLOWED_OID })
     assert.equal(owner.body.workspaces[0].role, 'owner')
     for (const path of ['/api/admin/settings', '/api/admin/settings/history', '/api/admin/deployments']) {
@@ -446,6 +446,7 @@ test('runtime activation is separate from admin editing; accepted snapshots and 
   const store = fakeStore()
   const server = await start({ store })
   try {
+    await seedWorkspace(server)
     const session = await server.request('/api/session')
     assert.equal(session.response.status, 200)
     const saved = await server.request('/api/admin/settings')
@@ -478,6 +479,7 @@ test('configured rollout pause closes new processing without reverting access, i
   let workspaceId
   let revision
   try {
+    await seedWorkspace(active)
     const session = await active.request('/api/session')
     workspaceId = session.body.workspaces[0].id
     directory._addMembership(workspaceId, membershipFor(workspaceId, { oid: OTHER_ALLOWED_OID, role: 'viewer' }))
@@ -641,7 +643,7 @@ test('request rollout readiness is immutable and synchronous without settings I/
   assert.equal(store.counters.initializations, 0)
 })
 
-test('workspace creation policy covers first-use bootstrap while preserving direct administrator identity', async () => {
+test('workspace creation policy blocks explicit admin creation while first-session reads stay empty', async () => {
   const server = await start()
   try {
     const current = await server.request('/api/admin/settings')
@@ -710,17 +712,17 @@ test('public capability composition never overrides service or Word deployment g
   assert.equal(frozenOnly.analysisEvidenceCorrections, true)
 })
 
-test('configuration keeps admins optional, tenant scoped, sign-in constrained, and model endpoints deployment-owned', () => {
+test('configuration never designates runtime admins through legacy IDs and keeps model endpoints deployment-owned', () => {
   const env = {
     AZURE_TENANT_ID: TENANT_ID, SCORE_ALLOWED_USER_IDS: `${ALLOWED_OID},${OTHER_ALLOWED_OID}`,
     COSMOS_ENDPOINT: 'https://example.documents.azure.com', STORAGE_ACCOUNT_URL: 'https://example.blob.core.windows.net',
     APP_ORIGIN, SCORE_AUTH_MODE: 'easyauth',
   }
   const base = loadConfig(env)
-  assert.equal(base.adminUserIds.size, 0)
+  assert.equal(base.adminUserIds, undefined)
   assert.equal(base.settings, undefined)
-  assert.throws(() => loadConfig({ ...env, SCORE_ADMIN_USER_IDS: 'not-a-guid' }), /GUID/)
-  assert.throws(() => loadConfig({ ...env, SCORE_ADMIN_USER_IDS: '00000000-0000-0000-0000-000000000000' }), /permitted/)
+  assert.equal(loadConfig({ ...env, SCORE_ADMIN_USER_IDS: 'not-a-guid' }).adminUserIds, undefined)
+  assert.equal(loadConfig({ ...env, SCORE_ADMIN_USER_IDS: '00000000-0000-0000-0000-000000000000' }).adminUserIds, undefined)
   assert.throws(() => loadConfig({ ...env, SCORE_RUNTIME_SETTINGS_ENABLED: 'true' }), /SCORE_SETTINGS_CONTAINER/)
   assert.throws(() => loadConfig({ ...env, SCORE_SETTINGS_CONTAINER: 'workspaces' }), /separate/)
   const configured = {
@@ -732,7 +734,7 @@ test('configuration keeps admins optional, tenant scoped, sign-in constrained, a
   assert.equal(config.settings.runtimeEnabled, false)
   assert.equal(config.settings.defaults.workers.jobs.maxItemsPerExecution, 5)
   assert.equal(config.settings.defaultSources['workers.jobs.maxItemsPerExecution'], 'WORKER_MAX_JOBS')
-  assert.equal(config.adminUserIds.has(ALLOWED_OID), true)
+  assert.equal(config.adminUserIds, undefined)
   for (const endpoint of ['https://example.com', 'http://example.openai.azure.com', 'https://user:secret@example.openai.azure.com', 'https://example.openai.azure.com/path', 'https://example.openai.azure.com?key=secret']) {
     assert.throws(() => loadConfig({ ...configured, RUBRIC_MODEL_ENDPOINT: endpoint }), /endpoint/)
   }

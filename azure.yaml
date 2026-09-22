@@ -39,6 +39,8 @@ hooks:
       if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       node scripts\azure-auth.mjs configure
       if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      node scripts\azure-auth.mjs consent-directory
+      if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       node scripts\azure-knowledge.mjs
       if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
   postdeploy:

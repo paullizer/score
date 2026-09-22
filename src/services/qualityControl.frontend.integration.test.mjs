@@ -69,10 +69,11 @@ after(async () => {
 })
 function Probe() { navigate = ui.useNavigate(); return null }
 function Harness({ role = fixture.role, admin = fixture.admin, cloud = true, app = false, normalReview = false, workspaceId = 'workspace-one',
-  routerWorkspaceId = workspaceId, tenantId = 'tenant', deletedAt, missingMembership = false,
+  routerWorkspaceId = workspaceId, tenantId = 'tenant', deletedAt, missingMembership = false, accessSource = 'membership', membershipRole,
   refreshWorkspaces = async () => { fixture.refreshes = (fixture.refreshes ?? 0) + 1 } }) {
   const context = frontendWorkspaceContext({ ...(cloud ? { cloud: { currentWorkspaceId: workspaceId,
-    refreshWorkspaces, workspaces: missingMembership ? [] : [{ id: workspaceId, role, name: 'QC fixture workspace', etag: '"workspace"', deletedAt }] } } : {}) })
+    refreshWorkspaces, workspaces: missingMembership ? [] : [{ id: workspaceId, role, accessSource, membershipRole,
+      name: 'QC fixture workspace', etag: '"workspace"', deletedAt }] } } : {}) })
   if (context.cloud) context.cloud.user.tenantId = tenantId
   return h(ui.GradeNavigationProtectionProvider, { workspaceId, routePrefix: cloud ? `/workspaces/${routerWorkspaceId}` : '/', apiRef: protectionRef },
     h(ui.BrowserRouter, { basename: cloud ? `/workspaces/${routerWorkspaceId}` : '/', future: { v7_startTransition: true, v7_relativeSplatPath: true } },
@@ -529,6 +530,33 @@ test('current member appadmins can use QC as viewers but losing admin capability
   assert.equal(previous.signal.aborted, true)
   assert.match(document.body.textContent, /authorized cloud workspace/)
   assert.doesNotMatch(document.body.textContent, /Jordan Example|Engineering methods/)
+})
+
+test('an Admin losing explicit membership clears private QC drafts without losing ordinary Owner access', async () => {
+  await render('/qc/reviews/run-one/comparison-1', {
+    admin: true, role: 'owner', accessSource: 'application-admin', membershipRole: 'viewer',
+  })
+  await completeDisagreement()
+  const previous = fixture.requests.find(item => item.url.includes('/qc/context'))
+  const reads = fixture.requests.length
+  await rerender({ membershipRole: undefined })
+  assert.equal(previous.signal.aborted, true)
+  assert.match(document.body.textContent, /authorized cloud workspace/)
+  assert.doesNotMatch(document.body.textContent, /narrower interpretation|Jordan Example|Engineering methods/)
+  assert.equal(unloadingBlocked(), false)
+  assert.equal(fixture.requests.length, reads)
+  await rerender({ membershipRole: 'viewer' })
+  assert.equal(field('Decision for Engineering methods').value, '', 'Restored membership cannot revive private unsaved feedback')
+})
+
+test('implicit Admin Owner access alone exposes neither QC navigation nor private requests', async () => {
+  const implicitAdmin = { admin: true, role: 'owner', accessSource: 'application-admin' }
+  await render('/analyses', { ...implicitAdmin, app: true })
+  assert.equal([...document.querySelectorAll('button')].some(item => item.textContent.trim() === 'QC mode'), false)
+  await act(async () => { root.unmount(); await pause() }); root = null
+  await render('/qc', implicitAdmin)
+  assert.match(document.body.textContent, /authorized cloud workspace/)
+  assert.equal(fixture.requests.some(item => item.url.includes('/qc/')), false)
 })
 
 test('invalid or absent membership roles deny QC even with application-admin capability', async () => {

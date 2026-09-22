@@ -70,14 +70,13 @@ for (const action of ['activate', 'restore']) {
         await f.plans.activate(f.caller('admin'), principal('admin'), ready.plan.id,
           { reason: 'Approve the evaluated release.', confirm: true }, randomUUID(), ready.etag)
       }
-      const admins = new Set([principal('admin').oid])
-      const server = await qcHttp(f, { adminUserIds: admins })
+      const server = await qcHttp(f)
       t.after(() => server.close())
       const before = await f.prompts.current()
       const count = f.registryStore.activations.length
       const reached = afterLastRegistryRead(f, async () => {
         if (fault === 'membership') server.memberships.delete(api.membershipIdFor(principal('admin').principalKey))
-        else if (fault === 'admin') admins.clear()
+        else if (fault === 'admin') server.setApplicationRoles('admin', ['Score.User'])
         else if (fault === 'workspace') server.archive()
         else server.setAdmissionEnabled(false)
       })

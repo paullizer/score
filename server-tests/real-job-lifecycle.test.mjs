@@ -3,7 +3,7 @@ import { randomUUID } from 'node:crypto'
 import { createServer } from 'node:http'
 import test from 'node:test'
 import { applySampleLifecycle, createAnalysisRun, createApp, StoreConflictError, WorkspaceRepository } from '../dist-server/app.mjs'
-import { ALLOWED_OID, OTHER_ALLOWED_OID, APP_ORIGIN, authHeaders, baseConfig, createFakeDirectoryStore, createFakeStateStore, membershipFor } from './helpers.mjs'
+import { ALLOWED_OID, OTHER_ALLOWED_OID, APP_ORIGIN, authHeaders, baseConfig, createFakeAccessStore, createFakeDirectoryStore, createFakeStateStore, membershipFor, seedWorkspace } from './helpers.mjs'
 import { createFakeRealJobs } from './job-lifecycle-fakes.mjs'
 
 const timestamp = '2026-09-18T12:00:00.000Z'
@@ -27,8 +27,10 @@ async function fixture({ grades, format = 'pdf', route = format === 'pdf' || for
   const directory = createFakeDirectoryStore()
   const state = createFakeStateStore()
   const jobs = createFakeRealJobs()
+  await seedWorkspace({ directory, state, now: () => new Date(timestamp) })
   const app = createApp({
-    directory, state, jobs, grades, config: baseConfig({ realJobs: {}, wordDocumentImports: true }), now: () => new Date(timestamp),
+    directory, state, jobs, grades, accessStore: createFakeAccessStore(),
+    config: baseConfig({ realJobs: {}, wordDocumentImports: true }), now: () => new Date(timestamp),
   })
   const server = createServer(app)
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve))

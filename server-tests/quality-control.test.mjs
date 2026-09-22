@@ -243,6 +243,25 @@ test('HTTP paid QC admission projects cancellation for the plan owner and coordi
       return { content: JSON.stringify(proposal(created.plan)), model: 'unit-planner' }
     },
   })
+
+  test('removing an Admin membership revokes every private QC surface but preserves ordinary workspace access', async t => {
+    const f = await qcFixture(), server = await qcHttp(f)
+    t.after(() => server.close())
+    const scope = f.contexts[0].scope
+    const contextPath = `/context?${new URLSearchParams({ runId: scope.runId, comparisonId: scope.comparisonId })}`
+    assert.equal((await server.request(contextPath, 'GET', undefined, 'admin')).status, 200)
+    const saved = await server.request('/reviews', 'PUT', feedback(f.contexts[0]), 'admin', { 'If-None-Match': '*' })
+    assert.equal(saved.status, 200, 'An explicit Reader member Admin can save QC feedback')
+    const before = clone([...f.qc.store.values])
+    server.memberships.delete(api.membershipIdFor(principal('admin').principalKey))
+    assert.equal(await server.repository.authorizeWorkspace(principal('admin'), f.workspaceId, 'write'), 'owner')
+    for (const path of ['/capabilities', contextPath, '/prompts', '/prompts/history', '/plans', '/batches']) {
+      assert.equal((await server.request(path, 'GET', undefined, 'admin')).status, 404, path)
+    }
+    assert.equal((await server.request('/peers', 'POST', scope, 'admin')).status, 404)
+    assert.equal((await server.request('/reviews/submit', 'POST', feedback(f.contexts[0]), 'admin')).status, 404)
+    assert.deepEqual([...f.qc.store.values], before, 'Revoked access cannot create feedback, exposure, or plan records')
+  })
   assert.deepEqual(outcome, { claimed: 1, completed: 0, deferred: 0, stopped: 1 })
   const stopped = await (await server.request(path)).json()
   assert.equal(stopped.plan.status, 'cancelled')

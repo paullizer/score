@@ -10,7 +10,7 @@ import { createFakeRealJobs } from './job-lifecycle-fakes.mjs'
 const headers = { origin: APP_ORIGIN, 'X-Score-Request': 'workspace', 'content-type': 'application/json' }
 
 async function setup(t, overrides = {}) {
-  const server = await startTestServer(overrides)
+  const server = await startTestServer({ seedWorkspace: true, ...overrides })
   t.after(async () => { server.server.closeAllConnections(); await server.close() })
   const response = await fetch(`${server.baseUrl}/api/session`, { headers: authHeaders() })
   assert.equal(response.status, 200)
@@ -87,8 +87,7 @@ test('owners grant and revoke exact admitted reviewer memberships with immutable
 })
 
 test('reviewer membership administration stays owner-only, including for member and nonmember application administrators', async t => {
-  const config = baseConfig({ adminUserIds: new Set([OTHER_ALLOWED_OID]) })
-  const server = await setup(t, { config })
+  const server = await setup(t)
   const current = await access(server)
   for (const role of [undefined, 'viewer', 'reviewer', 'editor']) {
     if (role) server.directory._addMembership(server.workspace.id, membershipFor(server.workspace.id, { oid: OTHER_ALLOWED_OID, role }))
@@ -97,7 +96,8 @@ test('reviewer membership administration stays owner-only, including for member 
       ['/reviewers', 'POST', { objectId: OTHER_ALLOWED_OID }],
       [`/reviewers/${ALLOWED_OID}`, 'DELETE'],
     ]) {
-      const response = await server.request(suffix, { method, body, oid: OTHER_ALLOWED_OID, etag: current.etag })
+      const response = await server.request(suffix, { method, body, oid: OTHER_ALLOWED_OID,
+        identity: { roles: ['Score.Admin'] }, etag: current.etag })
       assert.equal(response.status, role ? 403 : 404, `${role ?? 'nonmember'} admin ${method}`)
     }
   }
@@ -129,7 +129,7 @@ test('reviewer mutations reject forged roles, principals, tenants, unadmitted us
   assert.deepEqual((await access(server)).reviewers, [])
 })
 
-test('reviewer endpoints cannot replace existing access or remove the owner recovery membership', async t => {
+test('reviewer endpoints cannot replace existing roles or remove explicit owners', async t => {
   const server = await setup(t)
   const { etag } = await access(server)
   assert.equal((await add(server, etag, ALLOWED_OID)).status, 403)
@@ -137,8 +137,9 @@ test('reviewer endpoints cannot replace existing access or remove the owner reco
   for (const role of ['owner', 'editor', 'viewer']) {
     const membership = membershipFor(server.workspace.id, { oid: OTHER_ALLOWED_OID, role })
     server.directory._addMembership(server.workspace.id, membership)
-    assert.equal((await add(server, etag)).status, 409)
-    assert.equal((await server.request(`/reviewers/${OTHER_ALLOWED_OID}`, { method: 'DELETE', etag })).status, 403)
+    const current = await access(server)
+    assert.equal((await add(server, current.etag)).status, role === 'owner' ? 403 : 409)
+    assert.equal((await server.request(`/reviewers/${OTHER_ALLOWED_OID}`, { method: 'DELETE', etag: current.etag })).status, 403)
     assert.deepEqual(await server.directory.getMembership(server.workspace.id, membership.id), membership)
   }
   assert.deepEqual(server.directory._membershipAudits(server.workspace.id), [])
@@ -187,17 +188,19 @@ test('owners can revoke previously admitted reviewers without restoring their si
   const granted = await add(server, etag)
   assert.equal(granted.status, 201)
   const current = await granted.json()
-  server.config.allowedUserIds.delete(OTHER_ALLOWED_OID)
-  assert.equal((await server.request('/state', { oid: OTHER_ALLOWED_OID })).status, 403)
+  server.eligibleUsers._remove(OTHER_ALLOWED_OID)
+  assert.equal((await server.request('/state', { oid: OTHER_ALLOWED_OID })).status, 200,
+    'Existing admitted claims remain valid until token/session refresh, without a live Graph check')
+  assert.equal((await server.request('/state', { oid: OTHER_ALLOWED_OID, identity: { roles: [] } })).status, 403)
   const removed = await server.request(`/reviewers/${OTHER_ALLOWED_OID}`, { method: 'DELETE', etag: current.etag })
   assert.equal(removed.status, 200)
   assert.deepEqual((await removed.json()).reviewers, [])
   assert.equal((await add(server, (await access(server)).etag)).status, 400)
-  assert.equal(server.config.allowedUserIds.has(OTHER_ALLOWED_OID), false)
+  assert.equal(await server.eligibleUsers.get(OTHER_ALLOWED_OID), undefined)
 })
 
-test('invalid stored role or membership identity never becomes workspace access through administrator status', async t => {
-  const server = await setup(t, { config: baseConfig({ adminUserIds: new Set([OTHER_ALLOWED_OID]) }) })
+test('invalid memberships deny member access without suppressing an administrator ordinary access designation', async t => {
+  const server = await setup(t)
   const member = membershipFor(server.workspace.id, { oid: OTHER_ALLOWED_OID, role: 'reviewer' })
   for (const bad of [
     { ...member, role: 'admin' }, { ...member, role: undefined }, { ...member, principalType: 'group' },
@@ -210,12 +213,21 @@ test('invalid stored role or membership identity never becomes workspace access 
       oid: OTHER_ALLOWED_OID, etag: '"any"' })).status, 404)
     const list = await fetch(`${server.baseUrl}/api/workspaces`, { headers: authHeaders({ oid: OTHER_ALLOWED_OID }) })
     assert.deepEqual((await list.json()).workspaces, [])
+    const identity = { roles: ['Score.Admin'] }
+    assert.equal((await server.request('/state', { oid: OTHER_ALLOWED_OID, identity })).status, 200)
+    assert.equal((await server.request('/reviewers', { oid: OTHER_ALLOWED_OID, identity })).status, 404,
+      'Implicit ordinary Owner access never supplies explicit reviewer-administration membership')
+    const adminList = await fetch(`${server.baseUrl}/api/workspaces`, { headers: authHeaders({ oid: OTHER_ALLOWED_OID, ...identity }) })
+    const summary = (await adminList.json()).workspaces.find(item => item.id === server.workspace.id)
+    assert.equal(summary.role, 'owner')
+    assert.equal(summary.accessSource, 'application-admin')
+    assert.equal(summary.membershipRole, undefined)
   }
 })
 
-test('reviewers and member admins cannot perform any ordinary workspace mutation or original download', async t => {
+test('reviewers cannot perform any ordinary workspace mutation or original download', async t => {
   const jobs = createFakeRealJobs()
-  const server = await setup(t, { config: baseConfig({ realJobs: {}, adminUserIds: new Set([OTHER_ALLOWED_OID]) }), jobs })
+  const server = await setup(t, { config: baseConfig({ realJobs: {} }), jobs })
   server.directory._addMembership(server.workspace.id, membershipFor(server.workspace.id, { oid: OTHER_ALLOWED_OID, role: 'reviewer' }))
   const state = await (await server.request('/state', { oid: OTHER_ALLOWED_OID })).json()
   const mutations = [
@@ -243,4 +255,52 @@ test('reviewers and member admins cannot perform any ordinary workspace mutation
   assert.equal((await server.request('/state', { oid: OTHER_ALLOWED_OID })).status, 200)
   assert.equal((await server.state.getState(server.workspace.id)).etag, state.etag)
   assert.deepEqual(server.directory._membershipAudits(server.workspace.id), [])
+})
+
+test('equal co-owners manage reviewers and creator provenance does not preserve access after demotion', async t => {
+  const server = await setup(t)
+  const current = await (await server.request('/members')).json()
+  const shared = await server.request(`/members/${OTHER_ALLOWED_OID}`, {
+    method: 'PUT', etag: current.etag, body: { role: 'owner' },
+  })
+  assert.equal(shared.status, 200, await shared.clone().text())
+  const peerAccess = await (await server.request('/reviewers', { oid: OTHER_ALLOWED_OID })).json()
+  server.eligibleUsers._set({ id: NOT_ALLOWED_OID, name: 'Eligible reviewer', email: '', applicationRoles: ['Score.User'] })
+  const granted = await server.request('/reviewers', {
+    oid: OTHER_ALLOWED_OID, method: 'POST', etag: peerAccess.etag, body: { objectId: NOT_ALLOWED_OID },
+  })
+  assert.equal(granted.status, 201, await granted.clone().text())
+  const members = await (await server.request('/members', { oid: OTHER_ALLOWED_OID })).json()
+  const demoted = await server.request(`/members/${ALLOWED_OID}`, {
+    oid: OTHER_ALLOWED_OID, method: 'PUT', etag: members.etag, body: { role: 'reviewer' },
+  })
+  assert.equal(demoted.status, 200, await demoted.clone().text())
+  assert.equal((await server.request()).status, 403, 'The original creator is no longer an explicit Owner')
+  const reviewers = await (await server.request('/reviewers', { oid: OTHER_ALLOWED_OID })).json()
+  assert.ok(reviewers.reviewers.some(item => item.objectId === ALLOWED_OID))
+  const removed = await server.request(`/reviewers/${ALLOWED_OID}`, {
+    oid: OTHER_ALLOWED_OID, method: 'DELETE', etag: reviewers.etag,
+  })
+  assert.equal(removed.status, 200, await removed.clone().text())
+  assert.equal((await server.request('/state')).status, 404)
+  assert.equal((await server.directory.getMetadata(server.workspace.id)).metadata.ownerId,
+    principalKeyFor(TENANT_ID, ALLOWED_OID), 'Creator provenance remains immutable, not an authorization source')
+  assert.ok(server.directory._membershipAudits(server.workspace.id)
+    .every(item => item.actorId === principalKeyFor(TENANT_ID, OTHER_ALLOWED_OID)))
+})
+
+test('an unavailable eligible-user directory blocks reviewer grants, not saved reads or revocations', async t => {
+  const server = await setup(t)
+  const original = await access(server)
+  server.eligibleUsers._setError(new Error('Directory unavailable'))
+  assert.equal((await add(server, original.etag)).status, 503)
+  assert.deepEqual((await access(server)).reviewers, [])
+  assert.deepEqual(server.directory._membershipAudits(server.workspace.id), [])
+  server.eligibleUsers._setError(undefined)
+  const granted = await add(server, original.etag)
+  assert.equal(granted.status, 201)
+  const current = await granted.json()
+  server.eligibleUsers._setError(new Error('Directory unavailable'))
+  assert.equal((await server.request('/state', { oid: OTHER_ALLOWED_OID })).status, 200)
+  assert.equal((await server.request(`/reviewers/${OTHER_ALLOWED_OID}`, { method: 'DELETE', etag: current.etag })).status, 200)
 })

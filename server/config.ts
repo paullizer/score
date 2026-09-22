@@ -6,6 +6,8 @@ import type { RealAnalysesConfig } from './analyses/store'
 import type { SettingsConfig } from './settings/store'
 import type { QcConfig } from './qc/store'
 import { PROMPT_RUNTIME_VERSION } from '../src/domain/prompt-versions'
+import type { AccessConfig } from './access/store'
+import type { ApplicationRole } from '../src/domain/access'
 import { z } from 'zod'
 import { createDefaultAdminSettings, MODEL_TASK_IDS, parseAdminSettings, RUNTIME_SETTINGS_VERSION, SettingsValidationError } from '../src/domain/admin-settings'
 import type { ProcessingKind, ReasoningEffort, RuntimeSettingsWorkerVerification, WorkerPolicy } from '../src/domain/admin-settings'
@@ -31,8 +33,11 @@ export interface StorageConfig {
 export interface Config {
   readonly authMode: AuthMode
   readonly tenantId: string
-  readonly allowedUserIds: ReadonlySet<string>
+  /** Deprecated compatibility fields; never used for runtime authorization. */
+  readonly allowedUserIds?: ReadonlySet<string>
   readonly adminUserIds?: ReadonlySet<string>
+  readonly devUserRoles?: ReadonlyMap<string, readonly ApplicationRole[]>
+  readonly access?: AccessConfig
   readonly settings?: SettingsConfig
   readonly qc?: QcConfig
   readonly qcEnabled?: boolean
@@ -96,23 +101,37 @@ function requireGuid(env: NodeJS.ProcessEnv, name: string): string {
   return value.toLowerCase()
 }
 
-function parseAllowedUserIds(env: NodeJS.ProcessEnv): ReadonlySet<string> {
-  const raw = required(env, 'SCORE_ALLOWED_USER_IDS')
-  const ids = raw.split(',').map((value) => value.trim()).filter((value) => value.length > 0)
-  if (ids.length === 0) throw new ConfigError('SCORE_ALLOWED_USER_IDS must list at least one Entra object ID.')
-  for (const id of ids) {
-    if (!GUID_PATTERN.test(id)) throw new ConfigError(`SCORE_ALLOWED_USER_IDS contains a value that is not a GUID: ${id}.`)
+function developerRoles(env: NodeJS.ProcessEnv, authMode: AuthMode): ReadonlyMap<string, readonly ApplicationRole[]> | undefined {
+  if (authMode !== 'dev-header') return undefined
+  let entries: unknown
+  try { entries = JSON.parse(required(env, 'SCORE_DEV_USER_ROLES')) } catch {
+    throw new ConfigError('SCORE_DEV_USER_ROLES must be a JSON object mapping explicit developer object IDs to Score application-role arrays.')
   }
-  return new Set(ids.map((id) => id.toLowerCase()))
+  if (!entries || typeof entries !== 'object' || Array.isArray(entries) || !Object.keys(entries).length) {
+    throw new ConfigError('SCORE_DEV_USER_ROLES must configure at least one developer identity.')
+  }
+  const roles = new Map<string, readonly ApplicationRole[]>()
+  for (const [id, values] of Object.entries(entries)) {
+    if (!GUID_PATTERN.test(id) || roles.has(id.toLowerCase()) || !Array.isArray(values) || !values.length ||
+      values.some(value => value !== 'Score.User' && value !== 'Score.Admin')) {
+      throw new ConfigError('SCORE_DEV_USER_ROLES requires unique object-ID GUIDs and nonempty arrays containing only Score.User or Score.Admin.')
+    }
+    roles.set(id.toLowerCase(), [...new Set<ApplicationRole>(values)])
+  }
+  return roles
 }
 
-function parseAdminUserIds(env: NodeJS.ProcessEnv, allowed: ReadonlySet<string>): ReadonlySet<string> {
-  const raw = optional(env, 'SCORE_ADMIN_USER_IDS')
-  if (!raw) return new Set()
-  const ids = raw.split(',').map(value => value.trim().toLowerCase())
-  if (ids.some(id => !GUID_PATTERN.test(id))) throw new ConfigError('SCORE_ADMIN_USER_IDS must contain only Entra object-ID GUIDs.')
-  if (ids.some(id => !allowed.has(id))) throw new ConfigError('Every SCORE_ADMIN_USER_IDS entry must also be an explicitly permitted sign-in identity.')
-  return new Set(ids)
+function accessConfiguration(env: NodeJS.ProcessEnv): AccessConfig | undefined {
+  const container = optional(env, 'SCORE_ACCESS_CONTAINER')
+  const principalId = optional(env, 'SCORE_ENTRA_SERVICE_PRINCIPAL_ID')
+  if (!container && !principalId) return undefined
+  if (!container || !principalId) {
+    throw new ConfigError('SCORE_ACCESS_CONTAINER and SCORE_ENTRA_SERVICE_PRINCIPAL_ID must be supplied together.')
+  }
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,254}$/.test(container)) {
+    throw new ConfigError('SCORE_ACCESS_CONTAINER must be a valid dedicated container name.')
+  }
+  return { container, servicePrincipalId: requireGuid(env, 'SCORE_ENTRA_SERVICE_PRINCIPAL_ID') }
 }
 
 function azureModelEndpoint(value: string): string {
@@ -277,6 +296,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   const analysisRecords = optional(env, 'ANALYSIS_RECORDS_CONTAINER') ?? 'analysis-records'
   const analysisSources = optional(env, 'ANALYSIS_SOURCE_CONTAINER') ?? 'analysis-sources'
   const settings = settingsConfiguration(env, cosmos)
+  const access = accessConfiguration(env)
   const qcEnabled = featureEnabled(env, 'QC_ENABLED')
   const qcWorkerEnabled = featureEnabled(env, 'QC_WORKER_ENABLED')
   const configuredQcRecords = optional(env, 'QC_RECORDS_CONTAINER')
@@ -300,6 +320,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     ['ANALYSIS_RECORDS_CONTAINER', analysisRecords],
     ['QC_RECORDS_CONTAINER', qcRecords],
     ['SCORE_SETTINGS_CONTAINER', settings?.container ?? 'application-settings'],
+    ['SCORE_ACCESS_CONTAINER', access?.container ?? 'application-access'],
   ])
   requireSeparateContainers([
     ['WORKSPACE_BLOB_CONTAINER', storage.containerName], ['JOB_SOURCE_CONTAINER', jobSources],
@@ -343,12 +364,11 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     ...shared, container: analysisRecords, blobContainer: analysisSources,
   } : undefined)
 
-  const allowedUserIds = parseAllowedUserIds(env)
   return {
     authMode,
     tenantId: requireGuid(env, 'AZURE_TENANT_ID'),
-    allowedUserIds,
-    adminUserIds: parseAdminUserIds(env, allowedUserIds),
+    devUserRoles: developerRoles(env, authMode),
+    access,
     settings,
     qc,
     qcEnabled,

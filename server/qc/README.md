@@ -20,7 +20,7 @@ createQcRouter({
 
 `qc` contains `store`, `blobs`, and `workerEnabled`. Construct its adapters with `createAzureQcStore(config, credential)` and `createAzureQcBlobStore(config, credential, store)`. `QcConfig` supplies `cosmosEndpoint`, `database`, `container`, `storageAccountUrl`, `blobContainer`, and `workerEnabled`.
 
-QC independently authorizes read membership plus the QC capability before and inside the existing workspace lease. Do not route its mutations through the content-editor write gate: reviewers deliberately cannot edit workspace content. Application administrators still need workspace membership. All responses are private and non-cacheable.
+QC independently authorizes explicit membership through `repository.authorizeWorkspaceMembership` plus the QC capability before and inside the existing workspace lease. Do not route its mutations through the content-editor write gate: reviewers deliberately cannot edit workspace content. Application administrators retain tenant-wide ordinary access, but still need valid explicit membership for QC; even a Reader membership is sufficient with `Score.Admin` claims. Workspace summaries preserve the effective ordinary `role` separately from an Admin's explicit `membershipRole`, and losing the latter clears private QC state. All responses are private and non-cacheable.
 
 Keep configured `qc` stores available even when `Config.qcEnabled` is false. Only explicit `qcEnabled: true` admits new review, batch, plan, and prompt mutations. History, exact-result context, peer-exposure auditing, and cancellation of previously accepted work remain available when admission is off. `workerEnabled` separately gates new paid requests without blocking historical plans or evaluations.
 

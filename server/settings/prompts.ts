@@ -12,7 +12,7 @@ import { JOB_RUBRIC_COMPILED_PROMPT } from '../../worker/runtime'
 import { GRADE_COMPILED_PROMPTS } from '../../worker/grades/model'
 import { ANALYSIS_COMPILED_PROMPTS } from '../../worker/analyses/model'
 import { pinnedPromptTemplate, type CompiledPromptTemplate } from '../../worker/prompts'
-import type { AuthenticatedPrincipal } from '../auth'
+import { isApplicationAdmin, type AuthenticatedPrincipal } from '../auth'
 import type { Config } from '../config'
 import { conflict, forbidden, invalidRequest, notFound, preconditionRequired, unavailable } from '../errors'
 import { StoreConflictError } from '../store'
@@ -59,7 +59,7 @@ export type ActivatePromptBundleInput = z.infer<typeof activateInputSchema>
 export interface PromptRegistryCapture { capture(bundleId?: string): Promise<PromptBundleSnapshot> }
 export interface PromptRegistryServiceDeps {
   store: PromptRegistryStore
-  config?: Pick<Config, 'tenantId' | 'allowedUserIds' | 'adminUserIds'>
+  config?: Pick<Config, 'tenantId'>
   /** Source-plan membership, exact evaluated plan pins and peer visibility remain the route's responsibility. */
   authorizeActivation?: (principal: AuthenticatedPrincipal) => boolean | Promise<boolean>
   now?: () => Date
@@ -189,7 +189,7 @@ export class PromptRegistryService implements PromptRegistryCapture {
   private async authorize(principal: AuthenticatedPrincipal): Promise<void> {
     const config = this.deps.config
     const allowed = this.deps.authorizeActivation ? await this.deps.authorizeActivation(principal)
-      : Boolean(config && principal.tenantId === config.tenantId && config.allowedUserIds.has(principal.oid) && config.adminUserIds?.has(principal.oid))
+      : Boolean(config && isApplicationAdmin(principal, config))
     if (!allowed) throw forbidden('Only an application administrator can activate or restore a prompt bundle.')
   }
   private async findActivation(predicate: (activation: PromptActivation) => boolean): Promise<PromptActivation | undefined> {

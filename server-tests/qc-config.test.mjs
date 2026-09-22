@@ -1,11 +1,11 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import { loadConfig, RUNTIME_SETTINGS_VERSION } from '../dist-server/app.mjs'
-import { ALLOWED_OID, APP_ORIGIN, TENANT_ID } from './helpers.mjs'
+import { APP_ORIGIN, TENANT_ID } from './helpers.mjs'
 
 function environment(overrides = {}) {
   return {
-    SCORE_ALLOWED_USER_IDS: ALLOWED_OID, AZURE_TENANT_ID: TENANT_ID,
+    AZURE_TENANT_ID: TENANT_ID,
     COSMOS_ENDPOINT: 'https://cosmos.example.com/', STORAGE_ACCOUNT_URL: 'https://storage.example.com/',
     APP_ORIGIN, ...overrides,
   }
@@ -72,7 +72,7 @@ test('QC paid work requires explicit admission and verified model settings', () 
 })
 
 test('QC storage cannot alias private evidence, membership, or settings containers', () => {
-  for (const name of ['workspaces', 'job-records', 'resume-records', 'analysis-records', 'grade-records', 'application-settings']) {
+  for (const name of ['workspaces', 'job-records', 'resume-records', 'analysis-records', 'grade-records', 'application-settings', 'application-access']) {
     assert.throws(() => loadConfig(environment({
       QC_RECORDS_CONTAINER: name, QC_SOURCE_CONTAINER: 'qc-sources',
     })), /must be separate/)

@@ -95,7 +95,7 @@ export function createQcRouter(deps: QcRouterDeps): Router {
   }
   async function authorize(req: Request, write = false): Promise<{ caller: QcCaller; writable: boolean }> {
     const principal = getPrincipal(req), workspaceId = param(req, 'workspaceId')
-    const role = await deps.repository.authorizeWorkspace(principal, workspaceId, 'read')
+    const role = await deps.repository.authorizeWorkspaceMembership(principal, workspaceId)
     const applicationAdmin = isApplicationAdmin(principal, deps.config)
     if (!workspaceCanReview(role, applicationAdmin)) throw forbidden('Your workspace role does not grant QC access.')
     const { metadata } = await deps.repository.getWorkspaceMetadata(principal, workspaceId)

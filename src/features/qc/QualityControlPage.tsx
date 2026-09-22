@@ -3,7 +3,7 @@ import { Link, NavLink, Route, Routes } from 'react-router-dom'
 import { ClipboardCheck, LoaderCircle } from 'lucide-react'
 import { useWorkspace } from '../../app/workspace-context'
 import { useApplicationNavigation } from '../../app/application-navigation-context'
-import { workspaceCanReview } from '../../domain/workspace-permissions'
+import { workspaceCanReview, workspaceQcRole } from '../../domain/workspace-permissions'
 import { getQcCapabilities } from '../../services/qualityControl'
 import { Badge, Button, EmptyState, InlineError } from '../../components/ui'
 import { QcComparisonReview, QcReviews } from './QcReviews'
@@ -16,13 +16,14 @@ export function QualityControlPage() {
   const { cloud } = useWorkspace()
   const application = useApplicationNavigation()
   const metadata = cloud?.workspaces.find(item => item.id === cloud.currentWorkspaceId)
-  if (!cloud || !metadata || metadata.deletedAt || !workspaceCanReview(metadata.role, application?.applicationAdmin === true)) {
+  const role = workspaceQcRole(metadata)
+  if (!cloud || !metadata || metadata.deletedAt || !workspaceCanReview(role, application?.applicationAdmin === true)) {
     return <EmptyState icon={ClipboardCheck} title="QC requires an authorized cloud workspace"
       description="A workspace reviewer, editor, owner, or application admin with workspace membership can review real saved assessments. Samples cannot be used for calibration."
       action={<Link className="button button-secondary button-md" to="/analyses">Return to analyses</Link>} />
   }
   return <QcPrivacyBoundary key={JSON.stringify([
-    cloud.currentWorkspaceId, cloud.user.tenantId, cloud.user.id, metadata.role, application?.applicationAdmin === true,
+    cloud.currentWorkspaceId, cloud.user.tenantId, cloud.user.id, role, application?.applicationAdmin === true,
   ])}
     onAccessLost={cloud.refreshWorkspaces}>
     <QcWorkspace workspaceId={cloud.currentWorkspaceId} />
