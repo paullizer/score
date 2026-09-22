@@ -23,3 +23,30 @@ export async function fetchCosmosPage<T>(
   }
   throw new Error('Cosmos query exceeded its progress-page limit.')
 }
+
+export async function fetchCosmosCount(
+  iterator: Pick<QueryIterator<unknown>, 'fetchNext'>,
+): Promise<number> {
+  const tokens = new Set<string>()
+  // Aggregate iterators may report progress, but only one terminal scalar is a complete count.
+  for (let progress = 0; progress < 100; progress++) {
+    const { resources, hasMoreResults, continuationToken } = await iterator.fetchNext()
+    if ((hasMoreResults !== undefined && typeof hasMoreResults !== 'boolean') ||
+      (continuationToken !== undefined && (typeof continuationToken !== 'string' || continuationToken.length > 16 * 1024)) ||
+      (hasMoreResults === false && continuationToken)) {
+      throw new Error('Cosmos returned invalid aggregate progress.')
+    }
+    if (continuationToken) {
+      if (tokens.has(continuationToken)) throw new Error('Cosmos aggregate continuation did not advance.')
+      tokens.add(continuationToken)
+    }
+    const more = hasMoreResults === true || Boolean(continuationToken)
+    if ((resources === undefined || Array.isArray(resources) && resources.length === 0) && more) continue
+    if (!Array.isArray(resources) || resources.length !== 1 || more ||
+      typeof resources[0] !== 'number' || !Number.isSafeInteger(resources[0]) || resources[0] < 0) {
+      throw new Error('Cosmos returned an invalid aggregate count.')
+    }
+    return resources[0]
+  }
+  throw new Error('Cosmos aggregate exceeded its progress-page limit.')
+}

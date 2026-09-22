@@ -137,6 +137,14 @@ export function analysisStore() {
   const store = {
     values, controls, batches, save,
     async get(workspaceId, id, signal) { signal?.throwIfAborted(); return clone(values.get(key(workspaceId, id))) },
+    async countActive(workspaceId) {
+      if ([...controls.values()].some(({ record }) => record.workspaceId === workspaceId &&
+        ((!record.runId && record.state !== 'active') || (record.operation && record.operation.status !== 'complete')))) {
+        throw new api.StoreConflictError('Analysis lifecycle cleanup is incomplete.')
+      }
+      return [...values.values()].filter(({ record }) => record.workspaceId === workspaceId && record.recordType === 'analysis-run' &&
+        record.dataKind === 'real' && !record.lifecycle?.archivedAt && !record.lifecycle?.deletingAt && !record.lifecycle?.deletedAt).length
+    },
     async create(record) {
       if (beforeCreate) await beforeCreate(record)
       assert.equal(record.recordType, 'analysis-run')
@@ -278,6 +286,11 @@ export function fixture(workspaceId = WORKSPACE) {
     store: {
       async get(ws, id) { return clone(resumeValues.get(`${ws}/${id}`)) },
       async getControl() { return undefined },
+      async countActive(ws) {
+        return [...resumeValues.values()].filter(({ record }) => record.workspaceId === ws && record.recordType === 'resume' &&
+          record.dataKind === 'real' && record.resume.dataKind === 'real' &&
+          !record.lifecycle?.archivedAt && !record.lifecycle?.deletingAt && !record.lifecycle?.deletedAt).length
+      },
     },
   }
   const jobs = {
@@ -285,6 +298,10 @@ export function fixture(workspaceId = WORKSPACE) {
     store: {
       async get(ws, id) { return clone(jobValues.get(`${ws}/${id}`)) },
       async getWorkspaceLifecycle() { return { state: 'active', updatedAt: NOW } },
+      async countActive(ws) {
+        return [...jobValues.values()].filter(({ record }) => record.workspaceId === ws && record.recordType === 'job' &&
+          record.job.dataKind === 'real' && !record.lifecycle?.archivedAt && !record.lifecycle?.deletingAt && !record.lifecycle?.deletedAt).length
+      },
       async list(ws, token) {
         const values = [...jobValues.values()].filter(item => item.record.workspaceId === ws)
         const start = Number(token ?? 0)

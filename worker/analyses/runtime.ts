@@ -619,6 +619,7 @@ async function processRun(
   const store: AnalysisStore = {
     get: (workspaceId, id) => deps.store.get(workspaceId, id),
     list: (workspaceId, options) => deps.store.list(workspaceId, options),
+    countActive: workspaceId => deps.store.countActive(workspaceId),
     create: record => deps.store.create(record),
     replace: (record, etag) => deps.store.replace(record, etag),
     listPending: (now, limit) => deps.store.listPending(now, limit),

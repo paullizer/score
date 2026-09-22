@@ -325,7 +325,7 @@ function cloudFixture(workspace = emptyState(), summaries = []) {
     user, workspace, summaries, jobs: [], ladders: [], saves: [], mutations: [], requests: [], pendingArchive: false,
     beforeRead: null, beforeSave: null, saveFailures: [], jobPending: [], gradePending: [], gradeFailureStatus: 503,
     lifecycleFailure: null, impactFailures: 0, jobDetailFailures: 0, jobDetailFailureStatus: 503,
-    gradeImpactFailures: 0, hideDeletingFamilies: false, stateMissing: false,
+    gradeImpactFailures: 0, hideDeletingFamilies: false, stateMissing: false, summaryCounts: {},
   }
   const response = (route, body, status = 200, headers = {}) => route.fulfill({ status, contentType: 'application/json', headers, body: JSON.stringify(body) })
   const impact = (target, name, counts = {}, blockers = []) => ({ target, name, counts, blockers })
@@ -347,6 +347,10 @@ function cloudFixture(workspace = emptyState(), summaries = []) {
       const root = /^\/api\/workspaces\/([^/]+)(.*)$/.exec(path)
       if (!root) return response(route, { error: { code: 'not_found', message: path } }, 404)
       const [, workspaceId, tail] = root
+      if (tail === '/summary') {
+        const counts = state.summaryCounts[workspaceId] ?? { jobs: 0, resumes: 0, analyses: 0 }
+        return response(route, { workspaceId, ...Object.fromEntries(Object.entries(counts).map(([key, count]) => [key, { status: 'ready', count }])) })
+      }
       if (tail === '/state') {
         if (state.stateMissing) return response(route, { error: { code: 'not_found', message: 'Sample-state cleanup is already complete; workspace cleanup remains pending.' } }, 404)
         if (method === 'PUT') {
@@ -530,6 +534,78 @@ function realLadder(source, id = 'ladder-real-one', seedJobId = 'job-real-one') 
   }
 }
 
+for (const theme of ['light', 'dark']) for (const width of [1440, 390]) test(`workspace home is keyboard accessible and responsive at ${width}px in ${theme} mode`, { timeout: 60000 }, async (t) => {
+  const first = workspaceSummary('workspace-one', 'Clinical research')
+  const second = workspaceSummary('workspace-two', 'Program delivery', 'viewer')
+  const third = workspaceSummary('workspace-three', 'An exceptionally detailed workspace name for research and interdisciplinary work')
+  const archived = { ...workspaceSummary('workspace-archived', 'Archived review'), archivedAt: timestamp }
+  const fixture = cloudFixture(domain.createInitialWorkspace(), [first, second, third, archived])
+  fixture.summaryCounts[first.id] = { jobs: 12, resumes: 38, analyses: 7 }
+  const page = await pageFor(t)
+  await page.setViewportSize({ width, height: 1000 })
+  await page.addInitScript(({ theme, timestamp }) => {
+    localStorage.setItem('score-theme', theme)
+    localStorage.setItem('score-cloud-recent-workspaces:tenant:reviewer', JSON.stringify({ version: 1, entries: [
+      { id: 'workspace-two', lastOpenedAt: timestamp }, { id: 'workspace-one', lastOpenedAt: '2026-09-17T12:00:00.000Z' },
+      { id: 'workspace-archived', lastOpenedAt: '2026-09-16T12:00:00.000Z' },
+    ] }))
+  }, { theme, timestamp })
+  await fixture.install(page)
+  await page.goto(cloudServer.origin)
+  await page.getByRole('heading', { name: 'My workspaces', exact: true }).waitFor()
+  await page.locator('.workspace-card-counts dd').getByText('38', { exact: true }).waitFor()
+  assert.equal(new URL(page.url()).pathname, '/')
+  assert.equal(await page.locator('.workspace-home-card').count(), 3)
+  assert.equal(await page.getByRole('button', { name: 'Open recent workspace Program delivery', exact: true }).count(), 1)
+  assert.equal(await page.getByRole('button', { name: 'Open recent workspace Archived review', exact: true }).count(), 0)
+  assert.equal(await page.getByRole('button', { name: 'Rename Program delivery', exact: true }).count(), 0)
+  assert.equal(await page.evaluate(() => document.documentElement.dataset.theme), theme)
+  assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth), true, 'Home must fit the viewport, including long names')
+  assert.equal(fixture.requests.some(([, path]) => /\/workspaces\/[^/]+\/(?:state|jobs|resumes|analyses|grade-ladders)(?:\/|$)/.test(path)), false, 'Home must not fetch a workspace library or private content')
+  if (process.env.SCORE_TEST_SCREENSHOT_DIR) {
+    await mkdir(process.env.SCORE_TEST_SCREENSHOT_DIR, { recursive: true })
+    await page.screenshot({ path: join(process.env.SCORE_TEST_SCREENSHOT_DIR, `workspace-home-${width}-${theme}.png`), fullPage: true })
+  }
+  const create = page.getByRole('button', { name: 'New workspace', exact: true })
+  await create.focus()
+  await page.keyboard.press('Enter')
+  const input = page.getByRole('textbox', { name: 'New workspace name', exact: true })
+  await input.waitFor()
+  assert.equal(await input.evaluate((element) => element === document.activeElement), true)
+  await page.keyboard.press('Escape')
+  await page.getByRole('dialog', { name: 'New workspace', exact: true }).waitFor({ state: 'hidden' })
+  assert.equal(await create.evaluate((element) => element === document.activeElement), true)
+  await page.getByRole('searchbox', { name: 'Search workspaces', exact: true }).fill('Archived review')
+  await page.getByRole('button', { name: 'Archived review', exact: true }).waitFor()
+  assert.equal(await page.locator('.workspace-home-card').count(), 1)
+  assert.equal(await page.locator('.workspace-home-card .workspace-card-counts').count(), 0)
+  await page.getByRole('searchbox', { name: 'Search workspaces', exact: true }).fill('')
+  await page.getByRole('button', { name: first.name, exact: true }).click()
+  await page.getByRole('heading', { name: 'Your jobs', exact: true }).waitFor()
+  if (width < 760) {
+    await page.getByRole('button', { name: 'Open navigation', exact: true }).click()
+    await page.getByRole('dialog', { name: 'Your workspace', exact: true }).getByRole('button', { name: 'All workspaces', exact: true }).click()
+  } else await page.getByRole('link', { name: 'Score home', exact: true }).click()
+  await page.getByRole('heading', { name: 'My workspaces', exact: true }).waitFor()
+  assert.equal(new URL(page.url()).pathname, '/')
+})
+
+test('archiving the current workspace returns home rather than entering another available workspace', { timeout: 60000 }, async (t) => {
+  const first = workspaceSummary('workspace-one', 'Current review')
+  const other = workspaceSummary('workspace-two', 'Another review')
+  const fixture = cloudFixture(emptyState(), [first, other])
+  const page = await pageFor(t)
+  await fixture.install(page)
+  await page.goto(`${cloudServer.origin}/workspaces/workspace-one/jobs`)
+  await page.getByRole('heading', { name: 'Your jobs', exact: true }).waitFor()
+  await page.locator('.sidebar .workspace-switcher-trigger').click()
+  await lifecycle(page, first.name, 'archive')
+  await page.getByRole('heading', { name: 'My workspaces', exact: true }).waitFor()
+  assert.equal(new URL(page.url()).pathname, '/')
+  assert.equal(fixture.requests.some(([, path]) => path === '/api/workspaces/workspace-two/state'), false)
+  await page.getByRole('button', { name: other.name, exact: true }).waitFor()
+})
+
 test('cloud empty directory, last-workspace archive, pending retry, and explicit unarchive never recreate samples', { timeout: 90000 }, async (t) => {
   const page = await pageFor(t)
   const fixture = cloudFixture()
@@ -552,7 +628,7 @@ test('cloud empty directory, last-workspace archive, pending retry, and explicit
   assert.equal(await page.locator('.toast').count(), 0, 'Pending is not success')
   await dialog.getByRole('button', { name: 'Retry operation', exact: true }).click()
   await page.getByRole('heading', { name: 'My workspaces', exact: true }).waitFor()
-  assert.equal(await page.getByText('Archived', { exact: true }).count() > 0, true)
+  assert.equal(await page.getByText('Archived · read only', { exact: true }).count() > 0, true)
   await lifecycle(page, 'Only workspace', 'unarchive')
   await lifecycle(page, 'Only workspace', 'delete')
   await page.reload()

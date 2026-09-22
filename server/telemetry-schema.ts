@@ -40,7 +40,7 @@ const grades = `${workspace}/grade-ladders`
 const ladder = `${grades}/:ladderId`
 const routeTemplates = [
   '/healthz', '/api/features', '/api/session', '/api/workspaces', workspace,
-  `${workspace}/state`, `${workspace}/lifecycle`,
+  `${workspace}/state`, `${workspace}/lifecycle`, `${workspace}/summary`,
   analyses, `${analyses}/targets`, run, `${run}/metadata`, `${run}/lifecycle`,
   `${run}/comparisons`, `${run}/summaries`, summary, `${summary}/history`,
   `${summary}/publish`, `${summary}/retry`, `${run}/report-comparisons`,

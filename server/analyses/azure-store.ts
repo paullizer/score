@@ -10,7 +10,7 @@ import {
 import { MAX_MARKDOWN_BYTES } from '../../src/domain/source-files'
 import { WORKSPACE_ID_PATTERN } from '../ids'
 import { StoreConflictError } from '../store'
-import { fetchCosmosPage } from '../cosmos-query'
+import { fetchCosmosCount, fetchCosmosPage } from '../cosmos-query'
 import { assertWorkspaceMutationLease } from '../lifecycle/lease'
 import type {
   AnalysisBlob, AnalysisBlobStore, AnalysisStore, RealAnalysesConfig, AnalysisTransactionOptions, StoredAnalysisControl,
@@ -244,6 +244,23 @@ export function createAnalysisStoreFromContainer(
     }
   }
   const store: AnalysisStore = {
+    async countActive(workspaceId) {
+      scope(workspaceId)
+      const blocked = await fetchCosmosCount(container.items.query({
+        query: `SELECT VALUE COUNT(1) FROM c WHERE c.workspaceId = @workspaceId AND c.recordType = @recordType
+          AND ((NOT IS_DEFINED(c.runId) AND c.state != 'active')
+            OR (IS_DEFINED(c.operation) AND c.operation.status != 'complete'))`,
+        parameters: [{ name: '@workspaceId', value: workspaceId }, { name: '@recordType', value: 'analysis-lifecycle' }],
+      }, { partitionKey: workspaceId }))
+      if (blocked) throw new StoreConflictError('Analysis lifecycle cleanup is incomplete.')
+      return fetchCosmosCount(container.items.query({
+        query: `SELECT VALUE COUNT(1) FROM c WHERE c.workspaceId = @workspaceId
+          AND c.recordType = @recordType AND c.dataKind = 'real'
+          AND NOT IS_DEFINED(c.lifecycle.archivedAt)
+          AND NOT IS_DEFINED(c.lifecycle.deletingAt) AND NOT IS_DEFINED(c.lifecycle.deletedAt)`,
+        parameters: [{ name: '@workspaceId', value: workspaceId }, { name: '@recordType', value: 'analysis-run' }],
+      }, { partitionKey: workspaceId }))
+    },
     async get(workspaceId, id, signal) {
       signal?.throwIfAborted()
       scope(workspaceId, id)

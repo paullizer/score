@@ -6,7 +6,7 @@ import type { TokenCredential } from '@azure/identity'
 import type { RealResumeRecord, ResumeEntity, VersionedResumeEntity } from '../../src/domain/real-resumes'
 import { WORKSPACE_ID_PATTERN } from '../ids'
 import { StoreConflictError } from '../store'
-import { fetchCosmosPage } from '../cosmos-query'
+import { fetchCosmosCount, fetchCosmosPage } from '../cosmos-query'
 import { assertWorkspaceMutationLease } from '../lifecycle/lease'
 import type { RealResumesConfig, ResumeBlob, ResumeBlobStore, ResumeBlobWriteFence, ResumeStore, StoredResumeControl } from './store'
 import {
@@ -168,6 +168,23 @@ export function createResumeStoreFromContainer(container: Pick<Container, 'item'
         items: items as VersionedResumeEntity<Extract<ResumeEntity, { recordType: K }>>[],
         ...(response.continuationToken ? { continuationToken: response.continuationToken } : {}),
       }
+    },
+    async countActive(workspaceId) {
+      scope(workspaceId)
+      const blocked = await fetchCosmosCount(container.items.query({
+        query: `SELECT VALUE COUNT(1) FROM c WHERE c.workspaceId = @workspaceId AND c.recordType = @recordType
+          AND ((NOT IS_DEFINED(c.resumeId) AND c.state != 'active')
+            OR (IS_DEFINED(c.operation) AND c.operation.status != 'complete'))`,
+        parameters: [{ name: '@workspaceId', value: workspaceId }, { name: '@recordType', value: 'resume-lifecycle' }],
+      }, { partitionKey: workspaceId }))
+      if (blocked) throw new StoreConflictError('Resume lifecycle cleanup is incomplete.')
+      return fetchCosmosCount(container.items.query({
+        query: `SELECT VALUE COUNT(1) FROM c WHERE c.workspaceId = @workspaceId
+          AND c.recordType = @recordType AND c.dataKind = 'real' AND c.resume.dataKind = 'real'
+          AND NOT IS_DEFINED(c.lifecycle.archivedAt)
+          AND NOT IS_DEFINED(c.lifecycle.deletingAt) AND NOT IS_DEFINED(c.lifecycle.deletedAt)`,
+        parameters: [{ name: '@workspaceId', value: workspaceId }, { name: '@recordType', value: 'resume' }],
+      }, { partitionKey: workspaceId }))
     },
     async create<T extends ResumeEntity>(value: T) {
       const record = parseResumeEntity(value)

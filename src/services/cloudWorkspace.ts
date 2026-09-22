@@ -270,9 +270,8 @@ export function validateWorkspaceName(name: string): string | null {
 }
 
 /**
- * The only two things Score ever keeps in localStorage for cloud mode: the appearance theme (shared,
- * already handled by ThemeControl) and the last-selected workspace id, namespaced per tenant/user so
- * signing in as someone else never leaks or reuses a previous person's workspace choice.
+ * Legacy selection preference, read only as an untimed seed for workspaceRecents.
+ * Cloud preferences contain appearance and account-scoped workspace IDs/times, never document state.
  */
 function lastWorkspaceKey(tenantId: string, userId: string): string {
   return `score-cloud-last-workspace:${tenantId}:${userId}`
