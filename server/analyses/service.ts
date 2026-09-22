@@ -35,9 +35,9 @@ import type { AnalysisReportFormat, ReportSettingsCapture } from '../../src/doma
 import type { WorkspaceRole } from '../../src/domain/cloud'
 import { generateAnalysisSummaries, readAnalysisNarrativeInventory, readAnalysisSummaries, readAnalysisSummarySubject } from './narratives'
 import type { GenerateRealAnalysisSummariesInput } from '../../src/domain/analysis-narratives'
-import type { AnalysisSummarySubject, PublishSummaryDraftInput } from '../../src/domain/analysis-summary-history'
+import type { AnalysisSummarySubject, PublishSummaryDraftInput, RestartSummaryInput } from '../../src/domain/analysis-summary-history'
 import { readAnalysisSummaryHistory } from './summary-history'
-import { publishAnalysisSummaryDraft, retryAnalysisSummary } from './summary-actions'
+import { publishAnalysisSummaryDraft, restartAnalysisSummary, retryAnalysisSummary } from './summary-actions'
 import { prepareAnalysisNarrativeTransitions } from './narrative-scheduling'
 import { resolveAnalysisComparison, resolveAnalysisComparisons } from './current-results'
 import { AnalysisCorrectionService } from './correction-actions'
@@ -369,6 +369,12 @@ export class RealAnalysisService {
   }
   retrySummary(workspaceId: string, runId: string, subject: AnalysisSummarySubject, requestId: string, expected: string, actor: string) {
     return retryAnalysisSummary(this.deps, workspaceId, runId, subject, requestId, expected, actor, this.clock, this.settings)
+  }
+  restartSummary(
+    workspaceId: string, runId: string, subject: AnalysisSummarySubject, input: RestartSummaryInput,
+    requestId: string, expected: string, actor: string,
+  ) {
+    return restartAnalysisSummary(this.deps, workspaceId, runId, subject, input, requestId, expected, actor, this.clock, this.settings)
   }
   async diagnostics(workspaceId: string, runId: string, comparisonId: string, continuationToken?: string, signal?: AbortSignal) {
     const [run, comparison] = await Promise.all([

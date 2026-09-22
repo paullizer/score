@@ -24,11 +24,12 @@ import {
   AnalysisEvidenceBindingError, createAnalysisPassageResolver, type AnalysisEvidenceCatalog,
 } from './evidence-passages'
 import { analysisSchemaDiagnostics } from './diagnostics'
+import type { ModelRetryMetadata } from '../errors'
 
 export type { AnalysisModelStage } from './citation-diagnostics'
 export { describeAnalysisSummary as describeAnalysisAssessment } from '../../server/analyses/deterministic'
 
-export interface AnalysisModelErrorOptions {
+export interface AnalysisModelErrorOptions extends ModelRetryMetadata {
   retryable?: boolean
   stage?: AnalysisModelStage
   correctable?: boolean
@@ -47,6 +48,8 @@ export class AnalysisModelError extends Error {
   readonly citationDiagnostics?: AnalysisCitationDiagnostics
   readonly schemaDiagnostics?: AnalysisSchemaDiagnostics
   readonly reason?: AnalysisDiagnosticReason
+  readonly httpStatus?: number
+  readonly retryAt?: string
 
   constructor(code: AnalysisProcessingErrorCode, message: string, options: AnalysisModelErrorOptions = {}) {
     super(message)
@@ -59,6 +62,8 @@ export class AnalysisModelError extends Error {
     this.citationDiagnostics = options.citationDiagnostics
     this.schemaDiagnostics = options.schemaDiagnostics
     this.reason = options.reason
+    this.httpStatus = options.httpStatus
+    this.retryAt = options.retryAt
   }
 }
 

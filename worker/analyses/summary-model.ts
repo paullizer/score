@@ -15,7 +15,7 @@ import {
 import { systemClock, type Clock, type RubricModelOptions, type StructuredModelRequest } from '../runtime'
 import { AnalysisModelError, invokeAnalysisModel } from './model'
 import { analysisStructuredSchema } from './model-schema'
-import { NarrativeModelError, validateNarrativeModelOptions } from './narrative-model'
+import { NarrativeModelError, narrativeServiceError, validateNarrativeModelOptions } from './narrative-model'
 import {
   NarrativeInputError, narrativeJsonBytes, validateCandidateNarrativeInput, validateTargetNarrativeInput,
 } from './narrative-model-input'
@@ -29,6 +29,7 @@ export interface SummaryModelOptions {
   attemptId: string
   clock?: Clock
   signal?: AbortSignal
+  deadlineAt?: number
   steps?: readonly AnalysisSummaryStep[]
   seed?: AnalysisSummaryStep
   onCheckpoint?: (step: AnalysisSummaryStep) => Promise<void>
@@ -127,25 +128,30 @@ class SummarySession {
     const policy = modelProcessingSettings(options.model)?.settings.summaries
     this.maxRounds = policy?.maxRounds ?? SUMMARY_LIMITS.rounds
     const duration = policy?.operationTimeoutMilliseconds ?? NARRATIVE_MODEL_LIMITS.operationTimeoutMilliseconds
-    this.deadlineAt = this.clock.now().getTime() + duration
+    if (options.deadlineAt !== undefined && (!Number.isSafeInteger(options.deadlineAt) || options.deadlineAt < 0)) {
+      throw new NarrativeModelError('invalid-input', 'The summary processing deadline is invalid.', stage)
+    }
+    this.deadlineAt = Math.min(options.deadlineAt ?? Infinity, this.clock.now().getTime() + duration)
     this.signal = options.signal ? AbortSignal.any([options.signal, this.deadline.signal]) : this.deadline.signal
     for (const value of options.steps ?? []) {
       const step = summaryStepSchema.parse(value)
       const key = `${step.scopeId}:${step.round}`
       if (!this.steps.has(key)) this.steps.set(key, step)
     }
-    this.timer = setTimeout(() => this.deadline.abort(), duration)
+    this.timer = setTimeout(() => this.deadline.abort(), Math.max(1, this.deadlineAt - this.clock.now().getTime()))
     this.timer.unref()
   }
 
   stop(): void { clearTimeout(this.timer) }
 
+  private interrupted(stage = this.stage): NarrativeModelError {
+    return new NarrativeModelError('timeout', 'Summary processing was interrupted; saved drafts remain available.', stage,
+      { retryable: !this.options.signal?.aborted, cancelled: Boolean(this.options.signal?.aborted) })
+  }
+
   check(stage = this.stage): void {
     if (this.clock.now().getTime() >= this.deadlineAt) this.deadline.abort()
-    if (this.signal.aborted) {
-      throw new NarrativeModelError('timeout', 'Summary processing was interrupted; saved drafts remain available.', stage,
-        { retryable: !this.options.signal?.aborted, cancelled: Boolean(this.options.signal?.aborted) })
-    }
+    if (this.signal.aborted) throw this.interrupted(stage)
   }
 
   emit(event: Omit<SummaryTelemetryEvent, 'timestamp' | 'stage'> & { stage?: Stage }): void {
@@ -157,9 +163,33 @@ class SummarySession {
   async checkpoint(step: AnalysisSummaryStep): Promise<void> {
     this.check()
     const captured = summaryStepSchema.parse(step)
-    await this.options.onCheckpoint?.(captured)
+    let onAbort: (() => void) | undefined
+    try {
+      await new Promise<void>((resolve, reject) => {
+        onAbort = () => reject(this.interrupted())
+        this.signal.addEventListener('abort', onAbort, { once: true })
+        if (this.signal.aborted) { onAbort(); return }
+        Promise.resolve().then(() => {
+          this.check()
+          return this.options.onCheckpoint?.(captured)
+        }).then(resolve, reject)
+      })
+    } finally {
+      if (onAbort) this.signal.removeEventListener('abort', onAbort)
+    }
+    this.check()
     this.steps.set(`${step.scopeId}:${step.round}`, structuredClone(captured))
     this.emit({ event: 'summary-checkpoint', scopeId: step.scopeId, round: step.round })
+  }
+
+  async checkpointFailure(step: AnalysisSummaryStep, error: NarrativeModelError): Promise<void> {
+    const failure = {
+      code: error.code, stage: error.stage, message: error.message, retryable: error.retryable,
+      ...(error.diagnostic ? { diagnostic: error.diagnostic } : {}),
+    }
+    if (JSON.stringify(this.steps.get(`${step.scopeId}:${step.round}`)?.error) !== JSON.stringify(failure)) {
+      await this.checkpoint({ ...step, phase: 'failed', error: failure })
+    }
   }
 
   async call(request: StructuredModelRequest, stage: Stage, step: AnalysisSummaryStep) {
@@ -167,7 +197,10 @@ class SummarySession {
     const taskId = request.taskId!
     const model = taskModelOptions(this.options.model, taskId)
     const task = modelProcessingSettings(model)?.tasks[taskId]
-    request = { ...request, maxCompletionTokens: task?.completionTokenLimit ?? request.maxCompletionTokens }
+    request = {
+      ...request, maxCompletionTokens: task?.completionTokenLimit ?? request.maxCompletionTokens,
+      deadlineAt: Math.min(this.deadlineAt, this.clock.now().getTime() + NARRATIVE_MODEL_LIMITS.requestTimeoutMilliseconds),
+    }
     const requestBytes = narrativeJsonBytes({
       model: model.deployment,
       messages: [{ role: 'system', content: request.system }, { role: 'user', content: request.user }],
@@ -192,21 +225,24 @@ class SummarySession {
     try {
       return await invokeAnalysisModel(request, stage === 'grounding' ? 'grounding' : 'assessment', {
         model, signal: AbortSignal.any([this.signal, timeout.signal]), onEvent,
+        onRetry: async error => {
+          await this.checkpointFailure(step, narrativeServiceError(error, stage, { round: step.round, modelCallId }))
+        },
       }, this.clock, step.round - 1, {
         promptVersion: stage === 'grounding' ? `${SUMMARY_PIPELINE_VERSION}-factual-review` : SUMMARY_PIPELINE_VERSION,
         schemaVersion: 'analysis-summary-v2',
       })
     } catch (error) {
+      if (error instanceof AnalysisModelError && error.retryAt) {
+        throw narrativeServiceError(error, stage, { round: step.round, modelCallId })
+      }
       this.check(stage)
       if (timeout.signal.aborted) {
         throw new NarrativeModelError('timeout', 'The summary model request timed out; the saved round can resume.', stage,
           { retryable: true, diagnostic: { round: step.round, modelCallId } })
       }
       if (error instanceof AnalysisModelError) {
-        throw new NarrativeModelError(error.code, 'The summary model could not complete this request; saved drafts are retained.', stage, {
-          retryable: error.retryable, cancelled: error.cancelled,
-          diagnostic: { reason: error.reason, round: step.round, modelCallId },
-        })
+        throw narrativeServiceError(error, stage, { round: step.round, modelCallId })
       }
       throw error
     } finally { clearTimeout(timer) }
@@ -244,6 +280,11 @@ class SummarySession {
       if (step && step.sourceFingerprint !== sourceFingerprint) {
         throw new NarrativeModelError('stale-input', 'Saved summary progress belongs to different analysis inputs.', this.stage)
       }
+      if (step?.error?.diagnostic?.retryAt && Date.parse(step.error.diagnostic.retryAt) > this.clock.now().getTime()) {
+        throw new NarrativeModelError(step.error.code, step.error.message, step.error.stage, {
+          retryable: step.error.retryable, diagnostic: step.error.diagnostic,
+        })
+      }
       if (step?.review?.outcome === 'supported') return this.completed(step)
       if (step?.review) {
         lastFailure = new NarrativeModelError('grounding-failed',
@@ -252,7 +293,9 @@ class SummarySession {
         continue
       }
       if (step?.phase === 'failed' && !step.draft && !step.error?.retryable) {
-        if (step.error) lastFailure = new NarrativeModelError(step.error.code, step.error.message, step.error.stage, { diagnostic: { round } })
+        if (step.error) lastFailure = new NarrativeModelError(step.error.code, step.error.message, step.error.stage, {
+          diagnostic: { round, ...step.error.diagnostic },
+        })
         continue
       }
       step ??= { scopeId, sourceFingerprint, round, phase: 'started' }
@@ -325,10 +368,7 @@ class SummarySession {
           { diagnostic: { reason: 'factual-review', round, modelCallId: review.modelCallId, issueCount: review.issues.length } })
       } catch (error) {
         if (!(error instanceof NarrativeModelError) || error.cancelled || this.signal.aborted) throw error
-        await this.checkpoint({
-          ...step, phase: 'failed',
-          error: { code: error.code, stage: error.stage, message: error.message, retryable: error.retryable },
-        })
+        await this.checkpointFailure(step, error)
         this.emit({ event: 'validation-failed', stage: error.stage, scopeId, round, code: error.code, reason: error.diagnostic?.reason })
         // A malformed generation uses its existing draft slot; it cannot bypass the three-round bound.
         if (!step.draft && !error.retryable && error.code === 'invalid-model-output' &&

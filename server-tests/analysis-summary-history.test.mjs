@@ -240,7 +240,7 @@ test('historical completed results without a sidecar report no captured history 
   const subject = { kind: 'candidate', subjectId: pairs[0].record.id }
   const history = await api.readAnalysisSummaryHistory(f.analysis, f.workspaceId, created.run.id, subject)
   assert.deepEqual(history.entries, [])
-  assert.deepEqual(history.capabilities, { canPublish: false, canRetry: true })
+  assert.deepEqual(history.capabilities, { canPublish: false, canRetry: true, canResume: false, canRestart: true })
   const key = randomUUID()
   const result = await api.retryAnalysisSummary(f.analysis, f.workspaceId, created.run.id, subject, key, history.etag, ACTOR, clock(f))
   assert.equal(result.summaries.comparisons.find(value => value.comparisonId === pairs[0].record.id).status, 'queued')
@@ -632,6 +632,111 @@ test('retry receipts recover ambiguous writes, never duplicate a generation, and
   await assert.rejects(api.retryAnalysisSummary(f.analysis, f.workspaceId, runId, subject, key, page.etag, 'another-owner', clock(f)), { status: 409 })
 })
 
+test('a failed overview explicitly restarts with current settings without replacing any other publication or assessment', async () => {
+  const { f, runId, comparisons } = await setup(2, 2)
+  const targets = [...new Set(comparisons.map(value => value.record.target.summary.id))]
+  const publish = async subject => {
+    const saved = await rounds(f, runId, subject, 1)
+    await api.publishAnalysisSummaryDraft(f.analysis, f.workspaceId, runId, subject,
+      selection(saved.current.record, saved.entries[0]), randomUUID(), saved.current.etag, ACTOR, clock(f))
+  }
+  for (const comparison of comparisons) await publish({ kind: 'candidate', subjectId: comparison.record.id })
+  for (const targetId of targets) await publish({ kind: 'target', subjectId: targetId })
+  const subject = { kind: 'target', subjectId: targets[0] }
+  const ready = await api.readSummarySubject(f.analysis, f.workspaceId, runId, subject)
+  await api.retryAnalysisSummary(f.analysis, f.workspaceId, runId, subject, randomUUID(), ready.etag, ACTOR, clock(f))
+  const saved = await rounds(f, runId, subject)
+  const history = await api.readAnalysisSummaryHistory(f.analysis, f.workspaceId, runId, subject)
+  assert.equal(history.capabilities.canResume, true)
+  assert.equal(history.capabilities.canRestart, true)
+  const unchanged = () => clone([...f.analysis.store.values.values()].filter(value =>
+    value.record.recordType !== 'analysis-run' && value.record.id !== saved.current.record.id))
+  const before = unchanged()
+  const snapshots = clone([...f.analysis.blobs.values].filter(([name]) => !name.includes('/narrative-actions/')))
+  const currentPolicy = api.captureProcessingSettings(api.createDefaultAdminSettings({
+    model: { deploymentName: 'gpt-5.6-luna', modelName: 'gpt-5.6-luna', reasoningEffort: 'medium' },
+  }), 'luna-medium-summary-policy', f.now)
+  const supplier = async () => currentPolicy
+  const key = randomUUID()
+  f.analysis.blobs._afterPut(name => { if (name.includes('/narrative-actions/')) throw new Error('ambiguous restart reservation') })
+  f.analysis.store._afterBatch(() => { throw new Error('ambiguous committed restart') })
+  const restarted = await api.restartAnalysisSummary(f.analysis, f.workspaceId, runId, subject, { confirmRestart: true },
+    key, history.etag, ACTOR, clock(f), supplier)
+  const current = await f.analysis.store.get(f.workspaceId, saved.current.record.id)
+  assert.equal(restarted.summaries.scope.targetId, subject.subjectId)
+  assert.notEqual(current.record.generationId, saved.current.record.generationId)
+  assert.equal(current.record.processingSettings.revision, currentPolicy.revision)
+  assert.equal(current.record.processingSettings.tasks.targetSummary.deploymentName, 'gpt-5.6-luna')
+  assert.equal(current.record.processingSettings.tasks.summaryReview.reasoningEffort, 'medium')
+  assert.equal(current.record.status, 'waiting')
+  assert.equal(current.record.attempts, 0)
+  assert.equal(current.record.summaryRound, undefined)
+  assert.equal(current.record.retryCount, saved.current.record.retryCount + 1)
+  assert.equal(current.record.lease, undefined)
+  assert.deepEqual(current.record.history, saved.current.record.history)
+  assert.deepEqual(current.record.published, saved.current.record.published)
+  assert.deepEqual(unchanged(), before)
+  assert.deepEqual([...f.analysis.blobs.values].filter(([name]) => !name.includes('/narrative-actions/')), snapshots)
+  const replay = await api.restartAnalysisSummary(f.analysis, f.workspaceId, runId, subject, { confirmRestart: true },
+    key, history.etag, ACTOR, clock(f), supplier)
+  assert.equal(replay.summaries.targets[0].generationId, current.record.generationId)
+  assert.equal((await f.analysis.store.get(f.workspaceId, current.record.id)).etag, current.etag)
+  await assert.rejects(api.retryAnalysisSummary(f.analysis, f.workspaceId, runId, subject,
+    key, history.etag, ACTOR, clock(f), supplier), { status: 409 })
+  await assert.rejects(api.restartAnalysisSummary(f.analysis, f.workspaceId, runId, subject, { confirmRestart: true },
+    randomUUID(), history.etag, ACTOR, clock(f), supplier), { status: 409 })
+})
+
+test('confirmed subject restart fences an active attempt and rejects missing confirmation before reserving work', async () => {
+  const { f, runId, subject } = await setup()
+  const active = await claim(f, runId, subject)
+  const before = f.analysis.blobs.values.size
+  for (const input of [{}, { confirmRestart: false }, { confirmRestart: true, all: true }]) {
+    assert.throws(() => api.restartAnalysisSummary(f.analysis, f.workspaceId, runId, subject, input,
+      randomUUID(), active.etag, ACTOR, clock(f)), { status: 400 })
+  }
+  assert.equal(f.analysis.blobs.values.size, before)
+  await api.restartAnalysisSummary(f.analysis, f.workspaceId, runId, subject, { confirmRestart: true },
+    randomUUID(), active.etag, ACTOR, clock(f))
+  const current = await f.analysis.store.get(f.workspaceId, active.record.id)
+  assert.notEqual(current.record.generationId, active.record.generationId)
+  assert.equal(current.record.status, 'queued')
+  assert.equal(current.record.lease, undefined)
+  const after = f.analysis.blobs.values.size
+  await assert.rejects(api.writeSummaryCheckpoint(f.analysis, active.record, {
+    scopeId: 'final', sourceFingerprint: active.record.inputFingerprint, round: 1, phase: 'started',
+  }, { createdAt: advance(f), assertActive: async () => {} }), /generation|changed|attempt/i)
+  assert.equal(f.analysis.blobs.values.size, after)
+  assert.equal((await f.analysis.store.get(f.workspaceId, active.record.id)).etag, current.etag)
+})
+
+test('restart observes current admission while a failed-generation resume retains accepted settings and rounds', async () => {
+  for (const restriction of ['feature-disabled', 'maintenance', 'rollout-inactive']) {
+    const { f, runId, subject } = await setup()
+    const saved = await rounds(f, runId, subject)
+    const policy = api.createDefaultAdminSettings()
+    if (restriction === 'feature-disabled') policy.features.summaryGeneration = false
+    if (restriction === 'maintenance') policy.maintenance.pauseNewWork = true
+    const settings = { async capture() { return api.captureProcessingSettings(policy, 'restricted-current-policy', f.now) } }
+    const http = await startHttp(f, true, settings, restriction !== 'rollout-inactive')
+    const path = `/${runId}/summaries/${subject.kind}/${subject.subjectId}`
+    const headers = { 'if-match': saved.current.etag, 'idempotency-key': randomUUID() }
+    const before = f.analysis.blobs.values.size
+    try {
+      const denied = await http.request(`${path}/restart`, 'POST', { confirmRestart: true }, { headers })
+      assert.equal(denied.status, 503, `${restriction}: ${await denied.text()}`)
+      assert.equal(f.analysis.blobs.values.size, before)
+      const resumed = await http.request(`${path}/retry`, 'POST', {}, { headers })
+      assert.equal(resumed.status, 202, await resumed.clone().text())
+      const current = await f.analysis.store.get(f.workspaceId, saved.current.record.id)
+      assert.equal(current.record.generationId, saved.current.record.generationId)
+      assert.deepEqual(current.record.processingSettings, saved.current.record.processingSettings)
+      assert.equal(current.record.summaryRound, 3)
+      assert.deepEqual(current.record.history, saved.current.record.history)
+    } finally { await http.close() }
+  }
+})
+
 test('HTTP history and actions enforce owner/editor membership, exact subjects, CSRF, ETags and archived read-only history', async () => {
   const { f, runId, subject } = await setup()
   const result = await rounds(f, runId, subject, 1), http = await startHttp(f)
@@ -649,8 +754,8 @@ test('HTTP history and actions enforce owner/editor membership, exact subjects, 
     assert.equal((await http.request(`/${runId}/summaries/candidate/analysis-comparison-${randomUUID()}/history`)).status, 404)
     const chosen = selection(result.current.record, result.entries[0])
     const headers = { 'if-match': result.current.etag, 'idempotency-key': randomUUID() }
-    for (const action of ['retry', 'publish']) {
-      const body = action === 'retry' ? {} : chosen
+    for (const action of ['retry', 'publish', 'restart']) {
+      const body = action === 'retry' ? {} : action === 'restart' ? { confirmRestart: true } : chosen
       assert.equal((await http.request(`${base}/${action}`, 'POST', body, { role: 'viewer', headers })).status, 403)
       assert.equal((await http.request(`${base}/${action}`, 'POST', body, { headers: { ...headers, origin: 'https://evil.example' } })).status, 403)
       assert.equal((await http.request(`${base}/${action}`, 'POST', body, { headers: { 'idempotency-key': randomUUID() } })).status, 428)
@@ -665,8 +770,11 @@ test('HTTP history and actions enforce owner/editor membership, exact subjects, 
     const archived = await http.request(`${base}/history`, 'GET', undefined, { role: 'editor' })
     assert.equal(archived.status, 200)
     const history = await archived.json()
-    assert.deepEqual(history.capabilities, { canPublish: false, canRetry: false })
+    assert.deepEqual(history.capabilities, { canPublish: false, canRetry: false, canResume: false, canRestart: false })
     assert.equal((await http.request(`${base}/retry`, 'POST', {}, { headers: {
+      'if-match': history.etag, 'idempotency-key': randomUUID(),
+    } })).status, 409)
+    assert.equal((await http.request(`${base}/restart`, 'POST', { confirmRestart: true }, { headers: {
       'if-match': history.etag, 'idempotency-key': randomUUID(),
     } })).status, 409)
     assert.equal(f.mutationLeases.active, 0)

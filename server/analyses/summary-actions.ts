@@ -6,8 +6,8 @@ import {
 } from '../jobs/policy'
 import type { RealAnalysisNarrativeRecord } from '../../src/domain/analysis-narratives'
 import {
-  SUMMARY_PIPELINE_VERSION, publishSummaryDraftInputSchema,
-  type AnalysisSummaryHistoryEntry, type AnalysisSummarySubject, type PublishSummaryDraftInput,
+  SUMMARY_PIPELINE_VERSION, publishSummaryDraftInputSchema, restartSummaryInputSchema,
+  type AnalysisSummaryHistoryEntry, type AnalysisSummarySubject, type PublishSummaryDraftInput, type RestartSummaryInput,
 } from '../../src/domain/analysis-summary-history'
 import { conflict, invalidRequest, preconditionRequired } from '../errors'
 import { WORKSPACE_ID_PATTERN } from '../ids'
@@ -35,7 +35,7 @@ const actionReceiptSchema = z.strictObject({
   schemaVersion: z.literal(1), workspaceId: z.string().regex(WORKSPACE_ID_PATTERN),
   runId: z.string().refine(value => isAnalysisId(value, 'run')), targetId: analysisNarrativeTargetIdSchema,
   kind: z.enum(['candidate', 'target']), subjectId: z.string().min(1).max(200),
-  action: z.enum(['publish', 'retry']), requestId: z.string().uuid(), requestedBy: z.string().min(1).max(200),
+  action: z.enum(['publish', 'retry', 'restart']), requestId: z.string().uuid(), requestedBy: z.string().min(1).max(200),
   expectedEtag: z.string().min(1).max(1024), createdAt: z.iso.datetime({ precision: 3 }),
   manifestSha256: z.string().regex(/^[a-f0-9]{64}$/), inputFingerprint: z.string().regex(/^[a-f0-9]{64}$/),
   generationId: z.string().uuid(), previousGenerationId: z.string().uuid().nullable(),
@@ -109,7 +109,8 @@ function committed(state: SubjectState, receipt: ActionReceipt): boolean {
 function audit(receipt: ActionReceipt, selected?: AnalysisSummaryHistoryEntry): void {
   const event = {
     component: 'score-analysis-narrative', timestamp: receipt.createdAt,
-    event: receipt.action === 'publish' ? 'summary-manual-publication' : 'summary-retry',
+    event: receipt.action === 'publish' ? 'summary-manual-publication'
+      : receipt.action === 'restart' ? 'summary-restart' : 'summary-retry',
     pipelineVersion: SUMMARY_PIPELINE_VERSION, workspaceId: receipt.workspaceId, runId: receipt.runId,
     kind: receipt.kind, subjectId: receipt.subjectId, generationId: receipt.generationId, requestId: receipt.requestId,
     ...(selected ? { round: selected.round, draftGenerationId: selected.generationId,
@@ -146,7 +147,7 @@ async function executeSummaryAction(
   } else if (await deps.blobs.read(analysisNarrativeRequestBlobName(workspaceId, runId, requestId))) {
     throw conflict('This Idempotency-Key already belongs to a summary generation request.')
   }
-  if (state.etag !== expected) throw conflict('This summary changed. Reload its history before publishing or retrying.')
+  if (state.etag !== expected) throw conflict('This summary changed. Reload its history before changing it.')
   const resumeGeneration = action === 'retry' && state.current &&
     ['failed', 'cancelled'].includes(state.current.record.status) ? state.current.record : undefined
   if (resumeGeneration?.inputFingerprint && resumeGeneration.inputFingerprint !== state.inputFingerprint) {
@@ -157,9 +158,9 @@ async function executeSummaryAction(
   const selected = action === 'publish' ? await selectedDraft(deps, state, selection!) : undefined
   const processingSettings = receipt ? await resolveAcceptedProcessingSettings(settings, receipt.processingSettings)
     : resumeGeneration ? await resolveAcceptedProcessingSettings(settings, resumeGeneration.processingSettings)
-      : action === 'retry' ? await newWorkProcessingSettings(settings)
+      : action !== 'publish' ? await newWorkProcessingSettings(settings)
         : await resolveAcceptedProcessingSettings(settings, selected?.processingSettings)
-  if (action === 'retry' && !resumeGeneration && !receipt) assertNewWork(processingSettings, 'summaryGeneration')
+  if (action !== 'publish' && !resumeGeneration && !receipt) assertNewWork(processingSettings, 'summaryGeneration')
   const timestamp = narrativeTimestamp(state.inventory.run.record,
     new Date(Math.max(now().getTime(), Date.parse(state.current?.record.updatedAt ?? state.inventory.run.record.updatedAt))).toISOString())
   const planned: ActionReceipt = {
@@ -223,7 +224,7 @@ async function executeSummaryAction(
     delete record.attemptId
     delete record.error
     if (!waitingForInputs) delete record.waitingFor
-  } else if (action === 'retry') {
+  } else if (action !== 'publish') {
     if (subject.kind === 'candidate') {
       assertAnalysis(state.pair?.comparison?.status === 'complete' &&
         (!state.current || state.current.record.recordType === 'analysis-candidate-narrative'), 'Candidate retry requires its exact completed comparison.')
@@ -334,4 +335,15 @@ export function retryAnalysisSummary(
   settings?: ProcessingSettingsProvider,
 ) {
   return executeSummaryAction(deps, workspaceId, runId, subject, 'retry', requestId, expected, actor, now, undefined, settings)
+}
+
+export function restartAnalysisSummary(
+  deps: RealAnalysesDeps, workspaceId: string, runId: string, subject: AnalysisSummarySubject, input: RestartSummaryInput,
+  requestId: string, expected: string, actor: string, now: () => Date = () => new Date(),
+  settings?: ProcessingSettingsProvider,
+) {
+  if (!restartSummaryInputSchema.safeParse(input).success) {
+    throw invalidRequest('Confirm a new generation for this summary using current settings. Any existing attempt will be superseded.')
+  }
+  return executeSummaryAction(deps, workspaceId, runId, subject, 'restart', requestId, expected, actor, now, undefined, settings)
 }

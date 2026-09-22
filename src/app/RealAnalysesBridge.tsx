@@ -5,6 +5,7 @@ import type {
   RealAnalysisRunSummary, RealAnalysisTargetSummary,
 } from '../domain/real-analyses'
 import type { RealAnalysisSummariesResponse, RealAnalysisSummarySubjectResponse } from '../domain/analysis-narratives'
+import { analysisNarrativePollingRevision } from '../domain/analysis-narrative-work-health'
 import type { AnalysisSummaryHistoryPage, AnalysisSummarySubject, PublishSummaryDraftInput } from '../domain/analysis-summary-history'
 import * as api from '../services/realAnalyses'
 import { assertClientAdmission, clientAdmissionReason, usePublicSettings } from './public-settings-context'
@@ -301,7 +302,7 @@ function RealAnalysesProvider({ workspaceId, children }: { workspaceId: string; 
     if (!readableRun(value.runId) || !scope.accept(`narrative:${key}`, sequence)) return
     const selected = { runId: value.runId, ...(value.scope.targetId ? { targetId: value.scope.targetId } : {}) }
     narrativeScopes.current.set(key, selected)
-    backoff.record(`narratives:${key}`, value.revision)
+    backoff.record(`narratives:${key}`, analysisNarrativePollingRevision(value))
     putNarratives(key, { state: 'ready', value })
     if (!narrativeWorkActive(value)) narrativeProgress.current.delete(key)
     else if (activeAnalyses.current.has(value.runId) &&
@@ -357,7 +358,7 @@ function RealAnalysesProvider({ workspaceId, children }: { workspaceId: string; 
         throw new Error('The summary does not match this comparison’s exact saved job or grade. No other target was substituted.')
       }
       if (!scope.accept(`summary:${key}`, ticket.sequence)) return
-      backoff.record(ticket.key, value.revision)
+      backoff.record(ticket.key, analysisNarrativePollingRevision(value))
       putSummarySubject(key, { state: 'ready', value })
     } catch (caught) {
       if (!scope.current(ticket) || !readableRun(runId) || !scope.canAccept(`summary:${key}`, ticket.sequence)) return
@@ -733,7 +734,7 @@ function RealAnalysesProvider({ workspaceId, children }: { workspaceId: string; 
   }
 
   async function changeSummary(
-    runId: string, subject: AnalysisSummarySubject, action: 'publish' | 'retry', etag: string, input?: PublishSummaryDraftInput,
+    runId: string, subject: AnalysisSummarySubject, action: 'publish' | 'retry' | 'restart', etag: string, input?: PublishSummaryDraftInput,
   ): Promise<RealAnalysisSummariesResponse> {
     if (!mayReviewSummaries()) throw new Error('Only workspace owners and editors can review or change private summary drafts.')
     if (action === 'publish') {
@@ -747,8 +748,14 @@ function RealAnalysesProvider({ workspaceId, children }: { workspaceId: string; 
     const fingerprint = JSON.stringify([runId, subject.kind, subject.subjectId, action, input ?? null])
     const previous = narrativeRequests.current.get(fingerprint)
     if (!history || (!previous && history.etag !== etag)) throw new Error('Refresh this summary history and review the current draft before submitting.')
-    if (!previous && !history.capabilities[action === 'publish' ? 'canPublish' : 'canRetry']) {
+    if (!previous && !history.capabilities[action === 'publish' ? 'canPublish' : action === 'restart' ? 'canRestart' : 'canRetry']) {
       throw new Error('This summary action is not currently permitted. Refresh its history and check access or lifecycle status.')
+    }
+    if (action === 'restart' && !previous) {
+      assertClientAdmission(policyRef.current, 'summaryGeneration')
+      if (featuresRef.current?.analysisSummaryGeneration !== true) {
+        throw new Error('The summary generation service is unavailable. Existing saved summaries remain readable.')
+      }
     }
     // An uncertain acknowledgement keeps the exact intent, key and original ETag, even after a status refresh.
     const request = previous ?? { key: crypto.randomUUID(), etag, runId }
@@ -757,7 +764,9 @@ function RealAnalysesProvider({ workspaceId, children }: { workspaceId: string; 
       try {
         return action === 'publish' && input
           ? await api.publishRealAnalysisSummaryDraft(workspaceId, runId, subject, input, request.etag, request.key, history.targetId)
-          : await api.retryRealAnalysisSummary(workspaceId, runId, subject, request.etag, request.key, history.targetId)
+          : action === 'restart'
+            ? await api.restartRealAnalysisSummary(workspaceId, runId, subject, request.etag, request.key, history.targetId)
+            : await api.retryRealAnalysisSummary(workspaceId, runId, subject, request.etag, request.key, history.targetId)
       } catch (caught) {
         if (caught instanceof CloudApiError && caught.status >= 400 && caught.status < 500 && ![408, 429].includes(caught.status)) {
           narrativeRequests.current.delete(fingerprint)
@@ -849,6 +858,7 @@ function RealAnalysesProvider({ workspaceId, children }: { workspaceId: string; 
     },
     publishSummaryDraft: (runId, subject, input, etag) => changeSummary(runId, subject, 'publish', etag, input),
     retrySummary: (runId, subject, etag) => changeSummary(runId, subject, 'retry', etag),
+    restartSummary: (runId, subject, etag) => changeSummary(runId, subject, 'restart', etag),
     pending: (id) => scope.pending(id ? `run:${id}` : '$create'),
     requestKey: (input) => {
       const fingerprint = JSON.stringify(input)

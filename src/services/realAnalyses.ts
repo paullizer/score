@@ -25,6 +25,7 @@ import {
   type GenerateRealAnalysisSummariesInput, type RealAnalysisSummariesMutationResponse,
   type RealAnalysisSummariesQuery, type RealAnalysisSummariesResponse, type RealAnalysisSummarySubjectResponse,
 } from '../domain/analysis-narratives'
+import { analysisNarrativeWorkHealthSchema } from '../domain/analysis-narrative-validation'
 import {
   ANALYSIS_DIAGNOSTIC_LIMITS, ANALYSIS_DIAGNOSTIC_REASONS,
   type AnalysisFailureDiagnostic, type RealAnalysisDiagnosticsPage,
@@ -32,7 +33,7 @@ import {
 import {
   SUMMARY_LIMITS, publishSummaryDraftInputSchema, summaryApprovalSchema, summaryCandidateContentSchema,
   summaryDiagnosticSchema, summaryHistoryPageSchema, summaryTargetContentSchema,
-  type AnalysisSummaryHistoryPage, type AnalysisSummarySubject, type PublishSummaryDraftInput,
+  type AnalysisSummaryHistoryPage, type AnalysisSummarySubject, type PublishSummaryDraftInput, type RestartSummaryInput,
 } from '../domain/analysis-summary-history'
 import type { Citation } from '../domain/types'
 import { cloudJsonRequest, cloudJsonResponse, cloudLifecycleRequest } from './cloudWorkspace'
@@ -104,6 +105,7 @@ const narrativeState = z.object({
   attempts: z.number().int().min(0), retryCount: z.number().int().min(0),
   nextAttemptAt: narrativeId.nullable(), updatedAt: narrativeId.nullable(),
   hasHistory: z.boolean().optional(), summaryRound: z.number().int().min(1).max(SUMMARY_LIMITS.rounds).optional(),
+  workHealth: analysisNarrativeWorkHealthSchema.optional(),
   error: z.object({
     code: z.enum(['invalid-input', 'stale-input', 'snapshot-unavailable', 'snapshot-invalid', 'context-limit', 'invalid-model-output',
       'invalid-citation', 'grounding-failed', 'service-unavailable', 'storage-error', 'timeout', 'internal-error', 'dependency-failed']),
@@ -123,6 +125,7 @@ const targetSummary = narrativeState.extend({
 const summarySubjectBase = z.object({
   schemaVersion: z.literal(1), dataKind: z.literal('real'), workspaceId: narrativeId, runId: narrativeId,
   subjectId: narrativeId, revision: narrativeHash, etag: narrativeId,
+  workRevision: narrativeHash.optional(),
   resultRevisionId: z.union([z.literal('original'), z.string().uuid()]).optional(),
 })
 const summarySubjectEnvelope: z.ZodType<RealAnalysisSummarySubjectResponse> = z.discriminatedUnion('kind', [
@@ -132,6 +135,7 @@ const summarySubjectEnvelope: z.ZodType<RealAnalysisSummarySubjectResponse> = z.
 const summariesEnvelope: z.ZodType<RealAnalysisSummariesResponse> = z.object({
   schemaVersion: z.literal(1), dataKind: z.literal('real'), workspaceId: narrativeId, runId: narrativeId,
   scope: narrativeScope, revision: narrativeHash, etag: narrativeId, ready: z.boolean(),
+  workRevision: narrativeHash.optional(),
   scoring: z.object({
     total: narrativeCount, initialized: narrativeCount, queued: narrativeCount, running: narrativeCount,
     complete: narrativeCount, failed: narrativeCount, cancelled: narrativeCount,
@@ -288,7 +292,8 @@ export async function getRealAnalysisSummaryHistory(
   if (!parsed.success) throw new Error('The summary service returned invalid private history. No draft was substituted.')
   const page = parsed.data
   if (page.workspaceId !== workspaceId || page.runId !== runId || page.kind !== subject.kind || page.subjectId !== subject.subjectId ||
-    page.resultRevisionId !== resultRevisionId || Boolean(resultRevisionId && (page.capabilities.canPublish || page.capabilities.canRetry)) ||
+    page.resultRevisionId !== resultRevisionId || Boolean(resultRevisionId &&
+      (page.capabilities.canPublish || page.capabilities.canRetry || page.capabilities.canResume || page.capabilities.canRestart)) ||
     new Set(page.entries.map(entry => entry.id)).size !== page.entries.length ||
     new Set(page.entries.map(entry => entry.targetId)).size > 1 ||
     page.entries.some(entry => entry.workspaceId !== workspaceId || entry.runId !== runId || entry.kind !== subject.kind ||
@@ -302,8 +307,8 @@ export async function getRealAnalysisSummaryHistory(
 }
 
 async function mutateSummarySubject(
-  workspaceId: string, runId: string, subject: AnalysisSummarySubject, action: 'publish' | 'retry',
-  input: PublishSummaryDraftInput | Record<string, never>, etag: string, key: string, targetId: string,
+  workspaceId: string, runId: string, subject: AnalysisSummarySubject, action: 'publish' | 'retry' | 'restart',
+  input: PublishSummaryDraftInput | RestartSummaryInput | Record<string, never>, etag: string, key: string, targetId: string,
 ): Promise<RealAnalysisSummariesResponse> {
   const path = summarySubjectPath(workspaceId, runId, subject)
   checkedSummaryScope(workspaceId, runId, { targetId })
@@ -335,6 +340,12 @@ export function retryRealAnalysisSummary(
   workspaceId: string, runId: string, subject: AnalysisSummarySubject, etag: string, key: string, targetId: string,
 ): Promise<RealAnalysisSummariesResponse> {
   return mutateSummarySubject(workspaceId, runId, subject, 'retry', {}, etag, key, targetId)
+}
+
+export function restartRealAnalysisSummary(
+  workspaceId: string, runId: string, subject: AnalysisSummarySubject, etag: string, key: string, targetId: string,
+): Promise<RealAnalysisSummariesResponse> {
+  return mutateSummarySubject(workspaceId, runId, subject, 'restart', { confirmRestart: true }, etag, key, targetId)
 }
 
 export async function fetchAnalysisProcessingFeatures(signal?: AbortSignal): Promise<AnalysisProcessingFeatures> {

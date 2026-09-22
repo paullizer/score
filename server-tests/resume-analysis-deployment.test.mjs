@@ -6,7 +6,7 @@ import { join } from 'node:path'
 import test from 'node:test'
 import {
   WORD_WORKER_ARTIFACTS, WORD_WORKER_CAPABILITY, WORD_WORKER_EXTRACTION_VERSION, RUNTIME_SETTINGS_VERSION, SETTINGS_WORKER_RUNTIMES, WORKER_DEFINITIONS, configureScheduledWorker, configureWorkerDeployment,
-  disableEvidenceCorrectionAdmission, disableRuntimeSettingsAdmission, disableWordAdmission, prepareWebDeployment, validateFeatureSettings, validateRendererTemplate, validateWorkerImage, validateWorkerTemplate, verifyWordWorkerReadiness,
+  disableEvidenceCorrectionAdmission, disableRuntimeSettingsAdmission, disableWordAdmission, prepareWebDeployment, validateFeatureSettings, validateRendererTemplate, validateWorkerImage, validateWorkerModelDeployment, validateWorkerTemplate, verifyWordWorkerReadiness,
   wordWorkerVerificationArgs,
 } from '../scripts/azure-worker.mjs'
 
@@ -131,6 +131,68 @@ test('Azure resource-ID casing does not change worker identity ownership', () =>
     validateWorkerTemplate(env, value, definition)
     value.properties.configuration.registries[0].identity = identity.replace('/score-test/', '/another-group/')
     assert.throws(() => validateWorkerTemplate(env, value, definition), /dedicated identity/)
+  }
+})
+
+test('bootstrap model drift is not reported as dedicated store or identity drift and never rewrites the template', () => {
+  for (const definition of WORKER_DEFINITIONS) {
+    for (const field of ['RUBRIC_MODEL_ENDPOINT', 'RUBRIC_MODEL_DEPLOYMENT', 'RUBRIC_MODEL_NAME', 'RUBRIC_MODEL_REASONING_EFFORT']) {
+      for (const change of [
+        entries => { entries.find(setting => setting.name === field).value = 'PRIVATE-BOOTSTRAP-SENTINEL' },
+        entries => { entries.find(setting => setting.name === field).value = 12 },
+        entries => { entries.find(setting => setting.name === field).secretRef = 'PRIVATE-BOOTSTRAP-SENTINEL' },
+        entries => { entries.push({ ...entries.find(setting => setting.name === field) }) },
+        entries => { entries.splice(entries.findIndex(setting => setting.name === field), 1) },
+      ]) {
+        const value = template(definition)
+        change(value.properties.template.containers[0].env)
+        const before = structuredClone(value)
+        assert.throws(() => validateWorkerTemplate(env, value, definition), error => {
+          assert.match(error.message, /model\/bootstrap drift/)
+          assert.ok(error.message.includes(field))
+          assert.match(error.message, /declared infrastructure bootstrap.*Admin settings/)
+          assert.doesNotMatch(error.message, /PRIVATE-BOOTSTRAP-SENTINEL/)
+          return true
+        })
+        assert.deepEqual(value, before)
+      }
+    }
+    for (const field of [definition.recordsSetting, definition.sourcesSetting, 'AZURE_CLIENT_ID']) {
+      const value = template(definition)
+      value.properties.template.containers[0].env.find(setting => setting.name === field).value = 'PRIVATE-BOUNDARY-SENTINEL'
+      assert.throws(() => validateWorkerTemplate(env, value, definition), error => {
+        assert.match(error.message, /dedicated .* stores, identity/)
+        assert.doesNotMatch(error.message, /model\/bootstrap drift|PRIVATE-BOUNDARY-SENTINEL/)
+        return true
+      })
+    }
+  }
+})
+
+test('ARM deployment metadata must match both the declared bootstrap deployment and actual model', () => {
+  const deployment = {
+    name: 'job-rubric',
+    properties: { provisioningState: 'Succeeded', model: { name: 'gpt-5-mini', version: '2025-08-07' } },
+  }
+  validateWorkerModelDeployment(env, deployment)
+  for (const value of [
+    { ...deployment, name: 'gpt-5.6-luna' },
+    { ...deployment, properties: { ...deployment.properties, model: { name: 'gpt-5.6-luna' } } },
+    { ...deployment, properties: { ...deployment.properties, model: undefined } },
+    { ...deployment, properties: { ...deployment.properties, model: { name: 'PRIVATE-MODEL-SENTINEL' } } },
+  ]) {
+    assert.throws(() => validateWorkerModelDeployment(env, value), error => {
+      assert.match(error.message, /bootstrap deployment\/model pairing/)
+      assert.match(error.message, /descriptive model name does not select another deployment/)
+      assert.match(error.message, /Admin settings/)
+      assert.doesNotMatch(error.message, /PRIVATE-MODEL-SENTINEL/)
+      return true
+    })
+  }
+  assert.throws(() => validateWorkerModelDeployment({ ...env, AZURE_RUBRIC_MODEL_DEPLOYMENT: 'another-deployment' }, deployment),
+    /bootstrap deployment\/model pairing/)
+  for (const value of [undefined, {}, { ...deployment, properties: { ...deployment.properties, provisioningState: 'Updating' } }]) {
+    assert.throws(() => validateWorkerModelDeployment(env, value), /bootstrap model deployment must finish provisioning/)
   }
 })
 
@@ -542,7 +604,13 @@ function rolloutHarness(options = {}) {
         return { properties: { resource: { id, partitionKey: { paths: [partition] } } } }
       }
       if (path.includes('/Microsoft.Storage/')) return { properties: { publicAccess: 'None' } }
-      if (path.includes('/Microsoft.CognitiveServices/')) return { properties: { provisioningState: 'Succeeded' } }
+      if (path.includes('/Microsoft.CognitiveServices/')) return {
+        ...(path.includes('/deployments/') ? { name: env.AZURE_RUBRIC_MODEL_DEPLOYMENT } : {}),
+        properties: {
+          provisioningState: 'Succeeded',
+          ...(path.includes('/deployments/') ? { model: { name: 'gpt-5-mini', version: '2025-08-07' } } : {}),
+        },
+      }
       throw new Error(`Unexpected mocked management request: ${method} ${path}`)
     },
   }
@@ -567,6 +635,55 @@ test('Word is disabled before any shared consumer changes and enabled only after
   }
   assert.equal(settings().REAL_JOB_IMPORTS_ENABLED, 'true')
   assert.equal(settings().CUSTOM_EXISTING_SETTING, 'unchanged')
+})
+
+test('ARM bootstrap mismatch blocks image changes while preserving correction-gate cleanup', async () => {
+  for (const metadata of [
+    { name: 'job-rubric', properties: { provisioningState: 'Succeeded', model: { name: 'gpt-5.6-luna' } } },
+    { name: 'gpt-5.6-luna', properties: { provisioningState: 'Succeeded', model: { name: 'gpt-5-mini' } } },
+    { name: 'job-rubric', properties: { provisioningState: 'Succeeded' } },
+  ]) {
+    const { hooks, operations, pins, workers, settings } = rolloutHarness()
+    const originals = new Map([...workers].map(([kind, worker]) => [kind, structuredClone(worker)]))
+    const send = hooks.request
+    let reads = 0
+    hooks.request = async (...args) => {
+      const url = new URL(args[2])
+      if (url.pathname.includes('/Microsoft.CognitiveServices/accounts/score-ai/deployments/')) {
+        assert.equal(args[3] ?? 'GET', 'GET')
+        assert.equal(url.pathname.split('/').at(-1), env.AZURE_RUBRIC_MODEL_DEPLOYMENT)
+        assert.equal(url.searchParams.get('api-version'), '2025-06-01')
+        reads++
+        return metadata
+      }
+      return send(...args)
+    }
+    await assert.rejects(configureWorkerDeployment(env, {}, { image, rendererImage }, hooks), /bootstrap deployment\/model pairing/)
+    assert.equal(reads, 1)
+    assert.ok(operations.every(operation => operation.action === 'settings' ||
+      (operation.action === 'worker' && operation.kind === 'analysis' && operation.corrections === 'false')))
+    assert.equal(settings().WORD_DOCUMENT_IMPORTS_ENABLED, 'false')
+    assert.equal(settings().SCORE_RUNTIME_SETTINGS_ENABLED, 'false')
+    assert.equal(settings().ANALYSIS_EVIDENCE_CORRECTIONS_ENABLED, 'false')
+    assert.equal(settings().CUSTOM_EXISTING_SETTING, 'unchanged')
+    for (const definition of WORKER_DEFINITIONS) {
+      assert.equal(pins.get(definition.imageKey), `${definition.kind}-previous-pin`)
+      const current = structuredClone(workers.get(definition.kind))
+      const original = originals.get(definition.kind)
+      if (definition.kind === 'analysis') {
+        assert.equal(current.properties.template.containers[0].env.find(setting =>
+          setting.name === 'ANALYSIS_EVIDENCE_CORRECTIONS_ENABLED')?.value, 'false')
+        for (const worker of [current, original]) {
+          worker.properties.template.containers[0].env = worker.properties.template.containers[0].env.filter(setting =>
+            setting.name !== 'ANALYSIS_EVIDENCE_CORRECTIONS_ENABLED')
+        }
+      }
+      assert.deepEqual(current.properties, original.properties)
+      assert.deepEqual(current.identity, original.identity)
+      assert.equal(current.location, original.location)
+      assert.deepEqual(current.tags, original.tags)
+    }
+  }
 })
 
 test('complete deployment always enables both correction gates, ignoring saved false opt-ins', async () => {

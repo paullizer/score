@@ -3,9 +3,12 @@ import { LoaderCircle, RefreshCw, RotateCcw } from 'lucide-react'
 import { useRealAnalyses } from '../../app/real-analyses-context'
 import { clientAdmissionReason, usePublicSettings } from '../../app/public-settings-context'
 import type {
-  AnalysisNarrativeCounts, AnalysisNarrativeGenerationMode, RealAnalysisCandidateNarrativeSummary,
+  AnalysisNarrativeCounts, AnalysisNarrativeGenerationMode, AnalysisNarrativeSummaryBase, RealAnalysisCandidateNarrativeSummary,
   RealAnalysisSummariesResponse, RealAnalysisTargetNarrativeSummary,
 } from '../../domain/analysis-narratives'
+import {
+  analysisNarrativeDisplayWorkState, analysisNarrativeWorkCounts, analysisNarrativeWorkLabel,
+} from '../../domain/analysis-narrative-work-health'
 import type { RealAnalysisRunDetail, RealAnalysisTargetSummary } from '../../domain/real-analyses'
 import type { AnalysisSummarySubject } from '../../domain/analysis-summary-history'
 import { dateLabel } from '../../domain/selectors'
@@ -44,13 +47,19 @@ function useSavedSummarySubject(runId: string, kind: AnalysisSummarySubject['kin
   return entry
 }
 
-function SummaryCounts({ label, counts }: { label: string; counts: AnalysisNarrativeCounts }) {
+function SummaryCounts({ label, counts, summaries }: {
+  label: string; counts: AnalysisNarrativeCounts; summaries: readonly AnalysisNarrativeSummaryBase[]
+}) {
   const required = counts.total - counts.notRequired
+  const work = analysisNarrativeWorkCounts(summaries)
   return <section aria-label={label} className="space-y-2">
     <h3 className="text-[12px] font-semibold">{label}: {counts.ready} / {required} current and ready</h3>
     <progress className="summary-progress" max={Math.max(1, required)} value={counts.ready} aria-label={`${label} ready`} />
-    <p className="text-[11px] text-muted">{counts.missing} missing · {counts.waiting} waiting · {counts.queued + counts.running} generating
-      {' '}({counts.queued} queued, {counts.running} running) · {counts.stale} outdated · {counts.failed} failed · {counts.cancelled} cancelled</p>
+    <p className="text-[11px] text-muted">{counts.missing} missing · {work['waiting-prerequisites']} waiting for prerequisites
+      {' '}· {work.running} active · {work['awaiting-worker']} queued awaiting worker · {work.throttled} cooldown
+      {' '}· {work['retry-scheduled']} retry scheduled · {work.interrupted} interrupted
+      {work['unverified-running'] > 0 && <> · {work['unverified-running']} running with unverified lease</>}
+      {' '}· {counts.stale} outdated · {counts.failed} failed · {counts.cancelled} cancelled</p>
     {counts.notRequired > 0 && <p className="text-[11px] text-muted">{counts.notRequired} not required because no completed assessment is available.</p>}
   </section>
 }
@@ -62,12 +71,56 @@ export function AnalysisSummaryStatus({ summaries }: { summaries: RealAnalysisSu
   const rounds = [...new Set([...summaries.comparisons, ...summaries.targets]
     .filter(item => ['queued', 'running'].includes(item.status) && item.summaryRound !== undefined).map(item => item.summaryRound))]
   return <div className="space-y-4" aria-label="Summary readiness" aria-live="polite">
-    <SummaryCounts label="Candidate summaries" counts={summaries.counts.candidates} />
-    <SummaryCounts label="Job / grade overviews" counts={summaries.counts.targets} />
+    <SummaryCounts label="Candidate summaries" counts={summaries.counts.candidates} summaries={summaries.comparisons} />
+    <SummaryCounts label="Job / grade overviews" counts={summaries.counts.targets} summaries={summaries.targets} />
     {rounds.length > 0 && <p className="text-[12px] text-muted">Summary checks: {rounds.sort().map(round => `round ${round}`).join(' · ')}. Each operation retains its captured review budget.</p>}
     {pending > 0 && <p className="text-[12px] text-muted">{pending} {pending === 1 ? 'comparison is' : 'comparisons are'} still awaiting or undergoing scoring in this scope. Overviews wait for selected scoring and candidate summaries to finish.</p>}
     {uninitialized > 0 && <p className="text-[11px] text-muted">Not initialized yet: {uninitialized} (included in the waiting count).</p>}
     {(scoring.failed > 0 || scoring.cancelled > 0) && <p className="text-[11px] text-muted">{scoring.failed} failed and {scoring.cancelled} cancelled comparisons remain unassessed, not unsuccessful candidates.</p>}
+  </div>
+}
+
+function workTime(value: string): string {
+  return new Date(value).toLocaleString(undefined, {
+    year: 'numeric', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit', second: '2-digit', timeZoneName: 'short',
+  })
+}
+
+function summaryErrorText(narrative: AnalysisNarrativeSummaryBase): string {
+  if (!narrative.error) return ''
+  const { error } = narrative
+  const status = error.diagnostic?.httpStatus ? ` (HTTP ${error.diagnostic.httpStatus})` : ''
+  return `${analysisNarrativeDisplayWorkState(narrative) === 'failed' ? 'Failure' : 'Last attempt'}: ${error.message}${status} ` +
+    `[${error.stage} / ${error.code}]. Retry summary work, not scoring.`
+}
+
+function SummaryWorkDetails({ narrative, showError = true }: { narrative: AnalysisNarrativeSummaryBase; showError?: boolean }) {
+  const health = narrative.workHealth
+  const state = analysisNarrativeDisplayWorkState(narrative)
+  const lastActivity = health?.lastActivityAt ?? narrative.updatedAt
+  const nextEligibleAt = health?.nextEligibleAt ?? narrative.nextAttemptAt
+  return <div className="space-y-1 text-[11px] text-muted">
+    {state === 'waiting-prerequisites' && <p>{narrative.waitingFor === 'scoring'
+      ? 'Waiting for this target’s assessments or reviewed corrections to finish.'
+      : 'Waiting for this target’s completed candidate summaries.'}</p>}
+    {state === 'awaiting-worker' && <p>Eligible work is queued but has not been claimed by a worker. Queue age alone does not establish worker availability.</p>}
+    {state === 'interrupted' && <p>The recorded worker lease expired. A worker can reclaim eligible work; this is not confirmed active generation.</p>}
+    {state === 'unverified-running' && <p>This response has no lease metadata. Refresh status to check whether a worker still owns the attempt.</p>}
+    {lastActivity && <p>Last activity <time dateTime={lastActivity}>{workTime(lastActivity)}</time> · attempt {health?.attempt ?? narrative.attempts}</p>}
+    {health?.requestedAt && <p>Requested <time dateTime={health.requestedAt}>{workTime(health.requestedAt)}</time></p>}
+    {health?.leaseExpiresAt && ['running', 'interrupted'].includes(state) && <p>
+      {state === 'interrupted' ? 'Lease expired' : 'Worker lease valid until'} <time dateTime={health.leaseExpiresAt}>{workTime(health.leaseExpiresAt)}</time>
+    </p>}
+    {nextEligibleAt && ['throttled', 'retry-scheduled', 'awaiting-worker'].includes(state) && <p>
+      {state === 'awaiting-worker' ? 'Eligible since' : 'Next retry no earlier than'} <time dateTime={nextEligibleAt}>{workTime(nextEligibleAt)}</time>.
+      {' '}A worker must claim the work before it can progress.
+    </p>}
+    {health && <p>Captured settings revision: {health.capturedSettings.revision}.
+      {' '}{health.capturedSettings.modelName ? <>Accepted generator: {health.capturedSettings.modelName}
+        {health.capturedSettings.reasoningEffort ? ` (${health.capturedSettings.reasoningEffort} reasoning)` : ''}.</>
+        : 'Legacy work has no model identity recorded here.'}</p>}
+    {showError && narrative.error && (state === 'failed' ? <InlineError>{summaryErrorText(narrative)}</InlineError>
+      : <p>{summaryErrorText(narrative)}</p>)}
   </div>
 }
 
@@ -97,7 +150,8 @@ export function ManageAnalysisSummaries({ detail, open, initialTargetId, onOpenC
   const summaries = entry?.state === 'ready' ? entry.value : null
   const pending = submitting || Boolean(api?.pending(detail.run.id))
   const loadingError = entry?.state === 'error' || entry?.state === 'ready' ? entry.error : undefined
-  const generating = summaries ? [summaries.counts.candidates, summaries.counts.targets].some((count) => count.queued + count.running > 0) : false
+  const pendingRequests = summaries ? [summaries.counts.candidates, summaries.counts.targets].some((count) => count.queued + count.running > 0) : false
+  const work = analysisNarrativeWorkCounts(summaries ? [...summaries.comparisons, ...summaries.targets] : [])
   const needsSummaries = summaries ? [summaries.counts.candidates, summaries.counts.targets]
     .some((count) => count.missing + count.stale + count.failed + count.cancelled > 0) : false
   const waiting = summaries ? [summaries.counts.candidates, summaries.counts.targets].some((count) => count.waiting > 0) : false
@@ -107,7 +161,7 @@ export function ManageAnalysisSummaries({ detail, open, initialTargetId, onOpenC
     : clientAdmissionReason(policy, 'summaryGeneration') ?? (api.features?.analysisSummaryGeneration !== true ? capabilityReasons['service-unavailable']
     : summaries?.capabilities.reason ? capabilityReasons[summaries.capabilities.reason] : '')
   const allowed = Boolean(api?.phase === 'ready' && summaries?.capabilities.canGenerate && canEdit && api.canWrite &&
-    !loadingError && !permission && !pending && !generating && summaries.scoring.complete > 0)
+    !loadingError && !permission && !pending && !pendingRequests && summaries.scoring.complete > 0)
   useEffect(() => {
     if (!open) return
     setTargetId(initialTargetId ?? '')
@@ -128,7 +182,7 @@ export function ManageAnalysisSummaries({ detail, open, initialTargetId, onOpenC
       const result = await api.generateSummaries(detail.run.id, { mode, ...(targetId ? { targetId } : {}) }, summaries.etag)
       if (lifetime.current !== currentLifetime) return
       setConfirmAll(false)
-      setSuccess(`Summary request acknowledged: ${result.scheduled.candidates} candidate summaries and ${result.scheduled.targets} job / grade overviews scheduled. Work continues on the server if you close this dialog or browser.`)
+      setSuccess(`Summary request acknowledged: ${result.scheduled.candidates} candidate summaries and ${result.scheduled.targets} job / grade overviews scheduled. The request is saved if you close this dialog or browser; progress requires an available worker.`)
     } catch (caught) {
       if (lifetime.current !== currentLifetime) return
       setError(caught instanceof Error ? caught.message : 'The summary request could not be acknowledged. Refresh status before retrying.')
@@ -141,11 +195,12 @@ export function ManageAnalysisSummaries({ detail, open, initialTargetId, onOpenC
   const labels = detail.targets.map((target) => `${targetNames.get(target.id)} / ${targetVersionLabel(target.selection)}`)
   const summaryLabel = (item: RealAnalysisCandidateNarrativeSummary | RealAnalysisTargetNarrativeSummary) =>
     item.kind === 'candidate' ? `Candidate summary (${item.comparisonId})` : `Overview (${targetNames.get(item.targetId) ?? item.targetId})`
-  const failures = new Map<string, (RealAnalysisCandidateNarrativeSummary | RealAnalysisTargetNarrativeSummary)[]>()
+  const affected = new Map<string, (RealAnalysisCandidateNarrativeSummary | RealAnalysisTargetNarrativeSummary)[]>()
   for (const item of summaries ? [...summaries.comparisons, ...summaries.targets] : []) {
-    if (!item.error) continue
-    const key = JSON.stringify([item.error.code, item.error.stage, item.error.message])
-    failures.set(key, [...(failures.get(key) ?? []), item])
+    const state = analysisNarrativeDisplayWorkState(item)
+    if (state === 'inactive' && !item.error) continue
+    const key = JSON.stringify([state, item.error?.code, item.error?.stage, item.error?.message, item.error?.diagnostic?.httpStatus])
+    affected.set(key, [...(affected.get(key) ?? []), item])
   }
   return <Modal open={open} onOpenChange={onOpenChange} title="Manage summaries"
     description="Update narrative text for this saved analysis, without rerunning scoring or changing frozen evidence."
@@ -170,18 +225,20 @@ export function ManageAnalysisSummaries({ detail, open, initialTargetId, onOpenC
       {summaries ? <AnalysisSummaryStatus summaries={summaries} /> : !loadingError && <p className="flex items-center gap-2 text-[12px]" role="status">
         <LoaderCircle size={15} className="animate-spin" aria-hidden="true" />Loading saved summary status...</p>}
       {permission && <p className="text-[12px]" role="status">{permission}</p>}
-      {(generating || waiting) && <p className="text-[12px]" role="status">{generating ? 'Summaries are generating' : 'Summaries are waiting for prerequisites'}. Progress updates independently of scoring. Server work continues after the browser closes.</p>}
+      {work.running > 0 && <p className="text-[12px]" role="status">{work.running} {work.running === 1 ? 'summary has' : 'summaries have'} an active worker lease. Other queued, deferred, or interrupted summaries are listed separately below.</p>}
+      {(pendingRequests || waiting) && <p className="text-[12px]" role="status">Summary requests are saved on the server. Queued work requires an available worker; cooldowns and prerequisites must clear before it can start. Review each subject below rather than replacing every ready summary.</p>}
       {summaries?.ready && !loadingError && <p className="text-[12px]" role="status">All required summaries in this scope are current and ready.</p>}
       {(loadingError || error) && <InlineError>{error || loadingError}
         <p className="mt-2">If acknowledgement was interrupted, repeating the same action reuses its request key rather than starting a duplicate generation.</p>
       </InlineError>}
-      {failures.size > 0 && <div className="space-y-3">
-        {[...failures].map(([key, items]) => <section key={key} className="space-y-3 rounded-lg border p-3" aria-label="Affected summaries">
-          <InlineError>{items[0].error?.message} {items.length} {items.length === 1 ? 'summary affected' : 'summaries affected'}.
-            {' '}Retry summary work, not scoring.</InlineError>
-          <details><summary className="cursor-pointer text-[12px] font-semibold">Show affected summaries and history ({items.length})</summary>
+      {affected.size > 0 && <div className="space-y-3">
+        {[...affected].map(([key, items]) => <section key={key} className="space-y-3 rounded-lg border p-3" aria-label="Affected summaries">
+          <h3 className="text-[12px] font-semibold">{analysisNarrativeWorkLabel(items[0])}: {items.length} {items.length === 1 ? 'summary' : 'summaries'}.</h3>
+          {items[0].error && <InlineError>{summaryErrorText(items[0])}</InlineError>}
+          <details open={items.length <= 4 && analysisNarrativeDisplayWorkState(items[0]) !== 'failed'}><summary className="cursor-pointer text-[12px] font-semibold">Show affected summaries and history ({items.length})</summary>
             <ul className="mt-3 space-y-3">{items.map(item => <li key={`${targetId}:${item.kind}:${item.kind === 'candidate' ? item.comparisonId : item.targetId}`} className="space-y-2">
               <p className="text-[12px]">{summaryLabel(item)}{item.summaryRound !== undefined ? ` · round ${item.summaryRound}` : ''}</p>
+              <SummaryWorkDetails narrative={item} showError={false} />
               <SummaryHistoryControl runId={detail.run.id} narrative={item} label={summaryLabel(item)} />
             </li>)}</ul>
           </details>
@@ -218,9 +275,10 @@ function NarrativeContent({ runId, narrative, loadError }: {
   const { settings } = usePublicSettings()
   const updating = ['waiting', 'queued', 'running'].includes(narrative.status)
   const ready = narrative.status === 'ready' && !loadError
-  const label = loadError ? 'Current status unavailable' : ({
-    missing: 'Missing summary', waiting: 'Waiting', queued: 'Queued', running: 'Generating', ready: 'Current summary',
-    stale: 'Outdated', failed: 'Summary failed', cancelled: 'Summary cancelled', 'not-required': 'No completed assessment',
+  const label = loadError ? 'Current status unavailable' : updating ? analysisNarrativeWorkLabel(narrative) : ({
+    missing: 'Missing summary', ready: 'Current summary', stale: 'Outdated', failed: 'Summary failed',
+    cancelled: 'Summary cancelled', 'not-required': 'No completed assessment',
+    waiting: 'Waiting for prerequisites', queued: 'Queued - awaiting worker', running: 'Running - lease status unavailable',
   })[narrative.status]
   return <div className="space-y-3">
     <Badge tone={ready ? 'success' : narrative.status === 'failed' ? 'danger' : 'warning'}>{label}</Badge>
@@ -234,10 +292,7 @@ function NarrativeContent({ runId, narrative, loadError }: {
     </> : <p className="text-[12px] text-muted">{narrative.status === 'not-required'
       ? 'No completed assessment is available to summarize.'
       : 'No published summary is available. Use Manage summaries above to generate narratives from the saved evidence without rescoring.'}</p>}
-    {narrative.waitingFor && <p className="text-[11px] text-muted">{narrative.waitingFor === 'scoring'
-      ? 'Waiting for this target’s assessments or reviewed corrections to finish.' : 'Waiting for this target’s completed candidate summaries.'}</p>}
-    {narrative.nextAttemptAt && <p className="text-[11px] text-muted">Automatic summary retry {dateLabel(narrative.nextAttemptAt)}</p>}
-    {narrative.error && <InlineError>{narrative.error.message} Previous published text, if any, is retained. Retry summary work in Manage summaries.</InlineError>}
+    {(updating || narrative.status === 'failed' || narrative.error) && <SummaryWorkDetails narrative={narrative} />}
     <SummaryHistoryControl runId={runId} narrative={narrative} label={narrative.kind === 'candidate' ? 'Candidate summary' : 'Job / grade overview'} />
   </div>
 }

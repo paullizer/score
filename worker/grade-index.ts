@@ -14,6 +14,7 @@ import { loadGradeWorkerConfig, type GradeWorkerConfig } from './grades/config'
 import { draftGradeRubric, planGradeCompetencies, reviewGradeRubric } from './grades/model'
 import { GradeWorkerError, runGradeWorker, type GradeWorkerDependencies } from './grades/runtime'
 import { createAzureWorkerSettings } from './settings-store'
+import { workerFailureDiagnostic, workerStartupFailure, withWorkerSettingsDiagnostics, type WorkerStartupPhase } from './startup'
 
 export { loadGradeWorkerConfig } from './grades/config'
 export { runGradeWorker } from './grades/runtime'
@@ -33,7 +34,7 @@ export function createGradeWorkerDependencies(config: GradeWorkerConfig, credent
     getToken: (scope: string) => getToken(credential, scope),
   }
   return {
-    settings: createAzureWorkerSettings(config, credential, model),
+    settings: withWorkerSettingsDiagnostics(createAzureWorkerSettings(config, credential, model)),
     store: createAzureGradeStore(config.stores, credential),
     blobs: createAzureGradeBlobStore(config.stores, credential),
     discover: discoverOpmSources,
@@ -65,18 +66,25 @@ export async function main(): Promise<void> {
   const stop = () => stopping.abort()
   process.once('SIGTERM', stop)
   process.once('SIGINT', stop)
+  let phase: WorkerStartupPhase = 'configuration'
   try {
     const config = loadGradeWorkerConfig(process.env)
+    phase = 'identity'
     let credential: TokenCredential
     if (config.localDevelopment) credential = new AzureCliCredential({ tenantId: config.tenantId })
     else {
       if (!config.clientId) throw new GradeWorkerError('grade-identity-missing', 'The hosted grade worker requires its dedicated managed identity.')
       credential = new ManagedIdentityCredential({ clientId: config.clientId })
     }
-    const result = await runGradeWorker(createGradeWorkerDependencies(config, credential), {
+    phase = 'dependencies'
+    const dependencies = createGradeWorkerDependencies(config, credential)
+    phase = 'processing'
+    const result = await runGradeWorker(dependencies, {
       maxItems: config.maxItems, budgetMilliseconds: config.budgetMilliseconds, signal: stopping.signal,
     })
     console.log('Score grade worker completed:', result)
+  } catch (error) {
+    throw workerStartupFailure(phase, error)
   } finally {
     process.removeListener('SIGTERM', stop)
     process.removeListener('SIGINT', stop)
@@ -85,10 +93,9 @@ export async function main(): Promise<void> {
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   void main().catch(error => {
-    console.error('Score grade worker failed:', {
-      name: error instanceof Error ? error.name : 'UnknownError',
-      message: error instanceof Error ? error.message : 'Grade worker initialization failed.',
-    })
+    console.error(JSON.stringify({
+      component: 'score-grade-worker', event: 'worker-failed', code: 'grade-worker-failed', ...workerFailureDiagnostic(error),
+    }))
     process.exitCode = 1
   })
 }

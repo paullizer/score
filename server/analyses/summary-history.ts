@@ -309,7 +309,11 @@ export async function readAnalysisSummaryHistory(
       schemaVersion: 1, workspaceId, runId, ...subject, etag: state.etag, inputFingerprint: state.inputFingerprint,
       ...(resultRevisionId ? { resultRevisionId } : {}),
       entries, ...(next ? { continuationToken: next } : {}),
-      capabilities: { canPublish: writable && Boolean(record?.history), canRetry: writable },
+      capabilities: {
+        canPublish: writable && Boolean(record?.history), canRetry: writable, canRestart: writable,
+        canResume: writable && Boolean(record && ['failed', 'cancelled'].includes(record.status) &&
+          (!record.inputFingerprint || record.inputFingerprint === state.inputFingerprint)),
+      },
     })
   }
   throw conflict('Summary history changed while it was being read. Reload before choosing a draft.')

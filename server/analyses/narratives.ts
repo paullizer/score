@@ -5,14 +5,15 @@ import {
   assertNewWork, newWorkProcessingSettings, type ProcessingSettingsProvider,
 } from '../jobs/policy'
 import {
-  ANALYSIS_NARRATIVE_SCHEMA_VERSION, analysisNarrativeIsCurrent, type AnalysisCandidateNarrativeInputBinding,
-  type AnalysisNarrativeCounts, type AnalysisNarrativeCurrentState,
+  ANALYSIS_NARRATIVE_SCHEMA_VERSION, analysisNarrativeIsCurrent, analysisTargetNarrativeCanGenerate, type AnalysisCandidateNarrativeInputBinding,
+  type AnalysisNarrativeCounts, type AnalysisNarrativeCurrentState, type AnalysisNarrativeWaitReason,
   type AnalysisTargetNarrativeInputBinding, type GenerateRealAnalysisSummariesInput,
   type RealAnalysisCandidateNarrativeRecord, type RealAnalysisCandidateNarrativeSummary, type RealAnalysisNarrativeRecord,
   type RealAnalysisSummariesMutationResponse, type RealAnalysisSummariesResponse, type RealAnalysisTargetNarrativeRecord,
   type RealAnalysisTargetNarrativeSummary, type RealAnalysisSummarySubjectResponse,
 } from '../../src/domain/analysis-narratives'
 import type { AnalysisSummarySubject } from '../../src/domain/analysis-summary-history'
+import { deriveAnalysisNarrativeWorkHealth } from '../../src/domain/analysis-narrative-work-health'
 import {
   ANALYSIS_LIMITS, type AnalysisEntity, type AnalysisTargetSnapshotReference, type RealAnalysisComparisonRecord,
   type RealAnalysisInitializationManifest, type RealAnalysisNarrativeRequestRecord, type RealAnalysisRunRecord, type VersionedAnalysisEntity,
@@ -69,6 +70,7 @@ export interface AnalysisNarrativeInventory {
     binding: AnalysisTargetNarrativeInputBinding
     narrative?: RealAnalysisTargetNarrativeRecord
     state: AnalysisNarrativeCurrentState
+    waitingFor: AnalysisNarrativeWaitReason | null
   }[]
   revision: string
   scope: { targetId: string | null }
@@ -247,7 +249,9 @@ function inventoryTarget(
     const desired = newTargetNarrative(run, target, pending.identity, narrative)
     if (narrative?.generationId !== desired.generationId) narrative = desired
   }
-  return { target, binding, narrative, state: selected.some(pair => pair.status === 'complete')
+  const waitingFor = selected.some(pair => pair.status === 'queued' || pair.status === 'running' || pair.correctionPending) ? 'scoring'
+    : analysisTargetNarrativeCanGenerate(binding, selected.map(pair => pair.id)) ? null : 'candidate-narratives'
+  return { target, binding, narrative, waitingFor, state: selected.some(pair => pair.status === 'complete')
     ? narrativeCurrentState(run, narrative, analysisHash(binding))
     : { status: 'not-required', generationId: null, inputFingerprint: null, published: null } }
 }
@@ -357,7 +361,7 @@ function workSummary(record: RealAnalysisNarrativeRecord | undefined, state: Ana
   }
 }
 async function candidateSummary(
-  blobs: Pick<AnalysisBlobStore, 'read'>, pair: AnalysisNarrativeInventoryComparison, signal?: AbortSignal,
+  blobs: Pick<AnalysisBlobStore, 'read'>, pair: AnalysisNarrativeInventoryComparison, now: string, signal?: AbortSignal,
 ): Promise<RealAnalysisCandidateNarrativeSummary> {
   const record = pair.narrative
   const artifact = record?.published ? await traceOperation('score.analysis.publication.read', {
@@ -368,6 +372,7 @@ async function candidateSummary(
     kind: 'candidate', comparisonId: pair.id, comparisonStatus: pair.status, targetId: pair.target.summary.id,
     resultSha256: pair.binding?.resultSha256 ?? null,
     ...pair.state, ...workSummary(pair.narrative, pair.state),
+    ...(record ? { workHealth: deriveAnalysisNarrativeWorkHealth(record, pair.state.status, now) } : {}),
     published: artifact?.kind === 'candidate' && pair.narrative?.published ? {
       ...narrativePublicationVersion(pair.narrative.published), dataKind: 'real', text: artifact.text, overview: artifact.overview,
       ...(artifact.schemaVersion === 2 ? { summaryVersion: 2 as const, approval: artifact.approval } : {}),
@@ -375,7 +380,7 @@ async function candidateSummary(
   }
 }
 async function targetSummary(
-  blobs: Pick<AnalysisBlobStore, 'read'>, target: AnalysisNarrativeInventory['targets'][number], signal?: AbortSignal,
+  blobs: Pick<AnalysisBlobStore, 'read'>, target: AnalysisNarrativeInventory['targets'][number], now: string, signal?: AbortSignal,
 ): Promise<RealAnalysisTargetNarrativeSummary> {
   const record = target.narrative
   const artifact = record?.published ? await traceOperation('score.analysis.publication.read', {
@@ -384,11 +389,26 @@ async function targetSummary(
   assertAnalysis(!artifact || artifact.kind === 'target', 'Target overview has the wrong artifact kind.')
   return {
     kind: 'target', targetId: target.target.summary.id, ...target.state, ...workSummary(target.narrative, target.state),
+    waitingFor: target.state.status === 'waiting' ? target.waitingFor : null,
+    ...(record ? { workHealth: deriveAnalysisNarrativeWorkHealth(record, target.state.status, now, target.waitingFor) } : {}),
     published: artifact?.kind === 'target' && target.narrative?.published ? {
       ...narrativePublicationVersion(target.narrative.published), dataKind: 'real', paragraphs: artifact.paragraphs,
       ...(artifact.schemaVersion === 2 ? { summaryVersion: 2 as const, approval: artifact.approval } : {}),
     } : null,
   }
+}
+
+function workRevision(summaries: readonly (RealAnalysisCandidateNarrativeSummary | RealAnalysisTargetNarrativeSummary)[]): string {
+  return analysisHash(summaries.map(item => ({
+    kind: item.kind, subjectId: item.kind === 'candidate' ? item.comparisonId : item.targetId,
+    waitingFor: item.waitingFor, attempts: item.attempts, retryCount: item.retryCount, nextAttemptAt: item.nextAttemptAt,
+    error: item.error, hasHistory: item.hasHistory, summaryRound: item.summaryRound ?? null,
+    // Heartbeats remain visible metadata without invalidating stable content or resetting poll backoff.
+    health: item.workHealth ? {
+      state: item.workHealth.state, requestedAt: item.workHealth.requestedAt,
+      nextEligibleAt: item.workHealth.nextEligibleAt, capturedSettings: item.workHealth.capturedSettings,
+    } : null,
+  })))
 }
 
 async function readPublicationPool<T>(reads: ((signal: AbortSignal) => Promise<T>)[], signal?: AbortSignal): Promise<T[]> {
@@ -483,8 +503,9 @@ export async function readAnalysisSummarySubject(
   for (let attempt = 0; attempt < 4; attempt++) {
     const inventory = await readSubjectInventory(deps, workspaceId, runId, subject, signal, resultRevisionId)
     try {
-      const narrative = inventory.kind === 'candidate' ? await candidateSummary(deps.blobs, inventory.selected, signal)
-        : await targetSummary(deps.blobs, inventory.selected, signal)
+      const now = new Date().toISOString()
+      const narrative = inventory.kind === 'candidate' ? await candidateSummary(deps.blobs, inventory.selected, now, signal)
+        : await targetSummary(deps.blobs, inventory.selected, now, signal)
       const latest = await readableRun(deps, workspaceId, runId, signal)
       if (latest.etag !== inventory.run.etag) {
         const current = await readSubjectInventory(deps, workspaceId, runId, subject, signal, resultRevisionId)
@@ -494,6 +515,7 @@ export async function readAnalysisSummarySubject(
       const response = {
         schemaVersion: ANALYSIS_NARRATIVE_SCHEMA_VERSION, dataKind: 'real' as const, workspaceId, runId,
         subjectId: subject.subjectId, revision: inventory.revision, etag: `"${inventory.revision}"`,
+        workRevision: workRevision([narrative]),
         ...(resultRevisionId ? { resultRevisionId } : {}),
       }
       return narrative.kind === 'candidate' ? { ...response, kind: 'candidate', narrative } : { ...response, kind: 'target', narrative }
@@ -512,11 +534,12 @@ export async function readAnalysisSummaries(
   deps = immutableReadDeps(deps)
   for (let attempt = 0; attempt < 4; attempt++) {
     const inventory = await readAnalysisNarrativeInventory(deps, workspaceId, runId, targetId, signal)
+    const now = new Date().toISOString()
     let summaries: (RealAnalysisCandidateNarrativeSummary | RealAnalysisTargetNarrativeSummary)[]
     try {
       summaries = await readPublicationPool<RealAnalysisCandidateNarrativeSummary | RealAnalysisTargetNarrativeSummary>([
-        ...inventory.comparisons.map(pair => (signal: AbortSignal) => candidateSummary(deps.blobs, pair, signal)),
-        ...inventory.targets.map(target => (signal: AbortSignal) => targetSummary(deps.blobs, target, signal)),
+        ...inventory.comparisons.map(pair => (signal: AbortSignal) => candidateSummary(deps.blobs, pair, now, signal)),
+        ...inventory.targets.map(target => (signal: AbortSignal) => targetSummary(deps.blobs, target, now, signal)),
       ], signal)
     } catch (error) {
       signal?.throwIfAborted()
@@ -550,6 +573,7 @@ export async function readAnalysisSummaries(
     return {
       schemaVersion: ANALYSIS_NARRATIVE_SCHEMA_VERSION, dataKind: 'real', workspaceId, runId,
       scope: inventory.scope, revision: inventory.revision, etag: `"${inventory.revision}"`, ready,
+      workRevision: workRevision(summaries),
       scoring, counts: { candidates: counts(comparisons), targets: counts(targets) },
       capabilities: { canGenerate: reason === null, reason }, comparisons, targets,
       capture: {

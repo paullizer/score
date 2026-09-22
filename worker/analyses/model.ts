@@ -26,6 +26,7 @@ import {
   analysisResponseRequestId, emitAnalysisTelemetry, type AnalysisTelemetryEvent, type AnalysisTelemetrySink,
 } from './telemetry'
 import { modelProcessingSettings, taskModelOptions } from '../settings'
+import { safeModelRetryMetadata } from '../model-retry'
 
 export {
   AnalysisModelError, ANALYSIS_WEIGHT_TOLERANCE, ANALYSIS_CALCULATION_VERSION,
@@ -194,28 +195,41 @@ function responseEnvelope(value: unknown, stage: AnalysisModelStage): { content:
 function serviceError(error: unknown, stage: AnalysisModelStage): AnalysisModelError {
   if (error instanceof AnalysisModelError) return error
   const upstream = record(error) ? error : {}
-  const status = error instanceof Response ? error.status : typeof upstream.status === 'number' ? upstream.status : undefined
+  const metadata = safeModelRetryMetadata(error)
+  const status = metadata.httpStatus
+  if (status === 429) return new AnalysisModelError('service-unavailable',
+    'The analysis model service is rate limited (HTTP 429). Wait for the provider cooldown before retrying the saved work.', {
+      stage, retryable: true, cancelled: upstream.cancelled === true, ...metadata,
+    })
   if (upstream.code === 'model-context-limit') return new AnalysisModelError('context-limit',
     'The complete source or model request exceeds its captured budget; no evidence was omitted.', { stage, reason: 'context-budget' })
   if (upstream.code === 'settings-invalid') return new AnalysisModelError('invalid-input',
     'The captured model settings are invalid; no substitute model was used.', { stage })
   if (upstream.code === 'request-timeout' || upstream.name === 'TimeoutError') {
-    return new AnalysisModelError('timeout', 'The analysis model request timed out; retry the comparison.', { stage, retryable: true })
+    return new AnalysisModelError('timeout', 'The analysis model request timed out; retry the comparison.', { stage, retryable: true, ...metadata })
   }
   if (upstream.code === 'cancelled' || upstream.name === 'AbortError' || upstream.code === 'ABORT_ERR') {
-    return new AnalysisModelError('timeout', 'Analysis processing was cancelled; no result was published.', { stage, cancelled: true })
+    return new AnalysisModelError('timeout', 'Analysis processing was cancelled; no result was published.', { stage, cancelled: true, ...metadata })
   }
   if (['model-refused', 'model-empty-response', 'model-invalid-response'].includes(String(upstream.code))) {
     return new AnalysisModelError('invalid-model-output', 'The analysis model did not return a usable structured response.', { stage })
   }
-  return new AnalysisModelError('service-unavailable', 'The configured analysis model service could not complete this request.', {
-    stage, retryable: typeof upstream.retryable === 'boolean' ? upstream.retryable : status === undefined || status === 429 || status >= 500,
+  const message = status === 401 || status === 403
+    ? 'The configured analysis model service rejected authentication or access. Check its identity and permissions.'
+    : status !== undefined && status < 500
+      ? `The analysis model request was rejected (HTTP ${status}). Check the captured deployment and request settings before retrying.`
+      : 'The configured analysis model service is unavailable; the saved work can be retried.'
+  return new AnalysisModelError('service-unavailable', message, {
+    stage, retryable: typeof upstream.retryable === 'boolean' ? upstream.retryable : status === undefined || status >= 500,
+    cancelled: upstream.cancelled === true, ...metadata,
   })
 }
 
 export async function invokeAnalysisModel(
   request: StructuredModelRequest, stage: AnalysisModelStage,
-  options: Pick<AnalysisAssessmentOptions, 'model' | 'signal' | 'onEvent'>, clock: Clock, correctionCount: number,
+  options: Pick<AnalysisAssessmentOptions, 'model' | 'signal' | 'onEvent'> & {
+    onRetry?: (failure: AnalysisModelError) => Promise<void>
+  }, clock: Clock, correctionCount: number,
   versions: { promptVersion: string; schemaVersion: string } =
     { promptVersion: ANALYSIS_MODEL_PROMPT_VERSIONS[stage], schemaVersion: ANALYSIS_MODEL_SCHEMA_VERSIONS[stage] },
 ): Promise<ModelCallResult> {
@@ -249,6 +263,7 @@ export async function invokeAnalysisModel(
   const fetchImpl = options.model.fetch ?? fetch
   let envelopeError: AnalysisModelError | undefined
   let actualModel: string | undefined
+  let retryCaptureFailed = false
   // Keep the configured authentication, endpoint, timeout, and retry transport. Guard its legacy envelope
   // before it can hide a truncated completion or substitute a configured model name for actual provenance.
   const guardedFetch: typeof fetch = async (url, init) => {
@@ -264,17 +279,31 @@ export async function invokeAnalysisModel(
       if ([429, 502, 503, 504].includes(response.status)) return response
       try {
         if (!response.ok) {
-          if (response.status === 400 || response.status === 413 || response.status === 422) {
-            const payload = await boundedResponseJson(response, signal ?? undefined, stage)
+          if (response.status === 413) {
+            envelopeError = new AnalysisModelError('context-limit',
+              'The analysis service rejected the complete input or completion budget; no sections were truncated.', {
+                stage, reason: 'context-budget', httpStatus: response.status,
+              })
+          } else if (response.status === 400 || response.status === 422) {
+            let payload: unknown
+            try {
+              payload = await boundedResponseJson(response, signal ?? undefined, stage)
+            } catch (error) {
+              if (signal?.aborted || !(error instanceof AnalysisModelError) ||
+                error.code !== 'invalid-model-output' || error.reason !== 'invalid-envelope') throw error
+              return response
+            }
             const upstreamError = record(payload) && record(payload.error) ? payload.error : undefined
             const code = upstreamError?.code
-            if (response.status === 413 || ['context_length_exceeded', 'context_window_exceeded', 'max_tokens_exceeded', 'token_limit_exceeded'].includes(String(code))) {
-              envelopeError = new AnalysisModelError('context-limit', 'The analysis service rejected the complete input or completion budget; no sections were truncated.', { stage, reason: 'context-budget' })
+            if (['context_length_exceeded', 'context_window_exceeded', 'max_tokens_exceeded', 'token_limit_exceeded'].includes(String(code))) {
+              envelopeError = new AnalysisModelError('context-limit', 'The analysis service rejected the complete input or completion budget; no sections were truncated.', {
+                stage, reason: 'context-budget', httpStatus: response.status,
+              })
             } else if (code === 'content_filter' || code === 'ResponsibleAIPolicyViolation' ||
               record(upstreamError?.innererror) && upstreamError.innererror.code === 'ResponsibleAIPolicyViolation') {
               envelopeError = new AnalysisModelError('invalid-model-output',
                 'The analysis service content filter declined this request; no assessment or review was substituted.',
-                { stage, reason: 'content-filter' })
+                { stage, reason: 'content-filter', httpStatus: response.status })
             }
           }
           return response
@@ -305,10 +334,18 @@ export async function invokeAnalysisModel(
     }
   }
   try {
-    const response = await abortable(
-      () => invokeStructuredModel({ ...options.model, clock, fetch: guardedFetch }, { ...request, operation: 'analysis' }, options.signal),
-      options.signal, stage,
-    )
+    const response = await invokeStructuredModel({ ...options.model, clock, fetch: guardedFetch }, {
+      ...request, operation: 'analysis',
+      async onRetry(failure) {
+        try {
+          await options.onRetry?.(serviceError(failure, stage))
+          await request.onRetry?.(failure)
+        } catch (error) {
+          retryCaptureFailed = true
+          throw error
+        }
+      },
+    }, options.signal)
     checkCancelled(options.signal, stage)
     if (envelopeError) throw envelopeError
     if (!actualModel || response.model !== actualModel) {
@@ -325,9 +362,13 @@ export async function invokeAnalysisModel(
       },
     }
   } catch (error) {
+    if (retryCaptureFailed) throw error
     const failure = envelopeError ?? serviceError(error, stage)
-    emit({ event: 'model-failed', code: failure.code, reason: failure.reason, retryable: failure.retryable, cancelled: Boolean(options.signal?.aborted || failure.cancelled) })
-    checkCancelled(options.signal, stage)
+    emit({
+      event: 'model-failed', code: failure.code, reason: failure.reason, retryable: failure.retryable,
+      httpStatus: failure.httpStatus, cancelled: Boolean(options.signal?.aborted || failure.cancelled),
+    })
+    if (!failure.retryAt) checkCancelled(options.signal, stage)
     throw failure
   }
 }

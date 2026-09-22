@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useId, useRef, useState } from 'react'
 import { History, LoaderCircle, RotateCcw } from 'lucide-react'
 import { useRealAnalyses } from '../../app/real-analyses-context'
-import { usePublicSettings } from '../../app/public-settings-context'
+import { clientAdmissionReason, usePublicSettings } from '../../app/public-settings-context'
 import { useWorkspace } from '../../app/workspace-context'
 import { Badge, Button, InlineError } from '../../components/ui'
 import { useLifecycleAccess } from '../../components/lifecycle/useLifecycleAccess'
@@ -112,7 +112,8 @@ function matchingPublished(entry: AnalysisSummaryHistoryEntry, narrative: Summar
 
 function SummaryHistory({ runId, narrative, label, resultRevisionId }: Props) {
   const api = useRealAnalyses()
-  const { settings } = usePublicSettings()
+  const policy = usePublicSettings()
+  const { settings } = policy
   const { cloud } = useWorkspace()
   const role = cloud?.workspaces.find(item => item.id === api?.workspaceId)?.role
   const publicationAllowed = settings?.summaries.allowManualPublication !== false && (settings?.summaries.manualPublicationRoles !== 'owner' || role === 'owner')
@@ -133,6 +134,7 @@ function SummaryHistory({ runId, narrative, label, resultRevisionId }: Props) {
   const [success, setSuccess] = useState('')
   const [submitting, setSubmitting] = useState(false)
   const [selectedId, setSelectedId] = useState<string | null>(null)
+  const [confirmRestart, setConfirmRestart] = useState(false)
   const confirmation = useRef<HTMLElement | null>(null)
   const selectionTrigger = useRef<HTMLButtonElement | null>(null)
   const refreshTrigger = useRef<HTMLButtonElement | null>(null)
@@ -145,6 +147,11 @@ function SummaryHistory({ runId, narrative, label, resultRevisionId }: Props) {
   const writable = Boolean(!resultRevisionId && api?.canWrite && api.canReviewSummaries && lifecycle.canEdit &&
     !lifecycle.archived && !lifecycle.inherited && !lifecycle.deleting && !lifecycle.removed)
   const allowed = Boolean(writable && page && !pending && !loading && !loadError)
+  const hasResumeCapability = page?.capabilities.canResume !== undefined
+  const canResume = page?.capabilities.canResume ?? page?.capabilities.canRetry
+  const restartReason = api?.features?.analysisSummaryGeneration !== true
+    ? 'The summary generation service is unavailable.'
+    : clientAdmissionReason(policy, 'summaryGeneration')
 
   const load = useCallback(async (cursor?: string) => {
     if (controller.current) return
@@ -153,6 +160,7 @@ function SummaryHistory({ runId, narrative, label, resultRevisionId }: Props) {
     setLoading(true)
     setLoadError(null)
     setSelectedId(null)
+    setConfirmRestart(false)
     try {
       const { api: service, runId, subject, resultRevisionId } = context.current
       if (!service?.canReviewSummaries) throw new Error('Private summary history requires a workspace owner or editor.')
@@ -185,7 +193,7 @@ function SummaryHistory({ runId, narrative, label, resultRevisionId }: Props) {
     void load()
     return () => { lifetime.current = stamp + 1; controller.current?.abort(); controller.current = null }
   }, [load])
-  useEffect(() => { if (selectedId) confirmation.current?.focus() }, [selectedId])
+  useEffect(() => { if (selectedId || confirmRestart) confirmation.current?.focus() }, [confirmRestart, selectedId])
   useEffect(() => {
     if (restoreFocus.current && !submitting && !loading) {
       refreshTrigger.current?.focus()
@@ -199,9 +207,10 @@ function SummaryHistory({ runId, narrative, label, resultRevisionId }: Props) {
       entry.outputSha256 && entry.inputFingerprint === page.inputFingerprint)
   }
 
-  async function change(action: 'publish' | 'retry') {
+  async function change(action: 'publish' | 'retry' | 'restart') {
     if (!api || !page || !allowed || submittingRef.current ||
-      (action === 'publish' ? !selected || !selectable(selected) : !page.capabilities.canRetry)) return
+      (action === 'publish' ? !selected || !selectable(selected)
+        : action === 'restart' ? !confirmRestart || !page.capabilities.canRestart : !canResume)) return
     const stamp = lifetime.current
     submittingRef.current = true
     setSubmitting(true)
@@ -212,13 +221,17 @@ function SummaryHistory({ runId, narrative, label, resultRevisionId }: Props) {
         await api.publishSummaryDraft(runId, subject, {
           generationId: selected.generationId, round: selected.round, outputSha256: selected.outputSha256,
         }, page.etag)
-      } else await api.retrySummary(runId, subject, page.etag)
+      } else if (action === 'restart') await api.restartSummary(runId, subject, page.etag)
+      else await api.retrySummary(runId, subject, page.etag)
       if (stamp !== lifetime.current) return
       restoreFocus.current = true
       setSelectedId(null)
+      setConfirmRestart(false)
       setSuccess(action === 'publish'
         ? 'Manual publication acknowledged. Known issues remain disclosed; saved scores and evidence are unchanged.'
-        : 'Retry acknowledged for this summary only. Its captured review budget applies; scoring was not retried.')
+        : action === 'restart'
+          ? 'Restart acknowledged for this summary only. The new generation uses current settings; prior publications, scores and evidence are preserved.'
+          : `${hasResumeCapability ? 'Resume' : 'Retry'} acknowledged for this summary only. Its captured review budget applies; scoring was not retried.`)
       void load()
     } catch (caught) {
       if (stamp === lifetime.current) setMutationError(caught instanceof Error ? caught.message : 'This summary action could not be acknowledged.')
@@ -294,7 +307,7 @@ function SummaryHistory({ runId, narrative, label, resultRevisionId }: Props) {
         </details>
         {selectable(entry) && <Button size="sm" disabled={!allowed} onClick={event => {
           selectionTrigger.current = event.currentTarget
-          setSelectedId(entry.id); setMutationError(''); setSuccess('')
+          setConfirmRestart(false); setSelectedId(entry.id); setMutationError(''); setSuccess('')
         }}>Use this draft</Button>}
         {entry.draft && entry.scopeId === 'final' && entry.inputFingerprint !== page?.inputFingerprint &&
           <p className="text-muted">Historical saved inputs differ from the current summary. This draft cannot be published for the current input.</p>}
@@ -310,14 +323,37 @@ function SummaryHistory({ runId, narrative, label, resultRevisionId }: Props) {
         <Button size="sm" variant="primary" disabled={!allowed || !selectable(selected)} onClick={() => void change('publish')}>Confirm manual publication</Button>
       </div>
     </section>}
+    {confirmRestart && <section ref={confirmation} tabIndex={-1} className="space-y-3 rounded-lg border p-4" aria-label="Confirm summary restart">
+      <h4 className="font-semibold">Restart this summary with current settings?</h4>
+      <p>This starts new model work, which may incur provider charges, using the settings saved when the request is accepted. It begins a new generation and review budget instead of resuming saved checkpoints.</p>
+      <p>Prior publications and history remain available. Saved scores and frozen evidence do not change.
+        {narrative.kind === 'target' ? ' Candidate summaries and other job / grade overviews are unchanged.' : ' This candidate summary and its dependent job / grade overview are refreshed.'}</p>
+      {['waiting', 'queued', 'running'].includes(narrative.status) &&
+        <p>Queued or running work for this summary will be superseded. Late results from the old generation cannot publish.</p>}
+      <div className="flex flex-wrap gap-2">
+        <Button size="sm" disabled={pending} onClick={() => { setConfirmRestart(false); selectionTrigger.current?.focus() }}>Close confirmation</Button>
+        <Button size="sm" variant="primary" disabled={!allowed || !page?.capabilities.canRestart} onClick={() => void change('restart')}>Confirm restart with current settings</Button>
+      </div>
+    </section>}
     {mutationError && <InlineError>{mutationError}<p className="mt-2">If acknowledgement was interrupted, repeating this exact action reuses its request key and original ETag. Refresh history if the summary changed.</p></InlineError>}
     {success && <p role="status">{success}</p>}
     {!writable && <p className="text-muted">History remains readable. Unarchive this analysis and workspace, and finish any cleanup, before changing summaries.</p>}
     <div className="flex flex-wrap gap-2">
       <Button ref={refreshTrigger} size="sm" icon={RotateCcw} disabled={pending || loading} onClick={() => void load()}>Refresh summary history</Button>
       {page?.continuationToken && <Button size="sm" disabled={pending || loading} onClick={() => void load(page.continuationToken)}>Load earlier summary history</Button>}
-      <Button size="sm" disabled={!allowed || !page?.capabilities.canRetry} onClick={() => void change('retry')}>Retry this summary</Button>
+      <Button size="sm" disabled={!allowed || !canResume} onClick={() => void change('retry')}>
+        {hasResumeCapability ? 'Resume saved attempt' : 'Retry this summary'}
+      </Button>
+      {page?.capabilities.canRestart !== undefined && <Button size="sm"
+        disabled={!allowed || !page.capabilities.canRestart || Boolean(restartReason)} onClick={event => {
+          selectionTrigger.current = event.currentTarget
+          setSelectedId(null); setConfirmRestart(true); setMutationError(''); setSuccess('')
+        }}>Restart with current settings</Button>}
     </div>
-    <p className="text-muted">Retry retains this summary’s captured review budget, not a new scoring operation. A changed candidate publication also refreshes its dependent job / grade overview.</p>
+    {page?.capabilities.canRestart && restartReason && <p className="text-muted" role="status">{restartReason} Resuming an accepted attempt keeps its captured settings.</p>}
+    <p className="text-muted">{hasResumeCapability
+      ? 'Resume retains saved checkpoints, captured model settings and the remaining review budget. Restart explicitly starts a new generation with current settings.'
+      : 'Retry resumes failed or cancelled work with its captured review budget; otherwise it starts a new summary generation.'}
+      {' '}Neither action retries scoring. A changed candidate publication also refreshes its dependent job / grade overview.</p>
   </>
 }

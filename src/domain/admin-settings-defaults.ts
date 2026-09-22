@@ -32,6 +32,13 @@ export function modelCapabilitiesFor(modelName: string, modelVersion: string | n
       reasoningEfforts: ['minimal', 'low', 'medium', 'high'], temperature: false, topP: false,
     }
   }
+  if (modelName === 'gpt-5.6-luna' && (modelVersion === null || modelVersion === '2026-07-09')) {
+    // Azure's verified Luna adapter; expose only efforts represented by the existing application schema.
+    return {
+      structuredOutputs: true, contextTokens: 1_050_000, maxOutputTokens: 128_000,
+      reasoningEfforts: ['low', 'medium', 'high'], temperature: false, topP: false,
+    }
+  }
   if (modelName === 'gpt-4o' && (modelVersion === null || ['2024-08-06', '2024-11-20'].includes(modelVersion))) {
     return { structuredOutputs: true, contextTokens: 128_000, maxOutputTokens: 16_384, reasoningEfforts: [], temperature: true, topP: true }
   }

@@ -37,7 +37,8 @@ test('shared model retains bounded transient retries and actual response-model p
   const sleeps = []
   const result = await invokeStructuredModel({
     ...options,
-    clock: { now: () => new Date(), sleep: async ms => { sleeps.push(ms) } },
+    retryRandom: () => 1,
+    clock: { now: () => new Date('2026-09-21T12:00:00.000Z'), sleep: async ms => { sleeps.push(ms) } },
     fetch: async (_url, init) => {
       assert.equal(JSON.parse(init.body).max_completion_tokens, 8192)
       calls += 1

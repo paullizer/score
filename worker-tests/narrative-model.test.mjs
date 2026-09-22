@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import {
-  ACTUAL_MODEL, modelApi, validators, inputApi, deterministic, candidateFixture, candidateOutput,
+  ACTUAL_MODEL, NOW, modelApi, validators, inputApi, deterministic, candidateFixture, candidateOutput,
   candidateSelection, targetFixture, targetOutput, selectOutput, reductionOutput, mockModel, refreshCandidate,
   response, supportedReview, unsupportedReview, rejectsCode, assertStrictSchema, expandReviewedOutput,
 } from './narrative-model-test-support.mjs'
@@ -159,8 +159,10 @@ test('transport retries reuse the configured deployment and exact request rather
     new Response('PRIVATE-SENTINEL unavailable', { status: 429 }),
     candidateSelection(input), supportedReview(),
   ])
+  mock.model.retryRandom = () => 0.5
+  mock.clock.now = () => new Date(NOW)
   const result = await generateCandidateNarrative(input, mock.options)
-  assert.deepEqual(mock.sleeps, [500])
+  assert.deepEqual(mock.sleeps, [375])
   assert.deepEqual(mock.calls[0].request, mock.calls[1].request)
   assert.equal(result.provenance.generation.model, `${ACTUAL_MODEL}-2`)
   assert.equal(result.provenance.correctionCount, 0)
@@ -176,7 +178,7 @@ for (const [name, value, code] of [
   ['malformed envelope', new Response('PRIVATE-SENTINEL'), 'invalid-model-output'],
   ['declared oversized response', new Response('PRIVATE-SENTINEL', { headers: { 'content-length': '600000' } }), 'context-limit'],
   ['upstream token limit', Response.json({ error: { code: 'context_length_exceeded', message: 'PRIVATE-SENTINEL' } }, { status: 400 }), 'context-limit'],
-  ['oversized request refusal', new Response('PRIVATE-SENTINEL', { status: 413 }), 'invalid-model-output'],
+  ['oversized request refusal', new Response('PRIVATE-SENTINEL', { status: 413 }), 'context-limit'],
 ]) {
   test(`${name} is a safe explicit failure with no configured model substitution`, async () => {
     const mock = mockModel([value])

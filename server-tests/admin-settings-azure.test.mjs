@@ -199,6 +199,49 @@ test('inventory uses only resource-scoped managed-identity discovery and disting
   assert.doesNotMatch(JSON.stringify(result), /synthetic-managed-identity-token/)
 })
 
+test('inventory enables the verified Luna version, not lookalike names, unknown versions, or deployment-name aliases', async () => {
+  const pending = inventoryDocument('luna-pending', 'gpt-5.6-luna', '2026-07-09')
+  pending.properties.provisioningState = 'Creating'
+  const otherFormat = inventoryDocument('luna-other-format', 'gpt-5.6-luna', '2026-07-09')
+  otherFormat.properties.model.format = 'Other'
+  const fake = azure(async () => Response.json({
+    value: [
+      inventoryDocument('summary-luna', 'gpt-5.6-luna', '2026-07-09'),
+      inventoryDocument('luna-unknown-version', 'gpt-5.6-luna', '2026-07-10'),
+      inventoryDocument('luna-lookalike', 'gpt-5.6-luna-preview', '2026-07-09'),
+      inventoryDocument('gpt-5.6-luna', 'gpt-5-mini', '2025-08-07'),
+      pending, otherFormat,
+    ],
+  }))
+  const result = await fake.adapter.inventory()
+  const [luna, unknownVersion, lookalike, alias, notReady, unsupportedFormat] = result.deployments
+  assert.equal(luna.enabled, true)
+  assert.equal(luna.modelName, 'gpt-5.6-luna')
+  assert.equal(luna.modelVersion, '2026-07-09')
+  assert.equal(luna.deploymentName, 'summary-luna')
+  assert.equal(luna.capabilities.structuredOutputs, true)
+  assert.equal(luna.capabilities.contextTokens, 1_050_000)
+  assert.equal(luna.capabilities.maxOutputTokens, 128_000)
+  assert.deepEqual(luna.capabilities.reasoningEfforts, ['low', 'medium', 'high'])
+  assert.equal(luna.capabilities.temperature, false)
+  assert.equal(luna.capabilities.topP, false)
+  for (const unsupported of [unknownVersion, lookalike, unsupportedFormat]) {
+    assert.equal(unsupported.enabled, false)
+    assert.equal(unsupported.capabilities.structuredOutputs, false)
+    assert.equal(unsupported.capabilities.contextTokens, 0)
+  }
+  assert.equal(alias.enabled, true)
+  assert.equal(alias.modelName, 'gpt-5-mini')
+  assert.equal(alias.modelVersion, '2025-08-07')
+  assert.equal(notReady.enabled, false)
+  assert.equal(notReady.capabilities.structuredOutputs, true)
+  assert.equal(luna.verification, 'discovered')
+  assert.equal(luna.verifiedAt, null)
+  assert.equal(fake.calls.length, 1)
+  assert.equal(fake.calls[0].options.method, 'GET')
+  assert.deepEqual(fake.scopes, ['https://management.azure.com/.default'])
+})
+
 test('inventory refuses cross-resource or cross-origin continuation before sending credentials', async () => {
   for (const nextLink of [
     'https://evil.example/deployments',

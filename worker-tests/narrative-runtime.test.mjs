@@ -30,6 +30,214 @@ async function until(predicate) {
   assert.fail('Expected bounded asynchronous narrative progress')
 }
 
+async function summaryRetryFixture({ attempts = 3, transportAttempts = 1 } = {}) {
+  const f = fixture()
+  const accepted = settingsSnapshot(settings => {
+    settings.processing.analyses.maxAutomaticAttempts = attempts
+    settings.ai.transport.maxAttempts = transportAttempts
+  }, 'accepted-summary-retry-policy')
+  f.service = new api.RealAnalysisService(f.analysis, { resumes: f.resumes, jobs: f.jobs, grades: f.grades },
+    () => new Date(f.now), async () => accepted)
+  const created = await createRun(f)
+  const pair = runComparisons(f, created.run.id)[0]
+  await publishResult(f, created.run.id, pair.record.id)
+  const id = api.analysisNarrativeId('candidate', created.run.id, pair.record.id)
+  return { f, accepted, created, pair, id }
+}
+
+test('provider cooldown scheduling persists the maximum of captured backoff and provider not-before', async () => {
+  for (const seconds of [10, 300]) {
+    const { f, accepted, created, id } = await summaryRetryFixture()
+    const scoring = clone(runComparisons(f, created.run.id))
+    const retryAt = new Date(Date.parse(f.now) + seconds * 1_000).toISOString()
+    const first = narrativeWorker(f, ({ kind }) => kind === 'analysis_narrative_grounding_review'
+      ? new Response('PRIVATE-PROVIDER', { status: 429, headers: { 'Retry-After': String(seconds) } }) : undefined)
+    await runAnalysisWorker(first.deps, { maxItems: 1 })
+    const queued = (await f.analysis.store.get(f.workspaceId, id)).record
+    assert.equal(queued.status, 'queued')
+    assert.equal(queued.attempts, 1)
+    assert.equal(queued.summaryRound, 1)
+    assert.equal(queued.error.code, 'service-unavailable')
+    assert.equal(queued.error.diagnostic.httpStatus, 429)
+    assert.equal(queued.error.diagnostic.retryAt, retryAt)
+    assert.equal(Date.parse(queued.nextAttemptAt), Math.max(
+      Date.parse(queued.updatedAt) + accepted.settings.processing.analyses.retryBackoff.baseMilliseconds,
+      Date.parse(retryAt),
+    ))
+    const history = JSON.parse(Buffer.from((await f.analysis.blobs.read(queued.history.blob.blobName)).bytes).toString())
+    assert.equal(history.phase, 'failed')
+    assert.ok(history.draft)
+    assert.equal(history.error.diagnostic.httpStatus, 429)
+    assert.equal(history.error.diagnostic.retryAt, retryAt)
+    assert.deepEqual(queued.processingSettings, accepted)
+    const outcome = first.events.find(event => event.event === 'narrative-outcome')
+    assert.equal(outcome.outcome, 'queued')
+    assert.equal(outcome.httpStatus, 429)
+    assert.equal(outcome.retryAt, retryAt)
+    assert.doesNotMatch(JSON.stringify(first.events), /PRIVATE-PROVIDER/)
+    const resumed = narrativeWorker(f)
+    await runAnalysisWorker(resumed.deps, { maxItems: 1 })
+    assert.equal(resumed.calls.length, 0)
+    assert.equal((await f.analysis.store.get(f.workspaceId, id)).record.attempts, 1)
+    f.now = queued.nextAttemptAt
+    await runAnalysisWorker(resumed.deps, { maxItems: 1 })
+    const ready = (await f.analysis.store.get(f.workspaceId, id)).record
+    assert.equal(ready.status, 'ready')
+    assert.equal(ready.attempts, 2)
+    assert.deepEqual(resumed.calls.map(call => call.kind), ['analysis_narrative_grounding_review'])
+    assert.deepEqual(ready.processingSettings, accepted)
+    assert.deepEqual(runComparisons(f, created.run.id), scoring)
+  }
+})
+
+test('provider throttle exhaustion is terminal at the captured attempt limit and retains actionable metadata', async () => {
+  const { f, accepted, created, id } = await summaryRetryFixture({ attempts: 2, transportAttempts: 2 })
+  const scoring = clone(runComparisons(f, created.run.id))
+  const mock = narrativeWorker(f, ({ kind }) => kind === 'analysis_narrative_grounding_review'
+    ? new Response('PRIVATE-PROVIDER', { status: 429, headers: { 'x-ms-retry-after-ms': '300000' } }) : undefined)
+  mock.deps.model.processingSettings = settingsSnapshot(settings => {
+    settings.processing.analyses.maxAutomaticAttempts = 3
+    for (const deployment of settings.ai.deployments) deployment.deploymentName = `new-${deployment.id}`
+  }, 'new-policy-must-not-rebind')
+  let generatedHash
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    await runAnalysisWorker(mock.deps, { maxItems: 1 })
+    const record = (await f.analysis.store.get(f.workspaceId, id)).record
+    assert.equal(record.attempts, attempt)
+    assert.equal(record.status, attempt === 1 ? 'queued' : 'failed')
+    assert.equal(record.error.diagnostic.httpStatus, 429)
+    assert.equal(record.error.diagnostic.retryAt, new Date(Date.parse(f.now) + 300_000).toISOString())
+    assert.deepEqual(record.processingSettings, accepted)
+    const history = JSON.parse(Buffer.from((await f.analysis.blobs.read(record.history.blob.blobName)).bytes).toString())
+    generatedHash ??= history.outputSha256
+    assert.equal(history.outputSha256, generatedHash)
+    assert.equal(history.round, 1)
+    if (attempt === 1) f.now = record.nextAttemptAt
+    else {
+      assert.equal(record.nextAttemptAt, undefined)
+      assert.equal(record.lease, undefined)
+      assert.match(record.error.message, /rate limited.*Automatic attempts are exhausted \(2\).*resume explicitly/)
+    }
+  }
+  assert.equal(mock.calls.filter(call => call.kind === 'analysis_candidate_narrative').length, 1)
+  assert.equal(mock.calls.filter(call => call.kind === 'analysis_narrative_grounding_review').length, 2)
+  assert.ok(mock.calls.every(call => !call.request.model.startsWith('new-')))
+  const calls = mock.calls.length
+  f.now = new Date(Date.parse(f.now) + 600_000).toISOString()
+  await runAnalysisWorker(mock.deps, { maxItems: 10 })
+  assert.equal(mock.calls.length, calls, 'Terminal throttling must not automatically requeue forever.')
+  assert.equal((await f.analysis.store.get(f.workspaceId, id)).record.status, 'failed')
+  assert.deepEqual(runComparisons(f, created.run.id), scoring)
+})
+
+test('provider cooldown survives cancellation at the worker delay boundary and resumes only the saved review', async () => {
+  const { f, created, id } = await summaryRetryFixture({ transportAttempts: 2 })
+  const controller = new AbortController()
+  const retryAt = new Date(Date.parse(f.now) + 60_000).toISOString()
+  const first = narrativeWorker(f, ({ kind }) => kind === 'analysis_narrative_grounding_review'
+    ? new Response('PRIVATE-PROVIDER', { status: 429, headers: { 'retry-after': '60' } }) : undefined)
+  first.deps.clock.sleep = async (milliseconds, signal) => {
+    assert.equal(milliseconds, 60_000)
+    const running = (await f.analysis.store.get(f.workspaceId, id)).record
+    const checkpoint = JSON.parse(Buffer.from((await f.analysis.blobs.read(running.history.blob.blobName)).bytes).toString())
+    assert.equal(checkpoint.error.diagnostic.retryAt, retryAt)
+    controller.abort(new Error('PRIVATE-INTERRUPTION'))
+    signal.throwIfAborted()
+  }
+  await runAnalysisWorker(first.deps, { maxItems: 1, signal: controller.signal })
+  const queued = (await f.analysis.store.get(f.workspaceId, id)).record
+  assert.equal(queued.status, 'queued')
+  assert.equal(queued.error.code, 'service-unavailable')
+  assert.equal(queued.error.diagnostic.httpStatus, 429)
+  assert.equal(queued.error.diagnostic.retryAt, retryAt)
+  assert.equal(queued.nextAttemptAt, retryAt)
+  assert.equal(first.calls.length, 2)
+  assert.doesNotMatch(JSON.stringify(first.events), /PRIVATE/)
+  f.now = retryAt
+  const resumed = narrativeWorker(f)
+  await runAnalysisWorker(resumed.deps, { maxItems: 1 })
+  assert.equal((await f.analysis.store.get(f.workspaceId, id)).record.status, 'ready')
+  assert.deepEqual(resumed.calls.map(call => call.kind), ['analysis_narrative_grounding_review'])
+  assert.equal((await summaries(f, created.run.id)).counts.candidates.ready, 1)
+})
+
+test('interrupted cooldown recovery uses saved checkpoints without consuming an extra automatic attempt', async () => {
+  for (const attempts of [1, 3]) {
+    const { f, accepted, id } = await summaryRetryFixture({ attempts, transportAttempts: 2 })
+    const controller = new AbortController()
+    const retryAt = new Date(Date.parse(f.now) + 120_000).toISOString()
+    let crashed
+    const first = narrativeWorker(f, ({ kind }) => kind === 'analysis_narrative_grounding_review'
+      ? new Response('PRIVATE-PROVIDER', { status: 429, headers: { 'retry-after': '120' } }) : undefined)
+    first.deps.clock.sleep = async (milliseconds, signal) => {
+      assert.equal(milliseconds, 120_000)
+      crashed = clone((await f.analysis.store.get(f.workspaceId, id)).record)
+      controller.abort()
+      signal.throwIfAborted()
+    }
+    await runAnalysisWorker(first.deps, { maxItems: 1, signal: controller.signal })
+    assert.ok(crashed)
+    assert.equal(crashed.status, 'running')
+    assert.equal(crashed.error, undefined)
+    assert.equal(crashed.nextAttemptAt, undefined)
+    f.analysis.store.save(crashed)
+    f.now = new Date(Date.parse(crashed.lease.expiresAt) + 1).toISOString()
+    const recovering = narrativeWorker(f)
+    await runAnalysisWorker(recovering.deps, { maxItems: 1 })
+    const recovered = (await f.analysis.store.get(f.workspaceId, id)).record
+    assert.equal(recovering.calls.length, 0)
+    assert.equal(recovered.attempts, crashed.attempts)
+    assert.equal(recovered.error.diagnostic.httpStatus, 429)
+    assert.equal(recovered.error.diagnostic.retryAt, retryAt)
+    assert.deepEqual(recovered.history, crashed.history)
+    assert.deepEqual(recovered.processingSettings, accepted)
+    if (attempts === 1) {
+      assert.equal(recovered.status, 'failed')
+      assert.equal(recovered.nextAttemptAt, undefined)
+      assert.match(recovered.error.message, /Automatic attempts are exhausted \(1\)/)
+    } else {
+      assert.equal(recovered.status, 'queued')
+      assert.ok(recovered.nextAttemptAt >= retryAt)
+      f.now = recovered.nextAttemptAt
+      await runAnalysisWorker(recovering.deps, { maxItems: 1 })
+      assert.equal((await f.analysis.store.get(f.workspaceId, id)).record.status, 'ready')
+      assert.deepEqual(recovering.calls.map(call => call.kind), ['analysis_narrative_grounding_review'])
+    }
+  }
+})
+
+test('an unreadable cooldown checkpoint consumes bounded recovery attempts without calling the provider', async () => {
+  const { f, id } = await summaryRetryFixture({ attempts: 2, transportAttempts: 2 })
+  const controller = new AbortController()
+  let crashed
+  const first = narrativeWorker(f, ({ kind }) => kind === 'analysis_narrative_grounding_review'
+    ? new Response('PRIVATE-PROVIDER', { status: 429, headers: { 'retry-after': '120' } }) : undefined)
+  first.deps.clock.sleep = async (_milliseconds, signal) => {
+    crashed = clone((await f.analysis.store.get(f.workspaceId, id)).record)
+    controller.abort()
+    signal.throwIfAborted()
+  }
+  await runAnalysisWorker(first.deps, { maxItems: 1, signal: controller.signal })
+  assert.ok(crashed)
+  f.analysis.store.save(crashed)
+  f.now = new Date(Date.parse(crashed.lease.expiresAt) + 1).toISOString()
+  const read = f.analysis.blobs.read
+  f.analysis.blobs.read = async (name, signal) => {
+    if (name === crashed.history.blob.blobName) throw new Error('PRIVATE-CHECKPOINT-STORAGE')
+    return read(name, signal)
+  }
+  const recovering = narrativeWorker(f)
+  await runAnalysisWorker(recovering.deps, { maxItems: 1 })
+  const failed = (await f.analysis.store.get(f.workspaceId, id)).record
+  assert.equal(failed.status, 'failed')
+  assert.equal(failed.attempts, 2)
+  assert.equal(failed.error.code, 'storage-error')
+  assert.equal(failed.nextAttemptAt, undefined)
+  assert.equal(recovering.calls.length, 0)
+  assert.deepEqual(failed.history, crashed.history)
+  assert.doesNotMatch(JSON.stringify(recovering.events), /PRIVATE/)
+})
+
 test('new completion atomically queues independent narrative work and target publication uses every completed result', async () => {
   const f = fixture()
   const created = await createRun(f, 2)

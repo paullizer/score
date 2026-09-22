@@ -1,5 +1,5 @@
 import { ANALYSIS_LIMITS } from './real-analyses'
-import type { ProcessingSettingsSnapshot } from './admin-settings'
+import type { ProcessingSettingsSnapshot, ReasoningEffort } from './admin-settings'
 import type {
   AnalysisEntityBase,
   AnalysisModelProvenance,
@@ -51,6 +51,26 @@ export type AnalysisNarrativeStatus = AnalysisNarrativeWorkStatus | 'missing' | 
 export type AnalysisNarrativeWaitReason = 'scoring' | 'candidate-narratives'
 export type AnalysisNarrativeGenerationMode = 'missing' | 'all'
 export type AnalysisNarrativeGenerationReason = AnalysisNarrativeGenerationMode | 'comparison-completed' | 'comparison-changed'
+
+export type AnalysisNarrativeWorkHealthState =
+  | 'waiting-prerequisites' | 'awaiting-worker' | 'retry-scheduled' | 'throttled'
+  | 'running' | 'interrupted' | 'failed' | 'inactive'
+
+// Read-only work observations, never persisted statuses or publication/readiness inputs.
+export interface AnalysisNarrativeWorkHealth {
+  state: AnalysisNarrativeWorkHealthState
+  requestedAt: string
+  lastActivityAt: string
+  leaseExpiresAt: string | null
+  attempt: number
+  nextEligibleAt: string | null
+  capturedSettings: {
+    revision: string
+    // The accepted generation binding, not a claim about the model used by a completed call.
+    modelName: string | null
+    reasoningEffort: ReasoningEffort | null
+  }
+}
 
 export interface AnalysisNarrativeSnapshotIdentity {
   snapshotId: string
@@ -335,6 +355,7 @@ export interface AnalysisNarrativeSummaryBase extends AnalysisNarrativeCurrentSt
   error: AnalysisNarrativeProcessingError | null
   summaryRound?: number
   hasHistory?: boolean
+  workHealth?: AnalysisNarrativeWorkHealth
 }
 
 export interface RealAnalysisCandidateNarrativeSummary extends AnalysisNarrativeSummaryBase {
@@ -390,8 +411,12 @@ export interface RealAnalysisSummariesResponse extends AnalysisNarrativeScopeRev
   dataKind: 'real'
   workspaceId: string
   runId: string
-  // Quoted scope revision for GET ETag / POST If-Match, independent of the comparison ETag.
+  // Quoted scope revision for POST If-Match, independent of the comparison ETag.
+  // Reads are no-store: this concurrency token is not a timed display cache validator.
   etag: string
+  // Display/polling revision only. Time-based health transitions never change the scope ETag.
+  // Lease renewals and last-activity timestamps alone do not change this revision.
+  workRevision?: string
   ready: boolean
   capture: RealAnalysisNarrativeReportCapture
   scoring: AnalysisSummaryScoringCounts
@@ -413,6 +438,7 @@ export type RealAnalysisSummarySubjectResponse = {
   // This subject's revision is not the management/export scope revision used for mutations.
   revision: string
   etag: string
+  workRevision?: string
   resultRevisionId?: string
 } & (
   | { kind: 'candidate'; narrative: RealAnalysisCandidateNarrativeSummary }

@@ -152,9 +152,10 @@ test('execution limits and model reasoning must be explicit supported values', (
     assert.throws(() => loadResumeWorkerConfig(environment({ RESUME_WORKER_BUDGET_MS: value })), /between 1000 and 660000/)
   }
   assert.equal(loadResumeWorkerConfig(environment({ RESUME_WORKER_MAX_ITEMS: '20', RESUME_WORKER_BUDGET_MS: '1000' })).maxItems, 20)
-  assert.throws(() => loadResumeWorkerConfig(environment({ RUBRIC_MODEL_REASONING_EFFORT: 'high' })), /must be low/)
-  assert.throws(() => loadResumeWorkerConfig(environment({ RUBRIC_MODEL_NAME: 'other-model' })), /GPT-5/)
-  assert.equal(loadResumeWorkerConfig(environment({ RUBRIC_MODEL_REASONING_EFFORT: '', RUBRIC_MODEL_NAME: 'other-model' })).reasoningEffort, undefined)
+  assert.throws(() => loadResumeWorkerConfig(environment({ RUBRIC_MODEL_REASONING_EFFORT: 'unsupported' })), /not supported/)
+  assert.throws(() => loadResumeWorkerConfig(environment({ RUBRIC_MODEL_NAME: 'other-model' })), /supported structured-output/)
+  assert.throws(() => loadResumeWorkerConfig(environment({ RUBRIC_MODEL_REASONING_EFFORT: '', RUBRIC_MODEL_NAME: 'other-model' })), /supported structured-output/)
+  assert.equal(loadResumeWorkerConfig(environment({ RUBRIC_MODEL_REASONING_EFFORT: '', RUBRIC_MODEL_NAME: 'gpt-4.1' })).reasoningEffort, undefined)
   for (const key of ['RUBRIC_MODEL_NAME', 'RUBRIC_MODEL_DEPLOYMENT', 'JOB_RENDERER_URL']) {
     assert.throws(() => loadResumeWorkerConfig(environment({ [key]: '' })), new RegExp(key))
   }

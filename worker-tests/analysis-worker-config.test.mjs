@@ -146,7 +146,7 @@ test('model configuration and analysis work budgets fail closed', () => {
     assert.throws(() => loadAnalysisWorkerConfig(config({ [key]: '' })), /required|Azure/)
   }
   for (const overrides of [
-    { RUBRIC_MODEL_REASONING_EFFORT: 'high' }, { RUBRIC_MODEL_REASONING_EFFORT: 'low', RUBRIC_MODEL_NAME: 'gpt-4.1' },
+    { RUBRIC_MODEL_REASONING_EFFORT: 'unsupported' }, { RUBRIC_MODEL_REASONING_EFFORT: 'low', RUBRIC_MODEL_NAME: 'gpt-4.1' },
     { RUBRIC_MODEL_DEPLOYMENT: 'deployment?token=private' }, { RUBRIC_MODEL_NAME: 'raw private text' },
     { COSMOS_DATABASE: 'database/path' },
   ]) assert.throws(() => loadAnalysisWorkerConfig(config(overrides)), /RUBRIC_MODEL|identifiers|COSMOS_DATABASE/)
@@ -168,5 +168,8 @@ test('entrypoint exits nonzero on misconfiguration without exposing configuratio
   assert.equal(child.error, undefined)
   assert.equal(child.status, 1)
   assert.match(child.stderr, /analysis-worker-failed/)
+  assert.match(child.stderr, /phase: 'configuration'/)
+  assert.match(child.stderr, /field: 'AZURE_CLIENT_ID'/)
+  assert.match(child.stderr, /reason: 'invalid-identifier'/)
   assert.doesNotMatch(child.stderr + child.stdout, /PRIVATE-CONFIG-SENTINEL|test-token/)
 })
