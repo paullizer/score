@@ -1,10 +1,11 @@
 import { useRef, useState } from 'react'
 import { Link, NavLink, Navigate, Route, Routes, useLocation, useNavigate } from 'react-router-dom'
-import { ArrowUpRight, BarChart3, BriefcaseBusiness, Check, ChevronRight, CircleHelp, Files, FlaskConical, Layers3, LogOut, Menu, Plus, RotateCcw, Settings, ShieldCheck, X } from 'lucide-react'
+import { ArrowUpRight, BarChart3, BriefcaseBusiness, Check, ChevronRight, CircleHelp, Files, FlaskConical, Layers3, LayoutGrid, Menu, Plus, RotateCcw, Settings, ShieldCheck, X } from 'lucide-react'
 import { useWorkspace } from './workspace-context'
 import { ThemeControl } from './ThemeControl'
 import { Badge, Button, EmptyState, InlineError, Modal } from '../components/ui'
 import { WorkspaceSwitcher } from '../components/workspace/WorkspaceSwitcher'
+import { AccountPanel } from '../components/workspace/AccountPanel'
 import { CloudSaveBanner, CloudSaveIndicator } from '../components/workspace/CloudSaveStatus'
 import { JobsPage, JobDetail } from '../features/jobs/JobsPage'
 import { ResumesPage } from '../features/resumes/ResumesPage'
@@ -29,6 +30,7 @@ import { LibraryViewStateProvider } from './LibraryViewStateProvider'
 import { clientAdmissionReason, usePublicSettings } from './public-settings-context'
 import { useApplicationNavigation } from './application-navigation-context'
 import { defaultApplicationPage } from '../services/publicSettings'
+import { ApplicationPolicyBanners } from './ApplicationPolicyBanners'
 
 function Navigation({ onNavigate }: { onNavigate?: () => void }) {
   const { workspace } = useWorkspace()
@@ -47,17 +49,6 @@ function Navigation({ onNavigate }: { onNavigate?: () => void }) {
     <NavLink key={to} to={to} onClick={onNavigate} className={({ isActive }) => isActive || (to === '/rubrics' && location.pathname.startsWith('/grade-ladders')) ? 'nav-item is-active' : 'nav-item'}>
       <Icon size={18} strokeWidth={1.7} /><span>{label}</span><span className="nav-count">{count}</span>
     </NavLink>)}</nav>
-}
-
-/** Signed-in identity + sign-out, shown only in cloud mode. Used in both the sidebar and mobile nav. */
-function AccountPanel({ cloud }: { cloud: NonNullable<ReturnType<typeof useWorkspace>['cloud']> }) {
-  const [signingOut, setSigningOut] = useState(false)
-  return <div className="account-panel">
-    <span className="avatar avatar-small" aria-hidden="true">{cloud.user.name.trim().slice(0, 1).toUpperCase() || 'U'}</span>
-    <div className="min-w-0"><strong className="block truncate text-[12px] font-medium">{cloud.user.name}</strong><span className="block truncate text-[10px] text-muted">{cloud.user.email}</span></div>
-    <Button size="sm" variant="ghost" className="icon-button" aria-label="Sign out" icon={LogOut} disabled={signingOut}
-      onClick={() => { setSigningOut(true); void cloud.signOut().finally(() => setSigningOut(false)) }} />
-  </div>
 }
 
 export function App() {
@@ -79,6 +70,7 @@ function AppContent() {
   const [showReset, setShowReset] = useState(false)
   const [showAbout, setShowAbout] = useState(false)
   const [mobileNav, setMobileNav] = useState(false)
+  const [navigationError, setNavigationError] = useState('')
   const navigate = useNavigate()
   const location = useLocation()
   const policy = usePublicSettings()
@@ -95,6 +87,11 @@ function AppContent() {
   const { canEdit } = useLifecycleAccess()
   const leaveGuard = useGradeLeaveGuard(false, false, 'Workspace changes')
   const localRemoved = !cloud && isEntityRemoved(workspace, { kind: 'workspace', id: 'workspace' })
+  const openWorkspaceHome = () => {
+    setNavigationError('')
+    void application?.openWorkspaceHome().catch((caught) => setNavigationError(caught instanceof Error ? caught.message : 'Workspace home could not be opened. Your current workspace has been kept.'))
+  }
+  const brand = <><span className="brand-mark"><Layers3 size={22} strokeWidth={2} /></span><span>{title}</span></>
 
   if (!cloud && /^\/admin\/settings\/?$/.test(location.pathname)) return <main className="recovery-page"><div className="panel recovery-card">
     <h1>Application settings require a cloud administrator</h1><p>This standalone workspace is a fictional local demo. It cannot read or save cloud settings, designate administrators, or run model tests.</p>
@@ -111,7 +108,11 @@ function AppContent() {
   return <LifecycleDialogProvider><div className="app-layout">
     <a className="skip-link" href="#main-content">Skip to content</a>
     <aside className="sidebar">
-      <Link to={defaultApplicationPage(policy.settings)} className="brand" aria-label={`${title} home`}><span className="brand-mark"><Layers3 size={22} strokeWidth={2} /></span><span>{title}</span></Link>
+      {cloud && application ? <a href={application.workspaceHomePath} className="brand" aria-label={`${title} home`} onClick={(event) => {
+        if (event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return
+        event.preventDefault(); openWorkspaceHome()
+      }}>{brand}</a> : <Link to={defaultApplicationPage(policy.settings)} className="brand" aria-label={`${title} home`}>{brand}</Link>}
+      {cloud && application && <Button className="workspace-home-nav" variant="ghost" icon={LayoutGrid} onClick={openWorkspaceHome}>All workspaces</Button>}
       {cloud ? <WorkspaceSwitcher cloud={cloud} /> : <div className="workspace-label"><span className="workspace-monogram">S</span><div><strong>My workspace</strong><span>Personal / local</span></div><span className="workspace-online" /></div>}
       {!cloud && <div className="mb-4"><EntityLifecycleActions target={{ kind: 'workspace', id: 'workspace' }} name="My workspace" compact /></div>}
       <div className="nav-heading">WORKSPACE</div>
@@ -124,7 +125,7 @@ function AppContent() {
           {policy.settings?.help.documentationUrl && <a className="text-link" href={policy.settings.help.documentationUrl} target="_blank" rel="noopener noreferrer">Documentation <ArrowUpRight size={13} /></a>}
         </div>
         <div className="sidebar-utility"><span>Appearance</span><ThemeControl /></div>
-        {cloud && <AccountPanel cloud={cloud} />}
+        {cloud && <AccountPanel user={cloud.user} signOut={cloud.signOut} />}
         {samplesVisible && <button className="reset-button" disabled={!canEdit} onClick={() => setShowReset(true)}><RotateCcw size={14} />Reset {cloud ? 'samples' : 'demo workspace'}</button>}
         <div className="sidebar-version">{title} / UI PREVIEW <span>V0.1</span></div>
       </div>
@@ -141,9 +142,8 @@ function AppContent() {
             onClick={() => navigate(cloud ? `/analyses/new?data=${newAnalysisMode}` : '/analyses/new')}>New analysis</Button>
         </div>
       </header>
-      {policy.settings?.appearance.announcement.enabled && <aside className={`application-announcement ${policy.settings.appearance.announcement.tone === 'warning' ? 'is-warning' : ''}`} role="status">{policy.settings.appearance.announcement.text}</aside>}
-      {policy.settings?.maintenance.pauseNewWork && <aside className="application-announcement is-warning" role="status">New work is paused. {policy.settings.maintenance.explanation} Saved records remain available.</aside>}
-      {policy.phase === 'error' && <div className="storage-banner" role="alert"><span>Current application policy could not be checked. New actions are disabled; saved evidence is unchanged.</span><Button size="sm" onClick={() => void policy.refresh()}>Refresh application policy</Button></div>}
+      <ApplicationPolicyBanners />
+      {(navigationError || application?.directoryError) && <div className="storage-banner" role="alert">{navigationError || application?.directoryError}</div>}
       {cloud ? <CloudSaveBanner cloud={cloud} /> : storageError && <div className="storage-banner" role="alert"><span>{storageError}</span><Button size="sm" onClick={retrySave}>Retry saving</Button></div>}
       <main id="main-content" className="main-content">
         <LifecycleBanner />
@@ -172,7 +172,8 @@ function AppContent() {
     </div>
     {notice && <div className="toast" role="status"><span className="toast-icon"><Check size={16} /></span><p>{notice}</p><Button variant="ghost" className="icon-button" size="sm" icon={X} aria-label="Dismiss notification" onClick={clearNotice} /></div>}
     <Modal open={mobileNav} onOpenChange={setMobileNav} title="Your workspace" description="Explore your jobs, resumes, rubrics, and analyses." drawer>
-      {cloud && <div className="mb-5 space-y-3"><WorkspaceSwitcher cloud={cloud} /><AccountPanel cloud={cloud} /></div>}
+      {cloud && application && <Button className="mb-4" variant="ghost" icon={LayoutGrid} onClick={() => { setMobileNav(false); openWorkspaceHome() }}>All workspaces</Button>}
+      {cloud && <div className="mb-5 space-y-3"><WorkspaceSwitcher cloud={cloud} /><AccountPanel user={cloud.user} signOut={cloud.signOut} /></div>}
       {!cloud && <EntityLifecycleActions target={{ kind: 'workspace', id: 'workspace' }} name="My workspace" />}
       <Navigation onNavigate={() => setMobileNav(false)} /><div className="mobile-appearance"><span>Appearance</span><ThemeControl /></div>
       {application?.applicationAdmin && <Button icon={Settings} onClick={() => { setMobileNav(false); void application.openAdminSettings() }}>Application settings</Button>}

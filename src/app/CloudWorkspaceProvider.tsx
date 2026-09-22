@@ -11,6 +11,7 @@ import type { GradeLeaveProtectionApi } from './grade-navigation-context'
 import { workspaceLifecycleTransitionErrors, type LifecycleTarget } from '../domain/lifecycle'
 import { WorkspaceSwitcher } from '../components/workspace/WorkspaceSwitcher'
 import { LifecycleDialogProvider } from '../components/lifecycle/LifecycleControls'
+import { useApplicationNavigation } from './application-navigation-context'
 
 const SAVE_DEBOUNCE_MS = 700
 
@@ -66,6 +67,7 @@ export function CloudWorkspaceProvider({
   changeWorkspaceLifecycle: CloudWorkspaceStatus['changeWorkspaceLifecycle']
   leaveUnavailableWorkspace: CloudWorkspaceStatus['leaveUnavailableWorkspace']
 }) {
+  const application = useApplicationNavigation()
   const [phase, setPhase] = useState<{ kind: 'loading' } | { kind: 'error'; message: string } | { kind: 'ready' }>({ kind: 'loading' })
   const [recoveredNotice, setRecoveredNotice] = useState<string | null>(null)
   const [syncingState, setSyncingState] = useState(false)
@@ -418,12 +420,14 @@ export function CloudWorkspaceProvider({
     <div className="loading-pulse cloud-loading-mark" aria-hidden="true" />
     <h1>Opening your workspace</h1>
     <p>Loading your saved jobs, resumes, rubrics, and analyses from the cloud.</p>
+    {application && <Button onClick={() => void application.openWorkspaceHome().catch((caught) => setPhase({ kind: 'error', message: caught instanceof Error ? caught.message : 'Workspace home could not be opened.' }))}>All workspaces</Button>}
   </div></main>
 
   if (phase.kind === 'error') return <LifecycleDialogProvider><main className="recovery-page"><div className="panel recovery-card">
     <AlertTriangle size={32} /><h1>This workspace could not be opened</h1>
     <InlineError>{phase.message}</InlineError>
-    <div className="flex flex-wrap gap-3"><Button variant="primary" icon={RotateCcw} onClick={() => window.location.reload()}>Try again</Button></div>
+    <div className="flex flex-wrap gap-3"><Button variant="primary" icon={RotateCcw} onClick={() => window.location.reload()}>Try again</Button>
+      {application && <Button onClick={() => void application.openWorkspaceHome().catch((caught) => setPhase({ kind: 'error', message: caught instanceof Error ? caught.message : 'Workspace home could not be opened.' }))}>All workspaces</Button>}</div>
     <p className="mt-4 text-[12px] text-muted">Choose another workspace, or open the workspace picker to retry an unfinished lifecycle operation. Missing content is never replaced with samples.</p>
     <WorkspaceSwitcher cloud={{ workspaces, currentWorkspaceId: workspaceId, switchWorkspace, createWorkspace, renameWorkspace, refreshWorkspaces, getWorkspaceLifecycleImpact, changeWorkspaceLifecycle }} />
   </div></main></LifecycleDialogProvider>

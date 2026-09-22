@@ -28,6 +28,14 @@ export function installResumeLifecycleFake(store, { values = store.values, Store
   store.transactions ??= []
   store.failNextTransaction = (error, afterCommit = false) => { fault = { error, afterCommit } }
   store.get = async (workspaceId, id) => copy(values.get(key(workspaceId, id)))
+  store.countActive = async workspaceId => {
+    if ([...controls.values()].some(({ record }) => record.workspaceId === workspaceId &&
+      ((!record.resumeId && record.state !== 'active') || (record.operation && record.operation.status !== 'complete')))) {
+      throw new StoreConflictError('Resume lifecycle cleanup is incomplete.')
+    }
+    return [...values.values()].filter(({ record }) => record.workspaceId === workspaceId && record.recordType === 'resume' &&
+      record.dataKind === 'real' && record.resume.dataKind === 'real' && !resumeLifecycleTesting.resumeIsLocked(record.lifecycle)).length
+  }
   store.getControl = async (workspaceId, resumeId) => copy(controls.get(key(workspaceId, resumeLifecycleTesting.resumeControlId(resumeId))))
   store.listControls = async (workspaceId, token) => {
     const all = [...controls.values()].filter(value => value.record.workspaceId === workspaceId)

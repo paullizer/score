@@ -134,7 +134,7 @@ for (const [key, max, units, min] of [
 for (const path of ['reports.allowedRoles', 'documents.originalDownloadRoles']) field(path, path === 'reports.allowedRoles' ? 'Official export roles' : 'Original download roles', 'access', 'multiselect', 'Restricts existing authorized workspace readers only. Empty disables the action; never grants workspace access.', { options: ['owner', 'editor', 'viewer'] })
 field('appearance.applicationTitle', 'Application title', 'presentation', 'text', 'Navigation/browser title; does not rename saved records.', { max: 80 })
 select('appearance.defaultTheme', 'Default theme', 'presentation', ['system', 'light', 'dark'], 'Only for users without a saved preference. Host and personal preferences retain precedence.')
-select('navigation.defaultPage', 'Default page', 'presentation', ['jobs', 'resumes', 'rubrics', 'analyses'], 'Subject to usable capabilities; explicit deep links win.')
+select('navigation.defaultPage', 'Workspace start page', 'presentation', ['jobs', 'resumes', 'rubrics', 'analyses'], 'Opened after choosing a workspace. App entry shows workspace home; explicit deep links win.')
 field('appearance.announcement.enabled', 'Show announcement', 'presentation', 'boolean', 'Informational, independent of pausing work.')
 field('appearance.announcement.text', 'Announcement text', 'presentation', 'text', 'Plain text, not HTML.', { max: 2000 })
 select('appearance.announcement.tone', 'Announcement tone', 'presentation', ['info', 'warning'], 'Accessible informational or warning presentation.')

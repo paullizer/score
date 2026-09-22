@@ -49,6 +49,8 @@ export interface AnalysisStore {
     workspaceId: string,
     options: AnalysisListOptions<K>,
   ): Promise<{ items: VersionedAnalysisEntity<Extract<AnalysisEntity, { recordType: K }>>[]; continuationToken?: string }>
+  /** Counts active real runs, never their children; fails while library lifecycle work is incomplete. */
+  countActive(workspaceId: string): Promise<number>
   create<T extends AnalysisEntity>(record: T): Promise<{ created: boolean; value: VersionedAnalysisEntity<T> }>
   replace<T extends AnalysisEntity>(record: T, etag: string): Promise<VersionedAnalysisEntity<T>>
   // Pair comparison writes with an ETag-fenced run replacement; initialization uses bounded chunks.

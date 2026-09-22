@@ -248,7 +248,10 @@ export async function startTestServer(overrides = {}) {
   const state = overrides.state ?? createFakeStateStore()
   const config = overrides.config ?? baseConfig()
   const distDir = overrides.distDir ?? FIXTURE_DIST_DIR
-  const app = createApp({ config, directory, state, distDir, now: overrides.now, jobs: overrides.jobs, grades: overrides.grades })
+  const app = createApp({
+    config, directory, state, distDir, now: overrides.now, jobs: overrides.jobs, grades: overrides.grades,
+    resumes: overrides.resumes, analyses: overrides.analyses, settings: overrides.settings,
+  })
   const server = createServer(app)
   await new Promise((resolve, reject) => {
     server.once('error', reject)

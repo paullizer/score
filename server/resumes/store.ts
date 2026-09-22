@@ -48,6 +48,8 @@ export interface ResumeStore {
     workspaceId: string,
     options: ResumeListOptions<K>,
   ): Promise<{ items: VersionedResumeEntity<Extract<ResumeEntity, { recordType: K }>>[]; continuationToken?: string }>
+  /** Counts active real resumes without sources; fails while library lifecycle work is incomplete. */
+  countActive(workspaceId: string): Promise<number>
   create<T extends ResumeEntity>(record: T): Promise<{ created: boolean; value: VersionedResumeEntity<T> }>
   replace<T extends ResumeEntity>(record: T, etag: string): Promise<VersionedResumeEntity<T>>
   // Atomic within one workspace: a create conflict or stale ETag fails every operation.

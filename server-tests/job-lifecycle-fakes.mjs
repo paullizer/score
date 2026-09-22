@@ -78,6 +78,11 @@ export function createFakeRealJobs() {
       const value = records.get(keyFor(workspaceId, jobId))
       return value ? clone(value) : undefined
     },
+    async countActive(workspaceId) {
+      if (control(workspaceId).state !== 'active') throw new StoreConflictError('Job workspace lifecycle is not active.')
+      return [...records.values()].filter(({ record }) => record.workspaceId === workspaceId &&
+        record.recordType === 'job' && record.job.dataKind === 'real' && !locked(record.lifecycle)).length
+    },
     async list(workspaceId, continuationToken) {
       const offset = continuationToken ? Number(continuationToken) : 0
       const values = [...records.values()].filter(value => value.record.workspaceId === workspaceId)
