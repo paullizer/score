@@ -107,7 +107,7 @@ for (const kind of ['jobs', 'grades', 'resumes', 'analyses'] as const) {
 select('summaries.generationMode', 'Summary generation mode', 'processing', ['automatic', 'on-demand'], 'On-demand retains explicit Manage summaries actions. Importing never starts scoring.')
 number('summaries.maxRounds', 'Summary generate/review rounds', 'processing', 3, 'total rounds')
 field('summaries.allowManualPublication', 'Allow manual summary publication', 'access', 'boolean', 'Only exact saved drafts with required disclosure; does not remove historical published text.')
-for (const key of ['manualPublicationRoles', 'historyRoles']) select(`summaries.${key}`, `Summary ${key}`, 'access', ['owner', 'owner-and-editor'], 'Workspace roles only; application-admin status does not grant workspace access or expose unpublished drafts to viewers.')
+for (const key of ['manualPublicationRoles', 'historyRoles']) select(`summaries.${key}`, `Summary ${key}`, 'access', ['owner', 'owner-and-editor'], 'Effective workspace roles; application administrators have Owner-equivalent access. Readers cannot view private summary history or unpublished drafts.')
 number('summaries.historyPageSize', 'Summary history page size', 'processing', 12, 'attempts per page')
 number('summaries.operationTimeoutMilliseconds', 'Summary operation deadline', 'processing', 600_000, 'milliseconds', true, 1000)
 number('ai.transport.maxAttempts', 'Model transport attempts', 'processing', 2, 'total transport attempts')

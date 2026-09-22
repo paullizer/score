@@ -84,7 +84,7 @@ beforeEach(() => {
       markdownJobImports: true, markdownResumeImports: true, wordDocumentImports: true,
       publicSettings: ui.projectPublicSettings(ui.captureProcessingSettings(settings, 'revision-one', '2026-01-01T00:00:00.000Z')),
     })
-    if (path === '/api/session' || path === '/api/session/identity') return json({ mode: 'cloud', user: identity, workspaces, capabilities: { applicationAdmin: false } })
+    if (path === '/api/session' || path === '/api/session/identity') return json({ mode: 'cloud', user: identity, workspaces, capabilities: { applicationAdmin: false, canCreateWorkspaces: true } })
     if (path === '/api/workspaces') {
       if (method === 'POST') {
         const created = metadata(`workspace-${workspaces.length + 1}`, JSON.parse(init.body).name)
@@ -169,7 +169,7 @@ for (const count of [0, 1, 3]) test(`root shows workspace home with ${count} wor
   localStorage.setItem('score-cloud-last-workspace:tenant:reviewer', 'workspace-0')
   await render()
   await until(isHome, 'Workspace home loads')
-  await until(() => requests.some((item) => item.path === '/api/workspaces'), 'Directory refresh is complete')
+  await until(() => requests.filter((item) => item.path === '/api/session').length > 1, 'Directory and capability refresh is complete')
   assert.equal(location.pathname, '/')
   assert.equal(document.querySelectorAll('.workspace-home-card').length, count)
   assert.ok(button('New workspace'))
@@ -414,7 +414,7 @@ test('count loading is bounded, cancels on scope change, and never publishes an 
 
 test('directory refresh failures stay explicit and retry preserves access without a content fallback', async () => {
   let fail = true
-  override = (path) => path === '/api/workspaces' && fail ? failure('Directory refresh failed.') : undefined
+  override = (path) => path === '/api/session' && requests.filter(item => item.path === '/api/session').length > 1 && fail ? failure('Directory refresh failed.') : undefined
   await render()
   await until(() => button('Retry workspace list'), 'Refresh failure is visible')
   assert.ok(button('Research'))
@@ -422,4 +422,40 @@ test('directory refresh failures stay explicit and retry preserves access withou
   fail = false
   await click(button('Retry workspace list'))
   await until(() => !button('Retry workspace list'), 'Directory retry clears its error')
+})
+
+test('count requests and cached results are fenced across role changes, implicit-admin changes, and revoked membership', async () => {
+  let observed
+  const stale = deferred()
+  const first = { ...metadata(), accessSource: 'application-admin' }
+  const ids = [first.id]
+  let items = [first]
+  let firstRead = true
+  let jobs = 8
+  override = path => {
+    if (!path.endsWith('/summary')) return
+    if (firstRead) { firstRead = false; return stale.promise }
+    return json(counts(first.id, jobs))
+  }
+  function Probe({ items }) {
+    observed = ui.useWorkspaceCounts('same-account', items, ids, 0, message => { throw new Error(message) })
+    return null
+  }
+  await render(element(Probe, { items }))
+  await until(() => requests.some(item => item.path.endsWith('/summary')), 'Initial counts are pending')
+  items = [{ ...first, accessSource: 'membership' }]
+  await act(async () => { root.render(element(Probe, { items })); await pause() })
+  await until(() => observed.states[first.id]?.status === 'ready', 'A changed access source gets a fresh count response')
+  await act(async () => { stale.resolve(json(counts(first.id, 99))); await pause() })
+  assert.equal(observed.states[first.id].value.jobs.count, 8)
+  jobs = 9
+  items = [{ ...first, role: 'viewer', accessSource: 'membership' }]
+  await act(async () => { root.render(element(Probe, { items })); await pause() })
+  await until(() => observed.states[first.id]?.value?.jobs.count === 9, 'Role changes invalidate unchanged metadata ETags')
+  await act(async () => { root.render(element(Probe, { items: [] })); await pause() })
+  assert.deepEqual(observed.states, {})
+  jobs = 10
+  await act(async () => { root.render(element(Probe, { items })); await pause() })
+  await until(() => observed.states[first.id]?.value?.jobs.count === 10, 'Restored membership never reuses a revoked cache entry')
+  assert.equal(requests.filter(item => item.path.endsWith('/summary')).length, 4)
 })

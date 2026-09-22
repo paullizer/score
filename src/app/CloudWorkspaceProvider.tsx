@@ -4,13 +4,14 @@ import { type CloudSaveState, type CloudWorkspaceStatus, type WorkspaceContextVa
 import { useWorkspaceEngine, type PersistenceResult, type WorkspaceEngine } from './useWorkspaceEngine'
 import type { Workspace } from '../domain/types'
 import type { CloudUser, CloudWorkspaceSnapshot, WorkspaceSummary } from '../domain/cloud'
-import { authLoginUrl, CloudApiError, CloudAuthError, CloudConflictError, fetchSession, loadWorkspaceState, saveWorkspaceState } from '../services/cloudWorkspace'
+import { authLoginUrl, CloudAccessChangedError, CloudApiError, CloudAuthError, CloudConflictError, fetchSession, loadWorkspaceState, saveWorkspaceState, workspaceAccessStamp } from '../services/cloudWorkspace'
 import { recoverInterrupted, validateWorkspace, WorkspaceValidationError } from '../domain/workspace-validation'
-import { Button, InlineError } from '../components/ui'
+import { Button, InlineError, Modal } from '../components/ui'
 import type { GradeLeaveProtectionApi } from './grade-navigation-context'
 import { workspaceLifecycleTransitionErrors, type LifecycleTarget } from '../domain/lifecycle'
 import { WorkspaceSwitcher } from '../components/workspace/WorkspaceSwitcher'
 import { LifecycleDialogProvider } from '../components/lifecycle/LifecycleControls'
+import { AccessSuspendedContext } from './access-suspended-context'
 import { useApplicationNavigation } from './application-navigation-context'
 
 const SAVE_DEBOUNCE_MS = 700
@@ -49,10 +50,12 @@ export function CloudWorkspaceProvider({
   leaveProtectionRef,
   refreshWorkspaces, getWorkspaceLifecycleImpact, changeWorkspaceLifecycle,
   leaveUnavailableWorkspace,
+  canCreateWorkspaces = false,
 }: {
   workspaceId: string
   user: CloudUser
   workspaces: WorkspaceSummary[]
+  canCreateWorkspaces?: boolean
   apiRef: { current: CloudWorkspaceProviderApi | null }
   leaveProtectionRef?: { current: GradeLeaveProtectionApi | null }
   onAuthError: (message: string) => void
@@ -84,7 +87,7 @@ export function CloudWorkspaceProvider({
   const initialWorkspaceRef = useRef<Workspace | null>(null)
   const metadataRef = useRef(workspaces.find((item) => item.id === workspaceId))
   metadataRef.current = workspaces.find((item) => item.id === workspaceId)
-  const metadataStamp = JSON.stringify([metadataRef.current?.archivedAt, metadataRef.current?.deletedAt, metadataRef.current?.lifecycleOperation])
+  const metadataStamp = workspaceAccessStamp(metadataRef.current)
   const appliedMetadataStamp = useRef(metadataStamp)
   const metadataGeneration = useRef({ stamp: metadataStamp, value: 0 })
   if (metadataGeneration.current.stamp !== metadataStamp) {
@@ -104,6 +107,7 @@ export function CloudWorkspaceProvider({
 
   async function loadCurrentSnapshot(signal?: AbortSignal): Promise<CloudWorkspaceSnapshot & { metadataGeneration: number }> {
     for (let attempt = 0; attempt < 3; attempt++) {
+      if (!metadataRef.current || metadataRef.current.deletedAt) throw new CloudApiError('not_found', 'Workspace access is no longer available. Drafts cannot restore it; refresh access or contact an Owner.', 404)
       const generation = metadataGeneration.current.value
       const snapshot = await loadWorkspaceState(workspaceId, signal)
       if (generation === metadataGeneration.current.value) return { ...snapshot, metadataGeneration: generation }
@@ -184,10 +188,19 @@ export function CloudWorkspaceProvider({
   }, [])
 
   function blockedSave(): Result | null {
+    if ((pendingRef.current || savingRef.current) && writeBlockReason()) return { ok: false, message: writeBlockReason()! }
     if (resolvingRef.current) return { ok: false, message: 'Wait for the current conflict-resolution request to finish.' }
     if (statusRef.current.authenticationRequired) return { ok: false, message: 'Sign in again before saving or leaving this workspace.' }
     if (statusRef.current.state === 'conflict') return { ok: false, message: 'Resolve the save conflict before continuing.' }
     return null
+  }
+
+  function writeBlockReason(): string | null {
+    const metadata = metadataRef.current
+    return !metadata || metadata.deletedAt ? 'Workspace access was removed or the workspace was deleted. Unsaved drafts are kept in this tab, but cannot be uploaded. Refresh access or explicitly discard them before leaving.'
+      : metadata.role === 'viewer' ? 'Your workspace role is now Reader. Unsaved drafts are kept in this tab; saving is stopped. Ask an Owner for edit access, or explicitly discard the draft and reload saved content.'
+        : metadata.archivedAt || (metadata.lifecycleOperation && metadata.lifecycleOperation.status !== 'complete') ? 'The workspace is archived or has unfinished lifecycle work. Unsaved changes cannot overwrite that state.'
+          : null
   }
 
   async function runSaveLoop(): Promise<Result> {
@@ -204,13 +217,21 @@ export function CloudWorkspaceProvider({
     savingRef.current = true
     let outcome: Result = { ok: true }
     while (pendingRef.current && !resolvingRef.current) {
+      const reason = writeBlockReason()
+      if (reason) {
+        setStatus({ state: 'error', error: reason, conflict: null })
+        outcome = { ok: false, message: reason }
+        break
+      }
       const snapshot = pendingRef.current
       pendingRef.current = null
       if (!aliveRef.current) break
       setStatus({ state: 'saving', error: null, conflict: null })
       try {
+        const generation = metadataGeneration.current.value
         const result = await saveWorkspaceState(workspaceId, snapshot, etagRef.current)
         if (!aliveRef.current) break
+        if (generation !== metadataGeneration.current.value) throw new CloudAccessChangedError()
         etagRef.current = result.etag
         if (!pendingRef.current && !resolvingRef.current && statusRef.current.state !== 'conflict') setStatus({ state: 'saved', error: null, conflict: null })
       } catch (error) {
@@ -227,6 +248,12 @@ export function CloudWorkspaceProvider({
 
   function enqueue(next: Workspace): PersistenceResult {
     pendingRef.current = next
+    const reason = writeBlockReason()
+    if (reason) {
+      clearDebounce()
+      setStatus({ state: 'error', error: reason, conflict: null })
+      return 'queued'
+    }
     if (resolvingRef.current || statusRef.current.state === 'conflict' || statusRef.current.state === 'error') return 'queued'
     setStatus({ state: 'saving', error: null, conflict: null })
     clearDebounce()
@@ -292,11 +319,13 @@ export function CloudWorkspaceProvider({
     appliedMetadataStamp.current = metadataStamp
     if (!engineRef.current) return
     const metadata = metadataRef.current
-    if (!metadata || metadata.deletedAt || (metadata.lifecycleOperation && metadata.lifecycleOperation.status !== 'complete')) {
+    if (!metadata || metadata.deletedAt || metadata.role === 'viewer' || (metadata.lifecycleOperation && metadata.lifecycleOperation.status !== 'complete')) {
       clearDebounce()
+      engineRef.current.setExternalArchive(true)
       if (pendingRef.current || savingRef.current) {
-        setStatus({ state: 'conflict', error: 'Workspace lifecycle work is incomplete or this workspace was deleted elsewhere. Unsaved sample changes are kept here, not uploaded over it.', conflict: { detectedAt: new Date().toISOString() } })
+        setStatus({ state: 'error', error: writeBlockReason(), conflict: null })
       }
+      if (metadata && !metadata.deletedAt && metadata.role === 'viewer' && !pendingRef.current && !savingRef.current) void refreshState()
       return
     }
     void refreshState()
@@ -368,8 +397,8 @@ export function CloudWorkspaceProvider({
       requireCurrentSnapshot(fresh)
       const serverWorkspace = validateWorkspace(fresh.workspace)
       const metadata = metadataRef.current
-      if (!metadata || metadata.deletedAt || metadata.archivedAt || (metadata.lifecycleOperation && metadata.lifecycleOperation.status !== 'complete')) {
-        throw new CloudConflictError('This workspace is archived, unavailable, or has an incomplete lifecycle operation. Reload the server state; overwriting cannot restore it.')
+      if (!metadata || metadata.role === 'viewer' || metadata.deletedAt || metadata.archivedAt || (metadata.lifecycleOperation && metadata.lifecycleOperation.status !== 'complete')) {
+        throw new CloudConflictError('This workspace is read-only, archived, unavailable, or has an incomplete lifecycle operation. Reload the server state; overwriting cannot restore access.')
       }
       if (serverWorkspace.lifecycle?.archivedAt !== toSave.lifecycle?.archivedAt) {
         throw new CloudConflictError('Workspace archive state changed in another session. Reload the authoritative state; a sample overwrite cannot change its parent archive.')
@@ -405,6 +434,12 @@ export function CloudWorkspaceProvider({
         onAuthError("A different account signed in. The previous account's unsaved content was not uploaded; reopen the appropriate account's workspace.")
         return
       }
+      await refreshWorkspaces()
+      const current = refreshed.workspaces.find(item => item.id === workspaceId)
+      if (!current || current.role === 'viewer' || current.deletedAt || current.archivedAt) {
+        setStatus({ state: 'error', error: 'Sign-in was confirmed, but this account no longer has edit access. Drafts remain in this tab; no save was replayed.', conflict: null })
+        return
+      }
       setStatus({ state: 'saving', error: null, conflict: null })
       const result = await runSaveLoop()
       if (result.ok && !pendingRef.current) setStatus({ state: 'saved', error: null, conflict: null })
@@ -429,7 +464,7 @@ export function CloudWorkspaceProvider({
     <div className="flex flex-wrap gap-3"><Button variant="primary" icon={RotateCcw} onClick={() => window.location.reload()}>Try again</Button>
       {application && <Button onClick={() => void application.openWorkspaceHome().catch((caught) => setPhase({ kind: 'error', message: caught instanceof Error ? caught.message : 'Workspace home could not be opened.' }))}>All workspaces</Button>}</div>
     <p className="mt-4 text-[12px] text-muted">Choose another workspace, or open the workspace picker to retry an unfinished lifecycle operation. Missing content is never replaced with samples.</p>
-    <WorkspaceSwitcher cloud={{ workspaces, currentWorkspaceId: workspaceId, switchWorkspace, createWorkspace, renameWorkspace, refreshWorkspaces, getWorkspaceLifecycleImpact, changeWorkspaceLifecycle }} />
+    <WorkspaceSwitcher cloud={{ workspaces, currentWorkspaceId: workspaceId, canCreateWorkspaces, switchWorkspace, createWorkspace, renameWorkspace, refreshWorkspaces, getWorkspaceLifecycleImpact, changeWorkspaceLifecycle }} />
   </div></main></LifecycleDialogProvider>
 
   async function signOut() {
@@ -453,6 +488,7 @@ export function CloudWorkspaceProvider({
     recoveredNotice={recoveredNotice}
     engineRef={engineRef} resumeAuthentication={resumeAuthentication}
     user={user} workspaces={workspaces} workspaceId={workspaceId} status={status} syncingState={syncingState} snapshotRevision={snapshotRevision}
+    canCreateWorkspaces={canCreateWorkspaces}
     retrySave={() => { void runSaveLoop() }}
     reloadFromServer={reloadFromServer} keepMineAndOverwrite={keepMineAndOverwrite}
     switchWorkspace={switchWorkspace} createWorkspace={createWorkspace} renameWorkspace={renameWorkspace} signOut={signOut}
@@ -466,7 +502,7 @@ function CloudWorkspaceReady({
   reloadFromServer, keepMineAndOverwrite, switchWorkspace, createWorkspace, renameWorkspace, signOut, children, engineRef, resumeAuthentication,
   flushSave, refreshWorkspaces, getWorkspaceLifecycleImpact, changeWorkspaceLifecycle,
   syncingState,
-  snapshotRevision, leaveUnavailableWorkspace,
+  snapshotRevision, leaveUnavailableWorkspace, canCreateWorkspaces,
 }: {
   initialWorkspace: Workspace
   persist: (next: Workspace) => PersistenceResult
@@ -476,6 +512,7 @@ function CloudWorkspaceReady({
   user: CloudUser
   workspaces: WorkspaceSummary[]
   workspaceId: string
+  canCreateWorkspaces: boolean
   status: SaveStatus
   retrySave: () => void
   reloadFromServer: () => Promise<void>
@@ -494,9 +531,13 @@ function CloudWorkspaceReady({
   leaveUnavailableWorkspace: CloudWorkspaceStatus['leaveUnavailableWorkspace']
 }) {
   const engine = useWorkspaceEngine(initialWorkspace, persist)
+  const [confirmLeave, setConfirmLeave] = useState(false)
+  const [leaving, setLeaving] = useState(false)
+  const [accessError, setAccessError] = useState('')
   const pendingLifecycle = useRef(new Set<string>())
   useEffect(() => { pendingLifecycle.current.clear() }, [snapshotRevision])
   const metadata = workspaces.find((item) => item.id === workspaceId)
+  const unavailable = !metadata || Boolean(metadata.deletedAt)
   const writable = Boolean(metadata && metadata.role !== 'viewer' && !metadata.archivedAt && !metadata.deletedAt && !syncingState && (!metadata.lifecycleOperation || metadata.lifecycleOperation.status === 'complete'))
   const access = useRef({ metadata, writable })
   access.current = { metadata, writable }
@@ -528,7 +569,7 @@ function CloudWorkspaceReady({
 
   if (!engine.workspace) throw new Error('The cloud workspace engine has no document state.')
   const cloud: Omit<CloudWorkspaceStatus, 'realJobs'> = {
-    user, workspaces, currentWorkspaceId: workspaceId,
+    user, workspaces, currentWorkspaceId: workspaceId, canCreateWorkspaces,
     saveState: status.state, saveError: status.error, conflict: status.conflict, syncingState,
     retrySave, reloadFromServer, keepMineAndOverwrite, switchWorkspace, createWorkspace, renameWorkspace, signOut,
     flushSave, refreshWorkspaces, getWorkspaceLifecycleImpact, changeWorkspaceLifecycle,
@@ -580,5 +621,28 @@ function CloudWorkspaceReady({
       engine.notify(action === 'delete' ? 'Permanent deletion saved.' : action === 'archive' ? 'Archive saved. Owned unfinished work is cancelled.' : 'Unarchive saved. Cancelled work has not restarted.')
     },
   }
-  return children(value, cloud)
+  return <>
+    {unavailable && <main className="recovery-page"><div className="panel recovery-card">
+      <ShieldCheck size={30} /><h1>Workspace access is no longer available</h1>
+      <p>This workspace was removed or your membership changed. Workspace content is hidden and new requests and writes are stopped. Ask an Owner or application administrator for access.</p>
+      <p>Unsaved drafts remain in memory in this tab. They do not grant continued access and will not be uploaded automatically. Refresh access to check for a restored grant, or explicitly discard them before leaving.</p>
+      {accessError && <InlineError>{accessError}</InlineError>}
+      <div className="flex flex-wrap gap-3"><Button icon={RotateCcw} onClick={() => {
+        setAccessError('')
+        void refreshWorkspaces().catch(caught => setAccessError(caught instanceof Error ? caught.message : 'Current access could not be refreshed.'))
+      }}>Refresh access</Button><Button onClick={() => setConfirmLeave(true)}>Choose another workspace</Button></div>
+    </div></main>}
+    <AccessSuspendedContext.Provider value={unavailable}><div className="access-suspended" hidden={unavailable}>{children(value, cloud)}</div></AccessSuspendedContext.Provider>
+    <Modal open={confirmLeave} onOpenChange={setConfirmLeave} dismissDisabled={leaving} title="Discard unsaved changes and leave?"
+      description="Access has changed. This explicitly discards sample changes kept only in this tab. Unsaved real-workflow drafts still require their separate leave confirmation."
+      footer={<><Button disabled={leaving} onClick={() => setConfirmLeave(false)}>Keep this tab</Button><Button variant="danger" disabled={leaving} onClick={() => {
+        setLeaving(true); setAccessError('')
+        void leaveUnavailableWorkspace().then(result => { if (!result.ok) { setConfirmLeave(false); setAccessError(result.message) } })
+          .catch(caught => setAccessError(caught instanceof Error ? caught.message : 'The workspace could not be left.'))
+          .finally(() => setLeaving(false))
+      }}>Discard local changes and leave</Button></>}>
+      <p>Other workspaces and already accepted server work are not changed. Nothing is sent to the unavailable workspace.</p>
+      {accessError && <InlineError>{accessError}</InlineError>}
+    </Modal>
+  </>
 }

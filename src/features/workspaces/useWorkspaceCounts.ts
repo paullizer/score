@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { WorkspaceSummary } from '../../domain/cloud'
 import type { WorkspaceCounts } from '../../domain/workspace-summary'
-import { CloudAuthError } from '../../services/cloudWorkspace'
+import { CloudAuthError, workspaceAccessStamp } from '../../services/cloudWorkspace'
 import { isActiveWorkspace } from '../../services/workspaceRecents'
 import { fetchWorkspaceCounts } from '../../services/workspaceSummaries'
 
@@ -25,8 +25,10 @@ export function useWorkspaceCounts(scope: string, workspaces: WorkspaceSummary[]
     const controller = new AbortController()
     const initial: Record<string, WorkspaceCountsState> = {}
     const pending: { id: string; key: string }[] = []
+    const accessible = new Set(workspaces.filter(isActiveWorkspace).map(item => item.id))
+    for (const id of cache.current.keys()) if (!accessible.has(id)) cache.current.delete(id)
     for (const item of visible) {
-      const key = JSON.stringify([scope, revision, item.etag])
+      const key = JSON.stringify([scope, revision, item.etag, workspaceAccessStamp(item)])
       const saved = cache.current.get(item.id)
       if (saved?.key === key) initial[item.id] = saved.state
       else { initial[item.id] = { status: 'loading' }; pending.push({ id: item.id, key }) }
@@ -51,7 +53,7 @@ export function useWorkspaceCounts(scope: string, workspaces: WorkspaceSummary[]
     }
     for (let index = 0; index < Math.min(4, pending.length); index++) void consume()
     return () => controller.abort()
-  }, [revision, retry, scope, visible])
+  }, [revision, retry, scope, visible, workspaces])
 
   const retryCounts = useCallback((id: string) => {
     cache.current.delete(id)

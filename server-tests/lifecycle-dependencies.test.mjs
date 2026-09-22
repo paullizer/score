@@ -4,7 +4,7 @@ import { applySampleLifecycle, createAnalysisRun, createLifecycleDependencies } 
 import { authHeaders, sampleWorkspaceBody, startTestServer } from './helpers.mjs'
 
 test('blocker discovery includes archived analyses that captured historical rubric versions', async t => {
-  const server = await startTestServer()
+  const server = await startTestServer({ seedWorkspace: true })
   t.after(() => server.close())
   const response = await fetch(`${server.baseUrl}/api/session`, { headers: authHeaders() })
   const id = (await response.json()).workspaces[0].id

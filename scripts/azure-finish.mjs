@@ -1,5 +1,6 @@
 import { setTimeout as delay } from 'node:timers/promises'
 import { client, environment, identifier, request, required, setEnvironment } from './azure-common.mjs'
+import { admissionStage, verifyRoleAwareDeployment } from './azure-access.mjs'
 
 async function main() {
   const env = environment()
@@ -25,6 +26,11 @@ async function main() {
     if (response?.ok) {
       const health = await response.json()
       if (health.status === 'ok' || health.status === 'ready') {
+        if (admissionStage(env) === 'roles') {
+          const proof = await verifyRoleAwareDeployment(env, image.slice('DOCKER|'.length))
+          setEnvironment('AZURE_SCORE_ROLE_VERIFIED_IMAGE', proof.image)
+          setEnvironment('AZURE_SCORE_ROLE_VERIFIED_AT', proof.verifiedAt)
+        }
         console.log(`Score is running at ${url}; cloud storage readiness succeeded.`)
         return
       }

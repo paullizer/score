@@ -30,6 +30,10 @@ import { createResumeLifecycleParticipant } from './resumes/lifecycle'
 import { createAnalysisLifecycleParticipant } from './analyses/library-lifecycle'
 import { recordRequestError, telemetryMiddleware, telemetryRequests } from './telemetry-http'
 import { errorCategory, safeMethod, safeRoute } from './telemetry-schema'
+import { createAccessRouter } from './access/routes'
+import { CreationAccessService, WorkspaceAccessService } from './access/service'
+import type { AccessStore } from './access/store'
+import type { EligibleUserDirectory } from './access/directory'
 export { WorkspaceRepository } from './repository'
 export { WorkspaceLifecycleService } from './lifecycle/service'
 export { createLifecycleDependencies } from './lifecycle/dependencies'
@@ -59,6 +63,8 @@ export { RealAnalysisService } from './analyses/service'
 export { ConfigError, loadConfig } from './config'
 export { defaultPersonalWorkspaceId, isValidWorkspaceId, membershipIdFor, principalKeyFor } from './ids'
 export { isApplicationAdmin } from './auth'
+export { CreationAccessService, WorkspaceAccessService } from './access/service'
+export { createAccessStoreFromContainer } from './access/azure-store'
 export { AdminSettingsService } from './settings/service'
 export { createSettingsStoreFromContainer, createAzureSettingsStore, createSettingsReaderFromContainer, createAzureSettingsReader } from './settings/azure-store'
 export { createAzureSettingsModelAdapter } from './settings/models'
@@ -85,6 +91,8 @@ export interface AppDeps {
   readonly resumes?: RealResumesDeps
   readonly analyses?: RealAnalysesDeps
   readonly settings?: AdminSettingsService
+  readonly accessStore?: AccessStore
+  readonly eligibleUsers?: EligibleUserDirectory
   /** Overridable so tests don't depend on a real build of dist/. */
   readonly distDir?: string
   /** Injectable clock for deterministic tests. */
@@ -138,6 +146,8 @@ export function createApp(deps: AppDeps): Express {
   }
   const distDir = deps.distDir ?? DEFAULT_DIST_DIR
   const repository = new WorkspaceRepository({ directory, state, now: deps.now })
+  const creationAccess = new CreationAccessService(deps.accessStore, deps.eligibleUsers, deps.now)
+  const workspaceAccess = new WorkspaceAccessService(repository, directory, deps.eligibleUsers, deps.now)
   const participants: WorkspaceLifecycleParticipant[] = []
   if (deps.analyses) participants.push(createAnalysisLifecycleParticipant(deps.analyses))
   else if (config.realAnalyses || config.analysisLifecycleStore) participants.push(unavailableParticipant('Analysis'))
@@ -173,6 +183,7 @@ export function createApp(deps: AppDeps): Express {
 
   app.get('/healthz', noStore, async (_req, res) => {
     const status = await checkHealth()
+    if (config.authMode === 'easyauth') res.setHeader('X-Score-Access-Control', 'entra-roles-v1')
     res.status(status === 'ready' ? 200 : 503).json({ status })
   })
 
@@ -182,6 +193,7 @@ export function createApp(deps: AppDeps): Express {
   api.use(telemetryMiddleware('score.csrf', createCsrfMiddleware(config)))
   api.use(attachSettingsContext(config, deps.settings))
   api.use(createAdminSettingsRouter(config, deps.settings))
+  api.use(createAccessRouter(creationAccess, workspaceAccess, deps.eligibleUsers))
   api.get('/features', async (req, res) => {
     const snapshot = await getAdmissionSettings(req)
     res.json(effectiveFeatures({
@@ -196,21 +208,24 @@ export function createApp(deps: AppDeps): Express {
   api.use(createRealResumesRouter({ repository, resumes, lifecycle, now: deps.now, wordDocumentImports }))
   api.use(createRealAnalysesRouter({ repository, analyses, resumes, jobs, grades, now: deps.now }))
 
-  api.get('/session/identity', (req, res) => {
+  api.get('/session/identity', async (req, res) => {
     const principal = getPrincipal(req)
     res.json({
       mode: 'cloud',
       user: { id: principal.oid, tenantId: principal.tenantId, name: principal.name, email: principal.email },
-      capabilities: { applicationAdmin: isApplicationAdmin(principal, config) },
+      capabilities: {
+        applicationAdmin: isApplicationAdmin(principal, config),
+        canCreateWorkspaces: await creationAccess.canCreate(principal),
+      },
     })
   })
   api.get('/session', async (req, res) => {
     const principal = getPrincipal(req)
-    const session = await repository.getSession(principal, {
-      bootstrap: req.query.bootstrap !== 'false',
-      allowCreation: async () => (await getCurrentSettings(req)).workspaces.allowCreation,
-    })
-    res.json({ ...session, capabilities: { applicationAdmin: isApplicationAdmin(principal, config) } })
+    const session = await repository.getSession(principal)
+    res.json({ ...session, capabilities: {
+      applicationAdmin: isApplicationAdmin(principal, config),
+      canCreateWorkspaces: await creationAccess.canCreate(principal),
+    } })
   })
 
   api.get('/workspaces', async (req, res) => {
@@ -220,7 +235,9 @@ export function createApp(deps: AppDeps): Express {
   api.post('/workspaces', async (req, res) => {
     const name = pickAllowedField(req.body, 'name', ['name'])
     if (!(await getCurrentSettings(req)).workspaces.allowCreation) throw forbidden('New workspace creation is disabled by application policy.')
-    const workspace = await repository.createWorkspace(getPrincipal(req), name)
+    const principal = getPrincipal(req)
+    if (!await creationAccess.canCreate(principal)) throw forbidden('Ask an application administrator for permission to create workspaces.')
+    const workspace = await repository.createWorkspace(principal, name)
     res.status(201).json({ workspace })
   })
 

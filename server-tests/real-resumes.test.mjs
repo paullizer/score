@@ -306,17 +306,20 @@ function dependencies() {
   return { ...deps, deps, events, blobContainer, cosmos }
 }
 
-function auth(oid = OWNER) {
+function auth(oid = OWNER, roles = ['Score.User']) {
   return {
     'x-ms-client-principal': Buffer.from(JSON.stringify({
-      auth_typ: 'aad', claims: [{ typ: 'tid', val: TENANT }, { typ: 'oid', val: oid }, { typ: 'name', val: 'API test user' }],
+      auth_typ: 'aad', claims: [
+        { typ: 'tid', val: TENANT }, { typ: 'oid', val: oid }, { typ: 'name', val: 'API test user' },
+        ...roles.map(role => ({ typ: 'roles', val: role })),
+      ],
       name_typ: 'name', role_typ: 'roles',
     })).toString('base64'),
   }
 }
 
-function headers({ oid = OWNER, write = true, ...extra } = {}) {
-  return { ...auth(oid), ...(write ? { origin: ORIGIN, 'x-score-request': 'workspace' } : {}), ...extra }
+function headers({ oid = OWNER, roles = ['Score.User'], write = true, ...extra } = {}) {
+  return { ...auth(oid, roles), ...(write ? { origin: ORIGIN, 'x-score-request': 'workspace' } : {}), ...extra }
 }
 
 async function fixture(options = {}) {
@@ -357,7 +360,7 @@ async function fixture(options = {}) {
   const now = () => new Date(clock)
   const repository = new api.WorkspaceRepository({ directory, state, now })
   const config = {
-    authMode: 'easyauth', tenantId: TENANT, allowedUserIds: new Set([OWNER, VIEWER, OUTSIDER]), appOrigin: ORIGIN,
+    authMode: 'easyauth', tenantId: TENANT, appOrigin: ORIGIN,
     ...(options.settings ? { settings: { runtimeEnabled: options.runtimeSettingsEnabled ?? true } } : {}),
   }
   const app = express()
@@ -445,6 +448,20 @@ async function bodyOf(response, expectedStatus) {
   const body = await response.json()
   assert.equal(response.status, expectedStatus, JSON.stringify(body))
   return body
+}
+
+for (const [oid, ordinaryStatus] of [[OUTSIDER, 404], [VIEWER, 403]]) {
+  test(`application Admin with ${ordinaryStatus === 404 ? 'no' : 'viewer'} membership can import and download resumes under owner-only policy`, async t => {
+    const policy = api.createDefaultAdminSettings()
+    policy.documents.originalDownloadRoles = ['owner']
+    const server = await fixture({ settings: { async capture() { return api.captureProcessingSettings(policy, 'owner-downloads', NOW) } } })
+    t.after(() => server.close())
+    assert.equal((await importMarkdown(server, { oid })).status, ordinaryStatus)
+    const imported = await bodyOf(await importMarkdown(server, { oid, headers: { roles: ['Score.Admin'] } }), 202)
+    const path = `${server.path()}/${imported.resume.resume.id}/original`
+    assert.equal((await fetch(path, { headers: headers({ oid, write: false }) })).status, ordinaryStatus)
+    assert.equal((await fetch(path, { headers: headers({ oid, roles: ['Score.Admin'], write: false }) })).status, 200)
+  })
 }
 
 test('resume admissions enforce live lower bounds and source policy; accepted retries and captures retain the original pin during outage', async () => {

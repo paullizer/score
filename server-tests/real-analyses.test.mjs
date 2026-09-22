@@ -672,6 +672,34 @@ test('HTTP contracts enforce membership, viewer restrictions, CSRF, no-store, st
   try { assert.equal((await disabled.request()).status, 503) } finally { await disabled.close() }
 })
 
+for (const role of ['stranger', 'viewer']) {
+  test(`application Admin with ${role} workspace access can create analyses, read frozen evidence, and manage accepted work`, async t => {
+    const f = fixture()
+    const resume = await seedResume(f)
+    const job = await seedJob(f)
+    const http = await startHttp(f)
+    t.after(() => http.close())
+    const actor = { role, roles: ['Score.Admin'] }
+    const input = requestFor(resume, job)
+    assert.equal((await http.request('', 'POST', input, { role, headers: { 'idempotency-key': randomUUID() } })).status,
+      role === 'stranger' ? 404 : 403)
+    const response = await http.request('', 'POST', input, { ...actor, headers: { 'idempotency-key': randomUUID() } })
+    assert.equal(response.status, 202)
+    const created = (await response.json()).run
+    assert.equal((await http.request(`/${created.run.id}`, 'GET', undefined, actor)).status, 200)
+    const comparisons = await http.request(`/${created.run.id}/comparisons`, 'GET', undefined, actor)
+    assert.equal(comparisons.status, 200)
+    const comparison = (await comparisons.json()).comparisons[0].comparison
+    const evidence = await http.request(`/${created.run.id}/comparisons/${comparison.id}/documents/${resume.document.id}?version=1`,
+      'GET', undefined, actor)
+    assert.equal(evidence.status, 200)
+    assert.deepEqual((await evidence.json()).document, resume.document)
+    assert.equal((await http.request(`/${created.run.id}/cancel`, 'POST', {}, {
+      ...actor, headers: { 'if-match': created.etag },
+    })).status, 200)
+  })
+}
+
 test('manifest, snapshot and stored-record validators reject identity, cursor, scope and nested-field tampering', async () => {
   const f = fixture()
   const created = await createRun(f)

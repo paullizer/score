@@ -187,7 +187,7 @@ async function summaryFixture(t, options = {}) {
   const directory = createFakeDirectoryStore()
   const metadata = {
     id: 'workspace', workspaceId: WORKSPACE, name: 'Test workspace', kind: 'personal',
-    ownerId: principalKeyFor(TENANT_ID, ALLOWED_OID), tenantId: TENANT_ID, createdAt: NOW, updatedAt: NOW,
+    ownerId: principalKeyFor(TENANT_ID, ALLOWED_OID), ownerCount: 1, tenantId: TENANT_ID, createdAt: NOW, updatedAt: NOW,
     ...options.metadata,
   }
   await directory.createWorkspace(metadata, membershipFor(WORKSPACE, { oid: ALLOWED_OID, role: 'owner' }))
@@ -241,12 +241,14 @@ function assertUnavailable(body) {
 
 test('GET workspace summary returns direct no-store counts using only aggregates and directory metadata', async t => {
   const fixture = await summaryFixture(t)
+  assert.equal(fixture.directory._metadataReadCount(), 0)
   const response = await fixture.request()
   assert.equal(response.status, 200)
   assert.equal(response.headers.get('cache-control'), 'no-store')
   const body = await response.json()
   assert.deepEqual(body, { workspaceId: WORKSPACE, jobs: ready(137), resumes: ready(137), analyses: ready(137) })
   assert.equal(JSON.stringify(body).includes(PRIVATE), false)
+  assert.ok(fixture.directory._metadataReadCount() > 0)
   assert.deepEqual(fixture.privateReads, [])
   for (const container of Object.values(fixture.containers)) {
     assert.equal(container.queries.length, 2)
@@ -254,15 +256,20 @@ test('GET workspace summary returns direct no-store counts using only aggregates
   }
 })
 
-test('summary authentication, allow-list, tenant and actual membership checks run before every feature read', async t => {
+test('summary application-role admission, tenant and current membership checks run before every feature read', async t => {
   const fixture = await summaryFixture(t)
   for (const [headers, expected] of [
-    [{}, 401], [authHeaders({ oid: NOT_ALLOWED_OID }), 403],
+    [{}, 401], [authHeaders({ roles: [] }), 403], [authHeaders({ roles: ['Other.Application'] }), 403],
+    [authHeaders({ oid: NOT_ALLOWED_OID }), 404],
     [authHeaders({ tenantId: OTHER_TENANT_ID }), 403], [authHeaders({ oid: OTHER_ALLOWED_OID }), 404],
   ]) {
     const response = await fixture.request(headers)
     assert.equal(response.status, expected)
-    assert.ok((await response.json()).error.code)
+    const body = await response.json()
+    assert.ok(body.error.code)
+    assert.equal('workspaceId' in body, false)
+    assert.ok(metrics.every(metric => !(metric.key in body)))
+    assert.equal(JSON.stringify(body).includes(PRIVATE), false)
   }
   assert.equal((await fixture.request(authHeaders(), OTHER_WORKSPACE)).status, 404)
   assert.equal((await fixture.request(authHeaders(), 'bad%20workspace')).status, 404)
@@ -272,7 +279,7 @@ test('summary authentication, allow-list, tenant and actual membership checks ru
   assertNoFeatureReads(fixture)
 })
 
-test('workspace viewers can read summaries but never another workspace partition', async t => {
+test('workspace Readers with legacy viewer membership can read summaries but never another workspace partition', async t => {
   const fixture = await summaryFixture(t)
   fixture.directory._addMembership(WORKSPACE, membershipFor(WORKSPACE, { oid: OTHER_ALLOWED_OID, role: 'viewer' }))
   const response = await fixture.request(authHeaders({ oid: OTHER_ALLOWED_OID }))
@@ -282,6 +289,69 @@ test('workspace viewers can read summaries but never another workspace partition
     assert.ok(container.queries.every(query => query.options.partitionKey === WORKSPACE))
   }
   assert.equal((await fixture.request(authHeaders({ oid: OTHER_ALLOWED_OID }), OTHER_WORKSPACE)).status, 404)
+})
+
+test('summary fixtures publish metadata explicitly while first sessions remain read-only and create no grants or workspaces', async t => {
+  const fixture = await summaryFixture(t)
+  const saved = await fixture.directory.getMetadata(WORKSPACE)
+  for (const [headers, ids, canCreateWorkspaces] of [
+    [authHeaders(), [WORKSPACE], false],
+    [authHeaders({ oid: OTHER_ALLOWED_OID }), [], false],
+    [authHeaders({ oid: NOT_ALLOWED_OID, roles: ['Score.Admin'] }), [WORKSPACE], true],
+  ]) {
+    const response = await fetch(`${fixture.baseUrl}/api/session`, { headers })
+    assert.equal(response.status, 200)
+    const session = await response.json()
+    assert.deepEqual(session.workspaces.map(workspace => workspace.id), ids)
+    assert.equal(session.capabilities.canCreateWorkspaces, canCreateWorkspaces)
+  }
+  assert.deepEqual(await fixture.directory.getMetadata(WORKSPACE), saved)
+  assert.equal(fixture.directory._workspaceCount(), 1)
+  assert.deepEqual(fixture.accessStore._audits(), [])
+  assert.deepEqual(fixture.eligibleUsers.calls, [])
+  assertNoFeatureReads(fixture)
+})
+
+for (const role of [undefined, 'viewer']) {
+  test(`application Admin summaries retain implicit owner access with ${role ? 'Reader' : 'no'} membership and never cross tenants`, async t => {
+    const fixture = await summaryFixture(t)
+    if (role) fixture.directory._addMembership(WORKSPACE, membershipFor(WORKSPACE, { oid: NOT_ALLOWED_OID, role }))
+    const admin = authHeaders({ oid: NOT_ALLOWED_OID, roles: ['Score.Admin'] })
+    const response = await fixture.request(admin)
+    assert.equal(response.status, 200)
+    assert.deepEqual(await response.json(), {
+      workspaceId: WORKSPACE, jobs: ready(137), resumes: ready(137), analyses: ready(137),
+    })
+    const memberId = membershipFor(WORKSPACE, { oid: NOT_ALLOWED_OID, role: 'viewer' }).id
+    assert.equal((await fixture.directory.getMembership(WORKSPACE, memberId))?.role, role)
+    await fixture.directory.createWorkspace({
+      id: 'workspace', workspaceId: OTHER_WORKSPACE, name: 'Other tenant',
+      kind: 'personal', tenantId: OTHER_TENANT_ID, ownerId: principalKeyFor(OTHER_TENANT_ID, ALLOWED_OID),
+      ownerCount: 1, createdAt: NOW, updatedAt: NOW,
+    }, membershipFor(OTHER_WORKSPACE, { tenantId: OTHER_TENANT_ID, oid: ALLOWED_OID, role: 'owner' }))
+    const foreign = await fixture.request(admin, OTHER_WORKSPACE)
+    assert.equal(foreign.status, 404)
+    assert.equal((await foreign.json()).error.code, 'not_found')
+    for (const container of Object.values(fixture.containers)) {
+      assert.equal(container.queries.length, 2)
+      assert.ok(container.queries.every(query => query.options.partitionKey === WORKSPACE))
+    }
+    assert.deepEqual(fixture.privateReads, [])
+  })
+}
+
+test('Reader summary access does not depend on creation-grant storage or live Entra directory availability', async t => {
+  const fixture = await summaryFixture(t)
+  fixture.directory._addMembership(WORKSPACE, membershipFor(WORKSPACE, { oid: OTHER_ALLOWED_OID, role: 'viewer' }))
+  fixture.accessStore._setReadError(new Error(PRIVATE))
+  fixture.eligibleUsers._setError(new Error(PRIVATE))
+  const response = await fixture.request(authHeaders({ oid: OTHER_ALLOWED_OID }))
+  assert.equal(response.status, 200)
+  assert.deepEqual(await response.json(), {
+    workspaceId: WORKSPACE, jobs: ready(137), resumes: ready(137), analyses: ready(137),
+  })
+  assert.deepEqual(fixture.eligibleUsers.calls, [])
+  assert.deepEqual(fixture.privateReads, [])
 })
 
 test('archived workspaces return unavailable metrics without querying any content or lifecycle impact', async t => {
@@ -426,11 +496,27 @@ test('membership revoked during aggregation still returns the standard not-found
   let fixture
   fixture = await summaryFixture(t, {
     dependencies: { jobs: { store: { async countActive() {
-      fixture.directory._addMembership(WORKSPACE, membershipFor(WORKSPACE, { oid: ALLOWED_OID, role: 'revoked' }))
+      const current = await fixture.directory.getMetadata(WORKSPACE)
+      const originalOwner = (await fixture.directory.listWorkspaceMemberships(WORKSPACE))
+        .find(entry => entry.membership.principalId === principalKeyFor(TENANT_ID, ALLOWED_OID))
+      await fixture.directory.changeMembership({
+        metadata: { ...current.metadata, ownerCount: 1 }, expectedMetadataEtag: current.etag,
+        memberId: originalOwner.membership.id, expectedMemberEtag: originalOwner.etag,
+        audit: {
+          id: 'access-concurrent-removal', tenantId: TENANT_ID, actorId: OTHER_ALLOWED_OID, targetId: ALLOWED_OID,
+          action: 'workspace-membership', previous: 'owner', next: null, createdAt: NOW,
+        },
+      })
       return 137
     } } } },
   })
+  fixture.directory._addMembership(WORKSPACE, membershipFor(WORKSPACE, { oid: OTHER_ALLOWED_OID, role: 'owner' }))
   const response = await fixture.request()
   assert.equal(response.status, 404)
-  assert.equal((await response.json()).error.code, 'not_found')
+  const body = await response.json()
+  assert.equal(body.error.code, 'not_found')
+  assert.equal('workspaceId' in body, false)
+  assert.ok(metrics.every(metric => !(metric.key in body)))
+  assert.equal((await fixture.directory.getMetadata(WORKSPACE)).metadata.ownerCount, 1)
+  assert.deepEqual(fixture.privateReads, [])
 })

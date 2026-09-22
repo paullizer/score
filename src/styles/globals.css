@@ -130,7 +130,7 @@
   .workspace-recent-label > span { @apply mt-1 block text-[10px]; color: var(--cp-text-muted); }
   .workspace-home-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 300px), 1fr)); gap: 20px; }
   .workspace-home-card { @apply flex min-w-0 flex-col gap-4 rounded-2xl border p-6; background: var(--cp-surface); box-shadow: 0 1px 2px var(--cp-border); }
-  .workspace-card-heading { @apply flex items-center justify-between gap-3; }
+  .workspace-card-heading { @apply flex flex-wrap items-center justify-between gap-3; }
   .workspace-card-heading .workspace-monogram { @apply h-10 w-10 text-[15px]; background: var(--cp-accent-soft); color: var(--cp-accent); border-color: var(--cp-accent-soft); }
   .workspace-card-open { @apply flex w-full items-start justify-between gap-3 text-left text-[18px] font-semibold; }
   .workspace-card-open > span { overflow-wrap: anywhere; }

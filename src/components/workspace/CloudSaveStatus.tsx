@@ -26,7 +26,9 @@ export function CloudSaveBanner({ cloud }: { cloud: CloudWorkspaceStatus }) {
   const [busy, setBusy] = useState(false)
   const [confirmLeave, setConfirmLeave] = useState(false)
   const [leaveError, setLeaveError] = useState('')
-  const unavailable = cloud.workspaces.find((item) => item.id === cloud.currentWorkspaceId)?.deletedAt
+  const metadata = cloud.workspaces.find((item) => item.id === cloud.currentWorkspaceId)
+  const unavailable = !metadata || metadata.deletedAt
+  const readOnly = unavailable || metadata?.role === 'viewer' || metadata?.archivedAt
 
   if (unavailable) return <>
     <div className="storage-banner" role="alert"><span>This workspace was deleted elsewhere. Unsaved changes remain in this tab, but cannot recreate deleted records.</span>
@@ -42,19 +44,19 @@ export function CloudSaveBanner({ cloud }: { cloud: CloudWorkspaceStatus }) {
     </Modal>
   </>
 
-  if (cloud.saveState === 'error') return <div className="storage-banner" role="alert">
+  if (cloud.saveState === 'error' && !readOnly) return <div className="storage-banner" role="alert">
     <span>Sample autosave: {cloud.saveError ?? 'The sample workspace could not be saved to the cloud.'} Real imports and analyses have separate server progress.</span>
     <Button size="sm" onClick={cloud.retrySave}>Retry saving</Button>
   </div>
 
-  if (cloud.saveState !== 'conflict') return null
+  if (cloud.saveState !== 'conflict' && !(readOnly && cloud.saveState === 'error')) return null
 
   return <>
     <div className="storage-banner" role="alert">
       <span>Sample autosave: {cloud.saveError ?? 'Another session saved newer sample content. Your sample changes are kept, but saving is paused until you choose how to continue.'} Real records are not overwritten by either option.</span>
       <div className="flex flex-wrap gap-2">
         <Button size="sm" onClick={() => setConfirmReload(true)}>Reload latest</Button>
-        <Button size="sm" variant="danger" onClick={() => setConfirmKeepMine(true)}>Keep my changes</Button>
+        {!readOnly && <Button size="sm" variant="danger" onClick={() => setConfirmKeepMine(true)}>Keep my changes</Button>}
       </div>
     </div>
     <Modal open={confirmReload} onOpenChange={(open) => { if (!busy) setConfirmReload(open) }} title="Reload the latest saved version?"
@@ -69,7 +71,7 @@ export function CloudSaveBanner({ cloud }: { cloud: CloudWorkspaceStatus }) {
       description="This replaces ordinary sample edits from another session, never real records. Archive and deletion decisions remain protected; removed content cannot be restored by overwriting."
       footer={<>
         <Button disabled={busy} onClick={() => setConfirmKeepMine(false)}>Cancel</Button>
-        <Button variant="danger" disabled={busy} onClick={async () => { setBusy(true); await cloud.keepMineAndOverwrite(); setBusy(false); setConfirmKeepMine(false) }}>Overwrite with mine</Button>
+        <Button variant="danger" disabled={busy || Boolean(readOnly)} onClick={async () => { setBusy(true); await cloud.keepMineAndOverwrite(); setBusy(false); setConfirmKeepMine(false) }}>Overwrite with mine</Button>
       </>}>
       <p>If another session archived or deleted content, reload the latest workspace instead. Score will keep your unsaved state in this tab and reject an overwrite that would resurrect removed records.</p>
       <p>Server-owned real resumes, sources, rubrics, grade ladders, and analyses remain unchanged.</p>

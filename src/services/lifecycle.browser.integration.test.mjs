@@ -40,7 +40,8 @@ before(async () => {
   })
   domain = await import(pathToFileURL(join(directory, 'domain.mjs')).href)
   const [{ default: postcss }, { default: tailwind }, { default: autoprefixer }] = await Promise.all([import('postcss'), import('tailwindcss'), import('autoprefixer')])
-  const css = await postcss([tailwind(), autoprefixer()]).process(await readFile(join('src', 'styles', 'globals.css'), 'utf8'), { from: join('src', 'styles', 'globals.css') })
+  const styles = await Promise.all(['globals.css', 'admin-settings.css', 'workspace-access.css'].map(file => readFile(join('src', 'styles', file), 'utf8')))
+  const css = await postcss([tailwind(), autoprefixer()]).process(styles.join('\n'), { from: join('src', 'styles', 'globals.css') })
   await writeFile(join(directory, 'browser.css'), css.css)
   localServer = await serve('local'); cloudServer = await serve('cloud')
   try { browser = await chromium.launch({ headless: true }) }
@@ -67,7 +68,7 @@ async function until(check, message) {
 }
 
 async function refreshDirectory(page) {
-  const response = page.waitForResponse((response) => new URL(response.url()).pathname === '/api/workspaces')
+  const response = page.waitForResponse((response) => new URL(response.url()).pathname === '/api/session')
   await page.evaluate(() => window.dispatchEvent(new Event('focus')))
   await (await response).finished()
   await page.evaluate(() => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))))
@@ -323,6 +324,14 @@ function cloudFixture(workspace = emptyState(), summaries = []) {
   const user = { id: 'reviewer', tenantId: 'tenant', name: 'Lifecycle reviewer', email: 'reviewer@example.test' }
   const state = {
     user, workspace, summaries, jobs: [], ladders: [], saves: [], mutations: [], requests: [], pendingArchive: false,
+    capabilities: { applicationAdmin: false, canCreateWorkspaces: true },
+    settings: domain.createDefaultAdminSettings(),
+    eligibleUsers: [
+      { id: 'eligible-one', name: 'Eligible colleague', email: 'colleague@example.test', applicationRoles: ['Score.User'] },
+      { id: 'never-signed-in', name: 'New teammate', email: 'new@example.test', applicationRoles: ['Score.User'] },
+    ],
+    members: { members: [{ id: user.id, name: user.name, email: user.email, role: 'owner' }], etag: '"members-1"' },
+    creationGrant: { userId: 'never-signed-in', canCreateWorkspaces: false, etag: '"unassigned"' }, memberFailure: null,
     beforeRead: null, beforeSave: null, saveFailures: [], jobPending: [], gradePending: [], gradeFailureStatus: 503,
     lifecycleFailure: null, impactFailures: 0, jobDetailFailures: 0, jobDetailFailureStatus: 503,
     gradeImpactFailures: 0, hideDeletingFamilies: false, stateMissing: false, summaryCounts: {},
@@ -335,9 +344,23 @@ function cloudFixture(workspace = emptyState(), summaries = []) {
       const path = decodeURIComponent(url.pathname), body = method === 'POST' || method === 'PUT' || method === 'PATCH' ? request.postDataJSON() : undefined
       state.requests.push([method, path])
       if (method !== 'GET') state.mutations.push({ method, path, body, etag: request.headers()['if-match'] })
-      if (path === '/api/session') return response(route, { mode: 'cloud', user, workspaces: clone(state.summaries) })
+      if (path === '/api/session') return response(route, { mode: 'cloud', user, capabilities: clone(state.capabilities), workspaces: clone(state.summaries) })
+      if (path === '/api/session/identity') return response(route, { mode: 'cloud', user, capabilities: clone(state.capabilities) })
+      if (path === '/api/admin/users' || path.endsWith('/share-candidates')) {
+        const query = url.searchParams.get('query')?.toLowerCase()
+        const users = state.eligibleUsers.filter(person => !query || `${person.name} ${person.email}`.toLowerCase().includes(query))
+        const index = Number(url.searchParams.get('continuation') ?? 0)
+        return response(route, { users: clone(users.slice(index, index + 1)), ...(index + 1 < users.length ? { continuation: String(index + 1) } : {}) })
+      }
+      if (path.endsWith('/workspace-creation')) {
+        if (method === 'PUT') {
+          assert.equal(request.headers()['if-match'], state.creationGrant.etag)
+          state.creationGrant = { ...state.creationGrant, canCreateWorkspaces: body.canCreateWorkspaces, etag: `"grant-${++revision}"` }
+        }
+        return response(route, clone(state.creationGrant))
+      }
       if (path === '/api/features') return response(route, { realJobImports: true, realGradeLadders: true,
-        publicSettings: domain.projectPublicSettings(domain.captureProcessingSettings(domain.createDefaultAdminSettings(), 'legacy-v1', timestamp), false) })
+        publicSettings: domain.projectPublicSettings(domain.captureProcessingSettings(state.settings, 'legacy-v1', timestamp), false) })
       if (path === '/api/workspaces' && method === 'GET') return response(route, { workspaces: clone(state.summaries) })
       if (path === '/api/workspaces' && method === 'POST') {
         const created = workspaceSummary(`created-${revision++}`, body.name)
@@ -347,6 +370,25 @@ function cloudFixture(workspace = emptyState(), summaries = []) {
       const root = /^\/api\/workspaces\/([^/]+)(.*)$/.exec(path)
       if (!root) return response(route, { error: { code: 'not_found', message: path } }, 404)
       const [, workspaceId, tail] = root
+      if (tail === '/members') return response(route, clone(state.members))
+      if (tail.startsWith('/members/')) {
+        assert.equal(request.headers()['if-match'], state.members.etag)
+        if (state.memberFailure) {
+          const message = state.memberFailure; state.memberFailure = null
+          return response(route, { error: { code: 'conflict', message } }, 409)
+        }
+        const id = tail.split('/').at(-1)
+        const person = state.eligibleUsers.find(person => person.id === id) ?? user
+        state.members = {
+          members: [...state.members.members.filter(member => member.id !== id), ...(method === 'PUT' ? [{ id, name: person.name, email: person.email, role: body.role }] : [])],
+          etag: `"members-${++revision}"`,
+        }
+        if (id === user.id && !state.capabilities.applicationAdmin) {
+          state.summaries = method === 'DELETE' ? state.summaries.filter(item => item.id !== workspaceId)
+            : state.summaries.map(item => item.id === workspaceId ? { ...item, role: body.role, accessSource: 'membership' } : item)
+        }
+        return response(route, clone(state.members))
+      }
       if (tail === '/summary') {
         const counts = state.summaryCounts[workspaceId] ?? { jobs: 0, resumes: 0, analyses: 0 }
         return response(route, { workspaceId, ...Object.fromEntries(Object.entries(counts).map(([key, count]) => [key, { status: 'ready', count }])) })
@@ -588,6 +630,49 @@ for (const theme of ['light', 'dark']) for (const width of [1440, 390]) test(`wo
   } else await page.getByRole('link', { name: 'Score home', exact: true }).click()
   await page.getByRole('heading', { name: 'My workspaces', exact: true }).waitFor()
   assert.equal(new URL(page.url()).pathname, '/')
+})
+
+test('mobile workspace home shares access, prunes self-removal, and preserves implicit admin access with global creation policy', { timeout: 60000 }, async (t) => {
+  const summary = workspaceSummary()
+  const fixture = cloudFixture(domain.createInitialWorkspace(), [summary])
+  fixture.capabilities.canCreateWorkspaces = false
+  fixture.settings.workspaces.allowCreation = false
+  fixture.summaryCounts[summary.id] = { jobs: 7, resumes: 11, analyses: 2 }
+  const page = await pageFor(t)
+  await page.setViewportSize({ width: 390, height: 1000 })
+  await page.addInitScript(({ id, timestamp }) => localStorage.setItem('score-cloud-recent-workspaces:tenant:reviewer',
+    JSON.stringify({ version: 1, entries: [{ id, lastOpenedAt: timestamp }] })), { id: summary.id, timestamp })
+  await fixture.install(page)
+  await page.goto(cloudServer.origin)
+  await page.locator('.workspace-card-counts dd').getByText('11', { exact: true }).waitFor()
+  assert.equal(new URL(page.url()).pathname, '/')
+  assert.equal(await page.getByRole('button', { name: 'New workspace', exact: true }).isDisabled(), true)
+  await page.getByRole('button', { name: `Manage access to ${summary.name}`, exact: true }).click()
+  const access = page.getByRole('dialog', { name: 'Manage access', exact: true })
+  await access.getByRole('searchbox', { name: 'Search eligible people', exact: true }).fill('new@example.test')
+  await access.getByRole('button', { name: 'Select New teammate', exact: true }).click()
+  assert.equal(await access.getByRole('combobox', { name: 'New member role', exact: true }).inputValue(), 'viewer')
+  await access.getByRole('button', { name: 'Review adding member', exact: true }).click()
+  await page.getByRole('dialog', { name: 'Add workspace member?', exact: true }).getByRole('button', { name: 'Save membership', exact: true }).click()
+  await access.getByRole('combobox', { name: 'Role for New teammate', exact: true }).selectOption('owner')
+  await page.getByRole('dialog', { name: 'Change workspace role?', exact: true }).getByRole('button', { name: 'Save membership', exact: true }).click()
+  await until(() => access.getByRole('combobox', { name: 'Role for New teammate', exact: true }).inputValue().then(role => role === 'owner'), 'Peer ownership is acknowledged.')
+  await access.getByRole('button', { name: 'Remove Lifecycle reviewer', exact: true }).click()
+  await page.getByRole('dialog', { name: 'Remove workspace member?', exact: true }).getByRole('button', { name: 'Remove membership', exact: true }).click()
+  await access.getByRole('alert').filter({ hasText: 'no longer has permission to manage' }).waitFor()
+  await access.getByRole('button', { name: 'Close dialog', exact: true }).click()
+  assert.equal(await page.locator('.workspace-home-card').count(), 0)
+  assert.deepEqual(await page.evaluate(() => JSON.parse(localStorage.getItem('score-cloud-recent-workspaces:tenant:reviewer')).entries), [])
+  assert.equal(fixture.requests.some(([, path]) => /\/workspaces\/[^/]+\/(?:state|jobs|resumes|analyses|grade-ladders)(?:\/|$)/.test(path)), false)
+  fixture.capabilities = { applicationAdmin: true, canCreateWorkspaces: true }
+  fixture.summaries = [{ ...summary, accessSource: 'application-admin' }]
+  await refreshDirectory(page)
+  await page.locator('.workspace-home-card').getByText('Application administrator', { exact: true }).waitFor()
+  assert.equal(await page.getByRole('button', { name: 'New workspace', exact: true }).isDisabled(), true)
+  assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth), true)
+  await page.getByRole('button', { name: 'Users / user access', exact: true }).click()
+  await page.getByRole('heading', { name: 'Users / user access', exact: true }).waitFor()
+  assert.equal(new URL(page.url()).pathname, '/admin/users')
 })
 
 test('archiving the current workspace returns home rather than entering another available workspace', { timeout: 60000 }, async (t) => {
@@ -864,6 +949,123 @@ test('cross-tab workspace lifecycle refresh preserves unsaved grade drafts and t
   await protection.getByRole('button', { name: 'Stay here', exact: true }).click()
   assert.equal(await editor.getByRole('textbox', { name: 'Grade rubric name', exact: true }).inputValue(), 'Keep this unsaved draft')
   assert.equal(fixture.saves.length, 0)
+})
+
+test('workspace access browser: empty capabilities and pre-login admin creation grants', { timeout: 60000 }, async (t) => {
+  const fixture = cloudFixture()
+  fixture.capabilities.canCreateWorkspaces = false
+  const page = await pageFor(t)
+  await fixture.install(page)
+  await page.goto(cloudServer.origin)
+  await page.getByRole('heading', { name: 'My workspaces', exact: true }).waitFor()
+  assert.equal(await page.getByRole('button', { name: 'New workspace', exact: true }).isDisabled(), true)
+  assert.equal(fixture.mutations.length, 0)
+  fixture.capabilities.canCreateWorkspaces = true
+  await refreshDirectory(page)
+  assert.equal(await page.getByRole('button', { name: 'New workspace', exact: true }).isEnabled(), true)
+  assert.equal(fixture.mutations.length, 0, 'Session refresh never bootstraps a workspace.')
+
+  fixture.capabilities.applicationAdmin = true
+  await page.goto(`${cloudServer.origin}/admin/users`)
+  await page.getByRole('heading', { name: 'Users / user access', exact: true }).waitFor()
+  await page.getByRole('button', { name: 'Load more people', exact: true }).click()
+  await page.getByRole('button', { name: 'Select New teammate', exact: true }).click()
+  await page.getByRole('checkbox', { name: 'Can create workspaces', exact: true }).check()
+  await page.getByRole('button', { name: 'Review permission change', exact: true }).click()
+  assert.equal(fixture.mutations.length, 0)
+  await page.getByRole('dialog', { name: 'Grant workspace creation?', exact: true }).getByRole('button', { name: 'Grant permission', exact: true }).click()
+  await page.getByText('Workspace-creation permission granted. Existing workspace access is unchanged.', { exact: true }).waitFor()
+  assert.equal(fixture.creationGrant.canCreateWorkspaces, true)
+  assert.deepEqual(fixture.mutations.map(item => [item.method, item.path, item.etag]), [
+    ['PUT', '/api/admin/users/never-signed-in/workspace-creation', '"unassigned"'],
+  ])
+})
+
+test('workspace access browser: Reader sharing, conflict recovery, downgrade and revocation', { timeout: 60000 }, async (t) => {
+  const fixture = cloudFixture(domain.createInitialWorkspace(), [{ ...workspaceSummary(), accessSource: 'application-admin' }])
+  fixture.capabilities.applicationAdmin = true
+  const page = await pageFor(t)
+  await fixture.install(page)
+  await page.goto(`${cloudServer.origin}/workspaces/workspace-one/jobs?data=samples`)
+  await page.locator('.sidebar .workspace-switcher-trigger').click()
+  await page.getByRole('button', { name: 'Manage access to Lifecycle workspace', exact: true }).click()
+  const access = page.getByRole('dialog', { name: 'Manage access', exact: true })
+  await access.getByText('Your access: Application administrator', { exact: true }).waitFor()
+  await access.getByRole('searchbox', { name: 'Search eligible people', exact: true }).fill('new@example.test')
+  await access.getByRole('button', { name: 'Select New teammate', exact: true }).click()
+  assert.equal(await access.getByRole('combobox', { name: 'New member role', exact: true }).inputValue(), 'viewer')
+  await access.getByRole('button', { name: 'Review adding member', exact: true }).click()
+  assert.equal(fixture.mutations.length, 0)
+  await page.getByRole('dialog', { name: 'Add workspace member?', exact: true }).getByRole('button', { name: 'Save membership', exact: true }).click()
+  const role = access.getByRole('combobox', { name: 'Role for New teammate', exact: true })
+  await role.waitFor()
+  assert.deepEqual(fixture.mutations[0].body, { role: 'viewer' })
+  assert.equal(fixture.mutations[0].etag, '"members-1"')
+
+  fixture.memberFailure = 'Another Owner changed this membership revision.'
+  await role.selectOption('editor')
+  await page.getByRole('dialog', { name: 'Change workspace role?', exact: true }).getByRole('button', { name: 'Save membership', exact: true }).click()
+  await access.getByRole('alert').filter({ hasText: 'Nothing was automatically resent' }).waitFor()
+  assert.equal(await role.isDisabled(), true)
+  assert.equal(fixture.mutations.length, 2)
+  await access.getByRole('button', { name: 'Refresh members', exact: true }).click()
+  await until(() => role.isEnabled(), 'Membership recovery requires a fresh read.')
+  assert.equal(fixture.mutations.length, 2)
+  assert.equal(await role.inputValue(), 'viewer')
+
+  fixture.capabilities = { applicationAdmin: false, canCreateWorkspaces: false }
+  fixture.summaries[0] = { ...fixture.summaries[0], role: 'viewer', accessSource: 'membership' }
+  await refreshDirectory(page)
+  await access.getByRole('alert').filter({ hasText: 'no longer has permission to manage' }).waitFor()
+  await access.getByRole('button', { name: 'Close dialog', exact: true }).click()
+  const picker = page.getByRole('dialog', { name: 'My workspaces', exact: true })
+  assert.equal(await picker.getByRole('button', { name: 'Manage access to Lifecycle workspace', exact: true }).count(), 0)
+  await picker.getByRole('button', { name: 'Close dialog', exact: true }).click()
+  assert.equal(await page.getByRole('button', { name: 'New analysis', exact: true }).isDisabled(), true)
+  fixture.summaries = []
+  await refreshDirectory(page)
+  await page.getByRole('heading', { name: 'Workspace access is no longer available', exact: true }).waitFor()
+  assert.equal(await page.locator('.app-layout').isVisible(), false)
+  const requests = fixture.requests.filter(([, path]) => path.startsWith('/api/workspaces/')).length
+  await refreshDirectory(page)
+  assert.equal(fixture.requests.filter(([, path]) => path.startsWith('/api/workspaces/')).length, requests)
+})
+
+test('workspace access browser: revoked grade drafts remain protected and restore only with access', { timeout: 60000 }, async (t) => {
+  const sample = domain.createInitialWorkspace(), fixture = cloudFixture(sample, [workspaceSummary()])
+  fixture.ladders = [realLadder(sample)]
+  const family = fixture.ladders[0]
+  family.ladder.sourceSetId = 'set-one'; family.ladder.generationId = 'generation-one'
+  family.sourceSet = { id: 'set-one', sources: [], decisions: [], issues: [], context: family.ladder.context, grades: [9, 11], revision: 1, createdAt: timestamp }
+  const page = await pageFor(t)
+  await fixture.install(page)
+  await page.goto(`${cloudServer.origin}/workspaces/workspace-one/grade-ladders/${family.ladder.id}`)
+  const column = page.locator('.grade-matrix thead th').filter({ has: page.getByRole('heading', { name: 'GS-9', exact: true }) })
+  await column.getByRole('button', { name: 'Edit draft', exact: true }).click()
+  const editor = page.getByRole('dialog', { name: 'Edit GS-9 draft', exact: true })
+  await editor.getByRole('textbox', { name: 'Grade rubric name', exact: true }).fill('Retain my access-revoked draft')
+  fixture.summaries[0] = { ...fixture.summaries[0], role: 'viewer' }
+  await refreshDirectory(page)
+  assert.equal(await editor.getByRole('button', { name: 'Save draft and request review', exact: true }).isDisabled(), true)
+  assert.equal(await editor.getByRole('textbox', { name: 'Grade rubric name', exact: true }).inputValue(), 'Retain my access-revoked draft')
+  fixture.summaries = []
+  await refreshDirectory(page)
+  await page.getByRole('heading', { name: 'Workspace access is no longer available', exact: true }).waitFor()
+  assert.equal(await editor.isVisible(), false)
+  assert.equal(fixture.mutations.length, 0)
+  fixture.summaries = [{ ...workspaceSummary(), role: 'editor' }]
+  await refreshDirectory(page)
+  await editor.waitFor()
+  assert.equal(await editor.getByRole('textbox', { name: 'Grade rubric name', exact: true }).inputValue(), 'Retain my access-revoked draft')
+  assert.equal(fixture.mutations.length, 0, 'Restoration never replays the draft.')
+  fixture.summaries = []
+  await refreshDirectory(page)
+  await page.getByRole('button', { name: 'Choose another workspace', exact: true }).click()
+  await page.getByRole('dialog', { name: 'Discard unsaved changes and leave?', exact: true }).getByRole('button', { name: 'Discard local changes and leave', exact: true }).click()
+  const protection = page.getByRole('dialog', { name: 'Unsaved changes', exact: true })
+  await protection.getByRole('button', { name: 'Stay here', exact: true }).click()
+  await page.getByRole('heading', { name: 'Workspace access is no longer available', exact: true }).waitFor()
+  assert.equal(fixture.mutations.length, 0)
 })
 
 test('real jobs reconcile every page, evict deleted details, and reject stale detail replies without sample autosave', { timeout: 90000 }, async (t) => {

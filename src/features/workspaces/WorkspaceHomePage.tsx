@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import { ArrowRight, Clock3, Layers3, RefreshCw, Settings, ShieldCheck } from 'lucide-react'
+import { ArrowRight, Clock3, Layers3, RefreshCw, Settings, ShieldCheck, Users } from 'lucide-react'
 import type { CloudUser, WorkspaceSummary } from '../../domain/cloud'
 import { ThemeControl } from '../../app/ThemeControl'
 import { ApplicationPolicyBanners } from '../../app/ApplicationPolicyBanners'
@@ -11,7 +11,7 @@ import { Button, InlineError, PageHeader } from '../../components/ui'
 import { isActiveWorkspace, type RecentWorkspace } from '../../services/workspaceRecents'
 import { useWorkspaceCounts, type WorkspaceCountsState } from './useWorkspaceCounts'
 
-export function WorkspaceHomePage({ user, directory, recents, directoryRevision, directoryError, directoryReady, applicationAdmin, openAdminSettings, signOut, onAuthError }: {
+export function WorkspaceHomePage({ user, directory, recents, directoryRevision, directoryError, directoryReady, applicationAdmin, openAdminSettings, openAdminUsers, signOut, onAuthError }: {
   user: CloudUser
   directory: WorkspaceDirectoryActions
   recents: RecentWorkspace[]
@@ -20,6 +20,7 @@ export function WorkspaceHomePage({ user, directory, recents, directoryRevision,
   directoryReady: boolean
   applicationAdmin: boolean
   openAdminSettings: () => Promise<void>
+  openAdminUsers: () => Promise<void>
   signOut: () => Promise<void>
   onAuthError: (message: string) => void
 }) {
@@ -59,6 +60,9 @@ export function WorkspaceHomePage({ user, directory, recents, directoryRevision,
         {applicationAdmin && <Button variant="ghost" icon={Settings} disabled={busy} onClick={() => {
           void openAdminSettings().catch((caught) => setError(caught instanceof Error ? caught.message : 'Application settings could not be opened.'))
         }}>Application settings</Button>}
+        {applicationAdmin && <Button variant="ghost" icon={Users} disabled={busy} onClick={() => {
+          void openAdminUsers().catch((caught) => setError(caught instanceof Error ? caught.message : 'User access could not be opened.'))
+        }}>Users / user access</Button>}
         <ThemeControl /><AccountPanel user={user} signOut={signOut} />
       </div>
     </header>
@@ -91,7 +95,7 @@ export function WorkspaceHomePage({ user, directory, recents, directoryRevision,
           renderDetails={(item) => <WorkspaceCardCounts workspace={item} state={states[item.id]} retry={() => retryCounts(item.id)} />} />
       </section>}
       <footer className="workspace-home-footer">
-        <span><ShieldCheck size={14} aria-hidden="true" />Private workspaces. Clear criteria. A human makes the decision.</span>
+        <span><ShieldCheck size={14} aria-hidden="true" />Access-controlled workspaces. Clear criteria. A human makes the decision.</span>
         <div>{policy.settings?.help.supportUrl && <a className="text-link" href={policy.settings.help.supportUrl} target="_blank" rel="noopener noreferrer">Support</a>}
           {policy.settings?.help.documentationUrl && <a className="text-link" href={policy.settings.help.documentationUrl} target="_blank" rel="noopener noreferrer">Documentation</a>}</div>
       </footer>

@@ -1,0 +1,20 @@
+.access-hint { margin: 0.75rem 0; font-size: 0.75rem; line-height: 1.6; color: var(--cp-text-muted); }
+.access-notice { padding: 1rem; margin: 0 0 1rem; border: 1px solid var(--cp-border); border-radius: 0.625rem; background: var(--cp-surface-soft); color: var(--cp-text); font-size: 0.75rem; line-height: 1.6; }
+.access-notice p + p { margin-top: 0.5rem; }
+.access-person { min-width: 0; flex: 1; display: flex; flex-direction: column; align-items: flex-start; gap: 0.25rem; overflow-wrap: anywhere; }
+.access-person strong { font-size: 0.8125rem; font-weight: 600; }
+.access-person > span:not(.badge) { font-size: 0.75rem; color: var(--cp-text-muted); }
+.access-people-list, .access-members { margin: 0.75rem 0; padding: 0; list-style: none; }
+.access-people-list { max-height: 22rem; overflow-y: auto; }
+.access-people-list > li, .access-members > li { display: flex; flex-wrap: wrap; align-items: center; gap: 0.75rem; border-bottom: 1px solid var(--cp-border); padding: 0.75rem 0; }
+.access-people .search-field { min-width: 180px; flex: 1; }
+.access-section-heading, .access-add-selection { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 0.75rem; margin: 1rem 0; }
+.access-section-heading h3, .access-add h3 { font-size: 0.875rem; font-weight: 600; }
+.access-role { display: flex; flex-direction: column; gap: 0.25rem; font-size: 0.75rem; }
+.access-role select { min-width: 7rem; }
+.access-add { border-top: 1px solid var(--cp-border); margin-top: 1rem; padding-top: 1rem; }
+.access-suspended[hidden] { display: none !important; }
+@media (max-width: 600px) {
+  .access-person { flex-basis: 100%; }
+  .access-people-list { max-height: 18rem; }
+}

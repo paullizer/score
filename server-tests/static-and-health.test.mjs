@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { authHeaders, startTestServer } from './helpers.mjs'
+import { ALLOWED_OID, authHeaders, baseConfig, startTestServer } from './helpers.mjs'
 
 test('Unknown /api routes return a JSON CloudApiError, never the SPA HTML fallback', async () => {
   const server = await startTestServer()
@@ -110,6 +110,24 @@ test('/healthz is anonymous and reports ready when both stores are reachable', a
     assert.equal(body.status, 'ready')
   } finally {
     await server.close()
+  }
+})
+
+test('role-aware admission marker is Easy Auth-only and never changes healthy or unavailable health JSON', async () => {
+  for (const authMode of ['easyauth', 'dev-header']) {
+    for (const unavailable of [false, true]) {
+      const server = await startTestServer({ config: baseConfig({
+        authMode, ...(authMode === 'dev-header' ? { devUserRoles: new Map([[ALLOWED_OID, ['Score.User']]]) } : {}),
+      }) })
+      try {
+        if (unavailable) server.directory._setAccessError(new Error('Fixture dependency unavailable'))
+        const response = await fetch(`${server.baseUrl}/healthz`)
+        assert.equal(response.status, unavailable ? 503 : 200)
+        assert.equal(response.headers.get('x-score-access-control'), authMode === 'easyauth' ? 'entra-roles-v1' : null)
+        assert.equal(response.headers.get('cache-control'), 'no-store')
+        assert.deepEqual(await response.json(), { status: unavailable ? 'unavailable' : 'ready' })
+      } finally { await server.close() }
+    }
   }
 })
 

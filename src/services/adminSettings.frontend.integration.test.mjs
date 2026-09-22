@@ -218,7 +218,7 @@ test('a workspace owner without explicit application capability cannot read the 
 
 test('returning from direct administration loads a directory instead of presenting a failed read as an empty account', async () => {
   workspaces = [metadata]
-  override = path => path === '/api/workspaces' ? json({ error: { code: 'unavailable', message: 'Directory temporarily unavailable.' } }, 503) : undefined
+  override = path => path === '/api/session' ? json({ error: { code: 'unavailable', message: 'Directory temporarily unavailable.' } }, 503) : undefined
   await render(element(ui.CloudApplication))
   await until(() => document.querySelector('.settings-savebar'), 'Direct settings route loads')
   await click(button('Back to workspaces'))
@@ -861,7 +861,9 @@ for (const kind of ['job', 'resume', 'reference']) {
           element(ui.RealResumesContext.Provider, { value: resumes },
             element(ui.GradeLaddersContext.Provider, { value: grades },
               element(ui.MemoryRouter, { initialEntries: [route], future: { v7_startTransition: true, v7_relativeSplatPath: true } }, view))))))
-      await until(() => document.body.textContent.includes(evidence), `${kind} extracted evidence stays readable`)
+      if (kind === 'resume' && !role) {
+        await until(() => !document.body.textContent.includes(evidence), 'A removed workspace membership hides cached resume evidence')
+      } else await until(() => document.body.textContent.includes(evidence), `${kind} extracted evidence stays readable for current members`)
     }
     await show('viewer')
     assert.equal(document.querySelector('a[download]'), null, 'An owner role in another workspace cannot authorize this source')

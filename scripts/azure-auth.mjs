@@ -1,17 +1,22 @@
 import { setTimeout as delay } from 'node:timers/promises'
+import { pathToFileURL } from 'node:url'
 import { SecretClient } from '@azure/keyvault-secrets'
 import { client, environment, graph, identifier, request, required, setEnvironment } from './azure-common.mjs'
+import {
+  GRAPH_APPLICATION_ID, SCORE_ADMIN_ROLE_ID, SCORE_USER_ROLE_ID, admissionStage,
+  bootstrapAdministrators, directoryPermissionDefinitions, graphValues, identifiers, mergeApplicationRoles,
+  validateEasyAuth, validateRuntimeAccessSettings, verifyRoleAwareDeployment,
+} from './azure-access.mjs'
 
-const applicationRoleId = 'e859daa1-e9fa-426a-b79d-6d136d459222'
 const secretName = 'easyauth-client-secret'
 const credentialName = 'score-easyauth'
 const ownershipTag = 'github:paullizer/score'
 
-async function ensureSignInConsent(credential, app, principalId, allowedUserId) {
-  const graphApplications = await graph(credential,
-    `/servicePrincipals?$filter=${encodeURIComponent("appId eq '00000003-0000-0000-c000-000000000000'")}&$select=id,oauth2PermissionScopes`)
-  if (graphApplications.value.length !== 1) throw new Error('The tenant Microsoft Graph service principal could not be resolved uniquely.')
-  const graphApplication = graphApplications.value[0]
+export async function ensureSignInConsent(callGraph, app, principalId) {
+  const graphApplications = await graphValues(callGraph,
+    `/servicePrincipals?$filter=${encodeURIComponent(`appId eq '${GRAPH_APPLICATION_ID}'`)}&$select=id,oauth2PermissionScopes`)
+  if (graphApplications.length !== 1) throw new Error('The tenant Microsoft Graph service principal could not be resolved uniquely.')
+  const graphApplication = graphApplications[0]
   const scopeNames = ['openid', 'profile', 'email']
   const scopeIds = scopeNames.map(name => {
     const definition = graphApplication.oauth2PermissionScopes.find(scope => scope.value === name && scope.isEnabled)
@@ -29,22 +34,74 @@ async function ensureSignInConsent(credential, app, principalId, allowedUserId) 
     if (!entry.resourceAccess.some(item => item.id === id && item.type === 'Scope')) entry.resourceAccess.push({ id, type: 'Scope' })
   }
   if (JSON.stringify(permissions) !== JSON.stringify(app.requiredResourceAccess)) {
-    await graph(credential, `/applications/${app.id}`, 'PATCH', { requiredResourceAccess: permissions })
+    await callGraph(`/applications/${app.id}`, 'PATCH', { requiredResourceAccess: permissions })
   }
-  const grants = await graph(credential, `/oauth2PermissionGrants?$filter=${encodeURIComponent(`clientId eq '${principalId}'`)}`)
-  const existing = grants.value.find(grant => grant.resourceId === graphApplication.id &&
-    grant.consentType === 'Principal' && grant.principalId === allowedUserId)
+  const grants = await graphValues(callGraph, `/oauth2PermissionGrants?$filter=${encodeURIComponent(`clientId eq '${principalId}'`)}`)
+  const existing = grants.find(grant => grant.resourceId === graphApplication.id && grant.consentType === 'AllPrincipals')
   if (existing) {
     const scopes = [...new Set([...existing.scope.split(' ').filter(Boolean), ...scopeNames])]
-    if (scopes.join(' ') !== existing.scope) await graph(credential, `/oauth2PermissionGrants/${existing.id}`, 'PATCH', { scope: scopes.join(' ') })
+    if (scopes.join(' ') !== existing.scope) await callGraph(`/oauth2PermissionGrants/${existing.id}`, 'PATCH', { scope: scopes.join(' ') })
   } else {
-    await graph(credential, '/oauth2PermissionGrants', 'POST', {
+    await callGraph('/oauth2PermissionGrants', 'POST', {
       clientId: principalId,
-      consentType: 'Principal',
-      principalId: allowedUserId,
+      consentType: 'AllPrincipals',
       resourceId: graphApplication.id,
       scope: scopeNames.join(' '),
     })
+  }
+}
+
+export async function ensureRoleAssignments(env, principalId, callGraph) {
+  const admins = bootstrapAdministrators(env)
+  const targets = [
+    ...identifiers(env.AZURE_SCORE_USER_IDS || required(env, 'AZURE_ALLOWED_USER_ID'), 'Score user IDs', true)
+      .map(id => ({ id, type: 'User', roleId: SCORE_USER_ROLE_ID })),
+    ...admins.map(id => ({ id, type: 'User', roleId: SCORE_ADMIN_ROLE_ID })),
+    ...identifiers(env.AZURE_SCORE_USER_GROUP_IDS, 'Score user group IDs').map(id => ({ id, type: 'Group', roleId: SCORE_USER_ROLE_ID })),
+    ...identifiers(env.AZURE_SCORE_ADMIN_GROUP_IDS, 'Score admin group IDs').map(id => ({ id, type: 'Group', roleId: SCORE_ADMIN_ROLE_ID })),
+  ]
+  const assignments = await graphValues(callGraph, `/servicePrincipals/${principalId}/appRoleAssignedTo`)
+  for (const target of targets) {
+    const directoryObject = await callGraph(`/${target.type === 'User' ? 'users' : 'groups'}/${target.id}?$select=id`)
+    if (directoryObject?.id?.toLowerCase() !== target.id) throw new Error('An explicitly requested role-assignment recipient could not be verified.')
+    if (!assignments.some(assignment => assignment.principalId?.toLowerCase() === target.id &&
+      assignment.resourceId?.toLowerCase() === principalId.toLowerCase() && assignment.appRoleId?.toLowerCase() === target.roleId)) {
+      assignments.push(await callGraph(`/servicePrincipals/${principalId}/appRoleAssignedTo`, 'POST', {
+        principalId: target.id, resourceId: principalId, appRoleId: target.roleId,
+      }))
+    }
+  }
+}
+
+export async function ensureDirectoryConsent(env, callGraph) {
+  const principalId = identifier(required(env, 'AZURE_MANAGED_IDENTITY_PRINCIPAL_ID'), 'API managed identity principal').toLowerCase()
+  for (const key of ['AZURE_JOB_WORKER_PRINCIPAL_ID', 'AZURE_GRADE_WORKER_PRINCIPAL_ID',
+    'AZURE_RESUME_WORKER_PRINCIPAL_ID', 'AZURE_ANALYSIS_WORKER_PRINCIPAL_ID']) {
+    if (env[key]?.toLowerCase() === principalId) throw new Error('Graph consent belongs only to the API managed identity, never a document worker.')
+  }
+  const hidden = env.AZURE_SCORE_CONSENT_HIDDEN_MEMBERSHIP ?? 'false'
+  if (!['true', 'false'].includes(hidden)) throw new Error('AZURE_SCORE_CONSENT_HIDDEN_MEMBERSHIP must be explicitly true or false.')
+  const principal = await callGraph(`/servicePrincipals/${principalId}?$select=id,appId,servicePrincipalType`)
+  if (principal?.id?.toLowerCase() !== principalId || principal.servicePrincipalType !== 'ManagedIdentity' ||
+    principal.appId?.toLowerCase() !== identifier(required(env, 'AZURE_MANAGED_IDENTITY_CLIENT_ID'), 'API managed identity client').toLowerCase()) {
+    throw new Error('The Graph consent target is not the configured API managed identity.')
+  }
+  const graphPrincipals = await graphValues(callGraph,
+    `/servicePrincipals?$filter=${encodeURIComponent(`appId eq '${GRAPH_APPLICATION_ID}'`)}&$select=id,appRoles`)
+  if (graphPrincipals.length !== 1) throw new Error('The tenant Microsoft Graph service principal could not be resolved uniquely.')
+  const resource = graphPrincipals[0]
+  const permissions = directoryPermissionDefinitions(resource, hidden === 'true')
+  const assignments = await graphValues(callGraph, `/servicePrincipals/${principalId}/appRoleAssignments`)
+  if (assignments.some(item => item.resourceId?.toLowerCase() === resource.id.toLowerCase() &&
+    !permissions.some(permission => permission.id === item.appRoleId?.toLowerCase()))) {
+    throw new Error('The API identity has unapproved Graph permissions. Review and remove them explicitly; provisioning will not retain a write/broad-directory fallback.')
+  }
+  for (const permission of permissions) {
+    if (!assignments.some(item => item.resourceId?.toLowerCase() === resource.id.toLowerCase() && item.appRoleId?.toLowerCase() === permission.id)) {
+      await callGraph(`/servicePrincipals/${principalId}/appRoleAssignments`, 'POST', {
+        principalId, resourceId: resource.id, appRoleId: permission.id,
+      })
+    }
   }
 }
 
@@ -53,7 +110,23 @@ async function prepare(env) {
   if (!/^[a-z][a-z0-9-]{2,31}$/.test(envName)) throw new Error('Use a lowercase alphanumeric/hyphen environment name, 3-32 characters.')
   const allowedUserId = identifier(required(env, 'AZURE_ALLOWED_USER_ID'), 'Allowed user')
   const operatorId = identifier(required(env, 'AZURE_PRINCIPAL_ID'), 'Deployment principal')
+  bootstrapAdministrators(env)
+  const stage = admissionStage(env)
+  if (stage === 'roles' && env.AZURE_CONTAINER_IMAGE !== env.AZURE_SCORE_ROLE_VERIFIED_IMAGE) {
+    throw new Error('Provisioning would replace a released deployment with an unverified image. Verify the deployed image or restore guarded ingress first.')
+  }
   const credential = client(env)
+  if (env.AZURE_APP_SERVICE_NAME) {
+    const base = `https://management.azure.com/subscriptions/${identifier(required(env, 'AZURE_SUBSCRIPTION_ID'), 'Subscription')}/resourceGroups/${encodeURIComponent(required(env, 'AZURE_RESOURCE_GROUP'))}/providers/Microsoft.Web/sites/${encodeURIComponent(env.AZURE_APP_SERVICE_NAME)}`
+    const currentAuth = await request(credential, 'https://management.azure.com', `${base}/config/authsettingsV2?api-version=2024-11-01`)
+    validateEasyAuth(env, currentAuth.properties, stage)
+    if (stage === 'roles') {
+      const web = await request(credential, 'https://management.azure.com', `${base}/config/web?api-version=2024-11-01`)
+      const image = web.properties?.linuxFxVersion?.replace(/^DOCKER\|/, '')
+      if (image !== env.AZURE_SCORE_ROLE_VERIFIED_IMAGE) throw new Error('The live image does not match the verified role-aware deployment. Restore guarded ingress or verify it before provisioning.')
+      await verifyRoleAwareDeployment(env, image)
+    }
+  }
   const me = await graph(credential, '/me?$select=id')
   if (me.id !== operatorId) throw new Error('The Azure CLI identity does not match the configured deployment principal.')
   const displayName = `Score (${envName})`
@@ -62,22 +135,13 @@ async function prepare(env) {
   if (applications.value.length > 1) throw new Error(`Multiple registrations named ${displayName} exist. Resolve the duplicate registrations before deploying.`)
   let app = applications.value[0]
   if (app && !app.tags?.includes(ownershipTag)) throw new Error('An existing registration has the same name but is not tagged as this Score application. It has not been modified.')
-  if (app && !app.appRoles.some(role => role.id === applicationRoleId && role.value === 'Score.User' && role.isEnabled)) {
-    throw new Error('The existing Score registration has an unexpected application-role configuration. Review it before redeploying.')
-  }
+  const roles = mergeApplicationRoles(app?.appRoles ?? [])
   if (!app) {
     app = await graph(credential, '/applications', 'POST', {
       displayName,
       signInAudience: 'AzureADMyOrg',
       tags: [ownershipTag, `azd:${envName}`],
-      appRoles: [{
-        id: applicationRoleId,
-        allowedMemberTypes: ['User'],
-        description: 'Sign in to the Score application. Workspace permissions are enforced separately.',
-        displayName: 'Score user',
-        isEnabled: true,
-        value: 'Score.User',
-      }],
+      appRoles: roles,
       web: { redirectUris: [], implicitGrantSettings: { enableIdTokenIssuance: true, enableAccessTokenIssuance: false } },
       requiredResourceAccess: [],
     })
@@ -88,23 +152,92 @@ async function prepare(env) {
       })
     }
     await graph(credential, `/applications/${app.id}`, 'PATCH', { identifierUris: [`api://${app.appId}`] })
+  } else if (JSON.stringify(app.appRoles) !== JSON.stringify(roles)) {
+    await graph(credential, `/applications/${app.id}`, 'PATCH', { appRoles: roles })
   }
   const principals = await graph(credential, `/servicePrincipals?$filter=${encodeURIComponent(`appId eq '${app.appId}'`)}&$select=id,appId,appRoleAssignmentRequired`)
   if (principals.value.length > 1) throw new Error('Multiple service principals unexpectedly reference this application.')
   let principal = principals.value[0]
   if (!principal) principal = await graph(credential, '/servicePrincipals', 'POST', { appId: app.appId, appRoleAssignmentRequired: true })
   await graph(credential, `/servicePrincipals/${principal.id}`, 'PATCH', { appRoleAssignmentRequired: true })
-  const assignments = await graph(credential, `/servicePrincipals/${principal.id}/appRoleAssignedTo`)
-  if (!assignments.value.some(assignment => assignment.principalId === allowedUserId && assignment.appRoleId === applicationRoleId)) {
-    await graph(credential, `/servicePrincipals/${principal.id}/appRoleAssignedTo`, 'POST', {
-      principalId: allowedUserId, resourceId: principal.id, appRoleId: applicationRoleId,
-    })
-  }
-  await ensureSignInConsent(credential, app, principal.id, allowedUserId)
+  const callGraph = (path, method, body) => graph(credential, path, method, body)
+  await ensureRoleAssignments({ ...env, AZURE_ALLOWED_USER_ID: allowedUserId }, principal.id, callGraph)
+  await ensureSignInConsent(callGraph, app, principal.id)
   setEnvironment('AZURE_AUTH_CLIENT_ID', app.appId)
   setEnvironment('AZURE_AUTH_APP_OBJECT_ID', app.id)
   setEnvironment('AZURE_AUTH_SP_OBJECT_ID', principal.id)
-  console.log(`Entra registration prepared: ${displayName}. User assignment is required and the configured user has Score.User access.`)
+  setEnvironment('AZURE_SCORE_ADMISSION_STAGE', stage)
+  setEnvironment('AZURE_SCORE_ROLE_VERIFIED_IMAGE', env.AZURE_SCORE_ROLE_VERIFIED_IMAGE || '')
+  setEnvironment('AZURE_SCORE_ROLE_VERIFIED_AT', env.AZURE_SCORE_ROLE_VERIFIED_AT || '')
+  console.log(`Entra registration prepared: ${displayName}. Assignment is required; explicit users/groups have their requested roles. Ingress remains ${stage}.`)
+}
+
+export async function verifyEntraProvisioning(env, callGraph) {
+  const principalId = identifier(required(env, 'AZURE_AUTH_SP_OBJECT_ID'), 'Score service principal').toLowerCase()
+  const principal = await callGraph(`/servicePrincipals/${principalId}?$select=id,appId,appRoles,appRoleAssignmentRequired`)
+  if (principal?.id?.toLowerCase() !== principalId ||
+    principal.appId?.toLowerCase() !== required(env, 'AZURE_AUTH_CLIENT_ID').toLowerCase() ||
+    principal.appRoleAssignmentRequired !== true || mergeApplicationRoles(principal.appRoles).length !== principal.appRoles.length) {
+    throw new Error('The Score Enterprise Application must require assignment and expose both stable user-only application roles.')
+  }
+  const assignments = await graphValues(callGraph, `/servicePrincipals/${principalId}/appRoleAssignedTo`)
+  for (const id of bootstrapAdministrators(env)) {
+    if (!assignments.some(item => item.principalType === 'User' && item.principalId?.toLowerCase() === id &&
+      item.resourceId?.toLowerCase() === principalId && item.appRoleId?.toLowerCase() === SCORE_ADMIN_ROLE_ID)) {
+      throw new Error('Every explicit bootstrap administrator must have a verified direct Score.Admin assignment before deployment.')
+    }
+  }
+  const graphPrincipals = await graphValues(callGraph,
+    `/servicePrincipals?$filter=${encodeURIComponent(`appId eq '${GRAPH_APPLICATION_ID}'`)}&$select=id,appRoles`)
+  if (graphPrincipals.length !== 1) throw new Error('Microsoft Graph could not be resolved uniquely.')
+  const permissions = directoryPermissionDefinitions(graphPrincipals[0], env.AZURE_SCORE_CONSENT_HIDDEN_MEMBERSHIP === 'true')
+  const runtimeId = identifier(required(env, 'AZURE_MANAGED_IDENTITY_PRINCIPAL_ID'), 'API managed identity')
+  const consent = (await graphValues(callGraph, `/servicePrincipals/${runtimeId}/appRoleAssignments`))
+    .filter(item => item.resourceId?.toLowerCase() === graphPrincipals[0].id.toLowerCase())
+  if (permissions.some(permission => !consent.some(item => item.appRoleId?.toLowerCase() === permission.id)) ||
+    consent.some(item => !permissions.some(permission => permission.id === item.appRoleId?.toLowerCase()))) {
+    throw new Error('The API managed identity must have exactly the approved read-only Graph application permissions. Consent/propagation is not yet verified.')
+  }
+}
+
+export async function transitionIngress(env, mode, dependencies = {}) {
+  const credential = dependencies.credential ?? client(env)
+  const callArm = dependencies.arm ?? ((url, method, body) => request(credential, 'https://management.azure.com', url, method, body))
+  const callGraph = dependencies.graph ?? ((path, method, body) => graph(credential, path, method, body))
+  const save = dependencies.save ?? setEnvironment
+  const base = `https://management.azure.com/subscriptions/${identifier(required(env, 'AZURE_SUBSCRIPTION_ID'), 'Subscription')}/resourceGroups/${encodeURIComponent(required(env, 'AZURE_RESOURCE_GROUP'))}/providers/Microsoft.Web/sites/${encodeURIComponent(required(env, 'AZURE_APP_SERVICE_NAME'))}`
+  const authUrl = `${base}/config/authsettingsV2?api-version=2024-11-01`
+  const auth = await callArm(authUrl)
+  const existingIdentities = auth.properties?.identityProviders?.azureActiveDirectory?.validation?.defaultAuthorizationPolicy?.allowedPrincipals?.identities
+  validateEasyAuth(env, auth.properties, existingIdentities?.length ? 'guarded' : 'roles')
+  if (mode === 'restore-guard') {
+    const properties = structuredClone(auth.properties)
+    properties.identityProviders.azureActiveDirectory.validation.defaultAuthorizationPolicy = {
+      allowedPrincipals: { identities: [identifier(required(env, 'AZURE_ALLOWED_USER_ID'), 'Guarded user')] },
+    }
+    await callArm(authUrl, 'PUT', { properties })
+    validateEasyAuth(env, (await callArm(authUrl)).properties, 'guarded')
+    save('AZURE_SCORE_ADMISSION_STAGE', 'guarded')
+    save('AZURE_SCORE_ROLE_VERIFIED_IMAGE', '')
+    save('AZURE_SCORE_ROLE_VERIFIED_AT', '')
+    return
+  }
+  if (mode !== 'release-ingress') throw new Error('Unsupported ingress transition.')
+  await verifyEntraProvisioning(env, callGraph)
+  const appSettings = await callArm(`${base}/config/appsettings/list?api-version=2024-11-01`, 'POST')
+  validateRuntimeAccessSettings(env, appSettings.properties)
+  const web = await callArm(`${base}/config/web?api-version=2024-11-01`)
+  const image = web.properties?.linuxFxVersion?.replace(/^DOCKER\|/, '')
+  const proof = await verifyRoleAwareDeployment(env, image, dependencies)
+  const properties = structuredClone(auth.properties)
+  delete properties.identityProviders.azureActiveDirectory.validation.defaultAuthorizationPolicy
+  await callArm(authUrl, 'PUT', { properties })
+  validateEasyAuth(env, (await callArm(authUrl)).properties, 'roles')
+  // Persist proof before the released stage so an interrupted local save cannot claim verification.
+  save('AZURE_CONTAINER_IMAGE', image)
+  save('AZURE_SCORE_ROLE_VERIFIED_IMAGE', proof.image)
+  save('AZURE_SCORE_ROLE_VERIFIED_AT', proof.verifiedAt)
+  save('AZURE_SCORE_ADMISSION_STAGE', 'roles')
 }
 
 async function waitForVault(action) {
@@ -181,13 +314,27 @@ async function configure(env) {
 
 async function main() {
   const mode = process.argv[2]
-  if (mode !== 'prepare' && mode !== 'configure') throw new Error('Usage: node scripts\\azure-auth.mjs prepare|configure [--rotate]')
+  if (!['prepare', 'configure', 'consent-directory', 'release-ingress', 'restore-guard'].includes(mode)) {
+    throw new Error('Usage: node scripts\\azure-auth.mjs prepare|configure|consent-directory|release-ingress --verified-role-claims|restore-guard')
+  }
   const env = environment()
   if (mode === 'prepare') await prepare(env)
-  else await configure(env)
+  else if (mode === 'configure') await configure(env)
+  else if (mode === 'consent-directory') {
+    const credential = client(env)
+    await ensureDirectoryConsent(env, (path, method, body) => graph(credential, path, method, body))
+    console.log('Only the API managed identity has been provisioned with the explicitly approved read-only Graph permissions.')
+  } else {
+    if (mode === 'release-ingress' && !process.argv.includes('--verified-role-claims')) {
+      throw new Error('Release requires --verified-role-claims after testing real Easy Auth roles and the guarded role-aware deployment. Read the README migration checklist.')
+    }
+    await transitionIngress(env, mode)
+    console.log(mode === 'release-ingress' ? 'Verified role-based ingress released; future provisions preserve this explicit stage.' :
+      'Guarded ingress restored and verified. Restore legacy runtime settings before deploying a legacy image.')
+  }
 }
 
-main().catch(error => {
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) main().catch(error => {
   console.error(error instanceof Error ? error.message : 'Azure authentication setup failed.')
   process.exitCode = 1
 })

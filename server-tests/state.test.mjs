@@ -1,14 +1,8 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { ALLOWED_OID, OTHER_ALLOWED_OID, authHeaders, membershipFor, sampleWorkspaceBody, startTestServer } from './helpers.mjs'
+import { ALLOWED_OID, OTHER_ALLOWED_OID, authHeaders, membershipFor, sampleWorkspaceBody, seedWorkspace, startTestServer } from './helpers.mjs'
 
 const MUTATING_HEADERS = { origin: 'https://app-score-test.azurewebsites.net', 'X-Score-Request': 'workspace', 'content-type': 'application/json' }
-
-async function bootstrapWorkspace(server, oid = ALLOWED_OID) {
-  const response = await fetch(`${server.baseUrl}/api/session`, { headers: authHeaders({ oid }) })
-  const body = await response.json()
-  return body.workspaces[0]
-}
 
 async function getState(server, workspaceId, oid = ALLOWED_OID) {
   return fetch(`${server.baseUrl}/api/workspaces/${workspaceId}/state`, { headers: authHeaders({ oid }) })
@@ -37,10 +31,10 @@ function workspaceWithParsingJob() {
   return { schemaVersion: 1, jobs: [job], resumes: [], documents: [document], rubrics: [], runs: [] }
 }
 
-test('GET state returns the bootstrapped workspace content, with a self-consistent ETag header and body etag', async () => {
+test('GET state returns explicitly created fixture content, with a self-consistent ETag header and body etag', async () => {
   const server = await startTestServer()
   try {
-    const workspace = await bootstrapWorkspace(server)
+    const workspace = await seedWorkspace(server)
     const response = await getState(server, workspace.id)
     assert.equal(response.status, 200)
     const body = await response.json()
@@ -55,7 +49,7 @@ test('GET state returns the bootstrapped workspace content, with a self-consiste
 test('PUT state requires an If-Match header (428 when missing)', async () => {
   const server = await startTestServer()
   try {
-    const workspace = await bootstrapWorkspace(server)
+    const workspace = await seedWorkspace(server)
     const response = await putState(server, workspace.id, sampleWorkspaceBody(), undefined)
     assert.equal(response.status, 428)
   } finally {
@@ -66,7 +60,7 @@ test('PUT state requires an If-Match header (428 when missing)', async () => {
 test('PUT state rejects a wildcard If-Match', async () => {
   const server = await startTestServer()
   try {
-    const workspace = await bootstrapWorkspace(server)
+    const workspace = await seedWorkspace(server)
     const response = await putState(server, workspace.id, sampleWorkspaceBody(), '*')
     assert.equal(response.status, 400)
   } finally {
@@ -77,7 +71,7 @@ test('PUT state rejects a wildcard If-Match', async () => {
 test('PUT state rejects a stale etag with 409 and does not overwrite the stored state', async () => {
   const server = await startTestServer()
   try {
-    const workspace = await bootstrapWorkspace(server)
+    const workspace = await seedWorkspace(server)
     const before = await (await getState(server, workspace.id)).json()
 
     const stale = await putState(server, workspace.id, sampleWorkspaceBody(), '"definitely-stale"')
@@ -94,7 +88,7 @@ test('PUT state rejects a stale etag with 409 and does not overwrite the stored 
 test('PUT state succeeds with the current etag, returns a new etag, and GET reflects the new content', async () => {
   const server = await startTestServer()
   try {
-    const workspace = await bootstrapWorkspace(server)
+    const workspace = await seedWorkspace(server)
     const initial = await (await getState(server, workspace.id)).json()
 
     const edited = structuredClone(initial.workspace)
@@ -116,7 +110,7 @@ test('PUT state succeeds with the current etag, returns a new etag, and GET refl
 test('PUT state validates the full workspace and rejects invalid state without touching the stored copy', async () => {
   const server = await startTestServer()
   try {
-    const workspace = await bootstrapWorkspace(server)
+    const workspace = await seedWorkspace(server)
     const before = await (await getState(server, workspace.id)).json()
 
     const invalid = await putState(server, workspace.id, { schemaVersion: 1, jobs: 'not-an-array', resumes: [], documents: [], rubrics: [], runs: [] }, before.etag)
@@ -138,7 +132,7 @@ test('PUT state validates the full workspace and rejects invalid state without t
 test('The server never auto-recovers interrupted work on a plain GET (that is a client display decision)', async () => {
   const server = await startTestServer()
   try {
-    const workspace = await bootstrapWorkspace(server)
+    const workspace = await seedWorkspace(server)
     const before = await (await getState(server, workspace.id)).json()
 
     const incoming = workspaceWithParsingJob()
@@ -157,7 +151,7 @@ test('The server never auto-recovers interrupted work on a plain GET (that is a 
 test('Viewers can read state but cannot write it; editors can do both', async () => {
   const server = await startTestServer()
   try {
-    const workspace = await bootstrapWorkspace(server, ALLOWED_OID)
+    const workspace = await seedWorkspace(server, { oid: ALLOWED_OID })
     server.directory._addMembership(workspace.id, membershipFor(workspace.id, { oid: OTHER_ALLOWED_OID, role: 'viewer' }))
 
     const viewerGet = await getState(server, workspace.id, OTHER_ALLOWED_OID)
@@ -179,7 +173,7 @@ test('Viewers can read state but cannot write it; editors can do both', async ()
 test('whole-state saves cannot silently remove library records without lifecycle deletion bookkeeping', async () => {
   const server = await startTestServer()
   try {
-    const workspace = await bootstrapWorkspace(server)
+    const workspace = await seedWorkspace(server)
     const before = await (await getState(server, workspace.id)).json()
     assert.equal((await putState(server, workspace.id, sampleWorkspaceBody(), before.etag)).status, 409)
     assert.deepEqual((await (await getState(server, workspace.id)).json()).workspace, before.workspace)
@@ -189,7 +183,7 @@ test('whole-state saves cannot silently remove library records without lifecycle
 test('Corrupt or missing stored state surfaces as unavailable, never fabricated sample data', async () => {
   const server = await startTestServer()
   try {
-    const workspace = await bootstrapWorkspace(server)
+    const workspace = await seedWorkspace(server)
 
     server.state._setRawContent(workspace.id, 'not valid json {{{')
     const corrupt = await getState(server, workspace.id)

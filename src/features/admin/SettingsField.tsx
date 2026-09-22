@@ -1,7 +1,11 @@
 import { useId } from 'react'
 import type { AdminSettings, HostRule, SettingsFieldError, SettingsFieldMetadata } from '../../domain/admin-settings'
 import { Button } from '../../components/ui'
-import { describeValue, settingValue } from './settingsForm'
+import { describeSettingValue, settingValue } from './settingsForm'
+import { workspaceRoleLabel } from '../../domain/access'
+
+const optionLabel = (option: string | number) => option === 'viewer' || option === 'owner' || option === 'editor'
+  ? workspaceRoleLabel(option) : option === 'owner-and-editor' ? 'Owners and Editors' : option
 
 export function SettingsFieldProvenance({ field, changed }: { field?: SettingsFieldMetadata; changed: boolean }) {
   return <>Default source: {field?.defaultSource ?? 'Not reported'} · Source: {changed ? 'Unsaved draft' : field?.source ?? 'Not reported'}</>
@@ -32,7 +36,7 @@ export function SettingsField({ field, settings, saved, defaults, errors, onChan
     : field.control === 'select' ? <select {...common} className="input" value={value === null ? '' : String(value)} onChange={event => onChange(field.path, event.target.value === '' && nullable ? null : event.target.value)}>
       {nullable && <option value="">Not set</option>}
       {field.classification === 'read-only' && !options.length && <option value={String(value)}>{String(value)}</option>}
-      {options.map(option => <option key={option} value={option}>{option}</option>)}
+      {options.map(option => <option key={option} value={option}>{optionLabel(option)}</option>)}
     </select>
     : field.control === 'multiselect' || field.control === 'levels' ? <div id={id} className="grade-checks" role="group" aria-labelledby={`${id}-label`} aria-describedby={`${id}-help`}>
       {(field.control === 'levels' ? Array.from({ length: 15 }, (_, index) => index + 1) : options).map(option =>
@@ -40,7 +44,7 @@ export function SettingsField({ field, settings, saved, defaults, errors, onChan
           checked={Array.isArray(value) && value.includes(option)} onChange={() => {
             const values = Array.isArray(value) ? value : []
             onChange(field.path, values.includes(option) ? values.filter(item => item !== option) : [...values, option])
-          }} />{field.control === 'levels' ? `GS-${option}` : option}</label>)}
+          }} />{field.control === 'levels' ? `GS-${option}` : optionLabel(option)}</label>)}
     </div>
     : field.control === 'host-rules' ? <div id={id} className="space-y-2" role="group" aria-labelledby={`${id}-label`}>
       {(value as HostRule[]).map((rule, index, rules) => <div className="settings-host-row" key={index}>
@@ -60,7 +64,7 @@ export function SettingsField({ field, settings, saved, defaults, errors, onChan
     <div id={`${id}-help`} className="field-hint space-y-1">
       <p>{field.description}</p>
       <p><strong>{byteDisplay ? 'MiB (stored as bytes)' : field.units}</strong>{field.min !== undefined && ` · minimum ${byteDisplay ? field.min / (1024 * 1024) : field.min}`}{field.max !== undefined && ` · maximum ${byteDisplay ? field.max / (1024 * 1024) : field.max}`}</p>
-      <p>Default: <span className="settings-value">{describeValue(defaultValue)}</span> · <SettingsFieldProvenance field={field} changed={changed} /> · Scope: {field.scope} · Activation: {field.activation}</p>
+      <p>Default: <span className="settings-value">{describeSettingValue(field.path, defaultValue)}</span> · <SettingsFieldProvenance field={field} changed={changed} /> · Scope: {field.scope} · Activation: {field.activation}</p>
       {field.prerequisites.length > 0 && <p>Prerequisites: {field.prerequisites.join('; ')}</p>}
       <code>{field.path}</code>
     </div>

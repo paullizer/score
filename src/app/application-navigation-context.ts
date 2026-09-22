@@ -3,6 +3,7 @@ import { createContext, useContext } from 'react'
 export interface ApplicationNavigation {
   applicationAdmin: boolean
   openAdminSettings: () => Promise<void>
+  openAdminUsers: () => Promise<void>
   openWorkspaceHome: () => Promise<void>
   workspaceHomePath: string
   directoryError: string | null

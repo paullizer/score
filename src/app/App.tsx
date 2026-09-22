@@ -1,6 +1,6 @@
 import { useRef, useState } from 'react'
 import { Link, NavLink, Navigate, Route, Routes, useLocation, useNavigate } from 'react-router-dom'
-import { ArrowUpRight, BarChart3, BriefcaseBusiness, Check, ChevronRight, CircleHelp, Files, FlaskConical, Layers3, LayoutGrid, Menu, Plus, RotateCcw, Settings, ShieldCheck, X } from 'lucide-react'
+import { ArrowUpRight, BarChart3, BriefcaseBusiness, Check, ChevronRight, CircleHelp, Files, FlaskConical, Layers3, LayoutGrid, Menu, Plus, RotateCcw, Settings, ShieldCheck, Users, X } from 'lucide-react'
 import { useWorkspace } from './workspace-context'
 import { ThemeControl } from './ThemeControl'
 import { Badge, Button, EmptyState, InlineError, Modal } from '../components/ui'
@@ -93,7 +93,7 @@ function AppContent() {
   }
   const brand = <><span className="brand-mark"><Layers3 size={22} strokeWidth={2} /></span><span>{title}</span></>
 
-  if (!cloud && /^\/admin\/settings\/?$/.test(location.pathname)) return <main className="recovery-page"><div className="panel recovery-card">
+  if (!cloud && /^\/admin\/(?:settings|users)\/?$/.test(location.pathname)) return <main className="recovery-page"><div className="panel recovery-card">
     <h1>Application settings require a cloud administrator</h1><p>This standalone workspace is a fictional local demo. It cannot read or save cloud settings, designate administrators, or run model tests.</p>
     <Button onClick={() => navigate('/jobs')}>Back to demo workspace</Button>
   </div></main>
@@ -118,6 +118,7 @@ function AppContent() {
       <div className="nav-heading">WORKSPACE</div>
       <Navigation />
       {application?.applicationAdmin && <Button variant="ghost" icon={Settings} onClick={() => void application.openAdminSettings()}>Application settings</Button>}
+      {application?.applicationAdmin && <Button variant="ghost" icon={Users} onClick={() => void application.openAdminUsers()}>Users / user access</Button>}
       <div className="sidebar-bottom">
         <div className="sidebar-note"><span className="small-symbol"><ShieldCheck size={19} /></span><strong>Evidence, not impressions.</strong><p>Clear criteria. Traceable matches.<br />A human makes the decision.</p>
           <button className="text-link" onClick={() => setShowAbout(true)}>About this preview <ArrowUpRight size={13} /></button>
@@ -177,6 +178,7 @@ function AppContent() {
       {!cloud && <EntityLifecycleActions target={{ kind: 'workspace', id: 'workspace' }} name="My workspace" />}
       <Navigation onNavigate={() => setMobileNav(false)} /><div className="mobile-appearance"><span>Appearance</span><ThemeControl /></div>
       {application?.applicationAdmin && <Button icon={Settings} onClick={() => { setMobileNav(false); void application.openAdminSettings() }}>Application settings</Button>}
+      {application?.applicationAdmin && <Button icon={Users} onClick={() => { setMobileNav(false); void application.openAdminUsers() }}>Users / user access</Button>}
       {policy.settings?.help.supportUrl && <a className="text-link" href={policy.settings.help.supportUrl} target="_blank" rel="noopener noreferrer">Support</a>}
       {policy.settings?.help.documentationUrl && <a className="text-link" href={policy.settings.help.documentationUrl} target="_blank" rel="noopener noreferrer">Documentation</a>}
       {samplesVisible && <Button icon={RotateCcw} disabled={!canEdit} onClick={() => { setMobileNav(false); setShowReset(true) }}>Reset {cloud ? 'samples' : 'demo workspace'}</Button>}

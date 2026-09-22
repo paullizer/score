@@ -11,7 +11,7 @@ import {
 } from '../dist-server/app.mjs'
 import {
   ALLOWED_OID, OTHER_ALLOWED_OID, APP_ORIGIN, TENANT_ID,
-  authHeaders, baseConfig, createFakeDirectoryStore, createFakeStateStore, membershipFor,
+  authHeaders, baseConfig, createFakeAccessStore, createFakeDirectoryStore, createFakeStateStore, membershipFor, seedWorkspace,
 } from './helpers.mjs'
 import { installGradeLifecycleFake, installGradeBlobLifecycleFake, gradeLifecycleTesting } from './grade-lifecycle-fakes.mjs'
 
@@ -150,12 +150,13 @@ async function start(options = {}) {
     blobs: jobBlobs,
   }
   let now = new Date(NOW)
+  if (!options.persisted) await seedWorkspace({ directory, state, now: () => now })
   const config = baseConfig({
     realJobs: options.jobs === false ? undefined : JOB_CONFIG,
     realGrades: options.grades === false ? undefined : CONFIG,
     ...(options.settings ? { settings: { runtimeEnabled: options.runtimeSettingsEnabled ?? true } } : {}),
   })
-  const app = createApp({ config, directory, state, jobs, grades, now: () => now, settings: options.settings })
+  const app = createApp({ config, directory, state, jobs, grades, accessStore: createFakeAccessStore(), now: () => now, settings: options.settings })
   const server = createServer(app)
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve))
   const baseUrl = `http://127.0.0.1:${server.address().port}/api`

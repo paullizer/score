@@ -10,7 +10,7 @@ import type { AnalysisSummaryHistoryPage, AnalysisSummarySubject, PublishSummary
 import * as api from '../services/realAnalyses'
 import { assertClientAdmission, clientAdmissionReason, usePublicSettings } from './public-settings-context'
 import { analysisFeaturesWithPolicy, boundedPollingInterval } from '../services/publicSettings'
-import { CloudApiError, CloudConflictError, LifecycleOperationError } from '../services/cloudWorkspace'
+import { CloudApiError, CloudConflictError, LifecycleOperationError, workspaceAccessStamp } from '../services/cloudWorkspace'
 import { lifecycleIsRemoved, isEntityArchived, isEntityRemoved, type LifecycleAction, type LifecycleTarget } from '../domain/lifecycle'
 import { WorkspaceContext, useWorkspace, type PendingLifecycleChange, type RenameEntityTarget } from './workspace-context'
 import { getDisplayName } from '../domain/displayNames'
@@ -52,6 +52,9 @@ function RealAnalysesProvider({ workspaceId, children }: { workspaceId: string; 
   parentRef.current = parent
   const location = useLocation()
   const [scope] = useState(() => new RealRequestScope())
+  const metadata = parent.cloud?.workspaces.find(item => item.id === workspaceId)
+  const accessStamp = workspaceAccessStamp(metadata)
+  scope.updateAccess(accessStamp, Boolean(metadata && !metadata.deletedAt))
   const [backoff] = useState(() => new RealReadBackoff())
   const activeAnalyses = useRef(new Map<string, number>())
   const activeComparisons = useRef(new Map<string, number>())
@@ -576,6 +579,7 @@ function RealAnalysesProvider({ workspaceId, children }: { workspaceId: string; 
   }, [refresh, scope])
 
   useEffect(() => { void refresh() }, [policy.settings?.revision, refresh])
+  useEffect(() => { void refresh() }, [accessStamp, refresh])
 
   useEffect(() => {
     if (targetSubscriptions.current.size && features?.realAnalyses && tabVisible() && targetsRef.current.state !== 'ready') {
@@ -682,7 +686,7 @@ function RealAnalysesProvider({ workspaceId, children }: { workspaceId: string; 
       }
       throw caught
     } finally {
-      const current = scope.mutationCurrent(ticket)
+      const current = scope.mutationOwned(ticket)
       scope.finishMutation(ticket)
       if (current) {
         setPendingCount((value) => value - 1)
@@ -694,7 +698,7 @@ function RealAnalysesProvider({ workspaceId, children }: { workspaceId: string; 
             refreshRelevantNarratives(runId)
           }
         }
-        void parentRef.current.cloud?.refreshWorkspaces().catch(() => undefined)
+        void parentRef.current.cloud?.refreshWorkspaces().catch(caught => setError(`Workspace access refresh failed: ${realRequestError(caught, 'Try refreshing access again.')}`))
       }
     }
   }
@@ -886,6 +890,8 @@ function RealAnalysesProvider({ workspaceId, children }: { workspaceId: string; 
     },
     diagnostics: async (runId, comparisonId, continuationToken, signal) => {
       signal?.throwIfAborted()
+      const role = parentRef.current.cloud?.workspaces.find(item => item.id === workspaceId)?.role
+      if (role !== 'owner' && role !== 'editor') throw new Error('Private diagnostics require a workspace Owner or Editor. Readers can still view published results and accessible evidence.')
       if (!historyAvailable.current || !readableRun(runId)) throw new Error('The private diagnostic service is unavailable or this analysis is being deleted.')
       const ticket = scope.read(`diagnostics:${pairKey(runId, comparisonId)}`)
       if (!ticket) throw new Error('Wait for the pending analysis request, then retry opening its private diagnostics.')
@@ -920,6 +926,7 @@ function RealAnalysesProvider({ workspaceId, children }: { workspaceId: string; 
     if (pending && pending.operation.action !== action) throw new Error('Finish the incomplete analysis lifecycle operation before choosing another action.')
     const result = await mutate(target.id, async () => {
       const fresh = await api.getRealAnalysis(workspaceId, target.id)
+      assertRealLifecyclePermission(parentRef.current, workspaceId)
       return api.changeRealAnalysisLifecycle(workspaceId, target.id, action, fresh.etag)
     }, (response, sequence) => {
       if (response.analysis) {

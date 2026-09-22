@@ -16,6 +16,7 @@ export interface WorkspaceSummary {
   name: string
   kind: WorkspaceKind
   role: WorkspaceRole
+  accessSource?: 'membership' | 'application-admin'
   createdAt: string
   updatedAt: string
   etag: string
@@ -28,13 +29,18 @@ export interface CloudSession {
   mode: 'cloud'
   user: CloudUser
   workspaces: WorkspaceSummary[]
-  capabilities?: { applicationAdmin: boolean }
+  capabilities?: CloudCapabilities
+}
+
+export interface CloudCapabilities {
+  applicationAdmin: boolean
+  canCreateWorkspaces: boolean
 }
 
 export interface CloudSessionIdentity {
   mode: 'cloud'
   user: CloudUser
-  capabilities: { applicationAdmin: boolean }
+  capabilities: CloudCapabilities
 }
 
 export interface CloudWorkspaceSnapshot {

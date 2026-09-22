@@ -327,6 +327,39 @@ test('strict export boundary rebuilds spans, metrics and exceptions with no user
   assert.throws(() => sanitizeExportBody('x'.repeat(2_000_001), testKey))
 })
 
+test('workspace sharing and creation-grant telemetry redact workspace IDs, user OIDs, search text, and continuations', () => {
+  const { safeRoute, safeRequestName, safeAttributes, sanitizeExportBody } = telemetryExports
+  const workspaceId = '11111111-1111-4111-8111-111111111111'
+  const userId = '22222222-2222-4222-8222-222222222222'
+  const workspace = `/api/workspaces/${workspaceId}`
+  for (const [method, path, template] of [
+    ['GET', '/api/admin/users', '/api/admin/users'],
+    ['GET', `/api/admin/users/${userId}/workspace-creation`, '/api/admin/users/:userId/workspace-creation'],
+    ['PUT', `/api/admin/users/${userId}/workspace-creation`, '/api/admin/users/:userId/workspace-creation'],
+    ['GET', `${workspace}/members`, '/api/workspaces/:workspaceId/members'],
+    ['PUT', `${workspace}/members/${userId}`, '/api/workspaces/:workspaceId/members/:userId'],
+    ['DELETE', `${workspace}/members/${userId}`, '/api/workspaces/:workspaceId/members/:userId'],
+    ['GET', `${workspace}/share-candidates`, '/api/workspaces/:workspaceId/share-candidates'],
+  ]) {
+    const raw = `${path}?query=${SENTINEL}%40example.test&continuation=${SENTINEL}-page#${SENTINEL}`
+    assert.equal(safeRoute(raw), template)
+    assert.equal(safeRequestName(method, raw), `${method} ${template}`)
+    const properties = { 'http.method': method, 'http.route': raw, 'user.id': userId, 'search.query': SENTINEL }
+    assert.deepEqual(safeAttributes(properties), { 'http.method': method, 'http.route': template })
+    const safe = sanitizeExportBody(JSON.stringify([{
+      time: '2026-09-22T13:00:00.000Z',
+      data: { baseType: 'RequestData', baseData: {
+        id: 'c'.repeat(16), name: `${method} ${raw}`, url: `https://example.test${raw}`,
+        duration: '00:00:00.0010000', responseCode: '200', success: true, properties,
+      } },
+    }]), testKey)
+    const [exported] = JSON.parse(safe)
+    assert.equal(exported.data.baseData.name, `${method} ${template}`)
+    assert.equal(exported.data.baseData.properties['http.route'], template)
+    for (const privateValue of [workspaceId, userId, SENTINEL, 'example.test']) assert.ok(!safe.includes(privateValue), safe)
+  }
+})
+
 test('operation helper preserves values and errors with telemetry disabled, with bounded names and categories', async () => {
   const { traceOperation, safeOperationName, errorCategory, safeAttributes, readTelemetryConfiguration, createTelemetryWarnings } = telemetryExports
   assert.equal(await traceOperation('score.analysis.validation', {}, async () => 42), 42)

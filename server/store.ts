@@ -1,5 +1,6 @@
 import type { WorkspaceKind, WorkspaceRole } from '../src/domain/cloud'
 import type { LifecycleOperation } from '../src/domain/lifecycle'
+import type { AccessAudit } from './access/store'
 
 /** Per-workspace metadata document; Cosmos item id is always the literal string 'workspace'. */
 export interface WorkspaceMetadataDoc {
@@ -7,8 +8,10 @@ export interface WorkspaceMetadataDoc {
   readonly workspaceId: string
   readonly name: string
   readonly kind: WorkspaceKind
-  /** Immutable tenant+OID principal key of the workspace owner. Never a display name/email. */
+  /** Original creator provenance only; current ownership comes from membership. */
   readonly ownerId: string
+  readonly ownerCount?: number
+  readonly deletionRecoveryPrincipalId?: string
   readonly tenantId: string
   readonly createdAt: string
   readonly updatedAt: string
@@ -32,6 +35,22 @@ export interface MembershipDoc {
   readonly principalId: string
   readonly principalType: 'user'
   readonly role: WorkspaceRole
+  readonly name?: string
+  readonly email?: string
+}
+
+export interface StoredMembership {
+  readonly membership: MembershipDoc
+  readonly etag: string
+}
+
+export interface MembershipChange {
+  readonly metadata: WorkspaceMetadataDoc
+  readonly expectedMetadataEtag: string
+  readonly memberId: string
+  readonly membership?: MembershipDoc
+  readonly expectedMemberEtag?: string
+  readonly audit: AccessAudit
 }
 
 /** Thrown by a store when the requested item does not exist. */
@@ -60,6 +79,9 @@ export interface DirectoryStore {
   getMembership(workspaceId: string, membershipId: string): Promise<MembershipDoc | undefined>
   /** Cross-partition lookup of every membership for a principal, across all workspaces. */
   listMembershipsForPrincipal(principalKey: string): Promise<MembershipDoc[]>
+  listMetadataForTenant(tenantId: string): Promise<StoredMetadata[]>
+  listWorkspaceMemberships(workspaceId: string): Promise<StoredMembership[]>
+  changeMembership(change: MembershipChange): Promise<StoredMetadata>
   /**
    * Atomically creates metadata and upserts its owner membership in one workspace partition.
    * Metadata creation remains conditional, so an existing workspace is never modified. An orphan

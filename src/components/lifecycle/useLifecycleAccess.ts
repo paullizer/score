@@ -22,7 +22,7 @@ export function useLifecycleAccess(target?: LifecycleTarget) {
         normalized.kind === 'analysis' ? workspace.runs.some((item) => item.id === normalized.id) :
           normalized.kind === 'rubric' ? workspace.rubrics.some((item) => item.groupId === normalized.id) :
             sampleLifecycleTargets(workspace).some((item) => item.kind === 'ladder' && item.id === normalized.id))
-  const removed = Boolean(summary?.deletedAt) || !exists || isEntityRemoved(workspace, actual)
+  const removed = Boolean(cloud && !summary) || Boolean(summary?.deletedAt) || !exists || isEntityRemoved(workspace, actual)
   const managing = !cloud || Boolean(summary && !summary.deletedAt && (target?.kind === 'workspace' ? summary.role === 'owner' : summary.role !== 'viewer'))
   const editing = !cloud || Boolean(summary && summary.role !== 'viewer')
   const transitioning = Boolean(summary?.lifecycleOperation && summary.lifecycleOperation.status !== 'complete') ||
