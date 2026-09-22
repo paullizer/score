@@ -1,5 +1,6 @@
 import { z } from 'zod'
 import { processingSettingsSnapshotSchema } from '../../src/domain/admin-settings-schema'
+import { assertAcceptedPromptBinding } from '../settings/prompt-integrity'
 import { preservesProcessingSettings } from '../jobs/policy'
 import {
   ANALYSIS_CORRECTION_POLICY_VERSION, ANALYSIS_LEGACY_CORRECTION_POLICY_VERSION, type AnalysisCorrectionHistoryEntry, type AnalysisCorrectionInput,
@@ -115,6 +116,8 @@ export function assertCorrectionReviewBinding(
   review: RealAnalysisGroundingReview, proposal: AnalysisCorrectionProposal,
 ): void {
   analysisGroundingReviewSchema.parse(review)
+  assertAcceptedPromptBinding(review.provenance.prompt, proposal.processingSettings?.promptBundle,
+    proposal.provenance.policyVersion === ANALYSIS_CORRECTION_POLICY_VERSION ? 'evidenceGapReview' : 'assessmentGrounding')
   assertAnalysis(review.assessmentSha256 === analysisHash(proposal.assessment) &&
     review.resumeSnapshotSha256 === proposal.resumeSnapshot.sha256 &&
     review.targetSnapshotSha256 === proposal.targetSnapshot.sha256,

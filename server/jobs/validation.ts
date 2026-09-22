@@ -1,5 +1,6 @@
 import { JOB_IMPORT_LIMITS } from '../../src/domain/real-jobs'
 import { processingSettingsSnapshotSchema } from '../../src/domain/admin-settings-schema'
+import { promptExecutionProvenanceSchema } from '../../src/domain/prompt-versions'
 import type { RealJobRecord } from '../../src/domain/real-jobs'
 import { isSafeUploadedFilename } from '../../src/domain/source-files'
 import type { Citation, Rubric, SourceDocument } from '../../src/domain/types'
@@ -189,7 +190,9 @@ export function validateRealRubric(rubric: Rubric, document: SourceDocument, con
   if (!isTimestamp(rubric.createdAt)) errors.push('Rubric createdAt must be a timestamp.')
   if (rubric.dataKind !== 'real') errors.push('Real rubrics must have dataKind=real.')
   if (!isRecord(rubric.provenance) ||
-    !hasOnlyKeys(rubric.provenance, ['kind', 'model', 'promptVersion']) ||
+    !hasOnlyKeys(rubric.provenance, ['kind', 'model', 'promptVersion', 'prompt']) ||
+    (rubric.provenance.prompt !== undefined && (!promptExecutionProvenanceSchema.safeParse(rubric.provenance.prompt).success ||
+      rubric.provenance.prompt.family !== 'jobRubric' || rubric.provenance.prompt.revisionId !== rubric.provenance.promptVersion)) ||
     !['generated', 'edited'].includes(String(rubric.provenance.kind)) ||
     !isNonBlank(rubric.provenance.model) || !isNonBlank(rubric.provenance.promptVersion)) {
     errors.push('Rubric provenance must identify its kind, model, and prompt version.')
@@ -247,7 +250,10 @@ export function validateStoredRealRubric(value: unknown): value is Rubric {
     !isNonBlank(value.id) || !isNonBlank(value.groupId) || !isNonBlank(value.name) || !isNonBlank(value.description) ||
     !Number.isInteger(value.version) || Number(value.version) < 1 || !isTimestamp(value.createdAt) ||
     !Array.isArray(value.criteria) || value.criteria.length < 1 || value.criteria.length > JOB_IMPORT_LIMITS.maxCriteria ||
-    !isRecord(value.provenance) || !hasOnlyKeys(value.provenance, ['kind', 'model', 'promptVersion']) ||
+    !isRecord(value.provenance) || !hasOnlyKeys(value.provenance, ['kind', 'model', 'promptVersion', 'prompt']) ||
+    (value.provenance.prompt !== undefined && (!promptExecutionProvenanceSchema.safeParse(value.provenance.prompt).success ||
+      !isRecord(value.provenance.prompt) || value.provenance.prompt.family !== 'jobRubric' ||
+      value.provenance.prompt.revisionId !== value.provenance.promptVersion)) ||
     !['generated', 'edited'].includes(String(value.provenance.kind)) ||
     !isNonBlank(value.provenance.model) || !isNonBlank(value.provenance.promptVersion)) {
     return false

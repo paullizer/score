@@ -118,6 +118,7 @@ export const savedRubricSchema = z.strictObject({
     kind: z.enum(['generated', 'edited']),
     model: z.string().min(1).max(300),
     promptVersion: z.string().min(1).max(200),
+    prompt: promptExecutionProvenanceSchema.optional(),
   }).optional(),
   criteria: z.array(draftCriterionSchema.extend({
     id: identifier,
@@ -140,3 +141,4 @@ export function structuredSchema(schema: z.ZodType): Record<string, unknown> {
   delete result.$schema
   return result
 }
+import { promptExecutionProvenanceSchema } from '../../src/domain/prompt-versions'

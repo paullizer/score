@@ -1,7 +1,7 @@
 param location string
 param token string
 param tags object
-@allowed(['resume', 'analysis'])
+@allowed(['resume', 'analysis', 'qc'])
 param kind string
 param cosmosAccountName string
 param storageAccountName string
@@ -18,6 +18,7 @@ param tenantId string
 param workerImage string
 
 var isResume = kind == 'resume'
+var isQc = kind == 'qc'
 var recordContainer = '${kind}-records'
 var sourceContainer = '${kind}-sources'
 var prefix = toUpper(kind)
@@ -111,7 +112,7 @@ resource dataAccess 'Microsoft.DocumentDB/databaseAccounts/sqlRoleAssignments@20
 // Older job/grade images do not contain these entry points, even in the same registry.
 var deployed = startsWith(workerImage, '${registry.properties.loginServer}/score-worker:resume-analysis-') && (!isResume || (rendererDeployed && !empty(documentIntelligenceName) && !empty(rendererUrl)))
 resource worker 'Microsoft.App/jobs@2024-03-01' = {
-  name: 'job-score-${isResume ? 'resumes' : 'analyses'}-${token}'
+  name: 'job-score-${isResume ? 'resumes' : isQc ? 'qc' : 'analyses'}-${token}'
   location: location
   tags: tags
   identity: { type: 'UserAssigned', userAssignedIdentities: { '${identity.id}': {} } }
@@ -153,7 +154,7 @@ resource worker 'Microsoft.App/jobs@2024-03-01' = {
         ], isResume ? [
           { name: 'DOCUMENT_INTELLIGENCE_ENDPOINT', value: 'https://${documentIntelligenceName}.cognitiveservices.azure.com' }
           { name: 'JOB_RENDERER_URL', value: rendererUrl }
-        ] : [
+        ] : isQc ? [] : [
           { name: 'ANALYSIS_EVIDENCE_CORRECTIONS_ENABLED', value: 'false' }
         ])
       }]

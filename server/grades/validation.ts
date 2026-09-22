@@ -1,6 +1,8 @@
 import { createHash } from 'node:crypto'
 import { z } from 'zod'
 import { processingSettingsSnapshotSchema } from '../../src/domain/admin-settings-schema'
+import { promptExecutionProvenanceSchema } from '../../src/domain/prompt-versions'
+import { assertAcceptedPromptBinding } from '../settings/prompt-integrity'
 import {
   GRADE_LADDER_LIMITS as LIMITS, gradeHeadId,
   type GradeEntity, type GradeIssue, type GradeRubricVersionRecord, type GradeSourceSetRecord,
@@ -91,6 +93,7 @@ const child = { ...base, ladderId: id('ladder') }
 const blobName = z.string().max(700).refine(isSafeGradeBlobName, 'Invalid grade blob name.')
 const provenance = z.strictObject({
   kind: z.enum(['generated', 'edited']), model: text(300), promptVersion: text(200),
+  prompt: promptExecutionProvenanceSchema.optional(),
 })
 const criterion = z.strictObject({
   id: identifier, key: z.enum(['technical', 'delivery', 'analysis', 'communication', 'leadership', 'policy', 'custom']),
@@ -176,6 +179,7 @@ const planSchema = z.strictObject({
   generationId: identifier, sourceSetId: id('source-set'),
   competencies: z.array(competencySchema).min(1).max(LIMITS.maxCriteria), issues,
   model: text(300), promptVersion: text(200),
+  prompt: promptExecutionProvenanceSchema.optional(),
 })
 const versionSchema = z.strictObject({
   ...child, id: id('grade-version'), recordType: z.literal('grade-version'),
@@ -187,6 +191,7 @@ const reviewSchema = z.strictObject({
   ...child, id: id('grade-review'), recordType: z.literal('grade-review'), grade,
   versionId: id('grade-version'), versionHash: hash, sourceSetId: id('source-set'),
   outcome: z.enum(['supported', 'needs-sources']), issues, model: text(300), promptVersion: text(200),
+  prompt: promptExecutionProvenanceSchema.optional(),
 })
 const approvalSchema = z.strictObject({
   ...child, id: id('grade-approval'), recordType: z.literal('grade-approval'), grade,
@@ -487,6 +492,9 @@ export function parseGradeEntity(value: unknown): GradeEntity {
     assert(record.contentHash === gradeSourceSetHash(record), 'Frozen source-set hash mismatch.')
   }
   if (record.recordType === 'grade-version') {
+    if (record.rubric.provenance?.kind === 'generated') {
+      assertAcceptedPromptBinding(record.rubric.provenance.prompt, record.processingSettings?.promptBundle, 'gradeDraft')
+    }
     assert(record.rubric.id === record.id && record.rubric.groupId === gradeHeadId(record.ladderId, record.grade) &&
       record.rubric.createdAt === record.createdAt && record.rubric.version === record.version &&
       record.rubric.grade === `GS-${record.grade}`, 'Rubric identity, version, or grade mismatch.')
@@ -496,7 +504,13 @@ export function parseGradeEntity(value: unknown): GradeEntity {
     assert(unique(record.qualifications.map(item => item.id)), 'Qualifications must be unique.')
     assert(record.contentHash === gradeVersionHash(record), 'Grade version hash mismatch.')
   }
-  if (record.recordType === 'grade-competency-plan') assert(unique(record.competencies.map(item => item.id)), 'Competency IDs must be unique.')
+  if (record.recordType === 'grade-competency-plan') {
+    assert(unique(record.competencies.map(item => item.id)), 'Competency IDs must be unique.')
+    assertAcceptedPromptBinding(record.prompt, record.processingSettings?.promptBundle, 'gradeCompetencies')
+  }
+  if (record.recordType === 'grade-review') {
+    assertAcceptedPromptBinding(record.prompt, record.processingSettings?.promptBundle, 'gradeReview')
+  }
   return record
 }
 

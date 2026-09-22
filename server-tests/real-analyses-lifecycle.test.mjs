@@ -28,6 +28,61 @@ async function settle(f, runId) {
   assert.fail('Lifecycle operation did not finish within its bounded passes.')
 }
 
+test('QC fences and case-pack cleanup must complete before analysis evidence is removed', async () => {
+  for (const failure of ['fence', 'purge']) {
+    const f = fixture()
+    const created = await createRun(f)
+    const runId = created.run.id
+    const events = []
+    let unavailable = true
+    f.analysis.qcLifecycle = {
+      async setRunState(workspaceId, id, state, timestamp) {
+        assert.equal(workspaceId, f.workspaceId)
+        assert.equal(id, runId)
+        assert.equal(state, 'deleting')
+        assert.equal(timestamp, f.now)
+        events.push('fence')
+        if (unavailable && failure === 'fence') throw new Error('QC storage unavailable')
+      },
+      async purgeRun(workspaceId, id) {
+        assert.equal(workspaceId, f.workspaceId)
+        assert.equal(id, runId)
+        assert.ok(await current(f, runId), 'QC must be cleaned while the durable analysis operation still exists')
+        assert.equal(comparisons(f, runId).length, 1)
+        assert.ok(f.analysis.blobs.values.size > 0)
+        events.push('purge')
+        if (unavailable && failure === 'purge') throw new Error('QC writers are still draining')
+      },
+    }
+    const pending = await change(f, runId, 'delete')
+    assert.equal(pending.pending, true)
+    assert.equal(pending.operation.status, 'failed')
+    assert.equal(comparisons(f, runId).length, 1)
+    assert.ok(f.analysis.blobs.values.size > 0)
+    unavailable = false
+    await settle(f, runId)
+    assert.equal(await current(f, runId), undefined)
+    assert.equal(f.analysis.blobs.values.size, 0)
+    assert.equal(events.at(-1), 'purge')
+  }
+})
+
+test('QC run fences distinguish individual archives from inherited workspace archives', async () => {
+  const f = fixture()
+  const created = await createRun(f)
+  const states = []
+  f.analysis.qcLifecycle = {
+    async setRunState(_workspaceId, _runId, state) { states.push(state) },
+    async purgeRun() { assert.fail('Archive must retain QC feedback') },
+  }
+  await change(f, created.run.id, 'archive')
+  await change(f, created.run.id, 'unarchive')
+  assert.deepEqual(states, ['archived', 'active'])
+  await participant(f).setState(f.workspaceId, 'archived', NOW)
+  await participant(f).cancel(f.workspaceId, NOW)
+  assert.equal(states.at(-1), 'active', 'the separate QC workspace fence must not become an individual archive')
+})
+
 test('permanent deletion of an uninitialized 500-pair run resumes every cancellation and cleanup chunk', async () => {
   const f = fixture()
   const run = await createRun(f, 125, 4)

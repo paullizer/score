@@ -3,6 +3,7 @@ import type {
   GradeRubricVersionRecord, GradeSeedSnapshot, GradeSourceSetRecord, ReferenceDocument,
 } from '../../src/domain/real-grades'
 import type { ProcessingSettingsSnapshot } from '../../src/domain/admin-settings'
+import type { PromptExecutionProvenance } from '../../src/domain/prompt-versions'
 import type { StructuredModelRequest } from '../runtime'
 
 export type GradeModelRequest = StructuredModelRequest
@@ -24,6 +25,7 @@ export interface CompetencyModelResult {
   issues: GradeIssue[]
   model: string
   promptVersion: string
+  prompt?: PromptExecutionProvenance
 }
 
 export interface GradeDraftModelInput {
@@ -44,6 +46,7 @@ export interface GradeDraftModelResult {
   issues: GradeIssue[]
   model: string
   promptVersion: string
+  prompt?: PromptExecutionProvenance
 }
 
 export interface GradeReviewModelInput {
@@ -58,6 +61,7 @@ export interface GradeReviewModelResult {
   issues: GradeIssue[]
   model: string
   promptVersion: string
+  prompt?: PromptExecutionProvenance
 }
 
 export type PlanGradeCompetencies = (

@@ -740,6 +740,7 @@ export function createRealJobsRouter(deps: RealJobsRouterDeps): Router {
         kind: 'edited',
         model: latest.provenance?.model ?? '',
         promptVersion: latest.provenance?.promptVersion ?? '',
+        ...(latest.provenance?.prompt ? { prompt: latest.provenance.prompt } : {}),
       },
     }
     const errors = validateRealRubric(rubric, document, current.record.source.originalContentType)

@@ -1081,6 +1081,7 @@ export class GradeService {
         provenance: {
           kind: 'edited', model: old.rubric.provenance?.model ?? 'grade-draft-editor',
           promptVersion: old.rubric.provenance?.promptVersion ?? 'grade-edit-v1',
+          ...(old.rubric.provenance?.prompt ? { prompt: old.rubric.provenance.prompt } : {}),
         },
       },
       qualifications: copy(input.qualifications),

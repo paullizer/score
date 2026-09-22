@@ -1,6 +1,6 @@
 import { useRef, useState } from 'react'
 import { Link, NavLink, Navigate, Route, Routes, useLocation, useNavigate } from 'react-router-dom'
-import { ArrowUpRight, BarChart3, BriefcaseBusiness, Check, ChevronRight, CircleHelp, Files, FlaskConical, Layers3, LogOut, Menu, Plus, RotateCcw, Settings, ShieldCheck, X } from 'lucide-react'
+import { ArrowUpRight, BarChart3, BriefcaseBusiness, Check, ChevronRight, CircleHelp, ClipboardCheck, Files, FlaskConical, Layers3, LogOut, Menu, Plus, RotateCcw, Settings, ShieldCheck, X } from 'lucide-react'
 import { useWorkspace } from './workspace-context'
 import { ThemeControl } from './ThemeControl'
 import { Badge, Button, EmptyState, InlineError, Modal } from '../components/ui'
@@ -29,6 +29,17 @@ import { LibraryViewStateProvider } from './LibraryViewStateProvider'
 import { clientAdmissionReason, usePublicSettings } from './public-settings-context'
 import { useApplicationNavigation } from './application-navigation-context'
 import { defaultApplicationPage } from '../services/publicSettings'
+import { workspaceCanReview } from '../domain/workspace-permissions'
+import { QualityControlPage } from '../features/qc/QualityControlPage'
+
+function QcNavigation({ onNavigate }: { onNavigate?: () => void }) {
+  return <nav className="main-nav" aria-label="QC navigation">
+    <NavLink to="/qc" end onClick={onNavigate} className={({ isActive }) => `nav-item ${isActive ? 'is-active' : ''}`}><ClipboardCheck size={18} /><span>Reviews</span></NavLink>
+    <NavLink to="/qc/improvements" onClick={onNavigate} className={({ isActive }) => `nav-item ${isActive ? 'is-active' : ''}`}><FlaskConical size={18} /><span>Quality improvement</span></NavLink>
+    <NavLink to="/qc/prompts" onClick={onNavigate} className={({ isActive }) => `nav-item ${isActive ? 'is-active' : ''}`}><Layers3 size={18} /><span>Prompt versions</span></NavLink>
+    <Link to="/analyses?data=real" className="nav-item" onClick={onNavigate}><BarChart3 size={18} /><span>Return to normal mode</span></Link>
+  </nav>
+}
 
 function Navigation({ onNavigate }: { onNavigate?: () => void }) {
   const { workspace } = useWorkspace()
@@ -83,6 +94,10 @@ function AppContent() {
   const location = useLocation()
   const policy = usePublicSettings()
   const application = useApplicationNavigation()
+  const isQc = /^\/qc(?:\/|$)/.test(location.pathname)
+  const currentMetadata = cloud?.workspaces.find(item => item.id === cloud.currentWorkspaceId)
+  const canReview = Boolean(cloud && currentMetadata && !currentMetadata.deletedAt &&
+    workspaceCanReview(currentMetadata.role, application?.applicationAdmin === true))
   const title = policy.settings?.appearance.applicationTitle ?? 'Score'
   const samplesVisible = !cloud || policy.settings?.features.samplesVisible !== false
   const resumeLimits = realResumes?.features?.resumeLimits ?? RESUME_IMPORT_LIMITS
@@ -91,10 +106,15 @@ function AppContent() {
   const analysisPolicyReason = clientAdmissionReason(policy, 'newAnalyses')
   const section = location.pathname.startsWith('/grade-ladders') ? 'rubrics' : location.pathname.split('/')[1] || 'jobs'
   const isDetail = location.pathname.split('/').filter(Boolean).length > 1
-  const currentWorkspaceName = cloud?.workspaces.find((item) => item.id === cloud.currentWorkspaceId)?.name
+  const currentWorkspaceName = currentMetadata?.name
   const { canEdit } = useLifecycleAccess()
   const leaveGuard = useGradeLeaveGuard(false, false, 'Workspace changes')
   const localRemoved = !cloud && isEntityRemoved(workspace, { kind: 'workspace', id: 'workspace' })
+
+  if (!cloud && isQc) return <main className="recovery-page"><div className="panel recovery-card">
+    <h1>Quality control is not supported in standalone mode</h1><p>QC requires an authorized cloud workspace with real saved assessments. Local samples cannot be reviewed, used for calibration, or activate app-wide prompts.</p>
+    <Button onClick={() => navigate('/analyses')}>Return to normal demo mode</Button>
+  </div></main>
 
   if (!cloud && /^\/admin\/settings\/?$/.test(location.pathname)) return <main className="recovery-page"><div className="panel recovery-card">
     <h1>Application settings require a cloud administrator</h1><p>This standalone workspace is a fictional local demo. It cannot read or save cloud settings, designate administrators, or run model tests.</p>
@@ -114,8 +134,9 @@ function AppContent() {
       <Link to={defaultApplicationPage(policy.settings)} className="brand" aria-label={`${title} home`}><span className="brand-mark"><Layers3 size={22} strokeWidth={2} /></span><span>{title}</span></Link>
       {cloud ? <WorkspaceSwitcher cloud={cloud} /> : <div className="workspace-label"><span className="workspace-monogram">S</span><div><strong>My workspace</strong><span>Personal / local</span></div><span className="workspace-online" /></div>}
       {!cloud && <div className="mb-4"><EntityLifecycleActions target={{ kind: 'workspace', id: 'workspace' }} name="My workspace" compact /></div>}
-      <div className="nav-heading">WORKSPACE</div>
-      <Navigation />
+      <div className="nav-heading">{isQc ? 'QUALITY CONTROL MODE' : 'WORKSPACE'}</div>
+      {isQc ? <QcNavigation /> : <Navigation />}
+      {!isQc && canReview && <Link className="nav-item" to="/qc"><ClipboardCheck size={18} /><span>Enter QC mode</span></Link>}
       {application?.applicationAdmin && <Button variant="ghost" icon={Settings} onClick={() => void application.openAdminSettings()}>Application settings</Button>}
       <div className="sidebar-bottom">
         <div className="sidebar-note"><span className="small-symbol"><ShieldCheck size={19} /></span><strong>Evidence, not impressions.</strong><p>Clear criteria. Traceable matches.<br />A human makes the decision.</p>
@@ -125,20 +146,22 @@ function AppContent() {
         </div>
         <div className="sidebar-utility"><span>Appearance</span><ThemeControl /></div>
         {cloud && <AccountPanel cloud={cloud} />}
-        {samplesVisible && <button className="reset-button" disabled={!canEdit} onClick={() => setShowReset(true)}><RotateCcw size={14} />Reset {cloud ? 'samples' : 'demo workspace'}</button>}
+        {samplesVisible && !isQc && <button className="reset-button" disabled={!canEdit} onClick={() => setShowReset(true)}><RotateCcw size={14} />Reset {cloud ? 'samples' : 'demo workspace'}</button>}
         <div className="sidebar-version">{title} / UI PREVIEW <span>V0.1</span></div>
       </div>
     </aside>
     <div className="app-body">
       <header className="topbar">
         <div className="flex items-center gap-3"><Button variant="ghost" icon={Menu} className="mobile-menu icon-button" aria-label="Open navigation" onClick={() => setMobileNav(true)} />
-          <div className="breadcrumbs"><span>Workspace</span><ChevronRight size={12} /><Link to={`/${section}`}>{section[0].toUpperCase() + section.slice(1)}</Link>{isDetail && <><ChevronRight size={12} /><span>Review</span></>}</div>
+          <div className="breadcrumbs"><span>Workspace</span><ChevronRight size={12} /><Link to={`/${section}`}>{isQc ? 'Quality control' : section[0].toUpperCase() + section.slice(1)}</Link>{isDetail && <><ChevronRight size={12} /><span>Review</span></>}</div>
         </div>
         <div className="topbar-actions">
           {cloud ? <CloudSaveIndicator cloud={cloud} /> : <span className={`save-status ${storageError ? 'is-error' : ''}`}><span />{storageError ? 'Changes not saved' : 'Saved on this device'}</span>}
-          <button className="demo-chip" onClick={() => setShowAbout(true)}><FlaskConical size={13} />{cloud ? samplesVisible ? 'Real & sample workflows' : 'About this application' : 'Demo workspace'}</button>
-          <Button variant="primary" size="sm" icon={Plus} title={analysisPolicyReason ?? undefined} disabled={!canEdit || Boolean(cloud && newAnalysisMode === 'real' && (analysisPolicyReason || !realAnalyses?.canWrite || realAnalyses.phase !== 'ready' || !realAnalyses.features?.realAnalyses))}
-            onClick={() => navigate(cloud ? `/analyses/new?data=${newAnalysisMode}` : '/analyses/new')}>New analysis</Button>
+          {isQc ? <><Badge tone="accent">QC mode</Badge><Button size="sm" onClick={() => navigate('/analyses?data=real')}>Normal mode</Button></>
+            : <><button className="demo-chip" onClick={() => setShowAbout(true)}><FlaskConical size={13} />{cloud ? samplesVisible ? 'Real & sample workflows' : 'About this application' : 'Demo workspace'}</button>
+              {canReview && <Button size="sm" icon={ClipboardCheck} onClick={() => navigate('/qc')}>QC mode</Button>}
+              <Button variant="primary" size="sm" icon={Plus} title={analysisPolicyReason ?? undefined} disabled={!canEdit || Boolean(cloud && newAnalysisMode === 'real' && (analysisPolicyReason || !realAnalyses?.canWrite || realAnalyses.phase !== 'ready' || !realAnalyses.features?.realAnalyses))}
+                onClick={() => navigate(cloud ? `/analyses/new?data=${newAnalysisMode}` : '/analyses/new')}>New analysis</Button></>}
         </div>
       </header>
       {policy.settings?.appearance.announcement.enabled && <aside className={`application-announcement ${policy.settings.appearance.announcement.tone === 'warning' ? 'is-warning' : ''}`} role="status">{policy.settings.appearance.announcement.text}</aside>}
@@ -148,7 +171,7 @@ function AppContent() {
       <main id="main-content" className="main-content">
         <LifecycleBanner />
         <LifecycleOperationBanner />
-        {cloud && <RealResumeImportActivity />}
+        {cloud && !isQc && <RealResumeImportActivity />}
         <Routes>
           <Route path="/" element={<Navigate to={defaultApplicationPage(policy.settings)} replace />} />
           <Route path="/jobs" element={<JobsPage />} />
@@ -162,11 +185,12 @@ function AppContent() {
           <Route path="/analyses" element={<AnalysesPage />} />
           <Route path="/analyses/new" element={<AnalysisSetup key={location.key} />} />
           <Route path="/analyses/:id" element={<AnalysisDetail key={location.pathname} />} />
+          <Route path="/qc/*" element={<QualityControlPage />} />
           <Route path="*" element={<EmptyState title="This page is not in your workspace" description="Return to the jobs library to find your next review." action={<Button onClick={() => navigate('/jobs')}>Go to jobs</Button>} />} />
         </Routes>
         <footer className="workspace-footer">
-          <span><ShieldCheck size={13} />{cloud ? 'Real sources and analyses are private server records. Samples stay fictional. A human makes the decision.' : 'Private by design. This preview stays in your browser.'}</span>
-          <span>{workspace.jobs.filter((job) => !isEntityArchived(workspace, { kind: 'job', id: job.id }) && !isEntityRemoved(workspace, { kind: 'job', id: job.id })).length} active jobs / {[...workspace.resumes, ...(realResumes?.summaries.map((item) => item.resume) ?? [])].filter((resume) => !isEntityArchived(workspace, { kind: 'resume', id: resume.id }) && !isEntityRemoved(workspace, { kind: 'resume', id: resume.id })).length} active resumes{cloud && samplesVisible && ' · includes samples'}</span>
+          <span><ShieldCheck size={13} />{isQc ? 'Private QC feedback and trial results stay separate from published scores and normal exports.' : cloud ? 'Real sources and analyses are private server records. Samples stay fictional. A human makes the decision.' : 'Private by design. This preview stays in your browser.'}</span>
+          {!isQc && <span>{workspace.jobs.filter((job) => !isEntityArchived(workspace, { kind: 'job', id: job.id }) && !isEntityRemoved(workspace, { kind: 'job', id: job.id })).length} active jobs / {[...workspace.resumes, ...(realResumes?.summaries.map((item) => item.resume) ?? [])].filter((resume) => !isEntityArchived(workspace, { kind: 'resume', id: resume.id }) && !isEntityRemoved(workspace, { kind: 'resume', id: resume.id })).length} active resumes{cloud && samplesVisible && ' · includes samples'}</span>}
         </footer>
       </main>
     </div>
@@ -174,11 +198,13 @@ function AppContent() {
     <Modal open={mobileNav} onOpenChange={setMobileNav} title="Your workspace" description="Explore your jobs, resumes, rubrics, and analyses." drawer>
       {cloud && <div className="mb-5 space-y-3"><WorkspaceSwitcher cloud={cloud} /><AccountPanel cloud={cloud} /></div>}
       {!cloud && <EntityLifecycleActions target={{ kind: 'workspace', id: 'workspace' }} name="My workspace" />}
-      <Navigation onNavigate={() => setMobileNav(false)} /><div className="mobile-appearance"><span>Appearance</span><ThemeControl /></div>
+      {isQc ? <QcNavigation onNavigate={() => setMobileNav(false)} /> : <><Navigation onNavigate={() => setMobileNav(false)} />
+        {canReview && <Link className="nav-item" to="/qc" onClick={() => setMobileNav(false)}><ClipboardCheck size={18} /><span>Enter QC mode</span></Link>}</>}
+      <div className="mobile-appearance"><span>Appearance</span><ThemeControl /></div>
       {application?.applicationAdmin && <Button icon={Settings} onClick={() => { setMobileNav(false); void application.openAdminSettings() }}>Application settings</Button>}
       {policy.settings?.help.supportUrl && <a className="text-link" href={policy.settings.help.supportUrl} target="_blank" rel="noopener noreferrer">Support</a>}
       {policy.settings?.help.documentationUrl && <a className="text-link" href={policy.settings.help.documentationUrl} target="_blank" rel="noopener noreferrer">Documentation</a>}
-      {samplesVisible && <Button icon={RotateCcw} disabled={!canEdit} onClick={() => { setMobileNav(false); setShowReset(true) }}>Reset {cloud ? 'samples' : 'demo workspace'}</Button>}
+      {samplesVisible && !isQc && <Button icon={RotateCcw} disabled={!canEdit} onClick={() => { setMobileNav(false); setShowReset(true) }}>Reset {cloud ? 'samples' : 'demo workspace'}</Button>}
     </Modal>
     <Modal open={showReset} onOpenChange={setShowReset}
       title={cloud ? 'Reset sample content?' : 'A fresh starting point'}

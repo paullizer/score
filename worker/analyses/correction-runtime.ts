@@ -27,6 +27,7 @@ import {
 } from '../../server/analyses/validation'
 import { systemClock, type Clock } from '../runtime'
 import { operationSettings, retryBackoff, RuntimeSettingsError, safeSettingsMetadata } from '../settings'
+import { PromptPinError } from '../prompts'
 import { AnalysisModelError, reviewAnalysisAssessment, reviewAnalysisEvidenceGaps } from './model'
 import type { AnalysisWorkerDependencies } from './runtime'
 import { emitAnalysisTelemetry } from './telemetry'
@@ -82,7 +83,7 @@ function failureFor(error: unknown, stage: Stage, inputs = false): AnalysisProce
     code: error.code, stage: error.stage, retryable: error.retryable,
     message: 'The independent grounding review could not complete safely. The previous result was retained.',
   }
-  if (error instanceof RuntimeSettingsError) return {
+  if (error instanceof RuntimeSettingsError || error instanceof PromptPinError) return {
     code: error.code === 'model-context-limit' ? 'context-limit' : 'snapshot-invalid',
     stage, retryable: false, message: error.message,
   }

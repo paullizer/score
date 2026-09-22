@@ -5,7 +5,7 @@ import type {
   SettingsChange, SettingsFieldError, SettingsRevision, SettingsSection,
 } from '../../domain/admin-settings'
 import { MODEL_TASK_IDS } from '../../domain/admin-settings-tasks'
-import { parseAdminSettings, SettingsValidationError } from '../../domain/admin-settings-schema'
+import { parseAdminSettings, SettingsValidationError, upgradeQcAdminSettings } from '../../domain/admin-settings-schema'
 import { diffAdminSettings } from '../../domain/admin-settings-resolver'
 import * as service from '../../services/adminSettings'
 import { useGradeLeaveGuard } from '../../app/grade-navigation-context'
@@ -106,6 +106,7 @@ export function AdminSettingsPage({ onLeave }: { onLeave: () => void }) {
 
   async function fail(caught: unknown) {
     if (!live.current) return
+    if (caught instanceof SettingsValidationError) setErrors(caught.fields)
     if (caught instanceof service.SettingsRequestError) {
       setErrors(caught.fields)
       if (caught.status === 409 || caught.status === 412) {
@@ -175,13 +176,15 @@ export function AdminSettingsPage({ onLeave }: { onLeave: () => void }) {
     <h1>Application settings unavailable</h1><InlineError>{error || 'The server did not return settings. No local substitute was created.'}</InlineError>
     <Button onClick={onLeave}>Back to workspaces</Button><Button onClick={() => window.location.reload()}>Retry settings</Button>
   </div></main>
-  const fields = base.fields.filter(field => field.control !== 'deployments' && (!search ? field.section === section : `${field.path} ${field.label} ${field.description}`.toLocaleLowerCase().includes(search.toLocaleLowerCase()))
+  const availableFields = base.fields.filter(field => draft.schemaVersion !== 1 || !/^(?:ai\.tasks\.qcPlan|processing\.qc|workers\.qc)(?:\.|$)/.test(field.path))
+  const fields = availableFields.filter(field => field.control !== 'deployments' && (!search ? field.section === section : `${field.path} ${field.label} ${field.description}`.toLocaleLowerCase().includes(search.toLocaleLowerCase()))
     && (advanced || Boolean(search) || field.classification !== 'advanced'))
   const reviewChanges = review ? diffAdminSettings(base.settings, review.candidate) : []
   const appearance = policy.settings?.appearance ?? base.settings.appearance
   const workerVerification = base.environment.workerVerification
   const runtimeReadiness = base.environment.runtimeReadiness
   const paidProbe = probeKind !== 'connection'
+  const probeTaskAvailable = draft.ai.tasks[probeTask] !== undefined
 
   return <div className="settings-app">
     <a className="skip-link" href="#admin-settings-content">Skip to settings</a>
@@ -202,6 +205,15 @@ export function AdminSettingsPage({ onLeave }: { onLeave: () => void }) {
             const candidate = validate(draft); if (candidate) { setDraft(candidate); setReview({ kind: 'save', candidate }) }
           }}>Review and save</Button></div>
       </div>
+      {draft.schemaVersion === 1 && <section className="panel settings-section" aria-label="QC settings upgrade">
+        <h2>Add QC settings to a new configuration revision</h2>
+        <p>This version 1 configuration remains unchanged. Add the QC model and worker policy to your draft without resetting existing settings, then explicitly review and publish a new revision. Accepted work keeps its original captured policy.</p>
+        <Button disabled={pending || conflictPending} onClick={() => void action(async () => {
+          const upgraded = upgradeQcAdminSettings(draft)
+          setDraft(upgraded); setErrors([])
+          setStatus('QC settings were added only to this draft. Review and save to publish; no model work has started.')
+        })}>Add QC settings to draft</Button>
+      </section>}
       {error && <div className="my-4"><InlineError>{error}</InlineError></div>}
       {errors.length > 0 && <section className="settings-error-list" aria-label="Settings validation errors"><h2>Validation errors — draft retained</h2><ul>
         {errors.map((item, index) => <li key={index}><button type="button" className="text-link" onClick={() => { setSearch(item.path); setAdvanced(true) }}>{item.path || 'settings'}</button>: {item.message}</li>)}
@@ -228,7 +240,7 @@ export function AdminSettingsPage({ onLeave }: { onLeave: () => void }) {
         <button aria-current={section === 'history' && !search ? 'page' : undefined} onClick={() => { setSection('history'); setSearch(''); if (!historyLoaded) void loadHistory() }}><History size={14} />History & restore</button>
         <button aria-current={section === 'environment' && !search ? 'page' : undefined} onClick={() => { setSection('environment'); setSearch('') }}>Environment & readiness</button>
       </nav>
-      {(section === 'ai' || search) && <ModelSettingsEditor settings={draft} saved={base.settings} defaults={base.defaults} fields={base.fields.filter(field => advanced || search || field.classification !== 'advanced')}
+      {(section === 'ai' || search) && <ModelSettingsEditor settings={draft} saved={base.settings} defaults={base.defaults} fields={availableFields.filter(field => advanced || search || field.classification !== 'advanced')}
         errors={errors} onChange={update} inventory={inventory} disabled={pending} search={search} />}
       {fields.some(field => !field.path.startsWith('ai.tasks.') && field.path !== 'ai.defaultDeploymentId') && <section className="panel settings-section">
         <h2>{search ? 'Matching settings' : sections.find(item => item.id === section)?.title}</h2>
@@ -321,10 +333,15 @@ export function AdminSettingsPage({ onLeave }: { onLeave: () => void }) {
       {error && <InlineError>{error}</InlineError>}<p>Preview does not save anything. Applying an import replaces the reviewed settings, including any local unsaved edits, only after explicit publication.</p>
     </Modal>
     <Modal open={probeOpen} onOpenChange={setProbeOpen} title="Explicit synthetic model test" description="Tests never use private resumes, jobs, source documents, or workspace data. They do not save your settings draft." dismissDisabled={pending}
-      footer={<><Button disabled={pending} onClick={() => setProbeOpen(false)}>Cancel</Button><Button disabled={pending || (paidProbe && !costAcknowledged)} onClick={() => {
+      footer={<><Button disabled={pending} onClick={() => setProbeOpen(false)}>Cancel</Button><Button disabled={pending || (paidProbe && !costAcknowledged) || (probeKind === 'task' && !probeTaskAvailable)} onClick={() => {
         const candidate = validate(draft); if (!candidate) return
         void action(async () => {
-          const deploymentId = probeKind === 'task' ? candidate.ai.tasks[probeTask].deploymentId ?? candidate.ai.defaultDeploymentId : probeDeployment
+          let deploymentId = probeDeployment
+          if (probeKind === 'task') {
+            const binding = candidate.ai.tasks[probeTask]
+            if (!binding) throw new Error(`The settings draft does not configure ${probeTask}. Choose an available task before running a synthetic test.`)
+            deploymentId = binding.deploymentId ?? candidate.ai.defaultDeploymentId
+          }
           const result = await service.testModelConfiguration({ kind: probeKind, deploymentId, ...(probeKind === 'task' ? { taskId: probeTask } : {}), settings: candidate, acknowledgeCost: paidProbe && costAcknowledged })
           setProbe(result); setProbeOpen(false)
         })
@@ -332,8 +349,12 @@ export function AdminSettingsPage({ onLeave }: { onLeave: () => void }) {
       <div className="space-y-4"><label className="field"><span className="field-label">Test kind</span><select className="input" disabled={pending} value={probeKind} onChange={event => { setProbeKind(event.target.value as ModelTestResult['kind']); setCostAcknowledged(false) }}>
         <option value="connection">Connection only</option><option value="structured-output">Minimal structured output</option><option value="task">Task configuration compatibility</option>
       </select></label>
-        {probeKind === 'task' ? <label className="field"><span className="field-label">Synthetic task</span><select className="input" value={probeTask} disabled={pending} onChange={event => { setProbeTask(event.target.value as ModelTaskId); setCostAcknowledged(false) }}>{MODEL_TASK_IDS.map(task => <option key={task}>{task}</option>)}</select></label>
+        {probeKind === 'task' ? <label className="field"><span className="field-label">Synthetic task</span><select className="input" value={probeTask} disabled={pending} onChange={event => { setProbeTask(event.target.value as ModelTaskId); setCostAcknowledged(false) }}>
+          {!probeTaskAvailable && <option value={probeTask} disabled>Unavailable in this settings version: {probeTask}</option>}
+          {MODEL_TASK_IDS.filter(task => draft.ai.tasks[task] !== undefined).map(task => <option key={task}>{task}</option>)}
+        </select></label>
           : <label className="field"><span className="field-label">Test deployment</span><select className="input" value={probeDeployment} disabled={pending} onChange={event => { setProbeDeployment(event.target.value); setCostAcknowledged(false) }}>{draft.ai.deployments.map(item => <option key={item.id} value={item.id}>{item.label}</option>)}</select></label>}
+        {probeKind === 'task' && !probeTaskAvailable && <InlineError>The selected task is not configured in this settings version. Choose an available task; no test will run.</InlineError>}
         {paidProbe ? <><p><strong>Paid-call notice:</strong> synthetic inference can consume Azure quota and incur charges. No paid call runs until you explicitly confirm.</p>
           <label className="check-label"><input type="checkbox" checked={costAcknowledged} disabled={pending} onChange={event => setCostAcknowledged(event.target.checked)} />I authorize this synthetic test and acknowledge possible charges.</label></>
           : <p>Connection-only checks are a free scoped management read. They do not run model inference.</p>}

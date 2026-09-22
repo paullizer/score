@@ -507,6 +507,100 @@ test('paid probes reject missing acknowledgement before HTTP and a changed task 
   assert.ok(!requests.some(request => request.path === '/api/admin/deployments/test'))
 })
 
+test('QC planning has an editable dedicated binding and only explicit paid confirmation runs its synthetic probe', async () => {
+  let wire
+  override = (path, init) => {
+    if (path !== '/api/admin/deployments/test') return undefined
+    wire = JSON.parse(init.body)
+    return json({ kind: 'task', status: 'passed', deploymentId: wire.deploymentId, identity: 'api-managed-identity',
+      checkedAt: '2026-01-01T00:00:00.000Z', checks: [{ name: 'QC planner adapter', passed: true, message: 'Synthetic content only.' }] })
+  }
+  await renderAdmin()
+  const task = [...document.querySelectorAll('details')].find(item => item.querySelector('summary')?.textContent.startsWith('QC improvement planning'))
+  assert.ok(task)
+  await edit(task.querySelector('select'), settings.ai.defaultDeploymentId)
+  await click(button('Configure synthetic test'))
+  const probe = dialog('Explicit synthetic model test')
+  await edit(probe.querySelectorAll('select')[1], 'qcPlan')
+  assert.equal(button('Run explicit test', probe).disabled, true)
+  assert.equal(wire, undefined)
+  await click(probe.querySelector('input[type="checkbox"]'))
+  await click(button('Run explicit test', probe))
+  assert.equal(wire.taskId, 'qcPlan')
+  assert.equal(wire.deploymentId, settings.ai.defaultDeploymentId)
+  assert.equal(wire.confirmPaidProbe, true)
+  assert.equal(wire.draft.ai.tasks.qcPlan.deploymentId, settings.ai.defaultDeploymentId)
+  assert.equal(settings.ai.tasks.qcPlan.deploymentId, null, 'A synthetic probe never publishes the edited binding')
+  assert.equal(patches().length, 0)
+})
+
+test('legacy QC settings upgrade is explicit, discardable, and never mutates the saved v1 configuration', async () => {
+  settings.schemaVersion = 1
+  delete settings.ai.tasks.qcPlan
+  delete settings.processing.qc
+  delete settings.workers.qc
+  const saved = JSON.stringify(settings)
+  await renderAdmin()
+  assert.doesNotMatch(document.body.textContent, /QC improvement planning/)
+  assert.equal(unloadBlocked(), false)
+  await edit(document.querySelector('input[aria-label="Search application settings"]'), 'processing.qc')
+  assert.equal(document.querySelectorAll('.settings-field').length, 0, 'Missing legacy QC policy cannot be edited piecemeal')
+  await edit(document.querySelector('input[aria-label="Search application settings"]'), '')
+  await click(button('Configure synthetic test'))
+  assert.equal([...dialog('Explicit synthetic model test').querySelectorAll('option')].some(item => item.value === 'qcPlan'), false)
+  await click(button('Cancel', dialog('Explicit synthetic model test')))
+  await click(button('Add QC settings to draft'))
+  assert.match(document.body.textContent, /QC improvement planning/)
+  assert.equal(unloadBlocked(), true)
+  assert.equal(JSON.stringify(settings), saved)
+  assert.equal(patches().length, 0)
+  await click(button('Configure synthetic test'))
+  await edit(dialog('Explicit synthetic model test').querySelectorAll('select')[1], 'qcPlan')
+  await click(button('Cancel', dialog('Explicit synthetic model test')))
+  await click(button('Discard'))
+  await click(button('Discard settings draft', dialog('Discard settings draft?')))
+  assert.equal(unloadBlocked(), false)
+  assert.equal(JSON.stringify(settings), saved)
+  assert.doesNotMatch(document.body.textContent, /QC improvement planning/)
+  await click(button('Configure synthetic test'))
+  const probe = dialog('Explicit synthetic model test')
+  assert.match(probe.textContent, /selected task is not configured/)
+  await click(probe.querySelector('input[type="checkbox"]'))
+  assert.equal(button('Run explicit test', probe).disabled, true, 'A stale QC selection cannot run after discarding its binding')
+  assert.equal(requests.some(item => item.path === '/api/admin/deployments/test'), false)
+})
+
+test('publishing a QC configuration upgrade retains unrelated v1 values and creates a reviewed new revision', async () => {
+  settings.schemaVersion = 1
+  delete settings.ai.tasks.qcPlan
+  delete settings.processing.qc
+  delete settings.workers.qc
+  settings.appearance.applicationTitle = 'Existing application title'
+  const before = structuredClone(settings)
+  await renderAdmin()
+  await click(button('Add QC settings to draft'))
+  await click(button('Review and save'))
+  const review = dialog('Review application changes')
+  assert.ok(review)
+  assert.match(review.textContent, /ai\.tasks\.qcPlan/)
+  assert.match(review.textContent, /schemaVersion/)
+  assert.equal(patches().length, 0)
+  assert.deepEqual(settings, before)
+  await click(button('Publish new revision', review))
+  assert.equal(patches().length, 1)
+  assert.equal(patches()[0].init.headers.get('If-Match'), '"revision-1"')
+  assert.equal(settings.schemaVersion, 2)
+  assert.ok(settings.ai.tasks.qcPlan && settings.processing.qc && settings.workers.qc)
+  const withoutQc = structuredClone(settings)
+  withoutQc.schemaVersion = 1
+  delete withoutQc.ai.tasks.qcPlan
+  delete withoutQc.processing.qc
+  delete withoutQc.workers.qc
+  assert.deepEqual(withoutQc, before)
+  assert.equal(requests.some(item => item.path === '/api/admin/deployments/test'), false)
+  assert.equal(revision, 'revision-2')
+})
+
 function PolicyProbe() { observedPolicy = ui.usePublicSettings(); return element(ui.ThemeControl) }
 test('public provider consumes the actual server feature envelope without a settings wire alias', async () => {
   settings.appearance.applicationTitle = 'Authoritative feature policy'
@@ -696,9 +790,9 @@ test('policy appearance, hidden cloud sample affordances, default navigation, an
   assert.equal(document.querySelector('h1').textContent, 'Your jobs')
 })
 
-test('all eleven task bindings offer inheritance, deployment-specific reasoning, and bounded advanced controls', async () => {
+test('all twelve task bindings offer inheritance, deployment-specific reasoning, and bounded advanced controls', async () => {
   await renderAdmin()
-  assert.equal(document.querySelectorAll('details.settings-section').length, 11)
+  assert.equal(document.querySelectorAll('details.settings-section').length, 12)
   for (const item of document.querySelectorAll('details.settings-section')) {
     const selection = item.querySelector('select')
     assert.equal(selection.options[0].value, '')
@@ -712,6 +806,7 @@ test('all eleven task bindings offer inheritance, deployment-specific reasoning,
   assert.equal(temperature.disabled, true, 'The default GPT-5 deployment rejects sampling parameters')
   const completion = await field('ai.tasks.jobRubric.completionTokenLimit')
   assert.equal(Number(completion.max), 8192)
+  assert.equal(Number((await field('ai.tasks.qcPlan.completionTokenLimit')).max), 16384)
   await edit(document.querySelector('input[aria-label="Search application settings"]'), 'ai.defaultDeploymentId')
   assert.ok(document.querySelector('[aria-label="Azure deployment catalog"]'), 'Custom deployment controls are searchable by metadata path')
 })

@@ -10,6 +10,7 @@ import {
   type AnalysisTelemetryEvent,
 } from '../../src/domain/analysis-diagnostics'
 import type { ImmutableJsonBlobReference } from '../../src/domain/real-resumes'
+import type { AcceptedAssessmentQcDiagnostics, AnalysisQcDiagnosticsReference } from '../../src/domain/analysis-qc-diagnostics'
 import { StoreConflictError } from '../../server/store'
 import {
   advanceAnalysisRun, applyAnalysisComparisonTransition, loadAnalysisComparison, loadAnalysisRun,
@@ -20,6 +21,7 @@ import {
 } from '../../server/analyses/snapshots'
 import {
   analysisDiagnosticBlobName, analysisHash, analysisResultBlobName, assertAnalysisFailureDiagnosticBinding,
+  analysisQcDiagnosticsBlobName,
   assertAnalysisResultBinding, parseAnalysisEntity, parseAnalysisFailureDiagnostic, parseAnalysisResult,
 } from '../../server/analyses/validation'
 import type { AnalysisBlobStore, AnalysisStore } from '../../server/analyses/store'
@@ -34,7 +36,12 @@ import {
   type WorkerSettingsDependencies,
 } from '../settings'
 export { RUNTIME_SETTINGS_VERSION } from '../../src/domain/admin-settings'
+export { PROMPT_RUNTIME_VERSION } from '../../src/domain/prompt-versions'
 import { runAnalysisCorrectionWork } from './correction-runtime'
+import { PromptPinError } from '../prompts'
+import {
+  assertAnalysisQcDiagnosticsBinding, createAnalysisQcDiagnosticsSidecar, parseAnalysisQcDiagnostics,
+} from '../../server/analyses/qc-diagnostics'
 
 const LEASE_MS = 90_000
 const HEARTBEAT_MS = 25_000
@@ -93,6 +100,7 @@ function failureFor(error: unknown, stage: Stage, snapshots = false): AnalysisPr
     code: error.code === 'model-context-limit' ? 'context-limit' : 'snapshot-invalid',
     stage, retryable: false, message: error.message,
   }
+  if (error instanceof PromptPinError) return { code: 'snapshot-invalid', stage, retryable: false, message: error.message }
   if (isInvalidData(error)) {
     return {
       code: snapshots ? 'snapshot-invalid' : 'invalid-model-output', stage, retryable: false,
@@ -330,9 +338,11 @@ function resultSummary(result: RealAnalysisResult): RealAnalysisResultSummary {
 
 function completedComparison(
   record: RealAnalysisComparisonRecord, reference: ImmutableJsonBlobReference, summary: RealAnalysisResultSummary, timestamp: string,
+  qcDiagnostics?: AnalysisQcDiagnosticsReference,
 ): RealAnalysisComparisonRecord {
   const next: RealAnalysisComparisonRecord = {
     ...record, status: 'complete', updatedAt: timestamp, completedAt: timestamp, result: reference, resultSummary: summary,
+    ...(qcDiagnostics ? { qcDiagnostics } : {}),
   }
   delete next.lease
   delete next.nextAttemptAt
@@ -360,6 +370,35 @@ async function storeResult(
   const completed = completedComparison(comparison.record, reference, resultSummary(winning), winning.createdAt)
   await lease.control.wait(() => readAnalysisResult(deps.blobs, run.record, completed, snapshots))
   return { reference, result: winning }
+}
+
+async function storeQcDiagnostics(
+  deps: AnalysisWorkerDependencies, lease: ComparisonLease, snapshots: AnalysisSnapshots,
+  saved: { reference: ImmutableJsonBlobReference; result: RealAnalysisResult }, captured: AcceptedAssessmentQcDiagnostics,
+): Promise<AnalysisQcDiagnosticsReference> {
+  const { run, comparison } = await lease.check()
+  const completed = completedComparison(comparison.record, saved.reference, resultSummary(saved.result), saved.result.createdAt)
+  const context = { ...snapshots, run: run.record, comparison: completed, result: saved.result }
+  const sidecar = createAnalysisQcDiagnosticsSidecar(context, captured)
+  const name = analysisQcDiagnosticsBlobName(sidecar.workspaceId, sidecar.runId, sidecar.comparisonId, sidecar.attemptId)
+  const blobs = fencedAnalysisBlobs(deps, sidecar.workspaceId, sidecar.runId, lease.control.signal)
+  let blob: ImmutableJsonBlobReference
+  try { blob = await lease.control.wait(() => putAnalysisJson(blobs, name, sidecar)) } catch (error) {
+    lease.control.check()
+    const winning = await lease.control.wait(() => deps.blobs.read(name))
+    if (!winning || analysisHash(parseAnalysisJson(winning)) !== analysisHash(sidecar)) throw error
+    blob = analysisBlobReference(name, winning)
+  }
+  const reference: AnalysisQcDiagnosticsReference = {
+    schemaVersion: 1, attemptId: sidecar.attemptId, modelCallId: captured.modelCallId,
+    resultSha256: saved.reference.sha256, assessmentSha256: saved.result.provenance.assessmentSha256, blob,
+  }
+  const persisted = parseAnalysisQcDiagnostics(parseAnalysisJson(await lease.control.wait(() => readAnalysisBlob(
+    deps.blobs, blob, sidecar.workspaceId, sidecar.runId,
+  ))))
+  assertAnalysisQcDiagnosticsBinding(persisted, context, reference)
+  await lease.check()
+  return reference
 }
 
 async function storeFailureDiagnostic(
@@ -498,11 +537,15 @@ export async function processClaimedComparison(
     } satisfies RealAnalysisResult)
     assertAnalysisResultBinding(result, current.run.record, current.comparison.record, snapshots.resumeSnapshot, target)
     const saved = await storeResult(deps, lease, snapshots, result)
+    if (snapshot.promptBundle && !assessed.qcDiagnostics) throw new AnalysisModelError('invalid-model-output',
+      'The accepted pinned assessment is missing its original QC diagnostics; no completed result was published.')
+    const qcDiagnostics = assessed.qcDiagnostics
+      ? await storeQcDiagnostics(deps, lease, snapshots, saved, assessed.qcDiagnostics) : undefined
     correctionCount = saved.result.provenance.correctionCount
     published = saved.reference
     await lease.atomic((record, timestamp, liveRun) => {
       assertAnalysisResultBinding(saved.result, liveRun, record, snapshots.resumeSnapshot, target)
-      return completedComparison(record, saved.reference, resultSummary(saved.result), timestamp)
+      return completedComparison(record, saved.reference, resultSummary(saved.result), timestamp, qcDiagnostics)
     })
     outcome('complete')
     return true

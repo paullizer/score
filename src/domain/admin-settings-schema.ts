@@ -1,8 +1,9 @@
 import { z } from 'zod'
-import { MODEL_TASK_IDS } from './admin-settings-tasks'
-import type { AdminSettings, AdminSettingsPatch, ModelTaskId, ProcessingSettingsSnapshot, SettingsFieldError } from './admin-settings'
-import { TASK_MODEL_LIMITS } from './admin-settings-defaults'
+import { LEGACY_MODEL_TASK_IDS, MODEL_TASK_IDS } from './admin-settings-tasks'
+import type { AdminSettings, AdminSettingsPatch, CurrentAdminSettings, ModelTaskId, ProcessingSettingsSnapshot, SettingsFieldError } from './admin-settings'
+import { TASK_MODEL_LIMITS, createDefaultAdminSettings } from './admin-settings-defaults'
 import { ADMIN_SETTINGS_STORAGE_LIMITS, settingsJsonBytes } from './admin-settings-limits'
+import { PROMPT_REGISTRY_LIMITS, promptBundleSnapshotSchema } from './prompt-versions'
 
 const MIB = 1024 * 1024
 const integer = (max: number, min = 1) => z.number().int().min(min).max(max)
@@ -14,7 +15,7 @@ const requiredText = (max: number) => text(max).refine(value => value.length > 0
 const unique = <T extends z.ZodType>(schema: T, max: number, min = 0) =>
   z.array(schema).min(min).max(max).refine(values => new Set(values).size === values.length, 'Duplicate values are not allowed.')
 const identifier = z.string().min(1).max(128).regex(/^[A-Za-z0-9][A-Za-z0-9._-]*$/, 'Use a stable identifier with letters, digits, dots, underscores, or hyphens.')
-const role = z.enum(['owner', 'editor', 'viewer'])
+const role = z.enum(['owner', 'editor', 'viewer', 'reviewer'])
 const format = z.enum(['pdf', 'markdown', 'docx', 'doc'])
 const reportFormat = z.enum(['csv', 'pdf', 'docx', 'pptx'])
 const effort = z.enum(['minimal', 'low', 'medium', 'high'])
@@ -43,7 +44,10 @@ export const taskModelSettingsSchema = z.strictObject({
   deploymentId: identifier.nullable(), reasoningEffort: effort.nullable(), completionTokenLimit: integer(128_000),
   inputBudget: taskInputBudgetSchema, temperature: z.number().min(0).max(2).nullable(), topP: z.number().gt(0).max(1).nullable(),
 })
-const tasksSchema = z.strictObject(Object.fromEntries(MODEL_TASK_IDS.map(task => [task, taskModelSettingsSchema])) as Record<ModelTaskId, typeof taskModelSettingsSchema>)
+const tasksSchema = z.strictObject({
+  ...Object.fromEntries(LEGACY_MODEL_TASK_IDS.map(task => [task, taskModelSettingsSchema])) as Record<Exclude<ModelTaskId, 'qcPlan'>, typeof taskModelSettingsSchema>,
+  qcPlan: taskModelSettingsSchema.optional(),
+})
 const hostname = z.string().trim().toLowerCase().max(253).transform(value => value.replace(/\.$/, '')).refine(value => {
   if (!value || value.includes(':') || value.includes('/') || value.includes('*')) return false
   return value.split('.').every(label => /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(label))
@@ -65,7 +69,7 @@ const processingPolicy = (maxBackoff: number, maxBase: number) => z.strictObject
 })
 
 const settingsObject = z.strictObject({
-  schemaVersion: z.literal(1),
+  schemaVersion: z.union([z.literal(1), z.literal(2)]),
   ai: z.strictObject({
     deployments: z.array(modelDeploymentSchema).min(1).max(100), defaultDeploymentId: identifier, tasks: tasksSchema,
     jobRubric: z.strictObject({ maxOutputCorrections: integer(1, 0) }),
@@ -85,7 +89,7 @@ const settingsObject = z.strictObject({
       timeoutMilliseconds: integer(30_000, 1000), maxResponseBytes: integer(12 * MIB), maxRedirects: integer(5, 0),
     }),
   }),
-  documents: z.strictObject({ formattedDocxPreviewEnabled: z.boolean(), originalDownloadRoles: unique(role, 3) }),
+  documents: z.strictObject({ formattedDocxPreviewEnabled: z.boolean(), originalDownloadRoles: unique(role, 4) }),
   grades: z.strictObject({
     references: z.strictObject({
       maxSources: integer(15), maxPdfBytes: integer(20 * MIB), maxSelectedPages: integer(250),
@@ -106,13 +110,17 @@ const settingsObject = z.strictObject({
   processing: z.strictObject({
     jobs: processingPolicy(300_000, 15_000), grades: processingPolicy(120_000, 30_000),
     resumes: processingPolicy(60_000, 15_000), analyses: processingPolicy(120_000, 30_000),
+    qc: processingPolicy(300_000, 30_000).optional(),
   }),
   summaries: z.strictObject({
     generationMode: z.enum(['automatic', 'on-demand']), maxRounds: integer(3), allowManualPublication: z.boolean(),
     manualPublicationRoles: administrativeRoles, historyRoles: administrativeRoles, historyPageSize: integer(12),
     operationTimeoutMilliseconds: integer(600_000, 1000),
   }),
-  workers: z.strictObject({ jobs: workerPolicy(20), grades: workerPolicy(20), resumes: workerPolicy(20), analyses: workerPolicy(100) }),
+  workers: z.strictObject({
+    jobs: workerPolicy(20), grades: workerPolicy(20), resumes: workerPolicy(20), analyses: workerPolicy(100),
+    qc: workerPolicy(10).optional(),
+  }),
   extraction: z.strictObject({ transport: z.strictObject({ maxAttempts: integer(3) }), pollTimeoutMilliseconds: integer(240_000, 1000) }),
   rendering: z.strictObject({
     timeoutMilliseconds: integer(30_000, 1000), settleMilliseconds: integer(2000, 0),
@@ -124,7 +132,7 @@ const settingsObject = z.strictObject({
     highlightCount: integer(10), maxHighlights: integer(10), title: requiredText(200), additionalFooter: text(2000),
     maxComparisons: integer(500), batchComparisons: integer(25), maxConcurrentBatches: integer(3),
     maxInputBytes: integer(32 * MIB), maxOutputBytes: integer(64 * MIB), maxGenerationMilliseconds: integer(180_000, 1000),
-    maxPages: integer(10_000), maxSlides: integer(10_000), allowedRoles: unique(role, 3),
+    maxPages: integer(10_000), maxSlides: integer(10_000), allowedRoles: unique(role, 4),
   }),
   appearance: z.strictObject({
     applicationTitle: requiredText(80), defaultTheme: z.enum(['system', 'light', 'dark']),
@@ -148,6 +156,10 @@ export const reportSettingsSchema: z.ZodType<AdminSettings['reports']> = setting
 
 export const adminSettingsSchema: z.ZodType<AdminSettings> = settingsObject.superRefine((settings, ctx) => {
   const issue = (path: string, message: string) => ctx.addIssue({ code: 'custom', path: path.split('.'), message })
+  const qcFields = [settings.ai.tasks.qcPlan, settings.processing.qc, settings.workers.qc]
+  if (settings.schemaVersion === 2 ? qcFields.some(value => value === undefined) : qcFields.some(value => value !== undefined)) {
+    issue('schemaVersion', 'Version 1 retains its original shape. Version 2 requires the dedicated QC task, processing policy, and worker policy together.')
+  }
   const settingsBytes = settingsJsonBytes(settings)
   if (settingsBytes > ADMIN_SETTINGS_STORAGE_LIMITS.maxSettingsBytes) {
     ctx.addIssue({
@@ -166,6 +178,7 @@ export const adminSettingsSchema: z.ZodType<AdminSettings> = settingsObject.supe
   }
   for (const task of MODEL_TASK_IDS) {
     const binding = settings.ai.tasks[task]
+    if (!binding) continue
     const path = `ai.tasks.${task}`
     const ceiling = TASK_MODEL_LIMITS[task]
     const deployment = deployments.find(item => item.id === (binding.deploymentId ?? settings.ai.defaultDeploymentId))
@@ -205,10 +218,12 @@ export const adminSettingsSchema: z.ZodType<AdminSettings> = settingsObject.supe
   const references = settings.grades.references
   if (references.maxSelectedPages > references.maxTotalSelectedPages) issue('grades.references.maxSelectedPages', 'Per-source selected pages must fit the total selected-page bound.')
   if (references.pdfChunkPages > references.maxSelectedPages) issue('grades.references.pdfChunkPages', 'Extraction chunks must fit the per-source selected-page bound.')
-  for (const kind of ['jobs', 'grades', 'resumes', 'analyses'] as const) {
-    const retry = settings.processing[kind].retryBackoff
+  for (const kind of ['jobs', 'grades', 'resumes', 'analyses', 'qc'] as const) {
+    const policy = settings.processing[kind], worker = settings.workers[kind]
+    if (!policy || !worker) continue
+    const retry = policy.retryBackoff
     if (retry.baseMilliseconds > retry.maxMilliseconds) issue(`processing.${kind}.retryBackoff.baseMilliseconds`, 'The retry base must not exceed its cap.')
-    if (settings.ai.requestTimeoutMilliseconds > settings.workers[kind].budgetMilliseconds) {
+    if (settings.ai.requestTimeoutMilliseconds > worker.budgetMilliseconds) {
       issue(`workers.${kind}.budgetMilliseconds`, 'The execution budget must accommodate a model request.')
     }
   }
@@ -225,7 +240,8 @@ export const adminSettingsSchema: z.ZodType<AdminSettings> = settingsObject.supe
 function partialObject(schema: z.ZodObject): z.ZodObject {
   const shape: Record<string, z.ZodType> = {}
   for (const [key, field] of Object.entries(schema.shape)) {
-    const child = field as z.ZodType
+    let child = field as z.ZodType
+    if (child instanceof z.ZodOptional) child = child.unwrap() as z.ZodType
     shape[key] = (child instanceof z.ZodObject ? partialObject(child) : child).optional()
   }
   return z.strictObject(shape)
@@ -250,6 +266,26 @@ export function parseAdminSettings(value: unknown): AdminSettings {
   return result.data
 }
 
+/** Explicit new-QC-work/editor upgrade; never use when reconstructing accepted legacy snapshots. */
+export function upgradeQcAdminSettings(value: AdminSettings): CurrentAdminSettings {
+  const settings = parseAdminSettings(value)
+  if (settings.schemaVersion === 2) return structuredClone(settings) as CurrentAdminSettings
+  const defaults = createDefaultAdminSettings()
+  const deployment = settings.ai.deployments.find(item => item.id === settings.ai.defaultDeploymentId)!
+  const limit = TASK_MODEL_LIMITS.qcPlan
+  const completionTokenLimit = Math.min(limit.completionTokenLimit, deployment.capabilities.maxOutputTokens)
+  const maxRequest = Math.min(limit.inputBudget.maxRequest, deployment.capabilities.contextTokens - completionTokenLimit - limit.inputBudget.reservedTokens)
+  return parseAdminSettings({
+    ...settings, schemaVersion: 2,
+    ai: { ...settings.ai, tasks: { ...settings.ai.tasks, qcPlan: {
+      deploymentId: null, reasoningEffort: null, completionTokenLimit, temperature: null, topP: null,
+      inputBudget: { ...limit.inputBudget, maxRequest, maxInput: Math.min(limit.inputBudget.maxInput, maxRequest) },
+    } } },
+    processing: { ...settings.processing, qc: defaults.processing.qc },
+    workers: { ...settings.workers, qc: defaults.workers.qc },
+  }) as CurrentAdminSettings
+}
+
 function record(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
@@ -267,27 +303,41 @@ function merge(base: unknown, patch: unknown): unknown {
 export function mergeAdminSettings(current: AdminSettings, patch: unknown): AdminSettings {
   const result = adminSettingsPatchSchema.safeParse(patch)
   if (!result.success) throw settingsValidationError(result.error)
-  return parseAdminSettings(merge(current, result.data))
+  const base = current.schemaVersion === 1 && result.data.schemaVersion === 2 ? upgradeQcAdminSettings(current) : current
+  return parseAdminSettings(merge(base, result.data))
 }
 
 const resolvedTaskSchema = taskModelSettingsSchema.extend({
   taskId: z.enum(MODEL_TASK_IDS), deploymentId: identifier, deploymentName: identifier, modelName: requiredText(100),
   modelVersion: z.string().min(1).max(100).nullable(), capabilities: modelCapabilitiesSchema,
 })
-export const processingSettingsSnapshotSchema: z.ZodType<ProcessingSettingsSnapshot> = z.strictObject({
+const legacyProcessingSettingsSnapshotSchema = z.strictObject({
   schemaVersion: z.literal(1), revision: identifier, capturedAt: z.iso.datetime(), settings: adminSettingsSchema,
-  tasks: z.strictObject(Object.fromEntries(MODEL_TASK_IDS.map(task => [task, resolvedTaskSchema])) as Record<ModelTaskId, typeof resolvedTaskSchema>),
-}).superRefine((snapshot, ctx) => {
-  if (settingsJsonBytes(snapshot) > ADMIN_SETTINGS_STORAGE_LIMITS.maxSnapshotBytes) {
+  tasks: z.strictObject({
+    ...Object.fromEntries(LEGACY_MODEL_TASK_IDS.map(task => [task, resolvedTaskSchema])) as Record<Exclude<ModelTaskId, 'qcPlan'>, typeof resolvedTaskSchema>,
+    qcPlan: resolvedTaskSchema.optional(),
+  }),
+})
+export const processingSettingsSnapshotSchema: z.ZodType<ProcessingSettingsSnapshot> = z.discriminatedUnion('schemaVersion', [
+  legacyProcessingSettingsSnapshotSchema,
+  legacyProcessingSettingsSnapshotSchema.extend({ schemaVersion: z.literal(2), promptBundle: promptBundleSnapshotSchema }),
+]).superRefine((snapshot, ctx) => {
+  const maxBytes = snapshot.schemaVersion === 2 ? PROMPT_REGISTRY_LIMITS.snapshotBytes : ADMIN_SETTINGS_STORAGE_LIMITS.maxSnapshotBytes
+  if (settingsJsonBytes(snapshot) > maxBytes) {
     ctx.addIssue({
       code: 'custom', path: [],
-      message: `A complete processing-settings snapshot must fit within ${ADMIN_SETTINGS_STORAGE_LIMITS.maxSnapshotBytes} serialized UTF-8 bytes. No partial policy was captured.`,
+      message: `A complete processing-settings snapshot must fit within ${maxBytes} serialized UTF-8 bytes. No partial policy was captured.`,
     })
   }
   for (const task of MODEL_TASK_IDS) {
     const binding = snapshot.settings.ai.tasks[task]
-    const deployment = snapshot.settings.ai.deployments.find(item => item.id === (binding.deploymentId ?? snapshot.settings.ai.defaultDeploymentId))
     const resolved = snapshot.tasks[task]
+    if (!binding && !resolved) continue
+    if (!binding || !resolved) {
+      ctx.addIssue({ code: 'custom', path: ['tasks', task], message: 'A task and its exact resolved capture must both be present or both absent.' })
+      continue
+    }
+    const deployment = snapshot.settings.ai.deployments.find(item => item.id === (binding.deploymentId ?? snapshot.settings.ai.defaultDeploymentId))
     const expected = deployment && {
       ...binding, taskId: task, deploymentId: deployment.id, deploymentName: deployment.deploymentName,
       modelName: deployment.modelName, modelVersion: deployment.modelVersion, capabilities: deployment.capabilities,

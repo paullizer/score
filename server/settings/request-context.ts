@@ -72,7 +72,7 @@ export async function getSettingsForAcceptedWork(
   if (pinned !== undefined) {
     const parsed = processingSettingsSnapshotSchema.safeParse(pinned)
     if (!parsed.success) throw unavailable('The saved processing settings cannot be read; no model or policy substitution was made.')
-    return captureProcessingSettings(parsed.data.settings, parsed.data.revision, parsed.data.capturedAt)
+    return captureProcessingSettings(parsed.data.settings, parsed.data.revision, parsed.data.capturedAt, parsed.data.promptBundle)
   }
   const context = (req as SettingsRequest).applicationSettings
   if (!context) throw new Error('Settings context must be attached after authentication.')

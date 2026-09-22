@@ -1,6 +1,9 @@
 import { createHash } from 'node:crypto'
 import { z } from 'zod'
 import { processingSettingsSnapshotSchema } from '../../src/domain/admin-settings-schema'
+import { promptExecutionProvenanceSchema } from '../../src/domain/prompt-versions'
+import { analysisQcDiagnosticsReferenceSchema } from '../../src/domain/analysis-qc-diagnostics'
+import { assertAcceptedPromptBinding } from '../settings/prompt-integrity'
 import { MODEL_TASK_IDS } from '../../src/domain/admin-settings-tasks'
 import { REPORT_LIMITS } from '../../src/domain/analysis-reports'
 import {
@@ -225,6 +228,7 @@ const comparisonSchema = z.strictObject({
     attemptId: z.string().uuid(), status: z.enum(['saved', 'unavailable', 'disabled']), pipelineVersion: text(200),
   }).optional(),
   resultRevision: analysisResultRevisionSchema.optional(),
+  qcDiagnostics: analysisQcDiagnosticsReferenceSchema.optional(),
 })
 const narrativeIdentity = z.strictObject({ snapshotId, sha256: hash })
 const correctionSchema = z.strictObject({
@@ -408,7 +412,7 @@ export function isSafeAnalysisBlobName(name: string): boolean {
         : parts[3] === 'target' && analysisNarrativeTargetIdSchema.safeParse(parts[4]).success) &&
       new RegExp(`^${UUID}$`).test(parts[5]) && new RegExp(`^${UUID}\\.json$`).test(parts[6])
   }
-  return parts.length === 5 && ['results', 'diagnostics'].includes(parts[2]) && isAnalysisId(parts[3], 'comparison') &&
+  return parts.length === 5 && ['results', 'diagnostics', 'qc-diagnostics'].includes(parts[2]) && isAnalysisId(parts[3], 'comparison') &&
     new RegExp(`^${UUID}\\.json$`).test(parts[4])
 }
 export function analysisBlobInRun(name: string, workspaceId: string, runId: string): boolean {
@@ -492,6 +496,14 @@ export function parseAnalysisEntity(value: unknown): AnalysisEntity {
     }
     assertAnalysis(!record.resultRevision || record.status === 'complete' &&
       record.resultRevision.correctedAt === record.completedAt, 'Only completed projections may identify a corrected result.')
+    if (record.qcDiagnostics) {
+      const reference = record.qcDiagnostics
+      assertAnalysis(record.status === 'complete' && reference.resultSha256 ===
+        (record.resultRevision?.originalResultSha256 ?? record.result?.sha256) &&
+        (record.resultRevision || reference.attemptId === record.attemptId) &&
+        reference.blob.blobName === analysisQcDiagnosticsBlobName(record.workspaceId, record.runId, record.id, reference.attemptId),
+      'QC diagnostics must retain the original completed result and attempt binding.')
+    }
     if (record.status === 'cancelled') assertAnalysis(record.cancelledAt && !record.lease && !record.nextAttemptAt,
       'Cancelled comparisons must release work.')
     if (record.status === 'failed') assertAnalysis(record.error && !record.lease && !record.nextAttemptAt, 'Failed comparison must retain a terminal error.')
@@ -625,6 +637,12 @@ export function analysisResultBlobName(workspaceId: string, runId: string, compa
 export function analysisDiagnosticBlobName(workspaceId: string, runId: string, comparisonId: string, attemptId: string): string {
   const name = `${workspaceId}/${runId}/diagnostics/${comparisonId}/${attemptId}.json`
   assertAnalysis(isSafeAnalysisBlobName(name), 'Invalid failure diagnostic identity.')
+  return name
+}
+
+export function analysisQcDiagnosticsBlobName(workspaceId: string, runId: string, comparisonId: string, attemptId: string): string {
+  const name = `${workspaceId}/${runId}/qc-diagnostics/${comparisonId}/${attemptId}.json`
+  assertAnalysis(isSafeAnalysisBlobName(name), 'Invalid original-assessment QC diagnostic identity.')
   return name
 }
 
@@ -844,11 +862,14 @@ export const analysisAssessmentOutputSchema = z.strictObject({
   })).max(50),
   summary: text(12_000), limitations: z.array(limitationSchema).max(100),
 })
-const modelProvenanceSchema = z.strictObject({
+export const analysisModelProvenanceSchema = z.strictObject({
   model: text(300), deployment: text(300), promptVersion: text(200), schemaVersion: text(200),
   startedAt: timestamp, completedAt: timestamp, inputCharacters: z.number().int().min(1).max(10_000_000),
   settingsRevision: text(128).optional(), task: z.enum(MODEL_TASK_IDS).optional(),
+  prompt: promptExecutionProvenanceSchema.optional(), modelCallId: z.uuid().optional(),
 })
+const modelProvenanceSchema = analysisModelProvenanceSchema.refine(value => !value.prompt ||
+  value.promptVersion === value.prompt.revisionId && value.schemaVersion === value.prompt.outputSchemaVersion)
 const evidenceGapDecisionBase = { criterionId: identifier, message: text(8000) }
 export const analysisEvidenceGapScopeSchema = z.strictObject({
   kind: z.literal('evidence-gaps'), baseAssessmentSha256: hash,
@@ -1108,6 +1129,13 @@ export function assertAnalysisResultBinding(
     revision.baseResultSha256 === correction.baseResultSha256 && revision.correctedAt === result.createdAt &&
     analysisHash(revision.criterionIds) === analysisHash(correction.criterionIds),
   'Result correction provenance does not match its selected revision.')
+  if (!correction) {
+    const capture = (comparison.processingSettings ?? run.processingSettings)?.promptBundle
+    assertAcceptedPromptBinding(result.provenance.assessment.prompt, capture, 'assessment')
+    for (const review of result.provenance.groundingReviews) {
+      assertAcceptedPromptBinding(review.provenance.prompt, capture, 'assessmentGrounding')
+    }
+  }
   const assessment = { criteria: result.criteria, qualifications: result.qualifications, summary: result.summary, limitations: result.limitations }
   assertAnalysis(validateAnalysisAssessment(assessment, resume.document, target).length === 0, 'Result evidence does not match the frozen inputs.')
   for (const review of result.provenance.groundingReviews) for (const issue of review.issues) {

@@ -6,6 +6,7 @@ import { createHealthCheck } from './health'
 import { createAuthMiddleware, createCsrfMiddleware } from './middleware'
 import { getPrincipal } from './request-context'
 import { WorkspaceRepository } from './repository'
+import { createWorkspaceMembersRouter } from './members/routes'
 import { mountStaticSpa } from './static'
 import type { Config } from './config'
 import { createRealJobsRouter, type RealJobsDeps } from './jobs/routes'
@@ -17,6 +18,10 @@ import type { RealAnalysesDeps } from './analyses/store'
 import { isApplicationAdmin } from './auth'
 import { createAdminSettingsRouter } from './settings/routes'
 import type { AdminSettingsService } from './settings/service'
+import type { PromptRegistryService } from './settings/prompts'
+import type { QcDeps } from './qc/store'
+import { createQcRouter } from './qc/routes'
+import { createQcLifecycleParticipant, createQcRunLifecycleHooks } from './qc/lifecycle'
 import { attachSettingsContext, getAdmissionSettings, getCurrentSettings } from './settings/request-context'
 import { effectiveFeatures } from './settings/features'
 import type { DirectoryStore, StateStore } from './store'
@@ -59,6 +64,8 @@ export { ConfigError, loadConfig } from './config'
 export { defaultPersonalWorkspaceId, isValidWorkspaceId, membershipIdFor, principalKeyFor } from './ids'
 export { isApplicationAdmin } from './auth'
 export { AdminSettingsService } from './settings/service'
+export { PromptRegistryService, createPromptRegistryService, createCompiledPromptBaseline } from './settings/prompts'
+export { createAzurePromptStore, createAzurePromptReader, createPromptStoreFromContainer } from './settings/prompt-azure-store'
 export { createSettingsStoreFromContainer, createAzureSettingsStore, createSettingsReaderFromContainer, createAzureSettingsReader } from './settings/azure-store'
 export { createAzureSettingsModelAdapter } from './settings/models'
 export {
@@ -84,6 +91,8 @@ export interface AppDeps {
   readonly resumes?: RealResumesDeps
   readonly analyses?: RealAnalysesDeps
   readonly settings?: AdminSettingsService
+  readonly prompts?: PromptRegistryService
+  readonly qc?: QcDeps
   /** Overridable so tests don't depend on a real build of dist/. */
   readonly distDir?: string
   /** Injectable clock for deterministic tests. */
@@ -137,8 +146,18 @@ export function createApp(deps: AppDeps): Express {
   }
   const distDir = deps.distDir ?? DEFAULT_DIST_DIR
   const repository = new WorkspaceRepository({ directory, state, now: deps.now })
+  const qc = deps.qc
+  const unavailableQc = async (): Promise<never> => {
+    throw unavailable('QC storage is unavailable. Analysis lifecycle cleanup cannot skip its private feedback and case packs.')
+  }
+  const qcLifecycle: RealAnalysesDeps['qcLifecycle'] = qc ? createQcRunLifecycleHooks(qc)
+    : config.qc ? { setRunState: unavailableQc, purgeRun: unavailableQc } : undefined
+  const analysisStorage = deps.analyses
+    ? { ...deps.analyses, ...(qcLifecycle ? { qcLifecycle } : {}) } : undefined
   const participants: WorkspaceLifecycleParticipant[] = []
-  if (deps.analyses) participants.push(createAnalysisLifecycleParticipant(deps.analyses))
+  if (qc) participants.push(createQcLifecycleParticipant(qc))
+  else if (config.qc) participants.push(unavailableParticipant('QC'))
+  if (analysisStorage) participants.push(createAnalysisLifecycleParticipant(analysisStorage))
   else if (config.realAnalyses || config.analysisLifecycleStore) participants.push(unavailableParticipant('Analysis'))
   if (deps.resumes) participants.push(createResumeLifecycleParticipant(deps.resumes))
   else if (config.realResumes || config.resumeLifecycleStore) participants.push(unavailableParticipant('Resume'))
@@ -147,20 +166,23 @@ export function createApp(deps: AppDeps): Express {
   if (deps.jobs) participants.push(createJobLifecycleParticipant(deps.jobs))
   else if (config.realJobs || config.jobLifecycleStore) participants.push(unavailableParticipant('Job'))
   const lifecycle = createLifecycleDependencies(state, deps.jobs, deps.grades, Boolean(config.realGrades || config.gradeLifecycleStore),
-    deps.analyses, Boolean(config.realAnalyses || config.analysisLifecycleStore))
+    analysisStorage, Boolean(config.realAnalyses || config.analysisLifecycleStore))
   const workspaceLifecycle = new WorkspaceLifecycleService({ repository, directory, state, participants, lifecycle, now: deps.now })
   const checkHealth = createHealthCheck({ directory, state })
   const jobs = config.realJobs && deps.jobs?.store && deps.jobs.blobs ? deps.jobs : undefined
   const grades = config.realGrades && deps.grades?.store && deps.grades.blobs ? deps.grades : undefined
   const resumes = config.realResumes && deps.resumes?.store && deps.resumes.blobs ? deps.resumes : undefined
-  const analyses = config.realAnalyses && deps.analyses?.store && deps.analyses.blobs
-    ? { ...deps.analyses, evidenceCorrectionsEnabled: config.realAnalyses.evidenceCorrectionsEnabled === true } : undefined
+  const analyses = config.realAnalyses && analysisStorage?.store && analysisStorage.blobs
+    ? { ...analysisStorage, evidenceCorrectionsEnabled: config.realAnalyses.evidenceCorrectionsEnabled === true } : undefined
   const canCreateAnalyses = Boolean(analyses && resumes && (jobs || grades))
   const wordDocumentImports = config.wordDocumentImports === true
 
   const app = express()
   app.locals.reconcileLifecycle = () => workspaceLifecycle.reconcile()
-  app.locals.bootstrapSettings = async () => deps.settings?.current()
+  app.locals.bootstrapSettings = async () => {
+    const [settings] = await Promise.all([deps.settings?.current(), deps.prompts?.current()])
+    return settings
+  }
   app.disable('x-powered-by')
   app.use(telemetryRequests)
   const parseJson = express.json({ limit: MAX_JSON_BODY })
@@ -181,6 +203,8 @@ export function createApp(deps: AppDeps): Express {
   api.use(telemetryMiddleware('score.csrf', createCsrfMiddleware(config)))
   api.use(attachSettingsContext(config, deps.settings))
   api.use(createAdminSettingsRouter(config, deps.settings))
+  api.use(createWorkspaceMembersRouter({ repository, directory, config, now: deps.now }))
+  api.use(createQcRouter({ repository, state, config, qc, analyses: analysisStorage, prompts: deps.prompts, now: deps.now }))
   api.get('/features', async (req, res) => {
     const snapshot = await getAdmissionSettings(req)
     res.json(effectiveFeatures({

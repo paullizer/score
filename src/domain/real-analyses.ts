@@ -30,6 +30,8 @@ import type { AnalysisDiagnosticCapture, AnalysisFailureDiagnosticReference } fr
 import type { ModelTaskId, ProcessingSettingsSnapshot } from './admin-settings'
 import type { AnalysisCorrectionProvenance, AnalysisResultRevision, RealAnalysisCorrectionRecord } from './analysis-corrections'
 import type { AnalysisCriterionBlockerCode, AnalysisEvidenceGapReviewScope } from './analysis-evidence-policy'
+import type { PromptExecutionProvenance } from './prompt-versions'
+import type { AnalysisQcDiagnosticsReference } from './analysis-qc-diagnostics'
 
 export type {
   RealAnalysisCandidateNarrativeRecord,
@@ -371,6 +373,8 @@ export interface AnalysisModelProvenance {
   inputCharacters: number
   settingsRevision?: string
   task?: ModelTaskId
+  prompt?: PromptExecutionProvenance
+  modelCallId?: string
 }
 
 export interface AnalysisGroundingIssue {
@@ -432,6 +436,8 @@ export interface RealAnalysisComparisonRecord extends AnalysisEntityBase, Analys
   cancelledAt?: string
   failureDiagnostic?: AnalysisFailureDiagnosticReference
   diagnosticCapture?: AnalysisDiagnosticCapture
+  /** Original-assessment diagnostic sidecar. A corrected-result projection never rewrites this binding. */
+  qcDiagnostics?: AnalysisQcDiagnosticsReference
   // Read projection only; the original completed record remains immutable.
   resultRevision?: AnalysisResultRevision
 }

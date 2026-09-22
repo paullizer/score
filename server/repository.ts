@@ -4,6 +4,7 @@ import type { CloudSession, CloudWorkspaceSnapshot, WorkspaceRole, WorkspaceSumm
 import type { Workspace } from '../src/domain/types'
 import { validateWorkspace, WorkspaceValidationError } from '../src/domain/workspace-validation'
 import { workspaceLifecycleTransitionErrors } from '../src/domain/lifecycle'
+import { isWorkspaceRole, workspaceCanEdit } from '../src/domain/workspace-permissions'
 import type { AuthenticatedPrincipal } from './auth'
 import { conflict, forbidden, invalidRequest, notFound, preconditionRequired, unavailable } from './errors'
 import { defaultPersonalWorkspaceId, isValidWorkspaceId, membershipIdFor, newWorkspaceId } from './ids'
@@ -103,7 +104,10 @@ export class WorkspaceRepository {
     const memberships = await this.directory.listMembershipsForPrincipal(principal.principalKey)
     const summaries = await Promise.all(
       memberships.map(async (membership): Promise<WorkspaceSummary | undefined> => {
-        const stored = await this.directory.getMetadata(membership.workspaceId)
+        const [stored, currentMembership] = await Promise.all([
+          this.directory.getMetadata(membership.workspaceId),
+          this.directory.getMembership(membership.workspaceId, membershipIdFor(principal.principalKey)),
+        ])
         // Membership without metadata is a storage inconsistency, not a workspace to show; skip it
         // rather than crash the whole list or fabricate a placeholder.
         if (!stored) {
@@ -111,8 +115,12 @@ export class WorkspaceRepository {
           return undefined
         }
         if (stored.metadata.deletedAt) return undefined
-        if (stored.metadata.tenantId !== principal.tenantId || membership.principalId !== principal.principalKey) return undefined
-        return toSummary(stored.metadata, stored.etag, membership.role)
+        if (stored.metadata.tenantId !== principal.tenantId || stored.metadata.workspaceId !== membership.workspaceId ||
+          !currentMembership || currentMembership.workspaceId !== membership.workspaceId ||
+          currentMembership.id !== membershipIdFor(principal.principalKey) ||
+          currentMembership.principalId !== principal.principalKey || currentMembership.principalType !== 'user' ||
+          !isWorkspaceRole(currentMembership.role)) return undefined
+        return toSummary(stored.metadata, stored.etag, currentMembership.role)
       }),
     )
     return summaries
@@ -245,8 +253,9 @@ export class WorkspaceRepository {
     ])
     if (!stored || stored.metadata.deletedAt || !membership || stored.metadata.tenantId !== principal.tenantId ||
       stored.metadata.workspaceId !== workspaceId || membership.workspaceId !== workspaceId ||
+      membership.id !== membershipIdFor(principal.principalKey) ||
       membership.principalId !== principal.principalKey || membership.principalType !== 'user' ||
-      !['owner', 'editor', 'viewer'].includes(membership.role)) {
+      !isWorkspaceRole(membership.role)) {
       throw notFound()
     }
     return membership
@@ -261,8 +270,8 @@ export class WorkspaceRepository {
   ): Promise<WorkspaceRole> {
     if (!isValidWorkspaceId(workspaceId)) throw notFound()
     const membership = await this.requireMembership(principal, workspaceId)
-    if (access !== 'read' && membership.role === 'viewer') {
-      throw forbidden('Viewers cannot change this workspace.')
+    if (access !== 'read' && !workspaceCanEdit(membership.role)) {
+      throw forbidden('Only workspace owners and editors can change ordinary workspace content.')
     }
     if (access !== 'read') {
       const stored = await this.directory.getMetadata(workspaceId)

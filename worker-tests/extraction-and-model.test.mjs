@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import { loadWorker } from './shared-model-loader.mjs'
-import { settingsSnapshot } from './runtime-settings-test-support.mjs'
+import { settingsDomain, settingsSnapshot } from './runtime-settings-test-support.mjs'
 const {
   analyzePdf,
   documentIntelligenceParagraphs,
@@ -65,6 +65,36 @@ function modelResponse(result, model = 'gpt-5-mini-2026-08-01') {
     choices: [{ message: { content: JSON.stringify(result) } }],
   }), { status: 200, headers: { 'content-type': 'application/json' } })
 }
+
+test('pinned job rubric repairs retain the accepted guidance and publish the exact rendered prompt hash', async () => {
+  const { createCompiledPromptBaseline, promptTextHash } = await loadWorker('../server/settings/prompts.ts')
+  const baseline = createCompiledPromptBaseline('2026-09-17T12:00:00.000Z')
+  const snapshot = settingsSnapshot(settings => { settings.rubrics.jobs.maxCriteria = 2 })
+  const pinned = settingsDomain.captureProcessingSettings(snapshot.settings, snapshot.revision, snapshot.capturedAt, baseline)
+  const invalid = structuredClone(validResult)
+  invalid.criteria[0].weight = 50
+  const systems = []
+  const result = await generateGroundedRubric(document, {
+    endpoint: 'https://model.example', deployment: 'job-rubric', modelName: 'gpt-5-mini',
+    processingSettings: pinned, getToken: async () => 'test-token',
+    fetch: async (_url, init) => {
+      const body = JSON.parse(init.body)
+      systems.push(body.messages[0].content)
+      assert.match(body.messages[0].content, /Create 1 to 2 job-related professional criteria/)
+      assert.ok(body.messages[0].content.includes(baseline.revisions.jobRubric.guidance))
+      return modelResponse(systems.length === 1 ? invalid : validResult)
+    },
+  }, () => [], jobId, '2026-09-17T12:00:00.000Z')
+  assert.equal(systems.length, 2)
+  assert.equal(systems[0], systems[1])
+  assert.equal(result.rubric.provenance.promptVersion, baseline.revisions.jobRubric.revisionId)
+  assert.equal(result.rubric.provenance.prompt.family, 'jobRubric')
+  assert.equal(result.rubric.provenance.prompt.bundleSha256, baseline.bundle.bundleSha256)
+  assert.equal(result.rubric.provenance.prompt.systemSha256, promptTextHash(systems[0]))
+  const { validateRealRubric, validateStoredRealRubric } = await loadWorker('../server/jobs/validation.ts')
+  assert.deepEqual(validateRealRubric(result.rubric, document), [])
+  assert.equal(validateStoredRealRubric(result.rubric), true)
+})
 
 test('job rubric resolves only its captured task and enforces the frozen criterion and repair limits', async () => {
   let calls = 0

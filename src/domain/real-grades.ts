@@ -272,6 +272,7 @@ export interface GradeCompetencyPlanRecord extends GradeEntityBase {
   issues: GradeIssue[]
   model: string
   promptVersion: string
+  prompt?: PromptExecutionProvenance
 }
 
 export interface GradeCriterion extends Criterion {
@@ -322,6 +323,7 @@ export interface GradeReviewRecord extends GradeEntityBase {
   issues: GradeIssue[]
   model: string
   promptVersion: string
+  prompt?: PromptExecutionProvenance
 }
 
 export interface GradeApprovalRecord extends GradeEntityBase {
@@ -481,3 +483,4 @@ export function gradeRecordIs<K extends GradeEntity['recordType']>(
 ): value is Extract<GradeEntity, { recordType: K }> {
   return value.recordType === recordType
 }
+import type { PromptExecutionProvenance } from './prompt-versions'

@@ -2,7 +2,7 @@ import { CosmosClient, ErrorResponse } from '@azure/cosmos'
 import type { Container, DeleteOperation, OperationInput } from '@azure/cosmos'
 import type { TokenCredential } from '@azure/identity'
 import type { CosmosConfig } from './config'
-import { membershipIdFor } from './ids'
+import { GUID_PATTERN, membershipIdFor } from './ids'
 import {
   StoreConflictError,
   StoreNotFoundError,
@@ -66,6 +66,77 @@ export function createDirectoryStoreFromContainer(container: Pick<Container, 'it
       if (response.statusCode === 404) return undefined
       if (!response.resource) throw new Error('Cosmos returned no membership body.')
       return omitEtag(response.resource)
+    },
+
+    async getStoredMembership(workspaceId, membershipId) {
+      let response
+      try {
+        response = await container.item(membershipId, workspaceId).read<CosmosDoc<MembershipDoc>>()
+      } catch (error) {
+        if (statusCodeOf(error) === 404) return undefined
+        throw error
+      }
+      if (response.statusCode === 404) return undefined
+      if (!response.resource || !response.resource._etag) throw new Error('Cosmos membership is missing its body or ETag.')
+      return { membership: omitEtag(response.resource), etag: response.resource._etag }
+    },
+
+    async listReviewerMemberships(workspaceId) {
+      const { resources } = await container.items.query<CosmosDoc<MembershipDoc>>({
+        query: 'SELECT * FROM c WHERE c.principalType = @principalType AND c.role = @role',
+        parameters: [{ name: '@principalType', value: 'user' }, { name: '@role', value: 'reviewer' }],
+      }, { partitionKey: workspaceId }).fetchAll()
+      return resources.map(resource => {
+        if (!resource._etag || resource.workspaceId !== workspaceId || resource.principalType !== 'user' || resource.role !== 'reviewer') {
+          throw new Error('Cosmos returned invalid reviewer scope or concurrency metadata.')
+        }
+        return { membership: omitEtag(resource), etag: resource._etag }
+      })
+    },
+
+    async changeReviewerMembership({ metadata, expectedMetadataEtag, membership, expectedMembershipEtag, audit }) {
+      const removing = audit.action === 'reviewer-removed'
+      const objectId = membership.principalId.slice(metadata.tenantId.length + 1)
+      if (!expectedMetadataEtag || expectedMetadataEtag === '*' ||
+        (removing && (!expectedMembershipEtag || expectedMembershipEtag === '*')) ||
+        (!removing && (audit.action !== 'reviewer-added' || expectedMembershipEtag !== undefined))) {
+        throw new StoreConflictError('Exact membership and workspace concurrency conditions are required.')
+      }
+      if (metadata.deletedAt || (metadata.lifecycleOperation && metadata.lifecycleOperation.status !== 'complete') ||
+        membership.workspaceId !== metadata.workspaceId || membership.principalType !== 'user' || membership.role !== 'reviewer' ||
+        !membership.principalId.startsWith(`${metadata.tenantId}:`) || !GUID_PATTERN.test(objectId) ||
+        membership.id !== membershipIdFor(membership.principalId) || membership.principalId === metadata.ownerId ||
+        audit.type !== 'membership-audit' || !audit.id.startsWith('membership-audit-') || audit.workspaceId !== metadata.workspaceId ||
+        audit.actorId !== metadata.ownerId || audit.targetPrincipalId !== membership.principalId ||
+        audit.membershipId !== membership.id || audit.role !== 'reviewer') {
+        throw new StoreConflictError('The reviewer change does not match its workspace ownership or lifecycle fence.')
+      }
+      const { lifecycleOperation, ...fields } = metadata
+      const removeMembership: DeleteOperation = { operationType: 'Delete', id: membership.id, ifMatch: expectedMembershipEtag }
+      const operations: OperationInput[] = [
+        { operationType: 'Replace', id: 'workspace', ifMatch: expectedMetadataEtag,
+          resourceBody: { ...fields, ...(lifecycleOperation ? { lifecycleOperation: { ...lifecycleOperation } } : {}) } },
+        removing
+          ? removeMembership
+          : { operationType: 'Create', resourceBody: { ...membership } },
+        { operationType: 'Create', resourceBody: { ...audit } },
+      ]
+      try {
+        const response = await container.items.batch(operations, metadata.workspaceId)
+        const results = response.result ?? []
+        if (results.length !== operations.length || results.some(item => item.statusCode < 200 || item.statusCode >= 300) ||
+          (response.code !== undefined && (response.code < 200 || response.code >= 300))) {
+          const code = results.find(item => item.statusCode >= 400 && item.statusCode !== 424)?.statusCode ?? response.code
+          if ([404, 409, 412, 424].includes(code ?? 0)) throw new StoreConflictError('Workspace access changed. Refresh before retrying.')
+          throw new Error('The reviewer membership transaction did not succeed.')
+        }
+        const etag = results[0]?.eTag
+        if (!etag) throw new Error('The reviewer membership transaction returned no workspace ETag.')
+        return { metadata, etag }
+      } catch (error) {
+        if ([404, 409, 412].includes(statusCodeOf(error) ?? 0)) throw new StoreConflictError('Workspace access changed. Refresh before retrying.')
+        throw error
+      }
     },
 
     async listMembershipsForPrincipal(principalKey) {

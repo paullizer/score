@@ -12,6 +12,7 @@ param rendererImage string
 param gradeWorkerImage string
 param resumeWorkerImage string
 param analysisWorkerImage string
+param qcWorkerImage string
 param appServiceSku string
 param searchSku string
 param additionalModelDeployments array
@@ -330,12 +331,31 @@ module analyses 'private-processing.bicep' = {
   }
 }
 
-var settingsReaderKinds = ['job', 'grade', 'resume', 'analysis']
+module qc 'private-processing.bicep' = {
+  name: 'score-quality-control'
+  params: {
+    location: location
+    token: token
+    tags: tags
+    kind: 'qc'
+    cosmosAccountName: cosmos.name
+    storageAccountName: storage.name
+    registryName: registry.name
+    foundryAccountName: ai.outputs.accountName
+    modelDeploymentName: ingestion.outputs.modelDeploymentName
+    environmentId: ingestion.outputs.environmentId
+    tenantId: tenantId
+    workerImage: qcWorkerImage
+  }
+}
+
+var settingsReaderKinds = ['job', 'grade', 'resume', 'analysis', 'qc']
 var settingsReaderPrincipals = [
   ingestion.outputs.workerPrincipalId
   grades.outputs.workerPrincipalId
   resumes.outputs.workerPrincipalId
   analyses.outputs.workerPrincipalId
+  qc.outputs.workerPrincipalId
 ]
 
 resource settingsReadAccess 'Microsoft.DocumentDB/databaseAccounts/sqlRoleAssignments@2024-11-15' = [for (kind, index) in settingsReaderKinds: {
@@ -417,6 +437,7 @@ resource appSettings 'Microsoft.Web/sites/config@2024-11-01' = {
     GRADE_WORKER_MAX_ITEMS: '5'
     RESUME_WORKER_MAX_ITEMS: '5'
     ANALYSIS_WORKER_MAX_ITEMS: '2'
+    QC_WORKER_MAX_ITEMS: '2'
     AZURE_CLIENT_ID: runtimeIdentity.properties.clientId
     COSMOS_ENDPOINT: cosmos.properties.documentEndpoint
     COSMOS_DATABASE: database.name
@@ -439,6 +460,10 @@ resource appSettings 'Microsoft.Web/sites/config@2024-11-01' = {
     ANALYSIS_EVIDENCE_CORRECTIONS_ENABLED: 'false'
     ANALYSIS_RECORDS_CONTAINER: 'analysis-records'
     ANALYSIS_SOURCE_CONTAINER: 'analysis-sources'
+    QC_RECORDS_CONTAINER: 'qc-records'
+    QC_SOURCE_CONTAINER: 'qc-sources'
+    QC_ENABLED: 'false'
+    QC_WORKER_ENABLED: 'false'
     APP_ORIGIN: 'https://${web.properties.defaultHostName}'
     AZURE_AI_PROJECT_ENDPOINT: ai.outputs.projectEndpoint
     AZURE_AI_SEARCH_ENDPOINT: ai.outputs.searchEndpoint
@@ -553,3 +578,6 @@ output resumeWorkerPrincipalId string = resumes.outputs.workerPrincipalId
 output analysisWorkerName string = analyses.outputs.workerName
 output analysisWorkerId string = analyses.outputs.workerId
 output analysisWorkerPrincipalId string = analyses.outputs.workerPrincipalId
+output qcWorkerName string = qc.outputs.workerName
+output qcWorkerId string = qc.outputs.workerId
+output qcWorkerPrincipalId string = qc.outputs.workerPrincipalId

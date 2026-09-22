@@ -3,11 +3,17 @@ import type {
   AdminSettings, HostRule, ModelTaskId, ProcessingSettingsSnapshot, PublicSettings, ResolvedTaskModel,
   RuntimeSettingsReadiness, SettingsChange,
 } from './admin-settings'
-import { parseAdminSettings, processingSettingsSnapshotSchema, settingsValidationError, SettingsValidationError } from './admin-settings-schema'
+import { parseAdminSettings, processingSettingsSnapshotSchema, settingsValidationError, SettingsValidationError, upgradeQcAdminSettings } from './admin-settings-schema'
+import type { PromptBundleSnapshot } from './prompt-versions'
 
 export function resolveTaskModel(settings: AdminSettings | ProcessingSettingsSnapshot, taskId: ModelTaskId): ResolvedTaskModel {
-  if ('tasks' in settings) return structuredClone(settings.tasks[taskId])
+  if ('tasks' in settings) {
+    const captured = settings.tasks[taskId]
+    if (!captured) throw new SettingsValidationError([{ path: `tasks.${taskId}`, message: 'This accepted snapshot did not capture that task. No newer binding was substituted.' }])
+    return structuredClone(captured)
+  }
   const binding = settings.ai.tasks[taskId]
+  if (!binding) throw new SettingsValidationError([{ path: `ai.tasks.${taskId}`, message: 'This task requires an explicit compatible settings upgrade.' }])
   const id = binding.deploymentId ?? settings.ai.defaultDeploymentId
   const deployment = settings.ai.deployments.find(item => item.id === id)
   if (!deployment?.enabled || !deployment.capabilities.structuredOutputs) {
@@ -26,15 +32,25 @@ function freeze<T>(value: T): T {
   }
   return value
 }
-export function captureProcessingSettings(settings: AdminSettings, revision: string, capturedAt: string): ProcessingSettingsSnapshot {
+export function captureProcessingSettings(
+  settings: AdminSettings, revision: string, capturedAt: string, promptBundle?: PromptBundleSnapshot,
+): ProcessingSettingsSnapshot {
   if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(revision) || !Number.isFinite(Date.parse(capturedAt))) {
     throw new SettingsValidationError([{ path: 'revision', message: 'A valid immutable revision and capture timestamp are required.' }])
   }
   const copy = parseAdminSettings(settings)
-  const tasks = Object.fromEntries(MODEL_TASK_IDS.map(task => [task, resolveTaskModel(copy, task)])) as Record<ModelTaskId, ResolvedTaskModel>
-  const result = processingSettingsSnapshotSchema.safeParse({ schemaVersion: 1, revision, capturedAt, settings: copy, tasks })
+  const tasks = Object.fromEntries(MODEL_TASK_IDS.filter(task => copy.ai.tasks[task] !== undefined)
+    .map(task => [task, resolveTaskModel(copy, task)])) as ProcessingSettingsSnapshot['tasks']
+  const result = processingSettingsSnapshotSchema.safeParse({
+    schemaVersion: promptBundle ? 2 : 1, revision, capturedAt, settings: copy, tasks,
+    ...(promptBundle ? { promptBundle } : {}),
+  })
   if (!result.success) throw settingsValidationError(result.error)
   return freeze(result.data)
+}
+
+export function captureQcProcessingSettings(snapshot: ProcessingSettingsSnapshot): ProcessingSettingsSnapshot {
+  return captureProcessingSettings(upgradeQcAdminSettings(snapshot.settings), snapshot.revision, snapshot.capturedAt, snapshot.promptBundle)
 }
 
 /** Explicit allowlist: never serialize the admin response or deployment/environment object here. */

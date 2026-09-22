@@ -36,6 +36,7 @@ import {
   retryBackoff, RuntimeSettingsError, safeSettingsMetadata, sourcePolicy, type WorkerSettingsDependencies,
 } from '../settings'
 export { RUNTIME_SETTINGS_VERSION } from '../../src/domain/admin-settings'
+export { PROMPT_RUNTIME_VERSION } from '../../src/domain/prompt-versions'
 
 const LEASE_MILLISECONDS = 90_000
 const HEARTBEAT_MILLISECONDS = 25_000

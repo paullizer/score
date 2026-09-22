@@ -1,12 +1,13 @@
 import { useEffect, useState } from 'react'
-import { Check, ChevronsUpDown, Loader2, Pencil, Plus, X } from 'lucide-react'
+import { Check, ChevronsUpDown, Loader2, Pencil, Plus, Users, X } from 'lucide-react'
 import type { CloudWorkspaceStatus } from '../../app/workspace-context'
 import { Badge, Button, EmptyState, InlineError, Modal, SearchField } from '../ui'
 import { matchesArchiveFilter, type ArchiveFilter } from '../../domain/lifecycle'
 import { ArchiveStateFilter, LifecycleActions } from '../lifecycle/LifecycleControls'
 import { usePublicSettings } from '../../app/public-settings-context'
+import { WorkspaceAccessDialog } from './WorkspaceAccessDialog'
 
-export type WorkspaceDirectoryActions = Pick<CloudWorkspaceStatus, 'workspaces' | 'currentWorkspaceId' | 'switchWorkspace' | 'createWorkspace' | 'renameWorkspace' | 'refreshWorkspaces' | 'getWorkspaceLifecycleImpact' | 'changeWorkspaceLifecycle'>
+export type WorkspaceDirectoryActions = Pick<CloudWorkspaceStatus, 'user' | 'workspaces' | 'currentWorkspaceId' | 'switchWorkspace' | 'createWorkspace' | 'renameWorkspace' | 'refreshWorkspaces' | 'getWorkspaceLifecycleImpact' | 'changeWorkspaceLifecycle'>
 
 /**
  * The sidebar's "current workspace" label becomes this functional control: it opens a modal to
@@ -25,8 +26,10 @@ export function WorkspaceSwitcher({ cloud, empty = false }: { cloud: WorkspaceDi
   const [creating, setCreating] = useState(false)
   const [createValue, setCreateValue] = useState('')
   const [query, setQuery] = useState('')
+  const [accessId, setAccessId] = useState<string | null>(null)
   const [filter, setFilter] = useState<ArchiveFilter>(empty ? 'all' : 'default')
   const current = cloud.workspaces.find((item) => item.id === cloud.currentWorkspaceId)
+  const accessWorkspace = cloud.workspaces.find(item => item.id === accessId && item.role === 'owner' && !item.deletedAt)
   const visible = cloud.workspaces.filter((item) => !item.deletedAt && item.name.toLocaleLowerCase().includes(query.trim().toLocaleLowerCase()) &&
     (matchesArchiveFilter(Boolean(item.archivedAt), query, filter) || (item.lifecycleOperation && item.lifecycleOperation.status !== 'complete')))
   useEffect(() => {
@@ -40,7 +43,7 @@ export function WorkspaceSwitcher({ cloud, empty = false }: { cloud: WorkspaceDi
     if (!next && busyId !== null) return
     if (next && current?.archivedAt && filter === 'default') setFilter('all')
     setOpen(next)
-    if (!next) { setError(''); setRenamingId(null); setCreating(false); setCreateValue('') }
+    if (!next) { setError(''); setRenamingId(null); setCreating(false); setCreateValue(''); setAccessId(null) }
   }
 
   async function handleSwitch(id: string) {
@@ -71,6 +74,11 @@ export function WorkspaceSwitcher({ cloud, empty = false }: { cloud: WorkspaceDi
 
   const contents = <>
       {error && <div className="mb-4"><InlineError>{error}</InlineError></div>}
+      <div className="mb-4 rounded-xl border bg-soft p-3">
+        <p className="text-[12px] font-medium">Your account ID to share with a workspace owner</p>
+        <code className="break-all text-[12px]">{cloud.user.id}</code>
+        <p className="mt-1 break-all text-[11px] text-muted">Tenant: {cloud.user.tenantId}. Names and email addresses are not used to grant access.</p>
+      </div>
       <div className="toolbar mb-4"><SearchField value={query} onChange={setQuery} placeholder="Search workspaces…" label="Search workspaces" /><ArchiveStateFilter value={filter} onChange={setFilter} label="Workspace archive state" /></div>
       <p className="mb-4 text-[11px] text-muted">Owners can use the pencil beside a workspace to rename it. Search includes archived workspaces. Open one to read its content; unarchive to resume editing. Cancelled work does not restart.</p>
       <ul className="workspace-switcher-list">
@@ -91,6 +99,7 @@ export function WorkspaceSwitcher({ cloud, empty = false }: { cloud: WorkspaceDi
               </button>
               {item.archivedAt && <Badge tone="warning">Archived</Badge>}
               <Badge>{item.role}</Badge>
+              {item.role === 'owner' && <Button size="sm" variant="ghost" className="icon-button" aria-label={`Manage reviewer access for ${item.name}`} title="Manage reviewer access" icon={Users} onClick={() => setAccessId(item.id)} disabled={busyId !== null} />}
               {item.role === 'owner' && <Button size="sm" variant="ghost" className="icon-button" aria-label={`Rename ${item.name}`} icon={Pencil} onClick={() => { setRenamingId(item.id); setRenameValue(item.name); setError('') }} disabled={busyId !== null || Boolean(item.archivedAt) || Boolean(incomplete)} />}
               <LifecycleActions target={{ kind: 'workspace', id: item.id }} name={item.name} archived={Boolean(item.archivedAt)} canManage={item.role === 'owner'} compact
                 getImpact={() => cloud.getWorkspaceLifecycleImpact(item.id)}
@@ -122,6 +131,7 @@ export function WorkspaceSwitcher({ cloud, empty = false }: { cloud: WorkspaceDi
         <Button size="sm" type="button" variant="ghost" className="icon-button" aria-label="Cancel new workspace" icon={X} disabled={busyId !== null} onClick={() => { setCreating(false); setCreateValue('') }} />
       </form> : <Button className="mt-4" icon={Plus} disabled={busyId !== null || !creationAllowed} onClick={() => { setCreating(true); setCreateValue(''); setError('') }}>New workspace</Button>}
       {!creationAllowed && <p className="mt-3 text-[11px] text-muted" role="status">{policy.error ?? 'Creating new workspaces is disabled by application policy. Existing workspace history and application-administrator access are unchanged.'}</p>}
+      {accessWorkspace && <WorkspaceAccessDialog key={accessWorkspace.id} workspace={accessWorkspace} user={cloud.user} refreshWorkspaces={cloud.refreshWorkspaces} onClose={() => setAccessId(null)} />}
   </>
 
   if (empty) return <section className="workspace-directory" aria-label="My workspaces">{contents}</section>
@@ -131,7 +141,7 @@ export function WorkspaceSwitcher({ cloud, empty = false }: { cloud: WorkspaceDi
       <div><strong>{current?.name ?? 'My workspace'}</strong><span>{current?.archivedAt ? 'Archived · read only' : 'Personal · cloud'}</span></div>
       <ChevronsUpDown size={14} className="workspace-switcher-caret" aria-hidden="true" />
     </button>
-    <Modal open={open} onOpenChange={changeOpen} title="My workspaces" description="Switch between your personal Score workspaces, or start a new one. Each keeps its own jobs, resumes, rubrics, and analyses.">
+    <Modal open={open} onOpenChange={changeOpen} title="My workspaces" description="Switch between your owned and shared Score workspaces, or start a new one. Each keeps its own jobs, resumes, rubrics, and analyses.">
       {contents}
     </Modal>
   </>

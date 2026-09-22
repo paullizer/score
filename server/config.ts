@@ -4,6 +4,8 @@ import type { RealGradesConfig } from './grades/store'
 import type { RealResumesConfig } from './resumes/store'
 import type { RealAnalysesConfig } from './analyses/store'
 import type { SettingsConfig } from './settings/store'
+import type { QcConfig } from './qc/store'
+import { PROMPT_RUNTIME_VERSION } from '../src/domain/prompt-versions'
 import { z } from 'zod'
 import { createDefaultAdminSettings, MODEL_TASK_IDS, parseAdminSettings, RUNTIME_SETTINGS_VERSION, SettingsValidationError } from '../src/domain/admin-settings'
 import type { ProcessingKind, ReasoningEffort, RuntimeSettingsWorkerVerification, WorkerPolicy } from '../src/domain/admin-settings'
@@ -32,6 +34,8 @@ export interface Config {
   readonly allowedUserIds: ReadonlySet<string>
   readonly adminUserIds?: ReadonlySet<string>
   readonly settings?: SettingsConfig
+  readonly qc?: QcConfig
+  readonly qcEnabled?: boolean
   readonly managedIdentityClientId: string | undefined
   readonly cosmos: CosmosConfig
   readonly storage: StorageConfig
@@ -123,14 +127,18 @@ function azureModelEndpoint(value: string): string {
 
 function workerVerification(env: NodeJS.ProcessEnv): RuntimeSettingsWorkerVerification | undefined {
   const workerVersion = optional(env, 'SCORE_RUNTIME_SETTINGS_WORKER_VERSION')
+  const promptVersion = optional(env, 'SCORE_PROMPT_RUNTIME_WORKER_VERSION')
   const image = optional(env, 'SCORE_RUNTIME_SETTINGS_VERIFIED_IMAGE')
   const verifiedAt = optional(env, 'SCORE_RUNTIME_SETTINGS_VERIFIED_AT')
-  if (!workerVersion && !image && !verifiedAt) return undefined
-  if (!workerVersion || !image || !verifiedAt) {
-    throw new ConfigError('Runtime-settings worker version, verified image and verified timestamp must be supplied together or all cleared.')
+  if (!workerVersion && !promptVersion && !image && !verifiedAt) return undefined
+  if (!workerVersion || !promptVersion || !image || !verifiedAt) {
+    throw new ConfigError('Runtime-settings and prompt worker versions, verified image and verified timestamp must be supplied together or all cleared.')
   }
   if (workerVersion !== RUNTIME_SETTINGS_VERSION) {
     throw new ConfigError('SCORE_RUNTIME_SETTINGS_WORKER_VERSION must match this API runtime-settings contract.')
+  }
+  if (promptVersion !== PROMPT_RUNTIME_VERSION) {
+    throw new ConfigError('SCORE_PROMPT_RUNTIME_WORKER_VERSION must match this API prompt-version contract.')
   }
   if (image.length > 512 || !/^[A-Za-z0-9][A-Za-z0-9.-]*\/[a-z0-9][a-z0-9._/-]*(?::[A-Za-z0-9_][A-Za-z0-9_.-]{0,127})?(?:@sha256:[a-fA-F0-9]{64})?$/.test(image)) {
     throw new ConfigError('SCORE_RUNTIME_SETTINGS_VERIFIED_IMAGE must be a nonsecret registry image reference, not a URL or credential.')
@@ -163,13 +171,14 @@ function settingsConfiguration(env: NodeJS.ProcessEnv, cosmos: CosmosConfig): Se
     !GUID_PATTERN.test(resourceId.split('/')[2] ?? ''))) {
     throw new ConfigError('SCORE_MODEL_RESOURCE_ID must identify exactly one Azure Cognitive Services account.')
   }
-  const workers: Partial<Record<ProcessingKind, Partial<WorkerPolicy>>> = {}
+  const workers: Partial<Record<ProcessingKind | 'qc', Partial<WorkerPolicy>>> = {}
   const defaultSources: Record<string, string> = {}
   for (const [kind, itemsKey, budgetKey, max] of [
     ['jobs', 'WORKER_MAX_JOBS', 'WORKER_BUDGET_MS', 20],
     ['grades', 'GRADE_WORKER_MAX_ITEMS', 'GRADE_WORKER_BUDGET_MS', 20],
     ['resumes', 'RESUME_WORKER_MAX_ITEMS', 'RESUME_WORKER_BUDGET_MS', 20],
     ['analyses', 'ANALYSIS_WORKER_MAX_ITEMS', 'ANALYSIS_WORKER_BUDGET_MS', 100],
+    ['qc', 'QC_WORKER_MAX_ITEMS', 'QC_WORKER_BUDGET_MS', 10],
   ] as const) {
     const items = optional(env, itemsKey)
     const budget = optional(env, budgetKey)
@@ -194,9 +203,11 @@ function settingsConfiguration(env: NodeJS.ProcessEnv, cosmos: CosmosConfig): Se
     }
     throw error
   }
+  const verification = workerVerification(env)
+  if (runtimeEnabled && !verification) throw new ConfigError('Runtime settings require a verified prompt-aware worker rollout.')
   return {
     cosmosEndpoint: cosmos.endpoint, database: cosmos.database, container, applicationId: 'score', runtimeEnabled, defaults, defaultSources,
-    workerVerification: workerVerification(env),
+    workerVerification: verification,
     ...(endpointValue && deploymentName && modelName ? {
       model: { endpoint: azureModelEndpoint(endpointValue), deploymentName, modelName, ...(resourceId ? { resourceId } : {}) },
     } : {}),
@@ -266,22 +277,45 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   const analysisRecords = optional(env, 'ANALYSIS_RECORDS_CONTAINER') ?? 'analysis-records'
   const analysisSources = optional(env, 'ANALYSIS_SOURCE_CONTAINER') ?? 'analysis-sources'
   const settings = settingsConfiguration(env, cosmos)
+  const qcEnabled = featureEnabled(env, 'QC_ENABLED')
+  const qcWorkerEnabled = featureEnabled(env, 'QC_WORKER_ENABLED')
+  const configuredQcRecords = optional(env, 'QC_RECORDS_CONTAINER')
+  const configuredQcSources = optional(env, 'QC_SOURCE_CONTAINER')
+  if (Boolean(configuredQcRecords) !== Boolean(configuredQcSources)) {
+    throw new ConfigError('Both QC storage containers must be configured so private feedback cleanup cannot be skipped.')
+  }
+  if ((qcEnabled || qcWorkerEnabled) && (!configuredQcRecords || !configuredQcSources)) {
+    throw new ConfigError('QC admission requires its dedicated records and private source containers.')
+  }
+  if (qcWorkerEnabled && (!qcEnabled || !settings?.model || !settings.runtimeEnabled)) {
+    throw new ConfigError('QC_WORKER_ENABLED requires QC_ENABLED and verified runtime model settings.')
+  }
+  const qcRecords = configuredQcRecords ?? 'qc-records'
+  const qcSources = configuredQcSources ?? 'qc-sources'
 
   // Reserve inactive stores too: enabling another feature must never expose an aliased store.
   requireSeparateContainers([
     ['COSMOS_CONTAINER', cosmos.container], ['JOB_RECORDS_CONTAINER', jobRecords],
     ['GRADE_RECORDS_CONTAINER', gradeRecords], ['RESUME_RECORDS_CONTAINER', resumeRecords],
     ['ANALYSIS_RECORDS_CONTAINER', analysisRecords],
+    ['QC_RECORDS_CONTAINER', qcRecords],
     ['SCORE_SETTINGS_CONTAINER', settings?.container ?? 'application-settings'],
   ])
   requireSeparateContainers([
     ['WORKSPACE_BLOB_CONTAINER', storage.containerName], ['JOB_SOURCE_CONTAINER', jobSources],
     ['GRADE_SOURCE_CONTAINER', gradeSources], ['RESUME_SOURCE_CONTAINER', resumeSources],
     ['ANALYSIS_SOURCE_CONTAINER', analysisSources],
+    ['QC_SOURCE_CONTAINER', qcSources],
   ])
+  if (qcRecords !== 'qc-records' || qcSources !== 'qc-sources') {
+    throw new ConfigError('QC requires the dedicated qc-records and qc-sources containers.')
+  }
   const shared = {
     cosmosEndpoint: cosmos.endpoint, database: cosmos.database, storageAccountUrl: storage.accountUrl,
   }
+  const qc = configuredQcRecords && configuredQcSources
+    ? { ...shared, container: qcRecords, blobContainer: qcSources, workerEnabled: qcWorkerEnabled }
+    : undefined
   const realJobs: RealJobsConfig | undefined = jobsEnabled
     ? { ...shared, container: jobRecords, blobContainer: jobSources } : undefined
   const realGrades: RealGradesConfig | undefined = gradesEnabled
@@ -316,6 +350,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     allowedUserIds,
     adminUserIds: parseAdminUserIds(env, allowedUserIds),
     settings,
+    qc,
+    qcEnabled,
     managedIdentityClientId: optional(env, 'AZURE_CLIENT_ID'),
     cosmos,
     storage,

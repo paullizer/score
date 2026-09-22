@@ -7,7 +7,7 @@ const taskNames: Record<typeof MODEL_TASK_IDS[number], string> = {
   jobRubric: 'Job rubric extraction', resumeProfile: 'Resume profile extraction', gradeCompetencies: 'GS shared competency planning',
   gradeDraft: 'GS level draft', gradeReview: 'GS independent review', assessment: 'Candidate assessment',
   assessmentReview: 'Assessment grounding review', candidateSummary: 'Candidate summary', targetSummary: 'Job / grade overview',
-  summaryReduction: 'Large-cohort summary reduction', summaryReview: 'Summary factual review',
+  summaryReduction: 'Large-cohort summary reduction', summaryReview: 'Summary factual review', qcPlan: 'QC improvement planning',
 }
 
 export function ModelSettingsEditor({ settings, saved, defaults, fields, errors, onChange, inventory, disabled, search }: {
@@ -56,6 +56,7 @@ export function ModelSettingsEditor({ settings, saved, defaults, fields, errors,
     </section>}
     {MODEL_TASK_IDS.map(task => {
       const binding = settings.ai.tasks[task]
+      if (!binding) return null
       const deployment = deployments.find(item => item.id === (binding.deploymentId ?? settings.ai.defaultDeploymentId))
       const taskFields = fields.filter(field => field.path.startsWith(`ai.tasks.${task}.`) && !field.path.endsWith('.deploymentId'))
       if (!matches(`${taskNames[task]} ${task} ai.tasks.${task}.deploymentId ${taskFields.map(field => `${field.label} ${field.description} ${field.path}`).join(' ')}`)) return null
@@ -66,7 +67,7 @@ export function ModelSettingsEditor({ settings, saved, defaults, fields, errors,
             <option value="">Use application default ({settings.ai.defaultDeploymentId})</option>
             {binding.deploymentId && !compatible.some(item => item.id === binding.deploymentId) && <option value={binding.deploymentId}>Current selection unavailable: {binding.deploymentId}</option>}
             {compatible.map(item => <option value={item.id} key={item.id}>{item.label} ({item.deploymentName})</option>)}
-          </select><span className="field-hint">Default: inherit application deployment · <SettingsFieldProvenance field={fields.find(field => field.path === `ai.tasks.${task}.deploymentId`)} changed={binding.deploymentId !== saved.ai.tasks[task].deploymentId} /> · Scope: application · Activation: new-operation. Model-default reasoning omits the parameter, rather than inheriting another task.</span>
+          </select><span className="field-hint">Default: inherit application deployment · <SettingsFieldProvenance field={fields.find(field => field.path === `ai.tasks.${task}.deploymentId`)} changed={binding.deploymentId !== saved.ai.tasks[task]?.deploymentId} /> · Scope: application · Activation: new-operation. Model-default reasoning omits the parameter, rather than inheriting another task.</span>
           {errors.filter(error => error.path === `ai.tasks.${task}.deploymentId`).map((error, index) => <span role="alert" className="settings-error" key={index}>{error.message}</span>)}
         </label>
         <div className="settings-grid mt-4">{taskFields.map(field => {

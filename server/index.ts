@@ -11,9 +11,13 @@ import { createAzureResumeBlobStore, createAzureResumeStore } from './resumes/az
 import { createAzureAnalysisBlobStore, createAzureAnalysisStore } from './analyses/azure-store'
 import { createAzureSettingsStore } from './settings/azure-store'
 import { AdminSettingsService } from './settings/service'
+import { PromptRegistryService } from './settings/prompts'
+import { createAzurePromptStore } from './settings/prompt-azure-store'
+import { createAzureQcStore, createAzureQcBlobStore } from './qc/azure-store'
 import { createAzureSettingsModelAdapter } from './settings/models'
 import type { StoredSettings } from './settings/store'
 import { RUNTIME_SETTINGS_VERSION } from '../src/domain/admin-settings'
+import { PROMPT_RUNTIME_VERSION } from '../src/domain/prompt-versions'
 import { shutdownTelemetry, telemetryPreloaded } from './telemetry-lifecycle'
 import { errorCategory } from './telemetry-schema'
 
@@ -88,8 +92,17 @@ function main(): void {
         evidenceCorrectionsEnabled: analysisStorage.evidenceCorrectionsEnabled === true,
       }
     : undefined
+  const prompts = config.settings ? new PromptRegistryService({
+    config, store: createAzurePromptStore(config.settings, credential),
+  }) : undefined
+  const qcStore = config.qc ? createAzureQcStore(config.qc, credential) : undefined
+  const qc = config.qc && qcStore ? {
+    store: qcStore,
+    blobs: createAzureQcBlobStore(config.qc, credential, qcStore),
+    workerEnabled: config.qc.workerEnabled,
+  } : undefined
   const settings = config.settings ? new AdminSettingsService({
-    config, store: createAzureSettingsStore(config.settings, credential),
+    config, store: createAzureSettingsStore(config.settings, credential), prompts,
     ...(config.settings.model ? {
       models: createAzureSettingsModelAdapter({
         resource: config.settings.model,
@@ -97,12 +110,13 @@ function main(): void {
       }),
     } : {}),
   }) : undefined
-  const app = createApp({ config, directory, state, jobs, grades, resumes, analyses, settings })
+  const app = createApp({ config, directory, state, jobs, grades, resumes, analyses, settings, prompts, qc })
   const bootstrapSettings = app.locals.bootstrapSettings as () => Promise<StoredSettings | undefined>
   const initializeSettings = (): void => {
     void bootstrapSettings().then(current => {
       if (current) console.info('Application settings store initialized:', {
         revision: current.revision.revision, runtimeSettingsVersion: RUNTIME_SETTINGS_VERSION,
+        promptRuntimeVersion: PROMPT_RUNTIME_VERSION,
         runtimeEnabled: config.settings?.runtimeEnabled === true,
       })
     }, (error: unknown) => {

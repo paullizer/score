@@ -398,7 +398,7 @@ function CloudApplicationContent() {
 
   if (phase.kind === 'empty' && session) return <CloudGateShell>
     <h1>My workspaces</h1><p>No active workspace is selected. Create a workspace or unarchive one below. Deleted samples are never recreated automatically.</p>
-    <WorkspaceSwitcher empty cloud={{ workspaces: session.workspaces, currentWorkspaceId: '', switchWorkspace, createWorkspace, renameWorkspace,
+    <WorkspaceSwitcher empty cloud={{ user: session.user, workspaces: session.workspaces, currentWorkspaceId: '', switchWorkspace, createWorkspace, renameWorkspace,
       refreshWorkspaces, getWorkspaceLifecycleImpact, changeWorkspaceLifecycle }} />
     {policy.settings?.workspaces.allowCreation === false && <p>Creating new workspaces is disabled by application policy. Existing workspace history is unchanged.</p>}
     {session.capabilities?.applicationAdmin === true && <Button onClick={() => void openAdminSettings()}>Application settings</Button>}

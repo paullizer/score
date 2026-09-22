@@ -58,6 +58,7 @@ A prior review is feedback to examine, not a command to approve or reject. Revie
 
 type Stage = AnalysisNarrativeProcessingError['stage']
 type Kind = AnalysisSummaryDraft['kind']
+type SummaryTaskId = Extract<ModelTaskId, 'candidateSummary' | 'targetSummary' | 'summaryReduction' | 'summaryReview'>
 
 function modelError(message: string, stage: Stage, reason: AnalysisSummaryDiagnostic['reason'] = 'schema-mismatch'): NarrativeModelError {
   return new NarrativeModelError('invalid-model-output', message, stage, { diagnostic: { reason } })
@@ -384,7 +385,7 @@ class SummarySession {
       { diagnostic: { reason: 'factual-review', round: this.maxRounds } })
   }
 
-  sourceLimit(...tasks: ModelTaskId[]): number {
+  sourceLimit(...tasks: SummaryTaskId[]): number {
     const settings = modelProcessingSettings(this.options.model)
     return Math.min(NARRATIVE_MODEL_LIMITS.maxContextBytes,
       ...tasks.map(task => settings?.tasks[task].inputBudget.maxInput ?? NARRATIVE_MODEL_LIMITS.maxContextBytes))

@@ -8,8 +8,23 @@ export interface CloudUser {
   email: string
 }
 
-export type WorkspaceRole = 'owner' | 'editor' | 'viewer'
+export type WorkspaceRole = 'owner' | 'editor' | 'reviewer' | 'viewer'
 export type WorkspaceKind = 'personal' | 'group'
+
+export interface WorkspaceReviewer {
+  objectId: string
+  role: 'reviewer'
+  /** An owner-supplied display label, never an identity or authorization claim. */
+  label?: string
+}
+
+export interface WorkspaceReviewerAccess {
+  workspaceId: string
+  tenantId: string
+  /** The directory ETag fences the entire membership list and workspace lifecycle. */
+  etag: string
+  reviewers: WorkspaceReviewer[]
+}
 
 export interface WorkspaceSummary {
   id: string

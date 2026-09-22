@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
 import test from 'node:test'
 import { loadWorker } from './shared-model-loader.mjs'
-import { settingsSnapshot } from './runtime-settings-test-support.mjs'
+import { settingsDomain, settingsSnapshot } from './runtime-settings-test-support.mjs'
 import { assertLosslessModelInput, assertLosslessResume, passageSelection } from './analysis-selection-test-support.mjs'
 
 const {
@@ -28,6 +28,120 @@ const timestamp = '2026-09-18T01:00:00.000Z'
 const resumeSnapshotSha256 = 'a'.repeat(64)
 const targetSnapshotSha256 = 'b'.repeat(64)
 const actualModel = 'actual-analysis-model-2026-09-18'
+const { createCompiledPromptBaseline } = await loadWorker('../server/settings/prompts.ts')
+
+function qcOutput(output) {
+  return {
+    ...structuredClone(output),
+    qcDiagnostics: { criteria: output.criteria.map(row => ({
+      criterionId: row.criterionId, confidence: row.score === null ? null : 'high',
+      explanation: row.score === null ? 'The saved requirement is unscored; no rating confidence is asserted.'
+        : 'The document evidence distinguishes this saved score anchor clearly.',
+      ambiguity: [], alternativeScores: [],
+    })) },
+  }
+}
+function pinQcModel(mock, change = () => {}) {
+  const snapshot = settingsSnapshot(change)
+  mock.model.processingSettings = settingsDomain.captureProcessingSettings(
+    snapshot.settings, snapshot.revision, snapshot.capturedAt, createCompiledPromptBaseline(timestamp),
+  )
+  return mock
+}
+
+test('pinned full assessment captures bounded original confidence in the same call and keeps grounding independent', async () => {
+  const input = fixture(), output = qcOutput(selectedAssessment(input))
+  Object.assign(output.qcDiagnostics.criteria[0], {
+    confidence: 'medium', ambiguity: [{ category: 'rubric-anchors', explanation: 'The described scope is near the boundary between these saved anchors.' }],
+    alternativeScores: [3],
+  })
+  const mock = pinQcModel(mockModel([output, supportedReview()]))
+  const assessed = await assessResumeAgainstTarget(input, mock.options)
+  assert.equal(mock.calls.length, 2)
+  assert.equal(assessed.assessmentProvenance.schemaVersion, 'score-analysis-assessment-qc-v1')
+  assert.equal(assessed.assessmentProvenance.prompt.bundleId, 'pb-baseline-v1')
+  assert.equal(assessed.assessmentProvenance.prompt.family, 'assessment')
+  assert.equal(assessed.groundingReviews[0].provenance.prompt.family, 'assessmentGrounding')
+  assert.equal(assessed.qcDiagnostics.modelCallId, assessed.assessmentProvenance.modelCallId)
+  assert.equal(assessed.qcDiagnostics.criteria[0].confidence, 'medium')
+  assert.deepEqual(assessed.qcDiagnostics.criteria[0].alternativeScores, [3])
+  assert.deepEqual(assessed.summary.overall, { status: 'available', score: 56 })
+  assert.equal(hashAnalysisAssessment(assessed.assessment), assessed.assessmentSha256)
+  assert.equal('qcDiagnostics' in assessed.assessment, false)
+  const reviewBody = JSON.parse(mock.calls[1].request.messages[1].content)
+  assert.equal('qcDiagnostics' in reviewBody.assessment, false)
+  assert.match(mock.calls[0].request.messages[0].content, /NOT a probability of correctness/)
+  assert.doesNotMatch(mock.calls[1].request.messages[0].content, /TASK GUIDANCE/)
+})
+
+test('QC diagnostics come from the final accepted reassessment, not the rejected first attempt', async () => {
+  const input = fixture(), first = qcOutput(selectedAssessment(input)), final = qcOutput(selectedAssessment(input))
+  final.qcDiagnostics.criteria[0].confidence = 'low'
+  final.qcDiagnostics.criteria[0].explanation = 'This document supports the selected anchor but the exact scope remains difficult to distinguish.'
+  const mock = pinQcModel(mockModel([first, selectedUnsupportedReview(input), final, supportedReview()]))
+  const assessed = await assessResumeAgainstTarget(input, mock.options)
+  assert.equal(mock.calls.length, 4)
+  assert.equal(assessed.correctionCount, 1)
+  assert.equal(assessed.qcDiagnostics.criteria[0].confidence, 'low')
+  assert.equal(assessed.assessmentProvenance.model, `${actualModel}-3`)
+  assert.equal(assessed.qcDiagnostics.modelCallId, assessed.assessmentProvenance.modelCallId)
+})
+
+test('missing document evidence can be a confident zero and excluded rows never get fabricated confidence', async () => {
+  const input = fixture(), mock = pinQcModel(mockModel([qcOutput(selectedAssessment(input, [4, 2, 0])), supportedReview()]))
+  const result = await assessResumeAgainstTarget(input, mock.options)
+  assert.equal(result.assessment.criteria[2].score, 0)
+  assert.equal(result.qcDiagnostics.criteria[2].confidence, 'high')
+  const grade = gradeFixture(), gradeMock = pinQcModel(mockModel([qcOutput(selectedAssessment(grade)), supportedReview()]))
+  const graded = await assessResumeAgainstTarget(grade, gradeMock.options)
+  const excluded = graded.qcDiagnostics.criteria.find(row => row.assessedEvidenceStatus === 'not-applicable')
+  assert.ok(excluded)
+  assert.equal(excluded.confidence, null)
+  assert.deepEqual(excluded.alternativeScores, [])
+})
+
+test('pinned diagnostic schema rejects omissions, foreign IDs, invalid confidence, ambiguous alternatives and unscored numbers without extra budget', async () => {
+  const input = fixture()
+  const changes = [
+    output => { delete output.qcDiagnostics },
+    output => { output.qcDiagnostics.criteria.pop() },
+    output => { output.qcDiagnostics.criteria[0].criterionId = 'foreign' },
+    output => { output.qcDiagnostics.criteria[1].criterionId = output.qcDiagnostics.criteria[0].criterionId },
+    output => { output.qcDiagnostics.criteria[0].confidence = null },
+    output => { output.qcDiagnostics.criteria[0].confidence = 'certain' },
+    output => { output.qcDiagnostics.criteria[0].explanation = 'x'.repeat(1201) },
+    output => { output.qcDiagnostics.criteria[0].alternativeScores = [6] },
+    output => { output.qcDiagnostics.criteria[0].alternativeScores = [3, 3] },
+    output => { output.qcDiagnostics.criteria[0].alternativeScores = [4] },
+    output => { output.qcDiagnostics.criteria[0].alternativeScores = [3] },
+    output => { output.qcDiagnostics.criteria[0].ambiguity = [{ category: 'personal-ability', explanation: 'Not a permitted category.' }] },
+  ]
+  for (const change of changes) {
+    const output = qcOutput(selectedAssessment(input))
+    change(output)
+    const mock = pinQcModel(mockModel([output]), settings => { settings.analyses.maxOutputCorrections = 0 })
+    await assert.rejects(assessResumeAgainstTarget(input, mock.options), error => error.code === 'invalid-model-output')
+    assert.equal(mock.calls.length, 1)
+  }
+  const grade = gradeFixture(), excluded = qcOutput(selectedAssessment(grade))
+  excluded.qcDiagnostics.criteria.find(row => row.confidence === null).confidence = 'high'
+  const mock = pinQcModel(mockModel([excluded]), settings => { settings.analyses.maxOutputCorrections = 0 })
+  await assert.rejects(assessResumeAgainstTarget(grade, mock.options), error => error.code === 'invalid-model-output')
+})
+
+test('diagnostic failures consume the existing shared repair budget, and legacy output contracts remain unchanged', async () => {
+  const input = fixture(), valid = qcOutput(selectedAssessment(input)), invalid = structuredClone(valid)
+  delete invalid.qcDiagnostics
+  const mock = pinQcModel(mockModel([invalid, valid, selectedUnsupportedReview(input)]), settings => { settings.analyses.maxOutputCorrections = 1 })
+  await assert.rejects(assessResumeAgainstTarget(input, mock.options), error => error.code === 'grounding-failed')
+  assert.equal(mock.calls.length, 3)
+  const legacy = mockModel([selectedAssessment(input), supportedReview()])
+  const result = await assessResumeAgainstTarget(input, legacy.options)
+  assert.equal(result.qcDiagnostics, undefined)
+  assert.equal(result.assessmentProvenance.prompt, undefined)
+  assert.equal(result.assessmentProvenance.schemaVersion, ANALYSIS_MODEL_SCHEMA_VERSIONS.assessment)
+  assert.doesNotMatch(legacy.calls[0].request.messages[0].content, /qcDiagnostics/)
+})
 
 test('assessment and mandatory grounding review independently resolve the same immutable processing revision', async () => {
   const input = fixture()

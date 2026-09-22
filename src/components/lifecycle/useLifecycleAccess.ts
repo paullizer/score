@@ -1,5 +1,6 @@
 import { useWorkspace } from '../../app/workspace-context'
 import { getEntityLifecycle, isEntityArchived, isEntityRemoved, normalizeLifecycleTarget, sampleLifecycleTargets, type LifecycleTarget } from '../../domain/lifecycle'
+import { workspaceCanEdit } from '../../domain/workspace-permissions'
 
 export function useLifecycleAccess(target?: LifecycleTarget) {
   const { workspace, cloud, lifecycleOperations = [] } = useWorkspace()
@@ -23,8 +24,8 @@ export function useLifecycleAccess(target?: LifecycleTarget) {
           normalized.kind === 'rubric' ? workspace.rubrics.some((item) => item.groupId === normalized.id) :
             sampleLifecycleTargets(workspace).some((item) => item.kind === 'ladder' && item.id === normalized.id))
   const removed = Boolean(summary?.deletedAt) || !exists || isEntityRemoved(workspace, actual)
-  const managing = !cloud || Boolean(summary && !summary.deletedAt && (target?.kind === 'workspace' ? summary.role === 'owner' : summary.role !== 'viewer'))
-  const editing = !cloud || Boolean(summary && summary.role !== 'viewer')
+  const managing = !cloud || Boolean(summary && !summary.deletedAt && (actual.kind === 'workspace' ? summary.role === 'owner' : workspaceCanEdit(summary.role)))
+  const editing = !cloud || workspaceCanEdit(summary?.role)
   const transitioning = Boolean(summary?.lifecycleOperation && summary.lifecycleOperation.status !== 'complete') ||
     lifecycleOperations.some((item) => item.operation.status !== 'complete' &&
       ((item.target.kind === normalized.kind && item.target.id === normalized.id) || (parent && item.target.kind === parent.kind && item.target.id === parent.id)))

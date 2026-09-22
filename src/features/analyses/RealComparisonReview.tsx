@@ -34,14 +34,15 @@ function EvidenceButtons({ citations, kind, label, onSelect, active }: {
   </button>)}</div>
 }
 
-export function RealComparisonReview({ detail, actions, initialView }: {
+export function RealComparisonReview({ detail, actions, initialView, qc }: {
   detail: RealAnalysisComparisonDetail; actions?: ReactNode; initialView?: SavedReviewView | null
+  qc?: { renderCriterion: (criterionId: string) => ReactNode }
 }) {
   const { comparison, resumeSnapshot: resume, targetSnapshot: target, result } = detail
   const savedResume = comparison.resume.summary
   const resumeLabel = getDisplayName(savedResume, savedResume.name?.trim() || 'Name not stated')
   const rubric = target.kind === 'job' ? target.rubric : target.version.rubric
-  const [expanded, setExpanded] = useState<string[]>(() => rubric.criteria[0] ? [rubric.criteria[0].id] : [])
+  const [expanded, setExpanded] = useState<string[]>(() => qc ? rubric.criteria.map(row => row.id) : rubric.criteria[0] ? [rubric.criteria[0].id] : [])
   const [selected, setSelected] = useState<EvidenceSelection | null>(null)
   const [sourceView, setSourceView] = useState<SavedReviewView>(initialView ?? 'resume')
   const [pane, setPane] = useState<'criteria' | 'evidence'>(initialView ? 'evidence' : 'criteria')
@@ -105,9 +106,9 @@ export function RealComparisonReview({ detail, actions, initialView }: {
         <span>{result.overall.status === 'available' ? 'Weighted saved criterion scores · not a ranking' : 'Not a zero and not a failed candidate'}</span></div>
       <div className="result-summary"><ShieldCheck size={16} aria-hidden="true" /><div><h3>Evidence-based assessment</h3><p>{result.summary}</p></div></div>
     </section>
-    <AnalysisCorrectionDetails detail={detail} />
-    <RealCandidateNarrative runId={comparison.runId} comparisonId={comparison.id} targetId={comparison.target.summary.id}
-      resultSha256={comparison.result?.sha256} resultRevisionId={comparison.resultRevision?.id} />
+    {!qc && <><AnalysisCorrectionDetails detail={detail} />
+      <RealCandidateNarrative runId={comparison.runId} comparisonId={comparison.id} targetId={comparison.target.summary.id}
+        resultSha256={comparison.result?.sha256} resultRevisionId={comparison.resultRevision?.id} /></>}
     <section className="panel mt-5" aria-label="Evidence coverage and limitations"><div className="section-heading"><div><h2>Completion is separate from evidence coverage</h2>
       <p>{result.coverage.supported} supported · {result.coverage.partial} partial · {result.coverage.missing} missing · {result.coverage.notAssessed} not assessed · {result.coverage.notApplicable} not applicable</p>
       <p>{result.coverage.assessedWeight}% assessed weight / {result.coverage.totalWeight}% total weight. No client-side total or missing-criterion renormalization is used.</p></div></div>
@@ -146,6 +147,7 @@ export function RealComparisonReview({ detail, actions, initialView }: {
                 {requirementCitations.length ? <EvidenceButtons citations={requirementCitations} kind="requirement" label={criterion.label} onSelect={showEvidence} active={selected} />
                   : <p className="text-[11px] text-muted">No saved source quotation was supplied for this requirement. The saved rubric wording above is retained; no citation is invented.</p>}
               </div>
+              {qc?.renderCriterion(criterion.id)}
             </div>}
           </div>
         })}</div>
@@ -169,7 +171,7 @@ export function RealComparisonReview({ detail, actions, initialView }: {
       </section>
       <section ref={sourcePanel} className={`detail-panel evidence-panel ${pane !== 'evidence' ? 'mobile-pane-hidden' : ''}`} aria-label="Saved real source evidence">{sources}</section>
     </div>
-    {diagnostics}
+    {!qc && diagnostics}
     <details className="panel mt-5 p-5 text-[11px]"><summary className="cursor-pointer text-[12px] font-semibold">Processing provenance and immutable identities</summary>
       <dl className="mt-4 space-y-3 break-words">
         <div><dt className="text-muted">Assessment model / deployment</dt><dd>{result.provenance.assessment.model} · {result.provenance.assessment.deployment}</dd></div>

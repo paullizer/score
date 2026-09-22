@@ -1,5 +1,5 @@
 import type { Workspace } from '../domain/types'
-import type { CloudSession, CloudSessionIdentity, CloudWorkspaceSnapshot, WorkspaceSummary } from '../domain/cloud'
+import type { CloudSession, CloudSessionIdentity, CloudWorkspaceSnapshot, WorkspaceReviewerAccess, WorkspaceSummary } from '../domain/cloud'
 import type { LifecycleAction, LifecycleImpact, LifecycleOperation } from '../domain/lifecycle'
 
 /**
@@ -235,6 +235,24 @@ export async function renameWorkspace(id: string, name: string, etag: string, si
     method: 'PATCH', body: JSON.stringify({ name }), headers, signal,
   })
   return body.workspace
+}
+
+export function listWorkspaceReviewers(id: string, signal?: AbortSignal): Promise<WorkspaceReviewerAccess> {
+  return cloudJsonRequest(`/workspaces/${encodeURIComponent(id)}/reviewers`, { signal })
+}
+
+export function addWorkspaceReviewer(
+  id: string, reviewer: { objectId: string; label?: string }, etag: string, signal?: AbortSignal,
+): Promise<WorkspaceReviewerAccess> {
+  return cloudJsonRequest(`/workspaces/${encodeURIComponent(id)}/reviewers`, {
+    method: 'POST', body: JSON.stringify(reviewer), headers: { 'If-Match': etag }, signal,
+  })
+}
+
+export function removeWorkspaceReviewer(id: string, objectId: string, etag: string, signal?: AbortSignal): Promise<WorkspaceReviewerAccess> {
+  return cloudJsonRequest(`/workspaces/${encodeURIComponent(id)}/reviewers/${encodeURIComponent(objectId)}`, {
+    method: 'DELETE', headers: { 'If-Match': etag }, signal,
+  })
 }
 
 export async function loadWorkspaceState(id: string, signal?: AbortSignal): Promise<CloudWorkspaceSnapshot> {

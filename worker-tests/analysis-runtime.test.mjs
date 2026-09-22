@@ -5,7 +5,8 @@ import path from 'node:path'
 import { after, test } from 'node:test'
 import { pathToFileURL } from 'node:url'
 import { build } from 'esbuild'
-import { settingsSnapshot } from './runtime-settings-test-support.mjs'
+import { settingsDomain, settingsSnapshot } from './runtime-settings-test-support.mjs'
+import { loadWorker } from './shared-model-loader.mjs'
 import { assertLosslessResume, passageSelection } from './analysis-selection-test-support.mjs'
 import { narrativeModelResponse } from '../server-tests/real-analysis-narratives.test-support.mjs'
 import {
@@ -21,6 +22,218 @@ await build({
 })
 const { runAnalysisWorker, processClaimedComparison } = await import(pathToFileURL(bundle).href)
 after(async () => { await unlink(bundle) })
+const { createCompiledPromptBaseline } = await loadWorker('../server/settings/prompts.ts')
+const qc = await loadWorker('../server/analyses/qc-diagnostics.ts')
+
+function pinnedRunFixture() {
+  const f = fixture()
+  const legacy = settingsSnapshot(settings => { settings.summaries.generationMode = 'on-demand' })
+  f.acceptedSettings = settingsDomain.captureProcessingSettings(
+    legacy.settings, legacy.revision, legacy.capturedAt, createCompiledPromptBaseline(NOW),
+  )
+  f.settingsReads = 0
+  const provider = Object.assign(async () => { f.settingsReads++; return f.acceptedSettings }, {
+    pinNewAdmissions: true, accepted: async snapshot => snapshot ?? legacy,
+  })
+  f.service = new api.RealAnalysisService(f.analysis, { resumes: f.resumes, jobs: f.jobs, grades: f.grades },
+    () => new Date(f.now), provider)
+  return f
+}
+function withQcDiagnostics(output) {
+  return {
+    ...output, qcDiagnostics: { criteria: output.criteria.map(row => ({
+      criterionId: row.criterionId, confidence: row.score === null ? null : 'high',
+      explanation: row.score === null ? 'No numeric assessment was possible under the saved guidance.'
+        : 'The document evidence clearly distinguishes the saved score anchor.',
+      ambiguity: [], alternativeScores: [],
+    })) },
+  }
+}
+async function qcContext(f, runId, comparison = comparisons(f, runId)[0].record) {
+  const run = (await f.analysis.store.get(f.workspaceId, runId)).record
+  const snapshots = await api.readAnalysisSnapshots(f.analysis.blobs, run, comparison)
+  const result = await api.readAnalysisResult(f.analysis.blobs, run, comparison, snapshots)
+  return { ...snapshots, run, comparison, result }
+}
+
+test('new accepted pinned analysis publishes an immutable QC sidecar in the same completed-comparison fence', async () => {
+  const f = pinnedRunFixture(), created = await createRun(f)
+  const mock = modelFor(f, ({ kind, body }) => kind === 'resume_rubric_assessment'
+    ? withQcDiagnostics(modelAssessment(body.input)) : undefined)
+  await runAnalysisWorker(mock.deps, { maxItems: 1 })
+  const context = await qcContext(f, created.run.id)
+  const reference = context.comparison.qcDiagnostics
+  assert.ok(reference)
+  assert.equal(reference.resultSha256, context.comparison.result.sha256)
+  assert.equal(reference.assessmentSha256, context.result.provenance.assessmentSha256)
+  assert.equal(reference.modelCallId, context.result.provenance.assessment.modelCallId)
+  assert.equal(context.comparison.processingSettings.promptBundle.bundle.bundleId, 'pb-baseline-v1')
+  assert.match(reference.blob.blobName, /\/qc-diagnostics\//)
+  const count = mock.calls.length
+  const before = context.comparison.result.sha256
+  const first = await qc.readAnalysisQcDiagnostics(f.analysis.blobs, context)
+  assert.equal(first.status, 'recorded')
+  assert.equal(first.criteria[0].diagnostic.confidence, 'high')
+  assert.deepEqual(await qc.readAnalysisQcDiagnostics(f.analysis.blobs, context), first)
+  assert.equal(mock.calls.length, count, 'opening QC must not call a model')
+  assert.equal(context.comparison.result.sha256, before)
+  assert.equal('qcDiagnostics' in context.result, false)
+  assert.equal(first.sidecar.rubric.sha256, api.analysisHash(context.targetSnapshot.rubric))
+  assert.equal(first.sidecar.assessmentProvenance.prompt.systemSha256,
+    (await loadWorker('../server/settings/prompt-integrity.ts')).promptTextHash(mock.calls[0].request.messages[0].content))
+})
+
+test('code-normalized zero keeps the original unscored diagnostic and never invents score confidence', async () => {
+  const f = pinnedRunFixture(), created = await createRun(f)
+  const mock = modelFor(f, ({ kind, body }) => {
+    if (kind === 'resume_rubric_assessment') {
+      const output = modelAssessment(body.input)
+      for (const row of output.criteria) Object.assign(row, {
+        evidenceStatus: 'not-assessed', score: null, citations: [],
+        rationale: 'The saved scope could not distinguish these evidence anchors.',
+        limitation: { code: 'ambiguous-guidance', message: 'The saved scope anchors overlap.' },
+      })
+      return withQcDiagnostics(output)
+    }
+    if (kind === 'resume_evidence_gap_review') return { decisions: body.scope.criterionIds.map(criterionId => ({
+      criterionId, outcome: 'confirmed-missing', blockerCode: null, citations: [],
+      message: 'The complete usable document does not support this selected professional requirement.',
+    })) }
+  })
+  await runAnalysisWorker(mock.deps, { maxItems: 1 })
+  const context = await qcContext(f, created.run.id)
+  assert.equal(context.result.criteria[0].score, 0)
+  const reading = await qc.readAnalysisQcDiagnostics(f.analysis.blobs, context)
+  assert.equal(reading.status, 'recorded')
+  assert.equal(reading.criteria[0].status, 'not-recorded')
+  assert.equal(reading.criteria[0].reason, 'rating-normalized')
+  assert.equal(reading.sidecar.criteria[0].assessedScore, null)
+  assert.notEqual(reading.sidecar.modelAssessmentSha256, reading.sidecar.assessmentSha256)
+  assert.equal(mock.calls.filter(call => call.kind === 'resume_rubric_assessment').length, 1)
+})
+
+test('QC sidecar validates exact result, source, rubric, prompt, and final producing call bindings', async () => {
+  const f = pinnedRunFixture(), created = await createRun(f)
+  const mock = modelFor(f, ({ kind, body }) => kind === 'resume_rubric_assessment'
+    ? withQcDiagnostics(modelAssessment(body.input)) : undefined)
+  await runAnalysisWorker(mock.deps, { maxItems: 1 })
+  const context = await qcContext(f, created.run.id)
+  const { sidecar } = await qc.readAnalysisQcDiagnostics(f.analysis.blobs, context)
+  for (const mutate of [
+    value => { value.resultSha256 = '0'.repeat(64) },
+    value => { value.assessmentSha256 = '0'.repeat(64) },
+    value => { value.targetSnapshot.sha256 = '0'.repeat(64) },
+    value => { value.rubric.sha256 = '0'.repeat(64) },
+    value => { value.assessmentProvenance.prompt.bundleSha256 = '0'.repeat(64) },
+    value => { value.assessmentProvenance.modelCallId = randomUUID() },
+    value => { value.criteria[0].criterionId = 'foreign-criterion' },
+    value => { value.criteria[0].assessedScore = 5 },
+  ]) {
+    const invalid = clone(sidecar)
+    mutate(invalid)
+    assert.throws(() => qc.assertAnalysisQcDiagnosticsBinding(invalid, context, context.comparison.qcDiagnostics))
+  }
+  f.analysis.blobs.values.delete(context.comparison.qcDiagnostics.blob.blobName)
+  await assert.rejects(qc.readAnalysisQcDiagnostics(f.analysis.blobs, context), /missing or its digest changed/)
+})
+
+test('cancellation at QC sidecar upload prevents late diagnostic and completed-score publication', async () => {
+  const f = pinnedRunFixture(), created = await createRun(f)
+  const mock = modelFor(f, ({ kind, body }) => kind === 'resume_rubric_assessment'
+    ? withQcDiagnostics(modelAssessment(body.input)) : undefined)
+  let cancelled = false
+  f.analysis.blobs._beforeFencedPut(async name => {
+    if (!name.includes('/qc-diagnostics/')) return
+    cancelled = true
+    const current = comparisons(f, created.run.id)[0]
+    await cancelComparison(f, current)
+  })
+  await runAnalysisWorker(mock.deps, { maxItems: 1 })
+  assert.equal(cancelled, true)
+  const comparison = comparisons(f, created.run.id)[0].record
+  assert.equal(comparison.status, 'cancelled')
+  assert.equal(comparison.qcDiagnostics, undefined)
+  assert.equal(comparison.result, undefined)
+  assert.ok([...f.analysis.blobs.values.keys()].every(name => !name.includes('/qc-diagnostics/')))
+})
+
+test('QC sidecar storage failures cannot publish a successful-looking pinned comparison', async () => {
+  const f = pinnedRunFixture(), created = await createRun(f)
+  const mock = modelFor(f, ({ kind, body }) => kind === 'resume_rubric_assessment'
+    ? withQcDiagnostics(modelAssessment(body.input)) : undefined)
+  f.analysis.blobs._beforeFencedPut(async name => {
+    if (name.includes('/qc-diagnostics/')) throw new Error('Private sidecar store unavailable')
+  })
+  await runAnalysisWorker(mock.deps, { maxItems: 1 })
+  const comparison = comparisons(f, created.run.id)[0].record
+  assert.notEqual(comparison.status, 'complete')
+  assert.equal(comparison.result, undefined)
+  assert.equal(comparison.qcDiagnostics, undefined)
+})
+
+test('legacy assessments have Not recorded diagnostics and are neither backfilled nor rescored when read', async () => {
+  const f = fixture(), created = await createRun(f), mock = modelFor(f)
+  await runAnalysisWorker(mock.deps, { maxItems: 1 })
+  const context = await qcContext(f, created.run.id), count = mock.calls.length
+  const diagnostic = await qc.readAnalysisQcDiagnostics(f.analysis.blobs, context)
+  assert.equal(diagnostic.status, 'not-recorded')
+  assert.equal(diagnostic.label, 'Not recorded')
+  assert.equal(context.comparison.qcDiagnostics, undefined)
+  assert.equal(mock.calls.length, count)
+  assert.ok([...f.analysis.blobs.values.keys()].every(name => !name.includes('/qc-diagnostics/')))
+})
+
+test('a scoped corrected result never inherits original confidence, while the original diagnostic remains readable', async () => {
+  const f = pinnedRunFixture()
+  f.analysis.evidenceCorrectionsEnabled = true
+  const created = await createRun(f)
+  const mock = modelFor(f, ({ kind, body }) => {
+    if (kind === 'resume_rubric_assessment') {
+      const output = modelAssessment(body.input)
+      for (const row of output.criteria) Object.assign(row, {
+        evidenceStatus: 'not-assessed', score: null, citations: [],
+        rationale: 'The saved source scope could not safely distinguish these documentary evidence anchors.',
+        limitation: { code: 'ambiguous-guidance', message: 'The saved scope and responsibility anchors overlap and need review.' },
+      })
+      return withQcDiagnostics(output)
+    }
+    if (kind === 'resume_evidence_gap_review') return { decisions: body.scope.criterionIds.map(criterionId => ({
+      criterionId, outcome: 'blocked', blockerCode: 'ambiguous-guidance', citations: [],
+      message: 'The saved scope and responsibility anchors overlap and need review.',
+    })) }
+  })
+  await runAnalysisWorker(mock.deps, { maxItems: 1 })
+  const original = await qcContext(f, created.run.id)
+  const originalDiagnostic = await qc.readAnalysisQcDiagnostics(f.analysis.blobs, original)
+  assert.equal(originalDiagnostic.criteria[0].status, 'unscored')
+  const comparison = comparisons(f, created.run.id)[0]
+  await f.service.requestCorrection(f.workspaceId, created.run.id, comparison.record.id, {
+    policyVersion: 'missing-evidence-zero-v2', resultSha256: comparison.record.result.sha256,
+    criterionIds: original.result.criteria.map(row => row.criterionId), reason: 'Review the selected evidence gap only.',
+  }, randomUUID(), comparison.etag, ACTOR)
+  const acceptedReads = f.settingsReads
+  const correctionModel = modelFor(f, ({ kind, body, request }) => {
+    assert.equal(kind, 'resume_evidence_gap_review')
+    assert.doesNotMatch(request.messages[0].content, /TASK GUIDANCE/)
+    assert.equal(body.assessment, undefined)
+    return { decisions: body.scope.criterionIds.map(criterionId => ({
+      criterionId, outcome: 'confirmed-missing', blockerCode: null, citations: [],
+      message: 'The complete usable document has no supporting evidence for this selected professional requirement.',
+    })) }
+  })
+  await runAnalysisWorker({ ...correctionModel.deps, correctionsEnabled: true }, { maxItems: 1 })
+  assert.equal(f.settingsReads, acceptedReads, 'accepted correction must not resolve current admission settings')
+  const run = (await f.analysis.store.get(f.workspaceId, created.run.id)).record
+  const projected = await api.resolveAnalysisComparison(f.analysis.store, run, comparison)
+  assert.ok(projected.record.resultRevision)
+  const corrected = await qcContext(f, created.run.id, projected.record)
+  assert.equal(corrected.result.criteria[0].score, 0)
+  assert.equal(corrected.result.provenance.groundingReviews.at(-1).provenance.prompt.family, 'evidenceGapReview')
+  const revised = await qc.readAnalysisQcDiagnostics(f.analysis.blobs, corrected)
+  assert.equal(revised.status, 'not-recorded')
+  assert.ok(revised.criteria.every(row => row.reason === 'different-result'))
+  assert.deepEqual(await qc.readAnalysisQcDiagnostics(f.analysis.blobs, original), originalDiagnostic)
+})
 
 function comparisons(f, runId) {
   return [...f.analysis.store.values.values()].filter(item => item.record.recordType === 'analysis-comparison' &&

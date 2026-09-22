@@ -11,6 +11,7 @@ import type { GradeLeaveProtectionApi } from './grade-navigation-context'
 import { workspaceLifecycleTransitionErrors, type LifecycleTarget } from '../domain/lifecycle'
 import { WorkspaceSwitcher } from '../components/workspace/WorkspaceSwitcher'
 import { LifecycleDialogProvider } from '../components/lifecycle/LifecycleControls'
+import { workspaceCanEdit } from '../domain/workspace-permissions'
 
 const SAVE_DEBOUNCE_MS = 700
 
@@ -82,7 +83,7 @@ export function CloudWorkspaceProvider({
   const initialWorkspaceRef = useRef<Workspace | null>(null)
   const metadataRef = useRef(workspaces.find((item) => item.id === workspaceId))
   metadataRef.current = workspaces.find((item) => item.id === workspaceId)
-  const metadataStamp = JSON.stringify([metadataRef.current?.archivedAt, metadataRef.current?.deletedAt, metadataRef.current?.lifecycleOperation])
+  const metadataStamp = JSON.stringify([metadataRef.current?.role, metadataRef.current?.archivedAt, metadataRef.current?.deletedAt, metadataRef.current?.lifecycleOperation])
   const appliedMetadataStamp = useRef(metadataStamp)
   const metadataGeneration = useRef({ stamp: metadataStamp, value: 0 })
   if (metadataGeneration.current.stamp !== metadataStamp) {
@@ -202,6 +203,10 @@ export function CloudWorkspaceProvider({
     savingRef.current = true
     let outcome: Result = { ok: true }
     while (pendingRef.current && !resolvingRef.current) {
+      if (!workspaceCanEdit(metadataRef.current?.role) || metadataRef.current?.deletedAt) {
+        outcome = saveFailure(new CloudApiError('forbidden', 'Only a current workspace owner or editor can save changes. Reload to discard unsaved changes or restore your access before retrying.', 403))
+        break
+      }
       const snapshot = pendingRef.current
       pendingRef.current = null
       if (!aliveRef.current) break
@@ -224,6 +229,7 @@ export function CloudWorkspaceProvider({
   }
 
   function enqueue(next: Workspace): PersistenceResult {
+    if (!workspaceCanEdit(metadataRef.current?.role) || metadataRef.current?.deletedAt) return 'failed'
     pendingRef.current = next
     if (resolvingRef.current || statusRef.current.state === 'conflict' || statusRef.current.state === 'error') return 'queued'
     setStatus({ state: 'saving', error: null, conflict: null })
@@ -290,10 +296,12 @@ export function CloudWorkspaceProvider({
     appliedMetadataStamp.current = metadataStamp
     if (!engineRef.current) return
     const metadata = metadataRef.current
-    if (!metadata || metadata.deletedAt || (metadata.lifecycleOperation && metadata.lifecycleOperation.status !== 'complete')) {
+    if (!metadata || metadata.deletedAt || (metadata.lifecycleOperation && metadata.lifecycleOperation.status !== 'complete') ||
+      (!workspaceCanEdit(metadata.role) && (pendingRef.current || savingRef.current))) {
       clearDebounce()
+      engineRef.current.setExternalArchive(true)
       if (pendingRef.current || savingRef.current) {
-        setStatus({ state: 'conflict', error: 'Workspace lifecycle work is incomplete or this workspace was deleted elsewhere. Unsaved sample changes are kept here, not uploaded over it.', conflict: { detectedAt: new Date().toISOString() } })
+        setStatus({ state: 'conflict', error: 'Workspace editing access changed, lifecycle work is incomplete, or this workspace was deleted elsewhere. Unsaved sample changes are kept here, not uploaded over it.', conflict: { detectedAt: new Date().toISOString() } })
       }
       return
     }
@@ -366,8 +374,8 @@ export function CloudWorkspaceProvider({
       requireCurrentSnapshot(fresh)
       const serverWorkspace = validateWorkspace(fresh.workspace)
       const metadata = metadataRef.current
-      if (!metadata || metadata.deletedAt || metadata.archivedAt || (metadata.lifecycleOperation && metadata.lifecycleOperation.status !== 'complete')) {
-        throw new CloudConflictError('This workspace is archived, unavailable, or has an incomplete lifecycle operation. Reload the server state; overwriting cannot restore it.')
+      if (!metadata || !workspaceCanEdit(metadata.role) || metadata.deletedAt || metadata.archivedAt || (metadata.lifecycleOperation && metadata.lifecycleOperation.status !== 'complete')) {
+        throw new CloudConflictError('This workspace is read-only, archived, unavailable, or has an incomplete lifecycle operation. Reload the server state; overwriting cannot restore it.')
       }
       if (serverWorkspace.lifecycle?.archivedAt !== toSave.lifecycle?.archivedAt) {
         throw new CloudConflictError('Workspace archive state changed in another session. Reload the authoritative state; a sample overwrite cannot change its parent archive.')
@@ -425,7 +433,7 @@ export function CloudWorkspaceProvider({
     <InlineError>{phase.message}</InlineError>
     <div className="flex flex-wrap gap-3"><Button variant="primary" icon={RotateCcw} onClick={() => window.location.reload()}>Try again</Button></div>
     <p className="mt-4 text-[12px] text-muted">Choose another workspace, or open the workspace picker to retry an unfinished lifecycle operation. Missing content is never replaced with samples.</p>
-    <WorkspaceSwitcher cloud={{ workspaces, currentWorkspaceId: workspaceId, switchWorkspace, createWorkspace, renameWorkspace, refreshWorkspaces, getWorkspaceLifecycleImpact, changeWorkspaceLifecycle }} />
+    <WorkspaceSwitcher cloud={{ user, workspaces, currentWorkspaceId: workspaceId, switchWorkspace, createWorkspace, renameWorkspace, refreshWorkspaces, getWorkspaceLifecycleImpact, changeWorkspaceLifecycle }} />
   </div></main></LifecycleDialogProvider>
 
   async function signOut() {
@@ -493,7 +501,7 @@ function CloudWorkspaceReady({
   const pendingLifecycle = useRef(new Set<string>())
   useEffect(() => { pendingLifecycle.current.clear() }, [snapshotRevision])
   const metadata = workspaces.find((item) => item.id === workspaceId)
-  const writable = Boolean(metadata && metadata.role !== 'viewer' && !metadata.archivedAt && !metadata.deletedAt && !syncingState && (!metadata.lifecycleOperation || metadata.lifecycleOperation.status === 'complete'))
+  const writable = Boolean(metadata && workspaceCanEdit(metadata.role) && !metadata.archivedAt && !metadata.deletedAt && !syncingState && (!metadata.lifecycleOperation || metadata.lifecycleOperation.status === 'complete'))
   const access = useRef({ metadata, writable })
   access.current = { metadata, writable }
   useLayoutEffect(() => {
@@ -535,7 +543,7 @@ function CloudWorkspaceReady({
   }
   function assertLifecyclePermission(target: LifecycleTarget) {
     const current = access.current.metadata
-    if (!current || current.deletedAt || current.role === 'viewer' || (target.kind === 'workspace' && current.role !== 'owner')) {
+    if (!current || current.deletedAt || !workspaceCanEdit(current.role) || (target.kind === 'workspace' && current.role !== 'owner')) {
       throw new Error('Your role does not allow this lifecycle change.')
     }
   }

@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import { build } from 'esbuild'
-import { settingsSnapshot } from './runtime-settings-test-support.mjs'
+import { settingsDomain, settingsSnapshot } from './runtime-settings-test-support.mjs'
+import { loadWorker } from './shared-model-loader.mjs'
 
 const bundled = await build({
   entryPoints: ['worker\\grades\\model.ts'],
@@ -13,6 +14,32 @@ const {
 } = await import(`data:text/javascript;base64,${Buffer.from(moduleText).toString('base64')}`)
 
 const timestamp = '2026-09-17T20:00:00.000Z'
+
+test('all GS stages use accepted immutable bundle revisions while the independent review stays fixed', async () => {
+  const { createCompiledPromptBaseline, promptTextHash } = await loadWorker('../server/settings/prompts.ts')
+  const baseline = createCompiledPromptBaseline(timestamp)
+  const legacy = settingsSnapshot(settings => { settings.grades.maxCriteria = 1 })
+  const processingSettings = settingsDomain.captureProcessingSettings(legacy.settings, legacy.revision, legacy.capturedAt, baseline)
+  const f = fixture(), planner = invoker({ competencies: f.competencies, issues: [] })
+  const plan = await planGradeCompetencies({ seed: f.seed, sourceSet: f.sourceSet, documents: f.documents, processingSettings }, planner.invoke)
+  const drafter = invoker(draftOutput(f)), draft = await draftGradeRubric({ ...draftInput(f), processingSettings }, drafter.invoke)
+  const reviewer = invoker({ outcome: 'supported', issues: [] })
+  const review = await reviewGradeRubric({ ...reviewInput(f, { ...versionRecord(f, draft), processingSettings }), processingSettings }, reviewer.invoke)
+  for (const [generated, model, family] of [
+    [plan, planner, 'gradeCompetencies'], [draft, drafter, 'gradeDraft'], [review, reviewer, 'gradeReview'],
+  ]) {
+    const request = model.calls[0].request
+    assert.equal(generated.prompt.family, family)
+    assert.equal(generated.prompt.bundleSha256, baseline.bundle.bundleSha256)
+    assert.equal(generated.prompt.revisionId, baseline.revisions[family].revisionId)
+    assert.equal(generated.prompt.systemSha256, promptTextHash(request.system))
+    assert.deepEqual(request.processingSettings.promptBundle, processingSettings.promptBundle)
+  }
+  assert.deepEqual(draft.rubric.provenance.prompt, draft.prompt)
+  assert.match(planner.calls[0].request.system, /Return 1–1 stable/)
+  assert.match(drafter.calls[0].request.system, /TASK GUIDANCE/)
+  assert.doesNotMatch(reviewer.calls[0].request.system, /TASK GUIDANCE/)
+})
 
 test('competency planning, drafting and mandatory grounding review keep distinct captured task bindings', async () => {
   const f = fixture()

@@ -7,11 +7,13 @@ import type { RESUME_IMPORT_LIMITS } from './real-resumes'
 import type { GRADE_LADDER_LIMITS } from './real-grades'
 import type { ANALYSIS_LIMITS } from './real-analyses'
 import { MODEL_TASK_IDS } from './admin-settings-tasks'
+import type { PromptBundleSnapshot } from './prompt-versions'
 
-export const ADMIN_SETTINGS_SCHEMA_VERSION = 1 as const
-export const RUNTIME_SETTINGS_VERSION = 'score-runtime-settings-v1' as const
+export const ADMIN_SETTINGS_SCHEMA_VERSION = 2 as const
+export const RUNTIME_SETTINGS_VERSION = 'score-runtime-settings-v2' as const
 export { MODEL_TASK_IDS }
 export type ModelTaskId = typeof MODEL_TASK_IDS[number]
+export type ModelTaskBindings<T> = Record<Exclude<ModelTaskId, 'qcPlan'>, T> & { qcPlan?: T }
 export type ProcessingKind = 'jobs' | 'grades' | 'resumes' | 'analyses'
 export type ReasoningEffort = 'minimal' | 'low' | 'medium' | 'high'
 export type SettingsSection = 'ai' | 'intake' | 'grades' | 'processing' | 'presentation' | 'access' | 'operations'
@@ -83,11 +85,11 @@ export interface ProcessingPolicy {
 }
 
 export interface AdminSettings {
-  schemaVersion: 1
+  schemaVersion: 1 | 2
   ai: {
     deployments: ModelDeployment[]
     defaultDeploymentId: string
-    tasks: Record<ModelTaskId, TaskModelSettings>
+    tasks: ModelTaskBindings<TaskModelSettings>
     jobRubric: { maxOutputCorrections: number }
     resumeProfile: { maxOutputCorrections: number }
     grades: { maxOutputCorrections: number }
@@ -144,7 +146,7 @@ export interface AdminSettings {
   }
   rubrics: { jobs: { maxCriteria: number } }
   analyses: { maxComparisons: number; maxOutputCorrections: number }
-  processing: Record<ProcessingKind, ProcessingPolicy>
+  processing: Record<ProcessingKind, ProcessingPolicy> & { qc?: ProcessingPolicy }
   summaries: {
     generationMode: 'automatic' | 'on-demand'
     maxRounds: number
@@ -154,7 +156,7 @@ export interface AdminSettings {
     historyPageSize: number
     operationTimeoutMilliseconds: number
   }
-  workers: Record<ProcessingKind, WorkerPolicy>
+  workers: Record<ProcessingKind, WorkerPolicy> & { qc?: WorkerPolicy }
   extraction: { transport: { maxAttempts: number }; pollTimeoutMilliseconds: number }
   rendering: {
     timeoutMilliseconds: number
@@ -202,14 +204,22 @@ export interface ResolvedTaskModel extends Omit<TaskModelSettings, 'deploymentId
   modelVersion: string | null
   capabilities: ModelCapabilities
 }
+export type CurrentAdminSettings = AdminSettings & {
+  schemaVersion: 2
+  ai: { tasks: Record<ModelTaskId, TaskModelSettings> }
+  processing: Record<ProcessingKind | 'qc', ProcessingPolicy>
+  workers: Record<ProcessingKind | 'qc', WorkerPolicy>
+}
 
 export interface ProcessingSettingsSnapshot {
-  schemaVersion: 1
+  schemaVersion: 1 | 2
   revision: string
   capturedAt: string
   /** A complete value copy, not a pointer to mutable current settings. No secrets or endpoints. */
   settings: AdminSettings
-  tasks: Record<ModelTaskId, ResolvedTaskModel>
+  tasks: ModelTaskBindings<ResolvedTaskModel>
+  /** Version 2 requires the complete accepted immutable prompt selection. Version 1 is always legacy. */
+  promptBundle?: PromptBundleSnapshot
 }
 export type EffectiveSettingsSnapshot = ProcessingSettingsSnapshot
 export type DeepSettingsPatch<T> = T extends readonly unknown[] ? T : T extends object
@@ -379,7 +389,13 @@ export interface ModelConfigurationTestRequest {
 export {
   createDefaultAdminSettings, modelCapabilitiesFor, TASK_MODEL_LIMITS, LEGACY_SETTINGS_REVISION, LEGACY_SETTINGS_CAPTURED_AT,
 } from './admin-settings-defaults'
-export { adminSettingsSchema, adminSettingsPatchSchema, processingSettingsSnapshotSchema, reportSettingsSchema, parseAdminSettings, mergeAdminSettings, SettingsValidationError } from './admin-settings-schema'
+export {
+  adminSettingsSchema, adminSettingsPatchSchema, processingSettingsSnapshotSchema, reportSettingsSchema, parseAdminSettings,
+  mergeAdminSettings, upgradeQcAdminSettings, SettingsValidationError,
+} from './admin-settings-schema'
 export { ADMIN_SETTINGS_FIELDS } from './admin-settings-fields'
 export { ADMIN_SETTINGS_STORAGE_LIMITS, settingsJsonBytes } from './admin-settings-limits'
-export { captureProcessingSettings, resolveTaskModel, projectPublicSettings, runtimeSettingsReadiness, diffAdminSettings, hostMatchesRule, urlAllowedBySettings } from './admin-settings-resolver'
+export {
+  captureProcessingSettings, captureQcProcessingSettings, resolveTaskModel, projectPublicSettings,
+  runtimeSettingsReadiness, diffAdminSettings, hostMatchesRule, urlAllowedBySettings,
+} from './admin-settings-resolver'

@@ -13,6 +13,7 @@ import type { RealAnalysisComparisonDetail, RealAnalysisComparisonSummary, RealA
 import type { Citation } from '../../domain/types'
 import { getDisplayName } from '../../domain/displayNames'
 import { dateLabel } from '../../domain/selectors'
+import { workspaceCanEdit } from '../../domain/workspace-permissions'
 import {
   cancelAnalysisCorrection, getAnalysisCorrection, getAnalysisCorrectionHistory,
   getAnalysisCorrectionPreview, requestAnalysisCorrection,
@@ -45,7 +46,7 @@ function useCorrectionAccess(runId: string) {
     return value
   }, [bridge, identity])
   const readable = Boolean(api?.phase === 'ready' && cloud?.currentWorkspaceId === api.workspaceId && !lifecycle.deleting && !lifecycle.removed)
-  const reviewer = readable && (role === 'owner' || role === 'editor')
+  const reviewer = readable && workspaceCanEdit(role)
   const run = api?.summaries.find(item => item.run.id === runId)
   const mutationReason = !readable ? 'The saved analysis is unavailable or being removed.'
     : !reviewer ? 'Only a workspace owner or editor can request or cancel evidence-gap corrections.'

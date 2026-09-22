@@ -96,11 +96,11 @@ number('rubrics.jobs.maxCriteria', 'Job rubric criteria', 'processing', 20, 'cri
 number('analyses.maxComparisons', 'Analysis comparisons', 'processing', 500, 'resume/target pairs', false)
 number('analyses.maxOutputCorrections', 'Shared assessment correction budget', 'processing', 2, 'corrections', true, 0, 'Shared across assessment, review-format correction and reassessment. A stage transition never resets the budget.')
 for (const kind of ['jobRubric', 'resumeProfile', 'grades']) number(`ai.${kind}.maxOutputCorrections`, `${kind}: output repairs`, 'processing', 1, 'corrections', true, 0)
-for (const kind of ['jobs', 'grades', 'resumes', 'analyses'] as const) {
+for (const kind of ['jobs', 'grades', 'resumes', 'analyses', 'qc'] as const) {
   number(`processing.${kind}.maxAutomaticAttempts`, `${kind}: automatic attempts`, 'processing', 3, 'total attempts, including the initial attempt')
   number(`processing.${kind}.retryBackoff.baseMilliseconds`, `${kind}: retry base`, 'processing', defaults.processing[kind].retryBackoff.baseMilliseconds, 'milliseconds', true, 1000)
   number(`processing.${kind}.retryBackoff.maxMilliseconds`, `${kind}: retry cap`, 'processing', defaults.processing[kind].retryBackoff.maxMilliseconds, 'milliseconds', true, 1000)
-  number(`workers.${kind}.maxItemsPerExecution`, `${kind}: execution items`, 'operations', kind === 'analyses' ? 100 : 20, 'work items')
+  number(`workers.${kind}.maxItemsPerExecution`, `${kind}: execution items`, 'operations', kind === 'analyses' ? 100 : kind === 'qc' ? 10 : 20, 'work items')
   number(`workers.${kind}.budgetMilliseconds`, `${kind}: execution budget`, 'operations', 660_000, 'milliseconds', true, 1000)
   field(`workers.${kind}.pauseClaiming`, `${kind}: pause claiming`, 'operations', 'boolean', 'Stops new claims at execution/claim boundaries; does not cancel accepted or already claimed work.', { classification: 'advanced', activation: 'next-execution' })
 }
@@ -131,7 +131,7 @@ for (const [key, max, units, min] of [
   ['maxOutputBytes', 64 * MIB, 'bytes', 1], ['maxGenerationMilliseconds', 180_000, 'milliseconds', 1000],
   ['maxPages', 10_000, 'pages', 1], ['maxSlides', 10_000, 'slides', 1],
 ] as const) number(`reports.${key}`, `Report ${key}`, 'presentation', max, units, true, min)
-for (const path of ['reports.allowedRoles', 'documents.originalDownloadRoles']) field(path, path === 'reports.allowedRoles' ? 'Official export roles' : 'Original download roles', 'access', 'multiselect', 'Restricts existing authorized workspace readers only. Empty disables the action; never grants workspace access.', { options: ['owner', 'editor', 'viewer'] })
+for (const path of ['reports.allowedRoles', 'documents.originalDownloadRoles']) field(path, path === 'reports.allowedRoles' ? 'Official export roles' : 'Original download roles', 'access', 'multiselect', 'Restricts existing authorized workspace readers only. Empty disables the action; never grants workspace access.', { options: ['owner', 'editor', 'viewer', 'reviewer'] })
 field('appearance.applicationTitle', 'Application title', 'presentation', 'text', 'Navigation/browser title; does not rename saved records.', { max: 80 })
 select('appearance.defaultTheme', 'Default theme', 'presentation', ['system', 'light', 'dark'], 'Only for users without a saved preference. Host and personal preferences retain precedence.')
 select('navigation.defaultPage', 'Default page', 'presentation', ['jobs', 'resumes', 'rubrics', 'analyses'], 'Subject to usable capabilities; explicit deep links win.')
