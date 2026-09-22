@@ -6,7 +6,7 @@ import { join } from 'node:path'
 import test from 'node:test'
 import {
   WORD_WORKER_ARTIFACTS, WORD_WORKER_CAPABILITY, WORD_WORKER_EXTRACTION_VERSION, RUNTIME_SETTINGS_VERSION, SETTINGS_WORKER_RUNTIMES, WORKER_DEFINITIONS, configureScheduledWorker, configureWorkerDeployment,
-  disableRuntimeSettingsAdmission, disableWordAdmission, prepareWebDeployment, validateFeatureSettings, validateRendererTemplate, validateWorkerImage, validateWorkerModelDeployment, validateWorkerTemplate, verifyWordWorkerReadiness,
+  disableEvidenceCorrectionAdmission, disableRuntimeSettingsAdmission, disableWordAdmission, prepareWebDeployment, validateFeatureSettings, validateRendererTemplate, validateWorkerImage, validateWorkerModelDeployment, validateWorkerTemplate, verifyWordWorkerReadiness,
   wordWorkerVerificationArgs,
 } from '../scripts/azure-worker.mjs'
 
@@ -69,6 +69,7 @@ function appSettings() {
     COSMOS_CONTAINER: 'workspaces', WORKSPACE_BLOB_CONTAINER: 'workspace-state',
     REAL_JOB_IMPORTS_ENABLED: 'true', REAL_GRADE_LADDERS_ENABLED: 'false', REAL_RESUME_IMPORTS_ENABLED: 'true',
     REAL_ANALYSES_ENABLED: 'true', WORD_DOCUMENT_IMPORTS_ENABLED: 'true',
+    ANALYSIS_EVIDENCE_CORRECTIONS_ENABLED: 'true',
     SCORE_SETTINGS_CONTAINER: 'application-settings', SCORE_RUNTIME_SETTINGS_ENABLED: 'true',
     ...Object.fromEntries(WORKER_DEFINITIONS.flatMap(worker => [
       [worker.recordsSetting, worker.records], [worker.sourcesSetting, worker.sources],
@@ -250,8 +251,11 @@ test('API enablement requires separate provisioned stores but not enabled mutabl
   validateFeatureSettings({ ...appSettings(), REAL_JOB_IMPORTS_ENABLED: 'false', REAL_GRADE_LADDERS_ENABLED: 'true' }, analysis)
 })
 
-function deploymentHarness(definition, status = 'Succeeded') {
+function deploymentHarness(definition, status = 'Succeeded', correctionFlag) {
   let current = template(definition)
+  if (correctionFlag !== undefined) {
+    current.properties.template.containers[0].env.push({ name: 'ANALYSIS_EVIDENCE_CORRECTIONS_ENABLED', value: correctionFlag })
+  }
   let executionTemplate
   const identity = current.identity
   const operations = []
@@ -296,7 +300,59 @@ test('each worker verifies Word artifacts before its initial execution, then sch
     assert.equal(payload.properties.configuration.scheduleTriggerConfig.parallelism, 1)
     assert.deepEqual(payload.properties.template.containers[0].args, [definition.entryPoint])
     assert.deepEqual(operations[0].payload.properties.template.containers[0].args, wordWorkerVerificationArgs(definition))
+    for (const operation of operations.filter(value => value.payload)) {
+      assert.equal(operation.payload.properties.template.containers[0].env.find(setting =>
+        setting.name === 'ANALYSIS_EVIDENCE_CORRECTIONS_ENABLED')?.value, definition.kind === 'analysis' ? 'false' : undefined)
+    }
   }
+})
+
+test('analysis-worker verification closes missing, disabled, or previously enabled correction gates', async () => {
+  const definition = WORKER_DEFINITIONS.find(worker => worker.kind === 'analysis')
+  for (const flag of [undefined, 'false', 'true']) {
+    const { hooks, operations } = deploymentHarness(definition, 'Succeeded', flag)
+    await configureScheduledWorker(env, {}, definition, image, hooks)
+    for (const operation of operations.filter(value => value.payload)) {
+      const gates = operation.payload.properties.template.containers[0].env.filter(setting =>
+        setting.name === 'ANALYSIS_EVIDENCE_CORRECTIONS_ENABLED')
+      assert.deepEqual(gates, [{ name: 'ANALYSIS_EVIDENCE_CORRECTIONS_ENABLED', value: 'false' }])
+    }
+  }
+})
+
+test('unconfirmed analysis-worker gate closure cannot start a verification execution', async () => {
+  const definition = WORKER_DEFINITIONS.find(worker => worker.kind === 'analysis')
+  const { hooks, operations } = deploymentHarness(definition, 'Succeeded', 'true')
+  const send = hooks.request
+  let waits = 0
+  hooks.delay = async milliseconds => { assert.equal(milliseconds, 5000); waits++ }
+  hooks.request = async (...args) => {
+    const response = await send(...args)
+    if (args[3] === undefined && operations.some(operation => operation.action === 'Manual')) {
+      response.properties.template.containers[0].env.find(setting =>
+        setting.name === 'ANALYSIS_EVIDENCE_CORRECTIONS_ENABLED').value = 'true'
+    }
+    return response
+  }
+  await assert.rejects(configureScheduledWorker(env, {}, definition, image, hooks), /analysis-worker update did not finish/)
+  assert.equal(waits, 36)
+  assert.deepEqual(operations.map(operation => operation.action), ['Manual'])
+})
+
+test('analysis verification cannot certify an execution that admitted correction work', async () => {
+  const definition = WORKER_DEFINITIONS.find(worker => worker.kind === 'analysis')
+  const { hooks, operations } = deploymentHarness(definition)
+  const send = hooks.request
+  hooks.request = async (...args) => {
+    const response = await send(...args)
+    if (args[2].includes('/executions/')) {
+      response.properties.template.containers[0].env.find(setting =>
+        setting.name === 'ANALYSIS_EVIDENCE_CORRECTIONS_ENABLED').value = 'true'
+    }
+    return response
+  }
+  await assert.rejects(configureScheduledWorker(env, {}, definition, image, hooks), /claims disabled until reader verification/)
+  assert.ok(operations.every(operation => !['Schedule', 'pin'].includes(operation.action)))
 })
 
 test('failed initial execution never schedules or saves an unverified image pin', async () => {
@@ -434,6 +490,15 @@ test('the in-container probe rejects old, incomplete, or modified artifacts befo
 function rolloutHarness(options = {}) {
   let settings = { ...appSettings(), CUSTOM_EXISTING_SETTING: 'unchanged' }
   const workers = new Map(WORKER_DEFINITIONS.map(definition => [definition.kind, template(definition)]))
+  if (Object.hasOwn(options, 'correctionFlag')) {
+    if (options.correctionFlag === undefined) delete settings.ANALYSIS_EVIDENCE_CORRECTIONS_ENABLED
+    else {
+      settings.ANALYSIS_EVIDENCE_CORRECTIONS_ENABLED = options.correctionFlag
+      workers.get('analysis').properties.template.containers[0].env.push({
+        name: 'ANALYSIS_EVIDENCE_CORRECTIONS_ENABLED', value: options.correctionFlag,
+      })
+    }
+  }
   const executions = new Map()
   const operations = []
   const pins = new Map(WORKER_DEFINITIONS.map(definition => [definition.imageKey, `${definition.kind}-previous-pin`]))
@@ -477,6 +542,7 @@ function rolloutHarness(options = {}) {
         if (method === 'PUT') {
           assert.equal(settings.WORD_DOCUMENT_IMPORTS_ENABLED, 'false', 'Word must be off before renderer mutation')
           assert.equal(settings.SCORE_RUNTIME_SETTINGS_ENABLED, 'false', 'Settings admission must be off before renderer mutation')
+          assert.equal(settings.ANALYSIS_EVIDENCE_CORRECTIONS_ENABLED, 'false', 'Corrections must be off before renderer mutation')
           operations.push({ action: 'renderer' })
           renderer = {
             ...structuredClone(body), identity: renderer.identity,
@@ -497,7 +563,11 @@ function rolloutHarness(options = {}) {
           if (method === 'PUT') {
             assert.equal(settings.WORD_DOCUMENT_IMPORTS_ENABLED, 'false', 'Word must be off before worker mutation')
             assert.equal(settings.SCORE_RUNTIME_SETTINGS_ENABLED, 'false', 'Settings admission must be off before worker mutation')
-            operations.push({ action: 'worker', kind: definition.kind, trigger: body.properties.configuration.triggerType })
+            operations.push({
+              action: 'worker', kind: definition.kind, trigger: body.properties.configuration.triggerType,
+              corrections: body.properties.template.containers[0].env.find(setting =>
+                setting.name === 'ANALYSIS_EVIDENCE_CORRECTIONS_ENABLED')?.value,
+            })
             workers.set(definition.kind, {
               ...structuredClone(body), identity: current.identity,
               properties: { ...structuredClone(body.properties), provisioningState: 'Succeeded' },
@@ -544,7 +614,7 @@ function rolloutHarness(options = {}) {
       throw new Error(`Unexpected mocked management request: ${method} ${path}`)
     },
   }
-  return { hooks, operations, pins, workers, settings: () => settings }
+  return { hooks, operations, pins, workers, executions, settings: () => settings }
 }
 
 test('Word is disabled before any shared consumer changes and enabled only after all four verified workers', async () => {
@@ -567,13 +637,14 @@ test('Word is disabled before any shared consumer changes and enabled only after
   assert.equal(settings().CUSTOM_EXISTING_SETTING, 'unchanged')
 })
 
-test('the existing ARM preflight blocks bootstrap metadata mismatch before renderer, worker, or image pin changes', async () => {
+test('ARM bootstrap mismatch blocks image changes while preserving correction-gate cleanup', async () => {
   for (const metadata of [
     { name: 'job-rubric', properties: { provisioningState: 'Succeeded', model: { name: 'gpt-5.6-luna' } } },
     { name: 'gpt-5.6-luna', properties: { provisioningState: 'Succeeded', model: { name: 'gpt-5-mini' } } },
     { name: 'job-rubric', properties: { provisioningState: 'Succeeded' } },
   ]) {
-    const { hooks, operations, pins, settings } = rolloutHarness()
+    const { hooks, operations, pins, workers, settings } = rolloutHarness()
+    const originals = new Map([...workers].map(([kind, worker]) => [kind, structuredClone(worker)]))
     const send = hooks.request
     let reads = 0
     hooks.request = async (...args) => {
@@ -589,12 +660,222 @@ test('the existing ARM preflight blocks bootstrap metadata mismatch before rende
     }
     await assert.rejects(configureWorkerDeployment(env, {}, { image, rendererImage }, hooks), /bootstrap deployment\/model pairing/)
     assert.equal(reads, 1)
-    assert.ok(operations.every(operation => operation.action === 'settings'))
+    assert.ok(operations.every(operation => operation.action === 'settings' ||
+      (operation.action === 'worker' && operation.kind === 'analysis' && operation.corrections === 'false')))
     assert.equal(settings().WORD_DOCUMENT_IMPORTS_ENABLED, 'false')
     assert.equal(settings().SCORE_RUNTIME_SETTINGS_ENABLED, 'false')
+    assert.equal(settings().ANALYSIS_EVIDENCE_CORRECTIONS_ENABLED, 'false')
     assert.equal(settings().CUSTOM_EXISTING_SETTING, 'unchanged')
-    for (const definition of WORKER_DEFINITIONS) assert.equal(pins.get(definition.imageKey), `${definition.kind}-previous-pin`)
+    for (const definition of WORKER_DEFINITIONS) {
+      assert.equal(pins.get(definition.imageKey), `${definition.kind}-previous-pin`)
+      const current = structuredClone(workers.get(definition.kind))
+      const original = originals.get(definition.kind)
+      if (definition.kind === 'analysis') {
+        assert.equal(current.properties.template.containers[0].env.find(setting =>
+          setting.name === 'ANALYSIS_EVIDENCE_CORRECTIONS_ENABLED')?.value, 'false')
+        for (const worker of [current, original]) {
+          worker.properties.template.containers[0].env = worker.properties.template.containers[0].env.filter(setting =>
+            setting.name !== 'ANALYSIS_EVIDENCE_CORRECTIONS_ENABLED')
+        }
+      }
+      assert.deepEqual(current.properties, original.properties)
+      assert.deepEqual(current.identity, original.identity)
+      assert.equal(current.location, original.location)
+      assert.deepEqual(current.tags, original.tags)
+    }
   }
+})
+
+test('complete deployment always enables both correction gates, ignoring saved false opt-ins', async () => {
+  const definition = WORKER_DEFINITIONS.find(worker => worker.kind === 'analysis')
+  for (const correctionFlag of [undefined, 'false', 'true']) {
+    const { hooks, operations, workers, executions, settings } = rolloutHarness({ correctionFlag })
+    const saved = { ...env, ANALYSIS_EVIDENCE_CORRECTIONS_ENABLED: 'false' }
+    await configureWorkerDeployment(saved, {}, { image, rendererImage }, hooks)
+    assert.equal(settings().ANALYSIS_EVIDENCE_CORRECTIONS_ENABLED, 'true')
+    assert.equal(settings().CUSTOM_EXISTING_SETTING, 'unchanged')
+    const worker = workers.get('analysis')
+    const container = worker.properties.template.containers[0]
+    assert.equal(container.env.find(setting => setting.name === 'ANALYSIS_EVIDENCE_CORRECTIONS_ENABLED').value, 'true')
+    assert.deepEqual(container.env.filter(setting => setting.name !== 'ANALYSIS_EVIDENCE_CORRECTIONS_ENABLED'),
+      template(definition).properties.template.containers[0].env)
+    assert.deepEqual(worker.identity, template(definition).identity)
+    assert.deepEqual(container.args, [definition.entryPoint])
+    assert.equal(container.image, image)
+    assert.equal(executions.get('analysis').properties.template.containers[0].env.find(setting =>
+      setting.name === 'ANALYSIS_EVIDENCE_CORRECTIONS_ENABLED').value, 'false')
+    const claimActivation = operations.findIndex(operation => operation.action === 'worker' && operation.corrections === 'true')
+    assert.deepEqual(operations.slice(0, claimActivation).filter(operation => operation.action === 'history').map(operation =>
+      operation.kind), WORKER_DEFINITIONS.map(worker => worker.kind))
+    const apiActivation = operations.findIndex((operation, index) => index > claimActivation && operation.action === 'settings' &&
+      operation.settings.ANALYSIS_EVIDENCE_CORRECTIONS_ENABLED === 'true')
+    assert.ok(apiActivation > claimActivation)
+    assert.equal(operations[apiActivation].settings.SCORE_RUNTIME_SETTINGS_ENABLED, 'false')
+    assert.ok(operations.slice(claimActivation, apiActivation).every(operation => operation.action !== 'settings' ||
+      operation.settings.ANALYSIS_EVIDENCE_CORRECTIONS_ENABLED === 'false'))
+    for (const other of WORKER_DEFINITIONS.filter(worker => worker.kind !== 'analysis')) {
+      assert.equal(workers.get(other.kind).properties.template.containers[0].env.some(setting =>
+        setting.name === 'ANALYSIS_EVIDENCE_CORRECTIONS_ENABLED'), false)
+    }
+    await configureWorkerDeployment(saved, {}, { image, rendererImage }, hooks)
+    assert.equal(settings().ANALYSIS_EVIDENCE_CORRECTIONS_ENABLED, 'true', 'another deployment must not restore the saved false value')
+    assert.equal(workers.get('analysis').properties.template.containers[0].env.find(setting =>
+      setting.name === 'ANALYSIS_EVIDENCE_CORRECTIONS_ENABLED').value, 'true')
+  }
+})
+
+test('correction admission disablement is confirmed, idempotent, and preserves historical services', async () => {
+  const { hooks, operations, settings } = rolloutHarness()
+  await disableEvidenceCorrectionAdmission(env, {}, hooks)
+  await disableEvidenceCorrectionAdmission(env, {}, hooks)
+  assert.equal(operations.length, 1)
+  assert.equal(settings().ANALYSIS_EVIDENCE_CORRECTIONS_ENABLED, 'false')
+  for (const [name, value] of Object.entries(appSettings())) {
+    if (name !== 'ANALYSIS_EVIDENCE_CORRECTIONS_ENABLED') assert.equal(settings()[name], value)
+  }
+  for (const response of [undefined, {}]) {
+    await assert.rejects(disableEvidenceCorrectionAdmission(env, {}, {
+      request: async (_credential, _audience, _url, method) => {
+        assert.equal(method, 'POST')
+        return response
+      },
+    }), /settings are unavailable/)
+  }
+})
+
+test('unconfirmed correction admission closure blocks both web and worker deployment', async () => {
+  for (const prepare of [
+    hooks => prepareWebDeployment(env, {}, hooks),
+    hooks => configureWorkerDeployment(env, {}, { image, rendererImage }, hooks),
+  ]) {
+    const { hooks, operations } = rolloutHarness()
+    const send = hooks.request
+    hooks.request = async (...args) => {
+      const response = await send(...args)
+      if (args[2].includes('/config/appsettings/list')) response.properties.ANALYSIS_EVIDENCE_CORRECTIONS_ENABLED = 'true'
+      return response
+    }
+    await assert.rejects(prepare(hooks), /did not confirm evidence correction admission disabled/)
+    assert.ok(operations.every(operation => !['renderer', 'worker', 'execution', 'pin'].includes(operation.action)))
+  }
+})
+
+test('correction worker activation requires confirmed flags and the unchanged verified template', async () => {
+  for (const failure of ['denied', 'ignored', 'ambiguous', 'stale', 'updating', 'failed', 'drift']) {
+    const { hooks, operations, workers, settings, pins } = rolloutHarness()
+    const send = hooks.request
+    let attempted = false
+    let closing = false
+    let activationStart
+    let waits = 0
+    hooks.delay = async milliseconds => { assert.equal(milliseconds, 5000); waits++ }
+    hooks.request = async (...args) => {
+      const [, , url, method, body] = args
+      const analysis = new URL(url).pathname === env.AZURE_ANALYSIS_WORKER_ID
+      if (analysis && method === 'PUT') {
+        const enabled = body.properties.template.containers[0].env.find(setting =>
+          setting.name === 'ANALYSIS_EVIDENCE_CORRECTIONS_ENABLED')?.value === 'true'
+        if (enabled) {
+          attempted = true
+          activationStart = operations.length
+          if (failure === 'denied') throw new Error('Correction worker activation denied.')
+          if (failure === 'ignored') return undefined
+        } else if (attempted) closing = true
+        const response = await send(...args)
+        if (enabled && failure === 'ambiguous') throw new Error('Ambiguous correction worker activation response.')
+        if (enabled && failure === 'drift') workers.get('analysis').properties.template.containers[0].image = `${image}-drift`
+        return response
+      }
+      const response = await send(...args)
+      if (analysis && method === undefined && attempted && !closing) {
+        if (failure === 'stale') response.properties.template.containers[0].env.find(setting =>
+          setting.name === 'ANALYSIS_EVIDENCE_CORRECTIONS_ENABLED').value = 'false'
+        if (failure === 'updating') response.properties.provisioningState = 'Updating'
+        if (failure === 'failed') response.properties.provisioningState = 'Failed'
+      }
+      return response
+    }
+    await assert.rejects(configureWorkerDeployment(env, {}, { image, rendererImage }, hooks), /correction/i)
+    assert.equal(attempted, true)
+    assert.equal(closing, true, 'rollback must write the closed flag even when activation reads look disabled')
+    assert.equal(waits, ['ignored', 'stale', 'updating', 'drift'].includes(failure) ? 36 : 0)
+    assert.equal(settings().ANALYSIS_EVIDENCE_CORRECTIONS_ENABLED, 'false')
+    assert.equal(settings().SCORE_RUNTIME_SETTINGS_ENABLED, 'false')
+    const container = workers.get('analysis').properties.template.containers[0]
+    assert.equal(container.env.find(setting => setting.name === 'ANALYSIS_EVIDENCE_CORRECTIONS_ENABLED').value, 'false')
+    assert.equal(container.image, failure === 'drift' ? `${image}-drift` : image, 'closing must not restore a stale image')
+    assert.ok(operations.slice(activationStart).every(operation => operation.action !== 'settings' ||
+      operation.settings.ANALYSIS_EVIDENCE_CORRECTIONS_ENABLED === 'false'))
+    for (const definition of WORKER_DEFINITIONS) assert.equal(pins.get(definition.imageKey), image)
+  }
+})
+
+test('failed or unconfirmed correction API activation closes both flags even after stale reads', async () => {
+  for (const failure of ['denied', 'ignored', 'ambiguous', 'stale']) {
+    const { hooks, operations, workers, settings } = rolloutHarness()
+    const send = hooks.request
+    let attempted = false
+    let closing = false
+    hooks.request = async (...args) => {
+      const [, , url, method, body] = args
+      if (url.includes('/config/appsettings') && method === 'PUT') {
+        const enabled = body.properties.ANALYSIS_EVIDENCE_CORRECTIONS_ENABLED === 'true' &&
+          operations.some(operation => operation.action === 'worker' && operation.corrections === 'true')
+        if (enabled) {
+          attempted = true
+          if (failure === 'denied') throw new Error('Correction API activation denied.')
+          if (failure === 'ignored') return undefined
+        } else if (attempted) closing = true
+        const response = await send(...args)
+        if (enabled && failure === 'ambiguous') throw new Error('Ambiguous correction API activation response.')
+        return response
+      }
+      const response = await send(...args)
+      if (failure === 'stale' && url.includes('/config/appsettings/list') && attempted && !closing) {
+        response.properties.ANALYSIS_EVIDENCE_CORRECTIONS_ENABLED = 'false'
+      }
+      return response
+    }
+    await assert.rejects(configureWorkerDeployment(env, {}, { image, rendererImage }, hooks), /correction/i)
+    assert.equal(attempted, true)
+    assert.equal(closing, true)
+    assert.equal(settings().ANALYSIS_EVIDENCE_CORRECTIONS_ENABLED, 'false')
+    assert.equal(settings().SCORE_RUNTIME_SETTINGS_ENABLED, 'false')
+    assert.equal(workers.get('analysis').properties.template.containers[0].env.find(setting =>
+      setting.name === 'ANALYSIS_EVIDENCE_CORRECTIONS_ENABLED').value, 'false')
+  }
+})
+
+test('failed correction cleanup reports every unconfirmed surface without rolling back verified images', async () => {
+  const { hooks, operations, settings, pins } = rolloutHarness({ failEnable: true })
+  const send = hooks.request
+  let activated = false
+  hooks.request = async (...args) => {
+    const [, , url, method, body] = args
+    if (url.includes('/config/appsettings') && method === 'PUT') {
+      if (activated && body.properties.ANALYSIS_EVIDENCE_CORRECTIONS_ENABLED === 'false') {
+        throw new Error('Correction API disablement denied.')
+      }
+      if (body.properties.ANALYSIS_EVIDENCE_CORRECTIONS_ENABLED === 'true' &&
+        operations.some(operation => operation.action === 'worker' && operation.corrections === 'true')) activated = true
+    }
+    if (activated && new URL(url).pathname === env.AZURE_ANALYSIS_WORKER_ID && method === 'PUT' &&
+      body.properties.template.containers[0].env.find(setting => setting.name === 'ANALYSIS_EVIDENCE_CORRECTIONS_ENABLED').value === 'false') {
+      throw new Error('Correction worker disablement denied.')
+    }
+    return send(...args)
+  }
+  await assert.rejects(configureWorkerDeployment(env, {}, { image, rendererImage }, hooks), error => {
+    assert.ok(error instanceof AggregateError)
+    assert.match(error.message, /App Service and analysis-worker settings/)
+    assert.deepEqual(error.errors.map(failure => failure.message), [
+      'Ambiguous feature enablement response.', 'Correction API disablement denied.', 'Correction worker disablement denied.',
+    ])
+    return true
+  })
+  assert.equal(settings().SCORE_RUNTIME_SETTINGS_ENABLED, 'false')
+  assert.equal(settings().WORD_DOCUMENT_IMPORTS_ENABLED, 'false')
+  for (const definition of WORKER_DEFINITIONS) assert.equal(pins.get(definition.imageKey), image)
 })
 
 test('legacy Word disablement preserves other flags and deployment hooks enforce reader preparation', async () => {
@@ -642,6 +923,7 @@ test('pre-web preparation pauses and drains all old readers without changing the
   await prepareWebDeployment(env, {}, hooks)
   assert.equal(settings().WORD_DOCUMENT_IMPORTS_ENABLED, 'false')
   assert.equal(settings().SCORE_RUNTIME_SETTINGS_ENABLED, 'false')
+  assert.equal(settings().ANALYSIS_EVIDENCE_CORRECTIONS_ENABLED, 'false')
   assert.equal(settings().CUSTOM_EXISTING_SETTING, 'unchanged')
   for (const key of ['REAL_JOB_IMPORTS_ENABLED', 'REAL_GRADE_LADDERS_ENABLED', 'REAL_RESUME_IMPORTS_ENABLED', 'REAL_ANALYSES_ENABLED']) {
     assert.equal(settings()[key], appSettings()[key], 'historical API capability must not be disabled to pause readers')
@@ -776,9 +1058,12 @@ test('missing worker outputs or failed gate closure cannot change any reader sch
 
 test('a failure in any worker leaves Word off while preserving only independently verified pins', async () => {
   for (const [index, definition] of WORKER_DEFINITIONS.entries()) {
-    const { hooks, operations, pins, settings } = rolloutHarness({ failedKind: definition.kind })
+    const { hooks, operations, pins, workers, settings } = rolloutHarness({ failedKind: definition.kind })
     await assert.rejects(configureWorkerDeployment(env, {}, { image, rendererImage }, hooks), /initial execution.*Failed/)
     assert.equal(settings().WORD_DOCUMENT_IMPORTS_ENABLED, 'false')
+    assert.equal(settings().ANALYSIS_EVIDENCE_CORRECTIONS_ENABLED, 'false')
+    assert.equal(workers.get('analysis').properties.template.containers[0].env.find(setting =>
+      setting.name === 'ANALYSIS_EVIDENCE_CORRECTIONS_ENABLED').value, 'false')
     for (const [otherIndex, other] of WORKER_DEFINITIONS.entries()) {
       assert.equal(pins.get(other.imageKey), otherIndex < index ? image : `${other.kind}-previous-pin`)
     }
@@ -794,6 +1079,7 @@ test('renderer failures and renderer-only rollouts cannot enable Word or change 
     if (failRenderer) await assert.rejects(result, /renderer failed/)
     else await result
     assert.equal(settings().WORD_DOCUMENT_IMPORTS_ENABLED, 'false')
+    assert.equal(settings().ANALYSIS_EVIDENCE_CORRECTIONS_ENABLED, 'false')
     assert.equal(settings().REAL_RESUME_IMPORTS_ENABLED, 'true')
     assert.equal(settings().REAL_ANALYSES_ENABLED, 'true')
     assert.ok(operations.every(operation => operation.action !== 'worker'))
@@ -820,6 +1106,7 @@ test('current image drift or an older in-flight execution blocks Word even after
     const { hooks, settings } = rolloutHarness(options)
     await assert.rejects(configureWorkerDeployment(env, {}, { image, rendererImage }, hooks), /verified scheduled Word build|not bound to the verified Word image/)
     assert.equal(settings().WORD_DOCUMENT_IMPORTS_ENABLED, 'false')
+    assert.equal(settings().ANALYSIS_EVIDENCE_CORRECTIONS_ENABLED, 'false')
   }
 })
 
@@ -835,6 +1122,7 @@ test('saved image pins or an incomplete verification set cannot reopen Word admi
 test('infrastructure composes private stores and identities without new model/search or legacy access', () => {
   const module = readFileSync(new URL('../infra/private-processing.bicep', import.meta.url), 'utf8')
   const resources = readFileSync(new URL('../infra/resources.bicep', import.meta.url), 'utf8')
+  const main = readFileSync(new URL('../infra/main.bicep', import.meta.url), 'utf8')
   const parameters = JSON.parse(readFileSync(new URL('../infra/main.parameters.json', import.meta.url), 'utf8')).parameters
   assert.match(module, /@allowed\(\['resume', 'analysis'\]\)/)
   assert.match(module, /paths: \['\/workspaceId'\]/)
@@ -848,7 +1136,7 @@ test('infrastructure composes private stores and identities without new model/se
   assert.ok(module.includes("args: ['dist-worker/${kind}-worker.mjs']"))
   const branches = module.match(/isResume \? \[([\s\S]*?DOCUMENT_INTELLIGENCE_ENDPOINT[\s\S]*?JOB_RENDERER_URL[\s\S]*?)\] : \[([\s\S]*?)\]/)
   assert.ok(branches, 'Resume extraction endpoints must remain in the resume-only environment branch.')
-  assert.match(branches[2], /name: 'ANALYSIS_EVIDENCE_CORRECTIONS_ENABLED', value: analysisEvidenceCorrectionsEnabled/)
+  assert.match(branches[2], /name: 'ANALYSIS_EVIDENCE_CORRECTIONS_ENABLED', value: 'false'/)
   assert.doesNotMatch(branches[2], /DOCUMENT_INTELLIGENCE_ENDPOINT|JOB_RENDERER_URL/)
   assert.doesNotMatch(module, /(?:JOB|GRADE|WORKSPACE)_(?:RECORDS|SOURCE|BLOB)_CONTAINER/)
   assert.doesNotMatch(module, /Microsoft\.Search|Microsoft\.CognitiveServices\/accounts\/deployments/)
@@ -860,6 +1148,9 @@ test('infrastructure composes private stores and identities without new model/se
   assert.match(resources, /REAL_RESUME_IMPORTS_ENABLED: resumes\.outputs\.isDeployed \? 'true' : 'false'/)
   assert.match(resources, /REAL_ANALYSES_ENABLED: analyses\.outputs\.isDeployed \? 'true' : 'false'/)
   assert.match(resources, /WORD_DOCUMENT_IMPORTS_ENABLED: 'false'/)
+  assert.match(resources, /ANALYSIS_EVIDENCE_CORRECTIONS_ENABLED: 'false'/)
+  assert.equal(Object.hasOwn(parameters, 'analysisEvidenceCorrectionsEnabled'), false)
+  for (const source of [main, resources, module]) assert.doesNotMatch(source, /analysisEvidenceCorrectionsEnabled/)
 })
 
 test('worker build and shared container packaging include both new entry points and runtime bundles', () => {
@@ -910,11 +1201,14 @@ test('runtime settings failure and renderer-only paths keep admission disabled',
     { failedKind: 'job' }, { failedKind: 'grade' }, { failedKind: 'resume' }, { failedKind: 'analysis' },
     { oldExecutionKind: 'resume', secondPage: true }, { failRuntimeEnable: true }, { invalidSettingsPartition: true },
   ]) {
-    const { hooks, settings } = rolloutHarness(options)
+    const { hooks, workers, settings } = rolloutHarness(options)
     await assert.rejects(configureWorkerDeployment(env, {}, { image, rendererImage }, hooks))
     assert.equal(settings().SCORE_RUNTIME_SETTINGS_ENABLED, 'false')
     assert.equal(settings().SCORE_RUNTIME_SETTINGS_WORKER_VERSION, '')
     assert.equal(settings().WORD_DOCUMENT_IMPORTS_ENABLED, 'false')
+    assert.equal(settings().ANALYSIS_EVIDENCE_CORRECTIONS_ENABLED, 'false')
+    assert.equal(workers.get('analysis').properties.template.containers[0].env.find(setting =>
+      setting.name === 'ANALYSIS_EVIDENCE_CORRECTIONS_ENABLED').value, 'false')
   }
   const { hooks, settings } = rolloutHarness()
   await configureWorkerDeployment(env, {}, { rendererImage, rendererOnly: true }, hooks)

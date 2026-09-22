@@ -80,7 +80,8 @@ All paths below have prefix `/api/workspaces/:workspaceId/analyses`:
 | `POST /:runId/summaries` with `{mode: "missing" \| "all", targetId?}` | `RealAnalysisSummariesMutationResponse` with durable request ID, scheduled counts, and summary state |
 | `GET /:runId/summaries/:kind/:subjectId/history?continuationToken=...` | Owner/editor-only `AnalysisSummaryHistoryPage`, up to 12 private checkpoint events and the narrative record ETag |
 | `POST /:runId/summaries/:kind/:subjectId/publish` with `{generationId, round, outputSha256}` | `{summaries}` for the subject's exact target; explicit manual approval of a persisted final draft |
-| `POST /:runId/summaries/:kind/:subjectId/retry` with `{}` | HTTP 202 `{summaries}` for the subject's exact target; resumes the captured generation and remaining review budget |
+| `POST /:runId/summaries/:kind/:subjectId/retry` with `{}` | HTTP 202 `{summaries}` for the subject's exact target; failed/cancelled work resumes its captured generation and remaining review budget |
+| `POST /:runId/summaries/:kind/:subjectId/restart` with `{confirmRestart: true}` | HTTP 202 `{summaries}` for the exact target; explicitly supersedes one subject with a new generation using current settings |
 | `POST /:runId/retry` with `{comparisonIds?}` | `{run: RealAnalysisRunSummary}` |
 | `POST /:runId/cancel` with `{}` | `{run: RealAnalysisRunSummary}` |
 | `POST /:runId/comparisons/:comparisonId/retry` or `/cancel` with `{}` | `{comparison: RealAnalysisComparisonSummary}` |
@@ -164,13 +165,25 @@ prior candidate narrative publication remain available in private correction
 history; rejected proposals and failed review findings are distinct from published
 results.
 
-`ANALYSIS_EVIDENCE_CORRECTIONS_ENABLED` defaults to `false` in the API, worker, and
-deployment templates. The UI capability is `analysisEvidenceCorrections`. The gate
-controls new requests and worker discovery, not historical reads or authorized
-cancellation of accepted work. Deploy compatible readers/workers and drain older
-workers before deliberately enabling it. Turning the gate off does not reinterpret
-already-published revisions. Production deployment and a historical repair batch
-require separate approval and exact-hash scope verification.
+Successful application/worker deployment automatically writes
+`ANALYSIS_EVIDENCE_CORRECTIONS_ENABLED=true` to both the API and analysis worker.
+There is no deployment opt-in; a saved azd value of `false` is not honored as an
+opt-out. Provisioning stages both flags as `false`, and deployment preparation
+closes correction API admission. The replacement analysis worker keeps correction
+claims disabled during initial verification. After compatible-reader checks pass
+and incompatible executions have drained, deployment confirms worker activation,
+then API activation, before reopening runtime-settings admission. `-ProvisionOnly`
+must be followed by `-DeployOnly`; complete worker-only rollout also enables the
+feature. Failed activation attempts close both flags with readback, reporting any
+unconfirmed state. Renderer-only rollout leaves API admission closed and worker
+configuration unchanged. Missing flags still default off in runtime configuration.
+
+The UI capability is `analysisEvidenceCorrections`. The gate controls new requests
+and worker discovery, not historical reads or authorized cancellation of accepted
+work. Turning the gate off does not reinterpret already-published revisions, but
+the next successful deployment enables it again. Maintenance and role checks
+remain in force. Deployment does not create correction requests: a historical
+repair batch remains a separate approved action with exact-hash scope verification.
 
 ## Saved narrative summaries
 
@@ -209,7 +222,16 @@ request.
 
 The subject GET ETag is a display-read revision, not a substitute for the selected
 summary-scope ETag used by generation or the narrative-record ETag returned by
-private history for publication/retry actions.
+private history for publication/retry/restart actions.
+
+Optional `workHealth` metadata distinguishes prerequisites, eligible queues,
+provider cooldown, live leases, expired/interrupted leases, and terminal work.
+It includes available request/activity/lease/retry timestamps, attempts and
+captured settings identity without downloading additional evidence. The optional
+`workRevision` lets polling observe lease expiry and retry eligibility even
+when the existing revision/ETag is unchanged. Heartbeat-only updates do not
+reset polling backoff; health never changes publication hashes, summary-scope ETags,
+report capture pins or readiness, and deriving it never writes a status.
 
 Each candidate narrative binds the exact completed result, resume/target snapshots,
 and manifest hashes. Each target narrative binds the exhaustive exact-target
@@ -249,9 +271,10 @@ generation. A settled partial/cancelled run may explicitly summarize its complet
 results without restarting scoring.
 
 Version 2 summaries undergo a narrow factual review against the supplied saved
-assessment, not a new assessment of the original resume. Each generation has
+assessment, not a new assessment of the original resume. The default maximum is
 three durable logical rounds: an initial draft and at most two revisions with
-earlier findings carried forward. Sentence counts, exact wording, number
+earlier findings carried forward; captured policy may lower that budget.
+Process recovery and failed-generation resume never reset it. Sentence counts, exact wording, number
 formatting, score mentions, and exhaustive sentence/reference coverage are not
 publication gates. Nonempty response shapes, exact input/output bindings, and
 the technical bounds in `SUMMARY_LIMITS` still apply. Large target cohorts use
@@ -274,7 +297,7 @@ DTOs do not invent that metadata.
 comparison ID or target ID, never a label or arbitrary blob path. Owners and
 editors can inspect all captured checkpoint events, including completed
 generations and earlier retries. Viewers can read publications but cannot read
-unpublished history or invoke either action. Archived history remains readable
+unpublished history or invoke summary actions. Archived history remains readable
 to owners/editors; archived, deleting, and cancelling work cannot be mutated.
 History GET never schedules inference or repairs old runs. A pre-upgrade failure
 without captured history returns an empty history, not a reconstructed draft.
@@ -292,10 +315,21 @@ must disclose manual approval and its known issues.
 An immutable action reservation plus the committed request/generation identity
 reconciles ambiguous responses. Replaying a committed action does not repeat
 approval or create another generation; replay over newer work is rejected.
-Retry retains the previous publication and entire history. Candidate retry or
-manual publication queues only its dependent target overview through the
-existing narrative constructors. It never modifies scores, result bytes, or
-unrelated candidates.
+Retry of failed/cancelled work retains its generation, captured settings,
+checkpoints and remaining review budget. Legacy retry calls for other states
+retain their existing new-generation behavior. New clients use `canResume` for
+the resume control and `canRestart` for an explicitly confirmed restart;
+`canRetry` remains available for older clients.
+
+Restart always creates a new generation, captures current model/task settings
+and a new bounded review budget, and applies current new-work admission. It
+preserves previous publications and the entire private history while fencing
+late writes from the superseded generation. Compatible earlier draft/findings
+may seed feedback, but do not substitute for new-generation model calls.
+Candidate retry, restart or manual publication queues only its dependent target
+overview through the existing narrative constructors. A target restart leaves
+every candidate and unrelated target unchanged. These actions never modify
+scores or frozen result/evidence bytes.
 
 Checkpoint blobs use
 `<workspace>/<run>/narrative-history/<kind>/<subject>/<generation>/<attempt>/<entry>.json`;
@@ -319,7 +353,12 @@ Worker events and API action audits are single-line JSON with
 `component: "score-analysis-narrative"` and
 `pipelineVersion: "score-analysis-summaries-v2"`. Model events preserve HTTP
 status, safe request/call IDs, measured request budgets, timing, and completion
-finish reasons. A transport or storage failure is not a factual-review verdict.
+finish reasons. Optional `diagnostic.httpStatus` and `diagnostic.retryAt` survive
+checkpoints and runtime failures. Provider cooldown is checkpointed before
+sleeping and defers durably when it exceeds a cancellable operation deadline;
+`nextAttemptAt` cannot precede either the provider time or captured policy
+backoff. Deploy compatible strict readers before these new optional fields are
+written. A transport or storage failure is not a factual-review verdict.
 For worker diagnostics in the Container Apps Log Analytics table:
 
 ```kusto
