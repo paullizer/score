@@ -16,8 +16,6 @@ param rendererDeployed bool = false
 param tenantId string
 @description('Independent image pin, saved only after this worker passes its initial execution.')
 param workerImage string
-@allowed(['false', 'true'])
-param analysisEvidenceCorrectionsEnabled string = 'false'
 
 var isResume = kind == 'resume'
 var recordContainer = '${kind}-records'
@@ -156,7 +154,7 @@ resource worker 'Microsoft.App/jobs@2024-03-01' = {
           { name: 'DOCUMENT_INTELLIGENCE_ENDPOINT', value: 'https://${documentIntelligenceName}.cognitiveservices.azure.com' }
           { name: 'JOB_RENDERER_URL', value: rendererUrl }
         ] : [
-          { name: 'ANALYSIS_EVIDENCE_CORRECTIONS_ENABLED', value: analysisEvidenceCorrectionsEnabled }
+          { name: 'ANALYSIS_EVIDENCE_CORRECTIONS_ENABLED', value: 'false' }
         ])
       }]
     }
