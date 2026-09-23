@@ -476,6 +476,8 @@ resource appSettings 'Microsoft.Web/sites/config@2024-11-01' = {
     STORAGE_ACCOUNT_URL: storage.properties.primaryEndpoints.blob
     WORKSPACE_BLOB_CONTAINER: stateContainer.name
     REAL_JOB_IMPORTS_ENABLED: 'true'
+    // API-only feature; enabling sends job text and reviewer instructions from the API identity to the existing model deployment.
+    RUBRIC_ASSISTANT_ENABLED: 'false'
     // Provisioning never infers Word readiness from saved image tags.
     WORD_DOCUMENT_IMPORTS_ENABLED: 'false'
     JOB_RECORDS_CONTAINER: 'job-records'

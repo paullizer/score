@@ -79,6 +79,7 @@ export function jobFeaturesWithPolicy(features: JobProcessingFeatures, settings?
   const limits = clampClientLimits(JOB_IMPORT_LIMITS, features.limits)
   const intake = settings?.imports.jobs
   return { ...features, realJobImports: features.realJobImports && !admissionReason(settings, 'jobImports'),
+    rubricAssistant: features.rubricAssistant === true,
     limits: clampClientLimits(JOB_IMPORT_LIMITS, { ...limits, ...(intake ? {
       maxFileBytes: intake.maxFileBytes, maxPdfBytes: intake.maxFileBytes, maxMarkdownBytes: intake.maxFileBytes,
       maxPdfPages: intake.maxPdfPages, maxSourceCharacters: intake.maxSourceCharacters, maxBatchFiles: intake.maxBatchItems,

@@ -37,7 +37,7 @@ export function frontendWorkspaceContext(value = {}, { resumes = [], analyses = 
       realJobs: {
         phase: 'ready', features: null, summaries: [], error: null, detail: () => ({ state: 'idle' }), source: () => undefined,
         ensureDetail: acknowledged, refresh: acknowledged, importPdf: unused, importMarkdown: unused,
-        importFile: unused, importUrl: unused, originalUrl: unused, ...value.cloud.realJobs,
+        importFile: unused, importUrl: unused, assistRubric: unused, originalUrl: unused, ...value.cloud.realJobs,
       },
     }
   }

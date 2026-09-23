@@ -1,7 +1,7 @@
 import process from 'node:process'
 import { AzureCliCredential, ManagedIdentityCredential } from '@azure/identity'
 import type { TokenCredential } from '@azure/identity'
-import { createApp } from './app'
+import { createApp, createAssistLimiter, createAzureAssistModelInvoker } from './app'
 import { createAzureDirectoryStore } from './azure-directory-store'
 import { createAzureStateStore } from './azure-state-store'
 import { ConfigError, loadConfig, type Config } from './config'
@@ -112,9 +112,13 @@ function main(): void {
       }),
     } : {}),
   }) : undefined
+  const assist = config.rubricAssistant ? {
+    invoke: createAzureAssistModelInvoker({ ...config.rubricAssistant.model, credential }),
+    limiter: createAssistLimiter(),
+  } : undefined
   const accessStore = config.access ? createAzureAccessStore(config.cosmos, config.access.container, credential) : undefined
   const eligibleUsers = config.access ? createEntraDirectory(config.access, credential) : undefined
-  const app = createApp({ config, directory, state, jobs, grades, resumes, analyses, settings, prompts, qc, accessStore, eligibleUsers })
+  const app = createApp({ config, directory, state, jobs, grades, resumes, analyses, settings, prompts, qc, assist, accessStore, eligibleUsers })
   const bootstrapSettings = app.locals.bootstrapSettings as () => Promise<StoredSettings | undefined>
   const initializeSettings = (): void => {
     void bootstrapSettings().then(current => {

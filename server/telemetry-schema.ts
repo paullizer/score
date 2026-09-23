@@ -16,6 +16,7 @@ const operationNames = new Set([
   'score.analysis.validation',
   'score.storage.query',
   'score.storage.blob.read',
+  'score.assist.run',
   'score.operation.other',
 ])
 
@@ -139,6 +140,10 @@ const numericAttributes: Readonly<Record<string, number>> = {
   'score.comparison.count': 500,
   'score.publication.count': 500,
   'score.concurrency': 32,
+  'score.assist.correction_count': 2,
+  'score.assist.operation_count': 64,
+  'score.assist.turns_sent': 20,
+  'score.assist.turns_dropped': 20,
 }
 
 export function safeAttributes(attributes: Readonly<Record<string, unknown>>): SafeAttributes {
@@ -152,6 +157,9 @@ export function safeAttributes(attributes: Readonly<Record<string, unknown>>): S
     if (typeof value === 'number' && Number.isFinite(value) && value >= 0) result[key] = Math.min(max, Math.floor(value))
   }
   if (attributes['score.operation'] !== undefined) result['score.operation'] = safeOperationName(attributes['score.operation'])
+  if (typeof attributes['score.assist.kind'] === 'string' && /^[a-zA-Z0-9._-]{1,80}$/.test(attributes['score.assist.kind'])) {
+    result['score.assist.kind'] = attributes['score.assist.kind']
+  }
   if (attributes['score.error.category'] !== undefined) result['score.error.category'] = safeErrorCategory(attributes['score.error.category'])
   if (attributes['http.method'] !== undefined) result['http.method'] = safeMethod(attributes['http.method'])
   if (attributes['http.route'] !== undefined) result['http.route'] = safeRoute(attributes['http.route'])

@@ -52,6 +52,14 @@ export interface Config {
   readonly analysisLifecycleStore?: RealAnalysesConfig
   readonly realResumes?: RealResumesConfig
   readonly realAnalyses?: RealAnalysesConfig
+  readonly rubricAssistant?: {
+    readonly model: {
+      readonly endpoint: string
+      readonly deploymentName: string
+      readonly modelName: string
+      readonly reasoningEffort?: ReasoningEffort
+    }
+  }
   readonly wordDocumentImports: boolean
   readonly appOrigin: string
   readonly isProduction: boolean
@@ -233,6 +241,29 @@ function settingsConfiguration(env: NodeJS.ProcessEnv, cosmos: CosmosConfig): Se
   }
 }
 
+
+function rubricAssistantConfiguration(env: NodeJS.ProcessEnv, jobsEnabled: boolean): Config['rubricAssistant'] {
+  const enabled = featureEnabled(env, 'RUBRIC_ASSISTANT_ENABLED')
+  if (!enabled) return undefined
+  const endpointValue = optional(env, 'RUBRIC_MODEL_ENDPOINT')
+  const deploymentName = optional(env, 'RUBRIC_MODEL_DEPLOYMENT')
+  const modelName = optional(env, 'RUBRIC_MODEL_NAME')
+  const reasoning = optional(env, 'RUBRIC_MODEL_REASONING_EFFORT')
+  if (!jobsEnabled || !endpointValue || !deploymentName || !modelName) {
+    throw new ConfigError('RUBRIC_ASSISTANT_ENABLED requires REAL_JOB_IMPORTS_ENABLED=true and RUBRIC_MODEL_ENDPOINT, RUBRIC_MODEL_DEPLOYMENT and RUBRIC_MODEL_NAME.')
+  }
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(deploymentName)) throw new ConfigError('RUBRIC_MODEL_DEPLOYMENT must be an exact Azure deployment identifier.')
+  if (reasoning && !['minimal', 'low', 'medium', 'high'].includes(reasoning)) throw new ConfigError('RUBRIC_MODEL_REASONING_EFFORT is unsupported.')
+  return {
+    model: {
+      endpoint: azureModelEndpoint(endpointValue),
+      deploymentName,
+      modelName,
+      ...(reasoning ? { reasoningEffort: reasoning as ReasoningEffort } : {}),
+    },
+  }
+}
+
 function requireHttpsOrigin(env: NodeJS.ProcessEnv, name: string): string {
   const value = required(env, name)
   let url: URL
@@ -287,6 +318,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   const analysesEnabled = featureEnabled(env, 'REAL_ANALYSES_ENABLED')
   const evidenceCorrectionsEnabled = featureEnabled(env, 'ANALYSIS_EVIDENCE_CORRECTIONS_ENABLED')
   const wordDocumentImports = featureEnabled(env, 'WORD_DOCUMENT_IMPORTS_ENABLED')
+  const rubricAssistant = rubricAssistantConfiguration(env, jobsEnabled)
   const jobRecords = jobsEnabled ? required(env, 'JOB_RECORDS_CONTAINER') : optional(env, 'JOB_RECORDS_CONTAINER') ?? 'job-records'
   const jobSources = jobsEnabled ? required(env, 'JOB_SOURCE_CONTAINER') : optional(env, 'JOB_SOURCE_CONTAINER') ?? 'job-sources'
   const gradeRecords = optional(env, 'GRADE_RECORDS_CONTAINER') ?? 'grade-records'
@@ -383,6 +415,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     analysisLifecycleStore,
     realResumes,
     realAnalyses,
+    rubricAssistant,
     wordDocumentImports,
     appOrigin: requireHttpsOrigin(env, 'APP_ORIGIN'),
     isProduction,

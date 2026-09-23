@@ -43,6 +43,7 @@ export function effectiveFeatures(
     realAnalyses,
     analysisSummaryGeneration,
     analysisEvidenceCorrections: capabilities.analysisEvidenceCorrections === true && admitting,
+    rubricAssistant: capabilities.rubricAssistant === true && admitting,
     wordDocumentImports: capabilities.wordDocumentImports && (
       (realJobImports && jobPolicy.allowedFormats.some(format => format === 'doc' || format === 'docx')) ||
       (realResumeImports && resumePolicy.allowedFormats.some(format => format === 'doc' || format === 'docx'))
