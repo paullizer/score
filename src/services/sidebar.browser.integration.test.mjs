@@ -226,7 +226,8 @@ for (const theme of ['light', 'dark']) test(`desktop sidebar collapses to a cent
   assert.doesNotMatch(await about.innerText(), /UI preview|interactive preview/i)
   await about.getByRole('button', { name: 'Back to the workspace', exact: true }).click()
   await about.waitFor({ state: 'hidden' })
-  assert.equal(await aboutButton.evaluate((element) => element === document.activeElement), true, 'Closing About returns focus to the sidebar item')
+  // Radix restores focus in a task after the dialog unmounts, so wait for it rather than sampling once.
+  await until(() => aboutButton.evaluate((element) => element === document.activeElement), 'Closing About returns focus to the sidebar item')
   await screenshot(page, `sidebar-expanded-1440-${theme}`)
 
   // The same toggle element keeps keyboard focus while the rail collapses.
