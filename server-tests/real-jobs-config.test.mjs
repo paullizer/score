@@ -59,60 +59,21 @@ test('real job stores cannot alias legacy workspace containers', () => {
   )
 })
 
-test('rubric assistant config is opt-in and requires real jobs plus model settings', () => {
-  assert.equal(loadConfig(environment()).rubricAssistant, undefined)
-  const message = /RUBRIC_ASSISTANT_ENABLED requires REAL_JOB_IMPORTS_ENABLED=true and RUBRIC_MODEL_ENDPOINT, RUBRIC_MODEL_DEPLOYMENT and RUBRIC_MODEL_NAME/
-  assert.throws(() => loadConfig(environment({ RUBRIC_ASSISTANT_ENABLED: 'true' })), message)
-  assert.throws(() => loadConfig(environment({
-    RUBRIC_ASSISTANT_ENABLED: 'true',
-    RUBRIC_MODEL_ENDPOINT: 'https://score-test.openai.azure.com',
-    RUBRIC_MODEL_DEPLOYMENT: 'gpt-test',
-    RUBRIC_MODEL_NAME: 'gpt-test',
-  })), message)
-  assert.throws(() => loadConfig(environment({
-    REAL_JOB_IMPORTS_ENABLED: 'true',
-    JOB_RECORDS_CONTAINER: 'job-records',
-    JOB_SOURCE_CONTAINER: 'job-sources',
-    RUBRIC_ASSISTANT_ENABLED: 'true',
-    RUBRIC_MODEL_ENDPOINT: 'https://score-test.openai.azure.com',
-    RUBRIC_MODEL_DEPLOYMENT: '../bad',
-    RUBRIC_MODEL_NAME: 'gpt-test',
-  })), /RUBRIC_MODEL_DEPLOYMENT must be an exact Azure deployment identifier/)
-  assert.throws(() => loadConfig(environment({
-    REAL_JOB_IMPORTS_ENABLED: 'true',
-    JOB_RECORDS_CONTAINER: 'job-records',
-    JOB_SOURCE_CONTAINER: 'job-sources',
-    RUBRIC_ASSISTANT_ENABLED: 'true',
-    RUBRIC_MODEL_ENDPOINT: 'https://example.com',
-    RUBRIC_MODEL_DEPLOYMENT: 'gpt-test',
-    RUBRIC_MODEL_NAME: 'gpt-test',
-  })), /RUBRIC_MODEL_ENDPOINT must be/)
-  assert.throws(() => loadConfig(environment({
-    REAL_JOB_IMPORTS_ENABLED: 'true',
-    JOB_RECORDS_CONTAINER: 'job-records',
-    JOB_SOURCE_CONTAINER: 'job-sources',
-    RUBRIC_ASSISTANT_ENABLED: 'true',
-    RUBRIC_MODEL_ENDPOINT: 'https://score-test.openai.azure.com',
-    RUBRIC_MODEL_DEPLOYMENT: 'gpt-test',
-    RUBRIC_MODEL_NAME: 'gpt-test',
-    RUBRIC_MODEL_REASONING_EFFORT: 'extreme',
-  })), /RUBRIC_MODEL_REASONING_EFFORT is unsupported/)
-  const config = loadConfig(environment({
-    REAL_JOB_IMPORTS_ENABLED: 'true',
-    JOB_RECORDS_CONTAINER: 'job-records',
-    JOB_SOURCE_CONTAINER: 'job-sources',
-    RUBRIC_ASSISTANT_ENABLED: 'true',
-    RUBRIC_MODEL_ENDPOINT: 'https://score-test.openai.azure.com',
-    RUBRIC_MODEL_DEPLOYMENT: 'gpt-test',
-    RUBRIC_MODEL_NAME: 'gpt-test',
-    RUBRIC_MODEL_REASONING_EFFORT: 'low',
-  }))
-  assert.deepEqual(config.rubricAssistant, {
-    model: {
-      endpoint: 'https://score-test.openai.azure.com',
-      deploymentName: 'gpt-test',
-      modelName: 'gpt-test',
-      reasoningEffort: 'low',
-    },
+test('rubric assistant model config follows the deployed job-rubric model; there is no feature environment flag', () => {
+  const jobs = { REAL_JOB_IMPORTS_ENABLED: 'true', JOB_RECORDS_CONTAINER: 'job-records', JOB_SOURCE_CONTAINER: 'job-sources' }
+  const model = { RUBRIC_MODEL_ENDPOINT: 'https://score-test.openai.azure.com', RUBRIC_MODEL_DEPLOYMENT: 'gpt-test', RUBRIC_MODEL_NAME: 'gpt-test' }
+  assert.equal(loadConfig(environment()).rubricAssistant, undefined, 'No real jobs and no model: nothing to call')
+  assert.equal(loadConfig(environment(jobs)).rubricAssistant, undefined, 'Real jobs without a model deployment cannot offer the assistant')
+  assert.equal(loadConfig(environment(model)).rubricAssistant, undefined, 'A model without real jobs has no rubric to assist')
+  assert.deepEqual(loadConfig(environment({ ...jobs, ...model, RUBRIC_MODEL_REASONING_EFFORT: 'low' })).rubricAssistant, {
+    model: { endpoint: 'https://score-test.openai.azure.com', deploymentName: 'gpt-test', modelName: 'gpt-test', reasoningEffort: 'low' },
   })
+  // Retired flag: the Admin settings switch decides; leftover app settings neither enable, disable nor break startup.
+  assert.deepEqual(loadConfig(environment({ ...jobs, ...model, RUBRIC_ASSISTANT_ENABLED: 'false' })).rubricAssistant?.model.deploymentName, 'gpt-test')
+  assert.throws(() => loadConfig(environment({ ...jobs, RUBRIC_MODEL_ENDPOINT: model.RUBRIC_MODEL_ENDPOINT })),
+    /requires RUBRIC_MODEL_ENDPOINT, RUBRIC_MODEL_DEPLOYMENT and RUBRIC_MODEL_NAME together/)
+  assert.throws(() => loadConfig(environment({ ...jobs, ...model, RUBRIC_MODEL_DEPLOYMENT: '../bad' })),
+    /RUBRIC_MODEL_DEPLOYMENT must be an exact Azure deployment identifier/)
+  assert.throws(() => loadConfig(environment({ ...jobs, ...model, RUBRIC_MODEL_ENDPOINT: 'https://example.com' })), /RUBRIC_MODEL_ENDPOINT must be/)
+  assert.throws(() => loadConfig(environment({ ...jobs, ...model, RUBRIC_MODEL_REASONING_EFFORT: 'extreme' })), /RUBRIC_MODEL_REASONING_EFFORT is unsupported/)
 })

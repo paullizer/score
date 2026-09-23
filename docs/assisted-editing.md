@@ -89,11 +89,15 @@ The response contains `outcome`, a plain-text `reply`, `operations` (`updateRubr
 
 ## Configuration
 
-The assistant is off by default. Set `RUBRIC_ASSISTANT_ENABLED=true` on the web app. That requires `REAL_JOB_IMPORTS_ENABLED=true` and the existing `RUBRIC_MODEL_ENDPOINT`, `RUBRIC_MODEL_DEPLOYMENT` and `RUBRIC_MODEL_NAME` (optional `RUBRIC_MODEL_REASONING_EFFORT`); an incomplete configuration fails at startup.
+The assistant is **on by default** wherever it can run. Administrators turn it off or back on under **Admin settings → Features & intake → Rubric AI assistant** (`features.rubricAssistant`); there is no environment flag. The server applies the change to the next assistant request without a restart; pages that are already open hide the button when they next refresh settings, and until then a request gets a clear "turned off" message with the draft unchanged.
+
+It can run only where real job imports are enabled (`REAL_JOB_IMPORTS_ENABLED=true`) and the existing `RUBRIC_MODEL_ENDPOINT`, `RUBRIC_MODEL_DEPLOYMENT` and `RUBRIC_MODEL_NAME` are set (optional `RUBRIC_MODEL_REASONING_EFFORT`). Those describe the deployment rather than switch the feature, and a partial set fails at startup. Where they are missing, `/api/features` reports the assistant unavailable and the Admin switch cannot turn it on.
 
 The assistant reuses the **`jobRubric` task binding** from Admin settings for its deployment, reasoning effort and budgets. When runtime settings are enabled it uses the pinned binding; otherwise it uses the environment-configured deployment. It therefore shares that deployment's quota with rubric generation, so expect occasional 429s under load.
 
-The existing **Pause new work** switch and the runtime-settings admission gate also stop assistant requests. `/api/features` reports `rubricAssistant: true` only when the assistant is enabled and admitting work. No admin setting, settings schema or worker change is involved, so enabling or disabling the flag needs no worker rollout.
+The **Pause new work** switch and the runtime-settings admission gate also stop assistant requests, but turning off job imports does not: reviewers can still refine existing rubrics. `/api/features` reports `rubricAssistant: true` only when the deployment offers it, the Admin switch is on and new work is being admitted, and the assist route enforces the same checks.
+
+Revisions saved before the switch existed omit the key, and an absent key means on. The key is written only when an administrator changes it, so earlier revisions and captured settings keep their exact shape. A revision that contains the key can be read only by API and worker builds that know it, so deploy them together (as `scripts/deploy.ps1` does) and don't roll workers back to an older build after saving it.
 
 ## Adding another assisted editor
 
@@ -109,5 +113,5 @@ A future **GS grade draft** adapter must respect that editor's rules: support ve
 
 - AI assistance for GS grade drafts, and a scripted demo assistant for samples.
 - Recording AI-assisted provenance or saved-version authors (a worker-first schema rollout).
-- An Admin settings switch and a dedicated `rubricAssistant` model binding (a settings-version rollout).
+- A dedicated `rubricAssistant` model binding (a settings-version rollout).
 - Server-side conversation history, streaming responses, and a lint for manual rubric edits.

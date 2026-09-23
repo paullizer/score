@@ -261,7 +261,7 @@ async function postAssist(server, seed, body = assistRequest(seed), oid = ALLOWE
   })
 }
 
-test('rubric assistant feature flag and pause policy control availability', async () => {
+test('rubric assistant is on by default and is controlled by the Admin settings switch, deployment and pause policy', async () => {
   const disabled = await startAssistServer({ configRubricAssistant: false })
   try {
     const seed = await seedReadyJob(disabled)
@@ -273,9 +273,33 @@ test('rubric assistant feature flag and pause policy control availability', asyn
     assert.match((await response.text()), /not enabled/)
   } finally { await disabled.close() }
 
-  const enabled = await startAssistServer()
+  let calls = 0
+  const enabled = await startAssistServer({ invoke: async (...args) => { calls += 1; return fakeInvoker()(...args) } })
   try {
+    const seed = await seedReadyJob(enabled)
+    const defaults = createDefaultAdminSettings()
+    assert.equal('rubricAssistant' in defaults.features, false, 'Defaults keep their earlier shape; an absent key means on')
+    const initial = await (await fetch(`${enabled.baseUrl}/api/features`, { headers: authHeaders() })).json()
+    assert.equal(initial.rubricAssistant, true, 'On by default with no environment flag')
+    assert.equal(initial.publicSettings.features.rubricAssistant, true)
+
+    const off = createDefaultAdminSettings()
+    off.features.rubricAssistant = false
+    enabled.settings._set(off)
+    const switchedOff = await (await fetch(`${enabled.baseUrl}/api/features`, { headers: authHeaders() })).json()
+    assert.equal(switchedOff.rubricAssistant, false)
+    assert.equal(switchedOff.publicSettings.features.rubricAssistant, false)
+    assert.equal(switchedOff.deploymentCapabilities.rubricAssistant, true, 'The deployment can still offer it')
+    const refused = await postAssist(enabled, seed)
+    assert.equal(refused.status, 503)
+    assert.match(await refused.text(), /turned off in Admin settings/)
+    assert.equal(calls, 0, 'A switched-off assistant never calls the model')
+
+    const on = createDefaultAdminSettings()
+    on.features.rubricAssistant = true
+    enabled.settings._set(on)
     assert.equal((await (await fetch(`${enabled.baseUrl}/api/features`, { headers: authHeaders() })).json()).rubricAssistant, true)
+
     const paused = createDefaultAdminSettings()
     paused.maintenance.pauseNewWork = true
     paused.maintenance.explanation = 'Maintenance window.'

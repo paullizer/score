@@ -14,6 +14,7 @@ import { decodeMarkdown, MarkdownInputError } from '../documents/markdown'
 import { conflict, HttpError, invalidRequest, notFound, preconditionRequired, unavailable } from '../errors'
 import { getPrincipal, getRequestSettings } from '../request-context'
 import { assertNewProcessingAllowed, getAdmissionSettings, runtimeSettingsEnabled } from '../settings/request-context'
+import { rubricAssistantEnabled } from '../../src/domain/admin-settings'
 import type { WorkspaceRepository } from '../repository'
 import type { LifecycleDependencies } from '../lifecycle/contracts'
 import { assertWorkspaceMutationLease } from '../lifecycle/lease'
@@ -712,6 +713,9 @@ export function createRealJobsRouter(deps: RealJobsRouterDeps): Router {
     const snapshot = await getAdmissionSettings(req)
     if (snapshot.settings.maintenance.pauseNewWork) {
       throw unavailable(snapshot.settings.maintenance.explanation || 'New work is temporarily paused by application policy.')
+    }
+    if (!rubricAssistantEnabled(snapshot.settings)) {
+      throw unavailable('The rubric AI assistant is turned off in Admin settings. Your draft is unchanged, and saved rubrics are not affected.')
     }
     const pinned = runtimeSettingsEnabled(req) ? snapshot : undefined
 

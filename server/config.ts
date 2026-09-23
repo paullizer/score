@@ -242,15 +242,19 @@ function settingsConfiguration(env: NodeJS.ProcessEnv, cosmos: CosmosConfig): Se
 }
 
 
+/**
+ * The assistant is a product feature switched in Admin settings (features.rubricAssistant), not by an
+ * environment flag. This only describes the deployed model it would call: present whenever real jobs and
+ * the existing RUBRIC_MODEL_* deployment settings are configured.
+ */
 function rubricAssistantConfiguration(env: NodeJS.ProcessEnv, jobsEnabled: boolean): Config['rubricAssistant'] {
-  const enabled = featureEnabled(env, 'RUBRIC_ASSISTANT_ENABLED')
-  if (!enabled) return undefined
   const endpointValue = optional(env, 'RUBRIC_MODEL_ENDPOINT')
   const deploymentName = optional(env, 'RUBRIC_MODEL_DEPLOYMENT')
   const modelName = optional(env, 'RUBRIC_MODEL_NAME')
   const reasoning = optional(env, 'RUBRIC_MODEL_REASONING_EFFORT')
-  if (!jobsEnabled || !endpointValue || !deploymentName || !modelName) {
-    throw new ConfigError('RUBRIC_ASSISTANT_ENABLED requires REAL_JOB_IMPORTS_ENABLED=true and RUBRIC_MODEL_ENDPOINT, RUBRIC_MODEL_DEPLOYMENT and RUBRIC_MODEL_NAME.')
+  if (!jobsEnabled || !(endpointValue || deploymentName || modelName)) return undefined
+  if (!endpointValue || !deploymentName || !modelName) {
+    throw new ConfigError('The rubric assistant model requires RUBRIC_MODEL_ENDPOINT, RUBRIC_MODEL_DEPLOYMENT and RUBRIC_MODEL_NAME together.')
   }
   if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(deploymentName)) throw new ConfigError('RUBRIC_MODEL_DEPLOYMENT must be an exact Azure deployment identifier.')
   if (reasoning && !['minimal', 'low', 'medium', 'high'].includes(reasoning)) throw new ConfigError('RUBRIC_MODEL_REASONING_EFFORT is unsupported.')

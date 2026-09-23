@@ -1,4 +1,5 @@
 import type { PublicFeaturesResponse, PublicSettings } from '../domain/admin-settings'
+import { rubricAssistantEnabled } from '../domain/feature-switches'
 import { JOB_IMPORT_LIMITS, type JobProcessingFeatures } from '../domain/real-jobs'
 import { RESUME_IMPORT_LIMITS, type ResumeProcessingFeatures } from '../domain/real-resumes'
 import { GRADE_LADDER_LIMITS, type GradeProcessingFeatures } from '../domain/real-grades'
@@ -79,7 +80,8 @@ export function jobFeaturesWithPolicy(features: JobProcessingFeatures, settings?
   const limits = clampClientLimits(JOB_IMPORT_LIMITS, features.limits)
   const intake = settings?.imports.jobs
   return { ...features, realJobImports: features.realJobImports && !admissionReason(settings, 'jobImports'),
-    rubricAssistant: features.rubricAssistant === true,
+    // Absent from older revisions means on, so this cannot use admissionReason's required-key check.
+    rubricAssistant: features.rubricAssistant === true && !admissionReason(settings) && (!settings || rubricAssistantEnabled(settings)),
     limits: clampClientLimits(JOB_IMPORT_LIMITS, { ...limits, ...(intake ? {
       maxFileBytes: intake.maxFileBytes, maxPdfBytes: intake.maxFileBytes, maxMarkdownBytes: intake.maxFileBytes,
       maxPdfPages: intake.maxPdfPages, maxSourceCharacters: intake.maxSourceCharacters, maxBatchFiles: intake.maxBatchItems,

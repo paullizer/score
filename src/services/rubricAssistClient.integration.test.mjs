@@ -52,6 +52,8 @@ before(async () => {
       export * from './src/services/realJobs'
       export { jobFeaturesWithPolicy } from './src/services/publicSettings'
       export { ASSIST_LIMITS } from './src/domain/assist'
+      export { createDefaultAdminSettings } from './src/domain/admin-settings-defaults'
+      export { captureProcessingSettings, projectPublicSettings } from './src/domain/admin-settings-resolver'
     ` },
     outfile: join(output, 'client.mjs'),
     bundle: true,
@@ -191,4 +193,22 @@ test('rubricAssistant feature mapping is true only when advertised', async () =>
     assert.equal(features.rubricAssistant, expected)
     assert.equal(client.jobFeaturesWithPolicy(features).rubricAssistant, expected)
   }
+})
+
+test('rubricAssistant also follows the Admin switch and new-work admission, and absent means on', async () => {
+  const policy = change => {
+    const settings = client.createDefaultAdminSettings()
+    change(settings)
+    return client.projectPublicSettings(client.captureProcessingSettings(settings, 'revision-1', '2026-01-01T00:00:00.000Z'))
+  }
+  const withPolicy = async (advertised, change) => {
+    globalThis.fetch = async () => json({ realJobImports: true, rubricAssistant: advertised })
+    return client.jobFeaturesWithPolicy(await client.fetchJobProcessingFeatures(), policy(change)).rubricAssistant
+  }
+  assert.equal(await withPolicy(true, () => {}), true, 'Revisions saved before the switch existed keep the assistant on')
+  assert.equal(await withPolicy(true, settings => { settings.features.rubricAssistant = true }), true)
+  assert.equal(await withPolicy(true, settings => { settings.features.rubricAssistant = false }), false)
+  assert.equal(await withPolicy(true, settings => { settings.maintenance.pauseNewWork = true }), false)
+  assert.equal(await withPolicy(true, settings => { settings.features.jobImports = false }), true, 'Turning off job imports does not turn off editing existing rubrics')
+  assert.equal(await withPolicy(false, settings => { settings.features.rubricAssistant = true }), false, 'The switch cannot enable an undeployed model')
 })

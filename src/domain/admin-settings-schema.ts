@@ -80,6 +80,8 @@ const settingsObject = z.strictObject({
   features: z.strictObject({
     jobImports: z.boolean(), resumeImports: z.boolean(), gradeLadders: z.boolean(), newAnalyses: z.boolean(),
     summaryGeneration: z.boolean(), samplesVisible: z.boolean(),
+    // Optional, never defaulted here: absent keeps earlier revisions and captured snapshots byte-identical.
+    rubricAssistant: z.boolean().optional(),
   }),
   maintenance: z.strictObject({ pauseNewWork: z.boolean(), explanation: text(1000) }),
   imports: z.strictObject({

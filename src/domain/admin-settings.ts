@@ -103,6 +103,8 @@ export interface AdminSettings {
     newAnalyses: boolean
     summaryGeneration: boolean
     samplesVisible: boolean
+    /** Optional so earlier revisions and captures keep their exact shape; absent means on. Read it with rubricAssistantEnabled(). */
+    rubricAssistant?: boolean
   }
   maintenance: { pauseNewWork: boolean; explanation: string }
   imports: {
@@ -402,3 +404,4 @@ export {
   captureProcessingSettings, captureQcProcessingSettings, resolveTaskModel, projectPublicSettings,
   runtimeSettingsReadiness, diffAdminSettings, hostMatchesRule, urlAllowedBySettings,
 } from './admin-settings-resolver'
+export { rubricAssistantEnabled } from './feature-switches'
