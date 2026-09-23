@@ -40,7 +40,7 @@ export function ThemeControl() {
   }
   return <div className="theme-control" role="group" aria-label="Appearance">
     {([{ value: 'light', icon: Sun }, { value: 'dark', icon: Moon }, { value: 'system', icon: Monitor }] as const).map(({ value, icon: Icon }) =>
-      <button key={value} type="button" aria-label={`Use ${value} theme`} title={hostTheme ? 'Theme is controlled by the host preview' : `${value[0].toUpperCase()}${value.slice(1)} theme`}
+      <button key={value} type="button" aria-label={`Use ${value} theme`} title={hostTheme ? 'Theme is controlled by the host application' : `${value[0].toUpperCase()}${value.slice(1)} theme`}
         aria-pressed={(hostTheme ?? theme) === value} disabled={Boolean(hostTheme)} onClick={() => change(value)}><Icon size={15} /></button>)}
     {saveError && <span className="sr-only" role="status">{saveError}</span>}
   </div>

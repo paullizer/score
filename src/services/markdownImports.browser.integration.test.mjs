@@ -26,8 +26,8 @@ test('browser imports Markdown through job drop and resume picker, then highligh
   page.on('pageerror', error => errors.push(error.message))
   try {
     await page.goto(`${fixture.origin}/workspaces/${fixture.workspaceId}/jobs`)
-    await page.getByRole('button', { name: 'About this application', exact: true }).click()
-    const about = page.getByRole('dialog', { name: 'A clearer way to see the fit', exact: true })
+    await page.locator('.sidebar').getByRole('button', { name: 'About Score', exact: true }).click()
+    const about = page.getByRole('dialog', { name: 'About Score', exact: true })
     await about.waitFor({ state: 'visible' })
     const aboutText = await about.innerText()
     assert.match(aboutText, /Markdown uploads use \.md or \.markdown files/)

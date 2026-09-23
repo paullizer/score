@@ -1,8 +1,9 @@
-import { useState } from 'react'
+import { useRef, useState } from 'react'
 import { Link, NavLink, Navigate, Route, Routes, useLocation, useNavigate } from 'react-router-dom'
-import { ArrowUpRight, BarChart3, BriefcaseBusiness, Check, ChevronRight, CircleHelp, ClipboardCheck, Files, FlaskConical, Layers3, LayoutGrid, Menu, Plus, Settings, ShieldCheck, Users, X } from 'lucide-react'
+import { ArrowUpRight, BarChart3, BookOpen, BriefcaseBusiness, Check, ChevronLeft, ChevronRight, CircleHelp, ClipboardCheck, Files, FlaskConical, Info, Layers3, LayoutGrid, LifeBuoy, Menu, Plus, Settings, ShieldCheck, Users, X } from 'lucide-react'
 import { useWorkspace } from './workspace-context'
 import { ThemeControl } from './ThemeControl'
+import { useSidebarCollapsed } from './sidebar-preference'
 import { Badge, Button, EmptyState, Modal } from '../components/ui'
 import { WorkspaceSwitcher } from '../components/workspace/WorkspaceSwitcher'
 import { AccountPanel } from '../components/workspace/AccountPanel'
@@ -35,16 +36,21 @@ function active(workspace: Workspace, kind: 'job' | 'resume' | 'analysis', id: s
   return !isEntityArchived(workspace, { kind, id }) && !isEntityRemoved(workspace, { kind, id })
 }
 
-function QcNavigation({ onNavigate }: { onNavigate?: () => void }) {
-  return <nav className="main-nav" aria-label="QC navigation">
-    <NavLink to="/qc" end onClick={onNavigate} className={({ isActive }) => `nav-item ${isActive ? 'is-active' : ''}`}><ClipboardCheck size={18} /><span>Reviews</span></NavLink>
-    <NavLink to="/qc/improvements" onClick={onNavigate} className={({ isActive }) => `nav-item ${isActive ? 'is-active' : ''}`}><FlaskConical size={18} /><span>Quality improvement</span></NavLink>
-    <NavLink to="/qc/prompts" onClick={onNavigate} className={({ isActive }) => `nav-item ${isActive ? 'is-active' : ''}`}><Layers3 size={18} /><span>Prompt versions</span></NavLink>
-    <Link to="/analyses" className="nav-item" onClick={onNavigate}><BarChart3 size={18} /><span>Return to normal mode</span></Link>
-  </nav>
+const navClass = ({ isActive }: { isActive: boolean }) => isActive ? 'nav-item is-active' : 'nav-item'
+
+function QcNavigation({ onNavigate, collapsed = false }: { onNavigate?: () => void; collapsed?: boolean }) {
+  const items = [
+    { to: '/qc', label: 'Reviews', icon: ClipboardCheck, end: true },
+    { to: '/qc/improvements', label: 'Quality improvement', icon: FlaskConical, end: false },
+    { to: '/qc/prompts', label: 'Prompt versions', icon: Layers3, end: false },
+  ]
+  return <nav className="main-nav" aria-label="QC navigation">{items.map(({ to, label, icon: Icon, end }) =>
+    <NavLink key={to} to={to} end={end} onClick={onNavigate} title={collapsed ? label : undefined} className={navClass}>
+      <Icon size={18} strokeWidth={1.7} aria-hidden="true" /><span className="nav-label">{label}</span>
+    </NavLink>)}</nav>
 }
 
-function Navigation({ onNavigate }: { onNavigate?: () => void }) {
+function Navigation({ onNavigate, collapsed = false }: { onNavigate?: () => void; collapsed?: boolean }) {
   const { workspace } = useWorkspace()
   const gradeLadders = useGradeLadders()
   const realResumes = useRealResumes()
@@ -58,9 +64,28 @@ function Navigation({ onNavigate }: { onNavigate?: () => void }) {
     { to: '/analyses', label: 'Analyses', icon: BarChart3, count: (realAnalyses?.summaries ?? []).filter((item) => active(workspace, 'analysis', item.run.id)).length },
   ]
   return <nav className="main-nav" aria-label="Main navigation">{items.map(({ to, label, icon: Icon, count }) =>
-    <NavLink key={to} to={to} onClick={onNavigate} className={({ isActive }) => isActive || (to === '/rubrics' && location.pathname.startsWith('/grade-ladders')) ? 'nav-item is-active' : 'nav-item'}>
-      <Icon size={18} strokeWidth={1.7} /><span>{label}</span><span className="nav-count">{count}</span>
+    <NavLink key={to} to={to} onClick={onNavigate} title={collapsed ? `${label} · ${count}` : undefined} className={({ isActive }) => navClass({ isActive: isActive || (to === '/rubrics' && location.pathname.startsWith('/grade-ladders')) })}>
+      <Icon size={18} strokeWidth={1.7} aria-hidden="true" /><span className="nav-label">{label}</span><span className="nav-count">{count}</span>
     </NavLink>)}</nav>
+}
+
+// Administration, About, and configured help links share the main navigation's item styling.
+function SidebarLinks({ title, collapsed = false, onAbout, onLeave }: { title: string; collapsed?: boolean; onAbout: () => void; onLeave?: () => void }) {
+  const application = useApplicationNavigation()
+  const help = usePublicSettings().settings?.help
+  const tip = (label: string) => collapsed ? label : undefined
+  return <div className="sidebar-links">
+    {application?.applicationAdmin && <button type="button" className="nav-item" title={tip('Application settings')} onClick={() => { onLeave?.(); void application.openAdminSettings() }}>
+      <Settings size={18} strokeWidth={1.7} aria-hidden="true" /><span className="nav-label">Application settings</span></button>}
+    {application?.applicationAdmin && <button type="button" className="nav-item" title={tip('Users / user access')} onClick={() => { onLeave?.(); void application.openAdminUsers() }}>
+      <Users size={18} strokeWidth={1.7} aria-hidden="true" /><span className="nav-label">Users / user access</span></button>}
+    <button type="button" className="nav-item" title={tip(`About ${title}`)} onClick={onAbout}>
+      <Info size={18} strokeWidth={1.7} aria-hidden="true" /><span className="nav-label">About {title}</span></button>
+    {help?.supportUrl && <a className="nav-item" href={help.supportUrl} target="_blank" rel="noopener noreferrer" title={tip('Support')}>
+      <LifeBuoy size={18} strokeWidth={1.7} aria-hidden="true" /><span className="nav-label">Support</span><ArrowUpRight size={13} className="nav-external" aria-hidden="true" /></a>}
+    {help?.documentationUrl && <a className="nav-item" href={help.documentationUrl} target="_blank" rel="noopener noreferrer" title={tip('Documentation')}>
+      <BookOpen size={18} strokeWidth={1.7} aria-hidden="true" /><span className="nav-label">Documentation</span><ArrowUpRight size={13} className="nav-external" aria-hidden="true" /></a>}
+  </div>
 }
 
 export function App() {
@@ -70,6 +95,9 @@ export function App() {
   const [showAbout, setShowAbout] = useState(false)
   const [mobileNav, setMobileNav] = useState(false)
   const [navigationError, setNavigationError] = useState('')
+  const [collapsed, toggleCollapsed] = useSidebarCollapsed()
+  const aboutAfterDrawer = useRef(false)
+  const menuButton = useRef<HTMLButtonElement>(null)
   const navigate = useNavigate()
   const location = useLocation()
   const policy = usePublicSettings()
@@ -89,44 +117,45 @@ export function App() {
     setNavigationError('')
     void application?.openWorkspaceHome().catch((caught) => setNavigationError(caught instanceof Error ? caught.message : 'Workspace home could not be opened. Your current workspace has been kept.'))
   }
-  const brand = <><span className="brand-mark"><Layers3 size={22} strokeWidth={2} /></span><span>{title}</span></>
+  const brand = <><span className="brand-mark"><Layers3 size={22} strokeWidth={2} /></span><span className="brand-title">{title}</span></>
+  const brandTip = collapsed ? `${title} home` : undefined
+  const toggleLabel = collapsed ? 'Expand navigation' : 'Collapse navigation'
   const activeJobs = workspace.jobs.filter((job) => active(workspace, 'job', job.id)).length
   const activeResumes = (realResumes?.summaries ?? []).filter((item) => active(workspace, 'resume', item.resume.id)).length
 
   return <LifecycleDialogProvider><div className="app-layout">
     <a className="skip-link" href="#main-content">Skip to content</a>
-    <aside className="sidebar">
-      {application ? <a href={application.workspaceHomePath} className="brand" aria-label={`${title} home`} onClick={(event) => {
-        if (event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return
-        event.preventDefault(); openWorkspaceHome()
-      }}>{brand}</a> : <Link to={defaultApplicationPage(policy.settings)} className="brand" aria-label={`${title} home`}>{brand}</Link>}
-      {application && <Button className="workspace-home-nav" variant="ghost" icon={LayoutGrid} onClick={openWorkspaceHome}>All workspaces</Button>}
-      <WorkspaceSwitcher cloud={cloud} />
-      <div className="nav-heading">{isQc ? 'QUALITY CONTROL MODE' : 'WORKSPACE'}</div>
-      {isQc ? <QcNavigation /> : <Navigation />}
-      {!isQc && canReview && <Link className="nav-item" to="/qc"><ClipboardCheck size={18} /><span>Enter QC mode</span></Link>}
-      {application?.applicationAdmin && <Button variant="ghost" icon={Settings} onClick={() => void application.openAdminSettings()}>Application settings</Button>}
-      {application?.applicationAdmin && <Button variant="ghost" icon={Users} onClick={() => void application.openAdminUsers()}>Users / user access</Button>}
+    <aside id="primary-navigation" className={collapsed ? 'sidebar is-collapsed' : 'sidebar'}>
+      <div className="sidebar-brand-row">
+        {application ? <a href={application.workspaceHomePath} className="brand" aria-label={`${title} home`} title={brandTip} onClick={(event) => {
+          if (event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return
+          event.preventDefault(); openWorkspaceHome()
+        }}>{brand}</a> : <Link to={defaultApplicationPage(policy.settings)} className="brand" aria-label={`${title} home`} title={brandTip}>{brand}</Link>}
+        <button type="button" className="sidebar-toggle" onClick={toggleCollapsed} aria-expanded={!collapsed} aria-controls="primary-navigation" aria-label={toggleLabel} title={toggleLabel}>
+          {collapsed ? <ChevronRight size={16} aria-hidden="true" /> : <ChevronLeft size={16} aria-hidden="true" />}
+        </button>
+      </div>
+      <div className="sidebar-scroll">
+        {application && <button type="button" className="nav-item sidebar-home" title={collapsed ? 'All workspaces' : undefined} onClick={openWorkspaceHome}>
+          <LayoutGrid size={18} strokeWidth={1.7} aria-hidden="true" /><span className="nav-label">All workspaces</span></button>}
+        <WorkspaceSwitcher cloud={cloud} compact={collapsed} />
+        <div className="nav-heading">{isQc ? 'QUALITY CONTROL MODE' : 'WORKSPACE'}</div>
+        {isQc ? <QcNavigation collapsed={collapsed} /> : <Navigation collapsed={collapsed} />}
+        <SidebarLinks title={title} collapsed={collapsed} onAbout={() => setShowAbout(true)} />
+      </div>
       <div className="sidebar-bottom">
-        <div className="sidebar-note"><span className="small-symbol"><ShieldCheck size={19} /></span><strong>Evidence, not impressions.</strong><p>Clear criteria. Traceable matches.<br />A human makes the decision.</p>
-          <button className="text-link" onClick={() => setShowAbout(true)}>About this preview <ArrowUpRight size={13} /></button>
-          {policy.settings?.help.supportUrl && <a className="text-link" href={policy.settings.help.supportUrl} target="_blank" rel="noopener noreferrer">Support <ArrowUpRight size={13} /></a>}
-          {policy.settings?.help.documentationUrl && <a className="text-link" href={policy.settings.help.documentationUrl} target="_blank" rel="noopener noreferrer">Documentation <ArrowUpRight size={13} /></a>}
-        </div>
-        <div className="sidebar-utility"><span>Appearance</span><ThemeControl /></div>
-        <AccountPanel user={cloud.user} signOut={cloud.signOut} />
-        <div className="sidebar-version">{title} / UI PREVIEW <span>V0.1</span></div>
+        <div className="sidebar-utility"><span className="sidebar-utility-label">Appearance</span><ThemeControl /></div>
+        <AccountPanel user={cloud.user} signOut={cloud.signOut} compact={collapsed} />
       </div>
     </aside>
     <div className="app-body">
       <header className="topbar">
-        <div className="flex items-center gap-3"><Button variant="ghost" icon={Menu} className="mobile-menu icon-button" aria-label="Open navigation" onClick={() => setMobileNav(true)} />
+        <div className="flex items-center gap-3"><Button ref={menuButton} variant="ghost" icon={Menu} className="mobile-menu icon-button" aria-label="Open navigation" onClick={() => setMobileNav(true)} />
           <div className="breadcrumbs"><span>Workspace</span><ChevronRight size={12} /><Link to={`/${section}`}>{isQc ? 'Quality control' : section[0].toUpperCase() + section.slice(1)}</Link>{isDetail && <><ChevronRight size={12} /><span>Review</span></>}</div>
         </div>
         <div className="topbar-actions">
           {isQc ? <><Badge tone="accent">QC mode</Badge><Button size="sm" onClick={() => navigate('/analyses')}>Normal mode</Button></>
-            : <><button className="about-chip" onClick={() => setShowAbout(true)}><CircleHelp size={13} />About this application</button>
-              {canReview && <Button size="sm" icon={ClipboardCheck} onClick={() => navigate('/qc')}>QC mode</Button>}
+            : <>{canReview && <Button size="sm" icon={ClipboardCheck} onClick={() => navigate('/qc')}>QC mode</Button>}
               <Button variant="primary" size="sm" icon={Plus} title={analysisPolicyReason ?? undefined} disabled={!canEdit || Boolean(analysisPolicyReason || !realAnalyses?.canWrite || realAnalyses.phase !== 'ready' || !realAnalyses.features?.realAnalyses)}
                 onClick={() => navigate('/analyses/new')}>New analysis</Button></>}
         </div>
@@ -160,18 +189,23 @@ export function App() {
       </main>
     </div>
     {notice && <div className="toast" role="status"><span className="toast-icon"><Check size={16} /></span><p>{notice}</p><Button variant="ghost" className="icon-button" size="sm" icon={X} aria-label="Dismiss notification" onClick={clearNotice} /></div>}
-    <Modal open={mobileNav} onOpenChange={setMobileNav} title="Your workspace" description="Explore your jobs, resumes, rubrics, and analyses." drawer>
-      {application && <Button className="mb-4" variant="ghost" icon={LayoutGrid} onClick={() => { setMobileNav(false); openWorkspaceHome() }}>All workspaces</Button>}
+    <Modal open={mobileNav} onOpenChange={setMobileNav} title="Your workspace" description="Explore your jobs, resumes, rubrics, and analyses." drawer
+      onCloseAutoFocus={(event) => {
+        event.preventDefault()
+        menuButton.current?.focus()
+        // About opens only after the drawer has returned focus, so closing About returns to the menu button too.
+        if (!aboutAfterDrawer.current) return
+        aboutAfterDrawer.current = false
+        setShowAbout(true)
+      }}>
+      {application && <button type="button" className="nav-item mb-4" onClick={() => { setMobileNav(false); openWorkspaceHome() }}>
+        <LayoutGrid size={18} strokeWidth={1.7} aria-hidden="true" /><span className="nav-label">All workspaces</span></button>}
       <div className="mb-5 space-y-3"><WorkspaceSwitcher cloud={cloud} /><AccountPanel user={cloud.user} signOut={cloud.signOut} /></div>
-      {isQc ? <QcNavigation onNavigate={() => setMobileNav(false)} /> : <><Navigation onNavigate={() => setMobileNav(false)} />
-        {canReview && <Link className="nav-item" to="/qc" onClick={() => setMobileNav(false)}><ClipboardCheck size={18} /><span>Enter QC mode</span></Link>}</>}
+      {isQc ? <QcNavigation onNavigate={() => setMobileNav(false)} /> : <Navigation onNavigate={() => setMobileNav(false)} />}
+      <SidebarLinks title={title} onLeave={() => setMobileNav(false)} onAbout={() => { aboutAfterDrawer.current = true; setMobileNav(false) }} />
       <div className="mobile-appearance"><span>Appearance</span><ThemeControl /></div>
-      {application?.applicationAdmin && <Button icon={Settings} onClick={() => { setMobileNav(false); void application.openAdminSettings() }}>Application settings</Button>}
-      {application?.applicationAdmin && <Button icon={Users} onClick={() => { setMobileNav(false); void application.openAdminUsers() }}>Users / user access</Button>}
-      {policy.settings?.help.supportUrl && <a className="text-link" href={policy.settings.help.supportUrl} target="_blank" rel="noopener noreferrer">Support</a>}
-      {policy.settings?.help.documentationUrl && <a className="text-link" href={policy.settings.help.documentationUrl} target="_blank" rel="noopener noreferrer">Documentation</a>}
     </Modal>
-    <Modal open={showAbout} onOpenChange={setShowAbout} title="A clearer way to see the fit" description="Score / interactive UI preview"
+    <Modal open={showAbout} onOpenChange={setShowAbout} title={`About ${title}`} description="How it works, current limits, and privacy"
       footer={<Button variant="primary" onClick={() => setShowAbout(false)}>Back to the workspace</Button>}>
       <div className="about-illustration"><BriefcaseBusiness /><ChevronRight /><Layers3 /><ChevronRight /><BarChart3 /></div>
       <h3 className="mb-3 text-lg font-semibold">A job. A rubric. The evidence.</h3>

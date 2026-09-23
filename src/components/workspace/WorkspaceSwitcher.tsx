@@ -6,15 +6,17 @@ import { WorkspaceDirectory, type WorkspaceDirectoryActions } from './WorkspaceD
 
 export type { WorkspaceDirectoryActions } from './WorkspaceDirectory'
 
-export function WorkspaceSwitcher({ cloud, empty = false }: { cloud: WorkspaceDirectoryActions; empty?: boolean }) {
+export function WorkspaceSwitcher({ cloud, empty = false, compact = false }: { cloud: WorkspaceDirectoryActions; empty?: boolean; compact?: boolean }) {
   const [open, setOpen] = useState(false)
   const [busy, setBusy] = useState(false)
   const current = cloud.workspaces.find((item) => item.id === cloud.currentWorkspaceId)
   if (empty) return <WorkspaceDirectory cloud={cloud} initialFilter="all" />
+  const name = current?.name ?? 'Workspace'
+  const detail = current?.archivedAt ? 'Archived · read only' : current?.accessSource === 'application-admin' ? 'Application administrator · cloud' : current ? `${workspaceRoleLabel(current.role)} · cloud` : 'Cloud workspace'
   return <>
-    <button type="button" className="workspace-label workspace-switcher-trigger" onClick={() => setOpen(true)} aria-haspopup="dialog">
+    <button type="button" className="workspace-label workspace-switcher-trigger" onClick={() => setOpen(true)} aria-haspopup="dialog" title={compact ? `${name}\n${detail}` : undefined}>
       <span className="workspace-monogram">{(current?.name ?? 'W').trim().slice(0, 1).toUpperCase()}</span>
-      <div><strong>{current?.name ?? 'Workspace'}</strong><span>{current?.archivedAt ? 'Archived · read only' : current?.accessSource === 'application-admin' ? 'Application administrator · cloud' : current ? `${workspaceRoleLabel(current.role)} · cloud` : 'Cloud workspace'}</span></div>
+      <div><strong>{name}</strong><span>{detail}</span></div>
       <ChevronsUpDown size={14} className="workspace-switcher-caret" aria-hidden="true" />
     </button>
     <Modal open={open} onOpenChange={setOpen} dismissDisabled={busy} title="My workspaces"

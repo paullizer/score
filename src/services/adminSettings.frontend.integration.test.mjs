@@ -794,7 +794,8 @@ test('policy appearance, hidden cloud sample affordances, default navigation, an
     assert.equal(document.querySelector('.library-kind-switcher'), null)
     // No Samples switcher, sample reset, sample save status, or any other sample wording remains.
     assert.doesNotMatch(document.body.textContent, /\bsamples?\b|saved on this device/i)
-    assert.equal(document.querySelector('.about-chip')?.textContent.trim(), 'About this application')
+    assert.equal(document.querySelector('.about-chip'), null)
+    assert.ok([...document.querySelectorAll('.sidebar-links button.nav-item')].some(item => item.textContent.trim() === 'About Agency evidence'))
   }
   const tree = path => element(ui.PublicSettingsContext.Provider, { value: { settings: projection(), phase: 'ready', error: null, cloud: true, refresh: async () => {} } },
     element(ui.WorkspaceContext.Provider, { value: context }, element(ui.MemoryRouter, { key: path, initialEntries: [path],

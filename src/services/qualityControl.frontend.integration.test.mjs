@@ -1085,6 +1085,9 @@ test('prompt history comparison is read-only; restore requires rationale, curren
 test('QC app routing honors basename, focuses navigation, and normal mode keeps its existing navigation', async () => {
   await render('/qc', { app: true })
   assert.ok(document.querySelector('[aria-label="QC navigation"]'))
+  assert.deepEqual([...document.querySelectorAll('[aria-label="QC navigation"] a')].map(item => item.textContent), ['Reviews', 'Quality improvement', 'Prompt versions'],
+    'The QC sidebar leaves the return to normal mode to the top bar')
+  assert.equal(document.querySelector('.sidebar').textContent.includes('Return to normal mode'), false)
   assert.equal(document.querySelector('[aria-label="Main navigation"]'), null)
   assert.equal([...document.querySelectorAll('button')].some(item => item.textContent.trim() === 'New analysis'), false)
   assert.ok([...document.querySelectorAll('a')].some(item => item.href.endsWith('/workspaces/workspace-one/qc/improvements')))
