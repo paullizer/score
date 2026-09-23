@@ -634,7 +634,7 @@ This refreshes App Service's versionless Key Vault reference. `.azure\` and loca
 
 ### Cloud workspaces and individual sharing
 
-The browser app is always the authenticated workspace app. It never falls back to local fixtures if authentication or cloud storage fails. Signing in or refreshing a session does **not** create a personal workspace. Users see assigned workspaces, an explicit creation action when permitted, or a no-access empty state directing them to an Owner for sharing or an application Admin for creation rights. Existing workspaces and memberships remain intact, but existing non-admin owners do not automatically receive creation grants. Workspace links include `/workspaces/<id>/` so a bookmark cannot silently resolve against a different selected workspace.
+The browser app is always the authenticated workspace app. It has no local-data fallback if authentication or cloud storage fails. Signing in or refreshing a session does **not** create a personal workspace. Users see assigned workspaces, an explicit creation action when permitted, or a no-access empty state directing them to an Owner for sharing or an application Admin for creation rights. Existing workspaces and memberships remain intact, but existing non-admin owners do not automatically receive creation grants. Workspace links include `/workspaces/<id>/` so a bookmark cannot silently resolve against a different selected workspace.
 
 #### Compatibility notes
 
