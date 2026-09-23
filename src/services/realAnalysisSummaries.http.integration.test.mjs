@@ -19,8 +19,7 @@ before(async () => {
   const built = await Promise.all([
     buildResumeAnalysisTestRuntime(),
     build({ entryPoints: [join('src', 'services', 'realAnalyses.ts')], outfile: join(output, 'client.mjs'),
-      bundle: true, packages: 'external', format: 'esm', platform: 'node', logLevel: 'silent',
-      define: { 'import.meta.env.VITE_DEPLOYMENT_MODE': '"cloud"' } }),
+      bundle: true, packages: 'external', format: 'esm', platform: 'node', logLevel: 'silent' }),
   ])
   runtime = built[0]
   client = await import(pathToFileURL(join(output, 'client.mjs')).href)

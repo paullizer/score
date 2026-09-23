@@ -76,7 +76,6 @@ before(async () => {
     bundle: true,
     format: 'esm',
     platform: 'browser',
-    define: { 'import.meta.env.VITE_DEPLOYMENT_MODE': '"cloud"' },
     logLevel: 'silent',
   })
   client = await import(`${pathToFileURL(outfile).href}?test=${Date.now()}`)
@@ -105,8 +104,7 @@ before(async () => {
       export { uploadFileByteLimit } from './src/services/documentUploads';
       export { MemoryRouter, Routes, Route } from 'react-router-dom';
     ` },
-    outfile: uiOutfile, bundle: true, packages: 'external', format: 'esm', platform: 'node', jsx: 'automatic',
-    define: { 'import.meta.env.VITE_DEPLOYMENT_MODE': '"cloud"' }, logLevel: 'silent',
+    outfile: uiOutfile, bundle: true, packages: 'external', format: 'esm', platform: 'node', jsx: 'automatic', logLevel: 'silent',
   })
   ui = await import(pathToFileURL(uiOutfile).href)
 })
@@ -356,37 +354,19 @@ test('sends direct URL imports as JSON with the same idempotency key', async () 
   })
 })
 
-test('projects server records over colliding sample ids without mutating legacy state', () => {
+test('projects server records over colliding legacy ids without mutating base lifecycle', () => {
   const updatedAt = '2026-09-17T00:00:00.000Z'
   const server = summary('shared-job', updatedAt)
   server.job.documentId = 'shared-document'
   server.job.rubricId = 'shared-rubric'
-  const legacy = {
-    schemaVersion: 1,
-    jobs: [{ ...server.job, title: 'Sample collision', dataKind: undefined }],
-    resumes: [],
-    documents: [{ id: 'shared-document', title: 'Fictional filler', kind: 'job', version: 1, paragraphs: [], sample: true }],
-    rubrics: [{
-      id: 'shared-rubric',
-      groupId: 'sample-group',
-      kind: 'job',
-      jobId: 'shared-job',
-      name: 'Sample collision',
-      description: 'Must not leak into the real job',
-      version: 1,
-      criteria: [],
-      createdAt: updatedAt,
-    }],
-    runs: [],
-  }
+  const legacy = { jobs: [], documents: [], rubrics: [], lifecycle: { entities: { 'resume:legacy': { archivedAt: updatedAt } } } }
 
   const projected = projection.projectRealJobs(legacy, [server], [])
 
   assert.equal(projected.jobs[0].dataKind, 'real')
   assert.equal(projected.documents.some((document) => document.id === 'shared-document'), false)
   assert.equal(projected.rubrics.some((rubric) => rubric.id === 'shared-rubric'), false)
-  assert.equal(legacy.documents[0].sample, true)
-  assert.equal(legacy.jobs[0].title, 'Sample collision')
+  assert.equal(legacy.lifecycle.entities['resume:legacy'].archivedAt, updatedAt)
 })
 
 test('unwraps authoritative rubric detail from the PUT job envelope', async () => {
@@ -446,11 +426,11 @@ test('lifecycle preview and mutation use logical scope, exact ETag, and preserve
   assert.equal(result.deleted, undefined)
 })
 
-test('authoritative projections discard stale deleted rubric details and never write real lifecycle into samples', () => {
+test('authoritative projections discard stale deleted rubric details and preserve unrelated base lifecycle', () => {
   const time = '2026-09-18T00:00:00.000Z'
   const rubric = { id: 'old-version', groupId: 'real-group', jobId: 'real-job', kind: 'job', name: 'Real rubric', description: '', version: 1, criteria: [], createdAt: time, dataKind: 'real' }
   const old = summary('real-job', time, rubric)
-  const legacy = { schemaVersion: 1, jobs: [], resumes: [], documents: [], rubrics: [], runs: [], lifecycle: { entities: { 'resume:sample-resume': { archivedAt: time } } } }
+  const legacy = { jobs: [], documents: [], rubrics: [], lifecycle: { entities: { 'resume:sample-resume': { archivedAt: time } } } }
   const baseline = structuredClone(legacy)
   const current = { ...old, etag: '"new"', lifecycle: { archivedAt: time }, rubricLifecycle: { deletedAt: time }, job: { ...old.job, rubricId: null, rubricDeletedAt: time }, rubric: null }
   const staleDetail = { ...old, document: { id: 'real-document' }, rubricVersions: [rubric] }
@@ -469,7 +449,7 @@ test('pending deletion retains only recovery metadata, never source documents or
   const time = '2026-09-18T00:00:00.000Z'
   const rubric = { id: 'pending-rubric', groupId: 'pending-group', jobId: 'pending-job', kind: 'job', name: 'Pending rubric', description: '', version: 1, criteria: [], createdAt: time, dataKind: 'real' }
   const pending = { ...summary('pending-job', time, rubric), lifecycle: { deletingAt: time } }
-  const legacy = { schemaVersion: 1, jobs: [], resumes: [], documents: [], rubrics: [], runs: [] }
+  const legacy = { jobs: [], documents: [], rubrics: [] }
   const projected = projection.projectRealJobs(legacy, [pending], [{ ...pending, document: { id: 'private-source' }, rubricVersions: [rubric] }])
   assert.equal(projected.jobs[0].id, 'pending-job')
   assert.equal(projected.lifecycle.entities['job:pending-job'].deletingAt, time)
@@ -481,7 +461,7 @@ test('pending deletion retains only recovery metadata, never source documents or
 function workspaceValue(records = []) {
   return frontendWorkspaceContext({
     workspace: {
-      schemaVersion: 1, jobs: records.map((item) => item.job), resumes: [], runs: [],
+      jobs: records.map((item) => item.job),
       documents: records.flatMap((item) => item.document ? [item.document] : []),
       rubrics: records.flatMap((item) => item.rubricVersions ?? (item.rubric ? [item.rubric] : [])),
     },
@@ -656,9 +636,9 @@ for (const policyUnavailable of [false, true]) {
       throw new Error(`Unexpected bootstrap request: ${url}`)
     }
     const value = workspaceValue()
-    const { cloud, ...legacyValue } = value
+    const { cloud, ...base } = value
     await mount(React.createElement(React.StrictMode, null,
-      React.createElement(ui.RealJobsBridge, { workspaceId: 'workspace-one', legacyValue, cloud },
+      React.createElement(ui.RealJobsBridge, { workspaceId: 'workspace-one', base, cloud },
         React.createElement(JobsProbe))), value, `/jobs/${record.job.id}`)
     for (let index = 0; index < 30 && (current?.phase !== 'ready' || current.detail(record.job.id).state !== 'ready'); index++) {
       await act(async () => { await new Promise(resolve => setTimeout(resolve, 0)) })
@@ -678,7 +658,7 @@ for (const policyUnavailable of [false, true]) {
   })
 }
 
-test('job rename projects acknowledged metadata and preserves ready source details outside sample persistence', async () => {
+test('job rename projects acknowledged metadata and preserves ready source details outside the base workspace', async () => {
   let record = markdownDetail()
   const original = structuredClone(record)
   const baseEtag = record.etag
@@ -697,8 +677,8 @@ test('job rename projects acknowledged metadata and preserves ready source detai
     throw new Error(`Unexpected metadata dependency request: ${url}`)
   }
   const value = workspaceValue()
-  const { cloud, ...legacyValue } = value
-  await mount(React.createElement(ui.RealJobsBridge, { workspaceId: 'workspace-one', legacyValue, cloud },
+  const { cloud, ...base } = value
+  await mount(React.createElement(ui.RealJobsBridge, { workspaceId: 'workspace-one', base, cloud },
     React.createElement(RenameProbe)), value)
   for (let index = 0; index < 30 && projected?.cloud.realJobs.phase !== 'ready'; index++) {
     await act(async () => { await new Promise(resolve => setTimeout(resolve, 0)) })
@@ -712,7 +692,7 @@ test('job rename projects acknowledged metadata and preserves ready source detai
   assert.equal(projected.cloud.realJobs.detail(record.job.id).state, 'ready')
   assert.equal(projected.cloud.realJobs.detail(record.job.id).value.document, document)
   assert.deepEqual(record.job, original.job)
-  assert.deepEqual(legacyValue.workspace.jobs, [])
+  assert.deepEqual(base.workspace.jobs, [])
   assert.equal(requests.filter(request => request.init.method === 'PATCH').length, 1)
 })
 
@@ -724,8 +704,8 @@ test('job bridge fails closed for unadvertised Markdown without blocking PDF or 
     return json({ job: summary(`job-${requests.length}`, '2026-09-17T00:00:00.000Z') }, 202)
   }
   const value = workspaceValue()
-  const { cloud, ...legacyValue } = value
-  await mount(React.createElement(ui.RealJobsBridge, { workspaceId: 'workspace-one', legacyValue, cloud },
+  const { cloud, ...base } = value
+  await mount(React.createElement(ui.RealJobsBridge, { workspaceId: 'workspace-one', base, cloud },
     React.createElement(JobsProbe)), value)
   for (let index = 0; index < 30 && current?.phase !== 'ready'; index++) {
     await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)) })
@@ -758,28 +738,6 @@ function markdownDetail() {
     source: { kind: 'markdown', displayName: 'role.MD', originalContentType: 'text/markdown' }, document, rubric, rubricVersions: [rubric],
   }
 }
-
-test('real job source badges and Markdown filtering do not add Markdown controls to samples', async () => {
-  const markdown = markdownDetail()
-  const pdf = summary('pdf-job', '2026-09-17T00:00:00.000Z')
-  pdf.job.source = 'pdf'
-  pdf.source = { kind: 'pdf', displayName: 'role.pdf' }
-  const value = workspaceValue([markdown, pdf])
-  value.workspace.jobs.push({ ...pdf.job, id: 'sample-job', dataKind: undefined })
-  await mount(React.createElement(ui.JobsPage), value)
-  const select = dom.window.document.querySelector('select[aria-label="Filter by source"]')
-  assert.ok(select.querySelector('option[value="markdown"]'))
-  assert.match(dom.window.document.querySelector('tbody').textContent, /Markdown document/)
-  await act(async () => { select.value = 'markdown'; select.dispatchEvent(new dom.window.Event('change', { bubbles: true })) })
-  assert.equal(dom.window.document.querySelectorAll('tbody tr').length, 1)
-  assert.match(dom.window.document.querySelector('tbody').textContent, /markdown-job/)
-  const samples = [...dom.window.document.querySelectorAll('[aria-label="Choose real jobs or samples"] button')].find((button) => button.textContent.startsWith('Samples'))
-  await act(async () => samples.click())
-  const sampleSource = dom.window.document.querySelector('select[aria-label="Filter by source"]')
-  assert.equal(sampleSource.value, 'all')
-  assert.equal(sampleSource.querySelector('option[value="markdown"]'), null)
-  assert.match(dom.window.document.querySelector('tbody').textContent, /pdf-job/)
-})
 
 test('job and rubric evidence use Markdown sections and highlight exact plain-text citations', async () => {
   const saved = markdownDetail()

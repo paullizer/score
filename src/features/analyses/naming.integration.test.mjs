@@ -49,10 +49,9 @@ before(async () => {
     export { RealAnalysesPage } from './src/features/analyses/RealAnalysesPage';
     export { RealAnalysisSetup } from './src/features/analyses/RealAnalysisSetup';
     export { RealAnalysisDetail } from './src/features/analyses/RealAnalysisDetail';
-    export { createInitialWorkspace } from './src/data/fixtures';
     export { MemoryRouter, Routes, Route } from 'react-router-dom';
   ` }, outfile: join(output, 'ui.mjs'), bundle: true, packages: 'external', format: 'esm', platform: 'node',
-    jsx: 'automatic', logLevel: 'silent', define: { 'import.meta.env.VITE_DEPLOYMENT_MODE': '"cloud"' } })
+    jsx: 'automatic', logLevel: 'silent' })
   ui = await import(pathToFileURL(join(output, 'ui.mjs')).href)
 })
 beforeEach(() => {
@@ -87,7 +86,10 @@ after(async () => {
 
 const element = React.createElement
 const noop = async () => {}
-function context(workspace = ui.createInitialWorkspace(), fields = {}, extras = {}) {
+function emptyWorkspace() { const job = realJob(); return { jobs: [job], documents: [], rubrics: [realRubric(job)], lifecycle: { entities: { [`job:${job.id}`]: {}, 'rubric:group-real': { parentKey: `job:${job.id}` }, 'resume:resume-real': {}, 'analysis:run-real': {} } } } }
+function realJob(fields = {}) { return { id: 'job-real', title: 'Saved engineering role', organization: 'Source organization', location: 'Remote', grade: '', series: '', arrangement: '', employmentType: '', source: 'pdf', sourceLabel: 'Captured job', status: 'ready', rubricId: 'rubric-real', documentId: 'document-job', createdAt: timestamp, dataKind: 'real', ...fields } }
+function realRubric(job = realJob()) { return { id: job.rubricId, groupId: 'group-real', kind: 'job', jobId: job.id, name: 'Saved rubric', description: '', version: 1, criteria: [], createdAt: timestamp, dataKind: 'real' } }
+function context(workspace = emptyWorkspace(), fields = {}, extras = {}) {
   return frontendWorkspaceContext({ workspace, renameEntity: async (...args) => { calls.push(['rename', ...args]) }, ...fields }, extras)
 }
 async function render(Page, { workspace = context(), analyses = null, resumes = null, url = '/', path = '*', props = {} } = {}) {
@@ -185,7 +187,7 @@ test('name rules bound suggestions without treating filenames as source-stated p
 
 test('editor focuses its labeled field, rejects blank names, and confirms dirty Cancel, X, Escape and outside dismissal', async () => {
   const workspace = context()
-  const target = { kind: 'job', id: workspace.workspace.jobs[0].id }
+  const target = { kind: 'job', id: 'job-real' }
   const props = { target, name: 'Original title' }
   await render(RenameFixture, { workspace, props })
   const trigger = button('Rename job: Original title')
@@ -218,7 +220,7 @@ test('editor focuses its labeled field, rejects blank names, and confirms dirty 
 test('pending submission prevents duplicate submit and all dismissal; errors preserve the draft and guard', async () => {
   const pending = deferred()
   const workspace = context(undefined, { renameEntity: (...args) => { calls.push(['rename', ...args]); return pending.promise } })
-  const props = { target: { kind: 'resume', id: workspace.workspace.resumes[0].id }, name: 'Original label' }
+  const props = { target: { kind: 'resume', id: 'resume-real' }, name: 'Original label' }
   await render(RenameFixture, { workspace, props })
   await click(button('Rename resume: Original label'))
   await type(nameInput(), '  Draft label  ')
@@ -241,7 +243,7 @@ test('pending submission prevents duplicate submit and all dismissal; errors pre
 
 test('a synchronous rename failure retains dirty protection but allows confirmed navigation and Cancel', async () => {
   const workspace = context(undefined, { renameEntity: () => { throw new Error('The item is now read-only.') } })
-  const props = { target: { kind: 'job', id: workspace.workspace.jobs[0].id }, name: 'Original title' }
+  const props = { target: { kind: 'job', id: 'job-real' }, name: 'Original title' }
   await render(RenameFixture, { workspace, props })
   await click(button('Rename job: Original title'))
   await type(nameInput(), 'Retained draft')
@@ -286,25 +288,24 @@ test('real editor snapshots the opened ETag; polling never replaces the draft or
   assert.equal(blockers.size, 0)
 })
 
-test('an editor survives a filtered row disappearing and returns focus to the library search after acknowledgement', async () => {
+test('an editor survives a filtered real row disappearing and returns focus to the library search after acknowledgement', async () => {
   const pending = deferred()
-  const data = ui.createInitialWorkspace()
-  const run = data.runs[0]
-  run.displayName = 'Find this exact review'
+  const saved = realRun({ displayName: 'Find this exact review' })
   const fields = { renameEntity: (...args) => { calls.push(['rename', ...args]); return pending.promise } }
-  let workspace = context(data, fields)
-  await render(ui.AnalysesPage, { workspace, url: '/analyses' })
+  let api = analysisApi(saved)
+  let workspace = context(undefined, fields, { analyses: [saved] })
+  await render(ui.RealAnalysesPage, { workspace, analyses: api, url: '/analyses' })
   const search = document.querySelector('input[type="search"]')
-  await type(search, run.displayName)
-  const trigger = button(`Rename analysis: ${run.displayName}`)
+  await type(search, saved.run.displayName)
+  const trigger = button(`Rename analysis: ${saved.run.displayName}`)
   trigger.focus()
   await click(trigger)
   await type(nameInput(), 'Renamed out of the filter')
   await submit()
-  const updated = structuredClone(data)
-  updated.runs[0].displayName = 'Renamed out of the filter'
-  workspace = context(updated, fields)
-  await render(ui.AnalysesPage, { workspace, url: '/analyses' })
+  const updated = { ...saved, run: { ...saved.run, displayName: 'Renamed out of the filter' } }
+  api = analysisApi(updated)
+  workspace = context(undefined, fields, { analyses: [updated] })
+  await render(ui.RealAnalysesPage, { workspace, analyses: api, url: '/analyses' })
   assert.equal(trigger.isConnected, false)
   assert.equal(nameInput().value, 'Renamed out of the filter')
   assert.equal([...blockers.values()][0].pending, true)
@@ -352,10 +353,8 @@ test('real resume service failure cannot unmount an active rename or replace its
 })
 
 test('real detail cache loading and error transitions preserve drafts and the ETag captured on open', async () => {
-  const data = ui.createInitialWorkspace()
-  const job = { ...data.jobs[0], dataKind: 'real' }
-  data.jobs = [job]
-  data.documents = []
+  const job = realJob()
+  const data = { jobs: [job], documents: [], rubrics: [realRubric(job)], lifecycle: { entities: { [`job:${job.id}`]: {}, 'rubric:group-real': { parentKey: `job:${job.id}` } } } }
   const savedResume = realResume()
   const savedRun = realRun()
   const savedJob = { job, displayName: 'Private role label', etag: '"job-open"', warnings: [] }
@@ -397,41 +396,6 @@ test('real detail cache loading and error transitions preserve drafts and the ET
   }
 })
 
-test('sample list and detail naming keeps source identities visible and archived names read-only', async () => {
-  const data = ui.createInitialWorkspace()
-  const job = data.jobs[0], resume = data.resumes[0], run = data.runs[0]
-  job.displayName = 'A new job label'
-  resume.displayName = 'A new resume label'
-  run.displayName = 'A new analysis label'
-  const workspace = context(data)
-  await render(ui.JobsPage, { workspace, url: '/jobs' })
-  assert.ok(button(`Rename job: ${job.displayName}`))
-  assert.ok(document.body.textContent.includes(`Source title: ${job.title}`))
-  await click(button('Job / organization', document.querySelector('thead')))
-  assert.equal(document.querySelector('a.row-title').textContent, job.displayName)
-  await type(document.querySelector('input[type="search"]'), job.displayName)
-  assert.equal(document.querySelectorAll('tbody tr').length, 1)
-  await remount(ui.JobDetail, { workspace, url: `/jobs/${job.id}`, path: '/jobs/:id' })
-  assert.equal(document.querySelector('h1').textContent, job.displayName)
-  assert.match(document.body.textContent, /Original source:/)
-  await remount(ui.ResumesPage, { workspace, url: '/resumes' })
-  assert.equal(document.querySelectorAll(`[aria-label="Rename resume: ${resume.displayName}"]`).length, 2)
-  assert.ok(document.body.textContent.includes(`Source name: ${resume.name}`))
-  await click(button('Candidate', document.querySelector('thead')))
-  assert.equal(document.querySelector('a.row-title').textContent, resume.displayName)
-  await remount(ui.ResumesPage, { workspace, url: `/resumes/${resume.id}`, path: '/resumes/:id' })
-  assert.equal(document.querySelector('h1').textContent, resume.displayName)
-  assert.match(document.body.textContent, /Original filename:/)
-  await remount(ui.AnalysisDetail, { workspace, url: `/analyses/${run.id}`, path: '/analyses/:id' })
-  assert.equal(document.querySelector('h1').textContent, run.displayName)
-  assert.equal(button(`Rename analysis: ${run.displayName}`).disabled, false)
-  data.lifecycle = { entities: { [`analysis:${run.id}`]: { archivedAt: timestamp } } }
-  await render(ui.AnalysisDetail, { workspace: context(data), url: `/analyses/${run.id}`, path: '/analyses/:id' })
-  assert.equal(button(`Rename analysis: ${run.displayName}`).disabled, true)
-  assert.equal(data.jobs[0].title, job.title)
-  assert.equal(data.resumes[0].name, resume.name)
-})
-
 test('real analysis rename stays available with creation disabled and uses the summary ETag on history and detail', async () => {
   const saved = realRun()
   const api = analysisApi(saved, { features: { realAnalyses: false }, creationError: 'New inputs unavailable.' })
@@ -450,10 +414,9 @@ test('real analysis rename stays available with creation disabled and uses the s
 })
 
 test('real jobs and resumes use wrapper aliases, preserve stated identities, and send summary ETags', async () => {
-  const data = ui.createInitialWorkspace()
-  const job = { ...data.jobs[0], dataKind: 'real' }
+  const job = realJob()
+  const data = { jobs: [job], documents: [], rubrics: [realRubric(job)], lifecycle: { entities: { [`job:${job.id}`]: {}, 'rubric:group-real': { parentKey: `job:${job.id}` } } } }
   const jobSummary = { job, displayName: 'Private role label', etag: '"job-version"', warnings: [] }
-  data.jobs = [job]
   const saved = realResume()
   const resumes = resumeApi(saved)
   const workspace = context(data, { cloud: { currentWorkspaceId: 'workspace-one', realJobs: { summaries: [jobSummary] } } }, { resumes: [saved] })
@@ -479,23 +442,10 @@ test('real jobs and resumes use wrapper aliases, preserve stated identities, and
   assert.match(document.body.textContent, /Source name: Name not stated · Original source: not-a-person.pdf/)
 })
 
-test('analysis browsing uses captured labels only; current source renames do not rewrite comparisons', () => {
-  const data = ui.createInitialWorkspace()
-  const run = structuredClone(data.runs.find((item) => item.targets.length === 1))
-  run.displayName = 'Current analysis label'
-  run.targets[0].displayName = 'Captured target label'
-  run.resumes[0].resume.displayName = 'Captured resume label'
-  data.jobs.forEach((item) => { item.displayName = 'Live job label' })
-  data.resumes.forEach((item) => { item.displayName = 'Live resume label' })
-  const original = JSON.stringify(run)
-  assert.equal(ui.selectSampleAnalysisRuns([run], 'current ANALYSIS', 'all', null).length, 1)
-  assert.equal(ui.selectSampleAnalysisRuns([run], run.name, 'all', null).length, 0)
-  assert.equal(ui.selectSampleComparisons(run, { query: 'captured resume label', targetId: '', sort: null }).rows.length, 1)
-  assert.equal(ui.selectSampleComparisons(run, { query: 'live resume label', targetId: '', sort: null }).rows.length, 0)
-  assert.match(ui.sampleComparisonTargetLabel(run.targets[0]), /^Captured target label/)
-  assert.equal(JSON.stringify(run), original)
+test('analysis browsing uses captured real labels only; current source renames do not rewrite comparisons', () => {
   const saved = realRun()
   assert.equal(ui.selectRealAnalysisRuns([saved], 'Display analysis', 'all', null).length, 1)
+  assert.equal(ui.selectRealAnalysisRuns([saved], saved.run.name, 'all', null).length, 0)
   const pair = { comparison: { index: 0, status: 'complete', resume: { summary: { name: null, displayName: 'Captured real label', sourceLabel: 'original.pdf' } },
     target: { summary: { id: 'captured-target', label: 'Source job title', displayName: 'Captured real target', sublabel: 'Frozen scope',
       selection: { kind: 'job', jobId: 'j', rubricId: 'r', rubricVersion: 1 } } } } }
@@ -504,34 +454,10 @@ test('analysis browsing uses captured labels only; current source renames do not
   assert.equal(ui.selectRealComparisons([pair], [], { query: 'live job label', targetId: '', sort: null }).rows.length, 0)
 })
 
-test('sample setup suggests alias-and-count defaults, keeps custom input, and only submits manually', async () => {
-  const data = ui.createInitialWorkspace()
-  const job = data.jobs.find((item) => item.status === 'ready' && item.rubricId)
-  job.displayName = 'Program analyst shortlist'
-  data.resumes[0].displayName = 'Applicant review label'
-  const workspace = context(data, { startAnalysis: (...args) => { calls.push(['start', ...args]); return 'new-sample-run' } })
-  const url = `/analyses/new?resumes=${data.resumes[0].id}&rubrics=${job.rubricId}`
-  await render(ui.AnalysisSetup, { workspace, url })
-  const input = document.querySelector('input[maxlength="160"]')
-  assert.equal(input.placeholder, 'Program analyst shortlist - 1 resume')
-  assert.equal(calls.length, 0)
-  assert.ok(document.querySelector('[aria-label="Include Applicant review label"]'))
-  await type(input, '  My intentional title  ')
-  await click(document.querySelector(`[aria-label="Include ${data.resumes[1].name}"]`))
-  assert.equal(input.value, '  My intentional title  ')
-  assert.equal(input.placeholder, 'Program analyst shortlist - 2 resumes')
-  await click(button('Run sample analysis'))
-  assert.equal(calls.find(([kind]) => kind === 'start')[3], 'My intentional title')
-  await remount(ui.AnalysisSetup, { workspace, url })
-  await click(button('Run sample analysis'))
-  assert.equal(calls.filter(([kind]) => kind === 'start')[1][3], 'Program analyst shortlist - 1 resume')
-})
-
 test('real setup freezes the resolved default, exact input objects and key across uncertain acceptance retries', async () => {
-  const data = ui.createInitialWorkspace()
-  const job = { ...data.jobs.find((item) => item.status === 'ready' && item.rubricId), dataKind: 'real' }
-  data.jobs = [job]
-  const rubric = data.rubrics.find((item) => item.id === job.rubricId)
+  const job = realJob()
+  const rubric = realRubric(job)
+  const data = { jobs: [job], documents: [], rubrics: [rubric], lifecycle: { entities: { [`job:${job.id}`]: {}, 'rubric:group-real': { parentKey: `job:${job.id}` } } } }
   const target = { id: 'real-target', workspaceId: 'workspace-one', dataKind: 'real', kind: 'job', label: job.title,
     displayName: 'Cloud program analyst', sublabel: 'Source organization', rubricId: rubric.id, rubricVersion: rubric.version, criterionCount: 3,
     selection: { kind: 'job', jobId: job.id, rubricId: rubric.id, rubricVersion: rubric.version, rubricHash: hash,
@@ -553,7 +479,7 @@ test('real setup freezes the resolved default, exact input objects and key acros
     },
   })
   const workspace = context(data, {}, { resumes: [saved] })
-  const url = `/analyses/new?data=real&resumes=${saved.resume.id}&jobs=${job.id}`
+  const url = `/analyses/new?resumes=${saved.resume.id}&jobs=${job.id}`
   await render(ui.RealAnalysisSetup, { workspace, analyses: api, resumes, url })
   const input = document.querySelector('input[maxlength="160"]')
   assert.equal(input.placeholder, 'Cloud program analyst - 1 resume')

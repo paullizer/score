@@ -72,7 +72,6 @@ test('Word file HTTP intake matches frontend client routing and keeps private by
       }
     }
     assert.equal(fixture.analyses.store.values.size, 0, 'Importing Word prepares sources, never starts scoring.')
-    assert.equal(fixture.state.saves.length, 0, 'Word bytes and metadata never enter sample autosave.')
     assert.equal(fixture.requests.filter((request) => request.method === 'POST' && /\/jobs\/file$/.test(request.url)).length, 4)
     assert.equal(fixture.requests.filter((request) => request.method === 'POST' && /\/resumes\/file$/.test(request.url)).length, 4)
   } finally { restore(); await fixture.close() }
@@ -134,7 +133,6 @@ test('combined Markdown and Word file HTTP batches preserve dedicated routes, ex
     const posts = fixture.requests.filter((request) => request.method === 'POST')
     assert.deepEqual(posts.map((request) => request.url.split('/').at(-1)), ['markdown', 'file', 'file', 'pdf'])
     assert.equal(fixture.analyses.store.values.size, 0)
-    assert.equal(fixture.state.saves.length, 0)
   } finally { await fixture.close() }
 })
 
@@ -181,7 +179,6 @@ test('real resume intake preserves actual bytes, same-basename people, duplicate
     const resumes = await allPages(fixture, `/api/workspaces/${fixture.workspaceId}/resumes`, 'resumes')
     assert.equal(resumes.length, 3)
     assert.ok(fixture.requests.some((request) => request.url.includes('continuationToken=')), 'Real API paging was exercised.')
-    assert.equal(fixture.state.saves.length, 0, 'Real sources never use legacy sample autosave.')
   } finally { await fixture.close() }
 })
 
@@ -289,11 +286,10 @@ test('real resume access is authorized before raw uploads and every original rem
     assert.equal(action.status, 403)
     const anonymous = await fetch(`${fixture.origin}${path}`)
     assert.equal(anonymous.status, 401)
-    assert.equal(fixture.state.saves.length, 0)
   } finally { await fixture.close() }
 })
 
-test('unavailable real services do not substitute sample resumes or accept real work', async () => {
+test('unavailable real services do not substitute fixture resumes or accept real work', async () => {
   const fixture = await startResumeAnalysisFixture(runtime, {
     configOverrides: { realResumes: undefined, realAnalyses: undefined },
   })
@@ -305,10 +301,8 @@ test('unavailable real services do not substitute sample resumes or accept real 
     assert.equal(features.realGradeLadders, true)
     assert.equal((await fixture.request(`/api/workspaces/${fixture.workspaceId}/resumes`)).status, 503)
     assert.equal((await fixture.request(`/api/workspaces/${fixture.workspaceId}/analyses`)).status, 503)
-    assert.equal((await fixture.request(`/api/workspaces/${fixture.workspaceId}/state`)).status, 200)
     assert.equal(fixture.resumes.store.values.size, 0)
     assert.equal(fixture.analyses.store.values.size, 0)
-    assert.equal(fixture.state.saves.length, 0)
   } finally { await fixture.close() }
 })
 
@@ -379,7 +373,6 @@ test('the real resume worker processes PDF, public HTML, PDF links, and rendered
     assert.equal(recovered.resume.status, 'ready')
     assert.equal(recovered.retryCount, 1)
     assert.equal((await allPages(fixture, `/api/workspaces/${fixture.workspaceId}/resumes`, 'resumes')).length, imported.length)
-    assert.equal(fixture.state.saves.length, 0)
   } finally { await fixture.close() }
 })
 
@@ -478,7 +471,6 @@ test('real analyses score exact saved job and approved GS versions and retain in
     assert.ok([400, 409].includes(retry.status), 'Completed comparisons cannot be rewritten by retry.')
     await processAllAnalyses(fixture, stubs)
     assert.equal(stubs.modelCalls.length, modelCalls)
-    assert.equal(fixture.state.saves.length, 0)
   } finally { await fixture.close() }
 })
 
@@ -522,7 +514,6 @@ test('500 real comparisons finish across bounded chunks and pages; a unique 501s
     assert.ok(chunks.every((operations) => operations.filter((operation) => operation.kind === 'create' &&
       operation.record.recordType === 'analysis-comparison').length <= 25))
     assert.equal(stubs.modelCalls.filter((request) => request.response_format.json_schema.name === 'resume_rubric_assessment').length, 500)
-    assert.equal(fixture.state.saves.length, 0)
   } finally { await fixture.close() }
 })
 
@@ -583,7 +574,6 @@ test('a failed comparison does not rewrite a completed pair, and explicit retry 
     assert.equal(recovered.comparison.retryCount, 1)
     assert.equal(recovered.targetSnapshot.rubric.version, frozenVersion)
     assert.equal(recovered.result.overall.score, 60)
-    assert.equal(fixture.state.saves.length, 0)
   } finally { await fixture.close() }
 })
 
@@ -666,7 +656,6 @@ test('real lifecycle preserves frozen model evidence, blocks retained dependenci
     await change(resumePath, 'delete')
     assert.equal((await fixture.request(`${resumePath}/original`)).status, 404)
     assert.equal((await allPages(fixture, `${base}/resumes`, 'resumes')).length, 0)
-    assert.equal(fixture.state.saves.length, 0, 'Real lifecycle never serializes real documents or runs into sample autosave.')
   } finally { await fixture.close() }
 })
 

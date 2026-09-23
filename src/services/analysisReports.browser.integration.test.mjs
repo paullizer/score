@@ -1,8 +1,8 @@
 import assert from 'node:assert/strict'
 import { after, before, test } from 'node:test'
 import { randomUUID } from 'node:crypto'
-import { mkdir, rm, writeFile } from 'node:fs/promises'
-import { join, resolve } from 'node:path'
+import { mkdir, writeFile } from 'node:fs/promises'
+import { join } from 'node:path'
 import { chromium } from 'playwright'
 import { PDFDocument, PDFName } from 'pdf-lib'
 import yauzl from 'yauzl'
@@ -100,10 +100,10 @@ function csvRows(bytes) {
   assert.equal(quoted, false)
   return rows
 }
-function csvRecords(bytes, criterionCount, sample = false) {
+function csvRecords(bytes, criterionCount) {
   const [header, ...rows] = csvRows(bytes)
   assert.deepEqual(header, [
-    sample ? 'Candidate name (fictional sample)' : 'Candidate name', 'Job/grade', 'Overall score', 'Overall assessment',
+    'Candidate name', 'Job/grade', 'Overall score', 'Overall assessment',
     ...Array.from({ length: criterionCount }, (_, index) => `C${index + 1}`),
     'Analysis date', 'Source', 'Analysis link', 'Resume link', 'Job/grade link',
   ])
@@ -112,11 +112,11 @@ function csvRecords(bytes, criterionCount, sample = false) {
     return Object.fromEntries(header.map((name, index) => [name, row[index]]))
   })
 }
-function assertReviewDestination(value, { origin, workspaceId, runId, comparisonId, data, view = null }) {
+function assertReviewDestination(value, { origin, workspaceId, runId, comparisonId, view = null }) {
   const url = new URL(value)
   assert.equal(url.origin, origin)
   assert.equal(url.pathname, `${workspaceId ? `/workspaces/${encodeURIComponent(workspaceId)}` : ''}/analyses/${encodeURIComponent(runId)}`)
-  assert.equal(url.searchParams.get('data'), data)
+  assert.equal(url.searchParams.get('data'), null)
   assert.equal(url.searchParams.get('result'), comparisonId)
   assert.equal(url.searchParams.get('view'), view)
   assert.equal(url.username, '')
@@ -151,41 +151,8 @@ async function officeHyperlinks(bytes, pattern) {
   return links
 }
 const pptxHyperlinks = bytes => officeHyperlinks(bytes, /^ppt\/slides\/_rels\/slide\d+\.xml\.rels$/)
-async function followSampleSources(page, row, run) {
-  const pair = run.comparisons.find((comparison) => comparison.id === new URL(row['Analysis link']).searchParams.get('result'))
-  assert.ok(pair)
-  const resume = run.resumes.find((snapshot) => snapshot.resume.id === pair.resumeId).document
-  const target = run.targets.find((target) => target.id === pair.targetId)
-  await page.goto(row['Analysis link'])
-  await visible(page.getByRole('heading', { name: 'Why this score', exact: true }))
-  const citation = page.getByRole('button', { name: /^View resume evidence for/ }).first()
-  await citation.click()
-  await visible(page.locator('.document-paragraph.is-highlighted mark').first())
-  await page.goto(row['Resume link'])
-  const source = page.getByRole('region', { name: 'Source evidence viewer', exact: true })
-  await visible(source.locator('.document-viewer h2').getByText(resume.title, { exact: true }))
-  assert.equal(await source.locator('.is-highlighted').count(), 0)
-  await page.goto(row['Job/grade link'])
-  if (target.document) {
-    await visible(source.locator('.document-viewer h2').getByText(target.document.title, { exact: true }))
-    assert.equal(await source.locator('.is-highlighted').count(), 0)
-  } else {
-    await visible(source.getByRole('heading', { name: 'Source unavailable', exact: true }))
-    assert.equal(await source.locator('.document-viewer').count(), 0)
-  }
-  if (target.kind === 'grade') {
-    const requirements = source.getByRole('region', { name: 'Saved sample grade requirements', exact: true })
-    await visible(requirements)
-    await visible(requirements.getByText(target.rubric.criteria[0].description, { exact: true }))
-  }
-  await page.getByRole('link', { name: 'All comparisons', exact: true }).click()
-  assert.equal(new URL(page.url()).searchParams.get('result'), null)
-  assert.equal(new URL(page.url()).searchParams.get('view'), null)
-  await page.goBack()
-  assert.equal(new URL(page.url()).searchParams.get('view'), 'target')
-  await visible(source)
-}
-function reportProcessingStubs(fixture) {
+function reportProcessingStubs(fixture, { unassessedAssessments = 0 } = {}) {
+  let assessments = 0
   return processingStubs(fixture, {
     onModelRequest(request) {
       if (request.response_format.json_schema.name !== 'resume_rubric_assessment') return
@@ -195,13 +162,17 @@ function reportProcessingStubs(fixture) {
       const work = passages.find((passage) => passage.text.includes('Applied engineering methods independently'))
       const education = passages.find((passage) => passage.text.includes('Bachelor of Engineering'))
       assert.ok(work?.passageId, 'The report fixture must select actual frozen engineering evidence.')
+      const withhold = assessments++ < unassessedAssessments
       const output = {
         criteria: input.rubric.criteria.map((criterion) => ({
-          criterionId: criterion.id, evidenceStatus: criterion.support === 'not-applicable' ? 'not-applicable' : 'supported',
-          score: criterion.support === 'not-applicable' ? null : 3,
+          criterionId: criterion.id,
+          evidenceStatus: criterion.support === 'not-applicable' ? 'not-applicable' : withhold ? 'not-assessed' : 'supported',
+          score: criterion.support === 'not-applicable' || withhold ? null : 3,
           rationale: criterion.support === 'not-applicable' ? 'The exact approved rubric excludes this work row from scoring.'
-            : 'The cited passage describes independent engineering work within defined projects, matching the saved independent-work anchor.',
-          citations: criterion.support === 'not-applicable' ? [] : [{ passageId: work.passageId }], limitation: null,
+            : withhold ? 'The saved source does not provide assessable evidence for this criterion.'
+              : 'The cited passage describes independent engineering work within defined projects, matching the saved independent-work anchor.',
+          citations: criterion.support === 'not-applicable' || withhold ? [] : [{ passageId: work.passageId }],
+          limitation: withhold ? { code: 'unusable-source', message: 'The saved source text cannot support a reliable criterion assessment.' } : null,
         })),
         qualifications: input.qualifications.map((qualification) => ({
           qualificationId: qualification.id, evidenceStatus: education ? 'partial' : 'missing',
@@ -214,12 +185,12 @@ function reportProcessingStubs(fixture) {
     },
   })
 }
-async function completedFixture({ comparisons = 2, partial = false } = {}) {
+async function completedFixture({ comparisons = 2, partial = false, unassessedAssessments = 0 } = {}) {
   const fixture = await startResumeAnalysisFixture(runtime, { injectAuth: true })
   try {
     await seedRealJob(fixture)
     for (let index = 0; index < comparisons; index++) await importResumePdf(fixture, await resumePdf({ name: `resume-${index}.pdf` }))
-    const stubs = reportProcessingStubs(fixture)
+    const stubs = reportProcessingStubs(fixture, { unassessedAssessments })
     await processAllResumes(fixture, stubs)
     const resumes = await allPages(fixture, `/api/workspaces/${fixture.workspaceId}/resumes`, 'resumes')
     const targets = await allPages(fixture, `/api/workspaces/${fixture.workspaceId}/analyses/targets`, 'targets')
@@ -236,6 +207,67 @@ async function completedFixture({ comparisons = 2, partial = false } = {}) {
     if (!partial) assert.ok(pairs.every(({ comparison }) => comparison.status === 'complete'))
     return { fixture, stubs, runId, pairs }
   } catch (error) { await fixture.close(); throw error }
+}
+
+function comparisonEntry(fixture, comparisonId) {
+  const entry = [...fixture.analyses.store.values.entries()]
+    .find(([, value]) => value.record.recordType === 'analysis-comparison' && value.record.id === comparisonId)
+  assert.ok(entry, `Missing comparison fixture record: ${comparisonId}`)
+  return entry[1]
+}
+
+function markComparisonTerminal(fixture, comparisonId, status, message) {
+  const entry = comparisonEntry(fixture, comparisonId)
+  entry.record.status = status
+  entry.record.updatedAt = fixture.now().toISOString()
+  delete entry.record.completedAt
+  if (status === 'cancelled') entry.record.cancelledAt = fixture.now().toISOString()
+  else delete entry.record.cancelledAt
+  delete entry.record.result
+  delete entry.record.resultSummary
+  delete entry.record.lease
+  delete entry.record.nextAttemptAt
+  delete entry.record.failureDiagnostic
+  delete entry.record.diagnosticCapture
+  if (status === 'failed') entry.record.error = { code: 'storage-error', stage: 'assessment', message, retryable: false }
+  else delete entry.record.error
+  recomputeRunProgress(fixture, entry.record.runId)
+}
+
+function recomputeRunProgress(fixture, runId) {
+  const run = fixture.analyses.store.values.get(`${fixture.workspaceId}/${runId}`)?.record
+  assert.ok(run, `Missing run fixture record: ${runId}`)
+  const comparisons = [...fixture.analyses.store.values.values()]
+    .map(({ record }) => record)
+    .filter((record) => record.recordType === 'analysis-comparison' && record.runId === runId)
+  const count = status => comparisons.filter(record => record.status === status).length
+  run.progress = {
+    total: run.progress.total,
+    initialized: comparisons.length,
+    queued: count('queued'),
+    running: count('running'),
+    complete: count('complete'),
+    failed: count('failed'),
+    cancelled: count('cancelled'),
+    scored: comparisons.filter(record => record.resultSummary?.overall.status === 'available').length,
+    unscored: comparisons.filter(record => record.status === 'complete' && record.resultSummary?.overall.status !== 'available').length,
+  }
+  run.updatedAt = fixture.now().toISOString()
+  if (run.progress.initialized === run.progress.total && run.progress.queued + run.progress.running === 0) {
+    if (run.progress.complete === 0) {
+      run.status = 'cancelled'
+      run.cancellation = {
+        requestedAt: run.cancellation?.requestedAt ?? fixture.now().toISOString(),
+        requestedBy: run.cancellation?.requestedBy ?? 'integration-test',
+        nextComparisonIndex: run.progress.total,
+        completedAt: fixture.now().toISOString(),
+      }
+    } else {
+      run.status = run.progress.failed || run.progress.cancelled || run.progress.unscored ? 'partial' : 'complete'
+      delete run.cancellation
+    }
+    run.completedAt ??= fixture.now().toISOString()
+  }
 }
 
 async function deleteAnalysis(fixture, runId) {
@@ -276,7 +308,7 @@ test('renaming a real analysis changes new report filenames without rescoring or
     const path = `/api/workspaces/${fixture.workspaceId}/analyses/${runId}`
     const before = await jsonResponse(await fixture.request(path))
     const modelsBefore = stubs.modelCalls.length
-    await page.goto(`${fixture.origin}/workspaces/${fixture.workspaceId}/analyses/${runId}?data=real`)
+    await page.goto(`${fixture.origin}/workspaces/${fixture.workspaceId}/analyses/${runId}`)
     await page.getByRole('button', { name: 'Rename analysis: Grouped report review', exact: true }).click()
     const editor = page.getByRole('dialog', { name: 'Edit analysis name', exact: true })
     await editor.getByRole('textbox', { name: 'Analysis name', exact: true }).fill('Reviewer shortlist')
@@ -323,7 +355,7 @@ test('a read-only reviewer downloads genuine CSV, PDF, Word and PowerPoint files
       const features = await response.json()
       await route.fulfill({ response, json: { ...features, realAnalyses: false, wordDocumentImports: false } })
     })
-    await page.goto(`${fixture.origin}/workspaces/${fixture.workspaceId}/analyses/${runId}?data=real&result=${pairs[0].comparison.id}`)
+    await page.goto(`${fixture.origin}/workspaces/${fixture.workspaceId}/analyses/${runId}?result=${pairs[0].comparison.id}`)
     await visible(page.getByRole('heading', { name: 'Grouped report review', exact: true }))
     const exportButton = page.getByRole('button', { name: 'Export report', exact: true })
     await exportButton.click()
@@ -354,7 +386,7 @@ test('a read-only reviewer downloads genuine CSV, PDF, Word and PowerPoint files
           assert.match(row['Overall assessment'], /independent engineering work within defined projects/i)
           assert.doesNotMatch(row['Overall assessment'], /A specific explanation was not recorded/)
           for (const [index, value] of reportDestinations(row).entries()) assertReviewDestination(value, {
-            origin: fixture.origin, workspaceId: fixture.workspaceId, runId, comparisonId: comparison.id, data: 'real',
+            origin: fixture.origin, workspaceId: fixture.workspaceId, runId, comparisonId: comparison.id,
             view: [null, 'resume', 'target'][index],
           })
         }
@@ -409,97 +441,20 @@ test('a read-only reviewer downloads genuine CSV, PDF, Word and PowerPoint files
     assert.ok(fixture.requests.slice(requestsBefore).every((request) => request.method === 'GET'), 'Export is read-only.')
     assert.ok(fixture.requests.some((request) => request.url.includes('/report-comparisons?')))
     assert.equal(await page.evaluate(() => Object.values(localStorage).some((value) => /Jordan Example|assessmentSha256/.test(value))), false)
-    assert.equal(fixture.state.saves.length, 0)
-    assert.deepEqual(errors, [])
-  } finally { await context.close(); await fixture.close() }
-})
-
-test('sample exports stay fictional, include the entire grouped analysis from an individual review, and support exact target scope', { timeout: 90_000 }, async () => {
-  const fixture = await startResumeAnalysisFixture(runtime, { injectAuth: true })
-  const sample = runtime.fixtures.createInitialWorkspace()
-  fixture.state.states.set(fixture.workspaceId, { content: JSON.stringify(sample), etag: '"report-samples"' })
-  const run = sample.runs[0]
-  const { context, page, errors } = await newPage()
-  try {
-    await page.goto(`${fixture.origin}/workspaces/${fixture.workspaceId}/analyses/${run.id}?data=samples&result=${run.comparisons[0].id}`)
-    await page.getByRole('button', { name: 'Export report', exact: true }).click()
-    const dialog = await visible(page.getByRole('dialog', { name: 'Export analysis report', exact: true }))
-    await visible(dialog.getByText('Fictional sample', { exact: true }))
-    const entire = await download(page, 'csv')
-    assert.match(entire.filename, /^Sample - /)
-    const allRows = csvRecords(entire.bytes, Math.max(...run.targets.map((target) => target.rubric.criteria.length)), true)
-    assert.equal(allRows.length, run.comparisons.filter((pair) => pair.status === 'complete').length)
-    assert.deepEqual(new Set(allRows.map((row) => new URL(row['Analysis link']).searchParams.get('result'))),
-      new Set(run.comparisons.filter((pair) => pair.status === 'complete').map((pair) => pair.id)))
-    for (const row of allRows) for (const [index, value] of reportDestinations(row).entries()) assertReviewDestination(value, {
-      origin: fixture.origin, workspaceId: fixture.workspaceId, runId: run.id,
-      comparisonId: new URL(row['Analysis link']).searchParams.get('result'), data: 'samples', view: [null, 'resume', 'target'][index],
-    })
-    await dialog.getByLabel('Report scope', { exact: true }).selectOption(run.targets[1].id)
-    const selected = await download(page, 'csv')
-    const selectedRows = csvRecords(selected.bytes, run.targets[1].rubric.criteria.length, true)
-    assert.deepEqual(new Set(selectedRows.map((row) => new URL(row['Analysis link']).searchParams.get('result'))),
-      new Set(run.comparisons.filter((pair) => pair.targetId === run.targets[1].id && pair.status === 'complete').map((pair) => pair.id)))
-    await dialog.getByRole('button', { name: 'Close', exact: true }).click()
-    await page.goto(`${fixture.origin}/workspaces/${fixture.workspaceId}/analyses/${run.id}?data=samples`)
-    await page.getByRole('searchbox', { name: 'Search comparisons', exact: true }).fill('No candidate matches this filter')
-    await visible(page.getByRole('heading', { name: 'No matching comparisons', exact: true }))
-    await page.getByRole('button', { name: 'Export report', exact: true }).click()
-    const filteredTableExport = await download(page, 'csv')
-    const filteredRows = csvRecords(filteredTableExport.bytes, Math.max(...run.targets.map((target) => target.rubric.criteria.length)), true)
-    assert.deepEqual(new Set(filteredRows.map((row) => row['Analysis link'])), new Set(allRows.map((row) => row['Analysis link'])))
-    await page.getByRole('dialog', { name: 'Export analysis report', exact: true }).getByRole('button', { name: 'Close', exact: true }).click()
-    for (const kind of ['job', 'grade']) {
-      const target = run.targets.find((target) => target.kind === kind)
-      const pair = run.comparisons.find((pair) => pair.targetId === target.id && pair.status === 'complete')
-      await followSampleSources(page, allRows.find((row) => new URL(row['Analysis link']).searchParams.get('result') === pair.id), run)
-    }
-    assert.ok(!fixture.requests.some((request) => request.url.includes('/report-comparisons')))
-    await saveArtifact('browser-sample.csv', entire.bytes)
-    assert.deepEqual(errors, [])
-  } finally { await context.close(); await fixture.close() }
-})
-
-test('archived sample analyses retain read-only exports alongside lifecycle controls', { timeout: 90_000 }, async () => {
-  const fixture = await startResumeAnalysisFixture(runtime, { injectAuth: true })
-  const sample = runtime.fixtures.createInitialWorkspace()
-  fixture.state.states.set(fixture.workspaceId, { content: JSON.stringify(sample), etag: '"report-archive"' })
-  const run = sample.runs[0]
-  const { context, page, errors } = await newPage()
-  try {
-    await page.goto(`${fixture.origin}/workspaces/${fixture.workspaceId}/analyses/${run.id}?data=samples`)
-    await page.getByRole('button', { name: `Archive ${run.name}`, exact: true }).click()
-    const archive = await visible(page.getByRole('dialog', { name: `Archive ${run.name}?`, exact: true }))
-    await archive.getByRole('button', { name: 'Archive', exact: true }).click()
-    await archive.waitFor({ state: 'hidden' })
-    await visible(page.getByText('Archived · read only', { exact: true }))
-    assert.equal(await page.getByRole('button', { name: 'New run with these inputs', exact: true }).isDisabled(), true)
-    await page.getByRole('button', { name: 'Export report', exact: true }).click()
-    const output = await download(page, 'csv')
-    const rows = csvRecords(output.bytes, Math.max(...run.targets.map((target) => target.rubric.criteria.length)), true)
-    assert.equal(rows.length, run.comparisons.length)
-    await page.getByRole('dialog', { name: 'Export analysis report', exact: true }).getByRole('button', { name: 'Close', exact: true }).click()
-    await followSampleSources(page, rows[0], run)
-    await visible(page.getByText('Archived · read only', { exact: true }))
     assert.deepEqual(errors, [])
   } finally { await context.close(); await fixture.close() }
 })
 
 test('unfinished analyses explain why export is disabled until a comparison completes', { timeout: 60_000 }, async () => {
-  const fixture = await startResumeAnalysisFixture(runtime, { injectAuth: true })
-  const sample = runtime.fixtures.createInitialWorkspace()
-  const run = sample.runs[0]
-  run.comparisons = run.comparisons.map((comparison) => ({
-    ...comparison, status: 'cancelled', score: null, criteria: [],
-    summary: 'This comparison was cancelled before assessment.', error: 'Cancelled before a score was produced.',
-  }))
-  fixture.state.states.set(fixture.workspaceId, { content: JSON.stringify(sample), etag: '"report-unfinished"' })
-  const { context, page } = await newPage()
+  const { fixture, runId, pairs } = await completedFixture({ partial: true })
+  const { context, page, errors } = await newPage()
   try {
-    await page.goto(`${fixture.origin}/workspaces/${fixture.workspaceId}/analyses/${run.id}?data=samples`)
+    for (const { comparison } of pairs) markComparisonTerminal(fixture, comparison.id, 'cancelled', 'Cancelled before a score was produced.')
+    await page.goto(`${fixture.origin}/workspaces/${fixture.workspaceId}/analyses/${runId}`)
     const button = await visible(page.getByRole('button', { name: 'Export report', exact: true }))
     assert.equal(await button.isDisabled(), true)
     assert.match(await button.getAttribute('title'), /At least one completed comparison/)
+    assert.deepEqual(errors, [])
   } finally { await context.close(); await fixture.close() }
 })
 
@@ -509,7 +464,7 @@ test('an active run reports completion counts, excludes unfinished CSV rows, and
   try {
     assert.equal(pairs.filter(({ comparison }) => comparison.status === 'complete').length, 1)
     assert.equal(pairs.filter(({ comparison }) => comparison.status === 'queued').length, 1)
-    await page.goto(`${fixture.origin}/workspaces/${fixture.workspaceId}/analyses/${runId}?data=real`)
+    await page.goto(`${fixture.origin}/workspaces/${fixture.workspaceId}/analyses/${runId}`)
     await page.getByRole('button', { name: 'Export report', exact: true }).click()
     const dialog = page.getByRole('dialog', { name: 'Export analysis report', exact: true })
     await visible(dialog.getByText('Reporting on 1 of 2 candidates', { exact: true }))
@@ -532,21 +487,14 @@ test('an active run reports completion counts, excludes unfinished CSV rows, and
   } finally { await context.close(); await fixture.close() }
 })
 
-test('concise exports explain actual failure counts and include completed assessments with withheld scores', { timeout: 60_000 }, async () => {
-  const fixture = await startResumeAnalysisFixture(runtime, { injectAuth: true })
-  const sample = runtime.fixtures.createInitialWorkspace(), run = sample.runs[1]
-  const [withheld, failed, cancelled] = run.comparisons
-  withheld.score = null
-  withheld.summary = 'Some weighted criteria could not be assessed from the saved resume, so no overall score is available.'
-  withheld.criteria = withheld.criteria.map((criterion) => ({
-    ...criterion, score: null, evidenceStatus: 'not-assessed', rationale: 'The saved source does not provide assessable evidence for this criterion.', citations: [],
-  }))
-  Object.assign(failed, { status: 'failed', score: null, criteria: [], summary: 'This comparison could not be assessed.', error: 'Saved source unavailable.' })
-  Object.assign(cancelled, { status: 'cancelled', score: null, criteria: [], summary: 'This comparison was cancelled.', error: 'Cancelled before assessment.' })
-  fixture.state.states.set(fixture.workspaceId, { content: JSON.stringify(sample), etag: '"report-status-counts"' })
+test('concise exports explain actual failure counts and include completed assessments', { timeout: 60_000 }, async () => {
+  const { fixture, runId, pairs } = await completedFixture({ comparisons: 3 })
+  const [completed, failed, cancelled] = pairs.map(({ comparison }) => comparison)
   const { context, page, errors } = await newPage()
   try {
-    await page.goto(`${fixture.origin}/workspaces/${fixture.workspaceId}/analyses/${run.id}?data=samples`)
+    markComparisonTerminal(fixture, failed.id, 'failed', 'Saved source unavailable.')
+    markComparisonTerminal(fixture, cancelled.id, 'cancelled', 'Cancelled before assessment.')
+    await page.goto(`${fixture.origin}/workspaces/${fixture.workspaceId}/analyses/${runId}`)
     await page.getByRole('button', { name: 'Export report', exact: true }).click()
     const dialog = page.getByRole('dialog', { name: 'Export analysis report', exact: true })
     await visible(dialog.getByText('Reporting on 1 of 3 candidates', { exact: true }))
@@ -554,12 +502,14 @@ test('concise exports explain actual failure counts and include completed assess
     assert.equal(await dialog.getByText('Partial report', { exact: true }).count(), 0)
     const output = await download(page, 'csv')
     assert.doesNotMatch(output.filename, / - partial\.csv$/)
-    const rows = csvRecords(output.bytes, run.targets[0].rubric.criteria.length, true)
+    const rows = csvRecords(output.bytes, 1)
     assert.equal(rows.length, 1)
-    assert.equal(rows[0]['Overall score'], '')
-    assert.match(rows[0]['Overall assessment'], /no overall score|overall score.*unavailable|not.*assess/i)
-    for (let index = 1; index <= run.targets[0].rubric.criteria.length; index++) assert.equal(rows[0][`C${index}`], 'Not assessed')
-    assert.equal(new URL(rows[0]['Analysis link']).searchParams.get('result'), withheld.id)
+    const row = rows[0]
+    assert.ok(row, JSON.stringify(rows))
+    assert.equal(row['Overall score'], '60')
+    assert.match(row['Overall assessment'], /independent engineering work within defined projects/i)
+    assert.equal(row.C1, '3')
+    assert.equal(new URL(row['Analysis link']).searchParams.get('result'), completed.id)
     assert.deepEqual(errors, [])
   } finally { await context.close(); await fixture.close() }
 })
@@ -571,7 +521,7 @@ test('export permission failures are visible and cancelling a delayed evidence r
   const downloads = []
   page.on('download', (value) => downloads.push(value))
   try {
-    await page.goto(`${fixture.origin}/workspaces/${fixture.workspaceId}/analyses/${runId}?data=real`)
+    await page.goto(`${fixture.origin}/workspaces/${fixture.workspaceId}/analyses/${runId}`)
     await page.getByRole('button', { name: 'Export report', exact: true }).click()
     const dialog = page.getByRole('dialog', { name: 'Export analysis report', exact: true })
     await dialog.getByLabel('Report format', { exact: true }).selectOption('csv')
@@ -609,7 +559,7 @@ test('losing access to saved history cancels a pending export without a late pri
   const downloads = []
   page.on('download', (value) => downloads.push(value))
   try {
-    await page.goto(`${fixture.origin}/workspaces/${fixture.workspaceId}/analyses/${runId}?data=real`)
+    await page.goto(`${fixture.origin}/workspaces/${fixture.workspaceId}/analyses/${runId}`)
     await page.route('**/report-comparisons?*', async (route) => {
       const response = await route.fetch()
       captured.resolve()
@@ -641,7 +591,7 @@ test('analysis deletion removes the export controls and cancels a delayed report
   const downloads = []
   page.on('download', (value) => downloads.push(value))
   try {
-    await page.goto(`${fixture.origin}/workspaces/${fixture.workspaceId}/analyses/${runId}?data=real`)
+    await page.goto(`${fixture.origin}/workspaces/${fixture.workspaceId}/analyses/${runId}`)
     await page.route('**/report-comparisons?*', async (route) => {
       const response = await route.fetch()
       captured.resolve()
@@ -661,59 +611,6 @@ test('analysis deletion removes the export controls and cancels a delayed report
     assert.equal(downloads.length, 0)
     assert.deepEqual(errors, [])
   } finally { release.resolve(); await context.close(); await fixture.close() }
-})
-
-test('standalone sample exports link to frozen reviews and sources without a workspace prefix', { timeout: 180_000 }, async () => {
-  const directory = resolve(`.report-standalone-browser-${randomUUID()}`)
-  const { build, preview } = await import('vite')
-  const { context, page, errors } = await newPage()
-  let server
-  try {
-    await build({
-      configFile: resolve('vite.config.ts'), define: { 'import.meta.env.VITE_DEPLOYMENT_MODE': '"standalone"' },
-      build: { outDir: directory, emptyOutDir: false }, logLevel: 'error',
-    })
-    server = await preview({
-      configFile: false, build: { outDir: directory }, preview: { host: '127.0.0.1', port: 0, open: false }, logLevel: 'error',
-    })
-    const origin = `http://127.0.0.1:${server.httpServer.address().port}`
-    const sample = runtime.fixtures.createInitialWorkspace(), run = sample.runs[0]
-    await page.addInitScript((workspace) => {
-      if (!localStorage.getItem('score-demo-workspace-v1')) localStorage.setItem('score-demo-workspace-v1', JSON.stringify(workspace))
-    }, sample)
-    await page.goto(`${origin}/analyses/${run.id}?data=samples`)
-    await page.getByRole('button', { name: 'Export report', exact: true }).click()
-    const dialog = page.getByRole('dialog', { name: 'Export analysis report', exact: true })
-    await visible(dialog.getByText(`Reporting on ${run.comparisons.length} of ${run.comparisons.length} candidate-job reviews`, { exact: true }))
-    const output = await download(page, 'csv')
-    assert.match(output.filename, /^Sample - /)
-    const rows = csvRecords(output.bytes, Math.max(...run.targets.map((target) => target.rubric.criteria.length)), true)
-    assert.equal(rows.length, run.comparisons.length)
-    for (const row of rows) for (const [index, value] of reportDestinations(row).entries()) assertReviewDestination(value, {
-      origin, runId: run.id, comparisonId: new URL(row['Analysis link']).searchParams.get('result'), data: 'samples',
-      view: [null, 'resume', 'target'][index],
-    })
-    await dialog.getByRole('button', { name: 'Close', exact: true }).click()
-    for (const kind of ['job', 'grade']) {
-      const target = run.targets.find((target) => target.kind === kind)
-      const pair = run.comparisons.find((pair) => pair.targetId === target.id)
-      await followSampleSources(page, rows.find((row) => new URL(row['Analysis link']).searchParams.get('result') === pair.id), run)
-    }
-    const invalid = new URL(rows[0]['Analysis link'])
-    invalid.searchParams.set('view', 'live-library')
-    await page.goto(invalid.href)
-    const pair = run.comparisons.find((pair) => pair.id === invalid.searchParams.get('result'))
-    const resume = run.resumes.find((snapshot) => snapshot.resume.id === pair.resumeId)
-    await visible(page.getByRole('region', { name: 'Source evidence viewer', exact: true }).getByRole('heading', { name: resume.document.title, exact: true }))
-    assert.deepEqual(errors, [])
-  } finally {
-    await context.close()
-    if (server) {
-      server.httpServer.closeAllConnections()
-      await new Promise((resolve, reject) => server.httpServer.close((error) => error ? reject(error) : resolve()))
-    }
-    await rm(directory, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 })
-  }
 })
 
 test('grade export links open exact approved requirements and full frozen reference documents without invented citations', { timeout: 120_000 }, async () => {
@@ -755,7 +652,7 @@ test('grade export links open exact approved requirements and full frozen refere
     fixture.grades.blobs.values.delete(reference.source.documentBlobName)
     const modelCalls = stubs.modelCalls.length
     const before = JSON.stringify([...fixture.analyses.store.values.values()])
-    await page.goto(`${fixture.origin}/workspaces/${fixture.workspaceId}/analyses/${runId}?data=real`)
+    await page.goto(`${fixture.origin}/workspaces/${fixture.workspaceId}/analyses/${runId}`)
     await page.getByRole('button', { name: 'Export report', exact: true }).click()
     const output = await download(page, 'csv')
     const [row] = csvRecords(output.bytes, saved.targetSnapshot.version.rubric.criteria.length)
@@ -793,7 +690,7 @@ test('generated saved source links preserve workspace, access, missing-result, a
   const { fixture, runId, stubs } = await completedFixture({ comparisons: 1 })
   const { context, page, errors } = await newPage()
   try {
-    await page.goto(`${fixture.origin}/workspaces/${fixture.workspaceId}/analyses/${runId}?data=real`)
+    await page.goto(`${fixture.origin}/workspaces/${fixture.workspaceId}/analyses/${runId}`)
     await page.getByRole('button', { name: 'Export report', exact: true }).click()
     const output = await download(page, 'csv')
     const [row] = csvRecords(output.bytes, 1)

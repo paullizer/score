@@ -118,9 +118,8 @@ function tree() {
     importFile:(file,key,batch)=>importRealJobFile(workspaceId,file,key,batch),importPdf:(file,key,batch)=>importRealJobPdf(workspaceId,file,key,batch),importUrl:(url,key,batch)=>importRealJobUrl(workspaceId,url,key,batch),
     originalUrl:id=>originalUrl('jobs',id)};
   const cloud = {currentWorkspaceId:workspaceId,workspaces:[{id:workspaceId,role:'owner'}],realJobs};
-  const value = {workspace:{schemaVersion:1,jobs:[job],resumes:[],rubrics:[rubric],documents:[sourceDocument],runs:[]},notice:null,storageError:null,notify:noop,clearNotice:noop,
-    addJobs:()=>[],addResumes:async()=>[],cancelJob:done,retryJob:done,saveRubric:async()=>rubric.id,startAnalysis:()=>{throw Error('Scoring must remain manual')},cancelRun:noop,retryRun:noop,resetDemo:noop,retrySave:noop,
-    ...(mode==='sample-import'?{}:{cloud})};
+  const value = {workspace:{jobs:[job],documents:[sourceDocument],rubrics:[rubric],lifecycle:{entities:{}}},notice:null,notify:noop,clearNotice:noop,
+    cancelJob:done,retryJob:done,saveRubric:async()=>rubric.id,cloud};
   const resumeId = 'resume-'+id;
   const resumeDocument = {...sourceDocument,kind:'resume'};
   const docRef = {blobName:'private/document.json',contentType:'application/json',sha256:'a'.repeat(64),bytes:300,documentId,documentVersion:1};
@@ -134,7 +133,7 @@ function tree() {
     ? <RealResumesContext.Provider value={resumes}><RealResumesPage id={resumeId}/></RealResumesContext.Provider>
     : mode==='resume-import'
     ? <RealResumesBridge workspaceId={workspaceId}><ResumeProbe/><RealAddResumesDialog open onOpenChange={noop}/></RealResumesBridge>
-    : mode==='job-import'||mode==='sample-import' ? <JobImport onClose={noop}/> : mode==='jobs' ? <JobsPage/>
+    : mode==='job-import' ? <JobImport onClose={noop}/> : mode==='jobs' ? <JobsPage/>
     : <Routes><Route path="/jobs/:id" element={<JobDetail/>}/></Routes>;
   return <MemoryRouter key={workspaceId+':'+id+':'+mode+':'+format} initialEntries={['/jobs/'+jobId]} future={{v7_startTransition:true,v7_relativeSplatPath:true}}>
     <WorkspaceContext.Provider value={contextual}>{content}</WorkspaceContext.Provider></MemoryRouter>;
@@ -156,7 +155,7 @@ export async function buildWordPreviewTestRuntime() {
       build({
         stdin: { contents: harness, resolveDir: process.cwd(), sourcefile: 'word-preview-harness.tsx', loader: 'tsx' },
         outfile: join(directory, 'browser.js'), bundle: true, platform: 'browser', format: 'esm', jsx: 'automatic',
-        plugins: [docxPreviewBrowserPlugin()], define: { 'import.meta.env.VITE_DEPLOYMENT_MODE': '"cloud"', 'process.env.NODE_ENV': '"development"' }, logLevel: 'silent',
+        plugins: [docxPreviewBrowserPlugin()], define: { 'process.env.NODE_ENV': '"development"' }, logLevel: 'silent',
       }),
       buildDocxPreviewTestWorker(directory),
     ])

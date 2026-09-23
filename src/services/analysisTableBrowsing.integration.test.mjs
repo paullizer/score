@@ -97,35 +97,6 @@ function apiFor(pairs, targets = [target()], options = {}) {
   return { ...api, ...options }
 }
 
-function sampleRun({ multi = true, id = 'sample-run' } = {}) {
-  const workspace = ui.createInitialWorkspace()
-  const single = structuredClone(workspace.runs.find((run) => run.targets.length === 1))
-  const grade = structuredClone(workspace.runs.flatMap((run) => run.targets).find((target) => target.kind === 'grade'))
-  const targets = multi ? [grade, single.targets[0]] : single.targets
-  const resumes = single.resumes
-  const names = ['Zeta Person', 'alpha Person', 'Candidate 10']
-  resumes.forEach(({ resume, document }, index) => {
-    resume.name = names[index]
-    resume.role = ['Research analyst', 'Platform engineer', 'Data specialist'][index]
-    resume.sourceLabel = ['Research-CV.pdf', 'Engineering-profile.html', 'data-source.pdf'][index]
-    document.title = ['Saved research portfolio', 'Saved systems portfolio', 'Saved analytics portfolio'][index]
-  })
-  const run = { ...single, id, name: `Fictional ${id}`, targets, resumes, comparisons: [] }
-  for (const [resumeIndex, { resume }] of resumes.entries()) for (const [targetIndex, target] of targets.entries()) {
-    run.comparisons.push({ id: `${id}-pair-${resumeIndex}-${targetIndex}`, resumeId: resume.id, targetId: target.id, status: 'queued', score: null, criteria: [], summary: '' })
-  }
-  run.comparisons = run.comparisons.map((comparison) => ui.evaluateComparison(run, comparison.id))
-  for (const [index, { resume }] of resumes.entries()) for (const target of targets) {
-    const comparison = run.comparisons.find((comparison) => comparison.resumeId === resume.id && comparison.targetId === target.id)
-    comparison.score = (target.kind === 'job' ? [0, 75, null] : [95, 10, 20])[index]
-    comparison.criteria = comparison.criteria.map((criterion, criterionIndex) => ({ ...criterion,
-      citations: criterionIndex < [2, 1, 0][index] ? [{ documentId: resumes[index].document.id, documentVersion: 1,
-        paragraphId: resumes[index].document.paragraphs[0].id, page: 1, heading: 'Saved source', quote: 'Fictional citation' }] : [],
-    }))
-  }
-  return run
-}
-
 function frozen(value) {
   if (value && typeof value === 'object') { Object.freeze(value); for (const item of Object.values(value)) frozen(item) }
   return value
@@ -150,15 +121,11 @@ before(async () => {
     export { targetIdentity } from './src/features/analyses/realAnalysisUi';
     export { WorkspaceContext } from './src/app/workspace-context';
     export { RealAnalysesContext } from './src/app/real-analyses-context';
-    export { AnalysisDetail } from './src/features/analyses/AnalysisDetail';
+    export { AnalysesPage, AnalysisDetail } from './src/features/analyses/AnalysesPage';
     export { RealAnalysisDetail } from './src/features/analyses/RealAnalysisDetail';
-    export { AnalysesPage } from './src/features/analyses/AnalysesPage';
-    export { RealAnalysesPage } from './src/features/analyses/RealAnalysesPage';
     export { MemoryRouter, Routes, Route, useNavigate, useLocation } from 'react-router-dom';
-    export { createInitialWorkspace } from './src/data/fixtures';
-    export { evaluateComparison } from './src/services/scoring';
   ` }, outfile: join(output, 'ui.mjs'), bundle: true, packages: 'external', format: 'esm', platform: 'node',
-  jsx: 'automatic', logLevel: 'silent', define: { 'import.meta.env.VITE_DEPLOYMENT_MODE': '"cloud"' } })
+  jsx: 'automatic', logLevel: 'silent' })
   ui = await import(pathToFileURL(join(output, 'ui.mjs')).href)
 })
 
@@ -180,7 +147,6 @@ after(async () => {
 
 const browse = (overrides = {}) => ({ query: '', targetId: '', sort: null, ...overrides })
 const indexes = (rows) => rows.map((row) => row.comparison.index)
-const sampleNames = (rows) => rows.map((row) => row.snapshot.resume.name)
 
 test('real selectors preserve saved index ties, natural names, null-last scores in both directions, and frozen inputs', () => {
   const targets = [target()]
@@ -254,80 +220,14 @@ test('status sorting means processing, preserving completed unscored/limited pai
   for (const status of ['initializing', 'queued', 'running', 'parsing', 'generating', 'profiling']) assert.equal(ui.analysisProcessingRank(status), 1)
 })
 
-test('sample selectors retain matrix rows for target matches and search only frozen resume metadata and document labels', () => {
-  const run = frozen(sampleRun())
-  const original = JSON.stringify(run)
-  for (const query of ['  RESEARCH  ', 'research-CV', 'saved research portfolio', 'zeta']) {
-    assert.deepEqual(sampleNames(ui.selectSampleComparisons(run, browse({ query })).rows), ['Zeta Person'])
-  }
-  assert.equal(ui.selectSampleComparisons(run, browse({ query: run.targets[0].sublabel.toUpperCase() })).rows.length, 3)
-  assert.equal(ui.selectSampleComparisons(run, browse({ query: run.resumes[0].document.paragraphs[0].text })).rows.length, 0)
-  const job = run.targets.find((target) => target.kind === 'job')
-  assert.equal(ui.selectSampleComparisons(run, browse({ query: run.targets.find((target) => target.kind === 'grade').label, targetId: job.id })).rows.length, 0)
-  for (const key of ['score', 'coverage', 'status']) {
-    const result = ui.selectSampleComparisons(run, browse({ sort: { key, direction: 'desc' } }))
-    assert.equal(result.sort, null)
-    assert.deepEqual(sampleNames(result.rows), ['Zeta Person', 'alpha Person', 'Candidate 10'])
-  }
-  assert.equal(ui.selectSampleComparisons(run, browse()).comparisonCount, 6)
-  assert.equal(JSON.stringify(run), original)
-})
-
-test('sample target-scoped scores and cited-criterion counts keep zero and completed unscored rows separate from pending work', () => {
-  const run = sampleRun()
-  const targetId = run.targets.find((target) => target.kind === 'job').id
-  const sort = (key, direction) => ui.selectSampleComparisons(run, browse({ targetId, sort: { key, direction } })).rows
-  assert.deepEqual(sampleNames(sort('score', 'asc')), ['Zeta Person', 'alpha Person', 'Candidate 10'])
-  assert.deepEqual(sampleNames(sort('score', 'desc')), ['alpha Person', 'Zeta Person', 'Candidate 10'])
-  assert.deepEqual(sampleNames(sort('coverage', 'asc')), ['Candidate 10', 'alpha Person', 'Zeta Person'])
-  assert.deepEqual(sampleNames(sort('coverage', 'desc')), ['Zeta Person', 'alpha Person', 'Candidate 10'])
-  const first = run.comparisons.find((comparison) => comparison.resumeId === run.resumes[0].resume.id && comparison.targetId === targetId)
-  first.status = 'running'
-  first.score = 99
-  assert.deepEqual(sampleNames(sort('score', 'desc')), ['alpha Person', 'Zeta Person', 'Candidate 10'], 'An old score on unfinished work is not an available score.')
-  assert.deepEqual(sampleNames(sort('coverage', 'asc')), ['Candidate 10', 'alpha Person', 'Zeta Person'])
-  assert.deepEqual(sampleNames(sort('coverage', 'desc')), ['alpha Person', 'Candidate 10', 'Zeta Person'])
-  assert.deepEqual(sampleNames(sort('status', 'desc')), ['alpha Person', 'Candidate 10', 'Zeta Person'])
-  assert.deepEqual(ui.sampleComparisonDefaultSort(sampleRun({ multi: false })), { key: 'score', direction: 'desc' })
-  assert.equal(ui.sampleComparisonDefaultSort(run), null)
-})
-
-test('history selectors use true totals, chronological timestamps, sample runStatus, stable ties, and default source order', () => {
-  const real = [summary([], { id: 'ten', name: 'Analysis 10', total: 2, createdAt: '2026-09-18T23:30:00-04:00' }),
-    summary([], { id: 'two', name: 'analysis 2', total: 100, createdAt: '2026-09-19T01:00:00Z', status: 'partial' }),
-    summary([], { id: 'tie', name: 'Analysis 2', total: 0, createdAt: '2026-09-17T00:00:00Z', status: 'running' })]
-  const before = JSON.stringify(frozen(real))
-  const realOrder = (key, direction) => ui.selectRealAnalysisRuns(real, '', 'all', { key, direction }).map((summary) => summary.run.id)
-  assert.deepEqual(realOrder('name', 'asc'), ['two', 'tie', 'ten'])
-  assert.deepEqual(realOrder('name', 'desc'), ['ten', 'two', 'tie'])
-  assert.deepEqual(realOrder('comparisons', 'asc'), ['tie', 'ten', 'two'])
-  assert.deepEqual(realOrder('comparisons', 'desc'), ['two', 'ten', 'tie'])
-  assert.deepEqual(realOrder('created', 'desc'), ['ten', 'two', 'tie'])
-  assert.deepEqual(realOrder('status', 'asc'), ['two', 'tie', 'ten'])
-  assert.deepEqual(ui.selectRealAnalysisRuns(real, '', 'all', null), real)
-  assert.deepEqual(ui.selectRealAnalysisRuns(real, '  ANALYSIS  ', 'complete', null).map((summary) => summary.run.id), ['ten'])
-  assert.equal(JSON.stringify(real), before)
-  const complete = sampleRun({ multi: false, id: 'sample-complete' })
-  complete.comparisons.forEach((comparison) => { comparison.score = 50 })
-  const limited = sampleRun({ id: 'sample-limited' })
-  const running = sampleRun({ id: 'sample-running' })
-  running.comparisons[0].status = 'queued'
-  const sample = [complete, limited, running]
-  assert.deepEqual(ui.selectSampleAnalysisRuns(sample, '', 'all', { key: 'status', direction: 'asc' }).map((run) => run.id), ['sample-limited', 'sample-running', 'sample-complete'])
-  assert.deepEqual(ui.selectSampleAnalysisRuns(sample, '', 'all', { key: 'targets', direction: 'asc' }).map((run) => run.id), ['sample-complete', 'sample-limited', 'sample-running'])
-  assert.deepEqual(ui.selectSampleAnalysisRuns(sample, '', 'attention', null).map((run) => run.id), ['sample-limited', 'sample-running'])
-  assert.deepEqual(ui.selectSampleAnalysisRuns(sample, '', 'all', null), sample)
-})
-
 function Probe() {
   navigate = ui.useNavigate()
   location = ui.useLocation()
   return null
 }
-function app({ api = null, runs = [], cloud = true, path = '/analyses/run-one?data=real', directId } = {}) {
-  const workspace = { schemaVersion: 1, jobs: [], resumes: [], documents: [], rubrics: [], runs }
-  const value = { workspace, ...(cloud ? { cloud: { currentWorkspaceId: api?.workspaceId ?? workspaceId } } : {}),
-    cancelRun: (id) => calls.push(['cancel-sample', id]), retryRun: (id) => calls.push(['retry-sample', id]) }
+function app({ api = null, path = '/analyses/run-one?data=real', directId } = {}) {
+  const workspace = { jobs: [], documents: [], rubrics: [] }
+  const value = { workspace, cloud: { currentWorkspaceId: api?.workspaceId ?? workspaceId } }
   return React.createElement(ui.MemoryRouter, { initialEntries: [path], future: { v7_startTransition: true, v7_relativeSplatPath: true } },
     React.createElement(ui.WorkspaceContext.Provider, { value: frontendWorkspaceContext(value, { analyses: api?.summaries }) }, React.createElement(ui.RealAnalysesContext.Provider, { value: api },
       React.createElement(Probe),
@@ -557,7 +457,7 @@ test('all 500 acknowledged comparisons stay searchable and update in sorted orde
   assert.equal(element('input[aria-label="Search comparisons"]').value, 'Candidate')
 })
 
-test('real result links and browser history retain local browsing, while run, workspace, and real/sample boundaries reset it', async () => {
+test('real result links and browser history retain local browsing, while run and workspace boundaries reset it', async () => {
   const targets = [target(), target({ version: 2 })]
   const first = [pair(0, { name: 'Zeta Person', score: 0 }), pair(1, { name: 'Alpha Person', score: 75 }),
     pair(2, { name: 'Beta Person', chosenTarget: targets[1] })]
@@ -567,8 +467,7 @@ test('real result links and browser history retain local browsing, while run, wo
   const source = (id) => id === 'run-two' ? apiTwo : apiOne
   const api = { ...apiOne, summaries: [...apiOne.summaries, ...apiTwo.summaries],
     detail: (id) => source(id).detail(id), comparisons: (id) => source(id).comparisons(id), comparison: (id, pairId) => source(id).comparison(id, pairId) }
-  const runs = [sampleRun({ id: 'run-one' })]
-  await render(app({ api, runs }))
+  await render(app({ api }))
   await search('  PERSON ')
   await chooseTarget(ui.targetIdentity(targets[0].selection))
   await sortHeader('Assessment / evidence match')
@@ -591,16 +490,16 @@ test('real result links and browser history retain local browsing, while run, wo
   assert.equal(element('select[aria-label="Comparison target"]').value, '')
   await go('/analyses/run-one?data=real')
   await search('alpha')
-  await render(app({ api: { ...api, workspaceId: 'other-fictional-workspace' }, runs }))
+  await render(app({ api: { ...api, workspaceId: 'other-fictional-workspace' } }))
   assert.equal(element('input[aria-label="Search comparisons"]').value, '')
   assert.equal(chosenSort(), 'Saved order')
   await search('zeta')
-  await go('/analyses/run-one?data=samples')
-  assert.equal(element('input[aria-label="Search comparisons"]').value, '')
+  await go(`/analyses/run-one?${new URLSearchParams({ data: 'samples' })}`) // legacy parameter is ignored
+  assert.equal(element('input[aria-label="Search comparisons"]').value, 'zeta')
   assert.equal(chosenSort(), 'Saved order')
-  await search('systems portfolio')
+  await search('zeta')
   await go('/analyses/run-one?data=real')
-  assert.equal(element('input[aria-label="Search comparisons"]').value, '')
+  assert.equal(element('input[aria-label="Search comparisons"]').value, 'zeta')
   assert.doesNotMatch(location.search, /PERSON|alpha|zeta|portfolio/i)
   assert.equal(location.state, null)
   assert.equal(dom.window.localStorage.length, 0)
@@ -615,132 +514,6 @@ test('the directly mounted real detail resets on a new id without relying on ext
   await render(app({ api: second, directId: 'run-two' }))
   assert.equal(element('input[aria-label="Search comparisons"]').value, '')
   assert.equal(chosenSort(), 'Saved order')
-})
-
-test('sample matrix search and exact-target tables share browsing state without aggregate sorting', async () => {
-  const run = sampleRun()
-  const original = JSON.stringify(frozen(run))
-  const job = run.targets.find((target) => target.kind === 'job')
-  const grade = run.targets.find((target) => target.kind === 'grade')
-  await render(app({ runs: [run], cloud: false, path: '/analyses/sample-run' }))
-  assert.deepEqual(tableNames('.matrix-table'), ['Zeta Person', 'alpha Person', 'Candidate 10'])
-  assert.equal(chosenSort(), 'Saved order')
-  assert.equal([...element('select[aria-label="Sort comparisons"]').options].filter((option) => option.disabled).length, 6)
-  assert.match(dom.window.document.body.textContent, /The matrix has no combined score or status/)
-  assert.match(dom.window.document.body.textContent, /3 of 3 resumes shown · 6 of 6 saved comparisons shown/)
-  await sortHeader('Resume')
-  assert.deepEqual(tableNames('.matrix-table'), ['alpha Person', 'Candidate 10', 'Zeta Person'])
-  await search('  ENGINEERING-PROFILE.HTML  ')
-  assert.deepEqual(tableNames('.matrix-table'), ['alpha Person'])
-  assert.match(dom.window.document.body.textContent, /1 of 3 resumes shown · 2 of 6 saved comparisons shown/)
-  await search(grade.label.toUpperCase())
-  assert.equal(tableRows('.matrix-table').length, 3)
-  await chooseTarget(job.id)
-  assert.match(dom.window.document.body.textContent, /No matching comparisons/)
-  await click('Clear comparison filters')
-  assert.equal(tableRows('.matrix-table').length, 3)
-  await chooseTarget(job.id)
-  assert.equal(tableRows().length, 3)
-  assert.equal(dom.window.document.querySelector('.matrix-table'), null)
-  await sortHeader('Evidence match')
-  assert.deepEqual(tableNames(), ['alpha Person', 'Zeta Person', 'Candidate 10'])
-  assert.match(tableRows()[1].cells[1].textContent, /0\/ 100/)
-  assert.match(tableRows()[2].cells[1].textContent, /Not assessed/)
-  assert.equal(tableRows()[2].cells[3].querySelector('.badge').textContent, 'Complete')
-  await sortHeader('Evidence match')
-  assert.deepEqual(tableNames(), ['Zeta Person', 'alpha Person', 'Candidate 10'])
-  for (const text of ['Evidence match: high to low', 'Evidence coverage: fewest cited criteria first', 'Status / actions: complete first']) {
-    await chooseTarget(job.id)
-    await choose('Sort comparisons', text)
-    await chooseTarget('')
-    assert.equal(chosenSort(), 'Saved order')
-    assert.deepEqual(tableNames('.matrix-table'), ['Zeta Person', 'alpha Person', 'Candidate 10'])
-    assert.equal(dom.window.document.querySelector('th[aria-sort]'), null)
-  }
-  await chooseTarget(grade.id)
-  await sortHeader('Evidence match')
-  assert.deepEqual(tableNames(), ['Zeta Person', 'Candidate 10', 'alpha Person'])
-  await click('Zeta Person')
-  assert.equal(new URLSearchParams(location.search).get('result'), run.comparisons.find((comparison) => comparison.resumeId === run.resumes[0].resume.id && comparison.targetId === grade.id).id)
-  await backLink('All comparisons')
-  assert.equal(element('select[aria-label="Comparison target"]').value, grade.id)
-  assert.equal(chosenSort(), 'Evidence match: high to low')
-  assert.deepEqual(tableNames(), ['Zeta Person', 'Candidate 10', 'alpha Person'])
-  await click('Zeta Person')
-  await go(-1)
-  assert.equal(element('select[aria-label="Comparison target"]').value, grade.id)
-  assert.equal(JSON.stringify(run), original)
-  assert.deepEqual(calls, [])
-})
-
-test('single-target samples retain their score-descending default, zero/null directions, metadata query, and run resets', async () => {
-  const run = sampleRun({ multi: false })
-  const nextRun = sampleRun({ multi: false, id: 'next-sample' })
-  await render(app({ runs: [run, nextRun], cloud: false, path: '/analyses/sample-run' }))
-  assert.deepEqual(tableNames(), ['alpha Person', 'Zeta Person', 'Candidate 10'])
-  assert.equal(chosenSort(), 'Evidence match: high to low')
-  assert.equal(element('th[aria-sort]').getAttribute('aria-sort'), 'descending')
-  assert.equal(button('Sort Evidence match: low to high').disabled, false)
-  await sortHeader('Evidence match')
-  assert.deepEqual(tableNames(), ['Zeta Person', 'alpha Person', 'Candidate 10'])
-  await sortHeader('Resume')
-  assert.deepEqual(tableNames(), ['alpha Person', 'Candidate 10', 'Zeta Person'])
-  await choose('Sort comparisons', 'Default order (score: high to low)')
-  assert.deepEqual(tableNames(), ['alpha Person', 'Zeta Person', 'Candidate 10'])
-  await search('  SAVED SYSTEMS PORTFOLIO ')
-  assert.deepEqual(tableNames(), ['alpha Person'])
-  await click('alpha Person')
-  await backLink('All comparisons')
-  assert.equal(element('input[aria-label="Search comparisons"]').value, '  SAVED SYSTEMS PORTFOLIO ')
-  assert.deepEqual(tableNames(), ['alpha Person'])
-  await go('/analyses/next-sample')
-  assert.equal(element('input[aria-label="Search comparisons"]').value, '')
-  assert.equal(chosenSort(), 'Evidence match: high to low')
-  await search('Zeta')
-  await render(app({ runs: [run, nextRun], api: { workspaceId: 'another-sample-workspace' }, cloud: true }))
-  assert.equal(element('input[aria-label="Search comparisons"]').value, '')
-  assert.equal(dom.window.localStorage.length, 0)
-})
-
-test('sample status and coverage sorting keep processing labels visible and actions bound to the saved run', async () => {
-  const run = sampleRun({ multi: false })
-  run.comparisons[0].status = 'failed'
-  run.comparisons[0].score = null
-  run.comparisons[1].status = 'running'
-  run.comparisons[1].score = null
-  await render(app({ runs: [run], cloud: false, path: '/analyses/sample-run' }))
-  await sortHeader('Status / actions')
-  assert.deepEqual(tableNames(), ['Zeta Person', 'alpha Person', 'Candidate 10'])
-  assert.deepEqual(tableRows().map((row) => row.cells[3].querySelector('.badge').textContent), ['Failed', 'Running', 'Complete'])
-  await sortHeader('Status / actions')
-  assert.deepEqual(tableNames(), ['Candidate 10', 'alpha Person', 'Zeta Person'])
-  await sortHeader('Evidence coverage')
-  assert.deepEqual(tableNames(), ['Candidate 10', 'Zeta Person', 'alpha Person'])
-  await click('Cancel pending')
-  assert.deepEqual(calls, [['cancel-sample', 'sample-run']])
-  const updated = structuredClone(run)
-  updated.comparisons[1].status = 'cancelled'
-  await render(app({ runs: [updated], cloud: false }))
-  assert.equal(chosenSort(), 'Evidence coverage: fewest cited criteria first')
-  await click('Retry unfinished')
-  assert.deepEqual(calls.at(-1), ['retry-sample', 'sample-run'])
-  await search('no saved candidate')
-  assert.match(dom.window.document.body.textContent, /No matching comparisons/)
-  await click('Clear comparison filters')
-  assert.equal(tableRows().length, 3)
-})
-
-test('synthetic-data guards still block real or mixed sample snapshots before exposing comparison browsing', async () => {
-  const run = sampleRun()
-  run.targets[0].rubric.dataKind = 'real'
-  await render(app({ runs: [run], cloud: false, path: '/analyses/sample-run' }))
-  assert.match(dom.window.document.body.textContent, /Real inputs cannot have demo scores/)
-  assert.equal(dom.window.document.querySelector('input[aria-label="Search comparisons"]'), null)
-  const mixed = sampleRun()
-  mixed.resumes[0].document.sample = false
-  await render(app({ runs: [mixed], cloud: false }))
-  assert.match(dom.window.document.body.textContent, /Real inputs cannot have demo scores/)
-  assert.equal(dom.window.document.querySelector('table'), null)
 })
 
 test('real analysis history exposes total-count/status/date sorting, keeps filtering and read-only errors, and leaves Open unsortable', async () => {
@@ -775,43 +548,4 @@ test('real analysis history exposes total-count/status/date sorting, keeps filte
   await choose('Sort real analyses', 'Analysis: Z to A')
   await render(app({ api: { ...api, workspaceId: 'other-history-workspace' } }))
   assert.equal(chosenSort('Sort real analyses'), 'Default order')
-})
-
-test('sample analysis history sorts counts, processing status and dates with default reset and no human-review state', async () => {
-  const ten = sampleRun({ multi: false, id: 'sample-ten' })
-  ten.name = 'Analysis 10'
-  ten.comparisons.forEach((comparison) => { comparison.score = 50 })
-  ten.createdAt = '2026-09-17T00:00:00Z'
-  ten.resumes = ten.resumes.slice(0, 1)
-  const two = sampleRun({ id: 'sample-two' })
-  two.name = 'Analysis 2'
-  two.createdAt = '2026-09-19T00:00:00Z'
-  const one = sampleRun({ multi: false, id: 'sample-one' })
-  one.name = 'Analysis 1'
-  one.comparisons[0].status = 'queued'
-  one.createdAt = '2026-09-18T00:00:00Z'
-  one.resumes = one.resumes.slice(0, 2)
-  const runs = [ten, two, one]
-  await render(app({ runs, cloud: false, path: '/analyses' }))
-  assert.deepEqual(tableNames('.data-table'), ['Analysis 10', 'Analysis 2', 'Analysis 1'])
-  assert.equal(element('thead th:last-child').querySelector('button'), null)
-  await sortHeader('Analysis')
-  assert.deepEqual(tableNames('.data-table'), ['Analysis 1', 'Analysis 2', 'Analysis 10'])
-  await sortHeader('Resumes')
-  assert.deepEqual(tableNames('.data-table'), ['Analysis 10', 'Analysis 1', 'Analysis 2'])
-  await sortHeader('Targets')
-  assert.deepEqual(tableNames('.data-table'), ['Analysis 10', 'Analysis 1', 'Analysis 2'])
-  await sortHeader('Status')
-  assert.deepEqual(tableNames('.data-table'), ['Analysis 2', 'Analysis 1', 'Analysis 10'])
-  await sortHeader('Created')
-  assert.deepEqual(tableNames('.data-table'), ['Analysis 2', 'Analysis 1', 'Analysis 10'])
-  await choose('Sort analyses', 'Default order')
-  assert.deepEqual(tableNames('.data-table'), ['Analysis 10', 'Analysis 2', 'Analysis 1'])
-  await click('Complete')
-  assert.deepEqual(tableNames('.data-table'), ['Analysis 10'])
-  await search('missing analysis', 'Find an analysis...')
-  assert.match(dom.window.document.body.textContent, /No matching analyses/)
-  await click('Clear filters')
-  assert.equal(tableRows('.data-table').length, 3)
-  assert.equal(calls.length, 0)
 })

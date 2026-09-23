@@ -54,6 +54,7 @@ test('frontend workspace fakes enforce conditional metadata, idempotent cleanup,
     await second.renew()
     await second.release()
 
+    state.states.set(workspaceId, { etag: '"legacy-state"', content: '{}' })
     const snapshot = await state.getState(workspaceId)
     await assert.rejects(state.deleteState(workspaceId, '"stale"'), api.StoreConflictError)
     await state.deleteState(workspaceId, snapshot.etag)
@@ -145,7 +146,7 @@ test('real API/client lifecycle captures exact seed versions, real PDFs, frozen 
     assert.equal((await client.listAllGradeVersions(workspaceId, ladderId, 9)).length, 2)
     assert.equal(JSON.stringify(await fixture.jobs.store.get(workspaceId, seeded.seed.job.id)), jobBefore)
     assert.equal(JSON.stringify(await fixture.jobs.store.listRubrics(workspaceId, seeded.seed.job.id)), seedBefore)
-    assert.equal(fixture.state.saves.length, 0, 'real grade requests never write legacy sample state')
+    assert.equal(fixture.requests.some((request) => request.url.endsWith('/state') && request.method !== 'GET'), false, 'real grade requests never write legacy state')
   } finally { restoreFetch?.(); await fixture.close() }
 })
 
@@ -231,6 +232,6 @@ test('viewer and cross-workspace API boundaries authorize before reference mutat
     assert.equal(raw.status, 403, 'viewer authorization precedes raw PDF parsing and upload metadata checks')
     const anonymous = await nativeFetch(`${fixture.origin}/api/features`)
     assert.equal(anonymous.status, 401)
-    assert.equal(fixture.state.saves.length, 0)
+    assert.equal(fixture.requests.some((request) => request.url.endsWith('/state') && request.method !== 'GET'), false)
   } finally { restoreFetch?.(); await fixture.close() }
 })

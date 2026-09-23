@@ -83,7 +83,7 @@ before(async () => {
   ;({ createRoot } = await import('react-dom/client'))
   await Promise.all([
     build({ entryPoints: [join('src', 'services', 'realResumes.ts')], outfile: join(output, 'client.mjs'), bundle: true, packages: 'external',
-      format: 'esm', platform: 'node', logLevel: 'silent', define: { 'import.meta.env.VITE_DEPLOYMENT_MODE': '"cloud"' } }),
+      format: 'esm', platform: 'node', logLevel: 'silent' }),
     build({ stdin: { resolveDir: process.cwd(), loader: 'tsx', contents: `
       export * from './src/features/resumes/resumeImportUi';
       export { RealRequestScope } from './src/app/real-request-scope';
@@ -103,7 +103,7 @@ before(async () => {
       export { uploadFileByteLimit } from './src/services/documentUploads';
       export { MemoryRouter } from 'react-router-dom';
     ` }, outfile: join(output, 'ui.mjs'), bundle: true, packages: 'external', format: 'esm', platform: 'node',
-      jsx: 'automatic', logLevel: 'silent', define: { 'import.meta.env.VITE_DEPLOYMENT_MODE': '"cloud"' } }),
+      jsx: 'automatic', logLevel: 'silent' }),
   ])
   ;[client, ui] = await Promise.all(['client', 'ui'].map((name) => import(pathToFileURL(join(output, `${name}.mjs`)).href)))
 })
@@ -190,7 +190,7 @@ test('Markdown resume capability must be advertised explicitly with real resume 
   assert.equal((await client.fetchResumeProcessingFeatures()).markdownResumeImports, true)
 })
 
-test('resumes consume all pages, encode tokens, reject repeated tokens and foreign/sample records', async () => {
+test('resumes consume all pages, encode tokens, and reject repeated tokens or non-real records', async () => {
   const workspaceId = 'workspace / one'
   globalThis.fetch = async (url, init) => {
     requests.push({ url, init })
@@ -203,7 +203,7 @@ test('resumes consume all pages, encode tokens, reject repeated tokens and forei
   globalThis.fetch = async () => json({ resumes: [summary('foreign', 'other-workspace')] })
   await assert.rejects(client.listAllRealResumes('w'), /real record for this workspace/)
   globalThis.fetch = async () => json({ resumes: [{ ...summary('sample', 'w'), resume: { id: 'sample', sample: true } }] })
-  await assert.rejects(client.listAllRealResumes('w'), /No sample was substituted/)
+  await assert.rejects(client.listAllRealResumes('w'), /real record for this workspace/)
 })
 
 test('actual PDF bytes and both UUIDs are preserved, with a consistent declared batch count', async () => {
@@ -657,12 +657,11 @@ test('request scope fences stale reads and workspace lifetimes without cancellin
 })
 
 function Probe() { current = ui.useRealResumes(); projected = ui.useWorkspace(); return React.createElement('span', null, current.phase) }
-const sample = { schemaVersion: 1, jobs: [], resumes: [], rubrics: [], documents: [], runs: [] }
+const baseWorkspace = { jobs: [], documents: [], rubrics: [] }
 function tree(workspaceId, showProbe = true, role = 'owner', showDialog = false) {
   return React.createElement(ui.MemoryRouter, { future: { v7_startTransition: true, v7_relativeSplatPath: true } },
     React.createElement(ui.WorkspaceContext.Provider, { value: frontendWorkspaceContext({
-    workspace: sample, cloud: { currentWorkspaceId: workspaceId, workspaces: [{ id: workspaceId, role }] },
-    addResumes: () => { throw new Error('Real input reached sample intake') }, startAnalysis: () => { throw new Error('Real input reached sample scoring') },
+    workspace: baseWorkspace, cloud: { currentWorkspaceId: workspaceId, workspaces: [{ id: workspaceId, role }] },
   }) }, React.createElement(ui.RealResumesBridge, { workspaceId },
     React.createElement(React.Fragment, null, showProbe ? React.createElement(Probe) : null,
       showDialog ? React.createElement(ui.RealAddResumesDialog, { open: true, onOpenChange() {} }) : null))))
@@ -806,7 +805,7 @@ test('resume rename retains ready source details and never promotes a custom lab
   assert.equal(current.detail('resume-one').value.document, document)
   assert.deepEqual(record.resume, before.resume)
   assert.deepEqual(record.profile, before.profile)
-  assert.deepEqual(sample.resumes, [])
+  assert.deepEqual(baseWorkspace.jobs, [])
   assert.equal(requests.filter(request => request.init.method === 'PATCH').length, 1)
 })
 
@@ -824,7 +823,7 @@ test('provider retains independent accepted/unconfirmed uploads after dialog unm
   }
   await mount()
   await settle(() => current?.phase === 'ready')
-  const before = JSON.stringify(sample)
+  const before = JSON.stringify(baseWorkspace)
   dom.window.localStorage.clear()
   await act(async () => current.stage([{ kind: 'pdf', file: new File(['%PDF-one'], 'resume.pdf') }, { kind: 'url', url: 'https://example.test/profile' }]))
   const batch = current.batches[0]
@@ -847,7 +846,7 @@ test('provider retains independent accepted/unconfirmed uploads after dialog unm
   assert.equal(urlRequests[0].init.headers.get('X-Import-Batch'), urlRequests[1].init.headers.get('X-Import-Batch'))
   assert.equal(urlRequests[1].init.headers.get('X-Import-Count'), '2')
   assert.equal(urlRequests[0].init.body, urlRequests[1].init.body)
-  assert.equal(JSON.stringify(sample), before)
+  assert.equal(JSON.stringify(baseWorkspace), before)
   assert.equal(dom.window.localStorage.length, 0)
 })
 
@@ -905,7 +904,7 @@ test('mixed Markdown batches preserve retries, invalid entries and same-named fi
     new File(['# Second profile'], 'resume.MD', { type: 'application/pdf' }),
     new File(['invalid'], 'resume.docx'),
   ]
-  const initial = JSON.stringify(sample)
+  const initial = JSON.stringify(baseWorkspace)
   dom.window.localStorage.clear()
   await act(async () => current.stage([...files.map(ui.resumeFileSource), { kind: 'url', url: 'https://example.test/profile' }]))
   const batch = current.batches[0]
@@ -935,7 +934,7 @@ test('mixed Markdown batches preserve retries, invalid entries and same-named fi
   assert.deepEqual(new Uint8Array(retries[0].init.body), new Uint8Array(retries[1].init.body))
   assert.deepEqual(current.batches[0].items.map((item) => item.key), originalKeys)
   assert.equal(current.batches[0].items[1].source.file, null)
-  assert.equal(JSON.stringify(sample), initial)
+  assert.equal(JSON.stringify(baseWorkspace), initial)
   assert.equal(dom.window.localStorage.length, 0)
 })
 

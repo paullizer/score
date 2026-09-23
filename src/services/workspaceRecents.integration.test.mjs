@@ -18,7 +18,6 @@ before(async () => {
   await build({
     entryPoints: ['src/services/workspaceRecents.ts'], outfile: join(output, 'recents.mjs'),
     bundle: true, packages: 'external', format: 'esm', platform: 'node', logLevel: 'silent',
-    define: { 'import.meta.env.VITE_DEPLOYMENT_MODE': '"cloud"' },
   })
   recents = await import(pathToFileURL(join(output, 'recents.mjs')).href)
 })

@@ -364,7 +364,7 @@ test('job picker accepts advertised uppercase Word files, keeps invalid neighbor
   assert.equal(fixture.requests.some((request) => request.url.includes('/analyses')), false)
 })
 
-test('resume drop handles mixed files/URLs with per-item errors and releases accepted files; old servers and samples stay PDF-only', { timeout: 60_000 }, async (t) => {
+test('resume drop handles mixed files/URLs with per-item errors and releases accepted files; old servers stay PDF-only', { timeout: 60_000 }, async (t) => {
   const { page, fixture } = await open(t, { state: { mode: 'resume-import' } })
   const dialog = await visible(page.getByRole('dialog', { name: 'Add real resumes', exact: true }))
   await visible(dialog.getByRole('button', { name: 'Choose files', exact: true }))
@@ -397,12 +397,6 @@ test('resume drop handles mixed files/URLs with per-item errors and releases acc
   await oldInput.setInputFiles({ name: 'NotEnabled.DOCX', mimeType: '', buffer: docx })
   await visible(old.page.getByText(/DOCX uploads are not enabled/))
   assert.equal(uploads(old.fixture).length, 0)
-  const sample = await open(t, { state: { mode: 'sample-import' } })
-  const sampleInput = sample.page.getByLabel('Choose job PDF files', { exact: true })
-  assert.equal(await sampleInput.getAttribute('accept'), '.pdf,application/pdf')
-  await sampleInput.setInputFiles({ name: 'NotASample.DOCX', mimeType: '', buffer: docx })
-  await visible(sample.page.getByText('Choose PDF files only. File contents will not be read.', { exact: true }))
-  assert.equal(uploads(sample.fixture).length, 0)
 })
 
 test('browser picker combines Markdown and Word in one batch without capability cross-enabling', { timeout: 60_000 }, async (t) => {

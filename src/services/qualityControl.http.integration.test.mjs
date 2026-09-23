@@ -13,8 +13,7 @@ let client, http, role, requests
 before(async () => {
   await mkdir(output)
   await build({ entryPoints: [join('src', 'services', 'qualityControl.ts')], outfile: join(output, 'client.mjs'),
-    bundle: true, packages: 'external', format: 'esm', platform: 'node', logLevel: 'silent',
-    define: { 'import.meta.env.VITE_DEPLOYMENT_MODE': '"cloud"' } })
+    bundle: true, packages: 'external', format: 'esm', platform: 'node', logLevel: 'silent' })
   client = await import(pathToFileURL(join(output, 'client.mjs')).href)
 })
 afterEach(async () => { globalThis.fetch = nativeFetch; await http?.close(); http = null })

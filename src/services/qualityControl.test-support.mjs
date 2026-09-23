@@ -24,7 +24,7 @@ export function qcProposal() {
     findings: [{ description: 'One selected reviewer disputes the evidence interpretation.', reviewIds: ['submission-peer-1'] }],
     disagreements: ['The reviewers differ about breadth; neither opinion is assumed true.'],
     changes: [{ familyId: 'assessment', guidance: 'Describe the exact documented scope before assigning a numeric rating.', reason: 'Keep conclusions grounded in cited scope.' }],
-    expectedEffects: 'More explicit evidence scope.', risks: 'A selected sample may not generalize.' }
+    expectedEffects: 'More explicit evidence scope.', risks: 'A selected excerpt may not generalize.' }
 }
 export function qcPlanDetail({ status = 'draft', proposal = null, admin = false, id = 'plan-one' } = {}) {
   const plan = { ...base, id, recordType: 'qc-plan', name: 'Fixture improvement', objective: 'Make evidence interpretation more precise.',
