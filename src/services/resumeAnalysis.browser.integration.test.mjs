@@ -876,6 +876,8 @@ test('browser sample comparison browsing keeps the matrix and remembers search w
     await visible(search)
     await visible(targetSelect)
     await visible(sortSelect)
+    await visible(page.locator('.topbar').getByRole('button', { name: 'QC mode', exact: true }))
+    await visible(page.locator('.topbar').getByRole('button', { name: 'New analysis', exact: true }))
     assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth + 1))
     assert.equal(fixture.analyses.store.values.size, 0, 'Sample browsing must never start real processing.')
     assert.equal(fixture.state.saves.length, 0)

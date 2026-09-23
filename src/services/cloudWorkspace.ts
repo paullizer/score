@@ -1,6 +1,7 @@
 import type { Workspace } from '../domain/types'
-import type { CloudSession, CloudSessionIdentity, CloudWorkspaceSnapshot, WorkspaceSummary } from '../domain/cloud'
+import type { CloudSession, CloudSessionIdentity, CloudWorkspaceSnapshot, WorkspaceReviewerAccess, WorkspaceSummary } from '../domain/cloud'
 import type { LifecycleAction, LifecycleImpact, LifecycleOperation } from '../domain/lifecycle'
+import { workspaceCanEdit, workspaceCanReview, workspaceQcRole } from '../domain/workspace-permissions'
 
 /**
  * True when this build is deployed against the real Azure-hosted API (Docker/production build sets
@@ -72,7 +73,7 @@ export class CloudAccessChangedError extends CloudApiError {
 export const CLOUD_ACCESS_REFRESH_EVENT = 'score-cloud-access-refresh'
 
 export function workspaceAccessStamp(workspace?: WorkspaceSummary): string {
-  return JSON.stringify([workspace?.id, workspace?.role, workspace?.accessSource, workspace?.archivedAt, workspace?.deletedAt, workspace?.lifecycleOperation])
+  return JSON.stringify([workspace?.id, workspace?.role, workspace?.accessSource, workspace?.membershipRole, workspace?.archivedAt, workspace?.deletedAt, workspace?.lifecycleOperation])
 }
 
 type AccessEntry = { workspace: WorkspaceSummary; stamp: string; controller: AbortController }
@@ -119,11 +120,18 @@ export function cloudAccessRequestSignal(path: string, init: RequestInit = {}): 
   const id = decodeURIComponent(match[1])
   const entry = workspaceAccess.get(id)
   if (!entry) throw new CloudApiError('not_found', 'This workspace is no longer available to your account. Refresh access or contact a workspace owner or application administrator.', 404)
+  const qc = /^\/qc(?:\/|$)/.test(match[2] ?? '')
+  if (qc && !workspaceCanReview(workspaceQcRole(entry.workspace), sessionAccess.applicationAdmin)) {
+    throw new CloudApiError('forbidden', 'QC requires an explicit workspace membership and a reviewer, editor, owner, or application-admin role.', 403)
+  }
+  if (/^\/reviewers(?:\/|$)/.test(match[2] ?? '') && workspaceQcRole(entry.workspace) !== 'owner') {
+    throw new CloudApiError('forbidden', 'Only an explicit workspace Owner can use reviewer-only access management.', 403)
+  }
   const ownerOnly = /^\/(?:members|share-candidates)(?:\/|$)/.test(match[2] ?? '') ||
     (mutating && (!match[2] || match[2] === '/lifecycle'))
   if (ownerOnly && entry.workspace.role !== 'owner') throw new CloudApiError('forbidden', 'Only a workspace Owner or application administrator can manage workspace access and lifecycle.', 403)
-  if (mutating && (entry.workspace.role === 'viewer' || accessRefreshRequired.has(id))) {
-    throw new CloudApiError('forbidden', 'Workspace changes are paused. Reader access cannot save edits; refresh current access before continuing. Unsaved drafts remain in this tab.', 403)
+  if (mutating && ((!qc && !workspaceCanEdit(entry.workspace.role)) || accessRefreshRequired.has(id))) {
+    throw new CloudApiError('forbidden', 'Workspace changes are paused. Reader and Reviewer access cannot save ordinary edits; refresh current access before continuing. Unsaved drafts remain in this tab.', 403)
   }
   return entry.controller.signal
 }
@@ -312,6 +320,24 @@ export async function renameWorkspace(id: string, name: string, etag: string, si
     method: 'PATCH', body: JSON.stringify({ name }), headers, signal,
   })
   return body.workspace
+}
+
+export function listWorkspaceReviewers(id: string, signal?: AbortSignal): Promise<WorkspaceReviewerAccess> {
+  return cloudJsonRequest(`/workspaces/${encodeURIComponent(id)}/reviewers`, { signal })
+}
+
+export function addWorkspaceReviewer(
+  id: string, reviewer: { objectId: string; label?: string }, etag: string, signal?: AbortSignal,
+): Promise<WorkspaceReviewerAccess> {
+  return cloudJsonRequest(`/workspaces/${encodeURIComponent(id)}/reviewers`, {
+    method: 'POST', body: JSON.stringify(reviewer), headers: { 'If-Match': etag }, signal,
+  })
+}
+
+export function removeWorkspaceReviewer(id: string, objectId: string, etag: string, signal?: AbortSignal): Promise<WorkspaceReviewerAccess> {
+  return cloudJsonRequest(`/workspaces/${encodeURIComponent(id)}/reviewers/${encodeURIComponent(objectId)}`, {
+    method: 'DELETE', headers: { 'If-Match': etag }, signal,
+  })
 }
 
 export async function loadWorkspaceState(id: string, signal?: AbortSignal): Promise<CloudWorkspaceSnapshot> {

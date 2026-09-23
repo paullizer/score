@@ -13,7 +13,7 @@ export interface AuthenticatedPrincipal {
 }
 
 /** Application designation is tenant-scoped and independent of every workspace role. */
-export function isApplicationAdmin(principal: AuthenticatedPrincipal, config?: Config): boolean {
+export function isApplicationAdmin(principal: AuthenticatedPrincipal, config?: Pick<Config, 'tenantId'>): boolean {
   return (!config || principal.tenantId === config.tenantId) &&
     principal.applicationRoles?.includes('Score.Admin') === true
 }

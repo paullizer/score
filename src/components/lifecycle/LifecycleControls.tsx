@@ -6,6 +6,7 @@ import { getEntityLifecycle, isEntityArchived, type ArchiveFilter, type Lifecycl
 import { LifecycleOperationError } from '../../services/cloudWorkspace'
 import { Badge, Button, InlineError, Modal } from '../ui'
 import { useLifecycleAccess } from './useLifecycleAccess'
+import { workspaceCanEdit } from '../../domain/workspace-permissions'
 
 export function ArchiveStateFilter({ value, onChange, label = 'Archive state' }: {
   value: ArchiveFilter; onChange: (value: ArchiveFilter) => void; label?: string
@@ -27,12 +28,13 @@ export function LifecycleOperationBanner() {
   const { lifecycleOperations = [], changeLifecycle, cloud } = useWorkspace()
   const [busy, setBusy] = useState<string | null>(null)
   const [error, setError] = useState('')
-  const canManage = !cloud || cloud.workspaces.some((item) => item.id === cloud.currentWorkspaceId && item.role !== 'viewer' && !item.deletedAt)
+  const metadata = cloud?.workspaces.find(item => item.id === cloud.currentWorkspaceId)
+  const canManage = !cloud || Boolean(metadata && workspaceCanEdit(metadata.role) && !metadata.deletedAt)
   if (!lifecycleOperations.length) return null
   return <section className="lifecycle-operation-list" aria-label="Incomplete lifecycle operations">
     {lifecycleOperations.map((item) => <div className="lifecycle-banner" role="status" key={`${item.target.kind}:${item.target.id}`}>
       <div className="min-w-0 flex-1"><strong>{item.name} · {item.operation.action} {item.operation.status}</strong><p>{item.operation.error ?? 'The last response reports incomplete cleanup. Retry to check current state and resume. The item stays locked until completion.'}</p></div>
-      {canManage && <Button size="sm" disabled={busy !== null} onClick={() => {
+      {canManage && (!cloud || item.target.kind !== 'workspace' || metadata?.role === 'owner') && <Button size="sm" disabled={busy !== null} onClick={() => {
         setBusy(item.operation.id); setError('')
         void Promise.resolve().then(() => changeLifecycle(item.target, item.operation.action)).catch((caught) => setError(caught instanceof Error ? caught.message : 'Cleanup is still incomplete.')).finally(() => setBusy(null))
       }}>{busy === item.operation.id ? 'Awaiting acknowledgement…' : 'Retry lifecycle operation'}</Button>}
@@ -47,7 +49,7 @@ export function LifecycleBanner({ target }: { target?: LifecycleTarget }) {
   const { archived, inherited, deleting, removed, syncing, canEdit, transitioning } = useLifecycleAccess(actual)
   if (canEdit) return null
   return <div className="lifecycle-banner" role="status"><LockKeyhole size={17} aria-hidden="true" /><div>
-    <strong>{transitioning ? 'Lifecycle operation incomplete · read only' : deleting ? 'Deletion pending · read only' : removed ? 'Removed · read only' : archived ? 'Archived · read only' : syncing ? 'Refreshing saved content · read only' : 'Viewer access · read only'}</strong>
+    <strong>{transitioning ? 'Lifecycle operation incomplete · read only' : deleting ? 'Deletion pending · read only' : removed ? 'Removed · read only' : archived ? 'Archived · read only' : syncing ? 'Refreshing saved content · read only' : cloud?.workspaces.find(item => item.id === cloud.currentWorkspaceId)?.role === 'reviewer' ? 'Reviewer access · ordinary content is read only' : 'Viewer access · read only'}</strong>
     <p>{transitioning ? 'Changes and new processing are paused until the lifecycle operation finishes. Use the recovery controls above, or My workspaces for a workspace operation, to check status or retry.'
       : deleting ? 'Cleanup has not completed. Retry the lifecycle operation above; ordinary changes and unarchive remain locked until it finishes.'
         : removed ? 'This item was removed or is no longer available. Any unsaved draft remains in this tab, but cannot restore a deleted record.'

@@ -4,8 +4,8 @@ import { setWorkspaceArchive } from '../../src/domain/lifecycle'
 import type { WorkspaceSummary } from '../../src/domain/cloud'
 import { isApplicationAdmin, type AuthenticatedPrincipal } from '../auth'
 import { conflict, forbidden, HttpError, invalidRequest, notFound, preconditionRequired, unavailable } from '../errors'
-import { isValidWorkspaceId } from '../ids'
-import { decodeWorkspace, toSummary, type WorkspaceRepository } from '../repository'
+import { isValidWorkspaceId, membershipIdFor } from '../ids'
+import { decodeWorkspace, explicitMembershipRole, toSummary, type WorkspaceRepository } from '../repository'
 import { StoreConflictError, type DirectoryStore, type StateStore, type StoredMetadata } from '../store'
 import type { LifecycleDependencies, WorkspaceLifecycleParticipant } from './contracts'
 import { assertWorkspaceMutationLease, withWorkspaceMutationLease } from './lease'
@@ -77,7 +77,9 @@ export class WorkspaceLifecycleService {
   async impact(principal: AuthenticatedPrincipal, id: string) {
     const stored = await this.metadata(principal, id, false)
     const role = await this.deps.repository.authorizeWorkspace(principal, id, 'read')
-    return { impact: await this.savedImpact(stored), workspace: toSummary(stored.metadata, stored.etag, role, isApplicationAdmin(principal)) }
+    const membership = await this.deps.directory.getMembership(id, membershipIdFor(principal.principalKey))
+    return { impact: await this.savedImpact(stored), workspace: toSummary(stored.metadata, stored.etag, role,
+      isApplicationAdmin(principal), explicitMembershipRole(principal, id, membership)) }
   }
 
   async change(
@@ -100,7 +102,7 @@ export class WorkspaceLifecycleService {
           return this.forPrincipal(principal, await this.execute(stored))
         }
         if ((action === 'archive' && stored.metadata.archivedAt) || (action === 'unarchive' && !stored.metadata.archivedAt)) {
-          return { workspace: toSummary(stored.metadata, stored.etag, 'owner', isApplicationAdmin(principal)) }
+          return this.forPrincipal(principal, { workspace: toSummary(stored.metadata, stored.etag, 'owner') })
         }
         let recoveryPrincipalId: string | undefined
         if (action === 'delete') {
@@ -130,10 +132,14 @@ export class WorkspaceLifecycleService {
     }
   }
 
-  private forPrincipal(principal: AuthenticatedPrincipal, result: WorkspaceLifecycleResponse): WorkspaceLifecycleResponse {
-    return result.workspace ? {
-      ...result, workspace: { ...result.workspace, accessSource: isApplicationAdmin(principal) ? 'application-admin' : 'membership' },
-    } : result
+  private async forPrincipal(principal: AuthenticatedPrincipal, result: WorkspaceLifecycleResponse): Promise<WorkspaceLifecycleResponse> {
+    if (!result.workspace) return result
+    const admin = isApplicationAdmin(principal)
+    const membership = await this.deps.directory.getMembership(result.workspace.id, membershipIdFor(principal.principalKey))
+    return {
+      ...result, workspace: { ...result.workspace, accessSource: admin ? 'application-admin' : 'membership',
+        membershipRole: admin ? explicitMembershipRole(principal, result.workspace.id, membership) : undefined },
+    }
   }
 
   private async execute(initial: StoredMetadata): Promise<WorkspaceLifecycleResponse> {

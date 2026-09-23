@@ -1,10 +1,11 @@
 import { isEntityArchived, isEntityRemoved, type LifecycleMetadata, type LifecycleOperation, type LifecycleTarget } from '../domain/lifecycle'
 import type { Workspace } from '../domain/types'
 import type { PendingLifecycleChange, WorkspaceContextValue } from './workspace-context'
+import { workspaceCanEdit } from '../domain/workspace-permissions'
 
 export function realWorkspaceWritable(parent: WorkspaceContextValue, workspaceId: string): boolean {
   const metadata = parent.cloud?.workspaces.find((item) => item.id === workspaceId)
-  return Boolean(metadata && metadata.role !== 'viewer' && !metadata.archivedAt && !metadata.deletedAt
+  return Boolean(metadata && workspaceCanEdit(metadata.role) && !metadata.archivedAt && !metadata.deletedAt
     && (!metadata.lifecycleOperation || metadata.lifecycleOperation.status === 'complete') && !parent.cloud?.syncingState
     && !isEntityArchived(parent.workspace, { kind: 'workspace', id: workspaceId })
     && !isEntityRemoved(parent.workspace, { kind: 'workspace', id: workspaceId }))
@@ -12,7 +13,7 @@ export function realWorkspaceWritable(parent: WorkspaceContextValue, workspaceId
 
 export function assertRealLifecyclePermission(parent: WorkspaceContextValue, workspaceId: string) {
   const metadata = parent.cloud?.workspaces.find((item) => item.id === workspaceId)
-  if (!metadata || metadata.role === 'viewer' || metadata.deletedAt) throw new Error('This workspace is read-only or unavailable.')
+  if (!metadata || !workspaceCanEdit(metadata.role) || metadata.deletedAt) throw new Error('This workspace is read-only or unavailable.')
   if (metadata.lifecycleOperation && metadata.lifecycleOperation.status !== 'complete') throw new Error('Finish the workspace lifecycle operation before changing individual records.')
 }
 

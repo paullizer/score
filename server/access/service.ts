@@ -11,7 +11,7 @@ import type { EligibleUserDirectory } from './directory'
 import type { AccessAudit, AccessStore } from './store'
 
 const UNASSIGNED = '"unassigned"'
-const ROLE_RANK: Record<WorkspaceRole, number> = { viewer: 0, editor: 1, owner: 2 }
+const ROLE_RANK: Record<WorkspaceRole, number> = { viewer: 0, reviewer: 1, editor: 2, owner: 3 }
 
 export function userObjectId(value: string): string {
   if (!GUID_PATTERN.test(value)) throw invalidRequest('A valid Entra user object ID is required.')
@@ -28,7 +28,7 @@ export function requireApplicationAdmin(principal: AuthenticatedPrincipal): void
   if (!isApplicationAdmin(principal)) throw forbidden('Application administrator access is required.')
 }
 
-async function eligible(directory: EligibleUserDirectory | undefined, userId: string): Promise<EligibleUser> {
+export async function requireEligibleUser(directory: EligibleUserDirectory | undefined, userId: string): Promise<EligibleUser> {
   if (!directory) throw unavailable('The Entra user directory is not configured. An administrator must complete directory consent.')
   const user = await directory.get(userId)
   if (!user || user.id !== userId || !user.applicationRoles.some(role => role === 'Score.User' || role === 'Score.Admin')) {
@@ -69,7 +69,7 @@ export class CreationAccessService {
   async set(principal: AuthenticatedPrincipal, target: string, allowed: boolean, expected: string | undefined): Promise<CreationAccess> {
     const current = await this.read(principal, target)
     requireRevision(expected, current.etag)
-    if (allowed) await eligible(this.users, current.userId)
+    if (allowed) await requireEligibleUser(this.users, current.userId)
     try {
       await this.storage().setGrant({
         id: `grant-${current.userId}`, tenantId: principal.tenantId, userId: current.userId, canCreateWorkspaces: allowed,
@@ -126,7 +126,7 @@ export class WorkspaceAccessService {
   async change(principal: AuthenticatedPrincipal, workspaceId: string, target: string, role: WorkspaceRole | undefined,
     expected: string | undefined): Promise<WorkspaceMembers> {
     const userId = userObjectId(target)
-    if (role !== undefined && !Object.hasOwn(ROLE_RANK, role)) throw invalidRequest('Choose Owner, Editor, or Reader.')
+    if (role !== undefined && !Object.hasOwn(ROLE_RANK, role)) throw invalidRequest('Choose Owner, Editor, Reviewer, or Reader.')
     return this.repository.withWorkspaceMutation(principal, workspaceId, 'members', async () => {
       const stored = await this.repository.getWorkspaceMetadata(principal, workspaceId)
       requireRevision(expected, stored.etag)
@@ -142,7 +142,7 @@ export class WorkspaceAccessService {
       const nextOwners = owners - (previous?.membership.role === 'owner' ? 1 : 0) + (role === 'owner' ? 1 : 0)
       if (nextOwners < 1) throw conflict('A workspace must keep at least one explicit owner. Add another owner first.')
       const user = role && (!previous || ROLE_RANK[role] > ROLE_RANK[previous.membership.role])
-        ? await eligible(this.users, userId) : undefined
+        ? await requireEligibleUser(this.users, userId) : undefined
       const timestamp = this.clock().toISOString()
       assertWorkspaceMutationLease(workspaceId)
       const updated = await this.directory.changeMembership({

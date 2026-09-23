@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict'
+import { createHash } from 'node:crypto'
 import test from 'node:test'
 import { loadWorker } from './shared-model-loader.mjs'
-import { settingsDomain, settingsSnapshot } from './runtime-settings-test-support.mjs'
+import { legacyV1Capture, legacyV1Snapshot, settingsDomain, settingsSnapshot } from './runtime-settings-test-support.mjs'
 
 const [{ invokeStructuredModel }, policies, stores] = await Promise.all([
   loadWorker('../worker/model-transport.ts'), loadWorker('../worker/settings.ts'), loadWorker('../worker/settings-store.ts'),
@@ -12,8 +13,100 @@ const request = {
 }
 const bootstrap = { endpoint: 'https://fixed-resource.openai.azure.com', deployment: 'bootstrap', modelName: 'gpt-5-mini', getToken: async () => 'not-a-real-token' }
 const success = () => Response.json({ model: 'actual-response-model-2026', choices: [{ finish_reason: 'stop', message: { content: '{}' } }] })
+const snapshotHash = value => createHash('sha256').update(JSON.stringify(value)).digest('hex')
 
-test('all eleven explicit tasks use independently frozen deployments, budgets and request parameters at the fixed resource', async () => {
+function assertLegacyShape(snapshot) {
+  assert.equal(snapshot.schemaVersion, 1)
+  assert.equal(snapshot.settings.schemaVersion, 1)
+  assert.equal(Object.keys(snapshot.tasks).length, 11)
+  for (const value of [snapshot.tasks, snapshot.settings.ai.tasks]) assert.equal(Object.hasOwn(value, 'qcPlan'), false)
+  for (const value of [snapshot.settings.processing, snapshot.settings.workers]) assert.equal(Object.hasOwn(value, 'qc'), false)
+  for (const field of ['promptBundle', 'runtimeVersion', 'runtimeSettingsVersion']) assert.equal(Object.hasOwn(snapshot, field), false)
+}
+
+test('v2 readers preserve serialized v1 accepted snapshots and hashes without injecting QC, prompt, or runtime-marker fields', async () => {
+  const saved = legacyV1Snapshot(), original = legacyV1Capture.snapshotJson
+  assert.equal(legacyV1Capture.sourceCommit, '566a3d6d732e41b225bdfbdfe7dbd4b21b14aa3a')
+  assert.equal(legacyV1Capture.sourceRuntimeSettingsVersion, 'score-runtime-settings-v1')
+  assert.equal(Buffer.byteLength(original), legacyV1Capture.snapshotBytes)
+  assert.equal(snapshotHash(saved), legacyV1Capture.snapshotSha256)
+  assert.equal(snapshotHash(saved.settings), legacyV1Capture.policySha256)
+  assertLegacyShape(saved)
+  const requestSettings = await loadWorker('../server/settings/request-context.ts')
+  const req = {}
+  requestSettings.attachSettingsContext({ settings: { runtimeEnabled: false } }, {
+    capture: async () => assert.fail('Accepted v1 work cannot capture current settings or prompts'),
+    captureLegacy: async () => assert.fail('A present accepted v1 capture cannot be replaced by any baseline'),
+  })(req, {}, () => {})
+  const retained = [
+    settingsDomain.processingSettingsSnapshotSchema.parse(saved),
+    settingsDomain.captureProcessingSettings(saved.settings, saved.revision, saved.capturedAt),
+    policies.validateProcessingSettings(saved),
+    policies.operationSettings({ processingSettings: saved }, { settings: {
+      get legacy() { assert.fail('A present accepted capture cannot use a compatibility baseline') },
+      current: async () => assert.fail('An accepted operation cannot read current'),
+    } }),
+    await requestSettings.getSettingsForAcceptedWork(req, saved),
+  ]
+  for (const snapshot of retained) {
+    assertLegacyShape(snapshot)
+    assert.equal(JSON.stringify(snapshot), original)
+    assert.equal(snapshotHash(snapshot), legacyV1Capture.snapshotSha256)
+    assert.equal(snapshotHash(snapshot.settings), legacyV1Capture.policySha256)
+  }
+  assert.equal(JSON.stringify(saved), original)
+  assert.equal(settingsDomain.RUNTIME_SETTINGS_VERSION, 'score-runtime-settings-v2')
+})
+
+test('persisted v1 legacy baselines remain byte-identical when API and worker current defaults are v2', async () => {
+  const saved = legacyV1Snapshot()
+  const baseline = {
+    revision: saved.revision, previousRevision: null, createdAt: saved.capturedAt,
+    actor: { system: 'initialization' }, reason: 'initialize', changes: [], settings: saved.settings,
+  }
+  const current = settingsSnapshot(() => {}, 'new-v2-policy')
+  const store = {
+    getCurrent: async () => ({ etag: '"current-v2"', revision: { ...baseline, revision: current.revision, settings: current.settings } }),
+    getRevision: async id => { assert.equal(id, saved.revision); return structuredClone(baseline) },
+    initialize: async () => assert.fail('Existing legacy data cannot be reinitialized'),
+  }
+  const reader = stores.createWorkerSettingsReader(current, store)
+  await reader.current()
+  const { AdminSettingsService } = await loadWorker('../server/settings/service.ts')
+  const service = new AdminSettingsService({
+    config: { settings: { defaults: current.settings, runtimeEnabled: true } }, store,
+    now: () => new Date('2027-01-01T00:00:00.000Z'),
+    prompts: { capture: async () => assert.fail('Legacy work cannot capture a current prompt bundle') },
+  })
+  for (const retained of [reader.legacy, await service.captureLegacy()]) {
+    assertLegacyShape(retained)
+    assert.equal(JSON.stringify(retained), JSON.stringify(saved))
+    assert.equal(snapshotHash(retained), legacyV1Capture.snapshotSha256)
+    assert.equal(snapshotHash(retained.settings), legacyV1Capture.policySha256)
+  }
+})
+
+test('only an explicit new-QC capture adds dedicated bindings and never mutates or rebinds accepted v1 work', async () => {
+  const saved = legacyV1Snapshot(), original = legacyV1Capture.snapshotJson
+  const fresh = settingsDomain.captureQcProcessingSettings(saved)
+  assert.equal(fresh.settings.schemaVersion, 2)
+  assert.ok(fresh.tasks.qcPlan)
+  assert.ok(fresh.settings.processing.qc)
+  assert.ok(fresh.settings.workers.qc)
+  assert.equal(fresh.revision, saved.revision)
+  assert.equal(fresh.capturedAt, saved.capturedAt)
+  assert.equal(Object.hasOwn(fresh, 'promptBundle'), false)
+  assertLegacyShape(saved)
+  assert.equal(JSON.stringify(saved), original)
+  assert.equal(snapshotHash(policies.validateProcessingSettings(saved)), legacyV1Capture.snapshotSha256)
+  assert.equal(snapshotHash(saved.settings), legacyV1Capture.policySha256)
+  assert.throws(() => settingsDomain.resolveTaskModel(saved, 'qcPlan'), /did not capture/)
+  await assert.rejects(invokeStructuredModel({
+    ...bootstrap, processingSettings: saved, getToken: async () => assert.fail('A missing captured QC task cannot infer or substitute another task'),
+  }, { ...request, taskId: 'qcPlan' }), /did not capture/)
+})
+
+test('all twelve explicit tasks use independently frozen deployments, budgets and request parameters at the fixed resource', async () => {
   const snapshot = settingsSnapshot(settings => {
     settings.ai.tasks.assessment.reasoningEffort = 'high'
     settings.ai.tasks.assessmentReview.reasoningEffort = null
@@ -37,7 +130,7 @@ test('all eleven explicit tasks use independently frozen deployments, budgets an
     }, { ...request, taskId })
     assert.equal(result.model, 'actual-response-model-2026')
   }
-  assert.equal(new Set(seen).size, 11)
+  assert.equal(new Set(seen).size, 12)
 })
 
 test('only capability-supported temperature/topP are sent; invalid explicit snapshots never acquire a token or fall back', async () => {
@@ -302,10 +395,24 @@ test('all four readers load execution tuning once and pause before any new claim
     }
     assert.equal((await run(deps)).claimed, 0)
     assert.equal(reads, 1)
-    assert.equal(modules[index].RUNTIME_SETTINGS_VERSION, 'score-runtime-settings-v1')
+    assert.equal(modules[index].RUNTIME_SETTINGS_VERSION, 'score-runtime-settings-v2')
     await assert.rejects(run({
       ...deps, settings: { legacy: snapshot, current: async () => { throw new Error('Settings read denied') } },
     }), /Settings read denied/)
+  }
+})
+
+test('all five runtime entry bundles expose the independent prompt-pin reader capability', async () => {
+  const promptDomain = await loadWorker('../src/domain/prompt-versions.ts')
+  assert.equal(promptDomain.PROMPT_RUNTIME_VERSION, 'score-prompt-runtime-v1')
+  const paths = [
+    '../worker/runtime.ts', '../worker/grades/runtime.ts', '../worker/resumes/runtime.ts',
+    '../worker/analyses/runtime.ts', '../worker/qc/runtime.ts',
+  ]
+  const modules = await Promise.all(paths.map(path => loadWorker(path)))
+  for (const [index, runtime] of modules.entries()) {
+    assert.equal(runtime.PROMPT_RUNTIME_VERSION, promptDomain.PROMPT_RUNTIME_VERSION, paths[index])
+    assert.equal(runtime.RUNTIME_SETTINGS_VERSION, settingsDomain.RUNTIME_SETTINGS_VERSION, paths[index])
   }
 })
 

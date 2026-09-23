@@ -8,6 +8,7 @@ import { documentPagination, isUploadFormat, UPLOAD_CONTENT_TYPES } from '../../
 import { RubricEditor } from './RubricEditor'
 import { ArchivedBadge, EntityLifecycleActions, LifecycleBanner } from '../../components/lifecycle/LifecycleControls'
 import { useLifecycleAccess } from '../../components/lifecycle/useLifecycleAccess'
+import { workspaceCanEdit } from '../../domain/workspace-permissions'
 
 const scoreLegend = [
   { value: 0, label: 'No support' },
@@ -37,8 +38,8 @@ export function RubricPanel({ rubric, onSelectCriterion, onVersionSaved, readOnl
   const sourceLocation = (page: number) => pagination === 'pdf-pages' ? `p. ${page}`
     : `${pagination === 'markdown-sections' ? 'Markdown' : pagination === 'html-sections' ? 'HTML' : 'Captured'} section ${page}`
   const realGrade = rubric.dataKind === 'real' && rubric.kind === 'grade'
-  const viewer = Boolean(cloud && cloud.workspaces.find((item) => item.id === cloud.currentWorkspaceId)?.role === 'viewer')
-  const editable = canEdit && !readOnly && !realGrade && !viewer && (rubric.kind === 'grade' || (job?.status === 'ready' && !job.rubricDeletedAt)) && (rubric.dataKind !== 'real' || Boolean(document))
+  const roleReadOnly = Boolean(cloud && !workspaceCanEdit(cloud.workspaces.find((item) => item.id === cloud.currentWorkspaceId)?.role))
+  const editable = canEdit && !readOnly && !realGrade && !roleReadOnly && (rubric.kind === 'grade' || (job?.status === 'ready' && !job.rubricDeletedAt)) && (rubric.dataKind !== 'real' || Boolean(document))
   const total = rubric.criteria.reduce((sum, criterion) => sum + criterion.weight, 0)
   const balanced = Number.isFinite(total) && Math.abs(total - 100) <= 0.000001
 
@@ -106,7 +107,7 @@ export function RubricPanel({ rubric, onSelectCriterion, onVersionSaved, readOnl
         </Button>}
       </div>}
       {!readOnly && !realGrade && <p className="text-[11px] text-muted">Edit rubric includes the name and description. Even a name-only save creates a new version; saved analyses keep their original rubric.</p>}
-      {!readOnly && !editable && <p className="text-[11px] text-muted">{realGrade ? 'Open the real grade family to edit a draft with its separate grounding-review and approval safeguards.' : viewer ? 'This workspace is read-only. An owner or editor can change real rubrics.' : 'Finish the linked job import and load its source before editing this rubric.'}</p>}
+      {!readOnly && !editable && <p className="text-[11px] text-muted">{realGrade ? 'Open the real grade family to edit a draft with its separate grounding-review and approval safeguards.' : roleReadOnly ? 'This workspace is read-only. An owner or editor can change real rubrics.' : 'Finish the linked job import and load its source before editing this rubric.'}</p>}
       {error && <InlineError>{error}</InlineError>}
       {!balanced && <InlineError>These criterion weights do not total 100%. {readOnly ? 'Open the current version to review the rubric.' : 'Edit the rubric to correct its weights before analysis.'}</InlineError>}
 

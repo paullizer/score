@@ -6,7 +6,10 @@ import { after, test } from 'node:test'
 import { pathToFileURL } from 'node:url'
 import { build } from 'esbuild'
 import { api, fixture, seedJob, seedResume, citation, clone, ACTOR } from '../server-tests/real-analyses.test-support.mjs'
-import { settingsSnapshot } from './runtime-settings-test-support.mjs'
+import { settingsDomain, settingsSnapshot } from './runtime-settings-test-support.mjs'
+import { loadWorker } from './shared-model-loader.mjs'
+
+const { createCompiledPromptBaseline } = await loadWorker('../server/settings/prompts.ts')
 
 const bundle = path.resolve('dist-worker', `analysis-corrections-test-${process.pid}-${randomUUID()}.mjs`)
 await mkdir(path.dirname(bundle), { recursive: true })
@@ -247,7 +250,10 @@ async function cancel(f) {
 
 test('correction review and replacement narratives retain captured task settings rather than current policy or original scoring settings', async () => {
   const f = await correctionFixture()
-  const captured = settingsSnapshot(settings => { settings.ai.tasks.assessmentReview.completionTokenLimit = 512 })
+  const legacy = settingsSnapshot(settings => { settings.ai.tasks.assessmentReview.completionTokenLimit = 512 })
+  const captured = settingsDomain.captureProcessingSettings(
+    legacy.settings, legacy.revision, legacy.capturedAt, createCompiledPromptBaseline(f.now),
+  )
   const changed = settingsSnapshot(settings => {
     settings.features.summaryGeneration = false
     settings.ai.tasks.assessmentReview.deploymentId = settings.ai.defaultDeploymentId
@@ -266,8 +272,31 @@ test('correction review and replacement narratives retain captured task settings
   const review = (await historyEntry(f)).review
   assert.equal(review.provenance.task, 'assessmentReview')
   assert.equal(review.provenance.settingsRevision, captured.revision)
+  assert.equal(review.provenance.prompt.family, 'assessmentGrounding')
+  assert.equal(review.provenance.prompt.bundleSha256, captured.promptBundle.bundle.bundleSha256)
   const narrative = await f.analysis.store.get(f.workspaceId, api.analysisNarrativeId('candidate', f.runId, f.comparisonId, saved.requestId))
   assert.deepEqual(narrative.record.processingSettings, captured)
+  await assertOriginal(f)
+})
+
+test('unsupported accepted scoped-review pins fail terminally without new model calls or replacing the original result', async () => {
+  const f = await correctionFixture(), legacy = settingsSnapshot()
+  const integrity = await loadWorker('../server/settings/prompt-integrity.ts')
+  const capture = createCompiledPromptBaseline(f.now)
+  capture.revisions.evidenceGapReview.templateVersion = 'retired-gap-review-v1'
+  capture.revisions.evidenceGapReview.contentSha256 = integrity.promptRevisionContentHash(capture.revisions.evidenceGapReview)
+  capture.bundle.revisions.evidenceGapReview = integrity.promptRevisionReference(capture.revisions.evidenceGapReview)
+  capture.bundle.bundleSha256 = integrity.promptBundleContentHash(capture.bundle)
+  const accepted = settingsDomain.captureProcessingSettings(legacy.settings, legacy.revision, legacy.capturedAt, capture)
+  await enqueue(f, ['data-practices'], proposal => { proposal.processingSettings = accepted }, correction.ANALYSIS_CORRECTION_POLICY_VERSION)
+  const worker = workerFor(f)
+  worker.deps.settings = { mode: 'configured', legacy, current: async () => legacy }
+  await worker.run()
+  const saved = (await head(f)).record
+  assert.equal(saved.status, 'failed')
+  assert.equal(saved.error.code, 'snapshot-invalid')
+  assert.equal(saved.error.retryable, false)
+  assert.equal(worker.calls.length, 0)
   await assertOriginal(f)
 })
 

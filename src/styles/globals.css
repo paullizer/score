@@ -632,10 +632,10 @@
 }
 @media (max-width: 600px) {
   .main-content { padding: 24px 16px 16px; }
-  .topbar { padding: 0 12px; gap: 8px; }
+  .topbar { height: auto; min-height: 64px; flex-wrap: wrap; padding: 12px; gap: 8px; }
   .breadcrumbs { gap: 7px; font-size: 10px; }
   .breadcrumbs > span:first-child, .breadcrumbs > svg:first-of-type { display: none; }
-  .topbar-actions { gap: 7px; }
+  .topbar-actions { max-width: 100%; flex-wrap: wrap; gap: 7px; }
   .topbar-actions .demo-chip { font-size: 0; padding: 7px; }
   .page-heading { flex-direction: column; align-items: flex-start; margin-bottom: 22px; gap: 18px; }
   .page-heading h1 { font-size: 28px; }

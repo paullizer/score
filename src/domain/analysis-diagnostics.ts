@@ -30,6 +30,7 @@ export const ANALYSIS_DIAGNOSTIC_FIELDS = [
   'model', 'promptVersion', 'jobId', 'weight', 'key', 'label', 'guidance', 'sourceParagraphId',
   'requirementType', 'sourceCitations', 'ladder', 'grade', 'competencyId', 'support', 'gradeBasis',
   'interpretation', 'documentId', 'documentVersion', 'unknown-field',
+  'qcDiagnostics', 'confidence', 'explanation', 'ambiguity', 'category', 'alternativeScores',
 ] as const
 
 export interface AnalysisSchemaDiagnostics {

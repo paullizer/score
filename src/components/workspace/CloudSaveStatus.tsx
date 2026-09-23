@@ -1,6 +1,7 @@
 import { useState } from 'react'
 import type { CloudWorkspaceStatus } from '../../app/workspace-context'
 import { Button, Modal } from '../ui'
+import { workspaceCanEdit } from '../../domain/workspace-permissions'
 
 /** Small topbar pill mirroring the local demo's "Saved on this device" indicator, but reflecting the
  * real cloud save lifecycle: Saving / Saved / Error / Conflict. Never claims a save happened before
@@ -28,7 +29,7 @@ export function CloudSaveBanner({ cloud }: { cloud: CloudWorkspaceStatus }) {
   const [leaveError, setLeaveError] = useState('')
   const metadata = cloud.workspaces.find((item) => item.id === cloud.currentWorkspaceId)
   const unavailable = !metadata || metadata.deletedAt
-  const readOnly = unavailable || metadata?.role === 'viewer' || metadata?.archivedAt
+  const readOnly = unavailable || !workspaceCanEdit(metadata?.role) || metadata?.archivedAt
 
   if (unavailable) return <>
     <div className="storage-banner" role="alert"><span>This workspace was deleted elsewhere. Unsaved changes remain in this tab, but cannot recreate deleted records.</span>

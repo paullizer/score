@@ -15,11 +15,14 @@ import { StoreConflictError } from '../store'
 import { settingsRevisionSchema } from './azure-store'
 import type { SettingsModelAdapter } from './models'
 import type { SettingsHistoryPage, SettingsStore, StoredSettings } from './store'
+import type { PromptRegistryCapture } from './prompts'
+import { validatePromptSnapshot } from './prompt-integrity'
 
 export interface AdminSettingsServiceDeps {
   config: Config
   store: SettingsStore
   models?: SettingsModelAdapter
+  prompts?: PromptRegistryCapture
   now?: () => Date
   newId?: () => string
 }
@@ -46,6 +49,7 @@ export class AdminSettingsService {
   private readonly config: Config
   private readonly store: SettingsStore
   private readonly models?: SettingsModelAdapter
+  private readonly prompts?: PromptRegistryCapture
   private readonly clock: () => Date
   private readonly newId: () => string
   private readonly defaults: AdminSettings
@@ -54,6 +58,7 @@ export class AdminSettingsService {
     this.config = deps.config
     this.store = deps.store
     this.models = deps.models
+    this.prompts = deps.prompts
     this.clock = deps.now ?? (() => new Date())
     this.newId = deps.newId ?? randomUUID
     this.defaults = parseAdminSettings(deps.config.settings?.defaults ?? createDefaultAdminSettings())
@@ -119,7 +124,10 @@ export class AdminSettingsService {
   /** Saved policy stays authoritative even while rollout temporarily closes new processing. */
   async capture(): Promise<ProcessingSettingsSnapshot> {
     const stored = await this.current()
-    return captureProcessingSettings(stored.revision.settings, stored.revision.revision, this.clock().toISOString())
+    const promptBundle = this.prompts ? await this.prompts.capture() : undefined
+    if (this.prompts && !promptBundle) throw unavailable('The configured accepted-work prompt bundle is unavailable. No compiled default was substituted.')
+    if (promptBundle) validatePromptSnapshot(promptBundle)
+    return captureProcessingSettings(stored.revision.settings, stored.revision.revision, this.clock().toISOString(), promptBundle)
   }
 
   /** Accepted legacy work uses the immutable persisted baseline, never today's admin or env defaults. */

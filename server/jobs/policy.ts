@@ -34,7 +34,7 @@ export function requestProcessingSettings(req: Request): ProcessingSettingsProvi
 export function newProcessingSettings(
   provider: ProcessingSettingsProvider | undefined, snapshot: ProcessingSettingsSnapshot,
 ): ProcessingSettingsSnapshot | undefined {
-  return provider?.pinNewAdmissions === false ? undefined : snapshot
+  return provider?.pinNewAdmissions === false && !snapshot.promptBundle ? undefined : snapshot
 }
 
 export async function admittedProcessingSettings(
@@ -60,7 +60,7 @@ export async function resolveAcceptedProcessingSettings(
 export function preservesProcessingSettings(
   previous: ProcessingSettingsSnapshot | undefined, next: ProcessingSettingsSnapshot | undefined,
 ): boolean {
-  return previous ? isDeepStrictEqual(previous, next) : !next || next.revision === LEGACY_SETTINGS_REVISION
+  return previous ? isDeepStrictEqual(previous, next) : !next || next.revision === LEGACY_SETTINGS_REVISION && !next.promptBundle
 }
 
 export async function currentProcessingSettings(provider?: ProcessingSettingsProvider): Promise<ProcessingSettingsSnapshot> {

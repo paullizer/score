@@ -1,5 +1,6 @@
 import type { AdminSettings, SettingsChange } from '../../domain/admin-settings'
 import { workspaceRoleLabel } from '../../domain/access'
+import { isWorkspaceRole } from '../../domain/workspace-permissions'
 
 export function settingValue(settings: unknown, path: string): unknown {
   return path.split('.').reduce<unknown>((value, key) => value && typeof value === 'object' ? (value as Record<string, unknown>)[key] : undefined, settings)
@@ -23,7 +24,7 @@ export function describeValue(value: unknown): string {
 
 export function describeSettingValue(path: string, value: unknown): string {
   if (['reports.allowedRoles', 'documents.originalDownloadRoles', 'summaries.manualPublicationRoles', 'summaries.historyRoles'].includes(path)) {
-    const label = (role: unknown) => role === 'viewer' || role === 'owner' || role === 'editor' ? workspaceRoleLabel(role)
+    const label = (role: unknown) => isWorkspaceRole(role) ? workspaceRoleLabel(role)
       : role === 'owner-and-editor' ? 'Owners and Editors' : String(role)
     return Array.isArray(value) ? value.map(label).join(', ') || 'No roles' : label(value)
   }

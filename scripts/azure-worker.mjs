@@ -6,11 +6,14 @@ import { client, environment, identifier, request, required, setEnvironment } fr
 
 export const WORD_WORKER_CAPABILITY = 'word-document-imports-v1'
 export const WORD_WORKER_EXTRACTION_VERSION = 'score-word-extraction-v1'
-export const RUNTIME_SETTINGS_VERSION = 'score-runtime-settings-v1'
-export const SETTINGS_WORKER_RUNTIMES = ['runtime.mjs', 'grade-runtime.mjs', 'resume-runtime.mjs', 'analysis-runtime.mjs']
+export const RUNTIME_SETTINGS_VERSION = 'score-runtime-settings-v2'
+export const PROMPT_RUNTIME_VERSION = 'score-prompt-runtime-v1'
+export const QC_RUNTIME_VERSION = 'score-qc-worker-v1'
+export const SETTINGS_WORKER_RUNTIMES = ['runtime.mjs', 'grade-runtime.mjs', 'resume-runtime.mjs', 'analysis-runtime.mjs', 'qc-runtime.mjs']
 export const WORD_WORKER_ARTIFACTS = [
   'worker.mjs', 'runtime.mjs', 'grade-worker.mjs', 'grade-runtime.mjs',
   'resume-worker.mjs', 'resume-runtime.mjs', 'analysis-worker.mjs', 'analysis-runtime.mjs', 'word-parser.mjs',
+  'qc-worker.mjs', 'qc-runtime.mjs',
 ]
 const TERMINAL_EXECUTION_STATUSES = new Set(['Succeeded', 'Failed', 'Stopped', 'Cancelled', 'Canceled'])
 // Infrastructure bootstrap is stable; Admin settings own live task bindings and captured work keeps its policy.
@@ -44,9 +47,17 @@ export const WORKER_DEFINITIONS = [
     records: 'analysis-records', sources: 'analysis-sources', maxItemsSetting: 'ANALYSIS_WORKER_MAX_ITEMS', usesExtraction: false,
     feature: 'REAL_ANALYSES_ENABLED',
   },
+  {
+    kind: 'qc', idKey: 'AZURE_QC_WORKER_ID', imageKey: 'AZURE_QC_WORKER_CONTAINER_IMAGE',
+    containerName: 'qc-worker', entryPoint: 'dist-worker/qc-worker.mjs',
+    recordsSetting: 'QC_RECORDS_CONTAINER', sourcesSetting: 'QC_SOURCE_CONTAINER',
+    records: 'qc-records', sources: 'qc-sources', maxItemsSetting: 'QC_WORKER_MAX_ITEMS', usesExtraction: false,
+    feature: 'QC_WORKER_ENABLED',
+  },
 ]
 
 const ANALYSIS_WORKER = WORKER_DEFINITIONS.find(worker => worker.kind === 'analysis')
+const QC_WORKER = WORKER_DEFINITIONS.find(worker => worker.kind === 'qc')
 
 function analysisCorrectionEnvironment(container, enabled) {
   const name = 'ANALYSIS_EVIDENCE_CORRECTIONS_ENABLED'
@@ -81,10 +92,19 @@ export function wordWorkerVerificationArgs(definition) {
     "throw new Error('The worker extraction runtime does not provide the required Word extraction version.');",
     `if (manifest.runtimeSettingsVersion !== ${JSON.stringify(RUNTIME_SETTINGS_VERSION)})`,
     "throw new Error('The worker manifest does not certify runtime settings support.');",
+    `if (manifest.promptRuntimeVersion !== ${JSON.stringify(PROMPT_RUNTIME_VERSION)})`,
+    "throw new Error('The worker manifest does not certify prompt version readers.');",
+    `if (manifest.qcRuntimeVersion !== ${JSON.stringify(QC_RUNTIME_VERSION)})`,
+    "throw new Error('The worker manifest does not certify QC and prompt-version support.');",
+    "const qcRuntime = await import('./dist-worker/qc-runtime.mjs');",
+    `if (qcRuntime.QC_RUNTIME_VERSION !== ${JSON.stringify(QC_RUNTIME_VERSION)})`,
+    "throw new Error('The worker does not support the required QC contract.');",
     `for (const name of ${JSON.stringify(SETTINGS_WORKER_RUNTIMES)}) {`,
     "const reader = await import('./dist-worker/' + name);",
     `if (reader.RUNTIME_SETTINGS_VERSION !== ${JSON.stringify(RUNTIME_SETTINGS_VERSION)})`,
     "throw new Error('The worker does not provide the required runtime settings reader: ' + name);",
+    `if (reader.PROMPT_RUNTIME_VERSION !== ${JSON.stringify(PROMPT_RUNTIME_VERSION)})`,
+    "throw new Error('The worker does not provide the required prompt version reader: ' + name);",
     '}',
     // A normal child invocation preserves entry-point guards and parser-thread execArgv.
     `const child = spawn(process.execPath, [${JSON.stringify(definition.entryPoint)}], { stdio: 'inherit' });`,
@@ -228,7 +248,7 @@ export function validateFeatureSettings(settings, definition) {
   const sources = ['WORKSPACE_BLOB_CONTAINER', ...WORKER_DEFINITIONS.map(worker => worker.sourcesSetting)].map(name => settings[name])
   if (records.some(value => !value) || sources.some(value => !value) ||
     new Set(records).size !== records.length || new Set(sources).size !== sources.length) {
-    throw new Error('App Service must have separately provisioned workspace, job, grade, resume, and analysis stores.')
+    throw new Error('App Service must have separately provisioned workspace, job, grade, resume, analysis, and QC stores.')
   }
 }
 
@@ -368,20 +388,22 @@ async function updateRuntimeSettingsAdmission(env, credential, enabled, hooks, v
   const settings = await send(credential, 'https://management.azure.com', listUrl, 'POST')
   if (!settings?.properties) throw new Error('App Service settings are unavailable; runtime settings activation is blocked.')
   if (enabled && (settings.properties.SCORE_SETTINGS_CONTAINER !== 'application-settings' || !verifiedImage)) {
-    throw new Error('Runtime settings require the isolated settings store and four verified worker readers.')
+    throw new Error('Runtime settings require the isolated settings store and five verified worker readers.')
   }
   const properties = {
     ...settings.properties,
     SCORE_RUNTIME_SETTINGS_ENABLED: enabled ? 'true' : 'false',
     SCORE_RUNTIME_SETTINGS_WORKER_VERSION: enabled ? RUNTIME_SETTINGS_VERSION : '',
+    SCORE_PROMPT_RUNTIME_WORKER_VERSION: enabled ? PROMPT_RUNTIME_VERSION : '',
     SCORE_RUNTIME_SETTINGS_VERIFIED_IMAGE: enabled ? verifiedImage : '',
     SCORE_RUNTIME_SETTINGS_VERIFIED_AT: enabled ? new Date().toISOString() : '',
+    QC_WORKER_ENABLED: enabled ? settings.properties.QC_WORKER_ENABLED ?? 'false' : 'false',
   }
   if (Object.keys(properties).some(key => settings.properties[key] !== properties[key])) {
     await send(credential, 'https://management.azure.com', `${endpoint}?api-version=2024-11-01`, 'PUT', { properties })
   }
   const saved = await send(credential, 'https://management.azure.com', listUrl, 'POST')
-  for (const name of ['SCORE_RUNTIME_SETTINGS_ENABLED', 'SCORE_RUNTIME_SETTINGS_WORKER_VERSION', 'SCORE_RUNTIME_SETTINGS_VERIFIED_IMAGE', 'SCORE_RUNTIME_SETTINGS_VERIFIED_AT']) {
+  for (const name of ['SCORE_RUNTIME_SETTINGS_ENABLED', 'SCORE_RUNTIME_SETTINGS_WORKER_VERSION', 'SCORE_PROMPT_RUNTIME_WORKER_VERSION', 'SCORE_RUNTIME_SETTINGS_VERIFIED_IMAGE', 'SCORE_RUNTIME_SETTINGS_VERIFIED_AT', 'QC_WORKER_ENABLED']) {
     if (saved?.properties?.[name] !== properties[name]) {
       throw new Error(`App Service did not confirm runtime settings ${enabled ? 'enabled' : 'disabled'}; rollout is blocked.`)
     }
@@ -390,6 +412,33 @@ async function updateRuntimeSettingsAdmission(env, credential, enabled, hooks, v
 
 export async function disableRuntimeSettingsAdmission(env, credential, hooks = {}) {
   await updateRuntimeSettingsAdmission(env, credential, false, hooks)
+}
+
+export async function updateQcAdmission(env, credential, enabled, hooks = {}) {
+  const send = hooks.request ?? request
+  const endpoint = appSettingsEndpoint(env)
+  const listUrl = `${endpoint}/list?api-version=2024-11-01`
+  const settings = await send(credential, 'https://management.azure.com', listUrl, 'POST')
+  if (!settings?.properties) throw new Error('App Service settings are unavailable; QC admission remains unconfirmed.')
+  if (enabled) {
+    validateFeatureSettings(settings.properties, QC_WORKER)
+    if (settings.properties.SCORE_RUNTIME_SETTINGS_ENABLED !== 'true' ||
+      settings.properties.SCORE_RUNTIME_SETTINGS_WORKER_VERSION !== RUNTIME_SETTINGS_VERSION ||
+      settings.properties.SCORE_PROMPT_RUNTIME_WORKER_VERSION !== PROMPT_RUNTIME_VERSION ||
+      !settings.properties.SCORE_RUNTIME_SETTINGS_VERIFIED_IMAGE) {
+      throw new Error('QC activation requires all verified prompt-aware workers and active runtime settings.')
+    }
+  }
+  const properties = {
+    ...settings.properties,
+    QC_ENABLED: enabled ? 'true' : settings.properties.QC_ENABLED ?? 'false',
+    QC_WORKER_ENABLED: enabled ? 'true' : 'false',
+  }
+  await send(credential, 'https://management.azure.com', `${endpoint}?api-version=2024-11-01`, 'PUT', { properties })
+  const saved = await send(credential, 'https://management.azure.com', listUrl, 'POST')
+  if (saved?.properties?.QC_ENABLED !== properties.QC_ENABLED || saved?.properties?.QC_WORKER_ENABLED !== properties.QC_WORKER_ENABLED) {
+    throw new Error('App Service did not confirm QC admission. Saved history remains separate from new work.')
+  }
 }
 
 async function updateEvidenceCorrectionAdmission(env, credential, enabled, hooks, force = false) {
@@ -549,7 +598,7 @@ export async function prepareWebDeployment(env, credential, hooks = {}) {
   for (const worker of workers) {
     verifyPaused(worker, await send(credential, 'https://management.azure.com', worker.endpoint))
   }
-  console.log('All four worker schedules are paused and executions drained before replacing the API; verified worker rollout must restore processing.')
+  console.log('All five worker schedules are paused and executions drained before replacing the API; verified worker rollout must restore processing.')
 }
 
 export async function verifyWordWorkerReadiness(env, credential, image, verified, hooks = {}) {
@@ -559,7 +608,7 @@ export async function verifyWordWorkerReadiness(env, credential, image, verified
     WORKER_DEFINITIONS.some(definition => verified.filter(result =>
       result.kind === definition.kind && result.image === image && typeof result.executionName === 'string' && result.executionName.length > 0,
     ).length !== 1)) {
-    throw new Error('All four workers must pass Word build verification in this deployment before Word admission is enabled.')
+    throw new Error('All five workers must pass Word/QC build verification in this deployment before admission is enabled.')
   }
   for (const definition of WORKER_DEFINITIONS) {
     const workerBase = `https://management.azure.com${required(env, definition.idKey)}`
@@ -602,7 +651,7 @@ async function validatePrivateServices(env, credential, hooks) {
     JSON.stringify(settings.properties.resource.partitionKey?.paths) !== JSON.stringify(['/applicationId'])) {
     throw new Error('Provision application-settings with the /applicationId partition before deploying workers.')
   }
-  for (const definition of WORKER_DEFINITIONS.filter(worker => worker.kind === 'resume' || worker.kind === 'analysis')) {
+  for (const definition of WORKER_DEFINITIONS.filter(worker => ['resume', 'analysis', 'qc'].includes(worker.kind))) {
     const records = await send(credential, 'https://management.azure.com',
       `${cosmos}/sqlDatabases/score/containers/${definition.records}?api-version=2024-11-15`)
     if (records.properties?.resource?.id !== definition.records ||
@@ -711,24 +760,26 @@ export async function configureWorkerDeployment(env, credential, { image, render
       console.log('The isolated renderer is deployed; worker configuration is unchanged and Word/runtime-settings/evidence-correction admission remains disabled.')
       return
     }
-    const privateWorkers = WORKER_DEFINITIONS.filter(worker => worker.kind === 'resume' || worker.kind === 'analysis')
+    const privateWorkers = WORKER_DEFINITIONS.filter(worker => ['resume', 'analysis', 'qc'].includes(worker.kind))
     await updateFeatures(env, credential, privateWorkers, false, hooks)
     const verified = []
     for (const definition of WORKER_DEFINITIONS) {
       verified.push(await configureScheduledWorker(env, credential, definition, image, hooks))
-      if (definition.feature) await updateFeatures(env, credential, [definition], true, hooks)
+      if (definition.feature && definition.kind !== 'qc') await updateFeatures(env, credential, [definition], true, hooks)
     }
     await verifyWordWorkerReadiness(env, credential, image, verified, hooks)
     await updateEvidenceCorrectionClaims(env, credential, true, hooks, { verifiedImage: image })
     await updateEvidenceCorrectionAdmission(env, credential, true, hooks)
     await updateRuntimeSettingsAdmission(env, credential, true, hooks, image)
+    await updateQcAdmission(env, credential, true, hooks)
     await updateWordAdmission(env, credential, true, hooks)
-    console.log('Word, runtime-settings, and evidence-correction admission enabled after all four worker readers verified the same build and older executions drained.')
+    console.log('Word, runtime-settings, QC, and evidence-correction admission enabled after all five worker readers verified the same build and older executions drained.')
   } catch (error) {
     const failures = [error]
     // A stale read after ambiguous activation must not suppress the closing write.
     for (const disable of [
       () => updateEvidenceCorrectionAdmission(env, credential, false, hooks, true),
+      () => updateQcAdmission(env, credential, false, hooks),
       () => disableRuntimeSettingsAdmission(env, credential, hooks),
       () => disableWordAdmission(env, credential, hooks),
       ...(!rendererOnly ? [() => updateEvidenceCorrectionClaims(env, credential, false, hooks, { force: true })] : []),

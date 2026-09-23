@@ -22,6 +22,7 @@ param rendererImage string
 param gradeWorkerImage string
 param resumeWorkerImage string
 param analysisWorkerImage string
+param qcWorkerImage string
 
 @sealed()
 type AdditionalModelDeployment = {
@@ -79,6 +80,7 @@ module resources 'resources.bicep' = {
     gradeWorkerImage: gradeWorkerImage
     resumeWorkerImage: resumeWorkerImage
     analysisWorkerImage: analysisWorkerImage
+    qcWorkerImage: qcWorkerImage
     additionalModelDeployments: additionalModelDeployments
     appServiceSku: appServiceSku
     searchSku: searchSku
@@ -124,3 +126,6 @@ output AZURE_RESUME_WORKER_PRINCIPAL_ID string = resources.outputs.resumeWorkerP
 output AZURE_ANALYSIS_WORKER_NAME string = resources.outputs.analysisWorkerName
 output AZURE_ANALYSIS_WORKER_ID string = resources.outputs.analysisWorkerId
 output AZURE_ANALYSIS_WORKER_PRINCIPAL_ID string = resources.outputs.analysisWorkerPrincipalId
+output AZURE_QC_WORKER_NAME string = resources.outputs.qcWorkerName
+output AZURE_QC_WORKER_ID string = resources.outputs.qcWorkerId
+output AZURE_QC_WORKER_PRINCIPAL_ID string = resources.outputs.qcWorkerPrincipalId

@@ -25,6 +25,7 @@ import { projectRealJobs } from './realJobsProjection'
 import { isEntityArchived, isEntityRemoved, type LifecycleAction, type LifecycleTarget } from '../domain/lifecycle'
 import { assertClientAdmission, clientAdmissionReason, usePublicSettings } from './public-settings-context'
 import { boundedPollingInterval, jobFeaturesWithPolicy } from '../services/publicSettings'
+import { workspaceCanEdit } from '../domain/workspace-permissions'
 
 const ACTIVE_STATUSES = new Set(['queued', 'parsing', 'generating'])
 
@@ -261,7 +262,7 @@ export function RealJobsBridge({
   function requirePermission(target?: LifecycleTarget, lifecycle = false) {
     const state = currentCloud.current
     const metadata = state.workspaces.find((item) => item.id === workspaceId)
-    if (!metadata || metadata.role === 'viewer' || metadata.deletedAt) throw new Error('This workspace is read-only or unavailable.')
+    if (!metadata || !workspaceCanEdit(metadata.role) || metadata.deletedAt) throw new Error('This workspace is read-only or unavailable.')
     if (!lifecycle && (metadata.archivedAt || (metadata.lifecycleOperation && metadata.lifecycleOperation.status !== 'complete') || (target && (isEntityArchived(workspace, target) || isEntityRemoved(workspace, target))))) {
       throw new Error('Archived content is read-only. Unarchive its parent and the item before editing or starting work.')
     }

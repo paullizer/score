@@ -29,10 +29,12 @@ import { renderRequestPolicySchema, urlMatchesPolicy, type RenderRequestPolicy, 
 import { systemClock, type Clock } from './clock'
 import { WorkerError } from './errors'
 import { invokeStructuredModel } from './model-transport'
+import { PromptPinError, resolveAcceptedPrompt, type ResolvedPrompt } from './prompts'
 export { systemClock, type Clock } from './clock'
 export { WorkerError } from './errors'
 export { invokeStructuredModel } from './model-transport'
 export { RUNTIME_SETTINGS_VERSION } from '../src/domain/admin-settings'
+export { PROMPT_RUNTIME_VERSION } from '../src/domain/prompt-versions'
 
 const COGNITIVE_SCOPE = 'https://cognitiveservices.azure.com/.default'
 const DOCUMENT_API_VERSION = '2024-11-30'
@@ -1189,6 +1191,10 @@ A successfully reviewed usable resume with no supporting professional evidence r
 Do not create weighted criteria for protected characteristics or questionable personal requirements. Instead, mention those source requirements in warnings for human review.
 Return only the requested JSON schema.`
 
+export const JOB_RUBRIC_COMPILED_PROMPT = {
+  system: SYSTEM_INSTRUCTIONS, promptVersion: PROMPT_VERSION, schemaVersion: 'score-job-rubric-schema-v1',
+} as const
+
 export interface RubricModelOptions {
   endpoint: string
   deployment: string
@@ -1215,6 +1221,7 @@ function modelSource(document: SourceDocument): string {
 async function invokeModel(
   document: SourceDocument,
   options: RubricModelOptions,
+  prompt: ResolvedPrompt,
   correction?: string[],
   signal?: AbortSignal,
 ): Promise<{ content: string; model: string }> {
@@ -1228,7 +1235,7 @@ async function invokeModel(
     taskId: 'jobRubric',
     name: RUBRIC_JSON_SCHEMA.name,
     schema,
-    system: SYSTEM_INSTRUCTIONS.replace('1 to 20', `1 to ${maxCriteria}`),
+    system: prompt.system,
     source: modelSource(document),
     user: `${correction ? `The prior result was invalid. Correct all of these errors:\n${correction.join('\n')}\n\n` : ''}SOURCE DOCUMENT:\n${modelSource(document)}`,
     maxCompletionTokens: 8192,
@@ -1318,8 +1325,10 @@ export async function generateGroundedRubric(
   let correction: string[] | undefined
   const settings = modelProcessingSettings(options)
   const corrections = settings?.settings.ai.jobRubric.maxOutputCorrections ?? 1
+  const prompt = resolveAcceptedPrompt(settings, 'jobRubric', JOB_RUBRIC_COMPILED_PROMPT,
+    system => system.replace('1 to 20', `1 to ${settings?.settings.rubrics.jobs.maxCriteria ?? JOB_IMPORT_LIMITS.maxCriteria}`))
   for (let attempt = 0; attempt <= corrections; attempt += 1) {
-    const response = await invokeModel(document, options, correction, signal)
+    const response = await invokeModel(document, options, prompt, correction, signal)
     let parsed: unknown
     try {
       parsed = JSON.parse(response.content)
@@ -1375,7 +1384,8 @@ export async function generateGroundedRubric(
       criteria,
       createdAt: now,
       dataKind: 'real',
-      provenance: { kind: 'generated', model: response.model, promptVersion: PROMPT_VERSION },
+      provenance: { kind: 'generated', model: response.model, promptVersion: prompt.promptVersion,
+        ...(prompt.provenance ? { prompt: prompt.provenance } : {}) },
     }
     const domainErrors = validate(rubric, document)
     if (domainErrors.length > 0) {
@@ -1861,7 +1871,7 @@ function cleanMetadata(value: string | null): string {
 async function recordFailure(controller: LeaseController, error: unknown, clock: Clock, snapshot: ProcessingSettingsSnapshot): Promise<void> {
   const workerError = error instanceof WorkerError
     ? error
-    : error instanceof RuntimeSettingsError
+    : error instanceof RuntimeSettingsError || error instanceof PromptPinError
       ? new WorkerError(error.code, error.message, false, error.code === 'source-policy-limit' ? 'parsing' : 'rubric')
     : new WorkerError('worker-failed', 'The worker encountered an unexpected processing error.', true, 'rubric', { cause: error })
   if (workerError.code === 'cancelled') return

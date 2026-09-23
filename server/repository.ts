@@ -3,6 +3,7 @@ import type { CloudSession, CloudWorkspaceSnapshot, WorkspaceRole, WorkspaceSumm
 import type { Workspace } from '../src/domain/types'
 import { validateWorkspace, WorkspaceValidationError } from '../src/domain/workspace-validation'
 import { workspaceLifecycleTransitionErrors } from '../src/domain/lifecycle'
+import { isWorkspaceRole, workspaceCanEdit } from '../src/domain/workspace-permissions'
 import { isApplicationAdmin, type AuthenticatedPrincipal } from './auth'
 import { conflict, forbidden, invalidRequest, notFound, preconditionRequired, unavailable } from './errors'
 import { isValidWorkspaceId, membershipIdFor, newWorkspaceId } from './ids'
@@ -36,13 +37,21 @@ function validateName(name: unknown): string {
   return trimmed
 }
 
-export function toSummary(metadata: WorkspaceMetadataDoc, etag: string, role: WorkspaceRole, admin = false): WorkspaceSummary {
+export function explicitMembershipRole(principal: AuthenticatedPrincipal, workspaceId: string, membership: MembershipDoc | undefined): WorkspaceRole | undefined {
+  if (!membership || membership.workspaceId !== workspaceId || membership.id !== membershipIdFor(principal.principalKey) ||
+    membership.principalId !== principal.principalKey || membership.principalType !== 'user' || !isWorkspaceRole(membership.role)) return undefined
+  return membership.role
+}
+
+export function toSummary(metadata: WorkspaceMetadataDoc, etag: string, role: WorkspaceRole, admin = false,
+  membershipRole?: WorkspaceRole): WorkspaceSummary {
   return {
     id: metadata.workspaceId,
     name: metadata.name,
     kind: metadata.kind,
     role,
     accessSource: admin ? 'application-admin' : 'membership',
+    ...(admin && membershipRole ? { membershipRole } : {}),
     createdAt: metadata.createdAt,
     updatedAt: metadata.updatedAt,
     etag,
@@ -98,14 +107,20 @@ export class WorkspaceRepository {
   async listWorkspaces(principal: AuthenticatedPrincipal): Promise<WorkspaceSummary[]> {
     if (isApplicationAdmin(principal)) {
       const records = await this.directory.listMetadataForTenant(principal.tenantId)
-      return records.filter(({ metadata }) => metadata.tenantId === principal.tenantId && !metadata.deletedAt)
-        .map(({ metadata, etag }) => toSummary(metadata, etag, 'owner', true))
-        .sort((a, b) => a.createdAt.localeCompare(b.createdAt))
+      const summaries = await Promise.all(records.filter(({ metadata }) => metadata.tenantId === principal.tenantId && !metadata.deletedAt)
+        .map(async ({ metadata, etag }) => {
+          const membership = await this.directory.getMembership(metadata.workspaceId, membershipIdFor(principal.principalKey))
+          return toSummary(metadata, etag, 'owner', true, explicitMembershipRole(principal, metadata.workspaceId, membership))
+        }))
+      return summaries.sort((a, b) => a.createdAt.localeCompare(b.createdAt))
     }
     const memberships = await this.directory.listMembershipsForPrincipal(principal.principalKey)
     const summaries = await Promise.all(
       memberships.map(async (membership): Promise<WorkspaceSummary | undefined> => {
-        const stored = await this.directory.getMetadata(membership.workspaceId)
+        const [stored, currentMembership] = await Promise.all([
+          this.directory.getMetadata(membership.workspaceId),
+          this.directory.getMembership(membership.workspaceId, membershipIdFor(principal.principalKey)),
+        ])
         // Membership without metadata is a storage inconsistency, not a workspace to show; skip it
         // rather than crash the whole list or fabricate a placeholder.
         if (!stored) {
@@ -113,9 +128,9 @@ export class WorkspaceRepository {
           return undefined
         }
         if (stored.metadata.deletedAt) return undefined
-        if (stored.metadata.tenantId !== principal.tenantId || membership.principalId !== principal.principalKey ||
-          membership.principalType !== 'user' || !['owner', 'editor', 'viewer'].includes(membership.role)) return undefined
-        return toSummary(stored.metadata, stored.etag, membership.role)
+        const role = explicitMembershipRole(principal, membership.workspaceId, currentMembership)
+        if (stored.metadata.tenantId !== principal.tenantId || stored.metadata.workspaceId !== membership.workspaceId || !role) return undefined
+        return toSummary(stored.metadata, stored.etag, role)
       }),
     )
     return summaries
@@ -157,23 +172,26 @@ export class WorkspaceRepository {
 
     const stored = await this.directory.getMetadata(workspaceId)
     if (!stored) throw unavailable('Could not create the workspace. Try again.')
-    return toSummary(stored.metadata, stored.etag, 'owner', isApplicationAdmin(principal))
+    return toSummary(stored.metadata, stored.etag, 'owner', isApplicationAdmin(principal), 'owner')
   }
 
-  private async requireWorkspaceRole(principal: AuthenticatedPrincipal, workspaceId: string): Promise<WorkspaceRole> {
+  private async requireWorkspaceRole(principal: AuthenticatedPrincipal, workspaceId: string, explicit = false): Promise<WorkspaceRole> {
     const [stored, membership] = await Promise.all([
       this.directory.getMetadata(workspaceId),
       this.directory.getMembership(workspaceId, membershipIdFor(principal.principalKey)),
     ])
     if (!stored || stored.metadata.deletedAt || stored.metadata.tenantId !== principal.tenantId ||
       stored.metadata.workspaceId !== workspaceId) throw notFound()
-    if (isApplicationAdmin(principal)) return 'owner'
-    if (!membership || membership.workspaceId !== workspaceId ||
-      membership.principalId !== principal.principalKey || membership.principalType !== 'user' ||
-      !['owner', 'editor', 'viewer'].includes(membership.role)) {
-      throw notFound()
-    }
-    return membership.role
+    if (!explicit && isApplicationAdmin(principal)) return 'owner'
+    const role = explicitMembershipRole(principal, workspaceId, membership)
+    if (!role) throw notFound()
+    return role
+  }
+
+  /** QC requires explicit membership even when ordinary access comes from application administration. */
+  async authorizeWorkspaceMembership(principal: AuthenticatedPrincipal, workspaceId: string): Promise<WorkspaceRole> {
+    if (!isValidWorkspaceId(workspaceId)) throw notFound()
+    return this.requireWorkspaceRole(principal, workspaceId, true)
   }
 
   /** Shared authorization gate for workspace-scoped feature routers. */
@@ -185,8 +203,8 @@ export class WorkspaceRepository {
   ): Promise<WorkspaceRole> {
     if (!isValidWorkspaceId(workspaceId)) throw notFound()
     const role = await this.requireWorkspaceRole(principal, workspaceId)
-    if (access !== 'read' && role === 'viewer') {
-      throw forbidden('Readers cannot change this workspace.')
+    if (access !== 'read' && !workspaceCanEdit(role)) {
+      throw forbidden('Only workspace owners and editors can change ordinary workspace content.')
     }
     if (access === 'members' && role !== 'owner') throw forbidden('Only workspace owners and application admins can manage access.')
     if (access !== 'read') {
@@ -247,7 +265,9 @@ export class WorkspaceRepository {
       try {
         assertWorkspaceMutationLease(workspaceId)
         const updated = await this.directory.renameWorkspace(workspaceId, trimmed, this.now(), ifMatchEtag)
-        return toSummary(updated.metadata, updated.etag, role, isApplicationAdmin(principal))
+        const membership = await this.directory.getMembership(workspaceId, membershipIdFor(principal.principalKey))
+        return toSummary(updated.metadata, updated.etag, role, isApplicationAdmin(principal),
+          explicitMembershipRole(principal, workspaceId, membership))
       } catch (error) {
         if (error instanceof StoreNotFoundError) throw notFound()
         throw error

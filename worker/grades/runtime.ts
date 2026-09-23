@@ -28,6 +28,7 @@ import {
 } from '../settings'
 import { enforceReferenceCharacters } from '../references/html'
 export { RUNTIME_SETTINGS_VERSION } from '../../src/domain/admin-settings'
+export { PROMPT_RUNTIME_VERSION } from '../../src/domain/prompt-versions'
 
 const LEASE_MS = 120_000
 const HEARTBEAT_MS = 25_000
@@ -637,6 +638,7 @@ async function planCompetencies(deps: GradeWorkerDependencies, lease: GradeLease
     id: derivedId('competency-plan', work.id), workspaceId: work.workspaceId, ladderId: work.ladderId,
     recordType: 'grade-competency-plan', createdAt, updatedAt: createdAt, sourceSetId, generationId,
     competencies: result.competencies, issues: result.issues, model: result.model, promptVersion: result.promptVersion,
+    ...(result.prompt ? { prompt: result.prompt } : {}),
   }
   await lease.atomic(async () => {
     const ladder = await activeLadder(deps, work)
@@ -771,6 +773,7 @@ async function reviewGrade(deps: GradeWorkerDependencies, lease: GradeLease, now
     id: derivedId('grade-review', work.id), workspaceId: work.workspaceId, ladderId: work.ladderId, recordType: 'grade-review',
     grade, versionId, versionHash: version.contentHash, sourceSetId, outcome: supported ? 'supported' : 'needs-sources',
     issues, model: result.model, promptVersion: result.promptVersion, createdAt, updatedAt: createdAt,
+    ...(result.prompt ? { prompt: result.prompt } : {}),
   }
   await lease.atomic(async () => {
     const ladder = await activeLadder(deps, work)

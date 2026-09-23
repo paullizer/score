@@ -100,10 +100,10 @@ async function start(options = {}) {
   }
 }
 
-test('settings defaults cover exactly eleven tasks and reject literal-type, unknown-key, and cross-field mistakes', () => {
+test('settings defaults cover all twelve tasks and reject literal-type, unknown-key, and cross-field mistakes', () => {
   const defaults = parseAdminSettings(createDefaultAdminSettings())
-  assert.equal(MODEL_TASK_IDS.length, 11)
-  assert.equal(RUNTIME_SETTINGS_VERSION, 'score-runtime-settings-v1')
+  assert.equal(MODEL_TASK_IDS.length, 12)
+  assert.equal(RUNTIME_SETTINGS_VERSION, 'score-runtime-settings-v2')
   assert.deepEqual(Object.keys(defaults.ai.tasks), [...MODEL_TASK_IDS])
   assert.equal(defaults.workers.jobs.maxItemsPerExecution, 4)
   assert.equal(defaults.imports.urls.maxResponseBytes, 12 * 1024 * 1024)
@@ -140,7 +140,7 @@ test('API bootstrap initializes settings before activation, is create-only, and 
     await server.app.locals.bootstrapSettings()
     assert.equal(server.store.counters.initializations, 1)
     const current = await server.request('/api/admin/settings')
-    assert.equal(current.body.environment.runtimeSettingsVersion, 'score-runtime-settings-v1')
+    assert.equal(current.body.environment.runtimeSettingsVersion, RUNTIME_SETTINGS_VERSION)
     assert.equal(current.body.environment.runtimeEnabled, false)
     assert.equal(current.body.fields.find(field => field.path === 'grades.defaults.agency').max, 300)
     assert.equal(current.body.fields.find(field => field.path === 'grades.defaults.specialty').max, 1000)
@@ -232,7 +232,7 @@ test('frozen snapshot resolves every task, contains no resource secrets, and is 
   assert.doesNotMatch(JSON.stringify(publicSettings), /job-rubric|endpoint|credential|administratorUserIds/)
 })
 
-test('complete snapshots accommodate eleven independent deployment bindings and their version metadata', () => {
+test('complete snapshots accommodate twelve independent deployment bindings and their version metadata', () => {
   const settings = createDefaultAdminSettings()
   const deployment = settings.ai.deployments[0]
   settings.ai.deployments = MODEL_TASK_IDS.map((task, index) => ({
@@ -241,8 +241,8 @@ test('complete snapshots accommodate eleven independent deployment bindings and 
   }))
   settings.ai.defaultDeploymentId = settings.ai.deployments[0].id
   for (const [index, task] of MODEL_TASK_IDS.entries()) settings.ai.tasks[task].deploymentId = settings.ai.deployments[index].id
-  const snapshot = captureProcessingSettings(settings, 'eleven-deployments', now().toISOString())
-  assert.equal(new Set(Object.values(snapshot.tasks).map(task => task.deploymentId)).size, 11)
+  const snapshot = captureProcessingSettings(settings, 'twelve-deployments', now().toISOString())
+  assert.equal(new Set(Object.values(snapshot.tasks).map(task => task.deploymentId)).size, 12)
   for (const task of MODEL_TASK_IDS) {
     assert.equal(snapshot.tasks[task].deploymentName, `score-production-eastus-${task}`)
     assert.equal(snapshot.tasks[task].modelVersion, '2025-08-07')
@@ -739,7 +739,8 @@ test('configuration never designates runtime admins through legacy IDs and keeps
     assert.throws(() => loadConfig({ ...configured, RUBRIC_MODEL_ENDPOINT: endpoint }), /endpoint/)
   }
   const evidence = {
-    SCORE_RUNTIME_SETTINGS_WORKER_VERSION: 'score-runtime-settings-v1',
+    SCORE_RUNTIME_SETTINGS_WORKER_VERSION: RUNTIME_SETTINGS_VERSION,
+    SCORE_PROMPT_RUNTIME_WORKER_VERSION: 'score-prompt-runtime-v1',
     SCORE_RUNTIME_SETTINGS_VERIFIED_IMAGE: 'exampleregistry.azurecr.io/score-worker:verified-build',
     SCORE_RUNTIME_SETTINGS_VERIFIED_AT: '2026-09-21T12:00:00.000Z',
   }
@@ -750,7 +751,7 @@ test('configuration never designates runtime admins through legacy IDs and keeps
     verificationTimeOnly: true, liveHealth: false,
   })
   assert.equal(loadConfig(configured).settings.workerVerification, undefined)
-  assert.throws(() => loadConfig({ ...configured, SCORE_RUNTIME_SETTINGS_WORKER_VERSION: 'score-runtime-settings-v1' }), /together/)
+  assert.throws(() => loadConfig({ ...configured, SCORE_RUNTIME_SETTINGS_WORKER_VERSION: RUNTIME_SETTINGS_VERSION }), /together/)
   assert.throws(() => loadConfig({ ...configured, ...evidence, SCORE_RUNTIME_SETTINGS_WORKER_VERSION: 'unverified' }), /contract/)
   assert.throws(() => loadConfig({ ...configured, ...evidence, SCORE_RUNTIME_SETTINGS_VERIFIED_AT: 'yesterday' }), /ISO/)
   assert.throws(() => loadConfig({ ...configured, ...evidence, SCORE_RUNTIME_SETTINGS_VERIFIED_IMAGE: 'https://user:secret@registry.example/image' }), /nonsecret/)
@@ -759,7 +760,7 @@ test('configuration never designates runtime admins through legacy IDs and keeps
 test('worker adoption evidence is admin-only, read-only and explicitly not live health', async () => {
   const config = settingsConfig(false)
   const verification = {
-    workerVersion: 'score-runtime-settings-v1', image: 'exampleregistry.azurecr.io/score-worker:verified-build',
+    workerVersion: RUNTIME_SETTINGS_VERSION, image: 'exampleregistry.azurecr.io/score-worker:verified-build',
     verifiedAt: '2026-09-21T12:00:00.000Z', verificationTimeOnly: true, liveHealth: false,
   }
   config.settings.workerVerification = { ...verification, internalToken: 'do-not-expose-unrelated-config' }
@@ -793,7 +794,7 @@ test('deployment worker defaults seed once while local job default and saved rev
   const config = loadConfig(deployed)
   assert.equal(loadConfig(environment).settings.defaults.workers.jobs.maxItemsPerExecution, 4)
   assert.deepEqual(Object.fromEntries(Object.entries(config.settings.defaults.workers).map(([kind, worker]) => [kind, worker.maxItemsPerExecution])), {
-    jobs: 5, grades: 5, resumes: 5, analyses: 2,
+    jobs: 5, grades: 5, resumes: 5, analyses: 2, qc: 2,
   })
   for (const [name, value] of [
     ['WORKER_MAX_JOBS', '0'], ['GRADE_WORKER_MAX_ITEMS', '21'],
@@ -818,7 +819,7 @@ test('deployment worker defaults seed once while local job default and saved rev
   assert.equal(afterRestart.revision, edited.revision)
   assert.equal(afterRestart.etag, edited.etag)
   assert.deepEqual(Object.fromEntries(Object.entries(afterRestart.settings.workers).map(([kind, worker]) => [kind, worker.maxItemsPerExecution])), {
-    jobs: 2, grades: 4, resumes: 3, analyses: 1,
+    jobs: 2, grades: 4, resumes: 3, analyses: 1, qc: 2,
   })
   assert.equal(afterRestart.defaults.workers.jobs.maxItemsPerExecution, 7)
   assert.equal(afterRestart.fields.find(field => field.path === 'workers.jobs.maxItemsPerExecution').defaultSource, 'WORKER_MAX_JOBS')

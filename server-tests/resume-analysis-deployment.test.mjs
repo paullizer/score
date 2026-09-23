@@ -5,8 +5,8 @@ import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import test from 'node:test'
 import {
-  WORD_WORKER_ARTIFACTS, WORD_WORKER_CAPABILITY, WORD_WORKER_EXTRACTION_VERSION, RUNTIME_SETTINGS_VERSION, SETTINGS_WORKER_RUNTIMES, WORKER_DEFINITIONS, configureScheduledWorker, configureWorkerDeployment,
-  disableEvidenceCorrectionAdmission, disableRuntimeSettingsAdmission, disableWordAdmission, prepareWebDeployment, validateFeatureSettings, validateRendererTemplate, validateWorkerImage, validateWorkerModelDeployment, validateWorkerTemplate, verifyWordWorkerReadiness,
+  WORD_WORKER_ARTIFACTS, WORD_WORKER_CAPABILITY, WORD_WORKER_EXTRACTION_VERSION, RUNTIME_SETTINGS_VERSION, PROMPT_RUNTIME_VERSION, QC_RUNTIME_VERSION, SETTINGS_WORKER_RUNTIMES, WORKER_DEFINITIONS, configureScheduledWorker, configureWorkerDeployment,
+  disableEvidenceCorrectionAdmission, disableRuntimeSettingsAdmission, disableWordAdmission, prepareWebDeployment, updateQcAdmission, validateFeatureSettings, validateRendererTemplate, validateWorkerImage, validateWorkerModelDeployment, validateWorkerTemplate, verifyWordWorkerReadiness,
   wordWorkerVerificationArgs,
 } from '../scripts/azure-worker.mjs'
 
@@ -70,6 +70,7 @@ function appSettings() {
     REAL_JOB_IMPORTS_ENABLED: 'true', REAL_GRADE_LADDERS_ENABLED: 'false', REAL_RESUME_IMPORTS_ENABLED: 'true',
     REAL_ANALYSES_ENABLED: 'true', WORD_DOCUMENT_IMPORTS_ENABLED: 'true',
     ANALYSIS_EVIDENCE_CORRECTIONS_ENABLED: 'true',
+    QC_ENABLED: 'true', QC_WORKER_ENABLED: 'true',
     SCORE_SETTINGS_CONTAINER: 'application-settings', SCORE_RUNTIME_SETTINGS_ENABLED: 'true',
     ...Object.fromEntries(WORKER_DEFINITIONS.flatMap(worker => [
       [worker.recordsSetting, worker.records], [worker.sourcesSetting, worker.sources],
@@ -92,7 +93,7 @@ test('deployment requires the versioned Word image family, not an arbitrary olde
 
 test('each worker keeps its own identity, entry point, stores, registry, and processing services', () => {
   for (const definition of WORKER_DEFINITIONS) validateWorkerTemplate(env, template(definition), definition)
-  for (const definition of WORKER_DEFINITIONS.filter(worker => worker.kind === 'resume' || worker.kind === 'analysis')) {
+  for (const definition of WORKER_DEFINITIONS.filter(worker => ['resume', 'analysis', 'qc'].includes(worker.kind))) {
     const changes = [
       value => { value.identity.type = 'SystemAssigned, UserAssigned' },
       value => { value.identity.userAssignedIdentities = { [`${group}/providers/Microsoft.ManagedIdentity/userAssignedIdentities/id-job-worker-test`]: { clientId: 'job-client' } } },
@@ -108,7 +109,7 @@ test('each worker keeps its own identity, entry point, stores, registry, and pro
       value => { value.properties.template.containers[0].env.push({ name: 'AZURE_AI_SEARCH_ENDPOINT', value: 'https://search.example.com' }) },
       value => { value.properties.template.containers[0].env.push({ name: 'AZURE_CLIENT_SECRET', secretRef: 'secret' }) },
     ]
-    if (definition.kind === 'analysis') {
+    if (definition.kind === 'analysis' || definition.kind === 'qc') {
       for (const name of ['RESUME_RECORDS_CONTAINER', 'DOCUMENT_INTELLIGENCE_ENDPOINT', 'JOB_RENDERER_URL']) {
         changes.push(value => { value.properties.template.containers[0].env.push({ name, value: 'not-permitted' }) })
       }
@@ -406,12 +407,14 @@ test('the in-container probe rejects old, incomplete, or modified artifacts befo
         '}',
       ].join('\n')
       : SETTINGS_WORKER_RUNTIMES.includes(name)
-        ? `${name === 'runtime.mjs' ? `export const WORD_EXTRACTION_VERSION = ${JSON.stringify(WORD_WORKER_EXTRACTION_VERSION)};\n` : ''}export const RUNTIME_SETTINGS_VERSION = ${JSON.stringify(RUNTIME_SETTINGS_VERSION)};\n`
+        ? `${name === 'runtime.mjs' ? `export const WORD_EXTRACTION_VERSION = ${JSON.stringify(WORD_WORKER_EXTRACTION_VERSION)};\n` : ''}${name === 'qc-runtime.mjs' ? `export const QC_RUNTIME_VERSION = ${JSON.stringify(QC_RUNTIME_VERSION)};\n` : ''}export const RUNTIME_SETTINGS_VERSION = ${JSON.stringify(RUNTIME_SETTINGS_VERSION)};\nexport const PROMPT_RUNTIME_VERSION = ${JSON.stringify(PROMPT_RUNTIME_VERSION)};\n`
         : `// ${name}\n`,
   ]))
   const manifest = {
     schemaVersion: 1, capability: WORD_WORKER_CAPABILITY,
     runtimeSettingsVersion: RUNTIME_SETTINGS_VERSION,
+    promptRuntimeVersion: PROMPT_RUNTIME_VERSION,
+    qcRuntimeVersion: QC_RUNTIME_VERSION,
     artifacts: Object.fromEntries(Object.entries(files).map(([name, contents]) =>
       [name, createHash('sha256').update(contents).digest('hex')])),
   }
@@ -442,6 +445,10 @@ test('the in-container probe rejects old, incomplete, or modified artifacts befo
     () => writeManifest({ ...manifest, capability: 'resume-analysis-only' }),
     () => writeManifest({ ...manifest, runtimeSettingsVersion: undefined }),
     () => writeManifest({ ...manifest, runtimeSettingsVersion: 'unsupported-settings' }),
+    () => writeManifest({ ...manifest, promptRuntimeVersion: undefined }),
+    () => writeManifest({ ...manifest, promptRuntimeVersion: 'unsupported-prompt-pins' }),
+    () => writeManifest({ ...manifest, qcRuntimeVersion: undefined }),
+    () => writeManifest({ ...manifest, qcRuntimeVersion: 'unsupported-qc' }),
     () => writeManifest({ ...manifest, artifacts: {} }),
     () => writeFileSync(join(root, 'dist-worker', 'word-parser.mjs'), '// modified parser\n'),
     () => rmSync(join(root, 'dist-worker', 'grade-worker.mjs')),
@@ -478,6 +485,28 @@ test('the in-container probe rejects old, incomplete, or modified artifacts befo
     assert.match(result.stderr, /required runtime settings reader/)
     assert.doesNotMatch(result.stdout, /worker-entry-started/)
   }
+  for (const name of SETTINGS_WORKER_RUNTIMES) {
+    reset()
+    const oldReader = files[name].replace(PROMPT_RUNTIME_VERSION, 'old-unpinned-prompts')
+    writeFileSync(join(root, 'dist-worker', name), oldReader)
+    writeManifest({
+      ...manifest, artifacts: { ...manifest.artifacts, [name]: createHash('sha256').update(oldReader).digest('hex') },
+    })
+    const result = probe()
+    assert.notEqual(result.status, 0)
+    assert.match(result.stderr, /required prompt version reader/)
+    assert.doesNotMatch(result.stdout, /worker-entry-started/)
+  }
+  reset()
+  const oldQc = files['qc-runtime.mjs'].replace(QC_RUNTIME_VERSION, 'old-qc-contract')
+  writeFileSync(join(root, 'dist-worker', 'qc-runtime.mjs'), oldQc)
+  writeManifest({
+    ...manifest, artifacts: { ...manifest.artifacts, 'qc-runtime.mjs': createHash('sha256').update(oldQc).digest('hex') },
+  })
+  const oldQcResult = probe()
+  assert.notEqual(oldQcResult.status, 0)
+  assert.match(oldQcResult.stderr, /required QC contract/)
+  assert.doesNotMatch(oldQcResult.stdout, /worker-entry-started/)
   reset()
   const failingWorker = 'process.exitCode = 7\n'
   writeFileSync(join(root, 'dist-worker', 'worker.mjs'), failingWorker)
@@ -617,7 +646,7 @@ function rolloutHarness(options = {}) {
   return { hooks, operations, pins, workers, executions, settings: () => settings }
 }
 
-test('Word is disabled before any shared consumer changes and enabled only after all four verified workers', async () => {
+test('Word is disabled before any shared consumer changes and enabled only after all five verified workers', async () => {
   const { hooks, operations, pins, settings } = rolloutHarness()
   await configureWorkerDeployment(env, {}, { image, rendererImage }, hooks)
   assert.equal(operations[0].action, 'settings')
@@ -628,12 +657,19 @@ test('Word is disabled before any shared consumer changes and enabled only after
   for (const operation of operations.filter(operation => operation.action === 'settings').slice(0, -1)) {
     assert.equal(operation.settings.WORD_DOCUMENT_IMPORTS_ENABLED, 'false')
   }
-  assert.deepEqual(operations.filter(operation => operation.action === 'history').map(operation => operation.kind), ['job', 'grade', 'resume', 'analysis'])
+  assert.deepEqual(operations.filter(operation => operation.action === 'history').map(operation => operation.kind), ['job', 'grade', 'resume', 'analysis', 'qc'])
   for (const definition of WORKER_DEFINITIONS) {
     assert.equal(pins.get(definition.imageKey), image)
     if (definition.feature) assert.equal(settings()[definition.feature], 'true')
   }
   assert.equal(settings().REAL_JOB_IMPORTS_ENABLED, 'true')
+  assert.equal(settings().QC_ENABLED, 'true')
+  assert.equal(settings().QC_WORKER_ENABLED, 'true')
+  for (const operation of operations.filter(operation => operation.action === 'settings')) {
+    if (operation.settings.SCORE_RUNTIME_SETTINGS_ENABLED === 'false') {
+      assert.equal(operation.settings.QC_WORKER_ENABLED, 'false', 'paid QC work cannot run against unverified prompt consumers')
+    }
+  }
   assert.equal(settings().CUSTOM_EXISTING_SETTING, 'unchanged')
 })
 
@@ -941,9 +977,9 @@ test('pre-web preparation pauses and drains all old readers without changing the
     assert.equal(pins.get(definition.imageKey), `${definition.kind}-previous-pin`)
   }
   assert.ok(operations.every(operation => !['renderer', 'execution', 'pin'].includes(operation.action)))
-  assert.equal(operations.filter(operation => operation.action === 'worker').length, 4)
+  assert.equal(operations.filter(operation => operation.action === 'worker').length, WORKER_DEFINITIONS.length)
   await prepareWebDeployment(env, {}, hooks)
-  assert.equal(operations.filter(operation => operation.action === 'worker').length, 4, 'retrying an already paused deployment is idempotent')
+  assert.equal(operations.filter(operation => operation.action === 'worker').length, WORKER_DEFINITIONS.length, 'retrying an already paused deployment is idempotent')
 })
 
 test('an active old reader on any history page blocks web replacement without cancelling accepted work', async () => {
@@ -1102,6 +1138,7 @@ test('current image drift or an older in-flight execution blocks Word even after
     { oldExecutionKind: 'grade' },
     { oldExecutionKind: 'resume', secondPage: true },
     { oldExecutionKind: 'analysis' },
+    { oldExecutionKind: 'qc' },
   ]) {
     const { hooks, settings } = rolloutHarness(options)
     await assert.rejects(configureWorkerDeployment(env, {}, { image, rendererImage }, hooks), /verified scheduled Word build|not bound to the verified Word image/)
@@ -1115,7 +1152,7 @@ test('saved image pins or an incomplete verification set cannot reopen Word admi
   for (const results of [[], verified.slice(1), [...verified.slice(1), verified[1]], verified.map(value => ({ ...value, image: `${image}-older` }))]) {
     await assert.rejects(verifyWordWorkerReadiness(env, {}, image, results, {
       request: async () => { assert.fail('Incomplete readiness must fail before any management request') },
-    }), /All four workers must pass/)
+    }), /All five workers must pass/)
   }
 })
 
@@ -1124,7 +1161,7 @@ test('infrastructure composes private stores and identities without new model/se
   const resources = readFileSync(new URL('../infra/resources.bicep', import.meta.url), 'utf8')
   const main = readFileSync(new URL('../infra/main.bicep', import.meta.url), 'utf8')
   const parameters = JSON.parse(readFileSync(new URL('../infra/main.parameters.json', import.meta.url), 'utf8')).parameters
-  assert.match(module, /@allowed\(\['resume', 'analysis'\]\)/)
+  assert.match(module, /@allowed\(\['resume', 'analysis', 'qc'\]\)/)
   assert.match(module, /paths: \['\/workspaceId'\]/)
   assert.match(module, /publicAccess: 'None'/)
   assert.ok(module.includes("scope: '${cosmos.id}/dbs/score/colls/${recordContainer}'"))
@@ -1134,13 +1171,13 @@ test('infrastructure composes private stores and identities without new model/se
   assert.match(module, /triggerType: deployed \? 'Schedule' : 'Manual'/)
   assert.match(module, /score-worker:resume-analysis-/)
   assert.ok(module.includes("args: ['dist-worker/${kind}-worker.mjs']"))
-  const branches = module.match(/isResume \? \[([\s\S]*?DOCUMENT_INTELLIGENCE_ENDPOINT[\s\S]*?JOB_RENDERER_URL[\s\S]*?)\] : \[([\s\S]*?)\]/)
+  const branches = module.match(/isResume \? \[([\s\S]*?DOCUMENT_INTELLIGENCE_ENDPOINT[\s\S]*?JOB_RENDERER_URL[\s\S]*?)\] : isQc \? \[\] : \[([\s\S]*?)\]/)
   assert.ok(branches, 'Resume extraction endpoints must remain in the resume-only environment branch.')
   assert.match(branches[2], /name: 'ANALYSIS_EVIDENCE_CORRECTIONS_ENABLED', value: 'false'/)
   assert.doesNotMatch(branches[2], /DOCUMENT_INTELLIGENCE_ENDPOINT|JOB_RENDERER_URL/)
   assert.doesNotMatch(module, /(?:JOB|GRADE|WORKSPACE)_(?:RECORDS|SOURCE|BLOB)_CONTAINER/)
   assert.doesNotMatch(module, /Microsoft\.Search|Microsoft\.CognitiveServices\/accounts\/deployments/)
-  for (const [kind, stem] of [['resume', 'resumes'], ['analysis', 'analyses']]) {
+  for (const [kind, stem] of [['resume', 'resumes'], ['analysis', 'analyses'], ['qc', 'qc']]) {
     assert.equal(parameters[`${kind}WorkerImage`].value, `\${AZURE_${kind.toUpperCase()}_WORKER_CONTAINER_IMAGE}`)
     assert.match(resources, new RegExp(`module ${stem} 'private-processing.bicep'`))
     assert.ok(resources.includes(`workerImage: ${kind}WorkerImage`))
@@ -1149,6 +1186,8 @@ test('infrastructure composes private stores and identities without new model/se
   assert.match(resources, /REAL_ANALYSES_ENABLED: analyses\.outputs\.isDeployed \? 'true' : 'false'/)
   assert.match(resources, /WORD_DOCUMENT_IMPORTS_ENABLED: 'false'/)
   assert.match(resources, /ANALYSIS_EVIDENCE_CORRECTIONS_ENABLED: 'false'/)
+  assert.match(resources, /QC_ENABLED: 'false'/)
+  assert.match(resources, /QC_WORKER_ENABLED: 'false'/)
   assert.equal(Object.hasOwn(parameters, 'analysisEvidenceCorrectionsEnabled'), false)
   for (const source of [main, resources, module]) assert.doesNotMatch(source, /analysisEvidenceCorrectionsEnabled/)
 })
@@ -1160,11 +1199,12 @@ test('worker build and shared container packaging include both new entry points 
   for (const [source, output] of [
     ['worker/resume-index.ts', 'resume-worker'], ['worker/resumes/runtime.ts', 'resume-runtime'],
     ['worker/analysis-index.ts', 'analysis-worker'], ['worker/analyses/runtime.ts', 'analysis-runtime'],
+    ['worker/qc-index.ts', 'qc-worker'], ['worker/qc/runtime.ts', 'qc-runtime'],
   ]) {
     assert.ok(build.includes(`['${source}', 'dist-worker/${output}.mjs']`))
     assert.ok(docker.includes(`'${output}'`))
   }
-  for (const kind of ['RESUME', 'ANALYSIS']) {
+  for (const kind of ['RESUME', 'ANALYSIS', 'QC']) {
     assert.ok(provision.includes(`Set-EnvironmentValue 'AZURE_${kind}_WORKER_CONTAINER_IMAGE' 'mcr.microsoft.com/k8se/quickstart-jobs:latest'`))
   }
   assert.ok(docker.includes("'word-parser'"))
@@ -1182,6 +1222,7 @@ test('runtime settings activate only after every reader and active execution has
   await configureWorkerDeployment(env, {}, { image, rendererImage }, hooks)
   assert.equal(settings().SCORE_RUNTIME_SETTINGS_ENABLED, 'true')
   assert.equal(settings().SCORE_RUNTIME_SETTINGS_WORKER_VERSION, RUNTIME_SETTINGS_VERSION)
+  assert.equal(settings().SCORE_PROMPT_RUNTIME_WORKER_VERSION, PROMPT_RUNTIME_VERSION)
   assert.equal(settings().SCORE_RUNTIME_SETTINGS_VERIFIED_IMAGE, image)
   assert.ok(Number.isFinite(Date.parse(settings().SCORE_RUNTIME_SETTINGS_VERIFIED_AT)))
   const activation = operations.findIndex(operation => operation.action === 'settings' &&
@@ -1205,6 +1246,7 @@ test('runtime settings failure and renderer-only paths keep admission disabled',
     await assert.rejects(configureWorkerDeployment(env, {}, { image, rendererImage }, hooks))
     assert.equal(settings().SCORE_RUNTIME_SETTINGS_ENABLED, 'false')
     assert.equal(settings().SCORE_RUNTIME_SETTINGS_WORKER_VERSION, '')
+    assert.equal(settings().SCORE_PROMPT_RUNTIME_WORKER_VERSION, '')
     assert.equal(settings().WORD_DOCUMENT_IMPORTS_ENABLED, 'false')
     assert.equal(settings().ANALYSIS_EVIDENCE_CORRECTIONS_ENABLED, 'false')
     assert.equal(workers.get('analysis').properties.template.containers[0].env.find(setting =>
@@ -1222,18 +1264,18 @@ test('runtime settings pause is verified, idempotent, and preserves unrelated co
   assert.equal(operations.filter(operation => operation.action === 'settings').length, 1)
   assert.equal(settings().SCORE_RUNTIME_SETTINGS_ENABLED, 'false')
   for (const [key, value] of Object.entries(appSettings())) {
-    if (key !== 'SCORE_RUNTIME_SETTINGS_ENABLED') assert.equal(settings()[key], value)
+    if (!['SCORE_RUNTIME_SETTINGS_ENABLED', 'QC_WORKER_ENABLED'].includes(key)) assert.equal(settings()[key], value)
   }
   assert.equal(settings().CUSTOM_EXISTING_SETTING, 'unchanged')
 })
 
-test('settings and access infrastructure isolate runtime permission writes from four settings readers and the renderer', () => {
+test('settings and access infrastructure isolate runtime permission writes from five settings readers and the renderer', () => {
   const resources = readFileSync(new URL('../infra/resources.bicep', import.meta.url), 'utf8')
   const ai = readFileSync(new URL('../infra/ai.bicep', import.meta.url), 'utf8')
   const ingestion = readFileSync(new URL('../infra/ingestion.bicep', import.meta.url), 'utf8')
   const provision = readFileSync(new URL('../scripts/deploy.ps1', import.meta.url), 'utf8')
   assert.match(resources, /name: 'application-settings'[\s\S]*?paths: \['\/applicationId'\]/)
-  assert.match(resources, /settingsReaderKinds = \['job', 'grade', 'resume', 'analysis'\]/)
+  assert.match(resources, /settingsReaderKinds = \['job', 'grade', 'resume', 'analysis', 'qc'\]/)
   assert.match(resources, /settingsReadAccess[\s\S]*?00000000-0000-0000-0000-000000000001[\s\S]*?colls\/\$\{settingsContainer\.name\}/)
   assert.match(resources, /name: 'application-access'[\s\S]*?paths: \['\/tenantId'\]/)
   assert.match(resources, /resource applicationAccess[\s\S]*?principalId: runtimeIdentity\.properties\.principalId[\s\S]*?colls\/\$\{accessContainer\.name\}/)
@@ -1248,4 +1290,17 @@ test('settings and access infrastructure isolate runtime permission writes from 
   assert.match(provision, /PSBoundParameters\.ContainsKey\('BootstrapAdminUserIds'\)/)
   assert.match(provision, /get-value AZURE_BOOTSTRAP_ADMIN_USER_IDS --environment \$EnvironmentName/)
   assert.match(provision, /Legacy AZURE_ADMIN_USER_IDS and the operator are not migrated implicitly/)
+})
+
+test('QC shutdown preserves human feedback access while activation requires verified prompt readers', async () => {
+  const { hooks, settings } = rolloutHarness()
+  await updateQcAdmission(env, {}, false, hooks)
+  assert.equal(settings().QC_ENABLED, 'true')
+  assert.equal(settings().QC_WORKER_ENABLED, 'false')
+  await assert.rejects(updateQcAdmission(env, {}, true, hooks), /verified prompt-aware workers/)
+  await configureWorkerDeployment(env, {}, { image, rendererImage }, hooks)
+  assert.equal(settings().QC_WORKER_ENABLED, 'true')
+  await disableRuntimeSettingsAdmission(env, {}, hooks)
+  assert.equal(settings().QC_ENABLED, 'true')
+  assert.equal(settings().QC_WORKER_ENABLED, 'false')
 })

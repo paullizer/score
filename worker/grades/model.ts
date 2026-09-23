@@ -7,6 +7,7 @@ import {
 import type { Citation } from '../../src/domain/types'
 import type { ModelTaskId, ProcessingSettingsSnapshot } from '../../src/domain/admin-settings'
 import { validateProcessingSettings } from '../settings'
+import { resolveAcceptedPrompt } from '../prompts'
 import type {
   CompetencyModelInput, DraftGradeRubric, GradeDraftModelInput, GradeModelInvoker,
   GradeModelRequest, PlanGradeCompetencies, ReviewGradeRubric,
@@ -74,6 +75,12 @@ Check every work-level claim, scope/autonomy/complexity distinction, numeric cla
 Confirm that zero denotes no supporting evidence in a submitted resume, not proven inability, lack of awareness or advisory experience, or legal noncompliance. All positive anchors must describe documentary support rather than personal ability. Do not confuse missing resume evidence with a gap in the requirement sources or a saved zero-weight work-level exclusion. Review immutable guidance without rewriting it.
 In particular, a single-job expectation, qualification-only paragraph, titling-only flysheet, unrelated grade example, or FES factor example does not establish a grade-specific hiring competency. Confirm agency/functional applicability only from supplied evidence. Never use your knowledge of GS standards to repair a source gap.
 Return only outcome ("supported" or "needs-sources") and issues. This is NOT approval or official certification. Return needs-sources for any unresolved relevant blocker, unsupported criterion, semantic mismatch, missing qualification path, or insufficient context. Describe the affected grade/criterion and cite the exact problematic or qualifying passages where available. Never clear inherited source/version global blockers. Other-grade-only issues must not block this grade.`
+
+export const GRADE_COMPILED_PROMPTS = {
+  gradeCompetencies: { system: PLAN_SYSTEM, promptVersion: GRADE_MODEL_PROMPT_VERSIONS.competencies, schemaVersion: 'score-grade-competencies-schema-v1' },
+  gradeDraft: { system: DRAFT_SYSTEM, promptVersion: GRADE_MODEL_PROMPT_VERSIONS.draft, schemaVersion: 'score-grade-draft-schema-v3' },
+  gradeReview: { system: REVIEW_SYSTEM, promptVersion: GRADE_MODEL_PROMPT_VERSIONS.review, schemaVersion: 'score-grade-review-schema-v2' },
+} as const
 
 function invalidInput(message: string, details: string[] = []): never {
   throw new GradeModelError('invalid-input', message, { details })
@@ -279,9 +286,11 @@ export const planGradeCompetencies: PlanGradeCompetencies = async (input, invoke
   const evidence = inputEvidence(input.sourceSet, seed.documents, seed.issues)
   const seedIds = new Set(input.seed.rubric.criteria.map(value => value.id))
   const maxCriteria = input.processingSettings?.settings.grades.maxCriteria ?? GRADE_LADDER_LIMITS.maxCriteria
+  const prompt = resolveAcceptedPrompt(input.processingSettings, 'gradeCompetencies', GRADE_COMPILED_PROMPTS.gradeCompetencies,
+    system => system.replace(`1–${GRADE_LADDER_LIMITS.maxCriteria}`, `1–${maxCriteria}`))
   const generated = await structuredOutput({
     taskId: 'gradeCompetencies', name: 'score_grade_competencies_v2',
-    system: PLAN_SYSTEM.replace(`1–${GRADE_LADDER_LIMITS.maxCriteria}`, `1–${maxCriteria}`),
+    system: prompt.system,
     schema: planSchema.extend({ competencies: competencySchema.array().min(1).max(maxCriteria) }), maxCompletionTokens: 12_000,
   }, evidence, {
     operation: 'plan-competencies',
@@ -296,7 +305,8 @@ export const planGradeCompetencies: PlanGradeCompetencies = async (input, invoke
   }, [], (value, context) => validatePlan(value, seedIds, evidence, context.included), invoke, signal, input.processingSettings)
   return {
     competencies: generated.value.competencies, issues: generated.issues,
-    model: generated.model, promptVersion: GRADE_MODEL_PROMPT_VERSIONS.competencies,
+    model: generated.model, promptVersion: prompt.promptVersion,
+    ...(prompt.provenance ? { prompt: prompt.provenance } : {}),
   }
 }
 
@@ -309,8 +319,9 @@ export const draftGradeRubric: DraftGradeRubric = async (input, invoke, signal) 
     invalidInput('The frozen competency plan exceeds its captured criterion limit. No competencies were removed.')
   }
   const eligibleGradingDocumentIds = gradingDocumentIds(evidence)
+  const prompt = resolveAcceptedPrompt(input.processingSettings, 'gradeDraft', GRADE_COMPILED_PROMPTS.gradeDraft)
   const generated = await structuredOutput({
-    taskId: 'gradeDraft', name: 'score_grade_draft_v3', system: DRAFT_SYSTEM, schema: draftSchemaForDocuments(eligibleGradingDocumentIds, {
+    taskId: 'gradeDraft', name: 'score_grade_draft_v3', system: prompt.system, schema: draftSchemaForDocuments(eligibleGradingDocumentIds, {
       sourceIds: [...evidence.bindings.values()].filter(binding => binding.selected).map(binding => binding.source.sourceId),
       criterionIds: input.competencies.map(competency => competency.id), grade: input.grade,
     }), maxCompletionTokens: 24_000,
@@ -327,7 +338,8 @@ export const draftGradeRubric: DraftGradeRubric = async (input, invoke, signal) 
     name: `${input.ladder.name} · ${gradeLabel(input.grade)}`,
     description: `${generated.value.description}\n\n${SCORE_INTERPRETATION}`,
     version: input.version, createdAt: input.createdAt,
-    provenance: { kind: 'generated', model: generated.model, promptVersion: GRADE_MODEL_PROMPT_VERSIONS.draft },
+    provenance: { kind: 'generated', model: generated.model, promptVersion: prompt.promptVersion,
+      ...(prompt.provenance ? { prompt: prompt.provenance } : {}) },
     criteria: input.competencies.map(competency => {
       const criterion = generated.value.criteria.find(value => value.competencyId === competency.id)!
       return {
@@ -341,7 +353,8 @@ export const draftGradeRubric: DraftGradeRubric = async (input, invoke, signal) 
     qualifications: generated.value.qualifications.map(value => ({
       ...value, interpretation: `${value.interpretation}\n${QUALIFICATION_INTERPRETATION}`,
     })),
-    issues: generated.issues, model: generated.model, promptVersion: GRADE_MODEL_PROMPT_VERSIONS.draft,
+    issues: generated.issues, model: generated.model, promptVersion: prompt.promptVersion,
+    ...(prompt.provenance ? { prompt: prompt.provenance } : {}),
   }
 }
 
@@ -383,8 +396,9 @@ export const reviewGradeRubric: ReviewGradeRubric = async (input, invoke, signal
     invalidInput('The immutable version contains invalid citations, category/score claims, or grading structure. Save a corrected version before review; model review cannot repair persisted content.', deterministic.errors)
   }
   evidence.issues = mergeIssues(evidence.issues, deterministic.issues)
+  const prompt = resolveAcceptedPrompt(input.processingSettings, 'gradeReview', GRADE_COMPILED_PROMPTS.gradeReview)
   const generated = await structuredOutput({
-    taskId: 'gradeReview', name: 'score_grade_review_v2', system: REVIEW_SYSTEM, schema: reviewSchemaForScope({
+    taskId: 'gradeReview', name: 'score_grade_review_v2', system: prompt.system, schema: reviewSchemaForScope({
       sourceIds: [...evidence.bindings.values()].filter(binding => binding.selected).map(binding => binding.source.sourceId),
       criterionIds: competencies.map(competency => competency.id), grade: version.grade,
     }), maxCompletionTokens: 16_000,
@@ -409,6 +423,7 @@ export const reviewGradeRubric: ReviewGradeRubric = async (input, invoke, signal
   }
   return {
     outcome: generated.value.outcome === 'needs-sources' || issues.some(value => value.severity === 'blocker') ? 'needs-sources' : 'supported',
-    issues, model: generated.model, promptVersion: GRADE_MODEL_PROMPT_VERSIONS.review,
+    issues, model: generated.model, promptVersion: prompt.promptVersion,
+    ...(prompt.provenance ? { prompt: prompt.provenance } : {}),
   }
 }

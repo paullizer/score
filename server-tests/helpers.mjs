@@ -103,6 +103,36 @@ export function createFakeDirectoryStore() {
       const entry = partitions.get(workspaceId)?.get(membershipId)
       return entry ? clone(entry.doc) : undefined
     },
+    async getStoredMembership(workspaceId, membershipId) {
+      const entry = partitions.get(workspaceId)?.get(membershipId)
+      return entry ? { membership: structuredClone(entry.doc), etag: entry.etag } : undefined
+    },
+    async listReviewerMemberships(workspaceId) {
+      return [...(partitions.get(workspaceId)?.values() ?? [])]
+        .filter(entry => entry.doc.principalType === 'user' && entry.doc.role === 'reviewer')
+        .map(entry => ({ membership: structuredClone(entry.doc), etag: entry.etag }))
+    },
+    async changeReviewerMembership({ metadata, expectedMetadataEtag, membership, expectedMembershipEtag, audit }) {
+      const partition = partitions.get(metadata.workspaceId)
+      const current = partition?.get('workspace')
+      const target = partition?.get(membership.id)
+      const actor = partition?.get(membershipIdFor(audit.actorId))?.doc
+      if (!current || current.etag !== expectedMetadataEtag || partition.has(audit.id) ||
+        current.doc.deletedAt ||
+        (current.doc.lifecycleOperation && current.doc.lifecycleOperation.status !== 'complete') ||
+        membership.workspaceId !== metadata.workspaceId || membership.role !== 'reviewer' ||
+        actor?.role !== 'owner' || actor.principalId !== audit.actorId || audit.targetPrincipalId !== membership.principalId ||
+        (audit.action === 'reviewer-added' ? target || expectedMembershipEtag !== undefined :
+          audit.action !== 'reviewer-removed' || !target || target.etag !== expectedMembershipEtag || target.doc.role !== 'reviewer')) {
+        throw new StoreConflictError('Workspace access changed.')
+      }
+      const etag = nextEtag()
+      partition.set('workspace', { doc: structuredClone(metadata), etag })
+      if (audit.action === 'reviewer-added') partition.set(membership.id, { doc: structuredClone(membership), etag: nextEtag() })
+      else partition.delete(membership.id)
+      partition.set(audit.id, { doc: structuredClone(audit), etag: nextEtag() })
+      return { metadata: structuredClone(metadata), etag }
+    },
     async listMembershipsForPrincipal(principalKey) {
       const results = []
       for (const partition of partitions.values()) {
@@ -224,6 +254,13 @@ export function createFakeDirectoryStore() {
       if (ownerDelta && typeof metadata?.doc.ownerCount === 'number') {
         partition.set('workspace', { doc: { ...metadata.doc, ownerCount: metadata.doc.ownerCount + ownerDelta }, etag: nextEtag() })
       }
+    },
+    _membershipAudits(workspaceId) {
+      return [...(partitions.get(workspaceId)?.values() ?? [])]
+        .filter(entry => entry.doc.type === 'membership-audit').map(entry => structuredClone(entry.doc))
+    },
+    _removeMembership(workspaceId, membershipId) {
+      partitions.get(workspaceId)?.delete(membershipId)
     },
     _partitionCount(workspaceId) {
       return partitions.has(workspaceId) ? 1 : 0
@@ -375,7 +412,7 @@ export async function startTestServer(overrides = {}) {
   const app = createApp({
     config, directory, state, distDir, accessStore, eligibleUsers, now: overrides.now,
     jobs: overrides.jobs, grades: overrides.grades, resumes: overrides.resumes,
-    analyses: overrides.analyses, settings: overrides.settings,
+    analyses: overrides.analyses, settings: overrides.settings, prompts: overrides.prompts, qc: overrides.qc,
   })
   const server = createServer(app)
   await new Promise((resolve, reject) => {

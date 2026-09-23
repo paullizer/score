@@ -11,6 +11,7 @@ import { useGradeLeaveGuard } from './grade-navigation-context'
 import { useWorkspace, WorkspaceContext, type PendingLifecycleChange } from './workspace-context'
 import { gradeHeadId } from '../domain/real-grades'
 import { isEntityArchived, lifecycleIsRemoved, type LifecycleAction, type LifecycleTarget } from '../domain/lifecycle'
+import { workspaceCanEdit } from '../domain/workspace-permissions'
 
 type PendingGradeLifecycle = PendingLifecycleChange & { ladderId: string; grade?: number; etag?: string }
 
@@ -46,7 +47,7 @@ export function RealGradeLaddersBridge({ workspaceId, children }: { workspaceId:
   const summariesRef = useRef(summaries)
   summariesRef.current = summaries
   const metadata = parent.cloud?.workspaces.find((workspace) => workspace.id === workspaceId)
-  const canManage = Boolean(metadata && metadata.role !== 'viewer' && !metadata.deletedAt)
+  const canManage = Boolean(metadata && workspaceCanEdit(metadata.role) && !metadata.deletedAt)
   const canWrite = canManage && !metadata?.archivedAt && (!metadata?.lifecycleOperation || metadata.lifecycleOperation.status === 'complete')
   const accessStamp = workspaceAccessStamp(metadata)
   const accessRef = useRef({ stamp: accessStamp, canManage, canWrite, readable: Boolean(metadata && !metadata.deletedAt) })

@@ -272,6 +272,12 @@ async function finishOperation(analyses: RealAnalysesDeps, workspaceId: string, 
   const operation = control?.record.operation
   if (!operation || !control) throw unavailable('The durable analysis lifecycle operation is unavailable.')
   if (operation.status === 'complete') return true
+  if (analyses.qcLifecycle) {
+    await analyses.qcLifecycle.setRunState(workspaceId, runId,
+      operation.action === 'delete' ? 'deleting'
+        : operation.action === 'unarchive' || !current.record.lifecycle?.archivedAt ? 'active' : 'archived',
+      timestamp)
+  }
   if (needsCancellation(current.record)) {
     if (analysisCancellationNeedsRetry(current.record)) {
       throw unavailable('Analysis cancellation is paused. Retry the lifecycle action explicitly to resume cleanup.')
@@ -288,6 +294,7 @@ async function finishOperation(analyses: RealAnalysesDeps, workspaceId: string, 
     if (needsCancellation(current.record)) return false
   }
   if (operation.action === 'delete') {
+    await analyses.qcLifecycle?.purgeRun(workspaceId, runId, timestamp)
     for (const type of ['analysis-candidate-narrative', 'analysis-target-narrative', 'analysis-narrative-request', 'analysis-correction', 'analysis-comparison'] as const) {
       if (!await purgeComparisons(analyses, workspaceId, runId, timestamp, type)) return false
     }

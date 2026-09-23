@@ -10,7 +10,7 @@ const lookupQuery = z.strictObject({
   continuation: z.string().min(1).max(4096).optional(),
 })
 const creationBody = z.strictObject({ canCreateWorkspaces: z.boolean() })
-const memberBody = z.strictObject({ role: z.enum(['owner', 'editor', 'viewer']) })
+const memberBody = z.strictObject({ role: z.enum(['owner', 'editor', 'reviewer', 'viewer']) })
 
 function parse<T>(schema: z.ZodType<T>, value: unknown): T {
   const result = schema.safeParse(value)

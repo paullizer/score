@@ -98,6 +98,10 @@ export interface RealAnalysesDeps {
   readonly store: AnalysisStore
   readonly blobs: AnalysisBlobStore
   readonly evidenceCorrectionsEnabled?: boolean
+  readonly qcLifecycle?: {
+    setRunState(workspaceId: string, runId: string, state: WorkspaceLifecycleState, timestamp: string): Promise<void>
+    purgeRun(workspaceId: string, runId: string, timestamp: string): Promise<void>
+  }
 }
 
 export interface RealAnalysesConfig {

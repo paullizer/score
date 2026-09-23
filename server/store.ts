@@ -35,6 +35,8 @@ export interface MembershipDoc {
   readonly principalId: string
   readonly principalType: 'user'
   readonly role: WorkspaceRole
+  /** Optional owner-supplied display label. Never used to identify or authorize a principal. */
+  readonly label?: string
   readonly name?: string
   readonly email?: string
 }
@@ -42,6 +44,28 @@ export interface MembershipDoc {
 export interface StoredMembership {
   readonly membership: MembershipDoc
   readonly etag: string
+}
+
+export interface MembershipAuditDoc {
+  readonly id: string
+  readonly workspaceId: string
+  readonly type: 'membership-audit'
+  readonly action: 'reviewer-added' | 'reviewer-removed'
+  readonly actorId: string
+  readonly targetPrincipalId: string
+  readonly membershipId: string
+  readonly role: 'reviewer'
+  readonly label?: string
+  readonly createdAt: string
+}
+
+export interface ReviewerMembershipChange {
+  readonly metadata: WorkspaceMetadataDoc
+  readonly expectedMetadataEtag: string
+  readonly membership: MembershipDoc & { readonly role: 'reviewer' }
+  /** Required when removing a reviewer; adds are create-only, never upserts. */
+  readonly expectedMembershipEtag?: string
+  readonly audit: MembershipAuditDoc
 }
 
 export interface MembershipChange {
@@ -77,6 +101,10 @@ export class StoreConflictError extends Error {
 export interface DirectoryStore {
   getMetadata(workspaceId: string): Promise<StoredMetadata | undefined>
   getMembership(workspaceId: string, membershipId: string): Promise<MembershipDoc | undefined>
+  getStoredMembership(workspaceId: string, membershipId: string): Promise<StoredMembership | undefined>
+  listReviewerMemberships(workspaceId: string): Promise<StoredMembership[]>
+  /** Atomically changes one reviewer, creates its immutable audit, and advances the directory ETag. */
+  changeReviewerMembership(change: ReviewerMembershipChange): Promise<StoredMetadata>
   /** Cross-partition lookup of every membership for a principal, across all workspaces. */
   listMembershipsForPrincipal(principalKey: string): Promise<MembershipDoc[]>
   listMetadataForTenant(tenantId: string): Promise<StoredMetadata[]>

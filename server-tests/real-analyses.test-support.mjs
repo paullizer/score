@@ -645,9 +645,10 @@ const OWNER = '00000000-0000-4000-8000-000000000002'
 const VIEWER = '00000000-0000-4000-8000-000000000003'
 const STRANGER = '00000000-0000-4000-8000-000000000004'
 const EDITOR = '00000000-0000-4000-8000-000000000005'
+const REVIEWER = '00000000-0000-4000-8000-000000000006'
 const ORIGIN = 'https://score.example.test'
 export async function startHttp(f, enabled = true, settings, runtimeEnabled = true) {
-  const memberships = new Map([['owner', OWNER], ['editor', EDITOR], ['viewer', VIEWER]].map(([role, oid]) => {
+  const memberships = new Map([['owner', OWNER], ['editor', EDITOR], ['reviewer', REVIEWER], ['viewer', VIEWER]].map(([role, oid]) => {
     const principalId = api.principalKeyFor(TENANT, oid)
     const member = { id: api.membershipIdFor(principalId), workspaceId: f.workspaceId, principalId, principalType: 'user', role }
     return [member.id, member]
@@ -702,7 +703,7 @@ export async function startHttp(f, enabled = true, settings, runtimeEnabled = tr
     base, config,
     async close() { await new Promise(resolve => server.close(resolve)) },
     async request(suffix = '', method = 'GET', body, options = {}) {
-      const oid = options.role === 'viewer' ? VIEWER : options.role === 'editor' ? EDITOR : options.role === 'stranger' ? STRANGER : OWNER
+      const oid = options.role === 'viewer' ? VIEWER : options.role === 'editor' ? EDITOR : options.role === 'reviewer' ? REVIEWER : options.role === 'stranger' ? STRANGER : OWNER
       const principal = { auth_typ: 'aad', claims: [
         { typ: 'tid', val: TENANT }, { typ: 'oid', val: oid },
         ...(options.roles ?? ['Score.User']).map(role => ({ typ: 'roles', val: role })),

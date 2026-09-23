@@ -6,6 +6,7 @@ import {
 } from '../src/domain/admin-settings'
 import type { UploadFormat } from '../src/domain/document-formats'
 import type { DocumentIntelligenceClientOptions, RubricModelOptions, SafeFetchOptions, StructuredModelRequest } from './runtime'
+import { validatePromptSnapshot } from '../server/settings/prompt-integrity'
 
 export interface WorkerSettingsReader {
   readonly mode?: 'configured' | 'unconfigured'
@@ -34,7 +35,12 @@ export function validateProcessingSettings(snapshot: ProcessingSettingsSnapshot)
   if (existing) return existing
   const result = processingSettingsSnapshotSchema.safeParse(snapshot)
   if (!result.success) throw new RuntimeSettingsError('settings-invalid', 'The captured processing settings are invalid. No current policy or model was substituted.')
-  const frozen = captureProcessingSettings(result.data.settings, result.data.revision, result.data.capturedAt)
+  if (result.data.promptBundle) {
+    try { validatePromptSnapshot(result.data.promptBundle) } catch {
+      throw new RuntimeSettingsError('settings-invalid', 'The captured prompt bundle failed integrity validation. No current or legacy prompt was substituted.')
+    }
+  }
+  const frozen = captureProcessingSettings(result.data.settings, result.data.revision, result.data.capturedAt, result.data.promptBundle)
   validated.set(snapshot, frozen)
   validated.set(frozen, frozen)
   return frozen
@@ -178,12 +184,13 @@ export function assertSourcePolicy(
 }
 
 export function safeSettingsMetadata(snapshot: ProcessingSettingsSnapshot, taskId?: ModelTaskId): object {
+  const task = taskId ? resolveTaskModel(snapshot, taskId) : undefined
   return {
     settingsRevision: snapshot.revision,
-    ...(taskId ? { taskId, deployment: snapshot.tasks[taskId].deploymentName } : {}),
+    ...(task ? { taskId, deployment: task.deploymentName } : {}),
     ...(snapshot.settings.logging.detail === 'diagnostic-metadata' ? {
       schemaVersion: snapshot.schemaVersion,
-      ...(taskId ? { inputBudget: snapshot.tasks[taskId].inputBudget, completionTokenLimit: snapshot.tasks[taskId].completionTokenLimit } : {}),
+      ...(task ? { inputBudget: task.inputBudget, completionTokenLimit: task.completionTokenLimit } : {}),
     } : {}),
   }
 }

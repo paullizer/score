@@ -11,6 +11,7 @@ import type { GradeLeaveProtectionApi } from './grade-navigation-context'
 import { workspaceLifecycleTransitionErrors, type LifecycleTarget } from '../domain/lifecycle'
 import { WorkspaceSwitcher } from '../components/workspace/WorkspaceSwitcher'
 import { LifecycleDialogProvider } from '../components/lifecycle/LifecycleControls'
+import { workspaceCanEdit } from '../domain/workspace-permissions'
 import { AccessSuspendedContext } from './access-suspended-context'
 import { useApplicationNavigation } from './application-navigation-context'
 
@@ -198,7 +199,7 @@ export function CloudWorkspaceProvider({
   function writeBlockReason(): string | null {
     const metadata = metadataRef.current
     return !metadata || metadata.deletedAt ? 'Workspace access was removed or the workspace was deleted. Unsaved drafts are kept in this tab, but cannot be uploaded. Refresh access or explicitly discard them before leaving.'
-      : metadata.role === 'viewer' ? 'Your workspace role is now Reader. Unsaved drafts are kept in this tab; saving is stopped. Ask an Owner for edit access, or explicitly discard the draft and reload saved content.'
+      : !workspaceCanEdit(metadata.role) ? `Your workspace role is now ${metadata.role === 'reviewer' ? 'Reviewer' : 'Reader'}. Unsaved drafts are kept in this tab; saving is stopped. Ask an Owner for edit access, or explicitly discard the draft and reload saved content.`
         : metadata.archivedAt || (metadata.lifecycleOperation && metadata.lifecycleOperation.status !== 'complete') ? 'The workspace is archived or has unfinished lifecycle work. Unsaved changes cannot overwrite that state.'
           : null
   }
@@ -319,13 +320,13 @@ export function CloudWorkspaceProvider({
     appliedMetadataStamp.current = metadataStamp
     if (!engineRef.current) return
     const metadata = metadataRef.current
-    if (!metadata || metadata.deletedAt || metadata.role === 'viewer' || (metadata.lifecycleOperation && metadata.lifecycleOperation.status !== 'complete')) {
+    if (!metadata || metadata.deletedAt || !workspaceCanEdit(metadata.role) || (metadata.lifecycleOperation && metadata.lifecycleOperation.status !== 'complete')) {
       clearDebounce()
       engineRef.current.setExternalArchive(true)
       if (pendingRef.current || savingRef.current) {
         setStatus({ state: 'error', error: writeBlockReason(), conflict: null })
       }
-      if (metadata && !metadata.deletedAt && metadata.role === 'viewer' && !pendingRef.current && !savingRef.current) void refreshState()
+      if (metadata && !metadata.deletedAt && !workspaceCanEdit(metadata.role) && !pendingRef.current && !savingRef.current) void refreshState()
       return
     }
     void refreshState()
@@ -397,7 +398,7 @@ export function CloudWorkspaceProvider({
       requireCurrentSnapshot(fresh)
       const serverWorkspace = validateWorkspace(fresh.workspace)
       const metadata = metadataRef.current
-      if (!metadata || metadata.role === 'viewer' || metadata.deletedAt || metadata.archivedAt || (metadata.lifecycleOperation && metadata.lifecycleOperation.status !== 'complete')) {
+      if (!metadata || !workspaceCanEdit(metadata.role) || metadata.deletedAt || metadata.archivedAt || (metadata.lifecycleOperation && metadata.lifecycleOperation.status !== 'complete')) {
         throw new CloudConflictError('This workspace is read-only, archived, unavailable, or has an incomplete lifecycle operation. Reload the server state; overwriting cannot restore access.')
       }
       if (serverWorkspace.lifecycle?.archivedAt !== toSave.lifecycle?.archivedAt) {
@@ -436,7 +437,7 @@ export function CloudWorkspaceProvider({
       }
       await refreshWorkspaces()
       const current = refreshed.workspaces.find(item => item.id === workspaceId)
-      if (!current || current.role === 'viewer' || current.deletedAt || current.archivedAt) {
+      if (!current || !workspaceCanEdit(current.role) || current.deletedAt || current.archivedAt) {
         setStatus({ state: 'error', error: 'Sign-in was confirmed, but this account no longer has edit access. Drafts remain in this tab; no save was replayed.', conflict: null })
         return
       }
@@ -538,7 +539,7 @@ function CloudWorkspaceReady({
   useEffect(() => { pendingLifecycle.current.clear() }, [snapshotRevision])
   const metadata = workspaces.find((item) => item.id === workspaceId)
   const unavailable = !metadata || Boolean(metadata.deletedAt)
-  const writable = Boolean(metadata && metadata.role !== 'viewer' && !metadata.archivedAt && !metadata.deletedAt && !syncingState && (!metadata.lifecycleOperation || metadata.lifecycleOperation.status === 'complete'))
+  const writable = Boolean(metadata && workspaceCanEdit(metadata.role) && !metadata.archivedAt && !metadata.deletedAt && !syncingState && (!metadata.lifecycleOperation || metadata.lifecycleOperation.status === 'complete'))
   const access = useRef({ metadata, writable })
   access.current = { metadata, writable }
   useLayoutEffect(() => {
@@ -580,7 +581,7 @@ function CloudWorkspaceReady({
   }
   function assertLifecyclePermission(target: LifecycleTarget) {
     const current = access.current.metadata
-    if (!current || current.deletedAt || current.role === 'viewer' || (target.kind === 'workspace' && current.role !== 'owner')) {
+    if (!current || current.deletedAt || !workspaceCanEdit(current.role) || (target.kind === 'workspace' && current.role !== 'owner')) {
       throw new Error('Your role does not allow this lifecycle change.')
     }
   }

@@ -1,5 +1,5 @@
 import { MODEL_TASK_IDS } from './admin-settings-tasks'
-import type { AdminSettings, ModelCapabilities, ModelTaskId, ProcessingKind, ReasoningEffort, TaskInputBudget, TaskModelSettings, WorkerPolicy } from './admin-settings'
+import type { AdminSettings, CurrentAdminSettings, ModelCapabilities, ModelTaskId, ProcessingKind, ReasoningEffort, TaskInputBudget, TaskModelSettings, WorkerPolicy } from './admin-settings'
 
 export const LEGACY_SETTINGS_REVISION = 'legacy-v1'
 export const LEGACY_SETTINGS_CAPTURED_AT = '1970-01-01T00:00:00.000Z'
@@ -17,6 +17,7 @@ export const TASK_MODEL_LIMITS: Readonly<Record<ModelTaskId, { readonly completi
   targetSummary: { completionTokenLimit: 12_288, inputBudget: { unit: 'bytes', maxInput: 96_000, maxRequest: 288_000, reservedTokens: 2_048 } },
   summaryReduction: { completionTokenLimit: 16_384, inputBudget: { unit: 'bytes', maxInput: 96_000, maxRequest: 288_000, reservedTokens: 2_048 } },
   summaryReview: { completionTokenLimit: 8_192, inputBudget: { unit: 'bytes', maxInput: 96_000, maxRequest: 288_000, reservedTokens: 2_048 } },
+  qcPlan: { completionTokenLimit: 16_384, inputBudget: { unit: 'bytes', maxInput: 240_000, maxRequest: 300_000, reservedTokens: 2_048 } },
 }
 for (const limits of Object.values(TASK_MODEL_LIMITS)) {
   Object.freeze(limits.inputBudget)
@@ -53,10 +54,10 @@ export function modelCapabilitiesFor(modelName: string, modelVersion: string | n
 
 export interface AdminSettingsDefaultsOptions {
   model?: { deploymentName: string; modelName: string; reasoningEffort?: ReasoningEffort | null }
-  workers?: Partial<Record<ProcessingKind, Partial<WorkerPolicy>>>
+  workers?: Partial<Record<ProcessingKind | 'qc', Partial<WorkerPolicy>>>
 }
 
-export function createDefaultAdminSettings(options: AdminSettingsDefaultsOptions = {}): AdminSettings {
+export function createDefaultAdminSettings(options: AdminSettingsDefaultsOptions = {}): CurrentAdminSettings {
   const model = options.model ?? { deploymentName: 'job-rubric', modelName: 'gpt-5-mini', reasoningEffort: 'low' }
   const tasks = Object.fromEntries(MODEL_TASK_IDS.map(task => [task, {
     deploymentId: null, reasoningEffort: model.reasoningEffort ?? null,
@@ -68,11 +69,11 @@ export function createDefaultAdminSettings(options: AdminSettingsDefaultsOptions
     allowUrls: true, maxFileBytes: 10 * MIB, maxBatchItems: 10, maxPdfPages: 50, maxSourceCharacters: 180_000,
   })
   const hosts = () => ({ allowedHosts: [], blockedHosts: [] })
-  const worker = (kind: ProcessingKind, maxItemsPerExecution: number): WorkerPolicy => ({
+  const worker = (kind: ProcessingKind | 'qc', maxItemsPerExecution: number): WorkerPolicy => ({
     maxItemsPerExecution, budgetMilliseconds: 660_000, pauseClaiming: false, ...options.workers?.[kind],
   })
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     ai: {
       deployments: [{
         id: 'default', deploymentName: model.deploymentName, label: model.deploymentName, description: '', enabled: true,
@@ -110,13 +111,14 @@ export function createDefaultAdminSettings(options: AdminSettingsDefaultsOptions
       grades: { maxAutomaticAttempts: 3, retryBackoff: { baseMilliseconds: 30_000, maxMilliseconds: 120_000 } },
       resumes: { maxAutomaticAttempts: 3, retryBackoff: { baseMilliseconds: 15_000, maxMilliseconds: 60_000 } },
       analyses: { maxAutomaticAttempts: 3, retryBackoff: { baseMilliseconds: 30_000, maxMilliseconds: 120_000 } },
+      qc: { maxAutomaticAttempts: 3, retryBackoff: { baseMilliseconds: 30_000, maxMilliseconds: 300_000 } },
     },
     summaries: {
       generationMode: 'automatic', maxRounds: 3, allowManualPublication: true,
       manualPublicationRoles: 'owner-and-editor', historyRoles: 'owner-and-editor',
       historyPageSize: 12, operationTimeoutMilliseconds: 600_000,
     },
-    workers: { jobs: worker('jobs', 4), grades: worker('grades', 5), resumes: worker('resumes', 5), analyses: worker('analyses', 2) },
+    workers: { jobs: worker('jobs', 4), grades: worker('grades', 5), resumes: worker('resumes', 5), analyses: worker('analyses', 2), qc: worker('qc', 2) },
     extraction: { transport: { maxAttempts: 3 }, pollTimeoutMilliseconds: 240_000 },
     rendering: { timeoutMilliseconds: 30_000, settleMilliseconds: 2_000, maxRequests: 80, maxAggregateBytes: 8 * MIB, maxDomBytes: 2 * MIB },
     ui: { polling: { jobsMilliseconds: 2_000, otherProcessingMilliseconds: 3_000 } },

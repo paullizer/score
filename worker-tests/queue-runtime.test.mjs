@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
 import test from 'node:test'
 import { loadWorker } from './shared-model-loader.mjs'
-import { settingsSnapshot } from './runtime-settings-test-support.mjs'
+import { settingsDomain, settingsSnapshot } from './runtime-settings-test-support.mjs'
 const { runWorker, sourceBlobNames } = await loadWorker('../worker/runtime.ts')
 
 const workspaceId = '22222222-2222-4222-8222-222222222222'
@@ -230,11 +230,15 @@ function successfulModel(result = modelResult) {
 }
 
 test('durable job retries retain accepted task, attempt cap and backoff after current settings change', async () => {
-  const accepted = settingsSnapshot(settings => {
+  const legacy = settingsSnapshot(settings => {
     settings.processing.jobs.maxAutomaticAttempts = 2
     settings.processing.jobs.retryBackoff.baseMilliseconds = 7_000
     settings.ai.transport.maxAttempts = 1
   })
+  const { createCompiledPromptBaseline } = await loadWorker('../server/settings/prompts.ts')
+  const accepted = settingsDomain.captureProcessingSettings(
+    legacy.settings, legacy.revision, legacy.capturedAt, createCompiledPromptBaseline(now),
+  )
   const newer = settingsSnapshot(settings => {
     settings.ai.tasks.jobRubric.deploymentId = 'gradeDraft'
     settings.processing.jobs.maxAutomaticAttempts = 1
@@ -258,8 +262,31 @@ test('durable job retries retain accepted task, attempt cap and backoff after cu
   assert.equal(store.state().job.status, 'ready')
   assert.equal(store.state().attempts, 2)
   assert.equal(store.state().processingSettings.revision, accepted.revision)
+  assert.deepEqual(store.state().processingSettings.promptBundle, accepted.promptBundle)
+  assert.equal(store.published().provenance.prompt.bundleSha256, accepted.promptBundle.bundle.bundleSha256)
+  assert.equal(bodies[0].messages[0].content, bodies[1].messages[0].content)
   assert.deepEqual(bodies.map(body => body.model), ['deployment-jobRubric', 'deployment-jobRubric'])
   assert.equal(reads, 2)
+})
+
+test('an unsupported accepted job prompt fails terminally before model calls instead of retrying with newer defaults', async () => {
+  const { createCompiledPromptBaseline } = await loadWorker('../server/settings/prompts.ts')
+  const integrity = await loadWorker('../server/settings/prompt-integrity.ts')
+  const capture = createCompiledPromptBaseline(now), legacy = settingsSnapshot()
+  capture.revisions.jobRubric.templateVersion = 'retired-job-template-v1'
+  capture.revisions.jobRubric.contentSha256 = integrity.promptRevisionContentHash(capture.revisions.jobRubric)
+  capture.bundle.revisions.jobRubric = integrity.promptRevisionReference(capture.revisions.jobRubric)
+  capture.bundle.bundleSha256 = integrity.promptBundleContentHash(capture.bundle)
+  const accepted = settingsDomain.captureProcessingSettings(legacy.settings, legacy.revision, legacy.capturedAt, capture)
+  const store = fakeStore(record({ processingSettings: accepted }))
+  const deps = dependencies(store, fakeBlobs(), async () => { assert.fail('unsupported accepted templates cannot reach the model') })
+  deps.settings = { legacy, current: async () => legacy }
+  await runWorker(deps)
+  assert.equal(store.state().job.status, 'error')
+  assert.equal(store.state().error.code, 'prompt-pin-invalid')
+  assert.equal(store.state().error.retryable, false)
+  assert.equal(store.state().attempts, 1)
+  assert.equal(store.published(), undefined)
 })
 
 test('cached job evidence cannot bypass the accepted byte or complete-source character limits', async () => {

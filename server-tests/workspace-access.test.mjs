@@ -66,10 +66,12 @@ async function share(server, oid, role, actor = {}) {
 
 for (const [label, oid, memberRole, roles, readStatus, writeStatus, manageStatus] of [
   ['Reader', READER, 'viewer', ['Score.User'], 200, 403, 403],
+  ['Reviewer', NEW_USER, 'reviewer', ['Score.User'], 200, 403, 403],
   ['Editor', PEER, 'editor', ['Score.User'], 200, 200, 403],
   ['Owner', OWNER, 'owner', ['Score.User'], 200, 200, 200],
   ['application Admin without membership', ADMIN, undefined, ['Score.Admin'], 200, 200, 200],
   ['application Admin with Reader membership', ADMIN, 'viewer', ['Score.Admin'], 200, 200, 200],
+  ['application Admin with Reviewer membership', ADMIN, 'reviewer', ['Score.Admin'], 200, 200, 200],
   ['admitted nonmember', OUTSIDER, undefined, ['Score.User'], 404, 404, 404],
 ]) {
   test(`${label}: effective access is consistent across content, rename, lifecycle, sharing, and administration`, async t => {
@@ -84,14 +86,18 @@ for (const [label, oid, memberRole, roles, readStatus, writeStatus, manageStatus
     })).status, writeStatus)
     assert.equal((await members(server, actor)).status, manageStatus)
     assert.equal((await request(server, `${server.path}/share-candidates?query=person`, actor)).status, manageStatus)
+    const impact = await request(server, `${server.path}/lifecycle`, actor)
+    assert.equal(impact.status, readStatus)
     const metadata = await server.directory.getMetadata(server.workspace.id)
-    assert.equal((await request(server, server.path, {
+    const renamed = await request(server, server.path, {
       ...actor, method: 'PATCH', body: { name: `Renamed by ${label}` }, etag: metadata.etag,
-    })).status, manageStatus)
+    })
+    assert.equal(renamed.status, manageStatus)
     const current = await server.directory.getMetadata(server.workspace.id)
-    assert.equal((await request(server, `${server.path}/lifecycle`, {
+    const archived = await request(server, `${server.path}/lifecycle`, {
       ...actor, method: 'POST', body: { action: 'archive' }, etag: current.etag,
-    })).status, manageStatus)
+    })
+    assert.equal(archived.status, manageStatus)
     for (const path of ['/api/admin/users?query=person', grantPath(PEER)]) {
       assert.equal((await request(server, path, actor)).status, roles.includes('Score.Admin') ? 200 : 403)
     }
@@ -100,6 +106,20 @@ for (const [label, oid, memberRole, roles, readStatus, writeStatus, manageStatus
       const workspace = session.body.workspaces.find(item => item.id === server.workspace.id)
       assert.equal(workspace.role, 'owner')
       assert.equal(workspace.accessSource, 'application-admin')
+      for (const summary of [workspace, impact.body.workspace, renamed.body.workspace, archived.body.workspace]) {
+        assert.equal(summary.membershipRole, memberRole, 'Every summary retains explicit membership independently of effective Admin access')
+      }
+      let summary = archived.body.workspace
+      for (const action of ['archive', 'unarchive', 'unarchive']) {
+        const result = await request(server, `${server.path}/lifecycle`, {
+          ...actor, method: 'POST', body: { action }, etag: summary.etag,
+        })
+        assert.equal(result.status, 200)
+        summary = result.body.workspace
+        assert.equal(summary.role, 'owner')
+        assert.equal(summary.accessSource, 'application-admin')
+        assert.equal(summary.membershipRole, memberRole, 'No-op and completed lifecycle responses do not drop membership metadata')
+      }
       const explicit = await server.directory.getMembership(server.workspace.id, membershipIdFor(principalKeyFor(TENANT_ID, ADMIN)))
       assert.equal(explicit?.role, memberRole)
     }

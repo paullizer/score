@@ -33,5 +33,5 @@ export interface WorkspaceMembers {
 }
 
 export function workspaceRoleLabel(role: WorkspaceRole): string {
-  return role === 'viewer' ? 'Reader' : role === 'editor' ? 'Editor' : 'Owner'
+  return role === 'viewer' ? 'Reader' : role === 'reviewer' ? 'Reviewer' : role === 'editor' ? 'Editor' : 'Owner'
 }

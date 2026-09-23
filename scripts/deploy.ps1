@@ -121,15 +121,19 @@ try {
   if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($analysisWorkerImage)) {
     Set-EnvironmentValue 'AZURE_ANALYSIS_WORKER_CONTAINER_IMAGE' 'mcr.microsoft.com/k8se/quickstart-jobs:latest'
   }
+  $qcWorkerImage = & azd env get-value AZURE_QC_WORKER_CONTAINER_IMAGE --environment $EnvironmentName 2>$null
+  if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($qcWorkerImage)) {
+    Set-EnvironmentValue 'AZURE_QC_WORKER_CONTAINER_IMAGE' 'mcr.microsoft.com/k8se/quickstart-jobs:latest'
+  }
   Write-Host "Deploying Score to $Location in subscription $SubscriptionId."
   Write-Host "Initial guarded-ingress identity: $($user.userPrincipalName). Entra users/groups receive explicit Score.User or Score.Admin assignments."
   Write-Host 'Ingress is not released automatically. Follow the README role-verification and explicit release procedure.'
   Write-Host 'Rubric model: GPT-5 mini, US Data Zone Standard, in the existing North Central US Foundry resource.'
   if ($DeployOnly) {
-    foreach ($setting in @('AZURE_RESUME_WORKER_ID', 'AZURE_ANALYSIS_WORKER_ID')) {
+    foreach ($setting in @('AZURE_RESUME_WORKER_ID', 'AZURE_ANALYSIS_WORKER_ID', 'AZURE_QC_WORKER_ID')) {
       $workerId = & azd env get-value $setting --environment $EnvironmentName 2>$null
       if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($workerId)) {
-        throw 'Resume/analysis services have not been provisioned. Run this script with -ProvisionOnly before -DeployOnly.'
+        throw 'Resume/analysis/QC services have not been provisioned. Run this script with -ProvisionOnly before -DeployOnly.'
       }
     }
   }

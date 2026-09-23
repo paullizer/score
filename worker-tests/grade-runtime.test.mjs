@@ -5,7 +5,8 @@ import path from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { after, before, test } from 'node:test'
 import { build } from 'esbuild'
-import { settingsSnapshot } from './runtime-settings-test-support.mjs'
+import { settingsDomain, settingsSnapshot } from './runtime-settings-test-support.mjs'
+import { loadWorker } from './shared-model-loader.mjs'
 import { PDFDocument } from 'pdf-lib'
 import { installGradeLifecycleFake, installGradeBlobLifecycleFake, gradeLifecycleTesting } from '../server-tests/grade-lifecycle-fakes.mjs'
 import {
@@ -406,7 +407,13 @@ test('worker rejects invalid limits before requesting tasks', async () => {
 
 test('competency planning atomically creates independent tasks for every selected grade', async () => {
   const f = fixture({ kind: 'plan-competencies', sourceSetId: setId, generationId })
-  const accepted = settingsSnapshot(() => {}, 'accepted-grade-operation')
+  const legacy = settingsSnapshot(() => {}, 'accepted-grade-operation')
+  const { createCompiledPromptBaseline } = await loadWorker('../server/settings/prompts.ts')
+  const { resolveAcceptedPrompt } = await loadWorker('../worker/prompts.ts')
+  const { GRADE_COMPILED_PROMPTS } = await loadWorker('../worker/grades/model.ts')
+  const accepted = settingsDomain.captureProcessingSettings(
+    legacy.settings, legacy.revision, legacy.capturedAt, createCompiledPromptBaseline(now),
+  )
   const newer = settingsSnapshot(settings => { settings.ai.tasks.gradeDraft.deploymentId = 'gradeReview' }, 'newer-ladder-settings')
   f.store.set({ ...f.work, processingSettings: accepted })
   f.store.set({ ...f.ladder, processingSettings: newer })
@@ -420,9 +427,10 @@ test('competency planning atomically creates independent tasks for every selecte
     assert.equal(input.processingSettings.revision, accepted.revision)
     assert.equal(input.sourceSet.id, setId)
     assert.equal(input.seed.rubric.id, f.ladder.seedRubricId)
+    const prompt = resolveAcceptedPrompt(input.processingSettings, 'gradeCompetencies', GRADE_COMPILED_PROMPTS.gradeCompetencies)
     return {
       competencies: [{ id: 'analysis', label: 'Program analysis', description: 'Analyze programs', seedCriterionIds: ['c1'], citations: [] }],
-      issues: [], model: 'model-from-response', promptVersion: 'plan-v1',
+      issues: [], model: 'model-from-response', promptVersion: prompt.promptVersion, prompt: prompt.provenance,
     }
   }
   const result = await runtime.runGradeWorker(f.deps)
@@ -431,10 +439,12 @@ test('competency planning atomically creates independent tasks for every selecte
   assert.deepEqual(tasks.map(task => task.input.grade).sort((left, right) => left - right), [9, 11])
   assert.ok(tasks.every(task => task.input.sourceSetId === setId && task.input.generationId === generationId))
   assert.ok(tasks.every(task => task.processingSettings.revision === accepted.revision))
+  assert.ok(tasks.every(task => JSON.stringify(task.processingSettings.promptBundle) === JSON.stringify(accepted.promptBundle)))
   const plans = f.store.values().filter(record => record.recordType === 'grade-competency-plan')
   assert.equal(plans.length, 1)
   assert.equal(plans[0].model, 'model-from-response')
   assert.equal(plans[0].processingSettings.revision, accepted.revision)
+  assert.equal(plans[0].prompt.bundleSha256, accepted.promptBundle.bundle.bundleSha256)
 })
 
 for (const provenance of ['revision-only', 'historical-full']) {

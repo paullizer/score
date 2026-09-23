@@ -271,7 +271,7 @@ function fencedBlobs(
             ((current.record.recordType !== 'analysis-candidate-narrative' && current.record.recordType !== 'analysis-target-narrative') ||
               current.record.runId !== runId || current.record.generationId !== action.generationId)) denied()
         }
-        if (name.includes('/results/') || name.includes('/diagnostics/')) {
+        if (name.includes('/results/') || name.includes('/diagnostics/') || name.includes('/qc-diagnostics/')) {
           if (run?.record.recordType !== 'analysis-run') denied()
           const parts = name.split('/')
           const comparison = await deps.store.get(workspaceId, parts[3])

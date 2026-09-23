@@ -3,8 +3,9 @@ import type { AdminSettings, HostRule, SettingsFieldError, SettingsFieldMetadata
 import { Button } from '../../components/ui'
 import { describeSettingValue, settingValue } from './settingsForm'
 import { workspaceRoleLabel } from '../../domain/access'
+import { isWorkspaceRole } from '../../domain/workspace-permissions'
 
-const optionLabel = (option: string | number) => option === 'viewer' || option === 'owner' || option === 'editor'
+const optionLabel = (option: string | number) => isWorkspaceRole(option)
   ? workspaceRoleLabel(option) : option === 'owner-and-editor' ? 'Owners and Editors' : option
 
 export function SettingsFieldProvenance({ field, changed }: { field?: SettingsFieldMetadata; changed: boolean }) {

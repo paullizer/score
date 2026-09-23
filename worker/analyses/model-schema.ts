@@ -2,6 +2,8 @@ import { z } from 'zod'
 import type { RealAnalysisAssessmentInput } from '../../src/domain/real-analyses'
 import { ANALYSIS_DIAGNOSTIC_LIMITS, ANALYSIS_REVIEW_ISSUE_CODES } from '../../src/domain/analysis-diagnostics'
 import { ANALYSIS_CRITERION_BLOCKER_CODES } from '../../src/domain/analysis-evidence-policy'
+import { promptExecutionProvenanceSchema } from '../../src/domain/prompt-versions'
+import { modelCriterionQcDiagnosticSchema } from '../../src/domain/analysis-qc-diagnostics'
 
 export { ANALYSIS_CRITERION_BLOCKER_CODES } from '../../src/domain/analysis-evidence-policy'
 
@@ -66,6 +68,7 @@ const savedRubric = z.strictObject({
     kind: z.enum(['generated', 'edited']),
     model: nonblank(300),
     promptVersion: nonblank(200),
+    prompt: promptExecutionProvenanceSchema.optional(),
   }).optional(),
 })
 
@@ -220,6 +223,16 @@ export function groundingSelectionSchemaForInput(input: RealAnalysisAssessmentIn
       qualificationId: input.qualifications.length ? z.enum(input.qualifications.map(value => value.id)).nullable() : z.null(),
       citations: passageSelections(passageCount),
     })).max(ANALYSIS_MODEL_LIMITS.maxReviewIssues),
+  })
+}
+
+export function assessmentQcSelectionSchemaForInput(input: RealAnalysisAssessmentInput, passageCount: number) {
+  return assessmentSelectionSchemaForInput(input, passageCount).extend({
+    qcDiagnostics: z.strictObject({
+      criteria: z.array(modelCriterionQcDiagnosticSchema.extend({
+        criterionId: z.enum(input.rubric.criteria.map(value => value.id)),
+      })).length(input.rubric.criteria.length),
+    }),
   })
 }
 

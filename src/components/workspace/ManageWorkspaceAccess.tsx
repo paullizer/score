@@ -9,7 +9,7 @@ import { Badge, Button, InlineError, Modal } from '../ui'
 import { EligiblePeoplePicker } from './EligiblePeoplePicker'
 
 type Change = { person: WorkspaceMember | EligibleUser; role?: WorkspaceRole; kind: 'add' | 'change' | 'remove'; etag: string }
-const roles: WorkspaceRole[] = ['viewer', 'editor', 'owner']
+const roles: WorkspaceRole[] = ['viewer', 'reviewer', 'editor', 'owner']
 
 export function ManageWorkspaceAccess({ workspaceId, workspace, onClose, onAccessChanged }: {
   workspaceId: string
@@ -93,6 +93,7 @@ export function ManageWorkspaceAccess({ workspaceId, workspace, onClose, onAcces
       {!canRead ? <InlineError>Your account no longer has permission to manage this workspace. Membership controls are closed; refresh workspaces or contact an owner or application administrator.</InlineError> : <>
         <div className="access-notice">
           <p>Every workspace must keep at least one explicit Owner. Add another Owner before removing or demoting the last one. Application administrators have independent Owner-equivalent access to all workspaces, even with a Reader membership or no membership.</p>
+          <p>Reviewers can review saved analyses in QC but cannot edit ordinary workspace content. QC requires explicit membership, including for application administrators.</p>
           <p>Removing or downgrading membership cannot remove application-admin privileges. Accepted background work continues; previously downloaded content cannot be recalled.</p>
           {workspace?.accessSource === 'application-admin' && <Badge tone="accent">Your access: Application administrator</Badge>}
           {workspace?.archivedAt && <p>This workspace is archived. Access can still be managed; content remains read-only.</p>}
@@ -138,7 +139,7 @@ export function ManageWorkspaceAccess({ workspaceId, workspace, onClose, onAcces
       description={review ? `${review.person.name || review.person.email || review.person.id}${review.person.email ? ` · ${review.person.email}` : ''}` : 'Review this membership change.'}
       footer={<><Button disabled={pending} onClick={() => setReview(null)}>Cancel</Button><Button variant={review?.kind === 'remove' ? 'danger' : 'primary'} disabled={pending || !editable || recovery}
         onClick={() => void applyChange()}>{pending ? 'Saving access…' : review?.kind === 'remove' ? 'Remove membership' : 'Save membership'}</Button></>}>
-      <p>{review?.kind === 'remove' ? 'Remove this individual membership? Independent application-admin access, other workspaces, and accepted work are not affected.' : `Grant ${workspaceRoleLabel(review?.role ?? 'viewer')} access to this workspace. ${review?.role === 'owner' ? 'Owners can manage members, demote other owners, and permanently delete the workspace.' : review?.role === 'editor' ? 'Editors can edit, process, archive, and delete individual content, but cannot manage members or delete the workspace.' : 'Readers can view saved content and use downloads and reports only when application policy allows.'}`}</p>
+      <p>{review?.kind === 'remove' ? 'Remove this individual membership? QC access from this membership is removed; independent ordinary application-admin access, other workspaces, and accepted work are not affected.' : `Grant ${workspaceRoleLabel(review?.role ?? 'viewer')} access to this workspace. ${review?.role === 'owner' ? 'Owners can manage members, demote other owners, and permanently delete the workspace.' : review?.role === 'editor' ? 'Editors can edit, process, archive, and delete individual content, but cannot manage members or delete the workspace.' : review?.role === 'reviewer' ? 'Reviewers can submit QC feedback and propose improvements, but cannot edit ordinary workspace content or activate app-wide prompts without application-admin authority.' : 'Readers can view saved content and use downloads and reports only when application policy allows.'}`}</p>
       <p className="mt-3 text-muted">The last explicit Owner cannot be removed or demoted, even by an application administrator. The server checks this safeguard and current permissions before saving.</p>
     </Modal>
   </>

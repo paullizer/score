@@ -77,6 +77,7 @@ before(async () => {
       export { projectPublicSettings, captureProcessingSettings } from './src/domain/admin-settings-resolver';
       export { ADMIN_SETTINGS_FIELDS } from './src/domain/admin-settings-fields';
       export { describeSettingValue } from './src/features/admin/settingsForm';
+      export { SettingsField } from './src/features/admin/SettingsField';
       export * from './src/services/cloudWorkspace';
       export * from './src/services/workspaceAccess';
     ` },
@@ -232,7 +233,7 @@ test('access generations reject stale responses, stop queued writes and do not i
   held.resolve(json({ etag: '"accepted-but-stale"' }))
   await rejected
   const count = requests.length
-  await assert.rejects(ui.saveWorkspaceState(metadata.id, workspace, '"state"'), /Reader access/)
+  await assert.rejects(ui.saveWorkspaceState(metadata.id, workspace, '"state"'), /Reader and Reviewer access/)
   assert.equal(requests.length, count)
   workspaces = []
   ui.setCloudSessionAccess(session())
@@ -534,8 +535,8 @@ test('last-owner refusal and ambiguous sharing acknowledgement show explicit rec
   assert.equal(writes(path).length, 1)
 })
 
-test('Reader and Editor have no sharing/lifecycle ownership controls and no inherited creation grant', async () => {
-  for (const role of ['viewer', 'editor']) {
+test('Reader, Reviewer and Editor have no sharing/lifecycle ownership controls and no inherited creation grant', async () => {
+  for (const role of ['viewer', 'reviewer', 'editor']) {
     await render(element(ui.WorkspaceSwitcher, { empty: true, cloud: {
       workspaces: [{ ...metadata, role }], currentWorkspaceId: metadata.id, canCreateWorkspaces: false,
       refreshWorkspaces: async () => {}, switchWorkspace: async () => ({ ok: true }), createWorkspace: async () => ({ ok: true }),
@@ -545,10 +546,72 @@ test('Reader and Editor have no sharing/lifecycle ownership controls and no inhe
     assert.ok(!document.querySelector('[aria-label="Manage access to Shared workspace"]'))
     assert.ok(!document.querySelector('[aria-label="Rename Shared workspace"]'))
     assert.equal(button('New workspace').disabled, true)
-    assert.match(document.body.textContent, role === 'viewer' ? /Reader/ : /Editor/)
+    assert.match(document.body.textContent, role === 'viewer' ? /Reader/ : role === 'reviewer' ? /Reviewer/ : /Editor/)
     assert.ok(!document.body.textContent.includes('Personal'))
   }
   assert.equal(ui.describeSettingValue('reports.allowedRoles', ['owner', 'editor', 'viewer']), 'Owner, Editor, Reader')
+  assert.equal(ui.describeSettingValue('reports.allowedRoles', ['reviewer']), 'Reviewer')
+})
+
+test('unified sharing grants the Reviewer role using an eligible person and explicit confirmation', async () => {
+  await openSharing()
+  await until(() => document.body.textContent.includes('Pat Eligible'), 'Eligible recipient appears')
+  await click(button('Select Pat Eligible'))
+  await edit(document.querySelector('[aria-label="New member role"]'), 'reviewer')
+  await click(button('Review adding member'))
+  const confirmation = dialog('Add workspace member?')
+  assert.match(confirmation.textContent, /Grant Reviewer access/)
+  assert.match(confirmation.textContent, /cannot edit ordinary workspace content/)
+  assert.equal(requests.filter(item => item.method === 'PUT').length, 0)
+  await click(button('Save membership', confirmation))
+  await until(() => document.querySelector('[aria-label="Role for Pat Eligible"]')?.value === 'reviewer', 'Reviewer membership acknowledged')
+  const path = '/api/workspaces/workspace-one/members/person-one'
+  assert.deepEqual(JSON.parse(writes(path)[0].init.body), { role: 'reviewer' })
+  assert.equal(writes(path)[0].init.headers.get('If-Match'), '"members-1"')
+  await click(button('Remove Pat Eligible'))
+  assert.match(dialog('Remove workspace member?').textContent, /QC access from this membership is removed/)
+  await click(button('Remove membership', dialog('Remove workspace member?')))
+  await until(() => !document.querySelector('[aria-label="Role for Pat Eligible"]'), 'Reviewer removal acknowledged')
+  assert.equal(writes(path)[1].method, 'DELETE')
+})
+
+test('download and export policies label Reviewer explicitly without expanding their default permissions', async () => {
+  for (const path of ['reports.allowedRoles', 'documents.originalDownloadRoles']) {
+    let proposed
+    const field = ui.ADMIN_SETTINGS_FIELDS.find(item => item.path === path)
+    await render(element(ui.SettingsField, {
+      field, settings, saved: settings, defaults: settings, errors: [],
+      onChange: (changedPath, value) => { proposed = { path: changedPath, value } },
+    }))
+    const reviewer = [...document.querySelectorAll('.check-label')].find(item => item.textContent === 'Reviewer')?.querySelector('input')
+    assert.ok(reviewer, 'Reviewer is a named policy choice, not an Owner or a raw role token')
+    assert.equal(reviewer.checked, false)
+    await click(reviewer)
+    assert.equal(proposed.path, path)
+    assert.ok(proposed.value.includes('reviewer'))
+  }
+})
+
+test('request guards separate reviewer QC writes from ordinary editing and implicit Admin access', () => {
+  const path = '/workspaces/workspace-one'
+  workspaces = [{ ...metadata, role: 'reviewer' }]
+  ui.setCloudSessionAccess(session())
+  assert.equal(ui.cloudAccessRequestSignal(`${path}/qc/reviews/submit`, { method: 'POST' }).aborted, false)
+  assert.throws(() => ui.cloudAccessRequestSignal(`${path}/state`, { method: 'PUT' }), /Reviewer access cannot save ordinary edits/)
+  assert.throws(() => ui.cloudAccessRequestSignal(`${path}/members`), /Only a workspace Owner/)
+  capabilities = { ...capabilities, applicationAdmin: true }
+  workspaces = [{ ...metadata, accessSource: 'application-admin', membershipRole: 'viewer' }]
+  ui.setCloudSessionAccess(session())
+  const qc = ui.cloudAccessRequestSignal(`${path}/qc/peers`, { method: 'POST' })
+  assert.equal(qc.aborted, false, 'An explicit Reader member Admin can perform QC mutations')
+  assert.throws(() => ui.cloudAccessRequestSignal(`${path}/reviewers`), /explicit workspace Owner/)
+  workspaces = [{ ...metadata, accessSource: 'application-admin' }]
+  ui.setCloudSessionAccess(session())
+  assert.equal(qc.aborted, true, 'Removing membership invalidates private requests even while effective Owner access is unchanged')
+  assert.throws(() => ui.cloudAccessRequestSignal(`${path}/qc/context`), /explicit workspace membership/)
+  assert.throws(() => ui.cloudAccessRequestSignal(`${path}/qc/reviews`, { method: 'PUT' }), /explicit workspace membership/)
+  assert.equal(ui.cloudAccessRequestSignal(`${path}/state`, { method: 'PUT' }).aborted, false)
+  assert.equal(ui.cloudAccessRequestSignal(`${path}/members`).aborted, false)
 })
 
 test('downgrade stops debounced sample writes while keeping drafts; removal hides content without preserving a readable summary', async () => {

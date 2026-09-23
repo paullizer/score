@@ -13,6 +13,7 @@ import { RealAnalysisService } from './service'
 import { AnalysisLibraryLifecycleService } from './library-lifecycle'
 import { AnalysisReportCaptures } from './reports'
 import { REPORT_FORMATS, type AnalysisReportFormat } from '../../src/domain/analysis-reports'
+import { workspaceCanEdit } from '../../src/domain/workspace-permissions'
 import { analysisCorrectionInputSchema } from './correction-validation'
 import { publishSummaryDraftInputSchema, restartSummaryInputSchema, type AnalysisSummarySubject } from '../../src/domain/analysis-summary-history'
 import {
@@ -50,7 +51,7 @@ function summarySubject(req: Request): AnalysisSummarySubject {
 function summaryResultRevision(req: Request, res: Response): string | undefined {
   const revision = req.query.resultRevisionId
   if (revision === undefined) return undefined
-  if (!['owner', 'editor'].includes(res.locals.analysisWorkspaceRole)) throw forbidden('Only owners and editors may inspect historical result summaries.')
+  if (!workspaceCanEdit(res.locals.analysisWorkspaceRole)) throw forbidden('Only owners and editors may inspect historical result summaries.')
   if (param(req, 'kind') !== 'candidate' || typeof revision !== 'string' || revision !== 'original' && !isUuid(revision)) {
     throw invalidRequest('resultRevisionId must identify the original or one published candidate correction.')
   }
@@ -201,7 +202,7 @@ export function createRealAnalysesRouter(deps: RealAnalysesRouterDeps): Router {
     const targetId = req.query.targetId === undefined ? undefined : body(analysisNarrativeTargetIdSchema, req.query.targetId)
     const summaries = await requireService().summaries(param(req, 'workspaceId'), recordId(req, 'run'), targetId, signal)
     signal.throwIfAborted()
-    if (res.locals.analysisWorkspaceRole === 'viewer') summaries.capabilities = { canGenerate: false, reason: 'read-only' }
+    if (!workspaceCanEdit(res.locals.analysisWorkspaceRole)) summaries.capabilities = { canGenerate: false, reason: 'read-only' }
     res.setHeader('ETag', summaries.etag)
     res.json(summaries)
   }))
@@ -221,7 +222,7 @@ export function createRealAnalysesRouter(deps: RealAnalysesRouterDeps): Router {
     res.json(summary)
   }))
   router.get(`${summaryBase}/history`, read(async (req, res, signal) => {
-    if (!['owner', 'editor'].includes(res.locals.analysisWorkspaceRole)) {
+    if (!workspaceCanEdit(res.locals.analysisWorkspaceRole)) {
       throw forbidden('Only workspace owners and editors may inspect unpublished summary history.')
     }
     const policy = (await getRequestSettings(req)).settings.summaries
@@ -337,7 +338,7 @@ export function createRealAnalysesRouter(deps: RealAnalysesRouterDeps): Router {
   }))
   const correctionBase = `${base}/:runId/comparisons/:comparisonId/corrections`
   const correctionRead = (res: Response) => {
-    if (!['owner', 'editor'].includes(res.locals.analysisWorkspaceRole)) {
+    if (!workspaceCanEdit(res.locals.analysisWorkspaceRole)) {
       throw forbidden('Only workspace owners and editors may review correction proposals and history.')
     }
   }

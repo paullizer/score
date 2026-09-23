@@ -47,7 +47,7 @@ export interface Rubric {
   criteria: Criterion[]
   createdAt: string
   dataKind?: 'real'
-  provenance?: { kind: 'generated' | 'edited'; model: string; promptVersion: string }
+  provenance?: { kind: 'generated' | 'edited'; model: string; promptVersion: string; prompt?: PromptExecutionProvenance }
 }
 
 export interface Job {
@@ -158,3 +158,4 @@ export interface ImportCandidate {
   title: string
   fixtureIndex: number
 }
+import type { PromptExecutionProvenance } from './prompt-versions'
