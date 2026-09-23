@@ -47,7 +47,7 @@ function toyProfile(options = {}) {
       properties: {
         outcome: { type: 'string' },
         reply: { type: 'string' },
-        operations: { type: 'array', items: { type: 'object' } },
+        operations: { type: 'array', items: { type: 'object', additionalProperties: false, properties: {}, required: [] } },
         warnings: { type: 'array', items: { type: 'string' } },
       },
     }),
