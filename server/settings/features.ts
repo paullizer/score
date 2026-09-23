@@ -1,4 +1,4 @@
-import { projectPublicSettings, runtimeSettingsReadiness } from '../../src/domain/admin-settings'
+import { projectPublicSettings, rubricAssistantEnabled, runtimeSettingsReadiness } from '../../src/domain/admin-settings'
 import type { ProcessingSettingsSnapshot, PublicFeaturesResponse, SettingsDeploymentCapabilities } from '../../src/domain/admin-settings'
 import { JOB_IMPORT_LIMITS } from '../../src/domain/real-jobs'
 import { RESUME_IMPORT_LIMITS } from '../../src/domain/real-resumes'
@@ -24,11 +24,13 @@ export function effectiveFeatures(
   const realGradeLadders = capabilities.realGradeLadders && admitting && settings.features.gradeLadders
   const realAnalyses = capabilities.realAnalyses && admitting && settings.features.newAnalyses
   const analysisSummaryGeneration = capabilities.analysisSummaryGeneration && admitting && settings.features.summaryGeneration
+  // Deployed capability, the Admin settings switch (on unless turned off) and new-work admission must all agree.
+  const rubricAssistant = capabilities.rubricAssistant === true && admitting && rubricAssistantEnabled(settings)
   const reference = settings.grades.references
   const publicSettings = projectPublicSettings(snapshot, runtimeEnabled, settingsConfigured)
   publicSettings.features = {
     ...publicSettings.features, jobImports: realJobImports, resumeImports: realResumeImports,
-    gradeLadders: realGradeLadders, newAnalyses: realAnalyses, summaryGeneration: analysisSummaryGeneration,
+    gradeLadders: realGradeLadders, newAnalyses: realAnalyses, summaryGeneration: analysisSummaryGeneration, rubricAssistant,
   }
   for (const [kind, available] of [['jobs', realJobImports], ['resumes', realResumeImports]] as const) {
     publicSettings.imports[kind].allowedFormats = available
@@ -43,6 +45,7 @@ export function effectiveFeatures(
     realAnalyses,
     analysisSummaryGeneration,
     analysisEvidenceCorrections: capabilities.analysisEvidenceCorrections === true && admitting,
+    rubricAssistant,
     wordDocumentImports: capabilities.wordDocumentImports && (
       (realJobImports && jobPolicy.allowedFormats.some(format => format === 'doc' || format === 'docx')) ||
       (realResumeImports && resumePolicy.allowedFormats.some(format => format === 'doc' || format === 'docx'))

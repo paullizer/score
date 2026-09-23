@@ -1,6 +1,6 @@
 import { useRef, useState } from 'react'
 import { Link } from 'react-router-dom'
-import { Copy, FileSearch, Layers3, Pencil, ShieldCheck } from 'lucide-react'
+import { Copy, FileSearch, Layers3, Pencil, ShieldCheck, Sparkles } from 'lucide-react'
 import { useWorkspace } from '../../app/workspace-context'
 import { Badge, Button, DemoNote, EmptyState, InlineError } from '../../components/ui'
 import type { Citation, Criterion, Rubric } from '../../domain/types'
@@ -27,6 +27,8 @@ export function RubricPanel({ rubric, onSelectCriterion, onVersionSaved, readOnl
 }) {
   const { workspace, saveRubric, cloud } = useWorkspace()
   const [editing, setEditing] = useState(false)
+  const [initialEditorPanel, setInitialEditorPanel] = useState<'assist' | 'source' | 'changes' | null>(null)
+  const [initialFocusCriterionId, setInitialFocusCriterionId] = useState<string | null>(null)
   const [error, setError] = useState('')
   const [duplicating, setDuplicating] = useState(false)
   const duplicatingRef = useRef(false)
@@ -40,6 +42,8 @@ export function RubricPanel({ rubric, onSelectCriterion, onVersionSaved, readOnl
   const realGrade = rubric.dataKind === 'real' && rubric.kind === 'grade'
   const roleReadOnly = Boolean(cloud && !workspaceCanEdit(cloud.workspaces.find((item) => item.id === cloud.currentWorkspaceId)?.role))
   const editable = canEdit && !readOnly && !realGrade && !roleReadOnly && (rubric.kind === 'grade' || (job?.status === 'ready' && !job.rubricDeletedAt)) && (rubric.dataKind !== 'real' || Boolean(document))
+  const detail = rubric.dataKind === 'real' && job && cloud ? cloud.realJobs.detail(job.id) : undefined
+  const assistantAvailable = Boolean(editable && rubric.dataKind === 'real' && job && detail?.state === 'ready' && document && cloud?.realJobs.features?.rubricAssistant)
   const total = rubric.criteria.reduce((sum, criterion) => sum + criterion.weight, 0)
   const balanced = Number.isFinite(total) && Math.abs(total - 100) <= 0.000001
 
@@ -101,7 +105,8 @@ export function RubricPanel({ rubric, onSelectCriterion, onVersionSaved, readOnl
       </div>
 
       {!readOnly && <div className="flex flex-wrap gap-2">
-        <Button icon={Pencil} size="sm" disabled={!editable} onClick={() => { setError(''); setEditing(true) }}>Edit rubric</Button>
+        <Button icon={Pencil} size="sm" disabled={!editable} onClick={() => { setError(''); setInitialEditorPanel(null); setInitialFocusCriterionId(null); setEditing(true) }}>Edit rubric</Button>
+        {assistantAvailable && <Button icon={Sparkles} size="sm" variant="ghost" onClick={() => { setError(''); setInitialEditorPanel('assist'); setInitialFocusCriterionId(null); setEditing(true) }}>Edit with AI</Button>}
         {rubric.kind === 'grade' && rubric.dataKind !== 'real' && <Button icon={Copy} size="sm" variant="ghost" onClick={duplicate} disabled={duplicating || !editable}>
           {duplicating ? 'Duplicating…' : 'Duplicate as new rubric'}
         </Button>}
@@ -127,7 +132,14 @@ export function RubricPanel({ rubric, onSelectCriterion, onVersionSaved, readOnl
               <div className="min-w-0 flex-1">
                 <div className="flex items-start justify-between gap-3">
                   <h4 className="text-[12px] font-semibold leading-5">{criterion.label}</h4>
-                  <span className="shrink-0 text-[12px] font-semibold tabular-nums text-accent">{criterion.weight}%</span>
+                  <div className="flex shrink-0 flex-wrap items-center justify-end gap-2">
+                    {assistantAvailable && <Button size="sm" variant="ghost" icon={Sparkles} aria-label={`Ask AI about ${criterion.label}`} onClick={() => {
+                      setInitialEditorPanel('assist')
+                      setInitialFocusCriterionId(criterion.id)
+                      setEditing(true)
+                    }}>Ask AI</Button>}
+                    <span className="text-[12px] font-semibold tabular-nums text-accent">{criterion.weight}%</span>
+                  </div>
                 </div>
                 <p className="mt-2 text-[11px] text-muted">{criterion.description}</p>
                 {rubric.dataKind === 'real' && <div className="mt-2"><Badge tone={criterion.requirementType === 'preferred' ? 'neutral' : 'accent'}>{criterion.requirementType === 'preferred' ? 'Preferred' : 'Required'}</Badge></div>}
@@ -194,6 +206,8 @@ export function RubricPanel({ rubric, onSelectCriterion, onVersionSaved, readOnl
       rubric={rubric}
       onClose={() => setEditing(false)}
       onSaved={(id) => { setEditing(false); onVersionSaved?.(id) }}
+      initialPanel={initialEditorPanel}
+      initialFocusCriterionId={initialFocusCriterionId}
     />}
   </div>
 }

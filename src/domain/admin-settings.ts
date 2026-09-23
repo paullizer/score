@@ -103,6 +103,8 @@ export interface AdminSettings {
     newAnalyses: boolean
     summaryGeneration: boolean
     samplesVisible: boolean
+    /** Optional so earlier revisions and captures keep their exact shape; absent means on. Read it with rubricAssistantEnabled(). */
+    rubricAssistant?: boolean
   }
   maintenance: { pauseNewWork: boolean; explanation: string }
   imports: {
@@ -260,12 +262,15 @@ export interface SettingsDeploymentCapabilities {
   realAnalyses: boolean
   analysisSummaryGeneration: boolean
   analysisEvidenceCorrections?: boolean
+  rubricAssistant?: boolean
   wordDocumentImports: boolean
 }
 export type RuntimeNumericLimits<T> = { -readonly [K in keyof T]: T[K] extends number ? number : T[K] }
 export interface PublicFeaturesResponse extends SettingsDeploymentCapabilities {
   markdownJobImports: boolean
   markdownResumeImports: boolean
+  /** The job-rubric AI assistant is deployed and currently admitting new requests. */
+  rubricAssistant: boolean
   limits: RuntimeNumericLimits<typeof JOB_IMPORT_LIMITS>
   resumeLimits: RuntimeNumericLimits<typeof RESUME_IMPORT_LIMITS>
   gradeLimits: RuntimeNumericLimits<typeof GRADE_LADDER_LIMITS>
@@ -399,3 +404,4 @@ export {
   captureProcessingSettings, captureQcProcessingSettings, resolveTaskModel, projectPublicSettings,
   runtimeSettingsReadiness, diffAdminSettings, hostMatchesRule, urlAllowedBySettings,
 } from './admin-settings-resolver'
+export { rubricAssistantEnabled } from './feature-switches'

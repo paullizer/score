@@ -324,6 +324,40 @@ test('designated admins are separate from workspace owners and identity access n
   } finally { await server.close() }
 })
 
+test('rubric AI assistant is an optional Admin switch that defaults on without changing saved shapes', async () => {
+  const defaults = createDefaultAdminSettings()
+  assert.equal('rubricAssistant' in defaults.features, false, 'Compiled defaults and the legacy baseline keep their earlier shape')
+  const capture = captureProcessingSettings(defaults, 'legacy-v1', '1970-01-01T00:00:00.000Z')
+  assert.equal('rubricAssistant' in capture.settings.features, false, 'Captured snapshots are not rewritten with a default')
+  assert.throws(() => parseAdminSettings({ ...defaults, features: { ...defaults.features, rubricAssistant: 'yes' } }))
+  assert.equal(parseAdminSettings({ ...defaults, features: { ...defaults.features, rubricAssistant: false } }).features.rubricAssistant, false)
+
+  const server = await start()
+  try {
+    const first = await server.request('/api/admin/settings')
+    const field = first.body.fields.find(item => item.path === 'features.rubricAssistant')
+    assert.ok(field, 'The switch is on the Admin settings page')
+    assert.equal(field.control, 'boolean')
+    assert.equal(field.section, 'intake')
+    assert.equal(field.defaultValue, true, 'The effective default is reported even though the saved revision omits the key')
+    assert.match(field.description, /job text/)
+    assert.equal(first.body.settings.features.rubricAssistant, undefined)
+
+    const off = await server.request('/api/admin/settings', { method: 'PATCH', headers: { 'If-Match': first.body.etag }, body: { features: { rubricAssistant: false } } })
+    assert.equal(off.response.status, 200)
+    assert.equal(off.body.settings.features.rubricAssistant, false)
+    assert.equal(off.body.settings.features.jobImports, true, 'Only the switched key changes')
+    const history = await server.request('/api/admin/settings/history?limit=1')
+    assert.equal(history.body.revisions[0].changes.find(change => change.path === 'features.rubricAssistant')?.after, false)
+    const features = effectiveFeatures({
+      realJobImports: true, realGradeLadders: false, realResumeImports: false, realAnalyses: false,
+      analysisSummaryGeneration: false, wordDocumentImports: false, rubricAssistant: true,
+    }, captureProcessingSettings(off.body.settings, off.body.revision, '2026-09-21T12:00:00.000Z'), true)
+    assert.equal(features.rubricAssistant, false)
+    assert.equal(features.deploymentCapabilities.rubricAssistant, true)
+  } finally { await server.close() }
+})
+
 test('settings updates require exact ETags, publish atomic audit/history, and preserve stale drafts through conflicts', async () => {
   const server = await start()
   try {

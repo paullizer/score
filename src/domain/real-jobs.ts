@@ -87,6 +87,7 @@ export interface RealJobsPage {
 export interface JobProcessingFeatures extends WordImportFeatures {
   realJobImports: boolean
   markdownJobImports: boolean
+  rubricAssistant: boolean
   limits: { [K in keyof typeof JOB_IMPORT_LIMITS]: number }
 }
 

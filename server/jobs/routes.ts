@@ -1,4 +1,4 @@
-import { createHash } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import express, { type NextFunction, type Request, type RequestHandler, type Response, type Router } from 'express'
 import ipaddr from 'ipaddr.js'
 import { PDFDocument } from 'pdf-lib'
@@ -7,15 +7,22 @@ import { JOB_IMPORT_LIMITS } from '../../src/domain/real-jobs'
 import { isOriginalContentType, isSafeUploadedFilename } from '../../src/domain/source-files'
 import type { Job, Rubric, SourceDocument } from '../../src/domain/types'
 import { originalExtension, UPLOAD_CONTENT_TYPES, uploadFormatFromContentType, type UploadFormat } from '../../src/domain/document-formats'
+import { rubricAssistRequestSchema } from '../../src/domain/rubric-assist'
 import { validateWordUpload } from '../documents/upload'
 import type { AuthenticatedPrincipal } from '../auth'
 import { decodeMarkdown, MarkdownInputError } from '../documents/markdown'
 import { conflict, HttpError, invalidRequest, notFound, preconditionRequired, unavailable } from '../errors'
 import { getPrincipal, getRequestSettings } from '../request-context'
+import { assertNewProcessingAllowed, getAdmissionSettings, runtimeSettingsEnabled } from '../settings/request-context'
+import { rubricAssistantEnabled } from '../../src/domain/admin-settings'
 import type { WorkspaceRepository } from '../repository'
 import type { LifecycleDependencies } from '../lifecycle/contracts'
 import { assertWorkspaceMutationLease } from '../lifecycle/lease'
 import { StoreConflictError } from '../store'
+import type { AssistLimiter } from '../assist/limits'
+import { AssistCancelledError, runAssist } from '../assist/runner'
+import type { AssistModelInvoker } from '../assist/types'
+import { jobRubricAssistProfile } from '../assist/profiles/job-rubric'
 import type { JobBlobStore, JobLifecycleScope, RealJobStore } from './store'
 import { assertJobWritable, putJobBlob } from './guards'
 import {
@@ -41,6 +48,7 @@ export interface RealJobsDeps {
 export interface RealJobsRouterDeps {
   readonly repository: WorkspaceRepository
   readonly jobs?: RealJobsDeps
+  readonly assist?: { readonly invoke: AssistModelInvoker; readonly limiter: AssistLimiter }
   readonly now?: () => Date
   readonly lifecycle?: LifecycleDependencies
   readonly wordDocumentImports?: boolean
@@ -692,6 +700,80 @@ export function createRealJobsRouter(deps: RealJobsRouterDeps): Router {
     }
     const updated = await replaceOrConflict(jobs.store, replacement, current.etag)
     res.json({ job: await summary(jobs.store, updated) })
+  }))
+
+  router.post(`${base}/:jobId/rubric/assist`, authorize(deps.repository, 'write'), available(deps.jobs), asyncHandler(async (req, res) => {
+    const jobs = requireJobs(deps.jobs)
+    const assist = deps.assist
+    if (!assist) throw unavailable('The rubric assistant is not enabled for this deployment.')
+    const parsed = rubricAssistRequestSchema.safeParse(req.body)
+    if (!parsed.success) throw invalidRequest(parsed.error.issues[0]?.message ?? 'The assistant request is invalid.')
+    const request = parsed.data
+    assertNewProcessingAllowed(req)
+    const snapshot = await getAdmissionSettings(req)
+    if (snapshot.settings.maintenance.pauseNewWork) {
+      throw unavailable(snapshot.settings.maintenance.explanation || 'New work is temporarily paused by application policy.')
+    }
+    if (!rubricAssistantEnabled(snapshot.settings)) {
+      throw unavailable('The rubric AI assistant is turned off in Admin settings. Your draft is unchanged, and saved rubrics are not affected.')
+    }
+    const pinned = runtimeSettingsEnabled(req) ? snapshot : undefined
+
+    const workspaceId = pathParam(req, 'workspaceId')
+    const jobId = jobParam(req)
+    const current = await jobs.store.get(workspaceId, jobId)
+    if (!current) throw notFound('The requested job was not found.')
+    await requireMutableWorkspace(jobs.store, workspaceId)
+    assertJobWritable(current.record)
+    if (current.record.job.status !== 'ready' || !current.record.job.rubricId) {
+      throw conflict('Only ready jobs have an editable rubric.')
+    }
+    if (current.record.job.rubricDeletedAt || current.record.rubricLifecycle?.deletingAt || current.record.rubricLifecycle?.deletedAt) {
+      throw conflict('Only ready jobs have an editable rubric.')
+    }
+    const versions = await jobs.store.listRubrics(workspaceId, jobId)
+    const latest = versions.at(-1)
+    if (!latest || latest.id !== current.record.job.rubricId) throw conflict('The current rubric version could not be loaded.')
+    if (latest.id !== request.base.rubricId || latest.version !== request.base.version) {
+      throw conflict('A newer version of this rubric was saved. Your draft is unchanged; reload to review the latest version before asking the assistant.')
+    }
+    const document = await readDocument(jobs.blobs, current.record)
+    if (!document) throw conflict('The job has no extracted source document.')
+
+    const release = assist.limiter.acquire(getPrincipal(req).principalKey)
+    const controller = new AbortController()
+    res.on('close', () => {
+      if (!res.writableFinished) controller.abort()
+    })
+    try {
+      const result = await runAssist({
+        profile: jobRubricAssistProfile,
+        context: {
+          document,
+          jobTitle: current.record.displayName ?? current.record.job.title,
+          draft: request.draft,
+          focusCriterionId: request.focusCriterionId,
+          maxCriteria: snapshot.settings.rubrics.jobs.maxCriteria,
+          savedCriterionIds: new Set(latest.criteria.map(criterion => criterion.id)),
+          newId: randomUUID,
+        },
+        instruction: request.instruction,
+        conversation: request.conversation,
+        invoke: assist.invoke,
+        processingSettings: pinned,
+        maxCorrections: snapshot.settings.ai.jobRubric.maxOutputCorrections,
+        signal: controller.signal,
+      })
+      res.json(result)
+    } catch (error) {
+      if (error instanceof AssistCancelledError) {
+        if (!res.headersSent && !res.destroyed) res.end()
+        return
+      }
+      throw error
+    } finally {
+      release()
+    }
   }))
 
   router.put(`${base}/:jobId/rubric`, authorize(deps.repository, 'write'), mutation('write', async (req, res) => {

@@ -2,6 +2,7 @@ import { createContext, useContext } from 'react'
 import type { ImportCandidate, Rubric, SourceKind, Workspace } from '../domain/types'
 import type { CloudUser, WorkspaceSummary } from '../domain/cloud'
 import type { JobProcessingFeatures, RealJobDetail, RealJobSource, RealJobSummary } from '../domain/real-jobs'
+import type { RubricAssistRequest, RubricAssistResponse } from '../domain/rubric-assist'
 import type { LifecycleAction, LifecycleImpact, LifecycleOperation, LifecycleTarget } from '../domain/lifecycle'
 
 export interface PendingLifecycleChange {
@@ -60,6 +61,7 @@ export interface CloudWorkspaceStatus {
     importMarkdown: (file: File, idempotencyKey: string, batchId?: string) => Promise<RealJobSummary>
     importFile: (file: File, idempotencyKey: string, batchId?: string) => Promise<RealJobSummary>
     importUrl: (url: string, idempotencyKey: string, batchId?: string) => Promise<RealJobSummary>
+    assistRubric: (jobId: string, request: RubricAssistRequest, signal?: AbortSignal) => Promise<RubricAssistResponse>
     originalUrl: (jobId: string) => string
   }
 }

@@ -11,12 +11,14 @@ export type CloudErrorCode = CloudApiError['error']['code']
 export class HttpError extends Error {
   readonly status: number
   readonly code: CloudErrorCode
+  readonly retryAfterSeconds?: number
 
-  constructor(status: number, code: CloudErrorCode, message: string) {
+  constructor(status: number, code: CloudErrorCode, message: string, options?: { retryAfterSeconds?: number }) {
     super(message)
     this.name = 'HttpError'
     this.status = status
     this.code = code
+    this.retryAfterSeconds = options?.retryAfterSeconds
   }
 }
 
@@ -46,6 +48,10 @@ export function invalidRequest(message: string): HttpError {
 
 export function unavailable(message = 'This service is temporarily unavailable. Try again shortly.'): HttpError {
   return new HttpError(503, 'unavailable', message)
+}
+
+export function tooManyRequests(message: string, retryAfterSeconds: number): HttpError {
+  return new HttpError(429, 'unavailable', message, { retryAfterSeconds })
 }
 
 export function toCloudApiError(error: HttpError): CloudApiError {
