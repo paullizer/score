@@ -77,11 +77,15 @@ function owns(record: RealAnalysisCorrectionRecord, claimed: RealAnalysisCorrect
     record.attempts === claimed.attempts && record.retryCount === claimed.retryCount &&
     record.lease?.owner === claimed.lease?.owner && Boolean(record.lease && record.lease.expiresAt > now)
 }
+const RETAINED = 'The previous result was retained.'
+function retainedMessage(message: string): string {
+  const specific = message.trim().slice(0, 2_000 - RETAINED.length - 1).trim()
+  return specific ? `${specific} ${RETAINED}` : RETAINED
+}
 function failureFor(error: unknown, stage: Stage, inputs = false): AnalysisProcessingError {
   if (error instanceof CorrectionWorkFailure) return error.failure
   if (error instanceof AnalysisModelError) return {
-    code: error.code, stage: error.stage, retryable: error.retryable,
-    message: 'The independent grounding review could not complete safely. The previous result was retained.',
+    code: error.code, stage: error.stage, retryable: error.retryable, message: retainedMessage(error.message),
   }
   if (error instanceof RuntimeSettingsError || error instanceof PromptPinError) return {
     code: error.code === 'model-context-limit' ? 'context-limit' : 'snapshot-invalid',

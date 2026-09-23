@@ -530,6 +530,17 @@ test('failure explanations distinguish request filtering and output limits witho
     code: 'invalid-model-output', stage: 'assessment', retryable: false, message: 'The request was declined.',
   })
   assert.match(refusal.explanation, /did not return an acceptable assessment or review/)
+  const rejected = ui.analysisFailureExplanation({
+    code: 'service-unavailable', stage: 'grounding', retryable: false, message: "The AI service rejected Score's request (HTTP 400).",
+  })
+  assert.equal(rejected.title, 'The AI service rejected the request')
+  assert.match(rejected.explanation, /configuration or software problem.*says nothing about the evidence match/)
+  assert.match(rejected.nextAction, /will not help until the problem is fixed/)
+  const outage = ui.analysisFailureExplanation({
+    code: 'service-unavailable', stage: 'grounding', retryable: true, message: 'The configured analysis model service is unavailable.',
+  })
+  assert.equal(outage.title, 'A processing service was unavailable')
+  assert.match(outage.nextAction, /explicit saved-pair retry can try again/)
 })
 
 test('failed, queued, running, and cancelled pairs retain frozen sources without completed result or score sections', () => {

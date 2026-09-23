@@ -4,6 +4,7 @@ import { ANALYSIS_DIAGNOSTIC_LIMITS, ANALYSIS_REVIEW_ISSUE_CODES } from '../../s
 import { ANALYSIS_CRITERION_BLOCKER_CODES } from '../../src/domain/analysis-evidence-policy'
 import { promptExecutionProvenanceSchema } from '../../src/domain/prompt-versions'
 import { modelCriterionQcDiagnosticSchema } from '../../src/domain/analysis-qc-diagnostics'
+import { strictStructuredOutputSchema } from '../structured-output-schema'
 
 export { ANALYSIS_CRITERION_BLOCKER_CODES } from '../../src/domain/analysis-evidence-policy'
 
@@ -254,7 +255,5 @@ export function evidenceGapSelectionSchemaForInput(criterionIds: string[], passa
 }
 
 export function analysisStructuredSchema(schema: z.ZodType): Record<string, unknown> {
-  const result = z.toJSONSchema(schema)
-  delete result.$schema
-  return result
+  return strictStructuredOutputSchema(schema)
 }

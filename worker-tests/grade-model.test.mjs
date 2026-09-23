@@ -3,6 +3,7 @@ import test from 'node:test'
 import { build } from 'esbuild'
 import { settingsDomain, settingsSnapshot } from './runtime-settings-test-support.mjs'
 import { loadWorker } from './shared-model-loader.mjs'
+import { assertStrictSchema as assertSharedStrictSchema } from './strict-schema-test-support.mjs'
 
 const bundled = await build({
   entryPoints: ['worker\\grades\\model.ts'],
@@ -323,15 +324,7 @@ function addQualificationSource(f) {
 }
 
 function assertStrictSchema(schema) {
-  if (!schema || typeof schema !== 'object') return
-  if (schema.type === 'object') {
-    assert.equal(schema.additionalProperties, false)
-    assert.deepEqual([...schema.required].sort(), Object.keys(schema.properties).sort())
-  }
-  for (const value of Object.values(schema)) {
-    if (Array.isArray(value)) value.forEach(assertStrictSchema)
-    else assertStrictSchema(value)
-  }
+  assertSharedStrictSchema(schema)
 }
 
 test('review schema limits issue targets to actual competency and source IDs, not qualification IDs', async () => {

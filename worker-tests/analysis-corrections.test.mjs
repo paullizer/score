@@ -519,6 +519,26 @@ test('v2 does not reinterpret invalid out-of-scope reviews or provider failures 
   })
 })
 
+test('a correction request the AI service rejects fails once with the specific reason and retains the previous result', async () => {
+  const f = await correctionFixture()
+  await enqueue(f)
+  const worker = workerFor(f, () => new Response('PRIVATE-PROVIDER-BODY', { status: 400 }))
+  assert.deepEqual(await worker.run(), { claimed: 1, completed: 0 })
+  const saved = (await head(f)).record
+  assert.equal(saved.status, 'failed')
+  assert.equal(saved.attempts, 1)
+  assert.equal(saved.published, undefined)
+  assert.deepEqual(saved.error, {
+    code: 'service-unavailable', stage: 'grounding', retryable: false,
+    message: "The AI service rejected Score's request (HTTP 400) before the model read it. This is a Score configuration or " +
+      'software problem, not a problem with the documents; retrying will not help until it is fixed. The previous result was retained.',
+  })
+  assert.equal(worker.calls.length, 1)
+  assert.doesNotMatch(JSON.stringify(await historyEntry(f)), /PRIVATE-PROVIDER-BODY/)
+  assert.deepEqual(await worker.run(), { claimed: 0, completed: 0 })
+  await assertOriginal(f)
+})
+
 test('a later correction binds the previous revision and preserves all prior numeric rows and history', async () => {
   const f = await correctionFixture()
   await enqueue(f, ['data-practices'])
