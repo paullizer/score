@@ -42,6 +42,8 @@ async function newPage() {
   const context = await browser.newContext({ viewport: { width: 1440, height: 1100 }, acceptDownloads: false })
   const page = await context.newPage()
   page.setDefaultTimeout(15_000)
+  // Navigations load and parse a multi-megabyte development bundle, which is slow while the whole suite runs in parallel.
+  page.setDefaultNavigationTimeout(60_000)
   const errors = []
   page.on('pageerror', (error) => errors.push(error.message))
   return { context, page, errors }
