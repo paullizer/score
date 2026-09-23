@@ -7,7 +7,7 @@ import { pathToFileURL } from 'node:url'
 import { build } from 'esbuild'
 import {
   correctionFixture, correctionPreview, correctionSummary, correctionHistory, correctionReason,
-  correctionPolicy, correctionLegacyPolicy, correctionGapReview, correctionEvidence,
+  correctionPolicy, correctionLegacyPolicy, correctionGapReview, correctionEvidence, reassessmentPolicy,
 } from './analysisCorrections.synthetic.test-support.mjs'
 import { summarySubjectResponse, summaryHistoryFixture } from './analysisSummaries.test-support.mjs'
 
@@ -128,6 +128,84 @@ test('preview guards reject foreign ownership, incorrect score shapes, incomplet
   await assert.rejects(client.getAnalysisCorrectionPreview(workspaceId, runId, comparisonId, undefined, 'f'.repeat(64)), /mismatched/)
   blocked.criteria[0].blockedReason = null
   await assert.rejects(client.getAnalysisCorrectionPreview(workspaceId, runId, comparisonId), /mismatched/)
+})
+
+test('re-score previews bind eligibility to the withheld weighted criteria and the journal sends only the full-reassessment policy', async () => {
+  const source = correctionPreview(fixture, comparisonId, { blocked: true, policyVersion: correctionPolicy })
+  globalThis.fetch = async () => Response.json(source)
+  const value = await client.getAnalysisCorrectionPreview(workspaceId, runId, comparisonId)
+  assert.deepEqual(value.reassessment, { policyVersion: reassessmentPolicy, eligible: true, blockedReason: null, criterionIds: ['criterion-one'] })
+  assert.equal(state.correctionActionAvailable(value, 'missing-evidence'), false)
+  assert.equal(state.correctionActionAvailable(value, 'reassess'), true)
+  assert.throws(() => new state.CorrectionRequestJournal().prepare(comparisonId, value, correctionReason), /fresh selectable preview/)
+  const journal = new state.CorrectionRequestJournal()
+  const saved = journal.prepare(comparisonId, value, `  ${state.reassessmentPolicyReason}  `, 'reassess')
+  assert.deepEqual(saved.input, {
+    policyVersion: reassessmentPolicy, resultSha256: value.resultSha256, criterionIds: ['criterion-one'], reason: state.reassessmentPolicyReason,
+  })
+  assert.equal(journal.prepare(comparisonId, value, 'A replay keeps the retained re-score input.', 'missing-evidence'), saved)
+  assert.throws(() => journal.acknowledge(comparisonId, correctionSummary(fixture, comparisonId, {
+    requestId: saved.key, reason: saved.input.reason, policyVersion: correctionPolicy,
+  })), /retained request policy/)
+  assert.equal(journal.get(comparisonId), saved)
+  journal.acknowledge(comparisonId, correctionSummary(fixture, comparisonId, {
+    requestId: saved.key, reason: saved.input.reason, policyVersion: reassessmentPolicy,
+  }))
+  assert.equal(journal.get(comparisonId), undefined)
+
+  const numericId = fixture.details[1].comparison.id
+  globalThis.fetch = async () => Response.json(correctionPreview(fixture, numericId))
+  const numeric = await client.getAnalysisCorrectionPreview(workspaceId, runId, numericId)
+  assert.equal(numeric.reassessment.eligible, false)
+  assert.match(numeric.reassessment.blockedReason, /withheld/)
+  assert.equal(state.correctionActionAvailable(numeric, 'reassess'), false)
+  assert.throws(() => new state.CorrectionRequestJournal().prepare(numericId, numeric, state.reassessmentPolicyReason, 'reassess'), /fresh selectable preview/)
+
+  for (const edit of [
+    preview => { delete preview.reassessment },
+    preview => { preview.reassessment.policyVersion = correctionPolicy },
+    preview => { preview.reassessment.blockedReason = 'Eligible but blocked.' },
+    preview => { preview.reassessment.criterionIds = [] },
+    preview => { preview.reassessment.criterionIds = ['unrelated'] },
+    preview => { preview.reassessment.criterionIds.push('criterion-one') },
+    preview => { preview.reassessment.eligible = false },
+    preview => { preview.reassessment = { ...preview.reassessment, eligible: false, blockedReason: 'Blocked.' } },
+  ]) {
+    const invalid = correctionPreview(fixture, comparisonId)
+    edit(invalid)
+    globalThis.fetch = async () => Response.json(invalid)
+    await assert.rejects(client.getAnalysisCorrectionPreview(workspaceId, runId, comparisonId), /invalid|mismatched/)
+  }
+  const promoted = correctionPreview(fixture, numericId, { reassessment: {
+    policyVersion: reassessmentPolicy, eligible: true, blockedReason: null, criterionIds: ['criterion-one'],
+  } })
+  globalThis.fetch = async () => Response.json(promoted)
+  await assert.rejects(client.getAnalysisCorrectionPreview(workspaceId, runId, numericId), /invalid|mismatched/)
+})
+
+test('re-score history has no deterministic proposal until it publishes, and a published re-score must show its reviewed total', async () => {
+  const failed = correctionHistory(fixture, comparisonId, { policyVersion: reassessmentPolicy })
+  globalThis.fetch = async () => Response.json(failed)
+  const page = await client.getAnalysisCorrectionHistory(workspaceId, runId, comparisonId)
+  assert.equal(page.entries[0].policyVersion, reassessmentPolicy)
+  assert.equal(page.entries[0].after, null)
+  assert.equal(page.entries[0].review.scope, undefined)
+  const published = correctionHistory(fixture, comparisonId, { status: 'ready', policyVersion: reassessmentPolicy })
+  globalThis.fetch = async () => Response.json(published)
+  assert.equal((await client.getAnalysisCorrectionHistory(workspaceId, runId, comparisonId)).entries[0].after.overall.score, 0)
+  for (const [history, edit] of [
+    [published, entry => { entry.after = null }],
+    [failed, entry => { entry.after = structuredClone(published.entries[0].after) }],
+    [failed, entry => { entry.policyVersion = correctionPolicy }],
+    [correctionHistory(fixture, comparisonId, { policyVersion: correctionPolicy }), entry => { entry.after = null }],
+    [correctionHistory(fixture, comparisonId), entry => { entry.after = null }],
+    [failed, entry => { delete entry.policyVersion }],
+  ]) {
+    const invalid = structuredClone(history)
+    edit(invalid.entries[0])
+    globalThis.fetch = async () => Response.json(invalid)
+    await assert.rejects(client.getAnalysisCorrectionHistory(workspaceId, runId, comparisonId), /invalid|mismatched/)
+  }
 })
 
 test('both policy versions remain readable and unusable-source blockers never become selectable missing evidence', async () => {

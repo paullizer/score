@@ -1,13 +1,15 @@
 import { createHash } from 'node:crypto'
 import { z } from 'zod'
 import { processingSettingsSnapshotSchema } from '../../src/domain/admin-settings-schema'
+import type { ProcessingSettingsSnapshot } from '../../src/domain/admin-settings'
 import { promptExecutionProvenanceSchema } from '../../src/domain/prompt-versions'
 import { analysisQcDiagnosticsReferenceSchema } from '../../src/domain/analysis-qc-diagnostics'
 import { assertAcceptedPromptBinding } from '../settings/prompt-integrity'
 import { MODEL_TASK_IDS } from '../../src/domain/admin-settings-tasks'
 import { REPORT_LIMITS } from '../../src/domain/analysis-reports'
 import {
-  ANALYSIS_CORRECTION_POLICY_VERSION, ANALYSIS_CORRECTION_POLICY_VERSIONS, type RealAnalysisCorrectionRecord,
+  ANALYSIS_CORRECTION_POLICY_VERSION, ANALYSIS_CORRECTION_POLICY_VERSIONS, ANALYSIS_REASSESSMENT_POLICY_VERSION,
+  type RealAnalysisCorrectionRecord,
 } from '../../src/domain/analysis-corrections'
 import { ANALYSIS_CRITERION_BLOCKER_CODES, evidenceGapReviewIssues } from '../../src/domain/analysis-evidence-policy'
 import type { RealAnalysisNarrativeRecord } from '../../src/domain/analysis-narratives'
@@ -120,6 +122,7 @@ export const createAnalysisInputSchema = z.strictObject({
 })
 export const retryAnalysisInputSchema = z.strictObject({
   comparisonIds: z.array(comparisonId).min(1).max(ANALYSIS_LIMITS.maxComparisons).refine(unique).optional(),
+  useCurrentRules: z.boolean().optional(),
 })
 export const emptyAnalysisInputSchema = z.strictObject({})
 export const generateAnalysisSummariesInputSchema = z.strictObject({
@@ -229,6 +232,9 @@ const comparisonSchema = z.strictObject({
   }).optional(),
   resultRevision: analysisResultRevisionSchema.optional(),
   qcDiagnostics: analysisQcDiagnosticsReferenceSchema.optional(),
+  settingsUpgrade: z.strictObject({
+    processingSettings: processingSettingsSnapshotSchema, requestedAt: timestamp, requestedBy: text(200),
+  }).optional(),
 })
 const narrativeIdentity = z.strictObject({ snapshotId, sha256: hash })
 const correctionSchema = z.strictObject({
@@ -1103,13 +1109,26 @@ export function parseAnalysisResult(value: unknown): RealAnalysisResult {
       (review.outcome === 'supported' ? review.issues.length === 0 : review.issues.length > 0), 'Review provenance mismatch.')
   }
   assertAnalysis(provenance.assessment.completedAt >= provenance.assessment.startedAt, 'Invalid assessment provenance.')
-  if (provenance.correction) assertAnalysis(provenance.correction.requestedAt <= result.createdAt &&
+  if (provenance.correction?.policyVersion === ANALYSIS_REASSESSMENT_POLICY_VERSION) {
+    const { requestedAt, criterionIds } = provenance.correction
+    assertAnalysis(requestedAt <= result.createdAt && requestedAt <= provenance.assessment.startedAt &&
+      provenance.groundingReviews.every(review => review.provenance.startedAt >= requestedAt) &&
+      criterionIds.every(id => result.criteria.some(row => row.criterionId === id)),
+    'A re-scored result must come from a fresh assessment and review started after its explicit request.')
+  } else if (provenance.correction) assertAnalysis(provenance.correction.requestedAt <= result.createdAt &&
     provenance.correction.baseAssessmentSha256 !== provenance.assessmentSha256 &&
     provenance.correction.criterionIds.every(id => result.criteria.some(row =>
       row.criterionId === id && row.evidenceStatus === 'missing' && row.score === 0 && row.citations.length === 0)),
   'Corrected results must identify the changed evidence-gap rows and original assessment.')
   validateSummary(result)
   return result
+}
+/** The rules new scoring attempts use: an explicit current-rules retry supersedes the comparison's admitted pin. */
+export function analysisComparisonProcessingSettings(
+  comparison: Pick<RealAnalysisComparisonRecord, 'processingSettings' | 'settingsUpgrade'>,
+  run?: Pick<RealAnalysisRunRecord, 'processingSettings'>,
+): ProcessingSettingsSnapshot | undefined {
+  return comparison.settingsUpgrade?.processingSettings ?? comparison.processingSettings ?? run?.processingSettings
 }
 export function assertAnalysisResultBinding(
   result: RealAnalysisResult, run: RealAnalysisRunRecord, comparison: RealAnalysisComparisonRecord,
@@ -1130,7 +1149,7 @@ export function assertAnalysisResultBinding(
     analysisHash(revision.criterionIds) === analysisHash(correction.criterionIds),
   'Result correction provenance does not match its selected revision.')
   if (!correction) {
-    const capture = (comparison.processingSettings ?? run.processingSettings)?.promptBundle
+    const capture = analysisComparisonProcessingSettings(comparison, run)?.promptBundle
     assertAcceptedPromptBinding(result.provenance.assessment.prompt, capture, 'assessment')
     for (const review of result.provenance.groundingReviews) {
       assertAcceptedPromptBinding(review.provenance.prompt, capture, 'assessmentGrounding')

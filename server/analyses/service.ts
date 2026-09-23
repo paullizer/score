@@ -32,6 +32,7 @@ import { analysisPageCursor, analysisPageToken, validateAnalysisPage } from './p
 import { readAnalysisReportComparisons } from './reports'
 import type { AnalysisReportCaptures } from './reports'
 import type { AnalysisReportFormat, ReportSettingsCapture } from '../../src/domain/analysis-reports'
+import type { ProcessingSettingsSnapshot } from '../../src/domain/admin-settings'
 import type { WorkspaceRole } from '../../src/domain/cloud'
 import { generateAnalysisSummaries, readAnalysisNarrativeInventory, readAnalysisSummaries, readAnalysisSummarySubject } from './narratives'
 import type { GenerateRealAnalysisSummariesInput } from '../../src/domain/analysis-narratives'
@@ -63,6 +64,11 @@ function requireScope(workspaceId: string, id?: string, kind: 'run' | 'compariso
   if (!WORKSPACE_ID_PATTERN.test(workspaceId) || (id !== undefined && !isAnalysisId(id, kind))) {
     throw notFound('The requested analysis was not found.')
   }
+}
+// Revision labels and capture times change without changing the policy, models, or prompts a comparison runs with.
+function sameProcessingRules(a: ProcessingSettingsSnapshot, b: ProcessingSettingsSnapshot): boolean {
+  const rules = (value: ProcessingSettingsSnapshot) => ({ settings: value.settings, tasks: value.tasks, promptBundle: value.promptBundle ?? null })
+  return analysisHash(rules(a)) === analysisHash(rules(b))
 }
 function requireMatch(actual: string, expected: string): void {
   if (!expected) throw preconditionRequired('An If-Match header with the current analysis record ETag is required.')
@@ -477,12 +483,18 @@ export class RealAnalysisService {
     return runSummary(await advanceAnalysisRun(this.deps, workspaceId, runId, { now: this.clock }))
   }
 
-  async retry(workspaceId: string, runId: string, request: RetryRealAnalysisInput, expected: string): Promise<RealAnalysisRunSummary> {
+  async retry(
+    workspaceId: string, runId: string, request: RetryRealAnalysisInput, expected: string, actor?: string,
+  ): Promise<RealAnalysisRunSummary> {
     request = input(retryAnalysisInputSchema, request)
     let current = await this.run(workspaceId, runId)
     await this.writable(workspaceId, current.record)
     requireMatch(current.etag, expected)
     const timestamp = new Date(Math.max(Date.parse(this.now()), Date.parse(current.record.updatedAt))).toISOString()
+    if (request.useCurrentRules && ((current.record.cancellation && !current.record.cancellation.completedAt) ||
+      current.record.progress.initialized < current.record.progress.total)) {
+      throw conflict('Current rules apply only to failed or cancelled comparisons after initialization and cancellation finish.')
+    }
     if (current.record.cancellation && !current.record.cancellation.completedAt) {
       if (request.comparisonIds || !analysisCancellationNeedsRetry(current.record) ||
         (current.record.lease && current.record.lease.expiresAt > timestamp)) {
@@ -539,6 +551,14 @@ export class RealAnalysisService {
       resumes: [...new Map(selected.map(item => [item.record.resume.snapshotId, item.record.resume.summary.selection])).values()],
       targets: [...new Map(selected.map(item => [item.record.target.snapshotId, item.record.target.summary.selection])).values()],
     }, runId)
+    let currentRules: ProcessingSettingsSnapshot | undefined
+    if (request.useCurrentRules) {
+      if (!actor) throw invalidRequest('A current-rules retry must record who requested it.')
+      const admission = await newWorkProcessingSettings(this.settings)
+      assertNewWork(admission, 'newAnalyses')
+      currentRules = await admittedProcessingSettings(this.settings, newProcessingSettings(this.settings, admission))
+      if (!currentRules) throw conflict('This deployment does not pin processing rules, so a normal retry already uses the current rules.')
+    }
     let offset = 0
     while (offset < selected.length) {
       const batchTimestamp = new Date(Math.max(Date.parse(timestamp), Date.parse(current.record.updatedAt))).toISOString()
@@ -553,10 +573,12 @@ export class RealAnalysisService {
       let bytes = 0
       while (offset < selected.length && operations.length < Math.floor(ANALYSIS_LIMITS.initializationChunkSize / 2)) {
         const previous = selected[offset]
-        const next = retryAnalysisComparisonRecord({
-          ...previous.record, processingSettings: await resolveAcceptedProcessingSettings(this.settings,
-            previous.record.processingSettings ?? updated.processingSettings),
-        }, batchTimestamp)
+        const pinned = await resolveAcceptedProcessingSettings(this.settings,
+          previous.record.processingSettings ?? updated.processingSettings)
+        const effective = previous.record.settingsUpgrade?.processingSettings ?? pinned
+        const next = retryAnalysisComparisonRecord({ ...previous.record, processingSettings: pinned }, batchTimestamp,
+          currentRules && !sameProcessingRules(currentRules, effective)
+            ? { processingSettings: currentRules, requestedAt: batchTimestamp, requestedBy: actor! } : undefined)
         const operation: AnalysisTransaction = { kind: 'replace', record: next, etag: previous.etag }
         const size = Buffer.byteLength(JSON.stringify(operation))
         if (bytes + size + Buffer.byteLength(JSON.stringify(updated)) + 64 * 1024 > MAX_ANALYSIS_TRANSACTION_BYTES) break

@@ -6,7 +6,17 @@ import type { RealAnalysisComparisonSummary } from '../../domain/real-analyses'
 import { CloudApiError } from '../../services/cloudWorkspace'
 
 export const correctionPolicyReason = 'Apply the missing-evidence policy: an applicable professional criterion without supporting evidence in a successfully reviewed source is 0/5. Preserve existing numeric scores, weights, frozen evidence, and original history; retain genuine assessment blockers for human review.'
+export const reassessmentPolicyReason = 'Re-score this withheld comparison with the current processing rules: rerun the assessment, evidence-gap review, and independent grounding review against the same frozen resume and rubric. Keep the original result and its history.'
 export const correctionConcurrency = 2
+
+/** Which policy a reviewer applies to the selected withheld comparisons. */
+export type CorrectionAction = 'reassess' | 'missing-evidence'
+
+export function correctionActionAvailable(preview: AnalysisCorrectionPreview | null | undefined, action: CorrectionAction): boolean {
+  if (!preview) return false
+  return action === 'reassess' ? preview.reassessment.eligible && preview.reassessment.criterionIds.length > 0
+    : Boolean(preview.after) && preview.criterionIds.length > 0
+}
 
 export interface ReviewedCorrectionRequest {
   key: string
@@ -62,18 +72,21 @@ export class CorrectionRequestJournal {
 
   get(comparisonId: string): ReviewedCorrectionRequest | undefined { return this.requests.get(comparisonId) }
 
-  prepare(comparisonId: string, preview: AnalysisCorrectionPreview, reason: string): ReviewedCorrectionRequest {
+  prepare(
+    comparisonId: string, preview: AnalysisCorrectionPreview, reason: string, action: CorrectionAction = 'missing-evidence',
+  ): ReviewedCorrectionRequest {
     const previous = this.get(comparisonId)
     if (previous) return previous
-    if (preview.comparisonId !== comparisonId || !preview.after || !preview.criterionIds.length ||
-      !ANALYSIS_CORRECTION_POLICY_VERSIONS.includes(preview.policyVersion) || correctionIsActive(preview.correction)) {
+    const reassess = action === 'reassess'
+    if (preview.comparisonId !== comparisonId || !correctionActionAvailable(preview, action) ||
+      (!reassess && !ANALYSIS_CORRECTION_POLICY_VERSIONS.includes(preview.policyVersion)) || correctionIsActive(preview.correction)) {
       throw new Error('Load and review a fresh selectable preview for this exact comparison before requesting a correction.')
     }
     const request = {
       key: crypto.randomUUID(), etag: preview.etag, originalResultSha256: preview.originalResultSha256,
       input: {
-        policyVersion: preview.policyVersion, resultSha256: preview.resultSha256,
-        criterionIds: [...preview.criterionIds], reason: reason.trim(),
+        policyVersion: reassess ? preview.reassessment.policyVersion : preview.policyVersion, resultSha256: preview.resultSha256,
+        criterionIds: [...(reassess ? preview.reassessment.criterionIds : preview.criterionIds)], reason: reason.trim(),
       },
     }
     this.requests.set(comparisonId, request)

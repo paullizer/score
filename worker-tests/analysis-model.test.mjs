@@ -4,9 +4,10 @@ import test from 'node:test'
 import { loadWorker } from './shared-model-loader.mjs'
 import { settingsDomain, settingsSnapshot } from './runtime-settings-test-support.mjs'
 import { assertLosslessModelInput, assertLosslessResume, passageSelection } from './analysis-selection-test-support.mjs'
+import { assertStrictSchema as assertSharedStrictSchema } from './strict-schema-test-support.mjs'
 
 const {
-  assessResumeAgainstTarget, reviewAnalysisAssessment, reviewAnalysisEvidenceGaps,
+  assessResumeAgainstTarget, reviewAnalysisAssessment, reviewAnalysisEvidenceGaps, invokeAnalysisModel,
   AnalysisModelError, ANALYSIS_MODEL_LIMITS, ANALYSIS_MODEL_PROMPT_VERSIONS,
   ANALYSIS_MODEL_SCHEMA_VERSIONS, ANALYSIS_CALCULATION_VERSION, ANALYSIS_WEIGHT_TOLERANCE,
   ANALYSIS_CRITERION_BLOCKER_CODES,
@@ -416,15 +417,7 @@ function rejectsCode(code, { stage, retryable, correctable, cancelled, reason } 
 }
 
 function assertStrictSchema(schema) {
-  if (!schema || typeof schema !== 'object') return
-  if (schema.type === 'object') {
-    assert.equal(schema.additionalProperties, false)
-    assert.deepEqual([...schema.required].sort(), Object.keys(schema.properties).sort())
-  }
-  for (const value of Object.values(schema)) {
-    if (Array.isArray(value)) value.forEach(assertStrictSchema)
-    else assertStrictSchema(value)
-  }
+  assertSharedStrictSchema(schema)
 }
 
 test('real custom criteria use their exact saved wording, full resume, strict owner-free schemas, and independent review', async () => {
@@ -963,6 +956,45 @@ test('scoped evidence findings retain exact source citations and deterministical
   assert.equal(mock.calls.length, 1)
   assert.deepEqual(proposed, original)
   assert.deepEqual(analysisApi.analysisGroundingReviewSchema.parse(result.review), result.review)
+})
+
+test('a scoped review request the AI service rejects is a non-retryable Score problem, never an outage or a zero decision', async () => {
+  const input = fixture()
+  const proposed = validateAnalysisAssessment(assessment(input, [4, 0, 0]), input)
+  const criterionIds = input.rubric.criteria.slice(1).map(row => row.id)
+  const events = []
+  const mock = mockModel([Response.json({ error: { code: 'invalid_request_error', message: 'PRIVATE-SENTINEL' } }, { status: 400 })])
+  await assert.rejects(reviewAnalysisEvidenceGaps(input, proposed, {
+    ...mock.options, criterionIds, baseAssessmentSha256: 'c'.repeat(64), onEvent: event => events.push(event),
+  }), error => {
+    rejectsCode('service-unavailable', { stage: 'grounding', retryable: false, correctable: false })(error)
+    assert.match(error.message, /rejected Score's request \(HTTP 400\) before the model read it/)
+    assert.match(error.message, /not a problem with the documents; retrying will not help/)
+    return true
+  })
+  assert.equal(mock.calls.length, 1)
+  assertStrictSchema(mock.calls[0].request.response_format.json_schema.schema)
+  assert.equal(events.find(event => event.httpStatus === 400)?.event, 'model-response')
+  assert.doesNotMatch(JSON.stringify(events), /PRIVATE-SENTINEL/)
+})
+
+test('a response schema strict mode would reject is a non-retryable internal error raised before any token or model call', async () => {
+  const mock = mockModel([])
+  mock.model.getToken = async () => assert.fail('An invalid schema cannot acquire a model token')
+  const events = []
+  const schema = {
+    type: 'object', properties: { value: { oneOf: [{ type: 'string' }, { type: 'null' }] } }, required: ['value'], additionalProperties: false,
+  }
+  await assert.rejects(invokeAnalysisModel({ name: 'synthetic_review', schema, system: 'Synthetic system.', user: 'Synthetic user.' },
+    'grounding', { model: mock.model, onEvent: event => events.push(event) }, mock.clock, 0,
+    { promptVersion: 'synthetic-prompt-v1', schemaVersion: 'synthetic-schema-v1' }), error => {
+    rejectsCode('internal-error', { stage: 'grounding', retryable: false, correctable: false })(error)
+    assert.match(error.message, /schema for synthetic_review that the AI service would reject, so the request was not sent/)
+    assert.match(error.message, /at \/properties\/value\/oneOf: "oneOf" is not supported/)
+    return true
+  })
+  assert.equal(mock.calls.length, 0)
+  assert.deepEqual(events.map(event => [event.event, event.code, event.retryable]), [['model-failed', 'internal-error', false]])
 })
 
 test('scoped genuine blockers keep their machine-readable category and do not approve zeros', async () => {

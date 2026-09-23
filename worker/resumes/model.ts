@@ -16,6 +16,7 @@ import {
   type Clock, type RubricModelOptions, type StructuredModelRequest,
 } from '../runtime'
 import { modelProcessingSettings, RuntimeSettingsError } from '../settings'
+import { strictStructuredOutputSchema } from '../structured-output-schema'
 
 export const RESUME_PROFILE_MODEL_VERSIONS = {
   prompt: 'score-resume-profile-v1',
@@ -97,8 +98,7 @@ const profileSchema = z.strictObject({
 type ModelProfile = z.infer<typeof profileSchema>
 type LocalCitation = z.infer<typeof localCitationSchema>
 
-const JSON_SCHEMA = z.toJSONSchema(profileSchema)
-delete JSON_SCHEMA.$schema
+const JSON_SCHEMA = strictStructuredOutputSchema(profileSchema)
 
 const SYSTEM = `${RESUME_PROFILE_MODEL_VERSIONS.prompt}
 Extract display metadata from exactly one real person's professional resume or public professional profile.

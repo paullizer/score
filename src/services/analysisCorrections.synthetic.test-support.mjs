@@ -6,6 +6,7 @@ export const correctionReason = 'Apply the reviewed missing-evidence policy with
 export const correctionHash = value => createHash('sha256').update(value).digest('hex')
 export const correctionLegacyPolicy = 'missing-evidence-zero-v1'
 export const correctionPolicy = 'missing-evidence-zero-v2'
+export const reassessmentPolicy = 'full-reassessment-v1'
 export const correctionEvidence = {
   documentId: 'resume-document', documentVersion: 1, paragraphId: 'resume-p1',
   page: 1, heading: 'Experience', quote: 'Applied engineering methods independently.',
@@ -89,7 +90,9 @@ export function correctionSummary(fixture, comparisonId, options = {}) {
   }
 }
 
-export function correctionPreview(fixture, comparisonId, { correction = null, blocked = false, policyVersion = correctionLegacyPolicy } = {}) {
+export function correctionPreview(fixture, comparisonId, {
+  correction = null, blocked = false, policyVersion = correctionLegacyPolicy, reassessment,
+} = {}) {
   const detail = fixture.details.find(item => item.comparison.id === comparisonId)
   const withheld = detail.comparison.resultSummary.overall.status === 'withheld'
   return {
@@ -105,6 +108,9 @@ export function correctionPreview(fixture, comparisonId, { correction = null, bl
       limitation: { code: blocked ? 'source-quality' : 'sparse-source', message: blocked ? 'Synthetic unreadable passage.' : 'Supporting evidence was absent.', criterionId: 'criterion-one' },
       eligible: !blocked, blockedReason: blocked ? 'A genuine source-quality blocker must remain unscored.' : null,
     }] : [],
+    reassessment: reassessment ?? (withheld
+      ? { policyVersion: reassessmentPolicy, eligible: true, blockedReason: null, criterionIds: ['criterion-one'] }
+      : { policyVersion: reassessmentPolicy, eligible: false, blockedReason: 'Only a comparison whose total is withheld can be re-scored in place.', criterionIds: [] }),
     correction,
   }
 }
@@ -132,7 +138,9 @@ export function correctionHistory(fixture, comparisonId, {
 } = {}) {
   const detail = fixture.details.find(item => item.comparison.id === comparisonId)
   const summary = correction ?? correctionSummary(fixture, comparisonId, { status, requestId, policyVersion })
-  const scoped = (summary.policyVersion ?? summary.revision?.policyVersion) === correctionPolicy
+  const policy = summary.policyVersion ?? summary.revision?.policyVersion ?? correctionLegacyPolicy
+  const scoped = policy === correctionPolicy
+  const reassessed = policy === reassessmentPolicy
   const ready = summary.status === 'ready'
   return {
     dataKind: 'real', workspaceId: fixture.workspaceId, runId: detail.comparison.runId, comparisonId,
@@ -145,10 +153,10 @@ export function correctionHistory(fixture, comparisonId, {
     },
     correction: summary,
     entries: [{
-      id: randomUUID(), createdAt: correctionTime, requestId: summary.requestId, outcome: summary.status,
+      id: randomUUID(), createdAt: correctionTime, requestId: summary.requestId, outcome: summary.status, policyVersion: policy,
       requestedBy: summary.requestedBy, reason: summary.reason, criterionIds: ['criterion-one'],
       beforeResultSha256: summary.revision?.baseResultSha256 ?? detail.comparison.result.sha256,
-      after: structuredClone(correctionAfter),
+      after: reassessed && !ready ? null : structuredClone(correctionAfter),
       review: scoped ? correctionGapReview(decisions ?? (ready ? [{
         criterionId: 'criterion-one', outcome: 'confirmed-missing',
         message: 'The selected criterion has no supporting professional evidence in the readable saved source.', citations: [],

@@ -396,7 +396,8 @@ export function createRealAnalysesRouter(deps: RealAnalysesRouterDeps): Router {
   }))
   router.post(`${base}/:runId/retry`, mutate('write', async (req, res) => {
     query(req, [])
-    const run = await requireService(req).retry(param(req, 'workspaceId'), recordId(req, 'run'), body(retryAnalysisInputSchema, actionBody(req)), match(req))
+    const run = await requireService(req).retry(param(req, 'workspaceId'), recordId(req, 'run'),
+      body(retryAnalysisInputSchema, actionBody(req)), match(req), getPrincipal(req).principalKey)
     res.setHeader('ETag', run.etag)
     res.json({ run })
   }))

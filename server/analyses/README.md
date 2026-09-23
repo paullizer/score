@@ -82,7 +82,7 @@ All paths below have prefix `/api/workspaces/:workspaceId/analyses`:
 | `POST /:runId/summaries/:kind/:subjectId/publish` with `{generationId, round, outputSha256}` | `{summaries}` for the subject's exact target; explicit manual approval of a persisted final draft |
 | `POST /:runId/summaries/:kind/:subjectId/retry` with `{}` | HTTP 202 `{summaries}` for the subject's exact target; failed/cancelled work resumes its captured generation and remaining review budget |
 | `POST /:runId/summaries/:kind/:subjectId/restart` with `{confirmRestart: true}` | HTTP 202 `{summaries}` for the exact target; explicitly supersedes one subject with a new generation using current settings |
-| `POST /:runId/retry` with `{comparisonIds?}` | `{run: RealAnalysisRunSummary}` |
+| `POST /:runId/retry` with `{comparisonIds?, useCurrentRules?}` | `{run: RealAnalysisRunSummary}`; `useCurrentRules` records an audited `settingsUpgrade` on each retried comparison whose rules differ |
 | `POST /:runId/cancel` with `{}` | `{run: RealAnalysisRunSummary}` |
 | `POST /:runId/comparisons/:comparisonId/retry` or `/cancel` with `{}` | `{comparison: RealAnalysisComparisonSummary}` |
 
@@ -220,6 +220,35 @@ ordinary full grounding review. Confirmed absence is normalized to zero; actual
 support returns to bounded assessment repair, and genuine blockers retain a
 machine-readable `blockerCode` alongside legacy limitation codes. A processing
 failure never becomes a completed zero.
+
+`full-reassessment-v1` is a full re-score through the same correction head,
+request, lease, fence, and history machinery. The preview's `reassessment`
+object reports eligibility: the base total must be withheld by at least one
+positively weighted `not-assessed` criterion, and not only by personal-trait
+safeguards. A request must bind exactly those `criterionIds`; its proposal
+carries no precomputed assessment or summary. The worker runs the complete
+assessment pipeline, including the evidence-gap review and full (unscoped)
+grounding review, against the frozen snapshots with the processing settings
+captured when the request was accepted. Its clock never precedes the request.
+Publication requires a fresh result whose assessment hash differs from the base,
+whose calls all started after the request, and whose final grounding review is
+supported without issues. That result may still honestly withhold its total. A
+failed re-score saves no review and leaves the current result in place. Like new
+runs, re-score requests require the `newAnalyses` feature and are refused while
+new work is paused. Re-scored revisions have no QC diagnostics sidecar.
+
+`POST /:runId/retry` accepts `{useCurrentRules: true}` for failed or cancelled
+comparisons in an initialized run that is not cancelling. The comparison's
+admitted `processingSettings` stay immutable because they bind the manifest.
+Instead, the retry records `settingsUpgrade: {processingSettings, requestedAt,
+requestedBy}` with the current admitted rules, the retry timestamp, and the
+signed-in principal. Worker claims, model calls, automatic-attempt limits, and
+result/QC prompt bindings use the upgrade, then the comparison pin, then the run
+pin. The store guard allows the upgrade to change only in that explicit
+stopped-to-queued retry transition. Identical rules (ignoring revision labels
+and capture times) record nothing, and later ordinary retries keep an existing
+upgrade. The request requires `newAnalyses` and fails with 409 when the
+deployment does not pin processing rules.
 
 New correction proposals capture application processing settings independently of
 the original assessment. They require processing admission and respect maintenance

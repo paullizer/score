@@ -530,6 +530,17 @@ test('failure explanations distinguish request filtering and output limits witho
     code: 'invalid-model-output', stage: 'assessment', retryable: false, message: 'The request was declined.',
   })
   assert.match(refusal.explanation, /did not return an acceptable assessment or review/)
+  const rejected = ui.analysisFailureExplanation({
+    code: 'service-unavailable', stage: 'grounding', retryable: false, message: "The AI service rejected Score's request (HTTP 400).",
+  })
+  assert.equal(rejected.title, 'The AI service rejected the request')
+  assert.match(rejected.explanation, /configuration or software problem.*says nothing about the evidence match/)
+  assert.match(rejected.nextAction, /will not help until the problem is fixed/)
+  const outage = ui.analysisFailureExplanation({
+    code: 'service-unavailable', stage: 'grounding', retryable: true, message: 'The configured analysis model service is unavailable.',
+  })
+  assert.equal(outage.title, 'A processing service was unavailable')
+  assert.match(outage.nextAction, /explicit saved-pair retry can try again/)
 })
 
 test('failed, queued, running, and cancelled pairs retain frozen sources without completed result or score sections', () => {
@@ -1022,13 +1033,18 @@ test('bounded cancellation remains active and disables retries until durable can
   await render(content(pending))
   assert.match(dom.window.document.body.textContent, /Cancelling unfinished work/)
   assert.match(dom.window.document.body.textContent, /keeps polling until the server confirms completion/)
+  const currentRules = () => [...dom.window.document.querySelectorAll('button')].filter((button) => button.textContent === 'Retry with current rules')
   for (const label of ['Retry failed / cancelled', 'Retry saved pair']) {
     assert.equal([...dom.window.document.querySelectorAll('button')].find((button) => button.textContent === label).disabled, true)
   }
+  assert.equal(currentRules().length, 2)
+  assert.ok(currentRules().every((button) => button.disabled), 'Current-rules retries wait for durable cancellation too.')
   await render(content(finished))
   for (const label of ['Retry failed / cancelled', 'Retry saved pair']) {
     assert.equal([...dom.window.document.querySelectorAll('button')].find((button) => button.textContent === label).disabled, false)
   }
+  assert.equal(currentRules().length, 2)
+  assert.ok(currentRules().every((button) => !button.disabled))
 })
 
 test('paused cancellation exposes run-level cleanup recovery without restarting or retrying individual pairs', async () => {
@@ -1055,6 +1071,10 @@ test('paused cancellation exposes run-level cleanup recovery without restarting 
   const resume = [...dom.window.document.querySelectorAll('button')].find((button) => button.textContent === 'Resume cancellation')
   assert.equal(resume.disabled, false)
   assert.equal([...dom.window.document.querySelectorAll('button')].find((button) => button.textContent === 'Retry saved pair').disabled, true)
+  const currentRules = [...dom.window.document.querySelectorAll('button')].filter((button) => button.textContent === 'Retry with current rules')
+  assert.deepEqual(currentRules.map((button) => button.getAttribute('aria-label')), ['Retry comparison 1 with current rules'],
+    'A paused cancellation offers only cleanup recovery at run level, never a current-rules restart.')
+  assert.equal(currentRules[0].disabled, true)
   await act(async () => resume.click())
   assert.deepEqual(calls, [['run-one', {}, paused.etag]])
   await render(content({ ...value, canWrite: false }))
@@ -1086,19 +1106,30 @@ test('manual run and pair retries stay available after automatic retries stop an
   assert.match(dom.window.document.body.textContent, /2-correction limit/)
   const retryPair = [...dom.window.document.querySelectorAll('button')].find((button) => button.textContent === 'Retry saved pair')
   const retryRun = [...dom.window.document.querySelectorAll('button')].find((button) => button.textContent === 'Retry failed / cancelled')
+  const currentRules = () => [...dom.window.document.querySelectorAll('button')].filter((button) => button.textContent === 'Retry with current rules')
+  const currentPair = currentRules().find((button) => button.getAttribute('aria-label') === 'Retry comparison 1 with current rules')
+  const currentRun = currentRules().find((button) => !button.hasAttribute('aria-label'))
   assert.equal(retryPair.disabled, false)
   assert.equal(retryRun.disabled, false)
+  assert.equal(currentPair.disabled, false)
+  assert.equal(currentRun.disabled, false)
   await act(async () => retryPair.click())
   await act(async () => retryRun.click())
+  await act(async () => currentPair.click())
+  await act(async () => currentRun.click())
   assert.deepEqual(calls, [
     { action: 'pair', runId: 'run-one', comparisonId: 'comparison-one', etag: pair.etag },
     { action: 'run', runId: 'run-one', input: {}, etag: failed.etag },
+    { action: 'run', runId: 'run-one', input: { comparisonIds: ['comparison-one'], useCurrentRules: true }, etag: failed.etag },
+    { action: 'run', runId: 'run-one', input: { useCurrentRules: true }, etag: failed.etag },
   ])
   assert.equal(JSON.stringify({ failed, pair }), before, 'manual retries do not replace frozen snapshots or bind new target versions')
   await render(content(false))
   for (const label of ['Retry saved pair', 'Retry failed / cancelled']) {
     assert.equal([...dom.window.document.querySelectorAll('button')].find((button) => button.textContent === label).disabled, true)
   }
+  assert.equal(currentRules().length, 2)
+  assert.ok(currentRules().every((button) => button.disabled))
 })
 
 function Probe() { current = ui.useRealAnalyses(); projected = ui.useWorkspace(); return React.createElement('span', null, current.phase) }

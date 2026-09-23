@@ -2,6 +2,7 @@ import { systemClock } from './clock'
 import { WorkerError } from './errors'
 import { MAX_MODEL_RETRY_DELAY_MS, MAX_MODEL_RETRY_TIMESTAMP, modelRetryFallback, providerRetryAt } from './model-retry'
 import { assertModelBudget, safeSettingsMetadata, taskForRequest, validateProcessingSettings } from './settings'
+import { assertStrictStructuredOutputSchema, StructuredOutputSchemaError } from './structured-output-schema'
 import type { RubricModelOptions, StructuredModelRequest } from './runtime'
 
 const COGNITIVE_SCOPE = 'https://cognitiveservices.azure.com/.default'
@@ -30,6 +31,15 @@ export async function invokeStructuredModel(
 ): Promise<{ content: string; model: string }> {
   const cancelled = () => new WorkerError('cancelled', 'Operation was cancelled.', false, 'rubric', { cancelled: true })
   if (signal?.aborted) throw cancelled()
+  try {
+    assertStrictStructuredOutputSchema(request.schema)
+  } catch (error) {
+    if (!(error instanceof StructuredOutputSchemaError)) throw error
+    throw new WorkerError('model-schema-invalid',
+      `Score built a response schema for ${request.name} that the AI service would reject, so the request was not sent. ` +
+      `This is a Score software problem; retrying will not help until it is fixed. ${error.message}`,
+      false, 'rubric', { cause: error })
+  }
   const captured = request.processingSettings !== undefined ? request.processingSettings : options.processingSettings
   const settings = captured !== undefined ? validateProcessingSettings(captured) : undefined
   const task = taskForRequest(options, { ...request, processingSettings: settings })

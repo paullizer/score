@@ -137,8 +137,7 @@ export type ModelQualification = z.infer<typeof qualificationSchema>
 export type ModelReview = z.infer<typeof reviewSchema>
 
 export function structuredSchema(schema: z.ZodType): Record<string, unknown> {
-  const result = z.toJSONSchema(schema)
-  delete result.$schema
-  return result
+  return strictStructuredOutputSchema(schema)
 }
 import { promptExecutionProvenanceSchema } from '../../src/domain/prompt-versions'
+import { strictStructuredOutputSchema } from '../structured-output-schema'
