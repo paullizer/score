@@ -47,7 +47,8 @@ for (const task of MODEL_TASK_IDS) {
   number(`${prefix}.temperature`, `${task}: temperature`, 'ai', 2, 'sampling parameter', true, 0, 'Blank omits the parameter. Unsupported models reject it; do not combine with top-p.')
   number(`${prefix}.topP`, `${task}: top-p`, 'ai', 1, 'sampling probability (exclusive minimum 0)', true, 0, 'Blank omits the parameter. Must be greater than zero; do not combine with temperature.')
 }
-for (const key of ['jobImports', 'resumeImports', 'gradeLadders', 'newAnalyses', 'summaryGeneration', 'samplesVisible']) {
+// features.samplesVisible is retired: it stays in the strict schema so stored revisions still parse, but has no form field.
+for (const key of ['jobImports', 'resumeImports', 'gradeLadders', 'newAnalyses', 'summaryGeneration']) {
   field(`features.${key}`, key.replace(/([A-Z])/g, ' $1'), 'intake', 'boolean', 'Policy does not enable unprovisioned services or bypass rollout verification; disabling new work never hides historical evidence.')
 }
 field('maintenance.pauseNewWork', 'Pause new work', 'intake', 'boolean', 'Stops new imports, ladder generations, analyses and summaries, not accepted work, reads, cleanup or cancellation.')
@@ -123,7 +124,7 @@ field('reports.enabledFormats', 'Report formats', 'presentation', 'multiselect',
 select('reports.defaultFormat', 'Default report format', 'presentation', ['csv', 'pdf', 'docx', 'pptx'], 'One enabled format, or blank when all formats are disabled.')
 number('reports.highlightCount', 'Report highlight count', 'presentation', 10, 'comparisons per exact target', false)
 number('reports.maxHighlights', 'Report maximum highlights', 'presentation', 10, 'comparisons including cutoff ties', false)
-field('reports.title', 'Report title', 'presentation', 'text', 'Additive presentation only; captured identity, sample labels and human-review disclosures remain.', { max: 200 })
+field('reports.title', 'Report title', 'presentation', 'text', 'Additive presentation only; captured identity and human-review disclosures remain.', { max: 200 })
 field('reports.additionalFooter', 'Additional report footer', 'presentation', 'text', 'Optional plain text; cannot replace mandatory disclosures.', { max: 2000 })
 for (const [key, max, units, min] of [
   ['maxComparisons', 500, 'comparisons', 1], ['batchComparisons', 25, 'comparisons per read', 1],
@@ -152,7 +153,7 @@ for (const item of fields) {
     if (item.path.endsWith('.temperature')) item.prerequisites.push('The selected deployment supports temperature; top-p is unset')
     if (item.path.endsWith('.topP')) item.prerequisites.push('The selected deployment supports top-p; temperature is unset')
   }
-  if (item.path.startsWith('features.') && item.path !== 'features.samplesVisible') item.prerequisites = ['Corresponding deployed services are available', 'New-work admission is not paused']
+  if (item.path.startsWith('features.')) item.prerequisites = ['Corresponding deployed services are available', 'New-work admission is not paused']
   if (item.path.endsWith('.allowedFormats')) item.prerequisites = ['Corresponding import services are available', 'DOCX/DOC require verified Word rollout capability']
   if (item.path === 'documents.formattedDocxPreviewEnabled') item.prerequisites = ['The reader has an allowed original-download workspace role']
   if (item.path === 'summaries.allowManualPublication') item.prerequisites = ['Exact saved draft and required disclosure', 'Authorized source-workspace role']

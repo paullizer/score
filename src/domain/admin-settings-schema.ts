@@ -79,6 +79,7 @@ const settingsObject = z.strictObject({
   }),
   features: z.strictObject({
     jobImports: z.boolean(), resumeImports: z.boolean(), gradeLadders: z.boolean(), newAnalyses: z.boolean(),
+    // samplesVisible is retired and ignored, but strict stored revisions and snapshots still carry it.
     summaryGeneration: z.boolean(), samplesVisible: z.boolean(),
   }),
   maintenance: z.strictObject({ pauseNewWork: z.boolean(), explanation: text(1000) }),

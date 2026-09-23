@@ -26,7 +26,7 @@ export function GradeLadderLibrary({ search = '', archiveFilter = 'default' }: {
         : <p className="text-[11px] text-muted">{reason ?? (api.canWrite ? 'New ladder generation is unavailable. Saved families remain readable.' : 'Read-only workspace · an owner or editor can create a ladder.')}</p>}
     </div>
     {api.error && <InlineError>{api.error} <Button size="sm" icon={RotateCcw} onClick={() => void api.refresh()}>Retry service</Button></InlineError>}
-    {api.phase === 'loading' && <EmptyState icon={LoaderCircle} title="Loading private grade families" description="Reading every page from the real grade service. No sample content is substituted." />}
+    {api.phase === 'loading' && <EmptyState icon={LoaderCircle} title="Loading private grade families" description="Reading every page from the real grade service." />}
     {visible.length > 0 && <div className="grade-family-grid">{visible.map(({ ladder, levels }) => <article className="grade-family-card" key={ladder.id}>
       <div className="flex flex-wrap items-center gap-2"><Layers3 size={17} className="text-accent" aria-hidden="true" /><Badge tone="accent">Real · Series {ladder.context.series}</Badge>
         {getEntityLifecycle(workspace, { kind: 'ladder', id: ladder.id })?.deletingAt ? <Badge tone="warning">Deletion pending</Badge> : <Badge>{ladder.status.replaceAll('-', ' ')}</Badge>}

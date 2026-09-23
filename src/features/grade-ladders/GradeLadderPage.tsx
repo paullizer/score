@@ -28,11 +28,11 @@ export function GradeLadderPage({ ladderId: givenId }: { ladderId?: string }) {
   const detailState = ladderId && api ? api.detail(ladderId).state : 'idle'
   const { deleting } = useLifecycleAccess({ kind: 'ladder', id: ladderId ?? '' })
   useEffect(() => { if (ladderId && !deleting) void ensure?.(ladderId) }, [ensure, ladderId, detailState, api?.phase, deleting])
-  if (!api) return <EmptyState icon={Layers3} title="Real ladders require a cloud workspace" description="Samples remain a separate fictional preview. No real grade data is stored in browser persistence." />
+  if (!api) return <EmptyState icon={Layers3} title="Real ladders require a cloud workspace" description="Open this page from an authenticated workspace. Grade data is never stored in browser persistence." />
   if (!ladderId) return <EmptyState title="No grade ladder selected" description="Open a real grade family from Rubrics." />
   const entry = api.detail(ladderId)
   if (deleting) return <>
-    <Link className="back-link" to="/rubrics?kind=grade&data=real"><ArrowLeft size={14} aria-hidden="true" />Back to real grade families</Link>
+    <Link className="back-link" to="/rubrics?kind=grade"><ArrowLeft size={14} aria-hidden="true" />Back to real grade families</Link>
     <PageHeader title={entry.state === 'ready' ? entry.value.ladder.name : api.summaries.find((item) => item.ladder.id === ladderId)?.ladder.name ?? 'Grade ladder cleanup'}
       description="Permanent deletion is incomplete. Only recovery status is available." />
     <LifecycleBanner target={{ kind: 'ladder', id: ladderId }} />
@@ -115,9 +115,9 @@ function GradeLadderWorkspace({ detail, loadError }: { detail: GradeLadderDetail
   const generationBlocked = newWorkReason || (!editable ? 'Archived or read-only ladder: unarchive it and its workspace before generation.' : sourceDirty ? 'Confirm or discard unsaved source decisions first.' : !detail.sourceSet || detail.sourceSet.id !== detail.ladder.sourceSetId ? 'Review sources and confirm a current frozen source set first.' : active ? 'Wait for current discovery, extraction, generation, or review to finish, or cancel that work.' : '')
 
   return <>
-    <Link className="back-link" to="/rubrics?kind=grade&data=real"><ArrowLeft size={14} aria-hidden="true" />Back to real grade families</Link>
+    <Link className="back-link" to="/rubrics?kind=grade"><ArrowLeft size={14} aria-hidden="true" />Back to real grade families</Link>
     <PageHeader eyebrow="REAL GS GRADE LADDER" title={detail.ladder.name} description={`Series ${detail.ladder.context.series} · ${detail.ladder.context.agency || 'Agency unresolved'} · Seed rubric v${detail.ladder.seedRubricVersion}`}
-      actions={<><EntityLifecycleActions target={{ kind: 'ladder', id: detail.ladder.id }} name={detail.ladder.name} onComplete={(action) => { if (action === 'delete') navigate('/rubrics?kind=grade&data=real') }} /><Button icon={Pencil} disabled={!editable || busy || sourceDirty} title={sourceDirty ? 'Finish source decisions first.' : !editable ? 'Archived content and Reader access are read-only.' : undefined} onClick={() => setContextEditor(true)}>Context / add grades</Button>
+      actions={<><EntityLifecycleActions target={{ kind: 'ladder', id: detail.ladder.id }} name={detail.ladder.name} onComplete={(action) => { if (action === 'delete') navigate('/rubrics?kind=grade') }} /><Button icon={Pencil} disabled={!editable || busy || sourceDirty} title={sourceDirty ? 'Finish source decisions first.' : !editable ? 'Archived content and Reader access are read-only.' : undefined} onClick={() => setContextEditor(true)}>Context / add grades</Button>
         <Button icon={Play} variant="primary" disabled={busy || Boolean(generationBlocked)} title={generationBlocked || undefined}
           onClick={() => execute(() => api.generate(detail.ladder.id, detail.etag, keyFor('generate', [detail.ladder.id, detail.etag, detail.ladder.sourceSetId])), 'Generation accepted. Each grade is processed independently; closing the browser after acknowledgement does not stop durable work.')}>{detail.ladder.generationId ? 'Generate new revision' : 'Generate grade drafts'}</Button></>} />
     <LifecycleBanner target={{ kind: 'ladder', id: detail.ladder.id }} />

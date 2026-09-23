@@ -49,12 +49,10 @@ export function targetNarrativeDisclosures(target: ReportTarget): string[] {
 }
 
 export function reportTargetPresentation(target: ReportTarget): ReportTargetPresentation {
-  if (target.presentation !== undefined) {
-    const parsed = reportTargetPresentationSchema.safeParse(target.presentation)
-    requireSaved(parsed.success, 'Frozen target presentation metadata is invalid.')
-    return parsed.data
-  }
-  requireSaved(false, 'Frozen job title and organization metadata is missing; legacy labels cannot substitute for it.')
+  requireSaved(target.presentation !== undefined, 'Frozen job title and organization metadata is missing; legacy labels cannot substitute for it.')
+  const parsed = reportTargetPresentationSchema.safeParse(target.presentation)
+  requireSaved(parsed.success, 'Frozen target presentation metadata is invalid.')
+  return parsed.data
 }
 
 function matchesRevision(narrative: AnalysisNarrativeRevision | undefined, pin: AnalysisNarrativeRevision | null): boolean {

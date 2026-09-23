@@ -57,7 +57,7 @@ function concurrency(etag: string): Record<string, string> {
 
 function checkedRun(value: RealAnalysisRunSummary, workspaceId: string): RealAnalysisRunSummary {
   if (!value?.run?.id || value.run.dataKind !== 'real' || value.run.workspaceId !== workspaceId || !value.etag) {
-    throw new Error('The analysis service did not return a real run for this workspace. No sample was substituted.')
+    throw new Error('The analysis service did not return a real run for this workspace.')
   }
   return value
 }
@@ -461,7 +461,7 @@ export async function getRealAnalysisDocument(workspaceId: string, runId: string
     `${pairs(workspaceId, runId, comparisonId)}/documents/${encodeURIComponent(documentId)}?version=${version}`, { method: 'GET', signal },
   )
   if (result.document?.sample !== false || result.document.id !== documentId || result.document.version !== version) {
-    throw new Error('The service did not return the exact saved document. No live or sample source is substituted.')
+    throw new Error('The service did not return the exact saved document. No live source is substituted.')
   }
   return result.document
 }

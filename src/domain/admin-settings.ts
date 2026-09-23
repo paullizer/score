@@ -102,6 +102,7 @@ export interface AdminSettings {
     gradeLadders: boolean
     newAnalyses: boolean
     summaryGeneration: boolean
+    /** Retired sample-view switch. Kept so stored revisions and processing snapshots still parse; it has no effect. */
     samplesVisible: boolean
   }
   maintenance: { pauseNewWork: boolean; explanation: string }

@@ -119,10 +119,10 @@ function RealAnalysisView({ id }: { id: string }) {
     if (!summaryScope && summaryWasOpen.current) summaryTrigger.current?.focus()
     summaryWasOpen.current = summaryScope !== null
   }, [summaryScope])
-  if (!api) return <EmptyState title="Real analyses require a cloud workspace" description="A real analysis cannot be read from sample storage." />
-  const back = <Link className="back-link" to={selectedId ? `/analyses/${encodeURIComponent(id)}?data=real` : '/analyses?data=real'}><ArrowLeft size={14} aria-hidden="true" />{selectedId ? 'All saved comparisons' : 'Back to real analyses'}</Link>
+  if (!api) return <EmptyState title="Real analyses require a cloud workspace" description="Open this analysis from an authenticated workspace." />
+  const back = <Link className="back-link" to={selectedId ? `/analyses/${encodeURIComponent(id)}` : '/analyses'}><ArrowLeft size={14} aria-hidden="true" />{selectedId ? 'All saved comparisons' : 'Back to real analyses'}</Link>
   if (deleting || (removed && entry?.state === 'ready')) return <>{back}<LifecycleBanner target={{ kind: 'analysis', id }} /><EmptyState title="Analysis cleanup or removal" description="Cached comparisons, snapshots, and downloads are no longer available. Retry the lifecycle operation above if permanent cleanup is incomplete." /></>
-  if (api.phase === 'unavailable') return <>{back}<EmptyState title="Saved real analysis history is unavailable" description={api.error ?? 'The private history service is unavailable; no samples are substituted.'} action={<Button onClick={() => void api.refresh()}>Check service</Button>} /></>
+  if (api.phase === 'unavailable') return <>{back}<EmptyState title="Saved real analysis history is unavailable" description={api.error ?? 'The private history service is unavailable.'} action={<Button onClick={() => void api.refresh()}>Check service</Button>} /></>
   if (entry?.state !== 'ready') return <>{back}<EmptyState icon={entry?.state === 'error' || api.phase === 'error' ? Layers3 : LoaderCircle}
     title={entry?.state === 'error' || api.phase === 'error' ? 'This real analysis could not be opened' : 'Opening saved real analysis'}
     description={entry?.state === 'error' ? entry.error : api.error ?? 'Loading the authorized run and immutable input manifest, not the current live documents.'}
@@ -149,17 +149,17 @@ function RealAnalysisView({ id }: { id: string }) {
   }
   function openPair(pairId: string) {
     const next = new URLSearchParams(params)
-    next.set('data', 'real')
+    next.delete('data')
     next.set('result', pairId)
     next.delete('view')
     setParams(next)
   }
   return <>{back}
     <PageHeader eyebrow="REAL EVIDENCE · FROZEN INPUTS" title={getDisplayName(run, run.name)} description="Review each saved resume/target pair independently. Completion, coverage, and overall-score availability are separate."
-      actions={<><RenameEntityButton target={{ kind: 'analysis', id }} name={getDisplayName(run, run.name)} etag={summary.etag} disabled={!api.canWrite || api.phase !== 'ready' || !summary.etag || api.pending(id)} /><EntityLifecycleActions target={{ kind: 'analysis', id }} name={getDisplayName(run, run.name)} onComplete={(action) => { if (action === 'delete') navigate('/analyses?data=real') }} /><RealRunActions summary={summary} />
+      actions={<><RenameEntityButton target={{ kind: 'analysis', id }} name={getDisplayName(run, run.name)} etag={summary.etag} disabled={!api.canWrite || api.phase !== 'ready' || !summary.etag || api.pending(id)} /><EntityLifecycleActions target={{ kind: 'analysis', id }} name={getDisplayName(run, run.name)} onComplete={(action) => { if (action === 'delete') navigate('/analyses') }} /><RealRunActions summary={summary} />
         <ReviewWithheldScores runId={id} comparisons={savedPairs} available={pairs?.state === 'ready' && !pairs.error && api.phase === 'ready'} />
         <Button ref={summaryTrigger} onClick={() => setSummaryScope({ targetId: viewedTarget?.id })}>Manage summaries</Button><AnalysisReportExport source={{
-        kind: 'real', workspaceId: api.workspaceId, detail: { ...detail, ...summary },
+                workspaceId: api.workspaceId, detail: { ...detail, ...summary },
         comparisons: pairs?.state === 'ready' ? pairs.value : null, available: api.phase === 'ready',
       }} onManageSummaries={(targetId) => setSummaryScope({ targetId })} />{canEdit && api.canWrite && api.features?.realAnalyses
         ? <Link className="button button-secondary button-md" {...realAnalysisLink({ from: id }, api.workspaceId)}><Layers3 size={15} aria-hidden="true" />New run with these inputs</Link>
@@ -213,7 +213,7 @@ function RealAnalysisView({ id }: { id: string }) {
       </table></div> : savedPairs.length ? <EmptyState title="No matching comparisons" description="Try a different candidate, document, or target. Only saved summary metadata is searched."
         action={<Button onClick={() => { setQuery(''); chooseTarget('') }}>Clear comparison filters</Button>} />
         : <EmptyState icon={listError ? Layers3 : LoaderCircle} title={listError ? 'The comparison list could not be loaded' : pairs?.state === 'ready' ? 'Comparison initialization is still pending' : 'Loading independent comparisons'}
-          description={listError ? 'Retry the real comparison service. No sample rows or scores are substituted.' : 'The server materializes the frozen comparison plan in bounded batches. No scores or source snapshots are fabricated while work is pending.'} />}
+          description={listError ? 'Retry the real comparison service.' : 'The server materializes the frozen comparison plan in bounded batches. No scores or source snapshots are fabricated while work is pending.'} />}
       <div className="table-bottom"><span>Showing {browsing.rows.length} of {savedPairs.length} saved comparison records / {run.progress.total} planned</span><span>Retries reuse saved inputs, not current live sources.</span></div>
     </section>}
     <div className="info-callout mt-5"><ShieldCheck size={18} aria-hidden="true" /><p>Human review only. Scores describe evidence in the submitted document, not a person’s intrinsic ability. Missing evidence is not proof of missing skills; GS assessments are not official qualification or eligibility determinations.</p></div>

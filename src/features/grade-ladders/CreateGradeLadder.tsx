@@ -83,11 +83,11 @@ export function CreateGradeLadder() {
     }
   }
 
-  if (!api || api.phase === 'unavailable') return <EmptyState icon={Layers3} title="Real grade ladders are unavailable" description="Open an authenticated workspace with grade processing enabled. The Samples view is separate and is not a replacement for real sources." action={<Link className="button button-secondary button-md" to="/rubrics?kind=grade">Back to rubrics</Link>} />
+  if (!api || api.phase === 'unavailable') return <EmptyState icon={Layers3} title="Real grade ladders are unavailable" description="Open an authenticated workspace with grade processing enabled." action={<Link className="button button-secondary button-md" to="/rubrics?kind=grade">Back to rubrics</Link>} />
   const disabled = !api.canWrite || saving || api.mutationPending || api.phase !== 'ready' || !api.features?.realGradeLadders || Boolean(policyReason)
-  const close = () => { void guard.close(() => navigate('/rubrics?kind=grade&data=real', { replace: true })) }
+  const close = () => { void guard.close(() => navigate('/rubrics?kind=grade', { replace: true })) }
   return <>
-    <PageHeader eyebrow="PRIVATE GS GRADE LIBRARY" title="Create a grade ladder" description="Start from a saved real job, not a sample or an inferred occupational series." />
+    <PageHeader eyebrow="PRIVATE GS GRADE LIBRARY" title="Create a grade ladder" description="Start from a saved real job, not an inferred occupational series." />
     <LifecycleBanner />
     <GradeDisclaimer />
     <Modal open onOpenChange={(open) => { if (!open) close() }} title="Create grade ladder" description="Capture a seed job and saved rubric version. Automatic OPM discovery continues durably on the server." wide
@@ -100,7 +100,7 @@ export function CreateGradeLadder() {
         <fieldset disabled={disabled} className="space-y-4">
           <label className="field"><span className="field-label">Ready real job</span><select className="input" aria-label="Ready real job" value={jobId} required onChange={(event) => { setJobId(event.target.value); setRubricId(''); setRubricVersion(0); setSeedConfirmed(false); setDirty(true) }}>
             <option value="">Choose a ready real job</option>{jobs.map((item) => <option key={item.id} value={item.id}>{item.title} · {item.organization}</option>)}
-          </select><span className="field-hint">Archived jobs or rubrics, samples, and unfinished imports cannot seed a real grade ladder.</span></label>
+          </select><span className="field-hint">Archived jobs or rubrics and unfinished imports cannot seed a real grade ladder.</span></label>
           {!jobs.length && <p className="text-[12px] text-muted">{cloud?.realJobs.phase === 'loading' ? 'Loading real jobs…' : 'Import a real job and wait for its source-grounded rubric before starting.'}</p>}
           {jobId && detail?.state === 'error' && <InlineError>{detail.error}<button type="button" className="ml-2 underline" onClick={() => void ensureJob?.(jobId, true)}>Retry seed loading</button></InlineError>}
           {jobId && detail?.state !== 'ready' && detail?.state !== 'error' && <p role="status" className="text-[12px] text-muted">Loading the captured job source and saved rubric versions…</p>}

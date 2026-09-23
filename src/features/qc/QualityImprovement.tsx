@@ -38,7 +38,7 @@ export function ImprovementPlans({ workspaceId, capabilities }: QcPageProps) {
     <p className="qc-notice">You can only open plans whose selected feedback you are authorized to see. Reviewers may draft and evaluate; only a member application administrator may activate.</p>
     {plans.error && <InlineError>{plans.error} <Button onClick={plans.reload}>Reload plans</Button></InlineError>}
     {plans.loading && <p role="status">Loading saved plans…</p>}
-    {plans.value?.items.length === 0 && <EmptyState icon={FlaskConical} title="No visible saved plans" description="Start with submitted reviews of completed real comparisons. Empty lists do not substitute sample plans or expose blinded feedback." />}
+    {plans.value?.items.length === 0 && <EmptyState icon={FlaskConical} title="No visible saved plans" description="Start with submitted reviews of completed real comparisons. Empty lists do not expose blinded feedback." />}
     {plans.value?.items.map(({ record }) => <article className="qc-card" key={record.id}><div className="qc-toolbar"><div className="qc-grow">
       <h2><Link to={`/qc/improvements/${encodeURIComponent(record.id)}`}>{record.name}</Link></h2><p>{record.objective}</p></div>
       <Badge tone={record.status === 'failed' ? 'danger' : record.status === 'ready' ? 'success' : 'neutral'}>{record.status}</Badge></div>

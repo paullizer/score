@@ -1,4 +1,4 @@
-import type { AnalysisRun, Rubric, Workspace } from './types'
+import type { Rubric, Workspace } from './types'
 import { isEntityRemoved } from './lifecycle'
 
 export function latestRubrics(workspace: Workspace): Rubric[] {
@@ -7,13 +7,6 @@ export function latestRubrics(workspace: Workspace): Rubric[] {
     if ((latest.get(rubric.groupId)?.version ?? 0) < rubric.version) latest.set(rubric.groupId, rubric)
   }
   return [...latest.values()].filter((rubric) => !isEntityRemoved(workspace, { kind: 'rubric', id: rubric.groupId }))
-}
-
-export function runStatus(run: AnalysisRun): 'Running' | 'Complete' | 'Needs attention' | 'Cancelled' {
-  if (run.comparisons.some((item) => item.status === 'queued' || item.status === 'running')) return 'Running'
-  if (run.comparisons.some((item) => item.status === 'failed' || (item.status === 'complete' && item.score === null))) return 'Needs attention'
-  if (run.comparisons.some((item) => item.status === 'cancelled')) return 'Cancelled'
-  return 'Complete'
 }
 
 export function dateLabel(value: string): string {

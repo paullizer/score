@@ -411,7 +411,7 @@ export function buildAnalysisReport(input: AnalysisReportInput, options: Analysi
     candidateCount: new Set(comparisons.map(comparison => comparison.candidate.id)).size,
     counts,
     partial: counts.complete !== counts.total,
-    notices: buildReportNotices(source.dataKind, counts, settings.policy.additionalFooter),
+    notices: buildReportNotices(counts, settings.policy.additionalFooter),
     groups: targets.map(target => buildGroup(target, comparisons.filter(comparison => comparison.targetId === target.id), settings.policy)),
   }
   assertReportResourceLimits(report, limits.maxInputBytes)

@@ -1,7 +1,7 @@
 import { REPORT_FORMATS, REPORT_LIMITS } from '../../domain/analysis-reports'
 import type {
   AnalysisReport, AnalysisReportFormat, ReportCandidate, ReportCitation, ReportComparison,
-  ReportComparisonStatus, ReportCriterionAssessment, ReportDataKind, ReportEvidenceStatus,
+  ReportComparisonStatus, ReportCriterionAssessment, ReportEvidenceStatus,
   ReportGroup, ReportOverallScore, ReportStatusCounts, ReportTarget,
 } from '../../domain/analysis-reports'
 import type { DocumentPagination } from '../../domain/document-formats'
@@ -93,8 +93,7 @@ export function reportStatusNotice(counts: ReportStatusCounts): string {
     `Partial report: ${description}; ${counts.queued} queued; ${counts.running} running; ${counts.failed} failed; ${counts.cancelled} cancelled.`
 }
 
-export function buildReportNotices(dataKind: ReportDataKind, counts: ReportStatusCounts, additionalFooter = ''): string[] {
-  void dataKind
+export function buildReportNotices(counts: ReportStatusCounts, additionalFooter = ''): string[] {
   return [
     REPORT_HUMAN_REVIEW_NOTICE,
     reportStatusNotice(counts),

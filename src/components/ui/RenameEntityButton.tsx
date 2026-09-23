@@ -173,7 +173,7 @@ function RenameEntityDialog({ request, onClose }: { request: RenameRequest; onCl
       <p className="text-[11px] text-muted">Required · up to {DISPLAY_NAME_MAX_LENGTH} characters. Duplicate labels are allowed.</p>
       {fieldError && <InlineError><span id={errorId}>{fieldError}</span></InlineError>}
       {!canEdit && <InlineError>This item or workspace is now read-only or unavailable. Your draft has been kept; restore write access before saving.</InlineError>}
-      {error && <InlineError>{error}<p className="mt-2">Your draft is still here. {real ? 'Reload the latest saved name before explicitly retrying with its version.' : 'Check the workspace save status before trying again.'}</p></InlineError>}
+      {error && <InlineError>{error}<p className="mt-2">Your draft is still here. {real ? 'Reload the latest saved name before explicitly retrying with its version.' : 'Refresh the page to load its current version before trying again.'}</p></InlineError>}
       {real && (error || reviewLatest) && <div className="space-y-3 rounded-lg border p-3">
         <Button size="sm" disabled={pending} onClick={() => void reload()}>{reloading ? 'Reloading…' : 'Reload latest name'}</Button>
         {reviewLatest && (loaded ? <><p className="break-words text-[12px]">Latest saved name: <strong>{loaded.name}</strong></p>
@@ -184,7 +184,6 @@ function RenameEntityDialog({ request, onClose }: { request: RenameRequest; onCl
           }}>{matchesLoaded ? 'Use saved name' : 'Keep my draft and use this version'}</Button></>
           : <InlineError>{loadError ?? 'The current item is unavailable. No new save version has been accepted; your draft is unchanged.'}</InlineError>)}
       </div>}
-      {!real && cloud && <p className="text-[11px] text-muted">Sample changes use workspace saving. Check the workspace save indicator for cloud confirmation.</p>}
       {pending && <p role="status" className="text-[11px] text-muted">{saving ? 'Waiting for the name change to be acknowledged. Keep this dialog open.' : 'Loading the latest version without replacing your draft.'}</p>}
     </form>
   </Modal>

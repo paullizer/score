@@ -254,14 +254,15 @@ function addExactLinkInput(params: URLSearchParams, input: RealAnalysisLinkInput
 // Large selections use router history state, never an oversized URL or source-content browser storage.
 export function realAnalysisLink(input: RealAnalysisLinkInput = {}, workspaceId?: string): RealAnalysisNavigation {
   const exact = exactLinkInput(input)
-  const params = new URLSearchParams({ data: 'real' })
+  const params = new URLSearchParams()
   addExactLinkInput(params, exact)
-  const link = `/analyses/new?${params}`
+  const query = params.toString()
+  const link = query ? `/analyses/new?${query}` : '/analyses/new'
   if (link.length <= REAL_ANALYSIS_LINK_MAX_LENGTH) return { to: link }
   if (!workspaceId) throw new Error('A large exact selection needs its originating workspace. No selections were discarded.')
   const id = crypto.randomUUID()
   return {
-    to: `/analyses/new?${new URLSearchParams({ data: 'real', selectionTransfer: id })}`,
+    to: `/analyses/new?${new URLSearchParams({ selectionTransfer: id })}`,
     state: { kind: 'real-analysis-selection-v1', id, workspaceId, input: exact },
   }
 }
@@ -367,7 +368,7 @@ export function initialRealSelections(
       const current = resumes.find((item) => item.resume.id === id)
       chosenResumes.push(current && readyRealResume(current)
         ? { id, label: resumeName(current), selection: realResumeSelection(current) }
-        : { id, label: current ? resumeName(current) : 'Requested resume', selection: null, issue: `Resume ${id} is not a ready real source in this workspace. Sample, missing, and unfinished inputs cannot be used.` })
+        : { id, label: current ? resumeName(current) : 'Requested resume', selection: null, issue: `Resume ${id} is not a ready real source in this workspace. Missing and unfinished inputs cannot be used.` })
     }
     for (const selection of exactTargets) {
       const current = targets.find((item) => targetIdentity(item.selection) === targetIdentity(selection))
@@ -375,7 +376,7 @@ export function initialRealSelections(
     }
     function choose(matches: RealAnalysisTargetSummary[], requested: string) {
       if (matches.length !== 1) {
-        chosenTargets.push({ id: `requested:${requested}`, label: requested, selection: null, issue: `${requested} is missing, ambiguous, a sample, or not an eligible real target. An exact saved job or approved GS version is required.` })
+        chosenTargets.push({ id: `requested:${requested}`, label: requested, selection: null, issue: `${requested} is missing, ambiguous, or not an eligible real target. An exact saved job or approved GS version is required.` })
       } else {
         const current = matches[0]
         chosenTargets.push({ id: targetIdentity(current.selection), label: getDisplayName(current, current.label), selection: current.selection, summary: current })
@@ -418,7 +419,7 @@ export function targetSelectionIssue(choice: SelectedRealTarget, current: RealAn
   if (!choice.selection) return choice.issue ?? 'No exact target version is selected.'
   if (workspace && !realTargetAvailable(workspace, choice.selection)) return 'This target or its parent is archived or removed. Unarchive the input before starting a new run; retained analysis snapshots are unchanged.'
   const available = currentRealTarget(choice.selection, current)
-  if (!available) return 'This exact real target is no longer eligible. Unapproved, missing, and sample rubrics cannot be used.'
+  if (!available) return 'This exact real target is no longer eligible. Unapproved and missing rubrics cannot be used.'
   if (!sameTargetSelection(choice.selection, available.selection)) {
     return `Selected: ${targetVersionLabel(choice.selection)}. Available now: ${targetVersionLabel(available.selection)}. The version, hash, approval, or source set changed; review before explicitly selecting it.`
   }

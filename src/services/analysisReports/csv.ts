@@ -76,7 +76,7 @@ export function generateCsvReport(report: AnalysisReport, options?: ReportGenera
         readableAnalysisDate(comparison.analyzedAt), comparison.candidate.sourceLabel,
         links.analysis, links.resume, links.target,
         ...(displayLabels ? [comparison.candidate.displayName ?? null, target.displayName ?? null] : []),
-        ...(customized ? [reportTitle(report), buildReportNotices(report.dataKind, report.counts, policy.additionalFooter).join('\n\n')] : []),
+        ...(customized ? [reportTitle(report), buildReportNotices(report.counts, policy.additionalFooter).join('\n\n')] : []),
       ])
       rows++
       completed++

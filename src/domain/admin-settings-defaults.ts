@@ -84,6 +84,7 @@ export function createDefaultAdminSettings(options: AdminSettingsDefaultsOptions
       jobRubric: { maxOutputCorrections: 1 }, resumeProfile: { maxOutputCorrections: 1 }, grades: { maxOutputCorrections: 1 },
       transport: { maxAttempts: 2 }, requestTimeoutMilliseconds: 60_000,
     },
+    // samplesVisible is retired; the legacy baseline keeps it so existing revisions stay comparable.
     features: { jobImports: true, resumeImports: true, gradeLadders: true, newAnalyses: true, summaryGeneration: true, samplesVisible: true },
     maintenance: { pauseNewWork: false, explanation: '' },
     imports: {

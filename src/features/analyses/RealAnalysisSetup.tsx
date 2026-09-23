@@ -41,19 +41,19 @@ export function RealAnalysisSetup() {
   }, [navigation.error, subscribeTargets])
   useEffect(() => { if (previousId && api?.phase === 'ready') void ensure?.(previousId) }, [api?.phase, ensure, previous?.state, previousId])
   useEffect(() => { if (available) setPrepared(true) }, [available])
-  if (!api || !resumes) return <EmptyState title="Real analyses require a cloud workspace" description="The standalone preview only evaluates fictional fixtures. Real inputs are not sent to the sample scorer." />
+  if (!api || !resumes) return <EmptyState title="Real analyses require a cloud workspace" description="Open this page from an authenticated workspace." />
   if (navigation.error) return <EmptyState title="Exact selections unavailable in this link" description={navigation.error}
-    action={<><Link className="button button-secondary button-md" to="/resumes?data=real">Choose ready resumes again</Link><Link className="button button-secondary button-md" to="/analyses/new?data=real">Start a separate selection</Link></>} />
+    action={<><Link className="button button-secondary button-md" to="/resumes">Choose ready resumes again</Link><Link className="button button-secondary button-md" to="/analyses/new">Start a separate selection</Link></>} />
   if (!prepared && ((api.features && !api.features.realAnalyses) || api.creationError)) return <EmptyState title="New real analyses are currently unavailable"
-    description={api.creationError ?? 'New-run source dependencies are not ready. Saved history and frozen evidence have separate availability; no samples are substituted.'}
-    action={<><Link className="button button-secondary button-md" to="/analyses?data=real">Open saved analyses</Link><Button onClick={() => { void api.refresh(); void resumes.refresh() }}>Check new-run availability</Button></>} />
-  if (!prepared && (api.phase === 'unavailable' || resumes.phase === 'unavailable')) return <EmptyState title="Real analysis inputs are unavailable" description={api.error ?? resumes.error ?? 'This deployment has not enabled real resume and analysis processing. No sample fallback is used.'}
+    description={api.creationError ?? 'New-run source dependencies are not ready. Saved history and frozen evidence have separate availability.'}
+    action={<><Link className="button button-secondary button-md" to="/analyses">Open saved analyses</Link><Button onClick={() => { void api.refresh(); void resumes.refresh() }}>Check new-run availability</Button></>} />
+  if (!prepared && (api.phase === 'unavailable' || resumes.phase === 'unavailable')) return <EmptyState title="Real analysis inputs are unavailable" description={api.error ?? resumes.error ?? 'This deployment has not enabled real resume and analysis processing.'}
     action={<Button onClick={() => { void api.refresh(); void resumes.refresh() }}>Check availability</Button>} />
   if (previousId && previous?.state === 'error') return <EmptyState title="The saved real run could not be opened" description={previous.error}
-    action={<><Button onClick={() => void ensure?.(previousId, true)}>Retry saved inputs</Button><Link className="button button-secondary button-md" to="/analyses/new?data=real">Start a separate selection</Link></>} />
+    action={<><Button onClick={() => void ensure?.(previousId, true)}>Retry saved inputs</Button><Link className="button button-secondary button-md" to="/analyses/new">Start a separate selection</Link></>} />
   if (!available && !prepared) return <EmptyState icon={api.error || resumes.error || api.targets.state === 'error' ? Layers3 : LoaderCircle}
     title={api.error || resumes.error || api.targets.state === 'error' ? 'Real selections could not be loaded' : 'Loading ready resumes and eligible real targets'}
-    description={api.error ?? resumes.error ?? (api.targets.state === 'error' ? api.targets.error : 'Checking every server page for real job rubrics and exact approved GS versions. No cached-only or sample targets are substituted.')}
+    description={api.error ?? resumes.error ?? (api.targets.state === 'error' ? api.targets.error : 'Checking every server page for real job rubrics and exact approved GS versions. No cached-only targets are substituted.')}
     action={<Button onClick={() => { void api.refresh(); void api.refreshTargets(); void resumes.refresh(); if (previousId) void ensure?.(previousId, true) }}>Retry selections</Button>} />
   return <RealAnalysisBuilder previous={previous?.state === 'ready' ? previous.value : undefined} params={navigation.params} fragment={location.hash} transferred={navigation.transferred} />
 }
@@ -145,7 +145,7 @@ function RealAnalysisBuilder({ previous, params, fragment, transferred }: {
       const result = attempt ? await api.recoverCreation(request.input, request.key) : await api.create(request.input, request.key)
       acknowledged = true
       leaveGuard.release()
-      if (alive.current) navigate(`/analyses/${encodeURIComponent(result.run.id)}?data=real`)
+      if (alive.current) navigate(`/analyses/${encodeURIComponent(result.run.id)}`)
     } catch (caught) {
       if (alive.current) {
         setError(caught instanceof Error ? caught.message : 'The analysis request could not be acknowledged.')
@@ -158,7 +158,7 @@ function RealAnalysisBuilder({ previous, params, fragment, transferred }: {
   }
 
   return <>
-    <Link className="back-link" to="/analyses?data=real"><ArrowLeft size={14} aria-hidden="true" />Back to real analyses</Link>
+    <Link className="back-link" to="/analyses"><ArrowLeft size={14} aria-hidden="true" />Back to real analyses</Link>
     <PageHeader eyebrow="MANUAL, EVIDENCE-LED REVIEW" title="Build a real analysis" description="Select ready real resumes and exact saved job or approved GS targets. Nothing runs until you choose Run analysis."
       actions={<Button icon={RotateCcw} disabled={starting} onClick={() => { void api.refreshTargets(); void resumeApi.refresh() }}>Refresh available inputs</Button>} />
     <LifecycleBanner target={previous ? { kind: 'analysis', id: previous.run.id } : undefined} />
@@ -196,7 +196,7 @@ function RealAnalysisBuilder({ previous, params, fragment, transferred }: {
                 <div className="mt-2"><Badge tone={resumeReady(summary) ? 'success' : 'warning'}>{summary.resume.status}{summary.documentRef ? ` · document v${summary.documentRef.documentVersion}` : ''}</Badge><ArchivedBadge target={{ kind: 'resume', id: summary.resume.id }} /></div></div>
             </label>)}
             {!shownResumes.length && <div className="col-span-full"><EmptyState title="No real resumes to show" description="Search or change the archive filter to inspect retained inputs. Only active, ready real sources can start new analyses; supported PDF, Markdown, Word and public URL imports remain in the real resume library."
-              action={<Link className="button button-secondary button-md" to="/resumes?data=real">Open real resumes</Link>} /></div>}
+              action={<Link className="button button-secondary button-md" to="/resumes">Open real resumes</Link>} /></div>}
           </div>
           <div className="border-t px-5 py-3 text-[11px] text-muted">{ready.length} ready · public profiles may be sparse · imports do not automatically run analyses</div>
         </section>

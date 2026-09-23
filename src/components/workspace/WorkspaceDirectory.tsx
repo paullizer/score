@@ -95,7 +95,7 @@ export function WorkspaceDirectory({ cloud, initialFilter = 'default', cards = f
       <div className="toolbar mb-4"><SearchField value={query} onChange={setQuery} placeholder="Search workspaces…" label="Search workspaces" /><ArchiveStateFilter value={filter} onChange={setFilter} label="Workspace archive state" />
         {!cards && <Button size="sm" icon={RefreshCw} disabled={busy} onClick={() => void run('__refresh__', cloud.refreshWorkspaces)}>Refresh access</Button>}
       </div>
-      <p className="mb-4 text-[11px] text-muted">{cards && 'Counts include active real work only, never samples. '}Owners and application administrators can rename workspaces and manage access. Search includes archived workspaces; open them read-only. Ask an owner for access to another workspace.</p>
+      <p className="mb-4 text-[11px] text-muted">{cards && 'Counts include active work only. '}Owners and application administrators can rename workspaces and manage access. Search includes archived workspaces; open them read-only. Ask an owner for access to another workspace.</p>
       <ul className={cards ? 'workspace-home-grid' : 'workspace-switcher-list'}>
         {visible.map((item) => {
           const isCurrent = item.id === cloud.currentWorkspaceId

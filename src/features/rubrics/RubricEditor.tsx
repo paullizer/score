@@ -1,11 +1,11 @@
 import { useId, useRef, useState, type FormEvent } from 'react'
-import { Plus, Save, Trash2 } from 'lucide-react'
+import { Plus, Save, ShieldCheck, Trash2 } from 'lucide-react'
 import { useWorkspace } from '../../app/workspace-context'
 import { usePublicSettings } from '../../app/public-settings-context'
 import { useGradeLeaveGuard } from '../../app/grade-navigation-context'
-import { Badge, Button, DemoNote, InlineError, Modal } from '../../components/ui'
+import { Badge, Button, InlineError, Modal } from '../../components/ui'
 import type { Criterion, Rubric } from '../../domain/types'
-import { validateRubric } from '../../services/mockWorkspace'
+import { validateRubric } from '../../domain/rubric-validation'
 import { LifecycleBanner } from '../../components/lifecycle/LifecycleControls'
 import { useLifecycleAccess } from '../../components/lifecycle/useLifecycleAccess'
 
@@ -28,11 +28,10 @@ export function RubricEditor({ rubric, onClose, onSaved }: {
   const formId = useId()
   const errorsId = useId()
   const weightHintId = useId()
-  const real = rubric.dataKind === 'real'
   const job = workspace.jobs.find((item) => item.id === rubric.jobId)
   const document = workspace.documents.find((item) => item.id === job?.documentId)
-  const maxCriteria = Math.min(20, settings?.rubrics.jobs.maxCriteria ?? cloud?.realJobs.features?.limits.maxCriteria ?? 20)
-  const realErrors = real ? draft.criteria.flatMap((criterion, index) => {
+  const maxCriteria = Math.min(20, settings?.rubrics.jobs.maxCriteria ?? cloud.realJobs.features?.limits.maxCriteria ?? 20)
+  const realErrors = draft.criteria.flatMap((criterion, index) => {
     const label = `Criterion ${index + 1}`
     const result: string[] = []
     if (!criterion.requirementType) result.push(`${label} must be marked required or preferred.`)
@@ -44,8 +43,8 @@ export function RubricEditor({ rubric, onClose, onSaved }: {
       else if (!paragraph.text.includes(citation.quote.trim())) result.push(`${label}'s quotation must exactly match text in the selected source paragraph.`)
     }
     return result
-  }) : []
-  if (real && draft.criteria.length > maxCriteria && draft.criteria.some(criterion => !rubric.criteria.some(previous => previous.id === criterion.id))) realErrors.push(`Adding new criteria is limited to ${maxCriteria}. Existing saved criteria remain editable.`)
+  })
+  if (draft.criteria.length > maxCriteria && draft.criteria.some(criterion => !rubric.criteria.some(previous => previous.id === criterion.id))) realErrors.push(`Adding new criteria is limited to ${maxCriteria}. Existing saved criteria remain editable.`)
   const errors = [...validateRubric(draft), ...realErrors]
   const total = draft.criteria.reduce((sum, criterion) => sum + criterion.weight, 0)
   const balanced = Number.isFinite(total) && Math.abs(total - 100) <= 0.000001
@@ -60,7 +59,7 @@ export function RubricEditor({ rubric, onClose, onSaved }: {
   }
 
   function addCriterion() {
-    if (real && draft.criteria.length >= maxCriteria) {
+    if (draft.criteria.length >= maxCriteria) {
       setError(`Real job rubrics may contain no more than ${maxCriteria} criteria.`)
       return
     }
@@ -73,7 +72,8 @@ export function RubricEditor({ rubric, onClose, onSaved }: {
         description: '',
         guidance: '',
         weight: 0,
-        ...(real ? { requirementType: 'required' as const, sourceCitations: [] } : {}),
+        requirementType: 'required' as const,
+        sourceCitations: [],
       }],
     }))
     setError('')
@@ -94,7 +94,7 @@ export function RubricEditor({ rubric, onClose, onSaved }: {
     try {
       const id = await saveRubric({
         ...draft,
-        ...(real && draft.provenance ? { provenance: { ...draft.provenance, kind: 'edited' as const } } : {}),
+        ...(draft.provenance ? { provenance: { ...draft.provenance, kind: 'edited' as const } } : {}),
         name: draft.name.trim(),
         description: draft.description.trim(),
         criteria: draft.criteria.map((criterion) => ({
@@ -102,10 +102,8 @@ export function RubricEditor({ rubric, onClose, onSaved }: {
           label: criterion.label.trim(),
           description: criterion.description.trim(),
           guidance: criterion.guidance.trim(),
-          ...(real ? {
-            sourceParagraphId: criterion.sourceCitations?.[0]?.paragraphId,
-            sourceCitations: criterion.sourceCitations?.map((citation) => ({ ...citation, quote: citation.quote.trim() })),
-          } : {}),
+          sourceParagraphId: criterion.sourceCitations?.[0]?.paragraphId,
+          sourceCitations: criterion.sourceCitations?.map((citation) => ({ ...citation, quote: citation.quote.trim() })),
         })),
       })
       guard.release()
@@ -175,10 +173,7 @@ export function RubricEditor({ rubric, onClose, onSaved }: {
         <div>
           {draft.criteria.map((criterion, index) => <fieldset className="criterion-card min-w-0" key={criterion.id}>
             <legend className="px-1 text-[11px] font-semibold text-muted">Criterion {String(index + 1).padStart(2, '0')}</legend>
-            <div className="mb-4 flex flex-wrap items-center justify-between gap-2">
-              {criterion.key === 'custom'
-                ? <Badge tone="warning">Custom · not assessed in demo</Badge>
-                : <Badge>Sample scoring: {criterion.key}</Badge>}
+            <div className="mb-4 flex flex-wrap items-center justify-end gap-2">
               <Button
                 icon={Trash2}
                 size="sm"
@@ -244,7 +239,7 @@ export function RubricEditor({ rubric, onClose, onSaved }: {
                 aria-invalid={attempted && !criterion.guidance.trim()}
               />
             </label>
-            {real && <div className="mt-4 grid gap-4 sm:grid-cols-2">
+            <div className="mt-4 grid gap-4 sm:grid-cols-2">
               <label className="field">
                 <span className="field-label">Requirement type</span>
                 <select className="input" value={criterion.requirementType ?? ''} required
@@ -276,8 +271,8 @@ export function RubricEditor({ rubric, onClose, onSaved }: {
                   {document?.paragraphs.map((paragraph) => <option key={paragraph.id} value={paragraph.id}>Page {paragraph.page} / {paragraph.heading}</option>)}
                 </select>
               </label>
-            </div>}
-            {real && <label className="field mt-4">
+            </div>
+            <label className="field mt-4">
               <span className="field-label">Exact source quote</span>
               <textarea className="input" rows={3} required value={criterion.sourceCitations?.[0]?.quote ?? ''}
                 aria-invalid={attempted && !criterion.sourceCitations?.[0]?.quote.trim()}
@@ -288,24 +283,18 @@ export function RubricEditor({ rubric, onClose, onSaved }: {
                 placeholder={criterion.sourceCitations?.[0] ? 'Paste an exact quotation from the selected paragraph.' : 'Choose a source paragraph first.'}
                 disabled={!criterion.sourceCitations?.[0]} />
               <span className="field-hint">The server verifies this quote against the exact parsed paragraph. It cannot be a summary or invented page reference.</span>
-            </label>}
+            </label>
           </fieldset>)}
         </div>
 
         <div>
-          <Button icon={Plus} size="sm" onClick={addCriterion} disabled={real && draft.criteria.length >= maxCriteria}>Add criterion</Button>
+          <Button icon={Plus} size="sm" onClick={addCriterion} disabled={draft.criteria.length >= maxCriteria}>Add criterion</Button>
           <p className="mt-2 text-[11px] text-muted">
-            {real ? `New criteria require a required/preferred classification and an exact quotation from this source. Maximum ${maxCriteria} when adding criteria; larger saved versions remain readable and editable without additions.` : 'New criteria are custom. The demo cannot assess them and will not invent supporting evidence.'}
+            {`New criteria require a required/preferred classification and an exact quotation from this source. Maximum ${maxCriteria} when adding criteria; larger saved versions remain readable and editable without additions.`}
           </p>
         </div>
 
-        <DemoNote>
-          {real
-            ? 'Saving appends an immutable reviewer-edited server version. Existing generated and edited versions remain available.'
-            : rubric.kind === 'grade'
-            ? 'Grade guidance is illustrative, not an official qualification or eligibility standard. Edits change the rubric; demo scores still use fictional evidence.'
-            : 'Edits stay linked to this job. The demo uses fictional source text and fixed sample evidence, not a language model.'}
-        </DemoNote>
+        <p className="library-note-text"><ShieldCheck size={16} aria-hidden="true" /><span>Saving appends an immutable reviewer-edited server version. Existing generated and edited versions remain available.</span></p>
         {((attempted && errors.length > 0) || error) && <div id={errorsId} ref={feedback} tabIndex={-1} className="space-y-3">
           {attempted && errors.length > 0 && <InlineError>
             <p className="mb-1 font-medium">Review the rubric before saving.</p>

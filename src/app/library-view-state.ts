@@ -27,7 +27,7 @@ export const LibraryViewStateContext = createContext<LibraryViewStore | null>(nu
 const subscribeNothing = () => () => {}
 
 /**
- * Tab-only search/filter/sort state. Keys include the library and mode, e.g. jobs:real:query.
+ * Tab-only search/filter/sort state. Keys name the library and control, e.g. jobs:query.
  * Source records and selected IDs belong in their existing providers or component state.
  */
 export function useLibraryViewState<T>(key: string, initial: T | (() => T)): [T, Dispatch<SetStateAction<T>>] {

@@ -1,12 +1,11 @@
-import { useRef, useState } from 'react'
+import { useState } from 'react'
 import { Link, NavLink, Navigate, Route, Routes, useLocation, useNavigate } from 'react-router-dom'
-import { ArrowUpRight, BarChart3, BriefcaseBusiness, Check, ChevronRight, CircleHelp, ClipboardCheck, Files, FlaskConical, Layers3, LayoutGrid, Menu, Plus, RotateCcw, Settings, ShieldCheck, Users, X } from 'lucide-react'
+import { ArrowUpRight, BarChart3, BriefcaseBusiness, Check, ChevronRight, CircleHelp, ClipboardCheck, Files, FlaskConical, Layers3, LayoutGrid, Menu, Plus, Settings, ShieldCheck, Users, X } from 'lucide-react'
 import { useWorkspace } from './workspace-context'
 import { ThemeControl } from './ThemeControl'
-import { Badge, Button, EmptyState, InlineError, Modal } from '../components/ui'
+import { Badge, Button, EmptyState, Modal } from '../components/ui'
 import { WorkspaceSwitcher } from '../components/workspace/WorkspaceSwitcher'
 import { AccountPanel } from '../components/workspace/AccountPanel'
-import { CloudSaveBanner, CloudSaveIndicator } from '../components/workspace/CloudSaveStatus'
 import { JobsPage, JobDetail } from '../features/jobs/JobsPage'
 import { ResumesPage } from '../features/resumes/ResumesPage'
 import { RubricsPage } from '../features/rubrics/RubricsPage'
@@ -19,27 +18,29 @@ import { useGradeLadders } from './grade-ladders-context'
 import { CreateGradeLadder } from '../features/grade-ladders/CreateGradeLadder'
 import { GradeLadderPage } from '../features/grade-ladders/GradeLadderPage'
 import { isEntityArchived, isEntityRemoved } from '../domain/lifecycle'
-import { EntityLifecycleActions, LifecycleBanner, LifecycleDialogProvider, LifecycleOperationBanner } from '../components/lifecycle/LifecycleControls'
+import { LifecycleBanner, LifecycleDialogProvider, LifecycleOperationBanner } from '../components/lifecycle/LifecycleControls'
 import { useLifecycleAccess } from '../components/lifecycle/useLifecycleAccess'
 import { useRealResumes } from './real-resumes-context'
 import { useRealAnalyses } from './real-analyses-context'
 import { RealResumeImportActivity } from '../features/resumes/RealAddResumesDialog'
-import { GradeNavigationProtectionProvider, GradeRouterProtection } from './GradeNavigationProtection'
-import { useGradeLeaveGuard, type GradeLeaveProtectionApi } from './grade-navigation-context'
-import { LibraryViewStateProvider } from './LibraryViewStateProvider'
 import { clientAdmissionReason, usePublicSettings } from './public-settings-context'
 import { useApplicationNavigation } from './application-navigation-context'
 import { defaultApplicationPage } from '../services/publicSettings'
 import { workspaceCanReview, workspaceQcRole } from '../domain/workspace-permissions'
 import { QualityControlPage } from '../features/qc/QualityControlPage'
 import { ApplicationPolicyBanners } from './ApplicationPolicyBanners'
+import type { Workspace } from '../domain/types'
+
+function active(workspace: Workspace, kind: 'job' | 'resume' | 'analysis', id: string): boolean {
+  return !isEntityArchived(workspace, { kind, id }) && !isEntityRemoved(workspace, { kind, id })
+}
 
 function QcNavigation({ onNavigate }: { onNavigate?: () => void }) {
   return <nav className="main-nav" aria-label="QC navigation">
     <NavLink to="/qc" end onClick={onNavigate} className={({ isActive }) => `nav-item ${isActive ? 'is-active' : ''}`}><ClipboardCheck size={18} /><span>Reviews</span></NavLink>
     <NavLink to="/qc/improvements" onClick={onNavigate} className={({ isActive }) => `nav-item ${isActive ? 'is-active' : ''}`}><FlaskConical size={18} /><span>Quality improvement</span></NavLink>
     <NavLink to="/qc/prompts" onClick={onNavigate} className={({ isActive }) => `nav-item ${isActive ? 'is-active' : ''}`}><Layers3 size={18} /><span>Prompt versions</span></NavLink>
-    <Link to="/analyses?data=real" className="nav-item" onClick={onNavigate}><BarChart3 size={18} /><span>Return to normal mode</span></Link>
+    <Link to="/analyses" className="nav-item" onClick={onNavigate}><BarChart3 size={18} /><span>Return to normal mode</span></Link>
   </nav>
 }
 
@@ -51,10 +52,10 @@ function Navigation({ onNavigate }: { onNavigate?: () => void }) {
   const location = useLocation()
   const realGrades = gradeLadders?.summaries.reduce((count, family) => count + family.levels.filter((level) => level.head.latestVersionId && !isEntityRemoved(workspace, { kind: 'rubric', id: level.head.id }) && !isEntityArchived(workspace, { kind: 'rubric', id: level.head.id })).length, 0) ?? 0
   const items = [
-    { to: '/jobs', label: 'Jobs', icon: BriefcaseBusiness, count: workspace.jobs.filter((job) => !isEntityArchived(workspace, { kind: 'job', id: job.id }) && !isEntityRemoved(workspace, { kind: 'job', id: job.id })).length },
-    { to: '/resumes', label: 'Resumes', icon: Files, count: [...workspace.resumes, ...(realResumes?.summaries.map((item) => item.resume) ?? [])].filter((resume) => !isEntityArchived(workspace, { kind: 'resume', id: resume.id }) && !isEntityRemoved(workspace, { kind: 'resume', id: resume.id })).length },
-    { to: '/rubrics', label: 'Rubrics', icon: Layers3, count: latestRubrics(workspace).filter((rubric) => !(rubric.kind === 'grade' && rubric.dataKind === 'real') && !isEntityArchived(workspace, { kind: 'rubric', id: rubric.groupId })).length + realGrades },
-    { to: '/analyses', label: 'Analyses', icon: BarChart3, count: [...workspace.runs, ...(realAnalyses?.summaries.map((item) => item.run) ?? [])].filter((run) => !isEntityArchived(workspace, { kind: 'analysis', id: run.id }) && !isEntityRemoved(workspace, { kind: 'analysis', id: run.id })).length },
+    { to: '/jobs', label: 'Jobs', icon: BriefcaseBusiness, count: workspace.jobs.filter((job) => active(workspace, 'job', job.id)).length },
+    { to: '/resumes', label: 'Resumes', icon: Files, count: (realResumes?.summaries ?? []).filter((item) => active(workspace, 'resume', item.resume.id)).length },
+    { to: '/rubrics', label: 'Rubrics', icon: Layers3, count: latestRubrics(workspace).filter((rubric) => rubric.kind === 'job' && !isEntityArchived(workspace, { kind: 'rubric', id: rubric.groupId })).length + realGrades },
+    { to: '/analyses', label: 'Analyses', icon: BarChart3, count: (realAnalyses?.summaries ?? []).filter((item) => active(workspace, 'analysis', item.run.id)).length },
   ]
   return <nav className="main-nav" aria-label="Main navigation">{items.map(({ to, label, icon: Icon, count }) =>
     <NavLink key={to} to={to} onClick={onNavigate} className={({ isActive }) => isActive || (to === '/rubrics' && location.pathname.startsWith('/grade-ladders')) ? 'nav-item is-active' : 'nav-item'}>
@@ -63,22 +64,9 @@ function Navigation({ onNavigate }: { onNavigate?: () => void }) {
 }
 
 export function App() {
-  const { workspace, cloud } = useWorkspace()
-  const leaveRef = useRef<GradeLeaveProtectionApi | null>(null)
-  if (cloud) return <AppContent />
-  const workspaceId = workspace.lifecycle?.epoch ?? 'workspace'
-  return <LibraryViewStateProvider scopeKey={`local:${workspaceId}`}>
-    <GradeNavigationProtectionProvider workspaceId={workspaceId} routePrefix="/" apiRef={leaveRef}>
-      <GradeRouterProtection><AppContent /></GradeRouterProtection>
-    </GradeNavigationProtectionProvider>
-  </LibraryViewStateProvider>
-}
-
-function AppContent() {
-  const { workspace, storageError, retrySave, notice, clearNotice, resetDemo, cloud } = useWorkspace()
+  const { workspace, notice, clearNotice, cloud } = useWorkspace()
   const realResumes = useRealResumes()
   const realAnalyses = useRealAnalyses()
-  const [showReset, setShowReset] = useState(false)
   const [showAbout, setShowAbout] = useState(false)
   const [mobileNav, setMobileNav] = useState(false)
   const [navigationError, setNavigationError] = useState('')
@@ -87,54 +75,33 @@ function AppContent() {
   const policy = usePublicSettings()
   const application = useApplicationNavigation()
   const isQc = /^\/qc(?:\/|$)/.test(location.pathname)
-  const currentMetadata = cloud?.workspaces.find(item => item.id === cloud.currentWorkspaceId)
-  const canReview = Boolean(cloud && currentMetadata && !currentMetadata.deletedAt &&
+  const currentMetadata = cloud.workspaces.find(item => item.id === cloud.currentWorkspaceId)
+  const canReview = Boolean(currentMetadata && !currentMetadata.deletedAt &&
     workspaceCanReview(workspaceQcRole(currentMetadata), application?.applicationAdmin === true))
   const title = policy.settings?.appearance.applicationTitle ?? 'Score'
-  const samplesVisible = !cloud || policy.settings?.features.samplesVisible !== false
   const resumeLimits = realResumes?.features?.resumeLimits ?? RESUME_IMPORT_LIMITS
-  const jobLimits = cloud?.realJobs.features?.limits ?? JOB_IMPORT_LIMITS
-  const newAnalysisMode = samplesVisible && new URLSearchParams(location.search).get('data') === 'samples' ? 'samples' : 'real'
+  const jobLimits = cloud.realJobs.features?.limits ?? JOB_IMPORT_LIMITS
   const analysisPolicyReason = clientAdmissionReason(policy, 'newAnalyses')
   const section = location.pathname.startsWith('/grade-ladders') ? 'rubrics' : location.pathname.split('/')[1] || 'jobs'
   const isDetail = location.pathname.split('/').filter(Boolean).length > 1
-  const currentWorkspaceName = currentMetadata?.name
   const { canEdit } = useLifecycleAccess()
-  const leaveGuard = useGradeLeaveGuard(false, false, 'Workspace changes')
-  const localRemoved = !cloud && isEntityRemoved(workspace, { kind: 'workspace', id: 'workspace' })
   const openWorkspaceHome = () => {
     setNavigationError('')
     void application?.openWorkspaceHome().catch((caught) => setNavigationError(caught instanceof Error ? caught.message : 'Workspace home could not be opened. Your current workspace has been kept.'))
   }
   const brand = <><span className="brand-mark"><Layers3 size={22} strokeWidth={2} /></span><span>{title}</span></>
-
-  if (!cloud && isQc) return <main className="recovery-page"><div className="panel recovery-card">
-    <h1>Quality control is not supported in standalone mode</h1><p>QC requires an authorized cloud workspace with real saved assessments. Local samples cannot be reviewed, used for calibration, or activate app-wide prompts.</p>
-    <Button onClick={() => navigate('/analyses')}>Return to normal demo mode</Button>
-  </div></main>
-
-  if (!cloud && /^\/admin\/(?:settings|users)\/?$/.test(location.pathname)) return <main className="recovery-page"><div className="panel recovery-card">
-    <h1>Application settings require a cloud administrator</h1><p>This standalone workspace is a fictional local demo. It cannot read or save cloud settings, designate administrators, or run model tests.</p>
-    <Button onClick={() => navigate('/jobs')}>Back to demo workspace</Button>
-  </div></main>
-
-  if (localRemoved) return <main className="recovery-page"><div className="panel recovery-card">
-    <h1>{storageError ? 'Workspace deletion is not saved' : 'Your local workspace was deleted'}</h1>
-    <p>{storageError ? 'The change exists only in this tab. Keep it open and retry saving before leaving or creating another workspace.' : 'Its content was permanently removed. No samples are recreated automatically. You can explicitly create a fresh demo workspace.'}</p>
-    {storageError && <><InlineError>{storageError}</InlineError><Button onClick={retrySave}>Retry saving deletion</Button></>}
-    <Button variant="primary" icon={Plus} disabled={Boolean(storageError)} onClick={() => { void leaveGuard.leave(() => { resetDemo(); navigate('/jobs') }) }}>Create demo workspace</Button>
-  </div></main>
+  const activeJobs = workspace.jobs.filter((job) => active(workspace, 'job', job.id)).length
+  const activeResumes = (realResumes?.summaries ?? []).filter((item) => active(workspace, 'resume', item.resume.id)).length
 
   return <LifecycleDialogProvider><div className="app-layout">
     <a className="skip-link" href="#main-content">Skip to content</a>
     <aside className="sidebar">
-      {cloud && application ? <a href={application.workspaceHomePath} className="brand" aria-label={`${title} home`} onClick={(event) => {
+      {application ? <a href={application.workspaceHomePath} className="brand" aria-label={`${title} home`} onClick={(event) => {
         if (event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return
         event.preventDefault(); openWorkspaceHome()
       }}>{brand}</a> : <Link to={defaultApplicationPage(policy.settings)} className="brand" aria-label={`${title} home`}>{brand}</Link>}
-      {cloud && application && <Button className="workspace-home-nav" variant="ghost" icon={LayoutGrid} onClick={openWorkspaceHome}>All workspaces</Button>}
-      {cloud ? <WorkspaceSwitcher cloud={cloud} /> : <div className="workspace-label"><span className="workspace-monogram">S</span><div><strong>My workspace</strong><span>Personal / local</span></div><span className="workspace-online" /></div>}
-      {!cloud && <div className="mb-4"><EntityLifecycleActions target={{ kind: 'workspace', id: 'workspace' }} name="My workspace" compact /></div>}
+      {application && <Button className="workspace-home-nav" variant="ghost" icon={LayoutGrid} onClick={openWorkspaceHome}>All workspaces</Button>}
+      <WorkspaceSwitcher cloud={cloud} />
       <div className="nav-heading">{isQc ? 'QUALITY CONTROL MODE' : 'WORKSPACE'}</div>
       {isQc ? <QcNavigation /> : <Navigation />}
       {!isQc && canReview && <Link className="nav-item" to="/qc"><ClipboardCheck size={18} /><span>Enter QC mode</span></Link>}
@@ -147,8 +114,7 @@ function AppContent() {
           {policy.settings?.help.documentationUrl && <a className="text-link" href={policy.settings.help.documentationUrl} target="_blank" rel="noopener noreferrer">Documentation <ArrowUpRight size={13} /></a>}
         </div>
         <div className="sidebar-utility"><span>Appearance</span><ThemeControl /></div>
-        {cloud && <AccountPanel user={cloud.user} signOut={cloud.signOut} />}
-        {samplesVisible && !isQc && <button className="reset-button" disabled={!canEdit} onClick={() => setShowReset(true)}><RotateCcw size={14} />Reset {cloud ? 'samples' : 'demo workspace'}</button>}
+        <AccountPanel user={cloud.user} signOut={cloud.signOut} />
         <div className="sidebar-version">{title} / UI PREVIEW <span>V0.1</span></div>
       </div>
     </aside>
@@ -158,21 +124,19 @@ function AppContent() {
           <div className="breadcrumbs"><span>Workspace</span><ChevronRight size={12} /><Link to={`/${section}`}>{isQc ? 'Quality control' : section[0].toUpperCase() + section.slice(1)}</Link>{isDetail && <><ChevronRight size={12} /><span>Review</span></>}</div>
         </div>
         <div className="topbar-actions">
-          {cloud ? <CloudSaveIndicator cloud={cloud} /> : <span className={`save-status ${storageError ? 'is-error' : ''}`}><span />{storageError ? 'Changes not saved' : 'Saved on this device'}</span>}
-          {isQc ? <><Badge tone="accent">QC mode</Badge><Button size="sm" onClick={() => navigate('/analyses?data=real')}>Normal mode</Button></>
-            : <><button className="demo-chip" onClick={() => setShowAbout(true)}><FlaskConical size={13} />{cloud ? samplesVisible ? 'Real & sample workflows' : 'About this application' : 'Demo workspace'}</button>
+          {isQc ? <><Badge tone="accent">QC mode</Badge><Button size="sm" onClick={() => navigate('/analyses')}>Normal mode</Button></>
+            : <><button className="about-chip" onClick={() => setShowAbout(true)}><CircleHelp size={13} />About this application</button>
               {canReview && <Button size="sm" icon={ClipboardCheck} onClick={() => navigate('/qc')}>QC mode</Button>}
-              <Button variant="primary" size="sm" icon={Plus} title={analysisPolicyReason ?? undefined} disabled={!canEdit || Boolean(cloud && newAnalysisMode === 'real' && (analysisPolicyReason || !realAnalyses?.canWrite || realAnalyses.phase !== 'ready' || !realAnalyses.features?.realAnalyses))}
-                onClick={() => navigate(cloud ? `/analyses/new?data=${newAnalysisMode}` : '/analyses/new')}>New analysis</Button></>}
+              <Button variant="primary" size="sm" icon={Plus} title={analysisPolicyReason ?? undefined} disabled={!canEdit || Boolean(analysisPolicyReason || !realAnalyses?.canWrite || realAnalyses.phase !== 'ready' || !realAnalyses.features?.realAnalyses)}
+                onClick={() => navigate('/analyses/new')}>New analysis</Button></>}
         </div>
       </header>
       <ApplicationPolicyBanners />
       {(navigationError || application?.directoryError) && <div className="storage-banner" role="alert">{navigationError || application?.directoryError}</div>}
-      {cloud ? <CloudSaveBanner cloud={cloud} /> : storageError && <div className="storage-banner" role="alert"><span>{storageError}</span><Button size="sm" onClick={retrySave}>Retry saving</Button></div>}
       <main id="main-content" className="main-content">
         <LifecycleBanner />
         <LifecycleOperationBanner />
-        {cloud && !isQc && <RealResumeImportActivity />}
+        {!isQc && <RealResumeImportActivity />}
         <Routes>
           <Route path="/" element={<Navigate to={defaultApplicationPage(policy.settings)} replace />} />
           <Route path="/jobs" element={<JobsPage />} />
@@ -190,16 +154,15 @@ function AppContent() {
           <Route path="*" element={<EmptyState title="This page is not in your workspace" description="Return to the jobs library to find your next review." action={<Button onClick={() => navigate('/jobs')}>Go to jobs</Button>} />} />
         </Routes>
         <footer className="workspace-footer">
-          <span><ShieldCheck size={13} />{isQc ? 'Private QC feedback and trial results stay separate from published scores and normal exports.' : cloud ? 'Real sources and analyses are private server records. Samples stay fictional. A human makes the decision.' : 'Private by design. This preview stays in your browser.'}</span>
-          {!isQc && <span>{workspace.jobs.filter((job) => !isEntityArchived(workspace, { kind: 'job', id: job.id }) && !isEntityRemoved(workspace, { kind: 'job', id: job.id })).length} active jobs / {[...workspace.resumes, ...(realResumes?.summaries.map((item) => item.resume) ?? [])].filter((resume) => !isEntityArchived(workspace, { kind: 'resume', id: resume.id }) && !isEntityRemoved(workspace, { kind: 'resume', id: resume.id })).length} active resumes{cloud && samplesVisible && ' · includes samples'}</span>}
+          <span><ShieldCheck size={13} />{isQc ? 'Private QC feedback and trial results stay separate from published scores and normal exports.' : 'Sources and analyses are private server records. A human makes the decision.'}</span>
+          {!isQc && <span>{activeJobs} active jobs / {activeResumes} active resumes</span>}
         </footer>
       </main>
     </div>
     {notice && <div className="toast" role="status"><span className="toast-icon"><Check size={16} /></span><p>{notice}</p><Button variant="ghost" className="icon-button" size="sm" icon={X} aria-label="Dismiss notification" onClick={clearNotice} /></div>}
     <Modal open={mobileNav} onOpenChange={setMobileNav} title="Your workspace" description="Explore your jobs, resumes, rubrics, and analyses." drawer>
-      {cloud && application && <Button className="mb-4" variant="ghost" icon={LayoutGrid} onClick={() => { setMobileNav(false); openWorkspaceHome() }}>All workspaces</Button>}
-      {cloud && <div className="mb-5 space-y-3"><WorkspaceSwitcher cloud={cloud} /><AccountPanel user={cloud.user} signOut={cloud.signOut} /></div>}
-      {!cloud && <EntityLifecycleActions target={{ kind: 'workspace', id: 'workspace' }} name="My workspace" />}
+      {application && <Button className="mb-4" variant="ghost" icon={LayoutGrid} onClick={() => { setMobileNav(false); openWorkspaceHome() }}>All workspaces</Button>}
+      <div className="mb-5 space-y-3"><WorkspaceSwitcher cloud={cloud} /><AccountPanel user={cloud.user} signOut={cloud.signOut} /></div>
       {isQc ? <QcNavigation onNavigate={() => setMobileNav(false)} /> : <><Navigation onNavigate={() => setMobileNav(false)} />
         {canReview && <Link className="nav-item" to="/qc" onClick={() => setMobileNav(false)}><ClipboardCheck size={18} /><span>Enter QC mode</span></Link>}</>}
       <div className="mobile-appearance"><span>Appearance</span><ThemeControl /></div>
@@ -207,28 +170,14 @@ function AppContent() {
       {application?.applicationAdmin && <Button icon={Users} onClick={() => { setMobileNav(false); void application.openAdminUsers() }}>Users / user access</Button>}
       {policy.settings?.help.supportUrl && <a className="text-link" href={policy.settings.help.supportUrl} target="_blank" rel="noopener noreferrer">Support</a>}
       {policy.settings?.help.documentationUrl && <a className="text-link" href={policy.settings.help.documentationUrl} target="_blank" rel="noopener noreferrer">Documentation</a>}
-      {samplesVisible && !isQc && <Button icon={RotateCcw} disabled={!canEdit} onClick={() => { setMobileNav(false); setShowReset(true) }}>Reset {cloud ? 'samples' : 'demo workspace'}</Button>}
-    </Modal>
-    <Modal open={showReset} onOpenChange={setShowReset}
-      title={cloud ? 'Reset sample content?' : 'A fresh starting point'}
-      description={cloud ? `Reset only the fictional preview content in ${currentWorkspaceName ?? 'this workspace'}?` : 'Reset your demo workspace?'}
-      footer={<><Button onClick={() => setShowReset(false)}>Keep my workspace</Button><Button variant="danger" icon={RotateCcw} disabled={!canEdit} onClick={() => { void leaveGuard.leave(() => { resetDemo(); setShowReset(false); navigate('/jobs') }) }}>Reset {cloud ? 'samples' : 'demo'}</Button></>}>
-      {cloud ? <>
-        <p>This resets only the legacy sample imports, rubric edits, and simulated analysis history in <strong>{currentWorkspaceName ?? 'this workspace'}</strong>. Server-owned real resumes, original captures, analyses and their frozen inputs/results, jobs, grade ladders, reference captures, approvals, and all their versions are not deleted or changed.</p>
-        <p className="mt-4 text-muted">Your other workspaces are not affected.</p>
-      </> : <>
-        <p>This replaces demo imports, rubric edits, and analysis history with the original fictional examples. It cannot be undone.</p>
-        <p className="mt-4 text-muted">Your theme preference and all browser data outside Score are kept.</p>
-      </>}
     </Modal>
     <Modal open={showAbout} onOpenChange={setShowAbout} title="A clearer way to see the fit" description="Score / interactive UI preview"
       footer={<Button variant="primary" onClick={() => setShowAbout(false)}>Back to the workspace</Button>}>
       <div className="about-illustration"><BriefcaseBusiness /><ChevronRight /><Layers3 /><ChevronRight /><BarChart3 /></div>
       <h3 className="mb-3 text-lg font-semibold">A job. A rubric. The evidence.</h3>
-      <p>{cloud ? 'Import real resumes, inspect captured sources, then explicitly compare ready resumes against real jobs or exact approved GS versions. Real analyses use model-assisted evidence assessment and grounding review, with immutable snapshots and independent progress. Only the explicitly labeled Samples workflows are fictional. Scores are review aids, not hiring decisions or official GS eligibility determinations.' : 'Explore the complete review workflow with fictional jobs and resumes. Import files or URLs to simulate adding sample records, build a comparison, and follow each score back to its supporting passage.'}</p>
-      {cloud ? <div className="info-callout mt-5"><CircleHelp size={18} /><div><strong>Real sources are read, processed, and retained privately.</strong><p>Current resume limits: {resumeLimits.maxBatchItems} inputs per batch, {resumeLimits.maxFileBytes / 1024 / 1024} MiB per file, {resumeLimits.maxPdfPages} PDF pages, and {resumeLimits.maxSourceCharacters.toLocaleString()} normalized characters. Current job limits: {jobLimits.maxBatchFiles} inputs, {jobLimits.maxFileBytes / 1024 / 1024} MiB per file, {jobLimits.maxPdfPages} PDF pages, and {jobLimits.maxSourceCharacters.toLocaleString()} characters. Allowed file formats and public URLs depend on current application policy and deployment support; the import dialog shows the effective choices. Markdown uploads use .md or .markdown files; their links and images are not fetched. Word citations use captured sections, not printed pages; any formatted DOCX preview is approximate, and extracted text remains authoritative. Score never signs in or bypasses access controls. Public profiles can be sparse. Each analysis starts manually and is limited to {realAnalyses?.features?.analysisLimits.maxComparisons ?? ANALYSIS_LIMITS.maxComparisons} independent comparisons. Larger analyses use the same processing rate and may take longer.</p><p>Accepted imports and analysis work continue on the server after browser close and retain their captured limits. Real documents, profiles, and results never enter sample autosave or browser local storage. Reset samples does not delete them. Disabled services never substitute fictional content or hide saved evidence.</p><p>Archive makes content read-only and stops unfinished work it owns, never independent saved analyses. Search includes archived records; restoring them does not restart processing. Permanent deletion requires confirmation and cannot remove an input retained by an analysis or seed ladder, including archived history.</p></div></div>
-        : <div className="info-callout mt-5"><CircleHelp size={18} /><div><strong>Nothing is uploaded or evaluated by AI.</strong><p>Selected file contents are never read. URLs are not fetched. Scores and quotations come from synthetic fixtures, and GS examples are not official eligibility assessments.</p></div></div>}
-      <div className="mt-5 flex flex-wrap gap-2"><Badge>{cloud ? 'Cloud workspace storage' : 'Local demo storage'}</Badge><Badge>Human review first</Badge><Badge>No automatic hiring decisions</Badge></div>
+      <p>Import resumes, inspect captured sources, then explicitly compare ready resumes against jobs or exact approved GS versions. Analyses use model-assisted evidence assessment and grounding review, with immutable snapshots and independent progress. Scores are review aids, not hiring decisions or official GS eligibility determinations.</p>
+      <div className="info-callout mt-5"><CircleHelp size={18} /><div><strong>Sources are read, processed, and retained privately.</strong><p>Current resume limits: {resumeLimits.maxBatchItems} inputs per batch, {resumeLimits.maxFileBytes / 1024 / 1024} MiB per file, {resumeLimits.maxPdfPages} PDF pages, and {resumeLimits.maxSourceCharacters.toLocaleString()} normalized characters. Current job limits: {jobLimits.maxBatchFiles} inputs, {jobLimits.maxFileBytes / 1024 / 1024} MiB per file, {jobLimits.maxPdfPages} PDF pages, and {jobLimits.maxSourceCharacters.toLocaleString()} characters. Allowed file formats and public URLs depend on current application policy and deployment support; the import dialog shows the effective choices. Markdown uploads use .md or .markdown files; their links and images are not fetched. Word citations use captured sections, not printed pages; any formatted DOCX preview is approximate, and extracted text remains authoritative. Score never signs in or bypasses access controls. Public profiles can be sparse. Each analysis starts manually and is limited to {realAnalyses?.features?.analysisLimits.maxComparisons ?? ANALYSIS_LIMITS.maxComparisons} independent comparisons. Larger analyses use the same processing rate and may take longer.</p><p>Accepted imports and analysis work continue on the server after browser close and retain their captured limits. Documents, profiles, and results are stored on the server, never in browser local storage. Disabled services never hide saved evidence.</p><p>Archive makes content read-only and stops unfinished work it owns, never independent saved analyses. Search includes archived records; restoring them does not restart processing. Permanent deletion requires confirmation and cannot remove an input retained by an analysis or seed ladder, including archived history.</p></div></div>
+      <div className="mt-5 flex flex-wrap gap-2"><Badge>Cloud workspace storage</Badge><Badge>Human review first</Badge><Badge>No automatic hiring decisions</Badge></div>
     </Modal>
   </div></LifecycleDialogProvider>
 }

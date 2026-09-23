@@ -1,6 +1,6 @@
 import { forwardRef, useContext, useRef, type ButtonHTMLAttributes, type ReactNode } from 'react'
 import * as Dialog from '@radix-ui/react-dialog'
-import { AlertCircle, ArrowUpRight, Check, FlaskConical, Search, X, type LucideIcon } from 'lucide-react'
+import { AlertCircle, ArrowUpRight, Check, Search, X, type LucideIcon } from 'lucide-react'
 import type { JobStatus } from '../../domain/types'
 import { AccessSuspendedContext } from '../../app/access-suspended-context'
 
@@ -102,10 +102,6 @@ export function EmptyState({ icon: Icon = Search, title, description, action }: 
 
 export function InlineError({ children }: { children: ReactNode }) {
   return <div className="inline-error" role="alert"><AlertCircle size={17} /><div>{children}</div></div>
-}
-
-export function DemoNote({ children = 'A working preview with fictional documents and simulated results. Selected PDF contents are not read, and source URLs are not fetched.' }: { children?: ReactNode }) {
-  return <div className="demo-note"><FlaskConical size={16} aria-hidden="true" /><span>{children}</span></div>
 }
 
 export function Avatar({ initials, small = false }: { initials: string; small?: boolean }) {
