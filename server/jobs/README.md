@@ -13,7 +13,7 @@ membership, including when the workspace is archived.
 - Delete rechecks analyses and seed-ladder dependencies, including archived items
   and historical rubric versions. Missing dependency or storage capabilities fail
   closed. The application's workspace mutation lease serializes these checks with
-  new analyses, ladder seeds, and sample-state saves.
+  new analyses and ladder seeds.
 - Rubric deletion covers the logical group and all its immutable versions. The job
   and source remain; `job.rubricId` becomes `null`, `job.rubricDeletedAt` records the
   deliberate removal, and the job remains `ready`. Retry cannot recreate it.

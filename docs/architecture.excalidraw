@@ -11,8 +11,8 @@
     },
     {
       "id": "diagram-subtitle", "type": "text", "x": 48, "y": 111, "width": 1650, "height": 50,
-      "text": "From source documents to evidence-backed review. Cloud processing and standalone samples stay separate.",
-      "originalText": "From source documents to evidence-backed review. Cloud processing and standalone samples stay separate.",
+      "text": "From source documents to evidence-backed review with authenticated cloud processing.",
+      "originalText": "From source documents to evidence-backed review with authenticated cloud processing.",
       "fontSize": 20, "fontFamily": 2, "lineHeight": 1.35, "textAlign": "left", "verticalAlign": "top",
       "strokeColor": "#000000", "backgroundColor": "transparent", "angle": 0, "opacity": 100, "groupIds": [], "containerId": null, "seed": 102, "version": 1, "versionNonce": 102, "isDeleted": false
     },
@@ -157,7 +157,7 @@
     },
     {
       "id": "blobs-detail", "type": "text", "x": 920, "y": 650, "width": 290, "height": 150,
-      "text": "Private originals + sources\nFrozen inputs + saved results\nCloud samples: separate state", "originalText": "Private originals + sources\nFrozen inputs + saved results\nCloud samples: separate state",
+      "text": "Private originals + sources\nFrozen inputs + saved results\nWorkspace leases + legacy state", "originalText": "Private originals + sources\nFrozen inputs + saved results\nWorkspace leases + legacy state",
       "fontSize": 20, "fontFamily": 2, "lineHeight": 1.35, "textAlign": "left", "verticalAlign": "top",
       "strokeColor": "#000000", "backgroundColor": "transparent", "angle": 0, "opacity": 100, "groupIds": ["blobs-card"], "containerId": null, "seed": 127, "version": 1, "versionNonce": 127, "isDeleted": false
     },
@@ -308,36 +308,18 @@
       "strokeColor": "#000000", "backgroundColor": "transparent", "angle": 0, "opacity": 100, "groupIds": ["foundry-card"], "containerId": null, "seed": 153, "version": 1, "versionNonce": 153, "isDeleted": false
     },
     {
-      "id": "local-mode", "type": "rectangle", "x": 48, "y": 1340, "width": 550, "height": 220,
-      "strokeColor": "#495057", "backgroundColor": "#f8f9fa", "fillStyle": "solid", "strokeWidth": 1.5, "strokeStyle": "dashed", "roughness": 0, "opacity": 100, "angle": 0, "roundness": { "type": 3 },
-      "groupIds": ["local-mode-card"], "boundElements": [], "seed": 154, "version": 1, "versionNonce": 154, "isDeleted": false
-    },
-    {
-      "id": "local-mode-title", "type": "text", "x": 68, "y": 1355, "width": 510, "height": 55,
-      "text": "Separate mode / local samples", "originalText": "Separate mode / local samples",
-      "fontSize": 22, "fontFamily": 2, "lineHeight": 1.35, "textAlign": "left", "verticalAlign": "top",
-      "strokeColor": "#000000", "backgroundColor": "transparent", "angle": 0, "opacity": 100, "groupIds": ["local-mode-card"], "containerId": null, "seed": 155, "version": 1, "versionNonce": 155, "isDeleted": false
-    },
-    {
-      "id": "local-mode-detail", "type": "text", "x": 68, "y": 1412, "width": 510, "height": 135,
-      "text": "Vite + fictional fixtures + browser local storage\nNo real uploads, extraction, or AI calls\nCloud errors never switch to samples",
-      "originalText": "Vite + fictional fixtures + browser local storage\nNo real uploads, extraction, or AI calls\nCloud errors never switch to samples",
-      "fontSize": 18, "fontFamily": 2, "lineHeight": 1.35, "textAlign": "left", "verticalAlign": "top",
-      "strokeColor": "#000000", "backgroundColor": "transparent", "angle": 0, "opacity": 100, "groupIds": ["local-mode-card"], "containerId": null, "seed": 156, "version": 1, "versionNonce": 156, "isDeleted": false
-    },
-    {
-      "id": "privacy-boundary", "type": "rectangle", "x": 628, "y": 1340, "width": 1122, "height": 220,
+      "id": "privacy-boundary", "type": "rectangle", "x": 48, "y": 1340, "width": 1702, "height": 220,
       "strokeColor": "#495057", "backgroundColor": "#f8f9fa", "fillStyle": "solid", "strokeWidth": 1.5, "strokeStyle": "solid", "roughness": 0, "opacity": 100, "angle": 0, "roundness": { "type": 3 },
       "groupIds": ["privacy-boundary-card"], "boundElements": [], "seed": 157, "version": 1, "versionNonce": 157, "isDeleted": false
     },
     {
-      "id": "privacy-boundary-title", "type": "text", "x": 648, "y": 1355, "width": 1082, "height": 55,
+      "id": "privacy-boundary-title", "type": "text", "x": 68, "y": 1355, "width": 1662, "height": 55,
       "text": "Private evidence stays out of shared search", "originalText": "Private evidence stays out of shared search",
       "fontSize": 22, "fontFamily": 2, "lineHeight": 1.35, "textAlign": "left", "verticalAlign": "top",
       "strokeColor": "#000000", "backgroundColor": "transparent", "angle": 0, "opacity": 100, "groupIds": ["privacy-boundary-card"], "containerId": null, "seed": 158, "version": 1, "versionNonce": 158, "isDeleted": false
     },
     {
-      "id": "privacy-boundary-detail", "type": "text", "x": 648, "y": 1412, "width": 1082, "height": 135,
+      "id": "privacy-boundary-detail", "type": "text", "x": 68, "y": 1412, "width": 1662, "height": 135,
       "text": "Analysis uses frozen analysis stores, not live job/resume/grade stores or extraction services.\nShared AI Search / Foundry IQ: a nonsensitive app guide, never private source/result indexing.\nThis is repository-defined architecture; deployed services and feature flags control availability.",
       "originalText": "Analysis uses frozen analysis stores, not live job/resume/grade stores or extraction services.\nShared AI Search / Foundry IQ: a nonsensitive app guide, never private source/result indexing.\nThis is repository-defined architecture; deployed services and feature flags control availability.",
       "fontSize": 18, "fontFamily": 2, "lineHeight": 1.35, "textAlign": "left", "verticalAlign": "top",

@@ -1,8 +1,8 @@
 # Private real resume intake
 
-This module stores real resumes separately from the sample `Workspace`. It never writes sample
-state, selects a fictional profile, or starts scoring. Resume imports become eligible inputs for
-a separately requested analysis only after the resume worker publishes a validated ready record.
+This module stores real resumes as workspace-owned records. It never starts scoring.
+Resume imports become eligible inputs for a separately requested analysis only after
+the resume worker publishes a validated ready record.
 
 ## HTTP integration
 
@@ -95,7 +95,7 @@ before publication. An optional UTF-8 BOM and original line endings are preserve
 original. The shared decoder validates input before local text extraction with `marked`.
 The evidence viewer renders extracted text, never executable HTML or a formatted Markdown page.
 Embedded HTML and front matter remain inert text; linked images and assets are never fetched.
-Markdown imports are real-data uploads only: public Markdown URL retrieval, sample imports,
+Markdown imports are file uploads only: public Markdown URL retrieval,
 supporting grade reference uploads, and Markdown exports are not supported. The authenticated
 `/api/features` response advertises `markdownResumeImports` only when the real resume service is
 available and exposes `resumeLimits.maxMarkdownBytes`.
@@ -138,7 +138,7 @@ Never overwrite or delete another attempt's winning blobs to compensate for a fa
 Unpublished receipts/originals remain recoverable after a failed admission. A durable preparation
 control expires after 24 hours; the web-owned lifecycle reaper then removes that unpublished
 namespace, retains a permanent key tombstone, and never recreates it from a stale request.
-Resetting samples does not delete real resume data.
+Only authorized lifecycle deletion removes real resume data.
 
 Blob names are restricted to these exact names beneath `<workspaceId>/<resumeId>/`:
 
