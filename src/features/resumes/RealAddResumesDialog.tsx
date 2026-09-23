@@ -57,7 +57,7 @@ export function RealAddResumesDialog({ open, onOpenChange }: { open: boolean; on
       <Button variant="primary" icon={uploading ? LoaderCircle : UploadCloud} disabled={unavailable || uploading || !valid}
         onClick={() => submit()}>{uploading ? 'Awaiting acceptance…' : locked ? `Retry ${valid} unacknowledged` : `Import ${valid} valid ${valid === 1 ? 'input' : 'inputs'}`}</Button>
     </>}>
-    {!api ? <EmptyState title="A cloud workspace is required" description="Real imports are never sent through the sample workflow or stored in your browser." /> : <>
+    {!api ? <EmptyState title="A cloud workspace is required" description="Open this dialog from an authenticated workspace. Imports are never stored in your browser." /> : <>
       {api.phase !== 'ready' && <div className="mb-4"><InlineError>{api.error ?? 'Checking private import availability…'} <Button size="sm" onClick={() => void api.refresh()}>Check service</Button></InlineError></div>}
       {!api.canWrite && <div className="mb-4"><InlineError>This workspace is read-only. An owner or editor can import resumes.</InlineError></div>}
       {policyReason && <InlineError>{policyReason}</InlineError>}
@@ -113,7 +113,7 @@ export function RealAddResumesDialog({ open, onOpenChange }: { open: boolean; on
                 {item.warning && <p className="mt-2 text-[11px] text-muted">{item.warning}</p>}
                 {summary?.duplicates.map((duplicate, duplicateIndex) => <p key={duplicateIndex} className="mt-2 text-[11px] text-muted">{duplicate.message} No records were merged.</p>)}
                 {summary?.warnings.map((warning, warningIndex) => <p key={warningIndex} className="mt-2 text-[11px] text-muted">{warning}</p>)}
-                {item.resumeId && <Link to={`/resumes/${encodeURIComponent(item.resumeId)}?data=real`} onClick={() => onOpenChange(false)} className="text-link mt-2 text-[11px]">Inspect accepted resume</Link>}
+                {item.resumeId && <Link to={`/resumes/${encodeURIComponent(item.resumeId)}`} onClick={() => onOpenChange(false)} className="text-link mt-2 text-[11px]">Inspect accepted resume</Link>}
               </div>
               <div className="flex shrink-0 flex-col items-end gap-2">
                 <Badge>{item.source.kind === 'url' ? 'URL' : item.source.kind === 'unsupported' ? 'Unsupported file' : uploadFormatNames([item.source.kind])}</Badge>
@@ -153,6 +153,6 @@ export function RealResumeImportActivity() {
   return <div className="info-callout mb-5" role="status" aria-live="polite">
     {uploading ? <LoaderCircle size={18} className="motion-safe:animate-spin" aria-hidden="true" /> : <FileText size={18} aria-hidden="true" />}
     <div><strong>Resume imports: {accepted} accepted{uploading > 0 ? ` · ${uploading} uploading (not yet acknowledged)` : ''}{attention > 0 ? ` · ${attention} need attention` : ''}</strong>
-      <p>Only accepted inputs are durable. <Link className="text-link" to="/resumes?data=real&imports=open">Review batches and server progress</Link></p></div>
+      <p>Only accepted inputs are durable. <Link className="text-link" to="/resumes?imports=open">Review batches and server progress</Link></p></div>
   </div>
 }

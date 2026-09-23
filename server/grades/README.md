@@ -128,8 +128,8 @@ cancelling/purging; restoring or reactivating a deleting workspace is rejected.
 If later workspace finalization fails after grade cleanup has reached `deleted`,
 a repeated coordinator `deleting` request preserves the terminal `deleted` guard.
 Repeated cancel/purge/finalize steps are idempotent and cannot reactivate content.
-Workers need no access to the workspace directory, legacy sample state, or
-seed-job store.
+Workers need no access to the workspace directory, workspace-state Blob container,
+or seed-job store.
 
 Before copying seed bytes, creation reserves a noncontent input fingerprint and
 a 24-hour expiration in its family control. Publication clears that reservation

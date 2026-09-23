@@ -12,7 +12,7 @@ import {
   loadReportFoundation, realReportFixture, reportFixtureCitation, REPORT_TEST_TIMESTAMP, version2ReportFixture, withReportNarratives,
 } from './test-support.mjs'
 import {
-  fictionalPdfNavigationQaFixture, fictionalPdfQaFixture, fictionalSampleInput, readablePdfFixture, readPdf,
+  fictionalPdfNavigationQaFixture, fictionalPdfQaFixture, readablePdfFixture, readPdf,
 } from './pdf-test-support.mjs'
 
 let foundation, writer, cleanup, options
@@ -498,14 +498,6 @@ test('every one of 500 completed candidates remains in the editable glance table
   ]))
 })
 
-test('fictional sample identity remains explicit without real model provenance or network calls', async () => {
-  const report = foundation.buildSampleAnalysisReport(foundation.createInitialWorkspace().runs[0], { generatedAt: REPORT_TEST_TIMESTAMP })
-  const word = await generate(report, { fonts: options.fonts, links: { origin: options.links.origin } })
-  containsText(word.document, foundation.REPORT_SAMPLE_NOTICE)
-  containsText(word.document, foundation.REPORT_HUMAN_REVIEW_NOTICE)
-  for (const section of word.sections) containsText(section.header, 'FICTIONAL SAMPLE')
-})
-
 test('XML-invalid controls, including deliberately omitted evidence, fail visibly rather than corrupting the package', async () => {
   for (const invalid of ['\0', '\u0001', '\u000B', '\u000C', '\u001F', '\uFFFE', '\uFFFF', '\uD800', '\uDC00']) {
     const report = reportFor()
@@ -579,10 +571,9 @@ test('matching fictional Word and PDF fixtures support native local layout revie
     ['aliases', aliases], ['long-aliases', longAliases],
   ]
   for (const [name, input] of fixtures) {
-    const report = reportFor(fictionalSampleInput(input))
-    const generationOptions = { fonts: options.fonts, links: { origin: options.links.origin } }
+    const report = reportFor(withReportNarratives(input))
+    const generationOptions = options
     const word = await generate(report, generationOptions)
-    containsText(word.document, foundation.REPORT_SAMPLE_NOTICE)
     assert.equal(reviewSections(word).length, report.groups.reduce((sum, group) => sum + group.highlightedComparisonIds.length, 0))
     if (input.targets[0].displayName !== undefined) {
       for (const text of [input.run.name, input.targets[0].displayName, input.comparisons[0].candidate.displayName,

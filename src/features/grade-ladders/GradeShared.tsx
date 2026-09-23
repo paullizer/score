@@ -10,7 +10,7 @@ export function GradeStatus({ status }: { status: GradeLevelStatus }) {
 
 export function GradeDisclaimer() {
   return <div className="info-callout grade-disclaimer"><ShieldCheck size={18} aria-hidden="true" /><div><strong>Source-grounded work for human review</strong>
-    <p>Reviewer approval is not OPM certification, an official position classification, or an eligibility decision. Weights are review choices, not federal classification points. Real grades never enter demo applicant scoring.</p></div></div>
+    <p>Reviewer approval is not OPM certification, an official position classification, or an eligibility decision. Weights are review choices, not federal classification points.</p></div></div>
 }
 
 export function GradeIssues({ issues, title = 'Unresolved evidence and applicability' }: { issues: GradeIssue[]; title?: string }) {

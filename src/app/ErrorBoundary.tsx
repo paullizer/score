@@ -9,7 +9,7 @@ export class ErrorBoundary extends Component<{ children: ReactNode }, { error: E
   render() {
     if (this.state.error) return <main className="recovery-page"><div className="panel recovery-card">
       <AlertTriangle size={32} /><h1>This view could not be opened</h1>
-      <p>{this.state.error.message}</p><p>Your saved demo has not been cleared.</p>
+      <p>{this.state.error.message}</p><p>Your saved workspace content is unaffected.</p>
       <Button variant="primary" onClick={() => window.location.assign('/')}>Return to workspace</Button>
     </div></main>
     return this.props.children

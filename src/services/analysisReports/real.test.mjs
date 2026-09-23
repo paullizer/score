@@ -166,9 +166,7 @@ before(async () => {
       export * from './src/services/analysisReports/real';
       export { createDefaultAdminSettings } from './src/domain/admin-settings-defaults';
     ` }, outfile: join(output, 'real.mjs'),
-    bundle: true, packages: 'external', platform: 'node', format: 'esm', logLevel: 'silent',
-    define: { 'import.meta.env.VITE_DEPLOYMENT_MODE': '"cloud"' },
-  })
+    bundle: true, packages: 'external', platform: 'node', format: 'esm', logLevel: 'silent' })
   const api = await import(pathToFileURL(join(output, 'real.mjs')).href)
   ;({ loadRealAnalysisReport, assertRealAnalysisReportNarrativesCurrent } = api)
   defaultSettings = { revision: 'reports-test-v1', policy: api.createDefaultAdminSettings().reports }
@@ -340,8 +338,8 @@ test('batch scope, kinds, requested IDs, hashes, frozen candidate/selection bind
   const changes = [
     value => { value.workspaceId = 'another-workspace' },
     value => { value.runId = 'another-run' },
-    value => { value.dataKind = 'sample' },
-    value => { value.comparisons[0].dataKind = 'sample' },
+    value => { value.dataKind = 'foreign' },
+    value => { value.comparisons[0].dataKind = 'foreign' },
     value => { value.comparisons = [] },
     value => { value.comparisons.push(clone(value.comparisons[0])) },
     value => { value.comparisons[0].id = 'foreign-comparison' },
@@ -376,7 +374,7 @@ test('malformed, foreign, duplicate, repeated, missing and inconsistent complete
     f => { f.inventory[1].comparison.index = f.inventory[0].comparison.index },
     f => { f.inventory[0].comparison.workspaceId = 'foreign-workspace' },
     f => { f.inventory[0].comparison.runId = 'foreign-run' },
-    f => { f.inventory[0].comparison.dataKind = 'sample' },
+    f => { f.inventory[0].comparison.dataKind = 'foreign' },
     f => { f.inventory[0].comparison.resume.summary.selection.documentVersion++ },
     f => { f.inventory[0].comparison.target.summary.selection.rubricHash = 'b'.repeat(64) },
     f => { f.inventory[0].comparison.resume.blob.blobName = 'foreign/snapshot.json' },

@@ -129,6 +129,6 @@ test('Markdown job/resume uploads reach ready, freeze exact analysis evidence, a
     assert.equal(original.status, 200)
     assert.match(original.headers.get('content-type'), /^text\/markdown(?:;|$)/)
     assert.deepEqual(Buffer.from(await original.arrayBuffer()), markdownJob)
-    assert.equal(fixture.state.saves.length, 0, 'Markdown sources are never saved to the sample workspace.')
+    assert.equal(fixture.requests.some((request) => request.url.endsWith('/state') && request.method !== 'GET'), false, 'Markdown sources are never saved to legacy workspace state.')
   } finally { await fixture.close() }
 })

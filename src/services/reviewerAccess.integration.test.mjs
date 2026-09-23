@@ -18,12 +18,30 @@ const reviewerId = '00000000-0000-4000-8000-000000000003'
 const metadata = { id: 'workspace-one', name: 'Private workspace', role: 'owner', kind: 'personal',
   etag: '"workspace-1"', createdAt: '2026-09-22T14:00:00.000Z', updatedAt: '2026-09-22T14:00:00.000Z' }
 let ui, dom, root, createRoot, cloud, requests, savedAccess, override, workspace, directoryRefreshes
+const pause = (milliseconds = 10) => new Promise(resolve => setTimeout(resolve, milliseconds))
+function testWorkspace() {
+  return {
+    documents: [{ id: 'document-one', title: 'Position description', kind: 'job', version: 1, sample: false, paragraphs: [
+      { id: 'paragraph-one', page: 1, heading: 'Duties', text: 'Saved evidence remains readable for reviewers.' },
+    ] }],
+    jobs: [{ id: 'job-one', title: 'Program analyst', organization: 'Agency', location: 'Remote', arrangement: 'Remote',
+      employmentType: 'Full-time', grade: 'GS-13', series: '0343', source: 'pdf', sourceLabel: 'Position description.pdf',
+      documentId: 'document-one', rubricId: 'rubric-one', status: 'ready', createdAt: '2026-01-01T00:00:00.000Z', dataKind: 'real' }],
+    rubrics: [{ id: 'rubric-one', groupId: 'rubric-group-one', kind: 'job', jobId: 'job-one', name: 'Job rubric',
+      description: 'Measures the role.', version: 1, createdAt: '2026-01-01T00:00:00.000Z', dataKind: 'real',
+      criteria: [{ id: 'criterion-one', key: 'technical', label: 'Reviewer evidence', description: 'Uses evidence.',
+        guidance: 'Check exact source evidence.', weight: 100, requirementType: 'required',
+        sourceCitations: [{ documentId: 'document-one', documentVersion: 1, paragraphId: 'paragraph-one',
+          page: 1, heading: 'Duties', quote: 'Saved evidence' }] }] }],
+    lifecycle: { entities: {} },
+  }
+}
 
 before(async () => {
   await mkdir(output)
   dom = new JSDOM('<!doctype html><div id="root"></div>', { url: 'https://score.test/', pretendToBeVisual: true })
   for (const name of ['window', 'document', 'navigator', 'HTMLElement', 'HTMLInputElement', 'HTMLButtonElement',
-    'Element', 'Node', 'NodeFilter', 'MutationObserver', 'CustomEvent', 'DocumentFragment', 'localStorage']) {
+    'Element', 'Node', 'NodeFilter', 'MutationObserver', 'CustomEvent', 'Event', 'DocumentFragment', 'localStorage']) {
     originals.set(name, Object.getOwnPropertyDescriptor(globalThis, name))
     Object.defineProperty(globalThis, name, { configurable: true, writable: true, value: dom.window[name] })
   }
@@ -42,7 +60,6 @@ before(async () => {
   await build({
     stdin: { resolveDir: process.cwd(), loader: 'tsx', contents: `
       export * from './src/domain/workspace-permissions'
-      export { createInitialWorkspace } from './src/data/fixtures'
       export * from './src/services/cloudWorkspace'
       export { CloudWorkspaceProvider } from './src/app/CloudWorkspaceProvider'
       export { WorkspaceContext } from './src/app/workspace-context'
@@ -53,14 +70,14 @@ before(async () => {
       export { MemoryRouter } from 'react-router-dom'
     ` },
     outfile: join(output, 'ui.mjs'), bundle: true, packages: 'external', format: 'esm', platform: 'node',
-    jsx: 'automatic', logLevel: 'silent', define: { 'import.meta.env.VITE_DEPLOYMENT_MODE': '"cloud"' },
+    jsx: 'automatic', logLevel: 'silent',
   })
   ui = await import(pathToFileURL(join(output, 'ui.mjs')).href)
 })
 
 beforeEach(() => {
   requests = []; override = null; directoryRefreshes = 0
-  workspace = ui.createInitialWorkspace()
+  workspace = testWorkspace()
   savedAccess = { workspaceId: metadata.id, tenantId: user.tenantId, etag: '"access-1"', reviewers: [] }
   cloud = frontendWorkspaceContext({ cloud: { user, currentWorkspaceId: metadata.id, workspaces: [{ ...metadata }],
     refreshWorkspaces: async () => { directoryRefreshes++ } } }).cloud
@@ -70,10 +87,7 @@ beforeEach(() => {
     requests.push({ path, method, init })
     const custom = await override?.(path, init)
     if (custom !== undefined) return custom
-    if (path === `/api/workspaces/${metadata.id}/state`) {
-      assert.equal(method, 'GET', 'Read-only providers must not upload sample state')
-      return Response.json({ workspace: structuredClone(workspace), etag: '"state-1"' })
-    }
+    if (path.endsWith('/state')) throw new Error(`Workspace state API must not be used: ${method} ${path}`)
     const base = `/api/workspaces/${metadata.id}/reviewers`
     assert.ok(path === base || path.startsWith(`${base}/`), `${method} ${path}`)
     if (method !== 'GET') assert.equal(init.headers.get('If-Match'), savedAccess.etag, 'The current access-list ETag is mandatory')
@@ -91,7 +105,7 @@ beforeEach(() => {
 })
 
 afterEach(async () => {
-  if (root) { await act(async () => root.unmount()); root = null }
+  if (root) { await act(async () => { root.unmount(); await pause() }); root = null }
 })
 after(async () => {
   dom.window.close()
@@ -240,7 +254,7 @@ function provider(props, capture, apiRef) {
   function Probe() { capture.access = ui.useLifecycleAccess(); return null }
   return element(ui.CloudWorkspaceProvider, {
     workspaceId: metadata.id, user, workspaces: [props], apiRef,
-    onAuthError: message => assert.fail(message), onSignedOut: () => assert.fail('Unexpected sign out'),
+    onSignedOut: () => assert.fail('Unexpected sign out'),
     switchWorkspace: async () => ({ ok: true }), createWorkspace: async () => ({ ok: true }), renameWorkspace: async () => ({ ok: true }),
     refreshWorkspaces: async () => {}, getWorkspaceLifecycleImpact: async () => ({}), changeWorkspaceLifecycle: async () => {},
     leaveUnavailableWorkspace: async () => ({ ok: true }),
@@ -251,52 +265,51 @@ function provider(props, capture, apiRef) {
   })
 }
 
-test('cloud reviewer providers reject sample editing and lifecycle calls without autosaving a read', async () => {
+test('cloud reviewer providers render immediately and reject stale local editing without state reads', async () => {
   const capture = {}, apiRef = { current: null }
   await render(provider({ ...metadata, role: 'reviewer' }, capture, apiRef))
   await settle(() => Boolean(capture.value))
+  assert.deepEqual(capture.value.workspace.jobs, [])
+  assert.deepEqual(capture.value.workspace.documents, [])
+  assert.deepEqual(capture.value.workspace.rubrics, [])
+  assert.deepEqual(capture.value.workspace.lifecycle.entities, {})
   assert.equal(capture.access.canEdit, false)
   assert.equal(capture.access.canManage, false)
   for (const mutate of [
-    () => capture.value.resetDemo(), () => capture.value.addJobs([], 'pdf'), () => capture.value.addResumes([]),
-    () => capture.value.cancelJob(workspace.jobs[0].id), () => capture.value.retryJob(workspace.jobs[0].id),
-    () => capture.value.saveRubric(workspace.rubrics[0]), () => capture.value.startAnalysis([], []),
-    () => capture.value.cancelRun('run'), () => capture.value.retryRun('run'),
-  ]) assert.throws(mutate, /read-only/)
-  await assert.rejects(capture.value.renameEntity({ kind: 'job', id: workspace.jobs[0].id }, 'Forbidden'), /read-only/)
-  await assert.rejects(capture.value.changeLifecycle({ kind: 'job', id: workspace.jobs[0].id }, 'archive'), /role/)
-  await act(async () => { capture.cloud.retrySave(); await apiRef.current.flush() })
-  assert.ok(requests.every(item => item.method === 'GET'))
+    () => capture.value.cancelJob('job-one'), () => capture.value.retryJob('job-one'),
+    () => capture.value.saveRubric(workspace.rubrics[0]),
+    () => capture.value.renameEntity({ kind: 'job', id: 'job-one' }, 'Forbidden'),
+    () => capture.value.getLifecycleImpact({ kind: 'job', id: 'job-one' }),
+  ]) assert.throws(mutate, /no longer available/)
+  await assert.rejects(capture.value.changeLifecycle({ kind: 'job', id: 'job-one' }, 'archive'), /no longer available/)
+  await assert.rejects(capture.value.changeLifecycle({ kind: 'workspace', id: metadata.id }, 'archive'), /role/)
+  assert.ok(apiRef.current.prepareToLeave)
+  assert.equal(requests.some(item => item.path.endsWith('/state')), false)
 })
 
-test('a role downgrade pauses queued sample autosave and conflict overwrite before any network write', async () => {
+test('unavailable provider hides content and keeps the explicit leave modal', async () => {
   const capture = {}, apiRef = { current: null }
-  await render(provider({ ...metadata }, capture, apiRef))
-  await settle(() => Boolean(capture.value))
-  await act(async () => {
-    capture.value.resetDemo()
-    root.render(provider({ ...metadata, role: 'reviewer' }, capture, apiRef))
-  })
-  await act(async () => { await new Promise(resolve => setTimeout(resolve, 800)) })
-  assert.equal(capture.access.canEdit, false)
-  assert.equal(capture.cloud.saveState, 'error')
-  assert.match(capture.cloud.saveError, /role is now Reviewer.*Unsaved drafts are kept/)
-  assert.equal(apiRef.current.hasPendingChanges(), true, 'Previously editable sample changes are not silently discarded')
-  await act(async () => { capture.cloud.retrySave(); await capture.cloud.keepMineAndOverwrite() })
-  assert.ok(requests.every(item => item.method === 'GET'), 'No stale autosave or conflict overwrite can issue a write')
-  assert.equal((await apiRef.current.flush()).ok, false)
-})
-
-test('read-only reviewers still refresh saved sample content when workspace lifecycle metadata changes', async () => {
-  const capture = {}, apiRef = { current: null }
-  const reviewer = { ...metadata, role: 'reviewer' }
-  await render(provider(reviewer, capture, apiRef))
-  await settle(() => Boolean(capture.value))
-  workspace = structuredClone(workspace)
-  workspace.jobs[0].title = 'Updated saved evidence'
-  await render(provider({ ...reviewer, archivedAt: '2026-09-22T14:01:00.000Z' }, capture, apiRef))
-  await settle(() => capture.value.workspace.jobs[0].title === 'Updated saved evidence')
-  assert.equal(capture.access.canEdit, false)
-  assert.ok(requests.filter(item => item.path.endsWith('/state')).length >= 2)
-  assert.ok(requests.every(item => item.method === 'GET'))
+  let left = 0
+  await render(element(ui.CloudWorkspaceProvider, {
+    workspaceId: metadata.id, user, workspaces: [], apiRef,
+    onSignedOut: () => assert.fail('Unexpected sign out'),
+    switchWorkspace: async () => ({ ok: true }), createWorkspace: async () => ({ ok: true }), renameWorkspace: async () => ({ ok: true }),
+    refreshWorkspaces: async () => {}, getWorkspaceLifecycleImpact: async () => ({}), changeWorkspaceLifecycle: async () => {},
+    leaveUnavailableWorkspace: async () => { left++; return { ok: true } },
+    children: (value, cloudValue) => {
+      capture.value = value; capture.cloud = cloudValue
+      return element('p', { 'data-testid': 'private-content' }, 'Private workspace content')
+    },
+  }))
+  await settle(() => document.body.textContent.includes('Workspace access is no longer available'))
+  assert.equal(document.querySelector('[data-testid="private-content"]').closest('[hidden]') !== null, true)
+  await click('Choose another workspace')
+  assert.match(document.body.textContent, /Discard unsaved changes and leave\?/)
+  assert.match(document.body.textContent, /Access has changed/)
+  await click('Keep this tab')
+  assert.equal(left, 0)
+  await click('Choose another workspace')
+  await click('Discard local changes and leave')
+  await settle(() => left === 1)
+  assert.equal(requests.some(item => item.path.endsWith('/state')), false)
 })

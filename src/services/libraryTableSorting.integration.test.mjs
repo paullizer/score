@@ -28,7 +28,7 @@ function job(id, title, fields = {}) {
   return { id, title, organization: `Organization ${id}`, location: 'Remote', grade: '', series: '', arrangement: '', employmentType: '',
     source: 'pdf', sourceLabel: `Source ${id}`, status: 'ready', rubricId: `rubric-${id}`, documentId: `document-${id}`, createdAt: timestamp, ...fields }
 }
-function jobs(kind = 'samples') {
+function jobs(kind = 'real') {
   return freeze([
     job('j-z', 'zeta 10', { createdAt: '2026-09-18T20:30:00-04:00' }),
     job('j-a10', 'Alpha 10', { source: 'website', status: 'generating', createdAt: '2026-09-19T00:15:00Z' }),
@@ -77,10 +77,10 @@ function realResumes() {
     { ...realResume('r-blank', '  ', 'ready', '', '2026-09-13T15:00:00Z'), documentRef: null },
   ])
 }
-function workspaceContext({ jobRows = jobs(), resumeRows = sampleResumes(), cloud = false, workspaceId = 'workspace-one' } = {}) {
+function workspaceContext({ jobRows = jobs('real'), resumeRows = [], cloud = true, workspaceId = 'workspace-one' } = {}) {
   return {
     workspace: freeze({ schemaVersion: 1, jobs: jobRows, resumes: resumeRows, documents: [], runs: [],
-      rubrics: jobRows.map((item) => ({ id: item.rubricId, jobId: item.id, version: 1, criteria: [] })) }),
+      rubrics: jobRows.filter((item) => item.status === 'ready').map((item) => ({ id: item.rubricId, jobId: item.id, version: 1, criteria: [] })) }),
     ...(cloud ? { cloud: { currentWorkspaceId: workspaceId, realJobs: { phase: 'ready', error: null } } } : {}),
     cancelJob: async (id) => { calls.push({ kind: 'cancel-job', id }) },
     retryJob: async (id) => { calls.push({ kind: 'retry-job', id }) },
@@ -128,7 +128,7 @@ before(async () => {
     export { RealAnalysesContext } from './src/app/real-analyses-context';
     export { MemoryRouter, useLocation } from 'react-router-dom';
   ` }, outfile: join(output, 'ui.mjs'), bundle: true, packages: 'external', format: 'esm', platform: 'node',
-    jsx: 'automatic', logLevel: 'silent', define: { 'import.meta.env.VITE_DEPLOYMENT_MODE': '"cloud"' } })
+    jsx: 'automatic', logLevel: 'silent' })
   ui = await import(pathToFileURL(join(output, 'ui.mjs')).href)
 })
 beforeEach(() => {
@@ -149,7 +149,7 @@ after(async () => {
 })
 
 function NavigationProbe() { navigation = ui.useLocation(); return null }
-async function renderPage(Page, { context = workspaceContext(), resumes = resumesApi(), analyses = analysesApi(), url = '/resumes?data=samples' } = {}) {
+async function renderPage(Page, { context = workspaceContext(), resumes = resumesApi(), analyses = analysesApi(), url = '/resumes' } = {}) {
   root ??= createRoot(document.getElementById('root'))
   await act(async () => root.render(React.createElement(ui.MemoryRouter, {
     initialEntries: [url], future: { v7_startTransition: true, v7_relativeSplatPath: true },
@@ -221,9 +221,9 @@ async function segment(group, label) {
 const newestJobs = ['j-z', 'j-a10', 'j-tie', 'j-a2', 'j-cancel', 'j-queue', 'j-parse']
 const attentionJobs = ['j-a2', 'j-cancel', 'j-a10', 'j-queue', 'j-parse', 'j-z', 'j-tie']
 const completeJobs = ['j-z', 'j-tie', 'j-a10', 'j-queue', 'j-parse', 'j-a2', 'j-cancel']
-for (const kind of ['samples', 'real']) test(`${kind} jobs sort all meaningful headers and selector choices, with stable ties and a newest-first reset`, async () => {
-  const items = jobs(kind)
-  const context = workspaceContext({ jobRows: items, cloud: kind === 'real' })
+test('real jobs sort all meaningful headers and selector choices, with stable ties and a newest-first reset', async () => {
+  const items = jobs('real')
+  const context = workspaceContext({ jobRows: items, cloud: true })
   const snapshot = JSON.stringify(context.workspace)
   await renderPage(ui.JobsPage, { context, url: '/jobs' })
   order(newestJobs)
@@ -272,7 +272,8 @@ for (const kind of ['samples', 'real']) test(`${kind} jobs sort all meaningful h
 })
 
 test('jobs keep ready-only and hidden selections through source/status filters, zero matches, and sorting', async () => {
-  await renderPage(ui.JobsPage, { url: '/jobs' })
+  const items = jobs('real')
+  await renderPage(ui.JobsPage, { context: workspaceContext({ jobRows: items }), analyses: analysesApi([target(items[0]), target(items[3])]), url: '/jobs' })
   for (const id of ['j-a10', 'j-a2', 'j-cancel', 'j-queue', 'j-parse']) assert.equal(checkbox(id).disabled, true)
   await click(document.querySelector('input[aria-label="Select all visible ready jobs"]'))
   await sortHeader('Job / organization')
@@ -296,7 +297,7 @@ test('jobs keep ready-only and hidden selections through source/status filters, 
   noMutations()
   await click(button('Analyze selected'))
   assert.equal(navigation.pathname, '/analyses/new')
-  assert.equal(new URLSearchParams(navigation.search).get('rubrics'), 'rubric-j-z,rubric-j-tie')
+  assert.deepEqual(JSON.parse(new URLSearchParams(navigation.search).get('targetSelections')), [target(items[0]).selection, target(items[3]).selection])
   noMutations()
 })
 
@@ -338,43 +339,7 @@ test('real job selection stays read-only while browsing and writable row actions
   assert.equal(row('j-z').querySelector('a[aria-label="Open zeta 10"]').getAttribute('href'), '/jobs/j-z')
 })
 
-test('job real/sample and workspace boundaries reset browsing and selection without persisting anything', async () => {
-  const real = jobs('real')
-  const sample = [job('sample-one', 'Sample role')]
-  const context = workspaceContext({ jobRows: [...real, ...sample], cloud: true })
-  const analyses = analysesApi([target(real[0])])
-  await renderPage(ui.JobsPage, { context, analyses, url: '/jobs' })
-  await click(checkbox('j-z'))
-  await choose('Sort jobs', 'Job title: Z–A')
-  await search('zeta')
-  await choose('Filter by source', 'PDF files')
-  await segment('Filter jobs by status', 'Ready')
-  await segment('Choose real jobs or samples', 'Samples')
-  order(['sample-one'])
-  assert.equal(document.querySelector('input[type="search"]').value, '')
-  assert.equal(selectedOption('Sort jobs'), 'Newest first (default)')
-  assert.equal(selectedOption('Filter by source'), 'All sources')
-  assert.equal(document.querySelector('.selection-bar'), null)
-  await click(checkbox('sample-one'))
-  await search('Sample')
-  await choose('Sort jobs', 'Source type: Z–A')
-  await segment('Choose real jobs or samples', 'Real jobs')
-  order(newestJobs)
-  assert.equal(document.querySelector('.selection-bar'), null)
-  assert.equal(document.querySelector('input[type="search"]').value, '')
-  assert.equal(selectedOption('Sort jobs'), 'Newest first (default)')
-  await click(checkbox('j-z'))
-  await search('zeta')
-  await choose('Sort jobs', 'Job title: A–Z')
-  await renderPage(ui.JobsPage, { context: { ...context, cloud: { ...context.cloud, currentWorkspaceId: 'workspace-two' } }, analyses, url: '/jobs' })
-  order(newestJobs)
-  assert.equal(document.querySelector('.selection-bar'), null)
-  assert.equal(document.querySelector('input[type="search"]').value, '')
-  assert.equal(selectedOption('Sort jobs'), 'Newest first (default)')
-  noMutations()
-})
-
-test('merged Markdown and Word job sources retain filtering, source sorting, selections, and sample resets', async () => {
+test('merged Markdown and Word job sources retain filtering, source sorting, and selections', async () => {
   const items = freeze([
     job('job-docx', 'Zora role', { dataKind: 'real', source: 'docx' }),
     job('job-pdf', 'PDF role', { dataKind: 'real' }),
@@ -383,7 +348,7 @@ test('merged Markdown and Word job sources retain filtering, source sorting, sel
     job('job-url', 'URL role', { dataKind: 'real', source: 'url' }),
     job('job-website', 'Website role', { dataKind: 'real', source: 'website' }),
   ])
-  const context = workspaceContext({ jobRows: [...items, job('sample-one', 'Sample role')], cloud: true })
+  const context = workspaceContext({ jobRows: items, cloud: true })
   context.cloud.realJobs.features = { realJobImports: true, markdownJobImports: false, wordDocumentImports: false }
   const analyses = analysesApi(items.map((item) => target(item)))
   await renderPage(ui.JobsPage, { context, analyses, url: '/jobs' })
@@ -400,88 +365,11 @@ test('merged Markdown and Word job sources retain filtering, source sorting, sel
     if (id !== 'job-docx') assert.match(document.querySelector('.selection-bar').textContent, /including hidden rows/)
   }
   assert.equal(checkbox('job-docx').checked, true)
-  await segment('Choose real jobs or samples', 'Samples')
-  order(['sample-one'])
-  assert.equal(selectedOption('Filter by source'), 'All sources')
-  assert.equal(selectedOption('Sort jobs'), 'Newest first (default)')
-  assert.equal(document.querySelector('.selection-bar'), null)
-  assert.ok([...selector('Filter by source').options].every((option) => !['markdown', 'doc', 'docx'].includes(option.value)))
-  await segment('Choose real jobs or samples', 'Real jobs')
-  order(items.map((item) => item.id))
-  assert.equal(selectedOption('Filter by source'), 'All sources')
-  assert.equal(checkbox('job-docx').checked, false)
-  await click(checkbox('job-docx'))
+  await choose('Filter by source', 'All sources')
+  assert.equal(checkbox('job-docx').checked, true)
   await choose('Filter by source', 'Markdown files')
   await click(button('Analyze selected'))
   assert.deepEqual(JSON.parse(new URLSearchParams(navigation.search).get('targetSelections')), [target(items[0]).selection])
-  noMutations()
-})
-
-test('sample resumes sort displayed text naturally, keep missing fields last, and use the same order for desktop and cards', async () => {
-  const context = workspaceContext()
-  const initial = context.workspace.resumes.map((item) => item.id)
-  const snapshot = JSON.stringify(context.workspace)
-  await renderPage(ui.ResumesPage, { context })
-  order(initial, true)
-  assert.equal(selectedOption('Sort resumes'), 'Default order')
-  assert.equal(document.querySelectorAll('th[aria-sort]').length, 0)
-  assert.equal(document.querySelector('thead th:last-child button'), null, 'Navigation-only profile actions are not sortable')
-  const cases = [
-    ['Candidate', 'Candidate name', ['s-a2', 's-tie', 's-a10', 's-z', 's-missing'], ['s-z', 's-a10', 's-a2', 's-tie', 's-missing']],
-    ['Location', 'Location', ['s-a10', 's-tie', 's-a2', 's-z', 's-missing'], ['s-z', 's-a2', 's-a10', 's-tie', 's-missing']],
-    ['Experience', 'Experience text', ['s-a2', 's-a10', 's-tie', 's-z', 's-missing'], ['s-z', 's-tie', 's-a10', 's-a2', 's-missing']],
-    ['Document label', 'Document label', ['s-a2', 's-a10', 's-tie', 's-z', 's-missing'], ['s-z', 's-a10', 's-tie', 's-a2', 's-missing']],
-  ]
-  for (const [heading, label, ascending, descending] of cases) {
-    await sortHeader(heading)
-    order(ascending, true)
-    activeHeader(heading, 'ascending')
-    assert.equal(selectedOption('Sort resumes'), `${label}: A–Z`)
-    await sortHeader(heading)
-    order(descending, true)
-    activeHeader(heading, 'descending')
-    await choose('Sort resumes', `${label}: A–Z`)
-    order(ascending, true)
-    await choose('Sort resumes', `${label}: Z–A`)
-    order(descending, true)
-  }
-  await choose('Sort resumes', 'Added date: Oldest first')
-  order(['s-missing', 's-a2', 's-a10', 's-tie', 's-z'], true)
-  assert.equal(document.querySelectorAll('th[aria-sort]').length, 0)
-  await choose('Sort resumes', 'Added date: Newest first')
-  order(['s-z', 's-a10', 's-tie', 's-a2', 's-missing'], true)
-  await choose('Sort resumes', 'Default order')
-  order(initial, true)
-  assert.equal(document.querySelectorAll('select[aria-label="Sort resumes"]').length, 1)
-  assert.equal(selector('Sort resumes').closest('.hidden, .mobile-hide'), null)
-  assert.equal(JSON.stringify(context.workspace), snapshot)
-  assert.equal(navigation.search, '?data=samples')
-  noMutations()
-})
-
-test('sample resume selections survive sorting and empty search in both layouts, and navigation uses the selected IDs', async () => {
-  const context = workspaceContext({ cloud: true })
-  await renderPage(ui.ResumesPage, { context })
-  await click(checkbox('s-z'))
-  await choose('Sort resumes', 'Candidate name: A–Z')
-  const mobile = [...document.querySelectorAll('.resume-card')].find((item) => idFromLink(item.querySelector('a.row-title')) === 's-z')
-  assert.equal(mobile.querySelector('input[type="checkbox"]').checked, true)
-  assert.equal(row('s-z').querySelector('a[aria-label="View resume: Zoe 10"]').getAttribute('href'), '/resumes/s-z?data=samples')
-  await search('  ADA 2  ')
-  order(['s-a2', 's-tie'], true)
-  assert.match(document.querySelector('[role="status"]').textContent, /1 selected · 1 hidden by search/)
-  await search('no matches')
-  order([], true)
-  assert.match(document.body.textContent, /No matching resumes/)
-  await choose('Sort resumes', 'Location: Z–A')
-  assert.equal(button('Match to jobs (1)').disabled, false)
-  await click(button('Clear search'))
-  assert.equal(checkbox('s-z').checked, true)
-  noMutations()
-  await click(button('Match to jobs (1)'))
-  assert.equal(navigation.pathname, '/analyses/new')
-  assert.equal(new URLSearchParams(navigation.search).get('resumes'), 's-z')
-  assert.equal(new URLSearchParams(navigation.search).get('data'), 'samples')
   noMutations()
 })
 
@@ -608,7 +496,7 @@ test('sorted real resume actions retain exact IDs and ETags, and pending/read-on
     { kind: 'retry-resume', id: 'r-null', etag: '"r-null-error"' },
     { kind: 'cancel-resume', id: 'r-parse', etag: '"r-parse-parsing"' },
   ])
-  assert.equal(row('r-null').querySelector('a.text-link').getAttribute('href'), '/resumes/r-null?data=real')
+  assert.equal(row('r-null').querySelector('a.text-link').getAttribute('href'), '/resumes/r-null')
   await renderPage(ui.RealResumesPage, { resumes: { ...resumes, pending: (id) => id === 'r-null' }, url: '/resumes?data=real' })
   assert.equal(button('Retry processing', row('r-null')).disabled, true)
   await choose('Sort real resumes', 'Resume label / stated name: A–Z')
@@ -631,54 +519,8 @@ test('sorted real resume actions retain exact IDs and ETags, and pending/read-on
   assert.equal(calls.length, 2)
 })
 
-test('resume workspace and real/sample switches reset both browsing and selection, while provider refreshes do not', async () => {
-  const context = workspaceContext({ cloud: true })
-  const resumes = resumesApi()
-  await renderPage(ui.ResumesPage, { context, resumes, url: '/resumes?data=real' })
-  await click(checkbox('r-z'))
-  await choose('Sort real resumes', 'Resume label / stated name: Z–A')
-  await search('Zoe')
-  await segment('Choose real resumes or samples', 'Samples')
-  order(context.workspace.resumes.map((item) => item.id), true)
-  assert.equal(document.querySelector('input[type="search"]').value, '')
-  assert.equal(selectedOption('Sort resumes'), 'Default order')
-  assert.equal(button('Match to jobs').disabled, true)
-  await click(checkbox('s-z'))
-  await choose('Sort resumes', 'Candidate name: A–Z')
-  await search('Zoe')
-  await renderPage(ui.ResumesPage, { context: { ...context }, resumes: { ...resumes }, url: '/resumes?data=real' })
-  assert.equal(document.querySelector('input[type="search"]').value, 'Zoe')
-  assert.equal(selectedOption('Sort resumes'), 'Candidate name: A–Z')
-  assert.equal(checkbox('s-z').checked, true)
-  await segment('Choose real resumes or samples', 'Real resumes')
-  order(resumes.summaries.map((item) => item.resume.id))
-  assert.equal(document.querySelector('input[type="search"]').value, '')
-  assert.equal(selectedOption('Sort real resumes'), 'Default order')
-  assert.equal(button('Build analysis').disabled, true)
-  await click(checkbox('r-z'))
-  await search('Zoe')
-  await choose('Sort real resumes', 'Resume label / stated name: A–Z')
-  const switched = { ...context, cloud: { ...context.cloud, currentWorkspaceId: 'workspace-two' } }
-  await renderPage(ui.ResumesPage, { context: switched, resumes: { ...resumes, workspaceId: 'workspace-two' }, url: '/resumes?data=real' })
-  assert.equal(document.querySelector('input[type="search"]').value, '')
-  assert.equal(selectedOption('Sort real resumes'), 'Default order')
-  assert.equal(button('Build analysis').disabled, true)
-  await segment('Choose real resumes or samples', 'Samples')
-  assert.equal(selectedOption('Sort resumes'), 'Default order')
-  assert.equal(button('Match to jobs').disabled, true)
-  await click(checkbox('s-z'))
-  await search('Zoe')
-  await choose('Sort resumes', 'Document label: Z–A')
-  await renderPage(ui.ResumesPage, { context, resumes, url: '/resumes?data=real' })
-  assert.equal(document.querySelector('input[type="search"]').value, '')
-  assert.equal(selectedOption('Sort resumes'), 'Default order')
-  assert.equal(button('Match to jobs').disabled, true)
-  noMutations()
-})
-
 for (const [page, label, option, url] of [
   ['JobsPage', 'Sort jobs', 'Processing status: Complete first', '/jobs'],
-  ['ResumesPage', 'Sort resumes', 'Added date: Oldest first', '/resumes?data=samples'],
   ['RealResumesPage', 'Sort real resumes', 'Source label: Z–A', '/resumes?data=real'],
 ]) test(`${page} keeps its sort selector available for an empty library and empty searches`, async () => {
   await renderPage(ui[page], { context: workspaceContext({ jobRows: [], resumeRows: [] }), resumes: resumesApi([]), url })

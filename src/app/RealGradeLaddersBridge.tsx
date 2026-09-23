@@ -306,7 +306,6 @@ export function RealGradeLaddersBridge({ workspaceId, children }: { workspaceId:
     let authorized = false
     await mutationGuard.leave(() => { authorized = true })
     if (!authorized) throw new Error('Lifecycle change cancelled to preserve unsaved grade changes.')
-    await parent.cloud?.flushSave()
     if (!accessRef.current.canManage) throw new Error('Your workspace access changed. Grade lifecycle changes are stopped.')
     const accessStarted = accessRef.current.stamp
     const id = previousOperation?.ladderId ?? match!.family.ladder.id
@@ -410,9 +409,9 @@ export function RealGradeLaddersBridge({ workspaceId, children }: { workspaceId:
     create: (input, key) => {
       const job = workspace.jobs.find((item) => item.id === input.jobId)
       const rubric = workspace.rubrics.find((item) => item.id === input.rubricId && item.jobId === input.jobId)
-      if (!job || job.dataKind !== 'real' || job.status !== 'ready' || job.rubricDeletedAt || !rubric || rubric.dataKind !== 'real' ||
+      if (!job || job.status !== 'ready' || job.rubricDeletedAt || !rubric ||
         isEntityArchived(workspace, { kind: 'job', id: job.id }) || isEntityArchived(workspace, { kind: 'rubric', id: rubric.groupId })) {
-        return Promise.reject(new Error('A ladder requires an active, ready real job and an active saved rubric. Archived or removed seeds are not accepted.'))
+        return Promise.reject(new Error('A ladder requires an active, ready job and an active saved rubric. Archived or removed seeds are not accepted.'))
       }
       return admit(() => mutate(() => api.createGradeLadder(workspaceId, input, key, policy.settings)))
     },
@@ -463,20 +462,10 @@ export function RealGradeLaddersBridge({ workspaceId, children }: { workspaceId:
     changeLifecycle,
     lifecycleOperations: [...(parent.lifecycleOperations ?? []), ...pendingLifecycle],
     saveRubric: (rubric, duplicate) => {
-      if (rubric.kind === 'grade' && (rubric.dataKind === 'real' || versions.some((version) => version.rubric.id === rubric.id))) {
-        throw new Error('Edit real grades in their ladder. They cannot be saved or duplicated into sample content.')
+      if (rubric.kind === 'grade' || versions.some((version) => version.rubric.id === rubric.id)) {
+        throw new Error('Edit grades in their ladder. They cannot be saved or duplicated as job rubrics.')
       }
       return parent.saveRubric(rubric, duplicate)
-    },
-    startAnalysis: (resumeIds, rubricIds, name, failFirst) => {
-      if (rubricIds.some((id) => workspace.rubrics.find((rubric) => rubric.id === id)?.dataKind === 'real')) {
-        throw new Error('Real job and GS grade rubrics cannot use demo scoring, including mixed or directly preselected inputs.')
-      }
-      return parent.startAnalysis(resumeIds, rubricIds, name, failFirst)
-    },
-    resetDemo: () => {
-      parent.resetDemo()
-      parent.notify('Only samples were reset. Real resumes, analyses, jobs, grade ladders, captured sources, and saved versions are unchanged.')
     },
   }}>{children}</WorkspaceContext.Provider></GradeLaddersContext.Provider>
 }

@@ -520,7 +520,7 @@ function RealAnalysesProvider({ workspaceId, children }: { workspaceId: string; 
           setCreationError(null)
         } else {
           scope.cancelReads((key) => key === '$targets')
-          const message = 'New analyses are unavailable because their source or processing dependencies are not enabled. Saved history and frozen evidence remain separate; no samples are substituted.'
+          const message = 'New analyses are unavailable because their source or processing dependencies are not enabled. Saved history and frozen evidence remain available.'
           setCreationError(message)
           targetsRef.current = { state: 'error', error: message }
           setTargets(targetsRef.current)
@@ -657,8 +657,6 @@ function RealAnalysesProvider({ workspaceId, children }: { workspaceId: string; 
 
   async function mutate<T>(runId: string | undefined, operation: () => Promise<T>, commit: (value: T, sequence: number) => void, lifecycle = false, summariesOnly = false): Promise<T> {
     if (lifecycle) {
-      assertRealLifecyclePermission(parentRef.current, workspaceId)
-      await parentRef.current.cloud?.flushSave()
       assertRealLifecyclePermission(parentRef.current, workspaceId)
     } else {
       if (!realWorkspaceWritable(parentRef.current, workspaceId)) throw new Error('This workspace is archived, read-only, or unavailable. An owner or editor must make changes to analyses.')

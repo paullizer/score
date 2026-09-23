@@ -5,14 +5,13 @@ import { client, environment, identifier, request, required, setEnvironment } fr
 const apiVersion = '2026-04-01'
 const sourceName = 'score-demo-guide'
 const knowledgeBaseName = 'score-knowledge'
-const guide = `Score demo guide
+const guide = `Score application guide
 
 Score imports real job PDFs and public job URLs into server-owned workspace job records.
 A durable background worker extracts source text and creates a source-cited, versioned job rubric.
 Job criteria distinguish required and preferred qualifications and include weights and 0-5 scoring guidance.
-Real job rubrics are not evaluated by the demo resume-scoring engine.
-Existing example resume analyses remain simulated. Missing evidence is not proof that a person lacks a skill.
-The Azure application requires Microsoft Entra sign-in and stores personal workspace state privately.
+Analyses start only when explicitly requested. Missing evidence is not proof that a person lacks a skill.
+The Azure application requires Microsoft Entra sign-in and stores workspace records privately.
 Workspace access uses immutable tenant and object IDs, server-side membership checks, and ETag concurrency.
 Real job originals and extracted text are stored in a separate private job-sources container.
 Scanned PDFs use Document Intelligence OCR. Rubric generation uses Foundry with exact source-paragraph citations.
@@ -21,9 +20,9 @@ OPM references are discovered by occupational series; agency PDFs or public URLs
 Grade expectations retain exact citations and require source support and reviewer approval. Unsupported grades remain incomplete drafts.
 Qualification requirements are separate from weighted criteria. A saved grade rubric is not an official OPM classification or eligibility decision.
 Grade records and captured references live in separate private grade-records and grade-sources stores, not shared knowledge retrieval.
-Resume ingestion and scoring remain simulated; whole-site job discovery is not enabled.
+Whole-site job discovery is not enabled.
 This knowledge base contains only this general application guide. Private workspace state, resumes, job descriptions, and grade references are not indexed here.
-Group workspace administration and real resume scoring are future features, not enabled by this knowledge source.
+Group workspace administration is a future feature, not enabled by this knowledge source.
 `
 
 async function withPropagationRetry(action) {

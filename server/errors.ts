@@ -34,6 +34,11 @@ export function notFound(message = 'The requested workspace was not found.'): Ht
   return new HttpError(404, 'not_found', message)
 }
 
+/** A retired endpoint that existed in older releases. */
+export function gone(message: string): HttpError {
+  return new HttpError(410, 'not_found', message)
+}
+
 export function conflict(message = 'This workspace changed since you last loaded it.'): HttpError {
   return new HttpError(409, 'conflict', message)
 }

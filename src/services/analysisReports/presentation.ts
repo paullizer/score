@@ -1,7 +1,7 @@
 import { REPORT_FORMATS, REPORT_LIMITS } from '../../domain/analysis-reports'
 import type {
   AnalysisReport, AnalysisReportFormat, ReportCandidate, ReportCitation, ReportComparison,
-  ReportComparisonStatus, ReportCriterionAssessment, ReportDataKind, ReportEvidenceStatus,
+  ReportComparisonStatus, ReportCriterionAssessment, ReportEvidenceStatus,
   ReportGroup, ReportOverallScore, ReportStatusCounts, ReportTarget,
 } from '../../domain/analysis-reports'
 import type { DocumentPagination } from '../../domain/document-formats'
@@ -9,7 +9,6 @@ import { getDisplayName } from '../../domain/displayNames'
 
 export const REPORT_TITLE = 'Analysis evidence report'
 export const REPORT_HUMAN_REVIEW_NOTICE = 'Highest evidence matches are not hiring recommendations or official GS eligibility findings. A qualified reviewer must inspect the evidence and limitations.'
-export const REPORT_SAMPLE_NOTICE = 'Fictional sample data. Fixed illustrative scores are not real assessments.'
 export const REPORT_CAPTURE_NOTICE = 'This report records a capture interval, not an instantaneous database snapshot. Comparisons unfinished at capture remain unfinished in this report.'
 export const REPORT_FONT_FAMILY = 'Noto Sans'
 export const REPORT_PALETTE = {
@@ -22,7 +21,7 @@ export const REPORT_PALETTE = {
 } as const
 
 export function reportTitle(report: Pick<AnalysisReport, 'dataKind' | 'run' | 'capture'>): string {
-  return `${report.dataKind === 'sample' ? 'Sample ' : ''}${report.capture.settings.policy.title} — ${report.run.name}`
+  return `${report.capture.settings.policy.title} — ${report.run.name}`
 }
 
 export function comparisonStatusLabel(status: ReportComparisonStatus): string {
@@ -94,9 +93,8 @@ export function reportStatusNotice(counts: ReportStatusCounts): string {
     `Partial report: ${description}; ${counts.queued} queued; ${counts.running} running; ${counts.failed} failed; ${counts.cancelled} cancelled.`
 }
 
-export function buildReportNotices(dataKind: ReportDataKind, counts: ReportStatusCounts, additionalFooter = ''): string[] {
+export function buildReportNotices(counts: ReportStatusCounts, additionalFooter = ''): string[] {
   return [
-    ...(dataKind === 'sample' ? [REPORT_SAMPLE_NOTICE] : []),
     REPORT_HUMAN_REVIEW_NOTICE,
     reportStatusNotice(counts),
     REPORT_CAPTURE_NOTICE,
@@ -172,7 +170,7 @@ export function buildComparisonDetailBlocks(target: ReportTarget, comparison: Re
   add(`Status: ${comparisonStatusLabel(comparison.status)}\nOverall score: ${overallScoreLabel(comparison.overall)}`)
   if (comparison.error) add(`Processing error (${comparison.error.code}): ${comparison.error.message}`)
   if (comparison.status === 'complete') {
-    add(`Completion: ${comparison.completion}\nAnalyzed: ${comparison.analyzedAt ?? 'Timestamp not recorded in saved sample'}`)
+    add(`Completion: ${comparison.completion}\nAnalyzed: ${comparison.analyzedAt ?? 'Timestamp not recorded'}`)
     if (comparison.resultSha256) add(`Saved result SHA-256: ${comparison.resultSha256}`)
     add(comparison.summary!)
     if (comparison.coverage) {

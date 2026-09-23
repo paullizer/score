@@ -1,13 +1,6 @@
-import type { Workspace } from '../domain/types'
-import type { CloudSession, CloudSessionIdentity, CloudWorkspaceSnapshot, WorkspaceReviewerAccess, WorkspaceSummary } from '../domain/cloud'
+import type { CloudSession, CloudSessionIdentity, WorkspaceReviewerAccess, WorkspaceSummary } from '../domain/cloud'
 import type { LifecycleAction, LifecycleImpact, LifecycleOperation } from '../domain/lifecycle'
 import { workspaceCanEdit, workspaceCanReview, workspaceQcRole } from '../domain/workspace-permissions'
-
-/**
- * True when this build is deployed against the real Azure-hosted API (Docker/production build sets
- * VITE_DEPLOYMENT_MODE=cloud). Undefined/any other value keeps the original standalone local demo.
- */
-export const CLOUD_MODE = import.meta.env.VITE_DEPLOYMENT_MODE === 'cloud'
 
 export type CloudErrorCode =
   | 'unauthorized' | 'forbidden' | 'not_found' | 'conflict' | 'precondition_required' | 'invalid_request' | 'unavailable'
@@ -29,7 +22,7 @@ export class CloudApiError extends Error {
 /**
  * Thrown whenever a response indicates the user must (re)authenticate: an explicit 401/403, a
  * redirect back to a sign-in page, or a non-JSON (typically HTML) body where an API response was
- * expected. Callers must treat this as a hard sign-in/access failure and never fall back to fixtures.
+ * expected. Callers must treat this as a hard sign-in/access failure and never fall back to other content.
  */
 export class CloudAuthError extends CloudApiError {
   constructor(message: string, code: 'unauthorized' | 'forbidden' = 'unauthorized') {
@@ -84,7 +77,7 @@ let capabilityController = new AbortController()
 let workspaceAccess = new Map<string, AccessEntry>()
 const accessRefreshRequired = new Set<string>()
 
-/** Installed only by the authenticated app. Local samples and isolated service consumers are unchanged. */
+/** Installed only by the authenticated app. Isolated service consumers without a session are unchanged. */
 export function setCloudSessionAccess(session: CloudSession | null): void {
   const identity = session ? JSON.stringify([session.user.tenantId, session.user.id]) : ''
   const sameIdentity = sessionAccess?.identity === identity
@@ -361,17 +354,6 @@ export function addWorkspaceReviewer(
 export function removeWorkspaceReviewer(id: string, objectId: string, etag: string, signal?: AbortSignal): Promise<WorkspaceReviewerAccess> {
   return cloudJsonRequest(`/workspaces/${encodeURIComponent(id)}/reviewers/${encodeURIComponent(objectId)}`, {
     method: 'DELETE', headers: { 'If-Match': etag }, signal,
-  })
-}
-
-export async function loadWorkspaceState(id: string, signal?: AbortSignal): Promise<CloudWorkspaceSnapshot> {
-  return cloudJsonRequest<CloudWorkspaceSnapshot>(`/workspaces/${encodeURIComponent(id)}/state`, { method: 'GET', signal })
-}
-
-export async function saveWorkspaceState(id: string, workspace: Workspace, etag: string, signal?: AbortSignal): Promise<{ etag: string }> {
-  const headers = new Headers({ 'If-Match': etag })
-  return cloudJsonRequest<{ etag: string }>(`/workspaces/${encodeURIComponent(id)}/state`, {
-    method: 'PUT', body: JSON.stringify(workspace), headers, signal,
   })
 }
 

@@ -170,9 +170,9 @@ test('strict additive report fields reject malformed prose, wrong provenance and
     input => { input.targets[0].presentation.title = ' ' },
     input => { input.targets[0].presentation.organization = null },
     input => { input.targets[0].presentation.liveSource = 'mutable job' },
-    input => { input.targets[0].narrative.dataKind = 'sample' },
-    input => { input.comparisons[0].narrative.fixtureId = 'synthetic' },
-    input => { input.comparisons[0].narrative.dataKind = 'sample' },
+    input => { input.targets[0].narrative.dataKind = 'foreign' },
+    input => { input.comparisons[0].narrative.privateMarker = 'synthetic' },
+    input => { input.comparisons[0].narrative.dataKind = 'foreign' },
     input => { input.comparisons[0].narrative.text = 'One short statement.' },
     input => { input.comparisons[0].narrative.overview = 'A sentence with no ending' },
     input => { input.comparisons[0].narrative.overview = 'First complete sentence. Second complete sentence.' },
@@ -240,8 +240,8 @@ test('writer gate validates exact scope membership, complete result/status pins,
     report => { delete report.groups[0].comparisons[0].narrative },
     report => { delete report.groups[0].target.narrative },
     report => { delete report.groups[0].target.presentation },
-    report => { report.groups[0].comparisons[0].dataKind = 'sample' },
-    report => { report.groups[0].target.dataKind = 'sample' },
+    report => { report.groups[0].comparisons[0].dataKind = 'foreign' },
+    report => { report.groups[0].target.dataKind = 'foreign' },
   ]
   for (const mutate of mutations) {
     const report = structuredClone(good)
@@ -297,7 +297,7 @@ test('summary DTOs accept result-bound candidates and legacy reads but reject mi
   assert.equal(api.realAnalysisSummariesResponseSchema.safeParse(legacy).success, true)
 })
 
-test('opt-in shared fixture stamping preserves supplied prose and presentation with deterministic real or sample identities', () => {
+test('opt-in shared fixture stamping preserves supplied prose and presentation with deterministic real identities', () => {
   const real = realReportFixture({ scores: [90], targetCount: 2 })
   const candidate = {
     text: 'The saved resume documents investigations of operational problems using observations from delivered services. Those examples support analytical work within the recorded scope of responsibility. Evidence of broader organizational ownership is not established by those passages.',
@@ -328,94 +328,9 @@ test('opt-in shared fixture stamping preserves supplied prose and presentation w
   assert.notEqual(changedStamp.capture.summaries.revision, stamped.capture.summaries.revision)
   assert.equal(changedStamp.capture.summaries.comparisons[0].narrative.revision, changedStamp.comparisons[0].narrative.revision)
 
-  const saved = api.buildSampleAnalysisReport(api.createInitialWorkspace().runs[0], { generatedAt: REPORT_TEST_TIMESTAMP })
-  const sample = {
-    dataKind: 'sample', run: saved.run, capture: saved.capture, generatedAt: saved.generatedAt,
-    targets: saved.groups.map(group => group.target),
-    comparisons: saved.groups.flatMap(group => group.comparisons.map(comparison => {
-      const copy = structuredClone(comparison)
-      delete copy.rank
-      delete copy.highlighted
-      return copy
-    })),
-  }
-  const sampleOriginal = JSON.stringify(sample)
-  const sampleStamp = withReportNarratives(sample)
-  assert.equal(JSON.stringify(sample), sampleOriginal)
-  assert.equal(sampleStamp.capture.summaries.source, 'fixture')
-  assert.equal(sampleStamp.capture.summaries.dataKind, 'sample')
-  for (const [index, comparison] of sampleStamp.comparisons.entries()) {
-    assert.equal(comparison.narrative.text, sample.comparisons[index].narrative.text)
-    assert.equal(comparison.narrative.dataKind, 'sample')
-    assert.equal(comparison.narrative.fixtureId, sampleStamp.capture.summaries.fixtureId)
-    assert.equal(comparison.narrative.generationId, undefined)
-    assert.equal(comparison.narrative.publishedAt, undefined)
-  }
-  api.requireReportNarratives(api.buildAnalysisReport(sampleStamp))
-  assert.throws(() => reportSummariesFixture(sample), /Only a real-shaped test fixture/)
   const mixed = structuredClone(real)
-  mixed.comparisons[0].narrative.dataKind = 'sample'
-  assert.throws(() => withReportNarratives(mixed), /keep real and sample provenance separate/)
-})
-
-test('sample narratives are deterministic, explicitly fixture-only and isolated from the legacy summaries', () => {
-  const run = api.createInitialWorkspace().runs[0]
-  const original = JSON.stringify(run)
-  const options = { generatedAt: REPORT_TEST_TIMESTAMP }
-  const first = api.buildSampleAnalysisReport(run, options)
-  const second = api.buildSampleAnalysisReport(run, options)
-  assert.deepEqual(first, second)
-  assert.deepEqual(api.buildSampleAnalysisReport(run, { ...options, capture: first.capture }), first)
-  assert.equal(first.capture.summaries.dataKind, 'sample')
-  assert.equal(first.capture.summaries.source, 'fixture')
-  assert.ok(first.capture.summaries.fixtureId)
-  api.requireReportNarratives(first)
-  for (const group of first.groups) {
-    assert.equal(group.target.narrative.dataKind, 'sample')
-    assert.equal(group.target.narrative.fixtureId, first.capture.summaries.fixtureId)
-    assert.equal(group.target.narrative.generationId, undefined)
-    const target = run.targets.find(target => target.id === group.target.id)
-    assert.equal(group.target.presentation.title, target.job?.title ?? target.rubric.name)
-    assert.equal(group.target.presentation.organization, target.job?.organization ?? '')
-    assert.equal(group.target.presentation.description, target.rubric.description)
-    assert.deepEqual(api.targetNarrativeParagraphs(group.target), group.target.narrative.paragraphs)
-    for (const comparison of group.comparisons) {
-      const saved = run.comparisons.find(saved => saved.id === comparison.id)
-      assert.equal(comparison.summary, saved.summary)
-      assert.equal(comparison.overall.score, saved.score)
-      assert.equal(comparison.resultSha256, null)
-      assert.equal(comparison.narrative.dataKind, 'sample')
-      assert.equal(comparison.narrative.fixtureId, first.capture.summaries.fixtureId)
-      assert.ok(!/\.{3}|\u2026/.test(api.candidateNarrativeText(comparison)))
-      assert.ok(api.candidateNarrativeOverview(comparison).length <= 220)
-    }
-  }
-  assert.equal(JSON.stringify(run), original)
-  const wrong = structuredClone(first)
-  wrong.groups[0].comparisons[0].narrative.fixtureId = 'another-fixture'
-  assert.throws(() => api.requireReportNarratives(wrong), /fixture provenance/)
-  const foreign = structuredClone(first.capture)
-  foreign.summaries.fixtureId = 'another-fixture'
-  assert.throws(() => api.buildSampleAnalysisReport(run, { ...options, capture: foreign }), /does not match this frozen fixture/)
-})
-
-test('sample saved useful prose is reused, selected scopes stay exact and fallback metadata never affects real targets', () => {
-  const run = api.createInitialWorkspace().runs[0]
-  const comparison = run.comparisons[0]
-  comparison.summary = 'The fictional resume describes the investigation of service problems using documented observations. These examples support the target analytical work within the scope of the saved fixture. The evidence does not establish broader organizational responsibility beyond those examples.'
-  const report = api.buildSampleAnalysisReport(run, { generatedAt: REPORT_TEST_TIMESTAMP, targetId: comparison.targetId })
-  assert.equal(report.capture.summaries.scope.targetId, comparison.targetId)
-  assert.equal(report.groups.length, 1)
-  const saved = report.groups[0].comparisons.find(saved => saved.id === comparison.id)
-  assert.equal(api.candidateNarrativeText(saved), comparison.summary)
-  const target = structuredClone(report.groups[0].target)
-  delete target.presentation
-  target.label = 'Fixture title - including internal dashes'
-  const prior = JSON.stringify(target)
-  assert.equal(api.reportTargetPresentation(target).title, target.label)
-  assert.equal(JSON.stringify(target), prior)
-  target.dataKind = 'real'
-  assert.throws(() => api.reportTargetPresentation(target), /Frozen job title/)
+  mixed.comparisons[0].narrative.dataKind = 'foreign'
+  assert.throws(() => withReportNarratives(mixed), /real report provenance/)
 })
 
 test('report worker rejects narrative-free PDF, Word and PowerPoint requests before loading a writer or emitting progress', async () => {
@@ -443,7 +358,7 @@ test('report worker rejects narrative-free PDF, Word and PowerPoint requests bef
   }
 })
 
-test('additive presentation and narratives leave real and sample CSV output bytes unchanged', async () => {
+test('additive presentation and narratives leave real CSV output bytes unchanged', async () => {
   const bundled = await build({
     stdin: {
       resolveDir: process.cwd(), loader: 'ts',
@@ -469,17 +384,7 @@ test('additive presentation and narratives leave real and sample CSV output byte
     }))
   }
   const input = realReportFixture({ scores: [90, null, 0], targetCount: 2 })
-  const sample = api.buildSampleAnalysisReport(api.createInitialWorkspace().runs[0], { generatedAt: REPORT_TEST_TIMESTAMP })
-  const legacySample = structuredClone(sample)
-  delete legacySample.capture.summaries
-  for (const group of legacySample.groups) {
-    delete group.target.narrative
-    delete group.target.presentation
-    for (const comparison of group.comparisons) delete comparison.narrative
-  }
-  for (const [legacy, enriched] of [
-    [api.buildAnalysisReport(input), api.buildAnalysisReport(withReportNarratives(input))], [legacySample, sample],
-  ]) {
-    assert.deepEqual(await write(enriched), await write(legacy), `${legacy.dataKind} CSV`)
-  }
+  const legacy = api.buildAnalysisReport(input)
+  const enriched = api.buildAnalysisReport(withReportNarratives(input))
+  assert.deepEqual(await write(enriched), await write(legacy), 'real CSV')
 })

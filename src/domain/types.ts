@@ -4,7 +4,6 @@ import type { UploadFormat } from './document-formats'
 export type SourceKind = UploadFormat | 'url' | 'website'
 export type CriterionKey = 'technical' | 'delivery' | 'analysis' | 'communication' | 'leadership' | 'policy' | 'custom'
 export type JobStatus = 'queued' | 'parsing' | 'generating' | 'ready' | 'error' | 'cancelled'
-export type ComparisonStatus = 'queued' | 'running' | 'complete' | 'failed' | 'cancelled'
 
 export interface DocumentParagraph {
   id: string
@@ -19,7 +18,8 @@ export interface SourceDocument {
   kind: 'job' | 'resume'
   version: number
   paragraphs: DocumentParagraph[]
-  sample: boolean
+  /** Persisted compatibility marker required by server validation and workers; always false. */
+  sample: false
 }
 
 export interface Criterion {
@@ -73,21 +73,6 @@ export interface Job {
   dataKind?: 'real'
 }
 
-export interface Resume {
-  id: string
-  name: string
-  displayName?: string
-  role: string
-  location: string
-  initials: string
-  experience: string
-  documentId: string
-  sourceLabel: string
-  createdAt: string
-  sample: true
-  evidence: Partial<Record<CriterionKey, { score: number; paragraphId: string }>>
-}
-
 export interface Citation {
   documentId: string
   documentVersion: number
@@ -97,65 +82,11 @@ export interface Citation {
   quote: string
 }
 
-export interface CriterionResult {
-  criterionId: string
-  score: number | null
-  evidenceStatus: 'supported' | 'partial' | 'missing' | 'not-assessed'
-  rationale: string
-  citations: Citation[]
-}
-
-export interface AnalysisTarget {
-  id: string
-  kind: 'job' | 'grade'
-  label: string
-  displayName?: string
-  sublabel: string
-  rubric: Rubric
-  job?: Job
-  document?: SourceDocument
-}
-
-export interface ResumeSnapshot {
-  resume: Resume
-  document: SourceDocument
-}
-
-export interface Comparison {
-  id: string
-  resumeId: string
-  targetId: string
-  status: ComparisonStatus
-  score: number | null
-  criteria: CriterionResult[]
-  summary: string
-  error?: string
-}
-
-export interface AnalysisRun {
-  id: string
-  name: string
-  displayName?: string
-  createdAt: string
-  targets: AnalysisTarget[]
-  resumes: ResumeSnapshot[]
-  comparisons: Comparison[]
-}
-
+/** In-memory projection that the real feature bridges fill from server records. */
 export interface Workspace {
-  schemaVersion: 1
   lifecycle?: WorkspaceLifecycle
   jobs: Job[]
-  resumes: Resume[]
   documents: SourceDocument[]
   rubrics: Rubric[]
-  runs: AnalysisRun[]
-}
-
-export interface ImportCandidate {
-  key: string
-  label: string
-  title: string
-  fixtureIndex: number
 }
 import type { PromptExecutionProvenance } from './prompt-versions'

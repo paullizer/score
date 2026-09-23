@@ -18,7 +18,7 @@ before(async () => {
       export * from './src/app/real-request-scope'
     ` },
     outfile: join(output, 'client.mjs'), bundle: true, packages: 'external', format: 'esm', platform: 'node',
-    logLevel: 'silent', define: { 'import.meta.env.VITE_DEPLOYMENT_MODE': '"cloud"' },
+    logLevel: 'silent',
   })
   client = await import(pathToFileURL(join(output, 'client.mjs')).href)
 })
@@ -45,7 +45,7 @@ test('fetch deadlines become understandable typed read errors without replaying 
   deadline()
   const requests = []
   globalThis.fetch = async (url, init) => { requests.push({ url, init }); throw timeout() }
-  await assert.rejects(client.cloudJsonRequest('/workspaces/test/state'), (error) => {
+  await assert.rejects(client.cloudJsonRequest('/workspaces/test/records'), (error) => {
     assert.ok(error instanceof client.CloudTimeoutError)
     assert.ok(error instanceof client.CloudApiError)
     assert.equal(error.status, 408)
@@ -68,7 +68,7 @@ test('JSON, ETag and lifecycle reads normalize deadlines in both success bodies 
           timer.abort(timeout())
           throw new DOMException('The response stream was aborted', 'AbortError')
         })
-        await assert.rejects(request('/workspaces/test/state'), (error) =>
+        await assert.rejects(request('/workspaces/test/records'), (error) =>
           error instanceof client.CloudTimeoutError && error.acknowledgementUnknown === false)
       }
     }
@@ -108,20 +108,20 @@ test('intentional caller cancellation remains AbortError even during body reads 
       timer.abort(timeout())
       throw cancellation
     })
-    await assert.rejects(request('/workspaces/test/state', { signal: caller.signal }), (error) => error === cancellation)
+    await assert.rejects(request('/workspaces/test/records', { signal: caller.signal }), (error) => error === cancellation)
   }
   const caller = new AbortController()
   caller.abort()
   let calls = 0
   globalThis.fetch = async () => { calls++; return Response.json({}) }
-  await assert.rejects(client.cloudJsonRequest('/workspaces/test/state', { signal: caller.signal }), { name: 'AbortError' })
+  await assert.rejects(client.cloudJsonRequest('/workspaces/test/records', { signal: caller.signal }), { name: 'AbortError' })
   assert.equal(calls, 0)
 })
 
 test('non-timeout body and network failures are not swallowed or converted to acknowledgements', async () => {
   for (const error of [new TypeError('Connection interrupted'), new SyntaxError('Malformed API body')]) {
     globalThis.fetch = async () => { throw error }
-    await assert.rejects(client.cloudJsonRequest('/workspaces/test/state'), (caught) => caught === error)
+    await assert.rejects(client.cloudJsonRequest('/workspaces/test/records'), (caught) => caught === error)
   }
   const error = new TypeError('Lifecycle response stream interrupted')
   globalThis.fetch = async () => bodyFailure(503, async () => { throw error })

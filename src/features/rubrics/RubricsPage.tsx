@@ -1,11 +1,10 @@
 import { useEffect, useState } from 'react'
 import { Link, Navigate, useNavigate, useParams, useSearchParams } from 'react-router-dom'
-import { ArrowLeft, ArrowRight, BriefcaseBusiness, FileSearch, Layers3, LoaderCircle } from 'lucide-react'
+import { ArrowLeft, ArrowRight, BriefcaseBusiness, FileSearch, Layers3, LoaderCircle, ShieldCheck } from 'lucide-react'
 import { useWorkspace } from '../../app/workspace-context'
-import { usePublicSettings } from '../../app/public-settings-context'
 import { useLibraryViewState } from '../../app/library-view-state'
 import { DocumentViewer } from '../../components/documents/DocumentViewer'
-import { Badge, Button, DemoNote, EmptyState, InlineError, Modal, PageHeader, SearchField, SegmentedControl } from '../../components/ui'
+import { Badge, Button, EmptyState, InlineError, Modal, PageHeader, SearchField, SegmentedControl } from '../../components/ui'
 import { dateLabel, latestRubrics } from '../../domain/selectors'
 import type { Citation, Criterion, Rubric, Workspace } from '../../domain/types'
 import { documentPagination } from '../../domain/source-files'
@@ -13,70 +12,50 @@ import { RubricPanel } from './RubricPanel'
 import { useGradeLadders } from '../../app/grade-ladders-context'
 import { GradeLadderLibrary } from '../grade-ladders/GradeLadderLibrary'
 import { gradeLadderLink } from '../grade-ladders/gradeUi'
-import { getEntityLifecycle, isEntityArchived, isEntityRemoved, matchesArchiveFilter, sampleLifecycleTargets, type ArchiveFilter } from '../../domain/lifecycle'
+import { isEntityArchived, isEntityRemoved, matchesArchiveFilter, type ArchiveFilter } from '../../domain/lifecycle'
 import { ArchivedBadge, ArchiveStateFilter, EntityLifecycleActions, LifecycleBanner } from '../../components/lifecycle/LifecycleControls'
 import { useLifecycleAccess } from '../../components/lifecycle/useLifecycleAccess'
 import { useRealAnalyses } from '../../app/real-analyses-context'
-import { sampleDataLink } from '../../app/real-data-mode'
 import { realAnalysisLink } from '../analyses/realAnalysisUi'
 import type { RealAnalysisTargetSelection, RealAnalysisTargetSummary } from '../../domain/real-analyses'
 
-function analysisLink(ids: string[], cloud: boolean): string {
-  return sampleDataLink(`/analyses/new?${new URLSearchParams({ rubrics: ids.join(',') }).toString()}`, cloud)
-}
-
 function rubricReady(rubric: Rubric, workspace: Workspace, targets: RealAnalysisTargetSummary[] = []): boolean {
   if (isEntityArchived(workspace, { kind: 'rubric', id: rubric.groupId }) || isEntityRemoved(workspace, { kind: 'rubric', id: rubric.groupId })) return false
-  if (rubric.dataKind === 'real') return targets.some((target) => target.rubricId === rubric.id && target.rubricVersion === rubric.version)
-  return rubric.kind === 'grade' || workspace.jobs.some((job) => job.id === rubric.jobId && job.rubricId === rubric.id && job.status === 'ready' && !job.rubricDeletedAt && !isEntityArchived(workspace, { kind: 'job', id: job.id }) && !isEntityRemoved(workspace, { kind: 'job', id: job.id }))
+  return targets.some((target) => target.rubricId === rubric.id && target.rubricVersion === rubric.version)
 }
 
 function rubricLink(rubric: Rubric): string {
-  const query = rubric.dataKind === 'real' && rubric.jobId ? `?job=${encodeURIComponent(rubric.jobId)}` : ''
+  const query = rubric.jobId ? `?job=${encodeURIComponent(rubric.jobId)}` : ''
   return `/rubrics/${rubric.id}${query}`
 }
 
 function RubricsLibrary() {
-  const { workspace, cloud, notify } = useWorkspace()
-  const { settings } = usePublicSettings()
+  const { workspace, notify } = useWorkspace()
   const navigate = useNavigate()
   const [params, setParams] = useSearchParams()
   const gradeLadders = useGradeLadders()
   const analyses = useRealAnalyses()
   const eligible = analyses?.canWrite && analyses.phase === 'ready' && analyses.features?.realAnalyses && analyses.targets.state === 'ready' && !analyses.targets.error ? analyses.targets.value : []
   const kind = params.get('kind') === 'grade' ? 'grade' : 'job'
-  const libraryKind = cloud && params.get('data') !== 'samples' ? 'real' : 'samples'
-  const [search, setSearch] = useLibraryViewState(`rubrics:${libraryKind}:query`, '')
+  const [search, setSearch] = useLibraryViewState('rubrics:query', '')
   const [selection, setSelection] = useState<string[]>([])
-  const [archiveFilter, setArchiveFilter] = useLibraryViewState<ArchiveFilter>(`rubrics:${libraryKind}:archive`, 'default')
+  const [archiveFilter, setArchiveFilter] = useLibraryViewState<ArchiveFilter>('rubrics:archive', 'default')
   const { canEdit } = useLifecycleAccess()
   const [exactTargets, setExactTargets] = useState<Record<string, RealAnalysisTargetSelection>>({})
-  const rubrics = latestRubrics(workspace).filter((rubric) => libraryKind === 'real' ? rubric.dataKind === 'real' : rubric.dataKind !== 'real')
+  const rubrics = latestRubrics(workspace).filter((rubric) => rubric.kind === 'job')
   const query = search.trim().toLocaleLowerCase()
   const visible = rubrics.filter((rubric) => {
     const job = workspace.jobs.find((item) => item.id === rubric.jobId)
-    return rubric.kind === kind && matchesArchiveFilter(isEntityArchived(workspace, { kind: 'rubric', id: rubric.groupId }), search, archiveFilter) && [
+    return matchesArchiveFilter(isEntityArchived(workspace, { kind: 'rubric', id: rubric.groupId }), search, archiveFilter) && [
       rubric.name, rubric.description, rubric.ladder, rubric.grade, job?.title, job?.organization,
       ...rubric.criteria.map((criterion) => criterion.label),
     ].filter(Boolean).join(' ').toLocaleLowerCase().includes(query)
   })
   const selected = rubrics.filter((rubric) => selection.includes(rubric.id))
   const hiddenCount = selected.filter((rubric) => !visible.some((item) => item.id === rubric.id)).length
-  const groups = new Map<string, Rubric[]>()
-  const familyId = (rubric: Rubric) => getEntityLifecycle(workspace, { kind: 'rubric', id: rubric.groupId })?.parentKey?.replace(/^ladder:/, '') ?? rubric.ladder ?? 'General Schedule'
-  const familyName = (id: string) => rubrics.find((rubric) => rubric.kind === 'grade' && familyId(rubric) === id)?.ladder ?? id
-  for (const rubric of visible) {
-    const group = kind === 'grade' ? familyId(rubric) : 'Linked to your jobs'
-    groups.set(group, [...(groups.get(group) ?? []), rubric])
-  }
-  if (kind === 'grade' && libraryKind === 'samples') {
-    for (const target of sampleLifecycleTargets(workspace).filter((target) => target.kind === 'ladder')) {
-      if (!groups.has(target.id) && matchesArchiveFilter(isEntityArchived(workspace, target), search, archiveFilter) && familyName(target.id).toLocaleLowerCase().includes(query)) groups.set(target.id, [])
-    }
-  }
-  const orderedGroups = [...groups.entries()].sort(([left], [right]) => familyName(left).localeCompare(familyName(right)))
   const readyVisible = visible.filter((rubric) => canEdit && rubricReady(rubric, workspace, eligible))
   const allVisibleSelected = readyVisible.length > 0 && readyVisible.every((rubric) => selection.includes(rubric.id))
+  const gradeCount = gradeLadders?.summaries.reduce((count, family) => count + family.levels.filter((level) => !isEntityArchived(workspace, { kind: 'rubric', id: level.head.id }) && !isEntityRemoved(workspace, { kind: 'rubric', id: level.head.id })).length, 0) ?? 0
 
   function toggle(id: string) {
     choose(selection.includes(id) ? selection.filter((item) => item !== id) : [...selection, id])
@@ -96,11 +75,10 @@ function RubricsLibrary() {
       notify('Archived, removed, or unavailable inputs cannot start a new analysis. Review your selections; nothing was skipped.')
       return
     }
-    if (libraryKind !== 'real') { navigate(analysisLink(items.map((item) => item.id), Boolean(cloud))); return }
-    if (!analyses) { notify('Real analysis selection transfer is unavailable in this workspace.'); return }
+    if (!analyses) { notify('Analysis selection transfer is unavailable in this workspace.'); return }
     const targets = items.map((rubric) => (preserveSelection ? exactTargets[rubric.id] : undefined)
       ?? eligible.find((item) => item.rubricId === rubric.id && item.rubricVersion === rubric.version)?.selection)
-    if (targets.some((item) => !item)) { notify('An exact real target is unavailable. Refresh the eligible targets and review your selection. Nothing was skipped.'); return }
+    if (targets.some((item) => !item)) { notify('An exact saved target is unavailable. Refresh the eligible targets and review your selection. Nothing was skipped.'); return }
     const link = realAnalysisLink({ targets: targets as RealAnalysisTargetSelection[] }, analyses.workspaceId)
     navigate(link.to, { state: link.state })
   }
@@ -119,33 +97,30 @@ function RubricsLibrary() {
       actions={<Button
         icon={ArrowRight}
         variant="primary"
-        disabled={!canEdit || !selected.length || selected.length !== selection.length || selected.some((item) => !rubricReady(item, workspace, eligible)) || (libraryKind === 'real' && (!analyses?.canWrite || analyses.phase !== 'ready' || !analyses.features?.realAnalyses))}
+        disabled={!canEdit || !selected.length || selected.length !== selection.length || selected.some((item) => !rubricReady(item, workspace, eligible)) || !analyses?.canWrite || analyses.phase !== 'ready' || !analyses.features?.realAnalyses}
         onClick={() => analyze(selected, true)}
       >Analyze selected{selected.length ? ` (${selected.length})` : ''}</Button>}
     />
 
     <section className="panel">
-      {cloud && settings?.features.samplesVisible !== false && <div className="library-kind-switcher"><SegmentedControl label="Choose real rubrics or samples" value={libraryKind}
-        onChange={(value) => { choose([]); setParams({ kind, data: value }, { replace: true }) }} options={[{ value: 'real', label: 'Real rubrics' }, { value: 'samples', label: 'Samples' }]} />
-        <span>{libraryKind === 'real' ? 'Private evidence · exact saved versions for real analysis' : 'Fictional job and grade fixtures for demo analysis only.'}</span></div>}
       <div className="library-toolbar">
         <SegmentedControl<'job' | 'grade'>
           label="Rubric type"
           value={kind}
-          onChange={(value) => { choose([]); setParams({ kind: value, data: libraryKind }, { replace: true }) }}
+          onChange={(value) => { choose([]); setParams({ kind: value }, { replace: true }) }}
           options={[
-            { value: 'job', label: 'Job rubrics', count: rubrics.filter((rubric) => rubric.kind === 'job' && !isEntityArchived(workspace, { kind: 'rubric', id: rubric.groupId })).length },
-            { value: 'grade', label: 'GS / grade rubrics', count: libraryKind === 'real' ? gradeLadders?.summaries.reduce((count, family) => count + family.levels.filter((level) => !isEntityArchived(workspace, { kind: 'rubric', id: level.head.id }) && !isEntityRemoved(workspace, { kind: 'rubric', id: level.head.id })).length, 0) ?? 0 : rubrics.filter((rubric) => rubric.kind === 'grade' && !isEntityArchived(workspace, { kind: 'rubric', id: rubric.groupId })).length },
+            { value: 'job', label: 'Job rubrics', count: rubrics.filter((rubric) => !isEntityArchived(workspace, { kind: 'rubric', id: rubric.groupId })).length },
+            { value: 'grade', label: 'GS / grade rubrics', count: gradeCount },
           ]}
         />
         <div className="toolbar"><SearchField value={search} onChange={setSearch} placeholder="Search rubrics, criteria, or grades…" label="Search rubric library" /><ArchiveStateFilter value={archiveFilter} onChange={setArchiveFilter} label="Rubric archive state" /></div>
       </div>
 
-      {!(kind === 'grade' && libraryKind === 'real') && <><div className="flex flex-wrap items-center justify-between gap-3 border-b px-5 py-3">
+      {kind === 'job' && <><div className="flex flex-wrap items-center justify-between gap-3 border-b px-5 py-3">
         <p className="text-[11px] text-muted" role="status" aria-live="polite">
           {selected.length > 0
             ? <><strong className="font-semibold text-accent">{selected.length} selected</strong>{hiddenCount > 0 && ` · ${hiddenCount} outside this view`}</>
-            : libraryKind === 'real' ? 'Select eligible real job rubrics for manual analysis, or inspect approved GS versions in their grade families.' : 'Choose one or more sample rubrics to prefill a demo analysis.'}
+            : 'Select eligible real job rubrics for manual analysis, or inspect approved GS versions in their grade families.'}
         </p>
         <div className="flex items-center gap-4">
           {selected.length > 0 && <button type="button" className="link-button text-[11px]" onClick={() => choose([])}>Clear selection</button>}
@@ -155,35 +130,21 @@ function RubricsLibrary() {
         </div>
       </div>
 
-      {kind === 'grade' && <div className="flex items-start gap-3 border-b px-5 py-4">
-        <Layers3 size={18} className="mt-0.5 shrink-0 text-accent" aria-hidden="true" />
-        <div>
-          <h2 className="text-[12px] font-semibold">Explore a grade, not just a vacancy.</h2>
-          <p className="mt-1 text-[11px] text-muted">Select grades within a family to compare a resume across levels. No job is required. These are illustrative standards, not official qualification guidance.</p>
-        </div>
-      </div>}
-
-      {orderedGroups.length > 0 ? <div className="space-y-7 p-5">
-        {orderedGroups.map(([family, familyRubrics]) => <section key={family} aria-label={kind === 'grade' ? familyName(family) : family}>
+      {visible.length > 0 ? <div className="space-y-7 p-5">
+        <section aria-label="Linked to your jobs">
           <div className="mb-4 flex flex-wrap items-baseline justify-between gap-2">
-            <h2 className="text-[13px] font-semibold">{kind === 'grade' ? familyName(family) : family}</h2>
-            {kind === 'grade' && libraryKind === 'samples' && <div className="flex flex-wrap items-center gap-2"><ArchivedBadge target={{ kind: 'ladder', id: family }} /><EntityLifecycleActions target={{ kind: 'ladder', id: family }} name={familyName(family)} /></div>}
-            <span className="text-[10px] text-muted">
-              {kind === 'grade' ? 'Reusable grade family' : 'Each rubric stays attached to its source job'}
-            </span>
+            <h2 className="text-[13px] font-semibold">Linked to your jobs</h2>
+            <span className="text-[10px] text-muted">Each rubric stays attached to its source job</span>
           </div>
-          {!familyRubrics.length && <p className="text-[11px] text-muted">No grade rubrics match this view. Search or choose Active and archived to inspect retained rubrics. An empty ladder can still be archived or deleted.</p>}
           <div className="grid gap-4 lg:grid-cols-2 2xl:grid-cols-3">
-            {[...familyRubrics].sort((left, right) => (left.grade ?? left.name).localeCompare(right.grade ?? right.name, undefined, { numeric: true })).map((rubric) => {
+            {[...visible].sort((left, right) => (left.grade ?? left.name).localeCompare(right.grade ?? right.name, undefined, { numeric: true })).map((rubric) => {
               const job = workspace.jobs.find((item) => item.id === rubric.jobId)
               const ready = canEdit && rubricReady(rubric, workspace, eligible)
               const checked = selected.some((item) => item.id === rubric.id)
               return <article className={`rubric-card flex min-w-0 flex-col ${checked ? 'border-accent bg-accent-soft' : ''}`} key={rubric.id}>
                 <div className="mb-3 flex items-start justify-between gap-3">
                   <div className="flex flex-wrap items-center gap-2">
-                    {rubric.kind === 'grade'
-                      ? <Layers3 size={16} className="text-muted" aria-hidden="true" />
-                      : <BriefcaseBusiness size={16} className="text-muted" aria-hidden="true" />}
+                    <BriefcaseBusiness size={16} className="text-muted" aria-hidden="true" />
                     <Badge>{rubric.grade ?? job?.grade ?? 'Job-specific'}</Badge>
                     <ArchivedBadge target={{ kind: 'rubric', id: rubric.groupId }} />
                     <span className="text-[10px] text-muted">v{rubric.version}</span>
@@ -194,7 +155,7 @@ function RubricsLibrary() {
                     onChange={() => toggle(rubric.id)}
                     disabled={!ready}
                     aria-label={`Select ${rubric.name}`}
-                    title={ready ? `Select ${rubric.name}, version ${rubric.version}` : rubric.dataKind === 'real' ? 'Real analysis requires an eligible saved target, available processing, and write access.' : 'Finish the linked job import before analysis.'}
+                    title={ready ? `Select ${rubric.name}, version ${rubric.version}` : 'Real analysis requires an eligible saved target, available processing, and write access.'}
                   />
                 </div>
                 <h3><Link to={rubricLink(rubric)} className="row-title text-[14px] leading-5">{rubric.name}</Link></h3>
@@ -211,7 +172,7 @@ function RubricsLibrary() {
                   </ol>
                   {rubric.criteria.length > 3 && <p className="mt-2 text-[10px] text-muted">+ {rubric.criteria.length - 3} more to inspect</p>}
                 </div>
-                {!ready && <p className="mb-3 text-[10px] text-muted">{rubric.dataKind === 'real' ? 'This exact real version is not currently eligible, or analysis processing/write access is unavailable. The sample scorer cannot use it.' : 'The linked job must finish importing before this rubric can be used.'}</p>}
+                {!ready && <p className="mb-3 text-[10px] text-muted">This exact real version is not currently eligible, or analysis processing/write access is unavailable.</p>}
                 <div className="mt-auto flex flex-wrap items-center justify-between gap-2">
                   <Link to={rubricLink(rubric)} className="text-link text-[11px]">Inspect rubric <ArrowRight size={13} aria-hidden="true" /></Link>
                   <Button size="sm" variant="ghost" disabled={!ready} onClick={() => analyze([rubric])}>Use rubric</Button>
@@ -220,26 +181,22 @@ function RubricsLibrary() {
               </article>
             })}
           </div>
-        </section>)}
+        </section>
       </div> : <EmptyState
         icon={Layers3}
-        title={query ? 'No matching rubrics' : kind === 'job' ? 'No job rubrics yet' : 'No grade rubrics available'}
+        title={query ? 'No matching rubrics' : 'No job rubrics yet'}
         description={query
           ? 'Try a different name, criterion, family, or grade. Selections outside this view are kept.'
-          : kind === 'job'
-            ? cloud ? 'Import a real job or inspect the separate sample jobs to prepare a linked rubric.' : 'Add a sample job to prepare its linked rubric, or explore reusable grade standards.'
-            : 'This workspace has no reusable grade standards. Job rubrics are still available in the other view.'}
+          : 'Import a job to prepare its linked, source-grounded rubric.'}
         action={query
           ? <Button onClick={() => setSearch('')}>Clear search</Button>
-          : kind === 'job'
-            ? <Button onClick={() => navigate('/jobs')}>Open jobs</Button>
-            : <Button onClick={() => setParams({ kind: 'job', data: libraryKind }, { replace: true })}>View job rubrics</Button>}
+          : <Button onClick={() => navigate('/jobs')}>Open jobs</Button>}
       />}
       <div className="table-bottom"><span>{visible.length} {visible.length === 1 ? 'rubric' : 'rubrics'} in this view</span><span>Latest versions only · Previous versions are preserved</span></div>
       </>}
-      {kind === 'grade' && libraryKind === 'real' && <GradeLadderLibrary search={search} archiveFilter={archiveFilter} />}
+      {kind === 'grade' && <GradeLadderLibrary search={search} archiveFilter={archiveFilter} />}
     </section>
-    <div className="mt-5"><DemoNote>{cloud ? 'Real job and grade rubrics are private, source-grounded, and excluded from demo scoring. Samples remain fictional. Reset samples never changes real ladders or captured source history.' : 'Generated job rubrics and grade templates use fictional demo content. Every saved version remains inspectable, including the version used by a past analysis.'}</DemoNote></div>
+    <p className="library-note-text mt-5"><ShieldCheck size={16} aria-hidden="true" /><span>Job and grade rubrics are private and source-grounded. Every saved version remains inspectable, including the version used by a past analysis.</span></p>
   </>
 }
 
@@ -255,34 +212,33 @@ function RubricDetail({ id }: { id: string }) {
   const job = workspace.jobs.find((item) => item.id === rubric?.jobId)
   const document = workspace.documents.find((item) => item.id === job?.documentId)
   const requestedJobId = params.get('job') ?? job?.id
-  const realDetail = requestedJobId && cloud ? cloud.realJobs.detail(requestedJobId) : undefined
+  const realDetail = requestedJobId ? cloud.realJobs.detail(requestedJobId) : undefined
   const { canEdit } = useLifecycleAccess({ kind: 'rubric', id: rubric?.groupId ?? id })
 
   useEffect(() => {
-    if (requestedJobId && cloud) void cloud.realJobs.ensureDetail(requestedJobId)
+    if (requestedJobId) void cloud.realJobs.ensureDetail(requestedJobId)
   }, [cloud, requestedJobId])
 
   if (!rubric && requestedJobId && (realDetail?.state === 'idle' || realDetail?.state === 'loading')) return <>
     <Link className="back-link" to="/rubrics"><ArrowLeft size={14} aria-hidden="true" />Back to rubrics</Link>
     <PageHeader title="Loading rubric" description="Retrieving the server-authoritative source and immutable version history." />
-    <section className="panel"><EmptyState icon={LoaderCircle} title="Loading rubric versions" description="Score is opening the real job detail without substituting sample content." /></section>
+    <section className="panel"><EmptyState icon={LoaderCircle} title="Loading rubric versions" description="Score is opening the job detail and its saved rubric versions." /></section>
   </>
 
   if (!rubric) return <>
     <Link className="back-link" to="/rubrics"><ArrowLeft size={14} aria-hidden="true" />Back to rubrics</Link>
     <PageHeader title="Rubric unavailable" description="This rubric version could not be found in the current workspace." />
-    <section className="panel"><EmptyState icon={Layers3} title="This rubric is no longer here" description="It may belong to a workspace that was reset. Open the library to inspect an available version." action={<Button onClick={() => navigate('/rubrics')}>Open rubric library</Button>} /></section>
+    <section className="panel"><EmptyState icon={Layers3} title="This rubric is no longer here" description="It may have been deleted, or it belongs to another workspace. Open the library to inspect an available version." action={<Button onClick={() => navigate('/rubrics')}>Open rubric library</Button>} /></section>
   </>
 
-  const versions = [...(rubric.dataKind === 'real' && realDetail?.state === 'ready'
+  const versions = [...(realDetail?.state === 'ready'
     ? realDetail.value.rubricVersions
     : workspace.rubrics.filter((item) => item.groupId === rubric.groupId)
   )].sort((left, right) => right.version - left.version)
   const current = versions[0] ?? rubric
   const historic = rubric.id !== current.id || rubric.version !== current.version
-  const selectedVersion = rubric.dataKind === 'real' ? rubric : current
-  const realTarget = eligible.find((target) => target.rubricId === selectedVersion.id && target.rubricVersion === selectedVersion.version)
-  const ready = canEdit && rubricReady(selectedVersion, workspace, eligible)
+  const realTarget = eligible.find((target) => target.rubricId === rubric.id && target.rubricVersion === rubric.version)
+  const ready = canEdit && rubricReady(rubric, workspace, eligible)
 
   return <>
     <Link className="back-link" to={`/rubrics?kind=${rubric.kind}`}><ArrowLeft size={14} aria-hidden="true" />Back to rubrics</Link>
@@ -292,20 +248,14 @@ function RubricDetail({ id }: { id: string }) {
       description={rubric.kind === 'grade'
         ? 'A reusable set of expectations. Compare directly to this grade, with or without a job.'
         : 'A job-specific standard, with traceable source references and preserved version history.'}
-      actions={<>{rubric.kind === 'job' && rubric.dataKind === 'real' && <Button icon={Layers3} disabled={!canEdit || !gradeLadders?.canWrite || gradeLadders.phase !== 'ready' || job?.status !== 'ready' || Boolean(job?.rubricDeletedAt)}
+      actions={<>{rubric.kind === 'job' && <Button icon={Layers3} disabled={!canEdit || !gradeLadders?.canWrite || gradeLadders.phase !== 'ready' || job?.status !== 'ready' || Boolean(job?.rubricDeletedAt)}
         title={!gradeLadders?.canWrite ? 'Only an owner or editor in a grade-enabled workspace can create a ladder.' : 'Capture this exact saved job rubric version as a new GS family.'}
         onClick={() => navigate(`/grade-ladders/new?${new URLSearchParams({ job: job!.id, rubric: rubric.id, rubricVersion: String(rubric.version) })}`)}>Create grade ladder</Button>}
-        <Button variant="primary" icon={ArrowRight} disabled={!ready} title={rubric.dataKind === 'real' ? 'Use this exact saved version in a separate real analysis; no newer version is substituted.' : undefined} onClick={() => {
-          if (rubric.dataKind === 'real') {
-            if (realTarget && analyses) {
-              const link = realAnalysisLink({ targets: [realTarget.selection] }, analyses.workspaceId)
-              navigate(link.to, { state: link.state })
-            }
-          }
-          else navigate(analysisLink([current.id], Boolean(cloud)))
-        }}>
-        {historic && rubric.dataKind !== 'real' ? `Analyze with latest (v${current.version})` : 'Analyze with this rubric'}
-      </Button></>}
+        <Button variant="primary" icon={ArrowRight} disabled={!ready} title="Use this exact saved version in a separate analysis; no newer version is substituted." onClick={() => {
+          if (!realTarget || !analyses) return
+          const link = realAnalysisLink({ targets: [realTarget.selection] }, analyses.workspaceId)
+          navigate(link.to, { state: link.state })
+        }}>Analyze with this rubric</Button></>}
     />
     <LifecycleBanner target={{ kind: 'rubric', id: rubric.groupId }} />
     <div className="detail-metadata">
@@ -318,10 +268,10 @@ function RubricDetail({ id }: { id: string }) {
     </div>
     {historic && <div className="info-callout mb-5">
       <Layers3 size={18} aria-hidden="true" />
-      <div><strong>You’re inspecting a preserved version.</strong><p>Past results keep this version unchanged. To edit the rubric, use <Link className="link-button" to={rubricLink(current)}>version {current.version}</Link>. {rubric.dataKind === 'real' ? 'An eligible real version can be selected explicitly for a new analysis without substituting newer criteria.' : 'New sample analyses use the latest active version.'}</p></div>
+      <div><strong>You’re inspecting a preserved version.</strong><p>Past results keep this version unchanged. To edit the rubric, use <Link className="link-button" to={rubricLink(current)}>version {current.version}</Link>. An eligible saved version can be selected explicitly for a new analysis without substituting newer criteria.</p></div>
     </div>}
-    {!ready && <div className="info-callout mb-5"><BriefcaseBusiness size={18} aria-hidden="true" /><div><strong>{rubric.dataKind === 'real' ? 'This exact version is not available for real analysis.' : 'This job rubric is not ready for analysis.'}</strong><p>{rubric.dataKind === 'real' ? 'Confirm real analysis availability and write access, or review the current eligible version. No newer version or sample score will be silently substituted.' : job ? 'Finish or retry the sample job import before starting a comparison.' : 'Its linked job is unavailable. Choose another rubric from the library.'}</p></div></div>}
-    {rubric.dataKind === 'real' && realDetail?.state === 'error' && <div className="mb-5"><InlineError>{realDetail.error} <button className="ml-2 underline" onClick={() => requestedJobId && cloud && void cloud.realJobs.ensureDetail(requestedJobId, true)}>Retry loading</button></InlineError></div>}
+    {!ready && <div className="info-callout mb-5"><BriefcaseBusiness size={18} aria-hidden="true" /><div><strong>This exact version is not available for real analysis.</strong><p>Confirm real analysis availability and write access, or review the current eligible version. No newer version will be silently substituted.</p></div></div>}
+    {realDetail?.state === 'error' && <div className="mb-5"><InlineError>{realDetail.error} <button className="ml-2 underline" onClick={() => requestedJobId && void cloud.realJobs.ensureDetail(requestedJobId, true)}>Retry loading</button></InlineError></div>}
 
     <div className="grid items-start gap-5 xl:grid-cols-[minmax(0,1fr)_280px]">
       <section className="detail-panel">
@@ -338,21 +288,19 @@ function RubricDetail({ id }: { id: string }) {
           <div className="section-heading"><h2>Source &amp; context</h2><FileSearch size={16} className="text-muted" aria-hidden="true" /></div>
           <div className="space-y-4 p-5 text-[11px]">
             <dl className="space-y-4">
-              <div><dt className="mb-1 text-[10px] text-muted">Type</dt><dd>{rubric.dataKind === 'real' ? rubric.provenance?.kind === 'edited' ? 'Reviewer edited · linked to a real job' : 'Generated from source · linked to a real job' : rubric.kind === 'grade' ? 'Reusable, independent grade rubric' : 'Generated demo · linked to a job'}</dd></div>
+              <div><dt className="mb-1 text-[10px] text-muted">Type</dt><dd>{rubric.kind === 'grade' ? 'Reusable grade rubric' : rubric.provenance?.kind === 'edited' ? 'Reviewer edited · linked to a real job' : 'Generated from source · linked to a real job'}</dd></div>
               {rubric.kind === 'grade' ? <>
                 <div><dt className="mb-1 text-[10px] text-muted">Grade family</dt><dd>{rubric.ladder || 'Not specified'}</dd></div>
                 <div><dt className="mb-1 text-[10px] text-muted">Grade</dt><dd>{rubric.grade || 'Not specified'}</dd></div>
               </> : <>
                 <div><dt className="mb-1 text-[10px] text-muted">Linked job</dt><dd>{job ? <><Link to={`/jobs/${job.id}`} className="link-button">{job.title}</Link> <ArchivedBadge target={{ kind: 'job', id: job.id }} /></> : 'Job unavailable'}</dd></div>
                 <div><dt className="mb-1 text-[10px] text-muted">Source label</dt><dd className="break-words">{job?.sourceLabel || 'Source label unavailable'}</dd></div>
-                <div><dt className="mb-1 text-[10px] text-muted">Reference content</dt><dd>{document ? document.sample ? 'Fictional sample document' : 'Actual private source document' : rubric.dataKind === 'real' && realDetail?.state === 'loading' ? 'Loading private source' : 'Source document unavailable'}</dd></div>
+                <div><dt className="mb-1 text-[10px] text-muted">Reference content</dt><dd>{document ? 'Actual private source document' : realDetail?.state === 'loading' ? 'Loading private source' : 'Source document unavailable'}</dd></div>
               </>}
             </dl>
-            <div className="border-t pt-4"><DemoNote>{rubric.kind === 'grade'
-              ? 'Compare resumes to this grade without selecting a job. Guidance is illustrative, not official qualification or eligibility advice.'
-              : rubric.dataKind === 'real'
-                ? 'Every criterion must cite an exact quotation from this parsed source. Saving appends a reviewer-edited version; it never overwrites prior versions.'
-                : 'A source label does not mean its content was read. All source references lead to the fictional sample document.'}</DemoNote></div>
+            <p className="library-note-text border-t pt-4"><ShieldCheck size={16} aria-hidden="true" /><span>{rubric.kind === 'grade'
+              ? 'Grade guidance supports human review. It is not official qualification or eligibility advice.'
+              : 'Every criterion must cite an exact quotation from this parsed source. Saving appends a reviewer-edited version; it never overwrites prior versions.'}</span></p>
           </div>
         </section>
         <section className="detail-panel">
@@ -377,20 +325,19 @@ function RubricDetail({ id }: { id: string }) {
       open={sourceSelection !== null}
       onOpenChange={(open) => { if (!open) setSourceSelection(null) }}
       title="Criterion source"
-      description={rubric.dataKind === 'real' ? `Exact source evidence for ${sourceSelection?.criterion.label ?? 'this criterion'}.` : `Fictional job evidence for ${sourceSelection?.criterion.label ?? 'this criterion'}. This is sample text, not content extracted from the selected source.`}
+      description={`Exact source evidence for ${sourceSelection?.criterion.label ?? 'this criterion'}.`}
       wide
       footer={<><Button onClick={() => setSourceSelection(null)}>Close source</Button>{job && <Button onClick={() => navigate(`/jobs/${job.id}`)}>Open linked job</Button>}</>}
     >
       {document
         ? <DocumentViewer document={document} highlightedId={sourceSelection?.citation?.paragraphId ?? sourceSelection?.criterion.sourceCitations?.[0]?.paragraphId ?? sourceSelection?.criterion.sourceParagraphId} quote={sourceSelection?.citation?.quote ?? sourceSelection?.criterion.sourceCitations?.[0]?.quote}
-          pagination={rubric.dataKind === 'real' ? documentPagination(realDetail?.state === 'ready' ? realDetail.value.source.originalContentType : undefined) : 'pdf-pages'} />
-        : rubric.dataKind === 'real' && (realDetail?.state === 'idle' || realDetail?.state === 'loading')
+          pagination={documentPagination(realDetail?.state === 'ready' ? realDetail.value.source.originalContentType : undefined)} />
+        : realDetail?.state === 'idle' || realDetail?.state === 'loading'
           ? <EmptyState icon={LoaderCircle} title="Loading source document" description="Score is retrieving the parsed source and exact quotations." />
-          : <EmptyState icon={FileSearch} title="Source document unavailable" description={rubric.dataKind === 'real' ? 'The server did not return the parsed source. Refresh this real job and try again.' : 'This sample document is missing from the workspace. Open another rubric to inspect its source.'} />}
+          : <EmptyState icon={FileSearch} title="Source document unavailable" description="The server did not return the parsed source. Refresh this real job and try again." />}
     </Modal>
   </>
 }
-
 export function RubricsPage() {
   const { id } = useParams<{ id: string }>()
   const gradeLadders = useGradeLadders()

@@ -1,16 +1,16 @@
 # Real analysis persistence and API
 
 Real analysis is explicitly started **after** resume import. The server accepts only
-typed real selections and exact document/version/content hashes. It never calls the
-sample scorer, chooses an unapproved draft, drops an invalid selection, or invents a
-score. A run contains 1–500 resume/target pairs. The cap is on the total pair count,
+typed real selections and exact document/version/content hashes. It never chooses
+an unapproved draft, drops an invalid selection, or invents a score. A run contains
+1–500 resume/target pairs. The cap is on the total pair count,
 so 103 resumes against four targets fit in one 412-comparison run. Larger runs use
 the same worker concurrency and bounded processing, not a higher processing rate.
 
 Ready Markdown, DOCX, and legacy DOC resumes/jobs are supported real inputs alongside PDF/HTML.
 Markdown and Word are file-upload only. Those jobs can also appear as captured GS seeds, but
 neither format is an independent agency/OPM reference upload or URL format. None of this starts scoring
-automatically or changes sample-analysis behavior.
+automatically.
 
 ## Composition and authorization
 
@@ -92,7 +92,7 @@ ETag for the run or comparison being acted upon. Summary generation uses a stabl
 ETag. Lists support `limit` (1–100,
 default 50) and opaque `continuationToken` values bound to the workspace/list/run.
 Unknown body/query fields, duplicate selections, stale hashes, foreign IDs,
-sample/mixed input, and unsupported types are rejected. Document access resolves
+non-real, mixed, and unsupported input types are rejected. Document access resolves
 only IDs/versions in the comparison; callers cannot supply blob names.
 If independently imported sources reuse the same document ID/version, document
 lookup returns HTTP 409 rather than selecting a different source by array order.
@@ -712,7 +712,7 @@ realAnalysisDependencyBlockers(
 The participant exposes `setState`, `cancel`, `purge`, `counts`,
 `pendingWorkspaces`, and `resume`. Counts include **every retained run**, including
 archived and cleanup-pending runs (`analyses`, `analysisComparisons`). Workspace
-deletion must combine these with sample-run blockers and must remain blocked
+deletion must combine these with other lifecycle blockers and must remain blocked
 until all runs are explicitly deleted. `purge` also enforces this rule; it is not
 an implicit analysis cascade. Run cleanup precedes resume/grade/job cleanup.
 
@@ -720,7 +720,7 @@ Dependencies come from exact manifest/snapshot bindings, including source resume
 IDs, job IDs, stable logical rubric groups, historical rubric version IDs,
 `gradeHeadId(ladderId, grade)`, ladder IDs, and frozen GS seed jobs/rubrics. No
 mutable live-source lookup is needed. Unreadable dependency storage fails closed.
-Blocker links use `/analyses/<encodedId>?data=real`. A workspace target returns
+Blocker links use `/analyses/<encodedId>`. A workspace target returns
 all retained real runs; an analysis target has no dependent-run blockers.
 
 Delete durably saves the dependency bindings before removing evidence, fences the
@@ -788,7 +788,7 @@ For claim, heartbeat, automatic retry, terminal failure, and result publication,
 write the comparison and the returned progress/state update in **one**
 `store.transact(workspaceId, [...])` with both observed ETags. An API cancellation
 replaces that same run fence, preventing late result publication. The Azure store
-rejects standalone comparison writes and parent counters inconsistent with the
+rejects isolated comparison writes and parent counters inconsistent with the
 transaction's actual pair transitions.
 
 Initialization/cancellation workers should process successive bounded chunks
@@ -913,7 +913,7 @@ public original-file links.
 
 Do not log raw documents, profiles, source URLs, model responses, or validation
 errors containing those values. These are retained private captures, not browser
-sample state; sample reset does not delete them. Failed pre-publication attempts
+state; only authorized lifecycle deletion removes them. Failed pre-publication attempts
 can leave private immutable preparation blobs. Workspace cleanup enumerates
 those private families as well as published runs, retaining terminal fences.
 

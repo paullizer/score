@@ -76,7 +76,7 @@ const criterionDefinition = z.strictObject({
 })
 const targetShape = {
   id,
-  dataKind: z.enum(['real', 'sample']),
+  dataKind: z.literal('real'),
   kind: z.enum(['job', 'grade']),
   label,
   displayName: reportDisplayNameSchema.optional(),
@@ -95,19 +95,14 @@ const targetShape = {
 function validateTarget(target: ReportTarget, context: z.RefinementCtx): void {
   unique(target.criteria.map(criterion => criterion.id), context, 'criterion IDs')
   if (target.narrative && target.narrative.dataKind !== target.dataKind) issue(context, 'Target narrative provenance must match the report data kind.')
-  if (target.dataKind === 'sample') {
-    if (target.selection !== null || target.snapshot !== null) issue(context, 'Sample targets must not contain real snapshot or selection identities.')
-    if (target.id !== target.rubricId) issue(context, 'A sample target must match its saved rubric ID.')
-  } else {
-    if (!target.selection || !target.snapshot) issue(context, 'Real targets require frozen selection and snapshot identities.')
-    if (target.selection?.kind !== target.kind) issue(context, 'Target kind does not match its frozen selection.')
-    if (target.selection?.kind === 'job' &&
-      (target.selection.rubricId !== target.rubricId || target.selection.rubricVersion !== target.rubricVersion)) {
-      issue(context, 'Target rubric does not match its frozen job selection.')
-    }
-    if (target.selection?.kind === 'grade' && target.selection.version !== target.rubricVersion) {
-      issue(context, 'Target rubric version does not match its approved grade selection.')
-    }
+  if (!target.selection || !target.snapshot) issue(context, 'Real targets require frozen selection and snapshot identities.')
+  if (target.selection?.kind !== target.kind) issue(context, 'Target kind does not match its frozen selection.')
+  if (target.selection?.kind === 'job' &&
+    (target.selection.rubricId !== target.rubricId || target.selection.rubricVersion !== target.rubricVersion)) {
+    issue(context, 'Target rubric does not match its frozen job selection.')
+  }
+  if (target.selection?.kind === 'grade' && target.selection.version !== target.rubricVersion) {
+    issue(context, 'Target rubric version does not match its approved grade selection.')
   }
 }
 
@@ -166,7 +161,7 @@ const qualificationSchema = z.strictObject({
 })
 const comparisonShape = {
   id, index: z.number().int().min(0).max(REPORT_LIMITS.maxComparisons - 1),
-  dataKind: z.enum(['real', 'sample']), targetId: id, candidate: candidateSchema, status,
+  dataKind: z.literal('real'), targetId: id, candidate: candidateSchema, status,
   completion: z.enum(['assessed', 'limited']).nullable(), overall: overallSchema, summary: text.nullable(),
   narrative: reportCandidateNarrativeSchema.optional(),
   coverage: coverageSchema.nullable(),
@@ -181,11 +176,7 @@ function validateComparison(comparison: ReportComparison, context: z.RefinementC
   unique(comparison.criteria.map(criterion => criterion.criterionId), context, 'criterion assessments')
   unique(comparison.qualifications.map(qualification => qualification.qualificationId), context, 'qualification assessments')
   if (comparison.narrative && comparison.narrative.dataKind !== comparison.dataKind) issue(context, 'Candidate narrative provenance must match the report data kind.')
-  if (comparison.dataKind === 'sample') {
-    if (comparison.candidate.snapshot || comparison.candidate.documentSha256 || comparison.resultSha256 || comparison.qualifications.length) {
-      issue(context, 'Sample comparisons cannot contain real hashes, snapshots, or GS qualification assessments.')
-    }
-  } else if (!comparison.candidate.snapshot || !comparison.candidate.documentSha256) {
+  if (!comparison.candidate.snapshot || !comparison.candidate.documentSha256) {
     issue(context, 'Real candidates require frozen snapshot and document hashes.')
   }
   if (comparison.status !== 'complete') {
@@ -199,14 +190,12 @@ function validateComparison(comparison: ReportComparison, context: z.RefinementC
   if (comparison.overall.status === 'unavailable' || comparison.completion === null || !comparison.summary?.trim()) {
     issue(context, 'Complete comparisons require a saved assessment and either an available or withheld overall score.')
   }
-  if (comparison.dataKind === 'real') {
-    if (!comparison.resultSha256 || !comparison.analyzedAt || !comparison.coverage) issue(context, 'Completed real comparisons require a result hash, analysis timestamp, and saved coverage.')
-    if (comparison.overall.status === 'withheld' &&
-      !['unassessed-weighted-criteria', 'no-assessable-weight'].includes(comparison.overall.reason)) issue(context, 'Real overall-score withholding must retain a recognized saved reason.')
-    for (const criterion of comparison.criteria) {
-      if (criterion.score !== null && !Number.isInteger(criterion.score)) issue(context, 'Real criterion scores must retain integer 0–5 values.')
-      if (criterion.evidenceStatus === 'not-assessed' && !criterion.limitation) issue(context, 'An unassessed real criterion requires its saved limitation.')
-    }
+  if (!comparison.resultSha256 || !comparison.analyzedAt || !comparison.coverage) issue(context, 'Completed real comparisons require a result hash, analysis timestamp, and saved coverage.')
+  if (comparison.overall.status === 'withheld' &&
+    !['unassessed-weighted-criteria', 'no-assessable-weight'].includes(comparison.overall.reason)) issue(context, 'Real overall-score withholding must retain a recognized saved reason.')
+  for (const criterion of comparison.criteria) {
+    if (criterion.score !== null && !Number.isInteger(criterion.score)) issue(context, 'Real criterion scores must retain integer 0–5 values.')
+    if (criterion.evidenceStatus === 'not-assessed' && !criterion.limitation) issue(context, 'An unassessed real criterion requires its saved limitation.')
   }
   for (const assessment of [...comparison.criteria, ...comparison.qualifications]) {
     for (const citation of assessment.citations) {
@@ -224,15 +213,13 @@ function validateComparison(comparison: ReportComparison, context: z.RefinementC
       coverage.notApplicable !== counts['not-applicable'] || coverage.assessedWeight > coverage.totalWeight + WEIGHT_TOLERANCE) {
       issue(context, 'Saved evidence coverage does not match the criterion assessment states.')
     }
-    if (comparison.dataKind === 'real') {
-      if (comparison.completion === 'assessed' && (coverage.notAssessed > 0 || comparison.overall.status !== 'available')) {
-        issue(context, 'The saved completion state disagrees with the evidence coverage or withheld total.')
-      }
-      if (comparison.overall.status === 'available' && (coverage.totalWeight <= 0 ||
-        Math.abs(coverage.assessedWeight - coverage.totalWeight) > WEIGHT_TOLERANCE ||
-        comparison.criteria.some(criterion => criterion.evidenceStatus === 'not-assessed' && criterion.weight > 0))) {
-        issue(context, 'Unassessed weighted criteria or no assessable weight cannot have an available overall score.')
-      }
+    if (comparison.completion === 'assessed' && (coverage.notAssessed > 0 || comparison.overall.status !== 'available')) {
+      issue(context, 'The saved completion state disagrees with the evidence coverage or withheld total.')
+    }
+    if (comparison.overall.status === 'available' && (coverage.totalWeight <= 0 ||
+      Math.abs(coverage.assessedWeight - coverage.totalWeight) > WEIGHT_TOLERANCE ||
+      comparison.criteria.some(criterion => criterion.evidenceStatus === 'not-assessed' && criterion.weight > 0))) {
+      issue(context, 'Unassessed weighted criteria or no assessable weight cannot have an available overall score.')
     }
   }
 }
@@ -251,9 +238,9 @@ function validateCollection(targets: ReportTarget[], comparisons: ReportComparis
   const targetMap = new Map(targets.map(target => [target.id, target]))
   const candidateIdentities = new Map<string, string>()
   const usedTargets = new Set<string>()
-  for (const target of targets) if (target.dataKind !== dataKind) issue(context, 'Mixed real and sample targets are not allowed.')
+  for (const target of targets) if (target.dataKind !== dataKind) issue(context, 'Targets from another data source are not allowed.')
   for (const comparison of comparisons) {
-    if (comparison.dataKind !== dataKind) issue(context, 'Mixed real and sample comparisons are not allowed.')
+    if (comparison.dataKind !== dataKind) issue(context, 'Comparisons from another data source are not allowed.')
     const candidateIdentity = JSON.stringify(comparison.candidate)
     const existing = candidateIdentities.get(comparison.candidate.id)
     if (existing && existing !== candidateIdentity) issue(context, 'A candidate has inconsistent frozen identities across comparisons.')
@@ -320,8 +307,8 @@ export function parseRealReportBatchResponse(value: unknown): RealReportBatchRes
 }
 
 const reportInputSchema: z.ZodType<AnalysisReportInput> = z.strictObject({
-  dataKind: z.enum(['real', 'sample']),
-  workspaceId: id.optional(),
+  dataKind: z.literal('real'),
+  workspaceId: id,
   run: z.strictObject({ id, name: label, createdAt: timestamp }),
   capture: z.strictObject({
     startedAt: timestamp, completedAt: timestamp,
@@ -331,9 +318,6 @@ const reportInputSchema: z.ZodType<AnalysisReportInput> = z.strictObject({
   targets: z.array(reportTargetSchema).min(1).max(REPORT_LIMITS.maxTargets),
   comparisons: z.array(reportComparisonSchema).min(1).max(REPORT_LIMITS.maxComparisons),
 }).superRefine((input, context) => {
-  if ((input.dataKind === 'real' && !input.workspaceId) || (input.dataKind === 'sample' && input.workspaceId !== undefined)) {
-    issue(context, 'Real reports require a workspace; sample reports must not claim a real workspace.')
-  }
   if (Date.parse(input.capture.startedAt) > Date.parse(input.capture.completedAt) || Date.parse(input.capture.completedAt) > Date.parse(input.generatedAt)) {
     issue(context, 'The capture interval and generation timestamp must be in chronological order.')
   }
@@ -419,7 +403,7 @@ export function buildAnalysisReport(input: AnalysisReportInput, options: Analysi
   const report: AnalysisReport = {
     schemaVersion: ANALYSIS_REPORT_SCHEMA_VERSION,
     dataKind: source.dataKind,
-    ...(source.workspaceId === undefined ? {} : { workspaceId: source.workspaceId }),
+    workspaceId: source.workspaceId,
     run: source.run,
     capture: { ...source.capture, settings },
     generatedAt: source.generatedAt,
@@ -427,7 +411,7 @@ export function buildAnalysisReport(input: AnalysisReportInput, options: Analysi
     candidateCount: new Set(comparisons.map(comparison => comparison.candidate.id)).size,
     counts,
     partial: counts.complete !== counts.total,
-    notices: buildReportNotices(source.dataKind, counts, settings.policy.additionalFooter),
+    notices: buildReportNotices(counts, settings.policy.additionalFooter),
     groups: targets.map(target => buildGroup(target, comparisons.filter(comparison => comparison.targetId === target.id), settings.policy)),
   }
   assertReportResourceLimits(report, limits.maxInputBytes)

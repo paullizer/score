@@ -102,8 +102,7 @@ before(async () => {
       export { gradeHeadId } from './src/domain/real-grades'
       export { MemoryRouter, Routes, Route, useNavigate } from 'react-router-dom'
     ` },
-    outfile: join(directory, 'ui.mjs'), bundle: true, packages: 'external', format: 'esm', platform: 'node', jsx: 'automatic',
-    define: { 'import.meta.env.VITE_DEPLOYMENT_MODE': '"cloud"' }, logLevel: 'silent',
+    outfile: join(directory, 'ui.mjs'), bundle: true, packages: 'external', format: 'esm', platform: 'node', jsx: 'automatic', logLevel: 'silent',
   })
   ui = await import(pathToFileURL(join(directory, 'ui.mjs')).href)
 })
@@ -137,7 +136,7 @@ beforeEach(() => {
       if (method === 'GET') return json({ impact: {
         target: { kind: collection === 'resumes' ? 'resume' : 'analysis', id }, name: (record.resume ?? record.run).name,
         counts: { records: 1 }, blockers: collection === 'resumes' ? state.analyses.filter((run) => run.resumes.some((item) => item.selection.resumeId === id))
-          .map((item) => ({ kind: 'analysis', id: item.run.id, name: item.run.name, href: `/analyses/${item.run.id}?data=real` })) : [],
+          .map((item) => ({ kind: 'analysis', id: item.run.id, name: item.run.name, href: `/analyses/${item.run.id}` })) : [],
       } })
       assert.equal(init.headers.get('If-Match'), record.etag, 'Lifecycle mutations use the freshly read exact target ETag')
       const { action } = JSON.parse(init.body)
@@ -264,13 +263,13 @@ test('default cloud resume mode combines archive search, sorting, Word evidence 
   const header = document.querySelector('thead th button[aria-label^="Sort Resume label / stated name"]')
   await act(async () => header.click())
   assert.deepEqual([...document.querySelectorAll('tbody a.row-title')].map((item) => item.textContent), ['Ada 10', 'Zeta 2'])
-  await navigate('/resumes/resume-word?data=real')
+  await navigate('/resumes/resume-word')
   await settle(() => document.querySelector('.document-viewer'))
   assert.match(document.body.textContent, /Formatted Word preview/)
   assert.match(document.querySelector('.document-viewer').textContent, /Captured source section 1/)
   assert.match(document.querySelector('a[download]').href, /\/api\/workspaces\/workspace-one\/resumes\/resume-word\/original$/)
-  assert.equal(current.workspace.workspace.resumes.length, 0)
-  assert.equal(current.workspace.workspace.runs.length, 0)
+  assert.equal(current.workspace.workspace.resumes, undefined)
+  assert.equal(current.workspace.workspace.runs, undefined)
   assert.equal(current.workspace.workspace.documents.length, 0)
   assert.equal(current.workspace.workspace.lifecycle.entities['resume:resume-markdown'].archivedAt, timestamp)
   assert.equal(JSON.stringify(parent.workspace), original)
@@ -297,7 +296,7 @@ test('input archive preserves in-progress real snapshots and archived analyses r
   const impact = await current.workspace.getLifecycleImpact({ kind: 'resume', id: 'resume-word' })
   assert.deepEqual(impact.blockers.map((item) => item.id), ['run-one'])
   await act(async () => assert.rejects(current.workspace.changeLifecycle({ kind: 'resume', id: 'resume-word' }, 'delete'), /changed in another session/))
-  await navigate('/analyses/run-one?data=real')
+  await navigate('/analyses/run-one')
   assert.equal([...document.querySelectorAll('button')].find((item) => item.textContent === 'New run with these inputs').disabled, true)
   assert.equal([...document.querySelectorAll('button')].find((item) => item.textContent === 'Cancel unfinished').disabled, true)
   assert.deepEqual(current.analyses.detail('run-one').value.resumes, before.resumes)
@@ -327,7 +326,7 @@ test('real lifecycle dialog survives filtered rows and incomplete acknowledgemen
   assert.equal(posts.length, 2)
   assert.equal(posts[1].headers.get('If-Match'), '"new-authoritative-version"')
   assert.equal(current.workspace.lifecycleOperations.length, 0)
-  assert.equal(current.workspace.workspace.resumes.length, 0)
+  assert.equal(current.workspace.workspace.resumes, undefined)
 })
 
 test('cold deletion recovery clears documents, discovers pending status and never reports success on 202', async () => {
@@ -347,7 +346,7 @@ test('cold deletion recovery clears documents, discovers pending status and neve
 })
 
 test('pending real analysis deletion clears frozen caches, locks only that run and retries its current run ETag', async () => {
-  await mount('/analyses/run-one?data=real')
+  await mount('/analyses/run-one')
   await act(async () => current.analyses.ensureComparison('run-one', 'pair-one'))
   state.responses.push(({ record }) => {
     const operation = { id: randomUUID(), action: 'delete', status: 'failed', updatedAt: timestamp, error: 'Analysis cleanup is incomplete.' }
@@ -366,7 +365,7 @@ test('pending real analysis deletion clears frozen caches, locks only that run a
   assert.equal(state.requests.filter((item) => item.method === 'POST').at(-1).headers.get('If-Match'), '"latest-run-recovery"')
   assert.equal(current.workspace.lifecycleOperations.length, 0)
   assert.equal(current.analyses.summaries.length, 0)
-  assert.equal(current.workspace.workspace.runs.length, 0)
+  assert.equal(current.workspace.workspace.runs, undefined)
 })
 
 test('real restore changes only the item flag under an archived workspace and viewer lifecycle writes stay blocked', async () => {
@@ -450,7 +449,7 @@ test('authoritative refresh overlapping retained detail reads settles current re
 
 test('real direct preselection, archived grade heads and deleted job rubrics cannot enter a new 500-pair run', async () => {
   state.resumes[0].lifecycle = { archivedAt: timestamp }
-  await mount('/analyses/new?data=real&resumes=resume-word&jobs=job-one')
+  await mount('/analyses/new?resumes=resume-word&jobs=job-one')
   await settle(() => [...document.querySelectorAll('button')].some((item) => item.textContent === 'Run analysis'))
   const run = [...document.querySelectorAll('button')].find((item) => item.textContent === 'Run analysis')
   assert.equal(run.disabled, true)

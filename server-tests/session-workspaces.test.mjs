@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import {
   ALLOWED_OID, OTHER_ALLOWED_OID, authHeaders, createFakeAccessStore, createFakeDirectoryStore,
-  createFakeStateStore, defaultPersonalWorkspaceId, membershipFor, principalKeyFor, sampleWorkspaceBody,
+  createFakeStateStore, defaultPersonalWorkspaceId, membershipFor, principalKeyFor, legacyStateBody,
   seedWorkspace, startTestServer, TENANT_ID,
 } from './helpers.mjs'
 
@@ -34,8 +34,7 @@ test('concurrent first sessions and workspace lists are pure even for admins or 
   directory.createWorkspace = unexpectedWrite
   directory.replaceMetadata = unexpectedWrite
   directory.changeMembership = unexpectedWrite
-  state.createState = unexpectedWrite
-  state.putState = unexpectedWrite
+  state.deleteState = unexpectedWrite
   const server = await startTestServer({ directory, state, accessStore: createFakeAccessStore([{ userId: ALLOWED_OID }]) })
   try {
     const responses = await Promise.all(
@@ -83,7 +82,7 @@ test('legacy deterministic personal workspaces remain accessible without rewriti
     id: 'workspace', workspaceId: id, name: 'Existing personal workspace', kind: 'personal',
     ownerId: principalId, tenantId: TENANT_ID, createdAt: '2026-01-01T00:00:00.000Z', updatedAt: '2026-01-02T00:00:00.000Z',
   }
-  await server.state.createState(id, JSON.stringify(sampleWorkspaceBody()))
+  server.state._setRawContent(id, JSON.stringify(legacyStateBody()))
   await server.directory.createWorkspace(metadata, membershipFor(id, { oid: ALLOWED_OID, role: 'owner' }))
   const before = await server.directory.getMetadata(id)
   const state = await server.state.getState(id)
@@ -98,7 +97,7 @@ test('legacy deterministic personal workspaces remain accessible without rewriti
   const missing = await fetch(`${server.baseUrl}/api/session`, { headers: authHeaders() })
   assert.equal((await missing.json()).workspaces[0].id, id)
   assert.equal(await server.state.getState(id), undefined)
-  assert.equal((await fetch(`${server.baseUrl}/api/workspaces/${id}/state`, { headers: authHeaders() })).status, 503)
+  assert.equal((await fetch(`${server.baseUrl}/api/workspaces/${id}/lifecycle`, { headers: authHeaders() })).status, 200)
   assert.deepEqual(await server.directory.getMetadata(id), before)
 })
 
@@ -108,7 +107,7 @@ test('A workspace is invisible and inaccessible to a principal who is not a memb
     const ownerSession = await fetch(`${server.baseUrl}/api/session`, { headers: authHeaders({ oid: ALLOWED_OID }) })
     const ownerId = (await ownerSession.json()).workspaces[0].id
 
-    const strangerState = await fetch(`${server.baseUrl}/api/workspaces/${ownerId}/state`, {
+    const strangerState = await fetch(`${server.baseUrl}/api/workspaces/${ownerId}/lifecycle`, {
       headers: authHeaders({ oid: OTHER_ALLOWED_OID }),
     })
     assert.equal(strangerState.status, 404)
@@ -205,8 +204,8 @@ test('Malformed JSON bodies are rejected with 400, not a 500', async () => {
   }
 })
 
-test('sampleWorkspaceBody fixture is schema-valid enough to be reused across tests', () => {
-  const workspace = sampleWorkspaceBody()
+test('legacyStateBody fixture represents the deleted state.json shape', () => {
+  const workspace = legacyStateBody()
   assert.equal(workspace.schemaVersion, 1)
   assert.deepEqual(workspace.jobs, [])
 })

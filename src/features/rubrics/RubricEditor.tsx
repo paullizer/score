@@ -1,12 +1,12 @@
 import { useEffect, useId, useMemo, useRef, useState, type FormEvent, type ReactNode } from 'react'
-import { FileText, History, Plus, Save, Sparkles, Trash2 } from 'lucide-react'
+import { FileText, History, Plus, Save, ShieldCheck, Sparkles, Trash2 } from 'lucide-react'
 import { useWorkspace } from '../../app/workspace-context'
 import { usePublicSettings } from '../../app/public-settings-context'
 import { useGradeLeaveGuard } from '../../app/grade-navigation-context'
-import { Badge, Button, DemoNote, InlineError, Modal } from '../../components/ui'
+import { Badge, Button, InlineError, Modal } from '../../components/ui'
 import { DocumentViewer } from '../../components/documents/DocumentViewer'
 import type { Criterion, Rubric } from '../../domain/types'
-import { validateRubric } from '../../services/mockWorkspace'
+import { validateRubric } from '../../domain/rubric-validation'
 import { LifecycleBanner } from '../../components/lifecycle/LifecycleControls'
 import { useLifecycleAccess } from '../../components/lifecycle/useLifecycleAccess'
 import { documentPagination, isUploadFormat, UPLOAD_CONTENT_TYPES } from '../../domain/document-formats'
@@ -56,31 +56,30 @@ export function RubricEditor({ rubric, onClose, onSaved, initialPanel = null, in
   const formId = useId()
   const errorsId = useId()
   const weightHintId = useId()
-  const real = rubric.dataKind === 'real'
   const job = workspace.jobs.find((item) => item.id === rubric.jobId)
-  const detail = real && job && cloud ? cloud.realJobs.detail(job.id) : undefined
+  const detail = job ? cloud.realJobs.detail(job.id) : undefined
   const detailDocument = detail?.state === 'ready' ? detail.value.document : undefined
   const document = detailDocument ?? workspace.documents.find((item) => item.id === job?.documentId)
-  const source = real && job && cloud ? cloud.realJobs.source(job.id) : undefined
-  const pagination = real ? documentPagination(source?.originalContentType ?? (job && isUploadFormat(job.source) ? UPLOAD_CONTENT_TYPES[job.source] : undefined)) : 'pdf-pages'
-  const assistantAvailable = Boolean(real && job && document && detail?.state === 'ready' && cloud?.realJobs.features?.rubricAssistant && canEdit)
-  const assistantUnavailableReason = real && job && canEdit && cloud && !assistantAvailable
+  const source = job ? cloud.realJobs.source(job.id) : undefined
+  const pagination = documentPagination(source?.originalContentType ?? (job && isUploadFormat(job.source) ? UPLOAD_CONTENT_TYPES[job.source] : undefined))
+  const assistantAvailable = Boolean(job && document && detail?.state === 'ready' && cloud.realJobs.features?.rubricAssistant && canEdit)
+  const assistantUnavailableReason = job && canEdit && !assistantAvailable
     ? detail?.state !== 'ready' ? 'Load this real job before asking AI assist.'
     : !cloud.realJobs.features?.rubricAssistant ? 'AI assist is not available for this workspace right now.'
     : !document ? 'Load the job posting before asking AI assist.' : null
     : null
-  const maxCriteria = Math.min(20, settings?.rubrics.jobs.maxCriteria ?? cloud?.realJobs.features?.limits.maxCriteria ?? 20)
+  const maxCriteria = Math.min(20, settings?.rubrics.jobs.maxCriteria ?? cloud.realJobs.features?.limits.maxCriteria ?? 20)
 
   function versionId(version: Rubric): string {
     return `${version.id}:${version.version}`
   }
 
   function savedVersionRubrics(): Rubric[] {
-    const versions = real && detail?.state === 'ready' ? detail.value.rubricVersions : workspace.rubrics.filter((item) => item.groupId === rubric.groupId)
+    const versions = detail?.state === 'ready' ? detail.value.rubricVersions : workspace.rubrics.filter((item) => item.groupId === rubric.groupId)
     return [...versions].sort((left, right) => right.version - left.version)
   }
 
-  const savedRubrics = useMemo(savedVersionRubrics, [detail, real, rubric.groupId, workspace.rubrics])
+  const savedRubrics = useMemo(savedVersionRubrics, [detail, rubric.groupId, workspace.rubrics])
   const previewRubric = savedRubrics.find((item) => versionId(item) === previewVersionId) ?? null
   const savedVersions: SavedAssistVersion[] = savedRubrics.map((version, index, versions) => {
     const previous = versions.find((item) => item.version === version.version - 1)
@@ -104,7 +103,7 @@ export function RubricEditor({ rubric, onClose, onSaved, initialPanel = null, in
 
   const conversation = useAssistConversation<RubricAssistResponse>({
     send: ({ instruction, focusId, conversation, signal }) => {
-      if (!cloud || !job) throw new Error('The rubric assistant is not available for this workspace.')
+      if (!job) throw new Error('The rubric assistant is not available for this workspace.')
       return cloud.realJobs.assistRubric(job.id, {
         submissionId: crypto.randomUUID(),
         base: { rubricId: rubric.id, version: rubric.version },
@@ -154,7 +153,7 @@ export function RubricEditor({ rubric, onClose, onSaved, initialPanel = null, in
   // Only saves are "pending" writes; an in-flight assistant request is read-only and is cancelled if the editor closes.
   const guard = useGradeLeaveGuard(session.dirty || conversation.turns.length > 0, saving, `Rubric: ${rubric.name}${conversation.turns.length > 0 ? ' (and assistant conversation)' : ''}`)
   const locked = saving || conversation.pending || !canEdit
-  const realErrors = real ? session.draft.criteria.flatMap((criterion, index) => {
+  const realErrors = session.draft.criteria.flatMap((criterion, index) => {
     const label = `Criterion ${index + 1}`
     const result: string[] = []
     if (!criterion.requirementType) result.push(`${label} must be marked required or preferred.`)
@@ -166,8 +165,8 @@ export function RubricEditor({ rubric, onClose, onSaved, initialPanel = null, in
       else if (!paragraph.text.includes(citation.quote.trim())) result.push(`${label}'s quotation must exactly match text in the selected source paragraph.`)
     }
     return result
-  }) : []
-  if (real && session.draft.criteria.length > maxCriteria && session.draft.criteria.some(criterion => !rubric.criteria.some(previous => previous.id === criterion.id))) realErrors.push(`Adding new criteria is limited to ${maxCriteria}. Existing saved criteria remain editable.`)
+  })
+  if (session.draft.criteria.length > maxCriteria && session.draft.criteria.some(criterion => !rubric.criteria.some(previous => previous.id === criterion.id))) realErrors.push(`Adding new criteria is limited to ${maxCriteria}. Existing saved criteria remain editable.`)
   const errors = [...validateRubric(session.draft), ...realErrors]
   const total = session.draft.criteria.reduce((sum, criterion) => sum + criterion.weight, 0)
   const balanced = Number.isFinite(total) && Math.abs(total - 100) <= 0.000001
@@ -183,14 +182,14 @@ export function RubricEditor({ rubric, onClose, onSaved, initialPanel = null, in
   }
 
   function addCriterion() {
-    if (real && session.draft.criteria.length >= maxCriteria) {
+    if (session.draft.criteria.length >= maxCriteria) {
       setError(`Real job rubrics may contain no more than ${maxCriteria} criteria.`)
       return
     }
     const id = crypto.randomUUID()
     edit([criterionPresenceKey(id)], 'Added criterion', draft => ({
       ...draft,
-      criteria: [...draft.criteria, { id, key: 'custom', label: '', description: '', guidance: '', weight: 0, ...(real ? { requirementType: 'required' as const, sourceCitations: [] } : {}) }],
+      criteria: [...draft.criteria, { id, key: 'custom', label: '', description: '', guidance: '', weight: 0, requirementType: 'required' as const, sourceCitations: [] }],
     }))
   }
 
@@ -262,7 +261,7 @@ export function RubricEditor({ rubric, onClose, onSaved, initialPanel = null, in
     try {
       const id = await saveRubric({
         ...session.draft,
-        ...(real && session.draft.provenance ? { provenance: { ...session.draft.provenance, kind: 'edited' as const } } : {}),
+        ...(session.draft.provenance ? { provenance: { ...session.draft.provenance, kind: 'edited' as const } } : {}),
         name: session.draft.name.trim(),
         description: session.draft.description.trim(),
         criteria: session.draft.criteria.map((criterion) => ({
@@ -270,7 +269,8 @@ export function RubricEditor({ rubric, onClose, onSaved, initialPanel = null, in
           label: criterion.label.trim(),
           description: criterion.description.trim(),
           guidance: criterion.guidance.trim(),
-          ...(real ? { sourceParagraphId: criterion.sourceCitations?.[0]?.paragraphId, sourceCitations: criterion.sourceCitations?.map((citation) => ({ ...citation, quote: citation.quote.trim() })) } : {}),
+          sourceParagraphId: criterion.sourceCitations?.[0]?.paragraphId,
+          sourceCitations: criterion.sourceCitations?.map((citation) => ({ ...citation, quote: citation.quote.trim() })),
         })),
       })
       guard.release()
@@ -313,7 +313,6 @@ export function RubricEditor({ rubric, onClose, onSaved, initialPanel = null, in
       <div className="mb-4 flex flex-wrap items-center justify-between gap-2">
         <div className="flex flex-wrap items-center gap-2">
           {addedBy && <Badge tone={addedBy === 'ai' ? 'accent' : 'neutral'}>New · {addedBy === 'ai' ? 'AI assist' : 'You'}</Badge>}
-          {criterion.key === 'custom' ? <Badge tone="warning">Custom · not assessed in demo</Badge> : <Badge>Sample scoring: {criterion.key}</Badge>}
         </div>
         <div className="flex flex-wrap items-center gap-2">
           {assistantAvailable && <Button icon={Sparkles} size="sm" variant="ghost" aria-label={`Ask AI about criterion ${index + 1}`} onClick={() => { setFocusCriterionId(criterion.id); setActivePanel('assist') }}>Ask AI</Button>}
@@ -331,11 +330,11 @@ export function RubricEditor({ rubric, onClose, onSaved, initialPanel = null, in
       </div>
       {changedField(descriptionKey, 'Description', describedBy => <label className="field mt-4"><span className="field-label">Description</span><textarea className="input" rows={2} value={criterion.description} onBlur={session.endGroup} onChange={(event) => updateCriterion(criterion.id, { description: event.target.value }, [descriptionKey], 'Edited criterion description')} placeholder="Describe the experience or evidence to consider." required aria-describedby={describedBy} aria-invalid={attempted && !criterion.description.trim()} /></label>, Boolean(addedBy))}
       {changedField(guidanceKey, 'Score guidance', describedBy => <label className="field"><span className="field-label">Score guidance</span><textarea className="input" rows={3} value={criterion.guidance} onBlur={session.endGroup} onChange={(event) => updateCriterion(criterion.id, { guidance: event.target.value }, [guidanceKey], 'Edited score guidance')} placeholder="Explain what evidence supports different scores from 0 to 5." required aria-describedby={describedBy} aria-invalid={attempted && !criterion.guidance.trim()} /></label>, Boolean(addedBy))}
-      {real && <div className="mt-4 grid gap-4 sm:grid-cols-2">
+      <div className="mt-4 grid gap-4 sm:grid-cols-2">
         {changedField(requirementKey, 'Requirement type', describedBy => <label className="field"><span className="field-label">Requirement type</span><select className="input" value={criterion.requirementType ?? ''} required aria-describedby={describedBy} onChange={(event) => updateCriterion(criterion.id, { requirementType: event.target.value === 'preferred' ? 'preferred' : 'required' }, [requirementKey], 'Edited requirement type')}><option value="required">Required</option><option value="preferred">Preferred</option></select></label>, Boolean(addedBy))}
         {changedField(citationKey, 'Source quote', describedBy => <label className="field"><span className="field-label">Source paragraph</span><select className="input" value={criterion.sourceCitations?.[0]?.paragraphId ?? ''} required aria-describedby={describedBy} aria-invalid={attempted && !criterion.sourceCitations?.[0]?.paragraphId} onChange={(event) => updateCriterion(criterion.id, citationPatch(criterion, event.target.value || undefined), [citationKey], 'Edited source quote')}><option value="">Choose a paragraph</option>{document?.paragraphs.map((paragraph) => <option key={paragraph.id} value={paragraph.id}>Page {paragraph.page} / {paragraph.heading}</option>)}</select></label>, Boolean(addedBy))}
-      </div>}
-      {real && <div data-change-key={citationKey} className="mt-4"><label className="field"><span className="field-label">Exact source quote</span><textarea className="input" rows={3} required value={criterion.sourceCitations?.[0]?.quote ?? ''} onBlur={session.endGroup} aria-invalid={attempted && !criterion.sourceCitations?.[0]?.quote.trim()} onFocus={() => setSourceHighlight({ paragraphId: criterion.sourceCitations?.[0]?.paragraphId, quote: criterion.sourceCitations?.[0]?.quote })} onChange={(event) => updateCriterion(criterion.id, citationPatch(criterion, criterion.sourceCitations?.[0]?.paragraphId, event.target.value), [citationKey], 'Edited source quote')} placeholder={criterion.sourceCitations?.[0] ? 'Paste an exact quotation from the selected paragraph.' : 'Choose a source paragraph first.'} disabled={!criterion.sourceCitations?.[0]} /><span className="field-hint">The server verifies this quote against the exact parsed paragraph. It cannot be a summary or invented page reference.</span></label></div>}
+      </div>
+      <div data-change-key={citationKey} className="mt-4"><label className="field"><span className="field-label">Exact source quote</span><textarea className="input" rows={3} required value={criterion.sourceCitations?.[0]?.quote ?? ''} onBlur={session.endGroup} aria-invalid={attempted && !criterion.sourceCitations?.[0]?.quote.trim()} onFocus={() => setSourceHighlight({ paragraphId: criterion.sourceCitations?.[0]?.paragraphId, quote: criterion.sourceCitations?.[0]?.quote })} onChange={(event) => updateCriterion(criterion.id, citationPatch(criterion, criterion.sourceCitations?.[0]?.paragraphId, event.target.value), [citationKey], 'Edited source quote')} placeholder={criterion.sourceCitations?.[0] ? 'Paste an exact quotation from the selected paragraph.' : 'Choose a source paragraph first.'} disabled={!criterion.sourceCitations?.[0]} /><span className="field-hint">The server verifies this quote against the exact parsed paragraph.       It cannot be a summary or invented page reference.</span></label></div>
     </fieldset>
   }
 
@@ -350,8 +349,8 @@ export function RubricEditor({ rubric, onClose, onSaved, initialPanel = null, in
         {removedChanges.map((change) => <div key={change.key} data-change-key={change.key}><RemovedItemRow label={change.before ?? change.label} author={change.author} onRestore={() => session.revert(change.key)} disabled={locked} /></div>)}
         {session.draft.criteria.map((criterion, index) => renderCriterion(criterion, index))}
       </div>
-      <div><Button icon={Plus} size="sm" onClick={addCriterion} disabled={locked || (real && session.draft.criteria.length >= maxCriteria)}>Add criterion</Button><p className="mt-2 text-[11px] text-muted">{real ? `New criteria require a required/preferred classification and an exact quotation from this source. Maximum ${maxCriteria} when adding criteria; larger saved versions remain readable and editable without additions.` : 'New criteria are custom. The demo cannot assess them and will not invent supporting evidence.'}</p></div>
-      <DemoNote>{real ? 'Saving appends an immutable reviewer-edited server version. Existing generated and edited versions remain available.' : rubric.kind === 'grade' ? 'Grade guidance is illustrative, not an official qualification or eligibility standard. Edits change the rubric; demo scores still use fictional evidence.' : 'Edits stay linked to this job. The demo uses fictional source text and fixed sample evidence, not a language model.'}</DemoNote>
+      <div><Button icon={Plus} size="sm" onClick={addCriterion} disabled={locked || session.draft.criteria.length >= maxCriteria}>Add criterion</Button><p className="mt-2 text-[11px] text-muted">{`New criteria require a required/preferred classification and an exact quotation from this source. Maximum ${maxCriteria} when adding criteria; larger saved versions remain readable and editable without additions.`}</p></div>
+      <p className="library-note-text"><ShieldCheck size={16} aria-hidden="true" /><span>Saving appends an immutable reviewer-edited server version. Existing generated and edited versions remain available.</span></p>
       {((attempted && errors.length > 0) || error) && <div id={errorsId} ref={feedback} tabIndex={-1} className="space-y-3">{attempted && errors.length > 0 && <InlineError><p className="mb-1 font-medium">Review the rubric before saving.</p><ul className="list-disc space-y-1 pl-4">{errors.map((message, index) => <li key={`${index}-${message}`}>{message}</li>)}</ul></InlineError>}{error && <InlineError>{error}</InlineError>}</div>}
     </fieldset>
   </form>

@@ -78,7 +78,7 @@ export function GradeVersionHistory({ detail, grade, requestedVersion, onSource 
           <div className="space-y-4">{version.rubric.criteria.map((criterion) => <section key={criterion.id} className="grade-history-criterion"><h4>{criterion.label}</h4><GradeCriterionCell criterion={criterion} version={version} onSource={onSource} /></section>)}</div>
           <GradeQualifications version={version} onSource={onSource} />
           {version.issues.some((issue) => issue.citations?.length) && <section><h4>Issue evidence</h4><GradeCitations citations={version.issues.flatMap((issue) => issue.citations ?? [])} onOpen={(citation) => onSource({ citation, sourceSetId: version.sourceSetId })} /></section>}
-          <p className="mt-4 text-[11px] text-muted">Historical draft status is not inferred from the current grade head. Approval is an immutable server record tied to exact version and review hashes. History cannot be edited or sent to the fixture scorer.</p>
+          <p className="mt-4 text-[11px] text-muted">Historical draft status is not inferred from the current grade head. Approval is an immutable server record tied to exact version and review hashes. History cannot be edited.</p>
         </>}
       </div>
     </div>}

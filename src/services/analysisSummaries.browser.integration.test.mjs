@@ -49,18 +49,16 @@ before(async () => {
       import { WorkspaceContext } from './src/app/workspace-context'
       import { RealAnalysisDetail } from './src/features/analyses/RealAnalysisDetail'
       import { AnalysisSetup } from './src/features/analyses/AnalysisSetup'
-      import { AnalysisReportExport } from './src/features/analyses/AnalysisReportExport'
       import { frontendWorkspaceContext } from './src/services/frontend.test-support.mjs'
-      import { createInitialWorkspace } from './src/data/fixtures'
       function Probe() {
         const api = useRealAnalyses()
         const navigate = useNavigate()
         return <>
           <button onClick={() => void api.refresh()}>Refresh fixture history</button>
-          <button onClick={() => navigate('/analyses?data=real')}>Return fixture library</button>
-          <button onClick={() => navigate('/analyses/run-one?data=real')}>Open fixture analysis</button>
-          <button onClick={() => navigate('/analyses/new?data=real')}>Open fixture real setup</button>
-          <button onClick={() => navigate('/analyses/new?data=samples')}>Open fixture sample setup</button>
+          <button onClick={() => navigate('/analyses')}>Return fixture library</button>
+          <button onClick={() => navigate('/analyses/run-one')}>Open fixture analysis</button>
+          <button onClick={() => navigate('/analyses/new')}>Open fixture real setup</button>
+          <button onClick={() => navigate('/analyses/new?' + new URLSearchParams({ data: 'samples' }))}>Open fixture legacy setup</button>
         </>
       }
       function SavedAnalysis() {
@@ -74,13 +72,11 @@ before(async () => {
         const [workspaceId, setWorkspaceId] = useState('workspace-one')
         const context = frontendWorkspaceContext({ cloud: { currentWorkspaceId: workspaceId,
           workspaces: [{ id: workspaceId, role: window.fixtureRole || 'owner', name: workspaceId }] } })
-        const sample = new URLSearchParams(window.location.search).has('sample')
-        return <MemoryRouter initialEntries={['/analyses/run-one?data=real' + (new URLSearchParams(window.location.search).has('result') ? '&result=comparison-1' : '')]}
+        return <MemoryRouter initialEntries={['/analyses/run-one' + (new URLSearchParams(window.location.search).has('result') ? '?result=comparison-1' : '')]}
           future={{ v7_startTransition: true, v7_relativeSplatPath: true }}>
           <WorkspaceContext.Provider value={context}>
             <button onClick={() => setWorkspaceId('workspace-two')}>Switch fixture workspace</button>
-            {sample ? <AnalysisReportExport source={{ kind: 'sample', run: createInitialWorkspace().runs[0], available: true }} />
-              : <RealAnalysesBridge workspaceId={workspaceId}><Probe /><SavedAnalysis /></RealAnalysesBridge>}
+            <RealAnalysesBridge workspaceId={workspaceId}><Probe /><SavedAnalysis /></RealAnalysesBridge>
           </WorkspaceContext.Provider>
         </MemoryRouter>
       }
@@ -88,7 +84,7 @@ before(async () => {
       createRoot(document.getElementById('root')).render(<Harness />)
     ` },
     outfile: join(output, 'app.js'), bundle: true, format: 'esm', platform: 'browser', jsx: 'automatic', logLevel: 'silent',
-    define: { 'import.meta.env.VITE_DEPLOYMENT_MODE': '"cloud"', 'process.env.NODE_ENV': '"test"' },
+    define: { 'process.env.NODE_ENV': '"test"' },
     plugins: [{
       name: 'report-boundary-observer',
       setup(build) {
@@ -156,7 +152,7 @@ after(async () => {
 })
 
 async function setup(t, {
-  role = 'owner', archived = false, secondStatus = 'complete', summaryOptions = {}, result = false, sample = false,
+  role = 'owner', archived = false, secondStatus = 'complete', summaryOptions = {}, result = false,
   features = { realAnalyses: false, analysisSummaryGeneration: true },
   beforeSubjectGet = null,
   fixture: inputFixture,
@@ -305,8 +301,8 @@ async function setup(t, {
     }
     return respond({ error: { code: 'not_found', message: `Unexpected fixture request: ${url.pathname}` } }, 404)
   })
-  await page.goto(`${origin}/${sample ? '?sample=1' : result ? '?result=1' : ''}`)
-  if (!sample) await visible(page.getByRole('heading', { name: 'Saved narrative review', exact: true }))
+  await page.goto(`${origin}/${result ? '?result=1' : ''}`)
+  await visible(page.getByRole('heading', { name: 'Saved narrative review', exact: true }))
   return { page, context, state, fixture, errors }
 }
 
@@ -660,13 +656,13 @@ test('saved comparison navigation never discovers live new-run targets; actual s
   await page.getByRole('button', { name: 'Open fixture analysis', exact: true }).click()
   await visible(page.getByRole('heading', { name: 'Saved narrative review', exact: true }))
   await page.evaluate(() => window.dispatchEvent(new Event('focus')))
-  await page.getByRole('button', { name: 'Open fixture sample setup', exact: true }).click()
+  await page.getByRole('button', { name: 'Open fixture legacy setup', exact: true }).click()
   await page.waitForTimeout(200)
-  assert.equal(targetReads(), 2, 'Neither historical navigation nor a Samples setup subscribes to private live target discovery.')
+  assert.equal(targetReads(), 3, 'The legacy mode query opens the real setup and validates live target discovery.')
   state.liveTargets[0].displayName = 'Revalidated live job option'
   await page.getByRole('button', { name: 'Open fixture real setup', exact: true }).click()
   await visible(page.getByText('Revalidated live job option', { exact: true }))
-  assert.equal(targetReads(), 3, 'A newly opened setup must revalidate live eligibility rather than reuse inactive cached targets.')
+  assert.equal(targetReads(), 4, 'A newly opened setup must revalidate live eligibility rather than reuse inactive cached targets.')
   assert.equal(posts(state).length, 0)
 })
 
@@ -932,7 +928,7 @@ test('a late summary response cannot repopulate another workspace or an analysis
   }
 })
 
-test('deletion during local report rendering cancels the download and samples never call real summaries', async (t) => {
+test('deletion during local report rendering cancels the download', async (t) => {
   const { page, state, errors } = await setup(t, { summaryOptions: { candidateStatus: 'ready', targetStatus: 'ready' } })
   const report = await openExport(page)
   await readyDownload(report)
@@ -946,11 +942,6 @@ test('deletion during local report rendering cancels the download and samples ne
   await page.evaluate(() => window.releaseReportWorker?.())
   assert.equal(await page.evaluate(() => window.reportEvents.some((item) => item.event === 'download')), false)
   assert.deepEqual(errors, [])
-  const sample = await setup(t, { sample: true })
-  const sampleReport = await openExport(sample.page)
-  await visible(sampleReport.getByText(/Fictional samples use fixture summaries only/))
-  assert.equal(sample.state.requests.filter((request) => request.path.endsWith('/summaries')).length, 0)
-  assert.equal(posts(sample.state).length, 0)
 })
 
 test('summary management retains labeled keyboard controls and fits the existing mobile modal in both themes', async (t) => {

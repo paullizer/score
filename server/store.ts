@@ -95,8 +95,7 @@ export class StoreConflictError extends Error {
 
 /**
  * Low-level Cosmos DB access for the single `workspaces` container (partition key `/workspaceId`).
- * Holds directory metadata and membership only — never the large simulated workspace state, which
- * lives in Blob storage instead to stay well under Cosmos's per-item size limit.
+ * Holds directory metadata and membership only. Feature records live in their own dedicated stores.
  */
 export interface DirectoryStore {
   getMetadata(workspaceId: string): Promise<StoredMetadata | undefined>
@@ -140,16 +139,13 @@ export interface WorkspaceMutationLease {
 }
 
 /**
- * Low-level private Blob access for complete workspace state, one blob per workspace at
- * `${workspaceId}/state.json`. All writes are conditioned on Blob ETags for strong optimistic
- * concurrency; there is no last-write-wins path.
+ * Low-level private Blob access for the `workspace-state` container. It holds the per-workspace
+ * mutation lease blob `${workspaceId}/mutation.lock`. Legacy `${workspaceId}/state.json` sample-state
+ * blobs from older releases are never read by the application; they are only removed when their
+ * workspace is permanently deleted.
  */
 export interface StateStore {
   getState(workspaceId: string): Promise<StateStoreEntry | undefined>
-  /** First write for a new workspace; conditioned on the blob not already existing. */
-  createState(workspaceId: string, content: string): Promise<{ created: boolean; etag: string }>
-  /** Throws {@link StoreConflictError} if `expectedEtag` no longer matches the stored blob. */
-  putState(workspaceId: string, content: string, expectedEtag: string): Promise<{ etag: string }>
   deleteState(workspaceId: string, expectedEtag: string): Promise<void>
   acquireMutationLease(workspaceId: string): Promise<WorkspaceMutationLease>
   /** Cheap read used by /healthz to confirm the container is reachable with the current identity. */

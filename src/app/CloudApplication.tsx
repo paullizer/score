@@ -60,15 +60,15 @@ function resolveRequestedWorkspaceId(): string | null {
 }
 
 /**
- * Top-level cloud-mode gate, mounted instead of a plain BrowserRouter (see src/main.tsx). It owns:
+ * Top-level cloud gate, always mounted by src/main.tsx. It owns:
  *  - authenticating the session (GET /api/session) and showing an explicit sign-in/unavailable view
- *    on failure \u2014 never a silent fallback to fixtures,
- *  - resolving explicit `/workspaces/:workspaceId/...` links while keeping bare cloud visits on
+ *    on failure \u2014 never a silent fallback,
+ *  - resolving explicit `/workspaces/:workspaceId/...` links while keeping bare visits on
  *    the workspace home, outside any workspace-specific provider,
  *  - the actual BrowserRouter + CloudWorkspaceProvider, both remounted (via `key={workspaceId}`)
  *    whenever the active workspace changes so no stale controller/request can write into the wrong
  *    workspace,
- *  - workspace list/create/rename/switch and the flush-then-redirect sign-out flow.
+ *  - workspace list/create/rename/switch and the leave-protected sign-out flow.
  */
 export function CloudApplication() {
   return <PublicSettingsProvider><CloudApplicationContent /></PublicSettingsProvider>
@@ -376,7 +376,7 @@ function CloudApplicationContent() {
     if (existing.role !== 'owner') throw new Error('Only the workspace owner can archive, unarchive, or delete a workspace.')
     const accessStarted = workspaceAccessStamp(existing)
     const currentTarget = phaseRef.current.kind === 'ready' && phaseRef.current.workspaceId === id
-    const prepared = await (currentTarget ? providerApiRef.current?.prepareToLeave() : providerApiRef.current?.flush()) ?? { ok: true as const }
+    const prepared = (currentTarget ? await providerApiRef.current?.prepareToLeave() : undefined) ?? { ok: true as const }
     if (!prepared.ok) throw new Error(prepared.message)
     lifecyclePending.current = true
     ++metadataSequence.current
@@ -396,10 +396,6 @@ function CloudApplicationContent() {
       publishDirectory(next)
       if (operation && operation.status !== 'complete') throw new LifecycleOperationError(operation)
       if (!result.deleted && !updated) throw new Error('The service did not acknowledge a completed workspace change. Refresh status before retrying.')
-      if (phaseRef.current.kind === 'ready' && phaseRef.current.workspaceId === id && action === 'unarchive') {
-        const refreshed = await providerApiRef.current?.refreshState()
-        if (refreshed && !refreshed.ok) throw new Error(`Unarchive completed, but refreshing the saved content failed: ${refreshed.message}`)
-      }
       if (phaseRef.current.kind === 'ready' && phaseRef.current.workspaceId === id && action !== 'unarchive') {
         enterHome(true)
       }
@@ -420,7 +416,6 @@ function CloudApplicationContent() {
 
   async function leaveUnavailableWorkspace(): Promise<Result> {
     if (gradeLeaveRef.current && !await gradeLeaveRef.current.confirmLeave(undefined, true)) return { ok: false, message: 'Leaving was stopped to preserve unsaved changes or a pending request.' }
-    await providerApiRef.current?.discardPendingChanges()
     enterHome(true)
     return { ok: true }
   }
@@ -572,7 +567,7 @@ function CloudApplicationContent() {
   const activeSession = session
   if (!activeSession) throw new Error('The cloud session is missing after initialization.')
   const viewScope = JSON.stringify([activeSession.user.tenantId, activeSession.user.id, workspaceId])
-  // Keep pending saves above the router when browser history temporarily crosses its basename.
+  // Keep leave protection above the router when browser history temporarily crosses its basename.
   return <ApplicationNavigationContext.Provider value={{ applicationAdmin: activeSession.capabilities?.applicationAdmin === true, openAdminSettings, openAdminUsers, openWorkspaceHome, workspaceHomePath: homePath(), directoryError }}>
     {!activeSession.workspaces.some(item => item.id === workspaceId && !item.deletedAt) && accessNotice}
     <LibraryViewStateProvider scopeKey={viewScope}><GradeNavigationProtectionProvider key={workspaceId} workspaceId={workspaceId} apiRef={gradeLeaveRef}><CloudWorkspaceProvider
@@ -583,7 +578,6 @@ function CloudApplicationContent() {
         canCreateWorkspaces={activeSession.capabilities?.canCreateWorkspaces === true}
         apiRef={providerApiRef}
         leaveProtectionRef={gradeLeaveRef}
-        onAuthError={onAuthError}
         switchWorkspace={switchWorkspace}
         createWorkspace={createWorkspace}
         renameWorkspace={renameWorkspace}
@@ -593,8 +587,8 @@ function CloudApplicationContent() {
         leaveUnavailableWorkspace={leaveUnavailableWorkspace}
         onSignedOut={onSignedOut}
       >
-    {(legacyValue, cloud) => <BrowserRouter key={workspaceId} basename={`/workspaces/${encodeURIComponent(workspaceId)}`}>
-      <GradeRouterProtection><RealJobsBridge workspaceId={workspaceId} legacyValue={legacyValue} cloud={cloud}><RealGradeLaddersBridge workspaceId={workspaceId}><RealResumesBridge workspaceId={workspaceId}><RealAnalysesBridge workspaceId={workspaceId}>
+    {(base, cloud) => <BrowserRouter key={workspaceId} basename={`/workspaces/${encodeURIComponent(workspaceId)}`}>
+      <GradeRouterProtection><RealJobsBridge workspaceId={workspaceId} base={base} cloud={cloud}><RealGradeLaddersBridge workspaceId={workspaceId}><RealResumesBridge workspaceId={workspaceId}><RealAnalysesBridge workspaceId={workspaceId}>
         <TrackCloudPath pathRef={lastPathRef} stateRef={lastHistoryStateRef} basename={`/workspaces/${encodeURIComponent(workspaceId)}`} workspaceId={workspaceId} onOpened={onWorkspaceOpened} />
         <App />
       </RealAnalysesBridge></RealResumesBridge></RealGradeLaddersBridge></RealJobsBridge></GradeRouterProtection>

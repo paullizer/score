@@ -1,8 +1,4 @@
-import { createInitialWorkspace } from '../src/data/fixtures'
-import type { CloudSession, CloudWorkspaceSnapshot, WorkspaceRole, WorkspaceSummary } from '../src/domain/cloud'
-import type { Workspace } from '../src/domain/types'
-import { validateWorkspace, WorkspaceValidationError } from '../src/domain/workspace-validation'
-import { workspaceLifecycleTransitionErrors } from '../src/domain/lifecycle'
+import type { CloudSession, WorkspaceRole, WorkspaceSummary } from '../src/domain/cloud'
 import { isWorkspaceRole, workspaceCanEdit } from '../src/domain/workspace-permissions'
 import { isApplicationAdmin, type AuthenticatedPrincipal } from './auth'
 import { conflict, forbidden, invalidRequest, notFound, preconditionRequired, unavailable } from './errors'
@@ -23,6 +19,7 @@ const MAX_NAME_LENGTH = 80
 
 export interface WorkspaceRepositoryDeps {
   readonly directory: DirectoryStore
+  /** Workspace mutation leases only; legacy sample state is never read or written here. */
   readonly state: StateStore
   /** Injectable clock for deterministic tests. */
   readonly now?: () => Date
@@ -60,19 +57,8 @@ export function toSummary(metadata: WorkspaceMetadataDoc, etag: string, role: Wo
   }
 }
 
-export function decodeWorkspace(content: string): Workspace {
-  try {
-    return validateWorkspace(JSON.parse(content))
-  } catch (error) {
-    if (error instanceof SyntaxError || error instanceof WorkspaceValidationError) {
-      throw unavailable("This workspace's saved data could not be read. Nothing has been changed.")
-    }
-    throw error
-  }
-}
-
 /**
- * Cloud workspace business logic: effective access checks and the Cosmos-metadata/Blob-state split.
+ * Cloud workspace business logic: effective access checks, directory metadata, and mutation leases.
  * Talks only to the {@link DirectoryStore} and
  * {@link StateStore} abstractions, so the same logic runs against both the real Azure-backed stores
  * and an in-memory fake in tests — the authorization and consistency rules are exercised for real
@@ -165,10 +151,9 @@ export class WorkspaceRepository {
       email: principal.email,
     }
 
-    const prepared = await this.state.createState(workspaceId, JSON.stringify(createInitialWorkspace()))
-    if (!prepared.created) throw conflict('The new workspace identifier is already in use. No existing content was changed; try again.')
+    // Directory creation is authoritative: new workspaces start empty, with no seeded state document.
     const { created } = await this.directory.createWorkspace(metadata, membership)
-    if (!created) throw unavailable('Workspace creation could not be confirmed. Reload the workspace list before retrying.')
+    if (!created) throw conflict('The new workspace identifier is already in use. No existing content was changed; try again.')
 
     const stored = await this.directory.getMetadata(workspaceId)
     if (!stored) throw unavailable('Could not create the workspace. Try again.')
@@ -272,57 +257,6 @@ export class WorkspaceRepository {
         if (error instanceof StoreNotFoundError) throw notFound()
         throw error
       }
-    })
-  }
-
-  /** GET /api/workspaces/:id/state: never seeds/repairs missing or corrupt state, and never recovers interrupted work. */
-  async getWorkspaceState(principal: AuthenticatedPrincipal, workspaceId: string): Promise<CloudWorkspaceSnapshot> {
-    if (!isValidWorkspaceId(workspaceId)) throw notFound()
-    await this.requireWorkspaceRole(principal, workspaceId)
-
-    const entry = await this.state.getState(workspaceId)
-    if (!entry) throw unavailable("This workspace's saved data is unavailable right now. Nothing has been changed; try again shortly.")
-
-    return { workspace: decodeWorkspace(entry.content), etag: entry.etag }
-  }
-
-  /** PUT /api/workspaces/:id/state: strong optimistic concurrency, validated before storage. */
-  async putWorkspaceState(
-    principal: AuthenticatedPrincipal,
-    workspaceId: string,
-    body: unknown,
-    ifMatchEtag: string | undefined,
-  ): Promise<{ etag: string }> {
-    if (!isValidWorkspaceId(workspaceId)) throw notFound()
-    await this.authorizeWorkspace(principal, workspaceId, 'manage')
-    if (ifMatchEtag === undefined) throw preconditionRequired()
-    if (ifMatchEtag === '*') throw invalidRequest('Wildcard If-Match is not accepted; provide the current etag.')
-
-    let validated: Workspace
-    try {
-      validated = validateWorkspace(body)
-    } catch (error) {
-      if (error instanceof WorkspaceValidationError) throw invalidRequest(error.message)
-      throw error
-    }
-
-    return this.withWorkspaceMutation(principal, workspaceId, 'manage', async () => {
-      const previous = await this.state.getState(workspaceId)
-      if (!previous) throw unavailable("This workspace's saved data is unavailable. Nothing has been recreated.")
-      if (previous.etag !== ifMatchEtag) throw conflict()
-      const current = decodeWorkspace(previous.content)
-      if (current.lifecycle?.archivedAt !== validated.lifecycle?.archivedAt) {
-        throw invalidRequest('Workspace archive state can only be changed through workspace lifecycle controls.')
-      }
-      const roots = (workspace: Workspace) => Object.entries(workspace.lifecycle?.entities ?? {})
-        .filter(([key]) => key.startsWith('workspace:')).sort(([left], [right]) => left.localeCompare(right))
-      if (JSON.stringify(roots(current)) !== JSON.stringify(roots(validated))) {
-        throw invalidRequest('Workspace deletion state can only be changed through owner-only workspace lifecycle controls.')
-      }
-      const errors = workspaceLifecycleTransitionErrors(current, validated)
-      if (errors.length) throw conflict(errors[0])
-      assertWorkspaceMutationLease(workspaceId)
-      return this.state.putState(workspaceId, JSON.stringify(validated), ifMatchEtag)
     })
   }
 }

@@ -52,7 +52,7 @@ before(async () => {
     export * as improvement from './src/domain/quality-improvement'
     export { PROMPT_REGISTRY_LIMITS } from './src/domain/prompt-versions'
   ` }, outfile: join(output, 'ui.mjs'), bundle: true, packages: 'external', format: 'esm', platform: 'node',
-  jsx: 'automatic', loader: { '.css': 'empty' }, logLevel: 'silent', define: { 'import.meta.env.VITE_DEPLOYMENT_MODE': '"cloud"' } })
+  jsx: 'automatic', loader: { '.css': 'empty' }, logLevel: 'silent' })
   ui = await import(pathToFileURL(join(output, 'ui.mjs')).href)
 })
 beforeEach(() => {
@@ -731,8 +731,7 @@ test('admission-off preserves saved reviews and batches without permitting new f
   assert.equal([...document.querySelectorAll('button')].some(item => item.textContent === 'Save named batch'), false)
   await click(button('Normal mode'))
   assert.ok(document.querySelector('[aria-label="Main navigation"]'))
-  await click([...document.querySelectorAll('button')].find(item => item.textContent.startsWith('Samples')))
-  assert.equal(button('New analysis').disabled, false)
+  assert.equal(document.querySelector('.library-kind-switcher'), null)
   assert.deepEqual(writes().map(item => item.url.split('/').at(-1)), ['peers'])
 })
 
@@ -1086,18 +1085,15 @@ test('prompt history comparison is read-only; restore requires rationale, curren
 test('QC app routing honors basename, focuses navigation, and normal mode keeps its existing navigation', async () => {
   await render('/qc', { app: true })
   assert.ok(document.querySelector('[aria-label="QC navigation"]'))
+  assert.deepEqual([...document.querySelectorAll('[aria-label="QC navigation"] a')].map(item => item.textContent), ['Reviews', 'Quality improvement', 'Prompt versions'],
+    'The QC sidebar leaves the return to normal mode to the top bar')
+  assert.equal(document.querySelector('.sidebar').textContent.includes('Return to normal mode'), false)
   assert.equal(document.querySelector('[aria-label="Main navigation"]'), null)
   assert.equal([...document.querySelectorAll('button')].some(item => item.textContent.trim() === 'New analysis'), false)
   assert.ok([...document.querySelectorAll('a')].some(item => item.href.endsWith('/workspaces/workspace-one/qc/improvements')))
   await click(button('Normal mode'))
   assert.ok(document.querySelector('[aria-label="Main navigation"]'))
   assert.ok(button('New analysis'))
-})
-
-test('standalone QC direct URLs are explicitly unsupported and do not read cloud QC', async () => {
-  await render('/qc/improvements/plan-one', { app: true, cloud: false })
-  assert.match(document.body.textContent, /Quality control is not supported in standalone mode/)
-  assert.equal(fixture.requests.length, 0)
 })
 
 test('StrictMode effect replay does not permanently abort the QC privacy scope', async () => {

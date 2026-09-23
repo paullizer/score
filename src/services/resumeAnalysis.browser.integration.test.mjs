@@ -42,6 +42,8 @@ async function newPage() {
   const context = await browser.newContext({ viewport: { width: 1440, height: 1100 }, acceptDownloads: false })
   const page = await context.newPage()
   page.setDefaultTimeout(15_000)
+  // Navigations load and parse a multi-megabyte development bundle, which is slow while the whole suite runs in parallel.
+  page.setDefaultNavigationTimeout(60_000)
   const errors = []
   page.on('pageerror', (error) => errors.push(error.message))
   return { context, page, errors }
@@ -57,14 +59,14 @@ before(async () => {
 })
 after(async () => { await browser?.close(); await runtime?.close() })
 
-test('browser imports actual PDF bytes, explicitly runs real analysis, opens citations, and preserves results across sample reset', { timeout: 120_000 }, async (t) => {
+test('browser imports actual PDF bytes, explicitly runs real analysis, opens citations, and preserves results across reload', { timeout: 120_000 }, async (t) => {
   const fixture = await startResumeAnalysisFixture(runtime, { injectAuth: true })
   t.after(() => fixture.close())
   await seedRealJob(fixture)
   const stubs = processingStubs(fixture)
   const { context, page, errors } = await newPage()
   try {
-    await page.goto(`${fixture.origin}/workspaces/${fixture.workspaceId}/resumes?data=real`)
+    await page.goto(`${fixture.origin}/workspaces/${fixture.workspaceId}/resumes`)
     await visible(page.getByRole('heading', { name: 'Resumes', exact: true }))
     await page.getByRole('button', { name: 'Add resumes', exact: true }).click()
     const dialog = await visible(page.getByRole('dialog', { name: 'Add real resumes', exact: true }))
@@ -115,16 +117,8 @@ test('browser imports actual PDF bytes, explicitly runs real analysis, opens cit
     const sourceBefore = JSON.stringify([...fixture.resumes.store.values.values()])
     const storage = await page.evaluate(() => Object.values(localStorage).join('\n'))
     assert.doesNotMatch(storage, /Jordan Example|Applied engineering methods|documentSha256|assessmentSha256/)
-    assert.equal(fixture.state.saves.length, 0)
-
-    await page.getByRole('button', { name: 'Reset samples', exact: true }).click()
-    const reset = await visible(page.getByRole('dialog', { name: 'Reset sample content?', exact: true }))
-    await reset.getByRole('button', { name: 'Reset samples', exact: true }).click()
-    await reset.waitFor({ state: 'hidden' })
-    await until(() => fixture.state.saves.length > 0, 'The explicit sample reset should save only sample state.')
     assert.equal(JSON.stringify([...fixture.analyses.store.values.values()]), recordsBefore)
     assert.equal(JSON.stringify([...fixture.resumes.store.values.values()]), sourceBefore)
-    assert.ok(fixture.state.saves.every(({ content }) => !content.includes('Jordan Example') && !content.includes('assessmentSha256')))
     await page.goto(resultUrl)
     await visible(page.getByRole('heading', { name: 'Browser engineering review', exact: true }))
     await visible(page.getByRole('heading', { name: 'Evidence-based assessment', exact: true }))
@@ -143,7 +137,7 @@ test('browser multiline URLs keep good inputs, explain inaccessible LinkedIn, an
   })
   const { context, page, errors } = await newPage()
   try {
-    await page.goto(`${fixture.origin}/workspaces/${fixture.workspaceId}/resumes?data=real`)
+    await page.goto(`${fixture.origin}/workspaces/${fixture.workspaceId}/resumes`)
     await page.getByRole('button', { name: 'Add resumes', exact: true }).click()
     const dialog = await visible(page.getByRole('dialog', { name: 'Add real resumes', exact: true }))
     await dialog.getByRole('button', { name: 'Public URLs', exact: true }).click()
@@ -164,7 +158,6 @@ test('browser multiline URLs keep good inputs, explain inaccessible LinkedIn, an
     assert.equal([...fixture.resumes.store.values.values()].filter(({ record }) => record.recordType === 'resume').length, 2)
     assert.equal(stubs.modelCalls.length, 1)
     assert.equal(fixture.analyses.store.values.size, 0)
-    assert.equal(fixture.state.saves.length, 0)
     const storage = await page.evaluate(() => Object.values(localStorage).join('\n'))
     assert.doesNotMatch(storage, /linkedin\.com|profiles\.example|Jordan Example/)
     assert.deepEqual(errors, [])
@@ -182,7 +175,7 @@ test('browser workspace switching ignores a late private resume response from th
   const hold = deferred()
   const { context, page, errors } = await newPage()
   try {
-    await page.goto(`${fixture.origin}/workspaces/${fixture.workspaceId}/resumes?data=real`)
+    await page.goto(`${fixture.origin}/workspaces/${fixture.workspaceId}/resumes`)
     await visible(page.getByRole('link', { name: 'Jordan Example', exact: true }))
     fixture.staleRead(oldPath, oldDetail, hold.promise)
     await page.getByRole('link', { name: 'Jordan Example', exact: true }).click()
@@ -200,7 +193,7 @@ test('browser workspace switching ignores a late private resume response from th
   } finally { hold.resolve(); await context.close() }
 })
 
-test('browser unavailable real services remain explicit while Samples require deliberate selection', { timeout: 90_000 }, async (t) => {
+test('browser unavailable real services remain explicit without substituting fixture data', { timeout: 90_000 }, async (t) => {
   const fixture = await startResumeAnalysisFixture(runtime, {
     injectAuth: true, configOverrides: { realResumes: undefined, realAnalyses: undefined },
   })
@@ -212,14 +205,13 @@ test('browser unavailable real services remain explicit while Samples require de
     assert.equal(features.deploymentCapabilities.realAnalyses, false)
     assert.equal(features.publicSettings.features.resumeImports, false)
     assert.equal((await fixture.request(`/api/workspaces/${fixture.workspaceId}/resumes`)).status, 503, 'This fixture removes the history service, not merely new admissions')
-    await page.goto(`${fixture.origin}/workspaces/${fixture.workspaceId}/resumes?data=real`)
+    // A legacy data parameter from an old link is ignored and still opens the real library.
+    await page.goto(`${fixture.origin}/workspaces/${fixture.workspaceId}/resumes?${new URLSearchParams({ data: 'samples' })}`)
     await visible(page.getByRole('heading', { name: 'Real resume imports are not enabled', exact: true }))
     await visible(page.getByRole('button', { name: 'Check availability', exact: true }))
     assert.equal(await page.getByRole('button', { name: 'Add resumes', exact: true }).count(), 0)
     assert.equal(await page.getByRole('button', { name: 'Add real resumes', exact: true }).count(), 0)
     assert.equal(await page.getByText(/Every candidate is fictional/).count(), 0)
-    await page.getByRole('button', { name: /^Samples/ }).click()
-    await visible(page.getByText(/Every candidate is fictional/))
     assert.equal(fixture.resumes.store.values.size, 0)
     assert.equal(fixture.analyses.store.values.size, 0)
     assert.deepEqual(errors, [])
@@ -247,7 +239,7 @@ test('browser approved GS analysis opens copied reference evidence through its e
   await processAllResumes(fixture, stubs)
   const { context, page, errors } = await newPage()
   try {
-    await page.goto(`${fixture.origin}/workspaces/${fixture.workspaceId}/analyses/new?data=real`)
+    await page.goto(`${fixture.origin}/workspaces/${fixture.workspaceId}/analyses/new`)
     await visible(page.getByRole('heading', { name: 'Build a real analysis', exact: true }))
     await page.getByRole('checkbox', { name: 'Include Jordan Example from resume.pdf', exact: true }).check()
     await page.getByRole('button', { name: /^Approved GS versions/ }).click()
@@ -269,7 +261,6 @@ test('browser approved GS analysis opens copied reference evidence through its e
     assert.ok(fixture.requests.some((request) => request.method === 'GET' &&
       /\/analyses\/[^/]+\/comparisons\/[^/]+\/documents\/[^?]+\?version=1/.test(request.url)),
     'Copied GS evidence must use the authorized comparison-scoped document endpoint.')
-    assert.equal(fixture.state.saves.length, 0)
     assert.deepEqual(errors, [])
   } finally { await context.close() }
 })
@@ -289,7 +280,7 @@ test('browser preserves 103 resumes across navigation and reload and submits all
   await processAllResumes(fixture, stubs)
   const { context, page, errors } = await newPage()
   try {
-    await page.goto(`${fixture.origin}/workspaces/${fixture.workspaceId}/resumes?data=real`)
+    await page.goto(`${fixture.origin}/workspaces/${fixture.workspaceId}/resumes`)
     await page.getByRole('button', { name: 'Select ready visible', exact: true }).click()
     await page.getByRole('button', { name: 'Build analysis (103)', exact: true }).click()
     await visible(page.getByRole('heading', { name: 'Build a real analysis', exact: true }))
@@ -360,7 +351,7 @@ test('browser resumes a paused cancellation without scoring or replacing its cap
   const manifest = structuredClone(paused.manifest)
   const { context, page, errors } = await newPage()
   try {
-    await page.goto(`${fixture.origin}/workspaces/${fixture.workspaceId}/analyses/${created.run.id}?data=real`)
+    await page.goto(`${fixture.origin}/workspaces/${fixture.workspaceId}/analyses/${created.run.id}`)
     await visible(page.getByRole('heading', { name: 'Paused cancellation recovery', exact: true }))
     await visible(page.getByText('Cancellation paused', { exact: true }))
     assert.equal(await page.getByRole('button', { name: /^Retry comparison 1 with saved inputs$/ }).isDisabled(), true)
@@ -376,7 +367,6 @@ test('browser resumes a paused cancellation without scoring or replacing its cap
     assert.equal(stubs.modelCalls.length, 1, 'Resuming cleanup must not invoke the analysis model.')
     const pairs = await allPages(fixture, `${runPath}/comparisons`, 'comparisons')
     assert.ok(pairs.every(({ comparison }) => comparison.status === 'cancelled' && !comparison.result))
-    assert.equal(fixture.state.saves.length, 0)
     assert.deepEqual(errors, [])
   } finally { await context.close() }
 })
@@ -423,6 +413,18 @@ async function seedBrowsingInputs(fixture) {
   }
   const stubs = processingStubs(fixture, {
     onModelRequest(request) {
+      if (request.response_format.json_schema.name === 'resume_evidence_gap_review') {
+        const { scope } = JSON.parse(request.messages[1].content)
+        return modelResponse({
+          decisions: scope.criterionIds.map((criterionId) => ({
+            criterionId, outcome: 'confirmed-missing', citations: [], blockerCode: null,
+            message: 'The controlled fixture confirms no reliable evidence for this criterion.',
+          })),
+        })
+      }
+      if (request.response_format.json_schema.name === 'resume_rubric_grounding_review') {
+        return modelResponse({ outcome: 'supported', issues: [] })
+      }
       if (request.response_format.json_schema.name !== 'resume_rubric_assessment') return
       const input = JSON.parse(request.messages[1].content).input
       const work = analysisPassageFor(input.resume.paragraphs, 'Applied engineering methods')
@@ -477,7 +479,7 @@ async function diagnosticBrowserScenario(fixture) {
   return {
     runPath, pairPath, accepted, diagnostic, detail: failedComparisonFixture(accepted, diagnostic),
     run: await jsonResponse(await fixture.request(runPath)),
-    url: `${fixture.origin}/workspaces/${fixture.workspaceId}/analyses/${created.run.id}?data=real&result=${pair.comparison.id}`,
+    url: `${fixture.origin}/workspaces/${fixture.workspaceId}/analyses/${created.run.id}?result=${pair.comparison.id}`,
   }
 }
 
@@ -633,7 +635,7 @@ test('browser comparison browsing searches every page, scopes score sorting, and
   const requestStart = fixture.requests.length
   const { context, page, errors } = await newPage()
   try {
-    await page.goto(`${fixture.origin}/workspaces/${fixture.workspaceId}/analyses/${created.run.id}?data=real`)
+    await page.goto(`${fixture.origin}/workspaces/${fixture.workspaceId}/analyses/${created.run.id}`)
     const section = await visible(page.getByRole('region', { name: 'Real comparisons', exact: true }))
     const rows = section.locator('tbody tr')
     await until(async () => await rows.count() === 8, 'The comparison table must include every continuation page.')
@@ -664,14 +666,14 @@ test('browser comparison browsing searches every page, scopes score sorting, and
     assert.deepEqual(await names(), ['Zora Example', 'ada Example', 'Morgan Example', 'Name not stated'])
     await scoreHeader.getByRole('button').click()
     assert.equal(await scoreHeader.getAttribute('aria-sort'), 'ascending')
-    assert.deepEqual(await names(), ['Morgan Example', 'ada Example', 'Zora Example', 'Name not stated'])
+    assert.deepEqual(await names(), ['Morgan Example', 'Name not stated', 'ada Example', 'Zora Example'])
     assert.match(await rows.first().locator('td:nth-child(3)').textContent(), /0\s*\/\s*100/)
-    assert.match(await rows.last().locator('td:nth-child(3)').textContent(), /No overall score/)
+    assert.match(await rows.last().locator('td:nth-child(3)').textContent(), /60\s*\/\s*100/)
 
     for (const [query, expected] of [
       ['  ADA  ', ['ada Example']],
       ['rEsUmE-10.PdF', ['Zora Example']],
-      ['ENGINEERING SPECIALIST', ['Morgan Example', 'ada Example', 'Zora Example', 'Name not stated']],
+      ['ENGINEERING SPECIALIST', ['Morgan Example', 'Name not stated', 'ada Example', 'Zora Example']],
     ]) {
       await search.fill(query)
       await until(async () => JSON.stringify(await names()) === JSON.stringify(expected), `Saved metadata search should match ${query}.`)
@@ -712,7 +714,6 @@ test('browser comparison browsing searches every page, scopes score sorting, and
     assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth + 1), 'Only the table wrapper, not the page, may scroll horizontally.')
     assert.equal(JSON.stringify([...fixture.analyses.store.values.values()]), recordsBefore)
     assert.equal(stubs.modelCalls.length, modelCallsBefore)
-    assert.equal(fixture.state.saves.length, 0)
     assert.ok(fixture.requests.slice(requestStart).every((request) => request.method === 'GET'), 'Browsing must not send mutation requests.')
     const stored = await page.evaluate(() => Object.values(localStorage).join('\n'))
     assert.doesNotMatch(stored, /ada Example|Zora Example|resume-10\.pdf|no-matching-person/)
@@ -742,7 +743,7 @@ test('browser processing-status sorting preserves filters during refresh and can
   const queued = pairs.find(({ comparison }) => comparison.status === 'queued')
   const { context, page, errors } = await newPage()
   try {
-    await page.goto(`${fixture.origin}/workspaces/${fixture.workspaceId}/analyses/${created.run.id}?data=real`)
+    await page.goto(`${fixture.origin}/workspaces/${fixture.workspaceId}/analyses/${created.run.id}`)
     const section = await visible(page.getByRole('region', { name: 'Real comparisons', exact: true }))
     const rows = section.locator('tbody tr')
     await until(async () => await rows.count() === 4, 'All current processing states should be loaded.')
@@ -771,116 +772,6 @@ test('browser processing-status sorting preserves filters during refresh and can
     assert.equal(await search.inputValue(), 'resume-')
     assert.equal(await statusHeader.getAttribute('aria-sort'), 'descending')
     assert.equal(await rows.count(), 4)
-    assert.equal(fixture.state.saves.length, 0)
-    assert.deepEqual(errors, [])
-  } finally { await context.close() }
-})
-
-test('browser library sorting keeps sample selections and gives mobile cards the same order', { timeout: 90_000 }, async (t) => {
-  const fixture = await startResumeAnalysisFixture(runtime, { injectAuth: true })
-  t.after(() => fixture.close())
-  const samples = runtime.fixtures.createInitialWorkspace()
-  const collator = new Intl.Collator(undefined, { sensitivity: 'base', numeric: true })
-  const orderedNames = samples.resumes.map((resume) => resume.name).sort(collator.compare)
-  const { context, page, errors } = await newPage()
-  try {
-    await page.goto(`${fixture.origin}/workspaces/${fixture.workspaceId}/resumes?data=samples`)
-    await visible(page.getByRole('heading', { name: 'Resumes', exact: true }))
-    const candidateHeader = page.getByRole('columnheader').filter({ hasText: 'Candidate' })
-    await candidateHeader.getByRole('button').click()
-    const tableNames = () => page.locator('.data-table tbody .row-title').allTextContents()
-    assert.deepEqual(await tableNames(), orderedNames)
-    const chosen = samples.resumes[0]
-    await page.getByRole('checkbox', { name: `Select ${chosen.name}`, exact: true }).check()
-    const search = page.getByRole('searchbox', { name: 'Search resume library', exact: true })
-    await search.fill('no-such-sample-profile')
-    await visible(page.getByRole('heading', { name: 'No matching resumes', exact: true }))
-    await visible(page.getByText(/1 hidden by search/))
-    const sort = page.getByRole('combobox', { name: /sort/i })
-    const descending = await sort.locator('option').evaluateAll((options) =>
-      options.find((option) => /Candidate/.test(option.textContent) && /Z.*A/.test(option.textContent))?.value)
-    assert.ok(descending)
-    await sort.selectOption(descending)
-    await search.fill('')
-    assert.deepEqual(await tableNames(), [...orderedNames].reverse())
-    assert.equal(await page.getByRole('checkbox', { name: `Select ${chosen.name}`, exact: true }).isChecked(), true)
-    await page.setViewportSize({ width: 390, height: 844 })
-    await visible(sort)
-    assert.deepEqual(await page.locator('.resume-card .row-title').allTextContents(), [...orderedNames].reverse())
-    assert.equal(await page.getByRole('checkbox', { name: `Select ${chosen.name}`, exact: true }).isChecked(), true)
-    await sort.selectOption('')
-    assert.deepEqual(await page.locator('.resume-card .row-title').allTextContents(), samples.resumes.map((resume) => resume.name))
-    assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth + 1))
-
-    await page.setViewportSize({ width: 1440, height: 1100 })
-    await page.goto(`${fixture.origin}/workspaces/${fixture.workspaceId}/jobs`)
-    await visible(page.getByRole('heading', { name: 'Your jobs', exact: true }))
-    await page.getByRole('button', { name: /^Samples/ }).click()
-    const jobHeader = page.getByRole('columnheader').filter({ hasText: 'Job / organization' })
-    await jobHeader.getByRole('button').click()
-    assert.deepEqual(await tableNames(), samples.jobs.map((job) => job.title).sort(collator.compare))
-    await jobHeader.getByRole('button').click()
-    assert.deepEqual(await tableNames(), samples.jobs.map((job) => job.title).sort((left, right) => collator.compare(right, left)))
-    await page.setViewportSize({ width: 390, height: 844 })
-    await visible(page.getByRole('combobox', { name: /sort/i }))
-    assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth + 1))
-    assert.equal(fixture.analyses.store.values.size, 0)
-    assert.equal(fixture.state.saves.length, 0)
-    assert.deepEqual(errors, [])
-  } finally { await context.close() }
-})
-
-test('browser sample comparison browsing keeps the matrix and remembers search while reviewing one target', { timeout: 90_000 }, async (t) => {
-  const fixture = await startResumeAnalysisFixture(runtime, { injectAuth: true })
-  t.after(() => fixture.close())
-  const samples = runtime.fixtures.createInitialWorkspace()
-  const run = samples.runs.find((item) => item.targets.length > 1)
-  const selected = run.resumes[0].resume
-  const { context, page, errors } = await newPage()
-  try {
-    await page.goto(`${fixture.origin}/workspaces/${fixture.workspaceId}/analyses/${run.id}?data=samples`)
-    await visible(page.getByRole('heading', { name: run.name, exact: true }))
-    const search = page.getByRole('searchbox', { name: 'Search comparisons', exact: true })
-    const targetSelect = page.getByRole('combobox', { name: /target/i })
-    const sortSelect = page.getByRole('combobox', { name: /sort/i })
-    await visible(page.locator('.matrix-table'))
-    assert.equal(await page.locator('.matrix-table tbody tr').count(), run.resumes.length)
-    await search.fill(`  ${selected.name.toUpperCase()}  `)
-    assert.equal(await page.locator('.matrix-table tbody tr').count(), 1)
-    await targetSelect.selectOption(run.targets[0].id)
-    await visible(page.locator('.comparison-table'))
-    const rows = page.locator('.comparison-table tbody tr')
-    assert.equal(await rows.count(), 1)
-    assert.equal(await rows.first().locator('.row-title').textContent(), selected.name)
-    const scoreHeader = page.getByRole('columnheader').filter({ hasText: 'Evidence match' })
-    await scoreHeader.getByRole('button').click()
-    const sortValue = await sortSelect.inputValue()
-    await rows.first().locator('.row-title').click()
-    await visible(page.getByRole('heading', { name: 'The match, criterion by criterion', exact: true }))
-    await page.getByRole('link', { name: 'All comparisons', exact: true }).click()
-    assert.equal(await search.inputValue(), `  ${selected.name.toUpperCase()}  `)
-    assert.equal(await targetSelect.inputValue(), run.targets[0].id)
-    assert.equal(await sortSelect.inputValue(), sortValue)
-    assert.equal(await rows.count(), 1)
-    await search.fill('no-matching-sample')
-    await visible(page.getByRole('heading', { name: 'No matching comparisons', exact: true }))
-    assert.equal(await targetSelect.isVisible(), true)
-    await search.fill(selected.sourceLabel)
-    assert.equal(await rows.count(), 1)
-    await targetSelect.selectOption({ label: 'All targets' })
-    await visible(page.locator('.matrix-table'))
-    assert.equal(await sortSelect.inputValue(), '')
-    await search.fill('')
-    assert.equal(await page.locator('.matrix-table tbody tr').count(), run.resumes.length)
-    await page.setViewportSize({ width: 390, height: 844 })
-    await visible(search)
-    await visible(targetSelect)
-    await visible(sortSelect)
-    await visible(page.locator('.topbar').getByRole('button', { name: 'QC mode', exact: true }))
-    await visible(page.locator('.topbar').getByRole('button', { name: 'New analysis', exact: true }))
-    assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth + 1))
-    assert.equal(fixture.analyses.store.values.size, 0, 'Sample browsing must never start real processing.')
-    assert.equal(fixture.state.saves.length, 0)
     assert.deepEqual(errors, [])
   } finally { await context.close() }
 })

@@ -136,7 +136,7 @@ test('CSV uses the compact reader-facing schema and round-trips quoted Unicode s
   assert.equal(analysis.origin, options.links.origin)
   assert.equal(analysis.pathname, '/workspaces/workspace-one/analyses/run-one')
   assert.equal(analysis.searchParams.get('result'), 'comparison-0')
-  assert.equal(analysis.searchParams.get('data'), 'real')
+  assert.equal(analysis.searchParams.get('data'), null)
   assert.equal(new URL(result.records[0]['Resume link']).searchParams.get('view'), 'resume')
   assert.equal(new URL(result.records[0]['Job/grade link']).searchParams.get('view'), 'target')
 })
@@ -218,27 +218,6 @@ test('all 500 completed comparisons are exported without ranking and tie metadat
   assert.equal(result.headers.length, 11)
   assert.ok(!result.headers.some(header => /rank|highlight|cutoff|ties/i.test(header)))
   assert.equal(new Set(result.records.map(row => row['Analysis link'])).size, 500)
-})
-
-test('sample CSV is explicitly fictional without a repeated metadata column', () => {
-  const input = realReportFixture({ scores: [80] })
-  input.dataKind = 'sample'
-  delete input.workspaceId
-  for (const target of input.targets) { target.dataKind = 'sample'; target.selection = null; target.snapshot = null; target.rubricId = target.id }
-  for (const comparison of input.comparisons) {
-    comparison.dataKind = 'sample'
-    comparison.candidate.snapshot = null
-    comparison.candidate.documentSha256 = null
-    comparison.resultSha256 = null
-  }
-  const report = model.buildAnalysisReport(input)
-  const standalone = { links: { origin: 'http://localhost:5173' } }
-  const result = records(writer.generateCsvReport(report, standalone))
-  assert.equal(result.headers[0], 'Candidate name (fictional sample)')
-  assert.ok(!result.headers.includes('Report data'))
-  const link = new URL(result.records[0]['Analysis link'])
-  assert.equal(link.pathname, '/analyses/run-one')
-  assert.equal(link.searchParams.get('data'), 'samples')
 })
 
 test('inconsistent inventories and missing link context stop the CSV download', () => {

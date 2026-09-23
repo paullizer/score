@@ -28,7 +28,7 @@ before(async () => {
       export { getRealAnalysisSummarySubject, getRealAnalysisSummaryHistory } from './src/services/realAnalyses'
       export { CloudApiError } from './src/services/cloudWorkspace'
     ` }, outfile: join(output, 'client.mjs'), bundle: true, packages: 'external', format: 'esm',
-    platform: 'node', logLevel: 'silent', define: { 'import.meta.env.VITE_DEPLOYMENT_MODE': '"cloud"' },
+    platform: 'node', logLevel: 'silent',
   })
   client = await import(pathToFileURL(join(output, 'client.mjs')).href)
   state = client.state

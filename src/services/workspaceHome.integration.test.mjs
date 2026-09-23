@@ -28,6 +28,23 @@ function deferred() {
   const promise = new Promise((done) => { resolve = done })
   return { promise, resolve }
 }
+function testWorkspace() {
+  return {
+    documents: [{ id: 'document-one', title: 'Position description', kind: 'job', version: 1, sample: false, paragraphs: [
+      { id: 'paragraph-one', page: 1, heading: 'Duties', text: 'Real source evidence.' },
+    ] }],
+    jobs: [{ id: 'job-one', title: 'Program analyst', organization: 'Agency', location: 'Remote', arrangement: 'Remote',
+      employmentType: 'Full-time', grade: 'GS-13', series: '0343', source: 'pdf', sourceLabel: 'Position description.pdf',
+      documentId: 'document-one', rubricId: 'rubric-one', status: 'ready', createdAt: '2026-01-01T00:00:00.000Z', dataKind: 'real' }],
+    rubrics: [{ id: 'rubric-one', groupId: 'rubric-group-one', kind: 'job', jobId: 'job-one', name: 'Job rubric',
+      description: 'Measures the role.', version: 1, createdAt: '2026-01-01T00:00:00.000Z', dataKind: 'real',
+      criteria: [{ id: 'criterion-one', key: 'technical', label: 'Evidence', description: 'Uses evidence.',
+        guidance: 'Check exact source evidence.', weight: 100, requirementType: 'required',
+        sourceCitations: [{ documentId: 'document-one', documentVersion: 1, paragraphId: 'paragraph-one',
+          page: 1, heading: 'Duties', quote: 'Real source evidence' }] }] }],
+    lifecycle: { entities: {} },
+  }
+}
 
 before(async () => {
   await mkdir(output)
@@ -57,20 +74,18 @@ before(async () => {
       export { CloudApplication } from './src/app/CloudApplication';
       export { useWorkspaceCounts } from './src/features/workspaces/useWorkspaceCounts';
       export { fetchWorkspaceCounts } from './src/services/workspaceSummaries';
-      export { createInitialWorkspace } from './src/data/fixtures';
       export { createDefaultAdminSettings } from './src/domain/admin-settings-defaults';
       export { captureProcessingSettings, projectPublicSettings } from './src/domain/admin-settings-resolver';
     ` },
     outfile: join(output, 'ui.mjs'), bundle: true, packages: 'external', format: 'esm', platform: 'node',
     jsx: 'automatic', logLevel: 'silent', loader: { '.css': 'empty' },
-    define: { 'import.meta.env.VITE_DEPLOYMENT_MODE': '"cloud"' },
   })
   ui = await import(pathToFileURL(join(output, 'ui.mjs')).href)
 })
 
 beforeEach(() => {
   requests = []; unexpected = []; override = null; workspaces = [metadata()]
-  settings = ui.createDefaultAdminSettings(); workspace = ui.createInitialWorkspace()
+  settings = ui.createDefaultAdminSettings(); workspace = testWorkspace()
   dom.window.localStorage.clear()
   dom.window.history.replaceState(null, '', '/')
   globalThis.fetch = async (url, init = {}) => {
@@ -95,7 +110,7 @@ beforeEach(() => {
     }
     const summary = /^\/api\/workspaces\/([^/]+)\/summary$/.exec(path)
     if (summary) return json(counts(summary[1]))
-    if (path.endsWith('/state')) return method === 'PUT' ? json({ etag: '"saved"' }) : json({ workspace, etag: '"initial"' })
+    if (path.endsWith('/state')) throw new Error(`Workspace state API must not be used: ${method} ${path}`)
     if (path.endsWith('/jobs')) return json({ jobs: [] })
     if (path.endsWith('/resumes')) return json({ resumes: [] })
     if (path.endsWith('/grade-ladders')) return json({ ladders: [] })
@@ -212,7 +227,7 @@ test('selecting and returning home honors the workspace start page, host theme, 
 })
 
 test('deep links keep their record, query, and fragment while invalid links never select a different workspace', async () => {
-  const path = `/workspaces/workspace-one/jobs/${workspace.jobs[0].id}?data=samples&scoutTheme=dark#source`
+  const path = `/workspaces/workspace-one/jobs/${workspace.jobs[0].id}?scoutTheme=dark#source`
   dom.window.history.replaceState(null, '', path)
   await render()
   await until(() => document.querySelector('.sidebar'), 'Bookmarked workspace opens directly')
@@ -328,25 +343,6 @@ test('browser back to home preserves a dirty workspace and resolves a stay decis
   await until(() => dialog('Unsaved changes'), 'Another attempt can be explicitly discarded')
   await click(button('Discard unsaved changes and leave', dialog('Unsaved changes')))
   await until(isHome, 'Discard completes browser Back to home')
-})
-
-test('home waits for a sample save acknowledgement and does not unmount on save failure', async () => {
-  const save = deferred()
-  dom.window.history.replaceState(null, '', '/workspaces/workspace-one/jobs')
-  override = (path, init) => path.endsWith('/state') && init.method === 'PUT' ? save.promise : undefined
-  await render(); await until(() => document.querySelector('.sidebar'), 'Workspace opens')
-  await click(button('Reset samples', document.querySelector('.sidebar')))
-  await click(button('Reset samples', dialog('Reset sample content?')))
-  await click(button('All workspaces'))
-  await until(() => requests.some((item) => item.method === 'PUT'), 'Save is in flight')
-  assert.equal(location.pathname, '/workspaces/workspace-one/jobs')
-  assert.equal(isHome(), false)
-  await act(async () => { save.resolve(failure('Sample save was not acknowledged.')); await pause() })
-  await until(() => document.body.textContent.includes('Sample save was not acknowledged.'), 'Failed save is visible')
-  assert.equal(isHome(), false)
-  override = null
-  await click(button('All workspaces'))
-  await until(isHome, 'Acknowledged retry can leave')
 })
 
 test('workspace counts are real-only, failure is not zero, and retry does not reload other successful cards', async () => {

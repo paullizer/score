@@ -11,31 +11,6 @@ let api, cleanup
 before(async () => { ({ api, cleanup } = await loadReportFoundation()) })
 after(async () => { await cleanup?.() })
 
-function sampleRun() { return api.createInitialWorkspace().runs[0] }
-function sampleOptions() { return { generatedAt: REPORT_TEST_TIMESTAMP } }
-
-test('sample report display names retain source names and leave all saved results unchanged', () => {
-  const run = sampleRun()
-  const original = structuredClone(run)
-  run.displayName = 'Reviewer analysis title'
-  run.targets[0].displayName = 'Reviewer target label'
-  run.resumes[0].resume.displayName = 'Reviewer resume label'
-  const report = api.buildSampleAnalysisReport(run, sampleOptions())
-  assert.equal(report.run.name, run.displayName)
-  const group = report.groups.find(item => item.target.id === run.targets[0].id)
-  assert.equal(group.target.label, original.targets[0].label)
-  assert.equal(api.targetName(group.target), 'Reviewer target label')
-  const comparison = group.comparisons.find(item => item.candidate.id === run.resumes[0].resume.id)
-  assert.equal(comparison.candidate.name, original.resumes[0].resume.name)
-  assert.equal(api.candidateName(comparison.candidate), 'Reviewer resume label')
-  const text = api.buildComparisonDetailBlocks(group.target, comparison).map(block => block.text).join('\n')
-  assert.ok(text.includes(`Source-stated name: ${original.resumes[0].resume.name}`))
-  assert.ok(text.includes(`Source target title: ${original.targets[0].label}`))
-  assert.deepEqual(run.comparisons, original.comparisons)
-  assert.deepEqual(comparison.criteria.map(item => item.score),
-    original.comparisons.find(item => item.id === comparison.id).criteria.map(item => item.score))
-})
-
 test('invalid display metadata produces structured validation failures rather than escaping safeParse', () => {
   const input = realReportFixture({ scores: [80] })
   for (const displayName of [null, 42, '', '  ', ' surrounded ', 'line\nbreak', 'line\u2028break', 'control\u0001', 'x'.repeat(161), '😀'.repeat(81)]) {
@@ -319,16 +294,16 @@ test('strict real batch parsing enforces identity, schema version, bounded batch
   assert.deepEqual(api.parseRealReportBatchResponse(response), response)
   assert.equal(api.realReportBatchResponseSchema.safeParse(response).success, true)
   for (const mutate of [
-    value => { value.dataKind = 'sample' },
+    value => { value.dataKind = 'foreign' },
     value => { value.schemaVersion = 2 },
     value => { value.workspaceId = '' },
     value => { value.runId = ' ' },
-    value => { value.targets[0].dataKind = 'sample' },
+    value => { value.targets[0].dataKind = 'foreign' },
     value => { value.targets[0].snapshot = null },
-    value => { value.comparisons[0].dataKind = 'sample' },
+    value => { value.comparisons[0].dataKind = 'foreign' },
     value => { value.comparisons[0].overall.score = NaN },
     value => { value.comparisons[0].criteria[0].sourceDocument = { paragraphs: ['private original'] } },
-    value => { value.comparisons[0].candidate.sample = true },
+    value => { value.comparisons[0].candidate.unexpectedFlag = true },
   ]) {
     const copy = structuredClone(response)
     mutate(copy)
@@ -340,148 +315,6 @@ test('strict real batch parsing enforces identity, schema version, bounded batch
   assert.equal(api.parseRealReportBatchResponse(maximum).comparisons.length, 25)
   const queued = realReportBatchFixture(realReportFixture({ scores: [0], statuses: ['queued'] }))
   assert.equal(api.parseRealReportBatchResponse(queued).comparisons[0].status, 'queued')
-})
-
-test('sample reports read frozen snapshots, preserve saved totals, and never synthesize GS qualifications', () => {
-  const workspace = api.createInitialWorkspace()
-  const run = workspace.runs[0]
-  const before = JSON.stringify(run)
-  const report = api.buildSampleAnalysisReport(run, sampleOptions())
-  assert.equal(report.dataKind, 'sample')
-  assert.equal(report.workspaceId, undefined)
-  assert.equal(report.counts.total, run.comparisons.length)
-  assert.ok(report.notices.includes(api.REPORT_SAMPLE_NOTICE))
-  assert.ok(report.notices.includes(api.REPORT_HUMAN_REVIEW_NOTICE))
-  assert.equal(report.capture.startedAt, REPORT_TEST_TIMESTAMP)
-  assert.equal(report.capture.completedAt, REPORT_TEST_TIMESTAMP)
-  assert.equal(report.capture.summaries.dataKind, 'sample')
-  assert.equal(report.capture.summaries.source, 'fixture')
-  assert.equal(report.capture.summaries.ready, true)
-  assert.equal(report.generatedAt, REPORT_TEST_TIMESTAMP)
-  for (const group of report.groups) {
-    assert.equal(group.target.selection, null)
-    for (const comparison of group.comparisons) {
-      const original = run.comparisons.find(item => item.id === comparison.id)
-      assert.equal(comparison.overall.score, original.score)
-      assert.equal(comparison.summary, original.summary)
-      assert.deepEqual(comparison.qualifications, [])
-      assert.equal(comparison.coverage, null)
-      assert.equal(comparison.analyzedAt, null)
-      assert.equal(comparison.candidate.snapshot, null)
-      assert.equal(comparison.resultSha256, null)
-    }
-  }
-  assert.equal(JSON.stringify(run), before)
-  for (const rubric of workspace.rubrics) rubric.criteria[0].guidance = 'Changed live rubric, not frozen.'
-  for (const document of workspace.documents) document.paragraphs[0].text = 'Changed live document, not frozen.'
-  assert.deepEqual(api.buildSampleAnalysisReport(run, sampleOptions()), report)
-  const changed = structuredClone(run)
-  changed.comparisons[0].score = 0
-  const zero = api.buildSampleAnalysisReport(changed, sampleOptions())
-  const savedZero = zero.groups.flatMap(group => group.comparisons).find(item => item.id === changed.comparisons[0].id)
-  assert.equal(savedZero.overall.score, 0)
-  assert.equal(savedZero.overall.status, 'available')
-  changed.comparisons[0].score = null
-  const withheld = api.buildSampleAnalysisReport(changed, sampleOptions()).groups.flatMap(group => group.comparisons).find(item => item.id === changed.comparisons[0].id)
-  assert.equal(withheld.overall.status, 'withheld')
-  assert.equal(withheld.overall.score, null)
-})
-
-test('sample exact scope, saved guidance, requirement citations, unassessed criteria, and partial statuses are retained', () => {
-  const run = sampleRun()
-  const targetId = run.targets[0].id
-  const comparison = run.comparisons.find(item => item.targetId === targetId)
-  const assessment = comparison.criteria[0]
-  Object.assign(assessment, { score: null, evidenceStatus: 'not-assessed', citations: [], rationale: 'Saved custom-criterion limitation.' })
-  comparison.score = null
-  const other = run.comparisons.find(item => item.targetId === targetId && item.id !== comparison.id)
-  Object.assign(other, { status: 'failed', score: null, criteria: [], summary: 'Raw processing status, not an assessment.', error: 'Saved sample processing failure.' })
-  const report = api.buildSampleAnalysisReport(run, { ...sampleOptions(), targetId })
-  assert.equal(report.groups.length, 1)
-  assert.equal(report.groups[0].target.id, targetId)
-  assert.equal(report.partial, true)
-  const complete = report.groups[0].comparisons.find(item => item.status === 'complete')
-  assert.equal(complete.completion, 'limited')
-  assert.equal(complete.criteria[0].rationale, assessment.rationale)
-  assert.equal(report.groups[0].target.criteria[0].guidance, run.targets[0].rubric.criteria[0].guidance)
-  const failed = report.groups[0].comparisons.find(item => item.status === 'failed')
-  assert.equal(failed.summary, null)
-  assert.deepEqual(failed.criteria, [])
-  assert.equal(failed.error.message, 'Saved sample processing failure.')
-  if (run.targets[0].kind === 'job') assert.ok(complete.criteria[0].requirementCitations.length > 0)
-})
-
-test('sample adapters reject real/mixed data, missing snapshots, duplicates, and incomplete inventories', () => {
-  const mutations = [
-    run => { run.dataKind = 'real' },
-    run => { run.targets[0].rubric.dataKind = 'real' },
-    run => { run.targets[0].rubric.provenance = { kind: 'generated', model: 'real-model', promptVersion: 'v1' } },
-    run => { run.resumes[0].resume.sample = false },
-    run => { run.resumes[0].document.sample = false },
-    run => { run.resumes[0].resume.documentId = 'missing-document' },
-    run => { run.resumes[0].document = undefined },
-    run => { run.resumes.push(structuredClone(run.resumes[0])) },
-    run => { run.comparisons.pop() },
-    run => { run.comparisons[1].id = run.comparisons[0].id },
-    run => { Object.assign(run.comparisons[1], { resumeId: run.comparisons[0].resumeId, targetId: run.comparisons[0].targetId }) },
-    run => { run.comparisons[0].resumeId = 'missing-resume' },
-    run => { run.comparisons[0].targetId = 'missing-target' },
-    run => { run.comparisons[0].score = Infinity },
-    run => { run.comparisons[0].score = 101 },
-    run => { run.comparisons[0].criteria[0].score = -1 },
-    run => { run.comparisons[0].criteria[0].score = NaN },
-    run => { run.comparisons[0].criteria[1].criterionId = run.comparisons[0].criteria[0].criterionId },
-    run => { run.targets[0].rubric.criteria[1].id = run.targets[0].rubric.criteria[0].id },
-    run => { run.comparisons[0].status = 'queued' },
-    run => { run.comparisons[0].qualifications = [] },
-  ]
-  for (const mutate of mutations) {
-    const run = sampleRun()
-    mutate(run)
-    assert.throws(() => api.buildSampleAnalysisReport(run, sampleOptions()), `Mutation unexpectedly accepted: ${mutate}`)
-  }
-})
-
-test('sample citations are verified against exact saved text, headings, positions, IDs, and versions', () => {
-  const run = sampleRun()
-  const entry = run.comparisons.find(item => item.criteria.some(criterion => criterion.citations.length))
-  const assessment = entry.criteria.find(item => item.citations.length)
-  const original = assessment.citations[0]
-  for (const mutate of [
-    citation => { citation.quote = 'Fabricated evidence not present in the source.' },
-    citation => { citation.quote = '' },
-    citation => { citation.page += 1 },
-    citation => { citation.heading = 'Another heading' },
-    citation => { citation.paragraphId = 'missing-paragraph' },
-    citation => { citation.documentId = 'other-document' },
-    citation => { citation.documentVersion += 1 },
-  ]) {
-    const copy = structuredClone(run)
-    mutate(copy.comparisons.find(item => item.id === entry.id).criteria.find(item => item.criterionId === assessment.criterionId).citations[0])
-    assert.throws(() => api.buildSampleAnalysisReport(copy, sampleOptions()))
-  }
-  const excerpt = original.quote.slice(0, 24)
-  assessment.citations[0].quote = excerpt
-  const report = api.buildSampleAnalysisReport(run, sampleOptions())
-  const saved = report.groups.flatMap(group => group.comparisons).find(item => item.id === entry.id)
-  assert.equal(saved.criteria.find(item => item.criterionId === assessment.criterionId).citations[0].quote, excerpt)
-  const serialized = JSON.stringify(report)
-  assert.ok(!serialized.includes('"document":'))
-  assert.ok(report.groups.every(group => group.target.narrative.paragraphs.every(paragraph => typeof paragraph === 'string')))
-  assert.ok(!serialized.includes('This document is entirely synthetic and was written for the Score UI demonstration.'))
-})
-
-test('sample illustrative grade reports do not invent official qualification evidence', () => {
-  const workspace = api.createFixtureWorkspace()
-  const grade = workspace.rubrics.find(rubric => rubric.kind === 'grade')
-  const run = api.snapshotAnalysisRun(workspace, [workspace.resumes[0].id], [grade.id], 'Illustrative grade run', {
-    id: 'sample-grade-run', createdAt: REPORT_TEST_TIMESTAMP, comparisonId: () => 'sample-grade-comparison',
-  })
-  run.comparisons = run.comparisons.map(item => api.evaluateComparison(run, item.id))
-  const report = api.buildSampleAnalysisReport(run, sampleOptions())
-  assert.equal(report.groups[0].target.kind, 'grade')
-  assert.deepEqual(report.groups[0].comparisons[0].qualifications, [])
-  assert.ok(report.groups[0].comparisons[0].criteria.every(item => item.requirementCitations.length === 0))
 })
 
 test('full 500-comparison reports are valid and 501 comparisons cannot be silently truncated', () => {
@@ -578,9 +411,9 @@ test('licensed local Noto Sans regular and bold fonts expose usable, explicit gl
 
 test('shared foundation bundles for the browser without Node-specific dependencies', async () => {
   const output = await build({
-    entryPoints: ['model', 'sample', 'presentation'].map(name => resolve('src', 'services', 'analysisReports', `${name}.ts`)),
+    entryPoints: ['model', 'presentation'].map(name => resolve('src', 'services', 'analysisReports', `${name}.ts`)),
     bundle: true, platform: 'browser', format: 'esm', outdir: 'unused-in-memory-report-bundle', write: false, logLevel: 'silent',
   })
-  assert.equal(output.outputFiles.length, 3)
+  assert.equal(output.outputFiles.length, 2)
   assert.ok(output.outputFiles.every(file => file.contents.byteLength > 0))
 })

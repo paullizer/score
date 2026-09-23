@@ -78,7 +78,7 @@ export interface AnalysisNarrativeSnapshotIdentity {
 }
 
 export interface AnalysisNarrativeRevision {
-  // Real revisions are immutable artifact byte hashes; sample revisions are fixture-owned.
+  // Real revisions are immutable artifact byte hashes.
   revision: string
   inputFingerprint: string
 }
@@ -107,18 +107,8 @@ export interface RealAnalysisTargetNarrative extends AnalysisTargetNarrativeCont
   dataKind: 'real'
 }
 
-export interface SampleAnalysisCandidateNarrative extends AnalysisCandidateNarrativeContent, AnalysisNarrativeRevision {
-  dataKind: 'sample'
-  fixtureId: string
-}
-
-export interface SampleAnalysisTargetNarrative extends AnalysisTargetNarrativeContent, AnalysisNarrativeRevision {
-  dataKind: 'sample'
-  fixtureId: string
-}
-
-export type ReadyAnalysisCandidateNarrative = RealAnalysisCandidateNarrative | SampleAnalysisCandidateNarrative
-export type ReadyAnalysisTargetNarrative = RealAnalysisTargetNarrative | SampleAnalysisTargetNarrative
+export type ReadyAnalysisCandidateNarrative = RealAnalysisCandidateNarrative
+export type ReadyAnalysisTargetNarrative = RealAnalysisTargetNarrative
 
 export interface AnalysisNarrativeCurrentState {
   status: AnalysisNarrativeStatus
@@ -487,14 +477,7 @@ export interface RealAnalysisNarrativeReportCapture extends AnalysisNarrativeSco
   targets: AnalysisNarrativeTargetCapture[]
 }
 
-export interface SampleAnalysisNarrativeReportCapture extends AnalysisNarrativeScopeRevision {
-  dataKind: 'sample'
-  source: 'fixture'
-  fixtureId: string
-  ready: true
-}
-
-export type AnalysisNarrativeReportCapture = RealAnalysisNarrativeReportCapture | SampleAnalysisNarrativeReportCapture
+export type AnalysisNarrativeReportCapture = RealAnalysisNarrativeReportCapture
 
 // This checks freshness of validated metadata, not artifact bytes, text shape or grounding.
 export function analysisNarrativeIsCurrent(

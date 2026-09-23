@@ -1,7 +1,7 @@
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import express, { type Express, type NextFunction, type Request, type Response } from 'express'
-import { HttpError, forbidden, invalidRequest, notFound, toCloudApiError, unavailable } from './errors'
+import { HttpError, forbidden, gone, invalidRequest, notFound, toCloudApiError, unavailable } from './errors'
 import { createHealthCheck } from './health'
 import { createAuthMiddleware, createCsrfMiddleware } from './middleware'
 import { getPrincipal } from './request-context'
@@ -44,8 +44,6 @@ import type { AssistLimiter } from './assist/limits'
 export { WorkspaceRepository } from './repository'
 export { WorkspaceLifecycleService } from './lifecycle/service'
 export { createLifecycleDependencies } from './lifecycle/dependencies'
-export { applySampleLifecycle } from '../src/domain/lifecycle'
-export { createAnalysisRun } from '../src/services/mockWorkspace'
 export { StoreConflictError, StoreNotFoundError } from './store'
 export { createStateStoreFromContainer } from './azure-state-store'
 export { createDirectoryStoreFromContainer } from './azure-directory-store'
@@ -186,7 +184,7 @@ export function createApp(deps: AppDeps): Express {
   else if (config.realGrades || config.gradeLifecycleStore) participants.push(unavailableParticipant('Grade'))
   if (deps.jobs) participants.push(createJobLifecycleParticipant(deps.jobs))
   else if (config.realJobs || config.jobLifecycleStore) participants.push(unavailableParticipant('Job'))
-  const lifecycle = createLifecycleDependencies(state, deps.jobs, deps.grades, Boolean(config.realGrades || config.gradeLifecycleStore),
+  const lifecycle = createLifecycleDependencies(deps.jobs, deps.grades, Boolean(config.realGrades || config.gradeLifecycleStore),
     analysisStorage, Boolean(config.realAnalyses || config.analysisLifecycleStore))
   const workspaceLifecycle = new WorkspaceLifecycleService({ repository, directory, state, participants, lifecycle, now: deps.now })
   const checkHealth = createHealthCheck({ directory, state })
@@ -298,17 +296,13 @@ export function createApp(deps: AppDeps): Express {
     res.status(result.operation && result.operation.status !== 'complete' ? 202 : 200).json(result)
   })
 
-  api.get('/workspaces/:id/state', async (req, res) => {
-    const snapshot = await repository.getWorkspaceState(getPrincipal(req), req.params.id)
-    res.setHeader('ETag', snapshot.etag)
-    res.json(snapshot)
-  })
-
-  api.put('/workspaces/:id/state', async (req, res) => {
-    const result = await repository.putWorkspaceState(getPrincipal(req), req.params.id, req.body, readIfMatch(req))
-    res.setHeader('ETag', result.etag)
-    res.json(result)
-  })
+  // Retired sample-state endpoints. Stale browser tabs from older releases get an explicit reload
+  // instruction; no authorization lookup or storage access happens here.
+  const retiredWorkspaceState = (_req: Request, res: Response) => {
+    res.status(410).json(toCloudApiError(gone('This version of Score is out of date. Reload the page.')))
+  }
+  api.get('/workspaces/:id/state', retiredWorkspaceState)
+  api.put('/workspaces/:id/state', retiredWorkspaceState)
 
   app.use('/api', api)
   // Anything under /api not matched above must still come back as a CloudApiError, never the HTML

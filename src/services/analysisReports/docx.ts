@@ -393,7 +393,7 @@ class WordReportLayout implements DocumentReportLayout<string> {
   }
 
   private header(identity: DocumentPageIdentity): Header {
-    const designation = [this.report.dataKind === 'sample' ? 'FICTIONAL SAMPLE' : '', identity.section].filter(Boolean).join(' \u00b7 ')
+    const designation = identity.section
     const shaded = {
       shading: { fill: palette.background, type: ShadingType.CLEAR },
       indent: { left: -twips(DOCUMENT_REPORT_PAGE.margin), right: -twips(DOCUMENT_REPORT_PAGE.margin) },

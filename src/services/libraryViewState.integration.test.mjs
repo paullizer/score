@@ -32,10 +32,9 @@ before(async () => {
     export { useLibraryViewState } from './src/app/library-view-state';
     export { RubricsPage } from './src/features/rubrics/RubricsPage';
     export { WorkspaceContext } from './src/app/workspace-context';
-    export { createInitialWorkspace } from './src/data/fixtures';
     export { MemoryRouter, Routes, Route, useNavigate, useLocation } from 'react-router-dom';
   ` }, outfile: join(output, 'ui.mjs'), bundle: true, packages: 'external', format: 'esm', platform: 'node',
-  jsx: 'automatic', logLevel: 'silent', define: { 'import.meta.env.VITE_DEPLOYMENT_MODE': '"cloud"' } })
+  jsx: 'automatic', logLevel: 'silent' })
   ui = await import(pathToFileURL(join(output, 'ui.mjs')).href)
 })
 
@@ -57,10 +56,10 @@ after(async () => {
 })
 
 function Probe() { navigate = ui.useNavigate(); location = ui.useLocation(); return null }
-function Library({ library = 'jobs', mode = 'real', id = 'list' }) {
-  const [query, setQuery] = ui.useLibraryViewState(`${library}:${mode}:query`, '')
-  const [archive, setArchive] = ui.useLibraryViewState(`${library}:${mode}:archive`, 'default')
-  const [sort, setSort] = ui.useLibraryViewState(`${library}:${mode}:sort`, () => ({ key: 'date', direction: 'desc' }))
+function Library({ library = 'jobs', id = 'list' }) {
+  const [query, setQuery] = ui.useLibraryViewState(`${library}:query`, '')
+  const [archive, setArchive] = ui.useLibraryViewState(`${library}:archive`, 'default')
+  const [sort, setSort] = ui.useLibraryViewState(`${library}:sort`, () => ({ key: 'date', direction: 'desc' }))
   const [selected, setSelected] = useState([])
   controls.set(id, { query, archive, sort, selected, setQuery, setArchive, setSort, setSelected })
   return element('output', { 'data-list': id }, query)
@@ -73,9 +72,9 @@ function router(children, url = '/library') {
   return element(ui.MemoryRouter, { initialEntries: [url], future: { v7_startTransition: true, v7_relativeSplatPath: true } },
     element(React.Fragment, null, element(Probe), children))
 }
-async function renderLibrary({ scopeKey = 'tenant:user:one', library = 'jobs', mode = 'real', provider = true } = {}) {
+async function renderLibrary({ scopeKey = 'tenant:user:one', library = 'jobs', provider = true } = {}) {
   const tree = router(element(ui.Routes, null,
-    element(ui.Route, { path: '/library', element: element(Library, { library, mode }) }),
+    element(ui.Route, { path: '/library', element: element(Library, { library }) }),
     element(ui.Route, { path: '/detail', element: element('p', null, 'Saved record') })))
   await renderTree(provider ? element(ui.LibraryViewStateProvider, { scopeKey }, tree) : tree)
 }
@@ -104,22 +103,6 @@ test('library Back remount restores search, filters, and sort without retaining 
   assert.equal(document.querySelector('[data-list]'), null)
   await go(-1)
   assert.deepEqual(state(), { query: 'private reviewer query', archive: 'all', sort: { key: 'title', direction: 'asc' }, selected: [] })
-  noPersistence()
-})
-
-test('real and sample libraries keep separate state while retaining existing initial defaults', async () => {
-  await renderLibrary()
-  await act(async () => controls.get('list').setQuery('real only'))
-  await renderLibrary({ mode: 'samples' })
-  assert.equal(state().query, '')
-  await act(async () => controls.get('list').setQuery('sample only'))
-  await renderLibrary({ library: 'resumes', mode: 'samples' })
-  assert.equal(state().query, '')
-  await act(async () => controls.get('list').setQuery('resume only'))
-  await renderLibrary()
-  assert.equal(state().query, 'real only')
-  await renderLibrary({ mode: 'samples' })
-  assert.equal(state().query, 'sample only')
   noPersistence()
 })
 
@@ -176,13 +159,15 @@ test('without a provider the hook behaves like isolated component useState and r
   noPersistence()
 })
 
-test('rubric library restores its search/archive controls on Back and keeps URL mode navigation intentional', async () => {
-  const workspace = ui.createInitialWorkspace()
+test('rubric library restores its search/archive controls on Back and ignores legacy data query navigation', async () => {
+  const rubric = { id: 'rubric-one', groupId: 'group-one', kind: 'job', jobId: 'job-one', name: 'Analyst rubric', description: '', version: 1, criteria: [], createdAt: '2026-09-19T00:00:00.000Z', dataKind: 'real' }
+  const workspace = { jobs: [{ id: 'job-one', title: 'Analyst role', status: 'ready', rubricId: rubric.id, dataKind: 'real' }], documents: [], rubrics: [rubric], lifecycle: { entities: { 'job:job-one': {}, 'rubric:group-one': { parentKey: 'job:job-one' } } } }
   const context = frontendWorkspaceContext({ workspace, cloud: { currentWorkspaceId: 'one' } })
+  const legacyQuery = new URLSearchParams({ kind: 'job', data: 'samples' }).toString()
   const tree = router(element(ui.WorkspaceContext.Provider, { value: context },
     element(ui.Routes, null,
       element(ui.Route, { path: '/rubrics', element: element(ui.RubricsPage) }),
-      element(ui.Route, { path: '/rubrics/:id', element: element('p', null, 'Rubric details') }))), '/rubrics?kind=job&data=samples')
+      element(ui.Route, { path: '/rubrics/:id', element: element('p', null, 'Rubric details') }))), `/rubrics?${legacyQuery}`)
   await renderTree(element(ui.LibraryViewStateProvider, { scopeKey: 'tenant:user:one' }, tree))
   const search = () => document.querySelector('input[type="search"]')
   const archive = () => document.querySelector('select[aria-label="Rubric archive state"]')
@@ -192,15 +177,12 @@ test('rubric library restores its search/archive controls on Back and keeps URL 
     archive().value = 'all'
     archive().dispatchEvent(new dom.window.Event('change', { bubbles: true }))
   })
-  await go(`/rubrics/${workspace.rubrics[0].id}`)
+  await go(`/rubrics/${rubric.id}`)
   await go(-1)
   assert.equal(search().value, 'analyst')
   assert.equal(archive().value, 'all')
-  assert.equal(location.search, '?kind=job&data=samples')
+  assert.equal(location.search, `?${legacyQuery}`)
   await go('/rubrics?kind=job&data=real')
-  assert.equal(search().value, '')
-  assert.equal(archive().value, 'default')
-  await go('/rubrics?kind=job&data=samples')
   assert.equal(search().value, 'analyst')
   assert.equal(archive().value, 'all')
   assert.equal(dom.window.localStorage.length, 0)

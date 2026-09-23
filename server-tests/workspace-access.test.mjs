@@ -1,13 +1,13 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import {
-  applySampleLifecycle, captureProcessingSettings, createDefaultAdminSettings, WorkspaceAccessService, WorkspaceRepository,
+  captureProcessingSettings, createDefaultAdminSettings, WorkspaceAccessService, WorkspaceRepository,
 } from '../dist-server/app.mjs'
 import {
   ALLOWED_OID as OWNER, OTHER_ALLOWED_OID as PEER, NOT_ALLOWED_OID as OUTSIDER,
   APP_ORIGIN, CSRF_HEADER, OTHER_TENANT_ID, TENANT_ID, StoreConflictError, authHeaders,
   baseConfig, createFakeAccessStore, createFakeDirectoryStore, createFakeEligibleUsers, createFakeStateStore, membershipFor, membershipIdFor,
-  principalKeyFor, sampleWorkspaceBody, seedWorkspace, startTestServer,
+  principalKeyFor, legacyStateBody, seedWorkspace, startTestServer,
 } from './helpers.mjs'
 
 const ADMIN = '33333333-3333-4333-8333-333333333333'
@@ -64,26 +64,20 @@ async function share(server, oid, role, actor = {}) {
   return result
 }
 
-for (const [label, oid, memberRole, roles, readStatus, writeStatus, manageStatus] of [
-  ['Reader', READER, 'viewer', ['Score.User'], 200, 403, 403],
-  ['Reviewer', NEW_USER, 'reviewer', ['Score.User'], 200, 403, 403],
-  ['Editor', PEER, 'editor', ['Score.User'], 200, 200, 403],
-  ['Owner', OWNER, 'owner', ['Score.User'], 200, 200, 200],
-  ['application Admin without membership', ADMIN, undefined, ['Score.Admin'], 200, 200, 200],
-  ['application Admin with Reader membership', ADMIN, 'viewer', ['Score.Admin'], 200, 200, 200],
-  ['application Admin with Reviewer membership', ADMIN, 'reviewer', ['Score.Admin'], 200, 200, 200],
-  ['admitted nonmember', OUTSIDER, undefined, ['Score.User'], 404, 404, 404],
+for (const [label, oid, memberRole, roles, readStatus, manageStatus] of [
+  ['Reader', READER, 'viewer', ['Score.User'], 200, 403],
+  ['Reviewer', NEW_USER, 'reviewer', ['Score.User'], 200, 403],
+  ['Editor', PEER, 'editor', ['Score.User'], 200, 403],
+  ['Owner', OWNER, 'owner', ['Score.User'], 200, 200],
+  ['application Admin without membership', ADMIN, undefined, ['Score.Admin'], 200, 200],
+  ['application Admin with Reader membership', ADMIN, 'viewer', ['Score.Admin'], 200, 200],
+  ['application Admin with Reviewer membership', ADMIN, 'reviewer', ['Score.Admin'], 200, 200],
+  ['admitted nonmember', OUTSIDER, undefined, ['Score.User'], 404, 404],
 ]) {
-  test(`${label}: effective access is consistent across content, rename, lifecycle, sharing, and administration`, async t => {
+  test(`${label}: effective access is consistent across lifecycle, rename, sharing, and administration`, async t => {
     const server = await workspaceFixture(t)
     if (memberRole && oid !== OWNER) await share(server, oid, memberRole)
     const actor = { oid, roles }
-    const saved = await request(server, `${server.path}/state`)
-    const read = await request(server, `${server.path}/state`, actor)
-    assert.equal(read.status, readStatus)
-    assert.equal((await request(server, `${server.path}/state`, {
-      ...actor, method: 'PUT', etag: saved.body.etag, body: saved.body.workspace,
-    })).status, writeStatus)
     assert.equal((await members(server, actor)).status, manageStatus)
     assert.equal((await request(server, `${server.path}/share-candidates?query=person`, actor)).status, manageStatus)
     const impact = await request(server, `${server.path}/lifecycle`, actor)
@@ -126,31 +120,6 @@ for (const [label, oid, memberRole, roles, readStatus, writeStatus, manageStatus
   })
 }
 
-test('Editors retain content archive, restore, and deletion permissions; stored viewer membership remains read-only', async t => {
-  const server = await workspaceFixture(t)
-  await share(server, PEER, 'editor')
-  await share(server, READER, 'viewer')
-  const first = await request(server, `${server.path}/state`)
-  const target = { kind: 'resume', id: first.body.workspace.resumes[0].id }
-  let prepared = first.body.workspace
-  for (const run of first.body.workspace.runs) prepared = applySampleLifecycle(prepared, { kind: 'analysis', id: run.id }, 'delete', NOW)
-  assert.equal((await request(server, `${server.path}/state`, {
-    oid: PEER, method: 'PUT', body: prepared, etag: first.body.etag,
-  })).status, 200)
-  for (const action of ['archive', 'unarchive', 'delete']) {
-    const current = await request(server, `${server.path}/state`)
-    const next = applySampleLifecycle(current.body.workspace, target, action, NOW)
-    assert.equal((await request(server, `${server.path}/state`, {
-      oid: READER, method: 'PUT', body: next, etag: current.body.etag,
-    })).status, 403)
-    assert.equal((await request(server, `${server.path}/state`, {
-      oid: PEER, method: 'PUT', body: next, etag: current.body.etag,
-    })).status, 200)
-  }
-  const after = await request(server, `${server.path}/state`)
-  assert.ok(!after.body.workspace.resumes.some(item => item.id === target.id))
-})
-
 test('owning a workspace does not grant creation; explicit grant and revocation affect only future creation', async t => {
   const server = await workspaceFixture(t)
   assert.equal((await request(server, '/api/session')).body.capabilities.canCreateWorkspaces, false)
@@ -175,7 +144,7 @@ test('owning a workspace does not grant creation; explicit grant and revocation 
   assert.equal((await request(server, '/api/workspaces', { method: 'POST', body: { name: 'Revoked creation' } })).status, 403)
   assert.equal(server.directory._workspaceCount(), 2)
   for (const id of [server.workspace.id, created.body.workspace.id]) {
-    assert.equal((await request(server, `/api/workspaces/${id}/state`)).status, 200)
+    assert.equal((await request(server, `/api/workspaces/${id}/lifecycle`)).status, 200)
   }
   const audit = server.accessStore._audits()
   assert.deepEqual(audit.map(item => [item.actorId, item.targetId, item.previous, item.next]),
@@ -258,7 +227,7 @@ test('creation-store read and transaction failures are explicit errors, never im
   }
   assert.equal((await request(server, grantPath(OWNER), administrator)).status, 503)
   assert.equal((await request(server, '/api/workspaces', { method: 'POST', body: { name: 'No unsafe fallback' } })).status, 503)
-  assert.equal((await request(server, `${server.path}/state`)).status, 200)
+  assert.equal((await request(server, `${server.path}/lifecycle`)).status, 200)
   store._setReadError(undefined)
   store._setWriteError(new Error('Grant transaction failed'))
   assert.equal((await request(server, grantPath(OWNER), {
@@ -285,7 +254,7 @@ test('a never-signed-in eligible user receives named Reader access, not an impli
   assert.equal(server.directory._workspaceCount(), 1)
   assert.equal((await changeMember(server, NEW_USER, undefined, added.etag)).status, 200)
   assert.deepEqual((await request(server, '/api/session', { oid: NEW_USER })).body.workspaces, [])
-  assert.equal((await request(server, `${server.path}/state`, { oid: NEW_USER })).status, 404)
+  assert.equal((await request(server, `${server.path}/lifecycle`, { oid: NEW_USER })).status, 404)
   assert.deepEqual(await server.state.getState(server.workspace.id), initialState)
   const audits = server.directory._audits(server.workspace.id)
   assert.deepEqual(audits.map(item => [item.actorId, item.targetId, item.previous, item.next]),
@@ -301,7 +270,7 @@ test('legacy viewer membership without display fields is preserved and does not 
   const session = await request(server, '/api/session', { oid: READER })
   assert.equal(session.body.workspaces[0].role, 'viewer')
   assert.equal(session.body.capabilities.canCreateWorkspaces, false)
-  assert.equal((await request(server, `${server.path}/state`, { oid: READER })).status, 200)
+  assert.equal((await request(server, `${server.path}/lifecycle`, { oid: READER })).status, 200)
 })
 
 test('legacy metadata without ownerCount derives the last-owner guard and initializes its count atomically on change', async t => {
@@ -352,7 +321,7 @@ test('removing an Admin explicit Reader membership cannot revoke implicit applic
   const member = await share(server, ADMIN, 'viewer')
   assert.equal((await changeMember(server, ADMIN, undefined, member.etag)).status, 200)
   assert.equal((await members(server, administrator)).status, 200)
-  assert.equal((await request(server, `${server.path}/state`, administrator)).status, 200)
+  assert.equal((await request(server, `${server.path}/lifecycle`, administrator)).status, 200)
   assert.equal((await request(server, grantPath(OWNER), administrator)).status, 200)
   const session = await request(server, '/api/session', administrator)
   assert.equal(session.body.workspaces[0].role, 'owner')
@@ -530,7 +499,7 @@ test('Graph failures block new grants and promotions but never existing reads, p
   const member = await share(server, PEER, 'editor')
   const grant = await request(server, grantPath(PEER), administrator)
   server.eligibleUsers._setError(new Error('Graph is unavailable'))
-  assert.equal((await request(server, `${server.path}/state`, { oid: PEER })).status, 200)
+  assert.equal((await request(server, `${server.path}/lifecycle`, { oid: PEER })).status, 200)
   assert.equal((await request(server, '/api/workspaces', { oid: PEER, method: 'POST', body: { name: 'Already granted' } })).status, 201)
   assert.equal((await changeMember(server, NEW_USER, 'viewer', member.etag)).status, 503)
   assert.equal((await changeMember(server, PEER, 'owner', member.etag)).status, 503)
@@ -547,7 +516,7 @@ test('Graph failures block new grants and promotions but never existing reads, p
   assert.equal(server.eligibleUsers.calls.length, calls)
   assert.equal((await request(server, '/api/admin/users', administrator)).status, 503)
   assert.equal((await request(server, `${server.path}/share-candidates`)).status, 503)
-  assert.equal((await request(server, `${server.path}/state`, { oid: PEER })).status, 404)
+  assert.equal((await request(server, `${server.path}/lifecycle`, { oid: PEER })).status, 404)
 })
 
 test('promotion revalidates Entra eligibility while downgrade of a departed eligible user remains possible', async t => {
@@ -623,9 +592,9 @@ test('application Admin listing is tenant-scoped, includes archives and recovery
     assert.deepEqual(result.body.workspaces.map(item => item.id).sort(), [server.workspace.id, archived.id, recoverable.id].sort())
     assert.ok(result.body.workspaces.every(item => item.role === 'owner' && item.accessSource === 'application-admin'))
   }
-  assert.equal((await request(server, `/api/workspaces/${foreign.id}/state`, administrator)).status, 404)
+  assert.equal((await request(server, `/api/workspaces/${foreign.id}/lifecycle`, administrator)).status, 404)
   assert.equal((await request(server, `/api/workspaces/${foreign.id}/members`, administrator)).status, 404)
-  assert.equal((await request(server, `/api/workspaces/${deleted.id}/state`, administrator)).status, 404)
+  assert.equal((await request(server, `/api/workspaces/${deleted.id}/lifecycle`, administrator)).status, 404)
   assert.deepEqual((await request(server, '/api/session')).body.workspaces.map(item => item.id), [server.workspace.id])
   const explicit = await server.directory.listMembershipsForPrincipal(principalKeyFor(TENANT_ID, ADMIN))
   assert.equal(explicit.length, 1)
@@ -637,7 +606,7 @@ test('deletion recovery follows the current peer owner after creator removal and
   const coOwned = await share(server, PEER, 'owner')
   const removed = await changeMember(server, OWNER, undefined, coOwned.etag, { oid: PEER })
   assert.equal(removed.status, 200)
-  server.state._setRawContent(server.workspace.id, JSON.stringify(sampleWorkspaceBody()))
+  server.state._setRawContent(server.workspace.id, JSON.stringify(legacyStateBody()))
   const replace = server.directory.replaceMetadata
   let fail = true
   server.directory.replaceMetadata = async (metadata, etag) => {

@@ -19,7 +19,7 @@ On a new, empty criterion, **Draft with AI** fills in its label, description, 0�
 
 Every unsaved change stays highlighted until you save. **AI assist** changes are blue and **your edits** are violet. Each highlighted field also shows a text badge and its previous value, so color is never the only cue. Fields in a newly added criterion show who wrote them, with no previous value or per-field Revert; remove the criterion to undo the addition. Removed criteria stay visible as **Removed · Restore** rows. **Undo** and **Redo** in the editor header work across AI and manual changes; inside a text box, Ctrl/⌘+Z keeps the browser's own text undo. When AI changes are present, the first **Save version N** opens the **Changes** tab and asks you to **Confirm and save version N**. Saves with only your own edits still take one click.
 
-Highlighting, session history, undo/redo, the saved-versions list and the Job posting tab are part of the shared editor, so they also apply when you edit sample rubrics. The AI features appear only for real job rubrics in the cloud app.
+Highlighting, session history, undo/redo, the saved-versions list and the Job posting tab are part of the shared editor, so they also apply when AI assistance is unavailable. The AI features appear only for job rubrics, and only when the assistant is available to the workspace.
 
 ## Guarantees
 
@@ -111,7 +111,7 @@ A future **GS grade draft** adapter must respect that editor's rules: support ve
 
 ## Follow-ups
 
-- AI assistance for GS grade drafts, and a scripted demo assistant for samples.
+- AI assistance for GS grade drafts.
 - Recording AI-assisted provenance or saved-version authors (a worker-first schema rollout).
 - A dedicated `rubricAssistant` model binding (a settings-version rollout).
 - Server-side conversation history, streaming responses, and a lint for manual rubric edits.

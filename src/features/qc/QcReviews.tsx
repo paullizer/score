@@ -48,7 +48,7 @@ export function QcScopePicker({ workspaceId, onChoose, selected = [], limit = QC
       </option>)}
     </select></label><Button size="sm" icon={RefreshCw} disabled={disabled || runs.loading} onClick={() => { runs.reload(); comparisons.reload() }}>Refresh analyses</Button></div>
     {runs.error && <InlineError>{runs.error}</InlineError>}
-    {runs.value?.length === 0 && <EmptyState title="No saved real analyses" description="QC never uses samples. Complete at least one real comparison in normal mode first." />}
+    {runs.value?.length === 0 && <EmptyState title="No saved real analyses" description="Complete at least one real comparison in normal mode first." />}
     {runId && <><p className="qc-muted">{complete.length} completed comparisons in this run. Other comparisons may still be running or failed; they do not block review.</p>
       {comparisons.loading && <p role="status">Loading saved comparisons…</p>}
       {comparisons.error && <InlineError>{comparisons.error} <Button onClick={comparisons.reload}>Retry comparisons</Button></InlineError>}

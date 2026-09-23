@@ -22,45 +22,65 @@
 
 @layer components {
   .app-layout { @apply flex min-h-screen; background: radial-gradient(ellipse at 80% 0%, var(--cp-accent-soft), var(--cp-bg) 48%); }
-  .sidebar { @apply flex w-[228px] shrink-0 flex-col px-5; position: sticky; top: 0; height: 100dvh; border-right: 1px solid var(--cp-border); background: var(--cp-panel); backdrop-filter: blur(24px); }
+  .sidebar { @apply flex w-[228px] shrink-0 flex-col px-5; position: sticky; top: 0; height: 100dvh; overflow-x: hidden; overflow-y: auto; border-right: 1px solid var(--cp-border); background: var(--cp-panel); backdrop-filter: blur(24px); transition: width 200ms ease; }
+  .sidebar-brand-row { @apply flex shrink-0 items-center gap-2; height: 89px; }
   .brand { @apply flex items-center gap-2.5; height: 89px; font-size: 29px; font-weight: 650; letter-spacing: -1.5px; }
+  .sidebar-brand-row .brand { @apply min-w-0 flex-1 rounded-xl; height: auto; }
+  .brand-title { @apply min-w-0 truncate; padding-right: 2px; }
   .brand-mark { @apply flex h-9 w-9 items-center justify-center rounded-xl; color: var(--cp-accent-fg); background: var(--cp-accent); box-shadow: 0 3px 10px var(--cp-accent-soft); }
   .brand-period { color: var(--cp-accent); }
+  .sidebar-toggle { @apply flex h-8 w-8 shrink-0 items-center justify-center rounded-lg; color: var(--cp-text-muted); transition: background 150ms, color 150ms; }
+  .sidebar-toggle:hover { background: var(--cp-surface-soft); color: var(--cp-text); }
+  /* Scrolls on short viewports so appearance and account never clip; the padding keeps focus rings unclipped. */
+  .sidebar-scroll { @apply relative flex min-h-0 flex-1 flex-col; margin: 0 -8px; padding: 6px 8px 16px; overflow-x: hidden; overflow-y: auto; }
   .workspace-label { @apply mb-9 mt-1 flex items-center gap-2.5 rounded-xl border p-3; background: var(--cp-sheen); }
   .workspace-monogram { @apply flex h-8 w-8 items-center justify-center rounded-lg border text-xs font-semibold; background: var(--cp-surface); }
   .workspace-label strong { @apply block text-[12px] font-semibold; }
   .workspace-label div > span { @apply block text-[10px]; color: var(--cp-text-soft); margin-top: 2px; }
-  .workspace-online { @apply ml-auto h-1.5 w-1.5 rounded-full; background: var(--cp-success); }
   .nav-heading { @apply mb-3 px-3 text-[9px] font-semibold tracking-[0.15em]; color: var(--cp-text-soft); }
-  .main-nav { @apply flex flex-col gap-1.5; }
-  .nav-item { @apply flex items-center gap-3 rounded-[10px] px-3 py-3 text-[13px]; color: var(--cp-text-muted); transition: background 160ms; }
+  .main-nav, .sidebar-links { @apply flex flex-col gap-1.5; }
+  .nav-item { @apply flex w-full items-center gap-3 rounded-[10px] px-3 py-3 text-left text-[13px]; color: var(--cp-text-muted); transition: background 160ms; }
   .nav-item:hover { background: var(--cp-surface-soft); color: var(--cp-text); }
   .nav-item.is-active { background: var(--cp-accent-soft); color: var(--cp-accent); font-weight: 600; }
-  .nav-count { @apply ml-auto text-[10px]; opacity: .75; font-variant-numeric: tabular-nums; }
-  .sidebar-bottom { @apply mt-auto pb-5 pt-10; }
-  .sidebar-note { @apply mb-7 px-3; }
-  .small-symbol { @apply mb-3 inline-flex h-8 w-8 items-center justify-center rounded-[10px] border; color: var(--cp-text-muted); }
-  .sidebar-note strong { @apply block text-[11px] font-semibold; }
-  .sidebar-note p { @apply mb-3 mt-2 text-[11px] leading-5; color: var(--cp-text-soft); }
-  .sidebar-note .text-link { @apply text-[11px]; }
+  .nav-item > svg { @apply shrink-0; }
+  .nav-label { @apply min-w-0 truncate; }
+  .nav-count { @apply ml-auto shrink-0 text-[10px]; opacity: .75; font-variant-numeric: tabular-nums; }
+  .nav-external { margin-left: -8px; opacity: .7; }
+  .sidebar-home { @apply mb-3; }
+  /* The auto margin is the flexible spacer; the padding keeps the links apart from the navigation when space runs out. */
+  .sidebar .sidebar-links { @apply mt-auto pt-6; }
+  .sidebar-bottom { @apply shrink-0 pb-1; }
   .sidebar-utility { @apply mb-4 flex items-center justify-between border-t px-1 pt-5 text-[11px]; color: var(--cp-text-muted); }
   .theme-control { @apply inline-flex gap-0.5 rounded-lg border p-0.5; background: var(--cp-surface-soft); }
   .theme-control button { @apply flex h-7 w-7 items-center justify-center rounded-md; color: var(--cp-text-muted); }
   .theme-control button[aria-pressed="true"] { background: var(--cp-surface); color: var(--cp-accent); box-shadow: 0 1px 2px var(--cp-border); }
   .theme-control button:hover { color: var(--cp-accent); }
-  .reset-button { @apply flex items-center gap-2 px-1 py-2 text-[11px]; color: var(--cp-text-soft); }
-  .reset-button:hover { color: var(--cp-accent); }
-  .sidebar-version { @apply mt-5 flex justify-between px-1 text-[8px] tracking-[0.12em]; color: var(--cp-text-soft); }
+  /* Collapsed rail: every destination stays in place as an icon; labels stay available to assistive technology. */
+  .sidebar.is-collapsed { width: 77px; padding-left: 16px; padding-right: 16px; }
+  .sidebar.is-collapsed .sidebar-brand-row { @apply flex-col justify-center gap-2; height: auto; padding: 26px 0 10px; }
+  .sidebar.is-collapsed .brand { @apply flex-none justify-center gap-0; }
+  .sidebar.is-collapsed .brand-title,
+  .sidebar.is-collapsed .nav-heading,
+  .sidebar.is-collapsed .nav-label,
+  .sidebar.is-collapsed .nav-count,
+  .sidebar.is-collapsed .workspace-switcher-trigger > div,
+  .sidebar.is-collapsed .sidebar-utility-label,
+  .sidebar.is-collapsed .account-panel-identity { @apply sr-only; }
+  .sidebar.is-collapsed .nav-item { @apply justify-center gap-0 p-0; height: 44px; }
+  .sidebar.is-collapsed .nav-external, .sidebar.is-collapsed .workspace-switcher-caret { display: none; }
+  .sidebar.is-collapsed .workspace-switcher-trigger { @apply mb-5 justify-center gap-0; height: 44px; padding: 5px; }
+  .sidebar.is-collapsed .sidebar-utility { @apply mb-3 flex-col justify-center px-0 pt-3; }
+  .sidebar.is-collapsed .theme-control { @apply flex-col; }
+  .sidebar.is-collapsed .account-panel { @apply mb-3 flex-col gap-2 px-0 pt-3; }
+  /* Still scrollable by wheel, touch, and focus; a classic scrollbar would narrow the icon column and pull icons off center. */
+  .sidebar.is-collapsed, .sidebar.is-collapsed .sidebar-scroll { scrollbar-width: none; }
+  .sidebar.is-collapsed::-webkit-scrollbar, .sidebar.is-collapsed .sidebar-scroll::-webkit-scrollbar { display: none; }
+  .dialog-drawer .sidebar-links { @apply mt-5 border-t pt-4; }
   .app-body { @apply min-w-0 flex-1; }
   .topbar { @apply flex items-center justify-between gap-4 border-b px-9; height: 68px; background: var(--cp-panel); backdrop-filter: blur(20px); }
   .breadcrumbs { @apply flex items-center gap-3 text-[11px]; color: var(--cp-text-soft); }
   .breadcrumbs a { color: var(--cp-text); font-weight: 500; }
   .topbar-actions { @apply flex items-center gap-5; }
-  .save-status { @apply flex items-center gap-1.5 text-[10px]; color: var(--cp-text-soft); }
-  .save-status > span { @apply h-1 w-1 rounded-full; background: var(--cp-success); }
-  .save-status.is-error { color: var(--cp-danger); }
-  .save-status.is-error > span { background: var(--cp-danger); }
-  .demo-chip { @apply inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-[10px]; color: var(--cp-text-muted); background: var(--cp-surface); }
   .main-content { @apply mx-auto w-full max-w-[1600px] px-9 pb-4 pt-9; }
   .page-heading { @apply mb-7 flex flex-wrap items-end justify-between gap-5; }
   .page-heading > div:first-child { min-width: 0; max-width: 100%; }
@@ -116,7 +136,6 @@
   .workspace-home-main { @apply mx-auto w-full max-w-[1200px] px-10 pb-8 pt-12; }
   .workspace-home-main > .page-heading { @apply mb-10; }
   .workspace-home-main .page-heading h1:focus { outline: none; }
-  .workspace-home-nav { @apply mb-3 justify-start px-2; }
   .workspace-section-heading { @apply mb-4 flex flex-wrap items-center justify-between gap-3; }
   .workspace-section-heading h2 { @apply flex items-center gap-2 text-[15px] font-semibold; }
   .workspace-section-heading > span { @apply text-[11px]; color: var(--cp-text-muted); }
@@ -165,8 +184,6 @@
     .workspace-home-footer svg { flex-shrink: 0; margin-top: 3px; }
   }
   .workspace-operation { @apply w-full space-y-2 border-t pt-3 text-[11px]; color: var(--cp-text-muted); }
-  .library-kind-switcher { @apply flex flex-wrap items-center justify-between gap-3 border-b px-4 py-3; background: var(--cp-sheen); }
-  .library-kind-switcher > span { @apply text-[10px]; color: var(--cp-text-soft); }
   .segmented { @apply inline-flex flex-wrap gap-0.5 rounded-[10px] p-1; background: var(--cp-surface-soft); }
   .segmented button { @apply flex items-center gap-2 rounded-lg px-3 py-1.5 text-[11px] font-medium; color: var(--cp-text-muted); }
   .segmented button.is-active { background: var(--cp-surface); color: var(--cp-text); box-shadow: 0 1px 3px var(--cp-border); }
@@ -220,8 +237,8 @@
   .link-button:hover { text-decoration: underline; }
   .workspace-footer { @apply mt-8 flex flex-wrap items-center justify-between gap-2 text-[9px]; color: var(--cp-text-soft); }
   .workspace-footer > span:first-child { @apply flex items-center gap-1.5; }
-  .demo-note { @apply flex items-start gap-2 text-[11px]; color: var(--cp-text-soft); }
-  .demo-note > svg { @apply mt-0.5 shrink-0; }
+  .library-note-text { @apply flex items-start gap-2 text-[11px]; color: var(--cp-text-soft); }
+  .library-note-text > svg { @apply mt-0.5 shrink-0; }
   .library-note { @apply mt-5 flex items-center justify-between gap-3 px-1; }
   .empty-state { @apply flex flex-col items-center px-5 py-16 text-center; }
   .empty-icon { @apply mb-4 flex h-14 w-14 items-center justify-center rounded-2xl border; color: var(--cp-text-soft); background: var(--cp-surface-soft); }
@@ -425,7 +442,7 @@
   .evidence-gap p { @apply mt-1 text-[10px]; color: var(--cp-text-muted); }
   .score-legend { @apply flex flex-wrap gap-x-4 gap-y-2 border-t px-5 py-4 text-[8px]; color: var(--cp-text-soft); background: var(--cp-bg-elevated); }
 
-  /* Cloud workspace switcher, account panel, and save-status affordances */
+  /* Cloud workspace switcher and account panel affordances */
   .workspace-switcher-trigger { width: 100%; border: 1px solid transparent; text-align: left; transition: background 150ms, border-color 150ms; }
   .workspace-switcher-trigger:hover, .workspace-switcher-trigger:focus-visible { background: var(--cp-surface-soft); border-color: var(--cp-border); }
   .workspace-switcher-trigger > div { @apply min-w-0 flex-1; }
@@ -449,8 +466,6 @@
   .cloud-gate-card h1 { @apply mb-1 text-xl font-semibold; }
   .cloud-gate-card p { @apply mb-4; color: var(--cp-text-muted); }
   .cloud-gate-card.is-error h1 { color: var(--cp-danger); }
-  .save-status.is-saving { color: var(--cp-text-muted); }
-  .save-status.is-saving > span { background: var(--cp-warning); }
 
   .grade-disclaimer { @apply mb-5; }
   .grade-library { @apply space-y-5 p-5; }
@@ -598,7 +613,6 @@
   .sidebar { width: 208px; padding-left: 16px; padding-right: 16px; }
   .topbar { padding-left: 24px; padding-right: 24px; }
   .main-content { padding: 28px 24px 16px; }
-  .save-status { display: none; }
   .welcome-action .mini-path { display: none; }
   .data-table td { padding-left: 12px; padding-right: 12px; }
   .library-toolbar .search-field { width: 220px; }
@@ -638,7 +652,6 @@
   .breadcrumbs { gap: 7px; font-size: 10px; }
   .breadcrumbs > span:first-child, .breadcrumbs > svg:first-of-type { display: none; }
   .topbar-actions { max-width: 100%; flex-wrap: wrap; gap: 7px; }
-  .topbar-actions .demo-chip { font-size: 0; padding: 7px; }
   .page-heading { flex-direction: column; align-items: flex-start; margin-bottom: 22px; gap: 18px; }
   .page-heading h1 { font-size: 28px; }
   .page-heading p { font-size: 12px; }

@@ -30,7 +30,6 @@ export async function buildGradeTestRuntime({ browser = false, productionBrowser
       server: join('server', 'app.ts'),
       client: join('src', 'services', 'gradeLadders.ts'),
       jobs: join('src', 'services', 'realJobs.ts'),
-      fixtures: join('src', 'data', 'fixtures.ts'),
       'word-parser': join('server', 'documents', 'word-parser-worker.ts'),
     }
     await Promise.all(Object.entries(entries).map(([name, entry]) => build({
@@ -41,7 +40,7 @@ export async function buildGradeTestRuntime({ browser = false, productionBrowser
         },
       } : { entryPoints: [entry] }),
       outfile: join(directory, `${name}.mjs`), bundle: true, packages: 'external', platform: 'node',
-      format: 'esm', jsx: 'automatic', define: { 'import.meta.env.VITE_DEPLOYMENT_MODE': '"cloud"' }, logLevel: 'silent',
+      format: 'esm', jsx: 'automatic', logLevel: 'silent',
     })))
     await build({
       stdin: {
@@ -61,7 +60,6 @@ export async function buildGradeTestRuntime({ browser = false, productionBrowser
       const { build: buildVite } = await import('vite')
       await buildVite({
         configFile: resolve('vite.config.ts'),
-        define: { 'import.meta.env.VITE_DEPLOYMENT_MODE': '"cloud"' },
         build: { outDir: directory, emptyOutDir: false },
         logLevel: 'error',
       })
@@ -70,7 +68,7 @@ export async function buildGradeTestRuntime({ browser = false, productionBrowser
         entryPoints: [join('src', 'main.tsx')], outfile: join(directory, 'browser.js'), bundle: true, platform: 'browser',
         format: 'esm', jsx: 'automatic', loader: { '.css': 'empty' },
         plugins: [docxPreviewBrowserPlugin(), reportBrowserPlugin()],
-        define: { 'import.meta.env.VITE_DEPLOYMENT_MODE': '"cloud"', 'process.env.NODE_ENV': '"development"' }, logLevel: 'silent',
+        define: { 'process.env.NODE_ENV': '"development"' }, logLevel: 'silent',
       }), buildDocxPreviewTestWorker(directory), buildReportTestWorker(directory)])
       const [{ default: postcss }, { default: tailwind }, { default: autoprefixer }] = await Promise.all([import('postcss'), import('tailwindcss'), import('autoprefixer')])
       const css = await postcss([tailwind(), autoprefixer()]).process(await readFile(join('src', 'styles', 'globals.css'), 'utf8'), { from: join('src', 'styles', 'globals.css') })
@@ -78,8 +76,8 @@ export async function buildGradeTestRuntime({ browser = false, productionBrowser
       const html = (await readFile('index.html', 'utf8')).replace(/<script type="module" src="\/src\/main\.tsx"><\/script>/, '<link rel="stylesheet" href="/browser.css"><script type="module" src="/browser.js"></script>')
       await writeFile(join(directory, 'index.html'), html)
     }
-    const [api, client, jobsClient, fixtures, jobFakes] = await Promise.all(['server', 'client', 'jobs', 'fixtures', 'job-fakes'].map((name) => import(pathToFileURL(join(directory, `${name}.mjs`)).href)))
-    return { directory, api, client, jobsClient, fixtures, jobFakes, createFakeAccessStore: jobFakes.createFakeAccessStore, async close() {
+    const [api, client, jobsClient, jobFakes] = await Promise.all(['server', 'client', 'jobs', 'job-fakes'].map((name) => import(pathToFileURL(join(directory, `${name}.mjs`)).href)))
+    return { directory, api, client, jobsClient, jobFakes, createFakeAccessStore: jobFakes.createFakeAccessStore, async close() {
       try { stop() } finally { await rm(directory, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 }) }
     } }
   } catch (error) {
@@ -160,9 +158,7 @@ function memoryJobs(jobFakes) {
 function memoryWorkspace(api) {
   const metadata = new Map(), memberships = new Map(), states = new Map()
   let counter = 0
-  const saves = []
   const leases = new Set()
-  let nextSaveDelay
   const directory = {
     metadata, memberships,
     async getMetadata(id) { return clone(metadata.get(id)) },
@@ -202,20 +198,10 @@ function memoryWorkspace(api) {
     },
     async checkAccess() {},
   }
+  // Legacy state.json blobs only; the application never reads or writes them now.
   const state = {
-    states, saves,
-    delayNextSave(promise) { nextSaveDelay = promise },
+    states,
     async getState(id) { return clone(states.get(id)) },
-    async createState(id, content) {
-      if (states.has(id)) return { created: false, etag: states.get(id).etag }
-      const value = { content, etag: `"state-${++counter}"` }; states.set(id, value); return { created: true, etag: value.etag }
-    },
-    async putState(id, content, etag) {
-      const delay = nextSaveDelay; nextSaveDelay = undefined
-      if (delay) await delay
-      if (states.get(id)?.etag !== etag) throw new api.StoreConflictError()
-      const value = { content, etag: `"state-${++counter}"` }; states.set(id, value); saves.push({ id, content }); return { etag: value.etag }
-    },
     async deleteState(id, etag) {
       if (etag !== undefined && states.has(id) && states.get(id).etag !== etag) throw new api.StoreConflictError()
       states.delete(id)

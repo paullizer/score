@@ -24,7 +24,7 @@ function base(workspaceId: string, resumeId?: string): string {
 
 function checked(summary: RealResumeSummary, workspaceId: string): RealResumeSummary {
   if (!summary?.resume?.id || summary.resume.dataKind !== 'real' || summary.workspaceId !== workspaceId || !summary.etag) {
-    throw new Error('The resume service did not return a real record for this workspace. No sample was substituted.')
+    throw new Error('The resume service did not return a real record for this workspace.')
   }
   return summary
 }

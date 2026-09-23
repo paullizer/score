@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <svg xmlns="http://www.w3.org/2000/svg" width="1800" height="1608" viewBox="0 0 1800 1608" role="img" aria-labelledby="svg-title svg-description">
   <title id="svg-title">Score application architecture</title>
-  <desc id="svg-description">The React browser application calls an Entra-protected Express API hosted on Azure App Service. The API reads and writes workspace-scoped Cosmos records and private Blob sources, snapshots, and results. Cosmos feature records are the durable work queue for four independent Container Apps Jobs: jobs, grades, resumes, and analyses. Each worker uses its own feature stores. Job, grade, and resume workers acquire and extract sources through bounded public fetching, local parsers, Azure Document Intelligence, and an isolated internal Chromium renderer. All four workers use Foundry model inference. Analyses require an explicit user action and use frozen analysis inputs. Browser Web Workers export reports. Standalone samples use fictional browser-local data and are not a cloud fallback. Shared AI Search and Foundry IQ contain only a separate nonsensitive guide, not private evidence. This diagram describes the repository, not verified deployment status.</desc>
+  <desc id="svg-description">The React browser application calls an Entra-protected Express API hosted on Azure App Service. The API reads and writes workspace-scoped Cosmos records and private Blob sources, snapshots, and results. Cosmos feature records are the durable work queue for four independent Container Apps Jobs: jobs, grades, resumes, and analyses. Each worker uses its own feature stores. Job, grade, and resume workers acquire and extract sources through bounded public fetching, local parsers, Azure Document Intelligence, and an isolated internal Chromium renderer. All four workers use Foundry model inference. Analyses require an explicit user action and use frozen analysis inputs. Browser Web Workers export reports. Shared AI Search and Foundry IQ contain only a separate nonsensitive guide, not private evidence. This diagram describes the repository, not verified deployment status.</desc>
   <defs>
     <marker id="arrow-495057" viewBox="0 0 12 12" refX="11" refY="6" markerWidth="12" markerHeight="12" orient="auto-start-reverse" markerUnits="userSpaceOnUse">
       <path d="M 2 1 L 11 6 L 2 11" fill="none" stroke="#495057" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
@@ -21,7 +21,7 @@
     <tspan x="48" y="81">Score / application architecture</tspan>
   </text>
   <text id="diagram-subtitle" fill="#000000" font-family="Helvetica, Arial, sans-serif" font-size="20" text-anchor="start">
-    <tspan x="48" y="134.5">From source documents to evidence-backed review. Cloud processing and standalone samples stay separate.</tspan>
+    <tspan x="48" y="134.5">From source documents to evidence-backed review with authenticated cloud processing.</tspan>
   </text>
   <text id="diagram-legend" fill="#000000" font-family="Helvetica, Arial, sans-serif" font-size="16" text-anchor="end">
     <tspan x="1750" y="180.8">Double arrows: requests/responses or reads/writes</tspan>
@@ -91,7 +91,7 @@
   <text id="blobs-detail" fill="#000000" font-family="Helvetica, Arial, sans-serif" font-size="20" text-anchor="start">
     <tspan x="920" y="673.5">Private originals + sources</tspan>
     <tspan x="920" y="700.5">Frozen inputs + saved results</tspan>
-    <tspan x="920" y="727.5">Cloud samples: separate state</tspan>
+    <tspan x="920" y="727.5">Workspace leases + legacy state</tspan>
   </text>
   <rect id="workers" x="1380" y="240" width="370" height="610" rx="16" fill="none" stroke="#2f9e44" stroke-width="2"/>
   <text id="workers-title" fill="#000000" font-family="Helvetica, Arial, sans-serif" font-size="24" text-anchor="start">
@@ -157,23 +157,14 @@
     <tspan x="1400" y="1160.5">Rubrics, profiles, assessments</tspan>
     <tspan x="1400" y="1187.5">Saved narratives + review</tspan>
   </text>
-  <rect id="local-mode" x="48" y="1340" width="550" height="220" rx="16" fill="#f8f9fa" stroke="#495057" stroke-width="1.5" stroke-dasharray="8 6"/>
-  <text id="local-mode-title" fill="#000000" font-family="Helvetica, Arial, sans-serif" font-size="22" text-anchor="start">
-    <tspan x="68" y="1380.85">Separate mode / local samples</tspan>
-  </text>
-  <text id="local-mode-detail" fill="#000000" font-family="Helvetica, Arial, sans-serif" font-size="18" text-anchor="start">
-    <tspan x="68" y="1433.15">Vite + fictional fixtures + browser local storage</tspan>
-    <tspan x="68" y="1457.45">No real uploads, extraction, or AI calls</tspan>
-    <tspan x="68" y="1481.75">Cloud errors never switch to samples</tspan>
-  </text>
-  <rect id="privacy-boundary" x="628" y="1340" width="1122" height="220" rx="16" fill="#f8f9fa" stroke="#495057" stroke-width="1.5"/>
+  <rect id="privacy-boundary" x="48" y="1340" width="1702" height="220" rx="16" fill="#f8f9fa" stroke="#495057" stroke-width="1.5"/>
   <text id="privacy-boundary-title" fill="#000000" font-family="Helvetica, Arial, sans-serif" font-size="22" text-anchor="start">
-    <tspan x="648" y="1380.85">Private evidence stays out of shared search</tspan>
+    <tspan x="68" y="1380.85">Private evidence stays out of shared search</tspan>
   </text>
   <text id="privacy-boundary-detail" fill="#000000" font-family="Helvetica, Arial, sans-serif" font-size="18" text-anchor="start">
-    <tspan x="648" y="1433.15">Analysis uses frozen analysis stores, not live job/resume/grade stores or extraction services.</tspan>
-    <tspan x="648" y="1457.45">Shared AI Search / Foundry IQ: a nonsensitive app guide, never private source/result indexing.</tspan>
-    <tspan x="648" y="1481.75">This is repository-defined architecture; deployed services and feature flags control availability.</tspan>
+    <tspan x="68" y="1433.15">Analysis uses frozen analysis stores, not live job/resume/grade stores or extraction services.</tspan>
+    <tspan x="68" y="1457.45">Shared AI Search / Foundry IQ: a nonsensitive app guide, never private source/result indexing.</tspan>
+    <tspan x="68" y="1481.75">This is repository-defined architecture; deployed services and feature flags control availability.</tspan>
   </text>
   <polyline id="browser-api" points="378,555 460,555" fill="none" stroke="#495057" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" marker-start="url(#arrow-495057)" marker-end="url(#arrow-495057)"/>
   <text id="browser-api-label" fill="#000000" font-family="Helvetica, Arial, sans-serif" font-size="16" text-anchor="middle">

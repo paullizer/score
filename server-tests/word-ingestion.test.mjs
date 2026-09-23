@@ -176,7 +176,7 @@ for (const format of ['docx', 'doc']) {
     assert.deepEqual(Buffer.from(frozen.bytes), jobBytes)
     assert.deepEqual(detail.resumeSnapshot.document, resumeDetail.document)
     assert.equal(detail.result.criteria[0].citations[0].quote, resumeParagraphs[4].text)
-    assert.equal(fixture.state.saves.length, 0)
+    assert.equal(fixture.state.states.size, 0)
   })
 }
 
@@ -259,7 +259,7 @@ test('PDF, Markdown, DOCX, and DOC share one durable batch and retain distinct e
   assert.ok(comparisons.every(value => value.record.status === 'complete'), JSON.stringify(comparisons.map(value => value.record.error)))
   const run = await jsonResponse(await fixture.request(`/api/workspaces/${fixture.workspaceId}/analyses/${created.run.run.id}`))
   assert.equal(run.run.progress.total, 8)
-  assert.equal(fixture.state.saves.length, 0)
+  assert.equal(fixture.state.states.size, 0)
 })
 
 test('Word admissions are gated, actual formats are checked, and membership is checked before parsing', async (t) => {

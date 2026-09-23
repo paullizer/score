@@ -5,16 +5,18 @@ import { useWorkspace } from '../../app/workspace-context'
 import { useRealAnalyses } from '../../app/real-analyses-context'
 import { usePublicSettings } from '../../app/public-settings-context'
 import { REPORT_FORMATS, type AnalysisReport, type AnalysisReportFormat } from '../../domain/analysis-reports'
-import { createDefaultAdminSettings, LEGACY_SETTINGS_REVISION } from '../../domain/admin-settings-defaults'
+import { createDefaultAdminSettings } from '../../domain/admin-settings-defaults'
 import type { RealAnalysisComparisonSummary, RealAnalysisRunDetail } from '../../domain/real-analyses'
-import type { AnalysisRun } from '../../domain/types'
 import { Badge, Button, InlineError, Modal } from '../../components/ui'
 import { AnalysisSummaryStatus } from './AnalysisSummaries'
 import { getDisplayName } from '../../domain/displayNames'
 
-type ReportSource =
-  | { kind: 'sample'; run: AnalysisRun; available: boolean }
-  | { kind: 'real'; workspaceId: string; detail: RealAnalysisRunDetail; comparisons: RealAnalysisComparisonSummary[] | null; available: boolean }
+export interface ReportSource {
+  workspaceId: string
+  detail: RealAnalysisRunDetail
+  comparisons: RealAnalysisComparisonSummary[] | null
+  available: boolean
+}
 
 const descriptions: Record<AnalysisReportFormat, string> = {
   csv: 'A spreadsheet-ready row for each completed candidate and job/grade review, with criterion scores, a brief assessment, and links to the saved analysis and sources.',
@@ -45,13 +47,13 @@ export function AnalysisReportExport({ source, onManageSummaries }: { source: Re
   const [error, setError] = useState('')
   const [success, setSuccess] = useState('')
   const active = useRef<AbortController | null>(null)
-  const identity = source.kind === 'sample' ? `${cloud?.currentWorkspaceId ?? 'standalone'}:sample:${source.run.id}` : `${source.workspaceId}:${source.detail.run.id}`
+  const identity = `${source.workspaceId}:${source.detail.run.id}`
   const historyAvailable = source.available
   const formatDisabledReason = format === null ? 'No report format is selected.'
     : !reportPolicy.enabledFormats.includes(format) ? `${REPORT_FORMATS[format].label} export is disabled by application policy. Choose an enabled format.` : ''
   const requiresSummaries = format !== null && format !== 'csv'
-  const runId = source.kind === 'real' ? source.detail.run.id : null
-  const workspaceId = source.kind === 'real' ? source.workspaceId : null
+  const runId = source.detail.run.id
+  const workspaceId = source.workspaceId
   const summaryEntry = runId ? analyses?.narratives?.(runId, targetId || undefined) : undefined
   const ensureSummaries = analyses?.ensureNarratives
   const subscribeSummaries = analyses?.subscribeNarratives
@@ -85,20 +87,17 @@ export function AnalysisReportExport({ source, onManageSummaries }: { source: Re
     setError('Saved analysis access became unavailable. No file was downloaded. Reload the analysis before retrying.')
   }, [historyAvailable])
 
-  const targets = source.kind === 'sample'
-    ? source.run.targets.map((target) => ({ id: target.id, label: `${getDisplayName(target, target.label)} / rubric v${target.rubric.version}` }))
-    : source.detail.targets.map((target) => ({ id: target.id, label: `${getDisplayName(target, target.label)} / rubric v${target.rubricVersion}` }))
+  const targets = source.detail.targets.map((target) => ({ id: target.id, label: `${getDisplayName(target, target.label)} / rubric v${target.rubricVersion}` }))
   const targetLabelCounts = new Map<string, number>()
   for (const target of targets) targetLabelCounts.set(target.label, (targetLabelCounts.get(target.label) ?? 0) + 1)
-  const comparisons = source.kind === 'sample' ? source.run.comparisons.map((comparison) => ({ targetId: comparison.targetId, status: comparison.status }))
-    : source.comparisons?.map(({ comparison }) => ({ targetId: comparison.target.summary.id, status: comparison.status })) ?? []
+  const comparisons = source.comparisons?.map(({ comparison }) => ({ targetId: comparison.target.summary.id, status: comparison.status })) ?? []
   const selected = comparisons.filter((comparison) => !targetId || comparison.targetId === targetId)
   const complete = selected.filter((comparison) => comparison.status === 'complete').length
   const unfinished = selected.filter((comparison) => comparison.status === 'queued' || comparison.status === 'running').length
   const failed = selected.filter((comparison) => comparison.status === 'failed').length
   const cancelled = selected.filter((comparison) => comparison.status === 'cancelled').length
   const countLabel = !targetId && targets.length > 1 ? 'candidate-job reviews' : selected.length === 1 ? 'candidate' : 'candidates'
-  const ready = historyAvailable && (source.kind === 'sample' || source.comparisons !== null)
+  const ready = historyAvailable && source.comparisons !== null
   const totalComplete = comparisons.filter((comparison) => comparison.status === 'complete').length
   const disabledReason = policyDisabledReason || (!historyAvailable ? 'This analysis is not currently available to read or export.'
     : !ready ? 'Load the saved analysis and its comparison list before exporting.'
@@ -109,11 +108,10 @@ export function AnalysisReportExport({ source, onManageSummaries }: { source: Re
   const summaries = summaryEntry?.state === 'ready' ? summaryEntry.value : null
   const summaryError = summaryEntry?.state === 'ready' || summaryEntry?.state === 'error' ? summaryEntry.error : undefined
   const refreshingSummaries = checkingSummaries || (summaryEntry?.state === 'ready' && summaryEntry.refreshing)
-  const narrativeReady = source.kind === 'sample' ? unfinished === 0
-    : !refreshingSummaries && !summaryError && Boolean(summaries?.ready && summaries.capture.ready &&
-      summaries.scoring.total === source.detail.resumes.length * (targetId ? 1 : source.detail.targets.length) &&
-      summaries.scoring.complete === complete && summaries.scoring.initialized === summaries.scoring.total &&
-      summaries.scoring.queued === 0 && summaries.scoring.running === 0)
+  const narrativeReady = !refreshingSummaries && !summaryError && Boolean(summaries?.ready && summaries.capture.ready &&
+    summaries.scoring.total === source.detail.resumes.length * (targetId ? 1 : source.detail.targets.length) &&
+    summaries.scoring.complete === complete && summaries.scoring.initialized === summaries.scoring.total &&
+    summaries.scoring.queued === 0 && summaries.scoring.running === 0)
   const narrativeBlocked = requiresSummaries && !narrativeReady
 
   function cancel() {
@@ -131,9 +129,6 @@ export function AnalysisReportExport({ source, onManageSummaries }: { source: Re
   }
   async function exportReport() {
     if (active.current || !ready || complete === 0 || narrativeBlocked || policyDisabledReason || formatDisabledReason || scopeDisabledReason || format === null) return
-    const capturedSettings = structuredClone({
-      revision: publicSettings.settings?.revision ?? LEGACY_SETTINGS_REVISION, policy: reportPolicy,
-    })
     const controller = new AbortController()
     active.current = controller
     const { signal } = controller
@@ -143,26 +138,14 @@ export function AnalysisReportExport({ source, onManageSummaries }: { source: Re
     setProgress(null)
     setStage('Capturing saved analysis and evidence')
     try {
-      let report: AnalysisReport
-      if (source.kind === 'sample') {
-        const snapshot = structuredClone(source.run)
-        const { buildSampleAnalysisReport } = await import('../../services/analysisReports/sample')
-        signal.throwIfAborted()
-        const capturedAt = new Date().toISOString()
-        report = buildSampleAnalysisReport(snapshot, {
-          ...(targetId ? { targetId } : {}),
-          capture: { startedAt: capturedAt, completedAt: capturedAt, settings: capturedSettings },
-        })
-      } else {
-        const { loadRealAnalysisReport } = await import('../../services/analysisReports/real')
-        signal.throwIfAborted()
-        report = await loadRealAnalysisReport(source.workspaceId, source.detail.run.id, {
-          ...(targetId ? { targetId } : {}), format, ...(requiresSummaries ? { requireSummaries: true } : {}), signal,
-          onProgress: (completed, total) => {
-            if (current()) { setStage('Loading frozen report evidence'); setProgress({ completed, total }) }
-          },
-        })
-      }
+      const { loadRealAnalysisReport } = await import('../../services/analysisReports/real')
+      signal.throwIfAborted()
+      const report: AnalysisReport = await loadRealAnalysisReport(source.workspaceId, source.detail.run.id, {
+        ...(targetId ? { targetId } : {}), format, ...(requiresSummaries ? { requireSummaries: true } : {}), signal,
+        onProgress: (completed, total) => {
+          if (current()) { setStage('Loading frozen report evidence'); setProgress({ completed, total }) }
+        },
+      })
       signal.throwIfAborted()
       if (!current()) return
       setProgress(null)
@@ -171,10 +154,10 @@ export function AnalysisReportExport({ source, onManageSummaries }: { source: Re
       signal.throwIfAborted()
       const bytes = await generateReportInWorker(report, format, {
         signal, onProgress: (message) => { if (current()) setStage(message) },
-        links: { origin: window.location.origin, workspaceId: source.kind === 'real' ? source.workspaceId : cloud?.currentWorkspaceId },
+        links: { origin: window.location.origin, workspaceId: source.workspaceId },
       })
       if (!current()) return
-      if (source.kind === 'real' && requiresSummaries) {
+      if (requiresSummaries) {
         setStage('Verifying current summary versions')
         const { assertRealAnalysisReportNarrativesCurrent } = await import('../../services/analysisReports/real')
         signal.throwIfAborted()
@@ -207,9 +190,7 @@ export function AnalysisReportExport({ source, onManageSummaries }: { source: Re
         </Button>
       </>}>
       <div className="space-y-5">
-        <div className="flex flex-wrap gap-2"><Badge tone={source.kind === 'sample' ? 'warning' : 'accent'}>
-          {source.kind === 'sample' ? 'Fictional sample' : 'Saved real evidence'}
-        </Badge></div>
+        <div className="flex flex-wrap gap-2"><Badge tone="accent">Saved real evidence</Badge></div>
         <div><label className="mb-2 block text-[12px] font-semibold" htmlFor={`${fieldId}-format`}>Report format</label>
           <select id={`${fieldId}-format`} className="filter-select w-full" value={format ?? ''} disabled={busy || reportPolicy.enabledFormats.length === 0} onChange={(event) => {
             const value = event.target.value
@@ -236,20 +217,16 @@ export function AnalysisReportExport({ source, onManageSummaries }: { source: Re
         </div>
         {requiresSummaries && <section className="space-y-4 rounded-xl border p-4" aria-label="PDF, Word, and PowerPoint summary requirements">
           <p className="text-[12px] font-semibold">PDF, Word, and PowerPoint require current, ready summaries and settled scoring in the selected scope.</p>
-          {source.kind === 'real' ? <>
-            {summaries && <AnalysisSummaryStatus summaries={summaries} />}
-            {(refreshingSummaries || (!summaryError && !summaries)) && <p className="text-[12px]" role="status">Checking selected summary readiness...</p>}
-            {summaryError && <InlineError>{summaryError}</InlineError>}
-            {narrativeBlocked && <p className="text-[12px]" role="status">Missing, outdated, failed, waiting, or generating summaries block this download, even if previous text is still available. CSV remains available under its usual rules. Export never starts summary generation.</p>}
-            {narrativeBlocked && <div className="flex flex-wrap gap-2">
-              <Button size="sm" disabled={busy} onClick={() => void (runId && ensureSummaries?.(runId, targetId || undefined, true))}>Refresh summary readiness</Button>
-              {onManageSummaries && <Button size="sm" disabled={busy} onClick={() => {
-                changeOpen(false); onManageSummaries(targetId || undefined)
-              }}>Manage summaries</Button>}
-            </div>}
-          </> : <p className="text-[12px] text-muted">{unfinished > 0
-            ? `${unfinished} fictional comparisons are still processing. Wait for this selected scope to finish; CSV keeps its existing eligibility.`
-            : 'Fictional samples use fixture summaries only. No real summary service or model is called.'}</p>}
+          {summaries && <AnalysisSummaryStatus summaries={summaries} />}
+          {(refreshingSummaries || (!summaryError && !summaries)) && <p className="text-[12px]" role="status">Checking selected summary readiness...</p>}
+          {summaryError && <InlineError>{summaryError}</InlineError>}
+          {narrativeBlocked && <p className="text-[12px]" role="status">Missing, outdated, failed, waiting, or generating summaries block this download, even if previous text is still available. CSV remains available under its usual rules. Export never starts summary generation.</p>}
+          {narrativeBlocked && <div className="flex flex-wrap gap-2">
+            <Button size="sm" disabled={busy} onClick={() => void ensureSummaries?.(runId, targetId || undefined, true)}>Refresh summary readiness</Button>
+            {onManageSummaries && <Button size="sm" disabled={busy} onClick={() => {
+              changeOpen(false); onManageSummaries(targetId || undefined)
+            }}>Manage summaries</Button>}
+          </div>}
         </section>}
         <p className="text-[11px] text-muted">{format === 'csv' ? 'Only completed reviews are included. C1, C2, and later columns follow the linked scorecard order; criterion scores use a 0-5 scale. The assessment explains unavailable overall scores. Links open the saved review and sources.'
             : `The overview includes every completed review. Individual sections feature the highest ${reportPolicy.highlightCount} scored matches within each exact job or grade, including ties up to ${reportPolicy.maxHighlights} highlights. Equal scores remain equal; additional ties stay in the overview. Use the links for the full saved analysis and source documents.`}</p>

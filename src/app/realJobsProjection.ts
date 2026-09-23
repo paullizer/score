@@ -2,8 +2,9 @@ import type { RealJobDetail, RealJobSummary } from '../domain/real-jobs'
 import type { Rubric, Workspace } from '../domain/types'
 import { lifecycleIsRemoved } from '../domain/lifecycle'
 
+/** Projects server-owned jobs, their parsed sources, and rubric versions into the in-memory workspace. */
 export function projectRealJobs(
-  legacy: Workspace,
+  base: Workspace,
   summaries: RealJobSummary[],
   details: Iterable<RealJobDetail>,
 ): Workspace {
@@ -11,21 +12,16 @@ export function projectRealJobs(
   const byId = new Map(summaries.map((summary) => [summary.job.id, summary]))
   const detailList = [...details].filter((detail) => byId.get(detail.job.id)?.etag === detail.etag &&
     !lifecycleIsRemoved(byId.get(detail.job.id)?.lifecycle) && !lifecycleIsRemoved(detail.lifecycle))
-  const realJobs = summaries.map((summary) => ({
+  const jobs = summaries.map((summary) => ({
     ...summary.job,
     ...(summary.displayName === undefined ? {} : { displayName: summary.displayName }),
     dataKind: 'real' as const,
     error: summary.error?.message ?? summary.job.error,
   }))
-  const realJobIds = new Set(realJobs.map((job) => job.id))
 
-  const realDocuments = detailList.flatMap((detail) => detail.document
-    ? [{ ...detail.document, sample: false }]
+  const documents = detailList.flatMap((detail) => detail.document
+    ? [{ ...detail.document, sample: false as const }]
     : [])
-  const realDocumentIds = new Set([
-    ...realDocuments.map((document) => document.id),
-    ...realJobs.map((job) => job.documentId),
-  ])
 
   const rubricMap = new Map<string, Rubric>()
   for (const summary of summaries) {
@@ -36,26 +32,21 @@ export function projectRealJobs(
     for (const rubric of detail.rubricVersions) rubricMap.set(rubric.id, { ...rubric, dataKind: 'real' })
     if (detail.rubric) rubricMap.set(detail.rubric.id, { ...detail.rubric, dataKind: 'real' })
   }
-  const realRubrics = [...rubricMap.values()]
-  const realRubricIds = new Set([
-    ...realRubrics.map((rubric) => rubric.id),
-    ...realJobs.flatMap((job) => job.rubricId ? [job.rubricId] : []),
-  ])
 
   return {
-    ...legacy,
+    ...base,
     lifecycle: {
-      ...legacy.lifecycle,
+      ...base.lifecycle,
       entities: {
-        ...legacy.lifecycle?.entities,
+        ...base.lifecycle?.entities,
         ...Object.fromEntries(summaries.flatMap((summary) => [
           [`job:${summary.job.id}`, summary.lifecycle ?? {}],
           ...[...rubricMap.values()].filter((rubric) => rubric.jobId === summary.job.id).map((rubric) => [`rubric:${rubric.groupId}`, { ...summary.rubricLifecycle, parentKey: `job:${summary.job.id}` }]),
         ])),
       },
     },
-    jobs: [...realJobs, ...legacy.jobs.filter((job) => !realJobIds.has(job.id))],
-    documents: [...realDocuments, ...legacy.documents.filter((document) => !realDocumentIds.has(document.id))],
-    rubrics: [...realRubrics, ...legacy.rubrics.filter((rubric) => !realRubricIds.has(rubric.id))],
+    jobs,
+    documents,
+    rubrics: [...rubricMap.values()],
   }
 }

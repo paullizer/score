@@ -25,9 +25,9 @@ test('browser imports Markdown through job drop and resume picker, then highligh
   const errors = []
   page.on('pageerror', error => errors.push(error.message))
   try {
-    await page.goto(`${fixture.origin}/workspaces/${fixture.workspaceId}/jobs?data=real`)
-    await page.getByRole('button', { name: 'Real & sample workflows', exact: true }).click()
-    const about = page.getByRole('dialog', { name: 'A clearer way to see the fit', exact: true })
+    await page.goto(`${fixture.origin}/workspaces/${fixture.workspaceId}/jobs`)
+    await page.locator('.sidebar').getByRole('button', { name: 'About Score', exact: true }).click()
+    const about = page.getByRole('dialog', { name: 'About Score', exact: true })
     await about.waitFor({ state: 'visible' })
     const aboutText = await about.innerText()
     assert.match(aboutText, /Markdown uploads use \.md or \.markdown files/)
@@ -59,7 +59,8 @@ test('browser imports Markdown through job drop and resume picker, then highligh
     await page.getByRole('link', { name: 'Engineering specialist', exact: true }).click()
     await page.getByText('Markdown section 1 of 1', { exact: true }).waitFor({ state: 'visible' })
 
-    await page.goto(`${fixture.origin}/workspaces/${fixture.workspaceId}/resumes?data=real`)
+    // A legacy data parameter from an old link is ignored and still opens the real library.
+    await page.goto(`${fixture.origin}/workspaces/${fixture.workspaceId}/resumes?${new URLSearchParams({ data: 'samples' })}`)
     await page.getByRole('button', { name: 'Add resumes', exact: true }).click()
     const resumesDialog = page.getByRole('dialog', { name: 'Add real resumes', exact: true })
     await resumesDialog.waitFor({ state: 'visible' })
@@ -95,6 +96,6 @@ test('browser imports Markdown through job drop and resume picker, then highligh
     assert.deepEqual(stubs.sourceCalls, [])
     assert.deepEqual(stubs.browserCalls, [])
     assert.deepEqual(errors, [])
-    assert.equal(fixture.state.saves.length, 0)
+    assert.equal(fixture.requests.some((request) => request.url.endsWith('/state') && request.method !== 'GET'), false)
   } finally { await context.close() }
 })

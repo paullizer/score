@@ -18,7 +18,7 @@ const firstPerson = { id: 'person-one', name: 'Pat Eligible', email: 'pat@exampl
 const preLogin = { id: 'person-never-signed-in', name: 'New Reader', email: 'new@example.test', applicationRoles: ['Score.User'] }
 const adminPerson = { id: 'admin-person', name: 'App Administrator', email: 'admin@example.test', applicationRoles: ['Score.Admin'] }
 const json = (value, status = 200) => Response.json(value, { status })
-let ui, dom, root, createRoot, requests, override, capabilities, workspaces, workspace, members, grant, settings
+let ui, dom, root, createRoot, requests, override, capabilities, workspaces, members, grant, settings
 
 function deferred() {
   let resolve
@@ -70,9 +70,7 @@ before(async () => {
       export { WorkspaceSwitcher } from './src/components/workspace/WorkspaceSwitcher';
       export { ManageWorkspaceAccess } from './src/components/workspace/ManageWorkspaceAccess';
       export { EligiblePeoplePicker } from './src/components/workspace/EligiblePeoplePicker';
-      export { CloudSaveBanner } from './src/components/workspace/CloudSaveStatus';
       export { RealRequestScope } from './src/app/real-request-scope';
-      export { createInitialWorkspace } from './src/data/fixtures';
       export { createDefaultAdminSettings } from './src/domain/admin-settings-defaults';
       export { projectPublicSettings, captureProcessingSettings } from './src/domain/admin-settings-resolver';
       export { ADMIN_SETTINGS_FIELDS } from './src/domain/admin-settings-fields';
@@ -83,7 +81,6 @@ before(async () => {
     ` },
     outfile: join(output, 'ui.mjs'), bundle: true, packages: 'external', format: 'esm', platform: 'node',
     jsx: 'automatic', logLevel: 'silent', loader: { '.css': 'empty' },
-    define: { 'import.meta.env.VITE_DEPLOYMENT_MODE': '"cloud"' },
   })
   ui = await import(pathToFileURL(join(output, 'ui.mjs')).href)
 })
@@ -91,7 +88,7 @@ before(async () => {
 beforeEach(() => {
   requests = []; override = null
   capabilities = { applicationAdmin: false, canCreateWorkspaces: false }
-  workspaces = []; workspace = ui.createInitialWorkspace(); settings = ui.createDefaultAdminSettings()
+  workspaces = []; settings = ui.createDefaultAdminSettings()
   members = { members: [{ id: user.id, name: user.name, email: user.email, role: 'owner' }], etag: '"members-1"' }
   grant = { userId: firstPerson.id, canCreateWorkspaces: false, etag: '"unassigned"' }
   ui.setCloudSessionAccess(null)
@@ -148,7 +145,7 @@ beforeEach(() => {
       return json(members)
     }
     if (path === '/api/admin/settings') return json(settingsResponse())
-    if (path.endsWith('/state')) return json(method === 'PUT' ? { etag: '"state-2"' } : { workspace, etag: '"state-1"' })
+    if (path.endsWith('/state')) throw new Error(`Workspace state API must not be used: ${method} ${path}`)
     if (path.endsWith('/jobs')) return json({ jobs: [] })
     if (path.endsWith('/resumes')) return json({ resumes: [] })
     if (path.endsWith('/grade-ladders')) return json({ ladders: [] })
@@ -219,39 +216,26 @@ test('access clients use encoded, paged paths, CSRF and exact grant/member ETags
   assert.equal(requests.length, 6)
 })
 
-test('access generations reject stale responses, stop queued writes and do not infer creation from ownership', async () => {
+test('access generations stop new work and do not infer creation from ownership', async () => {
   workspaces = [metadata]
   ui.setCloudSessionAccess(session())
   await assert.rejects(ui.createWorkspace('Not authorized'), /grant you permission/)
   assert.equal(requests.length, 0)
-  const held = deferred()
-  override = path => path.endsWith('/state') ? held.promise : undefined
-  const pending = ui.saveWorkspaceState(metadata.id, workspace, '"state"')
-  const rejected = assert.rejects(pending, ui.CloudAccessChangedError)
+  const signal = ui.cloudAccessRequestSignal('/workspaces/workspace-one/jobs', { method: 'POST' })
+  assert.equal(signal.aborted, false)
   workspaces = [{ ...metadata, role: 'viewer' }]
   ui.setCloudSessionAccess(session())
-  held.resolve(json({ etag: '"accepted-but-stale"' }))
-  await rejected
-  const count = requests.length
-  await assert.rejects(ui.saveWorkspaceState(metadata.id, workspace, '"state"'), /Reader and Reviewer access/)
-  assert.equal(requests.length, count)
+  assert.equal(signal.aborted, true)
+  assert.throws(() => ui.cloudAccessRequestSignal('/workspaces/workspace-one/jobs', { method: 'POST' }), /Reader and Reviewer access cannot save ordinary edits/)
   workspaces = []
   ui.setCloudSessionAccess(session())
-  await assert.rejects(ui.loadWorkspaceState(metadata.id), /no longer available/)
-  assert.equal(requests.length, count)
+  assert.throws(() => ui.cloudAccessRequestSignal('/workspaces/workspace-one/jobs'), /no longer available/)
+  assert.equal(requests.length, 0)
 })
 
-test('implicit admin access-source changes invalidate reads; request scopes settle old writes without applying them', async () => {
+test('implicit admin access-source changes invalidate request scopes without applying old writes', async () => {
   capabilities = { applicationAdmin: true, canCreateWorkspaces: true }; workspaces = [metadata]
   ui.setCloudSessionAccess(session())
-  const held = deferred()
-  override = path => path.endsWith('/state') ? held.promise : undefined
-  const read = ui.loadWorkspaceState(metadata.id)
-  const rejected = assert.rejects(read, ui.CloudAccessChangedError)
-  workspaces = [{ ...metadata, accessSource: 'application-admin' }]
-  ui.setCloudSessionAccess(session())
-  held.resolve(json({ workspace, etag: '"state"' }))
-  await rejected
   const scope = new ui.RealRequestScope()
   scope.updateAccess('owner:membership', true)
   const ticket = scope.mutate('queued-write')
@@ -353,7 +337,7 @@ test('home sharing protects unfinished choices on browser history and clears rev
   assert.equal(document.querySelector('[aria-label="Manage access to Shared workspace"]'), null)
   assert.equal(button('New workspace').disabled, true)
   const oldRequests = requests.filter(item => item.path.startsWith('/api/workspaces/workspace-one/')).length
-  await assert.rejects(ui.loadWorkspaceState(metadata.id), /no longer available/)
+  assert.throws(() => ui.cloudAccessRequestSignal('/workspaces/workspace-one/jobs'), /no longer available/)
   await focus()
   assert.equal(requests.filter(item => item.path.startsWith('/api/workspaces/workspace-one/')).length, oldRequests)
   assert.equal(document.querySelector('.app-layout'), null)
@@ -597,7 +581,7 @@ test('request guards separate reviewer QC writes from ordinary editing and impli
   workspaces = [{ ...metadata, role: 'reviewer' }]
   ui.setCloudSessionAccess(session())
   assert.equal(ui.cloudAccessRequestSignal(`${path}/qc/reviews/submit`, { method: 'POST' }).aborted, false)
-  assert.throws(() => ui.cloudAccessRequestSignal(`${path}/state`, { method: 'PUT' }), /Reviewer access cannot save ordinary edits/)
+  assert.throws(() => ui.cloudAccessRequestSignal(`${path}/jobs`, { method: 'POST' }), /Reviewer access cannot save ordinary edits/)
   assert.throws(() => ui.cloudAccessRequestSignal(`${path}/members`), /Only a workspace Owner/)
   capabilities = { ...capabilities, applicationAdmin: true }
   workspaces = [{ ...metadata, accessSource: 'application-admin', membershipRole: 'viewer' }]
@@ -610,50 +594,50 @@ test('request guards separate reviewer QC writes from ordinary editing and impli
   assert.equal(qc.aborted, true, 'Removing membership invalidates private requests even while effective Owner access is unchanged')
   assert.throws(() => ui.cloudAccessRequestSignal(`${path}/qc/context`), /explicit workspace membership/)
   assert.throws(() => ui.cloudAccessRequestSignal(`${path}/qc/reviews`, { method: 'PUT' }), /explicit workspace membership/)
-  assert.equal(ui.cloudAccessRequestSignal(`${path}/state`, { method: 'PUT' }).aborted, false)
+  assert.equal(ui.cloudAccessRequestSignal(`${path}/jobs`, { method: 'POST' }).aborted, false)
   assert.equal(ui.cloudAccessRequestSignal(`${path}/members`).aborted, false)
 })
 
-test('downgrade stops debounced sample writes while keeping drafts; removal hides content without preserving a readable summary', async () => {
+test('provider renders immediately, uses no state flow, and removal hides content behind explicit leave', async () => {
   let observed
   const providerRef = { current: null }
   const leaveRef = { current: null }
+  let left = 0
   const acknowledged = async () => ({ ok: true })
   function Probe({ value, cloud }) {
     observed = { value, cloud }
-    return element('section', { 'data-testid': 'retained-content' }, element(ui.CloudSaveBanner, { cloud }), element('p', null, value.workspace.rubrics.map(item => item.name).join(' / ')))
+    return element('section', { 'data-testid': 'retained-content' }, element('p', null, String(value.workspace.jobs.length)))
   }
   function tree(items) {
     return element(ui.GradeNavigationProtectionProvider, { workspaceId: metadata.id, apiRef: leaveRef },
       element(ui.CloudWorkspaceProvider, {
         workspaceId: metadata.id, user, workspaces: items, apiRef: providerRef, leaveProtectionRef: leaveRef,
-        canCreateWorkspaces: false, onAuthError() {}, onSignedOut() {},
+        canCreateWorkspaces: false, onSignedOut() {},
         switchWorkspace: acknowledged, createWorkspace: acknowledged, renameWorkspace: acknowledged,
         refreshWorkspaces: async () => {}, getWorkspaceLifecycleImpact: async () => ({}), changeWorkspaceLifecycle: async () => {},
-        leaveUnavailableWorkspace: acknowledged,
+        leaveUnavailableWorkspace: async () => { left++; return { ok: true } },
       }, (value, cloud) => element(Probe, { value, cloud })))
   }
   await render(tree([metadata]))
-  await until(() => observed?.value.workspace, 'Sample snapshot ready')
-  await act(async () => {
-    observed.value.saveRubric({ ...observed.value.workspace.rubrics[0], name: 'Unsaved local draft' })
-    await pause()
-  })
-  assert.equal(providerRef.current.hasPendingChanges(), true)
-  await render(tree([{ ...metadata, role: 'viewer' }]))
-  await act(async () => { await pause(800) })
-  assert.equal(writes('/api/workspaces/workspace-one/state').length, 0)
-  assert.match(document.body.textContent, /role is now Reader/)
-  assert.match(document.body.textContent, /Unsaved local draft/)
-  assert.ok(![...document.querySelectorAll('button')].some(item => item.textContent === 'Keep my changes'))
-  await act(async () => { await observed.cloud.keepMineAndOverwrite() })
-  assert.equal(writes('/api/workspaces/workspace-one/state').length, 0)
+  await until(() => observed?.value.workspace, 'Provider snapshot ready')
+  assert.deepEqual(observed.value.workspace.jobs, [])
+  assert.deepEqual(observed.value.workspace.documents, [])
+  assert.deepEqual(observed.value.workspace.rubrics, [])
+  assert.deepEqual(observed.value.workspace.lifecycle.entities, {})
+  assert.equal(requests.some(item => item.path.endsWith('/state')), false)
   await render(tree([]))
   assert.equal(observed.cloud.workspaces.length, 0)
   assert.equal(document.querySelector('[data-testid="retained-content"]').closest('[hidden]') !== null, true)
   assert.match(document.body.textContent, /Workspace access is no longer available/)
-  assert.equal(providerRef.current.hasPendingChanges(), true)
-  assert.equal((await providerRef.current.flush()).ok, false)
+  assert.ok(providerRef.current.prepareToLeave)
+  await click(button('Choose another workspace'))
+  assert.match(document.body.textContent, /Discard unsaved changes and leave\?/)
+  assert.match(document.body.textContent, /Drafts with their own leave protection still ask for confirmation/)
+  await click(button('Keep this tab'))
+  assert.equal(left, 0)
+  await click(button('Choose another workspace'))
+  await click(button('Discard local changes and leave'))
+  await until(() => left === 1, 'Unavailable workspace leave is delegated')
 })
 
 test('focus revocation hides open access dialogs and stops workspace requests; restoration is explicit refresh', async () => {
@@ -669,7 +653,7 @@ test('focus revocation hides open access dialogs and stops workspace requests; r
   await until(() => document.body.textContent.includes('Workspace access is no longer available'), 'Revoked content is locked')
   assert.equal(document.querySelectorAll('[role="dialog"]').length, 0, 'Portalled dialogs are not readable through the lock.')
   const count = requests.filter(item => item.path.startsWith('/api/workspaces/')).length
-  await assert.rejects(ui.loadWorkspaceState(metadata.id), /no longer available/)
+  assert.throws(() => ui.cloudAccessRequestSignal('/workspaces/workspace-one/jobs'), /no longer available/)
   await focus()
   assert.equal(requests.filter(item => item.path.startsWith('/api/workspaces/')).length, count)
   workspaces = [{ ...metadata, role: 'viewer' }]

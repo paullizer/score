@@ -1,4 +1,3 @@
-import type { Workspace } from './types'
 import type { LifecycleOperation } from './lifecycle'
 
 export interface CloudUser {
@@ -58,11 +57,6 @@ export interface CloudSessionIdentity {
   mode: 'cloud'
   user: CloudUser
   capabilities: CloudCapabilities
-}
-
-export interface CloudWorkspaceSnapshot {
-  workspace: Workspace
-  etag: string
 }
 
 export interface CloudApiError {

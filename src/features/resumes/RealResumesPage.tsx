@@ -69,13 +69,13 @@ export function RealResumeActions({ summary }: { summary: RealResumeSummary }) {
 
 export function RealResumesPage({ id }: { id?: string }) {
   const api = useRealResumes()
-  if (!api) return <EmptyState title="Real resumes require a cloud workspace" description="Standalone mode contains only fictional samples. No real files, documents, or analysis results enter sample storage." />
+  if (!api) return <EmptyState title="Real resumes require a cloud workspace" description="Open this page from an authenticated workspace. Resume files, documents, and analysis results are never stored in your browser." />
   return <RenameEntityProvider key={`${api.workspaceId}:${id ?? 'library'}`}><RealResumesView id={id} /></RenameEntityProvider>
 }
 
 function RealResumesView({ id }: { id?: string }) {
   const api = useRealResumes()!
-  if (api.phase === 'unavailable') return <EmptyState title="Real resume imports are not enabled" description={api.error ?? 'No samples are substituted when real processing is unavailable.'} action={<Button onClick={() => void api.refresh()}>Check availability</Button>} />
+  if (api.phase === 'unavailable') return <EmptyState title="Real resume imports are not enabled" description={api.error ?? 'Saved records are unchanged while real processing is unavailable.'} action={<Button onClick={() => void api.refresh()}>Check availability</Button>} />
   return id ? <RealResumeDetail id={id} /> : <RealResumesLibrary />
 }
 
@@ -89,11 +89,11 @@ function RealResumesLibrary() {
   const analyses = useRealAnalyses()
   const navigate = useNavigate()
   const [params, setParams] = useSearchParams()
-  const [search, setSearch] = useLibraryViewState('resumes:real:query', '')
-  const [sort, setSort] = useLibraryViewState<TableSort<RealResumeSortKey> | null>('resumes:real:sort', null)
+  const [search, setSearch] = useLibraryViewState('resumes:query', '')
+  const [sort, setSort] = useLibraryViewState<TableSort<RealResumeSortKey> | null>('resumes:sort', null)
   const [selected, setSelected] = useState<RealAnalysisResumeSelection[]>([])
   const [adding, setAdding] = useState(false)
-  const [archiveFilter, setArchiveFilter] = useLibraryViewState<ArchiveFilter>('resumes:real:archive', 'default')
+  const [archiveFilter, setArchiveFilter] = useLibraryViewState<ArchiveFilter>('resumes:archive', 'default')
   const query = search.trim().toLocaleLowerCase()
   const selectable = (item: RealResumeSummary) => canEdit && readyRealResume(item) && !isEntityArchived(workspace, { kind: 'resume', id: item.resume.id }) && !isEntityRemoved(workspace, { kind: 'resume', id: item.resume.id })
   const visible = sortTableRows(api.summaries.filter((item) => !item.lifecycle?.deletedAt && matchesArchiveFilter(isEntityArchived(workspace, { kind: 'resume', id: item.resume.id }), search, archiveFilter) &&
@@ -162,7 +162,7 @@ function RealResumesLibrary() {
           return <tr key={summary.resume.id} className={checked ? 'row-selected' : ''}>
             <td className="checkbox-cell"><input type="checkbox" checked={checked} disabled={!ready && !checked}
               aria-label={`Select ${resumeName(summary)} from ${summary.source.displayName}`} onChange={() => toggle(summary)} /></td>
-            <td className="min-w-[180px]"><Link className="row-title" to={`/resumes/${encodeURIComponent(summary.resume.id)}?data=real`}>{resumeName(summary)}</Link>
+            <td className="min-w-[180px]"><Link className="row-title" to={`/resumes/${encodeURIComponent(summary.resume.id)}`}>{resumeName(summary)}</Link>
               <ArchivedBadge target={{ kind: 'resume', id: summary.resume.id }} />
               {summary.displayName && <p className="row-meta">Source name: {resumeStatedName(summary)}</p>}
               <p className="row-meta">{summary.resume.role ?? 'Role not stated'}</p><p className="row-meta">{summary.resume.location ?? 'Location not stated'} · {summary.resume.experience ?? 'Experience not stated'}</p></td>
@@ -174,19 +174,19 @@ function RealResumesLibrary() {
               {summary.duplicates.map((warning, index) => <p key={index} className="mt-2 text-[11px] text-muted">{warning.message} Records remain separate.</p>)}
               {summary.warnings.map((warning, index) => <p key={index} className="mt-2 text-[11px] text-muted">{warning}</p>)}
             </td>
-            <td><div className="space-y-3"><Link className="text-link" to={`/resumes/${encodeURIComponent(summary.resume.id)}?data=real`}>Inspect source <ArrowRight size={13} aria-hidden="true" /></Link><RealResumeActions summary={summary} /></div></td>
+            <td><div className="space-y-3"><Link className="text-link" to={`/resumes/${encodeURIComponent(summary.resume.id)}`}>Inspect source <ArrowRight size={13} aria-hidden="true" /></Link><RealResumeActions summary={summary} /></div></td>
           </tr>
         })}</tbody>
       </table></div> : <EmptyState icon={api.phase === 'loading' ? LoaderCircle : Users}
         title={api.phase === 'loading' ? 'Loading private resumes' : api.phase === 'error' ? 'Resume service unavailable' : search ? 'No matching real resumes' : importsUnavailable ? 'No saved real resumes' : 'Import your first real resume'}
-        description={api.phase === 'loading' ? 'Loading every page of authorized resume summaries.' : api.phase === 'error' ? 'No samples are substituted. Retry the service when available.'
-          : search ? 'Try a stated name, role, or source label. Hidden selections are retained.' : importsUnavailable ? 'This real library is empty. New imports are unavailable under current policy or deployment support; samples are never substituted.'
+        description={api.phase === 'loading' ? 'Loading every page of authorized resume summaries.' : api.phase === 'error' ? 'Retry the service when available.'
+          : search ? 'Try a stated name, role, or source label. Hidden selections are retained.' : importsUnavailable ? 'This real library is empty. New imports are unavailable under current policy or deployment support.'
             : `Choose actual ${uploadFormatNames(formats)} files or public HTML/PDF URLs. Inaccessible inputs get individual errors; successful imports remain available.`}
         action={search || api.summaries.length ? <Button onClick={() => { setSearch(''); setArchiveFilter('all') }}>Show active and archived</Button> : <Button disabled={!canEdit || !api.canWrite || api.phase !== 'ready' || importsUnavailable} title={importReason ?? undefined} icon={Plus} onClick={() => setAdding(true)}>Add real resumes</Button>} />}
-      <div className="table-bottom"><span>{visible.length} of {api.summaries.length} real sources</span><span>Private server records · no sample autosave</span></div>
+      <div className="table-bottom"><span>{visible.length} of {api.summaries.length} real sources</span><span>Private server records</span></div>
     </section>
     <div className="info-callout mt-5"><ShieldCheck size={18} aria-hidden="true" /><div><strong>Evidence about a document, not a judgment about a person.</strong>
-      <p>Public profiles may contain less evidence than full resumes. Importing never starts scoring. Real captures and analyses are retained separately and are not deleted by Reset samples.</p></div></div>
+      <p>Public profiles may contain less evidence than full resumes. Importing never starts scoring.</p></div></div>
     <RealAddResumesDialog open={importsOpen} onOpenChange={openImports} />
   </>
 }
@@ -202,11 +202,11 @@ function RealResumeDetail({ id }: { id: string }) {
   const { canEdit, deleting, removed } = useLifecycleAccess({ kind: 'resume', id })
   const ensure = api.ensureDetail
   useEffect(() => { if (api.phase === 'ready') void ensure(id) }, [api.phase, ensure, entry.state, id])
-  const back = <Link className="back-link" to="/resumes?data=real"><ArrowLeft size={14} aria-hidden="true" />Back to real resumes</Link>
+  const back = <Link className="back-link" to="/resumes"><ArrowLeft size={14} aria-hidden="true" />Back to real resumes</Link>
   if (deleting || (removed && entry.state === 'ready')) return <>{back}<LifecycleBanner target={{ kind: 'resume', id }} /><EmptyState title="Resume cleanup or removal" description="Only recovery metadata remains available. Cached documents and original downloads are hidden. Retry the lifecycle operation above if cleanup is incomplete." /></>
   if (entry.state !== 'ready') return <>{back}<EmptyState icon={entry.state === 'error' || api.phase === 'error' ? FileText : LoaderCircle}
     title={entry.state === 'error' || api.phase === 'error' ? 'This real resume could not be opened' : 'Opening private resume'}
-    description={entry.state === 'error' ? entry.error : api.error ?? 'Loading the actual captured source and evidence-derived profile. No sample is substituted.'}
+    description={entry.state === 'error' ? entry.error : api.error ?? 'Loading the actual captured source and evidence-derived profile.'}
     action={<Button onClick={() => { void api.refresh(); void ensure(id, true) }}>Retry loading</Button>} /></>
   const detail = entry.value
   const summary = api.summaries.find((item) => item.resume.id === id) ?? detail
@@ -229,10 +229,10 @@ function RealResumeDetail({ id }: { id: string }) {
     {(detail.source.kind === 'url' || summary.warnings.length > 0) && <div className="info-callout mb-5"><FileText size={18} aria-hidden="true" /><div><strong>Source limitations</strong>
       {detail.source.kind === 'url' && <p>A public profile may be sparse. Missing names, roles, experience, or evidence are never inferred from a URL or filename.</p>}
       {summary.warnings.map((warning, index) => <p key={index}>{warning}</p>)}</div></div>}
-    {summary.duplicates.map((warning, index) => <div className="info-callout mb-5" key={index}><p>{warning.message} <Link className="text-link" to={`/resumes/${encodeURIComponent(warning.resumeId)}?data=real`}>Inspect the other source</Link>. No profiles were merged or overwritten.</p></div>)}
+    {summary.duplicates.map((warning, index) => <div className="info-callout mb-5" key={index}><p>{warning.message} <Link className="text-link" to={`/resumes/${encodeURIComponent(warning.resumeId)}`}>Inspect the other source</Link>. No profiles were merged or overwritten.</p></div>)}
     <div className="grid items-start gap-5 xl:grid-cols-[minmax(0,1fr)_320px]">
       <section className="detail-panel" aria-label="Actual resume source">
-        <div className="section-heading"><div><h2>Inspect the captured evidence</h2><p>Normalized text from this private capture, not a fictional replacement</p></div></div>
+        <div className="section-heading"><div><h2>Inspect the captured evidence</h2><p>Normalized text from this private capture</p></div></div>
         {detail.document ? <PrivateDocumentViewer document={detail.document} originalUrl={api.originalUrl(id)} pagination={detail.extraction?.pagination}
           original={detail.capture?.original ?? { contentType: detail.source.kind === 'url' ? undefined : UPLOAD_CONTENT_TYPES[detail.source.kind] }} />
           : <EmptyState icon={resumeWorkActive(summary) ? LoaderCircle : FileText} title="No normalized source is available yet"
@@ -256,7 +256,7 @@ function RealResumeDetail({ id }: { id: string }) {
             {detail.documentRef && <div><p>Saved document v{detail.documentRef.documentVersion}</p><code className="block break-all text-[10px]">{detail.documentRef.documentId}<br />SHA-256 {detail.documentRef.sha256}</code></div>}
             <p>Processing attempt {summary.attempts} · {summary.retryCount} manual retries</p>
             {detail.profile && <p>Profile extraction: {detail.profile.provenance.model} · {detail.profile.provenance.promptVersion} · {detail.profile.provenance.schemaVersion}</p>}
-            <p className="border-t pt-4 text-muted">A retry reuses saved evidence when available. Sample reset does not delete this source or its analysis snapshots.</p>
+            <p className="border-t pt-4 text-muted">A retry reuses saved evidence when available.</p>
           </div>
         </section>
       </aside>

@@ -43,7 +43,7 @@ before(async () => {
     }
     createRoot(document.getElementById('root')).render(<Harness />)
   ` }, outfile: join(output, 'app.js'), bundle: true, format: 'esm', platform: 'browser', jsx: 'automatic', logLevel: 'silent',
-  define: { 'import.meta.env.VITE_DEPLOYMENT_MODE': '"cloud"', 'process.env.NODE_ENV': '"test"' } })
+  define: { 'process.env.NODE_ENV': '"test"' } })
   const js = await readFile(join(output, 'app.js'))
   const importedCss = await readFile(join(output, 'app.css'))
   const globals = await postcss([tailwindcss(tailwindConfig), autoprefixer]).process(await readFile(join('src', 'styles', 'globals.css'), 'utf8'),
@@ -188,7 +188,7 @@ test('browser: evaluated admin activation is explicit and mobile dark-mode revoc
   await go(page, '/qc/improvements/plan-one')
   await page.getByRole('button', { name: 'Review activation of evaluated revision 1', exact: true }).click()
   const dialog = page.getByRole('dialog', { name: 'Activate app-wide prompt guidance?', exact: true })
-  await dialog.getByLabel('Required administrator rationale', { exact: true }).fill('Reviewed exact evaluation and the limited reference sample.')
+  await dialog.getByLabel('Required administrator rationale', { exact: true }).fill('Reviewed exact evaluation and the limited reference excerpt.')
   await dialog.getByLabel('I reviewed this evaluated revision and understand the app-wide FUTURE-work effect.', { exact: true }).check()
   await dialog.getByRole('button', { name: 'Activate evaluated revision for FUTURE work', exact: true }).click()
   await page.getByText('The evaluated prompt release was activated for future newly accepted work.', { exact: true }).waitFor()
@@ -291,9 +291,8 @@ test('browser: admission-off keeps saved QC tabs and cancellation without disabl
   await page.getByRole('button', { name: 'Compare release release-old', exact: true }).click()
   await page.getByText('Previous compatible assessment guidance.', { exact: true }).first().waitFor()
   await page.getByRole('button', { name: 'Normal mode', exact: true }).click()
-  await page.getByRole('button', { name: /^Samples/ }).click()
-  await page.waitForURL(url => url.pathname.endsWith('/analyses') && url.searchParams.get('data') === 'samples')
-  assert.equal(await page.getByRole('button', { name: 'New analysis', exact: true }).first().isEnabled(), true)
+  await page.waitForURL(url => url.pathname.endsWith('/analyses') && !url.search)
+  await page.getByRole('button', { name: 'New analysis', exact: true }).first().waitFor()
   assert.deepEqual(writeCalls(fixture).map(item => item.url.split('/').at(-1)), ['cancel'])
   assert.equal(fixture.calls.paid, 0)
 })

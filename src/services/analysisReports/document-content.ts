@@ -4,7 +4,7 @@ import type {
 import { getDisplayName } from '../../domain/displayNames'
 import {
   evidenceStatusLabel, overallScoreLabel, REPORT_HUMAN_REVIEW_NOTICE,
-  REPORT_SAMPLE_NOTICE, REPORT_TITLE,
+  REPORT_TITLE,
 } from './presentation'
 import {
   compactReportText, criterionReviews, qualificationNotes,
@@ -34,9 +34,6 @@ function writeIntroduction<Color>(layout: DocumentReportLayout<Color>, report: A
   layout.startSection({ section: 'Introduction', primary: title, primaryFallback: REPORT_TITLE, secondary: 'Saved analysis scope' })
   layout.paragraph(title, { size: 23, bold: true, leading: 32, after: 8, headingLevel: 1 })
   layout.paragraph(report.run.name, { size: 13, leading: 18, bold: true, after: 8 })
-  if (report.dataKind === 'sample') {
-    layout.paragraph(REPORT_SAMPLE_NOTICE, { size: 9.5, leading: 14, bold: true, color: layout.colors.accent, after: 7 })
-  }
   const dates = report.groups.flatMap(group => group.comparisons)
     .filter(comparison => comparison.status === 'complete' && comparison.analyzedAt)
     .map(comparison => comparison.analyzedAt!)

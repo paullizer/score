@@ -384,7 +384,7 @@ test('cleanup and blocker recovery traverse EMPTY continuation pages and retain 
   ]) {
     const blockers = await api.realAnalysisDependencyBlockers(f.analysis, f.workspaceId, target)
     assert.deepEqual(blockers.map(value => value.id), [run.run.id])
-    assert.equal(blockers[0].href, `/analyses/${run.run.id}?data=real`)
+    assert.equal(blockers[0].href, `/analyses/${run.run.id}`)
   }
   assert.equal((await participant(f).counts(f.workspaceId)).analyses, 1, 'Partially deleted runs still block workspace deletion.')
   f.analysis.blobs._beforeDelete(undefined)

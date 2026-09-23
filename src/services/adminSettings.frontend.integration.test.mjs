@@ -18,11 +18,25 @@ const user = { id: 'reviewer', tenantId: 'tenant', name: 'Reviewer', email: 'rev
 const metadata = { id: 'workspace-one', name: 'Workspace one', role: 'owner', etag: '"workspace-one"' }
 let ui, dom, root, createRoot, requests, settings, revision, override, admin, workspaces, workspace, observedPolicy, observedAnalyses
 const json = (body, status = 200) => Response.json(body, { status })
-function deferred() {
-  let resolve
-  const promise = new Promise(yes => { resolve = yes })
-  return { promise, resolve }
+function testWorkspace() {
+  return {
+    documents: [{ id: 'document-one', title: 'Captured source', kind: 'job', version: 1, sample: false, paragraphs: [
+      { id: 'paragraph-one', page: 1, heading: 'Duties', text: 'Captured source evidence supports this review.' },
+    ] }],
+    jobs: [{ id: 'job-one', title: 'Program analyst', organization: 'Agency', location: 'Remote', arrangement: 'Remote',
+      employmentType: 'Full-time', grade: 'GS-13', series: '0343', source: 'pdf', sourceLabel: 'Captured job.pdf',
+      documentId: 'document-one', rubricId: 'rubric-one', status: 'ready', createdAt: '2026-01-01T00:00:00.000Z', dataKind: 'real' }],
+    rubrics: [{ id: 'rubric-one', groupId: 'rubric-group-one', kind: 'job', jobId: 'job-one', name: 'Job rubric',
+      description: 'Measures the role.', version: 1, createdAt: '2026-01-01T00:00:00.000Z', dataKind: 'real',
+      criteria: [{ id: 'criterion-one', key: 'technical', label: 'Evidence', description: 'Uses evidence.',
+        guidance: 'Check exact source evidence.', weight: 100, requirementType: 'required',
+        sourceCitations: [{ documentId: 'document-one', documentVersion: 1, paragraphId: 'paragraph-one',
+          page: 1, heading: 'Duties', quote: 'source evidence' }] }] }],
+    lifecycle: { entities: {} },
+  }
 }
+const testResume = () => ({ id: 'resume-one', name: 'Captured resume', displayName: 'Captured resume.pdf', status: 'ready',
+  source: 'pdf', sourceLabel: 'Captured resume.pdf', documentId: 'document-one', createdAt: '2026-01-01T00:00:00.000Z', dataKind: 'real' })
 function projection(value = settings, id = revision) {
   return ui.projectPublicSettings(ui.captureProcessingSettings(value, id, '2026-01-01T00:00:00.000Z'))
 }
@@ -87,7 +101,6 @@ before(async () => {
       export { projectPublicSettings, captureProcessingSettings, diffAdminSettings } from './src/domain/admin-settings-resolver';
       export { ADMIN_SETTINGS_FIELDS } from './src/domain/admin-settings-fields';
       export { effectiveFeatures } from './server/settings/features';
-      export { createInitialWorkspace } from './src/data/fixtures';
       export { initialGradeContext, initialGradeLevels } from './src/features/grade-ladders/gradeDefaults';
       export { requireGradeLevels, gradeSourceOriginalUrl } from './src/services/gradeLadders';
       export { createRealAnalysis } from './src/services/realAnalyses';
@@ -98,14 +111,13 @@ before(async () => {
     ` },
     outfile: join(output, 'ui.mjs'), bundle: true, packages: 'external', format: 'esm', platform: 'node',
     jsx: 'automatic', logLevel: 'silent', loader: { '.css': 'empty' },
-    define: { 'import.meta.env.VITE_DEPLOYMENT_MODE': '"cloud"' },
   })
   ui = await import(pathToFileURL(join(output, 'ui.mjs')).href)
 })
 
 beforeEach(() => {
   requests = []; override = null; admin = true; workspaces = []; observedPolicy = null; observedAnalyses = null
-  settings = ui.createDefaultAdminSettings(); revision = 'revision-1'; workspace = ui.createInitialWorkspace()
+  settings = ui.createDefaultAdminSettings(); revision = 'revision-1'; workspace = testWorkspace()
   dom.window.localStorage.clear()
   dom.window.history.replaceState(null, '', '/admin/settings')
   globalThis.fetch = async (url, init = {}) => {
@@ -124,7 +136,7 @@ beforeEach(() => {
     if (path === '/api/workspaces') return json({ workspaces })
     const workspaceCounts = /^\/api\/workspaces\/([^/]+)\/summary$/.exec(path)
     if (workspaceCounts) return json({ workspaceId: workspaceCounts[1], jobs: { status: 'ready', count: 0 }, resumes: { status: 'ready', count: 0 }, analyses: { status: 'ready', count: 0 } })
-    if (path.endsWith('/state')) return method === 'PUT' ? json({ etag: '"workspace-2"' }) : json({ workspace, etag: '"workspace-1"' })
+    if (path.endsWith('/state')) throw new Error(`Workspace state API must not be used: ${method} ${path}`)
     if (path.endsWith('/jobs')) return json({ jobs: [] })
     if (path.endsWith('/resumes')) return json({ resumes: [] })
     if (path.endsWith('/grade-ladders')) return json({ ladders: [] })
@@ -245,23 +257,6 @@ for (const archived of [false, true]) test(`admin navigation remains reachable w
   await until(() => document.querySelector('.settings-savebar'), 'Settings open independently')
   assert.equal(location.pathname, '/admin/settings')
   assert.ok(!requests.some(item => item.path.endsWith('/state')))
-})
-
-test('entering admin flushes pending workspace saves before unmounting the workspace', async () => {
-  dom.window.history.replaceState(null, '', '/workspaces/workspace-one/jobs')
-  workspaces = [metadata]
-  const save = deferred()
-  override = (path, init) => path.endsWith('/state') && init.method === 'PUT' ? save.promise : undefined
-  await render(element(ui.CloudApplication))
-  await until(() => document.querySelector('.sidebar'), 'Workspace shell loads')
-  await click(button('Reset samples', document.querySelector('.sidebar')))
-  await click(button('Reset samples', dialog('Reset sample content?')))
-  await click(button('Application settings'))
-  await until(() => requests.some(item => item.method === 'PUT'), 'Workspace save begins')
-  assert.equal(location.pathname, '/workspaces/workspace-one/jobs')
-  assert.ok(!requests.some(item => item.path === '/api/admin/settings'))
-  await act(async () => { save.resolve(json({ etag: '"saved-before-admin"' })); await pause() })
-  await until(() => document.querySelector('.settings-savebar'), 'Admin loads only after save acknowledgement')
 })
 
 test('entering admin honors dirty workspace drafts, with cancel and explicit discard', async () => {
@@ -790,24 +785,36 @@ test('new-operation preflight honors safe projection, hard ceilings, and retaine
 })
 
 test('policy appearance, hidden cloud sample affordances, default navigation, and explicit deep links are applied', async () => {
-  settings.navigation.defaultPage = 'rubrics'; settings.features.samplesVisible = false
+  settings.navigation.defaultPage = 'rubrics'
   settings.appearance.applicationTitle = 'Agency evidence'
   settings.appearance.announcement = { enabled: true, text: 'Review carefully', tone: 'warning' }
   settings.help.supportUrl = 'https://agency.example/support'; settings.help.documentationUrl = 'https://agency.example/help'
-  const policy = { settings: projection(), phase: 'ready', error: null, cloud: true, refresh: async () => {} }
   const context = frontendWorkspaceContext({ workspace, cloud: { currentWorkspaceId: metadata.id } })
-  const tree = path => element(ui.PublicSettingsContext.Provider, { value: policy },
+  const sampleAffordancesAreAbsent = () => {
+    assert.equal(document.querySelector('.library-kind-switcher'), null)
+    // No Samples switcher, sample reset, sample save status, or any other sample wording remains.
+    assert.doesNotMatch(document.body.textContent, /\bsamples?\b|saved on this device/i)
+    assert.equal(document.querySelector('.about-chip'), null)
+    assert.ok([...document.querySelectorAll('.sidebar-links button.nav-item')].some(item => item.textContent.trim() === 'About Agency evidence'))
+  }
+  const tree = path => element(ui.PublicSettingsContext.Provider, { value: { settings: projection(), phase: 'ready', error: null, cloud: true, refresh: async () => {} } },
     element(ui.WorkspaceContext.Provider, { value: context }, element(ui.MemoryRouter, { key: path, initialEntries: [path],
       future: { v7_startTransition: true, v7_relativeSplatPath: true } }, element(ui.App))))
+  for (const visible of [false, true]) {
+    settings.features.samplesVisible = visible
+    await render(tree('/'))
+    await until(() => document.querySelector('h1')?.textContent === 'Rubrics', 'Configured default page is selected')
+    sampleAffordancesAreAbsent()
+  }
   await render(tree('/'))
   await until(() => document.querySelector('h1')?.textContent === 'Rubrics', 'Configured default page is selected')
   assert.ok(document.querySelector('a[aria-label="Agency evidence home"]'))
   assert.match(document.body.textContent, /Review carefully/)
   assert.ok(document.querySelector('a[href="https://agency.example/support"]'))
-  assert.equal(document.querySelector('.library-kind-switcher'), null)
-  assert.ok(![...document.querySelectorAll('button')].some(item => item.textContent.trim() === 'Reset samples'))
+  sampleAffordancesAreAbsent()
   await render(tree('/jobs'))
   assert.equal(document.querySelector('h1').textContent, 'Your jobs')
+  sampleAffordancesAreAbsent()
 })
 
 test('all twelve task bindings offer inheritance, deployment-specific reasoning, and bounded advanced controls', async () => {
@@ -935,12 +942,12 @@ for (const kind of ['job', 'resume', 'reference']) {
   test(`${kind} original links recheck current workspace role and policy while retaining extracted evidence`, async () => {
     const timestamp = '2026-01-01T00:00:00.000Z'
     const original = { blobName: 'captured/source.pdf', contentType: 'application/pdf', bytes: 100, sha256: 'a'.repeat(64) }
-    const local = kind === 'resume' ? workspace.resumes[0] : workspace.jobs[0]
+    const local = kind === 'resume' ? testResume() : workspace.jobs[0]
     const documentValue = structuredClone(workspace.documents.find(item => item.id === local.documentId))
     documentValue.sample = false
     workspace.documents = workspace.documents.map(item => item.id === documentValue.id ? documentValue : item)
     const evidence = documentValue.paragraphs[0].text.slice(0, 40)
-    let view, resumes = null, grades = null
+    let view, resumes = null, resumeSummary = null, grades = null
     let cloud = {}, route = '/'
     if (kind === 'job') {
       const job = { ...local, dataKind: 'real' }
@@ -959,6 +966,7 @@ for (const kind of ['job', 'resume', 'reference']) {
         source: { kind: 'pdf', displayName: 'Captured resume.pdf' }, capture: { original, capturedAt: timestamp },
         document: documentValue, documentRef: null, profile: null, warnings: [], duplicates: [], attempts: 1, retryCount: 0,
       }
+      resumeSummary = value
       resumes = {
         workspaceId: metadata.id, phase: 'ready', error: null, features: null, canWrite: false, summaries: [value],
         detail: () => ({ state: 'ready', value }), ensureDetail: async () => {}, refresh: async () => {}, pending: () => false,
@@ -990,7 +998,7 @@ for (const kind of ['job', 'resume', 'reference']) {
         ...cloud, currentWorkspaceId: metadata.id, workspaces: [
           { ...metadata, id: 'another-workspace', role: 'owner' }, ...(role ? [{ ...metadata, role }] : []),
         ],
-      } })
+      } }, resumeSummary ? { resumes: [resumeSummary] } : {})
       await render(element(ui.PublicSettingsContext.Provider, { value: policy },
         element(ui.WorkspaceContext.Provider, { value: context },
           element(ui.RealResumesContext.Provider, { value: resumes },
@@ -1094,12 +1102,4 @@ test('private history and manual publication recheck current role policy without
   const request = requests.findLast(item => item.path.endsWith('/history'))
   assert.ok(!request.url.includes('limit='), 'Server applies the effective page size; the strict route does not accept a limit query')
   assert.ok(!requests.some(item => item.method === 'POST'))
-})
-
-test('standalone demo does not pretend to save cloud administration settings', async () => {
-  await render(element(ui.WorkspaceContext.Provider, { value: frontendWorkspaceContext({ workspace }) },
-    element(ui.MemoryRouter, { initialEntries: ['/admin/settings'], future: { v7_startTransition: true, v7_relativeSplatPath: true } }, element(ui.App))))
-  assert.match(document.body.textContent, /fictional local demo/)
-  assert.equal(requests.length, 0)
-  assert.equal(document.querySelector('.settings-savebar'), null)
 })

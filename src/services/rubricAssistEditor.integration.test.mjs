@@ -46,7 +46,7 @@ before(async () => {
     export { RubricPanel } from './src/features/rubrics/RubricPanel'
     export { WorkspaceContext } from './src/app/workspace-context'
     export { BrowserRouter } from 'react-router-dom'
-  ` }, outfile: join(output, 'ui.mjs'), bundle: true, packages: 'external', format: 'esm', platform: 'node', jsx: 'automatic', logLevel: 'silent', define: { 'import.meta.env.VITE_DEPLOYMENT_MODE': '"cloud"' } })
+  ` }, outfile: join(output, 'ui.mjs'), bundle: true, packages: 'external', format: 'esm', platform: 'node', jsx: 'automatic', logLevel: 'silent' })
   ui = await import(pathToFileURL(join(output, 'ui.mjs')).href)
 })
 
@@ -90,7 +90,7 @@ function fixture() {
     criteria: [{ ...rubric.criteria[0], label: 'Legacy analysis' }, rubric.criteria[1]],
   }
   const job = { id: 'job-1', title: 'Program analyst', organization: 'Fixture org', location: '', arrangement: '', employmentType: '', grade: '', series: '', source: 'pdf', sourceLabel: 'job.pdf', documentId: document.id, rubricId: rubric.id, status: 'ready', createdAt: '2026-01-01T00:00:00.000Z', dataKind: 'real' }
-  return { workspace: { schemaVersion: 1, jobs: [job], resumes: [], documents: [document], rubrics: [rubric], runs: [] }, job, document, rubric, firstVersion }
+  return { workspace: { jobs: [job], documents: [document], rubrics: [rubric] }, job, document, rubric, firstVersion }
 }
 
 function context({ assist, rubricAssistant = true, role = 'owner' } = {}) {
@@ -356,15 +356,7 @@ test('the read-only panel offers per-criterion Ask AI that opens the editor focu
   assert.match(dialog().textContent, /About: Criterion 02 · Communication/)
 })
 
-test('AI entry points are hidden for samples, viewers, read-only panels, and when the assistant is unavailable', async () => {
-  const ctx = context()
-  const sample = { ...ctx.workspace.rubrics[0], dataKind: undefined }
-  ctx.workspace = { ...ctx.workspace, rubrics: [sample] }
-  root ??= createRoot(document.getElementById('root'))
-  await act(async () => { root.render(h(ui.BrowserRouter, null, h(ui.WorkspaceContext.Provider, { value: ctx }, h(ui.RubricPanel, { rubric: sample })))); await pause() })
-  assert.equal(findButton('Edit with AI'), undefined)
-  await act(async () => { root.unmount(); await pause() }); root = null
-
+test('AI entry points are hidden for viewers, read-only panels, and when the assistant is unavailable', async () => {
   await render({ role: 'viewer' })
   assert.equal(findButton('Edit with AI'), undefined)
   await act(async () => { root.unmount(); await pause() }); root = null

@@ -278,36 +278,26 @@ export function createFakeDirectoryStore() {
 export function createFakeStateStore() {
   const blobs = new Map()
   const leases = new Set()
+  const operations = []
   let etagCounter = 0
   let accessError = null
   const nextEtag = () => `"state-etag-${(etagCounter += 1)}"`
 
   return {
     async getState(workspaceId) {
+      operations.push('getState')
       const entry = blobs.get(workspaceId)
       return entry ? { content: entry.content, etag: entry.etag } : undefined
     },
-    async createState(workspaceId, content) {
-      const existing = blobs.get(workspaceId)
-      if (existing) return { created: false, etag: existing.etag }
-      const etag = nextEtag()
-      blobs.set(workspaceId, { content, etag })
-      return { created: true, etag }
-    },
-    async putState(workspaceId, content, expectedEtag) {
-      const entry = blobs.get(workspaceId)
-      if (!entry || entry.etag !== expectedEtag) throw new StoreConflictError('The workspace state changed since it was last loaded.')
-      const etag = nextEtag()
-      blobs.set(workspaceId, { content, etag })
-      return { etag }
-    },
     async deleteState(workspaceId, expectedEtag) {
+      operations.push('deleteState')
       if (expectedEtag !== undefined && blobs.has(workspaceId) && blobs.get(workspaceId).etag !== expectedEtag) {
         throw new StoreConflictError()
       }
       blobs.delete(workspaceId)
     },
     async acquireMutationLease(workspaceId) {
+      operations.push('acquireMutationLease')
       if (leases.has(workspaceId)) throw new StoreConflictError('Another workspace change is in progress.')
       leases.add(workspaceId)
       return {
@@ -316,6 +306,7 @@ export function createFakeStateStore() {
       }
     },
     async checkAccess() {
+      operations.push('checkAccess')
       if (accessError) throw accessError
     },
     // Test-only escape hatches:
@@ -325,6 +316,12 @@ export function createFakeStateStore() {
     _setRawContent(workspaceId, content) {
       const existing = blobs.get(workspaceId)
       blobs.set(workspaceId, { content, etag: existing ? existing.etag : nextEtag() })
+    },
+    _operations() {
+      return [...operations]
+    },
+    _clearOperations() {
+      operations.length = 0
     },
   }
 }
@@ -425,12 +422,13 @@ export async function startTestServer(overrides = {}) {
   async function close() {
     server.closeAllConnections()
     await new Promise((resolve) => server.close(() => resolve()))
+    await new Promise(resolve => setTimeout(resolve, 10))
   }
 
   return { app, server, baseUrl, directory, state, config, accessStore, eligibleUsers, fixtureWorkspace, close }
 }
 
-export function sampleWorkspaceBody() {
+export function legacyStateBody() {
   return {
     schemaVersion: 1,
     jobs: [],

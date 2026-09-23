@@ -12,8 +12,9 @@ const originalFetch = globalThis.fetch
 const outputDirectory = resolve(`.grade-client-tests-${randomUUID()}`)
 const key = 'b170274c-b0dc-4579-a589-18c5c7bde712'
 const timestamp = '2026-09-17T18:00:00.000Z'
-let client, jobClient, ui, scoring, fixtures, validation, components
+let client, jobClient, ui, components
 let requests
+const emptyProjection = () => ({ jobs: [], documents: [], rubrics: [], lifecycle: { entities: {} } })
 
 function json(body, status = 200) {
   return new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json' } })
@@ -105,19 +106,16 @@ before(async () => {
     client: join('src', 'services', 'gradeLadders.ts'),
     jobs: join('src', 'services', 'realJobs.ts'),
     ui: join('src', 'features', 'grade-ladders', 'gradeUi.ts'),
-    scoring: join('src', 'services', 'scoring.ts'),
-    fixtures: join('src', 'data', 'fixtures.ts'),
-    validation: join('src', 'domain', 'workspace-validation.ts'),
   }
   await Promise.all(Object.entries(entries).map(([name, entry]) => build({
     entryPoints: [entry], outfile: join(outputDirectory, `${name}.mjs`), bundle: true, packages: 'external',
-    platform: 'node', format: 'esm', define: { 'import.meta.env.VITE_DEPLOYMENT_MODE': '"cloud"' }, logLevel: 'silent',
+    platform: 'node', format: 'esm', logLevel: 'silent',
   })))
   await build({
     stdin: { contents: `export { DocumentViewer } from './src/components/documents/DocumentViewer'; export { GradeMatrix } from './src/features/grade-ladders/GradeMatrix'; export { WorkspaceContext } from './src/app/workspace-context';`, resolveDir: process.cwd(), loader: 'tsx' },
-    outfile: join(outputDirectory, 'components.mjs'), bundle: true, packages: 'external', platform: 'node', format: 'esm', jsx: 'automatic', define: { 'import.meta.env.VITE_DEPLOYMENT_MODE': '"cloud"' }, logLevel: 'silent',
+    outfile: join(outputDirectory, 'components.mjs'), bundle: true, packages: 'external', platform: 'node', format: 'esm', jsx: 'automatic', logLevel: 'silent',
   })
-  ;[client, jobClient, ui, scoring, fixtures, validation, components] = await Promise.all(['client', 'jobs', 'ui', 'scoring', 'fixtures', 'validation', 'components'].map((name) => import(pathToFileURL(join(outputDirectory, `${name}.mjs`)).href)))
+  ;[client, jobClient, ui, components] = await Promise.all(['client', 'jobs', 'ui', 'components'].map((name) => import(pathToFileURL(join(outputDirectory, `${name}.mjs`)).href)))
 })
 
 beforeEach(() => {
@@ -210,8 +208,8 @@ test('grade lifecycle scopes previews and mutations to the logical grade with it
   assert.equal(result.deleted, undefined)
 })
 
-test('an authoritative empty grade list evicts all history projections without changing samples', () => {
-  const workspace = fixtures.createInitialWorkspace(), baseline = structuredClone(workspace)
+test('an authoritative empty grade list evicts all history projections without changing the base projection', () => {
+  const workspace = emptyProjection(), baseline = structuredClone(workspace)
   const result = ui.projectRealGrades(workspace, [makeVersion()], [])
   assert.equal(result.rubrics.some((rubric) => rubric.dataKind === 'real'), false)
   assert.deepEqual(workspace, baseline)
@@ -285,7 +283,7 @@ test('budgets exclude the automatic seed but include actual selected PDF pages',
 })
 
 test('private grades are display-only projections with stable family identity and latest-version selection', () => {
-  const legacy = fixtures.createInitialWorkspace()
+  const legacy = emptyProjection()
   const before = JSON.stringify(legacy)
   const current = makeVersion(9, 3, 'family-a')
   const older = makeVersion(9, 1, 'family-a')
@@ -297,28 +295,8 @@ test('private grades are display-only projections with stable family identity an
   assert.notEqual(real[0].groupId, real[1].groupId)
   assert.equal(projection.documents, legacy.documents)
   assert.equal(projection.jobs, legacy.jobs)
-  assert.equal(projection.runs, legacy.runs)
+  assert.deepEqual(projection.lifecycle, legacy.lifecycle)
   assert.equal(JSON.stringify(legacy), before)
-  assert.throws(() => validation.validateWorkspace(projection), { name: 'WorkspaceValidationError' })
-})
-
-test('real grades cannot reach direct, mixed, replayed or weighted fixture scoring', () => {
-  const legacy = fixtures.createInitialWorkspace()
-  const version = makeVersion()
-  const real = version.rubric
-  const sample = legacy.rubrics.find((rubric) => rubric.kind === 'grade')
-  const resumeId = legacy.resumes[0].id
-  const identity = { id: 'run-test', createdAt: timestamp, comparisonId: (index) => `comparison-${index}` }
-  const mixed = ui.projectRealGrades(legacy, [version])
-  assert.throws(() => scoring.snapshotAnalysisRun(mixed, [resumeId], [real.id], 'No real scores', identity), /Real job and GS grade/)
-  assert.throws(() => scoring.snapshotAnalysisRun(mixed, [resumeId], [sample.id, real.id], 'No mixed scores', identity), /Real job and GS grade/)
-  assert.throws(() => scoring.assertTargetSnapshot({ id: real.id, kind: 'grade', rubric: real }), /Real job and GS grade/)
-  assert.throws(() => scoring.weightedScore(real, []), /Real job and GS grade/)
-  const good = scoring.snapshotAnalysisRun(legacy, [resumeId], [sample.id], 'Sample only', identity)
-  assert.equal(scoring.evaluateComparison(good, good.comparisons[0].id).status, 'complete')
-  const replay = structuredClone(good)
-  replay.targets.push({ id: real.id, kind: 'grade', rubric: real })
-  assert.throws(() => scoring.evaluateComparison(replay, replay.comparisons[0].id), /Real job and GS grade/)
 })
 
 test('draft weight validation preserves zero and partial allocations without weighting evidence gaps or exclusions', () => {
@@ -424,7 +402,11 @@ test('source-cited not-applicable exclusions allow approval only with exact froz
 })
 
 function renderMatrix(props) {
-  const value = { workspace: fixtures.createInitialWorkspace(), getLifecycleImpact() {}, changeLifecycle() {} }
+  const value = {
+    workspace: emptyProjection(),
+    cloud: { mode: 'cloud', currentWorkspaceId: 'workspace-one', workspaces: [{ id: 'workspace-one', role: 'owner' }] },
+    getLifecycleImpact() {}, changeLifecycle() {},
+  }
   return renderToStaticMarkup(React.createElement(components.WorkspaceContext.Provider, { value }, React.createElement(components.GradeMatrix, props)))
 }
 

@@ -53,12 +53,12 @@ function latestSummaryById(items: RealJobSummary[]): RealJobSummary[] {
 
 export function RealJobsBridge({
   workspaceId,
-  legacyValue,
+  base,
   cloud,
   children,
 }: {
   workspaceId: string
-  legacyValue: Omit<WorkspaceContextValue, 'cloud'>
+  base: Omit<WorkspaceContextValue, 'cloud'>
   cloud: Omit<CloudWorkspaceStatus, 'realJobs'>
   children: ReactNode
 }) {
@@ -257,8 +257,8 @@ export function RealJobsBridge({
 
   const readyDetails = useMemo(() => Object.values(details).flatMap((entry) => entry.state === 'ready' ? [entry.value] : []), [details])
   const workspace = useMemo(
-    () => projectRealJobs(legacyValue.workspace, summaries, readyDetails),
-    [legacyValue.workspace, readyDetails, summaries],
+    () => projectRealJobs(base.workspace, summaries, readyDetails),
+    [base.workspace, readyDetails, summaries],
   )
 
   function requirePermission(target?: LifecycleTarget, lifecycle = false) {
@@ -271,8 +271,6 @@ export function RealJobsBridge({
   }
 
   async function mutate<T>(operation: () => Promise<T>, accept: (result: T, stamp: number) => void, target?: LifecycleTarget, lifecycle = false): Promise<T> {
-    requirePermission(target, lifecycle)
-    if (lifecycle) await currentCloud.current.flushSave()
     requirePermission(target, lifecycle)
     const accessStarted = accessRef.current.stamp
     const stamp = ++sequence.current
@@ -342,35 +340,32 @@ export function RealJobsBridge({
   }
 
   async function cancelJob(id: string) {
-    const job = workspace.jobs.find((item) => item.id === id)
-    if (job?.dataKind !== 'real') return legacyValue.cancelJob(id)
     try {
-      await mutate(() => cancelRealJob(workspaceId, id), remember, { kind: 'job', id })
+      if (!workspace.jobs.some((item) => item.id === id)) await base.cancelJob(id)
+      else await mutate(() => cancelRealJob(workspaceId, id), remember, { kind: 'job', id })
     } catch (error) {
-      if (aliveRef.current) legacyValue.notify(errorMessage(error, 'Score could not cancel this job. Its server processing may still continue.'))
+      if (aliveRef.current) base.notify(errorMessage(error, 'Score could not cancel this job. Its server processing may still continue.'))
     }
   }
 
   async function retryJob(id: string) {
     const job = workspace.jobs.find((item) => item.id === id)
-    if (job?.dataKind !== 'real') return legacyValue.retryJob(id)
     try {
+      if (!job) { await base.retryJob(id); return }
       if (job.rubricDeletedAt) throw new Error('This job has no rubric because it was permanently deleted. Retrying an import cannot restore it.')
       const rubric = workspace.rubrics.find((item) => item.jobId === id)
       if (rubric && isEntityArchived(workspace, { kind: 'rubric', id: rubric.groupId })) throw new Error('Unarchive this job’s logical rubric before retrying processing.')
       await mutate(() => retryRealJob(workspaceId, id), remember, { kind: 'job', id })
     } catch (error) {
-      if (aliveRef.current) legacyValue.notify(errorMessage(error, 'Score could not retry this job.'))
+      if (aliveRef.current) base.notify(errorMessage(error, 'Score could not retry this job.'))
     }
   }
 
   async function saveRubric(rubric: Rubric, duplicate = false): Promise<string> {
-    if (rubric.dataKind !== 'real') return legacyValue.saveRubric(rubric, duplicate)
-    if (duplicate) throw new Error('Real job rubrics remain attached to their source job and cannot be duplicated.')
-    const jobId = rubric.jobId
-    if (!jobId) throw new Error('This real rubric is missing its linked job.')
-    const summary = summaries.find((item) => item.job.id === jobId)
-    if (!summary) throw new Error('Refresh this job before saving its rubric.')
+    if (duplicate) throw new Error('Job rubrics remain attached to their source job and cannot be duplicated.')
+    const jobId = rubric.kind === 'job' ? rubric.jobId : undefined
+    const summary = jobId ? summaries.find((item) => item.job.id === jobId) : undefined
+    if (!jobId || !summary) return base.saveRubric(rubric, duplicate)
     const maximum = Math.min(20, policy.settings?.rubrics.jobs.maxCriteria ?? features?.limits.maxCriteria ?? 20)
     if (rubric.criteria.length > maximum && rubric.criteria.some(criterion => !summary.rubric?.criteria.some(previous => previous.id === criterion.id))) {
       throw new Error(`Application policy allows at most ${maximum} criteria when adding new criteria. Existing saved criteria can still be reviewed and edited.`)
@@ -379,7 +374,7 @@ export function RealJobsBridge({
     try {
       const detail = await mutate(() => saveRealJobRubric(workspaceId, jobId, rubric, summary.etag), remember, { kind: 'rubric', id: rubric.groupId })
       if (!detail.rubric || detail.job.rubricDeletedAt) throw new Error('The service did not acknowledge a current rubric. No older version was substituted.')
-      legacyValue.notify(`${detail.rubric?.name ?? rubric.name} saved as reviewer-edited version ${detail.rubric?.version ?? rubric.version + 1}.`)
+      base.notify(`${detail.rubric?.name ?? rubric.name} saved as reviewer-edited version ${detail.rubric?.version ?? rubric.version + 1}.`)
       return detail.rubric.id
     } catch (error) {
       if (error instanceof CloudConflictError) {
@@ -402,8 +397,8 @@ export function RealJobsBridge({
   }
 
   async function renameEntity(target: RenameEntityTarget, name: string, etag?: string) {
-    if (target.kind !== 'job' || !workspace.jobs.some((job) => job.id === target.id && job.dataKind === 'real')) {
-      return legacyValue.renameEntity(target, name, etag)
+    if (target.kind !== 'job' || !workspace.jobs.some((job) => job.id === target.id)) {
+      return base.renameEntity(target, name, etag)
     }
     if (!etag) throw new Error('Reload this job before editing its display title.')
     if (phase !== 'ready') throw new Error('The job service is unavailable. Refresh it before editing the title.')
@@ -418,24 +413,17 @@ export function RealJobsBridge({
           const next = { ...current }; delete next[target.id]; return next
         })
       }, target)
-      legacyValue.notify('Job display title saved. The original job and rubric are unchanged.')
+      base.notify('Job display title saved. The original job and rubric are unchanged.')
     } catch (error) {
       if (error instanceof CloudConflictError) throw new Error('This job changed. Reload its current title before trying again; your edit has not overwritten it.')
       throw error
     }
   }
 
-  function startAnalysis(resumeIds: string[], rubricIds: string[], name?: string, failFirst?: boolean): string {
-    if (rubricIds.some((id) => workspace.rubrics.find((rubric) => rubric.id === id)?.dataKind === 'real')) {
-      throw new Error('Real job rubrics cannot use the demo scorer. Use the separate real analysis workflow with ready real resumes.')
-    }
-    return legacyValue.startAnalysis(resumeIds, rubricIds, name, failFirst)
-  }
-
   function realTarget(target: LifecycleTarget) {
     if (target.kind === 'job') return summariesRef.current.find((item) => item.job.id === target.id)
     if (target.kind !== 'rubric') return undefined
-    const rubric = workspace.rubrics.find((item) => (item.id === target.id || item.groupId === target.id) && item.dataKind === 'real' && item.kind === 'job')
+    const rubric = workspace.rubrics.find((item) => (item.id === target.id || item.groupId === target.id) && item.kind === 'job')
     return rubric ? summariesRef.current.find((item) => item.job.id === rubric.jobId) : undefined
   }
 
@@ -454,7 +442,7 @@ export function RealJobsBridge({
         summary = retained
       }
     }
-    if (!summary) return legacyValue.changeLifecycle(target, action)
+    if (!summary) return base.changeLifecycle(target, action)
     const currentSummary = summary
     const scope = pending?.scope ?? (target.kind === 'job' ? 'job' : 'rubric')
     const result = await mutate(() => changeRealJobLifecycle(workspaceId, currentSummary.job.id, scope, action, currentSummary.etag), (response, stamp) => {
@@ -478,7 +466,7 @@ export function RealJobsBridge({
     }
     if (!result.job && !result.deleted) throw new Error('The service has not acknowledged this lifecycle change. Refresh and retry.')
     setPendingLifecycle((current) => current.filter((item) => !(item.jobId === currentSummary.job.id && item.scope === scope)))
-    legacyValue.notify(action === 'delete' ? 'Permanent deletion acknowledged by the job service.' : action === 'archive' ? 'Archive acknowledged. Owned unfinished processing was cancelled.' : 'Unarchive acknowledged. Processing has not restarted.')
+    base.notify(action === 'delete' ? 'Permanent deletion acknowledged by the job service.' : action === 'archive' ? 'Archive acknowledged. Owned unfinished processing was cancelled.' : 'Unarchive acknowledged. Processing has not restarted.')
   }
 
   const realJobs: CloudWorkspaceStatus['realJobs'] = {
@@ -498,25 +486,20 @@ export function RealJobsBridge({
     originalUrl: (jobId) => realJobOriginalUrl(workspaceId, jobId),
   }
   const value: WorkspaceContextValue = {
-    ...legacyValue,
+    ...base,
     workspace,
     cancelJob,
     retryJob,
     saveRubric,
     renameEntity,
-    startAnalysis,
     getLifecycleImpact: (target) => {
       const pending = pendingLifecycleRef.current.find((item) => item.target.kind === target.kind && item.target.id === target.id)
       if (pending) return getRealJobLifecycleImpact(workspaceId, pending.jobId, pending.scope)
       const summary = realTarget(target)
-      return summary ? getRealJobLifecycleImpact(workspaceId, summary.job.id, target.kind === 'job' ? 'job' : 'rubric') : legacyValue.getLifecycleImpact(target)
+      return summary ? getRealJobLifecycleImpact(workspaceId, summary.job.id, target.kind === 'job' ? 'job' : 'rubric') : base.getLifecycleImpact(target)
     },
     changeLifecycle,
-    lifecycleOperations: [...(legacyValue.lifecycleOperations ?? []), ...pendingLifecycle],
-    resetDemo: () => {
-      legacyValue.resetDemo()
-      legacyValue.notify('Sample content was reset. Server-owned real resumes, analyses, jobs, and rubric versions were not changed.')
-    },
+    lifecycleOperations: [...(base.lifecycleOperations ?? []), ...pendingLifecycle],
     cloud: { ...cloud, realJobs },
   }
   return <WorkspaceContext.Provider value={value}>{children}</WorkspaceContext.Provider>

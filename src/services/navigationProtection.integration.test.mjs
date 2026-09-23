@@ -48,12 +48,10 @@ before(async () => {
     export { GradeNavigationProtectionProvider, GradeRouterProtection } from './src/app/GradeNavigationProtection';
     export { useGradeLeaveGuard } from './src/app/grade-navigation-context';
     export { RubricEditor } from './src/features/rubrics/RubricEditor';
-    export { App } from './src/app/App';
     export { WorkspaceContext } from './src/app/workspace-context';
-    export { createInitialWorkspace } from './src/data/fixtures';
     export { BrowserRouter, Routes, Route, useNavigate, useLocation } from 'react-router-dom';
   ` }, outfile: join(output, 'ui.mjs'), bundle: true, packages: 'external', format: 'esm', platform: 'node',
-  jsx: 'automatic', logLevel: 'silent', define: { 'import.meta.env.VITE_DEPLOYMENT_MODE': '"cloud"' } })
+  jsx: 'automatic', logLevel: 'silent' })
   ui = await import(pathToFileURL(join(output, 'ui.mjs')).href)
 })
 
@@ -80,8 +78,24 @@ async function renderTree(tree) {
   root ??= createRoot(document.getElementById('root'))
   await act(async () => { root.render(tree); await pause() })
 }
+function testWorkspace() {
+  return {
+    documents: [{ id: 'document-one', title: 'Position description', kind: 'job', version: 1, sample: false, paragraphs: [
+      { id: 'paragraph-one', page: 1, heading: 'Duties', text: 'Design reliable public services with strong evidence and documentation.' },
+    ] }],
+    jobs: [{ id: 'job-one', title: 'Program analyst', organization: 'Agency', location: 'Remote', arrangement: 'Remote',
+      employmentType: 'Full-time', grade: 'GS-13', series: '0343', source: 'pdf', sourceLabel: 'Position description.pdf',
+      documentId: 'document-one', rubricId: 'rubric-one', status: 'ready', createdAt: '2026-01-01T00:00:00.000Z', dataKind: 'real' }],
+    rubrics: [{ id: 'rubric-one', groupId: 'rubric-group-one', kind: 'job', jobId: 'job-one', name: 'Job rubric',
+      description: 'Measures the role.', version: 1, createdAt: '2026-01-01T00:00:00.000Z', dataKind: 'real',
+      criteria: [{ id: 'criterion-one', key: 'technical', label: 'Evidence', description: 'Uses evidence.', guidance: 'Check exact source evidence.',
+        weight: 100, requirementType: 'required', sourceCitations: [{ documentId: 'document-one', documentVersion: 1,
+          paragraphId: 'paragraph-one', page: 1, heading: 'Duties', quote: 'strong evidence' }] }] }],
+    lifecycle: { entities: {} },
+  }
+}
 function contextFor(save = () => 'saved-rubric', cloud = false) {
-  const workspace = ui.createInitialWorkspace()
+  const workspace = testWorkspace()
   return frontendWorkspaceContext({
     workspace,
     ...(cloud ? { cloud: { currentWorkspaceId: 'workspace-one' } } : {}),
@@ -273,7 +287,7 @@ test('successful dirty save releases the guard before the saved-version callback
 })
 
 for (const cloud of [false, true]) {
-  const mode = cloud ? 'cloud' : 'standalone'
+  const mode = cloud ? 'cloud' : 'workspace'
   test(`${mode} push and replace navigation preserve dirty drafts until explicit discard`, async () => {
     const { rubric } = await renderEditor({ cloud })
     await editName()
@@ -306,7 +320,7 @@ for (const cloud of [false, true]) {
   })
 }
 
-test('Back without a React Router history index still protects and restores standalone edits', async () => {
+test('Back without a React Router history index still protects and restores workspace edits', async () => {
   const { path } = await renderEditor({ historyIndexes: false })
   await editName()
   await act(async () => dom.window.history.back())
@@ -351,23 +365,4 @@ test('cloud history outside the workspace prefix remains available to the cloud 
     dom.window.removeEventListener('popstate', outerGate, { capture: true })
     dom.window.history.replaceState({ idx: 1 }, '', path)
   }
-})
-
-test('standalone App installs protection around its existing router and rubric editor', async () => {
-  const context = contextFor()
-  const rubric = context.workspace.rubrics[0]
-  dom.window.history.replaceState({ idx: 0 }, '', `/rubrics/${rubric.id}`)
-  await renderTree(element(ui.BrowserRouter, { future: { v7_startTransition: true, v7_relativeSplatPath: true } },
-    element(ui.WorkspaceContext.Provider, { value: context }, element(ui.App))))
-  const edit = [...document.querySelectorAll('button')].find((item) => /^Edit (rubric|name)/.test(item.textContent.trim()))
-  await click(edit)
-  await editName()
-  await click(document.querySelector('.sidebar a[href="/jobs"]'))
-  assert.ok(dialog('Unsaved changes'))
-  await click(button('Stay here', dialog('Unsaved changes')))
-  assert.equal(nameInput().value, 'Unsaved rubric title')
-  await click(document.querySelector('.sidebar a[href="/jobs"]'))
-  await click(button('Discard unsaved changes and leave', dialog('Unsaved changes')))
-  assert.equal(dom.window.location.pathname, '/jobs')
-  assert.equal(Boolean(dialog('Edit rubric')), false)
 })

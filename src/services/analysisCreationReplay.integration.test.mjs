@@ -16,7 +16,7 @@ before(async () => {
   const output = join(directory, 'client.mjs')
   await build({
     entryPoints: [join('src', 'services', 'realAnalyses.ts')], outfile: output, bundle: true, packages: 'external',
-    format: 'esm', platform: 'node', logLevel: 'silent', define: { 'import.meta.env.VITE_DEPLOYMENT_MODE': '"cloud"' },
+    format: 'esm', platform: 'node', logLevel: 'silent',
   })
   client = await import(pathToFileURL(output).href)
 })

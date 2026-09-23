@@ -102,6 +102,7 @@ export interface AdminSettings {
     gradeLadders: boolean
     newAnalyses: boolean
     summaryGeneration: boolean
+    /** Retired sample-view switch. Kept so stored revisions and processing snapshots still parse; it has no effect. */
     samplesVisible: boolean
     /** Optional so earlier revisions and captures keep their exact shape; absent means on. Read it with rubricAssistantEnabled(). */
     rubricAssistant?: boolean

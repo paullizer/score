@@ -145,10 +145,9 @@ before(async () => {
   ;({ createRoot } = await import('react-dom/client'))
   await Promise.all([
     build({ entryPoints: [join('src', 'services', 'realAnalyses.ts')], outfile: join(output, 'client.mjs'), bundle: true, packages: 'external',
-      format: 'esm', platform: 'node', logLevel: 'silent', define: { 'import.meta.env.VITE_DEPLOYMENT_MODE': '"cloud"' } }),
+      format: 'esm', platform: 'node', logLevel: 'silent' }),
     build({ stdin: { resolveDir: process.cwd(), loader: 'tsx', contents: `
       export * from './src/features/analyses/realAnalysisUi';
-      export * from './src/app/real-data-mode';
       export { RealAnalysesBridge } from './src/app/RealAnalysesBridge';
       export { RealAnalysesContext, useRealAnalyses } from './src/app/real-analyses-context';
       export { RealResumesContext } from './src/app/real-resumes-context';
@@ -161,10 +160,8 @@ before(async () => {
       export { RealComparisonReview } from './src/features/analyses/RealComparisonReview';
       export { RealComparisonValue, RealAnalysisDetail } from './src/features/analyses/RealAnalysisDetail';
       export { BrowserRouter, MemoryRouter, Routes, Route, useLocation } from 'react-router-dom';
-      export { createInitialWorkspace } from './src/data/fixtures';
-      export { snapshotAnalysisRun, evaluateComparison } from './src/services/scoring';
     ` }, outfile: join(output, 'ui.mjs'), bundle: true, packages: 'external', format: 'esm', platform: 'node',
-      jsx: 'automatic', logLevel: 'silent', define: { 'import.meta.env.VITE_DEPLOYMENT_MODE': '"cloud"' } }),
+      jsx: 'automatic', logLevel: 'silent' }),
   ])
   ;[client, ui] = await Promise.all(['client', 'ui'].map((name) => import(pathToFileURL(join(output, `${name}.mjs`)).href)))
 })
@@ -409,7 +406,7 @@ test('retry/cancel use caller ETags, correct envelopes, saved pairs, and no auto
   await assert.rejects(client.getRealAnalysis(workspaceId, 'run-one'), { name: 'CloudAuthError' })
 })
 
-test('exact selections use documentRef IDs/hashes; unknown, sample, and pending inputs are preserved as errors', () => {
+test('exact selections use documentRef IDs/hashes; unknown and pending inputs are preserved as errors', () => {
   const ready = resumeSummary()
   assert.deepEqual(ui.realResumeSelection(ready), resumeSelection())
   const selection = ui.initialRealSelections(new URLSearchParams({ resumes: 'resume-one,sample-person,pending', rubrics: 'job-rubric,sample-rubric' }),
@@ -417,7 +414,7 @@ test('exact selections use documentRef IDs/hashes; unknown, sample, and pending 
   assert.equal(selection.resumes.length, 3)
   assert.equal(selection.targets.length, 2)
   assert.equal(selection.resumes[1].selection, null)
-  assert.match(ui.resumeSelectionIssue(selection.resumes[1], [ready]), /Sample, missing/)
+  assert.match(ui.resumeSelectionIssue(selection.resumes[1], [ready]), /not a ready real source/)
   assert.match(ui.resumeSelectionIssue(selection.resumes[2], [ready]), /unfinished/)
   assert.match(ui.targetSelectionIssue(selection.targets[1], [target('job')]), /sample/)
   const invalid = ui.initialRealSelections(new URLSearchParams({ targetSelections: '[{"kind":"grade","version":2}]' }), [ready], [target('grade')])
@@ -437,7 +434,7 @@ test('approved GS versions and new-run snapshots never silently use newer drafts
   assert.match(ui.resumeSelectionIssue(replay.resumes[0], [resumeSummary('resume-one', 2)]), /identity or hash changed/)
   assert.match(ui.targetSelectionIssue(replay.targets[0], [target('grade', 2)]), /source set changed/)
   const link = new URL(ui.realAnalysisLink({ resumes: [resumeSelection()], targets: [approved.selection] }).to, 'https://score.test')
-  assert.equal(link.searchParams.get('data'), 'real')
+  assert.equal(link.searchParams.get('data'), null)
   assert.deepEqual(JSON.parse(link.searchParams.get('targetSelections')), [approved.selection])
 })
 
@@ -458,23 +455,6 @@ test('historical job versions remain independently eligible and never collapse i
   await client.createRealAnalysis(workspaceId, { name: 'Separate saved versions', resumes: [resumeSelection()], targets: [older.selection, newer.selection] }, key)
   assert.deepEqual(JSON.parse(requests[0].init.body).targets.map((item) => item.rubricVersion), [1, 2])
   await assert.rejects(client.createRealAnalysis(workspaceId, { name: 'Duplicate same version', resumes: [resumeSelection()], targets: [older.selection, older.selection] }, key), /only once/)
-})
-
-test('direct IDs retain explicit modes, mixed sample links do not reach the fixture scorer, and sample behavior is unchanged', () => {
-  const sample = ui.createInitialWorkspace()
-  const before = JSON.stringify(sample)
-  const resume = sample.resumes[0].id
-  const rubric = sample.rubrics.find((item) => item.kind === 'grade').id
-  assert.equal(ui.analysisDataMode(new URLSearchParams(), true, sample, sample.runs[0].id), 'samples')
-  assert.equal(ui.analysisDataMode(new URLSearchParams({ data: 'real' }), true, sample, sample.runs[0].id), 'real')
-  assert.equal(ui.analysisDataMode(new URLSearchParams({ resumes: resume, rubrics: rubric }), true, sample), 'samples')
-  assert.equal(ui.analysisDataMode(new URLSearchParams({ resumes: `${resume},real-resume`, rubrics: rubric }), true, sample), 'real')
-  assert.equal(ui.analysisDataMode(new URLSearchParams({ data: 'unknown' }), true, sample), 'invalid')
-  const identity = { id: 'sample-run-test', createdAt: timestamp, comparisonId: (index) => `sample-pair-${index}` }
-  assert.throws(() => ui.snapshotAnalysisRun(sample, [resume, 'real-resume'], [rubric], 'Mixed', identity), /missing/)
-  const run = ui.snapshotAnalysisRun(sample, [resume], [rubric], 'Samples unchanged', identity)
-  assert.equal(ui.evaluateComparison(run, run.comparisons[0].id).status, 'complete')
-  assert.equal(JSON.stringify(sample), before)
 })
 
 test('results display server totals, limited completion, exact statuses and unscored GS qualifications separately', () => {
@@ -815,7 +795,7 @@ async function settle(predicate) {
   for (let index = 0; index < 30 && !predicate(); index++) await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)) })
   assert.equal(Boolean(predicate()), true, 'Expected asynchronous analysis UI state was reached')
 }
-function router(element, location = '/analyses/new?data=real') {
+function router(element, location = '/analyses/new') {
   const url = typeof location === 'string' ? null : new URL(location.to, 'https://score.test')
   const entry = url ? { pathname: url.pathname, search: url.search, hash: url.hash, state: location.state } : location
   return React.createElement(ui.MemoryRouter, { initialEntries: [entry], future: { v7_startTransition: true, v7_relativeSplatPath: true } }, element)

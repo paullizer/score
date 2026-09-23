@@ -201,7 +201,7 @@ test('actual API, store validators, durable worker and model functions create re
     assert.equal(current.version.version, 2)
     assert.equal(current.head.approvedVersionId, level.version.id)
     assert.equal((await fixture.jobs.store.get(fixture.workspaceId, seed.job.id)).record.job.rubricId, seed.rubric.id)
-    assert.equal(fixture.state.saves.length, 0)
+    assert.equal(fixture.state.states.size, 0, 'Grade work never writes a workspace state document.')
   } finally { restore(); await fixture.close() }
 })
 

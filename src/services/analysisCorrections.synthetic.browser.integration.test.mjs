@@ -91,8 +91,8 @@ before(async () => {
           narratives: () => ({ state: 'idle' }),
           ensureNarratives: async () => { throw new Error('Corrections must not fetch full-target narratives.') },
         }
-        const result = new URLSearchParams(location.search).has('result') ? '&result=' + fixture.details[0].comparison.id : ''
-        return <MemoryRouter initialEntries={['/analyses/' + fixture.summary.run.id + '?data=real' + result]}
+        const result = new URLSearchParams(location.search).has('result') ? '?result=' + fixture.details[0].comparison.id : ''
+        return <MemoryRouter initialEntries={['/analyses/' + fixture.summary.run.id + result]}
           future={{ v7_startTransition: true, v7_relativeSplatPath: true }}>
           <WorkspaceContext.Provider value={context}><RealAnalysesContext.Provider value={api}>
             <button onClick={() => setEnabled(false)}>Disable fixture corrections</button>
@@ -106,7 +106,7 @@ before(async () => {
       createRoot(document.getElementById('root')).render(<Harness />)
     ` },
     outfile: join(output, 'app.js'), bundle: true, format: 'esm', platform: 'browser', jsx: 'automatic', logLevel: 'silent',
-    define: { 'import.meta.env.VITE_DEPLOYMENT_MODE': '"cloud"', 'process.env.NODE_ENV': '"test"' },
+    define: { 'process.env.NODE_ENV': '"test"' },
     plugins: [{
       name: 'unrelated-narrative-export-boundary',
       setup(builder) {

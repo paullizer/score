@@ -3,7 +3,6 @@ WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci --no-audit --no-fund
 COPY . .
-ENV VITE_DEPLOYMENT_MODE=cloud
 RUN npm run build
 RUN node --input-type=module -e "import { accessSync } from 'node:fs'; for (const file of ['word-parser.mjs', 'telemetry.mjs']) accessSync('dist-server/' + file)"
 

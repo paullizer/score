@@ -27,7 +27,7 @@ export function generateCsvReport(report: AnalysisReport, options?: ReportGenera
   const displayLabels = report.groups.some(group => group.target.displayName || group.comparisons.some(comparison => comparison.candidate.displayName))
   const criterionCount = Math.max(0, ...report.groups.map(group => group.target.criteria.length))
   const header: Cell[] = [
-    report.dataKind === 'sample' ? 'Candidate name (fictional sample)' : 'Candidate name',
+    'Candidate name',
     'Job/grade', 'Overall score', 'Overall assessment',
     ...Array.from({ length: criterionCount }, (_, index) => `C${index + 1}`),
     'Analysis date', 'Source', 'Analysis link', 'Resume link', 'Job/grade link',
@@ -76,7 +76,7 @@ export function generateCsvReport(report: AnalysisReport, options?: ReportGenera
         readableAnalysisDate(comparison.analyzedAt), comparison.candidate.sourceLabel,
         links.analysis, links.resume, links.target,
         ...(displayLabels ? [comparison.candidate.displayName ?? null, target.displayName ?? null] : []),
-        ...(customized ? [reportTitle(report), buildReportNotices(report.dataKind, report.counts, policy.additionalFooter).join('\n\n')] : []),
+        ...(customized ? [reportTitle(report), buildReportNotices(report.counts, policy.additionalFooter).join('\n\n')] : []),
       ])
       rows++
       completed++

@@ -122,7 +122,7 @@ function RealResumesProvider({ workspaceId, children }: { workspaceId: string; c
       setFeatures(available)
       if (available?.deploymentCapabilities?.realResumeImports === false) {
         setPhase('unavailable')
-        setError('The real resume service is not configured in this deployment. Saved records have not been deleted, and no samples are substituted.')
+        setError('The real resume service is not configured in this deployment. Saved records have not been deleted.')
         return
       }
       const items = await api.listAllRealResumes(workspaceId, ticket.controller.signal)
@@ -187,8 +187,6 @@ function RealResumesProvider({ workspaceId, children }: { workspaceId: string; c
 
   async function mutate<T>(key: string, operation: () => Promise<T>, commit: (value: T, sequence: number) => void, lifecycle = false, resumeId?: string): Promise<T> {
     if (lifecycle) {
-      assertRealLifecyclePermission(parentRef.current, workspaceId)
-      await parentRef.current.cloud?.flushSave()
       assertRealLifecyclePermission(parentRef.current, workspaceId)
     } else assertWritable(resumeId)
     const ticket = scope.mutate(key)

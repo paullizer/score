@@ -61,7 +61,7 @@ test('direct grade links preserve saved evidence during feature-policy errors an
   } finally { await context.close() }
 })
 
-test('browser creates an exact-version ladder and uploads real, page-ranged reference bytes without sample persistence', { timeout: 90000 }, async (t) => {
+test('browser creates an exact-version ladder and uploads real, page-ranged reference bytes without legacy state persistence', { timeout: 90000 }, async (t) => {
   const fixture = await startGradeFixture(runtime, { injectAuth: true })
   t.after(() => fixture.close())
   const { context, page, errors } = await newPage(fixture)
@@ -114,7 +114,7 @@ test('browser creates an exact-version ladder and uploads real, page-ranged refe
     assert.equal(detail.sourceSet.decisions.find((decision) => decision.sourceId === source.id).applicability, 'applicable')
     await page.getByRole('button', { name: 'Generate grade drafts', exact: true }).click()
     await visible(page.getByText(/Generation accepted/))
-    assert.equal(fixture.state.saves.length, 0)
+    assert.equal(fixture.requests.some((request) => request.url.endsWith('/state') && request.method !== 'GET'), false)
     const persistence = await page.evaluate(() => JSON.stringify({ local: { ...localStorage }, session: { ...sessionStorage } }))
     assert.doesNotMatch(persistence, /Browser-created engineering|Engineering test reference|source-set-|grade-version-/)
     assert.deepEqual(errors, [])
@@ -168,12 +168,6 @@ test('browser review keeps exact citations, protects unsaved and accepted drafts
     const quotation = await visible(page.getByRole('dialog', { name: 'Cite an exact captured passage', exact: true }))
     await quotation.getByRole('button', { name: 'Cancel quotation', exact: true }).click()
     assert.equal(await page.getByRole('dialog', { name: 'Unsaved changes', exact: true }).count(), 0, 'closing an untouched nested quotation does not discard the outer draft')
-    await page.evaluate(() => history.back())
-    protection = await visible(page.getByRole('dialog', { name: 'Unsaved changes', exact: true }))
-    assert.match(page.url(), new RegExp(detail.ladder.id))
-    await protection.getByRole('button', { name: 'Stay here', exact: true }).click()
-    assert.equal(await editor.getByLabel('Grade rubric name', { exact: true }).inputValue(), 'Protected unsaved engineering draft')
-
     fixture.holdMutation(accepted.promise)
     await editor.getByRole('button', { name: 'Save draft and request review' }).click()
     await until(async () => {
@@ -257,13 +251,12 @@ test('browser saves a still-incomplete zero-weight draft and leaves approval blo
   } finally { await context.close(); await fixture.close() }
 })
 
-test('workspace/sign-out guards and cross-workspace history retain the outer cloud save queue', { timeout: 90000 }, async (t) => {
+test('workspace/sign-out guards protect unsaved real grade edits across navigation attempts', { timeout: 90000 }, async (t) => {
   const fixture = await startGradeFixture(runtime, { injectAuth: true })
   t.after(() => fixture.close())
   const { detail } = await seededLadder(fixture)
   const other = await fixture.seedWorkspace('Other review workspace')
   const { context, page, errors } = await newPage(fixture)
-  const save = deferred()
   try {
     await page.goto(`${fixture.origin}/workspaces/${fixture.workspaceId}/grade-ladders/${detail.ladder.id}`)
     await visible(page.getByRole('heading', { name: detail.ladder.name, exact: true }))
@@ -289,37 +282,18 @@ test('workspace/sign-out guards and cross-workspace history retain the outer clo
     await visible(page.locator('.grade-matrix'))
     assert.equal((await (await fixture.request(`/api/workspaces/${fixture.workspaceId}/grade-ladders/${detail.ladder.id}`)).json()).sourceSet.decisions.some((decision) => decision.reason === 'Unsaved applicability review kept in this tab'), false)
 
-    await page.locator('.sidebar').getByRole('link', { name: /Jobs/ }).click()
-    await page.getByRole('button', { name: /^Samples/ }).click()
-    const sampleJob = runtime.fixtures.createInitialWorkspace().jobs.find((job) => job.status === 'ready')
-    await page.getByRole('link', { name: sampleJob.title, exact: true }).click()
-    await visible(page.getByRole('heading', { name: sampleJob.title, exact: true }))
     await page.locator('.workspace-switcher-trigger').click()
     switcher = await visible(page.getByRole('dialog', { name: 'My workspaces', exact: true }))
     await switcher.getByRole('button', { name: other.name, exact: true }).click()
     await visible(page.locator('.workspace-switcher-trigger').filter({ hasText: other.name }))
     await page.evaluate(() => history.back())
-    await visible(page.getByRole('heading', { name: sampleJob.title, exact: true }))
-    await page.getByRole('button', { name: 'Edit rubric', exact: true }).click()
-    const editor = await visible(page.getByRole('dialog', { name: 'Edit rubric', exact: true }))
-    await editor.getByLabel('Rubric name', { exact: true }).fill('Sample save survives cross-workspace history')
-    fixture.state.delayNextSave(save.promise)
-    const writeStarted = page.waitForRequest((request) => request.method() === 'PUT' && request.url().endsWith(`/workspaces/${fixture.workspaceId}/state`))
-    await editor.getByRole('button', { name: /Save version/ }).click()
-    await writeStarted
+    await visible(page.getByRole('heading', { name: detail.ladder.name, exact: true }))
     await page.evaluate(() => history.forward())
-    assert.equal(fixture.state.saves.length, 0)
-    await visible(page.getByRole('heading', { name: sampleJob.title, exact: true }))
-    save.resolve()
     await visible(page.locator('.workspace-switcher-trigger').filter({ hasText: other.name }))
-    assert.ok(fixture.state.saves.length > 0)
-    const stored = JSON.parse(fixture.state.states.get(fixture.workspaceId).content)
-    assert.ok(stored.rubrics.some((rubric) => rubric.name === 'Sample save survives cross-workspace history'))
-    assert.equal(stored.rubrics.some((rubric) => rubric.dataKind === 'real'), false)
-    assert.equal(stored.documents.some((document) => document.kind === 'reference'), false)
+    assert.equal(fixture.requests.some((request) => request.url.endsWith('/state') && request.method !== 'GET'), false)
     assert.equal([...fixture.grades.store.values.values()].filter(({ record }) => record.recordType === 'grade-version').length, 2)
     assert.deepEqual(errors, [])
-  } finally { save.resolve(); await context.close(); await fixture.close() }
+  } finally { await context.close(); await fixture.close() }
 })
 
 test('viewer UI is read-only, private sources remain inspectable, and detail failures do not retry in a render loop', { timeout: 60000 }, async (t) => {
@@ -349,7 +323,7 @@ test('viewer UI is read-only, private sources remain inspectable, and detail fai
   } finally { await context.close(); await fixture.close() }
 })
 
-test('draft-only source work keeps polling; reset and cold rubric or analysis links preserve real/sample boundaries', { timeout: 90000 }, async (t) => {
+test('draft-only source work keeps polling and cold rubric links resolve to real grade history', { timeout: 90000 }, async (t) => {
   const fixture = await startGradeFixture(runtime, { injectAuth: true })
   t.after(() => fixture.close())
   const seeded = await seededLadder(fixture)
@@ -374,25 +348,14 @@ test('draft-only source work keeps polling; reset and cold rubric or analysis li
     await until(() => fixture.requests.filter((request) => request.method === 'GET' && request.url === listPath).length > initialLists, 'The pending extraction should trigger a polling cycle even though heads are drafts')
     await completeReference(fixture, detail, pendingSource.id)
     await until(() => card.getByRole('button', { name: 'Inspect captured source', exact: true }).isEnabled(), 'A second poll should observe completed extraction without manual refresh')
-    const recordsBefore = JSON.stringify([...fixture.grades.store.values.values()])
-    await page.getByRole('button', { name: 'Reset samples', exact: true }).click()
-    const reset = await visible(page.getByRole('dialog', { name: 'Reset sample content?', exact: true }))
-    await reset.getByRole('button', { name: 'Reset samples', exact: true }).click()
-    await visible(page.getByRole('heading', { name: 'Your jobs', exact: true }))
-    await until(() => fixture.state.saves.length > 0, 'Only sample reset should autosave')
-    assert.equal(JSON.stringify([...fixture.grades.store.values.values()]), recordsBefore)
-    assert.equal(JSON.parse(fixture.state.states.get(fixture.workspaceId).content).rubrics.some((rubric) => rubric.dataKind === 'real'), false)
-
     await page.goto(`${fixture.origin}/workspaces/${fixture.workspaceId}/rubrics/${seeded.first.version.id}`)
     await visible(page.getByRole('heading', { name: 'GS-9 · immutable history', exact: true }))
     assert.match(page.url(), new RegExp(`/grade-ladders/${detail.ladder.id}`))
     await visible(page.getByRole('heading', { name: seeded.first.version.rubric.name, exact: true }))
-    const samples = runtime.fixtures.createInitialWorkspace()
-    const sampleRubric = samples.rubrics.find((rubric) => rubric.kind === 'grade')
-    await page.goto(`${fixture.origin}/workspaces/${fixture.workspaceId}/analyses/new?${new URLSearchParams({ data: 'samples', resumes: samples.resumes[0].id, rubrics: `${sampleRubric.id},${seeded.first.version.id}` })}`)
-    await visible(page.getByRole('heading', { name: 'Build an analysis', exact: true }))
-    assert.equal(await page.getByRole('button', { name: 'Run sample analysis', exact: true }).isDisabled(), true)
-    await visible(page.getByText(/Real-only and mixed real\/sample selections cannot use the demo scorer/))
+    await page.goto(`${fixture.origin}/workspaces/${fixture.workspaceId}/analyses/new?${new URLSearchParams({ data: 'samples', rubrics: seeded.first.version.id })}`)
+    await visible(page.getByText('Analyses', { exact: true }).first())
+    await visible(page.getByText(/New real analyses are currently unavailable/))
+    assert.equal(new URL(page.url()).searchParams.get('data'), 'samples', 'Legacy data parameters are ignored, not stripped from the URL')
     assert.deepEqual(errors, [])
   } finally { await context.close(); await fixture.close() }
 })

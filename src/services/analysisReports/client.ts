@@ -151,7 +151,7 @@ export function downloadAnalysisReport(bytes: ArrayBuffer, report: AnalysisRepor
   signal.throwIfAborted()
   const limits = reportLimits(reportGenerationPolicy(report, format))
   assertReportFile(bytes, format, limits.maxOutputBytes)
-  const filename = safeReportFilename(`${report.dataKind === 'sample' ? 'Sample - ' : ''}${report.run.name}`, format)
+  const filename = safeReportFilename(report.run.name, format)
   const url = URL.createObjectURL(new Blob([bytes], { type: REPORT_FORMATS[format].mimeType }))
   const anchor = document.createElement('a')
   anchor.href = url

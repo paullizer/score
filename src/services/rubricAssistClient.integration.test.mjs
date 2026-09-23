@@ -60,7 +60,6 @@ before(async () => {
     format: 'esm',
     platform: 'node',
     logLevel: 'silent',
-    define: { 'import.meta.env.VITE_DEPLOYMENT_MODE': '"cloud"' },
   })
   client = await import(pathToFileURL(join(output, 'client.mjs')).href)
 })

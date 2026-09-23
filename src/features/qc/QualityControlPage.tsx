@@ -19,7 +19,7 @@ export function QualityControlPage() {
   const role = workspaceQcRole(metadata)
   if (!cloud || !metadata || metadata.deletedAt || !workspaceCanReview(role, application?.applicationAdmin === true)) {
     return <EmptyState icon={ClipboardCheck} title="QC requires an authorized cloud workspace"
-      description="A workspace reviewer, editor, owner, or application admin with workspace membership can review real saved assessments. Samples cannot be used for calibration."
+      description="A workspace reviewer, editor, owner, or application admin with workspace membership can review real saved assessments."
       action={<Link className="button button-secondary button-md" to="/analyses">Return to analyses</Link>} />
   }
   return <QcPrivacyBoundary key={JSON.stringify([
@@ -38,10 +38,10 @@ function QcWorkspace({ workspaceId }: { workspaceId: string }) {
     description="QC uses private saved evidence and independent human feedback. No model work starts by opening this page."
     action={<Button onClick={access.reload}>Check QC access</Button>} />{access.error && <InlineError>{access.error}</InlineError>}</>
   const capabilities = access.value
-  if (!capabilities.reviews) return <EmptyState title="QC storage is not ready" description={capabilities.message ?? 'An operator must deploy the private QC services. No sample feedback is substituted.'} action={<Button onClick={access.reload}>Check service</Button>} />
+  if (!capabilities.reviews) return <EmptyState title="QC storage is not ready" description={capabilities.message ?? 'An operator must deploy the private QC services.'} action={<Button onClick={access.reload}>Check service</Button>} />
   return <div className="qc-workspace">
     <div className="qc-mode-banner"><div><Badge tone="accent">QC mode</Badge><span>Human feedback and trial results never replace published scores.</span></div>
-      <Link className="text-link" to="/analyses?data=real">Return to normal mode</Link></div>
+      <Link className="text-link" to="/analyses">Return to normal mode</Link></div>
     <nav className="qc-tabs" aria-label="Quality control navigation">
       <NavLink to="/qc" end>Reviews</NavLink>
       <NavLink to="/qc/improvements">Quality improvement</NavLink>
