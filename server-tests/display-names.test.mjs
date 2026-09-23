@@ -7,9 +7,7 @@ const bundle = await build({
   stdin: {
     contents: [
       "export * from './src/domain/displayNames'",
-      "export * from './src/domain/workspace-validation'",
       "export * from './src/domain/lifecycle'",
-      "export { createInitialWorkspace } from './src/data/fixtures'",
     ].join('\n'),
     resolveDir: process.cwd(), loader: 'ts',
   },
@@ -19,8 +17,6 @@ const module = { exports: {} }
 new Function('require', 'module', 'exports', bundle.outputFiles[0].text)(createRequire(import.meta.url), module, module.exports)
 const {
   DISPLAY_NAME_MAX_LENGTH, normalizeDisplayName, getDisplayName, defaultAnalysisName,
-  validateWorkspace, createInitialWorkspace, workspaceLifecycleTransitionErrors, getSampleLifecycleImpact,
-  applySampleLifecycle, setWorkspaceArchive,
 } = module.exports
 
 test('display names normalize whitespace, preserve Unicode, and enforce explicit 160-character/control boundaries', () => {
@@ -51,59 +47,4 @@ test('default analysis names are descriptive, bounded, and safe before all selec
   const boundary = DISPLAY_NAME_MAX_LENGTH - suffix.length
   assert.equal(defaultAnalysisName(1, [`${'x'.repeat(boundary - 1)}\u{1F600} extra`]), `${'x'.repeat(boundary - 1)}${suffix}`)
   assert.equal(defaultAnalysisName(1, [`${'x'.repeat(boundary - 2)}\u{1F600} extra`]), `${'x'.repeat(boundary - 2)}\u{1F600}${suffix}`)
-})
-
-test('sample display metadata persists without changing original names or captured history and honors read-only lifecycle', () => {
-  const original = createInitialWorkspace()
-  assert.deepEqual(validateWorkspace(original), original)
-  const renamed = structuredClone(original)
-  renamed.jobs[0].displayName = 'Hiring target'
-  renamed.resumes[0].displayName = 'Candidate A'
-  renamed.runs[0].displayName = 'Interview shortlist'
-  assert.deepEqual(validateWorkspace(renamed), renamed)
-  assert.deepEqual(workspaceLifecycleTransitionErrors(original, renamed), [])
-  assert.equal(renamed.jobs[0].title, original.jobs[0].title)
-  assert.equal(renamed.resumes[0].name, original.resumes[0].name)
-  assert.equal(renamed.runs[0].name, original.runs[0].name)
-  assert.deepEqual(renamed.runs[0].targets, original.runs[0].targets)
-  assert.deepEqual(renamed.runs[0].resumes, original.runs[0].resumes)
-  assert.deepEqual(renamed.runs[0].comparisons, original.runs[0].comparisons)
-  for (const [kind, record, label] of [
-    ['job', renamed.jobs[0], 'Hiring target'], ['resume', renamed.resumes[0], 'Candidate A'],
-    ['analysis', renamed.runs[0], 'Interview shortlist'],
-  ]) {
-    assert.equal(getSampleLifecycleImpact(renamed, { kind, id: record.id }).name, label)
-    const archived = applySampleLifecycle(renamed, { kind, id: record.id }, 'archive', '2026-09-19T12:00:00.000Z')
-    const changed = structuredClone(archived)
-    changed[kind === 'analysis' ? 'runs' : `${kind}s`].find(item => item.id === record.id).displayName = 'Not permitted'
-    assert.ok(workspaceLifecycleTransitionErrors(archived, changed).some(error => /read-only/.test(error) && error.includes(label)))
-  }
-  const archived = setWorkspaceArchive(original, true, '2026-09-19T12:00:00.000Z')
-  const changed = structuredClone(archived)
-  changed.runs[0].displayName = 'Cannot change archived workspace'
-  assert.ok(workspaceLifecycleTransitionErrors(archived, changed).some(error => /read-only/.test(error)))
-  assert.ok(workspaceLifecycleTransitionErrors(original, renamed, { lifecycleOnly: true }).length)
-  const changedHistory = structuredClone(renamed)
-  changedHistory.runs[0].targets[0].displayName = 'Live labels must not rewrite snapshots'
-  changedHistory.runs[0].resumes[0].resume.displayName = 'Replaced captured name'
-  assert.ok(workspaceLifecycleTransitionErrors(renamed, changedHistory).some(error => /captured source snapshots/.test(error)))
-})
-
-test('sample schemas accept captured display metadata but reject malformed aliases without altering source fields', () => {
-  const workspace = createInitialWorkspace()
-  const captured = structuredClone(workspace)
-  captured.runs[0].targets[0].displayName = 'Captured target'
-  captured.runs[0].resumes[0].resume.displayName = 'Captured candidate'
-  assert.deepEqual(validateWorkspace(captured), captured)
-  for (const invalid of ['', ' spaced ', 'x'.repeat(161), 'line\nbreak', 'control\u0085', 1, null]) {
-    for (const record of ['job', 'resume', 'run', 'target', 'captured-resume']) {
-      const value = structuredClone(workspace)
-      const entity = {
-        job: value.jobs[0], resume: value.resumes[0], run: value.runs[0],
-        target: value.runs[0].targets[0], 'captured-resume': value.runs[0].resumes[0].resume,
-      }[record]
-      entity.displayName = invalid
-      assert.throws(() => validateWorkspace(value), /displayName/, `${record}: ${JSON.stringify(invalid)}`)
-    }
-  }
 })

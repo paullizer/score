@@ -39,8 +39,8 @@ test('configured but unavailable QC storage blocks cleanup even with QC admissio
       qc: { container: 'qc-records', blobContainer: 'qc-sources', workerEnabled: false },
     }),
   })
-  const read = await fetch(`${server.workspaceUrl}/state`, { headers: authHeaders() })
-  assert.equal(read.status, 200, 'ordinary saved workspace reads do not depend on QC readiness')
+  const read = await fetch(`${server.workspaceUrl}/members`, { headers: authHeaders() })
+  assert.equal(read.status, 200, 'ordinary workspace access reads do not depend on QC readiness')
   const impact = await fetch(`${server.workspaceUrl}/lifecycle`, { headers: authHeaders() })
   assert.equal(impact.status, 503)
   assert.match(JSON.stringify(await impact.json()), /QC storage.*cannot skip/)

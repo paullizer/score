@@ -2,42 +2,62 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import { Readable } from 'node:stream'
 import { RestError } from '@azure/storage-blob'
-import { createStateStoreFromContainer } from '../dist-server/app.mjs'
+import { createStateStoreFromContainer, StoreConflictError } from '../dist-server/app.mjs'
+
+test('getState returns undefined for a missing legacy state blob', async () => {
+  const store = createStateStoreFromContainer({
+    getBlockBlobClient(name) {
+      assert.equal(name, 'test-workspace/state.json')
+      return {
+        async download() { throw new RestError('Not found', { statusCode: 404 }) },
+      }
+    },
+    async getProperties() {},
+  })
+  assert.equal(await store.getState('test-workspace'), undefined)
+})
 
 for (const statusCode of [409, 412]) {
-  test(`conditional Blob create handles Azure HTTP ${statusCode} without overwriting existing state`, async () => {
-    let downloaded = false
+  test(`deleteState maps Azure HTTP ${statusCode} to StoreConflictError`, async () => {
     const store = createStateStoreFromContainer({
       getBlockBlobClient(name) {
         assert.equal(name, 'test-workspace/state.json')
         return {
-          async upload(_body, _length, options) {
-            assert.deepEqual(options.conditions, { ifNoneMatch: '*' })
-            throw new RestError('Conditional create failed', { statusCode })
-          },
-          async download() {
-            downloaded = true
-            return { etag: '"existing"', readableStreamBody: Readable.from(['{"preserved":true}']) }
+          async deleteIfExists(options) {
+            assert.deepEqual(options.conditions, { ifMatch: '"expected"' })
+            throw new RestError('Conditional delete failed', { statusCode })
           },
         }
       },
       async getProperties() {},
     })
-    assert.deepEqual(await store.createState('test-workspace', '{"replacement":true}'), { created: false, etag: '"existing"' })
-    assert.equal(downloaded, true)
+    await assert.rejects(store.deleteState('test-workspace', '"expected"'), StoreConflictError)
   })
 }
 
-test('a Blob authorization failure is not mistaken for an existing state', async () => {
+test('getState propagates authorization failures instead of treating them as absence', async () => {
   const denied = new RestError('Denied', { statusCode: 403 })
   const store = createStateStoreFromContainer({
     getBlockBlobClient() {
       return {
-        async upload() { throw denied },
-        async download() { assert.fail('Must not fall back to a download after an authorization error') },
+        async download() { throw denied },
       }
     },
     async getProperties() {},
   })
-  await assert.rejects(store.createState('test-workspace', '{}'), error => error === denied)
+  await assert.rejects(store.getState('test-workspace'), error => error === denied)
+})
+
+test('getState reads existing legacy state content and ETag', async () => {
+  const store = createStateStoreFromContainer({
+    getBlockBlobClient() {
+      return {
+        async download() {
+          return { etag: '"existing"', readableStreamBody: Readable.from(['{"preserved":true}']) }
+        },
+      }
+    },
+    async getProperties() {},
+  })
+  assert.deepEqual(await store.getState('test-workspace'), { content: '{"preserved":true}', etag: '"existing"' })
 })

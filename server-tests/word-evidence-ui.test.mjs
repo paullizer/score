@@ -25,10 +25,16 @@ await build({
     ].join('\n'),
   },
   outfile: bundle, bundle: true, platform: 'node', format: 'esm', packages: 'external', jsx: 'automatic', logLevel: 'silent',
-  define: { 'import.meta.env.VITE_DEPLOYMENT_MODE': '"cloud"' },
 })
 const ui = await import(pathToFileURL(bundle).href)
 after(async () => { await unlink(bundle) })
+
+const cloud = {
+  currentWorkspaceId: 'workspace-one',
+  user: { tenantId: 'tenant-one', id: 'user-one' },
+  workspaces: [{ id: 'workspace-one', role: 'owner' }],
+  realJobs: { source: () => undefined },
+}
 
 for (const format of ['docx', 'doc']) {
   test(`${format.toUpperCase()} rubric source buttons and links identify captured sections while PDF labels stay unchanged`, async () => {
@@ -44,8 +50,9 @@ for (const format of ['docx', 'doc']) {
       for (const interactive of [true, false]) {
         const render = source => renderToStaticMarkup(createElement(StaticRouter, { location: '/' },
           createElement(ui.WorkspaceContext.Provider, {
-            value: { workspace: { schemaVersion: 1, jobs: [{ ...job.record.job, source }], documents: [job.document],
-              rubrics: [rubric], resumes: [], runs: [] }, saveRubric: async () => rubric.id },
+            value: { workspace: { lifecycle: { entities: { [`rubric:${rubric.groupId}`]: {} } },
+              jobs: [{ ...job.record.job, source }], documents: [job.document], rubrics: [rubric] }, cloud,
+              saveRubric: async () => rubric.id },
           }, createElement(ui.RubricPanel, {
             rubric, readOnly: true, ...(interactive ? { onSelectCriterion: () => {} } : {}),
           })),
@@ -70,7 +77,8 @@ for (const format of ['docx', 'doc']) {
     const detail = await f.service.comparisonDetail(f.workspaceId, created.run.id, comparison.id)
     const comparisonMarkup = renderToStaticMarkup(createElement(StaticRouter, { location: '/' },
       createElement(ui.WorkspaceContext.Provider, {
-        value: { workspace: { schemaVersion: 1, jobs: [], documents: [], rubrics: [], resumes: [], runs: [] }, notify: () => {} },
+        value: { workspace: { lifecycle: { entities: { [`analysis:${created.run.id}`]: {} } }, jobs: [], documents: [], rubrics: [] },
+          cloud, notify: () => {} },
       }, createElement(ui.RealComparisonReview, { detail })),
     ))
     assert.match(comparisonMarkup, /Captured source section 1 of 1/)

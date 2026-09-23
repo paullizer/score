@@ -194,7 +194,7 @@ async function summaryFixture(t, options = {}) {
   const privateReads = []
   const forbidden = kind => async () => { privateReads.push(kind); assert.fail(`Summary must not read ${kind}.`) }
   const state = Object.fromEntries([
-    'getState', 'createState', 'putState', 'deleteState', 'acquireMutationLease', 'checkAccess',
+    'getState', 'deleteState', 'acquireMutationLease', 'checkAccess',
   ].map(name => [name, forbidden(`sample state ${name}`)]))
   const blobs = Object.fromEntries([
     'read', 'list', 'listFamilies', 'listPage', 'putImmutable', 'putFenced', 'delete',

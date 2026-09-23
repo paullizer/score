@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
 import { createServer } from 'node:http'
 import test from 'node:test'
-import { applySampleLifecycle, createAnalysisRun, createApp, StoreConflictError, WorkspaceRepository } from '../dist-server/app.mjs'
+import { createApp, StoreConflictError, WorkspaceRepository } from '../dist-server/app.mjs'
 import { ALLOWED_OID, OTHER_ALLOWED_OID, APP_ORIGIN, authHeaders, baseConfig, createFakeAccessStore, createFakeDirectoryStore, createFakeStateStore, membershipFor, seedWorkspace } from './helpers.mjs'
 import { createFakeRealJobs } from './job-lifecycle-fakes.mjs'
 
@@ -330,30 +330,6 @@ test('archived seed ladders on later pages block both job and logical rubric del
   } finally { await f.close() }
 })
 
-test('archived analyses retain historical job and rubric dependencies until explicitly removed', async () => {
-  const f = await fixture()
-  try {
-    const value = await ready(f)
-    const entry = await f.state.getState(f.workspaceId)
-    let workspace = JSON.parse(entry.content)
-    const sampleRubric = workspace.rubrics.find(rubric => rubric.kind === 'job')
-    const run = createAnalysisRun(workspace, [workspace.resumes[0].id], [sampleRubric.id], 'Archived historical comparison')
-    run.targets[0].job.id = f.jobId
-    run.targets[0].rubric.jobId = f.jobId
-    run.targets[0].rubric.groupId = `rubric-${f.jobId}`
-    workspace = { ...workspace, runs: [...workspace.runs, run] }
-    workspace = applySampleLifecycle(workspace, { kind: 'analysis', id: run.id }, 'archive', timestamp)
-    await f.state.putState(f.workspaceId, JSON.stringify(workspace), entry.etag)
-    for (const scope of ['job', 'rubric']) {
-      const response = await f.lifecycle('delete', scope, value.etag)
-      assert.equal(response.status, 409)
-      const body = await response.json()
-      assert.ok(body.impact.blockers.some(blocker => blocker.kind === 'analysis' && blocker.id === run.id))
-    }
-    assert.equal((await f.jobs.store.get(f.workspaceId, f.jobId)).etag, value.etag)
-  } finally { await f.close() }
-})
-
 test('every job mutator executes its complete handler under the appropriate workspace lease', async () => {
   const f = await fixture()
   const originalMutation = WorkspaceRepository.prototype.withWorkspaceMutation
@@ -503,11 +479,11 @@ test('disconnecting a lifecycle request does not release its workspace lease bef
         async release() { await lease.release(); released.resolve() },
       }
     }
-    const originalRead = f.state.getState.bind(f.state)
-    f.state.getState = async workspaceId => {
+    const originalPurge = f.jobs.store.purgeJobRecords.bind(f.jobs.store)
+    f.jobs.store.purgeJobRecords = async (workspaceId, jobId) => {
       entered.resolve()
       await resume.promise
-      return originalRead(workspaceId)
+      return originalPurge(workspaceId, jobId)
     }
     const controller = new AbortController()
     request = fetch(`${f.base}/workspaces/${f.workspaceId}/jobs/${f.jobId}/lifecycle`, {

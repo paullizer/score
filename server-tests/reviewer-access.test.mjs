@@ -3,7 +3,7 @@ import { randomUUID } from 'node:crypto'
 import test from 'node:test'
 import {
   ALLOWED_OID, OTHER_ALLOWED_OID, NOT_ALLOWED_OID, OTHER_TENANT_ID, TENANT_ID, APP_ORIGIN,
-  authHeaders, baseConfig, membershipFor, membershipIdFor, principalKeyFor, sampleWorkspaceBody, startTestServer,
+  authHeaders, baseConfig, membershipFor, membershipIdFor, principalKeyFor, startTestServer,
 } from './helpers.mjs'
 import { createFakeRealJobs } from './job-lifecycle-fakes.mjs'
 
@@ -64,7 +64,7 @@ test('owners grant and revoke exact admitted reviewer memberships with immutable
   assert.equal((await identity.json()).capabilities.applicationAdmin, false, 'A friendly label is never app-admin promotion')
   const directory = await fetch(`${server.baseUrl}/api/workspaces`, { headers: authHeaders({ oid: OTHER_ALLOWED_OID }) })
   assert.equal((await directory.json()).workspaces.find(item => item.id === server.workspace.id).role, 'reviewer')
-  assert.equal((await server.request('/state', { oid: OTHER_ALLOWED_OID })).status, 200)
+  assert.equal((await server.request('/lifecycle', { oid: OTHER_ALLOWED_OID })).status, 200)
   assert.equal((await server.request('/reviewers', { oid: OTHER_ALLOWED_OID })).status, 403)
   assert.equal((await add(server, original.etag)).status, 409)
   assert.equal((await add(server, granted.etag)).status, 409, 'Duplicate grants do not overwrite or add audit events')
@@ -74,7 +74,7 @@ test('owners grant and revoke exact admitted reviewer memberships with immutable
   const revoked = await removed.json()
   assert.deepEqual(revoked.reviewers, [])
   assert.notEqual(revoked.etag, granted.etag)
-  assert.equal((await server.request('/state', { oid: OTHER_ALLOWED_OID })).status, 404)
+  assert.equal((await server.request('/lifecycle', { oid: OTHER_ALLOWED_OID })).status, 404)
   const memberships = await fetch(`${server.baseUrl}/api/workspaces`, { headers: authHeaders({ oid: OTHER_ALLOWED_OID }) })
   assert.ok(!(await memberships.json()).workspaces.some(item => item.id === server.workspace.id))
   assert.equal((await server.request(`/reviewers/${OTHER_ALLOWED_OID}`, { method: 'DELETE', etag: granted.etag })).status, 409)
@@ -189,9 +189,9 @@ test('owners can revoke previously admitted reviewers without restoring their si
   assert.equal(granted.status, 201)
   const current = await granted.json()
   server.eligibleUsers._remove(OTHER_ALLOWED_OID)
-  assert.equal((await server.request('/state', { oid: OTHER_ALLOWED_OID })).status, 200,
+  assert.equal((await server.request('/lifecycle', { oid: OTHER_ALLOWED_OID })).status, 200,
     'Existing admitted claims remain valid until token/session refresh, without a live Graph check')
-  assert.equal((await server.request('/state', { oid: OTHER_ALLOWED_OID, identity: { roles: [] } })).status, 403)
+  assert.equal((await server.request('/lifecycle', { oid: OTHER_ALLOWED_OID, identity: { roles: [] } })).status, 403)
   const removed = await server.request(`/reviewers/${OTHER_ALLOWED_OID}`, { method: 'DELETE', etag: current.etag })
   assert.equal(removed.status, 200)
   assert.deepEqual((await removed.json()).reviewers, [])
@@ -208,13 +208,11 @@ test('invalid memberships deny member access without suppressing an administrato
     { ...member, workspaceId: 'foreign-workspace' },
   ]) {
     server.directory._addMembership(server.workspace.id, bad)
-    assert.equal((await server.request('/state', { oid: OTHER_ALLOWED_OID })).status, 404)
-    assert.equal((await server.request('/state', { method: 'PUT', body: sampleWorkspaceBody(),
-      oid: OTHER_ALLOWED_OID, etag: '"any"' })).status, 404)
+    assert.equal((await server.request('/lifecycle', { oid: OTHER_ALLOWED_OID })).status, 404)
     const list = await fetch(`${server.baseUrl}/api/workspaces`, { headers: authHeaders({ oid: OTHER_ALLOWED_OID }) })
     assert.deepEqual((await list.json()).workspaces, [])
     const identity = { roles: ['Score.Admin'] }
-    assert.equal((await server.request('/state', { oid: OTHER_ALLOWED_OID, identity })).status, 200)
+    assert.equal((await server.request('/lifecycle', { oid: OTHER_ALLOWED_OID, identity })).status, 200)
     assert.equal((await server.request('/reviewers', { oid: OTHER_ALLOWED_OID, identity })).status, 404,
       'Implicit ordinary Owner access never supplies explicit reviewer-administration membership')
     const adminList = await fetch(`${server.baseUrl}/api/workspaces`, { headers: authHeaders({ oid: OTHER_ALLOWED_OID, ...identity }) })
@@ -229,9 +227,8 @@ test('reviewers cannot perform any ordinary workspace mutation or original downl
   const jobs = createFakeRealJobs()
   const server = await setup(t, { config: baseConfig({ realJobs: {} }), jobs })
   server.directory._addMembership(server.workspace.id, membershipFor(server.workspace.id, { oid: OTHER_ALLOWED_OID, role: 'reviewer' }))
-  const state = await (await server.request('/state', { oid: OTHER_ALLOWED_OID })).json()
   const mutations = [
-    ['', 'PATCH', { name: 'Unauthorized rename' }], ['/state', 'PUT', sampleWorkspaceBody()],
+    ['', 'PATCH', { name: 'Unauthorized rename' }],
     ['/lifecycle', 'POST', { action: 'archive' }], ['/lifecycle', 'POST', { action: 'delete' }],
     ['/jobs/pdf', 'POST', {}], ['/jobs/markdown', 'POST', {}], ['/jobs/file', 'POST', {}], ['/jobs/url', 'POST', {}],
     ['/jobs/job-one/metadata', 'PATCH', {}], ['/jobs/job-one/rubric', 'PUT', {}],
@@ -247,13 +244,12 @@ test('reviewers cannot perform any ordinary workspace mutation or original downl
     ['/analyses/run-one/comparisons/comparison-one/corrections/cancel', 'POST', {}],
   ]
   for (const [suffix, method, body] of mutations) {
-    const response = await server.request(suffix, { method, body, oid: OTHER_ALLOWED_OID, etag: suffix === '/state' ? state.etag : server.workspace.etag })
+    const response = await server.request(suffix, { method, body, oid: OTHER_ALLOWED_OID, etag: server.workspace.etag })
     assert.equal(response.status, 403, `${method} ${suffix}: ${await response.text()}`)
   }
   const original = await server.request('/jobs/job-one/original', { oid: OTHER_ALLOWED_OID })
   assert.equal(original.status, 403, 'Reviewer read access does not change the original-download allowlist')
-  assert.equal((await server.request('/state', { oid: OTHER_ALLOWED_OID })).status, 200)
-  assert.equal((await server.state.getState(server.workspace.id)).etag, state.etag)
+  assert.equal((await server.request('/lifecycle', { oid: OTHER_ALLOWED_OID })).status, 200)
   assert.deepEqual(server.directory._membershipAudits(server.workspace.id), [])
 })
 
@@ -282,7 +278,7 @@ test('equal co-owners manage reviewers and creator provenance does not preserve 
     oid: OTHER_ALLOWED_OID, method: 'DELETE', etag: reviewers.etag,
   })
   assert.equal(removed.status, 200, await removed.clone().text())
-  assert.equal((await server.request('/state')).status, 404)
+  assert.equal((await server.request('/lifecycle')).status, 404)
   assert.equal((await server.directory.getMetadata(server.workspace.id)).metadata.ownerId,
     principalKeyFor(TENANT_ID, ALLOWED_OID), 'Creator provenance remains immutable, not an authorization source')
   assert.ok(server.directory._membershipAudits(server.workspace.id)
@@ -301,6 +297,6 @@ test('an unavailable eligible-user directory blocks reviewer grants, not saved r
   assert.equal(granted.status, 201)
   const current = await granted.json()
   server.eligibleUsers._setError(new Error('Directory unavailable'))
-  assert.equal((await server.request('/state', { oid: OTHER_ALLOWED_OID })).status, 200)
+  assert.equal((await server.request('/lifecycle', { oid: OTHER_ALLOWED_OID })).status, 200)
   assert.equal((await server.request(`/reviewers/${OTHER_ALLOWED_OID}`, { method: 'DELETE', etag: current.etag })).status, 200)
 })

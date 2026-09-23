@@ -458,7 +458,7 @@ test('runtime activation is separate from admin editing; accepted snapshots and 
     store.failRead(new Error('offline'))
     assert.equal((await server.request('/api/features')).response.status, 503)
     assert.equal((await server.request('/api/session')).response.status, 200)
-    assert.equal((await server.request(`/api/workspaces/${session.body.workspaces[0].id}/state`)).response.status, 200)
+    assert.equal((await server.request(`/api/workspaces/${session.body.workspaces[0].id}/lifecycle`)).response.status, 200)
     assert.equal((await server.request('/api/workspaces', { method: 'POST', body: { name: 'No unsafe default' } })).response.status, 503)
     assert.equal(processingSettingsSnapshotSchema.safeParse(snapshot).success, true)
   } finally { await server.close() }
@@ -534,7 +534,7 @@ test('configured rollout pause closes new processing without reverting access, i
     assert.equal(sourceReads, 1)
     assert.equal((await disabled.request('/api/session/identity')).response.status, 200)
     assert.equal((await disabled.request('/api/session')).response.status, 200)
-    assert.equal((await disabled.request(`/api/workspaces/${workspaceId}/state`, { oid: OTHER_ALLOWED_OID })).response.status, 200)
+    assert.equal((await disabled.request(`/api/workspaces/${workspaceId}/members`, { oid: OTHER_ALLOWED_OID })).response.status, 403)
     assert.equal(store.counters.initializations, 1)
   } finally { await disabled.close() }
 })

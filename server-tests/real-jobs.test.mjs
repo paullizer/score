@@ -656,9 +656,7 @@ test('job records are membership-isolated and never enter the legacy workspace s
     })
     assert.equal(otherDetail.status, 404)
 
-    const stateResponse = await fetch(`${server.baseUrl}/api/workspaces/${workspace.id}/state`, { headers: authHeaders() })
-    const snapshot = await stateResponse.json()
-    assert.equal(snapshot.workspace.jobs.some((job) => job.id === jobId || job.dataKind === 'real'), false)
+    assert.equal(await server.state.getState(workspace.id), undefined)
   } finally {
     await server.close()
   }

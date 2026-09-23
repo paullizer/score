@@ -51,3 +51,15 @@ test('developer identity roles require explicit local-only GUID-to-role configur
     assert.throws(() => loadConfig({ ...local, ...deployment, SCORE_DEV_USER_ROLES: roles }), /prohibited/)
   }
 })
+
+test('developer auth permits only loopback http origins while Easy Auth still requires https', () => {
+  const roles = JSON.stringify({ [oid]: ['Score.User'] })
+  for (const APP_ORIGIN of ['http://127.0.0.1:5173', 'http://localhost:5173', 'http://[::1]:5173']) {
+    const config = loadConfig({ ...env, APP_ORIGIN, SCORE_AUTH_MODE: 'dev-header', SCORE_DEV_USER_ROLES: roles })
+    assert.equal(config.appOrigin, APP_ORIGIN)
+  }
+  assert.throws(() => loadConfig({
+    ...env, APP_ORIGIN: 'http://example.com', SCORE_AUTH_MODE: 'dev-header', SCORE_DEV_USER_ROLES: roles,
+  }), /APP_ORIGIN must use https, or http on a loopback host/)
+  assert.throws(() => loadConfig({ ...env, APP_ORIGIN: 'http://127.0.0.1:5173' }), /APP_ORIGIN must use https/)
+})
