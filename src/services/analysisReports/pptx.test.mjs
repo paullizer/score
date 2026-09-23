@@ -5,9 +5,9 @@ import { createContext, runInContext } from 'node:vm'
 import { after, before, test } from 'node:test'
 import { build } from 'esbuild'
 import fontkit from '@pdf-lib/fontkit'
-import { loadReportFoundation, reportFixtureCitation, REPORT_TEST_TIMESTAMP, version2ReportFixture } from './test-support.mjs'
+import { loadReportFoundation, reportFixtureCitation, version2ReportFixture } from './test-support.mjs'
 import {
-  fictionalPptxFixture, inspectPptx, loadPptxTestApi, longPptxFixture, PPTX_SAMPLE_LINKS,
+  fictionalPptxFixture, inspectPptx, loadPptxTestApi, longPptxFixture,
   PPTX_TEST_LINKS, powerpointLayoutFixture, readablePptxFixture, readyPptxFixture, refreshPptxCoverage, unzipPptx,
 } from './pptx.test-support.mjs'
 
@@ -24,7 +24,7 @@ before(async () => {
 })
 after(async () => { await Promise.all([cleanupFoundation?.(), cleanupPptx?.()]) })
 
-async function inspectReport(report, options = report.dataKind === 'sample' ? PPTX_SAMPLE_LINKS : PPTX_TEST_LINKS) {
+async function inspectReport(report, options = PPTX_TEST_LINKS) {
   return inspectPptx(await api.generatePptxReport(report, options))
 }
 
@@ -195,7 +195,7 @@ test('fictional captured display labels support native local presentation review
         : `${'Captured research applicant '.repeat(7).slice(0, 158)} ${index + 1}`
     })
     const report = foundation.buildAnalysisReport(input)
-    const bytes = await api.generatePptxReport(report, PPTX_SAMPLE_LINKS)
+    const bytes = await api.generatePptxReport(report, PPTX_TEST_LINKS)
     const result = await inspectPptx(bytes)
     assertOverviewCoverage(report, result)
     assertFeaturedContract(report, result)
@@ -208,7 +208,7 @@ test('fictional captured display labels support native local presentation review
   }
 })
 
-function assertOverviewCoverage(report, result, options = report.dataKind === 'sample' ? PPTX_SAMPLE_LINKS : PPTX_TEST_LINKS) {
+function assertOverviewCoverage(report, result, options = PPTX_TEST_LINKS) {
   report.groups.forEach((group, groupIndex) => {
     const actual = []
     for (const slide of result.slides) {
@@ -374,7 +374,7 @@ function assertTargetNavigationAndOrder(report, result) {
     assert.equal(opener.slideRelationships.get(contents.links[0].id), result.slides.indexOf(entrySlide) + 1)
     assert.equal(contents.links[0].action, 'ppaction://hlinksldjump')
     const source = opener.shapes.find(shape => shape.name === `target-${index}-source-link`)
-    const options = report.dataKind === 'sample' ? PPTX_SAMPLE_LINKS : PPTX_TEST_LINKS
+    const options = PPTX_TEST_LINKS
     assert.equal(opener.relationships.get(source.links[0].id), api.reportReviewLinks(report, group.comparisons[0], options).target)
     assert.equal(matchingShapes(result.slides, new RegExp(`^target-${index}-description-part-`)).map(shape => shape.text).join(''),
       api.keepPptxParagraphEndWordsTogether(group.target.presentation.description,
@@ -967,11 +967,6 @@ test('floating point saved totals retain exact numeric precision rather than rou
   assert.match(result.text, /1e-12 \/ 100/)
   assert.match(result.text, /~33\.33%/)
   assert.doesNotMatch(result.text, /33\.333333333333336%/)
-  const sampleInput = fictionalPptxFixture()
-  sampleInput.comparisons[0].criteria[0].score = 10 / 3
-  const sample = await inspectReport(foundation.buildAnalysisReport(sampleInput))
-  assert.match(sample.text, /3\.3333333333333335 \/ 5/)
-  assertReadableGeometry(sample.slides)
 })
 
 test('native hyperlinks use real saved-workspace destinations and human-readable review labels', async () => {
@@ -1004,28 +999,11 @@ test('native hyperlinks use real saved-workspace destinations and human-readable
   await assert.rejects(api.generatePptxReport(noFeatured), /origin/i)
 })
 
-test('fictional samples stay unmistakably labelled on every slide with just one human-review caution', async () => {
-  for (const report of [
-    foundation.buildAnalysisReport(fictionalPptxFixture()),
-    foundation.buildSampleAnalysisReport(foundation.createInitialWorkspace().runs[0], { generatedAt: REPORT_TEST_TIMESTAMP }),
-  ]) {
-    const result = await inspectReport(report)
-    assertOverviewCoverage(report, result)
-    assertFeaturedContract(report, result)
-    assertReadableGeometry(result.slides)
-    assertNoAuditProse(result)
-    for (const slide of result.slides) assert.match(slide.text, /FICTIONAL SAMPLE/)
-    for (const slide of result.slides) {
-      for (const url of slide.relationships.values()) assert.ok(!url.includes('workspace-one'))
-    }
-  }
-})
-
 test('fictional QA decks use coherent stored scores and distinct substantive criterion rationales', () => {
   for (const kind of ['normal', 'long', 'large']) {
     const input = fictionalPptxFixture(kind)
     const report = foundation.buildAnalysisReport(input)
-    assert.equal(report.dataKind, 'sample')
+    assert.equal(report.dataKind, 'real')
     for (const comparison of input.comparisons.filter(item => item.overall.status === 'available')) {
       const weight = comparison.criteria.reduce((sum, criterion) => sum + criterion.weight, 0)
       const contribution = comparison.criteria.reduce((sum, criterion) => sum + criterion.score * criterion.weight, 0)

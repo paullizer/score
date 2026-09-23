@@ -12,7 +12,7 @@ import {
   loadReportFoundation, realReportFixture, reportFixtureCitation, REPORT_TEST_TIMESTAMP, version2ReportFixture, withReportNarratives,
 } from './test-support.mjs'
 import {
-  assertNoClipping as checkClipping, contentsPages, fictionalPdfNavigationQaFixture, fictionalPdfQaFixture, fictionalSampleInput,
+  assertNoClipping as checkClipping, contentsPages, fictionalPdfNavigationQaFixture, fictionalPdfQaFixture,
   overviewPages, readablePdfFixture, readPdf, reviewSections, targetOpenerPages,
 } from './pdf-test-support.mjs'
 
@@ -66,9 +66,8 @@ async function generate(input = readablePdfFixture(), generationOptions = option
 async function savePdfQaArtifact(name, input) {
   const directory = process.env.REPORT_PDF_QA_DIRECTORY
   if (!directory) return
-  const pdf = await generate(fictionalSampleInput(input), { fonts: options.fonts, links: { origin: options.links.origin } })
+  const pdf = await generate(withReportNarratives(input), options)
   checkClipping(pdf, measurementFonts)
-  assert.ok(pdf.body.includes(foundation.REPORT_SAMPLE_NOTICE))
   await mkdir(directory, { recursive: true })
   await writeFile(join(directory, name), pdf.bytes)
 }
@@ -106,7 +105,7 @@ function assertContentsDestinations(pdf) {
   const groups = pdf.report.groups.filter(group => group.comparisons.some(comparison => comparison.status === 'complete'))
   assert.equal(openers.length, groups.length)
   assert.ok(contents.length)
-  assert.equal(pdf.pages[0].section.replace('FICTIONAL SAMPLE · ', ''), 'Introduction')
+  assert.equal(pdf.pages[0].section, 'Introduction')
   assert.equal(pdf.pages[1], contents[0])
   assert.ok(contents.every(page => pdf.pages.indexOf(page) < pdf.pages.indexOf(openers[0])))
   for (const [index, group] of groups.entries()) {
@@ -208,7 +207,7 @@ test('PDF: source-name disclosures never strand the explanation section heading 
   input.run.name = 'Fictional research shortlisting review'
   input.targets[0].displayName = 'Survey methods vacancy'
   input.comparisons[0].candidate.displayName = 'Research applicant A'
-  const pdf = await generate(fictionalSampleInput(input), { fonts: options.fonts, links: { origin: options.links.origin } })
+  const pdf = await generate(withReportNarratives(input), options)
   const review = reviewSections(pdf)[0]
   const headingPage = review.pages.find(page => page.items.some(item => item.source === 'Why these scores'))
   assert.ok(headingPage)
@@ -297,16 +296,15 @@ test('PDF: fictional QA fixtures have consistent stored totals and distinct subs
     assert.ok(comparison.criteria.every(criterion => criterion.citations.length && criterion.rationale.length > 60))
     assert.doesNotMatch(comparison.summary, /Full saved overall assessment|flood-risk/)
     foundation.buildAnalysisReport(input)
-    const sample = fictionalSampleInput(input)
-    assert.deepEqual(sample.comparisons.map(comparison => comparison.summary), input.comparisons.map(comparison => comparison.summary))
-    assert.equal(sample.capture.summaries.source, 'fixture')
-    for (const narrative of [...sample.targets, ...sample.comparisons].map(value => value.narrative).filter(Boolean)) {
-      assert.equal(narrative.dataKind, 'sample')
-      assert.match(narrative.revision, /^fixture-/)
-      assert.equal('generationId' in narrative, false)
-      assert.equal('publishedAt' in narrative, false)
+    const stamped = withReportNarratives(input)
+    assert.deepEqual(stamped.comparisons.map(comparison => comparison.summary), input.comparisons.map(comparison => comparison.summary))
+    assert.equal(stamped.capture.summaries.dataKind, 'real')
+    for (const narrative of [...stamped.targets, ...stamped.comparisons].map(value => value.narrative).filter(Boolean)) {
+      assert.equal(narrative.dataKind, 'real')
+      assert.equal(typeof narrative.generationId, 'string')
+      assert.equal(typeof narrative.publishedAt, 'string')
     }
-    foundation.buildAnalysisReport(sample)
+    foundation.buildAnalysisReport(stamped)
   }
 })
 
@@ -570,9 +568,9 @@ test('PDF: capped ties stay equal in all-completed overview; only supplied highl
   assertNoClipping(pdf)
 })
 
-test('PDF: zero, completed withheld scores and actual unfinished reasons remain distinct', async () => {
-  const input = fictionalSampleInput(readablePdfFixture({
-    scores: [0, null, 40, 30, 20, 10], statuses: ['complete', 'complete', 'queued', 'running', 'failed', 'cancelled'], criterionCount: 1,
+test('PDF: zero, completed withheld scores and terminal unfinished reasons remain distinct', async () => {
+  const input = withReportNarratives(readablePdfFixture({
+    scores: [0, null, 20, 10], statuses: ['complete', 'complete', 'failed', 'cancelled'], criterionCount: 1,
   }))
   const comparison = input.comparisons[0]
   comparison.criteria[0].score = 0
@@ -583,11 +581,9 @@ test('PDF: zero, completed withheld scores and actual unfinished reasons remain 
   comparison.coverage.missing = 1
   comparison.summary = 'The submitted resume does not provide examples of the required engineering work.'
   const pdf = await generate(input)
-  assert.equal(occurrences(pdf.body, 'Reporting on 2 of 6 candidates'), 1)
-  assert.match(pdf.body, /2 still processing/)
+  assert.equal(occurrences(pdf.body, 'Reporting on 2 of 4 candidates'), 1)
   assert.match(pdf.body, /1 could not be assessed/)
   assert.match(pdf.body, /1 cancelled/)
-  assert.equal(occurrences(pdf.body, 'still processing'), 1)
   assert.equal(occurrences(pdf.body, 'could not be assessed'), 1)
   assert.equal(occurrences(pdf.body, 'cancelled'), 1)
   assert.equal(overviewPages(pdf).flatMap(page => page.annotations).length, 2)
@@ -605,21 +601,14 @@ test('PDF: zero, completed withheld scores and actual unfinished reasons remain 
   assertNoClipping(pdf)
 })
 
-test('PDF: all-withheld results remain in the overview without invented reviews; fictional samples stay unmistakable', async () => {
+test('PDF: all-withheld results remain in the overview without invented reviews', async () => {
   const withheld = await generate(readablePdfFixture({ scores: [null, null], criterionCount: 1 }))
   assert.equal(reviewSections(withheld).length, 0)
   assert.equal(overviewPages(withheld).flatMap(page => page.annotations).length, 2)
   assert.equal(occurrences(withheld.body, 'Withheld'), 2)
   assert.equal(occurrences(withheld.body, 'Weighted criteria were not assessed.'), 2)
   assert.ok(!withheld.body.includes('Scorecard'))
-  const report = foundation.buildSampleAnalysisReport(foundation.createInitialWorkspace().runs[0], { generatedAt: REPORT_TEST_TIMESTAMP })
-  const sample = await readPdf(await writer.generatePdfReport(report, { fonts: options.fonts, links: { origin: options.links.origin } }))
-  assert.equal(occurrences(sample.body, 'Analysis evidence report'), 1)
-  assert.equal(occurrences(sample.body, foundation.REPORT_SAMPLE_NOTICE), 1)
-  assert.ok(sample.pages.every(page => page.section.startsWith('FICTIONAL SAMPLE')))
-  assert.equal(reviewSections(sample).length, report.groups.reduce((sum, group) => sum + group.highlightedComparisonIds.length, 0))
   assertNoClipping(withheld)
-  assertNoClipping(sample)
 })
 
 test('PDF: duplicate or unnamed candidates have readable labels and distinct saved-review destinations', async () => {

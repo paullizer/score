@@ -205,11 +205,11 @@ test('Word downloads use PDF-equivalent links, fonts and naming for settled part
   assert.equal(downloads[0].blob.type, 'application/vnd.openxmlformats-officedocument.wordprocessingml.document')
 })
 
-test('all formats omit the partial filename marker and sample filenames stay labeled', () => {
+test('all formats omit the partial filename marker', () => {
   for (const format of ['csv', 'pdf', 'docx', 'pptx']) {
     const bytes = format === 'csv' ? csvBytes() : format === 'pdf' ? pdfBytes() : officeBytes()
-    const filename = api.downloadAnalysisReport(bytes, { ...report, dataKind: 'sample', partial: true }, format, new AbortController().signal)
-    assert.equal(filename, `Sample - Saved evidence review.${format}`)
+    const filename = api.downloadAnalysisReport(bytes, { ...report, partial: true }, format, new AbortController().signal)
+    assert.equal(filename, `Saved evidence review.${format}`)
   }
 })
 

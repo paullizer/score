@@ -40,7 +40,7 @@ export async function generatePdfReport(report: AnalysisReport, options?: Report
   document.setProducer('Score · pdf-lib')
   document.setCreationDate(new Date(report.generatedAt))
   document.setModificationDate(new Date(report.generatedAt))
-  const layout = new PdfReportLayout(document, fonts, report.dataKind === 'sample' ? 'FICTIONAL SAMPLE' : '', limits)
+  const layout = new PdfReportLayout(document, fonts, '', limits)
   writeDocumentReport(layout, report, options)
   layout.finish()
   const bytes = await document.save({ useObjectStreams: true, addDefaultPage: false })

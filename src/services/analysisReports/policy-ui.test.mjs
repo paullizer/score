@@ -34,12 +34,18 @@ function context(role = 'owner') {
 }
 async function render({ role = 'owner', phase = 'ready', error = null, cloud = true, preview = true, originalMetadata = originalDocx } = {}) {
   const policy = { settings, phase, error, cloud, refresh: async () => {} }
-  const run = { id: 'sample-run', name: 'Sample evidence', targets: [{ id: 'target-one', label: 'Saved target', rubric: { version: 1 } }],
-    comparisons: [{ id: 'comparison-one', targetId: 'target-one', status: 'complete' }] }
+  const detail = {
+    run: { id: 'run-one', name: 'Saved evidence', createdAt: '2026-09-18T18:00:00.000Z' },
+    targets: [{ id: 'target-one', label: 'Saved target', displayName: 'Saved target', rubricVersion: 1 }],
+    resumes: [{ id: 'resume-one' }],
+  }
+  const comparisons = [{ comparison: {
+    id: 'comparison-one', status: 'complete', target: { summary: { id: 'target-one' } },
+  } }]
   const content = preview
     ? React.createElement(runtime.PrivateDocumentViewer, { document: source, originalUrl, original: originalMetadata })
     : React.createElement(runtime.MemoryRouter, { future: { v7_startTransition: true, v7_relativeSplatPath: true } },
-      React.createElement(runtime.AnalysisReportExport, { source: { kind: 'sample', run, available: true } }))
+      React.createElement(runtime.AnalysisReportExport, { source: { workspaceId: 'workspace-one', detail, comparisons, available: true } }))
   await React.act(async () => {
     root.render(React.createElement(runtime.PublicSettingsContext.Provider, { value: policy },
       React.createElement(runtime.WorkspaceContext.Provider, { value: context(role) }, content)))
@@ -63,9 +69,7 @@ before(async () => {
       export { PublicSettingsContext } from './src/app/public-settings-context';
       export { createDefaultAdminSettings } from './src/domain/admin-settings-defaults';
       export { MemoryRouter } from 'react-router-dom';
-    ` }, outfile: join(output, 'ui.mjs'), bundle: true, jsx: 'automatic', packages: 'external', platform: 'node', format: 'esm', logLevel: 'silent',
-    define: { 'import.meta.env': JSON.stringify({ VITE_DEPLOYMENT_MODE: 'cloud' }) },
-  })
+    ` }, outfile: join(output, 'ui.mjs'), bundle: true, jsx: 'automatic', packages: 'external', platform: 'node', format: 'esm', logLevel: 'silent' })
   runtime = await import(pathToFileURL(join(output, 'ui.mjs')).href)
 })
 beforeEach(() => {

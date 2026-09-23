@@ -57,7 +57,7 @@ export interface RealReportCaptureResponse {
   captureToken: string
 }
 
-export type ReportDataKind = 'real' | 'sample'
+export type ReportDataKind = 'real'
 export type ReportComparisonStatus = 'queued' | 'running' | 'complete' | 'failed' | 'cancelled'
 export type ReportCompletion = 'assessed' | 'limited'
 export type ReportEvidenceStatus = 'supported' | 'partial' | 'missing' | 'not-assessed' | 'not-applicable'
@@ -278,7 +278,7 @@ export interface ReportCaptureInterval {
 
 export interface AnalysisReportInput {
   dataKind: ReportDataKind
-  workspaceId?: string
+  workspaceId: string
   run: ReportRun
   capture: ReportCaptureInterval
   generatedAt: string
@@ -290,15 +290,11 @@ export interface AnalysisReportBuildOptions {
   targetId?: string
 }
 
-export interface SampleAnalysisReportOptions extends AnalysisReportBuildOptions {
-  capture?: ReportCaptureInterval
-  generatedAt?: string
-}
 
 export interface AnalysisReport {
   schemaVersion: typeof ANALYSIS_REPORT_SCHEMA_VERSION
   dataKind: ReportDataKind
-  workspaceId?: string
+  workspaceId: string
   run: ReportRun
   capture: ReportCaptureInterval & { settings: ReportSettingsCapture }
   generatedAt: string
@@ -328,7 +324,7 @@ export interface ReportFontData {
 
 export interface ReportLinkContext {
   origin: string
-  workspaceId?: string
+  workspaceId: string
 }
 
 export interface ReportGenerationOptions {

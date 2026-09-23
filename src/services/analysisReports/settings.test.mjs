@@ -7,7 +7,7 @@ import { pathToFileURL } from 'node:url'
 import { build } from 'esbuild'
 import { SaxesParser } from 'saxes'
 import { loadReportFoundation, realReportFixture, version2ReportFixture, withReportNarratives } from './test-support.mjs'
-import { assertNoClipping, fictionalSampleInput, readPdf } from './pdf-test-support.mjs'
+import { assertNoClipping, readPdf } from './pdf-test-support.mjs'
 import { inspectSlideXml, unzipPptx } from './pptx.test-support.mjs'
 import fontkit from '@pdf-lib/fontkit'
 
@@ -157,12 +157,6 @@ test('all writers apply the captured title and full additive notice while retain
     }
   }
   assert.equal(JSON.stringify(value), saved)
-  const sample = report({ title: 'Agency sample report', additionalFooter: footer }, fictionalSampleInput(withReportNarratives(realReportFixture())))
-  const sampleOptions = { ...options, links: { origin: options.links.origin } }
-  assert.match(Buffer.from(await writers.csv(sample, sampleOptions)).toString(), /fictional sample/i)
-  assert.ok((await readPdf(await writers.pdf(sample, sampleOptions))).body.includes(api.REPORT_SAMPLE_NOTICE))
-  assert.ok((await wordText(await writers.docx(sample, sampleOptions))).includes(api.REPORT_SAMPLE_NOTICE))
-  assert.ok((await deck(await writers.pptx(sample, sampleOptions))).every(slide => slide.text.includes('FICTIONAL SAMPLE')))
 })
 
 test('a long configured title uses full flowing document text and separate deck title pages without shrinking or clipping', async () => {

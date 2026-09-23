@@ -17,13 +17,10 @@ export async function loadReportFoundation() {
         export * from './src/services/analysisReports/model';
         export * from './src/services/analysisReports/presentation';
         export * from './src/services/analysisReports/readable';
-        export * from './src/services/analysisReports/sample';
         export * from './src/services/analysisReports/narratives';
         export * from './src/services/analysisReports/narrative-schemas';
         export * from './src/services/analysisReports/policy';
         export { createDefaultAdminSettings, LEGACY_SETTINGS_REVISION } from './src/domain/admin-settings-defaults';
-        export { createInitialWorkspace, createFixtureWorkspace } from './src/data/fixtures';
-        export { snapshotAnalysisRun, evaluateComparison } from './src/services/scoring';
       ` },
       outfile: join(output, 'foundation.mjs'), bundle: true, packages: 'external',
       format: 'esm', platform: 'node', logLevel: 'silent',
@@ -133,19 +130,17 @@ export function realReportBatchFixture(input = realReportFixture()) {
 const narrativeHash = value => createHash('sha256').update(JSON.stringify(value)).digest('hex')
 const narrativePin = narrative => narrative ? { revision: narrative.revision, inputFingerprint: narrative.inputFingerprint } : null
 
-// Test-only publications preserve supplied prose; application samples use sample.ts.
+// Test-only publications preserve supplied prose for real report fixtures.
 export function withReportNarratives(input, { targetId = null } = {}) {
   const value = structuredClone(input)
-  if (!['real', 'sample'].includes(value.dataKind) ||
+  if (value.dataKind !== 'real' ||
     [...value.targets, ...value.comparisons].some(item => item.dataKind !== value.dataKind ||
       (item.narrative?.dataKind !== undefined && item.narrative.dataKind !== value.dataKind))) {
-    throw new Error('Narrative test fixtures must keep real and sample provenance separate.')
+    throw new Error('Narrative test fixtures must use real report provenance.')
   }
-  const fixtureId = `report-fixture-${narrativeHash(value.run.id)}`
-  const publicationMetadata = (kind, id, inputFingerprint) => value.dataKind === 'real'
-    ? { dataKind: 'real', generationId: `${kind}-generation-${id}`, inputFingerprint, publishedAt: REPORT_TEST_TIMESTAMP }
-    : { dataKind: 'sample', fixtureId, inputFingerprint: `fixture-${inputFingerprint}` }
-  const publicationRevision = publication => `${value.dataKind === 'sample' ? 'fixture-' : ''}${narrativeHash(publication)}`
+  const publicationMetadata = (kind, id, inputFingerprint) =>
+    ({ dataKind: 'real', generationId: `${kind}-generation-${id}`, inputFingerprint, publishedAt: REPORT_TEST_TIMESTAMP })
+  const publicationRevision = publication => narrativeHash(publication)
   for (const target of value.targets) {
     target.presentation ??= {
       title: target.label, organization: target.sublabel,
@@ -204,10 +199,7 @@ export function withReportNarratives(input, { targetId = null } = {}) {
     dataKind: 'real', ready: !comparisons.some(comparison => comparison.status === 'queued' || comparison.status === 'running'),
     scope: { targetId }, comparisons, targets,
   }
-  value.capture.summaries = value.dataKind === 'real' ? { ...capture, revision: narrativeHash(capture) } : {
-    dataKind: 'sample', source: 'fixture', fixtureId, ready: true, scope: { targetId },
-    revision: `fixture-${narrativeHash(capture)}`,
-  }
+  value.capture.summaries = { ...capture, revision: narrativeHash(capture) }
   return value
 }
 

@@ -12,7 +12,7 @@ import {
 } from './narratives'
 import {
   assertXmlText, criterionScoreLabel, evidenceStatusLabel, formatReportWeight, overallScoreLabel,
-  REPORT_FONT_FAMILY, REPORT_PALETTE, REPORT_SAMPLE_NOTICE, reportTitle,
+  REPORT_FONT_FAMILY, REPORT_PALETTE, reportTitle,
 } from './presentation'
 import { readableAnalysisDate, readableCandidateName, readableCompletionNotice, selectKeyCriteria } from './readable'
 import type { ReadableCriterion } from './readable'
@@ -137,11 +137,6 @@ class ReportDeck {
     if (reference) text(slide, reference, { x: 2.25, y: 0.615, w: 6.5, h: 0.3 }, 11, {
       color: C.muted, objectName: 'job-reference',
     })
-    if (this.report.dataKind === 'sample') {
-      text(slide, 'FICTIONAL SAMPLE', { x: 9.0, y: 0.615, w: PPTX_LAYOUT.width - 9.6, h: 0.32 }, 11, {
-        bold: true, align: 'right', color: C.accent, objectName: 'report-designation',
-      })
-    }
     if (title) text(slide, title, { x: 0.6, y: 1.12, w: BODY_WIDTH, h: height(title, BODY_WIDTH, fontSize) }, fontSize, {
       bold: true, objectName: name,
     })
@@ -1024,7 +1019,6 @@ export async function generatePptxReport(report: AnalysisReport, options?: Repor
   })
   finishAgenda(deck, agenda, destinations)
   if (policy.additionalFooter) reportNotice(deck, 'Additional report notice', [
-    ...(report.dataKind === 'sample' ? [{ key: 'footer-sample-disclosure', text: REPORT_SAMPLE_NOTICE }] : []),
     { key: 'footer-human-review', text: HUMAN_REVIEW },
     { key: 'additional-footer', text: policy.additionalFooter },
   ])

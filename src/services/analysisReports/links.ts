@@ -14,13 +14,12 @@ export function validatedReportLinkContext(report: AnalysisReport, options?: Rep
   if (context.workspaceId !== undefined && (typeof context.workspaceId !== 'string' || !context.workspaceId.trim())) {
     throw new Error('Report review links require a valid workspace identity when a workspace is supplied.')
   }
-  if (report.dataKind === 'real' && (!report.workspaceId || (context.workspaceId !== undefined && context.workspaceId !== report.workspaceId))) {
+  if (!report.workspaceId || context.workspaceId !== report.workspaceId) {
     throw new Error('The report review link workspace must match the saved real analysis workspace.')
   }
-  const workspaceId = report.dataKind === 'real' ? report.workspaceId : context.workspaceId
   // Validate route identities even when an export has no featured candidates.
-  savedReviewPath({ workspaceId, runId: report.run.id, comparisonId: 'validation', dataKind: report.dataKind })
-  return { origin: origin.origin, ...(workspaceId === undefined ? {} : { workspaceId }) }
+  savedReviewPath({ workspaceId: report.workspaceId, runId: report.run.id, comparisonId: 'validation' })
+  return { origin: origin.origin, workspaceId: report.workspaceId }
 }
 
 export function reportReviewLinks(
@@ -31,7 +30,7 @@ export function reportReviewLinks(
     && group.comparisons.some((saved) => saved.id === comparison.id))) {
     throw new Error('Report review links must refer to a comparison in this saved analysis.')
   }
-  const route = { workspaceId: context.workspaceId, runId: report.run.id, comparisonId: comparison.id, dataKind: report.dataKind }
+  const route = { workspaceId: context.workspaceId, runId: report.run.id, comparisonId: comparison.id }
   return {
     analysis: context.origin + savedReviewPath(route),
     resume: context.origin + savedReviewPath({ ...route, view: 'resume' }),

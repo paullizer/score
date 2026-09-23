@@ -54,16 +54,7 @@ export function reportTargetPresentation(target: ReportTarget): ReportTargetPres
     requireSaved(parsed.success, 'Frozen target presentation metadata is invalid.')
     return parsed.data
   }
-  requireSaved(target.dataKind === 'sample', 'Frozen job title and organization metadata is missing; legacy labels cannot substitute for it.')
-  const fact = (...labels: string[]) => labels.map(label => target.facts.find(item => item.label === label)?.value).find(value => value?.trim()) ?? ''
-  return reportTargetPresentationSchema.parse({
-    title: target.label,
-    organization: fact('Organization', 'Agency'),
-    description: fact('Rubric description') || 'Illustrative fixture target; no real assessment or eligibility decision is implied.',
-    series: fact('Series'),
-    grade: fact('Illustrative grade', 'GS grade', 'Grade'),
-    versionLabel: target.versionLabel,
-  })
+  requireSaved(false, 'Frozen job title and organization metadata is missing; legacy labels cannot substitute for it.')
 }
 
 function matchesRevision(narrative: AnalysisNarrativeRevision | undefined, pin: AnalysisNarrativeRevision | null): boolean {
@@ -74,8 +65,7 @@ function matchesRevision(narrative: AnalysisNarrativeRevision | undefined, pin: 
 // Validate the original capture, before a writer removes unassessed comparisons or empty target sections.
 export function requireReportNarratives(report: AnalysisReport): void {
   requireSaved(report?.schemaVersion === ANALYSIS_REPORT_SCHEMA_VERSION &&
-    (report.dataKind === 'real' || report.dataKind === 'sample') &&
-    (report.dataKind === 'real' ? Boolean(report.workspaceId?.trim()) : report.workspaceId === undefined) &&
+    report.dataKind === 'real' && Boolean(report.workspaceId?.trim()) &&
     Boolean(report.run?.id?.trim()) && report.scope &&
     (report.scope.targetId === null || (typeof report.scope.targetId === 'string' && report.scope.targetId.trim().length > 0)),
   'The narrative report identity or selected scope is invalid.')
@@ -111,9 +101,7 @@ export function requireReportNarratives(report: AnalysisReport): void {
       indexes.add(comparison.index)
       pairs.add(pair)
       if (comparison.status === 'complete') {
-        const narrative = candidateNarrative(comparison)
-        if (capture.dataKind === 'sample') requireSaved(narrative.dataKind === 'sample' && narrative.fixtureId === capture.fixtureId,
-          'Sample candidate prose must retain its explicit fixture provenance.')
+        candidateNarrative(comparison)
         targetComplete++
         complete++
       } else {
@@ -121,15 +109,12 @@ export function requireReportNarratives(report: AnalysisReport): void {
       }
     }
     if (targetComplete) {
-      const narrative = targetNarrative(target)
-      if (capture.dataKind === 'sample') requireSaved(narrative.dataKind === 'sample' && narrative.fixtureId === capture.fixtureId,
-        'Sample target prose must retain its explicit fixture provenance.')
+      targetNarrative(target)
     } else requireSaved(target.narrative === undefined, 'A target without completed reviews must not carry an assessment overview.')
   }
   requireSaved(complete > 0 && comparisons.size <= REPORT_LIMITS.maxComparisons &&
     report.counts?.total === comparisons.size && report.counts.complete === complete,
   'The narrative report is missing captured reviews or has inconsistent completion counts.')
-  if (capture.dataKind === 'sample') return
   requireSaved(capture.targets.length === targets.size && capture.comparisons.length === comparisons.size,
     'The report omits or adds target/comparison pins from the authoritative selected scope.')
   for (const pin of capture.targets) {

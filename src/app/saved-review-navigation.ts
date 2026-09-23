@@ -1,5 +1,6 @@
 export type SavedReviewView = 'resume' | 'target'
 
+/** Legacy `data=real|samples` parameters from older links and exported reports are ignored. */
 export function savedReviewView(params: URLSearchParams): SavedReviewView | null {
   const views = params.getAll('view')
   const results = params.getAll('result')
@@ -16,20 +17,18 @@ function identity(value: string, name: string): string {
 }
 
 export function savedReviewPath({
-  workspaceId, runId, comparisonId, dataKind, view,
+  workspaceId, runId, comparisonId, view,
 }: {
-  workspaceId?: string
+  workspaceId: string
   runId: string
   comparisonId: string
-  dataKind: 'real' | 'sample'
   view?: SavedReviewView
 }): string {
-  if (dataKind !== 'real' && dataKind !== 'sample') throw new Error('A real or sample data mode is required for saved review links.')
-  if (dataKind === 'real' && workspaceId === undefined) throw new Error('A workspace is required for real saved review links.')
+  if (workspaceId === undefined) throw new Error('A workspace is required for saved review links.')
   if (view !== undefined && view !== 'resume' && view !== 'target') throw new Error('The saved source view must be resume or target.')
-  const prefix = workspaceId === undefined ? '' : `/workspaces/${identity(workspaceId, 'workspace')}`
+  const prefix = `/workspaces/${identity(workspaceId, 'workspace')}`
   identity(comparisonId, 'comparison')
-  const params = new URLSearchParams({ data: dataKind === 'sample' ? 'samples' : 'real', result: comparisonId })
+  const params = new URLSearchParams({ result: comparisonId })
   if (view) params.set('view', view)
   return `${prefix}/analyses/${identity(runId, 'analysis')}?${params}`
 }

@@ -216,29 +216,6 @@ export function readablePdfFixture(options = {}) {
   return withReportNarratives(input)
 }
 
-export function fictionalSampleInput(input) {
-  const sample = structuredClone(input)
-  sample.dataKind = 'sample'
-  delete sample.workspaceId
-  delete sample.capture.summaries
-  for (const target of sample.targets) {
-    target.dataKind = 'sample'
-    target.rubricId = target.id
-    target.selection = null
-    target.snapshot = null
-    if (target.narrative) target.narrative = { paragraphs: target.narrative.paragraphs }
-  }
-  for (const comparison of sample.comparisons) {
-    comparison.dataKind = 'sample'
-    comparison.candidate.documentSha256 = null
-    comparison.candidate.snapshot = null
-    comparison.resultSha256 = null
-    comparison.qualifications = []
-    if (comparison.narrative) comparison.narrative = { text: comparison.narrative.text, overview: comparison.narrative.overview }
-  }
-  return withReportNarratives(sample)
-}
-
 export function fictionalPdfQaFixture(kind = 'ordinary') {
   const large = kind === 'large'
   const input = readablePdfFixture({ scores: [large ? 80 : 85], criterionCount: large ? 100 : 4 })

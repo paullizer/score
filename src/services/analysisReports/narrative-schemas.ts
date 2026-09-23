@@ -56,8 +56,6 @@ const targetContent = {
 }
 const realRevision = { revision: hash, inputFingerprint: hash }
 const published = { ...realRevision, generationId: id, publishedAt: timestamp }
-const sampleRevision = { revision: id, inputFingerprint: id, fixtureId: id, dataKind: z.literal('sample') }
-
 const legacyCandidateNarrativeSchema = z.strictObject({ dataKind: z.literal('real'), ...published, ...candidateContent })
   .superRefine((value, context) => { realProse(value.text, context); realProse(value.overview, context) })
 const legacyTargetNarrativeSchema = z.strictObject({ dataKind: z.literal('real'), ...published, ...targetContent })
@@ -71,12 +69,8 @@ export const realTargetNarrativeSchema = z.union([
     value.paragraphs.join('\n\n').length <= SUMMARY_LIMITS.totalCharacters, 'The saved summary exceeds its resource budget.'),
   legacyTargetNarrativeSchema,
 ])
-export const reportCandidateNarrativeSchema: z.ZodType<ReadyAnalysisCandidateNarrative> = z.union([
-  realCandidateNarrativeSchema, z.strictObject({ ...sampleRevision, ...candidateContent }),
-])
-export const reportTargetNarrativeSchema: z.ZodType<ReadyAnalysisTargetNarrative> = z.union([
-  realTargetNarrativeSchema, z.strictObject({ ...sampleRevision, ...targetContent }),
-])
+export const reportCandidateNarrativeSchema: z.ZodType<ReadyAnalysisCandidateNarrative> = realCandidateNarrativeSchema
+export const reportTargetNarrativeSchema: z.ZodType<ReadyAnalysisTargetNarrative> = realTargetNarrativeSchema
 
 export const reportTargetPresentationSchema: z.ZodType<ReportTargetPresentation> = z.strictObject({
   title: nonempty, organization: text, description: nonempty, series: text, grade: text, versionLabel: nonempty,
@@ -130,10 +124,7 @@ export const realNarrativeReportCaptureSchema: z.ZodType<RealAnalysisNarrativeRe
   }
 })
 
-export const reportNarrativeCaptureSchema: z.ZodType<AnalysisNarrativeReportCapture> = z.union([
-  realNarrativeReportCaptureSchema,
-  z.strictObject({ dataKind: z.literal('sample'), source: z.literal('fixture'), fixtureId: id, ready: z.literal(true), scope, revision: id }),
-])
+export const reportNarrativeCaptureSchema: z.ZodType<AnalysisNarrativeReportCapture> = realNarrativeReportCaptureSchema
 
 const summaryState = {
   status: narrativeStatus, generationId: id.nullable(), inputFingerprint: hash.nullable(), targetId: id,

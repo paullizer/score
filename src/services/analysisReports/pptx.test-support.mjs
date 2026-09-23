@@ -9,7 +9,6 @@ import { SaxesParser } from 'saxes'
 import { loadReportFoundation, realReportFixture, reportFixtureCitation, withReportNarratives } from './test-support.mjs'
 
 export const PPTX_TEST_LINKS = { links: { origin: 'https://score.example', workspaceId: 'workspace-one' } }
-export const PPTX_SAMPLE_LINKS = { links: { origin: 'https://score.example' } }
 
 export async function loadPptxTestApi() {
   const output = resolve(`.analysis-report-pptx-tests-${randomUUID()}`)
@@ -409,21 +408,6 @@ export function fictionalPptxFixture(kind = 'normal') {
       assessment.citations[0].quote += '\n' + `The fictional ${ordinaryLabels[index].toLowerCase()} record preserves detailed source evidence. `.repeat(180)
     })
   }
-  input.dataKind = 'sample'
-  delete input.workspaceId
-  for (const target of input.targets) {
-    target.dataKind = 'sample'
-    target.rubricId = target.id
-    target.selection = null
-    target.snapshot = null
-  }
-  for (const comparison of input.comparisons) {
-    comparison.dataKind = 'sample'
-    comparison.candidate.documentSha256 = null
-    comparison.candidate.snapshot = null
-    comparison.resultSha256 = null
-    comparison.qualifications = []
-  }
   return input
 }
 
@@ -445,7 +429,7 @@ export function powerpointLayoutFixture(kind = 'single-long') {
     'The organization expects careful stewardship of captured evidence and a reviewable record of the decisions made during survey development and program delivery.',
   ].join(' ')
   input.targets = Array.from({ length: kind === 'multi-long' ? 2 : 1 }, (_, index) => ({
-    ...structuredClone(originalTarget), id: `target-${index}`, rubricId: `target-${index}`,
+    ...structuredClone(originalTarget), id: `target-${index}`,
     rubricVersion: index + 1, versionLabel: `Saved illustrative rubric v${index + 1}`,
     presentation: {
       title, organization, series: '1530', grade: index ? 'GS-13' : 'GS-12',
@@ -463,6 +447,22 @@ export function powerpointLayoutFixture(kind = 'single-long') {
     ...structuredClone(comparison), id: `comparison-${targetIndex * originals.length + candidateIndex}`,
     index: targetIndex * originals.length + candidateIndex, targetId: target.id,
   })))
+  for (const target of input.targets) {
+    target.rubricId = `rubric-${target.id}`
+    if (target.selection?.kind === 'job') {
+      target.selection = {
+        ...target.selection, jobId: `job-${target.id}`, rubricId: target.rubricId,
+        rubricVersion: target.rubricVersion, documentId: `requirement-${target.id}`,
+      }
+    }
+    target.snapshot = { snapshotId: `snapshot-${target.id}`, sha256: target.snapshot.sha256 }
+  }
+  for (const comparison of input.comparisons) {
+    for (const assessment of comparison.criteria) {
+      assessment.requirementCitations = assessment.requirementCitations.map(citation =>
+        ({ ...citation, documentId: `requirement-${comparison.targetId}`, locator: citation.locator.replace(/requirement-[^ ·]+/, `requirement-${comparison.targetId}`) }))
+    }
+  }
   return readyPptxFixture(input)
 }
 
@@ -477,7 +477,7 @@ export async function writePowerpointLayoutExamples(directory, kinds = ['single-
     const files = []
     for (const { kind, input } of inputs) {
       const report = foundation.api.buildAnalysisReport(input)
-      const bytes = await pptx.api.generatePptxReport(report, PPTX_SAMPLE_LINKS)
+      const bytes = await pptx.api.generatePptxReport(report, PPTX_TEST_LINKS)
       const path = join(directory, `powerpoint-layout-${kind}.pptx`)
       await writeFile(path, bytes)
       files.push({ path, slides: (await inspectPptx(bytes)).slides.length })
