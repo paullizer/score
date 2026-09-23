@@ -440,6 +440,15 @@ export interface RealAnalysisComparisonRecord extends AnalysisEntityBase, Analys
   qcDiagnostics?: AnalysisQcDiagnosticsReference
   // Read projection only; the original completed record remains immutable.
   resultRevision?: AnalysisResultRevision
+  // The admitted pin stays immutable; an explicit current-rules retry records the rules later attempts use.
+  settingsUpgrade?: AnalysisSettingsUpgrade
+}
+
+/** Processing rules an authorized user explicitly selected when retrying unfinished scoring work. */
+export interface AnalysisSettingsUpgrade {
+  processingSettings: ProcessingSettingsSnapshot
+  requestedAt: string
+  requestedBy: string
 }
 
 export interface RealAnalysisNarrativeRequestRecord extends AnalysisEntityBase, AnalysisWorkState {
@@ -535,6 +544,8 @@ export interface AnalysisActionHeaders {
 export interface RetryRealAnalysisInput {
   // Omitted means all failed/cancelled comparisons (or interrupted initialization), never completed results.
   comparisonIds?: string[]
+  // Re-pin the retried comparisons to the current processing rules instead of their admitted rules.
+  useCurrentRules?: boolean
 }
 
 // GET details are unwrapped; mutations return a versioned summary in these wrappers.

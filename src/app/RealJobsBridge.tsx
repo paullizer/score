@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { useLocation } from 'react-router-dom'
 import type { JobProcessingFeatures, RealJobDetail, RealJobSummary } from '../domain/real-jobs'
+import type { RubricAssistRequest } from '../domain/rubric-assist'
 import { CloudAccessChangedError, CloudApiError, CloudConflictError, LifecycleOperationError, workspaceAccessStamp } from '../services/cloudWorkspace'
 import {
   cancelRealJob,
@@ -17,6 +18,7 @@ import {
   saveRealJobRubric,
   getRealJobLifecycleImpact, changeRealJobLifecycle,
 } from '../services/realJobs'
+import { requestRubricAssist } from '../services/rubricAssist'
 import type { Rubric } from '../domain/types'
 import { WorkspaceContext, type CloudWorkspaceStatus, type PendingLifecycleChange, type RenameEntityTarget, type WorkspaceContextValue } from './workspace-context'
 import { getDisplayName } from '../domain/displayNames'
@@ -383,6 +385,17 @@ export function RealJobsBridge({
     }
   }
 
+  async function assistRubric(jobId: string, request: RubricAssistRequest, signal?: AbortSignal) {
+    const effectiveFeatures = features ? jobFeaturesWithPolicy(features, policy.settings) : null
+    if (effectiveFeatures?.rubricAssistant !== true) throw new Error('The rubric assistant is not available for this workspace.')
+    const detail = details[jobId]
+    if (detail?.state !== 'ready' || detail.value.job.dataKind !== 'real') throw new Error('Load this real job before asking the rubric assistant.')
+    if (detail.value.job.rubricDeletedAt || detail.value.rubricLifecycle?.deletingAt || detail.value.rubricLifecycle?.deletedAt) {
+      throw new Error('This job has no editable rubric for the assistant.')
+    }
+    return requestRubricAssist(workspaceId, jobId, request, signal)
+  }
+
   async function renameEntity(target: RenameEntityTarget, name: string, etag?: string) {
     if (target.kind !== 'job' || !workspace.jobs.some((job) => job.id === target.id)) {
       return base.renameEntity(target, name, etag)
@@ -469,6 +482,7 @@ export function RealJobsBridge({
     importMarkdown,
     importFile,
     importUrl,
+    assistRubric,
     originalUrl: (jobId) => realJobOriginalUrl(workspaceId, jobId),
   }
   const value: WorkspaceContextValue = {

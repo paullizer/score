@@ -51,6 +51,10 @@ for (const task of MODEL_TASK_IDS) {
 for (const key of ['jobImports', 'resumeImports', 'gradeLadders', 'newAnalyses', 'summaryGeneration']) {
   field(`features.${key}`, key.replace(/([A-Z])/g, ' $1'), 'intake', 'boolean', 'Policy does not enable unprovisioned services or bypass rollout verification; disabling new work never hides historical evidence.')
 }
+// Absent in revisions saved before the switch existed, so the metadata carries the effective default.
+field('features.rubricAssistant', 'Rubric AI assistant', 'intake', 'boolean',
+  'Lets workspace owners and editors ask AI to draft, rewrite and rebalance real job rubric criteria from the job posting. Each request sends the job text, the unsaved draft and the reviewer\'s instruction from the API to the job-rubric model binding. Nothing is saved until the reviewer saves; turning this off never changes saved rubrics.',
+  { defaultValue: true })
 field('maintenance.pauseNewWork', 'Pause new work', 'intake', 'boolean', 'Stops new imports, ladder generations, analyses and summaries, not accepted work, reads, cleanup or cancellation.')
 field('maintenance.explanation', 'Maintenance explanation', 'intake', 'text', 'Optional plain-text explanation.', { max: 1000 })
 for (const kind of ['jobs', 'resumes'] as const) {
@@ -154,6 +158,7 @@ for (const item of fields) {
     if (item.path.endsWith('.topP')) item.prerequisites.push('The selected deployment supports top-p; temperature is unset')
   }
   if (item.path.startsWith('features.')) item.prerequisites = ['Corresponding deployed services are available', 'New-work admission is not paused']
+  if (item.path === 'features.rubricAssistant') item.prerequisites = ['Real jobs and the job-rubric model deployment are configured', 'New-work admission is not paused']
   if (item.path.endsWith('.allowedFormats')) item.prerequisites = ['Corresponding import services are available', 'DOCX/DOC require verified Word rollout capability']
   if (item.path === 'documents.formattedDocxPreviewEnabled') item.prerequisites = ['The reader has an allowed original-download workspace role']
   if (item.path === 'summaries.allowManualPublication') item.prerequisites = ['Exact saved draft and required disclosure', 'Authorized source-workspace role']

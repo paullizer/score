@@ -3,12 +3,14 @@ import { processingSettingsSnapshotSchema } from '../../src/domain/admin-setting
 import { assertAcceptedPromptBinding } from '../settings/prompt-integrity'
 import { preservesProcessingSettings } from '../jobs/policy'
 import {
-  ANALYSIS_CORRECTION_POLICY_VERSION, ANALYSIS_LEGACY_CORRECTION_POLICY_VERSION, type AnalysisCorrectionHistoryEntry, type AnalysisCorrectionInput,
+  ANALYSIS_CORRECTION_POLICY_VERSION, ANALYSIS_LEGACY_CORRECTION_POLICY_VERSION, ANALYSIS_REASSESSMENT_POLICY_VERSION,
+  type AnalysisCorrectionHistoryEntry, type AnalysisCorrectionInput,
   type AnalysisCorrectionPolicyVersion, type AnalysisCorrectionProposal, type RealAnalysisCorrectionRecord,
 } from '../../src/domain/analysis-corrections'
 import { isPersonalTraitCriterion, missingEvidenceCriterion } from '../../src/domain/analysis-evidence-policy'
 import type {
-  FrozenRealAnalysisTargetSnapshot, RealAnalysisAssessmentOutput, RealAnalysisGroundingReview, RealAnalysisResult, RealCriterionResult,
+  FrozenRealAnalysisTargetSnapshot, RealAnalysisAssessmentOutput, RealAnalysisGroundingReview, RealAnalysisResult,
+  RealAnalysisResultSummary, RealCriterionResult,
 } from '../../src/domain/real-analyses'
 import { WORKSPACE_ID_PATTERN } from '../ids'
 import {
@@ -39,8 +41,8 @@ const proposalSchema = z.strictObject({
   originalResultSha256: hash, baseResult: analysisJsonReferenceSchema, baseAttemptId: z.string().uuid(),
   baseRevision: analysisResultRevisionSchema.optional(),
   resumeSnapshot: analysisSnapshotIdentitySchema, targetSnapshot: analysisSnapshotIdentitySchema,
-  provenance: analysisCorrectionProvenanceSchema, assessment: analysisAssessmentOutputSchema,
-  summary: analysisResultSummarySchema,
+  provenance: analysisCorrectionProvenanceSchema, assessment: analysisAssessmentOutputSchema.optional(),
+  summary: analysisResultSummarySchema.optional(),
 })
 const historySchema = z.strictObject({
   ...identity, id: z.string().uuid(), attemptId: z.string().uuid().optional(),
@@ -62,7 +64,13 @@ export function analysisCorrectionFingerprint(
 export function parseAnalysisCorrectionProposal(value: unknown): AnalysisCorrectionProposal {
   assertAnalysis(Buffer.byteLength(JSON.stringify(value) ?? '') <= MAX_ANALYSIS_JSON_BYTES, 'Correction proposal exceeds its limit.')
   const parsed = proposalSchema.parse(value)
-  const proposal: AnalysisCorrectionProposal = { ...parsed, assessment: parseAnalysisAssessmentOutput(parsed.assessment) }
+  const reassessment = parsed.provenance.policyVersion === ANALYSIS_REASSESSMENT_POLICY_VERSION
+  assertAnalysis(reassessment ? !parsed.assessment && !parsed.summary : Boolean(parsed.assessment && parsed.summary),
+    'A missing-evidence correction must carry its deterministic proposal; a full re-score must not.')
+  const { assessment: proposed, ...fields } = parsed
+  const proposal: AnalysisCorrectionProposal = {
+    ...fields, ...(proposed ? { assessment: parseAnalysisAssessmentOutput(proposed) } : {}),
+  }
   assertAnalysis(proposal.requestId === proposal.provenance.requestId &&
     proposal.createdAt === proposal.provenance.requestedAt &&
     proposal.originalResultSha256 === proposal.provenance.originalResultSha256 &&
@@ -71,10 +79,22 @@ export function parseAnalysisCorrectionProposal(value: unknown): AnalysisCorrect
       policyVersion: proposal.provenance.policyVersion,
       resultSha256: proposal.baseResult.sha256, criterionIds: proposal.provenance.criterionIds, reason: proposal.provenance.reason,
     }, proposal.provenance.requestedBy), 'Correction proposal has inconsistent request bindings.')
-  assertAnalysis(analysisHash(proposal.summary) === analysisHash(calculateAnalysisSummary(
-    proposal.assessment.criteria, proposal.assessment.qualifications, proposal.assessment.limitations,
-  )), 'Correction preview was not calculated from the exact proposed assessment.')
+  if (!reassessment) {
+    const { assessment, summary } = correctionProposalAssessment(proposal)
+    assertAnalysis(analysisHash(summary) === analysisHash(calculateAnalysisSummary(
+      assessment.criteria, assessment.qualifications, assessment.limitations,
+    )), 'Correction preview was not calculated from the exact proposed assessment.')
+  }
   return proposal
+}
+
+/** The deterministic assessment and total of a missing-evidence correction; full re-scores have none. */
+export function correctionProposalAssessment(
+  proposal: AnalysisCorrectionProposal,
+): { assessment: RealAnalysisAssessmentOutput; summary: RealAnalysisResultSummary } {
+  assertAnalysis(proposal.provenance.policyVersion !== ANALYSIS_REASSESSMENT_POLICY_VERSION && proposal.assessment && proposal.summary,
+    'Only a missing-evidence correction has a deterministic proposed assessment.')
+  return { assessment: proposal.assessment, summary: proposal.summary }
 }
 
 export function assertAnalysisCorrectionProposalBinding(
@@ -113,19 +133,77 @@ export function parseAnalysisCorrectionHistoryEntry(value: unknown): AnalysisCor
 }
 
 export function assertCorrectionReviewBinding(
-  review: RealAnalysisGroundingReview, proposal: AnalysisCorrectionProposal,
+  review: RealAnalysisGroundingReview, proposal: AnalysisCorrectionProposal, reassessedAssessmentSha256?: string,
 ): void {
   analysisGroundingReviewSchema.parse(review)
+  const policyVersion = proposal.provenance.policyVersion
+  const reassessment = policyVersion === ANALYSIS_REASSESSMENT_POLICY_VERSION
   assertAcceptedPromptBinding(review.provenance.prompt, proposal.processingSettings?.promptBundle,
-    proposal.provenance.policyVersion === ANALYSIS_CORRECTION_POLICY_VERSION ? 'evidenceGapReview' : 'assessmentGrounding')
-  assertAnalysis(review.assessmentSha256 === analysisHash(proposal.assessment) &&
+    policyVersion === ANALYSIS_CORRECTION_POLICY_VERSION ? 'evidenceGapReview' : 'assessmentGrounding')
+  const assessmentSha256 = reassessment
+    ? reassessedAssessmentSha256
+    : analysisHash(correctionProposalAssessment(proposal).assessment)
+  assertAnalysis(Boolean(assessmentSha256) && review.assessmentSha256 === assessmentSha256 &&
     review.resumeSnapshotSha256 === proposal.resumeSnapshot.sha256 &&
     review.targetSnapshotSha256 === proposal.targetSnapshot.sha256,
   'Correction review does not bind the exact proposed assessment and frozen inputs.')
-  assertAnalysis(proposal.provenance.policyVersion === ANALYSIS_CORRECTION_POLICY_VERSION
+  assertAnalysis(policyVersion === ANALYSIS_CORRECTION_POLICY_VERSION
     ? Boolean(review.scope && review.scope.baseAssessmentSha256 === proposal.provenance.baseAssessmentSha256 &&
       analysisHash([...review.scope.criterionIds].sort()) === analysisHash([...proposal.provenance.criterionIds].sort()))
     : !review.scope, 'Correction review scope differs from the explicitly requested policy, base, or criteria.')
+}
+
+/** The positively weighted criteria that left this total withheld; a full re-score is requested for exactly these. */
+export function reassessmentCriterionIds(result: RealAnalysisAssessmentOutput): string[] {
+  return result.criteria.filter(row => row.evidenceStatus === 'not-assessed' && row.weight > 0).map(row => row.criterionId)
+}
+
+export function reassessmentBlockedReason(
+  result: RealAnalysisAssessmentOutput & Pick<RealAnalysisResult, 'overall'>, target: FrozenRealAnalysisTargetSnapshot,
+): string | null {
+  if (result.overall.score !== null) return 'Only a comparison whose total is withheld can be re-scored in place.'
+  const criterionIds = reassessmentCriterionIds(result)
+  if (!criterionIds.length) return 'No weighted criterion is waiting for a score; the total is withheld for another reason.'
+  const rubric = target.kind === 'job' ? target.rubric : target.version.rubric
+  const traits = criterionIds.every(id => {
+    const definition = rubric.criteria.find(row => row.id === id)
+    assertAnalysis(definition, 'Re-score criterion is absent from its frozen rubric.')
+    return isPersonalTraitCriterion(definition.label, definition.description)
+  })
+  return traits ? 'Only personal-trait safeguards withhold this total; Score does not infer those from a resume.' : null
+}
+
+/** Binds a full re-score request to the exact withheld result it replaces. */
+export function assertReassessmentProposal(
+  proposal: AnalysisCorrectionProposal, base: RealAnalysisResult, target: FrozenRealAnalysisTargetSnapshot,
+): void {
+  assertAnalysis(proposal.provenance.policyVersion === ANALYSIS_REASSESSMENT_POLICY_VERSION && !proposal.assessment &&
+    !proposal.summary && proposal.provenance.baseAssessmentSha256 === base.provenance.assessmentSha256 &&
+    reassessmentBlockedReason(base, target) === null &&
+    analysisHash(proposal.provenance.criterionIds) === analysisHash(reassessmentCriterionIds(base)),
+  'Re-score request no longer matches the withheld criteria of its base result.')
+}
+
+/** A re-scored result must be a fresh, supported full-pipeline result produced with the request's captured rules. */
+export function assertReassessmentResult(result: RealAnalysisResult, proposal: AnalysisCorrectionProposal): void {
+  const { provenance } = result
+  const supported = provenance.groundingReviews.at(-1)
+  assertAnalysis(proposal.provenance.policyVersion === ANALYSIS_REASSESSMENT_POLICY_VERSION && provenance.correction &&
+    analysisHash(provenance.correction) === analysisHash(proposal.provenance) &&
+    result.comparisonId === proposal.comparisonId && result.runId === proposal.runId &&
+    result.workspaceId === proposal.workspaceId && provenance.manifestSha256 === proposal.manifestSha256 &&
+    analysisHash(provenance.resumeSnapshot) === analysisHash(proposal.resumeSnapshot) &&
+    analysisHash(provenance.targetSnapshot) === analysisHash(proposal.targetSnapshot) &&
+    provenance.assessment.startedAt >= proposal.createdAt &&
+    provenance.groundingReviews.every(review => !review.scope && review.provenance.startedAt >= proposal.createdAt &&
+      review.provenance.completedAt <= result.createdAt) &&
+    supported?.outcome === 'supported' && supported.issues.length === 0,
+  'Re-scored result is not a fresh, supported assessment of the exact frozen inputs.')
+  assertAcceptedPromptBinding(provenance.assessment.prompt, proposal.processingSettings?.promptBundle, 'assessment')
+  for (const review of provenance.groundingReviews) {
+    assertAcceptedPromptBinding(review.provenance.prompt, proposal.processingSettings?.promptBundle, 'assessmentGrounding')
+  }
+  assertCorrectionReviewBinding(supported, proposal, provenance.assessmentSha256)
 }
 
 export function correctionBlockedReason(
@@ -169,8 +247,9 @@ export function buildEvidenceCorrectionAssessment(
 export function assertEvidenceCorrectionAssessment(
   proposal: AnalysisCorrectionProposal, base: RealAnalysisResult, target: FrozenRealAnalysisTargetSnapshot,
 ): void {
+  const { assessment } = correctionProposalAssessment(proposal)
   assertAnalysis(proposal.provenance.baseAssessmentSha256 === base.provenance.assessmentSha256 &&
-    analysisHash(proposal.assessment) === analysisHash(buildEvidenceCorrectionAssessment(
+    analysisHash(assessment) === analysisHash(buildEvidenceCorrectionAssessment(
       base, target, proposal.provenance.criterionIds,
       proposal.provenance.policyVersion,
     )), 'Correction changed an unrelated score, weight, qualification, evidence citation, or limitation.')

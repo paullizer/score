@@ -353,17 +353,7 @@ export function rejectsCode(code, stage, retryable) {
   }
 }
 
-export function assertStrictSchema(schema) {
-  if (!schema || typeof schema !== 'object') return
-  if (schema.type === 'object') {
-    assert.equal(schema.additionalProperties, false)
-    assert.deepEqual([...schema.required].sort(), Object.keys(schema.properties).sort())
-  }
-  for (const value of Object.values(schema)) {
-    if (Array.isArray(value)) value.forEach(assertStrictSchema)
-    else assertStrictSchema(value)
-  }
-}
+export { assertStrictSchema } from './strict-schema-test-support.mjs'
 
 export function expandReviewedOutput(body) {
   if (!body.referenceEncoding) return body.output

@@ -354,7 +354,7 @@ export function normalizeText(value: string): string {
     .trim()
 }
 
-function meaningfulText(value: string, minimumLength = 2): boolean {
+export function meaningfulText(value: string, minimumLength = 2): boolean {
   const text = normalizeText(value)
   return text.length >= minimumLength && /[\p{L}\p{N}]/u.test(text)
 }
@@ -1212,7 +1212,7 @@ export interface GeneratedRubric {
   responseModel: string
 }
 
-function modelSource(document: SourceDocument): string {
+export function modelSource(document: SourceDocument): string {
   return `<document title="${JSON.stringify(document.title)}">\n${document.paragraphs.map(paragraph =>
     `<paragraph id="${paragraph.id}" page="${paragraph.page}" heading="${JSON.stringify(paragraph.heading)}">${paragraph.text}</paragraph>`,
   ).join('\n')}\n</document>`
@@ -1258,7 +1258,15 @@ export interface StructuredModelRequest {
   onRetry?: (failure: WorkerError) => Promise<void>
 }
 
-const PROTECTED_CRITERION = /\b(age|race|racial|ethnicity|ethnic|religion|religious|sex|gender|pregnan|disab|marital|national origin|citizenship|sexual orientation|veteran|genetic)\b/i
+export const PROTECTED_CRITERION = /\b(age|race|racial|ethnicity|ethnic|religion|religious|sex|gender|pregnan|disab|marital|national origin|citizenship|sexual orientation|veteran|genetic)\b/i
+
+export function missingGuidanceAnchorScores(guidance: string): number[] {
+  const missing: number[] = []
+  for (let score = 0; score <= 5; score += 1) {
+    if (!new RegExp(`(?:^|\\D)${score}(?:\\D|$)`).test(guidance)) missing.push(score)
+  }
+  return missing
+}
 
 export function validateModelRubric(value: unknown, document: SourceDocument, maxCriteria: number = JOB_IMPORT_LIMITS.maxCriteria): string[] {
   const errors: string[] = []
@@ -1289,12 +1297,7 @@ export function validateModelRubric(value: unknown, document: SourceDocument, ma
     if (PROTECTED_CRITERION.test(`${criterion.label ?? ''} ${criterion.description ?? ''}`)) {
       errors.push(`Criterion ${index + 1} improperly weights a protected or questionable personal characteristic.`)
     }
-    const guidance = criterion.guidance ?? ''
-    for (let score = 0; score <= 5; score += 1) {
-      if (!new RegExp(`(?:^|\\D)${score}(?:\\D|$)`).test(guidance)) {
-        errors.push(`Criterion ${index + 1} guidance does not anchor score ${score}.`)
-      }
-    }
+    for (const score of missingGuidanceAnchorScores(criterion.guidance ?? '')) errors.push(`Criterion ${index + 1} guidance does not anchor score ${score}.`)
   })
   if (total !== 100) errors.push(`Criterion weights total ${total}, not 100.`)
   for (const field of ['title', 'organization', 'location', 'arrangement', 'employmentType', 'grade', 'series'] as const) {

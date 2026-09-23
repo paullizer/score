@@ -7,11 +7,23 @@ import type { ProcessingSettingsSnapshot } from './admin-settings'
 
 export const ANALYSIS_LEGACY_CORRECTION_POLICY_VERSION = 'missing-evidence-zero-v1' as const
 export const ANALYSIS_CORRECTION_POLICY_VERSION = 'missing-evidence-zero-v2' as const
+/**
+ * Re-scores a withheld comparison end to end (assessment, evidence-gap review, and full grounding review) with the
+ * processing rules current when the request is made. Its criterion IDs name the unassessed weighted criteria that
+ * withheld the total; every criterion is still reassessed against the same frozen resume and rubric.
+ */
+export const ANALYSIS_REASSESSMENT_POLICY_VERSION = 'full-reassessment-v1' as const
 export const ANALYSIS_CORRECTION_POLICY_VERSIONS = [
-  ANALYSIS_LEGACY_CORRECTION_POLICY_VERSION, ANALYSIS_CORRECTION_POLICY_VERSION,
+  ANALYSIS_LEGACY_CORRECTION_POLICY_VERSION, ANALYSIS_CORRECTION_POLICY_VERSION, ANALYSIS_REASSESSMENT_POLICY_VERSION,
 ] as const
 export type AnalysisCorrectionPolicyVersion = typeof ANALYSIS_CORRECTION_POLICY_VERSIONS[number]
 export const ANALYSIS_CORRECTION_LIMITS = { maxCriteria: 20, historyPageSize: 12, maxHistoryEntries: 1000 } as const
+
+export function isAnalysisReassessmentPolicy(
+  policyVersion: AnalysisCorrectionPolicyVersion | undefined,
+): policyVersion is typeof ANALYSIS_REASSESSMENT_POLICY_VERSION {
+  return policyVersion === ANALYSIS_REASSESSMENT_POLICY_VERSION
+}
 
 export interface AnalysisResultRevision {
   id: string
@@ -90,8 +102,9 @@ export interface AnalysisCorrectionProposal {
   resumeSnapshot: { snapshotId: string; sha256: string }
   targetSnapshot: { snapshotId: string; sha256: string }
   provenance: AnalysisCorrectionProvenance
-  assessment: RealAnalysisAssessmentOutput
-  summary: RealAnalysisResultSummary
+  /** The deterministic missing-evidence proposal. Absent for a full re-score, whose assessment is produced by the worker. */
+  assessment?: RealAnalysisAssessmentOutput
+  summary?: RealAnalysisResultSummary
 }
 
 export interface AnalysisCorrectionHistoryEntry {
@@ -159,6 +172,13 @@ export interface AnalysisCorrectionPreview {
     eligible: boolean
     blockedReason: string | null
   }[]
+  /** Whether this withheld comparison can be re-scored end to end with the current rules instead. */
+  reassessment: {
+    policyVersion: typeof ANALYSIS_REASSESSMENT_POLICY_VERSION
+    eligible: boolean
+    blockedReason: string | null
+    criterionIds: string[]
+  }
   correction: AnalysisCorrectionSummary | null
 }
 
@@ -176,11 +196,13 @@ export interface AnalysisCorrectionHistoryPage {
     createdAt: string
     requestId: string
     outcome: AnalysisCorrectionHistoryEntry['outcome']
+    policyVersion: AnalysisCorrectionPolicyVersion
     requestedBy: string
     reason: string
     criterionIds: string[]
     beforeResultSha256: string
-    after: RealAnalysisResultSummary
+    /** The proposed or published total. Null for a re-score that did not publish, because it has no deterministic proposal. */
+    after: RealAnalysisResultSummary | null
     review: Pick<RealAnalysisGroundingReview, 'outcome' | 'issues' | 'scope'> | null
     error: AnalysisProcessingError | null
     resultSha256: string | null

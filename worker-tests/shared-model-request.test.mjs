@@ -75,6 +75,24 @@ test('shared model preserves refusal, empty-response, failure and cancellation e
   }, request, controller.signal), error => error.code === 'cancelled')
 })
 
+test('shared model refuses a response schema strict mode would reject before acquiring a token or calling Azure', async () => {
+  const unions = { oneOf: [{ type: 'string' }, { type: 'null' }] }
+  for (const [invalid, path] of [
+    [{ ...schema, properties: { supported: unions }, required: ['supported'] }, '/properties/supported/oneOf'],
+    [{ ...schema, required: [] }, '/required'],
+    [{ ...schema, additionalProperties: true }, '/additionalProperties'],
+    [{ type: 'array', items: schema }, '/'],
+  ]) {
+    await assert.rejects(invokeStructuredModel({
+      ...options,
+      getToken: async () => assert.fail('An invalid schema cannot acquire a model token'),
+      fetch: async () => assert.fail('An invalid schema cannot be sent to the model'),
+    }, { ...request, schema: invalid }), error => error.code === 'model-schema-invalid' && error.retryable === false &&
+      error.message.includes(request.name) && error.message.includes(`at ${path}:`) &&
+      error.message.includes('retrying will not help'))
+  }
+})
+
 test('job paragraph extraction still enforces its unchanged 50-page guard', () => {
   assert.throws(() => documentIntelligenceParagraphs({
     status: 'succeeded',

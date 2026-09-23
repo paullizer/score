@@ -12,7 +12,7 @@ import autoprefixer from 'autoprefixer'
 import tailwindConfig from '../../tailwind.config.js'
 import {
   correctionFixture, correctionPreview, correctionSummary, correctionHistory, publishCorrectionFixture,
-  correctionPolicy, correctionLegacyPolicy, correctionGapReview, correctionEvidence,
+  correctionPolicy, correctionLegacyPolicy, correctionGapReview, correctionEvidence, reassessmentPolicy,
 } from './analysisCorrections.synthetic.test-support.mjs'
 import { summarySubjectResponse, summaryHistoryFixture } from './analysisSummaries.test-support.mjs'
 
@@ -258,16 +258,19 @@ async function setup(t, {
 
 const postRequests = state => state.requests.filter(request => request.method === 'POST' && request.path.endsWith('/corrections'))
 const historyRequests = state => state.requests.filter(request => request.path.endsWith('/corrections/history'))
-async function openReview(page, single = false) {
+async function openReview(page, single = false, action = 'missing-evidence') {
   await page.getByRole('button', { name: single ? /^(Review this withheld score|Manage current correction)$/ : /^Review withheld scores \(/ }).click()
   const dialog = page.getByRole('dialog', { name: 'Review withheld scores', exact: true })
   await dialog.waitFor()
   await until(async () => await dialog.getByText('Loading read-only preview…', { exact: true }).count() === 0, 'Previews should finish.')
+  assert.equal(await dialog.getByRole('radio', { name: /^Re-score with the current rules \(recommended\)/ }).isChecked(), true)
+  if (action === 'missing-evidence') await dialog.getByRole('radio', { name: /^Record verified missing evidence as 0 \/ 5/ }).check()
   return dialog
 }
-async function confirm(dialog, count) {
+async function confirm(dialog, count, action = 'missing-evidence') {
+  const noun = `${count} ${count === 1 ? 'comparison' : 'comparisons'}`
   await dialog.getByRole('checkbox', { name: /^I reviewed all/ }).check()
-  await dialog.getByRole('button', { name: `Confirm review for ${count} ${count === 1 ? 'comparison' : 'comparisons'}`, exact: true }).click()
+  await dialog.getByRole('button', { name: action === 'reassess' ? `Re-score ${noun}` : `Confirm review for ${noun}`, exact: true }).click()
 }
 
 test('run action reviews all available withheld comparisons beyond 25, limits preview concurrency, and discloses every blocked or failed item without writing', async t => {
@@ -626,6 +629,74 @@ test('all 21 verified gap corrections become published server revisions without 
   await dialog.getByRole('button', { name: 'Close', exact: true }).click()
   await page.getByRole('button', { name: 'Review withheld scores (0)', exact: true }).waitFor()
   assert.equal(await page.getByRole('button', { name: 'Review withheld scores (0)', exact: true }).isEnabled(), false)
+})
+
+test('re-score is the recommended default: it covers withheld comparisons the zero policy cannot and sends only the full-reassessment policy', async t => {
+  const { page, state } = await setup(t, { fixture: correctionFixture({ withheld: 3, numeric: 1, failed: 1 }) })
+  const untouched = structuredClone(state.fixture.details.slice(3))
+  state.blocked.add('synthetic-comparison-2')
+  state.onStatus = async id => {
+    const previous = state.heads.get(id)
+    if (previous?.status !== 'queued') return
+    const ready = correctionSummary(state.fixture, id, {
+      status: 'ready', requestId: previous.requestId, reason: previous.reason, policyVersion: previous.policyVersion,
+    })
+    state.heads.set(id, ready)
+    publishCorrectionFixture(state.fixture, ready)
+  }
+  const dialog = await openReview(page, false, 'reassess')
+  const reason = dialog.getByLabel('Reason recorded in the audit history')
+  let text = await dialog.innerText()
+  assert.match(text, /3 selected · 0 loading previews · 0 not eligible for a re-score · 0 with errors/)
+  assert.match(text, /Re-score policy: full-reassessment-v1/)
+  assert.match(text, /Determined by the re-score\. No total is predicted before the AI runs\./)
+  assert.doesNotMatch(text, /Proposed: not assessed → missing evidence/)
+  assert.match(await reason.inputValue(), /^Re-score this withheld comparison with the current processing rules/)
+  await dialog.getByRole('radio', { name: /^Record verified missing evidence as 0 \/ 5/ }).check()
+  text = await dialog.innerText()
+  assert.match(text, /2 selected · 0 loading previews · 1 without selectable criteria · 0 with errors/)
+  assert.match(await reason.inputValue(), /^Apply the missing-evidence policy/)
+  await dialog.getByRole('radio', { name: /^Re-score with the current rules \(recommended\)/ }).check()
+  assert.match(await dialog.innerText(), /3 selected · 0 loading previews · 0 not eligible for a re-score · 0 with errors/)
+  assert.match(await reason.inputValue(), /^Re-score this withheld comparison/)
+  assert.equal(postRequests(state).length, 0)
+  await confirm(dialog, 3, 'reassess')
+  await dialog.getByText('Saved server status: 0 queued · 0 running · 3 published · 0 failed · 0 cancelled.', { exact: true }).waitFor()
+  assert.equal(postRequests(state).length, 3)
+  assert.equal(new Set(postRequests(state).map(item => item.headers['idempotency-key'])).size, 3)
+  assert.ok(postRequests(state).every(item => item.body.policyVersion === reassessmentPolicy &&
+    item.body.criterionIds.join() === 'criterion-one' && item.body.reason.startsWith('Re-score this withheld comparison')))
+  assert.equal(await dialog.getByText('Re-score published', { exact: true }).count(), 3)
+  assert.ok(state.fixture.details.slice(0, 3).every(item => item.comparison.resultRevision.policyVersion === reassessmentPolicy))
+  assert.deepEqual(state.fixture.details.slice(3), untouched)
+})
+
+test('a published re-score is labelled as a re-scored revision in the detail and in its private history', async t => {
+  const { page, state } = await setup(t, { result: true })
+  state.onStatus = async id => {
+    const previous = state.heads.get(id)
+    if (previous?.status !== 'queued') return
+    const ready = correctionSummary(state.fixture, id, {
+      status: 'ready', requestId: previous.requestId, reason: previous.reason, policyVersion: previous.policyVersion,
+    })
+    state.heads.set(id, ready)
+    state.histories.set(id, correctionHistory(state.fixture, id, { correction: ready }))
+    publishCorrectionFixture(state.fixture, ready)
+  }
+  const dialog = await openReview(page, true, 'reassess')
+  await confirm(dialog, 1, 'reassess')
+  await dialog.getByText('Re-score published', { exact: true }).waitFor()
+  assert.equal(postRequests(state)[0].body.policyVersion, reassessmentPolicy)
+  await dialog.getByRole('button', { name: 'Close', exact: true }).click()
+  await page.getByText('Current re-scored revision', { exact: true }).waitFor()
+  assert.equal(await page.getByText('Current reviewed correction revision', { exact: true }).count(), 0)
+  await page.getByRole('button', { name: 'Original result and correction history', exact: true }).click()
+  const history = page.getByRole('region', { name: 'Private original result and correction history', exact: true })
+  await history.getByText('Published re-scored revision', { exact: true }).waitFor()
+  assert.match(await history.innerText(), /policy full-reassessment-v1/)
+  assert.match(await history.innerText(), /Published server total[\s\S]*0/)
+  assert.match(await history.innerText(), /Re-score grounding review: supported/)
+  assert.doesNotMatch(await history.innerText(), /Legacy full-assessment grounding review/)
 })
 
 async function failedReview(t, { legacy = false, result = false } = {}) {

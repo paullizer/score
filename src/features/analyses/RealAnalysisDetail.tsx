@@ -48,12 +48,21 @@ export function RealComparisonActions({ summary }: { summary: RealAnalysisCompar
     try { await api[action](pair.runId, pair.id, summary.etag) }
     catch (caught) { setError(caught instanceof Error ? caught.message : 'The comparison request could not be acknowledged.') }
   }
+  async function retryWithCurrentRules() {
+    if (!api || !run || !canEdit || api.pending(pair.runId) || cancelling) return
+    setError('')
+    try { await api.retry(pair.runId, { comparisonIds: [pair.id], useCurrentRules: true }, run.etag) }
+    catch (caught) { setError(caught instanceof Error ? caught.message : 'The comparison request could not be acknowledged.') }
+  }
   return <div className="space-y-2"><div className="flex flex-wrap gap-2">
     {active && <Button size="sm" variant="ghost" icon={X} disabled={!canEdit || !api?.canWrite || api.pending(pair.runId) || api.phase !== 'ready' || cancelling}
       aria-label={`Cancel comparison ${pair.index + 1}`} onClick={() => void act('cancelComparison')}>Cancel pair</Button>}
     {canRetry && <Button size="sm" icon={RotateCcw} disabled={!canEdit || !api?.canWrite || api.pending(pair.runId) || api.phase !== 'ready' || cancelling}
       title={cancelling ? 'Wait for the server to finish cancelling the run before retrying a saved pair.' : 'Explicitly retry this comparison with the same frozen inputs, even when automatic retries have stopped.'}
       aria-label={`Retry comparison ${pair.index + 1} with saved inputs`} onClick={() => void act('retryComparison')}>Retry saved pair</Button>}
+    {canRetry && run && <Button size="sm" variant="ghost" icon={RotateCcw} disabled={!canEdit || !api?.canWrite || api.pending(pair.runId) || api.phase !== 'ready' || cancelling}
+      title="Retry this comparison with the same frozen inputs and the processing rules, models, and prompts in effect now. Its original settings stay recorded."
+      aria-label={`Retry comparison ${pair.index + 1} with current rules`} onClick={() => void retryWithCurrentRules()}>Retry with current rules</Button>}
   </div>{cancelling && <p className="text-[10px] text-muted">{paused ? 'Resume the paused run cancellation before retrying individual pairs.' : 'Run cancellation is still being finalized.'}</p>}{error && <InlineError>{error}</InlineError>}</div>
 }
 
@@ -66,11 +75,13 @@ function RealRunActions({ summary }: { summary: RealAnalysisRunSummary }) {
   const paused = realAnalysisCancellationPaused(summary)
   const active = ['initializing', 'queued', 'running'].includes(run.status)
   const canRetry = run.progress.failed > 0 || run.progress.cancelled > 0 || ['failed', 'cancelled'].includes(run.status)
-  async function act(action: 'retry' | 'cancel') {
+  const canRetryCurrent = run.progress.initialized >= run.progress.total && (run.progress.failed > 0 || run.progress.cancelled > 0)
+  async function act(action: 'retry' | 'retryCurrent' | 'cancel') {
     if (!canEdit || api.pending(run.id) || (cancelling && (!paused || action !== 'retry'))) return
     setError('')
     try {
       if (action === 'retry') await api.retry(run.id, {}, summary.etag)
+      else if (action === 'retryCurrent') await api.retry(run.id, { useCurrentRules: true }, summary.etag)
       else await api.cancel(run.id, summary.etag)
     } catch (caught) { setError(caught instanceof Error ? caught.message : 'This run request could not be acknowledged.') }
   }
@@ -81,6 +92,9 @@ function RealRunActions({ summary }: { summary: RealAnalysisRunSummary }) {
       onClick={() => void act('retry')}>Resume cancellation</Button> : canRetry && <Button icon={RotateCcw} disabled={!canEdit || !api.canWrite || api.pending(run.id) || api.phase !== 'ready' || cancelling}
       title={cancelling ? 'Cancellation must finish before a saved run can be retried.' : 'Explicitly retry failed or cancelled comparisons with their saved inputs. Completed results are unchanged.'}
       onClick={() => void act('retry')}>Retry failed / cancelled</Button>}
+    {!paused && canRetryCurrent && <Button variant="ghost" icon={RotateCcw} disabled={!canEdit || !api.canWrite || api.pending(run.id) || api.phase !== 'ready' || cancelling}
+      title={cancelling ? 'Cancellation must finish before a saved run can be retried.' : 'Retry failed or cancelled comparisons with their saved inputs and the processing rules, models, and prompts in effect now. Their original settings stay recorded, and completed results are unchanged.'}
+      onClick={() => void act('retryCurrent')}>Retry with current rules</Button>}
   </div>{cancelling && <p className="text-[11px] text-muted" role="status">{paused
     ? 'Cancellation stopped after a processing error. Resume the saved cleanup explicitly; scoring will remain stopped and completed results will stay unchanged.'
     : 'Cancellation accepted. The server is still marking unfinished comparisons; retry becomes available when that work finishes.'}</p>}{error && <InlineError>{error}</InlineError>}</div>

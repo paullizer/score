@@ -17,11 +17,18 @@ export function SettingsField({ field, settings, saved, defaults, errors, onChan
   errors: SettingsFieldError[]; onChange: (path: string, value: unknown) => void; disabled?: boolean
 }) {
   const id = useId()
-  const value = settingValue(settings, field.path)
-  const defaultValue = settingValue(defaults, field.path)
+  // Optional settings are absent from revisions saved before they existed; show and compare their effective default.
+  // Only undefined falls back: null is a deliberate "not set" value for several settings.
+  const compiledDefault = settingValue(defaults, field.path)
+  const defaultValue = compiledDefault === undefined ? field.defaultValue : compiledDefault
+  const effective = (source: AdminSettings) => {
+    const found = settingValue(source, field.path)
+    return found === undefined ? defaultValue : found
+  }
+  const value = effective(settings)
   const fieldErrors = errors.filter(error => error.path === field.path || error.path.startsWith(`${field.path}.`))
   const common = { id, 'aria-describedby': `${id}-help`, 'aria-invalid': fieldErrors.length ? true as const : undefined, disabled: disabled || field.classification === 'read-only' }
-  const changed = JSON.stringify(value) !== JSON.stringify(settingValue(saved, field.path))
+  const changed = JSON.stringify(value) !== JSON.stringify(effective(saved))
   const nullable = field.path.endsWith('.temperature') || field.path.endsWith('.topP') || field.path.endsWith('.reasoningEffort') || field.path.endsWith('.deploymentId') || field.path === 'reports.defaultFormat'
   const byteDisplay = field.units?.startsWith('bytes') && !field.path.includes('inputBudget')
   let options = field.options ?? []

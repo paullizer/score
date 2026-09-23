@@ -84,11 +84,17 @@ export function analysisFailureExplanation(error: AnalysisProcessingError): { ti
       nextAction: 'Reload the saved comparison and inspect the available sources. Ask a workspace administrator to investigate snapshot availability before retrying; use a new analysis for changed inputs.',
     }
     case 'service-unavailable':
-    case 'timeout': return {
-      title: error.code === 'timeout' ? 'Processing did not finish in time' : 'A processing service was unavailable',
-      explanation: 'The service could not finish this attempt. A transport or availability failure says nothing about the evidence match.',
-      nextAction: 'Check the saved retry state. If automatic work has stopped, an explicit saved-pair retry can try again when the service is available.',
-    }
+    case 'timeout':
+      if (error.code === 'service-unavailable' && !error.retryable) return {
+        title: 'The AI service rejected the request',
+        explanation: 'The AI service refused Score\'s request before the model read the documents. This points to a Score configuration or software problem. It says nothing about the evidence match.',
+        nextAction: 'Ask a workspace administrator to review the recorded message and worker logs. Retrying the same request will not help until the problem is fixed.',
+      }
+      return {
+        title: error.code === 'timeout' ? 'Processing did not finish in time' : 'A processing service was unavailable',
+        explanation: 'The service could not finish this attempt. A transport or availability failure says nothing about the evidence match.',
+        nextAction: 'Check the saved retry state. If automatic work has stopped, an explicit saved-pair retry can try again when the service is available.',
+      }
     case 'storage-error': return {
       title: 'Processing could not save or retrieve required data',
       explanation: 'A storage operation failed. Even a readable draft is not a published assessment or a score.',

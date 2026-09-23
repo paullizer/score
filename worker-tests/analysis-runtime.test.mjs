@@ -22,7 +22,7 @@ await build({
 })
 const { runAnalysisWorker, processClaimedComparison } = await import(pathToFileURL(bundle).href)
 after(async () => { await unlink(bundle) })
-const { createCompiledPromptBaseline } = await loadWorker('../server/settings/prompts.ts')
+const { createCompiledPromptBaseline, createPromptCandidate } = await loadWorker('../server/settings/prompts.ts')
 const qc = await loadWorker('../server/analyses/qc-diagnostics.ts')
 
 function pinnedRunFixture() {
@@ -1143,6 +1143,40 @@ test('missing snapshot retries stop after three attempts; manual retry uses orig
   assert.deepEqual(f.analysis.blobs.values.get(completed.record.result.blobName), historical)
   const detail = await f.service.comparisonDetail(f.workspaceId, created.run.id, first.record.id)
   assertLosslessResume(mock.calls.at(-2).body.input.resume, detail.resumeSnapshot.document)
+})
+
+test('a current-rules retry scores stopped work with the recorded rules and prompts while the admitted pin stays immutable', async () => {
+  const f = pinnedRunFixture(), created = await createRun(f)
+  const [pair] = comparisons(f, created.run.id)
+  const pin = clone(pair.record.processingSettings)
+  assert.notEqual(pin.settings.ai.tasks.assessment.completionTokenLimit, 4096)
+  await cancelComparison(f, pair)
+  const current = settingsSnapshot(settings => {
+    settings.summaries.generationMode = 'on-demand'
+    settings.ai.tasks.assessment.completionTokenLimit = 4096
+  }, 'current-analysis-policy')
+  f.acceptedSettings = settingsDomain.captureProcessingSettings(current.settings, current.revision, current.capturedAt,
+    createPromptCandidate(createCompiledPromptBaseline(NOW),
+      { assessment: 'Explain defensible borderline distinctions under the retained rubric anchors.' },
+      { tenantId: '00000000-0000-4000-8000-000000000001', oid: '00000000-0000-4000-8000-000000000002' }, NOW, 'pb-current-assessment'))
+  const run = await f.analysis.store.get(f.workspaceId, created.run.id)
+  await f.service.retry(f.workspaceId, created.run.id, { useCurrentRules: true }, run.etag, ACTOR)
+  const queued = (await f.analysis.store.get(f.workspaceId, pair.record.id)).record
+  const upgrade = queued.settingsUpgrade.processingSettings
+  assert.deepEqual(queued.processingSettings, pin)
+  assert.notEqual(upgrade.promptBundle.bundle.bundleSha256, pin.promptBundle.bundle.bundleSha256)
+  const mock = modelFor(f, ({ kind, body }) => kind === 'resume_rubric_assessment'
+    ? withQcDiagnostics(modelAssessment(body.input)) : undefined)
+  await runAnalysisWorker(mock.deps, { maxItems: 1 })
+  const assessment = mock.calls.find(call => call.kind === 'resume_rubric_assessment')
+  assert.equal(assessment.request.max_completion_tokens, 4096)
+  assert.match(assessment.request.messages[0].content, /Explain defensible borderline distinctions/)
+  const context = await qcContext(f, created.run.id)
+  assert.equal(context.comparison.status, 'complete')
+  assert.deepEqual(context.comparison.processingSettings, pin)
+  assert.deepEqual(context.comparison.settingsUpgrade, queued.settingsUpgrade)
+  assert.equal(context.result.provenance.assessment.prompt.bundleSha256, upgrade.promptBundle.bundle.bundleSha256)
+  assert.equal((await qc.readAnalysisQcDiagnostics(f.analysis.blobs, context)).status, 'recorded')
 })
 
 test('worker finishes interrupted cancellation for both initializing and fully initialized 100-pair runs', async () => {

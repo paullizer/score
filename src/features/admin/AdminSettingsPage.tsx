@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import { ArrowLeft, Download, History, Layers3, LoaderCircle, RefreshCw, Save, Search, ShieldCheck, Upload, Users } from 'lucide-react'
 import type {
   AdminSettings, AdminSettingsResponse, DeploymentInventory, ModelTaskId, ModelTestResult,
-  SettingsChange, SettingsFieldError, SettingsRevision, SettingsSection,
+  SettingsChange, SettingsFieldError, SettingsFieldMetadata, SettingsRevision, SettingsSection,
 } from '../../domain/admin-settings'
 import { MODEL_TASK_IDS } from '../../domain/admin-settings-tasks'
 import { parseAdminSettings, SettingsValidationError, upgradeQcAdminSettings } from '../../domain/admin-settings-schema'
@@ -14,7 +14,7 @@ import { ThemeControl } from '../../app/ThemeControl'
 import { Badge, Button, InlineError, Modal, PageHeader, SearchField } from '../../components/ui'
 import { ModelSettingsEditor } from './ModelSettingsEditor'
 import { SettingsField } from './SettingsField'
-import { describeSettingValue, rebaseSettingsDraft, updateSetting } from './settingsForm'
+import { changeSetting, defaultsCandidate, describeChangeValue, rebaseSettingsDraft } from './settingsForm'
 
 const sections: { id: SettingsSection; title: string }[] = [
   { id: 'ai', title: 'AI deployments & tasks' }, { id: 'intake', title: 'Features & intake' }, { id: 'grades', title: 'GS ladders & references' },
@@ -25,11 +25,11 @@ type Review = { kind: 'save' | 'defaults'; candidate: AdminSettings }
   | { kind: 'restore'; candidate: AdminSettings; revision: string }
   | { kind: 'import'; candidate: AdminSettings; document: unknown; etag: string }
 
-function Changes({ changes, label }: { changes: SettingsChange[]; label: string }) {
+function Changes({ changes, label, fields }: { changes: SettingsChange[]; label: string; fields: SettingsFieldMetadata[] }) {
   return <div className="settings-diff" aria-label={label}>
     {changes.length ? <table><thead><tr><th scope="col">Setting</th><th scope="col">Before</th><th scope="col">After</th></tr></thead>
       <tbody>{changes.map(change => <tr key={change.path}><th scope="row"><code>{change.path}</code></th>
-        <td><pre>{describeSettingValue(change.path, change.before)}</pre></td><td><pre>{describeSettingValue(change.path, change.after)}</pre></td></tr>)}</tbody></table>
+        <td><pre>{describeChangeValue(change.path, change.before, fields)}</pre></td><td><pre>{describeChangeValue(change.path, change.after, fields)}</pre></td></tr>)}</tbody></table>
       : <p>No settings differ.</p>}
   </div>
 }
@@ -85,8 +85,8 @@ export function AdminSettingsPage({ onLeave, onOpenUsers }: { onLeave: () => voi
   }, [])
 
   function update(path: string, value: unknown) {
-    if (!draft || pending) return
-    setDraft(updateSetting(draft, path, value))
+    if (!draft || !base || pending) return
+    setDraft(changeSetting(draft, base.settings, path, value, base.fields.find(field => field.path === path)?.defaultValue))
     setStatus('')
   }
 
@@ -201,7 +201,7 @@ export function AdminSettingsPage({ onLeave, onOpenUsers }: { onLeave: () => voi
       <div className="settings-savebar">
         <p><strong>{changes.length} unsaved {changes.length === 1 ? 'change' : 'changes'}</strong> · Saved revision <code>{base.revision}</code> · {base.createdAt}</p>
         <div className="flex flex-wrap gap-2"><Button disabled={pending || !changes.length} onClick={() => setDiscard(true)}>Discard</Button>
-          <Button disabled={pending} onClick={() => { setDraft(structuredClone(base.defaults)); setReview({ kind: 'defaults', candidate: structuredClone(base.defaults) }) }}>Review reset to defaults</Button>
+          <Button disabled={pending} onClick={() => { const candidate = defaultsCandidate(base.defaults, base.settings, base.fields); setDraft(structuredClone(candidate)); setReview({ kind: 'defaults', candidate }) }}>Review reset to defaults</Button>
           <Button variant="primary" icon={pending ? LoaderCircle : Save} disabled={pending || !changes.length || conflictPending} onClick={() => {
             const candidate = validate(draft); if (candidate) { setDraft(candidate); setReview({ kind: 'save', candidate }) }
           }}>Review and save</Button></div>
@@ -223,8 +223,8 @@ export function AdminSettingsPage({ onLeave, onOpenUsers }: { onLeave: () => voi
       {conflictPending && <section className="panel settings-section" aria-label="Settings conflict">
         <h2>Review concurrent changes</h2>
         {conflict ? <><p>Current server revision: <code>{conflict.revision}</code>. Choose explicitly; no automatic overwrite or retry.</p>
-          <details open><summary>What changed on the server</summary><Changes changes={diffAdminSettings(base.settings, conflict.settings)} label="Server changes" /></details>
-          <details><summary>Your draft compared with current settings</summary><Changes changes={diffAdminSettings(conflict.settings, review?.candidate ?? draft)} label="Draft versus current" /></details>
+          <details open><summary>What changed on the server</summary><Changes changes={diffAdminSettings(base.settings, conflict.settings)} label="Server changes" fields={base.fields} /></details>
+          <details><summary>Your draft compared with current settings</summary><Changes changes={diffAdminSettings(conflict.settings, review?.candidate ?? draft)} label="Draft versus current" fields={base.fields} /></details>
           <div className="flex flex-wrap gap-2"><Button disabled={pending} onClick={() => {
             setBase(conflict); setDraft(structuredClone(conflict.settings)); setConflict(null); setConflictPending(false); setReview(null); setErrors([]); setError(''); setImportText('')
           }}>Reload current and discard my draft</Button><Button disabled={pending} onClick={() => {
@@ -269,7 +269,7 @@ export function AdminSettingsPage({ onLeave, onOpenUsers }: { onLeave: () => voi
         {!history.length && historyLoaded && <p>No revisions were returned.</p>}
         {historyCursor && <Button disabled={pending} onClick={() => void loadHistory(historyCursor)}>Load older revisions</Button>}
         {historyDetail && <div className="mt-4"><h3>Revision {historyDetail.revision}</h3>
-          <Changes changes={historyDetail.changes} label="Historical revision changes" />
+          <Changes changes={historyDetail.changes} label="Historical revision changes" fields={base.fields} />
           <Button disabled={pending} onClick={() => setReview({ kind: 'restore', revision: historyDetail.revision, candidate: historyDetail.settings })}>Review restore as new revision</Button>
         </div>}
       </section>}
@@ -309,7 +309,7 @@ export function AdminSettingsPage({ onLeave, onOpenUsers }: { onLeave: () => voi
       description="Publishing creates a new revision. Only reviewed configuration changes are saved; no data is deleted or historical operation rewritten." wide dismissDisabled={pending}
       footer={<><Button disabled={pending} onClick={() => setReview(null)}>Keep editing</Button><Button variant="primary" disabled={pending || !reviewChanges.length} onClick={() => void applyReview()}>Publish new revision</Button></>}>
       <p>Base revision: {base.revision}. {reviewChanges.length} changes. {review?.kind === 'restore' && `Restoring ${review.revision} as a new revision.`}</p>
-      {error && <InlineError>{error}</InlineError>}<Changes changes={reviewChanges} label="Changes to publish" />
+      {error && <InlineError>{error}</InlineError>}<Changes changes={reviewChanges} label="Changes to publish" fields={base.fields} />
       <p>Activation is per field: next public refresh, new operation, or next worker execution. A save does not provision Azure deployments or verify worker readiness.</p>
     </Modal>
     <Modal open={importOpen} onOpenChange={setImportOpen} title="Preview nonsecret settings import" description="Only the versioned Score settings export format is accepted. Unknown fields, credentials, bootstrap roster, and trust claims are rejected." wide dismissDisabled={pending}

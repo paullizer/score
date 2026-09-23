@@ -1,8 +1,9 @@
 import type {
   AnalysisCorrectionHistoryReference, AnalysisCorrectionProposal, AnalysisCorrectionSummary, RealAnalysisCorrectionRecord,
 } from '../../src/domain/analysis-corrections'
+import { isAnalysisReassessmentPolicy } from '../../src/domain/analysis-corrections'
 import type {
-  RealAnalysisComparisonRecord, RealAnalysisResult, RealAnalysisRunRecord, VersionedAnalysisEntity,
+  RealAnalysisComparisonRecord, RealAnalysisResult, RealAnalysisResultSummary, RealAnalysisRunRecord, VersionedAnalysisEntity,
 } from '../../src/domain/real-analyses'
 import type { ImmutableJsonBlobReference } from '../../src/domain/real-resumes'
 import { StoreConflictError } from '../store'
@@ -17,6 +18,7 @@ import {
 import { parseAnalysisJson, readAnalysisBlob, readAnalysisResult, readAnalysisSnapshots } from './snapshots'
 import {
   assertAnalysisCorrectionProposalBinding, assertCorrectionReviewBinding, assertEvidenceCorrectionAssessment,
+  assertReassessmentProposal, assertReassessmentResult, correctionProposalAssessment,
   parseAnalysisCorrectionHistoryEntry, parseAnalysisCorrectionProposal,
 } from './correction-validation'
 import { analysisCorrectionCanWork, loadAnalysisCorrection, projectAnalysisComparison } from './current-results'
@@ -105,18 +107,29 @@ export async function publishAnalysisCorrection(
     const snapshots = await readAnalysisSnapshots(deps.blobs, run.record, original.record)
     const base = await readAnalysisResult(deps.blobs, run.record, before, snapshots)
     assertAnalysis(base, 'Correction base result is unavailable.')
-    assertEvidenceCorrectionAssessment(proposal, base, snapshots.targetSnapshot)
-    for (const review of result.provenance.groundingReviews) assertCorrectionReviewBinding(review, proposal)
-    assertAnalysis(analysisHash(result.provenance.assessment) === analysisHash(base.provenance.assessment) &&
+    const fresh = result.provenance.attemptId === claimed.attemptId &&
       result.provenance.groundingReviews.every(review => review.provenance.startedAt >= claimed.requestedAt &&
-        review.provenance.completedAt <= result.createdAt && !base.provenance.groundingReviews.some(old => old.id === review.id)),
-    'A correction must retain original assessment attribution and obtain a fresh review after its explicit request.')
-    assertAnalysis(analysisHash(result.provenance.correction) === analysisHash(proposal.provenance) &&
-      analysisHash({ criteria: result.criteria, qualifications: result.qualifications, summary: result.summary, limitations: result.limitations }) ===
-        analysisHash(proposal.assessment) &&
-      result.provenance.attemptId === claimed.attemptId &&
-      analysisHash({ completion: result.completion, overall: result.overall, coverage: result.coverage }) === analysisHash(proposal.summary),
-    'Reviewed result differs from the accepted deterministic proposal.')
+        review.provenance.completedAt <= result.createdAt && !base.provenance.groundingReviews.some(old => old.id === review.id))
+    let summary: RealAnalysisResultSummary
+    if (isAnalysisReassessmentPolicy(claimed.policyVersion)) {
+      assertReassessmentProposal(proposal, base, snapshots.targetSnapshot)
+      assertReassessmentResult(result, proposal)
+      assertAnalysis(fresh && analysisHash(result.provenance.assessment) !== analysisHash(base.provenance.assessment),
+        'A re-score must publish a fresh assessment and review produced after its explicit request.')
+      summary = { completion: result.completion, overall: result.overall, coverage: result.coverage }
+    } else {
+      const expected = correctionProposalAssessment(proposal)
+      assertEvidenceCorrectionAssessment(proposal, base, snapshots.targetSnapshot)
+      for (const review of result.provenance.groundingReviews) assertCorrectionReviewBinding(review, proposal)
+      assertAnalysis(fresh && analysisHash(result.provenance.assessment) === analysisHash(base.provenance.assessment),
+        'A correction must retain original assessment attribution and obtain a fresh review after its explicit request.')
+      assertAnalysis(analysisHash(result.provenance.correction) === analysisHash(proposal.provenance) &&
+        analysisHash({ criteria: result.criteria, qualifications: result.qualifications, summary: result.summary, limitations: result.limitations }) ===
+          analysisHash(expected.assessment) &&
+        analysisHash({ completion: result.completion, overall: result.overall, coverage: result.coverage }) === analysisHash(expected.summary),
+      'Reviewed result differs from the accepted deterministic proposal.')
+      summary = expected.summary
+    }
     const saved = parseAnalysisResult(parseAnalysisJson(await readAnalysisBlob(deps.blobs, reference, run.record.workspaceId, run.record.id)))
     assertAnalysis(analysisHash(saved) === analysisHash(result), 'Correction result bytes differ from the reviewed result.')
     const entry = parseAnalysisCorrectionHistoryEntry(parseAnalysisJson(await readAnalysisBlob(
@@ -134,7 +147,7 @@ export async function publishAnalysisCorrection(
     const record: RealAnalysisCorrectionRecord = {
       ...work.record, status: 'ready', updatedAt: timestamp, history,
       published: {
-        result: reference, summary: proposal.summary, attemptId: result.provenance.attemptId,
+        result: reference, summary, attemptId: result.provenance.attemptId,
         revision: {
           id: claimed.requestId, policyVersion: claimed.policyVersion, originalResultSha256: claimed.originalResult.sha256,
           baseResultSha256: claimed.baseResult.sha256, correctedAt: result.createdAt, criterionIds: claimed.criterionIds,

@@ -9,11 +9,13 @@ export type CloudErrorCode =
 export class CloudApiError extends Error {
   readonly code: CloudErrorCode
   readonly status: number
-  constructor(code: CloudErrorCode, message: string, status: number) {
+  readonly retryAfterSeconds: number | undefined
+  constructor(code: CloudErrorCode, message: string, status: number, options: { retryAfterSeconds?: number } = {}) {
     super(message)
     this.name = 'CloudApiError'
     this.code = code
     this.status = status
+    this.retryAfterSeconds = options.retryAfterSeconds
   }
 }
 
@@ -166,6 +168,26 @@ export function changeWorkspaceLifecycle(id: string, action: LifecycleAction, et
 }
 
 const SCORE_REQUEST_HEADER = 'X-Score-Request'
+const DEFAULT_CLOUD_TIMEOUT_MILLISECONDS = 30_000
+const MAX_CLOUD_TIMEOUT_MILLISECONDS = 300_000
+
+export type CloudRequestInit = RequestInit & { timeoutMilliseconds?: number }
+
+export function resolveCloudRequestTimeout(init: Pick<CloudRequestInit, 'timeoutMilliseconds'> = {}): number {
+  const value = init.timeoutMilliseconds
+  if (value === undefined) return DEFAULT_CLOUD_TIMEOUT_MILLISECONDS
+  if (!Number.isInteger(value) || value <= 0) throw new Error('Cloud request timeout must be a positive integer number of milliseconds.')
+  return Math.min(value, MAX_CLOUD_TIMEOUT_MILLISECONDS)
+}
+
+export function parseRetryAfterSeconds(value: string | null): number | undefined {
+  if (!value) return undefined
+  const trimmed = value.trim()
+  if (/^\d+$/.test(trimmed)) return Number(trimmed)
+  const date = Date.parse(trimmed)
+  if (!Number.isFinite(date)) return undefined
+  return Math.max(0, Math.ceil((date - Date.now()) / 1000))
+}
 
 function isCloudErrorCode(value: unknown): value is CloudErrorCode {
   return typeof value === 'string' && ['unauthorized', 'forbidden', 'not_found', 'conflict', 'precondition_required', 'invalid_request', 'unavailable'].includes(value)
@@ -212,7 +234,7 @@ async function unwrap<T>(response: Response): Promise<T> {
     }
     if (response.status === 409) throw new CloudConflictError(envelope.message)
     if (response.status === 428) throw new CloudPreconditionError(envelope.message)
-    throw new CloudApiError(envelope.code, envelope.message, response.status)
+    throw new CloudApiError(envelope.code, envelope.message, response.status, { retryAfterSeconds: parseRetryAfterSeconds(response.headers.get('Retry-After')) })
   }
   const contentType = response.headers.get('content-type') ?? ''
   if (!contentType.toLowerCase().includes('application/json')) {
@@ -221,17 +243,19 @@ async function unwrap<T>(response: Response): Promise<T> {
   return response.json() as Promise<T>
 }
 
-async function cloudRequest<T>(path: string, init: RequestInit, read: (response: Response) => Promise<T>): Promise<T> {
+async function cloudRequest<T>(path: string, init: CloudRequestInit, read: (response: Response) => Promise<T>): Promise<T> {
+  const fetchInit = { ...init }
+  delete fetchInit.timeoutMilliseconds
   const accessSignal = cloudAccessRequestSignal(path, init)
   const headers = new Headers(init.headers)
   headers.set(SCORE_REQUEST_HEADER, 'workspace')
   if (init.body !== undefined && !headers.has('Content-Type')) headers.set('Content-Type', 'application/json')
-  const deadline = AbortSignal.timeout(30000)
+  const deadline = AbortSignal.timeout(resolveCloudRequestTimeout(init))
   const signal = AbortSignal.any([...(init.signal ? [init.signal] : []), ...(accessSignal ? [accessSignal] : []), deadline])
   try {
     signal.throwIfAborted()
     const response = await fetch(`/api${path}`, {
-      ...init, signal, redirect: 'manual', credentials: 'include', cache: 'no-store', headers,
+      ...fetchInit, signal, redirect: 'manual', credentials: 'include', cache: 'no-store', headers,
     })
     const value = await read(response)
     signal.throwIfAborted()
@@ -249,17 +273,17 @@ async function cloudRequest<T>(path: string, init: RequestInit, read: (response:
   }
 }
 
-export function cloudJsonRequest<T>(path: string, init: RequestInit = {}): Promise<T> {
+export function cloudJsonRequest<T>(path: string, init: CloudRequestInit = {}): Promise<T> {
   return cloudRequest(path, init, unwrap<T>)
 }
 
-export function cloudJsonResponse<T>(path: string, init: RequestInit = {}): Promise<{ value: T; etag?: string }> {
+export function cloudJsonResponse<T>(path: string, init: CloudRequestInit = {}): Promise<{ value: T; etag?: string; status: number }> {
   return cloudRequest(path, init, async (response) => ({
-    value: await unwrap<T>(response), etag: response.headers.get('ETag') ?? undefined,
+    value: await unwrap<T>(response), etag: response.headers.get('ETag') ?? undefined, status: response.status,
   }))
 }
 
-export function cloudLifecycleRequest<T>(path: string, init: RequestInit = {}): Promise<{ value: T; etag?: string }> {
+export function cloudLifecycleRequest<T>(path: string, init: CloudRequestInit = {}): Promise<{ value: T; etag?: string }> {
   return cloudRequest(path, init, async (response) => {
     const etag = response.headers.get('ETag') ?? undefined
     if (response.status === 503 && !response.redirected && response.type !== 'opaqueredirect' && response.headers.get('content-type')?.toLowerCase().includes('application/json')) {

@@ -33,7 +33,7 @@ const cloud = {
   currentWorkspaceId: 'workspace-one',
   user: { tenantId: 'tenant-one', id: 'user-one' },
   workspaces: [{ id: 'workspace-one', role: 'owner' }],
-  realJobs: { source: () => undefined },
+  realJobs: { source: () => undefined, detail: () => ({ state: 'idle' }) },
 }
 
 for (const format of ['docx', 'doc']) {

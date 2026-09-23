@@ -1,5 +1,5 @@
 import {
-  ANALYSIS_CORRECTION_LIMITS, type AnalysisCorrectionPublication, type RealAnalysisCorrectionRecord,
+  ANALYSIS_CORRECTION_LIMITS, isAnalysisReassessmentPolicy, type AnalysisCorrectionPublication, type RealAnalysisCorrectionRecord,
 } from '../../src/domain/analysis-corrections'
 import {
   ANALYSIS_LIMITS, type RealAnalysisComparisonRecord, type RealAnalysisRunRecord, type VersionedAnalysisEntity,
@@ -7,7 +7,7 @@ import {
 import { invalidRequest, notFound } from '../errors'
 import { isUuid } from '../jobs/validation'
 import { readAnalysisCorrectionHistoryEntry } from './correction-artifacts'
-import { assertCorrectionReviewBinding, parseAnalysisCorrectionProposal } from './correction-validation'
+import { assertCorrectionReviewBinding, assertReassessmentResult, parseAnalysisCorrectionProposal } from './correction-validation'
 import { parseAnalysisJson, readAnalysisBlob } from './snapshots'
 import type { AnalysisStore, RealAnalysesDeps } from './store'
 import { analysisCorrectionId, analysisHash, assertAnalysis, parseAnalysisEntity, parseAnalysisResult } from './validation'
@@ -98,7 +98,9 @@ export async function resolveAnalysisComparisonRevision(
     ])
     const proposal = parseAnalysisCorrectionProposal(parseAnalysisJson(proposalBytes))
     const result = parseAnalysisResult(parseAnalysisJson(resultBytes))
-    assertCorrectionReviewBinding(entry.review, proposal)
+    const reassessment = isAnalysisReassessmentPolicy(proposal.provenance.policyVersion)
+    const summary = { completion: result.completion, overall: result.overall, coverage: result.coverage }
+    assertCorrectionReviewBinding(entry.review, proposal, result.provenance.assessmentSha256)
     assertAnalysis(proposal.workspaceId === run.workspaceId && proposal.runId === run.id &&
       proposal.comparisonId === original.record.id && proposal.requestId === revisionId &&
       proposal.manifestSha256 === run.manifest.sha256 && proposal.originalResultSha256 === original.record.result.sha256 &&
@@ -110,12 +112,13 @@ export async function resolveAnalysisComparisonRevision(
       analysisHash(result.provenance.targetSnapshot) === analysisHash(proposal.targetSnapshot) &&
       analysisHash(result.provenance.correction) === analysisHash(proposal.provenance) &&
       analysisHash(result.provenance.groundingReviews.at(-1)) === analysisHash(entry.review) &&
-      analysisHash({ criteria: result.criteria, qualifications: result.qualifications, summary: result.summary, limitations: result.limitations }) ===
-        analysisHash(proposal.assessment) &&
-      analysisHash({ completion: result.completion, overall: result.overall, coverage: result.coverage }) === analysisHash(proposal.summary),
+      (reassessment || analysisHash({
+        criteria: result.criteria, qualifications: result.qualifications, summary: result.summary, limitations: result.limitations,
+      }) === analysisHash(proposal.assessment) && analysisHash(summary) === analysisHash(proposal.summary)),
     'Historical correction result is not bound to its reviewed proposal and original frozen inputs.')
+    if (reassessment) assertReassessmentResult(result, proposal)
     return version({
-      result: entry.result, summary: proposal.summary, attemptId: entry.attemptId,
+      result: entry.result, summary: reassessment ? summary : proposal.summary!, attemptId: entry.attemptId,
       revision: {
         id: revisionId, policyVersion: proposal.provenance.policyVersion, originalResultSha256: proposal.originalResultSha256,
         baseResultSha256: proposal.baseResult.sha256, correctedAt: result.createdAt, criterionIds: proposal.provenance.criterionIds,

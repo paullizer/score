@@ -113,7 +113,8 @@ export class AdminSettingsService {
         let value: unknown = this.defaults
         for (const key of field.path.split('.')) value = object(value) ? value[key] : undefined
         return {
-          ...structuredClone(field), defaultValue: structuredClone(value),
+          // Optional settings have no compiled default in the settings object; their metadata carries it.
+          ...structuredClone(field), defaultValue: structuredClone(value === undefined ? field.defaultValue : value),
           defaultSource: this.config.settings?.defaultSources?.[field.path] ?? field.defaultSource,
         }
       }),

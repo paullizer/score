@@ -61,16 +61,16 @@ export function SegmentedControl<T extends string>({ value, onChange, options, l
   </div>
 }
 
-export function Modal({ open, onOpenChange, title, description, children, footer, wide = false, drawer = false, dismissDisabled = false, onOpenAutoFocus, onCloseAutoFocus }: {
+export function Modal({ open, onOpenChange, title, description, children, footer, wide = false, drawer = false, fullscreen = false, dismissDisabled = false, onOpenAutoFocus, onCloseAutoFocus }: {
   open: boolean; onOpenChange: (open: boolean) => void; title: string; description: string
-  children: ReactNode; footer?: ReactNode; wide?: boolean; drawer?: boolean
+  children: ReactNode; footer?: ReactNode; wide?: boolean; drawer?: boolean; fullscreen?: boolean
   dismissDisabled?: boolean; onOpenAutoFocus?: (event: Event) => void; onCloseAutoFocus?: (event: Event) => void
 }) {
   const returnFocus = useRef<HTMLElement | null>(null)
   const accessSuspended = useContext(AccessSuspendedContext)
   return <Dialog.Root open={open && !accessSuspended} onOpenChange={(next) => { if (next || !dismissDisabled) onOpenChange(next) }}>
     <Dialog.Portal><Dialog.Overlay className="dialog-overlay" />
-      <Dialog.Content className={`dialog-content ${wide ? 'dialog-wide' : ''} ${drawer ? 'dialog-drawer' : ''}`}
+      <Dialog.Content className={`dialog-content ${wide ? 'dialog-wide' : ''} ${drawer ? 'dialog-drawer' : ''} ${fullscreen ? 'dialog-fullscreen' : ''}`}
         onEscapeKeyDown={(event) => { if (dismissDisabled) event.preventDefault() }}
         onInteractOutside={(event) => { if (dismissDisabled) event.preventDefault() }}
         onOpenAutoFocus={(event) => {

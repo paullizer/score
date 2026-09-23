@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
 import test from 'node:test'
 import {
-  api, fixture, createRun, seedResume, seedJob, publishResult, startHttp, ACTOR, NOW, clone,
+  api, fixture, createRun, finishInitialization, seedResume, seedJob, publishResult, startHttp, ACTOR, NOW, clone,
 } from './real-analyses.test-support.mjs'
 import { fakeJobCosmos, realJobRecord, realJobRubric, JOB_TEST_TIME } from './job-cosmos-fake.mjs'
 
@@ -430,4 +430,166 @@ test('real Cosmos job admission counts a whole batch atomically, retains consume
   await store.setWorkspaceLifecycle(first.workspaceId, 'deleting', JOB_TEST_TIME)
   await store.purgeWorkspaceRecords(first.workspaceId, JOB_TEST_TIME)
   assert.equal(cosmos.records.has(`${first.workspaceId}/job-batch-${batchId}`), false)
+})
+
+const HTTP_TENANT = '00000000-0000-4000-8000-000000000001'
+const HTTP_OWNER = '00000000-0000-4000-8000-000000000002'
+const rejectsWith = (status, pattern) => error => error.status === status && (!pattern || pattern.test(error.message))
+const byIndex = values => values.sort((a, b) => a.record.index - b.record.index)
+const changeRules = policy => {
+  policy.revision = 'policy-two'
+  policy.value.ai.tasks.assessment.completionTokenLimit = 4096
+}
+
+async function failComparison(f, runId, comparisonId) {
+  const [parent, value] = await Promise.all([f.analysis.store.get(f.workspaceId, runId), f.analysis.store.get(f.workspaceId, comparisonId)])
+  const timestamp = new Date(Math.max(Date.parse(f.now), Date.parse(parent.record.updatedAt), Date.parse(value.record.updatedAt))).toISOString()
+  const failed = {
+    ...clone(value.record), status: 'failed', attempts: 3, updatedAt: timestamp, completedAt: timestamp,
+    error: { code: 'grounding-failed', stage: 'grounding', message: 'Exact evidence could not be supported.', retryable: false },
+  }
+  delete failed.nextAttemptAt
+  delete failed.lease
+  delete failed.attemptId
+  await f.analysis.store.transact(f.workspaceId, [
+    { kind: 'replace', record: failed, etag: value.etag },
+    { kind: 'replace', record: api.applyAnalysisComparisonTransition(parent.record, value.record, failed, timestamp), etag: parent.etag },
+  ])
+}
+const runEtag = async (f, runId) => (await f.analysis.store.get(f.workspaceId, runId)).etag
+
+test('current-rules retry records an audited upgrade for stopped comparisons while pins and completed results stay immutable', async () => {
+  const f = fixture(), policy = runtimePolicy()
+  configure(f, policy)
+  const created = await createRun(f, 3, 1), runId = created.run.id
+  const pin = clone(created.run.processingSettings)
+  assert.equal(pin.revision, 'policy-one')
+  const [done, failed, cancelled] = byIndex(compareRecords(f, runId)).map(value => value.record.id)
+  await publishResult(f, runId, done)
+  await failComparison(f, runId, failed)
+  const active = await f.analysis.store.get(f.workspaceId, cancelled)
+  await f.service.comparisonAction(f.workspaceId, runId, cancelled, 'cancel', active.etag)
+  const completed = await f.analysis.store.get(f.workspaceId, done)
+
+  policy.revision = 'policy-relabelled'
+  await f.service.retry(f.workspaceId, runId, { comparisonIds: [failed], useCurrentRules: true }, await runEtag(f, runId), ACTOR)
+  let value = await f.analysis.store.get(f.workspaceId, failed)
+  assert.equal(value.record.status, 'queued')
+  assert.equal(value.record.settingsUpgrade, undefined, 'A new revision label with identical rules is an ordinary retry.')
+  assert.deepEqual(api.analysisComparisonProcessingSettings(value.record), pin)
+
+  await failComparison(f, runId, failed)
+  changeRules(policy)
+  const summary = await f.service.retry(f.workspaceId, runId, { useCurrentRules: true }, await runEtag(f, runId), ACTOR)
+  for (const id of [failed, cancelled]) {
+    value = await f.analysis.store.get(f.workspaceId, id)
+    assert.equal(value.record.status, 'queued')
+    assert.deepEqual(value.record.processingSettings, pin, 'The admitted pin is never rewritten.')
+    assert.equal(value.record.settingsUpgrade.requestedBy, ACTOR)
+    assert.equal(value.record.settingsUpgrade.requestedAt, value.record.updatedAt)
+    assert.equal(value.record.settingsUpgrade.processingSettings.revision, 'policy-two')
+    assert.equal(api.analysisComparisonProcessingSettings(value.record).settings.ai.tasks.assessment.completionTokenLimit, 4096)
+  }
+  assert.deepEqual(await f.analysis.store.get(f.workspaceId, done), completed, 'Completed evidence is never re-pinned.')
+  assert.deepEqual(summary.run.processingSettings, pin)
+  assert.deepEqual((await api.readAnalysisManifest(f.analysis.blobs, summary.run)).processingSettings, pin)
+
+  const upgraded = await f.analysis.store.get(f.workspaceId, failed)
+  await failComparison(f, runId, failed)
+  await f.service.retry(f.workspaceId, runId, { comparisonIds: [failed] }, await runEtag(f, runId))
+  assert.deepEqual((await f.analysis.store.get(f.workspaceId, failed)).record.settingsUpgrade, upgraded.record.settingsUpgrade,
+    'A later ordinary retry keeps the explicitly selected rules.')
+})
+
+test('current-rules retry refuses unfinished initialization or cancellation, anonymous callers and unpinned deployments', async () => {
+  const f = fixture(), policy = runtimePolicy()
+  configure(f, policy)
+  const initializing = await createRun(f, 2, 20)
+  assert.ok(initializing.run.progress.initialized < initializing.run.progress.total)
+  await assert.rejects(f.service.retry(f.workspaceId, initializing.run.id, { useCurrentRules: true }, initializing.etag, ACTOR),
+    rejectsWith(409, /Current rules apply only/))
+  await finishInitialization(f, initializing.run.id)
+  const cancelling = await f.service.cancel(f.workspaceId, initializing.run.id, ACTOR, await runEtag(f, initializing.run.id))
+  assert.equal(cancelling.run.cancellation.completedAt, undefined)
+  await assert.rejects(f.service.retry(f.workspaceId, initializing.run.id, { useCurrentRules: true }, cancelling.etag, ACTOR),
+    rejectsWith(409, /Current rules apply only/))
+
+  const created = await createRun(f, 1, 1), runId = created.run.id
+  const [pair] = compareRecords(f, runId)
+  await failComparison(f, runId, pair.record.id)
+  changeRules(policy)
+  await assert.rejects(f.service.retry(f.workspaceId, runId, { useCurrentRules: true }, await runEtag(f, runId)),
+    rejectsWith(400, /who requested/))
+  f.service = new api.RealAnalysisService(f.analysis, f, () => new Date(f.now),
+    Object.assign(() => policy.capture(), { pinNewAdmissions: false }))
+  await assert.rejects(f.service.retry(f.workspaceId, runId, { useCurrentRules: true }, await runEtag(f, runId), ACTOR),
+    rejectsWith(409, /does not pin processing rules/))
+  const unchanged = await f.analysis.store.get(f.workspaceId, pair.record.id)
+  assert.equal(unchanged.record.status, 'failed')
+  assert.equal(unchanged.record.settingsUpgrade, undefined)
+})
+
+test('the comparison store guard rejects forging, replacing or removing a current-rules upgrade outside an explicit retry', async () => {
+  const f = fixture(), policy = runtimePolicy()
+  configure(f, policy)
+  const created = await createRun(f, 2, 1), runId = created.run.id
+  const [first, second] = byIndex(compareRecords(f, runId)).map(value => value.record.id)
+  await failComparison(f, runId, first)
+  changeRules(policy)
+  await f.service.retry(f.workspaceId, runId, { comparisonIds: [first], useCurrentRules: true }, await runEtag(f, runId), ACTOR)
+  const upgraded = (await f.analysis.store.get(f.workspaceId, first)).record
+  const upgrade = clone(upgraded.settingsUpgrade)
+  const later = new Date(Date.parse(upgraded.updatedAt) + 1000).toISOString()
+  const rejected = (previous, next) => assert.throws(() => api.assertAnalysisReplacement(previous, next), /Current-rules processing settings/)
+  const removed = { ...clone(upgraded), updatedAt: later }
+  delete removed.settingsUpgrade
+  rejected(upgraded, removed)
+  rejected(upgraded, { ...clone(upgraded), updatedAt: later, settingsUpgrade: { ...upgrade, requestedBy: 'someone-else' } })
+  const queued = (await f.analysis.store.get(f.workspaceId, second)).record
+  rejected(queued, { ...clone(queued), updatedAt: later, settingsUpgrade: { ...upgrade, requestedAt: later } })
+
+  const stopped = { ...clone(upgraded), status: 'failed', updatedAt: later, completedAt: later,
+    error: { code: 'grounding-failed', stage: 'grounding', message: 'Exact evidence could not be supported.', retryable: false } }
+  delete stopped.nextAttemptAt
+  const retryAt = new Date(Date.parse(later) + 1000).toISOString()
+  api.assertAnalysisReplacement(stopped, api.retryAnalysisComparisonRecord(stopped, retryAt, { ...upgrade, requestedAt: retryAt }))
+  rejected(stopped, api.retryAnalysisComparisonRecord(stopped, retryAt, { ...upgrade, requestedAt: later }))
+  rejected(stopped, { ...api.retryAnalysisComparisonRecord(stopped, retryAt, { ...upgrade, requestedAt: retryAt }), retryCount: stopped.retryCount + 2 })
+})
+
+test('the HTTP retry route records the signed-in actor for current rules while ordinary retries survive disabled new analyses', async () => {
+  const f = fixture(), prepared = await createRun(f, 2, 1), policy = runtimePolicy()
+  const http = await startHttp(f, true, policy)
+  try {
+    let response = await http.request('', 'POST', prepared.request, { headers: { 'idempotency-key': randomUUID() } })
+    assert.equal(response.status, 202, await response.clone().text())
+    const runId = (await response.json()).run.run.id
+    const pin = clone((await f.analysis.store.get(f.workspaceId, runId)).record.processingSettings)
+    const [first, second] = byIndex(compareRecords(f, runId)).map(value => value.record.id)
+    await failComparison(f, runId, first)
+    await failComparison(f, runId, second)
+    const retry = async body => http.request(`/${runId}/retry`, 'POST', body, { headers: { 'if-match': await runEtag(f, runId) } })
+    assert.equal((await retry({ useCurrentRules: 'yes' })).status, 400)
+    assert.equal((await retry({ useCurrentRules: true, rules: 'current' })).status, 400)
+    changeRules(policy)
+    policy.value.features.newAnalyses = false
+    response = await retry({ comparisonIds: [first], useCurrentRules: true })
+    assert.equal(response.status, 503, await response.clone().text())
+    assert.equal((await f.analysis.store.get(f.workspaceId, first)).record.status, 'failed')
+    response = await retry({ comparisonIds: [first] })
+    assert.equal(response.status, 200, await response.clone().text())
+    let value = await f.analysis.store.get(f.workspaceId, first)
+    assert.equal(value.record.status, 'queued')
+    assert.equal(value.record.settingsUpgrade, undefined)
+    policy.value.features.newAnalyses = true
+    response = await retry({ comparisonIds: [second], useCurrentRules: true })
+    assert.equal(response.status, 200, await response.clone().text())
+    value = await f.analysis.store.get(f.workspaceId, second)
+    assert.equal(value.record.settingsUpgrade.requestedBy, api.principalKeyFor(HTTP_TENANT, HTTP_OWNER))
+    assert.equal(value.record.settingsUpgrade.processingSettings.revision, 'policy-two')
+    assert.deepEqual(value.record.processingSettings, pin)
+    const detail = await http.request(`/${runId}/comparisons/${second}`)
+    assert.equal(detail.status, 200)
+    assert.equal((await detail.json()).comparison.settingsUpgrade.processingSettings.revision, 'policy-two')
+  } finally { await http.close() }
 })

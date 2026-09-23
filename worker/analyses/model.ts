@@ -241,10 +241,15 @@ function serviceError(error: unknown, stage: AnalysisModelStage): AnalysisModelE
   if (['model-refused', 'model-empty-response', 'model-invalid-response'].includes(String(upstream.code))) {
     return new AnalysisModelError('invalid-model-output', 'The analysis model did not return a usable structured response.', { stage })
   }
+  if (upstream.code === 'model-schema-invalid') {
+    return new AnalysisModelError('internal-error', typeof upstream.message === 'string' ? upstream.message.slice(0, 1_500)
+      : 'Score built a response schema the AI service would reject, so the request was not sent.', { stage })
+  }
   const message = status === 401 || status === 403
     ? 'The configured analysis model service rejected authentication or access. Check its identity and permissions.'
     : status !== undefined && status < 500
-      ? `The analysis model request was rejected (HTTP ${status}). Check the captured deployment and request settings before retrying.`
+      ? `The AI service rejected Score's request (HTTP ${status}) before the model read it. ` +
+        'This is a Score configuration or software problem, not a problem with the documents; retrying will not help until it is fixed.'
       : 'The configured analysis model service is unavailable; the saved work can be retried.'
   return new AnalysisModelError('service-unavailable', message, {
     stage, retryable: typeof upstream.retryable === 'boolean' ? upstream.retryable : status === undefined || status >= 500,

@@ -5,6 +5,7 @@ import {
   type RealReportBatchResponse, type RealReportComparison, type RealReportTarget,
   type ReportCitation, type ReportCitationSource, type ReportFact,
 } from '../../src/domain/analysis-reports'
+import { isAnalysisReassessmentPolicy } from '../../src/domain/analysis-corrections'
 import { documentPagination } from '../../src/domain/document-formats'
 import type {
   FrozenRealAnalysisTargetSnapshot, RealAnalysisComparisonRecord, RealAnalysisInitializationManifest,
@@ -219,17 +220,20 @@ function provenanceFacts(result: RealAnalysisResult, snapshots: AnalysisSnapshot
   ]
   if (provenance.correction) {
     const correction = provenance.correction
+    const reassessed = isAnalysisReassessmentPolicy(correction.policyVersion)
     facts.push(
-      { label: 'Evidence correction revision', value: correction.requestId },
-      { label: 'Evidence correction policy', value: correction.policyVersion },
+      { label: reassessed ? 'Re-score revision' : 'Evidence correction revision', value: correction.requestId },
+      { label: reassessed ? 'Re-score policy' : 'Evidence correction policy', value: correction.policyVersion },
       { label: 'Original result SHA-256', value: correction.originalResultSha256 },
       { label: 'Previous result SHA-256', value: correction.baseResultSha256 },
-      { label: 'Corrected criteria', value: correction.criterionIds.join(', ') },
-      { label: 'Correction reason', value: correction.reason },
-      { label: 'Correction requested', value: correction.requestedAt },
-      { label: 'Correction provenance', value: provenance.groundingReviews.at(-1)?.scope
-        ? 'Deterministic evidence-gap correction. AI verified only the selected missing-evidence criteria; previously approved numeric scores were retained, not reassessed.'
-        : 'Deterministic evidence-gap correction; the assessment model above produced the original assessment. A fresh full grounding review approved this revision.' },
+      { label: reassessed ? 'Previously unassessed weighted criteria' : 'Corrected criteria', value: correction.criterionIds.join(', ') },
+      { label: reassessed ? 'Re-score reason' : 'Correction reason', value: correction.reason },
+      { label: reassessed ? 'Re-score requested' : 'Correction requested', value: correction.requestedAt },
+      { label: reassessed ? 'Re-score provenance' : 'Correction provenance', value: reassessed
+        ? 'Full re-score with the processing rules current when it was requested. The assessment model above produced this complete assessment from the same frozen resume and target, and an independent grounding review approved it before publication.'
+        : provenance.groundingReviews.at(-1)?.scope
+          ? 'Deterministic evidence-gap correction. AI verified only the selected missing-evidence criteria; previously approved numeric scores were retained, not reassessed.'
+          : 'Deterministic evidence-gap correction; the assessment model above produced the original assessment. A fresh full grounding review approved this revision.' },
     )
   }
   for (const [index, review] of provenance.groundingReviews.entries()) {

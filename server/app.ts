@@ -39,6 +39,8 @@ import { createAccessRouter } from './access/routes'
 import { CreationAccessService, WorkspaceAccessService } from './access/service'
 import type { AccessStore } from './access/store'
 import type { EligibleUserDirectory } from './access/directory'
+import type { AssistModelInvoker } from './assist/types'
+import type { AssistLimiter } from './assist/limits'
 export { WorkspaceRepository } from './repository'
 export { WorkspaceLifecycleService } from './lifecycle/service'
 export { createLifecycleDependencies } from './lifecycle/dependencies'
@@ -81,6 +83,13 @@ export {
 export { getRequestSettings } from './request-context'
 export { effectiveFeatures } from './settings/features'
 export * from '../src/domain/admin-settings'
+export { runAssist, AssistCancelledError } from './assist/runner'
+export { createAssistLimiter } from './assist/limits'
+export type { AssistLimiter } from './assist/limits'
+export type { AssistModelInvoker } from './assist/types'
+export { createAzureAssistModelInvoker } from './assist/model'
+export { tooManyRequests } from './errors'
+export { JOB_RUBRIC_ASSIST_SYSTEM_PROMPT, JOB_RUBRIC_COMPILED_PROMPT, jobRubricAssistProfile, rubricAssistResponseSchema } from './assist/profiles/job-rubric'
 
 const currentDir = path.dirname(fileURLToPath(import.meta.url))
 const DEFAULT_DIST_DIR = path.join(currentDir, '..', 'dist')
@@ -98,6 +107,7 @@ export interface AppDeps {
   readonly settings?: AdminSettingsService
   readonly prompts?: PromptRegistryService
   readonly qc?: QcDeps
+  readonly assist?: { readonly invoke: AssistModelInvoker; readonly limiter: AssistLimiter }
   readonly accessStore?: AccessStore
   readonly eligibleUsers?: EligibleUserDirectory
   /** Overridable so tests don't depend on a real build of dist/. */
@@ -185,6 +195,7 @@ export function createApp(deps: AppDeps): Express {
     ? { ...analysisStorage, evidenceCorrectionsEnabled: config.realAnalyses.evidenceCorrectionsEnabled === true } : undefined
   const canCreateAnalyses = Boolean(analyses && resumes && (jobs || grades))
   const wordDocumentImports = config.wordDocumentImports === true
+  const assist = config.rubricAssistant && jobs && deps.assist ? deps.assist : undefined
 
   const app = express()
   app.locals.reconcileLifecycle = () => workspaceLifecycle.reconcile()
@@ -222,10 +233,10 @@ export function createApp(deps: AppDeps): Express {
       realJobImports: Boolean(jobs), realGradeLadders: Boolean(grades), realResumeImports: Boolean(resumes),
       realAnalyses: canCreateAnalyses, analysisSummaryGeneration: Boolean(analyses),
       analysisEvidenceCorrections: Boolean(analyses?.evidenceCorrectionsEnabled),
-      wordDocumentImports: wordDocumentImports && Boolean(jobs || resumes),
+      wordDocumentImports: wordDocumentImports && Boolean(jobs || resumes), rubricAssistant: Boolean(assist),
     }, snapshot, config.settings?.runtimeEnabled === true, Boolean(config.settings || deps.settings)))
   })
-  api.use(createRealJobsRouter({ repository, jobs, lifecycle, now: deps.now, wordDocumentImports }))
+  api.use(createRealJobsRouter({ repository, jobs, lifecycle, now: deps.now, wordDocumentImports, assist }))
   api.use(createRealGradesRouter({ repository, grades, jobs, lifecycle, now: deps.now }))
   api.use(createRealResumesRouter({ repository, resumes, lifecycle, now: deps.now, wordDocumentImports }))
   api.use(createRealAnalysesRouter({ repository, analyses, resumes, jobs, grades, now: deps.now }))
@@ -311,6 +322,7 @@ export function createApp(deps: AppDeps): Express {
       return
     }
     if (err instanceof HttpError) {
+      if (err.retryAfterSeconds !== undefined) res.setHeader('Retry-After', String(Math.max(1, Math.ceil(err.retryAfterSeconds))))
       res.status(err.status).json(toCloudApiError(err))
       return
     }

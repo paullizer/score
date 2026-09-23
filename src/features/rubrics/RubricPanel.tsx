@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { Link } from 'react-router-dom'
-import { FileSearch, Layers3, Pencil, ShieldCheck } from 'lucide-react'
+import { FileSearch, Layers3, Pencil, ShieldCheck, Sparkles } from 'lucide-react'
 import { useWorkspace } from '../../app/workspace-context'
 import { Badge, Button, EmptyState, InlineError } from '../../components/ui'
 import type { Citation, Criterion, Rubric } from '../../domain/types'
@@ -27,6 +27,8 @@ export function RubricPanel({ rubric, onSelectCriterion, onVersionSaved, readOnl
 }) {
   const { workspace, cloud } = useWorkspace()
   const [editing, setEditing] = useState(false)
+  const [initialEditorPanel, setInitialEditorPanel] = useState<'assist' | 'source' | 'changes' | null>(null)
+  const [initialFocusCriterionId, setInitialFocusCriterionId] = useState<string | null>(null)
   const [error, setError] = useState('')
   const { canEdit } = useLifecycleAccess({ kind: 'rubric', id: rubric.groupId })
   const job = workspace.jobs.find((item) => item.id === rubric.jobId)
@@ -38,6 +40,8 @@ export function RubricPanel({ rubric, onSelectCriterion, onVersionSaved, readOnl
   const realGrade = rubric.kind === 'grade'
   const roleReadOnly = !workspaceCanEdit(cloud.workspaces.find((item) => item.id === cloud.currentWorkspaceId)?.role)
   const editable = canEdit && !readOnly && !realGrade && !roleReadOnly && job?.status === 'ready' && !job.rubricDeletedAt && Boolean(document)
+  const detail = job ? cloud.realJobs.detail(job.id) : undefined
+  const assistantAvailable = Boolean(editable && job && detail?.state === 'ready' && document && cloud.realJobs.features?.rubricAssistant)
   const total = rubric.criteria.reduce((sum, criterion) => sum + criterion.weight, 0)
   const balanced = Number.isFinite(total) && Math.abs(total - 100) <= 0.000001
 
@@ -78,7 +82,8 @@ export function RubricPanel({ rubric, onSelectCriterion, onVersionSaved, readOnl
       </div>
 
       {!readOnly && <div className="flex flex-wrap gap-2">
-        <Button icon={Pencil} size="sm" disabled={!editable} onClick={() => { setError(''); setEditing(true) }}>Edit rubric</Button>
+        <Button icon={Pencil} size="sm" disabled={!editable} onClick={() => { setError(''); setInitialEditorPanel(null); setInitialFocusCriterionId(null); setEditing(true) }}>Edit rubric</Button>
+        {assistantAvailable && <Button icon={Sparkles} size="sm" variant="ghost" onClick={() => { setError(''); setInitialEditorPanel('assist'); setInitialFocusCriterionId(null); setEditing(true) }}>Edit with AI</Button>}
       </div>}
       {!readOnly && !realGrade && <p className="text-[11px] text-muted">Edit rubric includes the name and description. Even a name-only save creates a new version; saved analyses keep their original rubric.</p>}
       {!readOnly && !editable && <p className="text-[11px] text-muted">{realGrade ? 'Open the real grade family to edit a draft with its separate grounding-review and approval safeguards.' : roleReadOnly ? 'This workspace is read-only. An owner or editor can change real rubrics.' : 'Finish the linked job import and load its source before editing this rubric.'}</p>}
@@ -101,7 +106,14 @@ export function RubricPanel({ rubric, onSelectCriterion, onVersionSaved, readOnl
               <div className="min-w-0 flex-1">
                 <div className="flex items-start justify-between gap-3">
                   <h4 className="text-[12px] font-semibold leading-5">{criterion.label}</h4>
-                  <span className="shrink-0 text-[12px] font-semibold tabular-nums text-accent">{criterion.weight}%</span>
+                  <div className="flex shrink-0 flex-wrap items-center justify-end gap-2">
+                    {assistantAvailable && <Button size="sm" variant="ghost" icon={Sparkles} aria-label={`Ask AI about ${criterion.label}`} onClick={() => {
+                      setInitialEditorPanel('assist')
+                      setInitialFocusCriterionId(criterion.id)
+                      setEditing(true)
+                    }}>Ask AI</Button>}
+                    <span className="text-[12px] font-semibold tabular-nums text-accent">{criterion.weight}%</span>
+                  </div>
                 </div>
                 <p className="mt-2 text-[11px] text-muted">{criterion.description}</p>
                 <div className="mt-2"><Badge tone={criterion.requirementType === 'preferred' ? 'neutral' : 'accent'}>{criterion.requirementType === 'preferred' ? 'Preferred' : 'Required'}</Badge></div>
@@ -164,6 +176,8 @@ export function RubricPanel({ rubric, onSelectCriterion, onVersionSaved, readOnl
       rubric={rubric}
       onClose={() => setEditing(false)}
       onSaved={(id) => { setEditing(false); onVersionSaved?.(id) }}
+      initialPanel={initialEditorPanel}
+      initialFocusCriterionId={initialFocusCriterionId}
     />}
   </div>
 }
