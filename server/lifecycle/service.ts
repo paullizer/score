@@ -1,11 +1,10 @@
 import { randomUUID } from 'node:crypto'
 import type { LifecycleAction, LifecycleImpact, LifecycleOperation } from '../../src/domain/lifecycle'
-import { setWorkspaceArchive } from '../../src/domain/lifecycle'
 import type { WorkspaceSummary } from '../../src/domain/cloud'
 import { isApplicationAdmin, type AuthenticatedPrincipal } from '../auth'
 import { conflict, forbidden, HttpError, invalidRequest, notFound, preconditionRequired, unavailable } from '../errors'
 import { isValidWorkspaceId, membershipIdFor } from '../ids'
-import { decodeWorkspace, explicitMembershipRole, toSummary, type WorkspaceRepository } from '../repository'
+import { explicitMembershipRole, toSummary, type WorkspaceRepository } from '../repository'
 import { StoreConflictError, type DirectoryStore, type StateStore, type StoredMetadata } from '../store'
 import type { LifecycleDependencies, WorkspaceLifecycleParticipant } from './contracts'
 import { assertWorkspaceMutationLease, withWorkspaceMutationLease } from './lease'
@@ -43,34 +42,34 @@ export class WorkspaceLifecycleService {
     return stored
   }
 
+  /** Counts and blockers come only from real feature stores; no legacy state document is read. */
   private async savedImpact(stored: StoredMetadata): Promise<LifecycleImpact> {
     const id = stored.metadata.workspaceId
-    const entry = await this.deps.state.getState(id)
-    if (!entry) {
-      if (stored.metadata.lifecycleOperation?.action === 'delete' && stored.metadata.lifecycleOperation.status !== 'complete') {
-        return { target: { kind: 'workspace', id }, name: stored.metadata.name, counts: {}, blockers: [] }
-      }
-      throw unavailable('The saved workspace could not be checked. Nothing has been deleted.')
-    }
-    const workspace = decodeWorkspace(entry.content)
-    const counts: Record<string, number> = {
-      jobs: workspace.jobs.length, resumes: workspace.resumes.length,
-      rubrics: new Set(workspace.rubrics.map(rubric => rubric.groupId)).size,
-      analyses: workspace.runs.length,
-    }
+    const counts: Record<string, number> = {}
     for (const participant of this.deps.participants) {
       for (const [kind, count] of Object.entries(await participant.counts(id))) counts[kind] = (counts[kind] ?? 0) + count
     }
-    if ((counts.analyses ?? 0) > workspace.runs.length && !this.deps.lifecycle) {
+    if ((counts.analyses ?? 0) > 0 && !this.deps.lifecycle) {
       throw unavailable('Real analysis dependencies must be checked before managing this workspace.')
     }
     const target = { kind: 'workspace' as const, id }
-    const blockers = this.deps.lifecycle ? await this.deps.lifecycle.impact(id, target) :
-      workspace.runs.map(run => ({
-        kind: 'analysis' as const, id: run.id, name: run.name, href: `/analyses/${encodeURIComponent(run.id)}`,
-      }))
+    const blockers = this.deps.lifecycle ? await this.deps.lifecycle.impact(id, target) : []
     return {
       target, name: stored.metadata.name, counts, blockers,
+    }
+  }
+
+  /** Legacy sample-state blobs are no longer used; remove one with its workspace when it still exists. */
+  private async deleteLegacyState(id: string): Promise<void> {
+    try {
+      const entry = await this.deps.state.getState(id)
+      if (!entry) return
+      assertWorkspaceMutationLease(id)
+      await this.deps.state.deleteState(id, entry.etag)
+    } catch (error) {
+      console.warn('Legacy workspace state cleanup was skipped:', {
+        workspaceId: id, name: error instanceof Error ? error.name : 'UnknownError',
+      })
     }
   }
 
@@ -160,33 +159,23 @@ export class WorkspaceLifecycleService {
         for (const participant of this.deps.participants) await participant.setState(id, action === 'delete' ? 'deleting' : 'archived', startedAt)
         for (const participant of this.deps.participants) await participant.cancel(id, startedAt)
       }
-      const entry = await this.deps.state.getState(id)
       if (action === 'delete') {
-        if (entry && decodeWorkspace(entry.content).runs.length) {
-          throw conflict('An associated analysis remains. Workspace cleanup has stopped without deleting its saved state.')
-        }
         if (!membershipsOnly) {
           // Participants are ordered with grade families before their seed jobs.
           for (const participant of this.deps.participants) await participant.purge(id, startedAt)
           for (const participant of this.deps.participants) await participant.setState(id, 'deleted', startedAt)
+          await this.deleteLegacyState(id)
           assertWorkspaceMutationLease(id)
-          if (entry) await this.deps.state.deleteState(id, entry.etag)
           stored = await this.deps.directory.replaceMetadata({
             ...stored.metadata, lifecycleStage: 'memberships',
           }, stored.etag)
-        } else if (entry) {
-          assertWorkspaceMutationLease(id)
-          await this.deps.state.deleteState(id, entry.etag)
+        } else {
+          await this.deleteLegacyState(id)
         }
         await this.deps.directory.deleteMemberships(id)
-      } else {
-        if (!entry) throw unavailable('The saved workspace is unavailable. The lifecycle operation has not completed.')
-        const next = setWorkspaceArchive(decodeWorkspace(entry.content), action === 'archive', stored.metadata.archivedAt ?? startedAt)
-        assertWorkspaceMutationLease(id)
-        await this.deps.state.putState(id, JSON.stringify(next), entry.etag)
-        if (action === 'unarchive') {
-          for (const participant of this.deps.participants) await participant.setState(id, 'active', startedAt)
-        }
+      } else if (action === 'unarchive') {
+        // Directory metadata is authoritative for the workspace archive state.
+        for (const participant of this.deps.participants) await participant.setState(id, 'active', startedAt)
       }
       const completedAt = this.timestamp()
       const complete: LifecycleOperation = { ...operation, status: 'complete', updatedAt: completedAt, error: undefined }

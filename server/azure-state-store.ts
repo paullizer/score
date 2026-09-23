@@ -47,43 +47,6 @@ export function createStateStoreFromContainer(containerClient: StateBlobContaine
     return { content, etag: response.etag }
   }
 
-  async function createState(workspaceId: string, content: string) {
-    const blob = containerClient.getBlockBlobClient(blobPathFor(workspaceId))
-    const body = Buffer.from(content, 'utf8')
-    try {
-      const response = await blob.upload(body, body.byteLength, {
-        conditions: { ifNoneMatch: '*' },
-        blobHTTPHeaders: { blobContentType: 'application/json' },
-      })
-      if (typeof response.etag !== 'string') throw new Error('Blob upload did not return an etag.')
-      return { created: true, etag: response.etag }
-    } catch (error) {
-      if (statusCodeOf(error) === 409 || statusCodeOf(error) === 412) {
-        // Lost a create race (e.g. a concurrent default-workspace bootstrap); read back what won.
-        const existing = await getState(workspaceId)
-        if (existing) return { created: false, etag: existing.etag }
-      }
-      throw error
-    }
-  }
-
-  async function putState(workspaceId: string, content: string, expectedEtag: string) {
-    const blob = containerClient.getBlockBlobClient(blobPathFor(workspaceId))
-    const body = Buffer.from(content, 'utf8')
-    try {
-      const response = await blob.upload(body, body.byteLength, {
-        conditions: { ifMatch: expectedEtag },
-        blobHTTPHeaders: { blobContentType: 'application/json' },
-      })
-      if (typeof response.etag !== 'string') throw new Error('Blob upload did not return an etag.')
-      return { etag: response.etag }
-    } catch (error) {
-      const statusCode = statusCodeOf(error)
-      if (statusCode === 412 || statusCode === 404) throw new StoreConflictError('The workspace state changed since it was last loaded.')
-      throw error
-    }
-  }
-
   async function checkAccess() {
     await containerClient.getProperties()
   }
@@ -130,6 +93,6 @@ export function createStateStoreFromContainer(containerClient: StateBlobContaine
     }
   }
 
-  const store: StateStore = { getState, createState, putState, deleteState, acquireMutationLease, checkAccess }
+  const store: StateStore = { getState, deleteState, acquireMutationLease, checkAccess }
   return store
 }

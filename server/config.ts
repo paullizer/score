@@ -233,7 +233,7 @@ function settingsConfiguration(env: NodeJS.ProcessEnv, cosmos: CosmosConfig): Se
   }
 }
 
-function requireHttpsOrigin(env: NodeJS.ProcessEnv, name: string): string {
+function requireHttpsOrigin(env: NodeJS.ProcessEnv, name: string, allowLoopbackHttp = false): string {
   const value = required(env, name)
   let url: URL
   try {
@@ -241,7 +241,11 @@ function requireHttpsOrigin(env: NodeJS.ProcessEnv, name: string): string {
   } catch {
     throw new ConfigError(`${name} must be a valid URL.`)
   }
-  if (url.protocol !== 'https:') throw new ConfigError(`${name} must use https.`)
+  // Local dev-header runs sit behind the Vite dev server, which cannot terminate https itself.
+  const loopbackHttp = allowLoopbackHttp && url.protocol === 'http:' && ['127.0.0.1', 'localhost', '[::1]'].includes(url.hostname)
+  if (url.protocol !== 'https:' && !loopbackHttp) {
+    throw new ConfigError(allowLoopbackHttp ? `${name} must use https, or http on a loopback host for local development.` : `${name} must use https.`)
+  }
   if (url.pathname !== '/' && url.pathname !== '') throw new ConfigError(`${name} must not include a path.`)
   return url.origin
 }
@@ -384,7 +388,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     realResumes,
     realAnalyses,
     wordDocumentImports,
-    appOrigin: requireHttpsOrigin(env, 'APP_ORIGIN'),
+    appOrigin: requireHttpsOrigin(env, 'APP_ORIGIN', authMode === 'dev-header'),
     isProduction,
     isAppService,
   }

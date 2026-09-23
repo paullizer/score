@@ -123,7 +123,7 @@ export async function realAnalysisDependencyBlockers(
     for (const { record } of await runs(analyses, workspaceId)) {
       if (target.kind !== 'workspace' && !(await dependencyTargets(analyses, record))
         .some(value => value.kind === target.kind && value.id === target.id)) continue
-      blockers.push({ kind: 'analysis', id: record.id, name: getDisplayName(record, record.name), href: `/analyses/${encodeURIComponent(record.id)}?data=real` })
+      blockers.push({ kind: 'analysis', id: record.id, name: getDisplayName(record, record.name), href: `/analyses/${encodeURIComponent(record.id)}` })
     }
     return blockers
   } catch {
