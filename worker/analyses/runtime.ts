@@ -20,6 +20,7 @@ import {
   readAnalysisResult, readAnalysisSnapshots, type AnalysisSnapshots,
 } from '../../server/analyses/snapshots'
 import {
+  analysisComparisonProcessingSettings,
   analysisDiagnosticBlobName, analysisHash, analysisResultBlobName, assertAnalysisFailureDiagnosticBinding,
   analysisQcDiagnosticsBlobName,
   assertAnalysisResultBinding, parseAnalysisEntity, parseAnalysisFailureDiagnostic, parseAnalysisResult,
@@ -298,7 +299,7 @@ async function claimComparison(
     if (!run || !current || !canScore(run.record) || !['queued', 'running'].includes(current.record.status) || !due(current.record, now)) return
     if (!await workspaceAllowsWork(deps.store, run.record.workspaceId)) return
     const maxAttempts = operationSettings({
-      processingSettings: current.record.processingSettings ?? run.record.processingSettings,
+      processingSettings: analysisComparisonProcessingSettings(current.record, run.record),
     }, deps).settings.processing.analyses.maxAutomaticAttempts
     const attemptLimitReached = current.record.attempts >= maxAttempts
     const timestamp = timeAfter(clock, run.record, current.record)
@@ -443,8 +444,9 @@ export async function processClaimedComparison(
   options: { deadline?: number; signal?: AbortSignal; attemptLimitReached?: boolean } = {},
 ): Promise<boolean> {
   if (deps.owner && deps.owner !== claimed.record.lease?.owner) return false
-  const parent = claimed.record.processingSettings ? undefined : await loadAnalysisRun(deps.store, claimed.record.workspaceId, claimed.record.runId)
-  const pinned = claimed.record.processingSettings ?? parent?.record.processingSettings ?? deps.settings?.legacy
+  const parent = analysisComparisonProcessingSettings(claimed.record)
+    ? undefined : await loadAnalysisRun(deps.store, claimed.record.workspaceId, claimed.record.runId)
+  const pinned = analysisComparisonProcessingSettings(claimed.record, parent?.record) ?? deps.settings?.legacy
   const snapshot = operationSettings({ processingSettings: pinned }, deps)
   deps = { ...deps, model: { ...deps.model, ...(pinned ? { processingSettings: snapshot } : {}) } }
   if (pinned) console.info('Score operation settings:', safeSettingsMetadata(snapshot, 'assessment'))

@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto'
 import { z } from 'zod'
 import {
   ANALYSIS_CORRECTION_LIMITS, ANALYSIS_CORRECTION_POLICY_VERSION, ANALYSIS_LEGACY_CORRECTION_POLICY_VERSION,
+  ANALYSIS_REASSESSMENT_POLICY_VERSION, isAnalysisReassessmentPolicy,
   type AnalysisCorrectionHistoryEntry, type AnalysisCorrectionHistoryPage, type AnalysisCorrectionHistoryReference,
   type AnalysisCorrectionInput, type AnalysisCorrectionPreview, type AnalysisCorrectionProposal,
   type AnalysisCorrectionResponse, type RealAnalysisCorrectionRecord,
@@ -18,15 +19,18 @@ import { StoreConflictError } from '../store'
 import { analysisIsRemoved, assertAnalysisRunWritable, assertAnalysisWorkspaceActive, fencedAnalysisBlobs } from './guards'
 import { loadAnalysisComparison, loadAnalysisRun } from './lifecycle'
 import { narrativeTimestamp } from './narrative-records'
-import { analysisBlobReference, parseAnalysisJson, putAnalysisJson, readAnalysisBlob, readAnalysisResult, readAnalysisSnapshots } from './snapshots'
+import {
+  analysisBlobReference, parseAnalysisJson, putAnalysisJson, readAnalysisBlob, readAnalysisResult, readAnalysisSnapshots,
+} from './snapshots'
 import type { RealAnalysesDeps } from './store'
 import {
   analysisCorrectionHistoryBlobName, analysisCorrectionId, analysisCorrectionProposalBlobName,
-  analysisHash, assertAnalysis, calculateAnalysisSummary, isAnalysisId, parseAnalysisEntity,
+  analysisHash, assertAnalysis, calculateAnalysisSummary, isAnalysisId, parseAnalysisEntity, parseAnalysisResult,
 } from './validation'
 import {
-  analysisCorrectionFingerprint, analysisCorrectionInputSchema, assertCorrectionReviewBinding, buildEvidenceCorrectionAssessment,
-  correctionBlockedReason, parseAnalysisCorrectionHistoryEntry, parseAnalysisCorrectionProposal,
+  analysisCorrectionFingerprint, analysisCorrectionInputSchema, assertCorrectionReviewBinding, assertReassessmentResult,
+  buildEvidenceCorrectionAssessment, correctionBlockedReason, parseAnalysisCorrectionHistoryEntry, parseAnalysisCorrectionProposal,
+  reassessmentBlockedReason, reassessmentCriterionIds,
 } from './correction-validation'
 import { analysisCorrectionCanWork, loadAnalysisCorrection, projectAnalysisComparison } from './current-results'
 import { analysisCorrectionSummary } from './corrections'
@@ -106,6 +110,7 @@ export class AnalysisCorrectionService {
     })
     const criterionIds = criteria.filter(row => row.eligible).map(row => row.criterionId)
     const proposed = criterionIds.length ? buildEvidenceCorrectionAssessment(result, target, criterionIds, ANALYSIS_CORRECTION_POLICY_VERSION) : null
+    const reassessmentReason = reassessmentBlockedReason(result, target)
     const latest = await this.context(workspaceId, runId, comparisonId, signal)
     if (latest.etag !== state.etag || latest.current.result?.sha256 !== state.current.result.sha256) {
       throw conflict('This result changed while its preview was being prepared. Reload the preview.')
@@ -115,7 +120,12 @@ export class AnalysisCorrectionService {
       resultSha256: state.current.result.sha256, originalResultSha256: state.original.record.result.sha256,
       policyVersion: ANALYSIS_CORRECTION_POLICY_VERSION, before: summary(result),
       after: proposed ? calculateAnalysisSummary(proposed.criteria, proposed.qualifications, proposed.limitations) : null,
-      criteria, criterionIds, correction: state.correction ? analysisCorrectionSummary(state.correction, state.run.record) : null,
+      criteria, criterionIds,
+      reassessment: {
+        policyVersion: ANALYSIS_REASSESSMENT_POLICY_VERSION, eligible: reassessmentReason === null, blockedReason: reassessmentReason,
+        criterionIds: reassessmentReason === null ? reassessmentCriterionIds(result) : [],
+      },
+      correction: state.correction ? analysisCorrectionSummary(state.correction, state.run.record) : null,
     }
   }
 
@@ -205,6 +215,7 @@ export class AnalysisCorrectionService {
     if (!parsed.success) throw invalidRequest('Provide one saved result hash, unique criterion IDs, and a correction reason.')
     input = parsed.data
     const policyVersion = input.policyVersion ?? ANALYSIS_LEGACY_CORRECTION_POLICY_VERSION
+    const reassessment = isAnalysisReassessmentPolicy(policyVersion)
     requestId = requestId.toLowerCase()
     const fingerprint = analysisCorrectionFingerprint(workspaceId, runId, comparisonId, input, actor)
     let state = await this.context(workspaceId, runId, comparisonId)
@@ -226,7 +237,7 @@ export class AnalysisCorrectionService {
     if (!blob) {
       await this.writable(state)
       const current = await newWorkProcessingSettings(this.settings)
-      assertNewWork(current)
+      assertNewWork(current, reassessment ? 'newAnalyses' : undefined)
       processingSettings = newProcessingSettings(this.settings, current)
     }
     if (state.correction && ['queued', 'running'].includes(state.correction.record.status)) {
@@ -247,13 +258,27 @@ export class AnalysisCorrectionService {
       const snapshots = await readAnalysisSnapshots(this.deps.blobs, state.run.record, state.current)
       const result = await readAnalysisResult(this.deps.blobs, state.run.record, state.current, snapshots)
       assertAnalysis(result && state.current.result && state.original.record.result && state.current.attemptId, 'Correction needs its exact completed result.')
-      const blocked = input.criterionIds.map(id => {
-        const row = result.criteria.find(criterion => criterion.criterionId === id)
-        return row ? correctionBlockedReason(result, snapshots.targetSnapshot, row, policyVersion) : 'The criterion is absent from this result.'
-      }).find(reason => reason !== null)
-      if (blocked) throw invalidRequest(blocked)
-      const criterionIds = result.criteria.filter(row => input.criterionIds.includes(row.criterionId)).map(row => row.criterionId)
-      const proposed = buildEvidenceCorrectionAssessment(result, snapshots.targetSnapshot, criterionIds, policyVersion)
+      let criterionIds: string[]
+      let proposed: Pick<AnalysisCorrectionProposal, 'assessment' | 'summary'> = {}
+      if (reassessment) {
+        const blocked = reassessmentBlockedReason(result, snapshots.targetSnapshot)
+        if (blocked) throw invalidRequest(blocked)
+        criterionIds = reassessmentCriterionIds(result)
+        if (analysisHash([...criterionIds].sort()) !== analysisHash([...input.criterionIds].sort())) {
+          throw invalidRequest('A re-score must name exactly the weighted criteria that withheld this total. Reload the preview.')
+        }
+      } else {
+        const blocked = input.criterionIds.map(id => {
+          const row = result.criteria.find(criterion => criterion.criterionId === id)
+          return row ? correctionBlockedReason(result, snapshots.targetSnapshot, row, policyVersion) : 'The criterion is absent from this result.'
+        }).find(reason => reason !== null)
+        if (blocked) throw invalidRequest(blocked)
+        criterionIds = result.criteria.filter(row => input.criterionIds.includes(row.criterionId)).map(row => row.criterionId)
+        const assessment = buildEvidenceCorrectionAssessment(result, snapshots.targetSnapshot, criterionIds, policyVersion)
+        proposed = {
+          assessment, summary: calculateAnalysisSummary(assessment.criteria, assessment.qualifications, assessment.limitations),
+        }
+      }
       const timestamp = narrativeTimestamp(state.run.record, [this.now().toISOString(), state.correction?.record.updatedAt ?? ''].sort().at(-1)!)
       proposal = parseAnalysisCorrectionProposal({
         schemaVersion: 1, dataKind: 'real', workspaceId, runId, comparisonId, requestId, createdAt: timestamp,
@@ -268,7 +293,7 @@ export class AnalysisCorrectionService {
           baseResultSha256: state.current.result.sha256, baseAssessmentSha256: result.provenance.assessmentSha256,
           criterionIds, requestedBy: actor, requestedAt: timestamp, reason: input.reason,
         },
-        assessment: proposed, summary: calculateAnalysisSummary(proposed.criteria, proposed.qualifications, proposed.limitations),
+        ...proposed,
       })
       const assertCurrent = async () => {
         const current = await this.context(workspaceId, runId, comparisonId)
@@ -369,11 +394,23 @@ export class AnalysisCorrectionService {
       assertAnalysis(proposal.workspaceId === workspaceId && proposal.runId === runId && proposal.comparisonId === comparisonId &&
         proposal.requestId === entry.requestId && proposal.manifestSha256 === state.run.record.manifest.sha256 &&
         proposal.originalResultSha256 === state.original.record.result.sha256, 'Correction history proposal belongs to other saved inputs.')
-      if (entry.review) assertCorrectionReviewBinding(entry.review, proposal)
+      let after = proposal.summary ?? null
+      if (isAnalysisReassessmentPolicy(proposal.provenance.policyVersion) && entry.result) {
+        assertAnalysis((bytes += entry.result.bytes) <= 128 * 1024 * 1024, 'Correction history results exceed the bounded read budget.')
+        const result = parseAnalysisResult(parseAnalysisJson(await readAnalysisBlob(this.deps.blobs, entry.result, workspaceId, runId, signal)))
+        assertReassessmentResult(result, proposal)
+        assertAnalysis(result.provenance.attemptId === entry.attemptId &&
+          analysisHash(result.provenance.groundingReviews.at(-1)) === analysisHash(entry.review),
+        'Re-score history result is not bound to its supported review.')
+        after = summary(result)
+      } else if (entry.review) {
+        assertCorrectionReviewBinding(entry.review, proposal, entry.review.assessmentSha256)
+      }
       entries.push({
         id: entry.id, createdAt: entry.createdAt, requestId: entry.requestId, outcome: entry.outcome,
+        policyVersion: proposal.provenance.policyVersion,
         requestedBy: proposal.provenance.requestedBy, reason: proposal.provenance.reason, criterionIds: proposal.provenance.criterionIds,
-        beforeResultSha256: proposal.baseResult.sha256, after: proposal.summary,
+        beforeResultSha256: proposal.baseResult.sha256, after,
         review: entry.review ? { outcome: entry.review.outcome, issues: entry.review.issues,
           ...(entry.review.scope ? { scope: entry.review.scope } : {}) } : null,
         error: entry.error ?? null, resultSha256: entry.result?.sha256 ?? null,

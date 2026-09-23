@@ -138,6 +138,26 @@ async function correctionFixture() {
 async function head(f) {
   return correction.loadAnalysisCorrection(f.analysis.store, f.workspaceId, f.runId, f.comparisonId)
 }
+const REASSESSMENT = 'full-reassessment-v1'
+const rescore = proposal => { delete proposal.assessment; delete proposal.summary }
+function freshAssessment(call) {
+  const { input } = call.body
+  const { passageId } = input.resume.paragraphs[0].passages[0]
+  const output = {
+    criteria: input.rubric.criteria.map(criterion => ({
+      criterionId: criterion.id, evidenceStatus: 'supported', score: 3, citations: [{ passageId }], limitation: null,
+      rationale: 'The cited document describes independently evaluating engineering systems, matching the saved independent-work anchor.',
+    })),
+    qualifications: [],
+  }
+  // Accepted prompt bundles also request per-criterion QC diagnostics.
+  return call.request.response_format.json_schema.schema.properties?.qcDiagnostics ? {
+    ...output, qcDiagnostics: { criteria: output.criteria.map(row => ({
+      criterionId: row.criterionId, confidence: 'high', explanation: 'The document evidence clearly distinguishes the saved score anchor.',
+      ambiguity: [], alternativeScores: [],
+    })) },
+  } : output
+}
 async function enqueue(f, criterionIds = ['data-practices', 'statistical-advising'], mutate, policyVersion = 'missing-evidence-zero-v1') {
   const run = await f.analysis.store.get(f.workspaceId, f.runId)
   const previous = await head(f)
@@ -205,14 +225,16 @@ function workerFor(f, handler) {
         const request = JSON.parse(init.body)
         const call = { url: String(url), request, kind: request.response_format.json_schema.name, body: JSON.parse(request.messages[1].content), signal: init.signal }
         calls.push(call)
-        assert.ok(['resume_rubric_grounding_review', 'resume_evidence_gap_review'].includes(call.kind),
-          'Correction work must never call assessment or rewrite scores.')
-        const value = await handler?.(call, calls.length) ?? (call.kind === 'resume_evidence_gap_review' ? {
-          decisions: (await head(f)).record.criterionIds.map(criterionId => ({
-            criterionId, outcome: 'confirmed-missing', message: 'The complete source contains no supporting professional evidence.',
-            citations: [], blockerCode: null,
-          })),
-        } : { outcome: 'supported', issues: [] })
+        const reassessing = (await head(f))?.record.policyVersion === REASSESSMENT
+        assert.ok([...(reassessing ? ['resume_rubric_assessment'] : []), 'resume_rubric_grounding_review', 'resume_evidence_gap_review'].includes(call.kind),
+          'Only an explicit re-score may call assessment; other correction work must never rewrite scores.')
+        const value = await handler?.(call, calls.length) ?? (call.kind === 'resume_rubric_assessment' ? freshAssessment(call)
+          : call.kind === 'resume_evidence_gap_review' ? {
+            decisions: (await head(f)).record.criterionIds.map(criterionId => ({
+              criterionId, outcome: 'confirmed-missing', message: 'The complete source contains no supporting professional evidence.',
+              citations: [], blockerCode: null,
+            })),
+          } : { outcome: 'supported', issues: [] })
         if (value instanceof Response) return value
         return Response.json({ model: 'synthetic-independent-reviewer', choices: [{ finish_reason: 'stop', message: { content: JSON.stringify(value) } }] })
       },
@@ -918,4 +940,112 @@ test('narrative scheduling, archival, workspace locks, and in-flight cancellatio
     assert.equal([...f.analysis.blobs.values.keys()].filter(name => name.includes('/results/')).length, 1, stopped)
     await assertOriginal(f)
   }
+})
+
+test('a full re-score runs the complete assessment pipeline with the request-time rules and publishes a fresh, fully reviewed revision', async () => {
+  const f = await correctionFixture()
+  const legacy = settingsSnapshot(settings => { settings.ai.tasks.assessment.completionTokenLimit = 4096 })
+  const captured = settingsDomain.captureProcessingSettings(
+    legacy.settings, legacy.revision, legacy.capturedAt, createCompiledPromptBaseline(f.now),
+  )
+  const changed = settingsSnapshot(settings => { settings.ai.tasks.assessment.deploymentId = settings.ai.defaultDeploymentId }, 'changed-policy')
+  const proposal = await enqueue(f, undefined, value => { rescore(value); value.processingSettings = captured }, REASSESSMENT)
+  const worker = workerFor(f)
+  worker.deps.settings = { mode: 'configured', legacy: changed, current: async () => changed }
+  assert.deepEqual(await worker.run(), { claimed: 1, completed: 0 })
+  const saved = (await head(f)).record
+  assert.equal(saved.status, 'ready', JSON.stringify(saved.error))
+  assert.deepEqual(worker.calls.map(call => call.kind), ['resume_rubric_assessment', 'resume_rubric_grounding_review'])
+  assert.equal(worker.calls[0].request.model, 'deployment-assessment')
+  assert.equal(worker.calls[0].request.max_completion_tokens, 4096)
+  assert.equal(saved.published.revision.policyVersion, REASSESSMENT)
+  assert.deepEqual(saved.published.revision.criterionIds, ['data-practices', 'statistical-advising'])
+  const run = (await f.analysis.store.get(f.workspaceId, f.runId)).record
+  const projected = correction.projectAnalysisComparison(f.original.record, saved)
+  const result = await api.readAnalysisResult(f.analysis.blobs, run, projected, f.snapshots)
+  assert.deepEqual(result.overall, { status: 'available', score: 60 })
+  assert.ok(result.criteria.every(row => row.evidenceStatus === 'supported' && row.score === 3))
+  assert.deepEqual(result.provenance.correction, proposal.provenance)
+  assert.notDeepEqual(result.provenance.assessment, f.originalResult.provenance.assessment)
+  assert.equal(result.provenance.assessment.prompt.family, 'assessment')
+  assert.equal(result.provenance.assessment.prompt.bundleSha256, captured.promptBundle.bundle.bundleSha256)
+  assert.ok(result.provenance.assessment.startedAt >= proposal.createdAt)
+  assert.ok(result.provenance.groundingReviews.every(review => !review.scope && review.provenance.startedAt >= proposal.createdAt))
+  const entry = await historyEntry(f)
+  assert.equal(entry.outcome, 'ready')
+  assert.deepEqual(entry.review, result.provenance.groundingReviews.at(-1))
+  assert.equal(run.progress.scored, 1)
+  assert.equal(run.progress.unscored, 0)
+  await assertOriginal(f)
+})
+
+test('a failed re-score keeps the previous result, records no review, and leaves the total withheld', async () => {
+  const f = await correctionFixture()
+  const captured = settingsSnapshot(settings => {
+    settings.ai.transport.maxAttempts = 1
+    settings.processing.analyses.maxAutomaticAttempts = 1
+  })
+  await enqueue(f, undefined, value => { rescore(value); value.processingSettings = captured }, REASSESSMENT)
+  const worker = workerFor(f, () => new Response('Synthetic provider outage', { status: 503 }))
+  await worker.run()
+  const saved = (await head(f)).record
+  assert.equal(saved.status, 'failed')
+  assert.equal(saved.error.stage, 'assessment')
+  assert.equal(saved.error.code, 'service-unavailable')
+  assert.equal(saved.published, undefined)
+  assert.deepEqual(worker.calls.map(call => call.kind), ['resume_rubric_assessment'])
+  const entry = await historyEntry(f)
+  assert.equal(entry.outcome, 'failed')
+  assert.equal(entry.review, undefined)
+  assert.equal(entry.result, undefined)
+  const run = (await f.analysis.store.get(f.workspaceId, f.runId)).record
+  assert.equal(run.progress.unscored, 1)
+  await assertOriginal(f)
+})
+
+test('re-score provenance never predates its explicit request when the worker clock trails the API', async () => {
+  const f = await correctionFixture()
+  const proposal = await enqueue(f, undefined, rescore, REASSESSMENT)
+  f.transactions.after(() => { f.now = new Date(Date.parse(f.now) - 2000).toISOString() })
+  const worker = workerFor(f)
+  await worker.run()
+  const saved = (await head(f)).record
+  assert.equal(saved.status, 'ready', JSON.stringify(saved.error))
+  assert.ok(Date.parse(f.now) < Date.parse(proposal.createdAt))
+  const run = (await f.analysis.store.get(f.workspaceId, f.runId)).record
+  const result = await api.readAnalysisResult(f.analysis.blobs, run, correction.projectAnalysisComparison(f.original.record, saved), f.snapshots)
+  assert.equal(result.provenance.assessment.startedAt, proposal.createdAt)
+  assert.ok(result.provenance.groundingReviews.every(review => review.provenance.startedAt >= proposal.createdAt))
+  await assertOriginal(f)
+})
+
+test('a re-score whose fresh assessment still has a genuine source blocker publishes that honest withheld result', async () => {
+  const f = await correctionFixture()
+  await enqueue(f, undefined, rescore, REASSESSMENT)
+  const blocker = 'The merged source text is ambiguous about whose data-handling work is described and needs human review.'
+  const worker = workerFor(f, call => {
+    if (call.kind === 'resume_evidence_gap_review') {
+      return { decisions: [{ criterionId: 'data-practices', outcome: 'blocked', message: blocker, citations: [], blockerCode: 'unusable-source' }] }
+    }
+    if (call.kind !== 'resume_rubric_assessment') return undefined
+    const output = freshAssessment(call)
+    output.criteria[1] = {
+      ...output.criteria[1], evidenceStatus: 'not-assessed', score: null, citations: [],
+      rationale: 'The captured source is ambiguous about whose data-handling work is described.',
+      limitation: { code: 'unusable-source', message: blocker },
+    }
+    return output
+  })
+  await worker.run()
+  const saved = (await head(f)).record
+  assert.equal(saved.status, 'ready', JSON.stringify(saved.error))
+  assert.equal(saved.published.summary.overall.status, 'withheld')
+  assert.deepEqual(worker.calls.map(call => call.kind), ['resume_rubric_assessment', 'resume_evidence_gap_review', 'resume_rubric_grounding_review'])
+  const run = (await f.analysis.store.get(f.workspaceId, f.runId)).record
+  const result = await api.readAnalysisResult(f.analysis.blobs, run, correction.projectAnalysisComparison(f.original.record, saved), f.snapshots)
+  assert.equal(result.criteria[1].limitation.blockerCode, 'unusable-source')
+  assert.equal(result.provenance.groundingReviews.length, 1)
+  assert.equal(result.provenance.groundingReviews[0].scope, undefined)
+  assert.equal(run.progress.unscored, 1)
+  await assertOriginal(f)
 })

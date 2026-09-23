@@ -94,6 +94,10 @@ export function assertAnalysisReplacement(previous: AnalysisEntity, next: Analys
   } else if (previous.recordType === 'analysis-comparison' && next.recordType === 'analysis-comparison') {
     assertAnalysis(preservesProcessingSettings(previous.processingSettings, next.processingSettings),
       'Accepted comparison processing settings are immutable.')
+    assertAnalysis(analysisHash(previous.settingsUpgrade ?? null) === analysisHash(next.settingsUpgrade ?? null) ||
+      (['failed', 'cancelled'].includes(previous.status) && next.status === 'queued' && next.settingsUpgrade !== undefined &&
+        next.settingsUpgrade.requestedAt === next.updatedAt && next.retryCount === previous.retryCount + 1),
+    'Current-rules processing settings can be recorded only by an explicit retry of stopped work.')
     assertAnalysis(previous.runId === next.runId && previous.index === next.index &&
       analysisHash(previous.resume) === analysisHash(next.resume) && analysisHash(previous.target) === analysisHash(next.target),
     'Comparison frozen inputs are immutable.')

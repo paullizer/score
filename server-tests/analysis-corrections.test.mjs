@@ -4,12 +4,17 @@ import test from 'node:test'
 import {
   api, fixture, seedResume, seedJob, seedGrade, publishResult, startHttp, citation, clone, ACTOR, guidance, finishInitialization,
 } from './real-analyses.test-support.mjs'
-import { reviewedCorrection as reviewed } from './analysis-corrections.test-support.mjs'
+import { reviewedCorrection as reviewed, reassessedCorrection as reassessed } from './analysis-corrections.test-support.mjs'
 import { narrativeRuntime, narrativeWorker, runComparisons, settleNarratives } from './real-analysis-narratives.test-support.mjs'
 
 const status = expected => error => error.status === expected
 const reason = 'Score absent documentary support as zero; preserve original results and evidence.'
 const input = preview => ({ policyVersion: preview.policyVersion, resultSha256: preview.resultSha256, criterionIds: preview.criterionIds, reason })
+const reassessment = 'full-reassessment-v1'
+const reassess = preview => ({
+  policyVersion: reassessment, resultSha256: preview.resultSha256, criterionIds: preview.reassessment.criterionIds,
+  reason: 'Re-score this withheld comparison with the current processing rules against the same frozen inputs.',
+})
 
 function professionalJobOptions(personal = false) {
   return {
@@ -66,6 +71,13 @@ async function requestCorrection(context, requestId = randomUUID(), policyVersio
   const { f, runId, comparisonId } = context
   const preview = await f.service.correctionPreview(f.workspaceId, runId, comparisonId)
   const response = await f.service.requestCorrection(f.workspaceId, runId, comparisonId, { ...input(preview), policyVersion }, requestId, preview.etag, ACTOR)
+  return { preview, response, requestId }
+}
+
+async function requestReassessment(context, requestId = randomUUID()) {
+  const { f, runId, comparisonId } = context
+  const preview = await f.service.correctionPreview(f.workspaceId, runId, comparisonId)
+  const response = await f.service.requestCorrection(f.workspaceId, runId, comparisonId, reassess(preview), requestId, preview.etag, ACTOR)
   return { preview, response, requestId }
 }
 
@@ -700,4 +712,178 @@ test('GS exclusions and unscored qualification limitations survive a zero correc
   assert.deepEqual(result.criteria[1], original.result.criteria[1])
   assert.deepEqual(result.qualifications, original.result.qualifications)
   assert.deepEqual(result.limitations, original.result.limitations)
+})
+
+test('previews offer a full re-score for exactly the weighted criteria that withheld a total, including rows a zero cannot resolve', async () => {
+  for (const options of [{}, { blocked: 'source-quality', blockerCode: 'unusable-source' }, { blocked: 'context-limit' }, { globalBlock: true }]) {
+    const { f, runId, comparisonId } = await setup(options)
+    const preview = await f.service.correctionPreview(f.workspaceId, runId, comparisonId)
+    assert.deepEqual(preview.reassessment, {
+      policyVersion: reassessment, eligible: true, blockedReason: null, criterionIds: ['confidentiality'],
+    }, JSON.stringify(options))
+  }
+  const all = await setup({ allMissing: true })
+  assert.deepEqual((await all.f.service.correctionPreview(all.f.workspaceId, all.runId, all.comparisonId)).reassessment.criterionIds,
+    ['engineering', 'confidentiality'])
+  const personal = await setup({ personal: true })
+  const traits = await personal.f.service.correctionPreview(personal.f.workspaceId, personal.runId, personal.comparisonId)
+  assert.equal(traits.reassessment.eligible, false)
+  assert.match(traits.reassessment.blockedReason, /personal-trait/)
+  assert.deepEqual(traits.reassessment.criterionIds, [])
+  const numeric = await setup({ unaffected: true })
+  const scored = await numeric.f.service.correctionPreview(numeric.f.workspaceId, numeric.runId, numeric.unchanged.completed.id)
+  assert.equal(scored.reassessment.eligible, false)
+  assert.match(scored.reassessment.blockedReason, /withheld/)
+})
+
+test('re-score requests bind the exact withheld criteria and key, and never carry a deterministic proposal', async () => {
+  const context = await setup({ blocked: 'source-quality', blockerCode: 'unusable-source' })
+  const { f, runId, comparisonId } = context
+  const preview = await f.service.correctionPreview(f.workspaceId, runId, comparisonId)
+  for (const criterionIds of [['engineering'], ['confidentiality', 'engineering']]) {
+    await assert.rejects(f.service.requestCorrection(f.workspaceId, runId, comparisonId,
+      { ...reassess(preview), criterionIds }, randomUUID(), preview.etag, ACTOR), status(400))
+  }
+  const personal = await setup({ personal: true })
+  const traits = await personal.f.service.correctionPreview(personal.f.workspaceId, personal.runId, personal.comparisonId)
+  await assert.rejects(personal.f.service.requestCorrection(personal.f.workspaceId, personal.runId, personal.comparisonId,
+    { ...reassess(traits), criterionIds: ['confidentiality'] }, randomUUID(), traits.etag, ACTOR), status(400))
+  assert.equal(await api.loadAnalysisCorrection(personal.f.analysis.store, personal.f.workspaceId, personal.runId, personal.comparisonId), undefined)
+  assert.equal(await api.loadAnalysisCorrection(f.analysis.store, f.workspaceId, runId, comparisonId), undefined)
+  const { response, requestId } = await requestReassessment(context)
+  assert.equal(response.correction.policyVersion, reassessment)
+  assert.deepEqual(response.correction.criterionIds, ['confidentiality'])
+  const head = await api.loadAnalysisCorrection(f.analysis.store, f.workspaceId, runId, comparisonId)
+  const run = await api.loadAnalysisRun(f.analysis.store, f.workspaceId, runId)
+  const proposal = await api.readAnalysisCorrectionProposal(f.analysis.blobs, run.record, head.record)
+  assert.equal(proposal.provenance.policyVersion, reassessment)
+  assert.equal(proposal.assessment, undefined)
+  assert.equal(proposal.summary, undefined)
+  assert.equal(proposal.provenance.baseAssessmentSha256, context.original.result.provenance.assessmentSha256)
+  const replay = await f.service.requestCorrection(f.workspaceId, runId, comparisonId, reassess(preview), requestId, preview.etag, ACTOR)
+  assert.equal(replay.correction.etag, response.correction.etag)
+  await assert.rejects(f.service.requestCorrection(f.workspaceId, runId, comparisonId,
+    { ...reassess(preview), policyVersion: api.ANALYSIS_CORRECTION_POLICY_VERSION }, requestId, preview.etag, ACTOR), status(409))
+  assert.throws(() => api.parseAnalysisCorrectionProposal({ ...clone(proposal), assessment: clone(context.original.result) }))
+})
+
+test('re-score admission requires new analyses to be enabled, while a missing-evidence correction does not', async t => {
+  const { f, runId, comparisonId } = await setup()
+  const snapshot = settingsFor(f, settings => { settings.features.newAnalyses = false })
+  const http = await startHttp(f, true, { async capture() { return snapshot } })
+  t.after(http.close)
+  const path = `/${runId}/comparisons/${comparisonId}/corrections`
+  const preview = await (await http.request(`${path}/preview`)).json()
+  assert.equal(preview.reassessment.eligible, true)
+  const records = clone([...f.analysis.store.values]), blobs = clone([...f.analysis.blobs.values])
+  const refused = await http.request(path, 'POST', reassess(preview), { headers: { 'If-Match': preview.etag, 'Idempotency-Key': randomUUID() } })
+  assert.equal(refused.status, 503)
+  assert.deepEqual([...f.analysis.store.values], records)
+  assert.deepEqual([...f.analysis.blobs.values], blobs)
+  const accepted = await http.request(path, 'POST', input(preview), { headers: { 'If-Match': preview.etag, 'Idempotency-Key': randomUUID() } })
+  assert.equal(accepted.status, 202)
+})
+
+test('a supported re-score publishes a fresh full assessment as the current revision and keeps the original and its history', async () => {
+  const context = await setup({ unaffected: true, blocked: 'source-quality', blockerCode: 'unusable-source' })
+  const { f, runId, comparisonId, original, unchanged } = context
+  const raw = clone(await f.analysis.store.get(f.workspaceId, comparisonId))
+  const untouched = clone(await f.analysis.store.get(f.workspaceId, unchanged.completed.id))
+  const originalBytes = clone(f.analysis.blobs.values.get(original.reference.blobName))
+  const { requestId } = await requestReassessment(context)
+  const accepted = await reassessed(context)
+  await accepted.publish()
+  await accepted.publish()
+  assert.deepEqual(await f.analysis.store.get(f.workspaceId, comparisonId), raw)
+  assert.deepEqual(await f.analysis.store.get(f.workspaceId, untouched.record.id), untouched)
+  assert.deepEqual(f.analysis.blobs.values.get(original.reference.blobName), originalBytes)
+  const detail = await f.service.comparisonDetail(f.workspaceId, runId, comparisonId)
+  assert.deepEqual(detail.result.overall, { status: 'available', score: 78 })
+  assert.equal(detail.comparison.resultRevision.id, requestId)
+  assert.equal(detail.comparison.resultRevision.policyVersion, reassessment)
+  assert.deepEqual(detail.comparison.resultRevision.criterionIds, ['confidentiality'])
+  assert.deepEqual(detail.result.criteria[0], original.result.criteria[0])
+  assert.equal(detail.result.criteria[1].evidenceStatus, 'partial')
+  assert.equal(detail.result.criteria[1].score, 3)
+  assert.equal(detail.result.provenance.assessment.promptVersion, 'synthetic-current-assessment')
+  assert.equal(detail.result.provenance.groundingReviews[0].scope, undefined)
+  assert.equal(detail.result.provenance.correction.policyVersion, reassessment)
+  const run = await f.service.detail(f.workspaceId, runId)
+  assert.equal(run.run.progress.scored, 2)
+  assert.equal(run.run.progress.unscored, 0)
+  const report = await f.service.reportComparisons(f.workspaceId, runId, [comparisonId])
+  const facts = report.comparisons[0].provenance
+  assert.ok(facts.some(item => item.label === 'Re-score revision' && item.value === requestId))
+  assert.ok(facts.some(item => item.label === 'Re-score provenance' && /^Full re-score/.test(item.value)))
+  assert.ok(!facts.some(item => item.label === 'Evidence correction revision'))
+  const history = await f.service.correctionHistory(f.workspaceId, runId, comparisonId)
+  assert.equal(history.entries[0].policyVersion, reassessment)
+  assert.equal(history.entries[0].outcome, 'ready')
+  assert.deepEqual(history.entries[0].after, detail.comparison.resultSummary)
+  assert.equal(history.entries[0].resultSha256, accepted.reference.sha256)
+  assert.equal(history.entries[0].review.scope, undefined)
+  assert.deepEqual(history.originalAssessment.criteria, original.result.criteria)
+  assert.equal(history.original.overall.status, 'withheld')
+  const after = await f.service.correctionPreview(f.workspaceId, runId, comparisonId)
+  assert.equal(after.reassessment.eligible, false)
+})
+
+test('a re-score cannot publish reused attribution or reviews that predate or narrow its explicit request', async () => {
+  const context = await setup()
+  const { f, runId, comparisonId, original } = context
+  await requestReassessment(context)
+  const reused = await reassessed(context, { mutate(result, base) { result.provenance.assessment = clone(base.provenance.assessment) } })
+  await assert.rejects(reused.publish(), /fresh/)
+  for (const mutate of [
+    result => { result.provenance.assessment.startedAt = '2020-01-01T00:00:00.000Z' },
+    result => { result.provenance.groundingReviews[0].provenance.startedAt = '2020-01-01T00:00:00.000Z' },
+    result => {
+      result.provenance.groundingReviews[0].scope = {
+        kind: 'evidence-gaps', baseAssessmentSha256: original.result.provenance.assessmentSha256, criterionIds: ['confidentiality'],
+        decisions: [{ criterionId: 'confidentiality', outcome: 'confirmed-missing', message: 'Scoped approval is not a full re-score.', citations: [] }],
+      }
+    },
+  ]) await assert.rejects(reassessed(context, { mutate }))
+  assert.equal((await f.service.comparisonDetail(f.workspaceId, runId, comparisonId)).comparison.result.sha256, original.reference.sha256)
+  assert.equal((await f.service.detail(f.workspaceId, runId)).run.progress.unscored, 1)
+})
+
+test('a re-score that still withholds publishes honestly and remains readable as a historical revision after a later correction', async () => {
+  const context = await setup({ allMissing: true })
+  const { f, runId, comparisonId, original } = context
+  const subject = { kind: 'candidate', subjectId: comparisonId }
+  await settleNarratives(f, runId)
+  const first = await requestReassessment(context)
+  assert.deepEqual(first.preview.reassessment.criterionIds, ['engineering', 'confidentiality'])
+  const rescored = await reassessed(context, { configure(assessment) {
+    assessment.criteria[1] = clone(original.result.criteria[1])
+    assessment.limitations = [clone(original.result.criteria[1].limitation)]
+  } })
+  await rescored.publish()
+  const withheld = await f.service.comparisonDetail(f.workspaceId, runId, comparisonId)
+  assert.equal(withheld.result.overall.status, 'withheld')
+  assert.equal(withheld.result.criteria[0].score, 3)
+  assert.equal(withheld.comparison.resultRevision.policyVersion, reassessment)
+  assert.equal((await f.service.detail(f.workspaceId, runId)).run.progress.unscored, 1)
+  await settleNarratives(f, runId)
+  const rescoredNarrative = await f.service.summarySubject(f.workspaceId, runId, subject)
+  assert.equal(rescoredNarrative.narrative.resultSha256, rescored.reference.sha256)
+  const second = await requestCorrection(context)
+  assert.deepEqual(second.preview.criterionIds, ['confidentiality'])
+  assert.deepEqual(second.preview.reassessment.criterionIds, ['confidentiality'])
+  const corrected = await reviewed(context)
+  assert.equal(corrected.proposal.baseResult.sha256, rescored.reference.sha256)
+  assert.equal(corrected.proposal.originalResultSha256, original.reference.sha256)
+  await corrected.publish()
+  const current = await f.service.comparisonDetail(f.workspaceId, runId, comparisonId)
+  assert.equal(current.result.overall.status, 'available')
+  assert.equal(current.result.criteria[0].score, 3)
+  assert.equal(current.result.criteria[1].score, 0)
+  assert.equal((await f.service.detail(f.workspaceId, runId)).run.progress.unscored, 0)
+  const historical = await f.service.summarySubject(f.workspaceId, runId, subject, undefined, first.requestId)
+  assert.equal(historical.resultRevisionId, first.requestId)
+  assert.deepEqual(historical.narrative, rescoredNarrative.narrative)
+  const history = await f.service.correctionHistory(f.workspaceId, runId, comparisonId)
+  assert.deepEqual(history.entries.map(entry => entry.policyVersion), [api.ANALYSIS_CORRECTION_POLICY_VERSION, reassessment])
+  assert.equal(history.entries[1].after.overall.status, 'withheld')
 })

@@ -1,6 +1,6 @@
 import {
   ANALYSIS_LIMITS, type RealAnalysisRunRecord, type RealAnalysisComparisonRecord,
-  type RealAnalysisInitializationManifest, type VersionedAnalysisEntity,
+  type RealAnalysisInitializationManifest, type VersionedAnalysisEntity, type AnalysisSettingsUpgrade,
 } from '../../src/domain/real-analyses'
 import { StoreConflictError } from '../store'
 import type { AnalysisStore, AnalysisTransaction, RealAnalysesDeps } from './store'
@@ -112,12 +112,15 @@ export function cancelAnalysisComparisonRecord(record: RealAnalysisComparisonRec
   delete updated.error
   return updated
 }
-export function retryAnalysisComparisonRecord(record: RealAnalysisComparisonRecord, timestamp: string): RealAnalysisComparisonRecord {
+export function retryAnalysisComparisonRecord(
+  record: RealAnalysisComparisonRecord, timestamp: string, settingsUpgrade?: AnalysisSettingsUpgrade,
+): RealAnalysisComparisonRecord {
   assertAnalysis(record.status === 'failed' || record.status === 'cancelled', 'Only failed or cancelled comparisons can be retried.')
   const updated: RealAnalysisComparisonRecord = {
     ...structuredClone(record), status: 'queued', updatedAt: timestamp, attempts: 0,
     processingSettings: acceptedProcessingSettings(record.processingSettings),
     retryCount: record.retryCount + 1, nextAttemptAt: timestamp,
+    ...(settingsUpgrade ? { settingsUpgrade: structuredClone(settingsUpgrade) } : {}),
   }
   delete updated.lease
   delete updated.attemptId

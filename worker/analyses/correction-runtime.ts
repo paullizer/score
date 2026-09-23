@@ -1,18 +1,22 @@
 import { randomUUID } from 'node:crypto'
 import {
-  ANALYSIS_CORRECTION_POLICY_VERSION, type AnalysisCorrectionHistoryEntry, type AnalysisCorrectionHistoryReference,
-  type AnalysisCorrectionProposal, type RealAnalysisCorrectionRecord,
+  ANALYSIS_CORRECTION_POLICY_VERSION, isAnalysisReassessmentPolicy, type AnalysisCorrectionHistoryEntry,
+  type AnalysisCorrectionHistoryReference, type AnalysisCorrectionProposal, type RealAnalysisCorrectionRecord,
 } from '../../src/domain/analysis-corrections'
 import {
   ANALYSIS_LIMITS, type AnalysisProcessingError, type RealAnalysisAssessmentInput, type RealAnalysisComparisonRecord,
-  type RealAnalysisGroundingReview, type RealAnalysisResult, type RealAnalysisRunRecord, type VersionedAnalysisEntity,
+  type RealAnalysisGroundingReview, type RealAnalysisResult, type RealAnalysisResultSummary, type RealAnalysisRunRecord,
+  type VersionedAnalysisEntity,
 } from '../../src/domain/real-analyses'
 import type { ImmutableJsonBlobReference } from '../../src/domain/real-resumes'
 import { StoreConflictError } from '../../server/store'
 import {
   analysisCorrectionCanWork, loadAnalysisCorrection, projectAnalysisComparison, publishAnalysisCorrection, readAnalysisCorrectionProposal,
 } from '../../server/analyses/corrections'
-import { assertCorrectionReviewBinding, assertEvidenceCorrectionAssessment, parseAnalysisCorrectionHistoryEntry } from '../../server/analyses/correction-validation'
+import {
+  assertCorrectionReviewBinding, assertEvidenceCorrectionAssessment, assertReassessmentProposal, assertReassessmentResult,
+  correctionProposalAssessment, parseAnalysisCorrectionHistoryEntry,
+} from '../../server/analyses/correction-validation'
 import { analysisAssessmentHash } from '../../server/analyses/deterministic'
 import { fencedAnalysisBlobs } from '../../server/analyses/guards'
 import { loadAnalysisComparison, loadAnalysisRun } from '../../server/analyses/lifecycle'
@@ -28,7 +32,7 @@ import {
 import { systemClock, type Clock } from '../runtime'
 import { operationSettings, retryBackoff, RuntimeSettingsError, safeSettingsMetadata } from '../settings'
 import { PromptPinError } from '../prompts'
-import { AnalysisModelError, reviewAnalysisAssessment, reviewAnalysisEvidenceGaps } from './model'
+import { AnalysisModelError, assessResumeAgainstTarget, reviewAnalysisAssessment, reviewAnalysisEvidenceGaps } from './model'
 import type { AnalysisWorkerDependencies } from './runtime'
 import { emitAnalysisTelemetry } from './telemetry'
 
@@ -323,20 +327,26 @@ function assertProposal(
     provenance.requestedAt === record.requestedAt && provenance.requestedBy === record.requestedBy && provenance.reason === record.reason &&
     analysisHash(provenance.criterionIds) === analysisHash(record.criterionIds),
   'Correction provenance does not bind the exact approved base assessment and selection.')
+  if (isAnalysisReassessmentPolicy(record.policyVersion)) {
+    assertReassessmentProposal(proposal, base, snapshots.targetSnapshot)
+    return
+  }
+  const { assessment } = correctionProposalAssessment(proposal)
   assertEvidenceCorrectionAssessment(proposal, base, snapshots.targetSnapshot)
-  assertAnalysis(validateAnalysisAssessment(proposal.assessment, snapshots.resumeSnapshot.document, snapshots.targetSnapshot).length === 0,
+  assertAnalysis(validateAnalysisAssessment(assessment, snapshots.resumeSnapshot.document, snapshots.targetSnapshot).length === 0,
     'The correction assessment does not match its exact frozen evidence.')
 }
 
 function assertReview(review: RealAnalysisGroundingReview, proposal: AnalysisCorrectionProposal, snapshots: AnalysisSnapshots): void {
+  const { assessment } = correctionProposalAssessment(proposal)
   assertCorrectionReviewBinding(review, proposal)
-  assertAnalysis(review.assessmentSha256 === analysisAssessmentHash(proposal.assessment) &&
+  assertAnalysis(review.assessmentSha256 === analysisAssessmentHash(assessment) &&
     review.resumeSnapshotSha256 === proposal.resumeSnapshot.sha256 && review.targetSnapshotSha256 === proposal.targetSnapshot.sha256 &&
     (review.outcome === 'supported' ? review.issues.length === 0 : review.issues.length > 0),
   'The independent correction review does not bind this exact proposal.')
   for (const issue of review.issues) assertAnalysis(!(issue.criterionId && issue.qualificationId) &&
-    (!issue.criterionId || proposal.assessment.criteria.some(row => row.criterionId === issue.criterionId)) &&
-    (!issue.qualificationId || proposal.assessment.qualifications.some(row => row.qualificationId === issue.qualificationId)) &&
+    (!issue.criterionId || assessment.criteria.some(row => row.criterionId === issue.criterionId)) &&
+    (!issue.qualificationId || assessment.qualifications.some(row => row.qualificationId === issue.qualificationId)) &&
     issue.citations.every(citation => citationMatchesDocument(citation, snapshots.resumeSnapshot.document)),
   'The independent correction review cites foreign evidence or requirements.')
 }
@@ -382,14 +392,15 @@ export async function processClaimedCorrection(
   options: { deadline?: number; signal?: AbortSignal; attemptLimitReached?: boolean } = {},
 ): Promise<boolean> {
   if (deps.correctionsEnabled !== true || deps.owner && deps.owner !== claimed.record.lease?.owner) return false
+  const reassessment = isAnalysisReassessmentPolicy(claimed.record.policyVersion)
   const pinned = claimed.record.processingSettings ?? deps.settings?.legacy
   const snapshot = operationSettings({ processingSettings: pinned }, deps)
   deps = { ...deps, model: { ...deps.model, ...(pinned ? { processingSettings: snapshot } : {}) } }
-  if (pinned) console.info('Score operation settings:', safeSettingsMetadata(snapshot, 'assessmentReview'))
+  if (pinned) console.info('Score operation settings:', safeSettingsMetadata(snapshot, reassessment ? 'assessment' : 'assessmentReview'))
   const maxAttempts = snapshot.settings.processing.analyses.maxAutomaticAttempts
   const clock = deps.clock ?? systemClock
   const lease = new CorrectionLease(claimed, deps, clock, options.deadline ?? clock.now().getTime() + RUN_BUDGET_MS, options.signal)
-  let stage: Stage = 'grounding'
+  let stage: Stage = reassessment ? 'assessment' : 'grounding'
   let inputs = true
   let review: RealAnalysisGroundingReview | undefined
   let reference: ImmutableJsonBlobReference | undefined
@@ -397,7 +408,7 @@ export async function processClaimedCorrection(
     const { run, correction, original } = await lease.check()
     if (options.attemptLimitReached) throw new CorrectionWorkFailure({
       code: 'timeout', stage, retryable: true,
-      message: `Correction review stopped after ${maxAttempts} attempts. A manual retry preserves the same saved evidence.`,
+      message: `${reassessment ? 'Re-scoring' : 'Correction review'} stopped after ${maxAttempts} attempts. A manual retry preserves the same saved evidence.`,
     })
     const reader = inputBlobs(deps.blobs)
     const snapshots = await lease.control.wait(() => readAnalysisSnapshots(reader, run.record, original.record))
@@ -417,46 +428,79 @@ export async function processClaimedCorrection(
     }
     inputs = false
     await lease.check()
+    const onEvent = (event: Parameters<typeof emitAnalysisTelemetry>[1]) => emitAnalysisTelemetry(deps.onEvent, {
+      ...event, workspaceId: correction.record.workspaceId, runId: correction.record.runId,
+      comparisonId: correction.record.comparisonId, attemptId: correction.record.attemptId,
+    })
     const reviewOptions = {
       model: deps.model, clock, signal: lease.control.signal,
       resumeSnapshotSha256: correction.record.resumeSnapshot.sha256, targetSnapshotSha256: correction.record.targetSnapshot.sha256,
-      onEvent: (event: Parameters<typeof emitAnalysisTelemetry>[1]) => emitAnalysisTelemetry(deps.onEvent, {
-        ...event, workspaceId: correction.record.workspaceId, runId: correction.record.runId,
-        comparisonId: correction.record.comparisonId, attemptId: correction.record.attemptId,
-      }),
+      onEvent,
     }
-    const reviewed = await lease.control.wait(() => correction.record.policyVersion === ANALYSIS_CORRECTION_POLICY_VERSION
-      ? reviewAnalysisEvidenceGaps(input, proposal.assessment, {
-        ...reviewOptions, criterionIds: correction.record.criterionIds,
-        baseAssessmentSha256: proposal.provenance.baseAssessmentSha256,
+    let result: RealAnalysisResult
+    let resultSummary: RealAnalysisResultSummary
+    let current: Awaited<ReturnType<CorrectionLease['check']>>
+    if (reassessment) {
+      // Model provenance must not predate the explicit request, even when this worker's clock trails the API's.
+      const requested = Date.parse(proposal.createdAt)
+      const requestClock: Clock = { now: () => new Date(Math.max(clock.now().getTime(), requested)), sleep: clock.sleep.bind(clock) }
+      const assessed = await lease.control.wait(() => assessResumeAgainstTarget(input, {
+        ...reviewOptions, clock: requestClock,
+        onEvent: event => { stage = event.stage; onEvent(event) },
+      }))
+      stage = 'publication'
+      current = await lease.check()
+      result = parseAnalysisResult({
+        ...assessed.assessment, ...assessed.summary, schemaVersion: 1, dataKind: 'real',
+        workspaceId: run.record.workspaceId, runId: run.record.id, comparisonId: original.record.id,
+        createdAt: timestamp(clock, current.run.record, current.correction.record), humanReviewRequired: true,
+        provenance: {
+          attemptId: correction.record.attemptId!, manifestSha256: run.record.manifest.sha256,
+          resumeSnapshot: correction.record.resumeSnapshot, targetSnapshot: correction.record.targetSnapshot,
+          assessment: assessed.assessmentProvenance, assessmentSha256: assessed.assessmentSha256,
+          groundingReviews: assessed.groundingReviews, correctionCount: assessed.correctionCount,
+          calculationVersion: 'weighted-0-100-v1', correction: proposal.provenance,
+        },
+      } satisfies RealAnalysisResult)
+      assertReassessmentResult(result, proposal)
+      review = result.provenance.groundingReviews.at(-1)!
+      resultSummary = { completion: result.completion, overall: result.overall, coverage: result.coverage }
+    } else {
+      const { assessment, summary } = correctionProposalAssessment(proposal)
+      const reviewed = await lease.control.wait(() => correction.record.policyVersion === ANALYSIS_CORRECTION_POLICY_VERSION
+        ? reviewAnalysisEvidenceGaps(input, assessment, {
+          ...reviewOptions, criterionIds: correction.record.criterionIds,
+          baseAssessmentSha256: proposal.provenance.baseAssessmentSha256,
+        })
+        : reviewAnalysisAssessment(input, assessment, reviewOptions))
+      assertReview(reviewed.review, proposal, snapshots)
+      assertAnalysis(reviewed.assessmentSha256 === analysisAssessmentHash(assessment),
+        'Independent review changed the immutable correction proposal.')
+      review = reviewed.review
+      if (review.outcome !== 'supported') throw new CorrectionWorkFailure({
+        code: 'grounding-failed', stage: 'grounding', retryable: false,
+        message: review.scope
+          ? `Evidence-gap verification found ${review.scope.decisions.filter(row => row.outcome === 'evidence-found').length} criteria with supporting evidence and ${review.scope.decisions.filter(row => row.outcome === 'blocked').length} genuine blockers. No zero correction was published. Open review findings for the affected criteria.`
+          : 'The legacy full-assessment review did not support this exact correction. The previous result was not changed. Open review findings or request a fresh scoped evidence-gap preview.',
       })
-      : reviewAnalysisAssessment(input, proposal.assessment, reviewOptions))
-    assertReview(reviewed.review, proposal, snapshots)
-    assertAnalysis(reviewed.assessmentSha256 === analysisAssessmentHash(proposal.assessment),
-      'Independent review changed the immutable correction proposal.')
-    review = reviewed.review
-    if (review.outcome !== 'supported') throw new CorrectionWorkFailure({
-      code: 'grounding-failed', stage: 'grounding', retryable: false,
-      message: review.scope
-        ? `Evidence-gap verification found ${review.scope.decisions.filter(row => row.outcome === 'evidence-found').length} criteria with supporting evidence and ${review.scope.decisions.filter(row => row.outcome === 'blocked').length} genuine blockers. No zero correction was published. Open review findings for the affected criteria.`
-        : 'The legacy full-assessment review did not support this exact correction. The previous result was not changed. Open review findings or request a fresh scoped evidence-gap preview.',
-    })
-    stage = 'publication'
-    const current = await lease.check()
-    const result = parseAnalysisResult({
-      ...proposal.assessment, ...proposal.summary, schemaVersion: 1, dataKind: 'real',
-      workspaceId: run.record.workspaceId, runId: run.record.id, comparisonId: original.record.id,
-      createdAt: timestamp(clock, current.run.record, current.correction.record), humanReviewRequired: true,
-      provenance: {
-        attemptId: correction.record.attemptId!, manifestSha256: run.record.manifest.sha256,
-        resumeSnapshot: correction.record.resumeSnapshot, targetSnapshot: correction.record.targetSnapshot,
-        assessment: base.provenance.assessment, assessmentSha256: reviewed.assessmentSha256, groundingReviews: [review],
-        correctionCount: reviewed.correctionCount, calculationVersion: 'weighted-0-100-v1', correction: proposal.provenance,
-      },
-    } satisfies RealAnalysisResult)
+      stage = 'publication'
+      current = await lease.check()
+      result = parseAnalysisResult({
+        ...assessment, ...summary, schemaVersion: 1, dataKind: 'real',
+        workspaceId: run.record.workspaceId, runId: run.record.id, comparisonId: original.record.id,
+        createdAt: timestamp(clock, current.run.record, current.correction.record), humanReviewRequired: true,
+        provenance: {
+          attemptId: correction.record.attemptId!, manifestSha256: run.record.manifest.sha256,
+          resumeSnapshot: correction.record.resumeSnapshot, targetSnapshot: correction.record.targetSnapshot,
+          assessment: base.provenance.assessment, assessmentSha256: reviewed.assessmentSha256, groundingReviews: [review],
+          correctionCount: reviewed.correctionCount, calculationVersion: 'weighted-0-100-v1', correction: proposal.provenance,
+        },
+      } satisfies RealAnalysisResult)
+      resultSummary = summary
+    }
     const proposed: RealAnalysisComparisonRecord = {
       ...original.record, attemptId: correction.record.attemptId, updatedAt: result.createdAt, completedAt: result.createdAt,
-      resultSummary: proposal.summary, resultRevision: {
+      resultSummary, resultRevision: {
         id: correction.record.requestId, policyVersion: correction.record.policyVersion,
         originalResultSha256: correction.record.originalResult.sha256, baseResultSha256: correction.record.baseResult.sha256,
         correctedAt: result.createdAt, criterionIds: correction.record.criterionIds,

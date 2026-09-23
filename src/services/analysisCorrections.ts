@@ -1,7 +1,7 @@
 import { z } from 'zod'
 import {
   ANALYSIS_CORRECTION_LIMITS, ANALYSIS_CORRECTION_POLICY_VERSION, ANALYSIS_CORRECTION_POLICY_VERSIONS,
-  ANALYSIS_LEGACY_CORRECTION_POLICY_VERSION,
+  ANALYSIS_LEGACY_CORRECTION_POLICY_VERSION, ANALYSIS_REASSESSMENT_POLICY_VERSION,
   type AnalysisCorrectionHistoryPage, type AnalysisCorrectionInput, type AnalysisCorrectionPreview,
   type AnalysisCorrectionResponse, type AnalysisCorrectionSummary,
 } from '../domain/analysis-corrections'
@@ -131,15 +131,19 @@ const previewSchema: z.ZodType<AnalysisCorrectionPreview> = z.object({
     criterionId: id, label: text, weight, rationale: text, limitation,
     eligible: z.boolean(), blockedReason: text.nullable(),
   })).max(ANALYSIS_CORRECTION_LIMITS.maxCriteria),
+  reassessment: z.object({
+    policyVersion: z.literal(ANALYSIS_REASSESSMENT_POLICY_VERSION), eligible: z.boolean(),
+    blockedReason: text.nullable(), criterionIds,
+  }),
   correction: correctionSchema.nullable(),
 })
 const historySchema: z.ZodType<AnalysisCorrectionHistoryPage> = z.object({
   dataKind: z.literal('real'), workspaceId: id, runId: id, comparisonId: id,
   originalResultSha256: hash, original: resultSummary, originalAssessment, correction: correctionSchema.nullable(),
   entries: z.array(z.object({
-    id, createdAt: timestamp, requestId: z.uuid(), outcome: z.enum(['ready', 'failed', 'cancelled']),
+    id, createdAt: timestamp, requestId: z.uuid(), outcome: z.enum(['ready', 'failed', 'cancelled']), policyVersion,
     requestedBy: id, reason: savedReason, criterionIds: selectedCriteria, beforeResultSha256: hash,
-    after: resultSummary, review: review.nullable(), error: processingError.nullable(), resultSha256: hash.nullable(),
+    after: resultSummary.nullable(), review: review.nullable(), error: processingError.nullable(), resultSha256: hash.nullable(),
   })).max(ANALYSIS_CORRECTION_LIMITS.historyPageSize),
   continuationToken: z.string().min(1).max(16 * 1024).optional(),
 })
@@ -206,7 +210,12 @@ export async function getAnalysisCorrectionPreview(
       value.after.coverage.notApplicable !== value.before.coverage.notApplicable ||
       value.after.coverage.missing !== value.before.coverage.missing + value.criterionIds.length ||
       value.after.coverage.notAssessed !== value.before.coverage.notAssessed - value.criterionIds.length ||
-      (value.after.overall.status === 'available' && value.criteria.some(item => !item.eligible && item.weight > 0))))) {
+      (value.after.overall.status === 'available' && value.criteria.some(item => !item.eligible && item.weight > 0)))) ||
+    (value.reassessment.eligible
+      ? value.reassessment.blockedReason !== null || value.before.overall.status !== 'withheld' ||
+        value.reassessment.criterionIds.length === 0 ||
+        !sameCriteria(value.reassessment.criterionIds, value.criteria.filter(item => item.weight > 0).map(item => item.criterionId))
+      : !value.reassessment.blockedReason || value.reassessment.criterionIds.length > 0)) {
     throw new Error('The correction service returned mismatched preview identities, criteria, ETag, or score coverage. Reload before continuing.')
   }
   return value
@@ -244,16 +253,18 @@ export async function getAnalysisCorrectionHistory(
     value.originalAssessment.criteria.filter(item => item.evidenceStatus === 'not-assessed').length !== value.original.coverage.notAssessed ||
     (continuationToken !== undefined && value.continuationToken === continuationToken) ||
     value.entries.some(entry => entry.criterionIds.some(criterionId =>
-      !value.originalAssessment.criteria.some(item => item.criterionId === criterionId && item.evidenceStatus === 'not-assessed' && item.weight > 0))) ||
+      !value.originalAssessment.criteria.some(item => item.criterionId === criterionId))) ||
     value.entries.some(entry => entry.review?.scope && !sameCriteria(entry.review.scope.criterionIds, entry.criterionIds)) ||
     value.entries.some(entry => {
       const current = value.correction?.requestId === entry.requestId ? value.correction : null
       const published = value.correction?.revision?.id === entry.requestId ? value.correction.revision : null
-      const policy = current?.policyVersion ?? published?.policyVersion
+      const reassessment = entry.policyVersion === ANALYSIS_REASSESSMENT_POLICY_VERSION
       return (current && (current.reason !== entry.reason || current.requestedBy !== entry.requestedBy ||
-        !sameCriteria(current.criterionIds, entry.criterionIds))) ||
-        (entry.review !== null && policy !== undefined &&
-          (policy === ANALYSIS_CORRECTION_POLICY_VERSION) !== Boolean(entry.review.scope))
+        !sameCriteria(current.criterionIds, entry.criterionIds) ||
+        (current.policyVersion !== undefined && current.policyVersion !== entry.policyVersion))) ||
+        (published && published.policyVersion !== entry.policyVersion) ||
+        (entry.review !== null && (entry.policyVersion === ANALYSIS_CORRECTION_POLICY_VERSION) !== Boolean(entry.review.scope)) ||
+        (reassessment ? (entry.after !== null) !== (entry.outcome === 'ready') : entry.after === null)
     }) ||
     value.entries.some(entry => entry.outcome === 'ready'
       ? !entry.resultSha256 || entry.resultSha256 === entry.beforeResultSha256 || entry.review?.outcome !== 'supported' ||

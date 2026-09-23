@@ -5,7 +5,7 @@ import { randomUUID } from 'node:crypto'
 import { setImmediate as nextTurn } from 'node:timers/promises'
 import { api, fixture, createRun, publishResult, NOW, LATER, ACTOR, clone } from './real-analyses.test-support.mjs'
 import { narrativeRuntime, narrativeWorker } from './real-analysis-narratives.test-support.mjs'
-import { reviewedCorrection } from './analysis-corrections.test-support.mjs'
+import { reassessedCorrection, reviewedCorrection } from './analysis-corrections.test-support.mjs'
 
 function cosmos() {
   const values = new Map()
@@ -117,6 +117,7 @@ function backedFixture(original, correctionsEnabled = false) {
 }
 
 for (const policyVersion of api.ANALYSIS_CORRECTION_POLICY_VERSIONS) test(`Cosmos ${policyVersion} correction publication preserves original evidence and atomically binds counts and summaries`, async () => {
+  const reassessment = api.isAnalysisReassessmentPolicy(policyVersion)
   const initial = fixture()
   initial.analysis.evidenceCorrectionsEnabled = true
   const created = await createRun(initial)
@@ -126,7 +127,8 @@ for (const policyVersion of api.ANALYSIS_CORRECTION_POLICY_VERSIONS) test(`Cosmo
   const original = await store.get(f.workspaceId, comparisonId)
   const preview = await f.service.correctionPreview(f.workspaceId, created.run.id, comparisonId)
   const response = await f.service.requestCorrection(f.workspaceId, created.run.id, comparisonId, {
-    policyVersion, resultSha256: preview.resultSha256, criterionIds: preview.criterionIds, reason: 'Synthetic reviewed evidence gap.',
+    policyVersion, resultSha256: preview.resultSha256,
+    criterionIds: reassessment ? preview.reassessment.criterionIds : preview.criterionIds, reason: 'Synthetic reviewed evidence gap.',
   }, randomUUID(), preview.etag, ACTOR)
   const accepted = await api.loadAnalysisCorrection(store, f.workspaceId, created.run.id, comparisonId)
   const runFence = await store.get(f.workspaceId, created.run.id)
@@ -144,12 +146,12 @@ for (const policyVersion of api.ANALYSIS_CORRECTION_POLICY_VERSIONS) test(`Cosmo
   assert.ok((await store.listPending(f.now, 100)).some(item => item.record.recordType === 'analysis-correction'))
   assert.ok(!(await api.createAnalysisStoreFromContainer(container).listPending(f.now, 100))
     .some(item => item.record.recordType === 'analysis-correction'))
-  const prepared = await reviewedCorrection({ f, runId: created.run.id, comparisonId })
+  const prepared = await (reassessment ? reassessedCorrection : reviewedCorrection)({ f, runId: created.run.id, comparisonId })
   await prepared.publish()
   await prepared.publish()
   assert.deepEqual(await store.get(f.workspaceId, comparisonId), original)
   const current = await f.service.comparisonDetail(f.workspaceId, created.run.id, comparisonId)
-  assert.equal(current.result.overall.score, 0)
+  assert.equal(current.result.overall.score, reassessment ? 60 : 0, 'Re-scored partial 3/5 rows keep their original weights.')
   assert.equal(current.comparison.resultRevision.id, response.requestId)
   assert.equal(Boolean(current.result.provenance.groundingReviews[0].scope), policyVersion === api.ANALYSIS_CORRECTION_POLICY_VERSION)
   const parent = await store.get(f.workspaceId, created.run.id)
