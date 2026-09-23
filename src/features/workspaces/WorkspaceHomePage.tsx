@@ -109,7 +109,7 @@ function WorkspaceCardCounts({ workspace, state, retry }: { workspace: Workspace
   const counts = state?.status === 'ready' ? state.value : null
   const unavailable = counts && [counts.jobs, counts.resumes, counts.analyses].some((value) => value.status === 'unavailable')
   return <div className="workspace-card-counts">
-    <dl aria-label={`Active real work in ${workspace.name}`} aria-busy={!counts}>
+    <dl aria-label={`Active work in ${workspace.name}`} aria-busy={!counts}>
       {(['jobs', 'resumes', 'analyses'] as const).map((kind) => {
         const value = counts?.[kind]
         return <div key={kind}><dt>{kind[0].toUpperCase() + kind.slice(1)}</dt><dd>{!value ? <span aria-label="Loading">...</span>
