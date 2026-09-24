@@ -26,6 +26,7 @@ import {
   type RealAnalysisSummariesQuery, type RealAnalysisSummariesResponse, type RealAnalysisSummarySubjectResponse,
 } from '../domain/analysis-narratives'
 import { analysisNarrativeWorkHealthSchema } from '../domain/analysis-narrative-validation'
+import { ANALYSIS_CORRECTION_POLICY_VERSIONS } from '../domain/analysis-corrections'
 import {
   ANALYSIS_DIAGNOSTIC_LIMITS, ANALYSIS_DIAGNOSTIC_REASONS,
   type AnalysisFailureDiagnostic, type RealAnalysisDiagnosticsPage,
@@ -62,10 +63,19 @@ function checkedRun(value: RealAnalysisRunSummary, workspaceId: string): RealAna
   return value
 }
 
+const activeCorrection = z.object({
+  status: z.enum(['queued', 'running']), policyVersion: z.enum(ANALYSIS_CORRECTION_POLICY_VERSIONS),
+  requestedAt: z.string().datetime({ offset: true }),
+})
+
 function checkedComparison(value: RealAnalysisComparisonSummary, workspaceId: string, runId: string): RealAnalysisComparisonSummary {
   if (!value?.comparison?.id || value.comparison.dataKind !== 'real' || value.comparison.workspaceId !== workspaceId
     || value.comparison.runId !== runId || !value.etag) {
     throw new Error('The analysis service did not return a real comparison for the requested run.')
+  }
+  if (value.activeCorrection !== undefined &&
+    (value.comparison.status !== 'complete' || !activeCorrection.safeParse(value.activeCorrection).success)) {
+    throw new Error('The analysis service returned an invalid re-score status for a saved comparison. Nothing was substituted.')
   }
   return value
 }

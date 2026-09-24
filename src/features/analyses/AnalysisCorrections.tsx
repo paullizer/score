@@ -8,7 +8,8 @@ import { Badge, Button, InlineError, Modal, Score } from '../../components/ui'
 import {
   ANALYSIS_CORRECTION_LIMITS, ANALYSIS_CORRECTION_POLICY_VERSION, ANALYSIS_LEGACY_CORRECTION_POLICY_VERSION,
   ANALYSIS_REASSESSMENT_POLICY_VERSION, isAnalysisReassessmentPolicy,
-  type AnalysisCorrectionHistoryPage, type AnalysisCorrectionPolicyVersion, type AnalysisCorrectionPreview, type AnalysisCorrectionSummary,
+  type AnalysisActiveCorrection, type AnalysisCorrectionHistoryPage, type AnalysisCorrectionPolicyVersion, type AnalysisCorrectionPreview,
+  type AnalysisCorrectionSummary,
 } from '../../domain/analysis-corrections'
 import type { RealAnalysisComparisonDetail, RealAnalysisComparisonSummary, RealAnalysisResultSummary } from '../../domain/real-analyses'
 import type { Citation } from '../../domain/types'
@@ -24,8 +25,9 @@ import { boundedPollingInterval } from '../../services/publicSettings'
 import { realAnalysisCancellationPending, targetVersionLabel } from './realAnalysisUi'
 import { HistoricalCandidateNarrative } from './AnalysisSummaryHistory'
 import {
-  availableWithheldComparisons, boundedCorrectionWork, correctionActionAvailable, correctionIsActive, correctionPolicyReason,
-  CorrectionRequestJournal, latestCorrectionFailure, reassessmentPolicyReason, type CorrectionAction,
+  activeCorrectionNote, availableWithheldComparisons, boundedCorrectionWork, correctionActionAvailable, correctionIsActive,
+  correctionPolicyReason, correctionStatusLabel, CorrectionRequestJournal, latestCorrectionFailure, reassessmentPolicyReason,
+  type CorrectionAction,
 } from './analysisCorrectionState'
 
 // The bridge callback scopes in-memory replay keys to this authenticated workspace lifetime, not browser storage.
@@ -251,11 +253,7 @@ function CorrectionStatus({ correction }: { correction: AnalysisCorrectionSummar
   const policy = correctionPolicy(correction)
   const reassessment = isAnalysisReassessmentPolicy(policy)
   const scoped = policy === ANALYSIS_CORRECTION_POLICY_VERSION
-  const status = reassessment
-    ? { queued: 'Re-score queued', running: 'Re-score running', ready: 'Re-score published',
-      failed: 'Re-score failed — not published', cancelled: 'Re-score cancelled — not published' }[correction.status]
-    : { queued: 'Correction queued', running: scoped ? 'Evidence-gap verification running' : 'Full-assessment grounding review running', ready: 'Correction published',
-      failed: 'Correction failed — not published', cancelled: 'Correction cancelled — not published' }[correction.status]
+  const status = correctionStatusLabel(correction.status, policy)
   return <div className="space-y-2 text-[12px]">
     <Badge tone={correction.status === 'ready' ? 'success' : correction.status === 'failed' ? 'danger' : 'warning'}>{status}</Badge>
     <p>Requested {dateLabel(correction.requestedAt)} · processing attempts {correction.attempts}</p>
@@ -274,6 +272,17 @@ function CorrectionStatus({ correction }: { correction: AnalysisCorrectionSummar
         <div><dt>{reassessment ? 'Weighted criteria that were not assessed' : 'Selected criteria'}</dt><dd>{correction.criterionIds.join(', ')}</dd></div>
       </dl>
     </details>
+  </div>
+}
+
+/** Status-only view of accepted work that every reader may see; its audited request details stay with owners and editors. */
+export function ActiveCorrectionStatus({ active, table = false }: { active: AnalysisActiveCorrection; table?: boolean }) {
+  const label = correctionStatusLabel(active.status, active.policyVersion)
+  if (table) return <div><Badge dot tone="neutral">{label}</Badge><p className="row-meta max-w-xs">{activeCorrectionNote(active)}</p></div>
+  return <div className="space-y-2 text-[12px]" role="status">
+    <Badge tone="warning">{label}</Badge>
+    <p>{activeCorrectionNote(active)}</p>
+    <p className="text-[11px] text-muted">Workspace owners and editors can see its request details.</p>
   </div>
 }
 
@@ -326,6 +335,13 @@ function CorrectionReviewDialog({ runId, comparisons, initialCorrection, onClose
   const [findingsKey, setFindingsKey] = useState<string | null>(null)
   const lifetime = useRef<AbortController | null>(null)
   const operations = useRef(new Map<string, AbortController>())
+  // The comparison table follows accepted work through the saved list, so refresh it once when a review that sent anything closes.
+  const sent = useRef({ changed: false })
+  const refreshComparisons = access.api?.ensureComparisons
+  useEffect(() => {
+    const session = sent.current
+    return () => { if (session.changed) void refreshComparisons?.(runId, true) }
+  }, [refreshComparisons, runId])
 
   const remember = monitor.remember
   useEffect(() => {
@@ -435,6 +451,7 @@ function CorrectionReviewDialog({ runId, comparisons, initialCorrection, onClose
     const release = monitorRef.current.hold(id)
     const signal = AbortSignal.any([life.signal, request.signal])
     patchRow(id, { phase: 'submitting', selected: false, error: '', requestId: saved.key })
+    sent.current.changed = true
     try {
       const response = await requestAnalysisCorrection(access.api.workspaceId, runId, id, saved.input, saved.etag, saved.key, signal)
       signal.throwIfAborted()
@@ -479,6 +496,7 @@ function CorrectionReviewDialog({ runId, comparisons, initialCorrection, onClose
     const release = monitorRef.current.hold(id)
     const signal = AbortSignal.any([life.signal, request.signal])
     patchRow(id, { phase: 'submitting', error: '' })
+    sent.current.changed = true
     try {
       const response = await cancelAnalysisCorrection(access.api.workspaceId, runId, id, correction, signal)
       signal.throwIfAborted()
@@ -633,7 +651,8 @@ function ComparisonCorrectionDetails({ detail }: { detail: RealAnalysisCompariso
   const { comparison } = detail
   const access = useCorrectionAccess(comparison.runId)
   const [reviewOpen, setReviewOpen] = useState(false)
-  const monitor = useCorrectionMonitor({ ...access, readable: access.readable && !reviewOpen }, comparison.runId, [detail], true)
+  // Private request status is owner/editor-only; other readers see the status-only projection on the comparison itself.
+  const monitor = useCorrectionMonitor({ ...access, readable: access.readable && access.reviewer && !reviewOpen }, comparison.runId, [detail], true)
   const [historyOpen, setHistoryOpen] = useState(false)
   const [failureRequestId, setFailureRequestId] = useState<string | null>(null)
   const historyId = useId()
@@ -665,6 +684,7 @@ function ComparisonCorrectionDetails({ detail }: { detail: RealAnalysisCompariso
     </div> : <p className="text-[12px]">The original saved result is shown. A re-score or reviewed correction publishes a separate current revision; it never overwrites the original result or source evidence.</p>}
     <p className="text-[11px] text-muted">Missing professional evidence in a successfully reviewed source can be 0/5. Processing failures, unreadable sources, protected traits, and genuine assessment blockers are not zeros. Narrative-summary failures are separate from score withholding.</p>
     {state?.correction && <CorrectionStatus correction={state.correction} />}
+    {!access.reviewer && detail.activeCorrection && <ActiveCorrectionStatus active={detail.activeCorrection} />}
     {state?.correction?.status === 'failed' && access.reviewer && <div className="space-y-3">
       <Button size="sm" icon={History} aria-expanded={failureRequestId === state.correction.requestId}
         onClick={() => setFailureRequestId(failureRequestId === state.correction!.requestId ? null : state.correction!.requestId)}>
@@ -683,8 +703,8 @@ function ComparisonCorrectionDetails({ detail }: { detail: RealAnalysisCompariso
         title={existingWork ? 'Inspect existing correction work. Authorized cancellation remains available even when new requests are disabled.'
           : access.reason || 'Preview this exact comparison; no changes are applied on opening.'}
         onClick={() => setReviewOpen(true)}>{existingWork ? 'Manage current correction' : 'Review this withheld score'}</Button>}
-      <Button size="sm" icon={RotateCcw} disabled={!access.readable || state?.loading}
-        onClick={() => void monitor.check([comparison.id])}>Check correction status</Button>
+      {access.reviewer && <Button size="sm" icon={RotateCcw} disabled={!access.readable || state?.loading}
+        onClick={() => void monitor.check([comparison.id])}>Check correction status</Button>}
       {access.reviewer && <Button size="sm" icon={History} aria-expanded={historyOpen} aria-controls={historyId}
         onClick={() => setHistoryOpen(value => !value)}>{historyOpen ? 'Close correction history' : 'Original result and correction history'}</Button>}
     </div>

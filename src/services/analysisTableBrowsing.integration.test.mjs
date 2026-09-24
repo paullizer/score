@@ -118,6 +118,7 @@ before(async () => {
   ;({ createRoot } = await import('react-dom/client'))
   await build({ stdin: { resolveDir: process.cwd(), loader: 'tsx', contents: `
     export * from './src/features/analyses/analysisTableBrowsing';
+    export { activeCorrectionProgress } from './src/features/analyses/analysisCorrectionState';
     export { targetIdentity } from './src/features/analyses/realAnalysisUi';
     export { WorkspaceContext } from './src/app/workspace-context';
     export { RealAnalysesContext } from './src/app/real-analyses-context';
@@ -218,6 +219,37 @@ test('status sorting means processing, preserving completed unscored/limited pai
   cancelling.run.cancellation.completedAt = timestamp
   assert.equal(ui.realAnalysisProcessingRank(cancelling), 0)
   for (const status of ['initializing', 'queued', 'running', 'parsing', 'generating', 'profiling']) assert.equal(ui.analysisProcessingRank(status), 1)
+})
+
+test('pending re-scores show in the status column and run progress while their rows keep the current result', async () => {
+  const requestedAt = '2026-09-23T12:00:00.000Z'
+  const requested = new Intl.DateTimeFormat('en', { month: 'short', day: 'numeric' }).format(new Date(requestedAt))
+  const pending = (status, policyVersion = 'full-reassessment-v1') => ({ status, policyVersion, requestedAt })
+  const pairs = [
+    { ...pair(0, { name: 'Queued re-score', score: null }), activeCorrection: pending('queued') },
+    { ...pair(1, { name: 'Running re-score', score: null }), activeCorrection: pending('running') },
+    { ...pair(2, { name: 'Gap verification', score: null }), activeCorrection: pending('running', 'missing-evidence-zero-v2') },
+    pair(3, { name: 'Settled', score: 64 }), pair(4, { name: 'Unfinished', status: 'failed' }),
+  ]
+  assert.deepEqual(pairs.map((item) => ui.realComparisonProcessingRank(item)), [1, 1, 1, 2, 0])
+  assert.deepEqual(indexes(ui.selectRealComparisons(pairs, [target()], browse({ sort: { key: 'status', direction: 'asc' } })).rows), [4, 0, 1, 2, 3])
+  await render(app({ api: apiFor(pairs) }))
+  assert.deepEqual(tableRows().map((row) => row.cells[3].querySelector('.badge').textContent),
+    ['Re-score queued', 'Re-score running', 'Evidence-gap verification running', 'Complete', 'Failed'])
+  assert.match(tableRows()[0].cells[3].textContent, new RegExp(`Requested ${requested}\\. Showing the current result until the re-score finishes\\.`))
+  assert.match(tableRows()[2].cells[3].textContent, /Showing the current result until the correction finishes\./)
+  assert.match(tableRows()[0].cells[2].textContent, /No overall score.*A saved weighted criterion was not assessable/s, 'The current withheld result stays visible.')
+  assert.doesNotMatch(tableRows()[3].cells[3].textContent, /Requested/)
+  const progress = element('section[aria-label="Real analysis progress"]')
+  assert.equal(progress.getAttribute('aria-live'), 'polite')
+  assert.match(progress.textContent, /3 re-scores and corrections in progress · 1 queued · 2 running\. Each comparison keeps its current result until its work finishes\./)
+  assert.equal(ui.activeCorrectionProgress(pairs.slice(1, 2)), '1 re-score in progress · 0 queued · 1 running. Each comparison keeps its current result until its work finishes.')
+  assert.match(ui.activeCorrectionProgress(pairs.slice(0, 2)), /^2 re-scores in progress · 1 queued · 1 running\./)
+  assert.match(ui.activeCorrectionProgress(pairs.slice(2, 3)), /^1 correction in progress · 0 queued · 1 running\./)
+  assert.equal(ui.activeCorrectionProgress(pairs.slice(3)), null)
+  await render(app({ api: apiFor(pairs.slice(3)) }))
+  assert.doesNotMatch(element('section[aria-label="Real analysis progress"]').textContent, /in progress/)
+  assert.deepEqual(calls.filter(([kind]) => !['detail', 'pairs'].includes(kind)), [])
 })
 
 function Probe() {
