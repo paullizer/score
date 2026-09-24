@@ -66,8 +66,8 @@ All paths below have prefix `/api/workspaces/:workspaceId/analyses`:
 | `PATCH /:runId/metadata` with `{displayName: string}` | `{run: RealAnalysisRunSummary}` and ETag header |
 | `GET /:runId/lifecycle` | `{impact: LifecycleImpact}` |
 | `POST /:runId/lifecycle` with `{action: "archive" \| "unarchive" \| "delete"}` | `{analysis: RealAnalysisDetail}` or `{deleted: true}`; HTTP 202 `{operation, etag?, analysis?}` while incomplete |
-| `GET /:runId/comparisons` | `RealAnalysisComparisonsPage` |
-| `GET /:runId/comparisons/:comparisonId` | Unwrapped `RealAnalysisComparisonDetail` |
+| `GET /:runId/comparisons` | `RealAnalysisComparisonsPage`; items with queued or running re-score/correction work carry a status-only `activeCorrection` |
+| `GET /:runId/comparisons/:comparisonId` | Unwrapped `RealAnalysisComparisonDetail`, with the same optional `activeCorrection` |
 | `GET /:runId/comparisons/:comparisonId/diagnostics?continuationToken=...` | `RealAnalysisDiagnosticsPage`; at most one private failed-attempt artifact per page |
 | `GET /:runId/comparisons/:comparisonId/corrections/preview` | Owner/editor-only `AnalysisCorrectionPreview`; read-only before/after totals, exact ETag and result hashes |
 | `GET /:runId/comparisons/:comparisonId/corrections` | Owner/editor-only `{correction}`; cheap status without loading evidence blobs |
@@ -269,6 +269,18 @@ run-scoped head queries, not one lookup per comparison. Original results and eve
 prior candidate narrative publication remain available in private correction
 history; rejected proposals and failed review findings are distinct from published
 results.
+
+While a head is `queued` or `running`, list and detail items also carry a
+status-only `activeCorrection: {status, policyVersion, requestedAt}` beside
+`comparison`. It is omitted once the work publishes, fails, or is cancelled, and for
+work its run can no longer finish (archived, deleting, or cancelling runs, or summary
+cancellation after the request), which the correction status reports as `cancelled`.
+Like `resultRevision`, it is a read projection and is never persisted. It is built
+from the heads these reads already load, so it adds no storage reads. Every
+workspace role receives it; the request key, reason, requester, criteria, and
+findings stay on the owner/editor-only correction routes. The UI shows it in the
+comparison table and run progress panel, and keeps polling the list while any
+comparison carries it.
 
 Successful application/worker deployment automatically writes
 `ANALYSIS_EVIDENCE_CORRECTIONS_ENABLED=true` to both the API and analysis worker.
