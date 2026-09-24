@@ -21,7 +21,7 @@ import {
   assertReassessmentProposal, assertReassessmentResult, correctionProposalAssessment,
   parseAnalysisCorrectionHistoryEntry, parseAnalysisCorrectionProposal,
 } from './correction-validation'
-import { analysisCorrectionCanWork, loadAnalysisCorrection, projectAnalysisComparison } from './current-results'
+import { analysisCorrectionCanWork, analysisCorrectionStopped, loadAnalysisCorrection, projectAnalysisComparison } from './current-results'
 
 export { analysisCorrectionCanWork, loadAnalysisCorrection, projectAnalysisComparison, resolveAnalysisComparison } from './current-results'
 
@@ -33,10 +33,7 @@ export function analysisCorrectionSummary(
   value: VersionedAnalysisEntity<RealAnalysisCorrectionRecord>, run?: RealAnalysisRunRecord,
 ): AnalysisCorrectionSummary {
   const { record, etag } = value
-  const stopped = run && ['queued', 'running'].includes(record.status) &&
-    (run.lifecycle?.archivedAt || run.lifecycle?.deletingAt || run.lifecycle?.deletedAt ||
-      run.narrativeCancelledAt && record.requestedAt <= run.narrativeCancelledAt ||
-      run.cancellation && !run.cancellation.completedAt)
+  const stopped = run !== undefined && analysisCorrectionStopped(run, record)
   return {
     workspaceId: record.workspaceId, runId: record.runId, comparisonId: record.comparisonId, etag,
     status: stopped ? 'cancelled' : record.status, requestId: record.requestId,

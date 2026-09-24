@@ -40,7 +40,9 @@ import type { AnalysisSummarySubject, PublishSummaryDraftInput, RestartSummaryIn
 import { readAnalysisSummaryHistory } from './summary-history'
 import { publishAnalysisSummaryDraft, restartAnalysisSummary, retryAnalysisSummary } from './summary-actions'
 import { prepareAnalysisNarrativeTransitions } from './narrative-scheduling'
-import { resolveAnalysisComparison, resolveAnalysisComparisons } from './current-results'
+import {
+  analysisActiveCorrection, resolveAnalysisComparison, resolveAnalysisComparisons, type ResolvedAnalysisComparison,
+} from './current-results'
 import { AnalysisCorrectionService } from './correction-actions'
 import type { AnalysisCorrectionInput } from '../../src/domain/analysis-corrections'
 import { readAnalysisFailureDiagnostics } from './diagnostics'
@@ -84,6 +86,11 @@ const runSummary = (value: VersionedAnalysisEntity<RealAnalysisRunRecord>): Real
   run: value.record, etag: value.etag, ...(value.record.lifecycle ? { lifecycle: value.record.lifecycle } : {}),
 })
 const comparisonSummary = (value: VersionedAnalysisEntity<RealAnalysisComparisonRecord>): RealAnalysisComparisonSummary => ({ comparison: value.record, etag: value.etag })
+// Every reader may see that accepted work is still pending; its private request details stay on the correction routes.
+function currentComparisonSummary(value: ResolvedAnalysisComparison, run: RealAnalysisRunRecord): RealAnalysisComparisonSummary {
+  const activeCorrection = analysisActiveCorrection(run, value.correction)
+  return { ...comparisonSummary(value), ...(activeCorrection ? { activeCorrection } : {}) }
+}
 
 export class RealAnalysisService {
   private readonly targets: RealAnalysisTargets
@@ -312,7 +319,7 @@ export class RealAnalysisService {
       const record = parseAnalysisEntity(value.record)
       assertAnalysis(record.recordType === 'analysis-comparison' && value.etag, 'Invalid comparison page.')
       assertComparisonManifestBinding(manifest, record)
-      return { comparison: record, etag: value.etag }
+      return currentComparisonSummary({ ...value, record }, run.record)
     })
     return { comparisons, ...(page.continuationToken ? { continuationToken: analysisPageToken(scope, page.continuationToken) } : {}) }
   }
@@ -326,12 +333,12 @@ export class RealAnalysisService {
         () => readAnalysisSnapshots(this.deps.blobs, run.record, comparison.record, signal))
       const result = await traceOperation('score.analysis.result.read', { 'score.read.count': comparison.record.result ? 1 : 0 },
         () => readAnalysisResult(this.deps.blobs, run.record, comparison.record, snapshots, signal))
-      await this.run(workspaceId, runId, false, signal)
+      const latest = await this.run(workspaceId, runId, false, signal)
       signal?.throwIfAborted()
       const workspace = await this.deps.store.getControl(workspaceId, undefined, signal)
       signal?.throwIfAborted()
       if (workspace && ['deleting', 'deleted'].includes(workspace.record.state)) throw notFound('The saved analysis is being removed.')
-      return { ...comparisonSummary(comparison), ...snapshots, result }
+      return { ...currentComparisonSummary(comparison, latest.record), ...snapshots, result }
     })
   }
   summaries(workspaceId: string, runId: string, targetId?: string, signal?: AbortSignal) {

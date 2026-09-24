@@ -1,8 +1,11 @@
 import {
-  ANALYSIS_CORRECTION_POLICY_VERSIONS, ANALYSIS_LEGACY_CORRECTION_POLICY_VERSION,
-  type AnalysisCorrectionHistoryPage, type AnalysisCorrectionInput, type AnalysisCorrectionPreview, type AnalysisCorrectionSummary,
+  ANALYSIS_CORRECTION_POLICY_VERSION, ANALYSIS_CORRECTION_POLICY_VERSIONS, ANALYSIS_LEGACY_CORRECTION_POLICY_VERSION,
+  isAnalysisReassessmentPolicy,
+  type AnalysisActiveCorrection, type AnalysisCorrectionHistoryPage, type AnalysisCorrectionInput,
+  type AnalysisCorrectionPolicyVersion, type AnalysisCorrectionPreview, type AnalysisCorrectionSummary,
 } from '../../domain/analysis-corrections'
 import type { RealAnalysisComparisonSummary } from '../../domain/real-analyses'
+import { dateLabel } from '../../domain/selectors'
 import { CloudApiError } from '../../services/cloudWorkspace'
 
 export const correctionPolicyReason = 'Apply the missing-evidence policy: an applicable professional criterion without supporting evidence in a successfully reviewed source is 0/5. Preserve existing numeric scores, weights, frozen evidence, and original history; retain genuine assessment blockers for human review.'
@@ -31,6 +34,36 @@ export function availableWithheldComparisons(comparisons: RealAnalysisComparison
 
 export function correctionIsActive(correction: AnalysisCorrectionSummary | null | undefined): boolean {
   return correction?.status === 'queued' || correction?.status === 'running'
+}
+
+/** One label for correction work, wherever it appears: the review dialog, the comparison table, or the comparison view. */
+export function correctionStatusLabel(
+  status: AnalysisCorrectionSummary['status'], policy: AnalysisCorrectionPolicyVersion | undefined,
+): string {
+  if (isAnalysisReassessmentPolicy(policy)) {
+    return { queued: 'Re-score queued', running: 'Re-score running', ready: 'Re-score published',
+      failed: 'Re-score failed — not published', cancelled: 'Re-score cancelled — not published' }[status]
+  }
+  return { queued: 'Correction queued',
+    running: policy === ANALYSIS_CORRECTION_POLICY_VERSION ? 'Evidence-gap verification running' : 'Full-assessment grounding review running',
+    ready: 'Correction published', failed: 'Correction failed — not published', cancelled: 'Correction cancelled — not published' }[status]
+}
+
+export function activeCorrectionNote(active: AnalysisActiveCorrection): string {
+  const work = isAnalysisReassessmentPolicy(active.policyVersion) ? 're-score' : 'correction'
+  return `Requested ${dateLabel(active.requestedAt)}. Showing the current result until the ${work} finishes.`
+}
+
+/** The run progress line for accepted re-score or correction work, or null when none is in progress. */
+export function activeCorrectionProgress(comparisons: readonly RealAnalysisComparisonSummary[]): string | null {
+  const active = comparisons.flatMap(({ activeCorrection }) => activeCorrection ? [activeCorrection] : [])
+  if (!active.length) return null
+  const rescores = active.filter(item => isAnalysisReassessmentPolicy(item.policyVersion)).length
+  const one = active.length === 1
+  const work = rescores === active.length ? one ? 're-score' : 're-scores'
+    : rescores === 0 ? one ? 'correction' : 'corrections' : 're-scores and corrections'
+  const queued = active.filter(item => item.status === 'queued').length
+  return `${active.length} ${work} in progress · ${queued} queued · ${active.length - queued} running. Each comparison keeps its current result until its work finishes.`
 }
 
 export function latestCorrectionFailure(

@@ -12,7 +12,7 @@ import autoprefixer from 'autoprefixer'
 import tailwindConfig from '../../tailwind.config.js'
 import {
   correctionFixture, correctionPreview, correctionSummary, correctionHistory, publishCorrectionFixture,
-  correctionPolicy, correctionLegacyPolicy, correctionGapReview, correctionEvidence, reassessmentPolicy,
+  correctionPolicy, correctionLegacyPolicy, correctionGapReview, correctionEvidence, reassessmentPolicy, correctionTime,
 } from './analysisCorrections.synthetic.test-support.mjs'
 import { summarySubjectResponse, summaryHistoryFixture } from './analysisSummaries.test-support.mjs'
 
@@ -61,9 +61,14 @@ before(async () => {
           const values = await listAllRealAnalysisComparisons(current.current.workspaceId, runId)
           setFixture(previous => ({ ...previous, details: previous.details.map(detail => {
             const next = values.find(value => value.comparison.id === detail.comparison.id)
-            return next ? { ...detail, ...next } : detail
+            if (!next) return detail
+            const saved = { ...detail }
+            delete saved.activeCorrection
+            return { ...saved, ...next }
           }) }))
         }, [])
+        // Stands in for the workspace bridge's bounded list polling, which this harness does not mount.
+        window.refreshFixturePairs = () => ensureComparisons(current.current.summary.run.id, true)
         const ensureComparison = useCallback(async (runId, comparisonId, force) => {
           if (!force) return
           window.refreshCalls.push({ kind: 'detail', runId, comparisonId })
@@ -173,6 +178,19 @@ async function setup(t, {
     state.heads.set(id, correctionSummary(fixture, id, { status: initialCorrectionStatus, policyVersion: initialCorrectionPolicy }))
   }
   const base = `/api/workspaces/${fixture.workspaceId}/analyses/${fixture.summary.run.id}`
+  // Mirrors the server's status-only projection: queued or running work on a run that can still finish it.
+  const pending = comparisonId => {
+    const head = state.heads.get(comparisonId)
+    const stopped = (fixture.summary.lifecycle ?? fixture.summary.run.lifecycle)?.archivedAt
+    return head && !stopped && ['queued', 'running'].includes(head.status) ? { activeCorrection: {
+      status: head.status, policyVersion: head.policyVersion ?? correctionLegacyPolicy, requestedAt: head.requestedAt,
+    } } : {}
+  }
+  const withPending = detail => {
+    const value = { ...detail }
+    delete value.activeCorrection
+    return { ...value, ...pending(detail.comparison.id) }
+  }
   await page.route('**/api/**', async route => {
     const request = route.request()
     const url = new URL(request.url())
@@ -186,7 +204,7 @@ async function setup(t, {
       if (state.comparisonReadFailures-- > 0) return respond({ error: {
         code: 'unavailable', message: 'Synthetic current scores unavailable.',
       } }, 503)
-      return respond({ comparisons: fixture.details.map(({ comparison, etag }) => ({ comparison, etag })) })
+      return respond({ comparisons: fixture.details.map(({ comparison, etag }) => withPending({ comparison, etag })) })
     }
     const historical = url.pathname.match(/\/summaries\/candidate\/([^/]+)(\/history)?$/)
     if (historical && record.resultRevisionId === 'original') {
@@ -203,7 +221,10 @@ async function setup(t, {
     const match = url.pathname.match(/\/comparisons\/([^/]+)(.*)$/)
     if (!match) return respond({ error: { code: 'invalid_request', message: 'Unexpected synthetic fixture request.' } }, 400)
     const [, comparisonId, suffix] = match
-    if (!suffix) return respond(fixture.details.find(item => item.comparison.id === comparisonId))
+    if (!suffix) {
+      const detail = fixture.details.find(item => item.comparison.id === comparisonId)
+      return detail ? respond(withPending(detail)) : respond({ error: { code: 'not_found', message: 'Unknown synthetic comparison.' } }, 404)
+    }
     if (suffix === '/corrections/preview') {
       state.activePreviews++
       state.maxPreviews = Math.max(state.maxPreviews, state.activePreviews)
@@ -352,7 +373,10 @@ test('only verified publication refreshes the run, pair list and affected detail
   await confirm(dialog, 1)
   await dialog.getByText('Correction published', { exact: true }).waitFor()
   await until(async () => (await page.evaluate(() => window.refreshCalls)).filter(item => item.kind === 'detail').length === 1, 'Publication must refresh the open detail.')
+  assert.deepEqual((await page.evaluate(() => window.refreshCalls)).map(item => item.kind).sort(), ['detail', 'pairs', 'run'])
   await dialog.getByRole('button', { name: 'Close', exact: true }).click()
+  await until(async () => (await page.evaluate(() => window.refreshCalls)).filter(item => item.kind === 'pairs').length === 2,
+    'Closing a review that sent work refreshes the comparison list once more.')
   await page.getByText('Current reviewed correction revision', { exact: true }).waitFor()
   assert.equal(await page.locator('.overall-score .score strong').innerText(), '0')
   assert.equal(await page.locator('.criterion-score strong').first().innerText(), '0')
@@ -361,7 +385,7 @@ test('only verified publication refreshes the run, pair list and affected detail
     /Selected evidence-gap verification only \(criterion-one\)[\s\S]*not independently reapproved/)
   assert.deepEqual(state.fixture.details.slice(1), untouched)
   const refreshes = await page.evaluate(() => window.refreshCalls)
-  assert.deepEqual(refreshes.map(item => item.kind).sort(), ['detail', 'pairs', 'run'])
+  assert.deepEqual(refreshes.map(item => item.kind).sort(), ['detail', 'pairs', 'pairs', 'run'], 'Only publication refreshes the run and detail.')
   assert.equal(refreshes.find(item => item.kind === 'detail').comparisonId, comparisonId)
   assert.equal(state.requests.some(item => item.path.includes('/summaries')), false)
   await page.getByRole('button', { name: 'Disable fixture corrections', exact: true }).click()
@@ -699,6 +723,68 @@ test('a published re-score is labelled as a re-scored revision in the detail and
   assert.doesNotMatch(await history.innerText(), /Legacy full-assessment grounding review/)
 })
 
+test('the comparison table follows accepted re-scores from queued to running and back to their current result', async t => {
+  const { page, state } = await setup(t, { fixture: correctionFixture({ withheld: 3, numeric: 1, failed: 1 }) })
+  const rows = page.locator('.comparison-table tbody tr')
+  const statuses = async () => (await rows.evaluateAll(items => items.map(row => row.cells[3].querySelector('.badge').textContent))).join()
+  const progress = page.locator('section[aria-label="Real analysis progress"]')
+  assert.equal(await statuses(), 'Complete,Complete,Complete,Complete,Failed')
+  const dialog = await openReview(page, false, 'reassess')
+  await confirm(dialog, 3, 'reassess')
+  await dialog.getByText('Saved server status: 3 queued · 0 running · 0 published · 0 failed · 0 cancelled.', { exact: true }).waitFor()
+  await dialog.getByRole('button', { name: 'Close', exact: true }).click()
+  await until(async () => await statuses() === 'Re-score queued,Re-score queued,Re-score queued,Complete,Failed',
+    'Closing the review shows the accepted re-scores in the table.')
+  assert.match(await rows.first().innerText(), /Showing the current result until the re-score finishes\./)
+  assert.match(await rows.first().innerText(), /No overall score/)
+  await progress.getByText('3 re-scores in progress · 3 queued · 0 running. Each comparison keeps its current result until its work finishes.', { exact: true }).waitFor()
+  await page.getByRole('button', { name: 'Review withheld scores (3)', exact: true }).waitFor()
+  for (const [id, head] of state.heads) state.heads.set(id, { ...head, status: 'running', attempts: 1 })
+  await page.evaluate(() => window.refreshFixturePairs())
+  await until(async () => await statuses() === 'Re-score running,Re-score running,Re-score running,Complete,Failed',
+    'The next list check shows the running work.')
+  await progress.getByText(/^3 re-scores in progress · 0 queued · 3 running\./).waitFor()
+  for (const [id, head] of state.heads) {
+    const ready = correctionSummary(state.fixture, id, {
+      status: 'ready', requestId: head.requestId, reason: head.reason, policyVersion: head.policyVersion,
+    })
+    state.heads.set(id, ready)
+    publishCorrectionFixture(state.fixture, ready)
+  }
+  await page.evaluate(() => window.refreshFixturePairs())
+  await until(async () => await statuses() === 'Complete,Complete,Complete,Complete,Failed',
+    'Published re-scores return to Complete with their current result.')
+  assert.match(await rows.first().locator('td').nth(2).textContent(), /0\/ 100/)
+  assert.equal(await progress.getByText(/in progress/).count(), 0)
+  await page.getByRole('button', { name: 'Review withheld scores (0)', exact: true }).waitFor()
+  assert.equal(postRequests(state).length, 3)
+})
+
+test('viewers see status-only re-score progress on the comparison view without private correction reads', async t => {
+  const fixture = correctionFixture()
+  const comparisonId = fixture.details[0].comparison.id
+  fixture.details[0].activeCorrection = { status: 'running', policyVersion: reassessmentPolicy, requestedAt: correctionTime }
+  const { page, state } = await setup(t, {
+    fixture, role: 'viewer', result: true, initialCorrectionStatus: 'running', initialCorrectionPolicy: reassessmentPolicy,
+  })
+  const section = page.getByRole('region', { name: 'Re-scores, evidence-gap corrections, and revision history', exact: true })
+  await section.getByText('Re-score running', { exact: true }).waitFor()
+  assert.match(await section.innerText(), /Showing the current result until the re-score finishes\./)
+  assert.match(await section.innerText(), /Workspace owners and editors can see its request details\./)
+  await page.locator('section[aria-label="Real analysis progress"]').getByText(/^1 re-score in progress · 0 queued · 1 running\./).waitFor()
+  assert.equal(await section.getByRole('button', { name: 'Check correction status', exact: true }).count(), 0)
+  assert.equal(await section.getByRole('button', { name: 'Review this withheld score', exact: true }).isEnabled(), false)
+  await pause(450)
+  assert.equal(state.requests.some(item => item.path.includes('/corrections')), false, 'Viewers never call the owner/editor correction routes.')
+  assert.doesNotMatch(await section.innerText(), /Only workspace owners and editors may review/)
+  assert.doesNotMatch(await section.innerText(), new RegExp(state.heads.get(comparisonId).requestId))
+  state.heads.set(comparisonId, { ...state.heads.get(comparisonId), status: 'cancelled' })
+  await page.evaluate(() => window.refreshFixturePairs())
+  await until(async () => await section.getByText('Re-score running', { exact: true }).count() === 0,
+    'Finished work disappears for viewers after the next list check.')
+  assert.equal(state.requests.some(item => item.path.includes('/corrections')), false)
+})
+
 async function failedReview(t, { legacy = false, result = false } = {}) {
   const { page, state } = await setup(t, {
     fixture: correctionFixture({ withheld: 1, numeric: 0, failed: 0 }), result, initialCorrectionStatus: 'failed',
@@ -821,7 +907,11 @@ test('closing a run modal stops status timers; a workspace change aborts preview
     await confirm(dialog, 1)
     await dialog.getByText('Correction queued', { exact: true }).waitFor()
     await until(() => state.requests.some(item => item.method === 'GET' && item.path.endsWith('/corrections')), 'Queued work should poll its cheap status endpoint.')
+    const lists = () => state.requests.filter(item => item.method === 'GET' && item.path.endsWith('/comparisons')).length
+    const listed = lists()
     await dialog.getByRole('button', { name: 'Close', exact: true }).click()
+    await until(() => lists() === listed + 1, 'Closing a review that sent work refreshes the comparison list once.')
+    await page.locator('.comparison-table').getByText('Correction queued', { exact: true }).waitFor()
     const count = state.requests.length
     await pause(450)
     assert.equal(state.requests.length, count)

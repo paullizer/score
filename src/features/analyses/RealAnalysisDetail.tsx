@@ -16,7 +16,8 @@ import {
 import { RealComparisonReview } from './RealComparisonReview'
 import { AnalysisReportExport } from './AnalysisReportExport'
 import { ManageAnalysisSummaries, RealTargetNarrative } from './AnalysisSummaries'
-import { ReviewWithheldScores } from './AnalysisCorrections'
+import { ActiveCorrectionStatus, ReviewWithheldScores } from './AnalysisCorrections'
+import { activeCorrectionProgress } from './analysisCorrectionState'
 import { ArchivedBadge, EntityLifecycleActions, LifecycleBanner } from '../../components/lifecycle/LifecycleControls'
 import { useLifecycleAccess } from '../../components/lifecycle/useLifecycleAccess'
 import { getDisplayName } from '../../domain/displayNames'
@@ -146,6 +147,7 @@ function RealAnalysisView({ id }: { id: string }) {
   const run = summary.run
   const finished = run.progress.complete + run.progress.failed + run.progress.cancelled
   const savedPairs = pairs?.state === 'ready' ? pairs.value : []
+  const correctionProgress = activeCorrectionProgress(savedPairs)
   const browsing = selectRealComparisons(savedPairs, detail.targets, { query, targetId, sort }, summary)
   const viewedTarget = (selectedId
     ? savedPairs.find((item) => item.comparison.id === selectedId)?.comparison.target.summary
@@ -187,6 +189,7 @@ function RealAnalysisView({ id }: { id: string }) {
       <progress max={Math.max(1, run.progress.total)} value={finished} aria-label="Finished comparisons" />
       <p>{run.progress.complete} complete · {run.progress.running} assessing · {run.progress.queued} queued · {run.progress.failed} failed · {run.progress.cancelled} cancelled</p>
       <p>{run.progress.scored} with a server-calculated score · {run.progress.unscored} completed without an overall score. Saved results are never overwritten when other pairs retry.</p>
+      {correctionProgress && <p>{correctionProgress}</p>}
       {realAnalysisCancellationPending(summary) && <p>Cancellation is progressing in bounded batches. This view keeps polling until the server confirms completion.</p>}
     </section>
     {viewedTarget && <RealTargetNarrative runId={id} target={viewedTarget} />}
@@ -218,8 +221,9 @@ function RealAnalysisView({ id }: { id: string }) {
               {analysisDiagnosticNotice(comparison) && <p className="row-meta max-w-xs">{analysisDiagnosticNotice(comparison)}</p>}
               {comparison.status === 'failed' && currentAnalysisDiagnostic(comparison) && <p className="row-meta max-w-xs">Open the saved pair for private validation reasons and the original sources.</p>}
               {comparison.nextAttemptAt && <p className="row-meta">Automatic retry {dateLabel(comparison.nextAttemptAt)}</p>}<p className="row-meta">Attempt {comparison.attempts} · manual retries {comparison.retryCount}</p></td>
-            <td><div className="space-y-3"><div><Badge dot tone={comparison.status === 'complete' ? 'success' : ['failed', 'cancelled'].includes(comparison.status) ? 'warning' : 'neutral'}>
-              {{ queued: 'Queued', running: 'Running', complete: 'Complete', failed: 'Failed', cancelled: 'Cancelled' }[comparison.status]}</Badge></div>
+            <td><div className="space-y-3">{pair.activeCorrection ? <ActiveCorrectionStatus active={pair.activeCorrection} table />
+              : <div><Badge dot tone={comparison.status === 'complete' ? 'success' : ['failed', 'cancelled'].includes(comparison.status) ? 'warning' : 'neutral'}>
+              {{ queued: 'Queued', running: 'Running', complete: 'Complete', failed: 'Failed', cancelled: 'Cancelled' }[comparison.status]}</Badge></div>}
               <Button size="sm" variant="ghost" icon={ArrowUpRight} aria-label={`Review comparison ${comparison.index + 1}: ${getDisplayName(resume, resume.name?.trim() || 'Name not stated')} against ${getDisplayName(target, target.label)}`}
               onClick={() => openPair(comparison.id)}>Review saved pair</Button><RealComparisonActions summary={pair} /></div></td>
           </tr>

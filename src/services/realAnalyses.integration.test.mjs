@@ -1352,6 +1352,102 @@ test('historical initialization and cancellation keep polling while new-run read
   }
 })
 
+test('comparison reads accept only a status-only pending re-score on a completed comparison', async () => {
+  const pending = { status: 'running', policyVersion: 'full-reassessment-v1', requestedAt: '2026-09-23T12:00:00.000Z' }
+  const detail = comparisonDetail()
+  const listed = (comparison, activeCorrection) => json({ comparisons: [{ comparison, etag: detail.etag, activeCorrection }] })
+  globalThis.fetch = async (url) => url.endsWith('/comparisons') ? listed(detail.comparison, pending) : json({ ...detail, activeCorrection: pending })
+  assert.deepEqual((await client.listAllRealAnalysisComparisons(workspaceId, 'run-one'))[0].activeCorrection, pending)
+  assert.deepEqual((await client.getRealAnalysisComparison(workspaceId, 'run-one', 'comparison-one')).activeCorrection, pending)
+  for (const activeCorrection of [null, { ...pending, status: 'ready' }, { ...pending, policyVersion: 'unknown-policy' },
+    { ...pending, requestedAt: 'yesterday' }, { status: 'queued' }]) {
+    globalThis.fetch = async () => listed(detail.comparison, activeCorrection)
+    await assert.rejects(client.listAllRealAnalysisComparisons(workspaceId, 'run-one'), /invalid re-score status/, JSON.stringify(activeCorrection))
+  }
+  const queued = { ...detail.comparison, status: 'queued' }
+  delete queued.resultSummary
+  globalThis.fetch = async () => listed(queued, pending)
+  await assert.rejects(client.listAllRealAnalysisComparisons(workspaceId, 'run-one'), /invalid re-score status/)
+  globalThis.fetch = async () => json({ ...detail, comparison: queued, activeCorrection: pending })
+  await assert.rejects(client.getRealAnalysisComparison(workspaceId, 'run-one', 'comparison-one'), /invalid re-score status/)
+})
+
+test('a completed run keeps checking its comparisons while a re-score runs, then refreshes its counts once', async () => {
+  const originalSetInterval = dom.window.setInterval
+  const originalClearInterval = dom.window.clearInterval
+  const originalNow = Date.now
+  let now = originalNow()
+  Date.now = () => now
+  const timers = new Map()
+  let timerId = 0
+  dom.window.setInterval = (callback) => { timers.set(++timerId, callback); return timerId }
+  dom.window.clearInterval = (id) => { timers.delete(id) }
+  let run = runSummary('run-one', 'complete')
+  run.etag = '"run-before-rescore"'
+  run.run.progress = { ...run.run.progress, scored: 0, unscored: 1 }
+  let etag = '"comparison-original"'
+  let activeCorrection = { status: 'queued', policyVersion: 'full-reassessment-v1', requestedAt: '2026-09-23T12:00:00.000Z' }
+  const reads = { runs: 0, run: 0, pairs: 0, pair: 0 }
+  const pending = () => activeCorrection ? { activeCorrection } : {}
+  globalThis.fetch = async (url) => {
+    if (url === '/api/features') return json({ realAnalyses: false })
+    if (url.endsWith('/analyses')) { reads.runs++; return json({ runs: [run] }) }
+    if (url.endsWith('/analyses/run-one')) { reads.run++; return json({ ...runDetail(), ...run }) }
+    if (url.endsWith('/analyses/run-one/comparisons')) {
+      reads.pairs++
+      return json({ comparisons: [{ comparison: comparisonDetail().comparison, etag, ...pending() }] })
+    }
+    if (url.endsWith('/comparisons/comparison-one')) { reads.pair++; return json({ ...comparisonDetail(), etag, ...pending() }) }
+    return json({ error: { code: 'invalid_request', message: `Unexpected synthetic request ${url}` } }, 400)
+  }
+  const tick = async (milliseconds) => {
+    now += milliseconds
+    await act(async () => { for (const callback of [...timers.values()]) callback(); await new Promise((resolve) => setTimeout(resolve, 0)) })
+  }
+  const listed = () => current.comparisons('run-one').value[0]
+  let release
+  try {
+    await render(bridge(workspaceId, 'owner', true, '/analyses/run-one'))
+    await settle(() => current?.phase === 'ready')
+    await act(async () => { release = current.subscribeAnalysis('run-one') })
+    await act(async () => {
+      await Promise.all([current.ensureDetail('run-one', true), current.ensureComparisons('run-one', true),
+        current.ensureComparison('run-one', 'comparison-one', true)])
+    })
+    assert.equal(listed().activeCorrection.status, 'queued')
+    assert.equal(current.comparison('run-one', 'comparison-one').value.activeCorrection.status, 'queued')
+    assert.equal(timers.size, 1)
+    const before = { ...reads }
+    activeCorrection = { ...activeCorrection, status: 'running' }
+    await tick(3000)
+    await settle(() => listed().activeCorrection?.status === 'running')
+    assert.equal(reads.pairs, before.pairs + 1, 'A completed run keeps checking its comparisons while re-score work is pending.')
+    assert.equal(current.comparison('run-one', 'comparison-one').value.activeCorrection.status, 'running',
+      'An open comparison follows the list status without re-reading its unchanged evidence.')
+    assert.deepEqual({ ...reads, pairs: before.pairs }, before, 'Pending work re-reads only the comparison list.')
+    activeCorrection = undefined
+    etag = '"comparison-rescored"'
+    run = { ...run, etag: '"run-after-rescore"', run: { ...run.run, progress: { ...run.run.progress, scored: 1, unscored: 0 } } }
+    await tick(3000)
+    await settle(() => current.summaries[0]?.etag === '"run-after-rescore"')
+    assert.equal(Object.hasOwn(listed(), 'activeCorrection'), false)
+    assert.equal(current.detail('run-one').value.run.progress.scored, 1)
+    assert.equal(reads.run, before.run + 1, 'The run counts refresh once when the re-score finishes.')
+    assert.equal(current.comparison('run-one', 'comparison-one').state, 'idle', 'A published revision reloads the open comparison.')
+    const settled = { ...reads }
+    await tick(30_000)
+    await tick(30_000)
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)) })
+    assert.deepEqual(reads, settled, 'Checking stops once no re-score or correction is pending.')
+  } finally {
+    if (release) await act(async () => release())
+    if (root) { await act(async () => root.unmount()); root = null }
+    dom.window.setInterval = originalSetInterval
+    dom.window.clearInterval = originalClearInterval
+    Date.now = originalNow
+  }
+})
+
 test('analysis provider keeps uncertain creation keys across view remounts and never writes sample storage', async () => {
   let attempts = 0
   let accepted = null

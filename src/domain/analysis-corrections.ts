@@ -151,6 +151,16 @@ export interface AnalysisCorrectionSummary {
   policyVersion?: AnalysisCorrectionPolicyVersion
 }
 
+/**
+ * Status-only view of accepted re-score or correction work that has not finished. Comparison reads return it to every
+ * reader; the reason, requester, criteria, and findings stay behind the owner/editor correction endpoints.
+ */
+export interface AnalysisActiveCorrection {
+  status: 'queued' | 'running'
+  policyVersion: AnalysisCorrectionPolicyVersion
+  requestedAt: string
+}
+
 export interface AnalysisCorrectionPreview {
   dataKind: 'real'
   workspaceId: string

@@ -17,7 +17,9 @@ runtime authorization sources.
 Reviewers can read saved workspace content and participate in the separate QC
 workflow. Ordinary content writes remain owner/editor-only: imports, scoring,
 rubric edits, summary management, evidence-gap corrections, renaming, and
-lifecycle mutations are not reviewer permissions. Workspace
+lifecycle mutations are not reviewer permissions. Reviewers and Readers can see
+that a re-score or correction is queued or running, but not its request details
+or findings. Workspace
 administration requires effective Owner access. Application Admins have
 tenant-wide ordinary Owner access, independently of membership, but receive QC
 permissions only while they have a valid explicit workspace membership.

@@ -21,6 +21,8 @@ import { realAnalysisWorkActive as active, realTargetAvailable } from '../featur
 import { assertRealLifecyclePermission, discoveredLifecycle, projectRealLifecycle, realWorkspaceWritable, reconcileLifecycleOperations } from './real-lifecycle'
 
 const pairKey = (runId: string, id: string) => `${runId}/${id}`
+const activeCorrectionKey = ({ activeCorrection: value }: RealAnalysisComparisonSummary) =>
+  value ? `${value.status}:${value.policyVersion}:${value.requestedAt}` : ''
 const narrativeKey = (runId: string, targetId?: string) => JSON.stringify([runId, targetId ?? null])
 const summaryHistoryKey = (runId: string, subject: AnalysisSummarySubject) => `${runId}/${JSON.stringify([subject.kind, subject.subjectId])}`
 const summarySubjectKey = summaryHistoryKey
@@ -92,6 +94,8 @@ function RealAnalysesProvider({ workspaceId, children }: { workspaceId: string; 
   const narrativeRequests = useRef(new Map<string, { key: string; etag: string; runId: string }>())
   const summaryHistoryScopes = useRef(new Map<string, Pick<AnalysisSummaryHistoryPage, 'etag' | 'capabilities'> & { runId: string; targetId: string }>())
   const pairSummaries = useRef(new Map<string, RealAnalysisComparisonSummary>())
+  // Runs whose re-score or correction work finished; their score counts refresh from a run read that starts afterwards.
+  const correctionSettlements = useRef(new Map<string, symbol>())
   const createKeys = useRef(new Map<string, string>())
   const createSubmissions = useRef(new Map<string, { fingerprint: string; retry: () => Promise<RealAnalysisRunSummary> }>())
   const [pendingCount, setPendingCount] = useState(0)
@@ -168,6 +172,7 @@ function RealAnalysesProvider({ workspaceId, children }: { workspaceId: string; 
     for (const [key, request] of narrativeRequests.current) if (request.runId === id) narrativeRequests.current.delete(key)
     for (const [key, selected] of summaryHistoryScopes.current) if (selected.runId === id) summaryHistoryScopes.current.delete(key)
     for (const key of pairSummaries.current.keys()) if (key.startsWith(`${id}/`)) pairSummaries.current.delete(key)
+    correctionSettlements.current.delete(id)
   }, [backoff, putDetail, scope])
 
   const removeRun = useCallback((id: string, sequence: number) => {
@@ -211,6 +216,13 @@ function RealAnalysesProvider({ workspaceId, children }: { workspaceId: string; 
     pairSummaries.current.set(key, summary)
     const cached = resultsRef.current[key]
     if (cached?.state === 'ready' && cached.value.etag !== summary.etag) putResult(key, { state: 'idle' })
+    // Pending re-score status changes without a new comparison ETag, so an open comparison follows the latest list read.
+    else if (cached?.state === 'ready' && activeCorrectionKey(cached.value) !== activeCorrectionKey(summary)) {
+      const value = { ...cached.value }
+      if (summary.activeCorrection) value.activeCorrection = summary.activeCorrection
+      else delete value.activeCorrection
+      putResult(key, { ...cached, value })
+    }
     return true
   }, [putResult, scope])
 
@@ -221,6 +233,7 @@ function RealAnalysesProvider({ workspaceId, children }: { workspaceId: string; 
     if (!force && previous && !['idle', 'loading'].includes(previous.state)) return
     const ticket = scope.read(`detail:${id}`)
     if (!ticket) return
+    const settlement = correctionSettlements.current.get(id)
     let superseded = false
     if (previous?.state !== 'ready') putDetail(id, { state: 'loading' })
     try {
@@ -228,8 +241,10 @@ function RealAnalysesProvider({ workspaceId, children }: { workspaceId: string; 
       if (!scope.current(ticket)) return
       backoff.record(ticket.key, value.etag)
       if (lifecycleIsRemoved(value.lifecycle ?? value.run.lifecycle)) { superseded = !rememberRun(value, ticket.sequence); return }
-      if (rememberRun(value, ticket.sequence) || summariesRef.current.find((item) => item.run.id === id)?.etag === value.etag) putDetail(id, { state: 'ready', value })
-      else superseded = true
+      if (rememberRun(value, ticket.sequence) || summariesRef.current.find((item) => item.run.id === id)?.etag === value.etag) {
+        putDetail(id, { state: 'ready', value })
+        if (settlement && correctionSettlements.current.get(id) === settlement) correctionSettlements.current.delete(id)
+      } else superseded = true
     } catch (caught) {
       if (!scope.current(ticket)) return
       if (!scope.canAccept(`run:${id}`, ticket.sequence)) { superseded = true; return }
@@ -253,11 +268,17 @@ function RealAnalysesProvider({ workspaceId, children }: { workspaceId: string; 
     try {
       const values = await api.listAllRealAnalysisComparisons(workspaceId, id, ticket.controller.signal)
       if (!scope.current(ticket) || !readableRun(id)) return
-      backoff.record(ticket.key, JSON.stringify(values.map((item) => [item.comparison.id, item.etag])))
+      // Worker heartbeats do not change these fingerprints, but a pending re-score moving on does, which resets the backoff.
+      backoff.record(ticket.key, JSON.stringify(values.map((item) => [item.comparison.id, item.etag, item.activeCorrection?.status ?? null])))
       for (const summary of values) rememberPair(summary, ticket.sequence)
       const merged = new Map<string, RealAnalysisComparisonSummary>()
       for (const summary of values) merged.set(summary.comparison.id, pairSummaries.current.get(pairKey(id, summary.comparison.id)) ?? summary)
+      const cached = comparisonsRef.current[id]
+      const settled = cached?.state === 'ready' &&
+        cached.value.some((item) => item.activeCorrection && !merged.get(item.comparison.id)?.activeCorrection)
+      if (settled) correctionSettlements.current.set(id, Symbol(id))
       putComparisons(id, { state: 'ready', value: [...merged.values()].sort((a, b) => a.comparison.index - b.comparison.index) })
+      if (settled) void ensureDetail(id, true)
     } catch (caught) {
       if (!scope.current(ticket)) return
       backoff.record(ticket.key)
@@ -265,7 +286,7 @@ function RealAnalysesProvider({ workspaceId, children }: { workspaceId: string; 
       const message = realRequestError(caught, 'The real comparisons could not be loaded.')
       putComparisons(id, previous?.state === 'ready' ? { ...previous, error: message } : { state: 'error', error: message })
     } finally { scope.finish(ticket) }
-  }, [backoff, putComparisons, readableRun, rememberPair, removeRun, scope, workspaceId])
+  }, [backoff, ensureDetail, putComparisons, readableRun, rememberPair, removeRun, scope, workspaceId])
 
   const ensureComparison = useCallback(async function loadComparison(runId: string, id: string, force = false): Promise<void> {
     if (!historyAvailable.current || !readableRun(runId)) return
@@ -602,9 +623,13 @@ function RealAnalysesProvider({ workspaceId, children }: { workspaceId: string; 
         if (entry?.state !== 'ready' || entry.error || active(entry.value)) {
           if (backoff.due(`detail:${id}`)) void ensureDetail(id, true)
           if (backoff.due(`pairs:${id}`)) void ensureComparisons(id, true)
-        } else if (pairs?.state !== 'ready' || pairs.error ||
-          pairs.value.some((item) => ['queued', 'running'].includes(item.comparison.status))) {
-          if (backoff.due(`pairs:${id}`)) void ensureComparisons(id, true)
+        } else {
+          if (correctionSettlements.current.has(id) && backoff.due(`detail:${id}`)) void ensureDetail(id, true)
+          // A completed run keeps checking while any accepted re-score or correction is still queued or running.
+          if (pairs?.state !== 'ready' || pairs.error || pairs.value.some((item) =>
+            ['queued', 'running'].includes(item.comparison.status) || Boolean(item.activeCorrection))) {
+            if (backoff.due(`pairs:${id}`)) void ensureComparisons(id, true)
+          }
         }
       }
       for (const key of activeComparisons.current.keys()) {

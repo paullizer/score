@@ -41,7 +41,8 @@ export function realAnalysisProcessingRank(summary: RealAnalysisRunSummary): num
 }
 
 export function realComparisonProcessingRank(summary: RealAnalysisComparisonSummary, run?: RealAnalysisRunSummary): number | null {
-  if (summary.comparison.status === 'complete') return 2
+  // Accepted re-score or correction work is still in progress, even though the current result is complete.
+  if (summary.comparison.status === 'complete') return summary.activeCorrection ? 1 : 2
   if (run && realAnalysisCancellationPaused(run)) return 0
   if (run && realAnalysisCancellationPending(run)) return 1
   return analysisProcessingRank(summary.comparison.status)
