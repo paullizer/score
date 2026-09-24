@@ -28,7 +28,9 @@ import type { LifecycleMetadata, LifecycleOperation } from './lifecycle'
 import type { RealAnalysisCandidateNarrativeSummary, RealAnalysisNarrativeRecord } from './analysis-narratives'
 import type { AnalysisDiagnosticCapture, AnalysisFailureDiagnosticReference } from './analysis-diagnostics'
 import type { ModelTaskId, ProcessingSettingsSnapshot } from './admin-settings'
-import type { AnalysisCorrectionProvenance, AnalysisResultRevision, RealAnalysisCorrectionRecord } from './analysis-corrections'
+import type {
+  AnalysisActiveCorrection, AnalysisCorrectionProvenance, AnalysisResultRevision, RealAnalysisCorrectionRecord,
+} from './analysis-corrections'
 import type { AnalysisCriterionBlockerCode, AnalysisEvidenceGapReviewScope } from './analysis-evidence-policy'
 import type { PromptExecutionProvenance } from './prompt-versions'
 import type { AnalysisQcDiagnosticsReference } from './analysis-qc-diagnostics'
@@ -496,6 +498,8 @@ export interface RealAnalysesPage {
 export interface RealAnalysisComparisonSummary {
   comparison: RealAnalysisComparisonRecord
   etag: string
+  // Read projection only: queued or running re-score/correction work. The comparison keeps its current result meanwhile.
+  activeCorrection?: AnalysisActiveCorrection
 }
 
 export interface RealAnalysisComparisonDetail extends RealAnalysisComparisonSummary {

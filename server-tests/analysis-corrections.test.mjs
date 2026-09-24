@@ -887,3 +887,106 @@ test('a re-score that still withholds publishes honestly and remains readable as
   assert.deepEqual(history.entries.map(entry => entry.policyVersion), [api.ANALYSIS_CORRECTION_POLICY_VERSION, reassessment])
   assert.equal(history.entries[1].after.overall.status, 'withheld')
 })
+
+test('comparison reads show every role status-only re-score work until it publishes, while correction routes stay owner/editor-only', async t => {
+  const context = await setup({ unaffected: true })
+  const { f, runId, comparisonId, unchanged } = context
+  const http = await startHttp(f)
+  t.after(() => http.close())
+  const roles = ['owner', 'editor', 'viewer', 'reviewer']
+  const read = async (role, suffix) => {
+    const response = await http.request(`/${runId}/comparisons${suffix}`, 'GET', undefined, { role })
+    assert.equal(response.status, 200, `${role} ${suffix}`)
+    return response.json()
+  }
+  const current = async role => {
+    const list = await read(role, '')
+    const detail = await read(role, `/${comparisonId}`)
+    const find = id => list.comparisons.find(item => item.comparison.id === id)
+    return { list, detail, pair: find(comparisonId), other: find(unchanged.completed.id) }
+  }
+  for (const role of roles) {
+    const { pair, detail } = await current(role)
+    assert.equal(Object.hasOwn(pair, 'activeCorrection'), false, role)
+    assert.equal(Object.hasOwn(detail, 'activeCorrection'), false, role)
+  }
+  const { response, requestId } = await requestReassessment(context)
+  const queued = { status: 'queued', policyVersion: reassessment, requestedAt: response.correction.requestedAt }
+  for (const role of roles) {
+    const { list, detail, pair, other } = await current(role)
+    assert.deepEqual(pair.activeCorrection, queued, role)
+    assert.deepEqual(detail.activeCorrection, queued, role)
+    assert.equal(pair.comparison.status, 'complete')
+    assert.equal(pair.comparison.resultSummary.overall.status, 'withheld', 'The current result stays in place while the re-score runs.')
+    assert.equal(Object.hasOwn(other, 'activeCorrection'), false, 'Unrelated comparisons carry no projection.')
+    for (const body of [JSON.stringify(list), JSON.stringify(detail)]) {
+      assert.equal(body.includes(requestId), false, 'Status-only reads do not expose the private request key.')
+      assert.equal(body.includes(response.correction.reason), false, 'Status-only reads do not expose the audited reason.')
+    }
+  }
+  const path = `/${runId}/comparisons/${comparisonId}/corrections`
+  for (const role of ['viewer', 'reviewer']) for (const suffix of ['', '/preview', '/history']) {
+    assert.equal((await http.request(`${path}${suffix}`, 'GET', undefined, { role })).status, 403, `${role} ${suffix}`)
+  }
+  const accepted = await reassessed(context)
+  for (const role of roles) {
+    const { pair, detail } = await current(role)
+    assert.deepEqual(pair.activeCorrection, { ...queued, status: 'running' }, role)
+    assert.deepEqual(detail.activeCorrection, { ...queued, status: 'running' }, role)
+  }
+  await accepted.publish()
+  for (const role of roles) {
+    const { pair, detail } = await current(role)
+    assert.equal(Object.hasOwn(pair, 'activeCorrection'), false, role)
+    assert.equal(Object.hasOwn(detail, 'activeCorrection'), false, role)
+    assert.equal(pair.comparison.resultRevision.id, requestId)
+    assert.equal(detail.comparison.result.sha256, accepted.reference.sha256)
+  }
+})
+
+test('cancelled re-scores and stopped runs show no active work, matching the private correction status', async () => {
+  const context = await setup()
+  const { f, runId, comparisonId, original } = context
+  const pair = async () => (await f.service.comparisons(f.workspaceId, runId)).comparisons.find(item => item.comparison.id === comparisonId)
+  const detail = () => f.service.comparisonDetail(f.workspaceId, runId, comparisonId)
+  const first = await requestReassessment(context)
+  assert.equal((await pair()).activeCorrection.status, 'queued')
+  await f.service.cancelCorrection(f.workspaceId, runId, comparisonId, first.response.correction.etag)
+  for (const value of [await pair(), await detail()]) {
+    assert.equal(Object.hasOwn(value, 'activeCorrection'), false)
+    assert.equal(value.comparison.result.sha256, original.reference.sha256)
+  }
+  await requestReassessment(context)
+  assert.equal((await detail()).activeCorrection.status, 'queued')
+  await f.service.cancel(f.workspaceId, runId, ACTOR, (await f.service.detail(f.workspaceId, runId)).etag)
+  assert.equal((await f.service.correctionState(f.workspaceId, runId, comparisonId)).correction.status, 'cancelled')
+  assert.equal(Object.hasOwn(await pair(), 'activeCorrection'), false, 'Run cancellation stops accepted work before a worker records it.')
+  assert.equal(Object.hasOwn(await detail(), 'activeCorrection'), false)
+
+  const head = await api.loadAnalysisCorrection(f.analysis.store, f.workspaceId, runId, comparisonId)
+  assert.equal(head.record.status, 'queued')
+  const { narrativeCancelledAt: _fence, ...run } = (await api.loadAnalysisRun(f.analysis.store, f.workspaceId, runId)).record
+  const active = { status: 'queued', policyVersion: reassessment, requestedAt: head.record.requestedAt }
+  assert.deepEqual(api.analysisActiveCorrection(run, head.record), active)
+  assert.deepEqual(api.analysisActiveCorrection(run, { ...head.record, status: 'running' }), { ...active, status: 'running' })
+  assert.equal(api.analysisActiveCorrection(run, undefined), undefined)
+  for (const status of ['ready', 'failed', 'cancelled']) assert.equal(api.analysisActiveCorrection(run, { ...head.record, status }), undefined, status)
+  const cancellation = { requestedAt: head.record.requestedAt, requestedBy: ACTOR, nextComparisonIndex: 0 }
+  for (const [label, stopped] of Object.entries({
+    archived: { ...run, lifecycle: { archivedAt: head.record.requestedAt } },
+    deleting: { ...run, lifecycle: { deletingAt: head.record.requestedAt } },
+    cancelling: { ...run, cancellation },
+    'summaries cancelled after the request': { ...run, narrativeCancelledAt: head.record.requestedAt },
+  })) {
+    assert.equal(api.analysisActiveCorrection(stopped, head.record), undefined, label)
+    assert.equal(api.analysisCorrectionSummary(head, stopped).status, 'cancelled', label)
+  }
+  for (const [label, resumable] of Object.entries({
+    'finished cancellation': { ...run, cancellation: { ...cancellation, completedAt: head.record.requestedAt } },
+    'pending summary scheduling': { ...run, narrativeRequestId: randomUUID() },
+    'summaries cancelled before the request': { ...run, narrativeCancelledAt: '2000-01-01T00:00:00.000Z' },
+  })) {
+    assert.deepEqual(api.analysisActiveCorrection(resumable, head.record), active, label)
+    assert.equal(api.analysisCorrectionSummary(head, resumable).status, 'queued', label)
+  }
+})

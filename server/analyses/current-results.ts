@@ -1,5 +1,6 @@
 import {
-  ANALYSIS_CORRECTION_LIMITS, isAnalysisReassessmentPolicy, type AnalysisCorrectionPublication, type RealAnalysisCorrectionRecord,
+  ANALYSIS_CORRECTION_LIMITS, isAnalysisReassessmentPolicy, type AnalysisActiveCorrection, type AnalysisCorrectionPublication,
+  type RealAnalysisCorrectionRecord,
 } from '../../src/domain/analysis-corrections'
 import {
   ANALYSIS_LIMITS, type RealAnalysisComparisonRecord, type RealAnalysisRunRecord, type VersionedAnalysisEntity,
@@ -16,6 +17,27 @@ export function analysisCorrectionCanWork(run: RealAnalysisRunRecord, record?: R
   return !run.lifecycle?.archivedAt && !run.lifecycle?.deletingAt && !run.lifecycle?.deletedAt &&
     (!run.cancellation || Boolean(run.cancellation.completedAt)) && !run.narrativeRequestId &&
     (!record || !run.narrativeCancelledAt || record.requestedAt > run.narrativeCancelledAt)
+}
+
+/** Accepted work that its run can no longer finish reads as cancelled, even before a worker records that outcome. */
+export function analysisCorrectionStopped(run: RealAnalysisRunRecord, record: RealAnalysisCorrectionRecord): boolean {
+  return ['queued', 'running'].includes(record.status) &&
+    Boolean(run.lifecycle?.archivedAt || run.lifecycle?.deletingAt || run.lifecycle?.deletedAt ||
+      (run.narrativeCancelledAt && record.requestedAt <= run.narrativeCancelledAt) ||
+      (run.cancellation && !run.cancellation.completedAt))
+}
+
+/** The status-only projection every comparison reader may see; private request details stay on the correction routes. */
+export function analysisActiveCorrection(
+  run: RealAnalysisRunRecord, record: RealAnalysisCorrectionRecord | undefined,
+): AnalysisActiveCorrection | undefined {
+  if (!record || (record.status !== 'queued' && record.status !== 'running') || analysisCorrectionStopped(run, record)) return undefined
+  return { status: record.status, policyVersion: record.policyVersion, requestedAt: record.requestedAt }
+}
+
+/** A current comparison and the correction head it was resolved from, when one exists. */
+export interface ResolvedAnalysisComparison extends VersionedAnalysisEntity<RealAnalysisComparisonRecord> {
+  correction?: RealAnalysisCorrectionRecord
 }
 
 export async function loadAnalysisCorrection(
@@ -130,7 +152,7 @@ export async function resolveAnalysisComparisonRevision(
 
 export async function resolveAnalysisComparison(
   store: AnalysisStore, run: RealAnalysisRunRecord, original: VersionedAnalysisEntity<RealAnalysisComparisonRecord>, signal?: AbortSignal,
-): Promise<VersionedAnalysisEntity<RealAnalysisComparisonRecord>> {
+): Promise<ResolvedAnalysisComparison> {
   signal?.throwIfAborted()
   if (original.record.status !== 'complete') return original
   const correction = await loadAnalysisCorrection(store, run.workspaceId, run.id, original.record.id, signal)
@@ -139,12 +161,13 @@ export async function resolveAnalysisComparison(
   return {
     record: projectAnalysisComparison(original.record, correction?.record),
     etag: correction?.record.published ? `"${analysisHash({ original: original.etag, revision: correction.record.published })}"` : original.etag,
+    ...(correction ? { correction: correction.record } : {}),
   }
 }
 
 export async function resolveAnalysisComparisons(
   store: AnalysisStore, run: RealAnalysisRunRecord, originals: VersionedAnalysisEntity<RealAnalysisComparisonRecord>[], signal?: AbortSignal,
-): Promise<VersionedAnalysisEntity<RealAnalysisComparisonRecord>[]> {
+): Promise<ResolvedAnalysisComparison[]> {
   signal?.throwIfAborted()
   if (!originals.some(value => value.record.status === 'complete')) return originals
   const heads = new Map<string, RealAnalysisCorrectionRecord>()
@@ -173,6 +196,7 @@ export async function resolveAnalysisComparisons(
     return {
       record: projectAnalysisComparison(original.record, correction),
       etag: correction?.published ? `"${analysisHash({ original: original.etag, revision: correction.published })}"` : original.etag,
+      ...(correction ? { correction } : {}),
     }
   })
 }
