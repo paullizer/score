@@ -202,6 +202,25 @@ function summaryWorkRevision(items) {
   return { workRevision: createHash('sha256').update(JSON.stringify(work)).digest('hex') }
 }
 
+// The whole-run GET /summary-status envelope for the same fixture state. It carries work metadata only.
+export function summaryStatusResponse(fixture, { items = false, generation = 'automatic', correctionPending = [], ...options } = {}) {
+  const value = summaryResponse(fixture, { ...options, targetId: null })
+  const status = {
+    schemaVersion: 1, dataKind: 'real', workspaceId: value.workspaceId, runId: value.runId, scope: { targetId: null },
+    revision: value.revision,
+    workRevision: createHash('sha256').update(JSON.stringify({ revision: value.revision, correctionPending })).digest('hex'),
+    generation, ready: value.ready, scoring: value.scoring, corrections: { pending: correctionPending.length }, counts: value.counts,
+  }
+  if (!items) return status
+  return {
+    ...status,
+    comparisons: value.comparisons.map((item) => ({ comparisonId: item.comparisonId, targetId: item.targetId,
+      comparisonStatus: item.comparisonStatus, resultSha256: item.comparisonStatus === 'complete' ? hash : null,
+      correctionPending: correctionPending.includes(item.comparisonId), status: item.status })),
+    targets: value.targets.map((item) => ({ targetId: item.targetId, status: item.status, waitingFor: item.waitingFor })),
+  }
+}
+
 export function summarySubjectResponse(fixture, subject, options = {}) {
   const targetId = subject.kind === 'target' ? subject.subjectId
     : fixture.details.find(({ comparison }) => comparison.id === subject.subjectId)?.comparison.target.summary.id

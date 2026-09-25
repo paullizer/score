@@ -1206,6 +1206,47 @@ test('missing snapshot retries stop after three attempts; manual retry uses orig
   assertLosslessResume(mock.calls.at(-2).body.input.resume, detail.resumeSnapshot.document)
 })
 
+function summaryProgress(f, runId) {
+  const records = recordType => [...f.analysis.store.values.values()].map(item => item.record)
+    .filter(record => record.recordType === recordType && record.runId === runId)
+  const scored = comparisons(f, runId).filter(item => item.record.status === 'complete').length
+  const summarized = records('analysis-candidate-narrative').filter(record => record.status === 'ready').length
+  return `${scored}/${summarized}/${records('analysis-target-narrative').map(record => record.status).join() || 'none'}`
+}
+
+test('each two-item execution scores one pair and summarizes a scored one, so summaries finish alongside scoring', async () => {
+  const f = fixture()
+  const created = await createRun(f, 4, 1)
+  const mock = modelFor(f)
+  const steps = []
+  for (let execution = 0; execution < 5; execution++) {
+    const { claimed, completed } = await runAnalysisWorker(mock.deps, { maxItems: 2 })
+    steps.push(`${claimed}:${completed} ${summaryProgress(f, created.run.id)}`)
+  }
+  assert.deepEqual(steps, [
+    '2:2 2/0/waiting', '2:1 3/1/waiting', '2:1 4/2/waiting', '2:0 4/4/waiting', '1:0 4/4/ready',
+  ], 'Scored/summarized/overview after each execution.')
+  assert.equal((await api.readAnalysisSummaries(f.analysis, f.workspaceId, created.run.id)).ready, true)
+})
+
+test('single-item executions take turns between scoring and summaries, and a waiting overview never takes the turn', async () => {
+  const f = fixture()
+  const created = await createRun(f, 3, 1)
+  const mock = modelFor(f)
+  const steps = []
+  for (const seconds of [0, 60, 90, 120, 180, 240, 300]) {
+    f.now = new Date(Date.parse(NOW) + seconds * 1000).toISOString()
+    assert.deepEqual(await runAnalysisWorker(mock.deps, { maxItems: 1 }), { claimed: 1, completed: [0, 90, 120].includes(seconds) ? 1 : 0 })
+    steps.push(summaryProgress(f, created.run.id))
+  }
+  assert.deepEqual(steps, [
+    '1/0/waiting', '1/1/waiting',
+    // A second summaries-first execution scores instead of rechecking an overview that can't start yet.
+    '2/1/waiting', '3/1/waiting',
+    '3/2/waiting', '3/3/waiting', '3/3/ready',
+  ])
+})
+
 test('a current-rules retry scores stopped work with the recorded rules and prompts while the admitted pin stays immutable', async () => {
   const f = pinnedRunFixture(), created = await createRun(f)
   const [pair] = comparisons(f, created.run.id)

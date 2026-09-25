@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { after, afterEach, before, beforeEach, test } from 'node:test'
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { mkdir, rm } from 'node:fs/promises'
 import { join, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
@@ -1512,6 +1512,154 @@ test('a completed run keeps checking its comparisons while a re-score runs, then
     dom.window.setInterval = originalSetInterval
     dom.window.clearInterval = originalClearInterval
     Date.now = originalNow
+  }
+})
+
+function summaryStatusFixture(runId, { candidate = 'queued', overview = 'waiting', items = false, generation = 'automatic' } = {}) {
+  const count = (status) => ({ total: 1, missing: 0, waiting: 0, queued: 0, running: 0, ready: 0, stale: 0, failed: 0, cancelled: 0, notRequired: 0,
+    [status === 'not-required' ? 'notRequired' : status]: 1 })
+  const revision = createHash('sha256').update(`${runId}:${candidate}:${overview}`).digest('hex')
+  const value = { schemaVersion: 1, dataKind: 'real', workspaceId, runId, scope: { targetId: null }, revision,
+    workRevision: createHash('sha256').update(`work:${revision}`).digest('hex'), generation,
+    ready: [candidate, overview].every((status) => status === 'ready' || status === 'not-required'),
+    scoring: { total: 1, initialized: 1, queued: 0, running: 0, complete: 1, failed: 0, cancelled: 0 },
+    corrections: { pending: 0 }, counts: { candidates: count(candidate), targets: count(overview) } }
+  return items ? { ...value,
+    comparisons: [{ comparisonId: 'comparison-one', targetId: 'grade-target-1', comparisonStatus: 'complete', resultSha256: hash, correctionPending: false, status: candidate }],
+    targets: [{ targetId: 'grade-target-1', status: overview, waitingFor: overview === 'waiting' ? 'candidate-narratives' : null }] } : value
+}
+function virtualIntervals() {
+  const originalSetInterval = dom.window.setInterval
+  const originalClearInterval = dom.window.clearInterval
+  const originalNow = Date.now
+  const clock = { now: originalNow(), timers: new Map() }
+  let timerId = 0
+  Date.now = () => clock.now
+  dom.window.setInterval = (callback) => { clock.timers.set(++timerId, callback); return timerId }
+  dom.window.clearInterval = (id) => { clock.timers.delete(id) }
+  clock.tick = async (milliseconds) => {
+    clock.now += milliseconds
+    await act(async () => { for (const callback of [...clock.timers.values()]) callback(); await new Promise((resolve) => setTimeout(resolve, 0)) })
+  }
+  clock.restore = () => {
+    dom.window.setInterval = originalSetInterval
+    dom.window.clearInterval = originalClearInterval
+    Date.now = originalNow
+  }
+  return clock
+}
+
+test('an open analysis follows summary progress until every automatic summary finishes, then stops checking', async () => {
+  const clock = virtualIntervals()
+  const run = runSummary('run-one', 'complete')
+  const state = { candidate: 'queued', overview: 'waiting' }
+  const statusReads = []
+  let unavailable = false
+  globalThis.fetch = async (url) => {
+    if (url === '/api/features') return json({ realAnalyses: false })
+    if (url.endsWith('/analyses')) return json({ runs: [run] })
+    if (url.includes('/analyses/run-one/summary-status')) {
+      statusReads.push(url)
+      if (unavailable) return json({ error: { code: 'invalid_request', message: 'Summary progress is not available.' } }, 400)
+      return json(summaryStatusFixture('run-one', { ...state, items: url.endsWith('?items=true') }))
+    }
+    return json({ error: { code: 'invalid_request', message: `Unexpected synthetic request ${url}` } }, 400)
+  }
+  const status = () => current.summaryStatus('run-one')
+  let release
+  try {
+    await render(bridge(workspaceId, 'owner', true, '/analyses/run-one'))
+    await settle(() => current?.phase === 'ready')
+    assert.deepEqual(statusReads, [], 'Only a subscribed page or the history list reads summary progress.')
+    assert.equal(status().state, 'idle')
+    await act(async () => { release = current.subscribeSummaryStatus('run-one') })
+    await settle(() => status().state === 'ready')
+    assert.deepEqual(statusReads, [`/api/workspaces/${workspaceId}/analyses/run-one/summary-status?items=true`],
+      'A subscribed page reads each comparison’s summary state.')
+    assert.equal(status().value.comparisons[0].status, 'queued')
+    assert.equal(clock.timers.size, 1)
+    state.candidate = 'running'
+    await clock.tick(3000)
+    await settle(() => status().value.comparisons[0].status === 'running')
+    state.candidate = 'ready'
+    state.overview = 'ready'
+    await clock.tick(3000)
+    await settle(() => status().value.ready === true)
+    assert.equal(statusReads.length, 3)
+    await clock.tick(30_000)
+    await clock.tick(30_000)
+    assert.equal(statusReads.length, 3, 'Checking stops once every summary has finished.')
+    unavailable = true
+    await act(async () => current.ensureSummaryStatus('run-one', true))
+    assert.equal(status().state, 'ready', 'A failed check keeps the last known progress.')
+    assert.equal(status().value.ready, true)
+    assert.match(status().error, /Summary progress could not be checked\. Scores and saved summaries are unchanged\./)
+    assert.equal(current.error, null, 'Summary progress failures never replace the analysis history error.')
+    unavailable = false
+    await clock.tick(30_000)
+    await settle(() => status().state === 'ready' && !status().error)
+    assert.equal(status().value.ready, true)
+    await act(async () => release())
+    release = null
+    assert.equal(clock.timers.size, 0, 'Leaving the page stops summary checks.')
+  } finally {
+    if (release) await act(async () => release())
+    if (root) { await act(async () => root.unmount()); root = null }
+    clock.restore()
+  }
+})
+
+test('the analysis history reads summary counts for finished automatic runs, three at a time, and stops once they finish', async () => {
+  const clock = virtualIntervals()
+  const settings = ui.createDefaultAdminSettings()
+  settings.summaries.generationMode = 'on-demand'
+  const automatic = ['run-one', 'run-two', 'run-three', 'run-four'].map((id) => runSummary(id, 'complete'))
+  const onDemand = runSummary('run-five', 'complete')
+  onDemand.run.processingSettings = ui.captureProcessingSettings(settings, 'on-demand-policy', timestamp)
+  const cancelled = runSummary('run-six', 'cancelled')
+  const state = { candidate: 'queued', overview: 'waiting' }
+  const statusReads = []
+  let held = deferred()
+  globalThis.fetch = async (url) => {
+    if (url === '/api/features') return json({ realAnalyses: false })
+    if (url.endsWith('/analyses')) return json({ runs: [...automatic, onDemand, cancelled] })
+    const match = /\/analyses\/([^/]+)\/summary-status(\?items=true)?$/.exec(url)
+    if (match) {
+      statusReads.push(url)
+      if (held) await held.promise
+      return json(summaryStatusFixture(match[1], { ...state, items: Boolean(match[2]) }))
+    }
+    return json({ error: { code: 'invalid_request', message: `Unexpected synthetic request ${url}` } }, 400)
+  }
+  const readRuns = () => statusReads.map((url) => /\/analyses\/([^/]+)\/summary-status/.exec(url)[1])
+  const ready = (id) => current.summaryStatus(id).state === 'ready'
+  try {
+    await render(bridge(workspaceId, 'owner', true, '/analyses'))
+    await settle(() => current?.phase === 'ready' && statusReads.length === 3)
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)) })
+    assert.equal(statusReads.length, 3, 'The history reads at most three summary statuses at once.')
+    assert.ok(statusReads.every((url) => url.endsWith('/summary-status')), 'The history reads counts only, never per-comparison states.')
+    held.resolve()
+    held = null
+    await settle(() => automatic.every((item) => ready(item.run.id)))
+    assert.deepEqual(new Set(readRuns()), new Set(automatic.map((item) => item.run.id)))
+    assert.equal(statusReads.length, 4)
+    assert.equal(current.summaryStatus('run-five').state, 'idle', 'On-demand runs are not checked before anyone asks for summaries.')
+    assert.equal(current.summaryStatus('run-six').state, 'idle', 'Runs whose scoring did not finish are not checked.')
+    assert.equal(clock.timers.size, 1)
+    state.candidate = 'ready'
+    state.overview = 'ready'
+    await clock.tick(3000)
+    await settle(() => automatic.every((item) => current.summaryStatus(item.run.id).value?.ready === true))
+    assert.equal(statusReads.length, 8)
+    await settle(() => clock.timers.size === 0)
+    await clock.tick(30_000)
+    assert.equal(statusReads.length, 8, 'The history stops checking once every summary has finished.')
+    assert.ok(!readRuns().includes('run-five') && !readRuns().includes('run-six'))
+  } finally {
+    held?.resolve()
+    if (root) { await act(async () => root.unmount()); root = null }
+    clock.restore()
   }
 })
 

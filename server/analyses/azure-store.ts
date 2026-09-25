@@ -24,6 +24,7 @@ import {
   analysisNarrativeCanWork, analysisNarrativeRequestCanAdvance, analysisNarrativeRequestCancelled, candidateNarrativeBinding,
 } from './narrative-records'
 import { analysisCorrectionCanWork, projectAnalysisComparison } from './current-results'
+import { ANALYSIS_WORK_LANES, mergeAnalysisWorkLanes } from './work-lanes'
 import {
   analysisBlobInRun, analysisBytesHash, analysisCancellationNeedsRetry, analysisHash, analysisNarrativeTargetIdSchema,
   assertAnalysis, isAnalysisId, isSafeAnalysisBlobName, MAX_ANALYSIS_JSON_BYTES,
@@ -604,14 +605,12 @@ export function createAnalysisStoreFromContainer(
       } while (continuationToken)
       return [...workspaces]
     },
-    async listPending(now, limit) {
+    async listPending(now, limit, options = {}) {
       assertAnalysis(Number.isFinite(Date.parse(now)) && Number.isInteger(limit) && limit > 0 && limit <= 100, 'Invalid pending work query.')
-      const records: VersionedAnalysisEntity[] = []
       const parents = new Map<string, Extract<AnalysisEntity, { recordType: 'analysis-run' }> | undefined>()
       const workspaces = new Map<string, string>()
-      // Initialize/cancel first; blocked children must not consume the ready-work limit.
-      for (const recordType of ['analysis-run', 'analysis-comparison', 'analysis-correction', 'analysis-narrative-request', 'analysis-candidate-narrative', 'analysis-target-narrative'] as const) {
-        if (recordType === 'analysis-correction' && !correctionsEnabled) continue
+      async function* pending(recordType: AnalysisEntity['recordType']): AsyncGenerator<VersionedAnalysisEntity> {
+        if (recordType === 'analysis-correction' && !correctionsEnabled) return
         const eligible = recordType === 'analysis-run'
           ? `(c.status = 'initializing' OR (IS_DEFINED(c.cancellation) AND NOT IS_DEFINED(c.cancellation.completedAt)
               AND (NOT IS_DEFINED(c.error) OR (c.error.retryable = true AND c.attempts < @maxAttempts))))`
@@ -658,6 +657,8 @@ export function createAnalysisStoreFromContainer(
                   ? !analysisNarrativeRequestCanAdvance(parent, record) || state === 'archived' && !analysisNarrativeRequestCancelled(parent, record)
                   : record.recordType === 'analysis-correction' ? !analysisCorrectionCanWork(parent, record)
                   : !analysisNarrativeCanWork(parent, record) || Boolean(parent.narrativeRequestId))) continue
+              // A waiting overview can't be ready while its run is still scoring, and every scored pair makes it due again.
+              if (record.recordType === 'analysis-target-narrative' && record.status === 'waiting' && analysisRunCanScore(parent)) continue
               if (record.recordType === 'analysis-candidate-narrative') {
                 const correction = await store.get(record.workspaceId, analysisCorrectionId(record.runId, record.comparisonId))
                 assertAnalysis(!correction || correction.record.recordType === 'analysis-correction', 'Invalid candidate current-result head.')
@@ -665,8 +666,7 @@ export function createAnalysisStoreFromContainer(
                 if (record.resultRevisionId !== currentRevision) continue
               }
             }
-            records.push(item)
-            if (records.length === limit) return records
+            yield item
           }
           continuationToken = response.continuationToken
           if (continuationToken) {
@@ -675,7 +675,19 @@ export function createAnalysisStoreFromContainer(
           }
         } while (continuationToken)
       }
-      return records
+      async function* lane(recordTypes: readonly AnalysisEntity['recordType'][]): AsyncGenerator<VersionedAnalysisEntity> {
+        for (const recordType of recordTypes) yield* pending(recordType)
+      }
+      // Initialize/cancel first; blocked children must not consume the ready-work limit.
+      const records: VersionedAnalysisEntity[] = []
+      for await (const item of pending('analysis-run')) {
+        records.push(item)
+        if (records.length === limit) return records
+      }
+      // Scoring and summaries then take turns, so a long scoring queue can't hold every summary back.
+      return [...records, ...await mergeAnalysisWorkLanes({
+        scoring: lane(ANALYSIS_WORK_LANES.scoring), summaries: lane(ANALYSIS_WORK_LANES.summaries),
+      }, options.firstLane ?? 'scoring', limit - records.length)]
     },
   }
   return store

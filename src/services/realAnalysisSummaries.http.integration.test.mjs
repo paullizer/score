@@ -90,6 +90,13 @@ test('frontend summary services consume actual authorized API envelopes and retr
   const targetSubject = { kind: 'target', subjectId: initializing.targets[0].targetId }
   const initialOverview = await client.getRealAnalysisSummarySubject(fixture.workspaceId, runId, targetSubject)
   assert.deepEqual(initialOverview.narrative, initialTarget.targets[0])
+  const initialStatus = await client.getRealAnalysisSummaryStatus(fixture.workspaceId, runId, { items: true })
+  assert.equal(initialStatus.ready, false)
+  assert.equal(initialStatus.revision, initializing.revision, 'Status and full summary reads share one run revision.')
+  assert.deepEqual(initialStatus.scoring, initializing.scoring)
+  assert.deepEqual(initialStatus.counts, initializing.counts)
+  assert.deepEqual(initialStatus.comparisons.map(({ comparisonId, resultSha256, status }) => [comparisonId, resultSha256, status]),
+    [[initializing.capture.comparisons[0].comparisonId, null, initializing.comparisons[0].status]])
   assert.equal(fixture.analyses.store.values.size, initialRecords, 'Reading pending scoring status does not materialize or enqueue work.')
   assert.equal(stubs.modelCalls.length, initialModelCalls)
   await processAllAnalyses(fixture, stubs)
@@ -105,6 +112,14 @@ test('frontend summary services consume actual authorized API envelopes and retr
   const recordCount = fixture.analyses.store.values.size
   const whole = await client.getRealAnalysisSummaries(fixture.workspaceId, runId)
   assert.equal(whole.scope.targetId, null)
+  const status = await client.getRealAnalysisSummaryStatus(fixture.workspaceId, runId, { items: true })
+  assert.equal(status.generation, 'automatic')
+  assert.equal(status.revision, whole.revision)
+  assert.equal(status.ready, whole.ready)
+  assert.deepEqual(status.scoring, whole.scoring)
+  assert.deepEqual(status.counts, whole.counts)
+  assert.equal(status.comparisons[0].resultSha256, whole.capture.comparisons[0].resultSha256)
+  assert.equal(status.comparisons[0].status, whole.comparisons[0].status)
   const targetId = detail.targets[0].id
   const selected = await client.getRealAnalysisSummaries(fixture.workspaceId, runId, { targetId })
   assert.equal(selected.capture.scope.targetId, targetId)
@@ -128,6 +143,9 @@ test('frontend summary services consume actual authorized API envelopes and retr
   assert.deepEqual(updating.narrative, repeated.summaries.comparisons[0])
   assert.ok(['queued', 'running', 'waiting'].includes(updating.narrative.status),
     'Acknowledged generation is visible independently of the immutable pair ETag.')
+  const generating = await client.getRealAnalysisSummaryStatus(fixture.workspaceId, runId, { items: true })
+  assert.equal(generating.ready, false, 'Scored work with a pending summary is not ready for PDF, Word or PowerPoint exports.')
+  assert.equal(generating.comparisons[0].status, updating.narrative.status)
   assert.equal(stubs.modelCalls.length, modelCalls, 'HTTP generation requests schedule durable narrative work, not scoring or inline inference.')
   const unchanged = await client.getRealAnalysisComparison(fixture.workspaceId, runId, comparisons[0].comparison.id)
   assert.deepEqual(unchanged.comparison, frozen.comparison)

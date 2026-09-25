@@ -5,7 +5,7 @@ import { mkdir, rm } from 'node:fs/promises'
 import { join, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { build } from 'esbuild'
-import { analysisSummaryFixture, summaryHistoryFixture, summaryResponse, summarySubjectResponse, summaryRunId, summaryTimestamp, summaryWorkspaceId } from './analysisSummaries.test-support.mjs'
+import { analysisSummaryFixture, summaryHistoryFixture, summaryResponse, summaryStatusResponse, summarySubjectResponse, summaryRunId, summaryTimestamp, summaryWorkspaceId } from './analysisSummaries.test-support.mjs'
 
 const output = resolve(`.summary-service-tests-${randomUUID()}`)
 const originalFetch = globalThis.fetch
@@ -179,6 +179,89 @@ test('summary envelopes reject foreign identities, implicit scopes, malformed co
   await assert.rejects(client.getRealAnalysisSummaries(summaryWorkspaceId, summaryRunId, { targetId: fixture.targets[0].id }), /mismatched/)
   await assert.rejects(client.getRealAnalysisSummaries(summaryWorkspaceId, summaryRunId, { targetId: '' }), /optional exact job or grade/)
   await assert.rejects(client.getRealAnalysisSummaries('', summaryRunId), /saved workspace/)
+})
+
+test('summary status is a read-only whole-run GET that asks for per-item states only when requested', async () => {
+  const requests = []
+  const pending = analysisSummaryFixture({ secondStatus: 'running' })
+  globalThis.fetch = async (url, init) => {
+    requests.push({ url, init })
+    const items = new URL(url, 'https://score.test').searchParams.get('items') === 'true'
+    return json(summaryStatusResponse(pending, { items, candidateStatus: 'queued', targetStatus: 'waiting' }))
+  }
+  const counts = await client.getRealAnalysisSummaryStatus(summaryWorkspaceId, summaryRunId)
+  assert.equal(counts.ready, false)
+  assert.equal(counts.generation, 'automatic')
+  assert.deepEqual(counts.scoring, { total: 2, initialized: 2, queued: 0, running: 1, complete: 1, failed: 0, cancelled: 0 })
+  assert.equal(counts.counts.candidates.queued, 1)
+  assert.equal(counts.counts.candidates.waiting, 1)
+  assert.equal(counts.comparisons, undefined)
+  assert.equal(counts.targets, undefined)
+  const detailed = await client.getRealAnalysisSummaryStatus(summaryWorkspaceId, summaryRunId, { items: true })
+  assert.deepEqual(detailed.comparisons.map(({ comparisonId, comparisonStatus, status }) => [comparisonId, comparisonStatus, status]),
+    [['comparison-1', 'complete', 'queued'], ['comparison-2', 'running', 'waiting']])
+  assert.equal(detailed.comparisons[1].resultSha256, null)
+  assert.ok(detailed.comparisons.every((item) => !('published' in item) && !('text' in item)), 'Status never carries summary text.')
+  await client.getRealAnalysisSummaryStatus(summaryWorkspaceId, summaryRunId, { items: 'true', targetId: pending.targets[0].id })
+  assert.deepEqual(requests.map(({ url }) => url), [
+    `/api/workspaces/${summaryWorkspaceId}/analyses/${summaryRunId}/summary-status`,
+    `/api/workspaces/${summaryWorkspaceId}/analyses/${summaryRunId}/summary-status?items=true`,
+    `/api/workspaces/${summaryWorkspaceId}/analyses/${summaryRunId}/summary-status`,
+  ])
+  for (const { init } of requests) {
+    assert.equal(init.method, 'GET')
+    assert.equal(init.body, undefined)
+    assert.equal(init.cache, 'no-store')
+    assert.equal(init.credentials, 'include')
+    assert.equal(init.headers.get('X-Score-Request'), 'workspace')
+  }
+})
+
+test('summary status rejects foreign identities, target scopes, inconsistent counts, missing items and false readiness', async () => {
+  const ready = summaryStatusResponse(fixture, { items: true, candidateStatus: 'ready', targetStatus: 'ready' })
+  globalThis.fetch = async () => json(ready)
+  assert.equal((await client.getRealAnalysisSummaryStatus(summaryWorkspaceId, summaryRunId, { items: true })).ready, true)
+  const edits = [
+    (value) => { value.workspaceId = 'other-workspace' },
+    (value) => { value.runId = 'other-run' },
+    (value) => { value.scope.targetId = fixture.targets[0].id },
+    (value) => { value.schemaVersion = 2 },
+    (value) => { value.dataKind = 'sample' },
+    (value) => { value.generation = 'manual' },
+    (value) => { value.revision = 'not-a-revision' },
+    (value) => { delete value.workRevision },
+    (value) => { delete value.comparisons },
+    (value) => { delete value.comparisons; delete value.targets },
+    (value) => { value.counts.candidates.total++ },
+    (value) => { value.scoring.queued++ },
+    (value) => { value.scoring.initialized-- },
+    (value) => { value.counts.targets.ready--; value.counts.targets.failed++ },
+    (value) => { value.corrections.pending = 1 },
+    (value) => { value.comparisons[0].correctionPending = true },
+    (value) => { value.comparisons[0].resultSha256 = null },
+    (value) => { value.comparisons[0].targetId = 'foreign-target' },
+    (value) => { value.comparisons[0].status = 'published' },
+    (value) => { value.comparisons[1].comparisonId = value.comparisons[0].comparisonId },
+    (value) => { value.comparisons.pop() },
+    (value) => { value.targets[0].waitingFor = 'scoring' },
+  ]
+  for (const edit of edits) {
+    const body = structuredClone(ready)
+    edit(body)
+    globalThis.fetch = async () => json(body)
+    await assert.rejects(client.getRealAnalysisSummaryStatus(summaryWorkspaceId, summaryRunId, { items: true }),
+      /summary service returned (an invalid|mismatched)/, `Rejected edit: ${edit}`)
+  }
+  const corrected = summaryStatusResponse(fixture, { items: true, candidateStatus: 'ready', targetStatus: 'ready', correctionPending: ['comparison-1'] })
+  globalThis.fetch = async () => json(corrected)
+  const pending = await client.getRealAnalysisSummaryStatus(summaryWorkspaceId, summaryRunId, { items: true })
+  assert.equal(pending.corrections.pending, 1)
+  assert.equal(pending.ready, true, 'Pending corrections never block readiness for the current published result.')
+  await assert.rejects(client.getRealAnalysisSummaryStatus('', summaryRunId), /saved workspace/)
+  await assert.rejects(client.getRealAnalysisSummaryStatus(summaryWorkspaceId, ''), /saved workspace/)
+  const controller = new AbortController()
+  globalThis.fetch = async () => { controller.abort(); return json(ready) }
+  await assert.rejects(client.getRealAnalysisSummaryStatus(summaryWorkspaceId, summaryRunId, {}, controller.signal), { name: 'AbortError' })
 })
 
 test('summary generation sends only exact scope and mode with the caller summary ETag and stable request key', async () => {

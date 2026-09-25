@@ -25,6 +25,7 @@ import {
   ANALYSIS_NARRATIVE_LIMITS, analysisNarrativeIsCurrent,
   type GenerateRealAnalysisSummariesInput, type RealAnalysisSummariesMutationResponse,
   type RealAnalysisSummariesQuery, type RealAnalysisSummariesResponse, type RealAnalysisSummarySubjectResponse,
+  type RealAnalysisSummaryStatusQuery, type RealAnalysisSummaryStatusResponse,
 } from '../domain/analysis-narratives'
 import { analysisNarrativeWorkHealthSchema } from '../domain/analysis-narrative-validation'
 import { ANALYSIS_CORRECTION_POLICY_VERSIONS } from '../domain/analysis-corrections'
@@ -226,6 +227,63 @@ export async function getRealAnalysisSummaries(
   const result = await cloudJsonRequest<unknown>(`${base(workspaceId, runId)}/summaries${suffix}`, { method: 'GET', signal })
   signal?.throwIfAborted()
   return checkedSummaries(result, workspaceId, runId, targetId)
+}
+
+const scoringCounts = z.object({
+  total: narrativeCount, initialized: narrativeCount, queued: narrativeCount, running: narrativeCount,
+  complete: narrativeCount, failed: narrativeCount, cancelled: narrativeCount,
+})
+const summaryStatusEnvelope: z.ZodType<RealAnalysisSummaryStatusResponse> = z.object({
+  schemaVersion: z.literal(1), dataKind: z.literal('real'), workspaceId: narrativeId, runId: narrativeId,
+  scope: narrativeScope, revision: narrativeHash, workRevision: narrativeHash,
+  generation: z.enum(['automatic', 'on-demand', 'disabled']), ready: z.boolean(),
+  scoring: scoringCounts, corrections: z.object({ pending: narrativeCount }),
+  counts: z.object({ candidates: narrativeCounts, targets: narrativeCounts }),
+  comparisons: z.array(z.object({
+    comparisonId: narrativeId, targetId: narrativeId, comparisonStatus, resultSha256: narrativeHash.nullable(),
+    correctionPending: z.boolean(), status: narrativeStatus,
+  })).max(ANALYSIS_LIMITS.maxComparisons).optional(),
+  targets: z.array(z.object({
+    targetId: narrativeId, status: narrativeStatus, waitingFor: z.enum(['scoring', 'candidate-narratives']).nullable(),
+  })).max(ANALYSIS_LIMITS.maxComparisons).optional(),
+})
+
+function checkedSummaryStatus(payload: unknown, workspaceId: string, runId: string, items: boolean): RealAnalysisSummaryStatusResponse {
+  const parsed = summaryStatusEnvelope.safeParse(payload)
+  if (!parsed.success) throw new Error('The summary service returned an invalid summary status. Reload the saved analysis before continuing.')
+  const value = parsed.data
+  const { scoring, counts } = value
+  const comparisons = value.comparisons, targets = value.targets
+  const targetIds = new Set(targets?.map((item) => item.targetId))
+  if (value.workspaceId !== workspaceId || value.runId !== runId || value.scope.targetId !== null ||
+    (comparisons === undefined) !== (targets === undefined) || (items && !comparisons) ||
+    counts.candidates.total !== scoring.total || scoring.initialized > scoring.total ||
+    scoring.queued + scoring.running + scoring.complete + scoring.failed + scoring.cancelled !== scoring.total ||
+    scoring.running + scoring.complete + scoring.failed + scoring.cancelled > scoring.initialized ||
+    value.corrections.pending > scoring.complete ||
+    (value.ready && (scoring.initialized !== scoring.total || scoring.queued + scoring.running > 0 ||
+      [counts.candidates, counts.targets].some((count) => count.ready + count.notRequired !== count.total))) ||
+    (comparisons && (comparisons.length !== counts.candidates.total ||
+      new Set(comparisons.map((item) => item.comparisonId)).size !== comparisons.length ||
+      comparisons.some((item) => !targetIds.has(item.targetId) || (item.comparisonStatus === 'complete') !== (item.resultSha256 !== null) ||
+        (item.correctionPending && item.comparisonStatus !== 'complete')) ||
+      comparisons.filter((item) => item.correctionPending).length !== value.corrections.pending)) ||
+    (targets && (targets.length !== counts.targets.total || targetIds.size !== targets.length ||
+      targets.some((item) => (item.waitingFor !== null) && item.status !== 'waiting')))) {
+    throw new Error('The summary service returned mismatched workspace, analysis, or summary status information. Nothing was substituted.')
+  }
+  return value
+}
+
+/** Work metadata only. The status never includes published text, so pages can poll it while summaries generate. */
+export async function getRealAnalysisSummaryStatus(
+  workspaceId: string, runId: string, query: RealAnalysisSummaryStatusQuery = {}, signal?: AbortSignal,
+): Promise<RealAnalysisSummaryStatusResponse> {
+  checkedSummaryScope(workspaceId, runId, {})
+  const items = query.items === true
+  const result = await cloudJsonRequest<unknown>(`${base(workspaceId, runId)}/summary-status${items ? '?items=true' : ''}`, { method: 'GET', signal })
+  signal?.throwIfAborted()
+  return checkedSummaryStatus(result, workspaceId, runId, items)
 }
 
 export async function generateRealAnalysisSummaries(

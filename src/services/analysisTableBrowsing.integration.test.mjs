@@ -102,6 +102,42 @@ function frozen(value) {
   return value
 }
 
+function narrativeCounts(statuses) {
+  const counts = { total: statuses.length, missing: 0, waiting: 0, queued: 0, running: 0, ready: 0, stale: 0, failed: 0, cancelled: 0, notRequired: 0 }
+  for (const status of statuses) counts[status === 'not-required' ? 'notRequired' : status]++
+  return counts
+}
+
+// Candidate summaries default to ready once a comparison is scored; overviews default to ready once any of their comparisons is.
+function summaryStatus(pairs, { runId = 'run-one', generation = 'automatic', candidates = {}, targetStatus, correctionPending = [], items = true } = {}) {
+  const scoring = { total: pairs.length, initialized: pairs.length, queued: 0, running: 0, complete: 0, failed: 0, cancelled: 0 }
+  for (const item of pairs) scoring[item.comparison.status]++
+  const comparisons = pairs.map(({ comparison }) => ({
+    comparisonId: comparison.id, targetId: comparison.target.summary.id, comparisonStatus: comparison.status,
+    resultSha256: comparison.status === 'complete' ? hash : null, correctionPending: correctionPending.includes(comparison.id),
+    status: comparison.status === 'complete' ? candidates[comparison.id] ?? 'ready' : 'not-required',
+  }))
+  const targets = [...new Set(comparisons.map((item) => item.targetId))].map((targetId) => ({
+    targetId, waitingFor: null,
+    status: targetStatus ?? (comparisons.some((item) => item.targetId === targetId && item.comparisonStatus === 'complete') ? 'ready' : 'not-required'),
+  }))
+  const ready = scoring.queued + scoring.running === 0 && [...comparisons, ...targets].every((item) => ['ready', 'not-required'].includes(item.status))
+  return {
+    schemaVersion: 1, dataKind: 'real', workspaceId, runId, scope: { targetId: null }, revision: 'fixture-revision', workRevision: 'fixture-work',
+    generation, ready, scoring, corrections: { pending: correctionPending.length },
+    counts: { candidates: narrativeCounts(comparisons.map((item) => item.status)), targets: narrativeCounts(targets.map((item) => item.status)) },
+    ...(items ? { comparisons, targets } : {}),
+  }
+}
+
+function statusApi(entryFor) {
+  return {
+    summaryStatus: (runId) => entryFor(runId) ?? { state: 'idle' },
+    ensureSummaryStatus: async (...args) => { calls.push(['ensure-status', ...args]) },
+    subscribeSummaryStatus: (runId) => { calls.push(['subscribe-status', runId]); return () => calls.push(['unsubscribe-status', runId]) },
+  }
+}
+
 before(async () => {
   await mkdir(output)
   dom = new JSDOM('<!doctype html><div id="root"></div>', { url: 'https://score.test/' })
@@ -118,6 +154,10 @@ before(async () => {
   ;({ createRoot } = await import('react-dom/client'))
   await build({ stdin: { resolveDir: process.cwd(), loader: 'tsx', contents: `
     export * from './src/features/analyses/analysisTableBrowsing';
+    export {
+      realAnalysisCompletionProgress, realAnalysisCompletionRank, realAnalysisFullyComplete, realAnalysisRunStage, realComparisonStage,
+      realSummariesNeedAttention, realSummaryCounts, realSummaryGeneration, realSummaryItems, realSummaryStatusCurrent, summaryStatusWorkActive,
+    } from './src/features/analyses/realAnalysisCompletion';
     export { activeCorrectionProgress } from './src/features/analyses/analysisCorrectionState';
     export { targetIdentity } from './src/features/analyses/realAnalysisUi';
     export { WorkspaceContext } from './src/app/workspace-context';
@@ -235,7 +275,7 @@ test('pending re-scores show in the status column and run progress while their r
   assert.deepEqual(indexes(ui.selectRealComparisons(pairs, [target()], browse({ sort: { key: 'status', direction: 'asc' } })).rows), [4, 0, 1, 2, 3])
   await render(app({ api: apiFor(pairs) }))
   assert.deepEqual(tableRows().map((row) => row.cells[3].querySelector('.badge').textContent),
-    ['Re-score queued', 'Re-score running', 'Evidence-gap verification running', 'Complete', 'Failed'])
+    ['Re-score queued', 'Re-score running', 'Evidence-gap verification running', 'Analysis complete', 'Failed'])
   assert.match(tableRows()[0].cells[3].textContent, new RegExp(`Requested ${requested}\\. Showing the current result until the re-score finishes\\.`))
   assert.match(tableRows()[2].cells[3].textContent, /Showing the current result until the correction finishes\./)
   assert.match(tableRows()[0].cells[2].textContent, /No overall score.*A saved weighted criterion was not assessable/s, 'The current withheld result stays visible.')
@@ -351,8 +391,8 @@ test('real comparison headers and mobile selector share state, expose exact targ
   assert.deepEqual(rowIndexes(), [1, 0, 2])
   assert.equal(chosenSort(), 'Assessment / evidence match: high to low')
   assert.match(tableRows()[1].cells[2].textContent, /0\/ 100/)
-  assert.match(tableRows()[2].textContent, /No overall score.*Complete · limited assessment.*A saved weighted criterion was not assessable/s)
-  assert.equal(tableRows()[2].cells[3].querySelector('.badge').textContent, 'Complete')
+  assert.match(tableRows()[2].textContent, /No overall score.*Analysis complete · limited assessment.*A saved weighted criterion was not assessable/s)
+  assert.equal(tableRows()[2].cells[3].querySelector('.badge').textContent, 'Analysis complete')
   await sortHeader('Assessment / evidence match')
   assert.deepEqual(rowIndexes(), [0, 1, 2])
   await choose('Sort comparisons', 'Saved order')
@@ -445,7 +485,7 @@ test('reordered real row actions retain record identities and read-only, cancell
   assert.equal(button('Cancel comparison 3').disabled, true)
   await choose('Sort comparisons', 'Status / actions: complete first')
   assert.deepEqual(rowIndexes(), [3, 2, 0, 1])
-  assert.equal(tableRows()[0].cells[3].querySelector('.badge').textContent, 'Complete')
+  assert.equal(tableRows()[0].cells[3].querySelector('.badge').textContent, 'Analysis complete')
   const cancelling = structuredClone(run)
   cancelling.run.status = 'cancelled'
   cancelling.run.cancellation = { requestedAt: timestamp, requestedBy: 'fixture', nextComparisonIndex: 0 }
@@ -459,7 +499,7 @@ test('reordered real row actions retain record identities and read-only, cancell
   assert.match(dom.window.document.body.textContent, /Cancellation paused/)
   assert.equal(button('Resume cancellation').disabled, false)
   assert.equal(button('Retry comparison 2 with saved inputs').disabled, true)
-  assert.equal(tableRows()[0].cells[3].querySelector('.badge').textContent, 'Complete')
+  assert.equal(tableRows()[0].cells[3].querySelector('.badge').textContent, 'Analysis complete')
   assert.equal(calls.filter(([kind]) => kind.endsWith('-pair')).length, 2, 'Browsing never implicitly retries or cancels a row.')
 })
 
@@ -580,4 +620,184 @@ test('real analysis history exposes total-count/status/date sorting, keeps filte
   await choose('Sort real analyses', 'Analysis: Z to A')
   await render(app({ api: { ...api, workspaceId: 'other-history-workspace' } }))
   assert.equal(chosenSort('Sort real analyses'), 'Default order')
+})
+
+test('summary-aware stages keep comparisons and runs short of Complete until their automatic summaries finish', () => {
+  const pairs = [pair(0), pair(1), pair(2), pair(3, { status: 'running' }), pair(4, { status: 'failed' }), pair(5, { status: 'queued' })]
+  const scoring = summary(pairs, { status: 'running' })
+  const active = summaryStatus(pairs, { candidates: { 'pair-1': 'running', 'pair-2': 'waiting' }, targetStatus: 'waiting' })
+  const stages = (status, generation = 'automatic') => {
+    const items = ui.realSummaryItems(status)
+    return pairs.map((item) => ui.realComparisonStage(item, generation, items.get(item.comparison.id)).label)
+  }
+  assert.deepEqual(stages(active), ['Complete', 'Generating summary', 'Queued for summary generation', 'Analyzing', 'Failed', 'Queued for analysis'])
+  assert.deepEqual(stages(undefined).slice(0, 3), Array(3).fill('Analysis complete'), 'Unknown summary progress never reads as Complete.')
+  assert.deepEqual(stages(undefined, 'on-demand').slice(0, 3), Array(3).fill('Complete'))
+  assert.equal(ui.realAnalysisRunStage(scoring, active).label, 'Analyzing')
+  assert.deepEqual(ui.realAnalysisCompletionProgress(scoring, active), {
+    total: 7, finished: 2, comparisons: { total: 6, finished: 2 },
+    candidates: { required: 5, ready: 1, queued: 1, running: 1, unfinished: 0 },
+    overviews: { required: 1, ready: 0, queued: 1, running: 0, unfinished: 0 },
+  })
+  assert.equal(ui.realAnalysisCompletionProgress(scoring, summaryStatus(pairs, { items: false })), null, 'Counts alone cannot place each comparison.')
+  assert.equal(ui.realAnalysisCompletionProgress(scoring, summaryStatus(pairs, { runId: 'run-two' })), null)
+  assert.equal(ui.summaryStatusWorkActive(active), true)
+
+  const scored = [pair(0), pair(1), pair(2)]
+  const complete = summary(scored)
+  const generating = summaryStatus(scored, { candidates: { 'pair-1': 'running', 'pair-2': 'queued' }, targetStatus: 'waiting' })
+  const queued = summaryStatus(scored, { candidates: { 'pair-0': 'queued', 'pair-1': 'queued', 'pair-2': 'waiting' }, targetStatus: 'waiting' })
+  const done = summaryStatus(scored)
+  const failed = summaryStatus(scored, { candidates: { 'pair-2': 'failed' } })
+  assert.deepEqual([undefined, generating, queued, done, failed].map((status) => ui.realAnalysisRunStage(complete, status).label),
+    ['Analysis complete', 'Generating summaries', 'Queued for summary generation', 'Complete', 'Summaries need attention'])
+  assert.deepEqual([undefined, generating, queued, done, failed].map((status) => ui.realAnalysisProcessingRank(complete, status)), [2, 1, 1, 2, 0])
+  assert.deepEqual([undefined, generating, done, failed].map((status) => ui.realAnalysisFullyComplete(complete, status)), [true, false, true, false])
+  assert.deepEqual([generating, done, failed].map((status) => ui.realSummariesNeedAttention(complete, status)), [false, false, true])
+  assert.equal(done.ready, true)
+  assert.equal(ui.summaryStatusWorkActive(done), false)
+  assert.equal(ui.summaryStatusWorkActive(failed), false)
+  assert.deepEqual(ui.realAnalysisCompletionProgress(complete, failed), {
+    total: 4, finished: 4, comparisons: { total: 3, finished: 3 },
+    candidates: { required: 3, ready: 2, queued: 0, running: 0, unfinished: 1 },
+    overviews: { required: 1, ready: 1, queued: 0, running: 0, unfinished: 0 },
+  }, 'A failed summary is finished work. The stage flags it instead.')
+  assert.deepEqual(ui.realSummaryCounts(complete, generating), { required: 4, ready: 1, queued: 2, running: 1, unfinished: 0 })
+
+  const early = summaryStatus([pair(0), pair(1), pair(2, { status: 'running' })])
+  assert.equal(ui.realSummaryStatusCurrent(complete, early), false, 'A status read before scoring finished is not current.')
+  assert.equal(ui.realAnalysisRunStage(complete, early).label, 'Analysis complete')
+  assert.equal(ui.realAnalysisCompletionRank(complete, early), null)
+  assert.equal(ui.realSummaryCounts(complete, early), null)
+  const rescored = { ...scored[0], comparison: { ...scored[0].comparison, result: { sha256: 'b'.repeat(64) } } }
+  assert.equal(ui.realComparisonStage(rescored, 'automatic', ui.realSummaryItems(done).get('pair-0')).label, 'Analysis complete',
+    'A summary of an earlier result never completes a re-scored comparison.')
+  const correcting = summaryStatus(scored, { correctionPending: ['pair-0'] })
+  assert.equal(ui.realComparisonStage(scored[0], 'automatic', ui.realSummaryItems(correcting).get('pair-0')).label, 'Analysis complete')
+  assert.equal(ui.realAnalysisRunStage(complete, correcting).label, 'Analyzing')
+  assert.equal(ui.realAnalysisFullyComplete(complete, correcting), false)
+
+  const requested = summaryStatus(scored, { generation: 'on-demand', candidates: { 'pair-0': 'running', 'pair-1': 'missing', 'pair-2': 'missing' }, targetStatus: 'missing' })
+  assert.deepEqual(scored.map((item) => ui.realComparisonStage(item, 'on-demand', ui.realSummaryItems(requested).get(item.comparison.id)).label),
+    ['Generating summary', 'Complete', 'Complete'])
+  assert.equal(ui.realAnalysisRunStage(complete, requested).label, 'Generating summaries')
+  const onDemand = summaryStatus(scored, { generation: 'on-demand', candidates: { 'pair-0': 'missing', 'pair-1': 'missing', 'pair-2': 'missing' }, targetStatus: 'missing' })
+  assert.equal(ui.realAnalysisRunStage(complete, onDemand).label, 'Complete', 'On-demand summaries do not hold a scored run open.')
+  assert.equal(ui.realAnalysisFullyComplete(complete, onDemand), true)
+  assert.equal(ui.realSummariesNeedAttention(complete, onDemand), false)
+  assert.equal(ui.realSummaryGeneration(complete), 'automatic', 'Runs without captured settings generate summaries automatically.')
+  assert.equal(ui.realSummaryGeneration(complete, onDemand), 'on-demand')
+  const captured = structuredClone(complete)
+  captured.run.processingSettings = { settings: { features: { summaryGeneration: false }, summaries: { generationMode: 'automatic' } } }
+  assert.equal(ui.realSummaryGeneration(captured), 'disabled')
+  captured.run.processingSettings.settings = { features: { summaryGeneration: true }, summaries: { generationMode: 'on-demand' } }
+  assert.equal(ui.realSummaryGeneration(captured), 'on-demand')
+
+  const completion = { generation: 'automatic', items: ui.realSummaryItems(generating) }
+  assert.deepEqual(scored.map((item) => ui.realComparisonProcessingRank(item, complete, completion)), [2, 1, 1])
+  assert.deepEqual(indexes(ui.selectRealComparisons(scored, [target()], browse({ sort: { key: 'status', direction: 'desc' } }), complete, completion).rows), [0, 1, 2])
+  assert.deepEqual(indexes(ui.selectRealComparisons(scored, [target()], browse({ sort: { key: 'status', direction: 'asc' } }), complete, completion).rows), [1, 2, 0])
+  const runs = [summary(scored, { id: 'generating' }), summary(scored, { id: 'done' })]
+  const statuses = new Map([['generating', { ...generating, runId: 'generating' }], ['done', { ...done, runId: 'done' }]])
+  const ids = (filter, sort = null, statusOf = (id) => statuses.get(id)) => ui.selectRealAnalysisRuns(runs, '', filter, sort, statusOf).map((item) => item.run.id)
+  assert.deepEqual(ids('complete'), ['done'])
+  assert.deepEqual(ids('attention'), ['generating'])
+  assert.deepEqual(ids('all', { key: 'status', direction: 'desc' }), ['done', 'generating'])
+  assert.deepEqual(ids('complete', null, () => undefined), ['generating', 'done'], 'Until summary progress is known, the filter follows scoring.')
+})
+
+test('the analysis page shows Complete only after each automatic summary is ready, with one combined progress bar', async () => {
+  const pairs = [pair(0, { name: 'Summarized' }), pair(1, { name: 'Summarizing' }), pair(2, { name: 'Summary waiting' }),
+    pair(3, { name: 'Scoring', status: 'running' }), pair(4, { name: 'Not started', status: 'queued' })]
+  let entry = { state: 'ready', value: summaryStatus(pairs, { candidates: { 'pair-1': 'running', 'pair-2': 'queued' }, targetStatus: 'waiting' }) }
+  await render(app({ api: apiFor(pairs, [target()], { summary: summary(pairs, { status: 'running' }), ...statusApi(() => entry) }) }))
+  const badges = () => tableRows().map((row) => row.cells[3].querySelector('.badge').textContent)
+  const progress = () => element('section[aria-label="Real analysis progress"]')
+  const bar = () => progress().querySelector('progress')
+  const runBadge = () => element('.analysis-meta').querySelectorAll('.badge')[1].textContent
+  assert.deepEqual(badges(), ['Complete', 'Generating summary', 'Queued for summary generation', 'Analyzing', 'Queued for analysis'])
+  assert.equal(bar().getAttribute('aria-label'), 'Finished analysis and summary steps')
+  assert.deepEqual([bar().getAttribute('value'), bar().getAttribute('max')], ['1', '6'])
+  assert.match(progress().textContent, /^Analyzing · 1 \/ 6 finished/)
+  assert.match(progress().textContent, /A comparison counts as finished when its score and its candidate summary are both done\./)
+  assert.match(progress().textContent, /Analysis: 3 \/ 5 comparisons finished · 3 complete · 1 assessing · 1 queued · 0 failed · 0 cancelled/)
+  assert.match(progress().textContent, /Candidate summaries: 1 \/ 5 ready · 1 queued · 1 generating · 2 waiting for analysis/)
+  assert.match(progress().textContent, /Job \/ grade overviews: 0 \/ 1 ready · 1 queued · 0 generating/)
+  assert.match(progress().textContent, /CSV reports don’t need summaries\. PDF, Word and PowerPoint need every summary to be ready\./)
+  assert.doesNotMatch(progress().textContent, /in progress/)
+  assert.deepEqual(calls.filter(([kind]) => kind.endsWith('-status')), [['subscribe-status', 'run-one'], ['ensure-status', 'run-one']])
+
+  const scored = pairs.map((item, index) => index < 3 ? item : pair(index, { name: item.comparison.resume.summary.name }))
+  entry = { state: 'ready', value: summaryStatus(scored, { candidates: { 'pair-4': 'running' }, targetStatus: 'waiting' }) }
+  const api = apiFor(scored, [target()], { summary: summary(scored), ...statusApi(() => entry) })
+  await render(app({ api }))
+  assert.equal(runBadge(), 'Generating summaries', 'Scoring finished, but the run is not complete while summaries generate.')
+  assert.deepEqual(badges(), ['Complete', 'Complete', 'Complete', 'Complete', 'Generating summary'])
+  assert.match(progress().textContent, /^Generating summaries · 4 \/ 6 finished/)
+  assert.match(progress().textContent, /Analysis: 5 \/ 5 comparisons finished/)
+
+  entry = { state: 'ready', value: summaryStatus(scored) }
+  await render(app({ api }))
+  assert.equal(runBadge(), 'Complete')
+  assert.deepEqual(badges(), Array(5).fill('Complete'))
+  assert.match(progress().textContent, /^Complete · 6 \/ 6 finished/)
+  assert.doesNotMatch(progress().textContent, /CSV reports|Some summaries/)
+
+  entry = { state: 'ready', value: summaryStatus(scored, { candidates: { 'pair-4': 'failed' } }) }
+  await render(app({ api }))
+  assert.equal(runBadge(), 'Summaries need attention')
+  assert.deepEqual(badges(), ['Complete', 'Complete', 'Complete', 'Complete', 'Summary failed'])
+  assert.match(progress().textContent, /Candidate summaries: 4 \/ 5 ready · 0 queued · 0 generating · 1 needs attention/)
+  assert.match(progress().textContent, /Some summaries didn’t finish\. Use Manage summaries to generate the missing ones before exporting PDF, Word or PowerPoint\./)
+
+  entry = { state: 'loading' }
+  await render(app({ api }))
+  assert.equal(runBadge(), 'Analysis complete')
+  assert.deepEqual(badges(), Array(5).fill('Analysis complete'))
+  assert.equal(bar().getAttribute('aria-label'), 'Checking summary progress')
+  assert.equal(bar().getAttribute('value'), null)
+  assert.match(progress().textContent, /Checking summary progress…/)
+
+  entry = { state: 'error', error: 'Summary progress could not be checked. Scores and saved summaries are unchanged.' }
+  await render(app({ api }))
+  assert.equal(bar().getAttribute('aria-label'), 'Finished comparisons')
+  assert.deepEqual([bar().getAttribute('value'), bar().getAttribute('max')], ['5', '5'])
+  assert.match(progress().textContent, /Summary progress could not be checked\. Scores and saved summaries are unchanged\./)
+  calls.length = 0
+  await click('Check summary progress')
+  assert.deepEqual(calls.filter(([kind]) => kind.endsWith('-status')), [['ensure-status', 'run-one', true]])
+
+  const missing = { 'pair-0': 'missing', 'pair-1': 'missing', 'pair-2': 'missing', 'pair-3': 'missing', 'pair-4': 'missing' }
+  entry = { state: 'ready', value: summaryStatus(scored, { generation: 'on-demand', candidates: missing, targetStatus: 'missing' }) }
+  await render(app({ api }))
+  assert.equal(runBadge(), 'Complete', 'Scoring completes a run whose summaries are generated on demand.')
+  assert.deepEqual(badges(), Array(5).fill('Complete'))
+  assert.equal(bar().getAttribute('aria-label'), 'Finished comparisons')
+  assert.match(progress().textContent, /Candidate summaries: 0 \/ 5 ready(?! ·)/)
+  assert.match(progress().textContent, /Summaries for this analysis are generated on demand\. Use Manage summaries to create them before exporting PDF, Word or PowerPoint\./)
+  entry = { state: 'ready', value: summaryStatus(scored, { generation: 'disabled', candidates: missing, targetStatus: 'missing' }) }
+  await render(app({ api }))
+  assert.match(progress().textContent, /Summary generation was off when this analysis started, so no summaries were created automatically\./)
+})
+
+test('the analysis history shows summary progress and filters Complete by scoring and summaries together', async () => {
+  const scored = [pair(0), pair(1), pair(2)]
+  const histories = [summary(scored, { id: 'generating', name: 'Generating run' }), summary(scored, { id: 'done', name: 'Done run' }),
+    summary([], { id: 'scoring', name: 'Scoring run', status: 'running', total: 3 })]
+  const statuses = {
+    generating: summaryStatus(scored, { runId: 'generating', candidates: { 'pair-1': 'running', 'pair-2': 'queued' }, targetStatus: 'waiting', items: false }),
+    done: summaryStatus(scored, { runId: 'done', items: false }),
+  }
+  const api = apiFor([], [target()], { summaries: histories, ...statusApi((runId) => statuses[runId] && { state: 'ready', value: statuses[runId] }) })
+  await render(app({ api, path: '/analyses?data=real' }))
+  const rows = () => tableRows('.data-table')
+  assert.deepEqual(rows().map((row) => row.cells[1].querySelector('.badge').textContent), ['Generating summaries', 'Complete', 'Analyzing'])
+  assert.match(rows()[0].cells[2].textContent, /Summaries: 1 \/ 4 ready · 2 queued · 1 generating/)
+  assert.match(rows()[1].cells[2].textContent, /Summaries: 4 \/ 4 ready · 0 queued · 0 generating/)
+  assert.doesNotMatch(rows()[2].cells[2].textContent, /Summaries/)
+  await click('Complete')
+  assert.deepEqual(tableNames('.data-table'), ['Done run'])
+  await click('In progress / attention')
+  assert.deepEqual(tableNames('.data-table'), ['Generating run', 'Scoring run'])
+  assert.deepEqual(calls.filter(([kind]) => kind.endsWith('-status')), [], 'The history page leaves summary reads to the shared bridge.')
 })

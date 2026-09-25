@@ -1,5 +1,5 @@
 import type { RealAnalysisComparisonRecord, RealAnalysisRunRecord } from '../../src/domain/real-analyses'
-import type { RealAnalysisTargetNarrativeRecord } from '../../src/domain/analysis-narratives'
+import { analysisSummaryGeneration, type RealAnalysisTargetNarrativeRecord } from '../../src/domain/analysis-narratives'
 import type { ProcessingSettingsSnapshot } from '../../src/domain/admin-settings'
 import type { AnalysisStore, AnalysisTransaction } from './store'
 import { analysisNarrativeId, assertAnalysis, parseAnalysisEntity } from './validation'
@@ -16,8 +16,7 @@ export async function prepareAnalysisNarrativeTransitions(
     run.processingSettings ?? transitions.find(value => value.next.processingSettings)?.next.processingSettings,
 ): Promise<AnalysisTransaction[]> {
   if (!analysisNarrativeCanWork(run)) return []
-  const policy = acceptedProcessingSettings(processingSettings).settings
-  if (!policy.features.summaryGeneration || policy.summaries.generationMode !== 'automatic') return []
+  if (analysisSummaryGeneration(acceptedProcessingSettings(processingSettings).settings) !== 'automatic') return []
   const timestamp = narrativeTimestamp(run, now)
   const operations: AnalysisTransaction[] = []
   const targets = new Map<string, { comparison: RealAnalysisComparisonRecord; completion: boolean }>()

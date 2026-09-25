@@ -7,7 +7,7 @@ import type { RealAnalysisDiagnosticsPage } from '../domain/analysis-diagnostics
 import type { RealLoadState } from './real-request-scope'
 import type {
   GenerateRealAnalysisSummariesInput, RealAnalysisSummariesMutationResponse, RealAnalysisSummariesResponse,
-  RealAnalysisSummarySubjectResponse,
+  RealAnalysisSummaryStatusResponse, RealAnalysisSummarySubjectResponse,
 } from '../domain/analysis-narratives'
 import type {
   AnalysisSummaryHistoryPage, AnalysisSummarySubject, PublishSummaryDraftInput,
@@ -41,6 +41,10 @@ export interface RealAnalysesContextValue {
   summarySubject: (runId: string, subject: AnalysisSummarySubject) => RealLoadState<RealAnalysisSummarySubjectResponse>
   ensureSummarySubject: (runId: string, subject: AnalysisSummarySubject, force?: boolean) => Promise<void>
   subscribeSummarySubject: (runId: string, subject: AnalysisSummarySubject) => () => void
+  // Metadata-only summary progress. The history list reads counts; a subscribed analysis page also reads each comparison's state.
+  summaryStatus: (runId: string) => RealLoadState<RealAnalysisSummaryStatusResponse>
+  ensureSummaryStatus: (runId: string, force?: boolean) => Promise<void>
+  subscribeSummaryStatus: (runId: string) => () => void
   generateSummaries: (runId: string, input: GenerateRealAnalysisSummariesInput, etag: string) => Promise<RealAnalysisSummariesMutationResponse>
   summaryHistory: (runId: string, subject: AnalysisSummarySubject, cursor?: string, signal?: AbortSignal) => Promise<AnalysisSummaryHistoryPage>
   publishSummaryDraft: (runId: string, subject: AnalysisSummarySubject, input: PublishSummaryDraftInput, etag: string) => Promise<RealAnalysisSummariesResponse>

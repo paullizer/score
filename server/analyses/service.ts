@@ -37,8 +37,10 @@ import type { AnalysisReportCaptures } from './reports'
 import type { AnalysisReportFormat, ReportSettingsCapture } from '../../src/domain/analysis-reports'
 import type { ProcessingSettingsSnapshot } from '../../src/domain/admin-settings'
 import type { WorkspaceRole } from '../../src/domain/cloud'
-import { generateAnalysisSummaries, readAnalysisNarrativeInventory, readAnalysisSummaries, readAnalysisSummarySubject } from './narratives'
-import type { GenerateRealAnalysisSummariesInput } from '../../src/domain/analysis-narratives'
+import {
+  generateAnalysisSummaries, readAnalysisNarrativeInventory, readAnalysisSummaries, readAnalysisSummaryStatus, readAnalysisSummarySubject,
+} from './narratives'
+import type { GenerateRealAnalysisSummariesInput, RealAnalysisSummaryStatusQuery } from '../../src/domain/analysis-narratives'
 import type { AnalysisSummarySubject, PublishSummaryDraftInput, RestartSummaryInput } from '../../src/domain/analysis-summary-history'
 import { readAnalysisSummaryHistory } from './summary-history'
 import { publishAnalysisSummaryDraft, restartAnalysisSummary, retryAnalysisSummary } from './summary-actions'
@@ -371,6 +373,9 @@ export class RealAnalysisService {
   }
   summaries(workspaceId: string, runId: string, targetId?: string, signal?: AbortSignal) {
     return readAnalysisSummaries(this.deps, workspaceId, runId, targetId, signal)
+  }
+  summaryStatus(workspaceId: string, runId: string, options?: RealAnalysisSummaryStatusQuery, signal?: AbortSignal) {
+    return readAnalysisSummaryStatus(this.deps, workspaceId, runId, options, signal)
   }
   summarySubject(workspaceId: string, runId: string, subject: AnalysisSummarySubject, signal?: AbortSignal, resultRevisionId?: string) {
     return traceOperation(subject.kind === 'candidate' ? 'score.analysis.summary.candidate' : 'score.analysis.summary.target',

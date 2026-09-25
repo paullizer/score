@@ -360,6 +360,15 @@ test('workspace sharing and creation-grant telemetry redact workspace IDs, user 
   }
 })
 
+test('summary status telemetry uses its own bounded route and operation names', () => {
+  const { safeRoute, safeRequestName, safeOperationName } = telemetryExports
+  const raw = `/api/workspaces/${SENTINEL}/analyses/analysis-run-${SENTINEL}/summary-status?items=true`
+  const template = '/api/workspaces/:workspaceId/analyses/:runId/summary-status'
+  assert.equal(safeRoute(raw), template)
+  assert.equal(safeRequestName('GET', raw), `GET ${template}`)
+  assert.equal(safeOperationName('score.analysis.summary.status'), 'score.analysis.summary.status')
+})
+
 test('operation helper preserves values and errors with telemetry disabled, with bounded names and categories', async () => {
   const { traceOperation, safeOperationName, errorCategory, safeAttributes, readTelemetryConfiguration, createTelemetryWarnings } = telemetryExports
   assert.equal(await traceOperation('score.analysis.validation', {}, async () => 42), 42)

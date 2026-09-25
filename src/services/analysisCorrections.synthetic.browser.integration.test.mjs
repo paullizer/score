@@ -728,12 +728,12 @@ test('the comparison table follows accepted re-scores from queued to running and
   const rows = page.locator('.comparison-table tbody tr')
   const statuses = async () => (await rows.evaluateAll(items => items.map(row => row.cells[3].querySelector('.badge').textContent))).join()
   const progress = page.locator('section[aria-label="Real analysis progress"]')
-  assert.equal(await statuses(), 'Complete,Complete,Complete,Complete,Failed')
+  assert.equal(await statuses(), 'Analysis complete,Analysis complete,Analysis complete,Analysis complete,Failed')
   const dialog = await openReview(page, false, 'reassess')
   await confirm(dialog, 3, 'reassess')
   await dialog.getByText('Saved server status: 3 queued · 0 running · 0 published · 0 failed · 0 cancelled.', { exact: true }).waitFor()
   await dialog.getByRole('button', { name: 'Close', exact: true }).click()
-  await until(async () => await statuses() === 'Re-score queued,Re-score queued,Re-score queued,Complete,Failed',
+  await until(async () => await statuses() === 'Re-score queued,Re-score queued,Re-score queued,Analysis complete,Failed',
     'Closing the review shows the accepted re-scores in the table.')
   assert.match(await rows.first().innerText(), /Showing the current result until the re-score finishes\./)
   assert.match(await rows.first().innerText(), /No overall score/)
@@ -741,7 +741,7 @@ test('the comparison table follows accepted re-scores from queued to running and
   await page.getByRole('button', { name: 'Review withheld scores (3)', exact: true }).waitFor()
   for (const [id, head] of state.heads) state.heads.set(id, { ...head, status: 'running', attempts: 1 })
   await page.evaluate(() => window.refreshFixturePairs())
-  await until(async () => await statuses() === 'Re-score running,Re-score running,Re-score running,Complete,Failed',
+  await until(async () => await statuses() === 'Re-score running,Re-score running,Re-score running,Analysis complete,Failed',
     'The next list check shows the running work.')
   await progress.getByText(/^3 re-scores in progress · 0 queued · 3 running\./).waitFor()
   for (const [id, head] of state.heads) {
@@ -752,8 +752,8 @@ test('the comparison table follows accepted re-scores from queued to running and
     publishCorrectionFixture(state.fixture, ready)
   }
   await page.evaluate(() => window.refreshFixturePairs())
-  await until(async () => await statuses() === 'Complete,Complete,Complete,Complete,Failed',
-    'Published re-scores return to Complete with their current result.')
+  await until(async () => await statuses() === 'Analysis complete,Analysis complete,Analysis complete,Analysis complete,Failed',
+    'Published re-scores return to their scored stage with their current result.')
   assert.match(await rows.first().locator('td').nth(2).textContent(), /0\/ 100/)
   assert.equal(await progress.getByText(/in progress/).count(), 0)
   await page.getByRole('button', { name: 'Review withheld scores (0)', exact: true }).waitFor()

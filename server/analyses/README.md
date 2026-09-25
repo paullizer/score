@@ -80,6 +80,7 @@ All paths below have prefix `/api/workspaces/:workspaceId/analyses`:
 | `GET /:runId/comparisons/:comparisonId/documents/:documentId?version=N` | `RealAnalysisDocumentResponse` |
 | `GET /:runId/summaries` with optional `targetId` query | `RealAnalysisSummariesResponse`, including selected-scope ETag, status, published narratives, and report capture pins |
 | `GET /:runId/summaries/:kind/:subjectId` | `RealAnalysisSummarySubjectResponse`; one candidate summary or exact target overview, with its own revision and ETag |
+| `GET /:runId/summary-status` with optional `items=true` | `RealAnalysisSummaryStatusResponse`; whole-run scoring counts, summary counts, captured generation mode and `ready`, without published text. `items=true` adds per-comparison and per-target status |
 | `POST /:runId/summaries` with `{mode: "missing" \| "all", targetId?}` | `RealAnalysisSummariesMutationResponse` with durable request ID, scheduled counts, and summary state |
 | `GET /:runId/summaries/:kind/:subjectId/history?continuationToken=...` | Owner/editor-only `AnalysisSummaryHistoryPage`, up to 12 private checkpoint events and the narrative record ETag |
 | `POST /:runId/summaries/:kind/:subjectId/publish` with `{generationId, round, outputSha256}` | `{summaries}` for the subject's exact target; explicit manual approval of a persisted final draft |
@@ -381,6 +382,23 @@ or failed narratives, and refreshes missing/outdated dependent target overviews.
 rescoring. Request replay must not start another generation or supersede a newer
 accepted request after an ambiguous response.
 
+`GET /:runId/summary-status` is the pollable progress read for the whole run. It
+reads only the narrative inventory's work metadata: it never loads published text
+or history, never schedules or repairs work, and any workspace reader can call it.
+`revision` is the same inventory revision that `GET /summaries` returns for the
+whole run. `workRevision` covers what that revision doesn't: it changes when the
+pending-correction set or an overview's waiting reason changes. `generation` is
+the run's captured summary policy: `automatic`, `on-demand`, or `disabled` when
+summary generation was off. `ready` is true once every pair is initialized, none
+is queued or running, and every candidate summary and overview is ready or not
+required; it deliberately ignores pending corrections, which
+`corrections.pending` counts separately. With `items=true`, each comparison
+reports its scoring status, current `resultSha256`, `correctionPending`, and
+candidate summary status, and each target reports its overview status and
+`waitingFor` reason. Clients compare `resultSha256` with the saved result so a
+summary of an earlier result is not shown as current. The UI counts a pair as
+finished when its score and candidate summary are both settled.
+
 New completed scoring results durably schedule candidate summaries and coalesce
 the affected target overview. Target synthesis waits until selected scoring has
 settled and every completed comparison has a current candidate narrative. A
@@ -662,7 +680,14 @@ materializes its remaining pairs as cancelled, so none are stranded or scored.
 comparison work; ordinary terminal records are excluded. Run control work is
 queried first so an initializer/canceller cannot be starved by its own queued pairs.
 Comparison discovery checks the current parent and pages past non-scoreable
-children without letting them consume the requested ready-work limit.
+children without letting them consume the requested ready-work limit. After run
+control work, the scoring lane (comparisons, then corrections) and the summary
+lane (summary requests, candidate summaries, then overviews) take turns, one item
+each, and the remaining lane fills the limit once the other runs out
+(`work-lanes.ts`). Lanes are read lazily, so nothing past the limit is queried or
+checked. The worker starts with scoring on even clock minutes and with summaries
+on odd ones, so executions that claim one item still alternate. A waiting
+overview is skipped while its run can still score.
 
 A cancellation with a durable non-retryable error, or an error after three
 automatic attempts, is paused instead of being polled forever. Its cancellation

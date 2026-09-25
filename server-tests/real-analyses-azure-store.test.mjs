@@ -505,6 +505,41 @@ test('pending work contains expired initialization/cancellation and eligible que
   assert.equal(f.workspaceId, initial.workspaceId)
 })
 
+test('pending scoring and summaries take turns in both adapters, and a waiting overview holds no slot while its run scores', async () => {
+  const f = fixture()
+  const created = await createRun(f, 4, 1)
+  const comparisons = [...f.analysis.store.values.values()].filter(value => value.record.recordType === 'analysis-comparison')
+    .sort((a, b) => a.record.index - b.record.index).map(value => value.record)
+  const pairs = comparisons.map(record => record.id)
+  const target = api.analysisNarrativeId('target', created.run.id, comparisons[0].target.summary.id)
+  const kinds = { 'analysis-comparison': 'score', 'analysis-candidate-narrative': 'summary', 'analysis-target-narrative': 'overview' }
+  const agree = async (limit, options) => {
+    const { store, container } = backedFixture(f)
+    const memory = await f.analysis.store.listPending(f.now, limit, options)
+    const cosmos = await store.listPending(f.now, limit, options)
+    assert.deepEqual(cosmos.map(item => item.record.id), memory.map(item => item.record.id), 'The adapters must pick the same work.')
+    return { order: memory.map(item => kinds[item.record.recordType]), memory, container }
+  }
+  for (const id of pairs.slice(0, 2)) await publishResult(f, created.run.id, id)
+  assert.equal((await f.analysis.store.get(f.workspaceId, target)).record.status, 'waiting')
+  assert.deepEqual((await agree(100)).order, ['score', 'summary', 'score', 'summary'], 'Scored pairs are summarized between later scores.')
+  assert.deepEqual((await agree(100, { firstLane: 'summaries' })).order, ['summary', 'score', 'summary', 'score'])
+  assert.deepEqual((await agree(3)).order, ['score', 'summary', 'score'])
+  assert.deepEqual((await agree(1, { firstLane: 'summaries' })).order, ['summary'])
+  const lazy = await agree(1)
+  assert.deepEqual(lazy.order, ['score'])
+  assert.deepEqual(lazy.container.queries.map(item => item.spec.parameters.find(value => value.name === '@recordType').value),
+    ['analysis-run', 'analysis-comparison'], 'A full slot list reads no further work types.')
+  await publishResult(f, created.run.id, pairs[2])
+  assert.deepEqual((await agree(100)).order, ['score', 'summary', 'summary', 'summary'], 'Summaries backfill once scoring runs short.')
+  assert.deepEqual((await agree(2, { firstLane: 'summaries' })).order, ['summary', 'score'])
+  await publishResult(f, created.run.id, pairs[3])
+  assert.equal((await f.analysis.store.get(f.workspaceId, created.run.id)).record.status, 'complete')
+  const settled = await agree(100)
+  assert.deepEqual(settled.order, ['summary', 'summary', 'summary', 'summary', 'overview'], 'The overview becomes due once scoring ends.')
+  assert.equal(settled.memory.at(-1).record.id, target)
+})
+
 test('blob adapter enforces safe namespaces, bounds, exact media metadata and immutable winner semantics', async () => {
   const { f, run } = await initializedPair()
   const values = new Map()
