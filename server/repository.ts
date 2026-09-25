@@ -1,11 +1,12 @@
 import type { CloudSession, WorkspaceRole, WorkspaceSummary } from '../src/domain/cloud'
 import { isWorkspaceRole, workspaceCanEdit } from '../src/domain/workspace-permissions'
 import { isApplicationAdmin, type AuthenticatedPrincipal } from './auth'
-import { conflict, forbidden, invalidRequest, notFound, preconditionRequired, unavailable } from './errors'
+import { conflict, forbidden, invalidRequest, notFound, preconditionRequired, unavailable, workspaceBusy } from './errors'
 import { isValidWorkspaceId, membershipIdFor, newWorkspaceId } from './ids'
 import {
   StoreConflictError,
   StoreNotFoundError,
+  WorkspaceMutationBusyError,
   type DirectoryStore,
   type MembershipDoc,
   type StateStore,
@@ -227,6 +228,7 @@ export class WorkspaceRepository {
         return operation()
       })
     } catch (error) {
+      if (error instanceof WorkspaceMutationBusyError) throw workspaceBusy(error.message)
       if (error instanceof StoreConflictError) throw conflict(error.message)
       throw error
     }

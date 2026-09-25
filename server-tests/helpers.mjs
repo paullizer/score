@@ -3,7 +3,7 @@
 import { createServer } from 'node:http'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { createApp, WorkspaceRepository, StoreConflictError, StoreNotFoundError, defaultPersonalWorkspaceId, isValidWorkspaceId, membershipIdFor, principalKeyFor } from '../dist-server/app.mjs'
+import { createApp, WorkspaceRepository, StoreConflictError, StoreNotFoundError, WorkspaceMutationBusyError, defaultPersonalWorkspaceId, isValidWorkspaceId, membershipIdFor, principalKeyFor } from '../dist-server/app.mjs'
 
 const currentDir = path.dirname(fileURLToPath(import.meta.url))
 export const FIXTURE_DIST_DIR = path.join(currentDir, 'fixtures', 'dist')
@@ -298,7 +298,7 @@ export function createFakeStateStore() {
     },
     async acquireMutationLease(workspaceId) {
       operations.push('acquireMutationLease')
-      if (leases.has(workspaceId)) throw new StoreConflictError('Another workspace change is in progress.')
+      if (leases.has(workspaceId)) throw new WorkspaceMutationBusyError('Another workspace change is in progress.')
       leases.add(workspaceId)
       return {
         async renew() { if (!leases.has(workspaceId)) throw new StoreConflictError('Lease lost.') },
