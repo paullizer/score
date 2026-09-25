@@ -3,7 +3,7 @@ import { z } from 'zod'
 import { processingSettingsSnapshotSchema } from '../../src/domain/admin-settings-schema'
 import type { ProcessingSettingsSnapshot } from '../../src/domain/admin-settings'
 import { promptExecutionProvenanceSchema } from '../../src/domain/prompt-versions'
-import { analysisQcDiagnosticsReferenceSchema } from '../../src/domain/analysis-qc-diagnostics'
+import { analysisQcDiagnosticsReferenceSchema, ANALYSIS_QC_DIAGNOSTIC_LIMITS } from '../../src/domain/analysis-qc-diagnostics'
 import { assertAcceptedPromptBinding } from '../settings/prompt-integrity'
 import { MODEL_TASK_IDS } from '../../src/domain/admin-settings-tasks'
 import { REPORT_LIMITS } from '../../src/domain/analysis-reports'
@@ -899,6 +899,7 @@ const groundingReviewSchema = z.strictObject({
   (review.outcome === 'supported' ? review.scope.decisions.every(row => row.outcome === 'confirmed-missing')
     : review.scope.decisions.some(row => row.outcome !== 'confirmed-missing')))
 const diagnosticNumber = z.number().int().min(0).max(Number.MAX_SAFE_INTEGER)
+const qcCriterionCount = z.number().int().min(0).max(ANALYSIS_QC_DIAGNOSTIC_LIMITS.maxCriteria)
 const citationDiagnosticsSchema = z.strictObject({
   findings: z.array(z.strictObject({
     reason: z.enum(ANALYSIS_CITATION_REASONS), scope: z.enum(['criteria', 'qualifications', 'issues', 'citations']),
@@ -937,6 +938,7 @@ const diagnosticEventSchema = z.strictObject({
     code: z.enum(ANALYSIS_REVIEW_ISSUE_CODES), criterionId: identifier.optional(), qualificationId: identifier.optional(),
   })).max(64).optional(),
   reviewIssueCount: diagnosticNumber.optional(), citationCount: diagnosticNumber.optional(), catalogVersion: text(200).optional(),
+  qcRecordedCriteria: qcCriterionCount.optional(), qcCleanedCriteria: qcCriterionCount.optional(), qcOmittedCriteria: qcCriterionCount.optional(),
   resumeDocumentSha256: hash.optional(), resumeSnapshotSha256: hash.optional(), targetSnapshotSha256: hash.optional(),
   sourceCharacters: diagnosticNumber.optional(), paragraphCount: diagnosticNumber.optional(), passageCount: diagnosticNumber.optional(),
   outcome: z.enum(['complete', 'failed', 'queued', 'abandoned']).optional(),

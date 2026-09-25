@@ -16,7 +16,6 @@ import type { Citation } from '../../src/domain/types'
 import {
   assessmentInputSchema, assessmentSchemaForInput, groundingSchemaForInput,
   assessmentSelectionSchemaForInput, groundingSelectionSchemaForInput, evidenceGapSelectionSchemaForInput,
-  assessmentQcSelectionSchemaForInput,
   type ModelResumeQuote,
 } from './model-schema'
 import {
@@ -28,7 +27,7 @@ import {
 } from './evidence-passages'
 import { analysisSchemaDiagnostics } from './diagnostics'
 import type { ModelRetryMetadata } from '../errors'
-import { criterionQcDiagnosticSchema, type CriterionQcDiagnostic } from '../../src/domain/analysis-qc-diagnostics'
+import { acceptModelQcDiagnostics, type QcDiagnosticsAcceptance } from '../../src/domain/analysis-qc-diagnostics'
 
 export type { AnalysisModelStage } from './citation-diagnostics'
 export { describeAnalysisSummary as describeAnalysisAssessment } from '../../server/analyses/deterministic'
@@ -270,26 +269,27 @@ export function validateAnalysisAssessmentSelections(
   })
 }
 
+function assessmentLanguageAllowed(value: string): boolean {
+  try {
+    checkAssessmentLanguage(value)
+    return true
+  } catch (error) {
+    if (error instanceof AnalysisModelError) return false
+    throw error
+  }
+}
+
+/**
+ * The pinned assessment is validated exactly like an unpinned one. Its QC diagnostics are then recorded where they
+ * conform, and can never reject the assessment or spend a correction.
+ */
 export function validateAnalysisAssessmentQcSelections(
   value: unknown, input: RealAnalysisAssessmentInput, catalog: AnalysisEvidenceCatalog,
-): { assessment: RealAnalysisAssessmentOutput; criteria: CriterionQcDiagnostic[] } {
-  const parsed = assessmentQcSelectionSchemaForInput(input, catalog.passages.length).safeParse(value)
-  if (!parsed.success) invalidSchema('The pinned assessment must include complete bounded QC diagnostics for every saved criterion.', parsed.error.issues)
-  const { qcDiagnostics, ...selection } = parsed.data
-  const assessment = validateAnalysisAssessmentSelections(selection, input, catalog)
-  if (!unique(qcDiagnostics.criteria.map(row => row.criterionId))) invalidOutput('QC diagnostics must cover every criterion exactly once.')
-  const criteria = assessment.criteria.map(row => {
-    const diagnostic = qcDiagnostics.criteria.find(item => item.criterionId === row.criterionId)
-    if (!diagnostic) invalidOutput('QC diagnostics omit a saved criterion.')
-    checkAssessmentLanguage(diagnostic.explanation)
-    for (const ambiguity of diagnostic.ambiguity) checkAssessmentLanguage(ambiguity.explanation)
-    const validated = criterionQcDiagnosticSchema.safeParse({
-      ...diagnostic, assessedScore: row.score, assessedEvidenceStatus: row.evidenceStatus,
-    })
-    if (!validated.success) invalidSchema('Scoring confidence and alternatives must match the actual assessed or unscored rating.', validated.error.issues)
-    return validated.data
-  })
-  return { assessment, criteria }
+): { assessment: RealAnalysisAssessmentOutput; diagnostics: QcDiagnosticsAcceptance } {
+  const object = value !== null && typeof value === 'object' && !Array.isArray(value)
+  const { qcDiagnostics, ...selection } = object ? value as Record<string, unknown> : { qcDiagnostics: undefined }
+  const assessment = validateAnalysisAssessmentSelections(object ? selection : value, input, catalog)
+  return { assessment, diagnostics: acceptModelQcDiagnostics(qcDiagnostics, assessment.criteria, assessmentLanguageAllowed) }
 }
 
 /** Validate a saved proposal without regenerating its summary, reordering rows, or narrowing legacy limitations. */

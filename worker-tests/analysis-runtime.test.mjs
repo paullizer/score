@@ -112,6 +112,67 @@ test('code-normalized zero keeps the original unscored diagnostic and never inve
   assert.equal(mock.calls.filter(call => call.kind === 'resume_rubric_assessment').length, 1)
 })
 
+test('inconsistent pinned diagnostics still publish the score without a correction and read as Not recorded', async () => {
+  const f = pinnedRunFixture(), created = await createRun(f)
+  const mock = modelFor(f, ({ kind, body }) => {
+    if (kind !== 'resume_rubric_assessment') return
+    const output = withQcDiagnostics(modelAssessment(body.input))
+    output.qcDiagnostics.criteria[0].alternativeScores = [2]
+    return output
+  })
+  const events = []
+  mock.deps.onEvent = event => events.push(event)
+  await runAnalysisWorker(mock.deps, { maxItems: 1 })
+  const context = await qcContext(f, created.run.id)
+  assert.equal(context.comparison.status, 'complete')
+  assert.equal(context.result.provenance.correctionCount, 0)
+  assert.deepEqual(mock.calls.map(call => call.kind), ['resume_rubric_assessment', 'resume_rubric_grounding_review'])
+  const criterionId = context.result.criteria[0].criterionId
+  const reading = await qc.readAnalysisQcDiagnostics(f.analysis.blobs, context)
+  assert.equal(reading.status, 'recorded')
+  assert.deepEqual(reading.sidecar.criteria, [])
+  assert.deepEqual(reading.criteria, [{ criterionId, status: 'not-recorded', reason: 'invalid-diagnostic' }])
+  const coverage = events.filter(event => event.event === 'qc-diagnostics')
+  assert.equal(coverage.length, 1)
+  assert.deepEqual([coverage[0].qcRecordedCriteria, coverage[0].qcCleanedCriteria, coverage[0].qcOmittedCriteria], [0, 0, 1])
+  assert.deepEqual(coverage[0].schemaDiagnostics.findings, [{ code: 'custom', path: ['qcDiagnostics', 'criteria', 0, 'alternativeScores'] }])
+  assert.equal(events.some(event => event.event === 'validation-failed' || event.event === 'correction'), false)
+
+  const recorded = {
+    criterionId, confidence: 'high', explanation: 'The document evidence clearly distinguishes the saved score anchor.',
+    ambiguity: [], alternativeScores: [], assessedScore: context.result.criteria[0].score, assessedEvidenceStatus: context.result.criteria[0].evidenceStatus,
+  }
+  assert.doesNotThrow(() => qc.assertAnalysisQcDiagnosticsBinding({ ...clone(reading.sidecar), criteria: [recorded] }, context))
+  for (const criteria of [
+    [{ ...recorded, criterionId: 'foreign-criterion' }],
+    [recorded, recorded],
+    [{ ...recorded, assessedScore: 5 }],
+  ]) {
+    assert.throws(() => qc.assertAnalysisQcDiagnosticsBinding({ ...clone(reading.sidecar), criteria }, context, context.comparison.qcDiagnostics))
+  }
+})
+
+test('failure diagnostics retain pinned QC coverage events without diagnostic text', async () => {
+  const f = pinnedRunFixture(), created = await createRun(f)
+  const mock = modelFor(f, ({ kind, body }) => {
+    if (kind === 'resume_rubric_assessment') return withQcDiagnostics(modelAssessment(body.input))
+    if (kind === 'resume_rubric_grounding_review') return { outcome: 'needs-correction', issues: [{
+      code: 'unsupported-score', message: 'The cited project scope does not support this saved anchor.',
+      criterionId: body.input.rubric.criteria[0].id, qualificationId: null, citations: [passageSelection(body.input)],
+    }] }
+  })
+  await runAnalysisWorker(mock.deps, { maxItems: 1 })
+  const saved = comparisons(f, created.run.id)[0]
+  assert.equal(saved.record.status, 'failed')
+  assert.equal(saved.record.error.code, 'grounding-failed')
+  assert.equal(saved.record.diagnosticCapture.status, 'saved')
+  const [attempt] = (await f.service.diagnostics(f.workspaceId, created.run.id, saved.record.id)).attempts
+  const coverage = attempt.events.filter(event => event.event === 'qc-diagnostics')
+  assert.equal(coverage.length, 3)
+  assert.ok(coverage.every(event => event.qcRecordedCriteria === 1 && event.qcOmittedCriteria === 0 && event.stage === 'assessment'))
+  assert.doesNotMatch(JSON.stringify(coverage), /clearly distinguishes|explanation/)
+})
+
 test('QC sidecar validates exact result, source, rubric, prompt, and final producing call bindings', async () => {
   const f = pinnedRunFixture(), created = await createRun(f)
   const mock = modelFor(f, ({ kind, body }) => kind === 'resume_rubric_assessment'

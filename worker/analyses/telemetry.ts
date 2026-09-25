@@ -30,6 +30,8 @@ export function emitAnalysisTelemetry(sink: AnalysisTelemetrySink | undefined, e
     completionTokenLimit: event.completionTokenLimit, finishReason: event.finishReason,
     cancelled: event.cancelled, reviewIssueCount: event.reviewIssueCount, outcome: event.outcome,
     citationCount: event.citationCount, catalogVersion: event.catalogVersion,
+    qcRecordedCriteria: event.qcRecordedCriteria, qcCleanedCriteria: event.qcCleanedCriteria,
+    qcOmittedCriteria: event.qcOmittedCriteria,
     resumeDocumentSha256: event.resumeDocumentSha256, resumeSnapshotSha256: event.resumeSnapshotSha256,
     targetSnapshotSha256: event.targetSnapshotSha256, sourceCharacters: event.sourceCharacters,
     paragraphCount: event.paragraphCount, passageCount: event.passageCount,

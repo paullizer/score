@@ -77,6 +77,7 @@ export interface AnalysisCitationDiagnostics {
 export const ANALYSIS_TELEMETRY_EVENTS = [
   'comparison-started', 'evidence-catalog', 'model-response', 'model-transport-failed', 'model-failed',
   'validation-failed', 'correction', 'citations-resolved', 'comparison-outcome', 'diagnostic-write-failed',
+  'qc-diagnostics',
 ] as const
 
 export interface AnalysisTelemetryEvent {
@@ -116,6 +117,10 @@ export interface AnalysisTelemetryEvent {
   }[]
   reviewIssueCount?: number
   citationCount?: number
+  /** Pinned-assessment QC diagnostic coverage; diagnostics never decide whether a score publishes. */
+  qcRecordedCriteria?: number
+  qcCleanedCriteria?: number
+  qcOmittedCriteria?: number
   catalogVersion?: string
   resumeDocumentSha256?: string
   resumeSnapshotSha256?: string

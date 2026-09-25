@@ -30,7 +30,8 @@ const schema: z.ZodType<AnalysisQcDiagnosticsSidecar> = z.strictObject({
   assessmentProvenance: analysisModelProvenanceSchema.extend({
     prompt: promptExecutionProvenanceSchema, modelCallId: z.uuid(),
   }),
-  criteria: z.array(criterionQcDiagnosticSchema).min(1).max(ANALYSIS_QC_DIAGNOSTIC_LIMITS.maxCriteria),
+  // Rows the model reported inconsistently are not recorded, so a sidecar can cover only some criteria.
+  criteria: z.array(criterionQcDiagnosticSchema).max(ANALYSIS_QC_DIAGNOSTIC_LIMITS.maxCriteria),
 })
 export interface AnalysisQcDiagnosticsReadContext extends AnalysisSnapshots {
   run: RealAnalysisRunRecord
@@ -69,13 +70,14 @@ export function assertAnalysisQcDiagnosticsBinding(
     analysisHash(sidecar.targetSnapshot) === analysisHash(result.provenance.targetSnapshot) &&
     analysisHash(sidecar.assessmentProvenance) === analysisHash(result.provenance.assessment) &&
     sidecar.rubric.id === rubric.id && sidecar.rubric.version === rubric.version && sidecar.rubric.sha256 === analysisHash(rubric) &&
-    sidecar.criteria.length === result.criteria.length,
+    sidecar.criteria.every(item => result.criteria.some(row => row.criterionId === item.criterionId)),
   'QC diagnostics are not bound to this exact original result, assessment, frozen rubric/source, and producing model call.')
   for (const row of result.criteria) {
     const diagnostic = sidecar.criteria.find(item => item.criterionId === row.criterionId)
-    assertAnalysis(diagnostic && (diagnostic.assessedScore === row.score && diagnostic.assessedEvidenceStatus === row.evidenceStatus ||
+    if (!diagnostic) continue
+    assertAnalysis(diagnostic.assessedScore === row.score && diagnostic.assessedEvidenceStatus === row.evidenceStatus ||
       diagnostic.assessedScore === null && diagnostic.assessedEvidenceStatus === 'not-assessed' &&
-      row.score === 0 && row.evidenceStatus === 'missing' && sidecar.modelAssessmentSha256 !== sidecar.assessmentSha256),
+      row.score === 0 && row.evidenceStatus === 'missing' && sidecar.modelAssessmentSha256 !== sidecar.assessmentSha256,
     'QC confidence targets a foreign criterion or a rating not produced by the accepted assessment.')
   }
   if (reference) {
@@ -142,7 +144,8 @@ export async function readAnalysisQcDiagnostics(
   )))
   assertAnalysisQcDiagnosticsBinding(sidecar, context, reference)
   const criteria: CriterionQcDiagnosticContext[] = result.criteria.map(row => {
-    const diagnostic = sidecar.criteria.find(item => item.criterionId === row.criterionId)!
+    const diagnostic = sidecar.criteria.find(item => item.criterionId === row.criterionId)
+    if (!diagnostic) return { criterionId: row.criterionId, status: 'not-recorded', reason: 'invalid-diagnostic' }
     if (diagnostic.assessedScore !== row.score) return { criterionId: row.criterionId, status: 'not-recorded', reason: 'rating-normalized' }
     return { criterionId: row.criterionId, status: row.score === null ? 'unscored' : 'recorded', diagnostic }
   })

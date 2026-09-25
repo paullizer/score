@@ -76,13 +76,20 @@ Unpinned work keeps the exact compiled legacy system templates and legacy schema
 - `ambiguity`: bounded `{ category, explanation }` entries;
 - `alternativeScores`: distinct defensible integers 0–5, excluding the selected score.
 
-Confidence describes applying the saved rubric to that document, not personal ability or a probability. Missing evidence can be a confident zero. Unscored rows have null confidence and no numeric alternatives. Coverage, categories, lengths, states and alternatives are validated within the existing shared correction budget. Independent grounding receives the canonical assessment without diagnostics and remains mandatory.
+Confidence describes applying the saved rubric to that document, not personal ability or a probability. Missing evidence can be a confident zero. Unscored rows have null confidence and no numeric alternatives. Independent grounding receives the canonical assessment without diagnostics and remains mandatory.
+
+Diagnostics never decide whether a score is published and never spend a correction. The assessment part of the response is validated exactly like an unpinned assessment, within the shared correction budget. `acceptModelQcDiagnostics` (`src\domain\analysis-qc-diagnostics.ts`) then records each criterion's diagnostic separately:
+
+- **Cleaned, then recorded.** Code repairs only formatting that cannot change what the model stated. It removes repeated alternative scores and the chosen score from `alternativeScores`, and clears confidence and alternatives on an unscored row. It also joins repeated ambiguity categories into one entry when the joined explanation still fits the 800-character limit.
+- **Not recorded.** Any other nonconforming row is left out rather than repaired by invention. Examples: a numeric score without confidence, alternatives without an ambiguity entry, text that is too long, an unknown category, policy-violating language, or an unknown or repeated `criterionId`. A missing or malformed `qcDiagnostics` object records no rows.
+
+Each accepted assessment emits a `qc-diagnostics` telemetry event with `qcRecordedCriteria`, `qcCleanedCriteria` and `qcOmittedCriteria`. For unrecorded rows it also emits schema findings whose paths name the model row and field, for example `qcDiagnostics.criteria[0].alternativeScores`. It never includes diagnostic text.
 
 The final accepted attempt's diagnostics are persisted in an immutable analysis-sources blob:
 
 `{workspaceId}/{runId}/qc-diagnostics/{comparisonId}/{attemptId}.json`
 
-The completed comparison links it with `qcDiagnostics: { schemaVersion, attemptId, modelCallId, resultSha256, assessmentSha256, blob }`. The sidecar carries the exact result/assessment/manifest/source hashes, frozen rubric ID/version/hash, assessment model/prompt/schema provenance and per-criterion `assessedScore` / `assessedEvidenceStatus`. It uses the same leased/lifecycle-fenced upload and completed-comparison transaction as score publication. Missing required capture or failed sidecar storage cannot publish a completed pinned comparison.
+The completed comparison links it with `qcDiagnostics: { schemaVersion, attemptId, modelCallId, resultSha256, assessmentSha256, blob }`. The sidecar carries the exact result/assessment/manifest/source hashes, frozen rubric ID/version/hash, assessment model/prompt/schema provenance and per-criterion `assessedScore` / `assessedEvidenceStatus`. Its `criteria` list covers only the recorded criteria and can be empty. Each listed row must be unique and belong to the result. It uses the same leased/lifecycle-fenced upload and completed-comparison transaction as score publication. A pinned comparison always publishes a sidecar, and failed sidecar storage cannot publish a completed pinned comparison.
 
 The sidecar's exact field names are:
 
@@ -102,4 +109,6 @@ Diagnostics are not embedded in the canonical assessment/result or deterministic
 
 `server\analyses\qc-diagnostics.ts` exports `readAnalysisQcDiagnostics(blobs, context, signal?)`, where `AnalysisQcDiagnosticsReadContext` contains `{ run, comparison, result, resumeSnapshot, targetSnapshot }` for the exact result selected through `current-results.ts`. It also exports `parseAnalysisQcDiagnostics`, `assertAnalysisQcDiagnosticsBinding`, and `createAnalysisQcDiagnosticsSidecar`.
 
-The reader returns `AnalysisQcDiagnosticsContext` with per-criterion states `recorded`, `unscored`, or `not-recorded`. Absent historical capture returns **Not recorded** without a model call. A declared missing/corrupt sidecar is an integrity failure. Corrected result projections retain the original reference but return Not recorded (`different-result`); selecting the original result still reads its unchanged diagnostic. Code-normalized ratings return `rating-normalized`, never fresh numeric confidence.
+The reader returns `AnalysisQcDiagnosticsContext` with per-criterion states `recorded`, `unscored`, or `not-recorded`. Absent historical capture returns **Not recorded** without a model call. A declared missing/corrupt sidecar is an integrity failure. A criterion that the sidecar does not list returns Not recorded (`invalid-diagnostic`). Corrected result projections retain the original reference but return Not recorded (`different-result`); selecting the original result still reads its unchanged diagnostic. Code-normalized ratings return `rating-normalized`, never fresh numeric confidence.
+
+Builds before this change cannot read sidecars that omit criteria, or failure diagnostics that contain the `qc-diagnostics` event. After this change is deployed and new work has run, fix forward instead of rolling the API or workers back.
