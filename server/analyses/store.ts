@@ -4,6 +4,7 @@ import type {
 } from '../../src/domain/real-analyses'
 import type { LifecycleOperation, LifecycleTarget } from '../../src/domain/lifecycle'
 import type { WorkspaceLifecycleState } from '../lifecycle/contracts'
+import type { AnalysisPendingOptions } from './work-lanes'
 
 export interface AnalysisListOptions<K extends AnalysisEntity['recordType'] = AnalysisEntity['recordType']> {
   recordType: K
@@ -58,10 +59,12 @@ export interface AnalysisStore {
   getControl(workspaceId: string, runId?: string, signal?: AbortSignal): Promise<StoredAnalysisControl | undefined>
   listControls(workspaceId: string, continuationToken?: string): Promise<{ items: StoredAnalysisControl[]; continuationToken?: string }>
   pendingLifecycleWorkspaces(limit: number): Promise<string[]>
-  // Includes bounded narrative scheduling and due/lease-expired sidecar work.
+  // Includes bounded narrative scheduling and due/lease-expired sidecar work. Run work comes first;
+  // scoring and summary work then take turns, starting with `options.firstLane`.
   listPending(
     now: string,
     limit: number,
+    options?: AnalysisPendingOptions,
   ): Promise<VersionedAnalysisEntity[]>
 }
 

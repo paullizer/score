@@ -206,6 +206,14 @@ export function createRealAnalysesRouter(deps: RealAnalysesRouterDeps): Router {
     res.setHeader('ETag', summaries.etag)
     res.json(summaries)
   }))
+  router.get(`${base}/:runId/summary-status`, read(async (req, res, signal) => {
+    query(req, ['items'])
+    const items = req.query.items
+    if (items !== undefined && items !== 'true' && items !== 'false') throw invalidRequest('items must be true or false.')
+    const status = await requireService().summaryStatus(param(req, 'workspaceId'), recordId(req, 'run'), { items: items === 'true' }, signal)
+    signal.throwIfAborted()
+    res.json(status)
+  }))
   router.post(`${base}/:runId/summaries`, mutate('write', async (req, res) => {
     query(req, [])
     const result = await requireService(req).generateSummaries(param(req, 'workspaceId'), recordId(req, 'run'),

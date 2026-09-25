@@ -1,13 +1,13 @@
 import { Link, useNavigate } from 'react-router-dom'
 import { ArrowUpRight, BarChart3, LoaderCircle, Plus, RotateCcw, ShieldCheck } from 'lucide-react'
-import { useRealAnalyses } from '../../app/real-analyses-context'
+import { useRealAnalyses, type RealAnalysesContextValue } from '../../app/real-analyses-context'
 import type { RealAnalysisRunSummary } from '../../domain/real-analyses'
 import { dateLabel } from '../../domain/selectors'
 import { Badge, Button, EmptyState, InlineError, PageHeader, SearchField, SegmentedControl } from '../../components/ui'
 import { SortableHeader, TableSortSelect } from '../../components/ui/TableSorting'
 import type { TableSort } from '../../domain/tableSorting'
 import { realAnalysisSortOptions, selectRealAnalysisRuns, type RealAnalysisSortKey } from './analysisTableBrowsing'
-import { realAnalysisCancellationPaused, realAnalysisCancellationPending } from './realAnalysisUi'
+import { realAnalysisRunStage, realSummaryCounts, realSummaryGeneration } from './realAnalysisCompletion'
 import { useWorkspace } from '../../app/workspace-context'
 import { useLibraryViewState } from '../../app/library-view-state'
 import { isEntityArchived, matchesArchiveFilter, type ArchiveFilter } from '../../domain/lifecycle'
@@ -15,12 +15,29 @@ import { ArchivedBadge, ArchiveStateFilter, EntityLifecycleActions } from '../..
 import { getDisplayName } from '../../domain/displayNames'
 import { RenameEntityButton, RenameEntityProvider } from '../../components/ui/RenameEntityButton'
 
+function readySummaryStatus(api: RealAnalysesContextValue | null, runId: string) {
+  const entry = api?.summaryStatus?.(runId)
+  return entry?.state === 'ready' && entry.value.runId === runId ? entry.value : undefined
+}
+
 export function RealAnalysisStatus({ summary }: { summary: RealAnalysisRunSummary }) {
+  const api = useRealAnalyses()
   if ((summary.lifecycle ?? summary.run.lifecycle)?.deletingAt) return <Badge tone="warning">Deletion pending</Badge>
-  const { run } = summary
-  const paused = realAnalysisCancellationPaused(summary)
-  const labels = { initializing: 'Freezing inputs', queued: 'Queued', running: 'Running', complete: 'Complete', partial: 'Partial / needs attention', failed: 'Failed', cancelled: 'Cancelled' }
-  return <Badge dot tone={paused || ['partial', 'failed'].includes(run.status) ? 'warning' : run.status === 'complete' ? 'success' : 'neutral'}>{paused ? 'Cancellation paused' : realAnalysisCancellationPending(summary) ? 'Cancelling unfinished work' : labels[run.status]}</Badge>
+  const stage = realAnalysisRunStage(summary, readySummaryStatus(api, summary.run.id))
+  return <Badge dot tone={stage.tone}>{stage.label}</Badge>
+}
+
+function RealSummaryProgress({ summary }: { summary: RealAnalysisRunSummary }) {
+  const api = useRealAnalyses()
+  const status = readySummaryStatus(api, summary.run.id)
+  const counts = realSummaryCounts(summary, status)
+  if (!counts || counts.required === 0) return null
+  const generation = realSummaryGeneration(summary, status)
+  const parts = [`${counts.ready} / ${counts.required} ready`]
+  if (generation === 'automatic' || counts.queued + counts.running > 0) parts.push(`${counts.queued} queued`, `${counts.running} generating`)
+  if (generation === 'automatic' && counts.unfinished > 0) parts.push(`${counts.unfinished} ${counts.unfinished === 1 ? 'needs' : 'need'} attention`)
+  const label = generation === 'automatic' ? 'Summaries' : generation === 'on-demand' ? 'Summaries on demand' : 'Automatic summaries off'
+  return <p className="row-meta">{label}: {parts.join(' · ')}</p>
 }
 
 export function RealAnalysesPage() {
@@ -39,7 +56,7 @@ function RealAnalysesHistory() {
   if (!api) return <EmptyState title="Real analyses require a cloud workspace" description="Open this page from an authenticated workspace." />
   if (api.phase === 'unavailable') return <EmptyState title="Saved real analyses are unavailable" description={api.error ?? 'The private analysis history service is not available.'}
     action={<Button onClick={() => void api.refresh()}>Check availability</Button>} />
-  const runs = selectRealAnalysisRuns(api.summaries, query, filter, sort)
+  const runs = selectRealAnalysisRuns(api.summaries, query, filter, sort, (runId) => readySummaryStatus(api, runId))
     .filter((item) => !(item.lifecycle ?? item.run.lifecycle)?.deletedAt && matchesArchiveFilter(isEntityArchived(workspace, { kind: 'analysis', id: item.run.id }), query, archiveFilter))
   return <>
     <PageHeader eyebrow="SAVED REAL EVIDENCE" title="Your analyses" description="Durable runs with frozen inputs, independent comparisons, and inspectable evidence."
@@ -63,7 +80,7 @@ function RealAnalysesHistory() {
             <Link className="row-title" to={`/analyses/${encodeURIComponent(summary.run.id)}`}>{getDisplayName(summary.run, summary.run.name)}</Link> <ArchivedBadge target={{ kind: 'analysis', id: summary.run.id }} /><p className="row-meta">Real evidence · immutable input snapshots</p></div></div></td>
           <td><RealAnalysisStatus summary={summary} /></td>
           <td><p className="text-[11px]">{summary.run.progress.complete} complete / {summary.run.progress.total} total</p><p className="row-meta">{summary.run.progress.scored} scored · {summary.run.progress.unscored} without an overall score</p>
-            <p className="row-meta">{summary.run.progress.failed} failed · {summary.run.progress.cancelled} cancelled</p>{summary.run.error && <p className="mt-2 text-[11px] text-[var(--cp-danger)]">{summary.run.error.message}</p>}</td>
+            <p className="row-meta">{summary.run.progress.failed} failed · {summary.run.progress.cancelled} cancelled</p><RealSummaryProgress summary={summary} />{summary.run.error && <p className="mt-2 text-[11px] text-[var(--cp-danger)]">{summary.run.error.message}</p>}</td>
           <td className="text-[11px] text-muted">{dateLabel(summary.run.createdAt)}</td>
           <td><div className="flex flex-wrap items-center gap-1"><Link className="button button-ghost icon-button" to={`/analyses/${encodeURIComponent(summary.run.id)}`} aria-label={`Open real analysis ${getDisplayName(summary.run, summary.run.name)}`}><ArrowUpRight size={17} aria-hidden="true" /></Link>
             <RenameEntityButton target={{ kind: 'analysis', id: summary.run.id }} name={getDisplayName(summary.run, summary.run.name)} etag={summary.etag} disabled={!api.canWrite || api.phase !== 'ready' || !summary.etag || api.pending(summary.run.id)} compact />

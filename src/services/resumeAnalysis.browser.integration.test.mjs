@@ -750,14 +750,23 @@ test('browser processing-status sorting preserves filters during refresh and can
     const search = section.getByRole('searchbox', { name: 'Search comparisons', exact: true })
     await search.fill('resume-')
     const statusHeader = section.getByRole('columnheader').filter({ hasText: /Status.*actions/i })
+    const completed = pairs.find(({ comparison }) => comparison.status === 'complete')
+    const review = { name: new RegExp(`^Review comparison ${completed.comparison.index + 1}:`) }
+    const completedRow = rows.filter({ has: page.getByRole('button', review) })
+    // The scored pair still waits for its automatic summary, so it sorts with the work in progress, in saved order.
+    await visible(completedRow.getByText('Queued for summary generation', { exact: true }))
+    const inProgress = pairs.filter(({ comparison }) => comparison.id !== cancelled.comparison.id)
+      .sort((left, right) => left.comparison.index - right.comparison.index)
+    const position = inProgress.findIndex(({ comparison }) => comparison.id === completed.comparison.id)
     await statusHeader.getByRole('button').click()
     assert.equal(await statusHeader.getAttribute('aria-sort'), 'ascending')
-    assert.equal(await rows.first().getByRole('button', { name: `Retry comparison ${cancelled.comparison.index + 1} with saved inputs`, exact: true }).count(), 1)
-    const completed = pairs.find(({ comparison }) => comparison.status === 'complete')
-    assert.equal(await rows.last().getByRole('button', { name: new RegExp(`^Review comparison ${completed.comparison.index + 1}:`) }).count(), 1)
+    const cancelledRetry = { name: `Retry comparison ${cancelled.comparison.index + 1} with saved inputs`, exact: true }
+    assert.equal(await rows.first().getByRole('button', cancelledRetry).count(), 1)
+    assert.equal(await rows.nth(1 + position).getByRole('button', review).count(), 1)
     await statusHeader.getByRole('button').click()
     assert.equal(await statusHeader.getAttribute('aria-sort'), 'descending')
-    assert.equal(await rows.first().getByRole('button', { name: new RegExp(`^Review comparison ${completed.comparison.index + 1}:`) }).count(), 1)
+    assert.equal(await rows.nth(position).getByRole('button', review).count(), 1)
+    assert.equal(await rows.last().getByRole('button', cancelledRetry).count(), 1)
 
     const requestStart = fixture.requests.length
     await rows.getByRole('button', { name: `Cancel comparison ${queued.comparison.index + 1}`, exact: true }).click()
@@ -769,6 +778,7 @@ test('browser processing-status sorting preserves filters during refresh and can
     await processAllAnalyses(fixture, stubs)
     await page.getByRole('button', { name: 'Refresh pairs', exact: true }).click()
     await visible(page.getByText('4 / 4 comparisons finished', { exact: true }))
+    await visible(completedRow.getByText('Complete', { exact: true }))
     assert.equal(await search.inputValue(), 'resume-')
     assert.equal(await statusHeader.getAttribute('aria-sort'), 'descending')
     assert.equal(await rows.count(), 4)

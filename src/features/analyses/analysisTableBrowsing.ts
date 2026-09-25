@@ -1,7 +1,9 @@
 import type { TableSortOption } from '../../components/ui/TableSorting'
+import type { AnalysisSummaryGeneration, RealAnalysisSummaryStatusComparison, RealAnalysisSummaryStatusResponse } from '../../domain/analysis-narratives'
 import type { RealAnalysisComparisonSummary, RealAnalysisRunSummary, RealAnalysisTargetSummary } from '../../domain/real-analyses'
 import { matchesTableSearch, sortTableRows, type TableSort } from '../../domain/tableSorting'
 import { realAnalysisCancellationPaused, realAnalysisCancellationPending, targetIdentity, targetVersionLabel } from './realAnalysisUi'
+import { realAnalysisCompletionRank, realAnalysisFullyComplete, realComparisonCompletionRank } from './realAnalysisCompletion'
 import { getDisplayName } from '../../domain/displayNames'
 
 export type AnalysisHistoryFilter = 'all' | 'complete' | 'attention'
@@ -34,15 +36,26 @@ export function analysisProcessingRank(status: string | undefined): number | nul
   return ['initializing', 'queued', 'running', 'parsing', 'generating', 'profiling'].includes(status.toLowerCase()) ? 1 : 0
 }
 
-export function realAnalysisProcessingRank(summary: RealAnalysisRunSummary): number | null {
+export function realAnalysisProcessingRank(summary: RealAnalysisRunSummary, status?: RealAnalysisSummaryStatusResponse): number | null {
   if (realAnalysisCancellationPaused(summary)) return 0
   if (realAnalysisCancellationPending(summary)) return 1
-  return analysisProcessingRank(summary.run.status)
+  return realAnalysisCompletionRank(summary, status) ?? analysisProcessingRank(summary.run.status)
 }
 
-export function realComparisonProcessingRank(summary: RealAnalysisComparisonSummary, run?: RealAnalysisRunSummary): number | null {
+/** Summary state for a run's comparisons. Without it, a scored comparison ranks as complete. */
+export interface RealComparisonCompletion {
+  generation: AnalysisSummaryGeneration
+  items: ReadonlyMap<string, RealAnalysisSummaryStatusComparison>
+}
+
+export function realComparisonProcessingRank(
+  summary: RealAnalysisComparisonSummary, run?: RealAnalysisRunSummary, completion?: RealComparisonCompletion,
+): number | null {
   // Accepted re-score or correction work is still in progress, even though the current result is complete.
-  if (summary.comparison.status === 'complete') return summary.activeCorrection ? 1 : 2
+  if (summary.comparison.status === 'complete') {
+    if (summary.activeCorrection) return 1
+    return completion ? realComparisonCompletionRank(summary, completion.generation, completion.items.get(summary.comparison.id)) : 2
+  }
   if (run && realAnalysisCancellationPaused(run)) return 0
   if (run && realAnalysisCancellationPending(run)) return 1
   return analysisProcessingRank(summary.comparison.status)
@@ -50,12 +63,15 @@ export function realComparisonProcessingRank(summary: RealAnalysisComparisonSumm
 
 export function selectRealAnalysisRuns(
   runs: readonly RealAnalysisRunSummary[], query: string, filter: AnalysisHistoryFilter, sort: TableSort<RealAnalysisSortKey> | null,
+  statusOf?: (runId: string) => RealAnalysisSummaryStatusResponse | undefined,
 ): RealAnalysisRunSummary[] {
+  const complete = (summary: RealAnalysisRunSummary) => statusOf
+    ? realAnalysisFullyComplete(summary, statusOf(summary.run.id)) : summary.run.status === 'complete'
   return sortTableRows(runs.filter((summary) => matchesTableSearch(query, [getDisplayName(summary.run, summary.run.name)])
-    && (filter === 'all' || (filter === 'complete' ? summary.run.status === 'complete' : summary.run.status !== 'complete'))), sort, (summary, key) => {
+    && (filter === 'all' || (filter === 'complete') === complete(summary))), sort, (summary, key) => {
     switch (key) {
       case 'name': return getDisplayName(summary.run, summary.run.name)
-      case 'status': return realAnalysisProcessingRank(summary)
+      case 'status': return realAnalysisProcessingRank(summary, statusOf?.(summary.run.id))
       case 'comparisons': return summary.run.progress.total
       case 'created': return Date.parse(summary.run.createdAt)
     }
@@ -79,7 +95,7 @@ export function distinctTargetLabels<T extends { id: string }>(targets: readonly
 
 export function selectRealComparisons(
   pairs: readonly RealAnalysisComparisonSummary[], manifestTargets: readonly RealAnalysisTargetSummary[],
-  browsing: ComparisonBrowsing<RealComparisonSortKey>, run?: RealAnalysisRunSummary,
+  browsing: ComparisonBrowsing<RealComparisonSortKey>, run?: RealAnalysisRunSummary, completion?: RealComparisonCompletion,
 ) {
   const targets = [...new Map([...manifestTargets, ...pairs.map((pair) => pair.comparison.target.summary)]
     .map((target) => [targetIdentity(target.selection), target])).values()]
@@ -98,7 +114,7 @@ export function selectRealComparisons(
     switch (key) {
       case 'name': return comparison.resume.summary.displayName ?? comparison.resume.summary.name
       case 'target': return getDisplayName(comparison.target.summary, comparison.target.summary.label).trim() ? realComparisonTargetLabel(comparison.target.summary) : null
-      case 'status': return realComparisonProcessingRank(pair, run)
+      case 'status': return realComparisonProcessingRank(pair, run, completion)
       case 'score': return comparison.status === 'complete' && comparison.resultSummary?.overall.status === 'available'
         ? comparison.resultSummary.overall.score : null
     }

@@ -419,6 +419,56 @@ export interface RealAnalysisSummariesResponse extends AnalysisNarrativeScopeRev
   targets: RealAnalysisTargetNarrativeSummary[]
 }
 
+// The run's captured policy for automatic summary work, as applied when each comparison finishes scoring.
+export type AnalysisSummaryGeneration = 'automatic' | 'on-demand' | 'disabled'
+
+export function analysisSummaryGeneration(
+  settings: Pick<ProcessingSettingsSnapshot['settings'], 'features' | 'summaries'>,
+): AnalysisSummaryGeneration {
+  if (!settings.features.summaryGeneration) return 'disabled'
+  return settings.summaries.generationMode === 'automatic' ? 'automatic' : 'on-demand'
+}
+
+export interface RealAnalysisSummaryStatusComparison {
+  comparisonId: string
+  targetId: string
+  comparisonStatus: RealAnalysisComparisonStatus
+  // The current scored result this summary state belongs to; null until the comparison completes.
+  resultSha256: string | null
+  correctionPending: boolean
+  status: AnalysisNarrativeStatus
+}
+
+export interface RealAnalysisSummaryStatusTarget {
+  targetId: string
+  status: AnalysisNarrativeStatus
+  waitingFor: AnalysisNarrativeWaitReason | null
+}
+
+// GET /api/workspaces/:workspaceId/analyses/:runId/summary-status reads work metadata only. It never reads
+// published text or enqueues work, so pages can poll it while summaries generate.
+export interface RealAnalysisSummaryStatusResponse extends AnalysisNarrativeScopeRevision {
+  schemaVersion: typeof ANALYSIS_NARRATIVE_SCHEMA_VERSION
+  dataKind: 'real'
+  workspaceId: string
+  runId: string
+  // Changes when pending corrections or overview prerequisites change without a summary input or status change.
+  workRevision: string
+  generation: AnalysisSummaryGeneration
+  // The same whole-run readiness that GET /summaries reports and PDF, Word and PowerPoint exports require.
+  ready: boolean
+  scoring: AnalysisSummaryScoringCounts
+  corrections: { pending: number }
+  counts: { candidates: AnalysisNarrativeCounts; targets: AnalysisNarrativeCounts }
+  // Per-comparison and per-target states, present only for ?items=true.
+  comparisons?: RealAnalysisSummaryStatusComparison[]
+  targets?: RealAnalysisSummaryStatusTarget[]
+}
+
+export interface RealAnalysisSummaryStatusQuery {
+  items?: boolean
+}
+
 export type RealAnalysisSummarySubjectResponse = {
   schemaVersion: typeof ANALYSIS_NARRATIVE_SCHEMA_VERSION
   dataKind: 'real'

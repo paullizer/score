@@ -19,7 +19,7 @@ await build({
     contents: [
       'service', 'routes', 'validation', 'snapshots', 'diagnostics', 'paging', 'lifecycle', 'library-lifecycle', 'guards', 'azure-store',
       'narratives', 'narrative-records', 'narrative-artifacts', 'narrative-scheduling', 'summary-history', 'summary-actions', 'reports',
-      'corrections', 'current-results', 'correction-actions', 'correction-validation', 'concurrency',
+      'corrections', 'current-results', 'correction-actions', 'correction-validation', 'concurrency', 'work-lanes',
     ].map(name => `export * from './server/analyses/${name}.ts';`).join('\n') +
       "\nexport * from './server/errors.ts'; export * from './server/store.ts';" +
       "\nexport * from './server/ids.ts'; export * from './server/middleware.ts';" +
@@ -234,8 +234,8 @@ export function analysisStore() {
       const items = all.slice(offset, offset + (options.limit ?? 50)).map(clone)
       return { items, ...(offset + items.length < all.length ? { continuationToken: `${offset + items.length}` } : {}) }
     },
-    async listPending(now, limit) {
-      return [...values.values()].filter(item => api.analysisWorkIsPending(item.record, now))
+    async listPending(now, limit, options = {}) {
+      const eligible = [...values.values()].filter(item => api.analysisWorkIsPending(item.record, now))
         .filter(({ record }) => {
           const state = controls.get(key(record.workspaceId, api.analysisControlId()))?.record.state ?? 'active'
           if (state !== 'active' && !(state === 'archived' &&
@@ -250,11 +250,15 @@ export function analysisStore() {
               : record.recordType === 'analysis-correction' ? api.analysisCorrectionCanWork(parent.record, record)
               : record.recordType === 'analysis-candidate-narrative' && record.resultRevisionId !==
                 values.get(key(record.workspaceId, api.analysisCorrectionId(record.runId, record.comparisonId)))?.record.published?.revision.id ? false
+              : record.recordType === 'analysis-target-narrative' && record.status === 'waiting' && api.analysisRunCanScore(parent.record) ? false
               : api.analysisNarrativeCanWork(parent.record, record) && !parent.record.narrativeRequestId
         })
-        .sort((a, b) => ['analysis-run', 'analysis-comparison', 'analysis-correction', 'analysis-narrative-request', 'analysis-candidate-narrative', 'analysis-target-narrative'].indexOf(a.record.recordType) -
-          ['analysis-run', 'analysis-comparison', 'analysis-correction', 'analysis-narrative-request', 'analysis-candidate-narrative', 'analysis-target-narrative'].indexOf(b.record.recordType))
-        .slice(0, limit).map(clone)
+      const ofTypes = recordTypes => recordTypes.flatMap(recordType => eligible.filter(item => item.record.recordType === recordType))
+      const runs = ofTypes(['analysis-run']).slice(0, limit)
+      const children = await api.mergeAnalysisWorkLanes({
+        scoring: ofTypes(api.ANALYSIS_WORK_LANES.scoring), summaries: ofTypes(api.ANALYSIS_WORK_LANES.summaries),
+      }, options.firstLane ?? 'scoring', limit - runs.length)
+      return [...runs, ...children].map(clone)
     },
     async getControl(workspaceId, runId, signal) { signal?.throwIfAborted(); return clone(controls.get(key(workspaceId, api.analysisControlId(runId)))) },
     async listControls(workspaceId, token) {

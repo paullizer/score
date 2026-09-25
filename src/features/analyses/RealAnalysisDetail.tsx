@@ -18,6 +18,10 @@ import { AnalysisReportExport } from './AnalysisReportExport'
 import { ManageAnalysisSummaries, RealTargetNarrative } from './AnalysisSummaries'
 import { ActiveCorrectionStatus, ReviewWithheldScores } from './AnalysisCorrections'
 import { activeCorrectionProgress } from './analysisCorrectionState'
+import {
+  realAnalysisCompletionProgress, realAnalysisRunStage, realComparisonStage, realSummariesNeedAttention, realSummaryGeneration, realSummaryItems,
+  type RealSummaryTally,
+} from './realAnalysisCompletion'
 import { ArchivedBadge, EntityLifecycleActions, LifecycleBanner } from '../../components/lifecycle/LifecycleControls'
 import { useLifecycleAccess } from '../../components/lifecycle/useLifecycleAccess'
 import { getDisplayName } from '../../domain/displayNames'
@@ -28,9 +32,18 @@ export function RealComparisonValue({ summary }: { summary: RealAnalysisComparis
   const result = comparison.resultSummary
   if (comparison.status !== 'complete') return <Badge tone={comparison.status === 'failed' ? 'danger' : 'neutral'}>{comparison.status === 'running' ? 'Assessing evidence' : comparison.status}</Badge>
   return <div className="space-y-2">{result?.overall.status === 'available' ? <Score value={result.overall.score} /> : <span className="text-[12px] font-semibold">No overall score</span>}
-    <div><Badge tone={result?.completion === 'limited' ? 'warning' : 'success'}>{result?.completion === 'limited' ? 'Complete · limited assessment' : 'Complete'}</Badge></div>
+    <div><Badge tone={result?.completion === 'limited' ? 'warning' : 'success'}>{result?.completion === 'limited' ? 'Analysis complete · limited assessment' : 'Analysis complete'}</Badge></div>
     {result?.overall.status === 'withheld' && <p className="max-w-xs text-[10px] text-muted">{result.overall.message}</p>}
   </div>
+}
+
+function summaryTallyLine(label: string, tally: RealSummaryTally, automatic: boolean) {
+  const parts = [`${tally.ready} / ${tally.required} ready`]
+  if (automatic || tally.queued + tally.running > 0) parts.push(`${tally.queued} queued`, `${tally.running} generating`)
+  const awaitingAnalysis = tally.required - tally.ready - tally.queued - tally.running - tally.unfinished
+  if (automatic && awaitingAnalysis > 0) parts.push(`${awaitingAnalysis} waiting for analysis`)
+  if (automatic && tally.unfinished > 0) parts.push(`${tally.unfinished} ${tally.unfinished === 1 ? 'needs' : 'need'} attention`)
+  return `${label}: ${parts.join(' · ')}`
 }
 
 export function RealComparisonActions({ summary }: { summary: RealAnalysisComparisonSummary }) {
@@ -122,14 +135,21 @@ function RealAnalysisView({ id }: { id: string }) {
   const ensure = api?.ensureDetail
   const ensurePairs = api?.ensureComparisons
   const subscribe = api?.subscribeAnalysis
+  const statusEntry = api?.summaryStatus?.(id)
+  const ensureStatus = api?.ensureSummaryStatus
+  const subscribeStatus = api?.subscribeSummaryStatus
   const selectedId = params.get('result')
   const sourceView = savedReviewView(params)
   useEffect(() => subscribe?.(id), [id, subscribe])
+  useEffect(() => subscribeStatus?.(id), [id, subscribeStatus])
   useEffect(() => {
     if (api?.phase !== 'ready') return
     void ensure?.(id)
     void ensurePairs?.(id)
   }, [api?.phase, ensure, ensurePairs, entry?.state, id, pairs?.state])
+  useEffect(() => {
+    if (api?.phase === 'ready') void ensureStatus?.(id)
+  }, [api?.phase, ensureStatus, id, statusEntry?.state])
   useEffect(() => {
     if (!summaryScope && summaryWasOpen.current) summaryTrigger.current?.focus()
     summaryWasOpen.current = summaryScope !== null
@@ -148,7 +168,24 @@ function RealAnalysisView({ id }: { id: string }) {
   const finished = run.progress.complete + run.progress.failed + run.progress.cancelled
   const savedPairs = pairs?.state === 'ready' ? pairs.value : []
   const correctionProgress = activeCorrectionProgress(savedPairs)
-  const browsing = selectRealComparisons(savedPairs, detail.targets, { query, targetId, sort }, summary)
+  // Older contexts, such as isolated fixtures, can't read summary progress, so the page shows scoring progress only.
+  const tracksSummaries = Boolean(api.summaryStatus)
+  const summaryStatus = statusEntry?.state === 'ready' && statusEntry.value.runId === id ? statusEntry.value : undefined
+  const statusError = statusEntry?.state === 'ready' || statusEntry?.state === 'error' ? statusEntry.error : undefined
+  const generation = realSummaryGeneration(summary, summaryStatus)
+  const automatic = generation === 'automatic'
+  const progress = realAnalysisCompletionProgress(summary, summaryStatus)
+  const combined = automatic ? progress : null
+  const checking = tracksSummaries && automatic && !progress && !statusError
+  const stage = realAnalysisRunStage(summary, summaryStatus)
+  const summaryItems = realSummaryItems(summaryStatus)
+  const browsing = selectRealComparisons(savedPairs, detail.targets, { query, targetId, sort }, summary,
+    summaryStatus?.comparisons ? { generation, items: summaryItems } : undefined)
+  const exportHint = !tracksSummaries || run.progress.complete === 0 || summaryStatus?.ready ? null
+    : generation === 'on-demand' ? 'Summaries for this analysis are generated on demand. Use Manage summaries to create them before exporting PDF, Word or PowerPoint.'
+      : generation === 'disabled' ? 'Summary generation was off when this analysis started, so no summaries were created automatically. PDF, Word and PowerPoint need summaries. Use Manage summaries to create them when generation is available.'
+        : realSummariesNeedAttention(summary, summaryStatus) ? 'Some summaries didn’t finish. Use Manage summaries to generate the missing ones before exporting PDF, Word or PowerPoint.'
+          : 'CSV reports don’t need summaries. PDF, Word and PowerPoint need every summary to be ready.'
   const viewedTarget = (selectedId
     ? savedPairs.find((item) => item.comparison.id === selectedId)?.comparison.target.summary
     : detail.targets.find((target) => targetIdentity(target.selection) === targetId))
@@ -185,9 +222,18 @@ function RealAnalysisView({ id }: { id: string }) {
     {(entry.error || api.error) && <div className="mb-5"><InlineError>{entry.error ?? api.error} The last acknowledged run is shown. <Button size="sm" onClick={() => { void api.refresh(); void api.ensureDetail(id, true) }}>Reload progress</Button></InlineError></div>}
     {!api.features?.realAnalyses && <p className="mb-5 text-[11px] text-muted">{api.creationError ?? 'Checking new-run readiness.'} This saved run and its frozen evidence are independent of new-run readiness.</p>}
     {run.error && <div className="mb-5"><InlineError>{run.error.code}: {run.error.message} Processing failures are not zero scores.</InlineError></div>}
-    <section className="run-progress panel" aria-label="Real analysis progress" aria-live="polite"><div><span>{finished} / {run.progress.total} comparisons finished</span><span>{run.progress.initialized} initialized</span></div>
-      <progress max={Math.max(1, run.progress.total)} value={finished} aria-label="Finished comparisons" />
-      <p>{run.progress.complete} complete · {run.progress.running} assessing · {run.progress.queued} queued · {run.progress.failed} failed · {run.progress.cancelled} cancelled</p>
+    <section className="run-progress panel" aria-label="Real analysis progress" aria-live="polite">
+      <div><span>{stage.label}{combined && ` · ${combined.finished} / ${combined.total} finished`}</span><span>{run.progress.initialized} initialized</span></div>
+      {combined ? <progress max={Math.max(1, combined.total)} value={combined.finished} aria-label="Finished analysis and summary steps" />
+        : checking ? <progress aria-label="Checking summary progress" />
+          : <progress max={Math.max(1, run.progress.total)} value={finished} aria-label="Finished comparisons" />}
+      {combined && <p>A comparison counts as finished when its score and its candidate summary are both done. Each job or grade overview counts once.</p>}
+      {checking && <p>Checking summary progress…</p>}
+      <p>Analysis: <span>{finished} / {run.progress.total} comparisons finished</span> · {run.progress.complete} complete · {run.progress.running} assessing · {run.progress.queued} queued · {run.progress.failed} failed · {run.progress.cancelled} cancelled</p>
+      {progress && <p>{summaryTallyLine('Candidate summaries', progress.candidates, automatic)}</p>}
+      {progress && progress.overviews.required > 0 && <p>{summaryTallyLine('Job / grade overviews', progress.overviews, automatic)}</p>}
+      {statusError && <p>{statusError} <Button size="sm" variant="ghost" onClick={() => void api.ensureSummaryStatus(id, true)}>Check summary progress</Button></p>}
+      {exportHint && <p>{exportHint}</p>}
       <p>{run.progress.scored} with a server-calculated score · {run.progress.unscored} completed without an overall score. Saved results are never overwritten when other pairs retry.</p>
       {correctionProgress && <p>{correctionProgress}</p>}
       {realAnalysisCancellationPending(summary) && <p>Cancellation is progressing in bounded batches. This view keeps polling until the server confirms completion.</p>}
@@ -195,7 +241,7 @@ function RealAnalysisView({ id }: { id: string }) {
     {viewedTarget && <RealTargetNarrative runId={id} target={viewedTarget} />}
     {selectedId ? <SelectedRealComparison runId={id} comparisonId={selectedId} initialView={sourceView} /> : <section className="panel mt-5" aria-label="Real comparisons">
       <div className="section-heading"><div><h2>Separate comparisons, not a cross-job ranking</h2><p>Open a result for the complete criterion breakdown and exact source quotations.</p></div>
-        <Button size="sm" icon={RotateCcw} onClick={() => { void api.ensureDetail(id, true); void api.ensureComparisons(id, true) }}>Refresh pairs</Button></div>
+        <Button size="sm" icon={RotateCcw} onClick={() => { void api.ensureDetail(id, true); void api.ensureComparisons(id, true); void ensureStatus?.(id, true) }}>Refresh pairs</Button></div>
       <div className="library-toolbar">
         <SearchField label="Search comparisons" value={query} onChange={setQuery} placeholder="Find a candidate, document, or target…" />
         <label className="table-sort-select"><span>Target</span><select className="filter-select" aria-label="Comparison target" value={targetId} onChange={(event) => chooseTarget(event.target.value)}>
@@ -211,6 +257,7 @@ function RealAnalysisView({ id }: { id: string }) {
           const comparison = pair.comparison
           const resume = comparison.resume.summary
           const target = comparison.target.summary
+          const rowStage = realComparisonStage(pair, generation, summaryItems.get(comparison.id))
           return <tr key={comparison.id}><td className="min-w-[180px]"><button className="row-title text-left" onClick={() => openPair(comparison.id)}>{getDisplayName(resume, resume.name?.trim() || 'Name not stated')}</button>
             {resume.displayName && <p className="row-meta">Source name: {resume.name?.trim() || 'Name not stated'}</p>}
             <p className="row-meta">{resume.role ?? 'Role not stated'}</p><p className="row-meta break-all">{resume.sourceLabel}</p><p className="row-meta">Document v{resume.selection.documentVersion}</p></td>
@@ -222,8 +269,7 @@ function RealAnalysisView({ id }: { id: string }) {
               {comparison.status === 'failed' && currentAnalysisDiagnostic(comparison) && <p className="row-meta max-w-xs">Open the saved pair for private validation reasons and the original sources.</p>}
               {comparison.nextAttemptAt && <p className="row-meta">Automatic retry {dateLabel(comparison.nextAttemptAt)}</p>}<p className="row-meta">Attempt {comparison.attempts} · manual retries {comparison.retryCount}</p></td>
             <td><div className="space-y-3">{pair.activeCorrection ? <ActiveCorrectionStatus active={pair.activeCorrection} table />
-              : <div><Badge dot tone={comparison.status === 'complete' ? 'success' : ['failed', 'cancelled'].includes(comparison.status) ? 'warning' : 'neutral'}>
-              {{ queued: 'Queued', running: 'Running', complete: 'Complete', failed: 'Failed', cancelled: 'Cancelled' }[comparison.status]}</Badge></div>}
+              : <div><Badge dot tone={rowStage.tone}>{rowStage.label}</Badge></div>}
               <Button size="sm" variant="ghost" icon={ArrowUpRight} aria-label={`Review comparison ${comparison.index + 1}: ${getDisplayName(resume, resume.name?.trim() || 'Name not stated')} against ${getDisplayName(target, target.label)}`}
               onClick={() => openPair(comparison.id)}>Review saved pair</Button><RealComparisonActions summary={pair} /></div></td>
           </tr>

@@ -249,6 +249,30 @@ test('supported publication preserves original bytes and unrelated results, proj
   assert.deepEqual(history.entries[0].review.scope, detail.result.provenance.groundingReviews[0].scope)
 })
 
+test('summary status holds a re-scored comparison open until the corrected result has its own summary', async () => {
+  const context = await setup({ unaffected: true })
+  const { f, runId, comparisonId, unchanged } = context
+  const before = await f.service.summaryStatus(f.workspaceId, runId, { items: true })
+  assert.deepEqual(before.corrections, { pending: 0 })
+  assert.equal(before.targets[0].waitingFor, 'candidate-narratives')
+  await requestCorrection(context)
+  const pending = await f.service.summaryStatus(f.workspaceId, runId, { items: true })
+  assert.deepEqual(pending.corrections, { pending: 1 })
+  assert.deepEqual(pending.comparisons.map(item => [item.comparisonId, item.correctionPending]).sort(),
+    [[comparisonId, true], [unchanged.completed.id, false]].sort())
+  assert.equal(pending.targets[0].waitingFor, 'scoring')
+  assert.notEqual(pending.workRevision, before.workRevision)
+  const accepted = await reviewed(context)
+  await accepted.publish()
+  const corrected = await f.service.summaryStatus(f.workspaceId, runId, { items: true })
+  assert.deepEqual(corrected.corrections, { pending: 0 })
+  const item = corrected.comparisons.find(value => value.comparisonId === comparisonId)
+  assert.equal(item.resultSha256, accepted.reference.sha256)
+  assert.equal(item.correctionPending, false)
+  assert.equal(item.status, 'queued')
+  assert.equal(corrected.ready, false)
+})
+
 test('all missing evidence yields an available numeric zero with all original weight assessed', async () => {
   const context = await setup({ allMissing: true })
   const { f, runId, comparisonId } = context

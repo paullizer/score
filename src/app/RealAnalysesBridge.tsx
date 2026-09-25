@@ -4,7 +4,7 @@ import type {
   AnalysisProcessingFeatures, CreateRealAnalysisInput, RealAnalysisComparisonDetail, RealAnalysisComparisonSummary, RealAnalysisRunDetail,
   RealAnalysisRunSummary, RealAnalysisTargetSummary,
 } from '../domain/real-analyses'
-import type { RealAnalysisSummariesResponse, RealAnalysisSummarySubjectResponse } from '../domain/analysis-narratives'
+import type { RealAnalysisSummariesResponse, RealAnalysisSummaryStatusResponse, RealAnalysisSummarySubjectResponse } from '../domain/analysis-narratives'
 import { analysisNarrativePollingRevision } from '../domain/analysis-narrative-work-health'
 import type { AnalysisSummaryHistoryPage, AnalysisSummarySubject, PublishSummaryDraftInput } from '../domain/analysis-summary-history'
 import * as api from '../services/realAnalyses'
@@ -17,7 +17,8 @@ import { getDisplayName } from '../domain/displayNames'
 import { useGradeLeaveGuard } from './grade-navigation-context'
 import { RealAnalysesContext, type RealAnalysesContextValue } from './real-analyses-context'
 import { RealReadBackoff, RealRequestScope, realRequestError, type RealLoadState } from './real-request-scope'
-import { realAnalysisWorkActive as active, realTargetAvailable } from '../features/analyses/realAnalysisUi'
+import { realAnalysisCancellationPending, realAnalysisWorkActive as active, realTargetAvailable } from '../features/analyses/realAnalysisUi'
+import { realSummaryGeneration, summaryStatusWorkActive } from '../features/analyses/realAnalysisCompletion'
 import { assertRealLifecyclePermission, discoveredLifecycle, projectRealLifecycle, realWorkspaceWritable, reconcileLifecycleOperations } from './real-lifecycle'
 
 const pairKey = (runId: string, id: string) => `${runId}/${id}`
@@ -39,6 +40,10 @@ function retainSubscription(subscriptions: Map<string, number>, key: string) {
 const narrativeWorkActive = (value: RealAnalysisSummariesResponse) =>
   value.scoring.initialized < value.scoring.total || value.scoring.queued > 0 || value.scoring.running > 0 ||
   [value.counts.candidates, value.counts.targets].some((count) => count.waiting + count.queued + count.running > 0)
+const summaryStatusKey = (runId: string) => `summary-status:${runId}`
+const summaryStatusError = 'Summary progress could not be checked. Scores and saved summaries are unchanged.'
+// The history list reads at most this many summary statuses at once, newest runs first.
+const listSummaryStatusReads = 3
 
 export function RealAnalysesBridge({ workspaceId, children }: { workspaceId: string; children: ReactNode }) {
   return <RealAnalysesProvider key={workspaceId} workspaceId={workspaceId}>{children}</RealAnalysesProvider>
@@ -92,6 +97,16 @@ function RealAnalysesProvider({ workspaceId, children }: { workspaceId: string; 
   const summarySubjectScopes = useRef(new Map<string, { runId: string; subject: AnalysisSummarySubject }>())
   const summarySubjectSubscriptions = useRef(new Map<string, number>())
   const narrativeRequests = useRef(new Map<string, { key: string; etag: string; runId: string }>())
+  // Summary scopes whose state changed. Their text stays visible while they refresh, but cannot start generation.
+  const invalidatedNarratives = useRef(new Set<string>())
+  const [summaryStatuses, setSummaryStatuses] = useState<Record<string, RealLoadState<RealAnalysisSummaryStatusResponse>>>({})
+  const summaryStatusesRef = useRef(summaryStatuses)
+  // Detail pages that show each comparison's summary state.
+  const summaryStatusSubscriptions = useRef(new Map<string, number>())
+  // The run and re-score state each status read started from. A different fence means the status may be out of date.
+  const summaryStatusFences = useRef(new Map<string, string>())
+  const pathnameRef = useRef(location.pathname)
+  pathnameRef.current = location.pathname
   const summaryHistoryScopes = useRef(new Map<string, Pick<AnalysisSummaryHistoryPage, 'etag' | 'capabilities'> & { runId: string; targetId: string }>())
   const pairSummaries = useRef(new Map<string, RealAnalysisComparisonSummary>())
   // Runs whose re-score or correction work finished; their score counts refresh from a run read that starts afterwards.
@@ -141,19 +156,27 @@ function RealAnalysesProvider({ workspaceId, children }: { workspaceId: string; 
     summarySubjectsRef.current = { ...summarySubjectsRef.current, [key]: entry }
     setSummarySubjects(summarySubjectsRef.current)
   }, [])
+  const putSummaryStatus = useCallback((runId: string, entry: RealLoadState<RealAnalysisSummaryStatusResponse>) => {
+    summaryStatusesRef.current = { ...summaryStatusesRef.current, [runId]: entry }
+    setSummaryStatuses(summaryStatusesRef.current)
+  }, [])
 
   const clearRunContent = useCallback((id: string) => {
     const removedScopes = new Set([...narrativeScopes.current].filter(([, item]) => item.runId === id).map(([key]) => key))
     const removedSubjects = new Set([...summarySubjectScopes.current].filter(([, item]) => item.runId === id).map(([key]) => key))
     const removedRead = (key: string) => key === `detail:${id}` || key === `pairs:${id}` || key.startsWith(`result:${id}/`) ||
       key.startsWith(`document:${id}/`) || key.startsWith(`diagnostics:${id}/`) ||
-      key.startsWith(`summary-history:${id}/`) || key.startsWith(`summary:${id}/`) ||
+      key.startsWith(`summary-history:${id}/`) || key.startsWith(`summary:${id}/`) || key === summaryStatusKey(id) ||
       [...removedScopes].some((item) => key === `narratives:${item}`)
     scope.cancelReads(removedRead)
     backoff.clear(removedRead)
     putDetail(id, { state: 'error', error: 'This analysis was removed or is awaiting permanent cleanup. Cached inputs and results are no longer available.' })
     const next = { ...comparisonsRef.current }; delete next[id]
     comparisonsRef.current = next; setComparisons(next)
+    const statuses = { ...summaryStatusesRef.current }; delete statuses[id]
+    summaryStatusesRef.current = statuses; setSummaryStatuses(statuses)
+    summaryStatusFences.current.delete(id)
+    summaryStatusSubscriptions.current.delete(id)
     resultsRef.current = Object.fromEntries(Object.entries(resultsRef.current).filter(([key]) => !key.startsWith(`${id}/`)))
     setResults(resultsRef.current)
     narrativesRef.current = Object.fromEntries(Object.entries(narrativesRef.current).filter(([key]) => !removedScopes.has(key)))
@@ -165,6 +188,7 @@ function RealAnalysesProvider({ workspaceId, children }: { workspaceId: string; 
       narrativeSubscriptions.current.delete(key)
       narrativeProgress.current.delete(key)
     }
+    for (const key of invalidatedNarratives.current) if (removedRead(key)) invalidatedNarratives.current.delete(key)
     for (const key of removedSubjects) {
       summarySubjectScopes.current.delete(key)
       summarySubjectSubscriptions.current.delete(key)
@@ -326,6 +350,7 @@ function RealAnalysesProvider({ workspaceId, children }: { workspaceId: string; 
     if (!readableRun(value.runId) || !scope.accept(`narrative:${key}`, sequence)) return
     const selected = { runId: value.runId, ...(value.scope.targetId ? { targetId: value.scope.targetId } : {}) }
     narrativeScopes.current.set(key, selected)
+    invalidatedNarratives.current.delete(`narratives:${key}`)
     backoff.record(`narratives:${key}`, analysisNarrativePollingRevision(value))
     putNarratives(key, { state: 'ready', value })
     if (!narrativeWorkActive(value)) narrativeProgress.current.delete(key)
@@ -382,6 +407,7 @@ function RealAnalysesProvider({ workspaceId, children }: { workspaceId: string; 
         throw new Error('The summary does not match this comparison’s exact saved job or grade. No other target was substituted.')
       }
       if (!scope.accept(`summary:${key}`, ticket.sequence)) return
+      invalidatedNarratives.current.delete(ticket.key)
       backoff.record(ticket.key, analysisNarrativePollingRevision(value))
       putSummarySubject(key, { state: 'ready', value })
     } catch (caught) {
@@ -401,19 +427,118 @@ function RealAnalysesProvider({ workspaceId, children }: { workspaceId: string; 
       if (selected.runId !== runId || (targetId && selected.targetId && selected.targetId !== targetId)) continue
       invalidatedReads.add(`narratives:${key}`)
       const previous = narrativesRef.current[key]
-      if (previous?.state === 'ready') putNarratives(key, { ...previous, error: 'Summary state changed. Refreshing its current revision; previous text is not current for export.' })
+      if (previous?.state === 'ready') putNarratives(key, { ...previous, refreshing: true })
       else putNarratives(key, { state: 'idle' })
     }
     for (const [key, selected] of summarySubjectScopes.current) {
       const previous = summarySubjectsRef.current[key]
       if (selected.runId !== runId || (targetId && previous?.state === 'ready' && previous.value.narrative.targetId !== targetId)) continue
       invalidatedReads.add(`summary:${key}`)
-      if (previous?.state === 'ready') putSummarySubject(key, { ...previous, error: 'Summary state changed. Refreshing its current revision; previous text is not current for export.' })
+      if (previous?.state === 'ready') putSummarySubject(key, { ...previous, refreshing: true })
       else putSummarySubject(key, { state: 'idle' })
     }
+    for (const key of invalidatedReads) invalidatedNarratives.current.add(key)
+    summaryStatusFences.current.delete(runId)
     scope.cancelReads((key) => invalidatedReads.has(key))
     backoff.clear((key) => invalidatedReads.has(key))
   }, [backoff, putNarratives, putSummarySubject, scope])
+
+  const summaryStatusFence = useCallback((runId: string) => {
+    const pairs = comparisonsRef.current[runId]
+    const corrections = pairs?.state === 'ready'
+      ? pairs.value.filter((item) => item.activeCorrection).map((item) => `${item.comparison.id}:${activeCorrectionKey(item)}`) : []
+    return JSON.stringify([summariesRef.current.find((item) => item.run.id === runId)?.etag ?? null, corrections])
+  }, [])
+  const summaryStatusFenceCurrent = useCallback((runId: string) =>
+    summaryStatusFences.current.get(runId) === summaryStatusFence(runId), [summaryStatusFence])
+
+  const ensureSummaryStatus = useCallback(async function loadSummaryStatus(runId: string, force = false): Promise<void> {
+    if (!historyAvailable.current || !readableRun(runId)) return
+    const items = summaryStatusSubscriptions.current.has(runId)
+    const previous = summaryStatusesRef.current[runId]
+    if (!force && previous && !['idle', 'loading'].includes(previous.state) &&
+      !(items && previous.state === 'ready' && !previous.value.comparisons)) return
+    const ticket = scope.read(summaryStatusKey(runId))
+    if (!ticket) return
+    const fence = summaryStatusFence(runId)
+    let settled = false
+    if (previous?.state !== 'ready') putSummaryStatus(runId, { state: 'loading' })
+    try {
+      const response = await api.getRealAnalysisSummaryStatus(workspaceId, runId, { items }, ticket.controller.signal)
+      if (!scope.current(ticket) || !readableRun(runId)) return
+      settled = true
+      backoff.record(ticket.key, analysisNarrativePollingRevision(response))
+      const cached = summaryStatusesRef.current[runId]
+      // Equal revisions describe the same comparison and overview states, so an earlier per-item read still applies.
+      const value = !response.comparisons && cached?.state === 'ready' && cached.value.comparisons &&
+        cached.value.revision === response.revision && cached.value.workRevision === response.workRevision
+        ? { ...response, comparisons: cached.value.comparisons, targets: cached.value.targets } : response
+      summaryStatusFences.current.set(runId, fence)
+      putSummaryStatus(runId, { state: 'ready', value })
+    } catch {
+      if (!scope.current(ticket) || !readableRun(runId)) return
+      settled = true
+      backoff.record(ticket.key)
+      summaryStatusFences.current.set(runId, fence)
+      // Summary progress is advisory: a failed read keeps the last known status and never clears the run or its results.
+      const cached = summaryStatusesRef.current[runId]
+      putSummaryStatus(runId, cached?.state === 'ready' ? { ...cached, error: summaryStatusError } : { state: 'error', error: summaryStatusError })
+    } finally {
+      scope.finish(ticket)
+      const current = summaryStatusesRef.current[runId]
+      // A page that subscribed or a run that changed during the read needs a read that starts now.
+      if (settled && summaryStatusSubscriptions.current.has(runId) && tabVisible() &&
+        ((current?.state === 'ready' && !current.error && !current.value.comparisons) || summaryStatusFences.current.get(runId) !== summaryStatusFence(runId))) {
+        void loadSummaryStatus(runId, true)
+      }
+    }
+  }, [backoff, putSummaryStatus, readableRun, scope, summaryStatusFence, workspaceId])
+
+  const summaryStatusStale = useCallback((runId: string) => {
+    const entry = summaryStatusesRef.current[runId]
+    return entry?.state !== 'ready' || Boolean(entry.error) || !entry.value.comparisons || !summaryStatusFenceCurrent(runId) ||
+      summaryStatusWorkActive(entry.value)
+  }, [summaryStatusFenceCurrent])
+
+  const subscribeSummaryStatus = useCallback((runId: string) => {
+    const first = !summaryStatusSubscriptions.current.has(runId)
+    const release = retainSubscription(summaryStatusSubscriptions.current, runId)
+    subscriptionsChanged()
+    if (first && tabVisible() && summaryStatusStale(runId)) void ensureSummaryStatus(runId, true)
+    return () => {
+      if (!release()) return
+      subscriptionsChanged()
+      scope.cancelReads((key) => key === summaryStatusKey(runId))
+    }
+  }, [ensureSummaryStatus, scope, subscriptionsChanged, summaryStatusStale])
+
+  // The history list reads counts only, for runs whose scoring has finished and whose summaries are automatic or already known.
+  const listSummaryStatusNeeded = useCallback((summary: RealAnalysisRunSummary, respectBackoff: boolean) => {
+    const id = summary.run.id
+    if (!historyAvailable.current || !readableRun(id) || (summary.lifecycle ?? summary.run.lifecycle)?.deletingAt ||
+      realAnalysisCancellationPending(summary) || !['complete', 'partial'].includes(summary.run.status)) return false
+    const entry = summaryStatusesRef.current[id]
+    if (!entry) return realSummaryGeneration(summary) === 'automatic'
+    if (entry.state !== 'ready' && entry.state !== 'error') return true
+    if (!summaryStatusFenceCurrent(id)) return true
+    const due = !respectBackoff || backoff.due(summaryStatusKey(id))
+    return (entry.state === 'error' || Boolean(entry.error) || summaryStatusWorkActive(entry.value)) && due
+  }, [backoff, readableRun, summaryStatusFenceCurrent])
+
+  const pumpListSummaryStatuses = useCallback(function pump() {
+    if (!scope.isOpen || pathnameRef.current !== '/analyses' || !tabVisible()) return
+    let slots = listSummaryStatusReads - summariesRef.current.filter((item) => scope.reading(summaryStatusKey(item.run.id))).length
+    for (const summary of summariesRef.current) {
+      if (slots <= 0) return
+      const id = summary.run.id
+      if (summaryStatusSubscriptions.current.has(id) || scope.reading(summaryStatusKey(id)) || !listSummaryStatusNeeded(summary, true)) continue
+      const read = ensureSummaryStatus(id, true)
+      // A busy or closed scope starts no read. Continue without chaining so the next tick retries.
+      if (!scope.reading(summaryStatusKey(id))) continue
+      slots--
+      void read.finally(pump)
+    }
+  }, [ensureSummaryStatus, listSummaryStatusNeeded, scope])
 
   const subscribeAnalysis = useCallback((runId: string) => {
     const release = retainSubscription(activeAnalyses.current, runId)
@@ -609,9 +734,12 @@ function RealAnalysesProvider({ workspaceId, children }: { workspaceId: string; 
   }, [features, refreshTargets, subscriptionsVersion])
 
   const listWorkPending = summaries.some(active)
+  const listSummaryPending = phase === 'ready' && location.pathname === '/analyses' &&
+    summaries.some((item) => !summaryStatusSubscriptions.current.has(item.run.id) && listSummaryStatusNeeded(item, false))
   useEffect(() => {
     if (phase !== 'ready' || (!activeAnalyses.current.size && !activeComparisons.current.size &&
       !narrativeSubscriptions.current.size && !summarySubjectSubscriptions.current.size && !narrativeProgress.current.size &&
+      !summaryStatusSubscriptions.current.size && !listSummaryPending &&
       !(location.pathname === '/analyses' && listWorkPending))) return
     const timer = window.setInterval(() => {
       if (!tabVisible()) return
@@ -640,9 +768,18 @@ function RealAnalysesProvider({ workspaceId, children }: { workspaceId: string; 
         }
       }
       refreshRelevantNarratives(undefined, true)
+      for (const id of summaryStatusSubscriptions.current.keys()) {
+        if (!summaryStatusFenceCurrent(id) || (summaryStatusStale(id) && backoff.due(summaryStatusKey(id)))) void ensureSummaryStatus(id, true)
+      }
+      pumpListSummaryStatuses()
     }, pollingInterval)
     return () => window.clearInterval(timer)
-  }, [backoff, ensureComparison, ensureComparisons, ensureDetail, listWorkPending, location.pathname, phase, pollingInterval, refresh, refreshRelevantNarratives, subscriptionsVersion])
+  }, [backoff, ensureComparison, ensureComparisons, ensureDetail, ensureSummaryStatus, listSummaryPending, listWorkPending, location.pathname, phase,
+    pollingInterval, pumpListSummaryStatuses, refresh, refreshRelevantNarratives, subscriptionsVersion, summaryStatusFenceCurrent, summaryStatusStale])
+
+  useEffect(() => {
+    if (phase === 'ready') pumpListSummaryStatuses()
+  }, [location.pathname, phase, pumpListSummaryStatuses, summaries])
 
   const scoringRevisions = useRef(new Map<string, string>())
   useEffect(() => {
@@ -652,10 +789,11 @@ function RealAnalysesProvider({ workspaceId, children }: { workspaceId: string; 
       if (previous && previous !== item.etag) {
         invalidateNarratives(item.run.id)
         refreshRelevantNarratives(item.run.id)
+        if (summaryStatusSubscriptions.current.has(item.run.id) && tabVisible()) void ensureSummaryStatus(item.run.id, true)
       }
     }
     scoringRevisions.current = new Map(summaries.map((item) => [item.run.id, item.etag]))
-  }, [invalidateNarratives, phase, refreshRelevantNarratives, summaries])
+  }, [ensureSummaryStatus, invalidateNarratives, phase, refreshRelevantNarratives, summaries])
 
   useEffect(() => {
     let lastResume = -Infinity
@@ -671,6 +809,8 @@ function RealAnalysesProvider({ workspaceId, children }: { workspaceId: string; 
         void ensureComparisons(id, true)
       }
       refreshRelevantNarratives()
+      for (const id of summaryStatusSubscriptions.current.keys()) void ensureSummaryStatus(id, true)
+      pumpListSummaryStatuses()
     }
     window.addEventListener('focus', resume)
     document.addEventListener('visibilitychange', resume)
@@ -678,7 +818,7 @@ function RealAnalysesProvider({ workspaceId, children }: { workspaceId: string; 
       window.removeEventListener('focus', resume)
       document.removeEventListener('visibilitychange', resume)
     }
-  }, [ensureComparisons, ensureDetail, location.pathname, refresh, refreshRelevantNarratives, refreshTargets])
+  }, [ensureComparisons, ensureDetail, ensureSummaryStatus, location.pathname, pumpListSummaryStatuses, refresh, refreshRelevantNarratives, refreshTargets])
 
   async function mutate<T>(runId: string | undefined, operation: () => Promise<T>, commit: (value: T, sequence: number) => void, lifecycle = false, summariesOnly = false): Promise<T> {
     if (lifecycle) {
@@ -719,6 +859,7 @@ function RealAnalysesProvider({ workspaceId, children }: { workspaceId: string; 
           if (runId && tabVisible()) {
             if (!summariesOnly && activeAnalyses.current.has(runId)) { void ensureDetail(runId, true); void ensureComparisons(runId, true) }
             refreshRelevantNarratives(runId)
+            if (summaryStatusSubscriptions.current.has(runId)) void ensureSummaryStatus(runId, true)
           }
         }
         void parentRef.current.cloud?.refreshWorkspaces().catch(caught => setError(`Workspace access refresh failed: ${realRequestError(caught, 'Try refreshing access again.')}`))
@@ -823,11 +964,14 @@ function RealAnalysesProvider({ workspaceId, children }: { workspaceId: string; 
     comparison: (runId, id) => results[pairKey(runId, id)] ?? { state: 'idle' },
     narratives: (runId, targetId) => narratives[narrativeKey(runId, targetId)] ?? { state: 'idle' },
     summarySubject: (runId, subject) => summarySubjects[summarySubjectKey(runId, subject)] ?? { state: 'idle' },
+    summaryStatus: (runId) => summaryStatuses[runId] ?? { state: 'idle' },
+    ensureSummaryStatus, subscribeSummaryStatus,
     generateSummaries: async (runId, input, etag) => {
       assertClientAdmission(policy, 'summaryGeneration')
       if (featuresRef.current?.analysisSummaryGeneration !== true) throw new Error('Summary generation is unavailable. Saved summaries, scores, and frozen evidence remain separate from new-run readiness.')
       const cached = narrativesRef.current[narrativeKey(runId, input.targetId)]
-      if (cached?.state !== 'ready' || cached.error || cached.value.etag !== etag) throw new Error('Refresh the selected summary scope before generating summaries.')
+      if (cached?.state !== 'ready' || cached.error || cached.value.etag !== etag ||
+        invalidatedNarratives.current.has(`narratives:${narrativeKey(runId, input.targetId)}`)) throw new Error('Refresh the selected summary scope before generating summaries.')
       if (!cached.value.capabilities.canGenerate) throw new Error('Summary generation is not permitted for this saved analysis. Check its access and lifecycle status.')
       if ([cached.value.counts.candidates, cached.value.counts.targets].some((count) => count.queued + count.running > 0)) {
         throw new Error('Summaries in this scope are already generating. Wait for the acknowledged work to finish.')

@@ -1,15 +1,17 @@
 import { z } from 'zod'
 import { processingSettingsSnapshotSchema } from '../../src/domain/admin-settings-schema'
 import {
-  admittedProcessingSettings, newProcessingSettings, preservesProcessingSettings,
+  acceptedProcessingSettings, admittedProcessingSettings, newProcessingSettings, preservesProcessingSettings,
   assertNewWork, newWorkProcessingSettings, type ProcessingSettingsProvider,
 } from '../jobs/policy'
 import {
-  ANALYSIS_NARRATIVE_SCHEMA_VERSION, analysisNarrativeIsCurrent, analysisTargetNarrativeCanGenerate, type AnalysisCandidateNarrativeInputBinding,
+  ANALYSIS_NARRATIVE_SCHEMA_VERSION, analysisNarrativeIsCurrent, analysisSummaryGeneration, analysisTargetNarrativeCanGenerate,
+  type AnalysisCandidateNarrativeInputBinding,
   type AnalysisNarrativeCounts, type AnalysisNarrativeCurrentState, type AnalysisNarrativeWaitReason,
   type AnalysisTargetNarrativeInputBinding, type GenerateRealAnalysisSummariesInput,
   type RealAnalysisCandidateNarrativeRecord, type RealAnalysisCandidateNarrativeSummary, type RealAnalysisNarrativeRecord,
   type RealAnalysisSummariesMutationResponse, type RealAnalysisSummariesResponse, type RealAnalysisTargetNarrativeRecord,
+  type RealAnalysisSummaryStatusQuery, type RealAnalysisSummaryStatusResponse,
   type RealAnalysisTargetNarrativeSummary, type RealAnalysisSummarySubjectResponse,
 } from '../../src/domain/analysis-narratives'
 import type { AnalysisSummarySubject } from '../../src/domain/analysis-summary-history'
@@ -587,6 +589,43 @@ export async function readAnalysisSummaries(
     }
   }
   throw conflict('The selected narratives changed while their published text was being read. Reload and retry.')
+}
+
+/** Work metadata only. It never reads published text, enqueues work or repairs a run, so pages can poll it. */
+export async function readAnalysisSummaryStatus(
+  deps: RealAnalysesDeps, workspaceId: string, runId: string, options: RealAnalysisSummaryStatusQuery = {}, signal?: AbortSignal,
+): Promise<RealAnalysisSummaryStatusResponse> {
+  return traceOperation('score.analysis.summary.status', {}, async () => {
+    const inventory = await readAnalysisNarrativeInventory(immutableReadDeps(deps), workspaceId, runId, undefined, signal)
+    await readableWorkspace(deps, workspaceId, signal)
+    const scoring = { total: inventory.comparisons.length, initialized: 0, queued: 0, running: 0, complete: 0, failed: 0, cancelled: 0 }
+    for (const pair of inventory.comparisons) {
+      if (pair.comparison) scoring.initialized++
+      scoring[pair.status]++
+    }
+    const candidates = inventory.comparisons.map(pair => pair.state)
+    const overviews = inventory.targets.map(target => target.state)
+    const ready = scoring.initialized === scoring.total && scoring.queued + scoring.running === 0 &&
+      [...candidates, ...overviews].every(state => state.status === 'ready' || state.status === 'not-required')
+    const corrections = inventory.comparisons.filter(pair => pair.correctionPending).map(pair => pair.id)
+    const waitingFor = (target: AnalysisNarrativeInventory['targets'][number]) => target.state.status === 'waiting' ? target.waitingFor : null
+    const run = inventory.run.record
+    return {
+      schemaVersion: ANALYSIS_NARRATIVE_SCHEMA_VERSION, dataKind: 'real', workspaceId, runId,
+      scope: inventory.scope, revision: inventory.revision,
+      workRevision: analysisHash({ corrections, waitingFor: inventory.targets.map(target => [target.target.summary.id, waitingFor(target)]) }),
+      generation: analysisSummaryGeneration(acceptedProcessingSettings(run.processingSettings ?? inventory.manifest.processingSettings).settings),
+      ready, scoring, corrections: { pending: corrections.length },
+      counts: { candidates: counts(candidates), targets: counts(overviews) },
+      ...(options.items ? {
+        comparisons: inventory.comparisons.map(pair => ({
+          comparisonId: pair.id, targetId: pair.target.summary.id, comparisonStatus: pair.status,
+          resultSha256: pair.binding?.resultSha256 ?? null, correctionPending: pair.correctionPending, status: pair.state.status,
+        })),
+        targets: inventory.targets.map(target => ({ targetId: target.target.summary.id, status: target.state.status, waitingFor: waitingFor(target) })),
+      } : {}),
+    }
+  })
 }
 
 function active(state: AnalysisNarrativeCurrentState): boolean {

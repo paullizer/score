@@ -28,6 +28,7 @@ import {
 import type { AnalysisBlobStore, AnalysisStore } from '../../server/analyses/store'
 import { analysisIsRemoved, fencedAnalysisBlobs } from '../../server/analyses/guards'
 import { prepareAnalysisNarrativeTransitions } from '../../server/analyses/narrative-scheduling'
+import { firstAnalysisWorkLane } from '../../server/analyses/work-lanes'
 import { systemClock, type Clock, type RubricModelOptions } from '../runtime'
 import { AnalysisModelError, assessResumeAgainstTarget } from './model'
 import { emitAnalysisTelemetry, type AnalysisTelemetrySink } from './telemetry'
@@ -667,7 +668,7 @@ async function processRun(
     countActive: workspaceId => deps.store.countActive(workspaceId),
     create: record => deps.store.create(record),
     replace: (record, etag) => deps.store.replace(record, etag),
-    listPending: (now, limit) => deps.store.listPending(now, limit),
+    listPending: (now, limit, pendingOptions) => deps.store.listPending(now, limit, pendingOptions),
     getControl: (workspaceId, runId) => deps.store.getControl(workspaceId, runId),
     listControls: (workspaceId, token) => deps.store.listControls(workspaceId, token),
     pendingLifecycleWorkspaces: limit => deps.store.pendingLifecycleWorkspaces(limit),
@@ -758,7 +759,7 @@ export async function runAnalysisWorker(
   const result = { claimed: 0, completed: 0 }
   const visited = new Set<string>()
   while (result.claimed < maxItems && clock.now().getTime() < deadline && !options.signal?.aborted) {
-    const pending = await deps.store.listPending(clock.now().toISOString(), pendingLimit)
+    const pending = await deps.store.listPending(clock.now().toISOString(), pendingLimit, { firstLane: firstAnalysisWorkLane(clock.now()) })
     const candidates = pending.filter(item => !visited.has(`${item.record.workspaceId}:${item.record.id}`))
       .sort((a, b) => Number(b.record.recordType === 'analysis-run') - Number(a.record.recordType === 'analysis-run'))
     if (!candidates.length) break
