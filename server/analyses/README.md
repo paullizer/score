@@ -47,7 +47,10 @@ reading already frozen runs.
 Every HTTP mutation awaits `repository.withWorkspaceMutation` for its entire
 handler. Ordinary writes require an active workspace/run; lifecycle management
 uses `manage` and remains available on archived workspaces. Publication checks
-the workspace mutation lease again immediately before writing.
+the workspace mutation lease again immediately before writing. When another
+request already holds the lease, the handler does not run and the API answers
+HTTP 409 with `Retry-After: 2`. Nothing changed, so the caller may send the same
+request again shortly; the browser does so automatically when starting a run.
 `WORD_DOCUMENT_IMPORTS_ENABLED` gates new job/resume Word admissions, not analysis source
 schemas or historical reads. Upgraded validators must accept already-frozen Word evidence
 even while that flag is off. Real analysis creation still needs its existing configured
@@ -569,7 +572,10 @@ narrative text. PDF and Word continue to share the same report content.
 ## Frozen evidence and recovery
 
 Discovery reads all authorized ready jobs and saved job rubric versions, plus
-grade heads with approval pointers. Archived/removing workspaces, resumes, jobs,
+grade heads with approval pointers. Each page of jobs resolves up to eight
+records at a time and each page of grade heads up to two, and a GS grade reads its approved reference
+documents in parallel; results, budgets, cursors, and the reported error are the
+same as a sequential scan. Archived/removing workspaces, resumes, jobs,
 logical job rubrics, ladders, grade heads, and approved grade seed jobs are not
 eligible for new work. Explicit scoring retries revalidate the exact selected
 sources under the workspace mutation lease. A grade's current draft is not its approval:
@@ -627,6 +633,24 @@ must still be eligible in the live libraries. A retained preparation is not
 permission to recreate deleted inputs. Revalidation never rewrites the winning
 manifest; historical inspection and already-admitted processing still use only
 the immutable captures.
+
+Creation freezes sources in bounded chunks of eight (`ANALYSIS_SOURCE_CONCURRENCY`).
+A chunk takes at most two GS grades (`ANALYSIS_GRADE_CONCURRENCY`), because a
+resolved grade holds its whole approved reference set in memory. A chunk resolves
+its resumes or targets in parallel, then saves their snapshots
+through one fenced writer batch (`putFencedAnalysisBlobs`, at most 16 blobs): one
+run-control reservation for the batch, parallel uploads that each recheck the
+workspace and run fences and their own reservation, and one release for the
+uploads that succeeded. Target evidence copies are written before the snapshots
+that reference them, and identical content-addressed copies, such as two saved
+versions of one job, are written once. Snapshot identities, order, bytes, and
+the manifest are the same as a one-at-a-time capture, and the manifest is still
+written last. The post-capture eligibility recheck also runs eight at a time.
+When several selections fail, the error for the lowest-index selection is
+reported, as a sequential scan would. Only sources in flight are held in memory.
+Browser clients wait up to two minutes per try and resend the identical request
+and key after a timeout, dropped connection, platform 5xx page, or `Retry-After`
+answer, for up to 10 minutes (`ANALYSIS_SUBMISSION_WAIT`).
 
 Initialization and cancellation use chunks of at most 25 pair writes plus one
 ETag-fenced run replacement, further reduced to stay below the transaction byte
@@ -743,8 +767,10 @@ after deletes so shifting page offsets cannot skip artifacts. All phases are
 resumable. Until completion, list/detail responses retain recovery metadata but
 deleting runs expose no partial comparison or document evidence.
 
-Blob writers reserve a bounded slot in the same-partition run control. Azure
-content PUTs require an exact placeholder ETag and a finite Blob lease, with
+Blob writers reserve a bounded slot in the same-partition run control. A creation
+batch reserves the slots for all of its blobs in one control write and releases
+the successful ones in another. Azure content PUTs require an exact placeholder
+ETag and a finite Blob lease, with
 bounded requests and no automatic upload retries. Failed/ambiguous writers keep
 their reservations until the request/lease window has drained; cleanup then
 breaks leases and conditionally deletes. A late source/result PUT cannot recreate
