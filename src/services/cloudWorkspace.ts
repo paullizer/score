@@ -10,12 +10,15 @@ export class CloudApiError extends Error {
   readonly code: CloudErrorCode
   readonly status: number
   readonly retryAfterSeconds: number | undefined
-  constructor(code: CloudErrorCode, message: string, status: number, options: { retryAfterSeconds?: number } = {}) {
+  /** A platform failure without a Score API response, such as a gateway timeout or restart. */
+  readonly transient: boolean
+  constructor(code: CloudErrorCode, message: string, status: number, options: { retryAfterSeconds?: number; transient?: boolean } = {}) {
     super(message)
     this.name = 'CloudApiError'
     this.code = code
     this.status = status
     this.retryAfterSeconds = options.retryAfterSeconds
+    this.transient = options.transient === true
   }
 }
 
@@ -33,8 +36,8 @@ export class CloudAuthError extends CloudApiError {
 
 /** A PUT/PATCH was rejected because the resource changed since the etag we sent (HTTP 409). */
 export class CloudConflictError extends CloudApiError {
-  constructor(message: string) {
-    super('conflict', message, 409)
+  constructor(message: string, options: { retryAfterSeconds?: number } = {}) {
+    super('conflict', message, 409, options)
     this.name = 'CloudConflictError'
   }
 }
@@ -49,12 +52,22 @@ export class CloudPreconditionError extends CloudApiError {
 
 export class CloudTimeoutError extends CloudApiError {
   readonly acknowledgementUnknown: boolean
-  constructor(mutating: boolean) {
+  constructor(mutating: boolean, timeoutMilliseconds = DEFAULT_CLOUD_TIMEOUT_MILLISECONDS) {
+    const seconds = Math.round(timeoutMilliseconds / 1000)
     super('unavailable', mutating
-      ? 'The request timed out after 30 seconds before Score received an acknowledgement. The change may still have been accepted. Refresh its status before explicitly retrying the same action; do not assume it was saved.'
-      : 'The request timed out after 30 seconds. Try again to load the saved data. This read did not change your saved scores or evidence.', 408)
+      ? `Score didn’t get a response within ${seconds} seconds, so it can’t tell yet whether your change was saved. Reload to check before trying again.`
+      : `Score didn’t get a response within ${seconds} seconds. Nothing was changed, so you can try again.`, 408)
     this.name = 'CloudTimeoutError'
     this.acknowledgementUnknown = mutating
+  }
+}
+
+/** An idempotent request kept getting no definite answer until its overall wait ran out. */
+export class CloudAcknowledgementPendingError extends CloudApiError {
+  readonly acknowledgementUnknown = true
+  constructor(message: string) {
+    super('unavailable', message, 408)
+    this.name = 'CloudAcknowledgementPendingError'
   }
 }
 
@@ -230,17 +243,26 @@ async function unwrap<T>(response: Response): Promise<T> {
   if (!response.ok) {
     const envelope = await readErrorEnvelope(response)
     if (!envelope) {
-      throw new CloudApiError('unavailable', `The cloud service returned HTTP ${response.status} instead of API data. Your changes have not been acknowledged; retry when the service is available.`, response.status)
+      throw new CloudApiError('unavailable', `The cloud service returned HTTP ${response.status} instead of API data. Your changes have not been acknowledged; retry when the service is available.`, response.status,
+        { transient: response.status === 408 || response.status >= 500 })
     }
-    if (response.status === 409) throw new CloudConflictError(envelope.message)
+    const retryAfterSeconds = parseRetryAfterSeconds(response.headers.get('Retry-After'))
+    if (response.status === 409) throw new CloudConflictError(envelope.message, { retryAfterSeconds })
     if (response.status === 428) throw new CloudPreconditionError(envelope.message)
-    throw new CloudApiError(envelope.code, envelope.message, response.status, { retryAfterSeconds: parseRetryAfterSeconds(response.headers.get('Retry-After')) })
+    throw new CloudApiError(envelope.code, envelope.message, response.status, { retryAfterSeconds })
   }
   const contentType = response.headers.get('content-type') ?? ''
   if (!contentType.toLowerCase().includes('application/json')) {
     throw new CloudAuthError('Score received an unexpected non-API response. Sign in again, or try again shortly.')
   }
   return response.json() as Promise<T>
+}
+
+const networkFailures = new WeakSet<object>()
+
+/** True when the connection failed before Score's answer arrived, so the request's outcome is unknown. */
+export function isCloudNetworkFailure(error: unknown): boolean {
+  return typeof error === 'object' && error !== null && networkFailures.has(error)
 }
 
 async function cloudRequest<T>(path: string, init: CloudRequestInit, read: (response: Response) => Promise<T>): Promise<T> {
@@ -250,7 +272,8 @@ async function cloudRequest<T>(path: string, init: CloudRequestInit, read: (resp
   const headers = new Headers(init.headers)
   headers.set(SCORE_REQUEST_HEADER, 'workspace')
   if (init.body !== undefined && !headers.has('Content-Type')) headers.set('Content-Type', 'application/json')
-  const deadline = AbortSignal.timeout(resolveCloudRequestTimeout(init))
+  const timeoutMilliseconds = resolveCloudRequestTimeout(init)
+  const deadline = AbortSignal.timeout(timeoutMilliseconds)
   const signal = AbortSignal.any([...(init.signal ? [init.signal] : []), ...(accessSignal ? [accessSignal] : []), deadline])
   try {
     signal.throwIfAborted()
@@ -264,10 +287,12 @@ async function cloudRequest<T>(path: string, init: CloudRequestInit, read: (resp
     // Body streams may reject with AbortError even when the deadline's reason is TimeoutError.
     const reason: unknown = signal.aborted ? signal.reason : caught
     if (reason instanceof Error && reason.name === 'TimeoutError') {
-      throw new CloudTimeoutError(!['GET', 'HEAD', 'OPTIONS'].includes((init.method ?? 'GET').toUpperCase()))
+      throw new CloudTimeoutError(!['GET', 'HEAD', 'OPTIONS'].includes((init.method ?? 'GET').toUpperCase()), timeoutMilliseconds)
     }
     if (accessSignal?.aborted) throw accessSignal.reason
     if (init.signal?.aborted && signal.reason === init.signal.reason) throw init.signal.reason
+    // fetch and body reads reject with TypeError when the connection drops.
+    if (caught instanceof TypeError && !signal.aborted) networkFailures.add(caught)
     reportCloudAccessFailure(path, caught)
     throw caught
   }
@@ -275,6 +300,80 @@ async function cloudRequest<T>(path: string, init: CloudRequestInit, read: (resp
 
 export function cloudJsonRequest<T>(path: string, init: CloudRequestInit = {}): Promise<T> {
   return cloudRequest(path, init, unwrap<T>)
+}
+
+export interface CloudPatientWait {
+  /** Deadline for each attempt. */
+  attemptTimeoutMilliseconds: number
+  /** Total time spent waiting for a definite answer, across every attempt and pause. */
+  totalWaitMilliseconds: number
+  /** Shown when the total wait runs out without a definite answer. */
+  pendingMessage?: string
+}
+
+/** Test seam for the pauses between automatic re-sends. Production uses real time. */
+export const cloudRetryClock = {
+  now: (): number => Date.now(),
+  sleep: (milliseconds: number, signal?: AbortSignal): Promise<void> => new Promise((resolve, reject) => {
+    if (signal?.aborted) { reject(signal.reason); return }
+    const abort = () => { clearTimeout(timer); reject(signal?.reason) }
+    const timer = setTimeout(() => { signal?.removeEventListener('abort', abort); resolve() }, milliseconds)
+    signal?.addEventListener('abort', abort, { once: true })
+  }),
+}
+
+const RETRY_DELAYS_MILLISECONDS = [1_000, 2_000, 4_000, 8_000]
+const STEADY_RETRY_DELAY_MILLISECONDS = 15_000
+const MAX_RETRY_AFTER_MILLISECONDS = 30_000
+
+/**
+ * Failures that say nothing definite about the request: Score didn't answer in time, the connection
+ * dropped, the platform answered instead of Score, or Score said to come back shortly.
+ */
+export function isCloudRetryableFailure(error: unknown): boolean {
+  if (error instanceof CloudTimeoutError || isCloudNetworkFailure(error)) return true
+  if (!(error instanceof CloudApiError) || error instanceof CloudAuthError || error instanceof CloudAccessChangedError) return false
+  return error.transient || (error.retryAfterSeconds !== undefined && [409, 429, 503].includes(error.status))
+}
+
+function retryDelay(attempt: number, error: unknown): number {
+  if (error instanceof CloudApiError && error.retryAfterSeconds !== undefined) {
+    return Math.min(Math.max(error.retryAfterSeconds * 1000, 1_000), MAX_RETRY_AFTER_MILLISECONDS)
+  }
+  return RETRY_DELAYS_MILLISECONDS[attempt - 1] ?? STEADY_RETRY_DELAY_MILLISECONDS
+}
+
+/**
+ * Sends an idempotent request and keeps waiting for a definite answer. When an attempt fails without
+ * one, the identical bytes and Idempotency-Key are sent again, so the server either returns what it
+ * already accepted or accepts the request once. Definite answers, caller cancellation, and access
+ * changes are never retried.
+ */
+export async function cloudIdempotentJsonRequest<T>(path: string, init: CloudRequestInit, wait: CloudPatientWait): Promise<T> {
+  const headers = new Headers(init.headers)
+  if (!headers.get('Idempotency-Key')) throw new Error('Automatic re-sending requires an Idempotency-Key.')
+  if (init.body !== undefined && init.body !== null && typeof init.body !== 'string') throw new Error('Automatic re-sending requires a replayable text body.')
+  // Each try looks up access again, so the access in force at the start is kept to stop any later try after a change.
+  const accessSignal = cloudAccessRequestSignal(path, init)
+  const stop = AbortSignal.any([...(init.signal ? [init.signal] : []), ...(accessSignal ? [accessSignal] : [])])
+  const started = cloudRetryClock.now()
+  for (let attempt = 1; ; attempt++) {
+    stop.throwIfAborted()
+    const remaining = Math.floor(wait.totalWaitMilliseconds - (cloudRetryClock.now() - started))
+    try {
+      return await cloudJsonRequest<T>(path, {
+        ...init, headers, timeoutMilliseconds: Math.max(1, Math.min(wait.attemptTimeoutMilliseconds, remaining)),
+      })
+    } catch (error) {
+      if (!isCloudRetryableFailure(error)) throw error
+      const delay = retryDelay(attempt, error)
+      if (cloudRetryClock.now() - started + delay >= wait.totalWaitMilliseconds) {
+        throw new CloudAcknowledgementPendingError(wait.pendingMessage ??
+          'Score hasn’t confirmed this request yet. It may still finish on its own. Trying again is safe: it sends the same request, so nothing is duplicated.')
+      }
+      await cloudRetryClock.sleep(delay, stop)
+    }
+  }
 }
 
 export function cloudJsonResponse<T>(path: string, init: CloudRequestInit = {}): Promise<{ value: T; etag?: string; status: number }> {

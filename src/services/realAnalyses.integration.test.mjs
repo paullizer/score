@@ -18,10 +18,10 @@ const key = '6b997c8d-331e-4149-a7fc-b93259efed42'
 const workspaceId = 'workspace-one'
 const hash = 'a'.repeat(64)
 const originals = new Map()
-let client, ui, dom, root, createRoot, requests, current, projected
+let client, ui, dom, root, createRoot, requests, current, projected, retry
 
-function json(body, status = 200) {
-  return new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json' } })
+function json(body, status = 200, headers = {}) {
+  return new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json', ...headers } })
 }
 function blob(name = 'private/snapshot.json') { return { blobName: name, contentType: 'application/json', bytes: 123, sha256: hash } }
 function resumeSelection(id = 'resume-one', version = 1) { return { resumeId: id, documentId: `document-${id}`, documentVersion: version, documentSha256: hash } }
@@ -144,10 +144,14 @@ before(async () => {
   dom.window.HTMLElement.prototype.scrollIntoView = () => {}
   ;({ createRoot } = await import('react-dom/client'))
   await Promise.all([
-    build({ entryPoints: [join('src', 'services', 'realAnalyses.ts')], outfile: join(output, 'client.mjs'), bundle: true, packages: 'external',
+    build({ stdin: { resolveDir: process.cwd(), contents: `
+      export * from './src/services/realAnalyses';
+      export { cloudRetryClock } from './src/services/cloudWorkspace';
+    ` }, outfile: join(output, 'client.mjs'), bundle: true, packages: 'external',
       format: 'esm', platform: 'node', logLevel: 'silent' }),
     build({ stdin: { resolveDir: process.cwd(), loader: 'tsx', contents: `
       export * from './src/features/analyses/realAnalysisUi';
+      export { cloudRetryClock } from './src/services/cloudWorkspace';
       export { RealAnalysesBridge } from './src/app/RealAnalysesBridge';
       export { RealAnalysesContext, useRealAnalyses } from './src/app/real-analyses-context';
       export { RealResumesContext } from './src/app/real-resumes-context';
@@ -165,7 +169,15 @@ before(async () => {
   ])
   ;[client, ui] = await Promise.all(['client', 'ui'].map((name) => import(pathToFileURL(join(output, `${name}.mjs`)).href)))
 })
-beforeEach(() => { requests = []; current = null; projected = null; dom.window.history.replaceState(null, '', '/') })
+// Pauses between automatic re-sends run on virtual time, so a slow or lost acceptance never waits in real time.
+beforeEach(() => {
+  requests = []; current = null; projected = null; dom.window.history.replaceState(null, '', '/')
+  retry = { now: 0, waits: [] }
+  for (const clock of [client.cloudRetryClock, ui.cloudRetryClock]) {
+    clock.now = () => retry.now
+    clock.sleep = async (milliseconds, signal) => { signal?.throwIfAborted(); retry.waits.push(milliseconds); retry.now += milliseconds }
+  }
+})
 afterEach(async () => { if (root) { await act(async () => root.unmount()); root = null } })
 after(async () => {
   globalThis.fetch = originalFetch
@@ -276,18 +288,47 @@ test('analysis submission recovery retains immutable validated bytes and surface
   assert.throws(() => client.startRealAnalysisSubmission(workspaceId, { ...input, resumes: Array.from({ length: 501 }, (_, index) => resumeSelection(`resume-${index}`)) }, key, projection()), /at most 500/)
   assert.equal(requests.length, 0, 'Hard-invalid inputs cannot obtain a recovery handle or reach HTTP')
   const submission = client.startRealAnalysisSubmission(workspaceId, input, key, projection())
-  await assert.rejects(submission.result, /Response lost/)
+  await assert.rejects(submission.result, /No prior acceptance exists; current policy blocks new processing/)
+  assert.equal(requests.length, 2, 'The lost response is re-sent once, then the definite rejection is shown')
   const originalBody = requests[0].init.body
+  assert.equal(requests[1].init.body, originalBody)
+  assert.equal(requests[1].init.headers.get('Idempotency-Key'), key)
   input.name = 'Changed caller state'
   input.resumes[0].documentVersion = 2
   input.targets[0].rubricVersion = 2
   settings.features.newAnalyses = false
   await assert.rejects(client.createRealAnalysis(workspaceId, input, randomUUID(), projection()), /disabled by application policy/)
-  assert.equal(requests.length, 1, 'A fresh call cannot use the recovery path')
+  assert.equal(requests.length, 2, 'A fresh call cannot use the recovery path')
   await assert.rejects(submission.retry(), /No prior acceptance exists; current policy blocks new processing/)
-  assert.equal(requests.length, 2)
-  assert.equal(requests[1].init.body, originalBody, 'Mutating caller objects cannot change a retained request')
-  assert.equal(requests[1].init.headers.get('Idempotency-Key'), key)
+  assert.equal(requests.length, 3)
+  assert.equal(requests[2].init.body, originalBody, 'Mutating caller objects cannot change a retained request')
+  assert.equal(requests[2].init.headers.get('Idempotency-Key'), key)
+})
+
+test('a slow analysis start waits for each try, then re-sends the same request until it is accepted', async () => {
+  const originalTimeout = AbortSignal.timeout
+  const deadlines = []
+  AbortSignal.timeout = (milliseconds) => { deadlines.push(milliseconds); return new AbortController().signal }
+  try {
+    const answers = [
+      () => { throw new DOMException('The operation was aborted due to timeout', 'TimeoutError') },
+      () => json({ error: { code: 'conflict', message: 'Another workspace change is in progress. Reload and retry.' } }, 409, { 'Retry-After': '2' }),
+      () => json({ run: runSummary('slow-start', 'initializing') }, 202),
+    ]
+    globalThis.fetch = async (url, init) => { requests.push({ url, init }); return answers[requests.length - 1]() }
+    const input = {
+      name: 'Full resume library review',
+      resumes: Array.from({ length: 103 }, (_, index) => resumeSelection(`resume-${index}`)),
+      targets: jobTargets(4).map(item => item.selection),
+    }
+    const created = await client.createRealAnalysis(workspaceId, input, key)
+    assert.equal(created.run.id, 'slow-start')
+    assert.equal(requests.length, 3)
+    assert.ok(requests.every(({ init }) => init.method === 'POST' && init.body === requests[0].init.body &&
+      init.headers.get('Idempotency-Key') === key), 'Every try sends the identical bytes and key')
+    assert.deepEqual(deadlines, [120_000, 120_000, 120_000], 'Each try waits up to two minutes, below the App Service limit')
+    assert.deepEqual(retry.waits, [1_000, 2_000], 'A busy workspace answer sets its own pause')
+  } finally { AbortSignal.timeout = originalTimeout }
 })
 
 test('103 resumes against four jobs are submitted as one complete 412-comparison request', async () => {
@@ -894,10 +935,36 @@ test('builder requires a manual click, keeps exact versions while targets refres
   assert.equal(calls.length, 1)
   assert.equal(calls[0].input.targets[0].version, 2)
   assert.equal(calls[0].input.resumes[0].documentSha256, hash)
-  const retry = [...dom.window.document.querySelectorAll('button')].find((item) => item.textContent === 'Retry unchanged submission')
+  const retry = [...dom.window.document.querySelectorAll('button')].find((item) => item.textContent === 'Try again')
   await act(async () => retry.click())
   assert.equal(calls.length, 2)
   assert.deepEqual(calls[1], calls[0])
+})
+
+test('while a large analysis starts, the builder says what is happening instead of asking for a refresh', async () => {
+  const pending = []
+  const start = (input, requestKey) => new Promise((resolve, reject) => { pending.push({ input, requestKey, resolve, reject }) })
+  const api = { ...baseApi, targets: { state: 'ready', value: jobTargets(4) }, create: start, recoverCreation: start,
+    hasRetainedCreation: (input, requestKey) => pending.some(call => call.requestKey === requestKey && JSON.stringify(call.input) === JSON.stringify(input)) }
+  const sources = Array.from({ length: 103 }, (_, index) => resumeSummary(`resume-${index}`))
+  const location = ui.realAnalysisLink({ resumes: sources.map(ui.realResumeSelection), targets: jobTargets(4).map(item => item.selection) }, workspaceId)
+  await render(builder(api, sources, location))
+  const action = label => [...dom.window.document.querySelectorAll('button')].find((item) => item.textContent === label)
+  const note = () => dom.window.document.querySelector('.analysis-summary [role="status"]')
+  await act(async () => action('Run analysis').click())
+  assert.equal(pending.length, 1)
+  assert.equal(action('Starting analysis…').disabled, true)
+  assert.match(note().textContent, /Setting up 412 comparisons\. Large analyses can take a minute or two, so keep this page open\./)
+  assert.doesNotMatch(dom.window.document.body.textContent, /Refresh its status|request key|acknowledgement/i)
+  await act(async () => { pending[0].reject(new Error('Score still hasn’t confirmed that this analysis started. It may still be starting.')) })
+  assert.equal(note(), null)
+  assert.match(dom.window.document.body.textContent, /Score still hasn’t confirmed that this analysis started/)
+  assert.match(dom.window.document.body.textContent, /Trying again sends the exact same request, so it can’t start a second copy/)
+  assert.ok(action('Change selections'))
+  await act(async () => action('Try again').click())
+  assert.equal(pending.length, 2)
+  assert.deepEqual([pending[1].input, pending[1].requestKey], [pending[0].input, pending[0].requestKey])
+  await act(async () => { pending[1].resolve({ run: { id: 'accepted-large-run' } }) })
 })
 
 test('builder allows exactly 500 comparisons and submits every pair only after a manual click', async () => {
@@ -1449,14 +1516,14 @@ test('a completed run keeps checking its comparisons while a re-score runs, then
 })
 
 test('analysis provider keeps uncertain creation keys across view remounts and never writes sample storage', async () => {
-  let attempts = 0
+  let lost = true
   let accepted = null
   globalThis.fetch = async (url, init) => {
     requests.push({ url, init })
     if (url === '/api/features') return json({ realAnalyses: true })
     if (url.endsWith('/targets')) return json({ targets: [target()] })
     if (init.method === 'GET') return json({ runs: accepted ? [accepted] : [] })
-    if (++attempts === 1) throw new TypeError('Response lost')
+    if (lost) throw new TypeError('Response lost')
     accepted = runSummary('accepted-real', 'queued')
     return json({ run: accepted }, 202)
   }
@@ -1466,16 +1533,20 @@ test('analysis provider keeps uncertain creation keys across view remounts and n
   await settle(() => current?.phase === 'ready')
   const input = { name: 'Saved review', resumes: [resumeSelection()], targets: [target().selection] }
   const firstKey = current.requestKey(input)
-  await act(async () => { await assert.rejects(current.create(input, firstKey), /Response lost/) })
+  await act(async () => { await assert.rejects(current.create(input, firstKey), /hasn’t confirmed that this analysis started/) })
+  const unanswered = requests.filter((item) => item.init.method === 'POST').length
+  assert.ok(unanswered > 1, 'Unanswered tries were re-sent automatically before giving up')
+  assert.ok(retry.waits.reduce((sum, wait) => sum + wait, 0) < 600_000, 'Automatic re-sending stops within the total wait')
+  lost = false
   await render(bridge(workspaceId, 'owner', false))
   await render(bridge())
   assert.equal(current.requestKey(input), firstKey)
   await act(async () => current.create(input, current.requestKey(input)))
   assert.equal(current.summaries[0].run.id, 'accepted-real')
   const posts = requests.filter((item) => item.init.method === 'POST')
-  assert.equal(posts.length, 2)
-  assert.equal(posts[0].init.headers.get('Idempotency-Key'), posts[1].init.headers.get('Idempotency-Key'))
-  assert.equal(posts[0].init.body, posts[1].init.body)
+  assert.equal(posts.length, unanswered + 1)
+  assert.ok(posts.every((post) => post.init.headers.get('Idempotency-Key') === firstKey && post.init.body === posts[0].init.body),
+    'Automatic and explicit tries all send the identical request and key')
   assert.notEqual(current.requestKey(input), firstKey, 'a separately requested new run after acknowledgement gets a fresh key')
   assert.equal(JSON.stringify(legacy), before)
   assert.equal(dom.window.localStorage.length, 0)
@@ -1494,6 +1565,7 @@ for (const change of ['disabled analyses', 'inactive rollout', 'lower comparison
     let unavailable = false
     let accepted = null
     let manifest = null
+    let lost = true
     const input = { name: 'Unchanged captured request', resumes: [resumeSelection(), resumeSelection('resume-two')], targets: [target().selection] }
     globalThis.fetch = async (url, init) => {
       requests.push({ url, init })
@@ -1502,11 +1574,9 @@ for (const change of ['disabled analyses', 'inactive rollout', 'lower comparison
       if (init.method === 'GET') return json({ runs: accepted ? [accepted] : [] })
       assert.equal(init.method, 'POST')
       const request = { body: init.body, key: init.headers.get('Idempotency-Key') }
-      if (!manifest) {
-        manifest = request
-        throw new TypeError('Response lost after saving the immutable manifest, before run creation.')
-      }
-      assert.deepEqual(request, manifest, 'Recovery sends only the exact original request and key')
+      manifest ??= request
+      assert.deepEqual(request, manifest, 'Every try sends only the exact original request and key')
+      if (lost) throw new TypeError('Response lost after saving the immutable manifest, before run creation.')
       accepted = runSummary('recovered-original', 'queued')
       accepted.run.processingSettings = originalPin
       return json({ run: accepted }, 202)
@@ -1515,8 +1585,9 @@ for (const change of ['disabled analyses', 'inactive rollout', 'lower comparison
     await render(tree())
     await settle(() => current?.phase === 'ready' && current.features?.realAnalyses)
     const requestKey = current.requestKey(input)
-    await act(async () => { await assert.rejects(current.create(input, requestKey), /Response lost/) })
+    await act(async () => { await assert.rejects(current.create(input, requestKey), /hasn’t confirmed that this analysis started/) })
     assert.equal(accepted, null, 'The acknowledged-unknown request has no run record to retry yet')
+    const unanswered = requests.filter(request => request.init.method === 'POST').length
 
     if (change === 'disabled analyses') settings.features.newAnalyses = false
     if (change === 'lower comparison limit') settings.analyses.maxComparisons = 1
@@ -1537,14 +1608,15 @@ for (const change of ['disabled analyses', 'inactive rollout', 'lower comparison
     await render(tree('viewer'))
     await act(async () => { await assert.rejects(current.recoverCreation(input, requestKey), /read-only/) })
     await render(tree())
-    assert.equal(requests.filter(request => request.init.method === 'POST').length, 1, 'No fresh operation bypasses changed admission policy')
+    assert.equal(requests.filter(request => request.init.method === 'POST').length, unanswered, 'No fresh operation bypasses changed admission policy')
+    lost = false
     await act(async () => { await current.create(input, requestKey) })
     const posts = requests.filter(request => request.init.method === 'POST')
-    assert.equal(posts.length, 2)
-    assert.equal(posts[1].init.body, posts[0].init.body)
-    assert.equal(posts[1].init.headers.get('Idempotency-Key'), requestKey)
+    assert.equal(posts.length, unanswered + 1)
+    assert.equal(posts[unanswered].init.body, posts[0].init.body)
+    assert.equal(posts[unanswered].init.headers.get('Idempotency-Key'), requestKey)
     assert.equal(accepted.run.processingSettings.revision, 'accepted-policy')
-    assert.deepEqual(JSON.parse(posts[1].init.body), input, 'No client policy or replacement input is sent as authority')
+    assert.deepEqual(JSON.parse(posts[unanswered].init.body), input, 'No client policy or replacement input is sent as authority')
     assert.equal(current.hasRetainedCreation(input, requestKey), false, 'Acknowledgement consumes the retained recovery handle')
   })
 }
@@ -1563,6 +1635,7 @@ for (const change of ['disabled analyses', 'inactive rollout', 'lower comparison
     let role = 'owner'
     let accepted = null
     let manifest = null
+    let lost = true
     const sources = [resumeSummary(), resumeSummary('resume-two')]
     const selected = { resumes: sources.map(ui.realResumeSelection), targets: [target().selection] }
     let resumeApi = { ...baseResumes, summaries: sources }
@@ -1575,11 +1648,9 @@ for (const change of ['disabled analyses', 'inactive rollout', 'lower comparison
         : json({ runs: accepted ? [accepted] : [] })
       assert.equal(init.method, 'POST')
       const request = { body: init.body, key: init.headers.get('Idempotency-Key') }
-      if (!manifest) {
-        manifest = request
-        throw new TypeError('Acknowledgement lost after manifest capture; no run record exists yet.')
-      }
+      manifest ??= request
       assert.deepEqual(request, manifest)
+      if (lost) throw new TypeError('Acknowledgement lost after manifest capture; no run record exists yet.')
       accepted = runSummary('recovered-builder')
       return json({ run: accepted }, 202)
     }
@@ -1597,9 +1668,11 @@ for (const change of ['disabled analyses', 'inactive rollout', 'lower comparison
     await render(tree())
     await settle(() => action('Run analysis')?.disabled === false)
     await act(async () => { action('Run analysis').click() })
-    await settle(() => Boolean(action('Retry unchanged submission')))
+    await settle(() => Boolean(action('Try again')))
     assert.equal(accepted, null)
-    assert.equal(requests.filter(request => request.init.method === 'POST').length, 1)
+    const unanswered = requests.filter(request => request.init.method === 'POST').length
+    assert.ok(unanswered > 1, 'Unanswered tries were re-sent automatically before asking')
+    assert.match(dom.window.document.body.textContent, /Score still hasn’t confirmed that this analysis started/)
     assert.equal(dom.window.document.querySelector('.analysis-summary input').disabled, true, 'Unknown-acceptance name and inputs remain locked')
 
     if (change === 'disabled analyses') settings.features.newAnalyses = false
@@ -1612,31 +1685,32 @@ for (const change of ['disabled analyses', 'inactive rollout', 'lower comparison
       error: change === 'disabled analyses' ? 'Resume storage is not configured.' : 'New input lookup is unavailable.' }
     await render(tree())
     await act(async () => { await current.refresh() })
-    await settle(() => action('Retry unchanged submission')?.disabled === false)
+    await settle(() => action('Try again')?.disabled === false)
     assert.equal(current.phase, 'ready')
-    assert.match(dom.window.document.body.textContent, /server recovers any prior acceptance or applies current policy if this request was never accepted/)
+    assert.match(dom.window.document.body.textContent, /Trying again sends the exact same request, so it can’t start a second copy or switch to newer versions/)
     assert.equal(dom.window.document.querySelector('.comparison-count strong').textContent, '2')
     assert.match(dom.window.document.querySelector('.comparison-count').textContent, /Original submitted count/)
     assert.doesNotMatch(dom.window.document.body.textContent, /2 comparisons exceeds the 1-comparison limit/)
 
     role = 'viewer'
     await render(tree())
-    assert.equal(action('Retry unchanged submission').disabled, true, 'Recovery does not grant workspace write permission')
+    assert.equal(action('Try again').disabled, true, 'Recovery does not grant workspace write permission')
     role = 'owner'
     historyUnavailable = true
     await render(tree())
     await act(async () => { await current.refresh() })
-    assert.equal(action('Retry unchanged submission').disabled, true, 'Recovery requires the authorized historical service')
+    assert.equal(action('Try again').disabled, true, 'Recovery requires the authorized historical service')
     historyUnavailable = false
     await act(async () => { await current.refresh() })
-    await settle(() => action('Retry unchanged submission')?.disabled === false)
-    assert.equal(requests.filter(request => request.init.method === 'POST').length, 1, 'Refresh and policy changes never resubmit automatically')
-    await act(async () => { action('Retry unchanged submission').click() })
+    await settle(() => action('Try again')?.disabled === false)
+    assert.equal(requests.filter(request => request.init.method === 'POST').length, unanswered, 'Refresh and policy changes never resubmit automatically')
+    lost = false
+    await act(async () => { action('Try again').click() })
     await settle(() => dom.window.document.body.textContent.includes('Recovered original submission'))
     const posts = requests.filter(request => request.init.method === 'POST')
-    assert.equal(posts.length, 2)
-    assert.equal(posts[1].init.body, posts[0].init.body)
-    assert.equal(posts[1].init.headers.get('Idempotency-Key'), posts[0].init.headers.get('Idempotency-Key'))
+    assert.equal(posts.length, unanswered + 1)
+    assert.equal(posts[unanswered].init.body, posts[0].init.body)
+    assert.equal(posts[unanswered].init.headers.get('Idempotency-Key'), posts[0].init.headers.get('Idempotency-Key'))
   })
 }
 

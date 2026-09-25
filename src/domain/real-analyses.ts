@@ -48,6 +48,16 @@ export const ANALYSIS_LIMITS = {
   maxOutputCorrections: 2,
 } as const
 
+/**
+ * How long the browser waits for a new analysis to be accepted. Each try stays below App Service's
+ * 230-second request limit; if a try gets no definite answer, the same request is sent again until
+ * the total wait runs out. Re-sending is safe because the server keys the run to its request key.
+ */
+export const ANALYSIS_SUBMISSION_WAIT = {
+  attemptTimeoutMilliseconds: 120_000,
+  totalWaitMilliseconds: 600_000,
+} as const
+
 export interface RealAnalysisResumeSelection {
   resumeId: string
   documentId: string
