@@ -34,7 +34,8 @@ import {
 import { modelProcessingSettings, taskModelOptions } from '../settings'
 import { resolveAcceptedPrompt, type ResolvedPrompt } from '../prompts'
 import { safeModelRetryMetadata } from '../model-retry'
-import type { AcceptedAssessmentQcDiagnostics } from '../../src/domain/analysis-qc-diagnostics'
+import type { AcceptedAssessmentQcDiagnostics, QcDiagnosticsAcceptance } from '../../src/domain/analysis-qc-diagnostics'
+import { analysisSchemaDiagnostics } from './diagnostics'
 
 export {
   AnalysisModelError, ANALYSIS_WEIGHT_TOLERANCE, ANALYSIS_CALCULATION_VERSION,
@@ -480,9 +481,11 @@ function modelOutputControl(
   const maxCorrections = modelProcessingSettings(options.model)?.settings.analyses.maxOutputCorrections ?? ANALYSIS_LIMITS.maxOutputCorrections
   let correctionCount = 0
   const outputEvent = (
-    response: ModelCallResult, stage: AnalysisModelStage, event: 'validation-failed' | 'correction' | 'citations-resolved',
+    response: ModelCallResult, stage: AnalysisModelStage,
+    event: 'validation-failed' | 'correction' | 'citations-resolved' | 'qc-diagnostics',
     details: Pick<AnalysisTelemetryEvent,
-      'code' | 'reason' | 'citationDiagnostics' | 'schemaDiagnostics' | 'reviewIssueCount' | 'reviewIssues' | 'reviewOutcome' | 'citationCount'>,
+      'code' | 'reason' | 'citationDiagnostics' | 'schemaDiagnostics' | 'reviewIssueCount' | 'reviewIssues' | 'reviewOutcome' | 'citationCount' |
+      'qcRecordedCriteria' | 'qcCleanedCriteria' | 'qcOmittedCriteria'>,
   ) => emitAnalysisTelemetry(options.onEvent, {
     event, timestamp: clock.now().toISOString(), stage, modelCallId: response.callId,
     model: response.provenance.model, deployment: response.provenance.deployment,
@@ -556,6 +559,22 @@ function groundingDisagreement(review: RealAnalysisGroundingReview) {
       const code = ANALYSIS_REVIEW_ISSUE_CODES.find(code => code === issue.code)
       return code ? [{ code, criterionId: issue.criterionId, qualificationId: issue.qualificationId }] : []
     }),
+  }
+}
+
+/** Counts plus the model row and field of each unrecordable diagnostic; never diagnostic text. */
+function qcDiagnosticsTelemetry(accepted: QcDiagnosticsAcceptance, criteria: number) {
+  return {
+    qcRecordedCriteria: accepted.criteria.length,
+    qcCleanedCriteria: accepted.cleanedCriteria,
+    qcOmittedCriteria: criteria - accepted.criteria.length,
+    ...(accepted.omitted.length ? {
+      schemaDiagnostics: analysisSchemaDiagnostics(accepted.omitted.map(row => ({
+        code: 'custom',
+        path: row.index === undefined ? ['qcDiagnostics']
+          : ['qcDiagnostics', 'criteria', row.index, ...(row.field === 'qcDiagnostics' ? [] : [row.field])],
+      }))),
+    } : {}),
   }
 }
 
@@ -747,11 +766,12 @@ export async function assessResumeAgainstTarget(
         outputEvent(response, 'assessment', 'citations-resolved', {
           citationCount: [...assessment.criteria, ...assessment.qualifications].reduce((sum, row) => sum + row.citations.length, 0),
         })
+        if (qc) outputEvent(response, 'assessment', 'qc-diagnostics', qcDiagnosticsTelemetry(qc.diagnostics, assessment.criteria.length))
         assessed = {
           assessment, provenance: response.provenance, hash: hashAnalysisAssessment(assessment),
           callId: response.callId, correctionCount: control.correctionCount,
           ...(qc ? { qcDiagnostics: {
-            modelCallId: response.callId, modelAssessmentSha256: hashAnalysisAssessment(assessment), criteria: qc.criteria,
+            modelCallId: response.callId, modelAssessmentSha256: hashAnalysisAssessment(assessment), criteria: qc.diagnostics.criteria,
           } } : {}),
         }
         options.onDiagnostic?.(structuredClone({

@@ -101,41 +101,94 @@ test('missing document evidence can be a confident zero and excluded rows never 
   assert.deepEqual(excluded.alternativeScores, [])
 })
 
-test('pinned diagnostic schema rejects omissions, foreign IDs, invalid confidence, ambiguous alternatives and unscored numbers without extra budget', async () => {
+test('inconsistent pinned diagnostics never block the score or spend a correction; each row is cleaned or left unrecorded', async () => {
   const input = fixture()
-  const changes = [
-    output => { delete output.qcDiagnostics },
-    output => { output.qcDiagnostics.criteria.pop() },
-    output => { output.qcDiagnostics.criteria[0].criterionId = 'foreign' },
-    output => { output.qcDiagnostics.criteria[1].criterionId = output.qcDiagnostics.criteria[0].criterionId },
-    output => { output.qcDiagnostics.criteria[0].confidence = null },
-    output => { output.qcDiagnostics.criteria[0].confidence = 'certain' },
-    output => { output.qcDiagnostics.criteria[0].explanation = 'x'.repeat(1201) },
-    output => { output.qcDiagnostics.criteria[0].alternativeScores = [6] },
-    output => { output.qcDiagnostics.criteria[0].alternativeScores = [3, 3] },
-    output => { output.qcDiagnostics.criteria[0].alternativeScores = [4] },
-    output => { output.qcDiagnostics.criteria[0].alternativeScores = [3] },
-    output => { output.qcDiagnostics.criteria[0].ambiguity = [{ category: 'personal-ability', explanation: 'Not a permitted category.' }] },
+  const rubric = input.rubric.criteria.map(row => row.id)
+  const ambiguity = category => [{ category, explanation: 'The described scope is near the boundary between these saved anchors.' }]
+  const cases = [
+    { change: output => { delete output.qcDiagnostics }, recorded: [], cleaned: 0, paths: [['qcDiagnostics']] },
+    { change: output => { output.qcDiagnostics.criteria.pop() }, recorded: rubric.slice(0, 2), cleaned: 0, paths: [] },
+    { change: output => { output.qcDiagnostics.criteria[0].criterionId = 'foreign' }, recorded: rubric.slice(1), cleaned: 0,
+      paths: [['qcDiagnostics', 'criteria', 0, 'criterionId']] },
+    { change: output => { output.qcDiagnostics.criteria[1].criterionId = output.qcDiagnostics.criteria[0].criterionId },
+      recorded: rubric.slice(2), cleaned: 0,
+      paths: [['qcDiagnostics', 'criteria', 0, 'criterionId'], ['qcDiagnostics', 'criteria', 1, 'criterionId']] },
+    { change: output => { output.qcDiagnostics.criteria[0].confidence = null }, recorded: rubric.slice(1), cleaned: 0,
+      paths: [['qcDiagnostics', 'criteria', 0, 'confidence']] },
+    { change: output => { output.qcDiagnostics.criteria[0].confidence = 'certain' }, recorded: rubric.slice(1), cleaned: 0,
+      paths: [['qcDiagnostics', 'criteria', 0, 'confidence']] },
+    { change: output => { output.qcDiagnostics.criteria[0].explanation = 'x'.repeat(1201) }, recorded: rubric.slice(1), cleaned: 0,
+      paths: [['qcDiagnostics', 'criteria', 0, 'explanation']] },
+    { change: output => { output.qcDiagnostics.criteria[0].explanation = 'The candidate lacks the calibration skills this role requires.' },
+      recorded: rubric.slice(1), cleaned: 0, paths: [['qcDiagnostics', 'criteria', 0, 'explanation']] },
+    { change: output => { output.qcDiagnostics.criteria[0].alternativeScores = [6] }, recorded: rubric.slice(1), cleaned: 0,
+      paths: [['qcDiagnostics', 'criteria', 0, 'alternativeScores']] },
+    { change: output => { output.qcDiagnostics.criteria[0].alternativeScores = [3] }, recorded: rubric.slice(1), cleaned: 0,
+      paths: [['qcDiagnostics', 'criteria', 0, 'alternativeScores']] },
+    { change: output => { output.qcDiagnostics.criteria[0].alternativeScores = [3, 3] }, recorded: rubric.slice(1), cleaned: 0,
+      paths: [['qcDiagnostics', 'criteria', 0, 'alternativeScores']] },
+    { change: output => { output.qcDiagnostics.criteria[0].ambiguity = [{ category: 'personal-ability', explanation: 'Not a permitted category.' }] },
+      recorded: rubric.slice(1), cleaned: 0, paths: [['qcDiagnostics', 'criteria', 0, 'ambiguity']] },
+    { change: output => { output.qcDiagnostics.criteria[0].alternativeScores = [4] }, recorded: rubric, cleaned: 1, paths: [],
+      diagnostic: { alternativeScores: [], ambiguity: [] } },
+    { change: output => Object.assign(output.qcDiagnostics.criteria[0], { alternativeScores: [3, 4, 3], ambiguity: ambiguity('rubric-anchors') }),
+      recorded: rubric, cleaned: 1, paths: [], diagnostic: { alternativeScores: [3], ambiguity: ambiguity('rubric-anchors') } },
+    { change: output => Object.assign(output.qcDiagnostics.criteria[0], { alternativeScores: [3], ambiguity: [
+      { category: 'evidence-scope', explanation: 'The cited work does not state its full scope.' },
+      { category: 'evidence-scope', explanation: 'Its outcomes are not quantified.' },
+    ] }), recorded: rubric, cleaned: 1, paths: [], diagnostic: { alternativeScores: [3], ambiguity: [
+      { category: 'evidence-scope', explanation: 'The cited work does not state its full scope. Its outcomes are not quantified.' },
+    ] } },
+    { change: output => { output.qcDiagnostics.criteria[0].ambiguity = [
+      { category: 'evidence-scope', explanation: 'x'.repeat(500) }, { category: 'evidence-scope', explanation: 'y'.repeat(500) },
+    ] }, recorded: rubric.slice(1), cleaned: 0, paths: [['qcDiagnostics', 'criteria', 0, 'category']] },
   ]
-  for (const change of changes) {
-    const output = qcOutput(selectedAssessment(input))
+  for (const { change, recorded, cleaned, paths, diagnostic } of cases) {
+    const output = qcOutput(selectedAssessment(input)), events = []
     change(output)
-    const mock = pinQcModel(mockModel([output]), settings => { settings.analyses.maxOutputCorrections = 0 })
-    await assert.rejects(assessResumeAgainstTarget(input, mock.options), error => error.code === 'invalid-model-output')
-    assert.equal(mock.calls.length, 1)
+    const mock = pinQcModel(mockModel([output, supportedReview()]), settings => { settings.analyses.maxOutputCorrections = 0 })
+    const assessed = await assessResumeAgainstTarget(input, { ...mock.options, onEvent: event => events.push(event) })
+    assert.equal(mock.calls.length, 2)
+    assert.equal(assessed.correctionCount, 0)
+    assert.deepEqual(assessed.summary.overall, { status: 'available', score: 56 })
+    assert.deepEqual(assessed.qcDiagnostics.criteria.map(row => row.criterionId), recorded)
+    assert.equal(assessed.qcDiagnostics.modelCallId, assessed.assessmentProvenance.modelCallId)
+    if (diagnostic) assert.deepEqual({
+      alternativeScores: assessed.qcDiagnostics.criteria[0].alternativeScores, ambiguity: assessed.qcDiagnostics.criteria[0].ambiguity,
+    }, diagnostic)
+    const qc = events.filter(event => event.event === 'qc-diagnostics')
+    assert.equal(qc.length, 1)
+    assert.equal(qc[0].modelCallId, assessed.assessmentProvenance.modelCallId)
+    assert.deepEqual([qc[0].qcRecordedCriteria, qc[0].qcCleanedCriteria, qc[0].qcOmittedCriteria],
+      [recorded.length, cleaned, rubric.length - recorded.length])
+    assert.deepEqual(qc[0].schemaDiagnostics?.findings.map(row => row.path) ?? [], paths)
+    assert.ok(qc[0].schemaDiagnostics?.findings.every(row => row.code === 'custom') ?? true)
+    assert.doesNotMatch(JSON.stringify(qc[0]), /boundary|scope|lacks|x{20}/)
+    assert.equal(events.some(event => event.event === 'validation-failed' || event.event === 'correction'), false)
   }
   const grade = gradeFixture(), excluded = qcOutput(selectedAssessment(grade))
-  excluded.qcDiagnostics.criteria.find(row => row.confidence === null).confidence = 'high'
-  const mock = pinQcModel(mockModel([excluded]), settings => { settings.analyses.maxOutputCorrections = 0 })
-  await assert.rejects(assessResumeAgainstTarget(grade, mock.options), error => error.code === 'invalid-model-output')
+  Object.assign(excluded.qcDiagnostics.criteria.find(row => row.confidence === null), { confidence: 'high', alternativeScores: [1] })
+  const mock = pinQcModel(mockModel([excluded, supportedReview()]), settings => { settings.analyses.maxOutputCorrections = 0 })
+  const graded = await assessResumeAgainstTarget(grade, mock.options)
+  const unscored = graded.qcDiagnostics.criteria.find(row => row.assessedEvidenceStatus === 'not-applicable')
+  assert.equal(graded.qcDiagnostics.criteria.length, grade.rubric.criteria.length)
+  assert.equal(unscored.confidence, null)
+  assert.deepEqual(unscored.alternativeScores, [])
+  assert.equal(mock.calls.length, 2)
 })
 
-test('diagnostic failures consume the existing shared repair budget, and legacy output contracts remain unchanged', async () => {
+test('pinned assessment validation failures still use the shared repair budget, and legacy output contracts remain unchanged', async () => {
   const input = fixture(), valid = qcOutput(selectedAssessment(input)), invalid = structuredClone(valid)
-  delete invalid.qcDiagnostics
-  const mock = pinQcModel(mockModel([invalid, valid, selectedUnsupportedReview(input)]), settings => { settings.analyses.maxOutputCorrections = 1 })
-  await assert.rejects(assessResumeAgainstTarget(input, mock.options), error => error.code === 'grounding-failed')
+  invalid.criteria[0].score = null
+  const mock = pinQcModel(mockModel([invalid, valid, supportedReview()]), settings => { settings.analyses.maxOutputCorrections = 1 })
+  const assessed = await assessResumeAgainstTarget(input, mock.options)
   assert.equal(mock.calls.length, 3)
+  assert.equal(assessed.correctionCount, 1)
+  assert.equal(assessed.qcDiagnostics.criteria.length, input.rubric.criteria.length)
+  assert.equal(assessed.qcDiagnostics.modelCallId, assessed.assessmentProvenance.modelCallId)
+  const correction = JSON.parse(mock.calls[1].request.messages[1].content).correction
+  assert.equal(correction.validation.code, 'invalid-model-output')
+  assert.doesNotMatch(correction.validation.message, /confidence|alternative/i)
   const legacy = mockModel([selectedAssessment(input), supportedReview()])
   const result = await assessResumeAgainstTarget(input, legacy.options)
   assert.equal(result.qcDiagnostics, undefined)
