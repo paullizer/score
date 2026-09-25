@@ -488,12 +488,12 @@ test('real setup freezes the resolved default, exact input objects and key acros
   await click(button('Run analysis'))
   assert.equal(calls.filter(([kind]) => kind === 'create').length, 1)
   assert.equal(input.disabled, true)
-  assert.match(document.body.textContent, /same request key on retry/)
+  assert.match(document.body.textContent, /Trying again uses the name “Cloud program analyst - 1 resume”/)
   target.displayName = 'A later live label'
   target.selection.documentVersion = 2
   await render(ui.RealAnalysisSetup, { workspace, analyses: { ...api }, resumes, url })
   assert.equal(input.placeholder, 'Cloud program analyst - 1 resume')
-  await click(button('Retry unchanged submission'))
+  await click(button('Try again'))
   const requests = calls.filter(([kind]) => kind === 'create')
   assert.deepEqual(requests[1], requests[0])
   assert.equal(requests[0][1].targets[0].documentVersion, 1)

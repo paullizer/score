@@ -1,7 +1,9 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import { RestError } from '@azure/storage-blob'
-import { createDirectoryStoreFromContainer, createStateStoreFromContainer, membershipIdFor, StoreConflictError } from '../dist-server/app.mjs'
+import {
+  createDirectoryStoreFromContainer, createStateStoreFromContainer, membershipIdFor, StoreConflictError, WorkspaceMutationBusyError,
+} from '../dist-server/app.mjs'
 
 test('workspace state deletion is exact-ETag scoped and never a wildcard purge', async () => {
   const calls = []
@@ -49,6 +51,38 @@ test('state mutation leases survive state deletion and renew with finite Azure d
   await lease.release()
   assert.deepEqual(calls, ['workspace-one/mutation.lock', ['acquire', 60], 'renew', 'release'])
   await assert.rejects(store.acquireMutationLease('../outside'), /Invalid workspace/)
+})
+
+test('a lease held by another request is a busy workspace that callers may retry shortly', async () => {
+  let acquired = false
+  const store = createStateStoreFromContainer({
+    getBlockBlobClient() {
+      return {
+        async upload() { throw new RestError('Already present', { statusCode: 412 }) },
+        getBlobLeaseClient() {
+          return {
+            async acquireLease() {
+              if (acquired) throw new RestError('There is already a lease present.', { statusCode: 409 })
+              acquired = true
+            },
+            async renewLease() {},
+            async releaseLease() { acquired = false },
+          }
+        },
+      }
+    },
+    async getProperties() {},
+  })
+  const held = await store.acquireMutationLease('workspace-one')
+  await assert.rejects(store.acquireMutationLease('workspace-one'), error => {
+    assert.ok(error instanceof WorkspaceMutationBusyError)
+    assert.ok(error instanceof StoreConflictError, 'Existing conflict handling still applies')
+    assert.equal(error.name, 'StoreConflictError')
+    assert.equal(error.message, 'Another workspace change is in progress. Reload and retry.')
+    return true
+  })
+  await held.release()
+  await (await store.acquireMutationLease('workspace-one')).release()
 })
 
 test('unavailable leases and authorization errors fail closed rather than pretending serialization', async () => {

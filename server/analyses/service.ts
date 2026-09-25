@@ -16,18 +16,21 @@ import {
   assertNewWork, currentProcessingSettings, newWorkProcessingSettings, type ProcessingSettingsProvider,
 } from '../jobs/policy'
 import { traceOperation } from '../telemetry-operations'
-import type { AnalysisTransaction, RealAnalysesDeps } from './store'
+import type { AnalysisBlob, AnalysisTransaction, RealAnalysesDeps } from './store'
 import {
-  analysisBytesHash, analysisCancellationNeedsRetry, analysisDeterministicId, analysisHash, analysisInputFingerprint,
+  analysisCancellationNeedsRetry, analysisDeterministicId, analysisHash, analysisInputFingerprint,
   assertAnalysis, createAnalysisInputSchema, isAnalysisId, MAX_ANALYSIS_TRANSACTION_BYTES,
   parseAnalysisEntity, parseAnalysisInitializationManifest, retryAnalysisInputSchema,
   reportComparisonIdsSchema,
 } from './validation'
 import {
-  analysisBlobReference, assertComparisonManifestBinding, parseAnalysisJson, putAnalysisJson, readAnalysisBlob,
-  readAnalysisManifest, readAnalysisResult, readAnalysisSnapshots,
+  analysisBlobReference, analysisSnapshotWrite, assertComparisonManifestBinding, parseAnalysisJson, readAnalysisBlob,
+  readAnalysisManifest, readAnalysisResult, readAnalysisSnapshots, savedAnalysisJson,
 } from './snapshots'
-import { RealAnalysisTargets, resolveAnalysisResume, copyAnalysisTargetEvidence, type AnalysisSourceDeps } from './targets'
+import {
+  RealAnalysisTargets, analysisTargetEvidence, freezeAnalysisTargetSnapshot, resolveAnalysisResume, type AnalysisSourceDeps,
+} from './targets'
+import { ANALYSIS_SOURCE_CONCURRENCY, analysisTargetChunks, chunked, mapWithConcurrency } from './concurrency'
 import { analysisPageCursor, analysisPageToken, validateAnalysisPage } from './paging'
 import { readAnalysisReportComparisons } from './reports'
 import type { AnalysisReportCaptures } from './reports'
@@ -51,11 +54,22 @@ import {
   loadAnalysisRun, retryAnalysisComparisonRecord,
 } from './lifecycle'
 import {
-  analysisIsRemoved, assertAnalysisRunWritable, assertAnalysisWorkspaceActive, fencedAnalysisBlobs,
+  ANALYSIS_BLOB_BATCH_LIMIT, analysisIsRemoved, assertAnalysisRunWritable, assertAnalysisWorkspaceActive, fencedAnalysisBlobs,
+  putFencedAnalysisBlobs,
 } from './guards'
+import type { ImmutableJsonBlobReference } from '../../src/domain/real-resumes'
 
 export type { RealAnalysesDeps } from './store'
 export { advanceAnalysisRun, applyAnalysisComparisonTransition } from './lifecycle'
+
+/** Saves a chunk of frozen snapshots under one fenced writer batch, in order. */
+async function saveAnalysisSnapshots(
+  deps: RealAnalysesDeps, workspaceId: string, runId: string, snapshots: readonly { snapshotId: string }[],
+): Promise<ImmutableJsonBlobReference[]> {
+  const writes = snapshots.map(snapshot => analysisSnapshotWrite(workspaceId, runId, snapshot))
+  const saved = await putFencedAnalysisBlobs(deps, workspaceId, runId, writes)
+  return writes.map((write, index) => savedAnalysisJson(write, saved[index]))
+}
 
 function input<T>(schema: z.ZodType<T>, value: unknown): T {
   const parsed = schema.safeParse(value)
@@ -123,10 +137,13 @@ export class RealAnalysisService {
   private async validateSelections(workspaceId: string, request: CreateRealAnalysisInput, runId: string): Promise<void> {
     assertWorkspaceMutationLease(workspaceId)
     const timestamp = this.now()
-    for (const [index, selection] of request.resumes.entries()) {
+    // Results are discarded as each check finishes, so only in-flight sources are held in memory.
+    await mapWithConcurrency(request.resumes, ANALYSIS_SOURCE_CONCURRENCY, async (selection, index) => {
       await resolveAnalysisResume(this.sources.resumes, workspaceId, selection, analysisDeterministicId('snapshot', runId, `resume:${index}`), timestamp)
+    })
+    for (const selections of analysisTargetChunks(request.targets)) {
+      await mapWithConcurrency(selections, ANALYSIS_SOURCE_CONCURRENCY, async selection => { await this.targets.resolve(workspaceId, selection) })
     }
-    for (const selection of request.targets) await this.targets.resolve(workspaceId, selection)
     assertWorkspaceMutationLease(workspaceId)
   }
   private async comparison(workspaceId: string, runId: string, comparisonId: string, signal?: AbortSignal) {
@@ -181,26 +198,37 @@ export class RealAnalysisService {
       const createdAt = this.now()
       const resumes: AnalysisResumeSnapshotReference[] = []
       const targets: AnalysisTargetSnapshotReference[] = []
-      for (const [index, selection] of request.resumes.entries()) {
-        const snapshotId = analysisDeterministicId('snapshot', runId, `resume:${index}`)
-        const snapshot = await resolveAnalysisResume(this.sources.resumes, workspaceId, selection, snapshotId, createdAt)
-        const hash = analysisBytesHash(Buffer.from(JSON.stringify(snapshot)))
-        const reference = await putAnalysisJson(blobs, `${workspaceId}/${runId}/snapshots/${snapshotId}/${hash}.json`, snapshot)
-        resumes.push({
-          snapshotId, blob: reference, summary: {
-            workspaceId, dataKind: 'real', selection, name: snapshot.resume.name, role: snapshot.resume.role,
+      // Sources freeze in bounded chunks: a chunk resolves in parallel, then its copies share one fenced writer batch.
+      for (const [chunk, selections] of chunked(request.resumes, ANALYSIS_SOURCE_CONCURRENCY).entries()) {
+        const offset = chunk * ANALYSIS_SOURCE_CONCURRENCY
+        const snapshots = await mapWithConcurrency(selections, ANALYSIS_SOURCE_CONCURRENCY, (selection, index) => resolveAnalysisResume(
+          this.sources.resumes, workspaceId, selection, analysisDeterministicId('snapshot', runId, `resume:${offset + index}`), createdAt,
+        ))
+        const references = await saveAnalysisSnapshots(this.deps, workspaceId, runId, snapshots)
+        snapshots.forEach((snapshot, index) => resumes.push({
+          snapshotId: snapshot.snapshotId, blob: references[index], summary: {
+            workspaceId, dataKind: 'real', selection: selections[index], name: snapshot.resume.name, role: snapshot.resume.role,
             ...(snapshot.displayName !== undefined ? { displayName: snapshot.displayName } : {}),
             sourceLabel: snapshot.resume.sourceLabel, capturedAt: snapshot.capture.capturedAt,
           },
-        })
+        }))
       }
-      for (const [index, selection] of request.targets.entries()) {
-        const snapshotId = analysisDeterministicId('snapshot', runId, `target:${index}`)
-        const resolved = await this.targets.resolve(workspaceId, selection)
-        const snapshot = await copyAnalysisTargetEvidence(blobs, workspaceId, runId, resolved, snapshotId, createdAt)
-        const hash = analysisBytesHash(Buffer.from(JSON.stringify(snapshot)))
-        const reference = await putAnalysisJson(blobs, `${workspaceId}/${runId}/snapshots/${snapshotId}/${hash}.json`, snapshot)
-        targets.push({ snapshotId, blob: reference, summary: snapshot.summary })
+      let offset = 0
+      for (const selections of analysisTargetChunks(request.targets)) {
+        const resolved = await mapWithConcurrency(selections, ANALYSIS_SOURCE_CONCURRENCY, selection => this.targets.resolve(workspaceId, selection))
+        // Versions of one job, or grades of one ladder, can share content-addressed evidence; each copy is written once.
+        const evidence = new Map(resolved.flatMap(target => analysisTargetEvidence(workspaceId, runId, target)).map(copy => [copy.name, copy]))
+        const saved = new Map<string, AnalysisBlob>()
+        for (const batch of chunked([...evidence.values()], ANALYSIS_BLOB_BATCH_LIMIT)) {
+          const results = await putFencedAnalysisBlobs(this.deps, workspaceId, runId, batch)
+          batch.forEach((copy, index) => saved.set(copy.name, results[index].blob))
+        }
+        const snapshots = resolved.map((target, index) => freezeAnalysisTargetSnapshot(
+          workspaceId, runId, target, analysisDeterministicId('snapshot', runId, `target:${offset + index}`), createdAt, saved,
+        ))
+        const references = await saveAnalysisSnapshots(this.deps, workspaceId, runId, snapshots)
+        snapshots.forEach((snapshot, index) => targets.push({ snapshotId: snapshot.snapshotId, blob: references[index], summary: snapshot.summary }))
+        offset += selections.length
       }
       const manifest = parseAnalysisInitializationManifest({
         schemaVersion: 1, dataKind: 'real', workspaceId, runId, createdAt, createdBy: actor,

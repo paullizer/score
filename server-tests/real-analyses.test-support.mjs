@@ -19,7 +19,7 @@ await build({
     contents: [
       'service', 'routes', 'validation', 'snapshots', 'diagnostics', 'paging', 'lifecycle', 'library-lifecycle', 'guards', 'azure-store',
       'narratives', 'narrative-records', 'narrative-artifacts', 'narrative-scheduling', 'summary-history', 'summary-actions', 'reports',
-      'corrections', 'current-results', 'correction-actions', 'correction-validation',
+      'corrections', 'current-results', 'correction-actions', 'correction-validation', 'concurrency',
     ].map(name => `export * from './server/analyses/${name}.ts';`).join('\n') +
       "\nexport * from './server/errors.ts'; export * from './server/store.ts';" +
       "\nexport * from './server/ids.ts'; export * from './server/middleware.ts';" +

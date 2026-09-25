@@ -19,7 +19,7 @@ import {
 import { validateRealJobRecord, validateRealRubric, validateRealSourceDocument } from '../jobs/validation'
 import { parseResumeEntity, parseRealResumeProfile, parseResumeCaptureManifest } from '../resumes/validation'
 import { conflict, invalidRequest, notFound, unavailable } from '../errors'
-import type { AnalysisBlob, AnalysisBlobStore } from './store'
+import type { AnalysisBlob } from './store'
 import {
   analysisBytesHash, analysisHash, analysisTargetSummaryId, assertAnalysis, parseFrozenResumeSnapshot,
   parseFrozenTargetSnapshot, analysisRequirementEvidence, parseAnalysisTargetSummary, MAX_ANALYSIS_JSON_BYTES, MAX_ANALYSIS_ORIGINAL_BYTES,
@@ -27,6 +27,7 @@ import {
 import { analysisPageCursor, analysisPageToken, validateAnalysisPage } from './paging'
 import { parseAnalysisJson } from './snapshots'
 import { analysisIsLocked } from './guards'
+import { ANALYSIS_GRADE_CONCURRENCY, ANALYSIS_SOURCE_CONCURRENCY, mapWithConcurrency } from './concurrency'
 import { assertWorkspaceMutationLease } from '../lifecycle/lease'
 
 export interface AnalysisSourceDeps {
@@ -173,16 +174,18 @@ export class RealAnalysisTargets {
     }
     const seedBlob = checkedBlob(await this.deps.grades.blobs.read(sourceSet.seedBlobName), 'application/json')
     const seed = parseGradeSeedSnapshot(parseAnalysisJson(seedBlob)) as FrozenGradeTargetSnapshot['seed']
-    const references: ResolvedGrade['references'] = []
     for (const source of sourceSet.sources) {
       if (!blobInGrade(source.documentBlobName, workspaceId, head.ladderId)) throw unavailable('Approved reference capture ownership is invalid.')
-      const blob = checkedBlob(await this.deps.grades.blobs.read(source.documentBlobName), 'application/json')
+    }
+    const grades = this.deps.grades
+    const references: ResolvedGrade['references'] = await mapWithConcurrency(sourceSet.sources, ANALYSIS_SOURCE_CONCURRENCY, async source => {
+      const blob = checkedBlob(await grades.blobs.read(source.documentBlobName), 'application/json')
       const document = parseAnalysisJson(blob) as ReferenceDocument
       if (validateReferenceDocument(document).length || document.id !== source.documentId || document.version !== source.documentVersion) {
         throw unavailable('An approved reference document is missing or invalid.')
       }
-      references.push({ source, document, blob })
-    }
+      return { source, document, blob }
+    })
     const seedReference = references.find(item => item.source.origin === 'seed-job')
     if (!seedReference || seedReference.document.id !== seed.document.id ||
       analysisHash(seedReference.document.paragraphs) !== analysisHash(seed.document.paragraphs) ||
@@ -236,13 +239,18 @@ export class RealAnalysisTargets {
       const seen = new Set<string>()
       do {
         const page = await this.deps.jobs.store.list(workspaceId, token)
-        for (const value of page.jobs) {
+        const first = count
+        count += page.jobs.length
+        // Records on a page resolve in parallel; the lowest failing record still wins, as in a sequential scan.
+        const found = await mapWithConcurrency(page.jobs, ANALYSIS_SOURCE_CONCURRENCY, async (value, index) => {
           const job = validateJob(value.record, workspaceId)
-          if (++count > 10_000) throw unavailable('The target library exceeds the safe discovery budget.')
-          if (job.job.status === 'ready' && !analysisIsLocked(job.lifecycle) &&
-            !analysisIsLocked(job.rubricLifecycle) && !job.job.rubricDeletedAt) {
-            summaries.push(...(await this.jobTarget(workspaceId, job)).map(item => item.summary))
-          }
+          if (first + index + 1 > 10_000) throw unavailable('The target library exceeds the safe discovery budget.')
+          if (job.job.status !== 'ready' || analysisIsLocked(job.lifecycle) ||
+            analysisIsLocked(job.rubricLifecycle) || job.job.rubricDeletedAt) return []
+          return (await this.jobTarget(workspaceId, job)).map(item => item.summary)
+        })
+        for (const items of found) {
+          summaries.push(...items)
           if (summaries.length > 10_000) throw unavailable('The saved target version library exceeds the safe discovery budget.')
         }
         token = page.continuationToken
@@ -255,14 +263,16 @@ export class RealAnalysisTargets {
       const seen = new Set<string>()
       do {
         const page = await this.deps.grades.store.list(workspaceId, { recordType: 'grade-head', limit: 100, continuationToken: token })
-        for (const value of page.items) {
+        const first = count
+        count += page.items.length
+        const found = await mapWithConcurrency(page.items, ANALYSIS_GRADE_CONCURRENCY, async (value, index) => {
           const head = parseGradeEntity(value.record)
           if (head.recordType !== 'grade-head' || head.workspaceId !== workspaceId) throw unavailable('Grade target ownership is invalid.')
-          if (++count > 10_000) throw unavailable('The target library exceeds the safe discovery budget.')
-          if (head.approvedVersionId && head.approvalId && await this.gradeEligible(workspaceId, head)) {
-            summaries.push((await this.gradeTarget(workspaceId, head)).summary)
-          }
-        }
+          if (first + index + 1 > 10_000) throw unavailable('The target library exceeds the safe discovery budget.')
+          if (!head.approvedVersionId || !head.approvalId || !await this.gradeEligible(workspaceId, head)) return undefined
+          return (await this.gradeTarget(workspaceId, head)).summary
+        })
+        for (const summary of found) if (summary) summaries.push(summary)
         token = page.continuationToken
         if (token && (seen.has(token) || seen.size >= 10_000)) throw unavailable('Grade target pagination did not advance within the safe budget.')
         if (token) seen.add(token)
@@ -323,32 +333,50 @@ export async function resolveAnalysisResume(
   })
 }
 
-export async function copyAnalysisTargetEvidence(
-  blobs: AnalysisBlobStore, workspaceId: string, runId: string, resolved: ResolvedAnalysisTarget, snapshotId: string, frozenAt: string,
-): Promise<FrozenJobTargetSnapshot | FrozenGradeTargetSnapshot> {
-  const base = { schemaVersion: 1 as const, snapshotId, workspaceId, dataKind: 'real' as const, frozenAt }
+export interface AnalysisEvidenceCopy {
+  name: string
+  bytes: Uint8Array
+  contentType: string
+  sha256: string
+}
+
+/** The content-addressed evidence copies a frozen target references. Identical content always shares one name. */
+export function analysisTargetEvidence(workspaceId: string, runId: string, resolved: ResolvedAnalysisTarget): AnalysisEvidenceCopy[] {
   if (resolved.kind === 'job') {
     const original = resolved.original
     assertAnalysis(isOriginalContentType(original.contentType), 'Unsupported captured job original content type.')
-    const blobName = `${workspaceId}/${runId}/evidence/${original.sha256}.${originalExtension(original.contentType)}`
-    const saved = (await blobs.putImmutable(blobName, original.bytes, original.contentType)).blob
-    checkedBlob(saved, original.contentType, original.sha256, original.bytes.byteLength)
+    return [{
+      name: `${workspaceId}/${runId}/evidence/${original.sha256}.${originalExtension(original.contentType)}`,
+      bytes: original.bytes, contentType: original.contentType, sha256: original.sha256,
+    }]
+  }
+  return resolved.references.map(item => ({
+    name: `${workspaceId}/${runId}/evidence/${item.blob.sha256}.json`,
+    bytes: item.blob.bytes, contentType: 'application/json', sha256: item.blob.sha256,
+  }))
+}
+
+/** Builds the frozen target snapshot after its evidence copies are saved, checking each saved copy against its source bytes. */
+export function freezeAnalysisTargetSnapshot(
+  workspaceId: string, runId: string, resolved: ResolvedAnalysisTarget, snapshotId: string, frozenAt: string,
+  saved: ReadonlyMap<string, AnalysisBlob>,
+): FrozenJobTargetSnapshot | FrozenGradeTargetSnapshot {
+  const base = { schemaVersion: 1 as const, snapshotId, workspaceId, dataKind: 'real' as const, frozenAt }
+  const copies = analysisTargetEvidence(workspaceId, runId, resolved).map(copy => ({
+    copy, blob: checkedBlob(saved.get(copy.name), copy.contentType, copy.sha256, copy.bytes.byteLength),
+  }))
+  if (resolved.kind === 'job') {
+    const [{ copy }] = copies
     return parseFrozenTargetSnapshot({
-      ...resolved, ...base, original: { blobName, contentType: original.contentType, sha256: original.sha256, bytes: original.bytes.byteLength },
+      ...resolved, ...base, original: { blobName: copy.name, contentType: copy.contentType, sha256: copy.sha256, bytes: copy.bytes.byteLength },
     }) as FrozenJobTargetSnapshot
   }
-  const references: FrozenGradeTargetSnapshot['references'] = []
-  for (const item of resolved.references) {
-    const blobName = `${workspaceId}/${runId}/evidence/${item.blob.sha256}.json`
-    const saved = (await blobs.putImmutable(blobName, item.blob.bytes, 'application/json')).blob
-    checkedBlob(saved, 'application/json', item.blob.sha256, item.blob.bytes.byteLength)
-    references.push({
-      source: item.source, document: {
-        blobName, contentType: 'application/json', sha256: saved.sha256, bytes: saved.bytes.byteLength,
-        documentId: item.document.id, documentVersion: item.document.version,
-      },
-    })
-  }
+  const references: FrozenGradeTargetSnapshot['references'] = resolved.references.map((item, index) => ({
+    source: item.source, document: {
+      blobName: copies[index].copy.name, contentType: 'application/json', sha256: copies[index].blob.sha256,
+      bytes: copies[index].blob.bytes.byteLength, documentId: item.document.id, documentVersion: item.document.version,
+    },
+  }))
   assertAnalysis(references.length === resolved.sourceSet.sources.length, 'Not all references were copied.')
   return parseFrozenTargetSnapshot({ ...resolved, ...base, references }) as FrozenGradeTargetSnapshot
 }

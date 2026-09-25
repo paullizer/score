@@ -3,6 +3,7 @@ import type { PublicSettings } from '../domain/admin-settings'
 import { analysisFeaturesWithPolicy, fetchPublicFeatures, requireAdmission } from './publicSettings'
 import {
   ANALYSIS_LIMITS,
+  ANALYSIS_SUBMISSION_WAIT,
   type AnalysisModelProvenance,
   type AnalysisProcessingFeatures,
   type CreateRealAnalysisInput,
@@ -37,7 +38,7 @@ import {
   type AnalysisSummaryHistoryPage, type AnalysisSummarySubject, type PublishSummaryDraftInput, type RestartSummaryInput,
 } from '../domain/analysis-summary-history'
 import type { Citation } from '../domain/types'
-import { cloudJsonRequest, cloudJsonResponse, cloudLifecycleRequest } from './cloudWorkspace'
+import { cloudIdempotentJsonRequest, cloudJsonRequest, cloudJsonResponse, cloudLifecycleRequest } from './cloudWorkspace'
 import type { LifecycleAction, LifecycleImpact, LifecycleOperation } from '../domain/lifecycle'
 import { normalizeDisplayName } from '../domain/displayNames'
 
@@ -609,9 +610,13 @@ export function startRealAnalysisSubmission(workspaceId: string, input: CreateRe
     throw new Error('Select each real resume and target only once. Duplicates were not silently removed.')
   }
   const body = JSON.stringify({ name: input.name, resumes, targets })
+  // Setting up a large run can outlast one try; unanswered tries resend the same bytes and key.
   const send = async () => {
-    const result = await cloudJsonRequest<RealAnalysisMutationResponse>(base(workspaceId), {
+    const result = await cloudIdempotentJsonRequest<RealAnalysisMutationResponse>(base(workspaceId), {
       method: 'POST', headers: { 'Idempotency-Key': key }, body,
+    }, {
+      ...ANALYSIS_SUBMISSION_WAIT,
+      pendingMessage: 'Score still hasn’t confirmed that this analysis started. It may still be starting.',
     })
     return checkedRun(result.run, workspaceId)
   }

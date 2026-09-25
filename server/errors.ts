@@ -43,6 +43,11 @@ export function conflict(message = 'This workspace changed since you last loaded
   return new HttpError(409, 'conflict', message)
 }
 
+/** Another request holds the workspace mutation lease. Nothing changed, so clients may resend the same request shortly. */
+export function workspaceBusy(message: string): HttpError {
+  return new HttpError(409, 'conflict', message, { retryAfterSeconds: 2 })
+}
+
 export function preconditionRequired(message = 'An If-Match header with the current version is required.'): HttpError {
   return new HttpError(428, 'precondition_required', message)
 }

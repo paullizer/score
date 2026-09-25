@@ -9,7 +9,7 @@ import { invalidRequest } from '../errors'
 import { traceOperation } from '../telemetry-operations'
 import { validateGradeApproval, validateReferenceDocument } from '../grades/validation'
 import { preservesProcessingSettings } from '../jobs/policy'
-import type { AnalysisBlob, AnalysisBlobStore } from './store'
+import type { AnalysisBlob, AnalysisBlobStore, AnalysisBlobWrite } from './store'
 import {
   analysisBlobInRun, analysisBytesHash, analysisHash, assertAnalysis, assertAnalysisResultBinding,
   MAX_ANALYSIS_JSON_BYTES, parseAnalysisEntity, parseAnalysisInitializationManifest, parseAnalysisResult,
@@ -75,16 +75,34 @@ export async function readAnalysisBlob(
   return blob
 }
 
+function analysisJsonBytes(value: unknown): Buffer {
+  const bytes = Buffer.from(JSON.stringify(value))
+  assertAnalysis(bytes.byteLength <= MAX_ANALYSIS_JSON_BYTES, 'Snapshot exceeds the blob budget.')
+  return bytes
+}
+
+/** A frozen snapshot's content-addressed write: the name binds the snapshot identity to its exact bytes. */
+export function analysisSnapshotWrite(workspaceId: string, runId: string, snapshot: { snapshotId: string }): AnalysisBlobWrite {
+  const bytes = analysisJsonBytes(snapshot)
+  return {
+    name: `${workspaceId}/${runId}/snapshots/${snapshot.snapshotId}/${analysisBytesHash(bytes)}.json`,
+    bytes, contentType: 'application/json',
+  }
+}
+
+/** Confirms an immutable JSON write saved exactly the requested bytes, even when an earlier identical write won. */
+export function savedAnalysisJson(write: AnalysisBlobWrite, saved: { blob: AnalysisBlob }): ImmutableJsonBlobReference {
+  assertAnalysis(saved.blob.contentType === 'application/json' && saved.blob.sha256 === analysisBytesHash(write.bytes) &&
+    analysisBytesHash(saved.blob.bytes) === saved.blob.sha256 && saved.blob.bytes.byteLength === write.bytes.byteLength,
+  'Immutable snapshot already contains different evidence.')
+  return analysisBlobReference(write.name, saved.blob)
+}
+
 export async function putAnalysisJson(
   blobs: AnalysisBlobStore, name: string, value: unknown,
 ): Promise<ImmutableJsonBlobReference> {
-  const bytes = Buffer.from(JSON.stringify(value))
-  assertAnalysis(bytes.byteLength <= MAX_ANALYSIS_JSON_BYTES, 'Snapshot exceeds the blob budget.')
-  const saved = await blobs.putImmutable(name, bytes, 'application/json')
-  assertAnalysis(saved.blob.contentType === 'application/json' && saved.blob.sha256 === analysisBytesHash(bytes) &&
-    analysisBytesHash(saved.blob.bytes) === saved.blob.sha256 && saved.blob.bytes.byteLength === bytes.byteLength,
-  'Immutable snapshot already contains different evidence.')
-  return analysisBlobReference(name, saved.blob)
+  const write: AnalysisBlobWrite = { name, bytes: analysisJsonBytes(value), contentType: 'application/json' }
+  return savedAnalysisJson(write, await blobs.putImmutable(write.name, write.bytes, write.contentType))
 }
 
 export async function readAnalysisManifest(

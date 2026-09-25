@@ -72,6 +72,13 @@ export interface AnalysisBlob {
   etag: string
 }
 
+/** One immutable blob to save under a run, as used by batched fenced writes. */
+export interface AnalysisBlobWrite {
+  name: string
+  bytes: Uint8Array
+  contentType: string
+}
+
 export interface AnalysisBlobStore {
   read(name: string, signal?: AbortSignal): Promise<AnalysisBlob | undefined>
   // On an existing name, return the winning stored bytes and metadata without overwriting them.

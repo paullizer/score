@@ -94,6 +94,17 @@ export class StoreConflictError extends Error {
 }
 
 /**
+ * The workspace mutation lease is held by another request, which may be the caller's own earlier
+ * attempt. Nothing was changed, so the same request can be sent again shortly. It keeps the
+ * `StoreConflictError` name so existing conflict handling is unchanged.
+ */
+export class WorkspaceMutationBusyError extends StoreConflictError {
+  constructor(message = 'Another workspace change is in progress. Reload and retry.') {
+    super(message)
+  }
+}
+
+/**
  * Low-level Cosmos DB access for the single `workspaces` container (partition key `/workspaceId`).
  * Holds directory metadata and membership only. Feature records live in their own dedicated stores.
  */

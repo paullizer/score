@@ -149,7 +149,12 @@ test('reviewer membership changes serialize with workspace mutations and fence l
   const server = await setup(t)
   let current = await access(server)
   const lease = await server.state.acquireMutationLease(server.workspace.id)
-  try { assert.equal((await add(server, current.etag)).status, 409) } finally { await lease.release() }
+  try {
+    const busy = await add(server, current.etag)
+    assert.equal(busy.status, 409)
+    assert.equal(busy.headers.get('Retry-After'), '2', 'A busy workspace tells the caller when to resend')
+    assert.equal((await busy.json()).error.code, 'conflict')
+  } finally { await lease.release() }
   assert.equal((await add(server, current.etag)).status, 201)
   current = await access(server)
   const before = await server.directory.getMetadata(server.workspace.id)

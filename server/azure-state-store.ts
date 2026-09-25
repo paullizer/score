@@ -3,7 +3,7 @@ import type { BlobLeaseClient, BlockBlobClient } from '@azure/storage-blob'
 import { buffer as streamToBuffer } from 'node:stream/consumers'
 import type { TokenCredential } from '@azure/identity'
 import type { StorageConfig } from './config'
-import { StoreConflictError, type StateStore } from './store'
+import { StoreConflictError, WorkspaceMutationBusyError, type StateStore } from './store'
 import { isValidWorkspaceId } from './ids'
 
 function statusCodeOf(error: unknown): number | undefined {
@@ -77,9 +77,7 @@ export function createStateStoreFromContainer(containerClient: StateBlobContaine
     try {
       await lease.acquireLease(60)
     } catch (error) {
-      if ([409, 412].includes(statusCodeOf(error) ?? 0)) {
-        throw new StoreConflictError('Another workspace change is in progress. Reload and retry.')
-      }
+      if ([409, 412].includes(statusCodeOf(error) ?? 0)) throw new WorkspaceMutationBusyError()
       throw error
     }
     return {
