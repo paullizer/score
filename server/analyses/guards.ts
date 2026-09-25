@@ -10,7 +10,8 @@ import { StoreConflictError } from '../store'
 import { analysisNarrativeCanWork, narrativeGenerationId } from './narrative-records'
 import { analysisCorrectionCanWork, loadAnalysisCorrection, projectAnalysisComparison } from './current-results'
 import type {
-  AnalysisBlobStore, AnalysisLifecycleControl, AnalysisStore, AnalysisTransaction, AnalysisTransactionOptions, RealAnalysesDeps,
+  AnalysisBlob, AnalysisBlobStore, AnalysisBlobWrite, AnalysisLifecycleControl, AnalysisStore, AnalysisTransaction,
+  AnalysisTransactionOptions, RealAnalysesDeps,
 } from './store'
 import {
   analysisBlobInRun, analysisHash, analysisNarrativeBlobName, analysisNarrativeId, analysisSummaryActionBlobName,
@@ -176,11 +177,87 @@ export async function updateAnalysisControl(
   throw new StoreConflictError('The analysis lifecycle changed during its guarded write.')
 }
 
+async function reserveAnalysisWriters(
+  deps: RealAnalysesDeps, workspaceId: string, runId: string, writers: readonly { id: string; name: string }[], expiresAt: string,
+): Promise<void> {
+  await updateAnalysisControl(deps.store, workspaceId, runId, record => ({
+    ...record, writers: {
+      ...Object.fromEntries(Object.entries(record.writers ?? {}).filter(([, writer]) => Date.parse(writer.expiresAt) > Date.now())),
+      ...Object.fromEntries(writers.map(writer => [writer.id, { blobName: writer.name, expiresAt }])),
+    },
+  }), false)
+}
+
+async function releaseAnalysisWriters(deps: RealAnalysesDeps, workspaceId: string, runId: string, ids: ReadonlySet<string>): Promise<void> {
+  await updateAnalysisControl(deps.store, workspaceId, runId, record => {
+    if (!Object.keys(record.writers ?? {}).some(id => ids.has(id))) return record
+    const writers = Object.fromEntries(Object.entries(record.writers ?? {}).filter(([id]) => !ids.has(id)))
+    return { ...record, writers: Object.keys(writers).length ? writers : undefined }
+  })
+}
+
+/** Checks every fenced writer repeats: the workspace and run are still active and this exact reservation is live. */
+async function assertAnalysisWriterActive(
+  deps: RealAnalysesDeps, workspaceId: string, runId: string, writer: { id: string; name: string; expiresAt: string },
+  signal?: AbortSignal, assertWorkActive?: () => Promise<unknown>,
+) {
+  signal?.throwIfAborted()
+  await assertWorkActive?.()
+  assertWorkspaceMutationLease(workspaceId)
+  const [workspace, control, run] = await Promise.all([
+    deps.store.getControl(workspaceId), deps.store.getControl(workspaceId, runId), deps.store.get(workspaceId, runId),
+  ])
+  const reserved = control?.record.writers?.[writer.id]
+  if (Date.parse(writer.expiresAt) <= Date.now() || workspace?.record.state !== 'active' || control?.record.state !== 'active' ||
+    reserved?.blobName !== writer.name || reserved.expiresAt !== writer.expiresAt) denied()
+  if (run?.record.recordType === 'analysis-run') assertAnalysisRunWritable(run.record)
+  return run
+}
+
 /** Finite Blob leases fence the content PUT itself, not just the later Cosmos publication. */
 export function fencedAnalysisBlobs(
   deps: RealAnalysesDeps, workspaceId: string, runId: string, signal?: AbortSignal, assertWorkActive?: () => Promise<unknown>,
 ): AnalysisBlobStore {
   return fencedBlobs(deps, workspaceId, runId, signal, assertWorkActive)
+}
+
+/** At most this many blobs share one writer reservation, well inside the 100-writer control cap. */
+export const ANALYSIS_BLOB_BATCH_LIMIT = 16
+
+/**
+ * Saves a bounded batch of run-owned snapshot or evidence blobs with one writer reservation and one
+ * release, instead of one of each per blob. Every upload still rechecks the workspace and run fences
+ * and its own reservation. A failed or ambiguous upload keeps its reservation until the bounded Blob
+ * request and lease have drained, exactly like a single fenced write. Results keep the input order;
+ * the lowest-index failure is thrown after the successful uploads are released.
+ */
+export async function putFencedAnalysisBlobs(
+  deps: RealAnalysesDeps, workspaceId: string, runId: string, writes: readonly AnalysisBlobWrite[],
+): Promise<{ created: boolean; blob: AnalysisBlob }[]> {
+  assertAnalysis(writes.length <= ANALYSIS_BLOB_BATCH_LIMIT && new Set(writes.map(write => write.name)).size === writes.length,
+    'An analysis Blob batch must be bounded and name each blob once.')
+  for (const write of writes) {
+    const area = write.name.split('/')[2]
+    assertAnalysis(analysisBlobInRun(write.name, workspaceId, runId) && (area === 'snapshots' || area === 'evidence'),
+      'Invalid analysis Blob batch writer scope.')
+  }
+  if (!writes.length) return []
+  const expiresAt = new Date(Date.now() + ANALYSIS_WRITER_MILLISECONDS).toISOString()
+  const writers = writes.map(write => ({ ...write, id: randomUUID(), expiresAt }))
+  await reserveAnalysisWriters(deps, workspaceId, runId, writers, expiresAt)
+  const settled = await Promise.allSettled(writers.map(writer => deps.blobs.putFenced(writer.name, writer.bytes, writer.contentType, {
+    id: writer.id, workspaceId, runId, blobName: writer.name, expiresAt,
+    async assertActive() {
+      await assertAnalysisWriterActive(deps, workspaceId, runId, writer)
+      assertWorkspaceMutationLease(workspaceId)
+    },
+  })))
+  const saved = new Set(writers.filter((_, index) => settled[index].status === 'fulfilled').map(writer => writer.id))
+  if (saved.size) await releaseAnalysisWriters(deps, workspaceId, runId, saved)
+  return settled.map(result => {
+    if (result.status === 'rejected') throw result.reason
+    return result.value
+  })
 }
 
 export interface SummaryActionWriteAuthorization {
@@ -247,23 +324,9 @@ function fencedBlobs(
       signal?.throwIfAborted()
       const id = randomUUID()
       const expiresAt = new Date(Date.now() + ANALYSIS_WRITER_MILLISECONDS).toISOString()
-      await updateAnalysisControl(deps.store, workspaceId, runId, record => ({
-        ...record, writers: {
-          ...Object.fromEntries(Object.entries(record.writers ?? {}).filter(([, writer]) => Date.parse(writer.expiresAt) > Date.now())),
-          [id]: { blobName: name, expiresAt },
-        },
-      }), false)
+      await reserveAnalysisWriters(deps, workspaceId, runId, [{ id, name }], expiresAt)
       const assertActive = async () => {
-        signal?.throwIfAborted()
-        await assertWorkActive?.()
-        assertWorkspaceMutationLease(workspaceId)
-        const [workspace, control, run] = await Promise.all([
-          deps.store.getControl(workspaceId), deps.store.getControl(workspaceId, runId), deps.store.get(workspaceId, runId),
-        ])
-        const writer = control?.record.writers?.[id]
-        if (Date.parse(expiresAt) <= Date.now() || workspace?.record.state !== 'active' || control?.record.state !== 'active' ||
-          writer?.blobName !== name || writer.expiresAt !== expiresAt) denied()
-        if (run?.record.recordType === 'analysis-run') assertAnalysisRunWritable(run.record)
+        const run = await assertAnalysisWriterActive(deps, workspaceId, runId, { id, name, expiresAt }, signal, assertWorkActive)
         if (action) {
           if (run?.record.recordType !== 'analysis-run' || !analysisNarrativeCanWork(run.record) || run.record.narrativeRequestId) denied()
           const current = await deps.store.get(workspaceId, action.recordId)
@@ -317,12 +380,7 @@ function fencedBlobs(
       const result = await blobs.putFenced(name, bytes, contentType, {
         id, workspaceId, runId, blobName: name, expiresAt, signal, assertActive,
       })
-      await updateAnalysisControl(deps.store, workspaceId, runId, record => {
-        if (!record.writers?.[id]) return record
-        const writers = { ...record.writers }
-        delete writers[id]
-        return { ...record, writers: Object.keys(writers).length ? writers : undefined }
-      })
+      await releaseAnalysisWriters(deps, workspaceId, runId, new Set([id]))
       return result
     },
   }
