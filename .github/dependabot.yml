@@ -1,0 +1,41 @@
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:17"
+      timezone: Etc/UTC
+    groups:
+      github-actions:
+        patterns:
+          - "*"
+    cooldown:
+      default-days: 7
+    commit-message:
+      prefix: ci
+
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:37"
+      timezone: Etc/UTC
+    groups:
+      npm-minor-and-patch:
+        patterns:
+          - "*"
+        update-types:
+          - minor
+          - patch
+    cooldown:
+      default-days: 7
+    open-pull-requests-limit: 5
+    ignore:
+      - dependency-name: "*"
+        update-types:
+          - version-update:semver-major
+    commit-message:
+      prefix: deps

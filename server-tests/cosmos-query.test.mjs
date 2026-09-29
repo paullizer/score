@@ -4,7 +4,7 @@ import test from 'node:test'
 import { build } from 'esbuild'
 
 const compiled = await build({
-  entryPoints: ['server\\cosmos-query.ts'], bundle: true, write: false,
+  entryPoints: ['server/cosmos-query.ts'], bundle: true, write: false,
   packages: 'external', platform: 'node', format: 'cjs', target: 'node24', logLevel: 'silent',
 })
 const module = { exports: {} }

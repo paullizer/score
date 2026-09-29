@@ -1,0 +1,182 @@
+name: Security guardrails
+
+on:
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      full_scan:
+        description: Scan all files instead of only the diff
+        required: true
+        type: boolean
+        default: true
+      base_ref:
+        description: Base ref to compare against
+        required: true
+        type: string
+        default: main
+      fail_on_findings:
+        description: Fail on review findings
+        required: true
+        type: boolean
+        default: false
+
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  guardrails:
+    name: Run security guardrails
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci --ignore-scripts --no-audit --no-fund
+
+      - name: Resolve comparison commits
+        id: refs
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          DISPATCH_BASE_REF: ${{ inputs.base_ref || 'main' }}
+          DISPATCH_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+
+          mkdir -p "$RUNNER_TEMP/security-reports"
+
+          if [[ "$EVENT_NAME" == "pull_request" ]]; then
+            BASE_SHA="$PR_BASE_SHA"
+            HEAD_SHA="$PR_HEAD_SHA"
+          else
+            BASE_REF="$DISPATCH_BASE_REF"
+            if BASE_SHA="$(git rev-parse --verify "origin/${BASE_REF}^{commit}" 2>/dev/null)"; then
+              :
+            else
+              BASE_SHA="$(git rev-parse --verify "${BASE_REF}^{commit}")"
+            fi
+            HEAD_SHA="$(git rev-parse --verify "${DISPATCH_SHA}^{commit}")"
+          fi
+
+          {
+            echo "BASE_SHA=$BASE_SHA"
+            echo "HEAD_SHA=$HEAD_SHA"
+          } >> "$GITHUB_ENV"
+
+      - name: Check XSS sinks
+        id: xss
+        if: ${{ !cancelled() }}
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          FULL_SCAN: ${{ inputs.full_scan && 'true' || 'false' }}
+          FAIL_ON_FINDINGS: ${{ inputs.fail_on_findings && 'true' || 'false' }}
+        run: |
+          set -euo pipefail
+
+          args=(
+            scripts/security/check-xss-sinks.mjs
+            --head "$HEAD_SHA"
+            --report "$RUNNER_TEMP/security-reports/xss-sinks.md"
+          )
+
+          if [[ "$EVENT_NAME" == "workflow_dispatch" && "$FULL_SCAN" == "true" ]]; then
+            args+=(--full-scan)
+          else
+            args+=(--base "$BASE_SHA")
+          fi
+
+          if [[ "$FAIL_ON_FINDINGS" == "true" ]]; then
+            args+=(--fail-on-findings)
+          fi
+
+          node "${args[@]}"
+
+      - name: Check access control
+        id: access-control
+        if: ${{ !cancelled() }}
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          FULL_SCAN: ${{ inputs.full_scan && 'true' || 'false' }}
+          FAIL_ON_FINDINGS: ${{ inputs.fail_on_findings && 'true' || 'false' }}
+        run: |
+          set -euo pipefail
+
+          args=(
+            scripts/security/check-access-control.mjs
+            --head "$HEAD_SHA"
+            --report "$RUNNER_TEMP/security-reports/access-control.md"
+          )
+
+          if [[ "$EVENT_NAME" == "workflow_dispatch" && "$FULL_SCAN" == "true" ]]; then
+            args+=(--full-scan)
+          else
+            args+=(--base "$BASE_SHA")
+          fi
+
+          if [[ "$FAIL_ON_FINDINGS" == "true" ]]; then
+            args+=(--fail-on-findings)
+          fi
+
+          node "${args[@]}"
+
+      - name: Check outbound requests
+        id: outbound-requests
+        if: ${{ !cancelled() }}
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          FULL_SCAN: ${{ inputs.full_scan && 'true' || 'false' }}
+          FAIL_ON_FINDINGS: ${{ inputs.fail_on_findings && 'true' || 'false' }}
+        run: |
+          set -euo pipefail
+
+          args=(
+            scripts/security/check-outbound-requests.mjs
+            --head "$HEAD_SHA"
+            --report "$RUNNER_TEMP/security-reports/outbound-requests.md"
+          )
+
+          if [[ "$EVENT_NAME" == "workflow_dispatch" && "$FULL_SCAN" == "true" ]]; then
+            args+=(--full-scan)
+          else
+            args+=(--base "$BASE_SHA")
+          fi
+
+          if [[ "$FAIL_ON_FINDINGS" == "true" ]]; then
+            args+=(--fail-on-findings)
+          fi
+
+          node "${args[@]}"
+
+      - name: Upload security guardrail reports
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: security-guardrail-reports
+          path: ${{ runner.temp }}/security-reports/
+          retention-days: 14
+          if-no-files-found: ignore

@@ -14,6 +14,8 @@
     "test:worker": "npm run build:worker && node --test worker-tests/*.test.mjs",
     "test:renderer": "npm run build:renderer && node --test renderer-tests/*.test.mjs",
     "test:reports": "node --test src/services/analysisReports/*.test.mjs",
+    "test:security": "node --test scripts/security/*.test.mjs",
+    "security:check": "node scripts/security/check-all.mjs",
     "lint": "eslint .",
     "preview": "vite preview --host 127.0.0.1"
   },
