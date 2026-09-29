@@ -64,9 +64,13 @@ npm run test:server
 npm run test:worker
 npm run test:renderer
 npm run test:reports
+npm run test:security
+npm run security:check
 node --test src\services\*.integration.test.mjs
 npm run preview
 ```
+
+`npm run security:check` runs the same supply-chain, XSS, access-control and outbound-request checks that run on pull requests, against your changes since `origin/main` (including uncommitted files). See [Security scanning](docs/security-scanning.md) for the rules and options.
 
 The application uses React 18, TypeScript, Vite, Tailwind CSS, React Router, and accessible Radix dialog primitives. Styling is custom: restrained glass surfaces, a warm light theme, and a charcoal dark theme. Theme colors are centralized in `index.html` as Clawpilot CSS variables. Light, Dark, and System preferences are supported; the host's `scoutTheme` query parameter takes precedence when supplied.
 
@@ -721,6 +725,12 @@ Theme preference uses `score-theme`, and the collapsed-sidebar preference uses `
 
 Historical results retain their original rubric and document snapshots even after later edits. Lifecycle deletion, not local browser clearing, controls durable source and result cleanup.
 
+## Security
+
+Report vulnerabilities privately through GitHub, as described in [SECURITY.md](SECURITY.md).
+
+Every pull request to `main` runs CI (lint, build and all test suites), CodeQL, GitHub dependency review, a supply-chain and malicious-change review, and XSS, access-control and outbound-request guardrails. None of them is a required check: a failure means fix it or explain it before merging. [Security scanning](docs/security-scanning.md) covers what each check blocks, how to suppress a reviewed finding, and how to run the checks locally.
+
 ## Code organization
 
 | Directory | Responsibility |
@@ -736,7 +746,8 @@ Historical results retain their original rubric and document snapshots even afte
 | `renderer` | Isolated internal Chromium service and fail-closed runtime identity boundary |
 | `server-tests`, `worker-tests`, `renderer-tests` | Node test-runner coverage of API access, concurrency, source extraction, model validation, and rendering isolation |
 | `infra` | Bicep resource definitions |
-| `scripts` | Container build, deployment, identity, and knowledge-base configuration |
+| `scripts` | Container build, deployment, identity, and knowledge-base configuration; `scripts\security` holds the pull-request security checks |
+| `.github` | CI, CodeQL, dependency-review and security-check workflows, Dependabot configuration, and Copilot instructions |
 
 Authenticated LinkedIn access, whole-site discovery and multi-page crawling, resume editing, infrastructure retention administration, group-workspace administration, and ATS integrations remain deferred. Direct job/profile URL rendering is not a general-purpose crawler.
 

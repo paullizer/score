@@ -39,3 +39,15 @@ The API and every worker validate saved settings revisions and captured `Process
   Update `README.md` and `docs/` in the same change.
 
 Human QC reviews and evidence corrections currently have only deployment gates. Give them Admin switches when they are next changed.
+
+## Security guardrails
+
+Pull requests to `main` run CodeQL, dependency review, a malicious-change review and three guardrail checks: XSS, access control and outbound requests. [docs/security-scanning.md](../docs/security-scanning.md) lists every rule. Run `npm run security:check` before you open a pull request, and fix what it reports rather than suppressing it.
+
+- **Browser:** Render untrusted text as React text. The only HTML that Score renders is the Word document preview: `sanitizeDocxPreview` cleans it with DOMPurify and `DocxPreview` shows it in an `<iframe sandbox="">`. Keep both. Don't add `dangerouslySetInnerHTML`, `innerHTML`, `insertAdjacentHTML`, `document.write`, `eval`, `new Function` or string timers. Check that a URL from data or user input uses `http:` or `https:` before you bind it to `href` or `src`.
+- **API:** Mount every route on the `api` router in `server/app.ts`, after the authentication and CSRF middleware. `/healthz` is the only route on `app` itself. Authorize inside the handler too: resolve the caller with `getPrincipal(req)` and let the repository or service check workspace membership or `isApplicationAdmin`. Never trust a workspace id, role or user id from the request body.
+- **Outbound requests:** Fetch URLs that users supply only through `safeFetch` (`worker/runtime.ts`). It allows only public `http:` and `https:` addresses on standard ports, connects to the address it checked and rechecks every redirect. Don't call `fetch`, `http.request`, axios or a WebSocket with a user-controlled URL, and don't turn off TLS verification.
+- **Supply chain:** Add a dependency only when it's needed, pin it through `package-lock.json`, and wait 7 days after a release before adopting it. Pin GitHub Actions to a full commit SHA, keep `permissions` minimal and never use `pull_request_target`. Don't add install scripts, encoded payloads or hidden Unicode.
+- **Suppressions:** When a finding is a reviewed false positive, add `// security-reviewed: <rule-id> -- <reason>` on the flagged line or up to two lines above it. Every new suppression is flagged for review.
+
+Changes to `.github/`, `scripts/security/`, `package.json` or `package-lock.json` are flagged for a closer look, so explain them in the pull request.

@@ -1,0 +1,150 @@
+name: Malicious PR security review
+
+on:
+  pull_request:
+    branches:
+      - main
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - ready_for_review
+  workflow_dispatch:
+    inputs:
+      base_ref:
+        description: Base ref to compare against
+        required: true
+        type: string
+        default: main
+      head_ref:
+        description: Head ref to scan; empty means the dispatched commit
+        required: false
+        type: string
+        default: ''
+      full_scan:
+        description: Scan all files instead of only the diff
+        required: true
+        type: boolean
+        default: false
+      verify_release_age:
+        description: Verify changed package releases are at least seven days old
+        required: true
+        type: boolean
+        default: true
+      fail_on_findings:
+        description: Fail workflow_dispatch runs on review findings
+        required: true
+        type: boolean
+        default: false
+      fail_on_unverified_release_age:
+        description: Fail workflow_dispatch runs when package release age cannot be verified
+        required: true
+        type: boolean
+        default: false
+
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  malicious-pr-review:
+    name: Review PR security posture
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || inputs.head_ref || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+
+      - name: Run malicious PR review
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          DISPATCH_BASE_REF: ${{ inputs.base_ref || 'main' }}
+          DISPATCH_HEAD_REF: ${{ inputs.head_ref || '' }}
+          DISPATCH_FULL_SCAN: ${{ inputs.full_scan && 'true' || 'false' }}
+          DISPATCH_VERIFY_RELEASE_AGE: ${{ inputs.verify_release_age && 'true' || 'false' }}
+          DISPATCH_FAIL_ON_FINDINGS: ${{ inputs.fail_on_findings && 'true' || 'false' }}
+          DISPATCH_FAIL_ON_UNVERIFIED_RELEASE_AGE: ${{ inputs.fail_on_unverified_release_age && 'true' || 'false' }}
+          DISPATCH_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+
+          mkdir -p "$RUNNER_TEMP/security-reports" "$RUNNER_TEMP/reviewer"
+
+          if [[ "$EVENT_NAME" == "pull_request" ]]; then
+            BASE_SHA="$PR_BASE_SHA"
+            HEAD_SHA="$PR_HEAD_SHA"
+          else
+            BASE_REF="$DISPATCH_BASE_REF"
+            HEAD_REF="${DISPATCH_HEAD_REF:-$DISPATCH_SHA}"
+
+            if BASE_SHA="$(git rev-parse --verify "origin/${BASE_REF}^{commit}" 2>/dev/null)"; then
+              :
+            else
+              BASE_SHA="$(git rev-parse --verify "${BASE_REF}^{commit}")"
+            fi
+            if HEAD_SHA="$(git rev-parse --verify "${HEAD_REF}^{commit}" 2>/dev/null)"; then
+              :
+            else
+              HEAD_SHA="$(git rev-parse --verify "HEAD^{commit}")"
+            fi
+          fi
+
+          if git cat-file -e "$BASE_SHA:scripts/security/malicious-pr-review.mjs" 2>/dev/null; then
+            git archive "$BASE_SHA" scripts/security | tar -x -C "$RUNNER_TEMP/reviewer"
+            REVIEWER="$RUNNER_TEMP/reviewer/scripts/security/malicious-pr-review.mjs"
+          else
+            echo "::notice title=Reviewer fallback::The base branch does not contain scripts/security/malicious-pr-review.mjs yet, so this run is using the checked-out copy from the pull request or dispatched commit."
+            REVIEWER="scripts/security/malicious-pr-review.mjs"
+          fi
+
+          args=(
+            "$REVIEWER"
+            --repo "$GITHUB_WORKSPACE"
+            --base "$BASE_SHA"
+            --head "$HEAD_SHA"
+            --report "$RUNNER_TEMP/security-reports/malicious-pr-review.md"
+          )
+
+          if [[ "$EVENT_NAME" == "pull_request" || "$DISPATCH_VERIFY_RELEASE_AGE" == "true" ]]; then
+            args+=(--verify-release-age)
+          fi
+
+          if [[ "$EVENT_NAME" != "pull_request" && "$DISPATCH_FULL_SCAN" == "true" ]]; then
+            args+=(--full-scan)
+          fi
+
+          if [[ "$EVENT_NAME" != "pull_request" && "$DISPATCH_FAIL_ON_FINDINGS" == "true" ]]; then
+            args+=(--fail-on-findings)
+          fi
+
+          if [[ "$EVENT_NAME" != "pull_request" && "$DISPATCH_FAIL_ON_UNVERIFIED_RELEASE_AGE" == "true" ]]; then
+            args+=(--fail-on-unverified-release-age)
+          fi
+
+          node "${args[@]}"
+
+      - name: Upload malicious PR review report
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: malicious-pr-review-report
+          path: ${{ runner.temp }}/security-reports/
+          retention-days: 14
+          if-no-files-found: ignore
