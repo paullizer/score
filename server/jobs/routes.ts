@@ -6,8 +6,11 @@ import type { RealJobDetail, RealJobRecord, RealJobSummary, VersionedRealJob } f
 import { JOB_IMPORT_LIMITS } from '../../src/domain/real-jobs'
 import { isOriginalContentType, isSafeUploadedFilename } from '../../src/domain/source-files'
 import type { Job, Rubric, SourceDocument } from '../../src/domain/types'
-import { originalExtension, UPLOAD_CONTENT_TYPES, uploadFormatFromContentType, type UploadFormat } from '../../src/domain/document-formats'
+import { documentPagination, originalExtension, UPLOAD_CONTENT_TYPES, uploadFormatFromContentType, type UploadFormat } from '../../src/domain/document-formats'
 import { rubricAssistRequestSchema } from '../../src/domain/rubric-assist'
+import {
+  isRubricExportFormat, RUBRIC_EXPORT_SCHEMA_VERSION, type RubricExportFormat, type RubricExportPayload,
+} from '../../src/domain/rubric-exports'
 import { validateWordUpload } from '../documents/upload'
 import type { AuthenticatedPrincipal } from '../auth'
 import { decodeMarkdown, MarkdownInputError } from '../documents/markdown'
@@ -26,7 +29,7 @@ import { jobRubricAssistProfile } from '../assist/profiles/job-rubric'
 import type { JobBlobStore, JobLifecycleScope, RealJobStore } from './store'
 import { assertJobWritable, putJobBlob } from './guards'
 import {
-  assertImportPolicy, assertOriginalDownload, newProcessingSettings, newWorkProcessingSettings,
+  assertImportPolicy, assertOriginalDownload, assertRubricExport, newProcessingSettings, newWorkProcessingSettings,
   requestProcessingSettings, resolveAcceptedProcessingSettings,
 } from './policy'
 import { JobCleanupPendingError, jobLifecycleImpact, purgeJob, purgeJobRubric, requireJobLifecycle } from './lifecycle'
@@ -38,6 +41,7 @@ import {
   validateRealJobRecord,
   validateRealRubric,
   validateRealSourceDocument,
+  validateStoredRealRubric,
 } from './validation'
 
 export interface RealJobsDeps {
@@ -101,6 +105,18 @@ function optionalUuid(value: unknown, name: string): string | undefined {
   if (value === undefined) return undefined
   if (typeof value !== 'string' || !isUuid(value)) throw invalidRequest(`${name} must be a UUID.`)
   return value.toLowerCase()
+}
+
+function rubricExportQuery(req: Request): { rubricId: string; version: number; format: RubricExportFormat } {
+  const unexpected = Object.keys(req.query).filter(key => !['rubricId', 'version', 'format'].includes(key))
+  if (unexpected.length) throw invalidRequest(`Rubric exports do not accept query parameter(s): ${unexpected.join(', ')}.`)
+  const { rubricId, version, format } = req.query
+  if (typeof rubricId !== 'string' || !rubricId || rubricId.length > 1024 || rubricId !== rubricId.trim()) {
+    throw invalidRequest('rubricId must identify one saved rubric.')
+  }
+  if (typeof version !== 'string' || !/^[1-9]\d{0,8}$/.test(version)) throw invalidRequest('version must be a saved rubric version number.')
+  if (!isRubricExportFormat(format)) throw invalidRequest('Choose a supported rubric export format.')
+  return { rubricId, version: Number(version), format }
 }
 
 function hash(value: Uint8Array | string): string {
@@ -869,6 +885,67 @@ export function createRealJobsRouter(deps: RealJobsRouterDeps): Router {
     res.setHeader('Referrer-Policy', 'no-referrer')
     if (expectedContentType === 'text/markdown') res.setHeader('Cache-Control', 'private, no-store')
     res.send(Buffer.from(blob.bytes))
+  }))
+
+  router.get(`${base}/:jobId/rubric-export`, authorize(deps.repository, 'read'), asyncHandler(async (req, res) => {
+    const jobs = requireJobs(deps.jobs)
+    const { rubricId, version, format } = rubricExportQuery(req)
+    const workspaceId = pathParam(req, 'workspaceId')
+    const role = await deps.repository.authorizeWorkspace(getPrincipal(req), workspaceId, 'read')
+    const snapshot = await getRequestSettings(req)
+    assertRubricExport(snapshot, role, format)
+    const current = await jobs.store.get(workspaceId, jobParam(req))
+    if (!current) throw notFound('The requested job was not found.')
+    const { record } = current
+    if (record.lifecycle?.deletingAt || record.lifecycle?.deletedAt || record.job.rubricDeletedAt ||
+      record.rubricLifecycle?.deletingAt || record.rubricLifecycle?.deletedAt) {
+      throw notFound('This rubric has been removed.')
+    }
+    if (!validateRealJobRecord(record)) throw unavailable('The job has invalid stored metadata.')
+    const versions = (await jobs.store.listRubrics(workspaceId, record.id)).filter(item => item.id === rubricId)
+    const rubric = versions.find(item => item.version === version)
+    if (!rubric) throw notFound('The requested rubric version was not found.')
+    if (!validateStoredRealRubric(rubric) || rubric.jobId !== record.id) throw unavailable('The rubric version has invalid stored data.')
+    const payload: RubricExportPayload = {
+      schemaVersion: RUBRIC_EXPORT_SCHEMA_VERSION,
+      dataKind: 'real',
+      workspaceId,
+      generatedAt: clock().toISOString(),
+      settings: { revision: snapshot.revision, policy: structuredClone(snapshot.settings.reports) },
+      job: {
+        id: record.id,
+        title: record.job.title.trim() ? record.job.title : record.source.displayName,
+        ...(record.displayName !== undefined ? { displayName: record.displayName } : {}),
+        organization: record.job.organization,
+        location: record.job.location,
+        arrangement: record.job.arrangement,
+        employmentType: record.job.employmentType,
+        grade: record.job.grade,
+        series: record.job.series,
+        sourceLabel: record.job.sourceLabel,
+        pagination: documentPagination(record.source.originalContentType),
+      },
+      rubric: {
+        id: rubric.id,
+        version: rubric.version,
+        latestVersion: Math.max(...versions.map(item => item.version)),
+        name: rubric.name,
+        description: rubric.description,
+        createdAt: rubric.createdAt,
+        provenance: rubric.provenance?.kind === 'edited' ? 'edited' : 'generated',
+        criteria: rubric.criteria.map(criterion => ({
+          label: criterion.label,
+          description: criterion.description,
+          weight: criterion.weight,
+          guidance: criterion.guidance,
+          requirementType: criterion.requirementType === 'preferred' ? 'preferred' : 'required',
+          citations: (criterion.sourceCitations ?? []).map(citation => ({
+            page: citation.page, heading: citation.heading, quote: citation.quote,
+          })),
+        })),
+      },
+    }
+    res.json(payload)
   }))
 
   return router

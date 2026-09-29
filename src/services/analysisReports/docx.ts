@@ -23,6 +23,8 @@ import { reportGenerationPolicy, reportLimits, snapshotReportPolicy } from './po
 
 type Content = Paragraph | Table
 type EmbeddedFonts = NonNullable<ConstructorParameters<typeof Document>[0]['fonts']>
+export interface WordReportFonts { embedded: EmbeddedFonts; regular: Font; bold: Font }
+export interface WordDocumentMetadata { title: string; subject: string; description: string }
 const twips = (points: number) => Math.round(points * 20)
 const lineParts = (value: string) => value.split(/\r\n|[\r\n\u0085\u2028\u2029]/u)
 const palette = REPORT_PALETTE
@@ -63,7 +65,7 @@ class BorderedParagraph extends Paragraph {
   }
 }
 
-function fontInputs(options?: ReportGenerationOptions): { embedded: EmbeddedFonts; regular: Font; bold: Font } {
+export function fontInputs(options?: Pick<ReportGenerationOptions, 'fonts'>): WordReportFonts {
   const fonts = options?.fonts
   if (!fonts?.regular?.byteLength || !fonts.bold?.byteLength) {
     throw new Error('Word generation requires the locally bundled Noto Sans regular and bold font bytes. Reload the application and retry; no report was generated.')
@@ -91,7 +93,7 @@ function fontInputs(options?: ReportGenerationOptions): { embedded: EmbeddedFont
   return { embedded, regular, bold }
 }
 
-class WordReportLayout implements DocumentReportLayout<string> {
+export class WordReportLayout implements DocumentReportLayout<string> {
   readonly colors = palette
   private readonly sections: { identity: DocumentPageIdentity; children: Content[] }[] = []
   private readonly bookmarkNames = new Map<string, string>()
@@ -102,7 +104,7 @@ class WordReportLayout implements DocumentReportLayout<string> {
   private remainingHeight = 0
 
   constructor(
-    private readonly report: AnalysisReport, private readonly fonts: ReturnType<typeof fontInputs>,
+    private readonly documentMetadata: WordDocumentMetadata, private readonly fonts: WordReportFonts,
     private readonly limits: ReturnType<typeof reportLimits>,
     private readonly startedAt: number,
   ) {}
@@ -443,8 +445,8 @@ class WordReportLayout implements DocumentReportLayout<string> {
       children: [new TextRun({ children: ['Page ', PageNumber.CURRENT, ' of ', PageNumber.TOTAL_PAGES], size: 17, color: palette.muted })],
     })] })
     const document = new Document({
-      creator: 'Score', lastModifiedBy: 'Score', title: reportTitle(this.report),
-      subject: 'Analysis evidence for human review', description: REPORT_HUMAN_REVIEW_NOTICE,
+      creator: 'Score', lastModifiedBy: 'Score', title: this.documentMetadata.title,
+      subject: this.documentMetadata.subject, description: this.documentMetadata.description,
       styles, features: { updateFields: true }, fonts: this.fonts.embedded,
       numbering: { config: [{ reference: 'review-notes', levels: [{
         level: 0, format: LevelFormat.BULLET, text: '\u2022', alignment: AlignmentType.LEFT,
@@ -485,7 +487,9 @@ export async function generateDocxReport(report: AnalysisReport, options?: Repor
   assertReportResourceLimits(report, limits.maxInputBytes)
   requireReportNarratives(report)
   assertReportXmlText(report)
-  const layout = new WordReportLayout(report, fontInputs(options), limits, startedAt)
+  const layout = new WordReportLayout({
+    title: reportTitle(report), subject: 'Analysis evidence for human review', description: REPORT_HUMAN_REVIEW_NOTICE,
+  }, fontInputs(options), limits, startedAt)
   writeDocumentReport(layout, report, options)
   return layout.finish()
 }

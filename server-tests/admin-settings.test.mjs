@@ -358,6 +358,56 @@ test('rubric AI assistant is an optional Admin switch that defaults on without c
   } finally { await server.close() }
 })
 
+test('rubric exports are an optional Admin switch that defaults on, needs real jobs and ignores the new-work pause', async () => {
+  const defaults = createDefaultAdminSettings()
+  assert.equal('rubricExports' in defaults.features, false, 'Compiled defaults and the legacy baseline keep their earlier shape')
+  const capture = captureProcessingSettings(defaults, 'legacy-v1', '1970-01-01T00:00:00.000Z')
+  assert.equal('rubricExports' in capture.settings.features, false, 'Captured snapshots are not rewritten with a default')
+  assert.deepEqual(processingSettingsSnapshotSchema.parse(capture), capture)
+  assert.throws(() => parseAdminSettings({ ...defaults, features: { ...defaults.features, rubricExports: 'yes' } }))
+  assert.equal(parseAdminSettings({ ...defaults, features: { ...defaults.features, rubricExports: false } }).features.rubricExports, false)
+  const capabilities = {
+    realJobImports: true, realGradeLadders: false, realResumeImports: false, realAnalyses: false,
+    analysisSummaryGeneration: false, wordDocumentImports: false, rubricAssistant: false,
+  }
+  const absent = effectiveFeatures(capabilities, capture, true)
+  assert.equal(absent.rubricExports, true, 'An absent key means on')
+  assert.equal(absent.publicSettings.features.rubricExports, true)
+  assert.equal(effectiveFeatures({ ...capabilities, realJobImports: false }, capture, true).rubricExports, false,
+    'Rubric exports need the real-job deployment')
+  const paused = structuredClone(defaults)
+  paused.maintenance.pauseNewWork = true
+  const whilePaused = effectiveFeatures(capabilities, captureProcessingSettings(paused, 'paused', '2026-09-21T12:00:00.000Z'), true)
+  assert.equal(whilePaused.realJobImports, false)
+  assert.equal(whilePaused.rubricExports, true, 'Exports are reads, so pausing new work leaves them available')
+  assert.equal(effectiveFeatures(capabilities, capture, false).rubricExports, true, 'Settings rollout readiness does not gate reads')
+
+  const server = await start()
+  try {
+    const first = await server.request('/api/admin/settings')
+    const field = first.body.fields.find(item => item.path === 'features.rubricExports')
+    assert.ok(field, 'The switch is on the Admin settings page')
+    assert.equal(field.label, 'Rubric exports')
+    assert.equal(field.control, 'boolean')
+    assert.equal(field.section, 'intake')
+    assert.equal(field.defaultValue, true, 'The effective default is reported even though the saved revision omits the key')
+    assert.match(field.description, /never call AI/)
+    assert.ok(field.prerequisites.includes('Real jobs are configured'))
+    assert.equal(first.body.settings.features.rubricExports, undefined)
+
+    const off = await server.request('/api/admin/settings', { method: 'PATCH', headers: { 'If-Match': first.body.etag }, body: { features: { rubricExports: false } } })
+    assert.equal(off.response.status, 200)
+    assert.equal(off.body.settings.features.rubricExports, false)
+    assert.equal(off.body.settings.features.rubricAssistant, undefined, 'Only the switched key changes')
+    const history = await server.request('/api/admin/settings/history?limit=1')
+    assert.equal(history.body.revisions[0].changes.find(change => change.path === 'features.rubricExports')?.after, false)
+    const features = effectiveFeatures(capabilities, captureProcessingSettings(off.body.settings, off.body.revision, '2026-09-21T12:00:00.000Z'), true)
+    assert.equal(features.rubricExports, false)
+    assert.equal(features.publicSettings.features.rubricExports, false)
+    assert.equal(features.realJobImports, true, 'Turning exports off leaves job imports alone')
+  } finally { await server.close() }
+})
+
 test('settings updates require exact ETags, publish atomic audit/history, and preserve stale drafts through conflicts', async () => {
   const server = await start()
   try {

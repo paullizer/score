@@ -61,6 +61,32 @@ restrictions still apply. Workers preserve the latest alias when updating
 progress or publishing a rubric and retry bounded ETag contention only while
 they still own the active attempt; cancellation or lease loss still fences them.
 
+## Rubric exports
+
+`GET /api/workspaces/:workspaceId/jobs/:jobId/rubric-export?rubricId=…&version=…&format=pdf|docx|pptx|markdown|csv`
+returns one saved job rubric version as a JSON `RubricExportPayload`
+(`src/domain/rubric-exports.ts`). The browser validates it again and writes the
+file in a worker, so the API never generates documents or calls a model. The
+payload holds the job's facts, the rubric version with its criteria, guidance
+and posting quotes, the latest version number, and the current report policy
+with its settings revision. It contains no candidate data or source bytes.
+
+Any workspace member may call it, subject to application policy, and archived
+jobs and rubrics remain exportable. It returns:
+
+- 400 for missing or malformed `rubricId`, `version` or `format`, or any other
+  query parameter;
+- 403 when `features.rubricExports` is off, the member's role isn't in
+  `reports.allowedRoles`, or `reports.enabledFormats` excludes the format.
+  Markdown isn't a report format, so the format list doesn't restrict it;
+- 404 when the job doesn't exist, the job or its rubric is being deleted or has
+  been deleted, or the version doesn't belong to that rubric;
+- 503 when real jobs aren't configured or stored records fail validation.
+
+**Pause new work** and runtime admission don't affect this route, because it
+only reads saved records. Rubric version content is immutable, so the export
+matches what the rubric page shows for that version.
+
 ## Storage and worker fencing
 
 Every normal Cosmos create, replacement/claim, and rubric publication includes an

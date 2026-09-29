@@ -19,6 +19,8 @@ import {
   requireReportNarratives, targetNarrativeDisclosures, targetNarrativeParagraphs,
 } from './narratives'
 import type { DocumentReportLayout } from './document-layout'
+import { writeRubricSection } from './rubric-document'
+import { RUBRIC_SECTION_SUBTITLE, rubricDetailsTitle, rubricDocumentFromReportGroup } from './rubric-model'
 
 const CONTENTS_DESTINATION = 'contents'
 
@@ -80,18 +82,23 @@ function writeTargetIdentity<Color>(layout: DocumentReportLayout<Color>, section
   layout.metadata(targetMetadata(presentation))
 }
 
-function writeContents<Color>(layout: DocumentReportLayout<Color>, sections: TargetSection[]): void {
+function writeContents<Color>(layout: DocumentReportLayout<Color>, sections: TargetSection[], rubricDetails: boolean): void {
   layout.startSection({ section: 'Contents', primary: 'Included job and grade analyses', secondary: 'Navigation within this report' })
   layout.markDestination(CONTENTS_DESTINATION)
   layout.paragraph('Contents', { size: 22, leading: 31, bold: true, after: 7, keepWithNext: 30, headingLevel: 1 })
-  layout.paragraph('Select a job or grade to open its context, saved overview, featured reviews and complete candidate table.',
-    { size: 10, leading: 15, after: 15 })
+  layout.paragraph(rubricDetails
+    ? 'Select a job or grade to open its context, saved overview, featured reviews, complete candidate table and rubric details.'
+    : 'Select a job or grade to open its context, saved overview, featured reviews and complete candidate table.',
+  { size: 10, leading: 15, after: 15 })
   for (const section of sections) {
     const count = section.group.comparisons.filter(comparison => comparison.status === 'complete').length
     layout.contentsEntry({
       label: section.label, title: getDisplayName(section.group.target, section.presentation.title), organization: section.presentation.organization,
       metadata: targetMetadata(section.presentation),
-      detail: `${count} completed ${count === 1 ? 'comparison' : 'comparisons'}`,
+      detail: [
+        `${count} completed ${count === 1 ? 'comparison' : 'comparisons'}`,
+        ...(rubricDetails ? [`${section.group.target.kind === 'grade' ? 'Grade' : 'Job'} & rubric details included`] : []),
+      ].join(' · '),
       destination: section.destination,
     })
   }
@@ -148,6 +155,14 @@ function writeCandidatesAtAGlance<Color>(
     }),
     [133, 76, 311],
   )
+}
+
+function writeRubricDetails<Color>(
+  layout: DocumentReportLayout<Color>, report: AnalysisReport, section: TargetSection, options?: ReportGenerationOptions,
+): void {
+  const { group } = section
+  layout.startSection({ section: rubricDetailsTitle(group.target.kind), primary: section.label, secondary: RUBRIC_SECTION_SUBTITLE })
+  writeRubricSection(layout, rubricDocumentFromReportGroup(report, group, options), { level: 2 })
 }
 
 function highlightedComparisons(group: ReportGroup): RankedReportComparison[] {
@@ -248,12 +263,14 @@ export function writeDocumentReport<Color>(
       destination: `target:${group.target.id}`, presentation: reportTargetPresentation(group.target),
     }))
   if (!sections.length) throw new Error('At least one completed comparison is required for a document report.')
+  const rubricDetails = options?.rubricDetails === true
   writeIntroduction(layout, report, sections)
-  writeContents(layout, sections)
+  writeContents(layout, sections, rubricDetails)
   for (const section of sections) {
     writeTargetOverview(layout, report, section, options)
     highlightedComparisons(section.group).forEach((comparison, index) => writeComparison(layout, report, section, comparison, index, options))
     writeCandidatesAtAGlance(layout, report, section, options)
+    if (rubricDetails) writeRubricDetails(layout, report, section, options)
   }
   if (policy.additionalFooter) {
     layout.heading('Additional report notice', 13)

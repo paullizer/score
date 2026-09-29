@@ -12,6 +12,7 @@ import type {
   RealAnalysisResult, RealAnalysisRunRecord,
 } from '../../src/domain/real-analyses'
 import type { ProcessingSettingsSnapshot } from '../../src/domain/admin-settings'
+import { rubricExportsEnabled } from '../../src/domain/feature-switches'
 import type { WorkspaceRole } from '../../src/domain/cloud'
 import type { Citation } from '../../src/domain/types'
 import { gradeSourcePagination } from '../../src/features/grade-ladders/gradeUi'
@@ -45,11 +46,14 @@ export class AnalysisReportCaptures {
   capture(
     snapshot: ProcessingSettingsSnapshot, role: WorkspaceRole, actor: string,
     run: RealAnalysisRunRecord, manifest: RealAnalysisInitializationManifest,
-    format: AnalysisReportFormat, targetId?: string,
+    format: AnalysisReportFormat, targetId?: string, rubricDetails = false,
   ) {
     const policy = structuredClone(snapshot.settings.reports)
     if (!policy.allowedRoles.includes(role)) throw forbidden('Application policy does not allow your workspace role to export reports.')
     if (!policy.enabledFormats.includes(format)) throw forbidden('This report format is disabled by application policy.')
+    if (rubricDetails && !rubricExportsEnabled(snapshot.settings)) {
+      throw forbidden('Rubric exports are turned off in Admin settings. Export the report without job & rubric details.')
+    }
     const target = targetId === undefined ? undefined : manifest.targets.find(target => target.summary.id === targetId)
     if (targetId !== undefined && !target) throw invalidRequest('Select an exact target in this saved analysis.')
     const selected = manifest.comparisons.filter(pair => !target || pair.targetSnapshotId === target.snapshotId)
@@ -127,6 +131,8 @@ function targetFacts(target: FrozenRealAnalysisTargetSnapshot): ReportFact[] {
     { label: 'Inputs frozen', value: target.frozenAt },
   ]
   const add = (label: string, value: string | undefined) => { if (value?.trim()) facts.push({ label, value }) }
+  // Rubric-detail facts use distinct labels so sections that read Location and similar labels stay unchanged.
+  add('Rubric name', rubric.name)
   if (target.kind === 'job') {
     add('Organization', target.job.organization)
     add('Series', target.job.series)
@@ -134,6 +140,12 @@ function targetFacts(target: FrozenRealAnalysisTargetSnapshot): ReportFact[] {
     add('Source captured', target.source.capturedAt)
     add('Rubric SHA-256', target.selection.rubricHash)
     add('Requirement document SHA-256', target.selection.documentSha256)
+    add('Job location', target.job.location)
+    add('Job work arrangement', target.job.arrangement)
+    add('Job employment type', target.job.employmentType)
+    add('Job source', target.job.sourceLabel)
+    add('Rubric origin', target.rubric.provenance?.kind === 'edited' ? 'Edited by a reviewer'
+      : target.rubric.provenance?.kind === 'generated' ? 'Generated from the job posting' : undefined)
   } else {
     const { context } = target.sourceSet
     add('GS grade', `GS-${target.selection.grade}`)

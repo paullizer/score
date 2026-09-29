@@ -277,14 +277,18 @@ export function createRealAnalysesRouter(deps: RealAnalysesRouterDeps): Router {
     res.status(202).json(result)
   }))
   router.get(`${base}/:runId/report-capture`, read(async (req, res, signal) => {
-    query(req, ['format', 'targetId'])
+    query(req, ['format', 'targetId', 'rubricDetails'])
     if (typeof req.query.format !== 'string' || !Object.hasOwn(REPORT_FORMATS, req.query.format)) {
       throw invalidRequest('Choose a supported report format.')
+    }
+    const rubricDetails = req.query.rubricDetails
+    if (rubricDetails !== undefined && rubricDetails !== 'true' && rubricDetails !== 'false') {
+      throw invalidRequest('rubricDetails must be true or false.')
     }
     const targetId = req.query.targetId === undefined ? undefined : body(analysisNarrativeTargetIdSchema, req.query.targetId)
     const capture = await requireService(req).captureReport(
       reportCaptures, param(req, 'workspaceId'), recordId(req, 'run'), getPrincipal(req).principalKey,
-      res.locals.analysisWorkspaceRole, req.query.format as AnalysisReportFormat, targetId, signal,
+      res.locals.analysisWorkspaceRole, req.query.format as AnalysisReportFormat, targetId, signal, rubricDetails === 'true',
     )
     signal.throwIfAborted()
     res.json(capture)

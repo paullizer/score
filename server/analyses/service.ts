@@ -432,13 +432,13 @@ export class RealAnalysisService {
   }
   async captureReport(
     captures: AnalysisReportCaptures, workspaceId: string, runId: string, actor: string, role: WorkspaceRole,
-    format: AnalysisReportFormat, targetId?: string, signal?: AbortSignal,
+    format: AnalysisReportFormat, targetId?: string, signal?: AbortSignal, rubricDetails = false,
   ) {
     const run = await this.run(workspaceId, runId, false, signal)
     const manifest = await readAnalysisManifest(this.deps.blobs, run.record, signal)
     const settings = await currentProcessingSettings(this.settings)
     signal?.throwIfAborted()
-    return captures.capture(settings, role, actor, run.record, manifest, format, targetId)
+    return captures.capture(settings, role, actor, run.record, manifest, format, targetId, rubricDetails)
   }
   async reportComparisons(
     workspaceId: string, runId: string, comparisonIds: string[], signal?: AbortSignal,

@@ -1,5 +1,5 @@
 import {
-  REPORT_FORMATS, type AnalysisReportWriter, type ReportWorkerRequest, type ReportWorkerResponse,
+  REPORT_FORMATS, reportDownloadType, type AnalysisReportWriter, type ReportWorkerRequest, type ReportWorkerResponse,
 } from '../../domain/analysis-reports'
 import { assertReportResourceLimits } from './model'
 import { requireReportNarratives } from './narratives'
@@ -21,10 +21,11 @@ self.addEventListener('message', (event: MessageEvent<ReportWorkerRequest>) => {
     const limits = reportLimits(reportGenerationPolicy(request.report, request.format))
     assertReportResourceLimits(request.report, limits.maxInputBytes)
     if (request.format !== 'csv') requireReportNarratives(request.report)
-    send({ type: 'progress', requestId: request.requestId, message: `Generating ${REPORT_FORMATS[request.format].label} from saved evidence` })
+    const rubricDetails = request.options?.rubricDetails === true
+    send({ type: 'progress', requestId: request.requestId, message: `Generating ${reportDownloadType(request.format, rubricDetails).label} from saved evidence` })
     let generate: AnalysisReportWriter
     switch (request.format) {
-      case 'csv': generate = (await import('./csv')).generateCsvReport; break
+      case 'csv': generate = rubricDetails ? (await import('./csv-bundle')).generateCsvBundle : (await import('./csv')).generateCsvReport; break
       case 'pdf': generate = (await import('./pdf')).generatePdfReport; break
       case 'docx': generate = (await import('./docx')).generateDocxReport; break
       case 'pptx': generate = (await import('./pptx')).generatePptxReport; break

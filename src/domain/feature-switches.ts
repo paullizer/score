@@ -9,3 +9,8 @@ import type { AdminSettings } from './admin-settings'
 export function rubricAssistantEnabled(settings: Pick<AdminSettings, 'features'>): boolean {
   return settings.features.rubricAssistant !== false
 }
+
+/** On unless an administrator turned it off; revisions saved before the switch existed omit the key. */
+export function rubricExportsEnabled(settings: Pick<AdminSettings, 'features'>): boolean {
+  return settings.features.rubricExports !== false
+}

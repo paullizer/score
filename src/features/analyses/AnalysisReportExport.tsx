@@ -4,10 +4,10 @@ import { Download, LoaderCircle } from 'lucide-react'
 import { useWorkspace } from '../../app/workspace-context'
 import { useRealAnalyses } from '../../app/real-analyses-context'
 import { usePublicSettings } from '../../app/public-settings-context'
-import { REPORT_FORMATS, type AnalysisReport, type AnalysisReportFormat } from '../../domain/analysis-reports'
+import { REPORT_FORMATS, reportDownloadType, type AnalysisReport, type AnalysisReportFormat } from '../../domain/analysis-reports'
 import { createDefaultAdminSettings } from '../../domain/admin-settings-defaults'
 import type { RealAnalysisComparisonSummary, RealAnalysisRunDetail } from '../../domain/real-analyses'
-import { Badge, Button, InlineError, Modal } from '../../components/ui'
+import { Badge, Button, CheckLabel, InlineError, Modal } from '../../components/ui'
 import { AnalysisSummaryStatus } from './AnalysisSummaries'
 import { getDisplayName } from '../../domain/displayNames'
 
@@ -41,6 +41,10 @@ export function AnalysisReportExport({ source, onManageSummaries }: { source: Re
   const fieldId = useId()
   const [open, setOpen] = useState(false)
   const [format, setFormat] = useState<AnalysisReportFormat | null>(reportPolicy.defaultFormat)
+  // The Rubric exports Admin switch, as reported by /api/features, decides whether reports can include rubric details.
+  const rubricDetailsAvailable = cloud?.realJobs?.features?.rubricExports === true
+  const [rubricDetailsChosen, setRubricDetailsChosen] = useState(true)
+  const rubricDetails = rubricDetailsAvailable && rubricDetailsChosen
   const [targetId, setTargetId] = useState('')
   const [stage, setStage] = useState<string | null>(null)
   const [progress, setProgress] = useState<{ completed: number; total: number } | null>(null)
@@ -124,7 +128,10 @@ export function AnalysisReportExport({ source, onManageSummaries }: { source: Re
     if (!value) cancel()
     setError('')
     setSuccess('')
-    if (value) setFormat(reportPolicy.defaultFormat)
+    if (value) {
+      setFormat(reportPolicy.defaultFormat)
+      setRubricDetailsChosen(true)
+    }
     setOpen(value)
   }
   async function exportReport() {
@@ -141,7 +148,8 @@ export function AnalysisReportExport({ source, onManageSummaries }: { source: Re
       const { loadRealAnalysisReport } = await import('../../services/analysisReports/real')
       signal.throwIfAborted()
       const report: AnalysisReport = await loadRealAnalysisReport(source.workspaceId, source.detail.run.id, {
-        ...(targetId ? { targetId } : {}), format, ...(requiresSummaries ? { requireSummaries: true } : {}), signal,
+        ...(targetId ? { targetId } : {}), format, ...(requiresSummaries ? { requireSummaries: true } : {}),
+        ...(rubricDetails ? { rubricDetails: true } : {}), signal,
         onProgress: (completed, total) => {
           if (current()) { setStage('Loading frozen report evidence'); setProgress({ completed, total }) }
         },
@@ -155,6 +163,7 @@ export function AnalysisReportExport({ source, onManageSummaries }: { source: Re
       const bytes = await generateReportInWorker(report, format, {
         signal, onProgress: (message) => { if (current()) setStage(message) },
         links: { origin: window.location.origin, workspaceId: source.workspaceId },
+        ...(rubricDetails ? { rubricDetails: true } : {}),
       })
       if (!current()) return
       if (requiresSummaries) {
@@ -164,7 +173,7 @@ export function AnalysisReportExport({ source, onManageSummaries }: { source: Re
         await assertRealAnalysisReportNarrativesCurrent(source.workspaceId, source.detail.run.id, report, signal)
         if (!current()) return
       }
-      const filename = downloadAnalysisReport(bytes, report, format, signal)
+      const filename = downloadAnalysisReport(bytes, report, format, signal, rubricDetails)
       setSuccess(`Download started: ${filename}`)
     } catch (caught) {
       if (current()) setError(caught instanceof Error && caught.name === 'TimeoutError'
@@ -186,7 +195,7 @@ export function AnalysisReportExport({ source, onManageSummaries }: { source: Re
         <Button variant="primary" icon={busy ? LoaderCircle : Download}
           disabled={busy || !ready || complete === 0 || narrativeBlocked || Boolean(policyDisabledReason || formatDisabledReason || scopeDisabledReason)}
           onClick={() => void exportReport()}>
-          {busy ? 'Preparing report...' : format === null ? 'Exports disabled' : `Download ${REPORT_FORMATS[format].label}`}
+          {busy ? 'Preparing report...' : format === null ? 'Exports disabled' : `Download ${reportDownloadType(format, rubricDetails).label}`}
         </Button>
       </>}>
       <div className="space-y-5">
@@ -203,6 +212,14 @@ export function AnalysisReportExport({ source, onManageSummaries }: { source: Re
             })}
           </select>{format !== null && <p className="mt-2 text-[11px] text-muted">{descriptions[format]}</p>}
           {formatDisabledReason && <p className="mt-2 text-[11px] text-muted" role="status">{formatDisabledReason}</p>}</div>
+        {rubricDetailsAvailable && <div>
+          <CheckLabel checked={rubricDetailsChosen} disabled={busy} onChange={() => {
+            setRubricDetailsChosen(value => !value); setError(''); setSuccess('')
+          }}>Include job & rubric details</CheckLabel>
+          <p className="mt-1 text-[11px] text-muted">{format === 'csv'
+            ? 'Downloads a .zip with analyses.csv and rubrics.csv. rubrics.csv has a row for each criterion: what it asks for, its weight, how it is scored and the source quotes behind it. It uses the same Job/grade labels and C1, C2 numbers as analyses.csv.'
+            : 'Ends each job or grade section with its rubric: what each criterion asks for, its weight, how it is scored and the source quotes behind it.'}</p>
+        </div>}
         {targets.length > 1 && <div><label className="mb-2 block text-[12px] font-semibold" htmlFor={`${fieldId}-target`}>Report scope</label>
           <select id={`${fieldId}-target`} className="filter-select w-full" value={targetId} disabled={busy} onChange={(event) => { setTargetId(event.target.value); setError(''); setSuccess('') }}>
             <option value="">Entire analysis - all jobs and grades</option>

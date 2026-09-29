@@ -7,6 +7,8 @@ import {
   createDefaultAdminSettings, LEGACY_SETTINGS_CAPTURED_AT, LEGACY_SETTINGS_REVISION,
 } from '../../src/domain/admin-settings-defaults'
 import { captureProcessingSettings, urlAllowedBySettings } from '../../src/domain/admin-settings-resolver'
+import { rubricExportsEnabled } from '../../src/domain/feature-switches'
+import { rubricExportFormatAllowed, type RubricExportFormat } from '../../src/domain/rubric-exports'
 import { forbidden, HttpError, invalidRequest, unavailable } from '../errors'
 import {
   getAdmissionSettings, getProcessingAdmissionSettings, getRuntimeSettingsReadiness,
@@ -116,6 +118,17 @@ export function assertOriginalDownload(snapshot: ProcessingSettingsSnapshot, rol
   }
   if (preview && !snapshot.settings.documents.formattedDocxPreviewEnabled) {
     throw forbidden('Formatted original-document previews are disabled by application policy.')
+  }
+}
+
+/** Rubric exports follow the Admin switch, then the report roles and formats. Pausing new work doesn't affect them. */
+export function assertRubricExport(snapshot: ProcessingSettingsSnapshot, role: WorkspaceRole, format: RubricExportFormat): void {
+  if (!rubricExportsEnabled(snapshot.settings)) throw forbidden('Rubric exports are turned off in Admin settings.')
+  if (!snapshot.settings.reports.allowedRoles.includes(role)) {
+    throw forbidden('Application policy does not allow your workspace role to export rubrics.')
+  }
+  if (!rubricExportFormatAllowed(snapshot.settings.reports, format)) {
+    throw forbidden('This export format is disabled by application policy.')
   }
 }
 

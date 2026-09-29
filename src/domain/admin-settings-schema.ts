@@ -83,6 +83,7 @@ const settingsObject = z.strictObject({
     summaryGeneration: z.boolean(), samplesVisible: z.boolean(),
     // Optional, never defaulted here: absent keeps earlier revisions and captured snapshots byte-identical.
     rubricAssistant: z.boolean().optional(),
+    rubricExports: z.boolean().optional(),
   }),
   maintenance: z.strictObject({ pauseNewWork: z.boolean(), explanation: text(1000) }),
   imports: z.strictObject({

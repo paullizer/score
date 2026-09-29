@@ -12,6 +12,7 @@ import {
   processAllAnalyses, processAllResumes, processingStubs, resumePdf, resumeSelection, startResumeAnalysisFixture,
 } from './resumeAnalysis.test-support.mjs'
 import { seededLadder, seedRealJob } from './gradeLadders.test-support.mjs'
+import { readPdf } from './analysisReports/pdf-test-support.mjs'
 
 let runtime, browser
 const deferred = () => {
@@ -36,9 +37,13 @@ async function newPage() {
   page.on('pageerror', (error) => errors.push(error.message))
   return { context, page, errors }
 }
-async function download(page, format) {
-  const dialog = page.getByRole('dialog', { name: 'Export analysis report', exact: true })
+async function chooseFormat(dialog, format, { rubricDetails = false } = {}) {
   await dialog.getByLabel('Report format', { exact: true }).selectOption(format)
+  await dialog.getByRole('checkbox', { name: 'Include job & rubric details', exact: true }).setChecked(rubricDetails)
+}
+async function download(page, format, options) {
+  const dialog = page.getByRole('dialog', { name: 'Export analysis report', exact: true })
+  await chooseFormat(dialog, format, options)
   const [result] = await Promise.all([
     Promise.race([
       page.waitForEvent('download', { timeout: 90_000 }),
@@ -58,6 +63,28 @@ async function download(page, format) {
   await visible(dialog.getByText(/^Download started:/))
   return { filename: result.suggestedFilename(), bytes: Buffer.concat(chunks) }
 }
+async function downloadRubric(page, format) {
+  const dialog = page.getByRole('dialog', { name: 'Export rubric', exact: true })
+  await dialog.getByLabel('File format', { exact: true }).selectOption(format)
+  const [result] = await Promise.all([
+    Promise.race([
+      page.waitForEvent('download', { timeout: 60_000 }),
+      dialog.getByRole('alert').first().waitFor({ state: 'visible', timeout: 60_000 }).then(async () => {
+        throw new Error(`${format} rubric export failed: ${await dialog.getByRole('alert').first().innerText()}`)
+      }),
+    ]),
+    dialog.getByRole('button', { name: /^Download / }).click(),
+  ]).catch(async (cause) => {
+    const state = await dialog.innerText().catch(() => 'The rubric export dialog is no longer available.')
+    throw new Error(`${format.toUpperCase()} rubric download failed:\n${state}`, { cause })
+  })
+  assert.equal(await result.failure(), null)
+  const chunks = []
+  for await (const chunk of await result.createReadStream()) chunks.push(chunk)
+  const filename = result.suggestedFilename()
+  await visible(dialog.getByText(`Download started: ${filename}`, { exact: true }))
+  return { filename, bytes: Buffer.concat(chunks) }
+}
 function xmlParts(bytes, pattern) {
   return new Promise((resolve, reject) => {
     yauzl.fromBuffer(bytes, { lazyEntries: true }, (error, archive) => {
@@ -73,6 +100,26 @@ function xmlParts(bytes, pattern) {
           stream.on('data', (chunk) => chunks.push(chunk))
           stream.on('error', reject)
           stream.on('end', () => { documents.push(Buffer.concat(chunks).toString('utf8')); archive.readEntry() })
+        })
+      })
+      archive.readEntry()
+    })
+  })
+}
+function zipEntries(bytes) {
+  return new Promise((resolve, reject) => {
+    yauzl.fromBuffer(bytes, { lazyEntries: true }, (error, archive) => {
+      if (error) { reject(error); return }
+      const entries = new Map()
+      archive.on('error', reject)
+      archive.on('end', () => resolve(entries))
+      archive.on('entry', (entry) => {
+        archive.openReadStream(entry, (error, stream) => {
+          if (error) { reject(error); return }
+          const chunks = []
+          stream.on('data', (chunk) => chunks.push(chunk))
+          stream.on('error', reject)
+          stream.on('end', () => { entries.set(entry.fileName, Buffer.concat(chunks)); archive.readEntry() })
         })
       })
       archive.readEntry()
@@ -445,6 +492,234 @@ test('a read-only reviewer downloads genuine CSV, PDF, Word and PowerPoint files
   } finally { await context.close(); await fixture.close() }
 })
 
+test('reports end each job section with its rubric details by default, and CSV becomes analyses.csv plus rubrics.csv', { timeout: 180_000 }, async () => {
+  const { fixture, stubs, runId, pairs } = await completedFixture()
+  const { context, page, errors } = await newPage()
+  try {
+    const saved = await jsonResponse(await fixture.request(`/api/workspaces/${fixture.workspaceId}/analyses/${runId}/comparisons/${pairs[0].comparison.id}`))
+    const { rubric } = saved.targetSnapshot
+    assert.ok(rubric.criteria.length > 0)
+    await page.goto(`${fixture.origin}/workspaces/${fixture.workspaceId}/analyses/${runId}`)
+    await visible(page.getByRole('heading', { name: 'Grouped report review', exact: true }))
+    await page.getByRole('button', { name: 'Export report', exact: true }).click()
+    const dialog = await visible(page.getByRole('dialog', { name: 'Export analysis report', exact: true }))
+    assert.equal(await dialog.getByRole('checkbox', { name: 'Include job & rubric details', exact: true }).isChecked(), true)
+    await dialog.getByLabel('Report format', { exact: true }).selectOption('csv')
+    await visible(dialog.getByRole('button', { name: 'Download CSV (.zip)', exact: true }))
+    await visible(dialog.getByText(/^Downloads a \.zip with analyses\.csv and rubrics\.csv\./))
+    const modelsBefore = stubs.modelCalls.length
+    const stateBefore = JSON.stringify([...fixture.analyses.store.values.values()])
+    const requestsBefore = fixture.requests.length
+
+    const bundle = await download(page, 'csv', { rubricDetails: true })
+    assert.equal(bundle.filename, 'Grouped report review.zip')
+    const entries = await zipEntries(bundle.bytes)
+    assert.deepEqual([...entries.keys()], ['analyses.csv', 'rubrics.csv'])
+    const analyses = csvRecords(entries.get('analyses.csv'), rubric.criteria.length)
+    assert.equal(analyses.length, pairs.length)
+    assert.deepEqual([...entries.get('rubrics.csv').subarray(0, 3)], [239, 187, 191])
+    const [header, ...rows] = csvRows(entries.get('rubrics.csv'))
+    assert.deepEqual(header.slice(0, 13), [
+      'Job/grade', 'Organization', 'Rubric', 'Rubric version', 'Criterion #', 'Criterion', 'Requirement type', 'Weight (%)',
+      'Scored', 'Description', 'Scoring guidance', 'Source quotes', 'Source locations',
+    ])
+    assert.ok(header.includes('Link'))
+    const records = rows.map((row) => {
+      assert.equal(row.length, header.length)
+      return Object.fromEntries(header.map((name, index) => [name, row[index]]))
+    })
+    assert.deepEqual(records.map((record) => record['Criterion #']), rubric.criteria.map((_, index) => `C${index + 1}`))
+    assert.deepEqual(records.map((record) => record.Criterion), rubric.criteria.map((criterion) => criterion.label))
+    for (const [index, record] of records.entries()) {
+      assert.equal(record['Job/grade'], analyses[0]['Job/grade'])
+      assert.equal(record.Rubric, rubric.name)
+      assert.equal(record['Rubric version'], String(rubric.version))
+      assert.equal(record.Description, rubric.criteria[index].description)
+      assert.ok(analyses.some((row) => row['Job/grade link'] === record.Link), `rubrics.csv link: ${record.Link}`)
+    }
+    await saveArtifact('browser-real-rubric-details.zip', bundle.bytes)
+
+    const pdf = await readPdf((await download(page, 'pdf', { rubricDetails: true })).bytes)
+    const rubricPages = pdf.pages.filter((item) => item.section.endsWith('Job & rubric details'))
+    assert.ok(rubricPages.length > 0, 'The PDF needs a Job & rubric details section.')
+    assert.ok(pdf.pages.indexOf(rubricPages[0]) > pdf.pages.findIndex((item) => item.section.endsWith('Candidates at a glance')),
+      'Rubric details close the job section.')
+    const rubricBody = rubricPages.map((item) => item.body).join('').replace(/\u00a0/gu, ' ')
+    for (const heading of ['How this rubric is scored', 'Criteria at a glance', 'Criteria in detail']) assert.ok(rubricBody.includes(heading), heading)
+    for (const criterion of rubric.criteria) assert.ok(rubricBody.includes(criterion.label), criterion.label)
+
+    for (const format of ['docx', 'pptx']) {
+      const { bytes, filename } = await download(page, format, { rubricDetails: true })
+      assert.ok(filename.endsWith(`.${format}`))
+      const content = (await xmlParts(bytes, format === 'docx' ? /^word\/document\.xml$/ : /^ppt\/slides\/slide\d+\.xml$/)).join('\n')
+        .replace(/\u00a0|&#160;|&#xa0;/giu, ' ')
+      assert.match(content, /Job &amp; rubric details/)
+      assert.match(content, /How this rubric is scored/)
+      for (const criterion of rubric.criteria) assert.ok(content.includes(criterion.label), `${format}: ${criterion.label}`)
+      await saveArtifact(`browser-real-rubric-details.${format}`, bytes)
+    }
+    assert.equal(stubs.modelCalls.length, modelsBefore)
+    assert.equal(JSON.stringify([...fixture.analyses.store.values.values()]), stateBefore)
+    const exportRequests = fixture.requests.slice(requestsBefore)
+    assert.ok(exportRequests.every((request) => request.method === 'GET'), 'Export is read-only.')
+    assert.ok(exportRequests.filter((request) => request.url.includes('/report-capture?'))
+      .every((request) => new URL(request.url, fixture.origin).searchParams.get('rubricDetails') === 'true'))
+    assert.deepEqual(errors, [])
+  } finally { await context.close(); await fixture.close() }
+})
+
+test('a job rubric page downloads its saved version as PDF, Word, PowerPoint, Markdown and CSV without writes or AI calls', { timeout: 150_000 }, async () => {
+  const fixture = await startResumeAnalysisFixture(runtime, { injectAuth: true })
+  const { context, page, errors } = await newPage()
+  try {
+    const { job, latestRubric } = await seedRealJob(fixture)
+    const [criterion] = latestRubric.criteria
+    const rubricLink = `${fixture.origin}/workspaces/${fixture.workspaceId}/rubrics/${latestRubric.id}?job=${job.id}`
+    await page.goto(rubricLink)
+    await visible(page.getByRole('heading', { name: latestRubric.name, exact: true, level: 1 }))
+    const stateBefore = JSON.stringify([[...fixture.jobs.records.values()], [...fixture.jobs.rubrics.values()]])
+    const requestsBefore = fixture.requests.length
+    const exportButton = await visible(page.getByRole('button', { name: 'Export rubric', exact: true }))
+    assert.equal(await exportButton.isDisabled(), false)
+    await exportButton.click()
+    const dialog = await visible(page.getByRole('dialog', { name: 'Export rubric', exact: true }))
+    assert.equal(await dialog.getByLabel('File format', { exact: true }).inputValue(), 'pdf')
+    await visible(dialog.getByRole('button', { name: 'Download PDF', exact: true }))
+
+    for (const [format, extension] of [['pdf', 'pdf'], ['docx', 'docx'], ['pptx', 'pptx'], ['markdown', 'md'], ['csv', 'csv']]) {
+      const { filename, bytes } = await downloadRubric(page, format)
+      assert.equal(filename, `Engineering specialist - rubric v2.${extension}`)
+      if (format === 'pdf') {
+        const pdf = await readPdf(bytes)
+        const squash = (value) => value.replace(/\s+/gu, '')
+        const text = squash(pdf.text)
+        for (const expected of [latestRubric.name, 'How this rubric is scored', 'Criteria at a glance', 'Criteria in detail', criterion.label, criterion.description, 'Integration test agency']) {
+          assert.ok(text.includes(squash(expected)), `PDF: ${expected}`)
+        }
+        assert.deepEqual(pdf.uriAnnotations.map((annotation) => annotation.url), [rubricLink])
+      } else if (format === 'docx' || format === 'pptx') {
+        const content = (await xmlParts(bytes, format === 'docx' ? /^word\/document\.xml$/ : /^ppt\/slides\/slide\d+\.xml$/)).join('\n')
+          .replace(/\u00a0|&#160;|&#xa0;/giu, ' ')
+        for (const expected of ['How this rubric is scored', criterion.label, 'Engineering methods']) assert.ok(content.includes(expected), `${format}: ${expected}`)
+        assert.ok(content.includes('Integration test agency'), `${format}: organization`)
+        const links = format === 'pptx' ? await pptxHyperlinks(bytes) : await officeHyperlinks(bytes, /^word\/_rels\/document\.xml\.rels$/)
+        assert.ok(links.length > 0 && links.every((link) => link === rubricLink), `${format} links: ${links.join(', ')}`)
+      } else if (format === 'markdown') {
+        const text = new TextDecoder('utf-8', { fatal: true }).decode(bytes)
+        assert.match(text, /^# Engineering specialist/)
+        for (const expected of ['## How this rubric is scored', `### C1. ${criterion.label}`, criterion.description, `[View rubric in Score](<${rubricLink}>)`]) {
+          assert.ok(text.includes(expected), `Markdown: ${expected}\n${text}`)
+        }
+      } else {
+        assert.deepEqual([...bytes.subarray(0, 3)], [239, 187, 191])
+        const [header, ...rows] = csvRows(bytes)
+        assert.equal(rows.length, latestRubric.criteria.length)
+        const record = Object.fromEntries(header.map((name, index) => [name, rows[0][index]]))
+        assert.equal(record['Job/grade'], 'Engineering specialist')
+        assert.equal(record.Organization, 'Integration test agency')
+        assert.equal(record.Rubric, latestRubric.name)
+        assert.equal(record['Rubric version'], '2')
+        assert.equal(record['Criterion #'], 'C1')
+        assert.equal(record.Criterion, criterion.label)
+        assert.equal(record['Requirement type'], 'Required')
+        assert.equal(record['Weight (%)'], '100')
+        assert.equal(record.Description, criterion.description)
+        assert.equal(record['Scoring guidance'], criterion.guidance)
+        assert.equal(record['Source quotes'], `[1] “${criterion.sourceCitations[0].quote}”`)
+        assert.equal(record.Link, rubricLink)
+      }
+      await saveArtifact(`browser-rubric.${extension}`, bytes)
+    }
+    await dialog.getByRole('button', { name: 'Close', exact: true }).click()
+    await dialog.waitFor({ state: 'hidden' })
+
+    const exportRequests = fixture.requests.slice(requestsBefore).filter((request) => request.url.includes('/rubric-export?'))
+    assert.deepEqual(exportRequests.map((request) => {
+      const url = new URL(request.url, fixture.origin)
+      return [request.method, url.pathname, url.searchParams.get('rubricId'), url.searchParams.get('version'), url.searchParams.get('format')]
+    }), ['pdf', 'docx', 'pptx', 'markdown', 'csv'].map((format) => [
+      'GET', `/api/workspaces/${fixture.workspaceId}/jobs/${job.id}/rubric-export`, latestRubric.id, '2', format,
+    ]))
+    assert.ok(fixture.requests.slice(requestsBefore).every((request) => request.method === 'GET'), 'Rubric export is read-only.')
+    assert.equal(JSON.stringify([[...fixture.jobs.records.values()], [...fixture.jobs.rubrics.values()]]), stateBefore)
+
+    await page.goto(`${fixture.origin}/workspaces/${fixture.workspaceId}/jobs/${job.id}`)
+    const jobRubric = page.getByRole('region', { name: 'Associated job rubric', exact: true })
+    await visible(jobRubric.getByRole('heading', { name: latestRubric.name, exact: true }))
+    await jobRubric.getByRole('button', { name: 'Export rubric', exact: true }).click()
+    await visible(page.getByRole('dialog', { name: 'Export rubric', exact: true }))
+    assert.equal((await downloadRubric(page, 'markdown')).filename, 'Engineering specialist - rubric v2.md')
+    assert.deepEqual(errors, [])
+  } finally { await context.close(); await fixture.close() }
+})
+
+test('rubric export follows the Admin switch, allowed workspace roles and enabled report formats', { timeout: 90_000 }, async () => {
+  const fixture = await startResumeAnalysisFixture(runtime, { injectAuth: true })
+  const { context, page, errors } = await newPage()
+  try {
+    const { job, latestRubric } = await seedRealJob(fixture)
+    let override = (features) => features
+    await page.route('**/api/features', async (route) => {
+      const response = await route.fetch()
+      await route.fulfill({ response, json: override(await response.json()) })
+    })
+    const rubricLink = `${fixture.origin}/workspaces/${fixture.workspaceId}/rubrics/${latestRubric.id}?job=${job.id}`
+    const open = async () => {
+      await page.goto(rubricLink)
+      await visible(page.getByRole('heading', { name: latestRubric.name, exact: true, level: 1 }))
+      await visible(page.getByRole('heading', { name: 'Evaluation rubric', exact: true }))
+    }
+    const withPolicy = (reports) => (features) => ({
+      ...features, publicSettings: { ...features.publicSettings, reports: { ...features.publicSettings.reports, ...reports } },
+    })
+
+    await open()
+    const features = await jsonResponse(await fixture.request('/api/features'))
+    assert.equal(features.rubricExports, true, 'Rubric exports are on when Admin settings omit the switch.')
+    assert.equal(features.publicSettings.features.rubricExports, true)
+    await visible(page.getByRole('button', { name: 'Export rubric', exact: true }))
+
+    override = (value) => ({ ...value, rubricExports: false, publicSettings: { ...value.publicSettings, features: { ...value.publicSettings.features, rubricExports: false } } })
+    await open()
+    await page.waitForLoadState('networkidle')
+    assert.equal(await page.getByRole('button', { name: 'Export rubric', exact: true }).count(), 0)
+    await page.goto(`${fixture.origin}/workspaces/${fixture.workspaceId}/jobs/${job.id}`)
+    await visible(page.getByRole('region', { name: 'Associated job rubric', exact: true }).getByRole('heading', { name: latestRubric.name, exact: true }))
+    await page.waitForLoadState('networkidle')
+    assert.equal(await page.getByRole('button', { name: 'Export rubric', exact: true }).count(), 0)
+
+    fixture.setRole('viewer')
+    override = withPolicy({ allowedRoles: ['owner', 'editor'] })
+    await open()
+    const blocked = await visible(page.getByRole('button', { name: 'Export rubric', exact: true }))
+    const deadline = Date.now() + 20_000
+    while (!/Your current workspace role is not allowed to export rubrics/.test(await blocked.getAttribute('title') ?? '')) {
+      assert.ok(Date.now() < deadline, `Unexpected rubric export state: ${await blocked.getAttribute('title')}`)
+      await new Promise((resolve) => setTimeout(resolve, 100))
+    }
+    assert.equal(await blocked.isDisabled(), true)
+
+    override = withPolicy({ enabledFormats: ['pdf'], defaultFormat: 'pdf' })
+    await open()
+    const requestsBefore = fixture.requests.length
+    await page.getByRole('button', { name: 'Export rubric', exact: true }).click()
+    const dialog = await visible(page.getByRole('dialog', { name: 'Export rubric', exact: true }))
+    const select = dialog.getByLabel('File format', { exact: true })
+    const options = await select.locator('option').evaluateAll((items) => items.map((item) => [item.value, item.textContent, item.disabled]))
+    assert.deepEqual(options, [
+      ['pdf', 'PDF', false],
+      ['docx', 'Word (.docx) (disabled by policy)', true],
+      ['pptx', 'PowerPoint (.pptx) (disabled by policy)', true],
+      ['markdown', 'Markdown (.md)', false],
+      ['csv', 'CSV (disabled by policy)', true],
+    ])
+    const { filename } = await downloadRubric(page, 'markdown')
+    assert.equal(filename, 'Engineering specialist - rubric v2.md')
+    assert.ok(fixture.requests.slice(requestsBefore).every((request) => request.method === 'GET'))
+    assert.deepEqual(errors, [])
+  } finally { await context.close(); await fixture.close() }
+})
+
 test('unfinished analyses explain why export is disabled until a comparison completes', { timeout: 60_000 }, async () => {
   const { fixture, runId, pairs } = await completedFixture({ partial: true })
   const { context, page, errors } = await newPage()
@@ -524,7 +799,7 @@ test('export permission failures are visible and cancelling a delayed evidence r
     await page.goto(`${fixture.origin}/workspaces/${fixture.workspaceId}/analyses/${runId}`)
     await page.getByRole('button', { name: 'Export report', exact: true }).click()
     const dialog = page.getByRole('dialog', { name: 'Export analysis report', exact: true })
-    await dialog.getByLabel('Report format', { exact: true }).selectOption('csv')
+    await chooseFormat(dialog, 'csv')
     await page.route('**/report-comparisons?*', (route) => route.fulfill({
       status: 403, contentType: 'application/json', body: JSON.stringify({ error: { code: 'forbidden', message: 'Report access denied for this workspace.' } }),
     }))
@@ -545,7 +820,7 @@ test('export permission failures are visible and cancelling a delayed evidence r
     release.resolve()
     await finished.promise
     await page.getByRole('button', { name: 'Export report', exact: true }).click()
-    await dialog.getByLabel('Report format', { exact: true }).selectOption('csv')
+    await chooseFormat(dialog, 'csv')
     await visible(page.getByRole('button', { name: 'Download CSV', exact: true }))
     assert.equal(downloads.length, 0)
     assert.deepEqual(errors, [])
@@ -568,7 +843,7 @@ test('losing access to saved history cancels a pending export without a late pri
     })
     await page.getByRole('button', { name: 'Export report', exact: true }).click()
     const dialog = page.getByRole('dialog', { name: 'Export analysis report', exact: true })
-    await dialog.getByLabel('Report format', { exact: true }).selectOption('csv')
+    await chooseFormat(dialog, 'csv')
     await dialog.getByRole('button', { name: 'Download CSV', exact: true }).click()
     await captured.promise
     await page.route(`**/api/workspaces/${fixture.workspaceId}/analyses**`, (route) => route.fulfill({
@@ -600,7 +875,7 @@ test('analysis deletion removes the export controls and cancels a delayed report
     })
     await page.getByRole('button', { name: 'Export report', exact: true }).click()
     const dialog = page.getByRole('dialog', { name: 'Export analysis report', exact: true })
-    await dialog.getByLabel('Report format', { exact: true }).selectOption('csv')
+    await chooseFormat(dialog, 'csv')
     await dialog.getByRole('button', { name: 'Download CSV', exact: true }).click()
     await captured.promise
     await deleteAnalysis(fixture, runId)

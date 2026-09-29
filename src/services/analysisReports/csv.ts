@@ -5,9 +5,9 @@ import { assessmentSummary, readableAnalysisDate, readableCandidateSourceName, r
 import { reportGenerationPolicy, reportLimits, snapshotReportPolicy } from './policy'
 import { buildReportNotices, REPORT_TITLE, reportTitle } from './presentation'
 
-type Cell = string | number | null
+export type CsvCell = string | number | null
 
-function csvCell(value: Cell): string {
+export function csvCell(value: CsvCell): string {
   if (value === null || value === '') return ''
   if (typeof value === 'number') {
     if (!Number.isFinite(value)) throw new Error('The CSV report contains an invalid numeric value.')
@@ -26,7 +26,7 @@ export function generateCsvReport(report: AnalysisReport, options?: ReportGenera
   const customized = policy.title !== REPORT_TITLE || policy.additionalFooter !== ''
   const displayLabels = report.groups.some(group => group.target.displayName || group.comparisons.some(comparison => comparison.candidate.displayName))
   const criterionCount = Math.max(0, ...report.groups.map(group => group.target.criteria.length))
-  const header: Cell[] = [
+  const header: CsvCell[] = [
     'Candidate name',
     'Job/grade', 'Overall score', 'Overall assessment',
     ...Array.from({ length: criterionCount }, (_, index) => `C${index + 1}`),
@@ -42,7 +42,7 @@ export function generateCsvReport(report: AnalysisReport, options?: ReportGenera
       throw new Error('CSV generation exceeded its time limit. Export one job or grade at a time; no file was downloaded.')
     }
   }
-  function append(cells: Cell[]) {
+  function append(cells: CsvCell[]) {
     checkTime()
     const chunk = encoder.encode(`${cells.map(csvCell).join(',')}\r\n`)
     bytes += chunk.byteLength
@@ -62,7 +62,7 @@ export function generateCsvReport(report: AnalysisReport, options?: ReportGenera
       comparisons++
       if (comparison.status !== 'complete') continue
       const assessments = new Map(comparison.criteria.map(criterion => [criterion.criterionId, criterion]))
-      const scores = Array.from({ length: criterionCount }, (_, index): Cell => {
+      const scores = Array.from({ length: criterionCount }, (_, index): CsvCell => {
         const definition = target.criteria[index]
         if (!definition) return null
         const assessment = assessments.get(definition.id)
