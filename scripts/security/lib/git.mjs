@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process'
-import { existsSync, readFileSync, statSync } from 'node:fs'
+import { closeSync, constants, existsSync, fstatSync, openSync, readFileSync } from 'node:fs'
 import path from 'node:path'
 
 const MAX_BUFFER = 512 * 1024 * 1024
@@ -230,10 +230,23 @@ export function readAt(repoRoot, ref, file) {
   return readManyAt(repoRoot, ref, [file]).get(file) ?? null
 }
 
+const MISSING_WORKTREE_FILE = new Set(['ENOENT', 'ENOTDIR', 'EISDIR', 'ELOOP', 'ENXIO'])
+
+/** Reads a regular file from the working tree; anything else (missing, directory, FIFO, socket) maps to null. */
 export function readWorktree(repoRoot, file) {
-  const absolute = path.join(repoRoot, file)
-  if (!existsSync(absolute) || !statSync(absolute).isFile()) return null
-  return readFileSync(absolute)
+  let fd
+  try {
+    // Checking the open descriptor avoids a check-then-read race, and O_NONBLOCK keeps a FIFO from stalling the scan.
+    fd = openSync(path.join(repoRoot, file), constants.O_RDONLY | (constants.O_NONBLOCK ?? 0))
+  } catch (error) {
+    if (MISSING_WORKTREE_FILE.has(error.code)) return null
+    throw error
+  }
+  try {
+    return fstatSync(fd).isFile() ? readFileSync(fd) : null
+  } finally {
+    closeSync(fd)
+  }
 }
 
 /** Tracked files at a commit, or tracked plus untracked (not ignored) files in the working tree. */

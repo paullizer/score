@@ -34,11 +34,9 @@ const ASSIGNMENT_OPERATORS = new Set([
   '||=',
   '??=',
 ])
-const MODEL_TRANSPORT_PATTERNS = [
-  /openai\/v1\/chat\/completions/i,
-  /cognitiveservices\.azure\.com\/\.default/i,
-  /\binvokeStructuredModel\s*\(/,
-]
+// Text markers, not URL validators: a file that mentions a model endpoint or token scope is a model transport.
+const MODEL_TRANSPORT_MARKERS = ['openai/v1/chat/completions', 'cognitiveservices.azure.com/.default']
+const MODEL_TRANSPORT_CALL = /\binvokeStructuredModel\s*\(/
 
 function ruleAllowed(file, rule) {
   const entry = SANCTIONED.get(file)
@@ -227,10 +225,6 @@ function isMaxRedirectsOption(ts, node) {
   return ts.isPropertyAssignment(node) && propertyName(ts, node.name) === 'maxRedirects'
 }
 
-function lineSet(lines) {
-  return new Set((lines ?? []).map(item => typeof item === 'number' ? item : item.line))
-}
-
 function changedLineText(lines) {
   return (lines ?? []).map(item => typeof item === 'string' ? item : item.text).join('\n')
 }
@@ -240,7 +234,8 @@ function ssrfPolicyHint(entry) {
 }
 
 function hasModelTransportPattern(text) {
-  return MODEL_TRANSPORT_PATTERNS.some(pattern => pattern.test(text))
+  const lower = text.toLowerCase()
+  return MODEL_TRANSPORT_MARKERS.some(marker => lower.includes(marker)) || MODEL_TRANSPORT_CALL.test(text)
 }
 
 export function includeFile(file) {

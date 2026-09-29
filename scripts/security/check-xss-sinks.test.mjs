@@ -223,9 +223,64 @@ describe('xss sink analysis', () => {
     const policy = { indexInlineScriptAllowed: [{ file: 'index.html', sha256: inlineScriptDigest(body), reason: 'fixture theme bootstrap' }] }
     const inline = source => analyzeFile('index.html', source, { ts, policy }).map(item => item.rule)
     assert.deepEqual(inline(`<script>\r\n  ${body}\r\n</script>`), [])
+    assert.deepEqual(inline(`<script>${body}</script\t\nfoo="bar">`), [])
     assert.deepEqual(inline(`<script>${body};fetch('/steal')</script>`), ['xss/index-inline-script'])
     const [blocked] = analyzeFile('index.html', `<script>${body};fetch('/steal')</script>`, { ts, policy })
     assert.match(blocked.hint, new RegExp(inlineScriptDigest(`${body};fetch('/steal')`)))
+
+    const marked = `${body} // <!--`
+    const markedPolicy = { indexInlineScriptAllowed: [{ file: 'index.html', sha256: inlineScriptDigest(marked), reason: 'fixture with markup' }] }
+    const [unpinnable, ...rest] = analyzeFile('index.html', `<script>${marked}</script>`, { ts, policy: markedPolicy })
+    assert.deepEqual(rest, [])
+    assert.equal(unpinnable.rule, 'xss/index-inline-script')
+    assert.match(unpinnable.hint, /can't be pinned/)
+  })
+
+  test('reads index.html tags, attributes, character references and script ends the way browsers do', () => {
+    const htmlRules = source => findings('index.html', source).map(item => item.rule)
+    const remote = 'https://cdn.example.invalid/app.js'
+    for (const source of [
+      `<script src="//cdn.example.invalid/app.js"></script>`,
+      `<script src="\\\\cdn.example.invalid\\app.js"></script>`,
+      `<script src="/\\cdn.example.invalid/app.js"></script>`,
+      `<script src="&#47;&#x2f;cdn.example.invalid/app.js"></script>`,
+      `<script src="/&Tab;/cdn.example.invalid/app.js"></script>`,
+      `<script src="${joined('data', ':text/javascript,void 0')}"></script>`,
+      `<script/src=//cdn.example.invalid/app.js></script>`,
+      `<SCRIPT TITLE="a>b" SRC='${remote}'></SCRIPT >`,
+      `<script src="${remote}" src="/src/main.tsx"></script>`,
+      `<svg><script href="${remote}"></script></svg>`,
+      `<svg><script xlin\u212A:href="/src/main.tsx" xlink:href="${remote}"></script></svg>`,
+    ]) {
+      assert.deepEqual(htmlRules(source), ['xss/index-remote-script'], source)
+    }
+    for (const source of [
+      `<script type="module" src="/src/main.tsx"></script>`,
+      `<script type=module src=/src/main.tsx>\n</script>`,
+      `<script src="&sol;src/main.tsx"></script>`,
+      `<script type=" Application/JSON ">{"ok":true}</script>`,
+    ]) {
+      assert.deepEqual(htmlRules(source), [], source)
+    }
+    for (const source of [
+      `<script>fetch('/a')</script foo="bar">`,
+      `<script>fetch('/a')`,
+      `<script type="importmap">{"imports":{}}</script>`,
+      `<script type="speculationrules">{}</script>`,
+      `<svg><script src="/src/main.tsx">fetch('/a')</script></svg>`,
+    ]) {
+      assert.deepEqual(htmlRules(source), ['xss/index-inline-script'], source)
+    }
+    assert.deepEqual(htmlRules(`<base href="https://cdn.example.invalid/">`), ['xss/index-base-element'])
+    assert.deepEqual(htmlRules(`<iframe srcdoc="&lt;script&gt;fetch('/a')&lt;/script&gt;"></iframe>`), ['xss/srcdoc'])
+    assert.deepEqual(htmlRules(`<div title="a>b" onclick="go()"></div>`), ['xss/index-inline-handler'])
+    assert.deepEqual(htmlRules(`<body/ONLOAD=go()>`), ['xss/index-inline-handler'])
+    for (const href of ['java&#115;cript:go()', '&#x6A;ava&Tab;script&colon;go()', ' JAVA&#10;SCRIPT:go()']) {
+      assert.deepEqual(htmlRules(`<a href="${href}">x</a>`), ['xss/javascript-url'], href)
+    }
+    assert.deepEqual(htmlRules(`<svg><a><animate attributeName="href" values="#;java&#115;cript:go()"/></a></svg>`), ['xss/javascript-url'])
+    assert.deepEqual(htmlRules(`<meta http-equiv="refresh" content="0;url=java&#115;cript:go()">`), ['xss/javascript-url'])
+    assert.deepEqual(htmlRules(`<meta content="script-src 'unsafe-eval'" http-equiv=" content-security-policy ">`), ['xss/csp-unsafe-script'])
   })
 
   test('the current index.html passes the default policy', () => {

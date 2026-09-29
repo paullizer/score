@@ -16,8 +16,8 @@ on:
         required: true
         type: string
         default: main
-      head_ref:
-        description: Head ref to scan; empty means the dispatched commit
+      scan_ref:
+        description: Commit, branch or tag to scan; empty means the dispatched commit
         required: false
         type: string
         default: ''
@@ -60,7 +60,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || inputs.head_ref || github.sha }}
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || inputs.scan_ref || github.sha }}
           fetch-depth: 0
           persist-credentials: false
 
@@ -76,7 +76,7 @@ jobs:
           PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
           PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           DISPATCH_BASE_REF: ${{ inputs.base_ref || 'main' }}
-          DISPATCH_HEAD_REF: ${{ inputs.head_ref || '' }}
+          DISPATCH_SCAN_REF: ${{ inputs.scan_ref || '' }}
           DISPATCH_FULL_SCAN: ${{ inputs.full_scan && 'true' || 'false' }}
           DISPATCH_VERIFY_RELEASE_AGE: ${{ inputs.verify_release_age && 'true' || 'false' }}
           DISPATCH_FAIL_ON_FINDINGS: ${{ inputs.fail_on_findings && 'true' || 'false' }}
@@ -92,14 +92,14 @@ jobs:
             HEAD_SHA="$PR_HEAD_SHA"
           else
             BASE_REF="$DISPATCH_BASE_REF"
-            HEAD_REF="${DISPATCH_HEAD_REF:-$DISPATCH_SHA}"
+            SCAN_REF="${DISPATCH_SCAN_REF:-$DISPATCH_SHA}"
 
             if BASE_SHA="$(git rev-parse --verify "origin/${BASE_REF}^{commit}" 2>/dev/null)"; then
               :
             else
               BASE_SHA="$(git rev-parse --verify "${BASE_REF}^{commit}")"
             fi
-            if HEAD_SHA="$(git rev-parse --verify "${HEAD_REF}^{commit}" 2>/dev/null)"; then
+            if HEAD_SHA="$(git rev-parse --verify "${SCAN_REF}^{commit}" 2>/dev/null)"; then
               :
             else
               HEAD_SHA="$(git rev-parse --verify "HEAD^{commit}")"

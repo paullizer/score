@@ -7,7 +7,7 @@ import test from 'node:test'
 import { build } from 'esbuild'
 
 const bundled = await build({
-  entryPoints: ['worker\\resumes\\config.ts'],
+  entryPoints: ['worker/resumes/config.ts'],
   bundle: true, write: false, packages: 'external', format: 'cjs',
   platform: 'node', target: 'node24', logLevel: 'silent',
 })
@@ -21,10 +21,10 @@ let dependencyFactory
 async function createDependencies(config) {
   if (!dependencyFactory) {
     const result = await build({
-      entryPoints: ['worker\\resume-index.ts'],
+      entryPoints: ['worker/resume-index.ts'],
       bundle: true, write: false, packages: 'external', format: 'cjs',
       platform: 'node', target: 'node24', logLevel: 'silent',
-      define: { 'import.meta.url': JSON.stringify(pathToFileURL(resolve('worker-tests\\resume-config-tests-not-main.mjs')).href) },
+      define: { 'import.meta.url': JSON.stringify(pathToFileURL(resolve('worker-tests/resume-config-tests-not-main.mjs')).href) },
     })
     const entry = { exports: {} }
     new Function('require', 'module', 'exports', result.outputFiles[0].text)(
@@ -211,7 +211,7 @@ test('local renderer responses reject private destinations, malformed payloads, 
 })
 
 test('dedicated entry point constructs actual private clients and logs only counts or a safe error code', async () => {
-  const source = await readFile('worker\\resume-index.ts', 'utf8')
+  const source = await readFile('worker/resume-index.ts', 'utf8')
   assert.match(source, /new ManagedIdentityCredential\(\{ clientId: config\.clientId \}\)/)
   assert.match(source, /if \(config\.localDevelopment\) credential = new AzureCliCredential/)
   assert.match(source, /createAzureResumeStore\(config\.stores, credential\)/)

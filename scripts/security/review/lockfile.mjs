@@ -1,5 +1,5 @@
 import { allowedRegistries } from '../policy/review.mjs'
-import { BLOCKER, NOTE, REVIEW, addFinding, lineMatcher } from './common.mjs'
+import { BLOCKER, REVIEW, addFinding, lineMatcher } from './common.mjs'
 
 const MAX_PACKUMENT_BYTES = 25 * 1024 * 1024
 
@@ -97,7 +97,9 @@ async function fetchPackument(fetchImpl, name) {
   const controller = new AbortController()
   const timer = setTimeout(() => controller.abort(), 20_000)
   try {
-    const url = `https://registry.npmjs.org/${encodeURIComponent(name).replace('%40', '@')}`
+    // Scoped names keep a literal "@" and encode the "/" (for example @types%2Fnode), as the registry expects.
+    const encoded = name.startsWith('@') ? `@${encodeURIComponent(name.slice(1))}` : encodeURIComponent(name)
+    const url = `https://registry.npmjs.org/${encoded}`
     const response = await fetchImpl(url, { signal: controller.signal })
     return JSON.parse(await readCappedText(response))
   } finally {

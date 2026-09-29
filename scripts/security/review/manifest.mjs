@@ -54,7 +54,7 @@ export function checkPackageJson(ctx) {
     const base = parseManifest(file.baseText(), file.path, findings)
     const head = parseManifest(headText, file.path, findings)
     const lineOf = lineMatcher(headText)
-    for (const [name, script] of addedOrChanged(base.scripts, head.scripts)) {
+    for (const [name] of addedOrChanged(base.scripts, head.scripts)) {
       if (ctx.fullScan && !LIFECYCLE.has(name)) continue
       const verdict = LIFECYCLE.has(name) ? BLOCKER : REVIEW
       addFinding(findings, {

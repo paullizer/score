@@ -42,8 +42,9 @@ export function annotation(item) {
   return `::${command} ${properties.join(',')}::${escapeData(`${item.message}${location}${hint}`)}`
 }
 
+/** Plain text for a Markdown table cell: backslashes and pipes are escaped so text can't end the cell early. */
 function cell(value) {
-  return escapeControl(value).replace(/\|/g, '\\|')
+  return escapeControl(value).replace(/[\\|]/g, '\\$&')
 }
 
 /** A Markdown code span that untrusted text can't break out of. */
@@ -55,15 +56,23 @@ function code(value) {
   return `${fence}${pad}${text}${pad}${fence}`
 }
 
+/**
+ * A code span inside a table cell. A table splits on "|" before code spans are read, and backslash escapes
+ * don't work inside code spans, so a pipe is shown as a visible \x7c escape like other structural characters.
+ */
+function cellCode(value) {
+  return code(String(value ?? '').replace(/\|/g, '\\x7c'))
+}
+
 function location(item) {
   if (!item.file) return '(repository)'
   const suffix = item.line ? `:${item.line}` : ''
-  return item.side === 'base' ? `${code(`${item.file}${suffix}`)} (removed)` : code(`${item.file}${suffix}`)
+  return item.side === 'base' ? `${cellCode(`${item.file}${suffix}`)} (removed)` : cellCode(`${item.file}${suffix}`)
 }
 
 function table(items) {
   const rows = items.map(item =>
-    `| ${cell(code(item.rule))} | ${cell(location(item))} | ${cell(item.message)}${item.hint ? ` ${cell(item.hint)}` : ''} |`)
+    `| ${cellCode(item.rule)} | ${location(item)} | ${cell(item.message)}${item.hint ? ` ${cell(item.hint)}` : ''} |`)
   return ['| Rule | Location | Details |', '| --- | --- | --- |', ...rows].join('\n')
 }
 
@@ -99,7 +108,7 @@ export function renderMarkdown({ title, description, rangeText, filesChecked, fi
   }
   if (suppressed.length) {
     lines.push(`### Suppressed (${suppressed.length})`, '', '| Rule | Location | Reason |', '| --- | --- | --- |')
-    for (const item of suppressed) lines.push(`| ${cell(code(item.rule))} | ${cell(location(item))} | ${cell(item.reason)} |`)
+    for (const item of suppressed) lines.push(`| ${cellCode(item.rule)} | ${location(item)} | ${cell(item.reason)} |`)
     lines.push('')
   }
   if (changedByArea && changedByArea.size) {

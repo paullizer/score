@@ -69,7 +69,7 @@ export function parseSuppression(lineText) {
   const match = SUPPRESSION_PATTERN.exec(lineText)
   if (!match) return null
   const reason = (match[2] ?? '')
-    .replace(/\s*(\*\/\s*\}?|-->|#\}|%\})\s*$/, '')
+    .replace(/\s*(\*\/\s*\}?|--!?>|#\}|%\})\s*$/, '')
     .trim()
   return { rule: match[1], reason, valid: reason.length >= MIN_SUPPRESSION_REASON }
 }

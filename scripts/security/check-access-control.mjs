@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs'
+import { readFileSync, readdirSync } from 'node:fs'
 import path from 'node:path'
 import { BLOCKER, NOTE, REVIEW, finding, scopeToChanges } from './lib/findings.mjs'
 import { loadTypeScript, parseTypeScript, walk, calleeName, expressionName, lineOf, stringLiteralValue, propertyName, unwrapExpression } from './lib/ast.mjs'
@@ -15,7 +15,6 @@ import {
 } from './policy/access-control.mjs'
 
 const ROUTE_METHODS = new Set(['get', 'post', 'put', 'patch', 'delete', 'all', 'options', 'head'])
-const MUTATING_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE'])
 const GUARD_NAMES = new Set(recognizedGuards.map(guard => guard.name))
 const SERVER_TS = /^server\/.*\.ts$/
 
@@ -29,10 +28,6 @@ function lineStarts(text) {
     if (text[index] === '\n') starts.push(index + 1)
   }
   return starts
-}
-
-function offsetForLine(starts, line) {
-  return starts[Math.max(0, Math.min(starts.length - 1, line - 1))]
 }
 
 function lineFromOffset(starts, offset) {
@@ -542,21 +537,26 @@ function analyzeDevHeaderGuard(file, text) {
   })]
 }
 
+/** Server TypeScript files in the working tree. Symbolic links are skipped, so the walk can't loop or leave the repository. */
 function readServerFiles(repoRoot) {
-  const root = path.join(repoRoot, 'server')
   const files = []
-  const visit = dir => {
-    for (const name of readdirSync(dir)) {
-      const absolute = path.join(dir, name)
-      const stat = statSync(absolute)
-      if (stat.isDirectory()) visit(absolute)
-      else if (name.endsWith('.ts')) {
-        const relative = posix(path.relative(repoRoot, absolute))
-        files.push({ path: relative, text: readFileSync(absolute, 'utf8') })
+  const visit = relativeDir => {
+    let entries
+    try {
+      entries = readdirSync(path.join(repoRoot, relativeDir), { withFileTypes: true })
+    } catch (error) {
+      if (error.code === 'ENOENT' || error.code === 'ENOTDIR') return
+      throw error
+    }
+    for (const entry of entries) {
+      const relative = `${relativeDir}/${entry.name}`
+      if (entry.isDirectory()) visit(relative)
+      else if (entry.isFile() && entry.name.endsWith('.ts')) {
+        files.push({ path: relative, text: readFileSync(path.join(repoRoot, relative), 'utf8') })
       }
     }
   }
-  if (existsSync(root)) visit(root)
+  visit('server')
   return files
 }
 

@@ -124,16 +124,20 @@ describe('malicious PR reviewer', () => {
   test('release age verification handles fresh, old, unverified, fail flag, oversize and full-scan note', async () => {
     const fixture = repo({
       base: { 'package-lock.json': lock({}) },
-      head: { 'package-lock.json': lock({ 'node_modules/fresh': pkg('fresh', '1.0.0'), 'node_modules/old': pkg('old', '1.0.0'), 'node_modules/missing': pkg('missing', '1.0.0'), 'node_modules/big': pkg('big', '1.0.0') }) },
+      head: { 'package-lock.json': lock({ 'node_modules/fresh': pkg('fresh', '1.0.0'), 'node_modules/@scope/fresh-scoped': pkg('@scope/fresh-scoped', '1.0.0'), 'node_modules/old': pkg('old', '1.0.0'), 'node_modules/missing': pkg('missing', '1.0.0'), 'node_modules/big': pkg('big', '1.0.0') }) },
     })
     const packuments = {
       fresh: { time: { '1.0.0': '2026-09-28T12:00:00Z' } },
+      '@scope/fresh-scoped': { time: { '1.0.0': '2026-09-28T12:00:00Z' } },
       old: { time: { '1.0.0': '2026-01-01T12:00:00Z' } },
       missing: { time: {} },
       big: 'oversize',
     }
-    const result = await runSpec(specWithPackuments(packuments), fixture, ['--verify-release-age'])
+    const calls = []
+    const result = await runSpec(specWithPackuments(packuments, calls), fixture, ['--verify-release-age'])
     assert.ok(rules(result).includes('review/release-age-fresh'))
+    assert.ok(calls.includes('https://registry.npmjs.org/@scope%2Ffresh-scoped'), calls.join('\n'))
+    assert.ok(result.findings.some(item => item.rule === 'review/release-age-fresh' && item.message.includes('@scope/fresh-scoped@1.0.0')))
     assert.equal(result.findings.filter(item => item.rule === 'review/release-age-unverified').length, 2)
     assert.ok(!result.findings.some(item => item.message.includes('old@1.0.0')))
 

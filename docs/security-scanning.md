@@ -82,16 +82,17 @@ Dependabot uses the same 7-day `cooldown` for version updates, so its routine pu
 | `xss/inner-html-assignment` | Blocker | Setting or appending to `innerHTML` or `outerHTML` |
 | `xss/html-insertion` | Blocker | `insertAdjacentHTML`, `document.write`, `createContextualFragment`, `setHTMLUnsafe`, `parseHTMLUnsafe`, and `DOMParser` output inserted into the page |
 | `xss/string-code-execution` | Blocker | `eval`, `Function`, and `setTimeout` or `setInterval` called with a string |
-| `xss/srcdoc` | Blocker | `srcDoc` anywhere except the Word preview |
+| `xss/srcdoc` | Blocker | `srcDoc` anywhere except the Word preview, and any `srcdoc` attribute in `index.html` |
 | `xss/iframe-sandbox` | Blocker | An iframe without `sandbox`, or with both `allow-scripts` and `allow-same-origin`. `allow-scripts` alone, or a sandbox value the checker can't resolve, is a Review |
 | `xss/csp-unsafe-script` | Blocker | `'unsafe-inline'` or `'unsafe-eval'` in a `script-src` or `default-src` directive |
 | `xss/markup-renderer-import` | Blocker | A Markdown renderer, HTML parser, sanitizer or Word-to-HTML converter imported into the browser app, other than the Word preview's DOMPurify and mammoth. `import`, `export … from`, `import = require`, `require()` and `import()` all count |
 | `xss/post-message-wildcard` | Blocker | `postMessage` to `'*'` |
 | `xss/runtime-script` | Blocker | A `<script>` element created at runtime |
-| `xss/javascript-url` | Blocker | A `javascript:` URL |
-| `xss/index-inline-script` | Blocker | An inline script in `index.html` whose SHA-256 isn't pinned in the policy. The finding gives the hash to record after review |
+| `xss/javascript-url` | Blocker | A `javascript:` URL. In `index.html`, the scheme anywhere in an attribute value counts, after character references are decoded |
+| `xss/index-inline-script` | Blocker | An inline script in `index.html` whose SHA-256 isn't pinned in the policy. The finding gives the hash to record after review. Only `application/json` and `application/ld+json` data blocks are exempt: import maps and speculation rules change what loads, so they need a pin too. Script text containing markup such as `<!--` or `<tag` can't be pinned, because browsers can read it past the first `</script>` |
 | `xss/index-inline-handler` | Blocker | An inline `on…=` event handler in `index.html` |
-| `xss/index-remote-script` | Blocker | A script in `index.html` loaded from an absolute URL |
+| `xss/index-remote-script` | Blocker | A script in `index.html` whose `src`, `href` or `xlink:href` isn't a same-origin path such as `/src/main.tsx`. Absolute, protocol-relative, backslash and `data:` URLs all count, including ones spelled with character references |
+| `xss/index-base-element` | Blocker | A `<base>` element in `index.html`, which would change where relative script and asset URLs load from |
 | `xss/nonliteral-url` | Review | A computed `href`, `src`, `action` or `formAction`, unless a same-origin URL helper in the policy builds it |
 | `xss/dynamic-module-load` | Review | `import()` or `require()` with a computed module name, which the checker can't resolve |
 | `xss/navigation-nonliteral` | Review | Navigating to a computed URL with `location` or `window.open` |

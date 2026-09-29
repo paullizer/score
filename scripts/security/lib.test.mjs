@@ -103,6 +103,15 @@ describe('report', () => {
     assert.equal(line, '::error file=dir/a%2Cb.ts,line=3,title=demo/block::bad%0Athing')
     assert.equal(annotation(finding({ rule: 'n', verdict: NOTE, message: 'note' })), null)
   })
+
+  test('escapes backslashes and pipes in Markdown table cells and code spans', () => {
+    const markdown = renderMarkdown({
+      title: 't', rangeText: 'r', filesChecked: 1, exitCode: 1, summary: { blockers: 1, review: 0, notes: 0 },
+      findings: [finding({ rule: 'demo/a|b', verdict: BLOCKER, file: 'dir\\a|b.ts', line: 2, message: 'ends with \\', hint: 'x\\|y | z' })],
+    })
+    const row = markdown.split('\n').find(line => line.includes('demo/'))
+    assert.equal(row, '| `demo/a\\x7cb` | `dir\\a\\x7cb.ts:2` | ends with \\\\ x\\\\\\|y \\| z |')
+  })
 })
 
 describe('git diff parsing', () => {
