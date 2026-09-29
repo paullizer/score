@@ -18,7 +18,7 @@ async function loadModule(entryPoint) {
 }
 
 const [modelModule, validationModule] = await Promise.all([
-  loadModule('worker\\resumes\\model.ts'), loadModule('server\\resumes\\validation.ts'),
+  loadModule('worker/resumes/model.ts'), loadModule('server/resumes/validation.ts'),
 ])
 const {
   extractResumeProfile, ResumeProfileError, RESUME_PROFILE_MODEL_VERSIONS, RESUME_PROFILE_MODEL_LIMITS,

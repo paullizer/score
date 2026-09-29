@@ -6,7 +6,7 @@ import { loadWorker } from './shared-model-loader.mjs'
 import { assertStrictSchema as assertSharedStrictSchema } from './strict-schema-test-support.mjs'
 
 const bundled = await build({
-  entryPoints: ['worker\\grades\\model.ts'],
+  entryPoints: ['worker/grades/model.ts'],
   bundle: true, write: false, format: 'esm', platform: 'node', target: 'node24', logLevel: 'silent',
 })
 const moduleText = `${bundled.outputFiles[0].text}\n//# sourceURL=score-grade-model-tests.mjs`

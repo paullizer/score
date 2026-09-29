@@ -1,0 +1,70 @@
+name: CI
+
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  ci:
+    name: Lint, build, and test
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci --ignore-scripts --no-audit --no-fund
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Build
+        id: build
+        run: npm run build
+
+      - name: Test server
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: npm run test:server
+
+      - name: Test worker
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: npm run test:worker
+
+      - name: Test renderer
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: npm run test:renderer
+
+      - name: Test reports
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: npm run test:reports
+
+      - name: Test security tooling
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: npm run test:security
+
+      - name: Verify admission
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: node scripts/verify-admission.mjs
