@@ -547,6 +547,17 @@ Client polling must continue after scoring is terminal and follow summary
 revisions, because regenerating a narrative never changes a completed
 comparison's ETag.
 
+`GET /api/workspaces/:workspaceId/analyses/:runId/report-capture` also accepts
+`rubricDetails=true|false`; omitting it means `false`, and any other value
+returns 400. With `true`, capture returns 403 when `features.rubricExports` is
+off, in addition to the existing role, format and limit checks. Otherwise the
+capture and comparison batches are unchanged. The browser builds each target's
+**Job & rubric details** from its frozen target snapshot and the completed
+comparisons it has already collected, so no other records are read and no model
+is called. With `true`, CSV downloads as a `.zip` of `analyses.csv`, identical to
+the plain CSV, and `rubrics.csv`. Like other report reads, capture ignores
+**Pause new work**.
+
 Deploy compatible schema readers, lifecycle handlers, API, and report clients
 before enabling workers that write narrative records. Historical source/results
 remain unchanged, and older analyses are not backfilled by reading them. Retain

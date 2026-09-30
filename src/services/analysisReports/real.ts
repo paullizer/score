@@ -309,7 +309,7 @@ export async function assertRealAnalysisReportNarrativesCurrent(
 export async function loadRealAnalysisReport(
   workspaceId: string, runId: string,
   options: {
-    targetId?: string; format?: AnalysisReportFormat; requireSummaries?: boolean;
+    targetId?: string; format?: AnalysisReportFormat; requireSummaries?: boolean; rubricDetails?: boolean;
     signal?: AbortSignal; onProgress?: (completed: number, total: number) => void
   } = {},
 ): Promise<AnalysisReport> {
@@ -317,6 +317,7 @@ export async function loadRealAnalysisReport(
   id.parse(runId)
   if (options.targetId !== undefined) id.parse(options.targetId)
   if (options.requireSummaries !== undefined) z.boolean().parse(options.requireSummaries)
+  if (options.rubricDetails !== undefined) z.boolean().parse(options.rubricDetails)
   const format = z.enum(['csv', 'pdf', 'docx', 'pptx']).parse(options.format ?? (options.requireSummaries ? 'pdf' : 'csv'))
   const requireSummaries = format !== 'csv'
   const cancellation = new AbortController()
@@ -329,7 +330,11 @@ export async function loadRealAnalysisReport(
   const startedAt = new Date().toISOString()
   let timer: ReturnType<typeof setTimeout> | undefined
   try {
-    const captureQuery = new URLSearchParams({ format, ...(options.targetId === undefined ? {} : { targetId: options.targetId }) })
+    // Only an export that includes rubric details names them, so the server can apply the Rubric exports switch.
+    const captureQuery = new URLSearchParams({
+      format, ...(options.targetId === undefined ? {} : { targetId: options.targetId }),
+      ...(options.rubricDetails ? { rubricDetails: 'true' } : {}),
+    })
     const rawCapture = await cloudJsonRequest<unknown>(
       `/workspaces/${encodeURIComponent(workspaceId)}/analyses/${encodeURIComponent(runId)}/report-capture?${captureQuery}`,
       { method: 'GET', signal },

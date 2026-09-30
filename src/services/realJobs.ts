@@ -37,6 +37,7 @@ export async function fetchJobProcessingFeatures(signal?: AbortSignal): Promise<
     markdownJobImports: features.realJobImports === true && features.markdownJobImports === true,
     wordDocumentImports: features.realJobImports === true && features.wordDocumentImports === true,
     rubricAssistant: features.rubricAssistant === true,
+    rubricExports: features.rubricExports === true,
     limits: {
       ...JOB_IMPORT_LIMITS,
       ...features.limits,

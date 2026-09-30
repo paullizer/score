@@ -106,6 +106,8 @@ export interface AdminSettings {
     samplesVisible: boolean
     /** Optional so earlier revisions and captures keep their exact shape; absent means on. Read it with rubricAssistantEnabled(). */
     rubricAssistant?: boolean
+    /** Optional so earlier revisions and captures keep their exact shape; absent means on. Read it with rubricExportsEnabled(). */
+    rubricExports?: boolean
   }
   maintenance: { pauseNewWork: boolean; explanation: string }
   imports: {
@@ -272,6 +274,8 @@ export interface PublicFeaturesResponse extends SettingsDeploymentCapabilities {
   markdownResumeImports: boolean
   /** The job-rubric AI assistant is deployed and currently admitting new requests. */
   rubricAssistant: boolean
+  /** Real job rubrics can be exported and detailed in analysis reports. Exports are reads, so pausing new work does not affect this. */
+  rubricExports: boolean
   limits: RuntimeNumericLimits<typeof JOB_IMPORT_LIMITS>
   resumeLimits: RuntimeNumericLimits<typeof RESUME_IMPORT_LIMITS>
   gradeLimits: RuntimeNumericLimits<typeof GRADE_LADDER_LIMITS>
@@ -405,4 +409,4 @@ export {
   captureProcessingSettings, captureQcProcessingSettings, resolveTaskModel, projectPublicSettings,
   runtimeSettingsReadiness, diffAdminSettings, hostMatchesRule, urlAllowedBySettings,
 } from './admin-settings-resolver'
-export { rubricAssistantEnabled } from './feature-switches'
+export { rubricAssistantEnabled, rubricExportsEnabled } from './feature-switches'

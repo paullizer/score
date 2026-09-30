@@ -223,11 +223,14 @@ export function paginatePptxBlocks(
       const minimum = pptxTextHeight(2, fontSize) + padding * 2 + contextHeight
       const following = blocks[blockIndex + 1]
       const followingFont = following?.fontSize ?? PPTX_LAYOUT.bodyFontSize
+      // A citation panel moves whole when it fits, so a heading keeps its entire panel.
+      const followingPanel = kind === 'heading' && following?.kind === 'citation' ?
+        measurePptxText(following.text, textWidth - 0.32, followingFont).height + 0.32 : Infinity
       const headingReserve = kind === 'heading' && following ?
-        Math.max(
+        (followingPanel <= continuedHeight - measured.height - 0.1 ? followingPanel : Math.max(
           Math.min(measurePptxText(following.text, textWidth, followingFont).height, pptxTextHeight(3, followingFont)),
           Math.min(measurePptxText(firstSentence(following.text), textWidth, followingFont).height, continuedHeight - measured.height - 0.1),
-        ) + 0.1 : 0
+        )) + 0.1 : 0
       const wholeHeight = measured.height + padding * 2 + contextHeight
       const firstSentenceHeight = measurePptxText(firstSentence(remaining), textWidth, fontSize).height + padding * 2 + contextHeight
       const canMoveParagraph = kind !== 'heading' && page.fragments.at(-1)?.kind !== 'heading' &&

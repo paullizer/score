@@ -9,7 +9,7 @@ import { PdfReportLayout } from './pdf-layout'
 import type { PdfReportFonts } from './pdf-layout'
 import { reportGenerationPolicy, reportLimits, snapshotReportPolicy } from './policy'
 
-async function embedReportFonts(document: PDFDocument, options?: ReportGenerationOptions): Promise<PdfReportFonts> {
+export async function embedReportFonts(document: PDFDocument, options?: Pick<ReportGenerationOptions, 'fonts'>): Promise<PdfReportFonts> {
   if (!options?.fonts?.regular?.byteLength || !options.fonts.bold?.byteLength) {
     throw new Error('PDF generation requires the locally bundled Noto Sans regular and bold font bytes. Reload the application and retry; no report was generated.')
   }

@@ -1,5 +1,4 @@
-import PptxGenJS from 'pptxgenjs'
-import { REPORT_LIMITS } from '../../domain/analysis-reports'
+import type PptxGenJS from 'pptxgenjs'
 import type {
   AnalysisReport, ReportComparison, ReportGenerationOptions, ReportGroup, ReportTargetPresentation,
 } from '../../domain/analysis-reports'
@@ -11,139 +10,41 @@ import {
   requireReportNarratives, targetNarrativeDisclosures, targetNarrativeParagraphs,
 } from './narratives'
 import {
-  assertXmlText, criterionScoreLabel, evidenceStatusLabel, formatReportWeight, overallScoreLabel,
-  REPORT_FONT_FAMILY, REPORT_PALETTE, reportTitle,
+  criterionScoreLabel, evidenceStatusLabel, formatReportWeight, overallScoreLabel, reportTitle,
 } from './presentation'
 import { readableAnalysisDate, readableCandidateName, readableCompletionNotice, selectKeyCriteria } from './readable'
 import type { ReadableCriterion } from './readable'
 import {
-  assertPptxBox, keepPptxParagraphEndWordsTogether, measurePptxText, paginatePptxBlocks, PPTX_LAYOUT, takePptxText,
+  assertPptxBox, keepPptxParagraphEndWordsTogether, paginatePptxBlocks, PPTX_LAYOUT, takePptxText,
 } from './pptx-layout'
-import type { PptxBox, PptxFlowBlock } from './pptx-layout'
+import type { PptxFlowBlock } from './pptx-layout'
 import { reportGenerationPolicy, reportLimits, reportPolicyTitle, snapshotReportPolicy } from './policy'
+import {
+  BODY_WIDTH, C, COLUMN_GAP, CONTENT_BOTTOM, fits, HEADER_HEIGHT, height, hyperlink, internalLink, LIMIT_MESSAGE,
+  linkText, rectangle, SlideDeck, summaryLeading, table, TABLE_FONT, TABLE_PADDING_X, TABLE_PADDING_Y, tableRowHeight,
+  text, uniformRowHeights, LINKS_Y,
+} from './pptx-primitives'
+import type { DeckCell } from './pptx-primitives'
+import { addRubricSlides } from './rubric-pptx'
+import { rubricDetailsTitle, rubricDocumentFromReportGroup } from './rubric-model'
 
-const C = REPORT_PALETTE
-const BODY_WIDTH = PPTX_LAYOUT.width - 2 * PPTX_LAYOUT.margin
-const CONTENT_BOTTOM = PPTX_LAYOUT.bodyBottom
-const LINKS_Y = 6.55
-const TABLE_FONT = PPTX_LAYOUT.tableFontSize
-const TABLE_PADDING_X = 0.14
-const TABLE_PADDING_Y = 0.05
-const HEADER_HEIGHT = 0.46
 const REVIEW_TABLE_Y = 2.58
-const COLUMN_GAP = 0.36
 const EXPLANATION_WIDTH = (BODY_WIDTH - COLUMN_GAP) / 2
 const EXPLANATION_TEXT_GAP = 0.04
 const HUMAN_REVIEW = 'Human review required. Evidence matches are not hiring decisions or official GS eligibility findings.'
-const LIMIT_MESSAGE = 'Narrow the export to one exact job/grade target; the export was not generated.'
 const WEIGHT_NOTICE = 'Weights: ~ rounded to two decimals; <0.01% is a positive weight below 0.01%.'
 
 type ReviewLinks = ReturnType<typeof reportReviewLinks>
-type TextValue = string | PptxGenJS.TextProps[]
-
-function hyperlink(url: string, tooltip?: string): PptxGenJS.HyperlinkProps {
-  assertXmlText(url, 'Review link')
-  if (tooltip) assertXmlText(tooltip, 'Review link description')
-  return { url, ...(tooltip ? { tooltip } : {}) }
-}
-
-function internalLink(slide: number): PptxGenJS.HyperlinkProps {
-  if (!Number.isInteger(slide) || slide < 1) throw new Error('PowerPoint navigation has no valid destination.')
-  return { slide }
-}
-
-function height(value: string, width: number, fontSize: number): number {
-  return measurePptxText(value, width, fontSize).height
-}
-
-function fits(value: string, width: number, available: number, fontSize: number): boolean {
-  return height(value, width, fontSize) <= available + 0.000001
-}
-
-function summaryLeading(fontSize: number): PptxGenJS.TextPropsOptions {
-  // Percentage leading varies with a viewer's font metrics; point leading matches the paginator.
-  return { lineSpacingMultiple: undefined, lineSpacing: fontSize * PPTX_LAYOUT.lineHeight }
-}
-
-function text(
-  slide: PptxGenJS.Slide, value: TextValue, box: PptxBox, fontSize = 16,
-  options: PptxGenJS.TextPropsOptions = {},
-): void {
-  const plain = typeof value === 'string' ? value : value.map(run => run.text).join('')
-  assertXmlText(plain)
-  assertPptxBox(box)
-  if (!fits(plain, box.w, box.h, fontSize)) {
-    throw new Error(`PowerPoint text exceeds its readable layout budget. ${LIMIT_MESSAGE}`)
-  }
-  slide.addText(value, {
-    ...box, fontFace: REPORT_FONT_FAMILY, fontSize, color: C.text, margin: 0, lang: 'en-US',
-    breakLine: false, paraSpaceAfter: 0, paraSpaceBefore: 0, lineSpacingMultiple: PPTX_LAYOUT.lineHeight,
-    valign: 'top', wrap: true, fit: 'none', ...options,
-  })
-}
-
-function rectangle(slide: PptxGenJS.Slide, box: PptxBox, color: string, name: string): void {
-  assertPptxBox(box)
-  slide.addShape('rect', { ...box, objectName: name, fill: { color }, line: { color, width: 0 } })
-}
-
-function linkText(
-  slide: PptxGenJS.Slide, label: string, url: string, box: PptxBox, name: string, tooltip?: string,
-): void {
-  text(slide, label, box, 14, {
-    color: C.accent, underline: { style: 'sng' }, hyperlink: hyperlink(url, tooltip), objectName: name,
-  })
-}
 
 function sectionReference(group: ReportGroup, groupIndex: number): string {
   return `Section ${groupIndex + 1} · ${group.target.kind === 'grade' ? 'Grade' : 'Job'} analysis`
 }
 
-class ReportDeck {
-  readonly presentation = new PptxGenJS()
-  readonly limits: ReturnType<typeof reportLimits>
-  slideCount = 0
-
-  constructor(readonly report: AnalysisReport, readonly options: ReportGenerationOptions | undefined, private readonly startedAt: number) {
-    this.limits = reportLimits(reportGenerationPolicy(report, 'pptx'))
-    this.presentation.layout = 'LAYOUT_WIDE'
-    this.presentation.author = 'Score'
-    this.presentation.subject = 'Analysis evidence for human review'
-    const title = reportTitle(report)
-    assertXmlText(title)
-    this.presentation.title = title
-    this.presentation.company = 'Score'
-    this.presentation.theme = { headFontFace: REPORT_FONT_FAMILY, bodyFontFace: REPORT_FONT_FAMILY }
-  }
-
-  checkBudget(): void {
-    if (Date.now() - this.startedAt > this.limits.maxGenerationMilliseconds) {
-      throw new Error(`PowerPoint generation exceeded the time limit. ${LIMIT_MESSAGE}`)
-    }
-  }
-
-  slide(title: string, reference = '', name = 'slide-title', fontSize = 36): PptxGenJS.Slide {
-    this.checkBudget()
-    if (this.slideCount >= Math.min(this.limits.maxSlides, REPORT_LIMITS.maxPages)) {
-      throw new Error(`PowerPoint exceeds the slide/page limit. ${LIMIT_MESSAGE}`)
-    }
-    const slide = this.presentation.addSlide()
-    this.slideCount++
-    slide.background = { color: C.background }
-    rectangle(slide, { x: 0.6, y: 0.6, w: 1.35, h: 0.35 }, C.accent, 'score-brand')
-    text(slide, 'SCORE', { x: 0.76, y: 0.615, w: 1.04, h: 0.32 }, 12, {
-      bold: true, color: C.paper, objectName: 'brand',
+class ReportDeck extends SlideDeck {
+  constructor(readonly report: AnalysisReport, readonly options: ReportGenerationOptions | undefined, startedAt: number) {
+    super(reportLimits(reportGenerationPolicy(report, 'pptx')), startedAt, {
+      title: reportTitle(report), subject: 'Analysis evidence for human review',
     })
-    if (reference) text(slide, reference, { x: 2.25, y: 0.615, w: 6.5, h: 0.3 }, 11, {
-      color: C.muted, objectName: 'job-reference',
-    })
-    if (title) text(slide, title, { x: 0.6, y: 1.12, w: BODY_WIDTH, h: height(title, BODY_WIDTH, fontSize) }, fontSize, {
-      bold: true, objectName: name,
-    })
-    text(slide, `${this.slideCount}`, { x: 12.21, y: 6.6, w: 0.52, h: 0.3 }, 11, {
-      color: C.muted, align: 'right', objectName: 'slide-number',
-    })
-    return slide
   }
 
   links(comparison: ReportComparison): ReviewLinks {
@@ -422,51 +323,6 @@ function jobIntroduction(deck: ReportDeck, group: ReportGroup, index: number, co
     }
   })
   return destination
-}
-
-interface DeckCell {
-  text: string
-  url?: string
-  tooltip?: string
-  runs?: PptxGenJS.TextProps[]
-}
-
-function tableRowHeight(cells: readonly DeckCell[], widths: readonly number[]): number {
-  return Math.max(...cells.map((cell, index) =>
-    height(cell.text, widths[index] - TABLE_PADDING_X * 2, TABLE_FONT))) + TABLE_PADDING_Y * 2
-}
-
-function uniformRowHeights(heights: readonly number[]): number[] {
-  const maximum = Math.max(...heights)
-  return heights.map(() => maximum)
-}
-
-function table(
-  slide: PptxGenJS.Slide, headers: readonly string[], rows: readonly DeckCell[][],
-  widths: number[], heights: number[], y: number, name: string,
-): void {
-  const box = { x: 0.6, y, w: BODY_WIDTH, h: HEADER_HEIGHT + heights.reduce((sum, value) => sum + value, 0) }
-  assertPptxBox(box)
-  const tableRows: PptxGenJS.TableRow[] = [headers.map(value => ({ text: value })), ...rows].map((row, rowIndex) =>
-    row.map((cell: DeckCell) => {
-      assertXmlText(cell.text)
-      if (cell.runs && cell.runs.map(run => run.text).join('') !== cell.text) {
-        throw new Error('PowerPoint table links must preserve the complete measured cell text.')
-      }
-      return {
-        text: cell.runs ?? (cell.url ? [{ text: cell.text, options: { color: C.accent, hyperlink: hyperlink(cell.url, cell.tooltip) } }] : cell.text),
-        options: {
-          bold: rowIndex === 0, color: rowIndex === 0 ? C.paper : cell.url ? C.accent : C.text,
-          fill: { color: rowIndex === 0 ? C.text : rowIndex % 2 ? C.paper : C.background },
-        },
-      }
-    }))
-  slide.addTable(tableRows, {
-    ...box, objectName: name, colW: widths, rowH: [HEADER_HEIGHT, ...heights], autoPage: false,
-    margin: [TABLE_PADDING_Y * 72, TABLE_PADDING_X * 72, TABLE_PADDING_Y * 72, TABLE_PADDING_X * 72],
-    fontFace: REPORT_FONT_FAMILY, fontSize: TABLE_FONT, color: C.text,
-    border: { color: C.border, pt: 0.65 }, valign: 'top',
-  })
 }
 
 function resumeDocumentReference(comparison: ReportComparison): string {
@@ -1016,6 +872,14 @@ export async function generatePptxReport(report: AnalysisReport, options?: Repor
       if (featured.has(comparison.id)) candidateOverviews.set(comparison.id, featuredReview(deck, group, comparison, groupIndex, index))
     })
     overview(deck, group, groupIndex, candidateOverviews)
+    if (options?.rubricDetails === true) {
+      addRubricSlides(deck, rubricDocumentFromReportGroup(report, group, options), {
+        title: rubricDetailsTitle(group.target.kind),
+        reference: `${sectionReference(group, groupIndex)} · Rubric details`,
+        key: `target-${groupIndex}-rubric`,
+        links: (slide, key) => targetLinks(slide, deck, group, key, contentsSlide),
+      })
+    }
   })
   finishAgenda(deck, agenda, destinations)
   if (policy.additionalFooter) reportNotice(deck, 'Additional report notice', [

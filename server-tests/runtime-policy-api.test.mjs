@@ -342,6 +342,46 @@ test('official export capture enforces format, scope, roles and pinned policy ev
   } finally { await http.close() }
 })
 
+test('report capture offers job & rubric details by default and refuses them only when the Rubric exports switch is off', async () => {
+  const f = fixture(), policy = runtimePolicy(), { run } = await createRun(f)
+  for (const pair of compareRecords(f, run.id)) await publishResult(f, run.id, pair.record.id)
+  const http = await startHttp(f, true, policy)
+  const path = `/${run.id}/report-capture`
+  const capture = (suffix, options) => http.request(`${path}?format=pdf${suffix}`, 'GET', undefined, options)
+  try {
+    assert.equal('rubricExports' in policy.value.features, false, 'The saved policy omits the key, so the switch is on')
+    for (const format of ['csv', 'pdf', 'docx', 'pptx']) {
+      const response = await http.request(`${path}?format=${format}&rubricDetails=true`)
+      assert.equal(response.status, 200, await response.clone().text())
+      assert.equal((await response.json()).settings.revision, 'policy-one')
+    }
+    for (const value of ['yes', '1', 'TRUE', '']) assert.equal((await capture(`&rubricDetails=${value}`)).status, 400, value)
+    assert.equal((await capture('&rubricDetails=true&rubricDetails=false')).status, 400)
+
+    policy.value.maintenance.pauseNewWork = true
+    assert.equal((await capture('&rubricDetails=true')).status, 200, 'Pausing new work leaves exports of saved results available')
+    policy.value.maintenance.pauseNewWork = false
+
+    policy.revision = 'policy-two'
+    policy.value.features.rubricExports = false
+    const refused = await capture('&rubricDetails=true')
+    assert.equal(refused.status, 403)
+    assert.match(await refused.text(), /Rubric exports are turned off in Admin settings/)
+    for (const suffix of ['', '&rubricDetails=false']) {
+      const response = await capture(suffix)
+      assert.equal(response.status, 200, `Reports without rubric details stay available: ${suffix || 'omitted'}`)
+      assert.equal((await response.json()).settings.revision, 'policy-two')
+    }
+    policy.value.features.rubricExports = true
+    policy.value.reports.allowedRoles = ['owner']
+    assert.equal((await capture('&rubricDetails=true', { role: 'viewer' })).status, 403, 'Rubric details never widen the export roles')
+    assert.equal((await capture('&rubricDetails=true', { role: 'stranger' })).status, 404)
+    assert.equal((await capture('&rubricDetails=true')).status, 200)
+    policy.unavailable = true
+    assert.equal((await capture('&rubricDetails=true')).status, 503)
+  } finally { await http.close() }
+})
+
 test('configured rollout inactivity preserves saved report restrictions without applying new-analysis limits to history', async () => {
   const f = fixture(), policy = runtimePolicy(), { run } = await createRun(f, 2)
   const pairs = compareRecords(f, run.id)

@@ -211,3 +211,34 @@ test('rubricAssistant also follows the Admin switch and new-work admission, and 
   assert.equal(await withPolicy(true, settings => { settings.features.jobImports = false }), true, 'Turning off job imports does not turn off editing existing rubrics')
   assert.equal(await withPolicy(false, settings => { settings.features.rubricAssistant = true }), false, 'The switch cannot enable an undeployed model')
 })
+
+test('rubricExports feature mapping is true only when advertised', async () => {
+  for (const [advertised, expected] of [
+    [{ realJobImports: true, rubricExports: true }, true],
+    [{ realJobImports: true, rubricExports: false }, false],
+    [{ realJobImports: true }, false],
+  ]) {
+    globalThis.fetch = async () => json(advertised)
+    const features = await client.fetchJobProcessingFeatures()
+    assert.equal(features.rubricExports, expected)
+    assert.equal(client.jobFeaturesWithPolicy(features).rubricExports, expected)
+  }
+})
+
+test('rubricExports follows the Admin switch, stays available while new work is paused, and absent means on', async () => {
+  const policy = change => {
+    const settings = client.createDefaultAdminSettings()
+    change(settings)
+    return client.projectPublicSettings(client.captureProcessingSettings(settings, 'revision-1', '2026-01-01T00:00:00.000Z'))
+  }
+  const withPolicy = async (advertised, change) => {
+    globalThis.fetch = async () => json({ realJobImports: true, rubricExports: advertised })
+    return client.jobFeaturesWithPolicy(await client.fetchJobProcessingFeatures(), policy(change)).rubricExports
+  }
+  assert.equal(await withPolicy(true, () => {}), true, 'Revisions saved before the switch existed keep rubric exports on')
+  assert.equal(await withPolicy(true, settings => { settings.features.rubricExports = true }), true)
+  assert.equal(await withPolicy(true, settings => { settings.features.rubricExports = false }), false)
+  assert.equal(await withPolicy(true, settings => { settings.maintenance.pauseNewWork = true }), true, 'Exports read saved rubrics, so pausing new work does not hide them')
+  assert.equal(await withPolicy(true, settings => { settings.features.jobImports = false }), true, 'Turning off job imports does not hide existing rubrics')
+  assert.equal(await withPolicy(false, settings => { settings.features.rubricExports = true }), false, 'The switch cannot enable an undeployed export path')
+})

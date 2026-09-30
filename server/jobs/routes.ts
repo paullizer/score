@@ -1,17 +1,21 @@
 import { createHash, randomUUID } from 'node:crypto'
 import express, { type NextFunction, type Request, type RequestHandler, type Response, type Router } from 'express'
+import { rateLimit, type RateLimitInfo } from 'express-rate-limit'
 import ipaddr from 'ipaddr.js'
 import { PDFDocument } from 'pdf-lib'
 import type { RealJobDetail, RealJobRecord, RealJobSummary, VersionedRealJob } from '../../src/domain/real-jobs'
 import { JOB_IMPORT_LIMITS } from '../../src/domain/real-jobs'
 import { isOriginalContentType, isSafeUploadedFilename } from '../../src/domain/source-files'
 import type { Job, Rubric, SourceDocument } from '../../src/domain/types'
-import { originalExtension, UPLOAD_CONTENT_TYPES, uploadFormatFromContentType, type UploadFormat } from '../../src/domain/document-formats'
+import { documentPagination, originalExtension, UPLOAD_CONTENT_TYPES, uploadFormatFromContentType, type UploadFormat } from '../../src/domain/document-formats'
 import { rubricAssistRequestSchema } from '../../src/domain/rubric-assist'
+import {
+  isRubricExportFormat, RUBRIC_EXPORT_SCHEMA_VERSION, type RubricExportFormat, type RubricExportPayload,
+} from '../../src/domain/rubric-exports'
 import { validateWordUpload } from '../documents/upload'
 import type { AuthenticatedPrincipal } from '../auth'
 import { decodeMarkdown, MarkdownInputError } from '../documents/markdown'
-import { conflict, HttpError, invalidRequest, notFound, preconditionRequired, unavailable } from '../errors'
+import { conflict, HttpError, invalidRequest, notFound, preconditionRequired, tooManyRequests, unavailable } from '../errors'
 import { getPrincipal, getRequestSettings } from '../request-context'
 import { assertNewProcessingAllowed, getAdmissionSettings, runtimeSettingsEnabled } from '../settings/request-context'
 import { rubricAssistantEnabled } from '../../src/domain/admin-settings'
@@ -19,14 +23,14 @@ import type { WorkspaceRepository } from '../repository'
 import type { LifecycleDependencies } from '../lifecycle/contracts'
 import { assertWorkspaceMutationLease } from '../lifecycle/lease'
 import { StoreConflictError } from '../store'
-import type { AssistLimiter } from '../assist/limits'
+import { formatRetryAfter, type AssistLimiter } from '../assist/limits'
 import { AssistCancelledError, runAssist } from '../assist/runner'
 import type { AssistModelInvoker } from '../assist/types'
 import { jobRubricAssistProfile } from '../assist/profiles/job-rubric'
 import type { JobBlobStore, JobLifecycleScope, RealJobStore } from './store'
 import { assertJobWritable, putJobBlob } from './guards'
 import {
-  assertImportPolicy, assertOriginalDownload, newProcessingSettings, newWorkProcessingSettings,
+  assertImportPolicy, assertOriginalDownload, assertRubricExport, newProcessingSettings, newWorkProcessingSettings,
   requestProcessingSettings, resolveAcceptedProcessingSettings,
 } from './policy'
 import { JobCleanupPendingError, jobLifecycleImpact, purgeJob, purgeJobRubric, requireJobLifecycle } from './lifecycle'
@@ -38,6 +42,7 @@ import {
   validateRealJobRecord,
   validateRealRubric,
   validateRealSourceDocument,
+  validateStoredRealRubric,
 } from './validation'
 
 export interface RealJobsDeps {
@@ -61,6 +66,11 @@ interface AuthorizedRequest extends Request {
 const ACTIVE_STATUSES = new Set(['queued', 'parsing', 'generating'])
 const PDF_MAGIC = Buffer.from('%PDF-', 'ascii')
 const MAX_FILENAME_LENGTH = 255
+const RUBRIC_EXPORT_RATE_LIMIT = { limit: 60, windowMilliseconds: 60_000 } as const
+
+interface RateLimitedRequest extends Request {
+  rateLimit?: RateLimitInfo
+}
 
 function bodyRecord(value: unknown, allowed: readonly string[]): Record<string, unknown> {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) throw invalidRequest('Request body must be a JSON object.')
@@ -101,6 +111,18 @@ function optionalUuid(value: unknown, name: string): string | undefined {
   if (value === undefined) return undefined
   if (typeof value !== 'string' || !isUuid(value)) throw invalidRequest(`${name} must be a UUID.`)
   return value.toLowerCase()
+}
+
+function rubricExportQuery(req: Request): { rubricId: string; version: number; format: RubricExportFormat } {
+  const unexpected = Object.keys(req.query).filter(key => !['rubricId', 'version', 'format'].includes(key))
+  if (unexpected.length) throw invalidRequest(`Rubric exports do not accept query parameter(s): ${unexpected.join(', ')}.`)
+  const { rubricId, version, format } = req.query
+  if (typeof rubricId !== 'string' || !rubricId || rubricId.length > 1024 || rubricId !== rubricId.trim()) {
+    throw invalidRequest('rubricId must identify one saved rubric.')
+  }
+  if (typeof version !== 'string' || !/^[1-9]\d{0,8}$/.test(version)) throw invalidRequest('version must be a saved rubric version number.')
+  if (!isRubricExportFormat(format)) throw invalidRequest('Choose a supported rubric export format.')
+  return { rubricId, version: Number(version), format }
 }
 
 function hash(value: Uint8Array | string): string {
@@ -337,6 +359,12 @@ function attachmentHeader(filename: string): string {
   return `attachment; filename="${fallback}"; filename*=UTF-8''${encoded}`
 }
 
+function rateLimitRetryAfterSeconds(req: Request, fallbackMilliseconds: number): number {
+  const resetTime = (req as RateLimitedRequest).rateLimit?.resetTime
+  const milliseconds = resetTime instanceof Date ? resetTime.getTime() - Date.now() : fallbackMilliseconds
+  return Math.max(1, Math.ceil(milliseconds / 1000))
+}
+
 type AsyncJobHandler = (req: Request, res: Response, next: NextFunction) => Promise<void>
 
 function asyncHandler(handler: AsyncJobHandler): RequestHandler {
@@ -350,6 +378,17 @@ function asyncHandler(handler: AsyncJobHandler): RequestHandler {
 export function createRealJobsRouter(deps: RealJobsRouterDeps): Router {
   const router = express.Router()
   const clock = deps.now ?? (() => new Date())
+  const rubricExportLimiter = rateLimit({
+    windowMs: RUBRIC_EXPORT_RATE_LIMIT.windowMilliseconds,
+    limit: RUBRIC_EXPORT_RATE_LIMIT.limit,
+    keyGenerator: req => getPrincipal(req).principalKey,
+    standardHeaders: false,
+    legacyHeaders: false,
+    handler: (req, _res, next) => {
+      const retryAfter = rateLimitRetryAfterSeconds(req, RUBRIC_EXPORT_RATE_LIMIT.windowMilliseconds)
+      next(tooManyRequests(`Rubric export limit reached. Try again in about ${formatRetryAfter(retryAfter)}.`, retryAfter))
+    },
+  })
   const mutation = (access: 'write' | 'manage', handler: AsyncJobHandler): RequestHandler => asyncHandler(
     (req, res, next) => deps.repository.withWorkspaceMutation(
       getPrincipal(req), pathParam(req, 'workspaceId'), access, () => handler(req, res, next),
@@ -869,6 +908,67 @@ export function createRealJobsRouter(deps: RealJobsRouterDeps): Router {
     res.setHeader('Referrer-Policy', 'no-referrer')
     if (expectedContentType === 'text/markdown') res.setHeader('Cache-Control', 'private, no-store')
     res.send(Buffer.from(blob.bytes))
+  }))
+
+  router.get(`${base}/:jobId/rubric-export`, rubricExportLimiter, authorize(deps.repository, 'read'), asyncHandler(async (req, res) => {
+    const jobs = requireJobs(deps.jobs)
+    const { rubricId, version, format } = rubricExportQuery(req)
+    const workspaceId = pathParam(req, 'workspaceId')
+    const role = await deps.repository.authorizeWorkspace(getPrincipal(req), workspaceId, 'read')
+    const snapshot = await getRequestSettings(req)
+    assertRubricExport(snapshot, role, format)
+    const current = await jobs.store.get(workspaceId, jobParam(req))
+    if (!current) throw notFound('The requested job was not found.')
+    const { record } = current
+    if (record.lifecycle?.deletingAt || record.lifecycle?.deletedAt || record.job.rubricDeletedAt ||
+      record.rubricLifecycle?.deletingAt || record.rubricLifecycle?.deletedAt) {
+      throw notFound('This rubric has been removed.')
+    }
+    if (!validateRealJobRecord(record)) throw unavailable('The job has invalid stored metadata.')
+    const versions = (await jobs.store.listRubrics(workspaceId, record.id)).filter(item => item.id === rubricId)
+    const rubric = versions.find(item => item.version === version)
+    if (!rubric) throw notFound('The requested rubric version was not found.')
+    if (!validateStoredRealRubric(rubric) || rubric.jobId !== record.id) throw unavailable('The rubric version has invalid stored data.')
+    const payload: RubricExportPayload = {
+      schemaVersion: RUBRIC_EXPORT_SCHEMA_VERSION,
+      dataKind: 'real',
+      workspaceId,
+      generatedAt: clock().toISOString(),
+      settings: { revision: snapshot.revision, policy: structuredClone(snapshot.settings.reports) },
+      job: {
+        id: record.id,
+        title: record.job.title.trim() ? record.job.title : record.source.displayName,
+        ...(record.displayName !== undefined ? { displayName: record.displayName } : {}),
+        organization: record.job.organization,
+        location: record.job.location,
+        arrangement: record.job.arrangement,
+        employmentType: record.job.employmentType,
+        grade: record.job.grade,
+        series: record.job.series,
+        sourceLabel: record.job.sourceLabel,
+        pagination: documentPagination(record.source.originalContentType),
+      },
+      rubric: {
+        id: rubric.id,
+        version: rubric.version,
+        latestVersion: Math.max(...versions.map(item => item.version)),
+        name: rubric.name,
+        description: rubric.description,
+        createdAt: rubric.createdAt,
+        provenance: rubric.provenance?.kind === 'edited' ? 'edited' : 'generated',
+        criteria: rubric.criteria.map(criterion => ({
+          label: criterion.label,
+          description: criterion.description,
+          weight: criterion.weight,
+          guidance: criterion.guidance,
+          requirementType: criterion.requirementType === 'preferred' ? 'preferred' : 'required',
+          citations: (criterion.sourceCitations ?? []).map(citation => ({
+            page: citation.page, heading: citation.heading, quote: citation.quote,
+          })),
+        })),
+      },
+    }
+    res.json(payload)
   }))
 
   return router

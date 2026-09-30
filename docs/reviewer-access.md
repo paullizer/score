@@ -26,6 +26,7 @@ permissions only while they have a valid explicit workspace membership.
 Even a Reader membership allows an application Admin to participate in QC.
 
 Original downloads and report exports retain their separate role allowlists.
+Rubric exports use the report export allowlist (**Official export roles**).
 Adding the reviewer role does not add it to defaults or to existing saved policies.
 
 ## API contracts

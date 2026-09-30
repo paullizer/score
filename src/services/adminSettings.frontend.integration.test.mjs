@@ -907,6 +907,47 @@ test('rubric AI assistant switch is on for revisions saved before it existed and
   assert.equal(JSON.parse(patches()[1].init.body).features.rubricAssistant, true, 'A merging PATCH must name the switch to reset it')
 })
 
+test('rubric exports switch is on for revisions saved before it existed and publishes only explicit changes', async () => {
+  assert.equal('rubricExports' in settings.features, false, 'The fixture revision predates the switch')
+  await renderAdmin()
+  const control = await field('features.rubricExports')
+  const wrapper = control.closest('.settings-field')
+  assert.equal(control.type, 'checkbox')
+  assert.equal(control.checked, true, 'Absent means on')
+  assert.match(wrapper.textContent, /Rubric exports/)
+  assert.match(wrapper.textContent, /Default: On/)
+  assert.match(wrapper.textContent, /Official export roles/, 'The prerequisites name the roles that still apply')
+  assert.doesNotMatch(wrapper.textContent, /· changed/)
+  assert.equal(unloadBlocked(), false)
+  await click(control)
+  assert.equal(control.checked, false)
+  assert.match(wrapper.textContent, /· changed/)
+  await click(control)
+  assert.equal(control.checked, true)
+  assert.doesNotMatch(wrapper.textContent, /· changed/)
+  assert.equal(unloadBlocked(), false, 'Turning it back on restores the unsaved default instead of pinning a redundant value')
+
+  await click(control)
+  await click(button('Review and save'))
+  const review = dialog('Review application changes')
+  assert.match(review.textContent, /features\.rubricExports/)
+  assert.match(review.textContent, /Not saved \(default: On\)/)
+  assert.doesNotMatch(review.textContent, /undefined/)
+  await click(button('Publish new revision', review))
+  assert.equal(patches().length, 1)
+  const published = JSON.parse(patches()[0].init.body).features
+  assert.equal(published.rubricExports, false)
+  assert.equal('rubricAssistant' in published, false, 'Only the changed switch is written')
+  assert.equal((await field('features.rubricExports')).checked, false)
+
+  await click(button('Review reset to defaults'))
+  const reset = dialog('Review reset to defaults')
+  assert.match(reset.textContent, /features\.rubricExports/)
+  await click(button('Publish new revision', reset))
+  assert.equal(patches().length, 2)
+  assert.equal(JSON.parse(patches()[1].init.body).features.rubricExports, true, 'A merging PATCH must name the switch to reset it')
+})
+
 for (const recorded of [false, true]) {
   test(`read-only worker rollout evidence is ${recorded ? 'verification-time only, never live health' : 'explicitly absent when not configured or cleared'}`, async () => {
     const receipt = recorded ? {

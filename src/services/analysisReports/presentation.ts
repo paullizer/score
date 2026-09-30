@@ -1,4 +1,4 @@
-import { REPORT_FORMATS, REPORT_LIMITS } from '../../domain/analysis-reports'
+import { REPORT_LIMITS, reportDownloadType } from '../../domain/analysis-reports'
 import type {
   AnalysisReport, AnalysisReportFormat, ReportCandidate, ReportCitation, ReportComparison,
   ReportComparisonStatus, ReportCriterionAssessment, ReportEvidenceStatus,
@@ -116,12 +116,16 @@ export function summaryExcerpt(summary: string, maxCharacters = 240): { text: st
   return { text: `${characters.slice(0, maxCharacters - suffix.length).join('').trimEnd()}${suffix}`, shortened: true }
 }
 
-export function safeReportFilename(name: string, format: AnalysisReportFormat): string {
+export function safeReportFilename(name: string, format: AnalysisReportFormat, rubricDetails = false): string {
+  return safeDownloadFilename(name, reportDownloadType(format, rubricDetails).extension, 'Analysis report')
+}
+
+export function safeDownloadFilename(name: string, extension: string, fallback: string): string {
   let stem = name.normalize('NFKC').replace(/[<>:"/\\|?*]/g, '-').replace(/[\p{Cc}\p{Cf}]/gu, '')
     .replace(/\s+/g, ' ').trim().replace(/^[. ]+|[. ]+$/g, '')
-  stem = Array.from(stem).slice(0, 96).join('').replace(/[. ]+$/g, '') || 'Analysis report'
+  stem = Array.from(stem).slice(0, 96).join('').replace(/[. ]+$/g, '') || fallback
   if (/^(con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i.test(stem)) stem = `Report ${stem}`
-  return `${stem}.${REPORT_FORMATS[format].extension}`
+  return `${stem}.${extension}`
 }
 
 export function assertXmlText(text: string, context = 'Report text'): void {
@@ -134,11 +138,15 @@ export function assertXmlText(text: string, context = 'Report text'): void {
 }
 
 export function assertReportXmlText(report: AnalysisReport): void {
-  const pending: unknown[] = [report]
+  assertXmlTextTree(report)
+}
+
+export function assertXmlTextTree(root: unknown, context?: string): void {
+  const pending: unknown[] = [root]
   const seen = new WeakSet<object>()
   while (pending.length) {
     const value = pending.pop()
-    if (typeof value === 'string') assertXmlText(value)
+    if (typeof value === 'string') assertXmlText(value, context)
     else if (value !== null && typeof value === 'object' && !seen.has(value)) {
       seen.add(value)
       pending.push(...Object.values(value))

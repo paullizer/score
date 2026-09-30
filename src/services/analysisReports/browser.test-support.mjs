@@ -13,6 +13,11 @@ export function reportBrowserPlugin() {
           .replace("new URL('../../assets/report-fonts/NotoSans-Bold.ttf', import.meta.url)", "new URL('/report-fonts/NotoSans-Bold.ttf', window.location.href)"),
         loader: 'ts',
       }))
+      builder.onLoad({ filter: /analysisReports[\\/]rubric-export-client\.ts$/ }, async ({ path }) => ({
+        contents: (await readFile(path, 'utf8'))
+          .replace("new URL('./rubric-export.worker.ts', import.meta.url)", "new URL('/rubric-export-worker.mjs', window.location.href)"),
+        loader: 'ts',
+      }))
     },
   }
 }
@@ -23,6 +28,10 @@ export async function buildReportTestWorker(directory) {
     build({
       entryPoints: [join('src', 'services', 'analysisReports', 'report.worker.ts')],
       outfile: join(directory, 'analysis-report-worker.mjs'), bundle: true, platform: 'browser', format: 'esm', logLevel: 'silent',
+    }),
+    build({
+      entryPoints: [join('src', 'services', 'analysisReports', 'rubric-export.worker.ts')],
+      outfile: join(directory, 'rubric-export-worker.mjs'), bundle: true, platform: 'browser', format: 'esm', logLevel: 'silent',
     }),
     ...['NotoSans-Regular.ttf', 'NotoSans-Bold.ttf'].map((name) =>
       copyFile(join('src', 'assets', 'report-fonts', name), join(directory, 'report-fonts', name))),

@@ -19,6 +19,16 @@ export const REPORT_FORMATS = {
   pptx: { extension: 'pptx', mimeType: 'application/vnd.openxmlformats-officedocument.presentationml.presentation', label: 'PowerPoint (.pptx)' },
 } as const
 
+/** A CSV export with job & rubric details is a ZIP holding analyses.csv and rubrics.csv. */
+export const REPORT_CSV_BUNDLE = { extension: 'zip', mimeType: 'application/zip', label: 'CSV (.zip)' } as const
+export const REPORT_CSV_BUNDLE_FILES = { analyses: 'analyses.csv', rubrics: 'rubrics.csv' } as const
+
+export function reportDownloadType(
+  format: AnalysisReportFormat, rubricDetails = false,
+): { extension: string; mimeType: string; label: string } {
+  return format === 'csv' && rubricDetails ? REPORT_CSV_BUNDLE : REPORT_FORMATS[format]
+}
+
 export const REPORT_LIMITS = {
   maxComparisons: 500,
   batchComparisons: 25,
@@ -330,6 +340,8 @@ export interface ReportLinkContext {
 export interface ReportGenerationOptions {
   fonts?: ReportFontData
   links?: ReportLinkContext
+  /** Adds a job & rubric details section to each target; CSV becomes a ZIP with analyses.csv and rubrics.csv. Absent means off. */
+  rubricDetails?: boolean
 }
 
 export type AnalysisReportWriter = (report: AnalysisReport, options?: ReportGenerationOptions) => Uint8Array | Promise<Uint8Array>

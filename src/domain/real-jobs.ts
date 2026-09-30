@@ -88,6 +88,8 @@ export interface JobProcessingFeatures extends WordImportFeatures {
   realJobImports: boolean
   markdownJobImports: boolean
   rubricAssistant: boolean
+  /** Rubric-page downloads and report rubric details; exports are reads, so this ignores new-work admission. */
+  rubricExports: boolean
   limits: { [K in keyof typeof JOB_IMPORT_LIMITS]: number }
 }
 

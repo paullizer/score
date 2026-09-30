@@ -9,15 +9,8 @@ import { RubricEditor } from './RubricEditor'
 import { ArchivedBadge, EntityLifecycleActions, LifecycleBanner } from '../../components/lifecycle/LifecycleControls'
 import { useLifecycleAccess } from '../../components/lifecycle/useLifecycleAccess'
 import { workspaceCanEdit } from '../../domain/workspace-permissions'
-
-const scoreLegend = [
-  { value: 0, label: 'No support' },
-  { value: 1, label: 'Introductory' },
-  { value: 2, label: 'Limited' },
-  { value: 3, label: 'Independent' },
-  { value: 4, label: 'Substantial' },
-  { value: 5, label: 'Sustained' },
-]
+import { SCORE_LEGEND } from '../../domain/rubric-exports'
+import { RubricExport } from './RubricExport'
 
 export function RubricPanel({ rubric, onSelectCriterion, onVersionSaved, readOnly = false }: {
   rubric: Rubric
@@ -48,7 +41,7 @@ export function RubricPanel({ rubric, onSelectCriterion, onVersionSaved, readOnl
   return <div className="min-w-0">
     <div className="section-heading">
       <div><h2>Evaluation rubric</h2><p>{readOnly ? 'Saved version · read only' : 'Transparent criteria. Traceable expectations.'}</p></div>
-      <Badge>v{rubric.version}</Badge>
+      <div className="flex shrink-0 flex-wrap items-center justify-end gap-2"><RubricExport rubric={rubric} /><Badge>v{rubric.version}</Badge></div>
     </div>
 
     <div className="space-y-5 p-5">
@@ -161,7 +154,7 @@ export function RubricPanel({ rubric, onSelectCriterion, onVersionSaved, readOnl
           <span className="text-[10px] text-muted">Per criterion</span>
         </div>
         <ol className="grid grid-cols-3 gap-2 sm:grid-cols-6">
-          {scoreLegend.map((score) => <li key={score.value} className="rounded-lg border bg-soft px-2 py-2 text-center">
+          {SCORE_LEGEND.map((score) => <li key={score.value} className="rounded-lg border bg-soft px-2 py-2 text-center">
             <span className="block text-[12px] font-semibold">{score.value}</span>
             <span className="mt-1 block text-[9px] text-muted">{score.label}</span>
           </li>)}

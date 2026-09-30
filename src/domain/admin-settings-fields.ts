@@ -55,6 +55,9 @@ for (const key of ['jobImports', 'resumeImports', 'gradeLadders', 'newAnalyses',
 field('features.rubricAssistant', 'Rubric AI assistant', 'intake', 'boolean',
   'Lets workspace owners and editors ask AI to draft, rewrite and rebalance real job rubric criteria from the job posting. Each request sends the job text, the unsaved draft and the reviewer\'s instruction from the API to the job-rubric model binding. Nothing is saved until the reviewer saves; turning this off never changes saved rubrics.',
   { defaultValue: true })
+field('features.rubricExports', 'Rubric exports', 'intake', 'boolean',
+  'Lets people with an Official export role download a real job rubric as PDF, Word, PowerPoint, Markdown or CSV, and adds an "Include job & rubric details" option to analysis report exports. Exports read saved rubrics and frozen analysis inputs in the browser and never call AI. Turning this off removes rubric downloads and the report option. Saved rubrics aren\'t affected, and analysis reports still export without rubric details.',
+  { defaultValue: true })
 field('maintenance.pauseNewWork', 'Pause new work', 'intake', 'boolean', 'Stops new imports, ladder generations, analyses and summaries, not accepted work, reads, cleanup or cancellation.')
 field('maintenance.explanation', 'Maintenance explanation', 'intake', 'text', 'Optional plain-text explanation.', { max: 1000 })
 for (const kind of ['jobs', 'resumes'] as const) {
@@ -124,7 +127,7 @@ for (const [key, max, units, min] of [
   ['maxRequests', 80, 'requests', 1], ['maxAggregateBytes', 8 * MIB, 'bytes', 1], ['maxDomBytes', 2 * MIB, 'bytes', 1],
 ] as const) number(`rendering.${key}`, `Hosted renderer ${key}`, 'operations', max, units, true, min)
 for (const key of ['jobsMilliseconds', 'otherProcessingMilliseconds']) number(`ui.polling.${key}`, `UI polling ${key}`, 'presentation', 60_000, 'milliseconds', true, 1000, 'UI refresh only; does not schedule or stop worker processing.')
-field('reports.enabledFormats', 'Report formats', 'presentation', 'multiselect', 'Empty disables official exports; does not prevent authorized readers copying information.', { options: ['csv', 'pdf', 'docx', 'pptx'] })
+field('reports.enabledFormats', 'Report formats', 'presentation', 'multiselect', 'Empty disables official exports, including PDF, Word, PowerPoint and CSV rubric exports; does not prevent authorized readers copying information.', { options: ['csv', 'pdf', 'docx', 'pptx'] })
 select('reports.defaultFormat', 'Default report format', 'presentation', ['csv', 'pdf', 'docx', 'pptx'], 'One enabled format, or blank when all formats are disabled.')
 number('reports.highlightCount', 'Report highlight count', 'presentation', 10, 'comparisons per exact target', false)
 number('reports.maxHighlights', 'Report maximum highlights', 'presentation', 10, 'comparisons including cutoff ties', false)
@@ -136,7 +139,9 @@ for (const [key, max, units, min] of [
   ['maxOutputBytes', 64 * MIB, 'bytes', 1], ['maxGenerationMilliseconds', 180_000, 'milliseconds', 1000],
   ['maxPages', 10_000, 'pages', 1], ['maxSlides', 10_000, 'slides', 1],
 ] as const) number(`reports.${key}`, `Report ${key}`, 'presentation', max, units, true, min)
-for (const path of ['reports.allowedRoles', 'documents.originalDownloadRoles']) field(path, path === 'reports.allowedRoles' ? 'Official export roles' : 'Original download roles', 'access', 'multiselect', 'Restricts existing authorized workspace readers only. Empty disables the action; never grants workspace access.', { options: ['owner', 'editor', 'viewer', 'reviewer'] })
+for (const path of ['reports.allowedRoles', 'documents.originalDownloadRoles']) field(path, path === 'reports.allowedRoles' ? 'Official export roles' : 'Original download roles', 'access', 'multiselect', path === 'reports.allowedRoles'
+  ? 'Restricts existing authorized workspace readers only, for analysis reports and rubric exports. Empty disables the action; never grants workspace access.'
+  : 'Restricts existing authorized workspace readers only. Empty disables the action; never grants workspace access.', { options: ['owner', 'editor', 'viewer', 'reviewer'] })
 field('appearance.applicationTitle', 'Application title', 'presentation', 'text', 'Navigation/browser title; does not rename saved records.', { max: 80 })
 select('appearance.defaultTheme', 'Default theme', 'presentation', ['system', 'light', 'dark'], 'Only for users without a saved preference. Host and personal preferences retain precedence.')
 select('navigation.defaultPage', 'Workspace start page', 'presentation', ['jobs', 'resumes', 'rubrics', 'analyses'], 'Opened after choosing a workspace. App entry shows workspace home; explicit deep links win.')
@@ -159,6 +164,7 @@ for (const item of fields) {
   }
   if (item.path.startsWith('features.')) item.prerequisites = ['Corresponding deployed services are available', 'New-work admission is not paused']
   if (item.path === 'features.rubricAssistant') item.prerequisites = ['Real jobs and the job-rubric model deployment are configured', 'New-work admission is not paused']
+  if (item.path === 'features.rubricExports') item.prerequisites = ['Real jobs are configured', 'The workspace role is in Official export roles', 'PDF, Word, PowerPoint and CSV also need the format in Report formats']
   if (item.path.endsWith('.allowedFormats')) item.prerequisites = ['Corresponding import services are available', 'DOCX/DOC require verified Word rollout capability']
   if (item.path === 'documents.formattedDocxPreviewEnabled') item.prerequisites = ['The reader has an allowed original-download workspace role']
   if (item.path === 'summaries.allowManualPublication') item.prerequisites = ['Exact saved draft and required disclosure', 'Authorized source-workspace role']

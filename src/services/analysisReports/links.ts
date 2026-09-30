@@ -1,16 +1,21 @@
 import type { AnalysisReport, ReportComparison, ReportGenerationOptions, ReportLinkContext } from '../../domain/analysis-reports'
 import { savedReviewPath } from '../../app/saved-review-navigation'
 
-export function validatedReportLinkContext(report: AnalysisReport, options?: ReportGenerationOptions): ReportLinkContext {
-  const context = options?.links
-  if (!context) throw new Error('Report review links require the trusted application origin. Open the analysis in Score and export again.')
-  const invalidOrigin = 'Report review links require a valid HTTP(S) application origin without credentials, a path, a query, or a fragment.'
-  if (typeof context.origin !== 'string' || !/^https?:\/\/[^/?#\\\s@]+\/?$/i.test(context.origin)) throw new Error(invalidOrigin)
+export function trustedApplicationOrigin(value: unknown, subject = 'Report review links'): string {
+  const invalidOrigin = `${subject} require a valid HTTP(S) application origin without credentials, a path, a query, or a fragment.`
+  if (typeof value !== 'string' || !/^https?:\/\/[^/?#\\\s@]+\/?$/i.test(value)) throw new Error(invalidOrigin)
   let origin: URL
-  try { origin = new URL(context.origin) } catch { throw new Error(invalidOrigin) }
+  try { origin = new URL(value) } catch { throw new Error(invalidOrigin) }
   if (!['http:', 'https:'].includes(origin.protocol) || origin.username || origin.password || origin.pathname !== '/' || origin.search || origin.hash) {
     throw new Error(invalidOrigin)
   }
+  return origin.origin
+}
+
+export function validatedReportLinkContext(report: AnalysisReport, options?: ReportGenerationOptions): ReportLinkContext {
+  const context = options?.links
+  if (!context) throw new Error('Report review links require the trusted application origin. Open the analysis in Score and export again.')
+  const origin = trustedApplicationOrigin(context.origin)
   if (context.workspaceId !== undefined && (typeof context.workspaceId !== 'string' || !context.workspaceId.trim())) {
     throw new Error('Report review links require a valid workspace identity when a workspace is supplied.')
   }
@@ -19,7 +24,7 @@ export function validatedReportLinkContext(report: AnalysisReport, options?: Rep
   }
   // Validate route identities even when an export has no featured candidates.
   savedReviewPath({ workspaceId: report.workspaceId, runId: report.run.id, comparisonId: 'validation' })
-  return { origin: origin.origin, workspaceId: report.workspaceId }
+  return { origin, workspaceId: report.workspaceId }
 }
 
 export function reportReviewLinks(
