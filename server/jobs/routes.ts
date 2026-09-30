@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto'
 import express, { type NextFunction, type Request, type RequestHandler, type Response, type Router } from 'express'
+import { rateLimit, type RateLimitInfo } from 'express-rate-limit'
 import ipaddr from 'ipaddr.js'
 import { PDFDocument } from 'pdf-lib'
 import type { RealJobDetail, RealJobRecord, RealJobSummary, VersionedRealJob } from '../../src/domain/real-jobs'
@@ -14,7 +15,7 @@ import {
 import { validateWordUpload } from '../documents/upload'
 import type { AuthenticatedPrincipal } from '../auth'
 import { decodeMarkdown, MarkdownInputError } from '../documents/markdown'
-import { conflict, HttpError, invalidRequest, notFound, preconditionRequired, unavailable } from '../errors'
+import { conflict, HttpError, invalidRequest, notFound, preconditionRequired, tooManyRequests, unavailable } from '../errors'
 import { getPrincipal, getRequestSettings } from '../request-context'
 import { assertNewProcessingAllowed, getAdmissionSettings, runtimeSettingsEnabled } from '../settings/request-context'
 import { rubricAssistantEnabled } from '../../src/domain/admin-settings'
@@ -22,7 +23,7 @@ import type { WorkspaceRepository } from '../repository'
 import type { LifecycleDependencies } from '../lifecycle/contracts'
 import { assertWorkspaceMutationLease } from '../lifecycle/lease'
 import { StoreConflictError } from '../store'
-import type { AssistLimiter } from '../assist/limits'
+import { formatRetryAfter, type AssistLimiter } from '../assist/limits'
 import { AssistCancelledError, runAssist } from '../assist/runner'
 import type { AssistModelInvoker } from '../assist/types'
 import { jobRubricAssistProfile } from '../assist/profiles/job-rubric'
@@ -65,6 +66,11 @@ interface AuthorizedRequest extends Request {
 const ACTIVE_STATUSES = new Set(['queued', 'parsing', 'generating'])
 const PDF_MAGIC = Buffer.from('%PDF-', 'ascii')
 const MAX_FILENAME_LENGTH = 255
+const RUBRIC_EXPORT_RATE_LIMIT = { limit: 60, windowMilliseconds: 60_000 } as const
+
+interface RateLimitedRequest extends Request {
+  rateLimit?: RateLimitInfo
+}
 
 function bodyRecord(value: unknown, allowed: readonly string[]): Record<string, unknown> {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) throw invalidRequest('Request body must be a JSON object.')
@@ -353,6 +359,12 @@ function attachmentHeader(filename: string): string {
   return `attachment; filename="${fallback}"; filename*=UTF-8''${encoded}`
 }
 
+function rateLimitRetryAfterSeconds(req: Request, fallbackMilliseconds: number): number {
+  const resetTime = (req as RateLimitedRequest).rateLimit?.resetTime
+  const milliseconds = resetTime instanceof Date ? resetTime.getTime() - Date.now() : fallbackMilliseconds
+  return Math.max(1, Math.ceil(milliseconds / 1000))
+}
+
 type AsyncJobHandler = (req: Request, res: Response, next: NextFunction) => Promise<void>
 
 function asyncHandler(handler: AsyncJobHandler): RequestHandler {
@@ -366,6 +378,17 @@ function asyncHandler(handler: AsyncJobHandler): RequestHandler {
 export function createRealJobsRouter(deps: RealJobsRouterDeps): Router {
   const router = express.Router()
   const clock = deps.now ?? (() => new Date())
+  const rubricExportLimiter = rateLimit({
+    windowMs: RUBRIC_EXPORT_RATE_LIMIT.windowMilliseconds,
+    limit: RUBRIC_EXPORT_RATE_LIMIT.limit,
+    keyGenerator: req => getPrincipal(req).principalKey,
+    standardHeaders: false,
+    legacyHeaders: false,
+    handler: (req, _res, next) => {
+      const retryAfter = rateLimitRetryAfterSeconds(req, RUBRIC_EXPORT_RATE_LIMIT.windowMilliseconds)
+      next(tooManyRequests(`Rubric export limit reached. Try again in about ${formatRetryAfter(retryAfter)}.`, retryAfter))
+    },
+  })
   const mutation = (access: 'write' | 'manage', handler: AsyncJobHandler): RequestHandler => asyncHandler(
     (req, res, next) => deps.repository.withWorkspaceMutation(
       getPrincipal(req), pathParam(req, 'workspaceId'), access, () => handler(req, res, next),
@@ -887,7 +910,7 @@ export function createRealJobsRouter(deps: RealJobsRouterDeps): Router {
     res.send(Buffer.from(blob.bytes))
   }))
 
-  router.get(`${base}/:jobId/rubric-export`, authorize(deps.repository, 'read'), asyncHandler(async (req, res) => {
+  router.get(`${base}/:jobId/rubric-export`, rubricExportLimiter, authorize(deps.repository, 'read'), asyncHandler(async (req, res) => {
     const jobs = requireJobs(deps.jobs)
     const { rubricId, version, format } = rubricExportQuery(req)
     const workspaceId = pathParam(req, 'workspaceId')

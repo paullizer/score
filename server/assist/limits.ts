@@ -67,7 +67,7 @@ export function createAssistLimiter(options: AssistLimiterOptions = {}): AssistL
   }
 }
 
-function formatRetryAfter(seconds: number): string {
+export function formatRetryAfter(seconds: number): string {
   if (seconds < 90) return `${seconds} ${seconds === 1 ? 'second' : 'seconds'}`
   const minutes = Math.max(1, Math.ceil(seconds / 60))
   return `${minutes} ${minutes === 1 ? 'minute' : 'minutes'}`

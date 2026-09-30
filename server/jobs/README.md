@@ -72,7 +72,9 @@ and posting quotes, the latest version number, and the current report policy
 with its settings revision. It contains no candidate data or source bytes.
 
 Any workspace member may call it, subject to application policy, and archived
-jobs and rubrics remain exportable. It returns:
+jobs and rubrics remain exportable. Each API instance allows 60 rubric export
+requests per minute per user. Excess requests return 429 through the standard
+error shape with `Retry-After`. It returns:
 
 - 400 for missing or malformed `rubricId`, `version` or `format`, or any other
   query parameter;
@@ -81,6 +83,7 @@ jobs and rubrics remain exportable. It returns:
   Markdown isn't a report format, so the format list doesn't restrict it;
 - 404 when the job doesn't exist, the job or its rubric is being deleted or has
   been deleted, or the version doesn't belong to that rubric;
+- 429 when the per-user export limit is reached;
 - 503 when real jobs aren't configured or stored records fail validation.
 
 **Pause new work** and runtime admission don't affect this route, because it

@@ -7,7 +7,10 @@ Object.defineProperty(globalThis, 'fetch', { value: () => Promise.reject(new Err
 Object.defineProperty(globalThis, 'XMLHttpRequest', { value: () => { throw new Error('Network access is disabled during rubric export.') } })
 Object.defineProperty(globalThis, 'WebSocket', { value: () => { throw new Error('Network access is disabled during rubric export.') } })
 
-self.addEventListener('message', (event: MessageEvent<RubricExportWorkerRequest>) => {
+function handleRubricExportMessage(event: MessageEvent<RubricExportWorkerRequest>) {
+  // Dedicated worker messages from the owning page use an empty origin; allow the worker origin if a browser supplies it.
+  if (event.origin !== '' && event.origin !== self.location.origin) return
+  self.removeEventListener('message', handleRubricExportMessage)
   const request = event.data
   const send = (message: RubricExportWorkerResponse, transfer: Transferable[] = []) => self.postMessage(message, { transfer })
   void (async () => {
@@ -38,4 +41,6 @@ self.addEventListener('message', (event: MessageEvent<RubricExportWorkerRequest>
     type: 'error', requestId: typeof request?.requestId === 'string' ? request.requestId : '',
     message: error instanceof Error ? error.message : 'The rubric could not be exported. No file was downloaded.',
   }))
-}, { once: true })
+}
+
+self.addEventListener('message', handleRubricExportMessage)

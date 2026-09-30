@@ -184,6 +184,36 @@ test('rubric export returns exactly one saved job rubric version, the export pol
   } finally { await server.close() }
 })
 
+test('rubric export rate limit is per user and returns retry guidance', async () => {
+  const server = await startExportServer()
+  try {
+    const workspace = await seedWorkspace(server)
+    const { jobId, rubricId } = await seedJob(server, workspace)
+    server.directory._addMembership(workspace.id, membershipFor(workspace.id, { oid: OTHER_ALLOWED_OID, role: 'viewer' }))
+    const path = exportPath(workspace.id, jobId, { rubricId, version: '1', format: 'pdf' })
+
+    for (let attempt = 1; attempt <= 60; attempt += 1) {
+      const response = await get(server, path)
+      assert.equal(response.status, 200, `request ${attempt} stays under the limit`)
+      await response.arrayBuffer()
+    }
+
+    const limited = await get(server, path)
+    assert.equal(limited.status, 429)
+    assert.match(limited.headers.get('retry-after'), /^[1-9]\d*$/)
+    const body = await limited.json()
+    assert.equal(body.error.code, 'unavailable')
+    assert.match(body.error.message, /^Rubric export limit reached\. Try again in about \d+ seconds?\.$/)
+
+    const otherMember = await get(server, path, OTHER_ALLOWED_OID)
+    assert.equal(otherMember.status, 200, 'another workspace member has a separate quota')
+    await otherMember.arrayBuffer()
+
+    const unrelatedRoute = await get(server, '/api/features')
+    assert.equal(unrelatedRoute.status, 200, 'limiting rubric exports does not block other routes')
+  } finally { await server.close() }
+})
+
 test('rubric export validates the exact saved version it is asked for', async () => {
   const server = await startExportServer()
   try {
