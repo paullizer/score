@@ -214,7 +214,10 @@ export async function startWordPreviewFixture(runtime, options = {}) {
       const name = ['browser.js', 'docxPreview.worker.js', 'browser.css'].find((item) => path === `/${item}`) ?? 'index.html'
       res.writeHead(200, { 'Content-Type': name.endsWith('.js') ? 'text/javascript' : name.endsWith('.css') ? 'text/css' : 'text/html' })
       res.end(await readFile(join(runtime.directory, name)))
-    } catch (error) { if (!res.headersSent) res.statusCode = 500; if (!res.destroyed) res.end(String(error)) }
+    } catch (error) {
+      if (!res.headersSent) res.statusCode = 500
+      if (!res.destroyed) res.end(error instanceof Error ? error.message : 'The test server could not answer this request.')
+    }
   })
   await new Promise((resolve, reject) => { server.once('error', reject); server.listen(0, '127.0.0.1', resolve) })
   port = server.address().port

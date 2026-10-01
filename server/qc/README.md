@@ -64,6 +64,8 @@ All paths below are relative to `/api/workspaces/:workspaceId/qc`.
 | POST | `/plans/:id/activate` | `{reason, confirm:true}`; exact eligible evaluation and member-administrator authorization |
 | GET | `/plans/:id/history` | Immutable plan revisions, with all selected peer gates enforced |
 
+Before any of these routes, QC checks three things in order. First, the request must come from the application origin: `Sec-Fetch-Site: cross-site` or a foreign `Origin` returns 403, because reading a plan can record peer exposure. Second, each API instance allows 300 QC requests per minute per user; excess requests return 429 through the standard error shape with `Retry-After`. Third, the caller needs QC access to the workspace.
+
 Every mutation requires a stable UUID `Idempotency-Key`. Reuse it only for the same actor/action/payload after an ambiguous transport result. Existing review and plan edits/actions require one exact strong quoted `If-Match` ETag; restore uses the current prompt-registry ETag. Initial drafts require no existing head or `If-None-Match: *`. Missing required matches return 428; stale/create conflicts return 409; malformed keys, fields, or ETags return 400. Successful versioned responses also set `ETag`.
 
 Pages accept `limit` (1-50) and an opaque `continuationToken`; private-page tokens bind the exact workspace, filters, author, result, and page size. Peer pagination uses the POST body for its exact comparison scope and query parameters for paging.

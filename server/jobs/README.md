@@ -61,6 +61,14 @@ restrictions still apply. Workers preserve the latest alias when updating
 progress or publishing a rubric and retry bounded ETag contention only while
 they still own the active attempt; cancellation or lease loss still fences them.
 
+## Request limits
+
+Each API instance allows 600 requests per minute per user across every
+`/api/workspaces/:workspaceId/jobs` route, in any workspace. The limit is
+checked before workspace authorization, so refused requests still count. Excess
+requests return 429 through the standard error shape with `Retry-After`. Rubric
+exports also have their own, lower limit.
+
 ## Rubric exports
 
 `GET /api/workspaces/:workspaceId/jobs/:jobId/rubric-export?rubricId=…&version=…&format=pdf|docx|pptx|markdown|csv`
@@ -73,8 +81,9 @@ with its settings revision. It contains no candidate data or source bytes.
 
 Any workspace member may call it, subject to application policy, and archived
 jobs and rubrics remain exportable. Each API instance allows 60 rubric export
-requests per minute per user. Excess requests return 429 through the standard
-error shape with `Retry-After`. It returns:
+requests per minute per user, and they also count toward the job request limit.
+Excess requests return 429 through the standard error shape with
+`Retry-After`. It returns:
 
 - 400 for missing or malformed `rubricId`, `version` or `format`, or any other
   query parameter;

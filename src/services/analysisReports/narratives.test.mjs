@@ -346,16 +346,55 @@ test('report worker rejects narrative-free PDF, Word and PowerPoint requests bef
     runInNewContext(bundled.outputFiles[0].text, {
       TextEncoder, TextDecoder, Intl, console,
       self: {
+        location: { origin: 'https://score.test' },
         addEventListener: (_type, callback) => { listener = callback },
+        removeEventListener: () => {},
         postMessage: message => { sent.push(message); resolve(message) },
       },
     })
-    listener({ data: { type: 'generate', requestId: `gate-${format}`, format, report, options: {} } })
+    // Dedicated worker messages from the owning page carry an empty origin.
+    listener({ origin: '', data: { type: 'generate', requestId: `gate-${format}`, format, report, options: {} } })
     const message = await result
     assert.equal(message.type, 'error')
     assert.match(message.message, /ready narrative capture/)
     assert.equal(sent.length, 1)
   }
+})
+
+test('report worker ignores messages from other origins and stops listening after its page request', async () => {
+  const bundled = await build({
+    entryPoints: ['src/services/analysisReports/report.worker.ts'], bundle: true, write: false,
+    format: 'iife', platform: 'browser', logLevel: 'silent',
+  })
+  const report = api.buildAnalysisReport(realReportFixture())
+  let listener, resolve
+  const result = new Promise(done => { resolve = done })
+  const sent = []
+  runInNewContext(bundled.outputFiles[0].text, {
+    TextEncoder, TextDecoder, Intl, console,
+    self: {
+      location: { origin: 'https://score.test' },
+      addEventListener: (_type, callback) => { listener = callback },
+      removeEventListener: (_type, callback) => { if (listener === callback) listener = undefined },
+      postMessage: message => { sent.push(message); resolve(message) },
+    },
+  })
+  const handler = listener
+  const request = { type: 'generate', format: 'pdf', report, options: {} }
+  for (const origin of ['https://attacker.example', 'null', 'https://score.test.attacker.example']) {
+    handler({ origin, data: { ...request, requestId: `foreign-${origin}` } })
+  }
+  await new Promise(done => setImmediate(done))
+  assert.equal(listener, handler, 'messages from other origins leave the worker waiting for its page')
+  assert.equal(sent.length, 0)
+
+  handler({ origin: '', data: { ...request, requestId: 'page' } })
+  assert.equal(listener, undefined, 'the worker accepts one request from its page')
+  const message = await result
+  assert.equal(message.requestId, 'page')
+  assert.equal(message.type, 'error')
+  assert.match(message.message, /ready narrative capture/)
+  assert.equal(sent.length, 1)
 })
 
 test('additive presentation and narratives leave real CSV output bytes unchanged', async () => {

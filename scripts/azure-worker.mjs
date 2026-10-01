@@ -824,14 +824,15 @@ async function main() {
     const tag = `resume-analysis-word-v1-${new Date().toISOString().replace(/[-:.TZ]/g, '')}`
     const relativeImage = `score-worker:${tag}`
     const rendererRelativeImage = `score-renderer:${tag}`
-    console.log(JSON.stringify({
+    // The command's result for deploy-worker.ps1, not a log line. Registry, subscription and image names aren't secrets.
+    process.stdout.write(`${JSON.stringify({
       registry: required(env, 'AZURE_CONTAINER_REGISTRY_NAME'),
       subscription: required(env, 'AZURE_SUBSCRIPTION_ID'),
       relativeImage,
       image: `${required(env, 'AZURE_CONTAINER_REGISTRY_ENDPOINT')}/${relativeImage}`,
       rendererRelativeImage,
       rendererImage: `${required(env, 'AZURE_CONTAINER_REGISTRY_ENDPOINT')}/${rendererRelativeImage}`,
-    }))
+    })}\n`)
     return
   }
   if (mode !== 'configure' && mode !== 'configure-renderer') throw new Error('Usage: node scripts\\azure-worker.mjs context|prepare-web-deploy|disable-admission [--if-provisioned]|configure <worker-image> <renderer-image>|configure-renderer <renderer-image>')

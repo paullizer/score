@@ -78,7 +78,7 @@ function page(req: Request) {
   if (token !== undefined && (typeof token !== 'string' || !token || token.length > 16 * 1024)) throw invalidRequest('continuationToken must be a single valid token.')
   const limit = req.query.limit
   if (limit !== undefined && (typeof limit !== 'string' || !/^(?:[1-9]\d?|100)$/.test(limit))) throw invalidRequest('limit must be an integer between 1 and 100.')
-  return { continuationToken: token as string | undefined, limit: limit === undefined ? 50 : Number(limit) }
+  return { continuationToken: typeof token === 'string' ? token : undefined, limit: limit === undefined ? 50 : Number(limit) }
 }
 function body<T>(schema: { safeParse(value: unknown): { success: true; data: T } | { success: false } }, value: unknown): T {
   const result = schema.safeParse(value)

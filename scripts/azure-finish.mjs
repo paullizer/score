@@ -1,5 +1,5 @@
 import { setTimeout as delay } from 'node:timers/promises'
-import { client, environment, identifier, request, required, setEnvironment } from './azure-common.mjs'
+import { client, environment, identifier, redactUrl, request, required, setEnvironment } from './azure-common.mjs'
 import { admissionStage, verifyRoleAwareDeployment } from './azure-access.mjs'
 
 async function main() {
@@ -17,11 +17,12 @@ async function main() {
   }
   setEnvironment('AZURE_CONTAINER_IMAGE', image.slice('DOCKER|'.length))
   const url = required(env, 'AZURE_APP_SERVICE_URL').replace(/\/$/, '')
+  const shownUrl = redactUrl(url)
   for (let attempt = 0; attempt < 60; attempt++) {
     let response
     try { response = await fetch(`${url}/healthz`, { signal: AbortSignal.timeout(10000) }) } catch (error) {
       if (!(error instanceof TypeError) && !(error instanceof DOMException)) throw error
-      if (attempt === 59) throw new Error(`The application did not become reachable at ${url}. Inspect its App Service logs.`)
+      if (attempt === 59) throw new Error(`The application did not become reachable at ${shownUrl}. Inspect its App Service logs.`)
     }
     if (response?.ok) {
       const health = await response.json()
@@ -31,11 +32,11 @@ async function main() {
           setEnvironment('AZURE_SCORE_ROLE_VERIFIED_IMAGE', proof.image)
           setEnvironment('AZURE_SCORE_ROLE_VERIFIED_AT', proof.verifiedAt)
         }
-        console.log(`Score is running at ${url}; cloud storage readiness succeeded.`)
+        console.log(`Score is running at ${shownUrl}; cloud storage readiness succeeded.`)
         return
       }
     }
-    if (attempt === 59) throw new Error(`The deployed application is not ready at ${url}/healthz. Inspect its managed-identity permissions and App Service logs.`)
+    if (attempt === 59) throw new Error(`The deployed application is not ready at ${shownUrl}/healthz. Inspect its managed-identity permissions and App Service logs.`)
     if (attempt === 0) console.log('Waiting for the container and managed-identity storage access to become ready...')
     await delay(10000)
   }

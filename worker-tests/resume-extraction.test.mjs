@@ -130,8 +130,8 @@ test('HTTP-200 access, login, private-profile, consent and challenge walls overr
       assert.ok(hasCode('access-blocked')(error))
       assert.equal(error.stage, 'download')
       assert.equal(error.retryable, false)
+      // An exact, fixed message also guarantees the private source URL is never echoed.
       assert.equal(error.message, 'This URL is not publicly accessible and could not be processed.')
-      assert.ok(!error.message.includes(sourceUrl))
       return true
     })
   }
