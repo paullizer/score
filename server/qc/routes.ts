@@ -1,4 +1,5 @@
 import express, { type Request, type RequestHandler, type Response, type Router } from 'express'
+import { rateLimit } from 'express-rate-limit'
 import { z } from 'zod'
 import { QC_LIMITS, qcComparisonRefSchema, qcIdentifier } from '../../src/domain/quality-control'
 import type { QcPlanDetail } from '../../src/domain/quality-improvement'
@@ -7,6 +8,7 @@ import type { WorkspaceRepository } from '../repository'
 import { isApplicationAdmin } from '../auth'
 import type { Config } from '../config'
 import { conflict, forbidden, invalidRequest, notFound, preconditionRequired, unavailable } from '../errors'
+import { userRateLimitOptions } from '../rate-limit'
 import { getPrincipal } from '../request-context'
 import type { StateStore } from '../store'
 import { StoreConflictError } from '../store'
@@ -18,6 +20,8 @@ import type { QcDeps } from './store'
 import { QcService, type QcCaller } from './service'
 import { QcPlanService, qcReasonInputSchema, qcRestoreInputSchema } from './plans'
 import { qcEtag, qcInput, qcRequestKey } from './validation'
+
+const QC_REQUEST_RATE_LIMIT = { limit: 300, windowMilliseconds: 60_000, message: 'QC request limit reached.' } as const
 
 export interface QcRouterDeps {
   repository: WorkspaceRepository
@@ -77,6 +81,7 @@ function send(res: Response, value: unknown, status = 200): void {
 /** Mount only below the app's authentication, admission, JSON and same-origin CSRF middleware. */
 export function createQcRouter(deps: QcRouterDeps): Router {
   const router = express.Router(), base = '/workspaces/:workspaceId/qc'
+  const qcRequestLimiter = rateLimit(userRateLimitOptions(QC_REQUEST_RATE_LIMIT))
   const admissionEnabled = () => deps.config.qcEnabled === true
   const assertAdmission = () => {
     if (!admissionEnabled()) throw unavailable('New QC reviews and improvement changes are disabled. Saved QC remains readable and accepted work can still be cancelled.')
@@ -113,13 +118,19 @@ export function createQcRouter(deps: QcRouterDeps): Router {
     assertAdmission()
     if (!access.caller.applicationAdmin) throw forbidden('Application-administrator access is required to publish prompt changes.')
   }
-  const middleware: RequestHandler = async (req, res, next) => {
+  // Reading a plan can record peer exposure. Cross-site navigations must not create false independence audits.
+  // This check only ever refuses a request; workspace authorization still runs for every request it lets through.
+  const sameOriginOnly: RequestHandler = (req, res, next) => {
     res.setHeader('Cache-Control', 'private, no-store')
+    const origin = req.header('Origin')
+    if (req.header('Sec-Fetch-Site') === 'cross-site' || origin && origin !== deps.config.appOrigin) {
+      next(forbidden('QC evidence is available only from this application origin.'))
+      return
+    }
+    next()
+  }
+  const workspaceAccess: RequestHandler = async (req, _res, next) => {
     try {
-      // Reading a plan can record peer exposure. Cross-site navigations must not create false independence audits.
-      if (req.header('Sec-Fetch-Site') === 'cross-site' || req.header('Origin') && req.header('Origin') !== deps.config.appOrigin) {
-        throw forbidden('QC evidence is available only from this application origin.')
-      }
       await authorize(req)
       next()
     } catch (error) { next(error) }
@@ -153,7 +164,8 @@ export function createQcRouter(deps: QcRouterDeps): Router {
   const key = (req: Request) => qcRequestKey(req.header('Idempotency-Key'))
   const empty = (req: Request) => qcInput(z.strictObject({}), body(req))
   const noQuery = (req: Request) => query(req, [])
-  router.use(base, middleware)
+  // Same-origin check, then a per-user request budget, then workspace authorization, before any QC route.
+  router.use(base, sameOriginOnly, qcRequestLimiter, workspaceAccess)
   router.get(`${base}/capabilities`, read(async (req, caller, writable) => {
     noQuery(req)
     if (!deps.qc || !deps.analyses) return {

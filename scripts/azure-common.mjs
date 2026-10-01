@@ -20,6 +20,13 @@ export function required(env, name) {
   return value
 }
 
+/** A URL for console output. Credentials, query strings and fragments can carry tokens, so only the origin and path are shown. */
+export function redactUrl(value) {
+  let url
+  try { url = new URL(value) } catch { return '(invalid URL)' }
+  return `${url.origin}${url.pathname === '/' ? '' : url.pathname}`
+}
+
 export function setEnvironment(name, value) {
   execFileSync('azd', ['env', 'set', name, value, ...selectedEnvironment()], { stdio: ['ignore', 'pipe', 'pipe'] })
 }

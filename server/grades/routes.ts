@@ -72,7 +72,7 @@ function page(req: Request): { continuationToken?: string; limit: number } {
   if (limit !== undefined && (typeof limit !== 'string' || !/^\d{1,3}$/.test(limit) || Number(limit) < 1 || Number(limit) > 100)) {
     throw invalidRequest('limit must be an integer between 1 and 100.')
   }
-  return { continuationToken: token as string | undefined, limit: limit === undefined ? 50 : Number(limit) }
+  return { continuationToken: typeof token === 'string' ? token : undefined, limit: limit === undefined ? 50 : Number(limit) }
 }
 
 function historicalSourceSet(req: Request): string | undefined {

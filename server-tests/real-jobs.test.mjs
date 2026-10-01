@@ -662,6 +662,39 @@ test('job records are membership-isolated and never enter the legacy workspace s
   }
 })
 
+test('job routes share one per-user request limit across workspaces, ahead of authorization', async () => {
+  const server = await startRealJobsServer()
+  try {
+    const workspace = await seedWorkspace(server, { oid: ALLOWED_OID })
+    server.directory._addMembership(workspace.id, membershipFor(workspace.id, { oid: OTHER_ALLOWED_OID, role: 'viewer' }))
+    const jobs = `${server.baseUrl}/api/workspaces/${workspace.id}/jobs`
+    for (let attempt = 1; attempt <= 600; attempt += 1) {
+      const response = await fetch(jobs, { headers: authHeaders() })
+      assert.equal(response.status, 200, `request ${attempt} stays under the limit`)
+      await response.arrayBuffer()
+    }
+
+    const limited = await fetch(`${jobs}/${randomUUID()}`, { headers: authHeaders() })
+    assert.equal(limited.status, 429, 'every job route shares one budget')
+    assert.match(limited.headers.get('retry-after'), /^[1-9]\d*$/)
+    const body = await limited.json()
+    assert.equal(body.error.code, 'unavailable')
+    assert.match(body.error.message, /^Job request limit reached\. Try again in about \d+ seconds?\.$/)
+    const elsewhere = await fetch(`${server.baseUrl}/api/workspaces/${randomUUID()}/jobs`, { headers: authHeaders() })
+    assert.equal(elsewhere.status, 429, 'the budget is per user and is spent before workspace authorization')
+    await elsewhere.arrayBuffer()
+
+    const other = await fetch(jobs, { headers: authHeaders({ oid: OTHER_ALLOWED_OID }) })
+    assert.equal(other.status, 200, 'another workspace member has a separate quota')
+    await other.arrayBuffer()
+    const features = await fetch(`${server.baseUrl}/api/features`, { headers: authHeaders() })
+    assert.equal(features.status, 200, 'limiting job requests does not block other routes')
+    await features.arrayBuffer()
+  } finally {
+    await server.close()
+  }
+})
+
 test('cancel and retry use CAS, clear leases, and prevent a stale worker publication', async () => {
   const server = await startRealJobsServer()
   try {
