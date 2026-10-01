@@ -35,7 +35,7 @@
     "@pdf-lib/fontkit": "^1.1.1",
     "@radix-ui/react-dialog": "^1.1.15",
     "cfb": "^1.2.2",
-    "dompurify": "^3.4.15",
+    "dompurify": "^3.4.16",
     "docx": "^9.7.1",
     "express": "^5.2.1",
     "express-rate-limit": "^8.7.0",
@@ -51,7 +51,7 @@
     "pptxgenjs": "^4.0.1",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
-    "react-router-dom": "^6.30.1",
+    "react-router-dom": "^7.18.4",
     "saxes": "^6.0.0",
     "word-extractor": "^1.0.4",
     "yauzl": "^3.4.0",
@@ -79,5 +79,10 @@
     "typescript": "~5.9.2",
     "typescript-eslint": "^8.42.0",
     "vite": "^7.1.4"
+  },
+  "overrides": {
+    "pptxgenjs": {
+      "image-size": "^2.0.4"
+    }
   }
 }
