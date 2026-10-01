@@ -70,6 +70,8 @@ The reviewer blocks any package version added or changed in `package-lock.json` 
 
 Dependabot uses the same 7-day `cooldown` for version updates, so its routine pull requests pass. Security updates ignore the cooldown, so a fresh security fix can trip the release-age Blocker. Review the update and merge it anyway if the fix matters more than the wait; the check isn't required.
 
+Dependabot can't open a security update when the fix is only in a major version that the parent package doesn't accept. Use a scoped `overrides` entry in `package.json` for those, after checking that the parent still works with the fixed version, and remove it once the parent accepts that version. `pptxgenjs` 4.0.1 still asks for `image-size` 1.x, which has no fix for GHSA-w3rx-r6r6-pgpr or GHSA-5p2g-fcmc-qvqq. pptxgenjs never loads `image-size`, so Score overrides it to 2.x.
+
 `package-lock.json` resolves every package through a public Microsoft mirror of the npm registry (`ms-feed-25.pkgs.visualstudio.com/1es-public`). The reviewer allows that mirror and `registry.npmjs.org`, and blocks anything else.
 
 ### XSS sinks

@@ -587,7 +587,9 @@ function CloudApplicationContent() {
         leaveUnavailableWorkspace={leaveUnavailableWorkspace}
         onSignedOut={onSignedOut}
       >
-    {(base, cloud) => <BrowserRouter key={workspaceId} basename={`/workspaces/${encodeURIComponent(workspaceId)}`}>
+    {(base, cloud) => <BrowserRouter key={workspaceId} basename={`/workspaces/${encodeURIComponent(workspaceId)}`}
+      // React Router 7 wraps navigations in startTransition by default; keep v6's synchronous route updates.
+      useTransitions={false}>
       <GradeRouterProtection><RealJobsBridge workspaceId={workspaceId} base={base} cloud={cloud}><RealGradeLaddersBridge workspaceId={workspaceId}><RealResumesBridge workspaceId={workspaceId}><RealAnalysesBridge workspaceId={workspaceId}>
         <TrackCloudPath pathRef={lastPathRef} stateRef={lastHistoryStateRef} basename={`/workspaces/${encodeURIComponent(workspaceId)}`} workspaceId={workspaceId} onOpened={onWorkspaceOpened} />
         <App />

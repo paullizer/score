@@ -6,7 +6,7 @@ import { pathToFileURL } from 'node:url'
 import { after, test } from 'node:test'
 import { createElement } from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
-import { StaticRouter } from 'react-router-dom/server.js'
+import { StaticRouter } from 'react-router-dom'
 import { build } from 'esbuild'
 import {
   api, fixture, seedJob, seedResume, seedGrade, publishResult, ACTOR, NOW,
