@@ -1,73 +1,204 @@
-import type { AdminSettings, DeploymentInventory, SettingsFieldError, SettingsFieldMetadata } from '../../domain/admin-settings'
+import { RefreshCw } from 'lucide-react'
+import type {
+  AdminSettings, DeploymentInventory, ModelDeployment, ModelTaskId, SettingsFieldError, SettingsFieldMetadata, TaskModelSettings,
+} from '../../domain/admin-settings'
 import { MODEL_TASK_IDS } from '../../domain/admin-settings-tasks'
 import { Badge, Button } from '../../components/ui'
 import { SettingsField, SettingsFieldProvenance } from './SettingsField'
 
-const taskNames: Record<typeof MODEL_TASK_IDS[number], string> = {
+const taskNames: Record<ModelTaskId, string> = {
   jobRubric: 'Job rubric extraction', resumeProfile: 'Resume profile extraction', gradeCompetencies: 'GS shared competency planning',
   gradeDraft: 'GS level draft', gradeReview: 'GS independent review', assessment: 'Candidate assessment',
   assessmentReview: 'Assessment grounding review', candidateSummary: 'Candidate summary', targetSummary: 'Job / grade overview',
   summaryReduction: 'Large-cohort summary reduction', summaryReview: 'Summary factual review', qcPlan: 'QC improvement planning',
 }
 
-export function ModelSettingsEditor({ settings, saved, defaults, fields, errors, onChange, inventory, disabled, search }: {
+/** What the configured Azure resource reports. Reading it never saves settings or provisions a model. */
+export interface DeploymentDiscovery {
+  status: 'idle' | 'loading' | 'ready' | 'error'
+  inventory: DeploymentInventory | null
+  error: string
+}
+
+// Settings IDs can't contain ':', so this prefix never collides with a deployment Score already lists.
+const AVAILABLE = 'azure:'
+const usable = (item: ModelDeployment) => item.enabled && item.capabilities.structuredOutputs
+const titleOf = (item: ModelDeployment) => item.label || item.deploymentName
+const sameName = (left: ModelDeployment, right: ModelDeployment) => left.deploymentName.toLowerCase() === right.deploymentName.toLowerCase()
+const verificationText: Record<ModelDeployment['verification'], string> = {
+  'deployment-config': 'This environment’s deployment settings', discovered: 'Your Azure resource', validated: 'A model test',
+}
+
+function versionOf(item: ModelDeployment, inventory: DeploymentInventory | null): string | null {
+  return item.modelVersion ?? inventory?.deployments.find(found => sameName(found, item))?.modelVersion ?? null
+}
+
+/** The deployment and the model behind it, such as "job-rubric · gpt-5-mini 2025-08-07". */
+function describe(item: ModelDeployment, inventory: DeploymentInventory | null): string {
+  const version = versionOf(item, inventory)
+  const model = titleOf(item) === item.modelName ? version : [item.modelName, version].filter(Boolean).join(' ')
+  return model ? `${titleOf(item)} · ${model}` : titleOf(item)
+}
+
+function capabilitiesText(item: ModelDeployment, inventory: DeploymentInventory | null): string {
+  const { contextTokens, maxOutputTokens, reasoningEfforts } = item.capabilities
+  if (!item.capabilities.structuredOutputs) return [item.modelName, versionOf(item, inventory)].filter(Boolean).join(' ')
+  return [
+    [item.modelName, versionOf(item, inventory)].filter(Boolean).join(' '),
+    `${contextTokens.toLocaleString()}-token context`,
+    `up to ${maxOutputTokens.toLocaleString()} output tokens`,
+    reasoningEfforts.length ? `reasoning ${reasoningEfforts.join(', ')}` : 'no reasoning setting',
+  ].join(' · ')
+}
+
+function unavailableReason(item: ModelDeployment, listed: boolean): string {
+  if (!item.capabilities.structuredOutputs) return 'Score doesn’t support this model'
+  return listed ? 'turned off for new work' : 'not ready in Azure yet'
+}
+
+/** The schema's model-dependent checks, so a problem shows when a model is chosen rather than only at save. */
+function taskIssues(binding: TaskModelSettings, deployment: ModelDeployment | undefined, deploymentId: string): string[] {
+  if (!deployment || !usable(deployment)) return [`its model, ${deployment ? titleOf(deployment) : deploymentId}, can’t be used for new work`]
+  const name = titleOf(deployment)
+  const { capabilities } = deployment
+  const issues: string[] = []
+  if (binding.reasoningEffort !== null && !capabilities.reasoningEfforts.includes(binding.reasoningEffort)) {
+    issues.push(`${name} doesn’t support reasoning effort “${binding.reasoningEffort}”`)
+  }
+  if (binding.temperature !== null && !capabilities.temperature) issues.push(`${name} doesn’t support temperature`)
+  if (binding.topP !== null && !capabilities.topP) issues.push(`${name} doesn’t support top-p`)
+  if (binding.completionTokenLimit > capabilities.maxOutputTokens) {
+    issues.push(`its completion limit is above ${name}’s ${capabilities.maxOutputTokens.toLocaleString()}-token maximum`)
+  }
+  if (binding.inputBudget.maxRequest + binding.inputBudget.reservedTokens + binding.completionTokenLimit > capabilities.contextTokens) {
+    issues.push(`its request budget doesn’t fit ${name}’s context window`)
+  }
+  return issues
+}
+
+function checkedTime(value: string): string {
+  const date = new Date(value)
+  return Number.isNaN(date.getTime()) ? value : date.toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' })
+}
+
+export function ModelSettingsEditor({
+  settings, saved, defaults, fields, errors, onChange, discovery, discoveryAvailable, onRefreshDeployments, disabled, search,
+}: {
   settings: AdminSettings; saved: AdminSettings; defaults: AdminSettings; fields: SettingsFieldMetadata[]; errors: SettingsFieldError[]
-  onChange: (path: string, value: unknown) => void; inventory: DeploymentInventory | null; disabled: boolean; search: string
+  onChange: (path: string, value: unknown) => void
+  discovery: DeploymentDiscovery; discoveryAvailable: boolean; onRefreshDeployments: () => void
+  disabled: boolean; search: string
 }) {
   const deployments = settings.ai.deployments
-  const compatible = deployments.filter(item => item.enabled && item.capabilities.structuredOutputs)
+  const inventory = discovery.inventory
+  const elsewhere = (inventory?.deployments ?? []).filter(item => !deployments.some(listed => sameName(listed, item)))
+  const addable = elsewhere.filter(usable)
+  const blocked = elsewhere.filter(item => !usable(item))
+  const offline = deployments.filter(item => !usable(item))
+  const defaultId = settings.ai.defaultDeploymentId
+  const defaultDeployment = deployments.find(item => item.id === defaultId)
+  const tasks = MODEL_TASK_IDS.filter(task => settings.ai.tasks[task] !== undefined)
+  const bindingOf = (task: ModelTaskId) => settings.ai.tasks[task] as TaskModelSettings
+  const targetOf = (task: ModelTaskId) => bindingOf(task).deploymentId ?? defaultId
+  const deploymentFor = (task: ModelTaskId) => deployments.find(item => item.id === targetOf(task))
+  const nameFor = (task: ModelTaskId) => { const deployment = deploymentFor(task); return deployment ? titleOf(deployment) : targetOf(task) }
+  const ownModel = tasks.filter(task => bindingOf(task).deploymentId !== null)
+  const attention = tasks.map(task => ({ task, issues: taskIssues(bindingOf(task), deploymentFor(task), targetOf(task)) })).filter(item => item.issues.length > 0)
+  const modelChanged = defaultId !== saved.ai.defaultDeploymentId || JSON.stringify(deployments) !== JSON.stringify(saved.ai.deployments)
+    || tasks.some(task => bindingOf(task).deploymentId !== saved.ai.tasks[task]?.deploymentId)
   const common = { settings, saved, defaults, errors, onChange, disabled }
   const matches = (value: string) => !search || value.toLocaleLowerCase().includes(search.toLocaleLowerCase())
+  const metadata = (path: string) => fields.find(field => field.path === path)
+  const names = deployments.map(item => `${item.label} ${item.deploymentName} ${item.modelName}`).join(' ')
+
+  function add(item: ModelDeployment): string {
+    const taken = new Set(deployments.map(entry => entry.id))
+    let id = item.id
+    for (let suffix = 2; taken.has(id); suffix++) id = `${item.id.slice(0, 120)}-${suffix}`
+    onChange('ai.deployments', [...deployments, { ...item, id, enabled: true }])
+    return id
+  }
+
+  /** Choosing a deployment Score doesn't list yet adds it, so one choice is all it takes. */
+  function choose(path: string, value: string) {
+    if (!value.startsWith(AVAILABLE)) { onChange(path, value || null); return }
+    const found = addable.find(item => item.deploymentName === value.slice(AVAILABLE.length))
+    if (found) onChange(path, add(found))
+  }
+
+  function useDefaultEverywhere() {
+    onChange('ai.tasks', Object.fromEntries(Object.entries(settings.ai.tasks).map(([task, binding]) => [task, { ...binding, deploymentId: null }])))
+  }
+
+  const missing = (id: string) => !deployments.some(item => item.id === id) && <option value={id}>Unavailable: {id}</option>
+  const options = <>
+    {deployments.filter(usable).map(item => <option key={item.id} value={item.id}>{describe(item, inventory)}</option>)}
+    {addable.length > 0 && <optgroup label="Also in your Azure resource">
+      {addable.map(item => <option key={item.deploymentName} value={`${AVAILABLE}${item.deploymentName}`}>{describe(item, inventory)}</option>)}
+    </optgroup>}
+    {offline.length + blocked.length > 0 && <optgroup label="Can’t be used">
+      {offline.map(item => <option key={item.id} value={item.id} disabled>{describe(item, inventory)} — {unavailableReason(item, true)}</option>)}
+      {blocked.map(item => <option key={item.deploymentName} value={`${AVAILABLE}${item.deploymentName}`} disabled>{describe(item, inventory)} — {unavailableReason(item, false)}</option>)}
+    </optgroup>}
+  </>
+
+  const discoveryText = !discoveryAvailable
+    ? 'These lists show only the deployments Score already uses. Finding the other deployments in your Azure resource isn’t set up for this environment; ask an operator to turn it on.'
+    : discovery.status === 'error'
+      ? `Couldn’t list the deployments in your Azure resource: ${discovery.error.replace(/\.?$/, '.')} The lists show only the deployments Score already uses.`
+      : discovery.status === 'loading'
+        ? inventory ? 'Checking your Azure resource again…' : 'Looking for deployments in your Azure resource…'
+        : inventory
+          ? inventory.deployments.length === 0 ? `Your Azure resource reported no deployments at ${checkedTime(inventory.checkedAt)}.`
+            : `Found ${inventory.deployments.length === 1 ? '1 deployment' : `${inventory.deployments.length} deployments`} in your Azure resource at ${checkedTime(inventory.checkedAt)}.`
+          : ''
+  const coverage = ownModel.length === 0
+    ? `All ${tasks.length} AI tasks use the default model.`
+    : `${tasks.length - ownModel.length} of ${tasks.length} AI tasks use the default model. ${ownModel.length === 1 ? 'One task uses its own model' : `${ownModel.length} tasks use their own model`}: ${ownModel.map(task => `${taskNames[task]} (${nameFor(task)})`).join(', ')}.`
+
   return <div className="space-y-6">
-    {matches(`ai.deployments ai.defaultDeploymentId Azure deployment catalog default model ${deployments.map(item => `${item.label} ${item.deploymentName} ${item.modelName}`).join(' ')}`) && <section className="panel settings-section" aria-label="Azure deployment catalog">
-      <h2>Azure deployment catalog</h2>
-      <p>One configured Azure resource. Catalog entries name existing deployments; this page never provisions capacity. Model capabilities and verification come from server inventory, not editable claims.</p>
-      <p className="field-hint"><SettingsFieldProvenance field={fields.find(field => field.path === 'ai.deployments')} changed={JSON.stringify(deployments) !== JSON.stringify(saved.ai.deployments)} /></p>
-      {deployments.map((deployment, index) => {
-        const patch = (value: Partial<typeof deployment>) => onChange('ai.deployments', deployments.map((item, at) => at === index ? { ...item, ...value } : item))
-        return <section className="settings-deployment" key={deployment.id} aria-label={`Deployment ${deployment.label}`}>
-          <div className="flex flex-wrap items-center gap-2"><h3>{deployment.label || deployment.id}</h3><Badge>{deployment.verification}</Badge><Badge tone={deployment.capabilities.structuredOutputs ? 'success' : 'warning'}>{deployment.capabilities.structuredOutputs ? 'Structured outputs supported' : 'Not compatible'}</Badge></div>
-          <dl className="settings-facts"><dt>Stable ID</dt><dd><code>{deployment.id}</code></dd><dt>Azure deployment name</dt><dd><code>{deployment.deploymentName}</code></dd>
-            <dt>Model / version</dt><dd>{deployment.modelName} / {deployment.modelVersion ?? 'not reported'}</dd><dt>Context / output capacity</dt><dd>{deployment.capabilities.contextTokens.toLocaleString()} / {deployment.capabilities.maxOutputTokens.toLocaleString()} tokens</dd>
-            <dt>Verification timestamp</dt><dd>{deployment.verifiedAt ?? 'No live verification recorded'}</dd></dl>
-          <div className="settings-grid">
-            <label className="field"><span className="field-label">Label: {deployment.id}</span><input className="input" maxLength={100} disabled={disabled} value={deployment.label} onChange={event => patch({ label: event.target.value })} /></label>
-            <label className="field"><span className="field-label">Description: {deployment.id}</span><input className="input" maxLength={500} disabled={disabled} value={deployment.description} onChange={event => patch({ description: event.target.value })} /></label>
-          </div>
-          <div className="flex flex-wrap items-center gap-3"><label className="check-label"><input type="checkbox" disabled={disabled} checked={deployment.enabled} onChange={event => patch({ enabled: event.target.checked })} />Enabled for new work</label>
-            <Button size="sm" disabled={disabled || deployments.length === 1} onClick={() => onChange('ai.deployments', deployments.filter((_, at) => at !== index))}>Remove from draft catalog</Button></div>
-          {errors.filter(error => error.path.startsWith(`ai.deployments.${index}`)).map((error, at) => <p className="settings-error" role="alert" key={at}>{error.path}: {error.message}</p>)}
-        </section>
-      })}
-      {inventory && <div className="space-y-2"><p>Inventory checked {inventory.checkedAt}. Adding an entry only edits this unsaved draft.</p>
-        {inventory.deployments.filter(item => !deployments.some(existing => existing.deploymentName === item.deploymentName)).map(item => <div className="flex flex-wrap items-center gap-2" key={item.id}>
-          <code>{item.deploymentName}</code><span>{item.modelName} · {item.capabilities.structuredOutputs ? 'compatible API family' : 'unsupported structured-output adapter'}</span>
-          <Button size="sm" disabled={disabled} onClick={() => onChange('ai.deployments', [...deployments, { ...item, enabled: item.capabilities.structuredOutputs }])}>Add to draft catalog</Button>
-        </div>)}
-        {!inventory.deployments.length && <p>No deployments were returned by the inventory service. No model was created or substituted.</p>}
-      </div>}
-      <label className="field mt-4"><span className="field-label">Application default deployment</span>
-        <select className="input" disabled={disabled} value={settings.ai.defaultDeploymentId} onChange={event => onChange('ai.defaultDeploymentId', event.target.value)}>
-          {!compatible.some(item => item.id === settings.ai.defaultDeploymentId) && <option value={settings.ai.defaultDeploymentId}>Current selection unavailable: {settings.ai.defaultDeploymentId}</option>}
-          {compatible.map(item => <option key={item.id} value={item.id}>{item.label} ({item.deploymentName})</option>)}
-        </select><span className="field-hint">Default: {defaults.ai.defaultDeploymentId} · <SettingsFieldProvenance field={fields.find(field => field.path === 'ai.defaultDeploymentId')} changed={settings.ai.defaultDeploymentId !== saved.ai.defaultDeploymentId} /> · Scope: application · Activation: new-operation. Inherited choices are frozen for new work. No automatic model substitution.</span>
+    {matches(`ai.defaultDeploymentId AI model default model ${names}`) && <section className="panel settings-section" aria-label="AI model">
+      <h2>AI model</h2>
+      <p>Score sends job rubric, resume, assessment, summary, and QC work to a model deployment in your Azure resource. Changes apply to new work once you review and save them; work that has already started keeps its model.</p>
+      <label className="field settings-model-picker"><span className="field-label">Default model</span>
+        <select className="input" disabled={disabled} value={defaultId} onChange={event => choose('ai.defaultDeploymentId', event.target.value)}>
+          {missing(defaultId)}{options}
+        </select>
+        <span className="field-hint">Used by every task that doesn’t have its own model. <SettingsFieldProvenance field={metadata('ai.defaultDeploymentId')} changed={defaultId !== saved.ai.defaultDeploymentId} /></span>
         {errors.filter(error => error.path === 'ai.defaultDeploymentId').map((error, index) => <span role="alert" className="settings-error" key={index}>{error.message}</span>)}
       </label>
+      {defaultDeployment && <p className="settings-model-facts">{capabilitiesText(defaultDeployment, inventory)}</p>}
+      <div className="settings-discovery"><span role="status">{discoveryText}</span>
+        {discoveryAvailable && discovery.status !== 'loading' && <Button size="sm" icon={RefreshCw} disabled={disabled} onClick={onRefreshDeployments}>
+          {discovery.status === 'error' ? 'Try again' : inventory ? 'Check Azure again' : 'Find deployments in Azure'}
+        </Button>}
+      </div>
+      <div className="settings-model-coverage"><p>{coverage}</p>
+        {ownModel.length > 0 && <Button size="sm" disabled={disabled} onClick={useDefaultEverywhere}>Use the default model for every task</Button>}
+      </div>
+      {attention.length > 0 && <div className="settings-attention" role="alert"><strong>Fix before saving</strong>
+        <ul>{attention.map(item => <li key={item.task}>{taskNames[item.task]}: {item.issues.join('; ')}.</li>)}</ul>
+        <p>Open the task below and choose a setting its model supports.</p>
+      </div>}
+      {modelChanged && <p className="settings-model-unsaved">Not saved yet. Choose <strong>Review and save</strong> at the top of the page, then <strong>Publish new revision</strong>, to use this for new work.</p>}
     </section>}
-    {MODEL_TASK_IDS.map(task => {
-      const binding = settings.ai.tasks[task]
-      if (!binding) return null
-      const deployment = deployments.find(item => item.id === (binding.deploymentId ?? settings.ai.defaultDeploymentId))
+    {!search && tasks.length > 0 && <div className="settings-subheading"><h2>Model for each task</h2>
+      <p>Each task uses the default model unless you choose another one. Open a task to change its model, reasoning, or limits.</p></div>}
+    {tasks.map(task => {
+      const binding = bindingOf(task)
+      const deployment = deploymentFor(task)
+      const issues = attention.find(item => item.task === task)?.issues ?? []
       const taskFields = fields.filter(field => field.path.startsWith(`ai.tasks.${task}.`) && !field.path.endsWith('.deploymentId'))
       if (!matches(`${taskNames[task]} ${task} ai.tasks.${task}.deploymentId ${taskFields.map(field => `${field.label} ${field.description} ${field.path}`).join(' ')}`)) return null
-      return <details className="panel settings-section" key={task} open={Boolean(search) || undefined}>
-        <summary><strong>{taskNames[task]}</strong> <span className="text-muted">{binding.deploymentId === null ? 'Inherits default' : 'Task override'} · {deployment?.deploymentName ?? 'Unavailable deployment'}</span></summary>
-        <label className="field mt-4"><span className="field-label">{taskNames[task]} deployment</span>
-          <select className="input" disabled={disabled} value={binding.deploymentId ?? ''} onChange={event => onChange(`ai.tasks.${task}.deploymentId`, event.target.value || null)}>
-            <option value="">Use application default ({settings.ai.defaultDeploymentId})</option>
-            {binding.deploymentId && !compatible.some(item => item.id === binding.deploymentId) && <option value={binding.deploymentId}>Current selection unavailable: {binding.deploymentId}</option>}
-            {compatible.map(item => <option value={item.id} key={item.id}>{item.label} ({item.deploymentName})</option>)}
-          </select><span className="field-hint">Default: inherit application deployment · <SettingsFieldProvenance field={fields.find(field => field.path === `ai.tasks.${task}.deploymentId`)} changed={binding.deploymentId !== saved.ai.tasks[task]?.deploymentId} /> · Scope: application · Activation: new-operation. Model-default reasoning omits the parameter, rather than inheriting another task.</span>
+      return <details className="panel settings-section" key={task} open={Boolean(search) || issues.length > 0 || undefined}>
+        <summary><strong>{taskNames[task]}</strong> <span className="settings-summary-detail text-muted">{nameFor(task)} · {binding.deploymentId === null ? 'default model' : 'chosen for this task'} · reasoning {binding.reasoningEffort ?? 'model default'}</span>
+          {issues.length > 0 && <Badge tone="warning" dot>Needs attention</Badge>}</summary>
+        <label className="field mt-4"><span className="field-label">{taskNames[task]} model</span>
+          <select className="input" disabled={disabled} value={binding.deploymentId ?? ''} onChange={event => choose(`ai.tasks.${task}.deploymentId`, event.target.value)}>
+            <option value="">Use the default model ({defaultDeployment ? titleOf(defaultDeployment) : defaultId})</option>
+            {binding.deploymentId !== null && missing(binding.deploymentId)}
+            {options}
+          </select><span className="field-hint">Default: use the default model · <SettingsFieldProvenance field={metadata(`ai.tasks.${task}.deploymentId`)} changed={binding.deploymentId !== saved.ai.tasks[task]?.deploymentId} /> · Activation: new-operation. Model-default reasoning omits the parameter, rather than inheriting another task.</span>
           {errors.filter(error => error.path === `ai.tasks.${task}.deploymentId`).map((error, index) => <span role="alert" className="settings-error" key={index}>{error.message}</span>)}
         </label>
         <div className="settings-grid mt-4">{taskFields.map(field => {
@@ -86,5 +217,51 @@ export function ModelSettingsEditor({ settings, saved, defaults, fields, errors,
         })}</div>
       </details>
     })}
+    {matches(`ai.deployments Azure deployments catalog Deployments Score can use ${names}`) && <section className="panel settings-section" aria-label="Deployments Score can use">
+      <h2>Deployments Score can use</h2>
+      <p>Score sends AI work only to the deployments listed here. Choosing one from “Also in your Azure resource” in a list above adds it, and removing one here doesn’t delete it from Azure.</p>
+      <p className="field-hint"><SettingsFieldProvenance field={metadata('ai.deployments')} changed={JSON.stringify(deployments) !== JSON.stringify(saved.ai.deployments)} /></p>
+      <ul className="settings-deployment-list">{deployments.map((deployment, index) => {
+        const patch = (value: Partial<ModelDeployment>) => onChange('ai.deployments', deployments.map((item, at) => at === index ? { ...item, ...value } : item))
+        const inUse = deployment.id === defaultId || tasks.some(task => bindingOf(task).deploymentId === deployment.id)
+        const taskCount = tasks.filter(task => targetOf(task) === deployment.id).length
+        const locked = deployments.length === 1 ? 'Score needs at least one deployment.' : inUse ? 'In use. Choose another model for the default and its tasks first.' : ''
+        return <li className="settings-deployment" key={deployment.id} aria-label={`Deployment ${titleOf(deployment)}`}>
+          <div className="settings-deployment-head"><h3>{titleOf(deployment)}</h3>
+            {deployment.id === defaultId && <Badge tone="accent">Default model</Badge>}
+            {taskCount > 0 && <Badge>{taskCount === 1 ? 'Used by 1 task' : `Used by ${taskCount} tasks`}</Badge>}
+            {!deployment.capabilities.structuredOutputs && <Badge tone="warning" dot>Not supported by Score</Badge>}
+            {!deployment.enabled && <Badge>Turned off</Badge>}
+          </div>
+          <dl className="settings-facts">
+            <dt>Azure deployment</dt><dd><code>{deployment.deploymentName}</code></dd>
+            <dt>Model</dt><dd>{capabilitiesText(deployment, inventory)}</dd>
+            <dt>Listed from</dt><dd>{verificationText[deployment.verification]}{deployment.verifiedAt ? ` · ${deployment.verifiedAt}` : ''}</dd>
+            <dt>Settings ID</dt><dd><code>{deployment.id}</code></dd>
+          </dl>
+          <div className="flex flex-wrap items-center gap-3">
+            <label className={`check-label${inUse && deployment.enabled ? ' is-disabled' : ''}`}><input type="checkbox" disabled={disabled || (inUse && deployment.enabled)} checked={deployment.enabled} onChange={event => patch({ enabled: event.target.checked })} />Enabled for new work</label>
+            <Button size="sm" disabled={disabled || Boolean(locked)} onClick={() => onChange('ai.deployments', deployments.filter((_, at) => at !== index))}>Remove from list</Button>
+            {locked && <span className="field-hint">{locked}</span>}
+          </div>
+          <details className="settings-deployment-names"><summary>Rename or describe</summary>
+            <div className="settings-grid">
+              <label className="field"><span className="field-label">Display name</span><input className="input" maxLength={100} disabled={disabled} value={deployment.label} onChange={event => patch({ label: event.target.value })} /></label>
+              <label className="field"><span className="field-label">Description</span><input className="input" maxLength={500} disabled={disabled} value={deployment.description} onChange={event => patch({ description: event.target.value })} /></label>
+            </div>
+          </details>
+          {errors.filter(error => error.path.startsWith(`ai.deployments.${index}`)).map((error, at) => <p className="settings-error" role="alert" key={at}>{error.path}: {error.message}</p>)}
+        </li>
+      })}</ul>
+      {elsewhere.length > 0 && <div className="settings-available"><h3>Also in your Azure resource</h3>
+        <ul>
+          {addable.map(item => <li key={item.deploymentName}><span><code>{item.deploymentName}</code> · {capabilitiesText(item, inventory)}</span>
+            <Button size="sm" disabled={disabled} onClick={() => add(item)}>Add to list</Button></li>)}
+          {blocked.map(item => <li key={item.deploymentName}><span><code>{item.deploymentName}</code> · {capabilitiesText(item, inventory)}</span>
+            <span className="field-hint">{unavailableReason(item, false)}</span></li>)}
+        </ul>
+      </div>}
+      {errors.filter(error => error.path === 'ai.deployments').map((error, index) => <p className="settings-error" role="alert" key={index}>{error.message}</p>)}
+    </section>}
   </div>
 }

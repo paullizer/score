@@ -12,7 +12,7 @@ import { useGradeLeaveGuard } from '../../app/grade-navigation-context'
 import { usePublicSettings } from '../../app/public-settings-context'
 import { ThemeControl } from '../../app/ThemeControl'
 import { Badge, Button, InlineError, Modal, PageHeader, SearchField } from '../../components/ui'
-import { ModelSettingsEditor } from './ModelSettingsEditor'
+import { ModelSettingsEditor, type DeploymentDiscovery } from './ModelSettingsEditor'
 import { SettingsField } from './SettingsField'
 import { changeSetting, defaultsCandidate, describeChangeValue, rebaseSettingsDraft } from './settingsForm'
 
@@ -32,6 +32,10 @@ function Changes({ changes, label, fields }: { changes: SettingsChange[]; label:
         <td><pre>{describeChangeValue(change.path, change.before, fields)}</pre></td><td><pre>{describeChangeValue(change.path, change.after, fields)}</pre></td></tr>)}</tbody></table>
       : <p>No settings differ.</p>}
   </div>
+}
+
+function discoveryError(caught: unknown): string {
+  return caught instanceof Error && caught.message ? caught.message : 'The deployment list is unavailable.'
 }
 
 export function AdminSettingsPage({ onLeave, onOpenUsers }: { onLeave: () => void; onOpenUsers?: () => Promise<void> }) {
@@ -55,7 +59,8 @@ export function AdminSettingsPage({ onLeave, onOpenUsers }: { onLeave: () => voi
   const [historyLoaded, setHistoryLoaded] = useState(false)
   const [historyDetail, setHistoryDetail] = useState<SettingsRevision | null>(null)
   const historyCursors = useRef(new Set<string>())
-  const [inventory, setInventory] = useState<DeploymentInventory | null>(null)
+  const [discovery, setDiscovery] = useState<DeploymentDiscovery>({ status: 'idle', inventory: null, error: '' })
+  const discoveryStarted = useRef(false)
   const [probeOpen, setProbeOpen] = useState(false)
   const [probeKind, setProbeKind] = useState<ModelTestResult['kind']>('task')
   const [probeTask, setProbeTask] = useState<ModelTaskId>('jobRubric')
@@ -84,9 +89,34 @@ export function AdminSettingsPage({ onLeave, onOpenUsers }: { onLeave: () => voi
     return () => { live.current = false; controller.abort() }
   }, [])
 
+  const inventoryAvailable = base?.environment.model.inventoryAvailable === true
+  const modelsVisible = section === 'ai' || search !== ''
+  // Listing deployments is a read-only management call, so the model lists fill in without an extra click.
+  useEffect(() => {
+    if (!inventoryAvailable || !modelsVisible || discoveryStarted.current) return
+    discoveryStarted.current = true
+    const controller = new AbortController()
+    let settled = false
+    setDiscovery(current => ({ ...current, status: 'loading', error: '' }))
+    service.readDeploymentInventory(controller.signal).then(inventory => {
+      settled = true
+      if (!controller.signal.aborted) setDiscovery({ status: 'ready', inventory, error: '' })
+    }, caught => {
+      settled = true
+      if (!controller.signal.aborted) setDiscovery(current => ({ ...current, status: 'error', error: discoveryError(caught) }))
+    })
+    return () => {
+      if (settled) return
+      controller.abort()
+      discoveryStarted.current = false
+    }
+  }, [inventoryAvailable, modelsVisible])
+
   function update(path: string, value: unknown) {
     if (!draft || !base || pending) return
-    setDraft(changeSetting(draft, base.settings, path, value, base.fields.find(field => field.path === path)?.defaultValue))
+    const defaultValue = base.fields.find(field => field.path === path)?.defaultValue
+    // Functional, so the changes from one choice compose, such as adding a deployment and then selecting it.
+    setDraft(current => current && changeSetting(current, base.settings, path, value, defaultValue))
     setStatus('')
   }
 
@@ -125,6 +155,19 @@ export function AdminSettingsPage({ onLeave, onOpenUsers }: { onLeave: () => voi
     inFlight.current = true; setPending(true); setError(''); setStatus(''); guard.hold()
     try { await operation() } catch (caught) { await fail(caught) }
     finally { inFlight.current = false; if (live.current) { setPending(false); guard.settle() } }
+  }
+
+  async function refreshDeployments(): Promise<DeploymentInventory> {
+    discoveryStarted.current = true
+    setDiscovery(current => ({ ...current, status: 'loading', error: '' }))
+    try {
+      const inventory = await service.refreshDeploymentInventory()
+      if (live.current) setDiscovery({ status: 'ready', inventory, error: '' })
+      return inventory
+    } catch (caught) {
+      if (live.current) setDiscovery(current => ({ ...current, status: 'error', error: discoveryError(caught) }))
+      throw caught
+    }
   }
 
   async function applyReview() {
@@ -242,7 +285,8 @@ export function AdminSettingsPage({ onLeave, onOpenUsers }: { onLeave: () => voi
         <button aria-current={section === 'environment' && !search ? 'page' : undefined} onClick={() => { setSection('environment'); setSearch('') }}>Environment & readiness</button>
       </nav>
       {(section === 'ai' || search) && <ModelSettingsEditor settings={draft} saved={base.settings} defaults={base.defaults} fields={availableFields.filter(field => advanced || search || field.classification !== 'advanced')}
-        errors={errors} onChange={update} inventory={inventory} disabled={pending} search={search} />}
+        errors={errors} onChange={update} discovery={discovery} discoveryAvailable={base.environment.model.inventoryAvailable}
+        onRefreshDeployments={() => { void refreshDeployments().catch(() => undefined) }} disabled={pending} search={search} />}
       {fields.some(field => !field.path.startsWith('ai.tasks.') && field.path !== 'ai.defaultDeploymentId') && <section className="panel settings-section">
         <h2>{search ? 'Matching settings' : sections.find(item => item.id === section)?.title}</h2>
         <div className="settings-grid">{fields.filter(field => !field.path.startsWith('ai.tasks.') && field.path !== 'ai.defaultDeploymentId').map(field =>
@@ -251,7 +295,7 @@ export function AdminSettingsPage({ onLeave, onOpenUsers }: { onLeave: () => voi
       {(section === 'ai' || section === 'environment') && !search && <section className="panel settings-section" aria-label="Deployment discovery and synthetic tests">
         <h2>Inventory and explicit synthetic tests</h2><p>Inventory refresh reads existing deployments; it does not create deployments, save settings, or run inference. Tests are separate, use only synthetic nonprivate content, and never save the draft.</p>
         <div className="flex flex-wrap gap-2"><Button icon={RefreshCw} disabled={pending || !base.environment.model.inventoryAvailable} onClick={() => void action(async () => {
-          const result = await service.refreshDeploymentInventory(); setInventory(result); setStatus(`Deployment inventory checked at ${result.checkedAt}. Review additions in the catalog; nothing was saved.`)
+          const result = await refreshDeployments(); setStatus(`Checked the deployments in your Azure resource at ${result.checkedAt}. They're listed in the model choices above; nothing was saved.`)
         })}>Refresh deployment inventory</Button>
           <Button disabled={pending} onClick={() => { setCostAcknowledged(false); setProbeOpen(true) }}>Configure synthetic test</Button></div>
         {!base.environment.model.inventoryAvailable && <p className="field-hint">Inventory discovery is not configured or the API identity lacks scoped deployment-read permission. Ask an operator; a catalog dropdown does not grant permission.</p>}
