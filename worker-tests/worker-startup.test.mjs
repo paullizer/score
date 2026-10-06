@@ -81,8 +81,24 @@ for (const worker of workers) {
     }
   })
 
+  test(`${worker.kind} accepts GPT-6 Luna only with efforts the application schema can represent`, () => {
+    for (const value of ['low', 'medium', 'high']) {
+      const loaded = worker.load(environment(worker, {
+        RUBRIC_MODEL_NAME: 'gpt-6-luna', RUBRIC_MODEL_DEPLOYMENT: 'gpt-6-luna', RUBRIC_MODEL_REASONING_EFFORT: value,
+      }))
+      assert.equal(loaded[name], 'gpt-6-luna')
+      assert.equal(loaded[deployment], 'gpt-6-luna')
+      assert.equal(loaded[effort], value)
+    }
+    for (const value of ['minimal', 'none', 'xhigh', 'max']) {
+      assert.throws(() => worker.load(environment(worker, {
+        RUBRIC_MODEL_NAME: 'gpt-6-luna', RUBRIC_MODEL_REASONING_EFFORT: value,
+      })), error => error.field === 'RUBRIC_MODEL_REASONING_EFFORT' && error.reason === 'unsupported-reasoning')
+    }
+  })
+
   test(`${worker.kind} omits unset reasoning and accepts supported non-reasoning models`, () => {
-    for (const model of ['gpt-5-mini', 'gpt-5.6-luna', 'gpt-4.1', 'gpt-4o']) {
+    for (const model of ['gpt-5-mini', 'gpt-5.6-luna', 'gpt-6-luna', 'gpt-4.1', 'gpt-4o']) {
       for (const value of [undefined, '', '  ']) {
         const loaded = worker.load(environment(worker, { RUBRIC_MODEL_NAME: model, RUBRIC_MODEL_REASONING_EFFORT: value }))
         assert.equal(loaded[name], model)

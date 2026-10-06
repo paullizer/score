@@ -10,7 +10,9 @@
     "authServicePrincipalId": { "value": "${AZURE_AUTH_SP_OBJECT_ID}" },
     "allowedUserId": { "value": "${AZURE_ALLOWED_USER_ID}" },
     "admissionStage": { "value": "${AZURE_SCORE_ADMISSION_STAGE}" },
-    "additionalModelDeployments": { "value": [] },
+    "additionalModelDeployments": { "value": [
+      { "name": "gpt-6-luna", "modelName": "gpt-6-luna", "modelVersion": "2026-09-22", "sku": "DataZoneStandard", "capacity": 300, "versionUpgradeOption": "OnceCurrentVersionExpired" }
+    ] },
     "operatorPrincipalId": { "value": "${AZURE_PRINCIPAL_ID}" },
     "containerImage": { "value": "${AZURE_CONTAINER_IMAGE}" },
     "workerImage": { "value": "${AZURE_WORKER_CONTAINER_IMAGE}" },
