@@ -96,7 +96,7 @@ before(async () => {
       export { JobDetail } from './src/features/jobs/JobsPage';
       export { RealResumesPage } from './src/features/resumes/RealResumesPage';
       export { GradeSourceInspector } from './src/features/grade-ladders/GradeSourceInspector';
-      export { createDefaultAdminSettings } from './src/domain/admin-settings-defaults';
+      export { createDefaultAdminSettings, modelCapabilitiesFor } from './src/domain/admin-settings-defaults';
       export { ADMIN_SETTINGS_STORAGE_LIMITS, settingsJsonBytes } from './src/domain/admin-settings';
       export { projectPublicSettings, captureProcessingSettings, diffAdminSettings } from './src/domain/admin-settings-resolver';
       export { ADMIN_SETTINGS_FIELDS } from './src/domain/admin-settings-fields';
@@ -148,6 +148,7 @@ beforeEach(() => {
       return json(response())
     }
     if (path === '/api/admin/settings/history') return json({ revisions: [] })
+    if (path === '/api/admin/deployments' && method === 'GET') return json({ checkedAt: '2026-01-01T00:00:00.000Z', deployments: [] })
     throw new Error(`Unexpected fixture request: ${method} ${url}`)
   }
 })
@@ -823,7 +824,7 @@ test('all twelve task bindings offer inheritance, deployment-specific reasoning,
   for (const item of document.querySelectorAll('details.settings-section')) {
     const selection = item.querySelector('select')
     assert.equal(selection.options[0].value, '')
-    assert.match(selection.options[0].textContent, /Use application default/)
+    assert.match(selection.options[0].textContent, /Use the default model \(job-rubric\)/)
     assert.match(selection.closest('label').textContent, /Default source: compiled-default/)
     assert.match(selection.closest('label').textContent, /Source: application-revision/)
   }
@@ -835,7 +836,9 @@ test('all twelve task bindings offer inheritance, deployment-specific reasoning,
   assert.equal(Number(completion.max), 8192)
   assert.equal(Number((await field('ai.tasks.qcPlan.completionTokenLimit')).max), 16384)
   await edit(document.querySelector('input[aria-label="Search application settings"]'), 'ai.defaultDeploymentId')
-  assert.ok(document.querySelector('[aria-label="Azure deployment catalog"]'), 'Custom deployment controls are searchable by metadata path')
+  assert.ok(document.querySelector('[aria-label="AI model"]'), 'The default model control is searchable by metadata path')
+  await edit(document.querySelector('input[aria-label="Search application settings"]'), 'ai.deployments')
+  assert.ok(document.querySelector('[aria-label="Deployments Score can use"]'), 'Custom deployment controls are searchable by metadata path')
 })
 
 test('deployment-seeded defaults display their provenance and a default reset remains an unsaved draft', async () => {
@@ -862,9 +865,123 @@ test('deployment-seeded defaults display their provenance and a default reset re
   assert.match(wrapper.textContent, /Source: Unsaved draft/)
   assert.equal(patches().length, 0, 'A configured-default reset still requires review and save')
   await edit(document.querySelector('input[aria-label="Search application settings"]'), 'ai.defaultDeploymentId')
-  const catalog = document.querySelector('[aria-label="Azure deployment catalog"]')
-  assert.match(catalog.textContent, /Default source: AZURE_OPENAI_DEPLOYMENT_NAME/)
-  assert.match(catalog.querySelector('label.field.mt-4').textContent, /Default source: AZURE_OPENAI_DEPLOYMENT_NAME/)
+  const model = document.querySelector('[aria-label="AI model"]')
+  assert.match(model.querySelector('label.settings-model-picker').textContent, /Default source: AZURE_OPENAI_DEPLOYMENT_NAME/)
+  await edit(document.querySelector('input[aria-label="Search application settings"]'), 'ai.deployments')
+  assert.match(document.querySelector('[aria-label="Deployments Score can use"]').textContent, /Default source: AZURE_OPENAI_DEPLOYMENT_NAME/)
+})
+
+function inventoryEntry(name, modelName, modelVersion, overrides = {}) {
+  const capabilities = ui.modelCapabilitiesFor(modelName, modelVersion)
+  return {
+    id: name, deploymentName: name, label: name, description: '', enabled: capabilities.structuredOutputs,
+    modelName, modelVersion, capabilities, verification: 'discovered', verifiedAt: null, ...overrides,
+  }
+}
+const azureInventory = () => ({
+  checkedAt: '2026-10-06T18:00:00.000Z',
+  deployments: [
+    inventoryEntry('job-rubric', 'gpt-5-mini', '2025-08-07', { id: 'default' }),
+    inventoryEntry('gpt-6-luna', 'gpt-6-luna', '2026-09-22'),
+    inventoryEntry('gpt-6-sol', 'gpt-6-sol', '2026-09-22'),
+  ],
+})
+const listsAzure = (path, init) => path === '/api/admin/deployments' && (init.method ?? 'GET') === 'GET' ? json(azureInventory()) : undefined
+const modelPanel = () => document.querySelector('[aria-label="AI model"]')
+const defaultModel = () => modelPanel().querySelector('select')
+const untilDeploymentsListed = () =>
+  until(() => /Found 3 deployments in your Azure resource/.test(modelPanel()?.textContent ?? ''), 'The Azure deployments are listed')
+
+test('the default model lists every deployment in the Azure resource, and one choice adds and selects it', async () => {
+  settings.ai.tasks.candidateSummary.deploymentId = 'default'
+  override = listsAzure
+  await renderAdmin()
+  await untilDeploymentsListed()
+  assert.equal(requests.filter(item => item.path === '/api/admin/deployments').length, 1)
+  assert.ok(requests.every(item => item.path !== '/api/admin/deployments/refresh'), 'Listing deployments needs no refresh click')
+  const options = [...defaultModel().options]
+  assert.deepEqual(options.map(option => option.textContent), [
+    'job-rubric · gpt-5-mini 2025-08-07', 'gpt-6-luna · 2026-09-22', 'gpt-6-sol · 2026-09-22 — Score doesn’t support this model',
+  ])
+  assert.equal(options[1].parentElement.label, 'Also in your Azure resource')
+  assert.equal(options[2].disabled, true)
+  assert.match(modelPanel().textContent, /11 of 12 AI tasks use the default model\. One task uses its own model: Candidate summary \(job-rubric\)\./)
+  assert.doesNotMatch(modelPanel().textContent, /Not saved yet/)
+
+  await edit(defaultModel(), 'azure:gpt-6-luna')
+  assert.equal(defaultModel().value, 'gpt-6-luna')
+  assert.match(modelPanel().textContent, /gpt-6-luna 2026-09-22 · 1,050,000-token context · up to 128,000 output tokens · reasoning low, medium, high/)
+  assert.match(modelPanel().textContent, /Not saved yet/)
+  assert.equal(defaultModel().querySelector('optgroup[label="Also in your Azure resource"]'), null, 'The added deployment is listed with the others')
+  const catalog = document.querySelector('[aria-label="Deployments Score can use"]')
+  assert.match(catalog.querySelector('[aria-label="Deployment gpt-6-luna"]').textContent, /Default model/)
+  assert.equal(button('Remove from list', catalog.querySelector('[aria-label="Deployment gpt-6-luna"]')).disabled, true, 'A deployment in use cannot be removed')
+
+  await click(button('Use the default model for every task'))
+  assert.match(modelPanel().textContent, /All 12 AI tasks use the default model\./)
+  assert.equal(patches().length, 0, 'Choosing a model only edits the draft')
+  await click(button('Review and save'))
+  await click(button('Publish new revision', dialog('Review application changes')))
+  assert.equal(patches().length, 1)
+  const published = JSON.parse(patches()[0].init.body)
+  assert.equal(published.ai.defaultDeploymentId, 'gpt-6-luna')
+  const luna = published.ai.deployments.find(item => item.id === 'gpt-6-luna')
+  assert.equal(luna.deploymentName, 'gpt-6-luna')
+  assert.equal(luna.modelVersion, '2026-09-22')
+  assert.equal(luna.enabled, true)
+  assert.deepEqual(luna.capabilities, ui.modelCapabilitiesFor('gpt-6-luna', '2026-09-22'))
+  assert.ok(Object.values(published.ai.tasks).every(task => task.deploymentId === null))
+})
+
+test('choosing a model that can’t run a task’s settings flags that task before saving', async () => {
+  settings.ai.tasks.jobRubric.reasoningEffort = 'minimal'
+  override = listsAzure
+  await renderAdmin()
+  await untilDeploymentsListed()
+  assert.equal(modelPanel().querySelector('.settings-attention'), null)
+  await edit(defaultModel(), 'azure:gpt-6-luna')
+  assert.match(modelPanel().querySelector('.settings-attention').textContent, /Job rubric extraction: gpt-6-luna doesn’t support reasoning effort “minimal”\./)
+  const task = [...document.querySelectorAll('details')].find(item => item.querySelector('summary')?.textContent.startsWith('Job rubric extraction'))
+  assert.equal(task.open, true, 'The affected task opens so its setting can be changed')
+  assert.match(task.querySelector('summary').textContent, /gpt-6-luna · default model · reasoning minimal.*Needs attention/)
+  await click(button('Review and save'))
+  assert.equal(dialog('Review application changes'), undefined)
+  assert.equal(patches().length, 0)
+  await edit(await field('ai.tasks.jobRubric.reasoningEffort'), 'low')
+  await edit(document.querySelector('input[aria-label="Search application settings"]'), '')
+  assert.equal(modelPanel().querySelector('.settings-attention'), null)
+})
+
+test('listing Azure deployments falls back to the known deployments when it fails and can be retried', async () => {
+  let refreshes = 0
+  override = (path, init) => {
+    if (path === '/api/admin/deployments' && (init.method ?? 'GET') === 'GET') return json({ error: { message: 'Azure deployment inventory is unavailable' } }, 503)
+    if (path === '/api/admin/deployments/refresh') { refreshes++; assert.equal(init.body, '{}'); return json(azureInventory()) }
+    return undefined
+  }
+  await renderAdmin()
+  await until(() => /Couldn’t list the deployments in your Azure resource: Azure deployment inventory is unavailable\. The lists show only the deployments Score already uses\./
+    .test(modelPanel()?.textContent ?? ''), 'The listing failure is explained')
+  assert.deepEqual([...defaultModel().options].map(option => option.value), ['default'])
+  assert.equal(refreshes, 0)
+  await click(button('Try again', modelPanel()))
+  await untilDeploymentsListed()
+  assert.equal(refreshes, 1)
+  assert.ok([...defaultModel().options].some(option => option.value === 'azure:gpt-6-luna'))
+  assert.equal(patches().length, 0)
+})
+
+test('without deployment discovery the model lists show only known deployments and never call Azure', async () => {
+  override = (path, init) => {
+    if (path !== '/api/admin/settings' || (init.method && init.method !== 'GET')) return undefined
+    const current = response()
+    current.environment.model.inventoryAvailable = false
+    return json(current)
+  }
+  await renderAdmin()
+  assert.match(modelPanel().textContent, /Finding the other deployments in your Azure resource isn’t set up for this environment/)
+  assert.ok(requests.every(item => !item.path.startsWith('/api/admin/deployments')))
+  assert.equal(button('Refresh deployment inventory').disabled, true)
 })
 
 test('rubric AI assistant switch is on for revisions saved before it existed and publishes only explicit changes', async () => {
@@ -975,7 +1092,7 @@ for (const recorded of [false, true]) {
       assert.match(panel.textContent, /No verification-time worker rollout evidence recorded/)
       assert.equal(panel.querySelector('time'), null)
     }
-    assert.ok(requests.every(request => (request.init.method ?? 'GET') === 'GET'), 'Viewing rollout evidence does not save, discover deployments, or run inference')
+    assert.ok(requests.every(request => (request.init.method ?? 'GET') === 'GET'), 'Viewing rollout evidence only reads; it does not save or run inference')
   })
 }
 

@@ -59,6 +59,9 @@ export function previewSettingsImport(document: unknown, etag: string): Promise<
 export function importAdminSettings(document: unknown, etag: string): Promise<AdminSettingsResponse> {
   return request('/admin/settings/import-apply', { method: 'POST', headers: { 'If-Match': etag }, body: JSON.stringify({ document, confirm: true }) })
 }
+export function readDeploymentInventory(signal?: AbortSignal): Promise<DeploymentInventory> {
+  return request('/admin/deployments', { signal })
+}
 export function refreshDeploymentInventory(): Promise<DeploymentInventory> {
   return request('/admin/deployments/refresh', { method: 'POST', body: '{}' })
 }

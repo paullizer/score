@@ -12,7 +12,8 @@
 .settings-section h3 { font-size: 0.875rem; font-weight: 600; }
 .settings-section p { font-size: 0.8125rem; margin: 0.5rem 0; line-height: 1.6; }
 .settings-section summary { cursor: pointer; font-size: 0.875rem; }
-.settings-section summary span { margin-left: 0.75rem; font-size: 0.75rem; }
+.settings-section summary .settings-summary-detail { margin-left: 0.75rem; font-size: 0.75rem; }
+.settings-section summary .badge { margin-left: 0.75rem; vertical-align: middle; }
 .settings-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 1.5rem; }
 .settings-field { min-width: 0; padding: 1rem; border: 1px solid var(--cp-border); border-radius: 0.625rem; display: flex; flex-direction: column; align-items: flex-start; gap: 0.625rem; }
 .settings-field .input { width: 100%; }
@@ -22,7 +23,26 @@
 .settings-value { white-space: pre-wrap; }
 .settings-host-row { display: flex; align-items: center; flex-wrap: wrap; gap: 0.5rem; }
 .settings-host-row input.input { flex: 1; min-width: 150px; }
-.settings-deployment { border: 1px solid var(--cp-border); padding: 1rem; border-radius: 0.625rem; margin: 1rem 0; }
+.settings-model-picker { max-width: 40rem; margin-top: 1.25rem; }
+.settings-section .settings-model-facts { margin: 0.5rem 0 0; font-size: 0.75rem; color: var(--cp-text-muted); }
+.settings-discovery { display: flex; align-items: center; flex-wrap: wrap; gap: 0.5rem 0.75rem; margin-top: 0.75rem; font-size: 0.75rem; color: var(--cp-text-muted); }
+.settings-model-coverage { display: flex; align-items: center; flex-wrap: wrap; gap: 0.75rem 1.5rem; margin-top: 1.25rem; padding-top: 1.25rem; border-top: 1px solid var(--cp-border); }
+.settings-section .settings-model-coverage p { flex: 1 1 24rem; margin: 0; }
+.settings-attention { margin-top: 1rem; padding: 0.875rem 1rem; border: 1px solid var(--cp-warning); border-radius: 0.625rem; font-size: 0.8125rem; }
+.settings-attention ul { list-style: disc; padding-left: 1.25rem; margin-top: 0.375rem; line-height: 1.6; }
+.settings-section .settings-model-unsaved { margin-top: 1rem; color: var(--cp-accent); }
+.settings-subheading { margin: 2.5rem 0 0.75rem; }
+.settings-subheading h2 { font-size: 1rem; font-weight: 650; }
+.settings-subheading p { margin-top: 0.25rem; font-size: 0.8125rem; color: var(--cp-text-muted); }
+.settings-deployment-list { margin-top: 0.5rem; }
+.settings-deployment { padding: 1.25rem 0; border-top: 1px solid var(--cp-border); }
+.settings-deployment-head { display: flex; align-items: center; flex-wrap: wrap; gap: 0.5rem; }
+.settings-deployment-names { margin-top: 0.875rem; }
+.settings-deployment-names summary { cursor: pointer; font-size: 0.75rem; color: var(--cp-text-muted); }
+.settings-deployment-names .settings-grid { margin-top: 0.875rem; }
+.settings-available { padding-top: 1.25rem; border-top: 1px solid var(--cp-border); }
+.settings-available li { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 0.5rem 1rem; padding: 0.5rem 0; font-size: 0.75rem; }
+.settings-available li .field-hint { margin: 0; }
 .settings-facts { display: grid; grid-template-columns: minmax(130px, 1fr) 3fr; gap: 0.625rem 1rem; font-size: 0.75rem; margin: 1rem 0; }
 .settings-facts dt { color: var(--cp-text-muted); }
 .settings-facts dd { overflow-wrap: anywhere; }
