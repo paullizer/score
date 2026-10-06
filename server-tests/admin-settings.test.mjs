@@ -214,6 +214,53 @@ test('Luna medium uses an explicit model/version adapter without changing the de
   assert.ok(Object.values(defaults.ai.tasks).every(task => task.reasoningEffort === 'low'))
 })
 
+test('GPT-6 Luna uses its own explicit model/version adapter and binds tasks alongside the default deployment', () => {
+  const capabilities = modelCapabilitiesFor('gpt-6-luna', '2026-09-22')
+  assert.deepEqual(capabilities, {
+    structuredOutputs: true, contextTokens: 1_050_000, maxOutputTokens: 128_000,
+    reasoningEfforts: ['low', 'medium', 'high'], temperature: false, topP: false,
+  })
+  assert.deepEqual(modelCapabilitiesFor('gpt-6-luna'), capabilities)
+  assert.deepEqual(modelCapabilitiesFor('gpt-6-luna', null), capabilities)
+  for (const [name, version] of [
+    ['gpt-6-luna', '2026-07-09'], ['gpt-6-luna', '2026-09-21'], ['gpt-6-luna', '2026-09-23'], ['gpt-6-luna', ''],
+    ['gpt-6-luna-preview', '2026-09-22'], ['gpt-6', '2026-09-22'], ['GPT-6-LUNA', '2026-09-22'],
+    ['gpt-6-sol', '2026-09-22'], ['gpt-6-astra', '2026-09-03'], ['gpt-6.1-sol', '2026-09-29'], ['gpt-5.6-luna', '2026-09-22'],
+  ]) assert.deepEqual(modelCapabilitiesFor(name, version), modelCapabilitiesFor('unsupported'))
+
+  const luna = parseAdminSettings(createDefaultAdminSettings({
+    model: { deploymentName: 'gpt-6-luna', modelName: 'gpt-6-luna', reasoningEffort: 'medium' },
+  }))
+  for (const reasoningEffort of ['minimal', 'none', 'xhigh', 'max']) {
+    assert.throws(() => mergeAdminSettings(luna, { ai: { tasks: { jobRubric: { reasoningEffort } } } }))
+  }
+  for (const parameter of ['temperature', 'topP']) {
+    assert.throws(() => mergeAdminSettings(luna, { ai: { tasks: { jobRubric: { [parameter]: 0.5 } } } }))
+  }
+
+  // The deployed shape: job-rubric stays the default and an administrator binds every task to the discovered GPT-6 Luna deployment.
+  const mixed = createDefaultAdminSettings()
+  mixed.ai.deployments.push({
+    id: 'gpt-6-luna', deploymentName: 'gpt-6-luna', label: 'gpt-6-luna', description: '', enabled: true,
+    modelName: 'gpt-6-luna', modelVersion: '2026-09-22', capabilities, verification: 'discovered', verifiedAt: null,
+  })
+  for (const task of MODEL_TASK_IDS) Object.assign(mixed.ai.tasks[task], { deploymentId: 'gpt-6-luna', reasoningEffort: 'medium' })
+  const snapshot = captureProcessingSettings(parseAdminSettings(mixed), 'gpt-6-luna-medium', now().toISOString())
+  const defaults = createDefaultAdminSettings()
+  for (const task of MODEL_TASK_IDS) {
+    assert.equal(snapshot.tasks[task].modelName, 'gpt-6-luna')
+    assert.equal(snapshot.tasks[task].modelVersion, '2026-09-22')
+    assert.equal(snapshot.tasks[task].deploymentName, 'gpt-6-luna')
+    assert.equal(snapshot.tasks[task].reasoningEffort, 'medium')
+    assert.deepEqual(snapshot.tasks[task].capabilities, capabilities)
+    assert.equal(snapshot.tasks[task].completionTokenLimit, defaults.ai.tasks[task].completionTokenLimit)
+    assert.deepEqual(snapshot.tasks[task].inputBudget, defaults.ai.tasks[task].inputBudget)
+  }
+  assert.equal(snapshot.settings.ai.defaultDeploymentId, 'default')
+  assert.equal(defaults.ai.deployments.length, 1)
+  assert.equal(defaults.ai.deployments[0].modelName, 'gpt-5-mini')
+})
+
 test('frozen snapshot resolves every task, contains no resource secrets, and is independent of later defaults', () => {
   const defaults = createDefaultAdminSettings()
   const captured = captureProcessingSettings(defaults, 'revision-1', now().toISOString())

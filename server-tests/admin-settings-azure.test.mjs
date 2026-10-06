@@ -242,6 +242,36 @@ test('inventory enables the verified Luna version, not lookalike names, unknown 
   assert.deepEqual(fake.scopes, ['https://management.azure.com/.default'])
 })
 
+test('inventory enables the verified GPT-6 Luna version beside existing deployments, not other GPT-6 models or versions', async () => {
+  const fake = azure(async () => Response.json({
+    value: [
+      inventoryDocument('job-rubric'),
+      inventoryDocument('gpt-5.6-luna', 'gpt-5.6-luna', '2026-07-09'),
+      inventoryDocument('gpt-6-luna', 'gpt-6-luna', '2026-09-22'),
+      inventoryDocument('gpt-6-luna-next', 'gpt-6-luna', '2026-11-01'),
+      inventoryDocument('gpt-6-sol', 'gpt-6-sol', '2026-09-22'),
+      inventoryDocument('gpt-6-astra', 'gpt-6-astra', '2026-09-03'),
+    ],
+  }))
+  const result = await fake.adapter.inventory()
+  const [rubric, luna56, luna6, unknownVersion, sol, astra] = result.deployments
+  assert.equal(rubric.enabled, true)
+  assert.equal(luna56.enabled, true)
+  assert.equal(luna6.enabled, true)
+  assert.equal(luna6.deploymentName, 'gpt-6-luna')
+  assert.equal(luna6.modelName, 'gpt-6-luna')
+  assert.equal(luna6.modelVersion, '2026-09-22')
+  assert.deepEqual(luna6.capabilities, {
+    structuredOutputs: true, contextTokens: 1_050_000, maxOutputTokens: 128_000,
+    reasoningEfforts: ['low', 'medium', 'high'], temperature: false, topP: false,
+  })
+  assert.equal(luna6.verification, 'discovered')
+  for (const unsupported of [unknownVersion, sol, astra]) {
+    assert.equal(unsupported.enabled, false)
+    assert.equal(unsupported.capabilities.structuredOutputs, false)
+  }
+})
+
 test('inventory refuses cross-resource or cross-origin continuation before sending credentials', async () => {
   for (const nextLink of [
     'https://evil.example/deployments',
