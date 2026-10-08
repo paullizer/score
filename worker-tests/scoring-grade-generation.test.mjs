@@ -297,3 +297,29 @@ test('the paid runner resumes grade-generation manifests without inference, the 
     await rm(root, { recursive: true, force: true })
   }
 })
+
+test('grade-target scoring inputs mirror production and bind to suite cases with targetKind grade', async () => {
+  const { prepareResumeGradeEvaluation, prepareResumeJobEvaluation, evaluationExcludedCriterionIds, validateEvaluationCaseInput, scoringSuiteSchema } =
+    await loadWorker('../worker/evals/index.ts')
+  const data = harness(), sink = emptySink()
+  await executeGradeGeneration(data.job, options(data, fakeAzure(data), sink))
+  const { draft } = sink.generated[0].grades[0]
+  const text = '# Profile\n\nApplied established analytical methods to bounded program assignments.'
+  const input = prepareResumeGradeEvaluation(text, 'family-1', draft.rubric, draft.qualifications)
+  assert.equal(input.rubric.kind, 'grade')
+  assert.deepEqual(input.requirementEvidence.map(row => row.kind), ['criterion'])
+  assert.deepEqual(input.requirementEvidence[0].citations.map(row => row.paragraphId), ['p-role', 'p-gs9'])
+  assert.deepEqual(evaluationExcludedCriterionIds(input), [])
+  const suite = scoringSuiteSchema.parse({
+    schemaVersion: 1, id: 'grade-targets', purpose: 'smoke', sourceVersion: 'fixtures-v1', repetitions: 1,
+    configurations: [{ id: 'baseline', settingsSha256: 'a'.repeat(64), algorithmVersion: 'score-production-v1' }],
+    cases: [{
+      id: 'family-1-gs-9', familyId: 'family-1', jobId: 'ladder-test-gs-9', targetKind: 'grade', split: 'development',
+      inputSha256: evaluationHash(input), criterionIds: input.rubric.criteria.map(row => row.id),
+    }],
+  })
+  assert.deepEqual(validateEvaluationCaseInput(suite.cases[0], input), input)
+  const jobRubric = { ...data.fixture.seed.rubric, kind: 'job' }
+  assert.throws(() => prepareResumeGradeEvaluation(text, 'family-1', jobRubric, []), /grade rubric/)
+  assert.equal(prepareResumeJobEvaluation(text, 'family-1', jobRubric).rubric.kind, 'job')
+})

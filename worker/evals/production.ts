@@ -91,7 +91,27 @@ export function freezeEvaluationInput(value: unknown) {
 }
 
 export function prepareResumeJobEvaluation(text: string, familyId: string, rawRubric: unknown) {
+  return resumeEvaluationInput(text, familyId, assessmentInputSchema.shape.rubric.parse(rawRubric), [])
+}
+
+/** Mirrors production grade targets: the approved version's rubric plus its separate, unscored qualification notes. */
+export function prepareResumeGradeEvaluation(text: string, familyId: string, rawRubric: unknown, rawQualifications: unknown) {
   const rubric = assessmentInputSchema.shape.rubric.parse(rawRubric)
+  if (rubric.kind !== 'grade') throw new Error('Grade evaluations need a saved GS grade rubric version.')
+  return resumeEvaluationInput(text, familyId, rubric, assessmentInputSchema.shape.qualifications.parse(rawQualifications))
+}
+
+/** Saved not-applicable grade criteria are the suite case's excludedCriterionIds. */
+export function evaluationExcludedCriterionIds(rawInput: unknown): string[] {
+  const input = validateAnalysisAssessmentInput(rawInput)
+  return input.rubric.kind === 'grade' ? input.rubric.criteria.filter(row => row.support === 'not-applicable').map(row => row.id) : []
+}
+
+function resumeEvaluationInput(
+  text: string, familyId: string,
+  rubric: ReturnType<typeof assessmentInputSchema.shape.rubric.parse>,
+  qualifications: ReturnType<typeof assessmentInputSchema.shape.qualifications.parse>,
+) {
   const extracted = extractMarkdown(new TextEncoder().encode(text), {
     defaultHeading: 'Resume', maxCharacters: 180_000,
   })
@@ -101,8 +121,8 @@ export function prepareResumeJobEvaluation(text: string, familyId: string, rawRu
       title: extracted.title?.slice(0, 500) ?? 'Simulated professional profile',
       paragraphs: extracted.paragraphs,
     },
-    rubric, qualifications: [],
-    requirementEvidence: analysisRequirementEvidenceForInput({ rubric, qualifications: [] }),
+    rubric, qualifications,
+    requirementEvidence: analysisRequirementEvidenceForInput({ rubric, qualifications }),
   })
 }
 
