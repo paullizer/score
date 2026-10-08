@@ -848,6 +848,16 @@ export interface DocumentIntelligenceParagraphOptions extends ParagraphOptions {
   sectionHeadingPattern?: RegExp
   requirePageNumbers?: boolean
   capturedSections?: boolean
+  tableParagraphPolicy?: 'preserve' | 'span-bound'
+}
+
+function layoutTextSpanKey(
+  text: string, spans: Array<{ offset?: number; length?: number }> | undefined, page: number,
+): string | null {
+  if (!spans?.length || spans.some(span => typeof span.offset !== 'number' ||
+    !Number.isSafeInteger(span.offset) || span.offset < 0 || typeof span.length !== 'number' ||
+    !Number.isSafeInteger(span.length) || span.length <= 0)) return null
+  return JSON.stringify([text, page, spans.map(span => [span.offset, span.length])])
 }
 
 export function documentIntelligenceParagraphs(
@@ -878,7 +888,10 @@ export function documentIntelligenceParagraphs(
     }
     return numbers[0]
   }
-  const blocks: Array<{ offset: number; text: string; page: number; heading?: string; section?: boolean; table?: boolean }> = []
+  const blocks: Array<{
+    offset: number; text: string; page: number; heading?: string; section?: boolean; table?: boolean; spanKey?: string | null
+  }> = []
+  const renderedCellSpanKeys = new Set<string>()
   let heading = options.defaultHeading ?? 'Job posting'
   const sectionHeadingPattern = options.sectionHeadingPattern ?? JOB_SECTION_HEADING
   for (const paragraph of analyze.paragraphs ?? []) {
@@ -887,25 +900,37 @@ export function documentIntelligenceParagraphs(
     const role = paragraph.role
     const section = role === 'title' || role === 'sectionHeading' || sectionHeadingPattern.test(text)
     if (section) heading = text
+    const page = options.capturedSections ? 1 : options.requirePageNumbers
+      ? singlePage(originalPages(paragraph.boundingRegions)) : paragraph.boundingRegions?.[0]?.pageNumber ?? 1
     blocks.push({
       offset: paragraph.spans?.[0]?.offset ?? Number.MAX_SAFE_INTEGER,
       text,
-      page: options.capturedSections ? 1 : options.requirePageNumbers ? singlePage(originalPages(paragraph.boundingRegions)) : paragraph.boundingRegions?.[0]?.pageNumber ?? 1,
+      page,
       heading: role === 'title' || role === 'sectionHeading' ? text : heading,
       section,
+      spanKey: layoutTextSpanKey(text, paragraph.spans, page),
     })
   }
   for (const table of analyze.tables ?? []) {
     const tablePages = options.capturedSections ? [1] : options.requirePageNumbers ? originalPages(table.boundingRegions) : [table.boundingRegions?.[0]?.pageNumber ?? 1]
-    const groups = new Map<number, { rows: Map<number, Map<number, string>>; offset: number }>()
+    const groups = new Map<number, {
+      rows: Map<number, Map<number, string>>; offset: number; cellSpanKeys: Map<string, string>
+    }>()
     for (const cell of table.cells ?? []) {
       const cellPages = options.requirePageNumbers ? originalPages(cell.boundingRegions) : tablePages
       const page = options.requirePageNumbers ? singlePage(cellPages.length ? cellPages : tablePages) : tablePages[0]
-      const group = groups.get(page) ?? { rows: new Map<number, Map<number, string>>(), offset: Number.MAX_SAFE_INTEGER }
+      const group = groups.get(page) ?? {
+        rows: new Map<number, Map<number, string>>(), offset: Number.MAX_SAFE_INTEGER, cellSpanKeys: new Map<string, string>(),
+      }
       const row = cell.rowIndex ?? 0
       const column = cell.columnIndex ?? 0
       const values = group.rows.get(row) ?? new Map<number, string>()
-      values.set(column, normalizeText(cell.content ?? ''))
+      const text = normalizeText(cell.content ?? '')
+      values.set(column, text)
+      const spanKey = layoutTextSpanKey(text, cell.spans, page)
+      const cellKey = JSON.stringify([row, column])
+      if (spanKey && text) group.cellSpanKeys.set(cellKey, spanKey)
+      else group.cellSpanKeys.delete(cellKey)
       group.rows.set(row, values)
       group.offset = Math.min(group.offset, cell.spans?.[0]?.offset ?? table.spans?.[0]?.offset ?? Number.MAX_SAFE_INTEGER)
       groups.set(page, group)
@@ -924,6 +949,9 @@ export function documentIntelligenceParagraphs(
           heading: `${heading} - table`,
           table: true,
         })
+        if (meaningfulText(normalizeText(text), options.minimumTextLength)) {
+          for (const key of group.cellSpanKeys.values()) renderedCellSpanKeys.add(key)
+        }
       }
     }
   }
@@ -935,7 +963,9 @@ export function documentIntelligenceParagraphs(
       block.heading = block.table ? `${heading} - table` : heading
     }
   }
-  return createParagraphs(blocks, options)
+  return createParagraphs(options.tableParagraphPolicy === 'span-bound'
+    ? blocks.filter(block => block.table || !block.spanKey || !renderedCellSpanKeys.has(block.spanKey))
+    : blocks, options)
 }
 
 export interface PdfAnalysisOptions extends DocumentIntelligenceClientOptions {
@@ -1205,6 +1235,7 @@ export interface RubricModelOptions {
   clock?: Clock
   retryRandom?: () => number
   processingSettings?: ProcessingSettingsSnapshot
+  onModelAttempt?: (attempt: import('./model-usage').ModelAttemptUsage) => Promise<void>
 }
 
 export interface GeneratedRubric {

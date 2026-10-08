@@ -491,6 +491,49 @@ test('settings updates require exact ETags, publish atomic audit/history, and pr
   } finally { await server.close() }
 })
 
+for (const key of ['qcReviews', 'analysisEvidenceCorrections']) {
+  test(`${key} defaults on without altering legacy shapes and requires deployment, policy and admission`, async () => {
+    const defaults = createDefaultAdminSettings()
+    const capture = captureProcessingSettings(defaults, 'legacy-v1', '1970-01-01T00:00:00.000Z')
+    const original = JSON.stringify(capture)
+    assert.equal(Object.hasOwn(defaults.features, key), false)
+    assert.equal(JSON.stringify(processingSettingsSnapshotSchema.parse(capture)), original)
+    assert.throws(() => parseAdminSettings({ ...defaults, features: { ...defaults.features, [key]: 'yes' } }))
+    const capabilities = {
+      realJobImports: false, realGradeLadders: false, realResumeImports: false, realAnalyses: true,
+      analysisSummaryGeneration: false, wordDocumentImports: false, qcReviews: true, analysisEvidenceCorrections: true,
+    }
+    assert.equal(effectiveFeatures(capabilities, capture, true)[key], true)
+    assert.equal(effectiveFeatures(capabilities, capture, true).publicSettings.features[key], true)
+    assert.equal(effectiveFeatures({ ...capabilities, [key]: false }, capture, true)[key], false)
+    assert.equal(effectiveFeatures(capabilities, capture, false, true)[key], false)
+    const paused = mergeAdminSettings(defaults, { maintenance: { pauseNewWork: true } })
+    assert.equal(effectiveFeatures(capabilities, captureProcessingSettings(paused, 'paused', capture.capturedAt), true)[key], false)
+
+    const server = await start()
+    try {
+      const first = await server.request('/api/admin/settings')
+      const field = first.body.fields.find(item => item.path === `features.${key}`)
+      assert.equal(field.control, 'boolean')
+      assert.equal(field.defaultValue, true)
+      assert.ok(field.prerequisites.some(value => /New-work admission/.test(value)))
+      assert.match(field.description, /Turning this off stops new/)
+      const off = await server.request('/api/admin/settings', {
+        method: 'PATCH', headers: { 'If-Match': first.body.etag }, body: { features: { [key]: false } },
+      })
+      assert.equal(off.response.status, 200)
+      assert.equal(off.body.settings.features[key], false)
+      assert.equal(Object.hasOwn(off.body.settings.features, key === 'qcReviews' ? 'analysisEvidenceCorrections' : 'qcReviews'), false)
+      const features = effectiveFeatures(capabilities,
+        captureProcessingSettings(off.body.settings, off.body.revision, capture.capturedAt), true)
+      assert.equal(features[key], false)
+      assert.equal(features.publicSettings.features[key], false)
+      assert.equal(features.deploymentCapabilities[key], true)
+      assert.equal(JSON.stringify(processingSettingsSnapshotSchema.parse(capture)), original)
+    } finally { await server.close() }
+  })
+}
+
 test('workspace ownership never grants settings access and admin mutations keep the existing CSRF boundary', async () => {
   const server = await start()
   try {

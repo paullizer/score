@@ -1,4 +1,7 @@
-import { projectPublicSettings, rubricAssistantEnabled, rubricExportsEnabled, runtimeSettingsReadiness } from '../../src/domain/admin-settings'
+import {
+  projectPublicSettings, rubricAssistantEnabled, rubricExportsEnabled, runtimeSettingsReadiness,
+  qcReviewsEnabled, analysisEvidenceCorrectionsEnabled,
+} from '../../src/domain/admin-settings'
 import type { ProcessingSettingsSnapshot, PublicFeaturesResponse, SettingsDeploymentCapabilities } from '../../src/domain/admin-settings'
 import { JOB_IMPORT_LIMITS } from '../../src/domain/real-jobs'
 import { RESUME_IMPORT_LIMITS } from '../../src/domain/real-resumes'
@@ -6,6 +9,13 @@ import { GRADE_LADDER_LIMITS } from '../../src/domain/real-grades'
 import { ANALYSIS_LIMITS } from '../../src/domain/real-analyses'
 
 export type { SettingsDeploymentCapabilities } from '../../src/domain/admin-settings'
+
+export function qcReviewsAdmission(
+  deploymentAvailable: boolean, snapshot: ProcessingSettingsSnapshot, newProcessingAllowed: boolean,
+): boolean {
+  return deploymentAvailable && newProcessingAllowed && !snapshot.settings.maintenance.pauseNewWork &&
+    qcReviewsEnabled(snapshot.settings)
+}
 
 export function effectiveFeatures(
   capabilities: SettingsDeploymentCapabilities, snapshot: ProcessingSettingsSnapshot, runtimeEnabled: boolean,
@@ -24,6 +34,9 @@ export function effectiveFeatures(
   const realGradeLadders = capabilities.realGradeLadders && admitting && settings.features.gradeLadders
   const realAnalyses = capabilities.realAnalyses && admitting && settings.features.newAnalyses
   const analysisSummaryGeneration = capabilities.analysisSummaryGeneration && admitting && settings.features.summaryGeneration
+  const analysisEvidenceCorrections = capabilities.analysisEvidenceCorrections === true && admitting &&
+    analysisEvidenceCorrectionsEnabled(settings)
+  const qcReviews = qcReviewsAdmission(capabilities.qcReviews === true, snapshot, runtimeReadiness.newProcessingAllowed)
   // Deployed capability, the Admin settings switch (on unless turned off) and new-work admission must all agree.
   const rubricAssistant = capabilities.rubricAssistant === true && admitting && rubricAssistantEnabled(settings)
   // Exports are reads: they need the real-job deployment and the Admin switch, but not new-work admission.
@@ -34,6 +47,7 @@ export function effectiveFeatures(
     ...publicSettings.features, jobImports: realJobImports, resumeImports: realResumeImports,
     gradeLadders: realGradeLadders, newAnalyses: realAnalyses, summaryGeneration: analysisSummaryGeneration, rubricAssistant,
     rubricExports,
+    qcReviews, analysisEvidenceCorrections,
   }
   for (const [kind, available] of [['jobs', realJobImports], ['resumes', realResumeImports]] as const) {
     publicSettings.imports[kind].allowedFormats = available
@@ -47,7 +61,7 @@ export function effectiveFeatures(
     realResumeImports, markdownResumeImports: realResumeImports && resumePolicy.allowedFormats.includes('markdown'),
     realAnalyses,
     analysisSummaryGeneration,
-    analysisEvidenceCorrections: capabilities.analysisEvidenceCorrections === true && admitting,
+    analysisEvidenceCorrections, qcReviews,
     rubricAssistant,
     rubricExports,
     wordDocumentImports: capabilities.wordDocumentImports && (

@@ -55,11 +55,11 @@ export function qcPlanDetail({ status = 'draft', proposal = null, admin = false,
   return detail
 }
 
-export function createQcFixture({ role = 'reviewer', admin = false, submitted = false, admissionEnabled = true, workerEnabled = true } = {}) {
+export function createQcFixture({ role = 'reviewer', admin = false, submitted = false, admissionEnabled = true, workerEnabled = true, qcReviews = true } = {}) {
   const analysis = analysisSummaryFixture({ secondStatus: 'failed' })
   analysis.summary.run.status = 'partial'
   const state = {
-    analysis, role, admin, admissionEnabled, workerEnabled, requests: [], heads: new Map(), submissions: [], batchRecords: [], memo: new Map(),
+    analysis, role, admin, admissionEnabled, workerEnabled, qcReviews, requests: [], heads: new Map(), submissions: [], batchRecords: [], memo: new Map(),
     plans: new Map(), histories: new Map(), calls: { submitted: 0, createdPlans: 0, paid: 0, activated: 0, restored: 0 },
     current: { revision: 'release-baseline', etag: '"release-baseline"', guidance: structuredClone(qcGuidance) },
     promptHistory: [{ revision: 'release-old', createdAt: summaryTimestamp, actor: 'Fixture admin', reason: 'Prior audited activation.', guidance: { ...qcGuidance, assessment: 'Previous compatible assessment guidance.' } }],
@@ -100,6 +100,7 @@ export function createQcFixture({ role = 'reviewer', admin = false, submitted = 
     if (key && state.memo.has(`${path}:${key}`)) return reply(state.memo.get(`${path}:${key}`))
     const remember = value => { if (key) state.memo.set(`${path}:${key}`, structuredClone(value)); return reply(value) }
     const projectPlan = value => state.admissionEnabled ? value : { ...value, canEdit: false, canActivate: false }
+    if (path === '/api/features') return reply({ qcReviews: state.qcReviews })
     if (path.endsWith('/qc/capabilities')) return reply({ reviews: true, improvements: state.admissionEnabled && state.workerEnabled,
       admissionEnabled: state.admissionEnabled, applicationAdmin: state.admin,
       coordinator: state.admin || ['owner', 'editor'].includes(state.role), writable: true,

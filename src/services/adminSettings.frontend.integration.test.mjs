@@ -1065,6 +1065,34 @@ test('rubric exports switch is on for revisions saved before it existed and publ
   assert.equal(JSON.parse(patches()[1].init.body).features.rubricExports, true, 'A merging PATCH must name the switch to reset it')
 })
 
+for (const key of ['qcReviews', 'analysisEvidenceCorrections']) {
+  test(`${key} displays its absent-key default and only persists an explicit Admin change`, async () => {
+    assert.equal(Object.hasOwn(settings.features, key), false)
+    await renderAdmin()
+    const control = await field(`features.${key}`)
+    assert.equal(control.checked, true)
+    assert.match(control.closest('.settings-field').textContent, /Default: On/)
+    await click(control)
+    assert.equal(control.checked, false)
+    await click(control)
+    assert.equal(control.checked, true)
+    assert.equal(unloadBlocked(), false)
+    assert.equal(Object.hasOwn(settings.features, key), false)
+    await click(control)
+    await click(button('Review and save'))
+    const review = dialog('Review application changes')
+    assert.match(review.textContent, /Not saved \(default: On\)/)
+    await click(button('Publish new revision', review))
+    assert.equal(JSON.parse(patches()[0].init.body).features[key], false)
+    assert.equal(Object.hasOwn(JSON.parse(patches()[0].init.body).features,
+      key === 'qcReviews' ? 'analysisEvidenceCorrections' : 'qcReviews'), false)
+    assert.equal((await field(`features.${key}`)).checked, false)
+    await click(button('Review reset to defaults'))
+    await click(button('Publish new revision', dialog('Review reset to defaults')))
+    assert.equal(JSON.parse(patches()[1].init.body).features[key], true)
+  })
+}
+
 for (const recorded of [false, true]) {
   test(`read-only worker rollout evidence is ${recorded ? 'verification-time only, never live health' : 'explicitly absent when not configured or cleared'}`, async () => {
     const receipt = recorded ? {

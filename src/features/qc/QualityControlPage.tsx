@@ -5,6 +5,7 @@ import { useWorkspace } from '../../app/workspace-context'
 import { useApplicationNavigation } from '../../app/application-navigation-context'
 import { workspaceCanReview, workspaceQcRole } from '../../domain/workspace-permissions'
 import { getQcCapabilities } from '../../services/qualityControl'
+import { fetchPublicFeatures } from '../../services/publicSettings'
 import { Badge, Button, EmptyState, InlineError } from '../../components/ui'
 import { QcComparisonReview, QcReviews } from './QcReviews'
 import { CreateImprovementPlan, ImprovementPlan, ImprovementPlans, PromptHistory } from './QualityImprovement'
@@ -31,7 +32,18 @@ export function QualityControlPage() {
 }
 
 function QcWorkspace({ workspaceId }: { workspaceId: string }) {
-  const load = useCallback((signal: AbortSignal) => getQcCapabilities(workspaceId, signal), [workspaceId])
+  const load = useCallback(async (signal: AbortSignal) => {
+    const [access, policy] = await Promise.allSettled([
+      getQcCapabilities(workspaceId, signal), fetchPublicFeatures(signal),
+    ])
+    if (access.status === 'rejected') throw access.reason
+    const capabilities = access.value
+    const admissionEnabled = capabilities.admissionEnabled && policy.status === 'fulfilled' && policy.value.qcReviews === true
+    const policyError = policy.status === 'rejected'
+      ? 'Current QC policy could not be loaded. New changes are disabled; saved QC history remains available.'
+      : null
+    return { ...capabilities, admissionEnabled, improvements: capabilities.improvements && admissionEnabled, policyError }
+  }, [workspaceId])
   const access = useQcResource(load)
   if (!access.value) return <><EmptyState icon={access.loading ? LoaderCircle : ClipboardCheck}
     title={access.loading ? 'Opening quality control' : 'Quality control is unavailable'}
@@ -47,6 +59,7 @@ function QcWorkspace({ workspaceId }: { workspaceId: string }) {
       <NavLink to="/qc/improvements">Quality improvement</NavLink>
       <NavLink to="/qc/prompts">Prompt versions</NavLink>
     </nav>
+    {capabilities.policyError && <InlineError><p>{capabilities.policyError}</p><Button onClick={access.reload}>Check QC policy</Button></InlineError>}
     {!capabilities.admissionEnabled && <p className="qc-notice">{capabilities.message ?? 'New QC changes are disabled. Saved QC history and cancellation of accepted work remain available.'} This switch does not change normal workspace permissions.</p>}
     {!capabilities.writable && <p className="qc-notice">QC changes are read-only for this workspace. Saved QC history remains available.</p>}
     {capabilities.admissionEnabled && !capabilities.improvements && <p className="qc-notice">{capabilities.message ?? 'New AI planning and evaluation work is unavailable; saved reviews and plans remain readable.'}</p>}

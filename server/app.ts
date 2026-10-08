@@ -233,6 +233,7 @@ export function createApp(deps: AppDeps): Express {
       realJobImports: Boolean(jobs), realGradeLadders: Boolean(grades), realResumeImports: Boolean(resumes),
       realAnalyses: canCreateAnalyses, analysisSummaryGeneration: Boolean(analyses),
       analysisEvidenceCorrections: Boolean(analyses?.evidenceCorrectionsEnabled),
+      qcReviews: config.qcEnabled === true && Boolean(qc && analysisStorage),
       wordDocumentImports: wordDocumentImports && Boolean(jobs || resumes), rubricAssistant: Boolean(assist),
     }, snapshot, config.settings?.runtimeEnabled === true, Boolean(config.settings || deps.settings)))
   })
