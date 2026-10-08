@@ -9,6 +9,7 @@ import {
 } from '../../src/domain/analysis-corrections'
 import type { RealAnalysisAssessmentOutput, RealAnalysisResult, RealAnalysisResultSummary } from '../../src/domain/real-analyses'
 import type { ProcessingSettingsSnapshot } from '../../src/domain/admin-settings'
+import { analysisEvidenceCorrectionsEnabled } from '../../src/domain/feature-switches'
 import { conflict, invalidRequest, notFound, preconditionRequired, unavailable } from '../errors'
 import { WORKSPACE_ID_PATTERN } from '../ids'
 import { isUuid } from '../jobs/validation'
@@ -238,6 +239,9 @@ export class AnalysisCorrectionService {
       await this.writable(state)
       const current = await newWorkProcessingSettings(this.settings)
       assertNewWork(current, reassessment ? 'newAnalyses' : undefined)
+      if (!analysisEvidenceCorrectionsEnabled(current.settings)) {
+        throw unavailable('New analysis evidence corrections are disabled by application policy. Saved results and correction history remain readable.')
+      }
       processingSettings = newProcessingSettings(this.settings, current)
     }
     if (state.correction && ['queued', 'running'].includes(state.correction.record.status)) {

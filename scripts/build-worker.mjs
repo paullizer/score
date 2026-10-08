@@ -12,6 +12,7 @@ for (const [entry, output] of [
   ['worker/analyses/runtime.ts', 'dist-worker/analysis-runtime.mjs'],
   ['worker/qc-index.ts', 'dist-worker/qc-worker.mjs'],
   ['worker/qc/runtime.ts', 'dist-worker/qc-runtime.mjs'],
+  ['worker/evals/index.ts', 'dist-worker/scoring-evaluation.mjs'],
 ]) {
   await build({
     entryPoints: [entry],

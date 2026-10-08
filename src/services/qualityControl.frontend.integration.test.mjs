@@ -791,6 +791,48 @@ test('a disabled improvement worker leaves human QC admission and all saved-hist
   assert.doesNotMatch(document.body.textContent, /New QC reviews and improvement changes are disabled/)
 })
 
+test('QC follows the effective public feature without recomputing the optional Admin switch', async () => {
+  fixture.qcReviews = false
+  fixture.seedSubmission()
+  await render()
+  assert.ok(fixture.requests.some(item => item.url === '/api/features'))
+  assert.match(document.body.textContent, /New QC changes are disabled/)
+  assert.equal(field('Decision for Engineering methods').matches(':disabled'), true)
+  assert.equal([...document.querySelectorAll('button')].some(item => item.textContent === 'Revise my feedback'), false)
+  assert.ok(fixture.requests.some(item => item.url.includes('/qc/reviews/history')))
+  await click(button('Load authorized peer feedback'))
+  assert.match(document.body.textContent, /Independent peer/)
+  assert.deepEqual(writes().map(item => item.url.split('/').at(-1)), ['peers'])
+})
+
+test('unavailable public policy explicitly disables new QC changes but keeps history readable and supports retry', async () => {
+  fixture.override = url => String(url) === '/api/features'
+    ? Response.json({ error: { code: 'unavailable', message: 'Current policy unavailable.' } }, { status: 503 })
+    : undefined
+  await render()
+  assert.match(document.body.textContent, /Current QC policy could not be loaded/)
+  assert.equal(button('Save incomplete draft').disabled, true)
+  assert.ok(fixture.requests.some(item => item.url.includes('/qc/reviews/history')))
+  assert.equal(writes().length, 0)
+  fixture.override = null
+  await click(button('Check QC policy'))
+  assert.doesNotMatch(document.body.textContent, /Current QC policy could not be loaded/)
+  assert.equal(button('Save incomplete draft').disabled, false)
+})
+
+test('public QC policy off preserves accepted cancellation without admitting a new paid plan', async () => {
+  fixture.qcReviews = false
+  fixture.role = 'owner'
+  fixture.plans.set('plan-one', qcPlanDetail({ status: 'planning' }))
+  await render('/qc/improvements/plan-one')
+  assert.equal(button('Draft improvement plan').disabled, true)
+  assert.equal(button('Cancel QC work').disabled, false)
+  await click(button('Cancel QC work'))
+  assert.equal(fixture.plans.get('plan-one').work.status, 'cancelled')
+  assert.equal(fixture.calls.paid, 0)
+  assert.deepEqual(writes().map(item => item.url.split('/').at(-1)), ['cancel'])
+})
+
 test('plan edits invalidate exact evaluation readiness and paid trial confirmation states bounded work', async () => {
   fixture.admin = true
   fixture.plans.set('plan-one', qcPlanDetail({ status: 'ready', proposal: qcProposal(), admin: true }))

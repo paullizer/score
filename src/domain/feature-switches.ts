@@ -14,3 +14,11 @@ export function rubricAssistantEnabled(settings: Pick<AdminSettings, 'features'>
 export function rubricExportsEnabled(settings: Pick<AdminSettings, 'features'>): boolean {
   return settings.features.rubricExports !== false
 }
+
+export function qcReviewsEnabled(settings: Pick<AdminSettings, 'features'>): boolean {
+  return settings.features.qcReviews !== false
+}
+
+export function analysisEvidenceCorrectionsEnabled(settings: Pick<AdminSettings, 'features'>): boolean {
+  return settings.features.analysisEvidenceCorrections !== false
+}

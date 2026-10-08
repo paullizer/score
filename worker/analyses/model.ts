@@ -320,6 +320,8 @@ export async function invokeAnalysisModel(
     const requestStartedAt = clock.now().getTime()
     let response: Response | undefined
     let finishReason: AnalysisTelemetryEvent['finishReason']
+    let responseUsage: unknown
+    let responseModel: unknown
     try {
       response = await abortable(() => fetchImpl(url, init), signal ?? undefined, stage)
       if ([429, 502, 503, 504].includes(response.status)) return response
@@ -355,19 +357,26 @@ export async function invokeAnalysisModel(
           return response
         }
         const payload = await boundedResponseJson(response, signal ?? undefined, stage)
+        if (record(payload)) {
+          responseUsage = payload.usage
+          responseModel = payload.model
+        }
         if (record(payload) && Array.isArray(payload.choices) && record(payload.choices[0])) {
           const value = payload.choices[0].finish_reason
           finishReason = (['stop', 'length', 'content_filter', 'tool_calls', 'function_call'] as const).find(reason => reason === value)
         }
         const parsed = responseEnvelope(payload, stage)
         actualModel = parsed.model
-        return Response.json({ model: parsed.model, choices: [{ message: { content: parsed.content } }] })
+        return Response.json({ model: parsed.model, usage: responseUsage, choices: [{ message: { content: parsed.content } }] })
       } catch (error) {
         if (signal?.aborted) throw error
         envelopeError = error instanceof AnalysisModelError ? error :
           new AnalysisModelError('invalid-model-output', 'The analysis service response could not be validated.', { stage, reason: 'invalid-envelope' })
         // A refusal prevents the shared transport from retrying this non-transient envelope failure.
-        return Response.json({ choices: [{ message: { refusal: 'Analysis response validation failed.' } }] })
+        return Response.json({
+          model: responseModel, usage: responseUsage,
+          choices: [{ message: { refusal: 'Analysis response validation failed.' } }],
+        })
       }
     } finally {
       const timestamp = clock.now().toISOString()

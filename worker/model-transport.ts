@@ -4,6 +4,8 @@ import { MAX_MODEL_RETRY_DELAY_MS, MAX_MODEL_RETRY_TIMESTAMP, modelRetryFallback
 import { assertModelBudget, safeSettingsMetadata, taskForRequest, validateProcessingSettings } from './settings'
 import { assertStrictStructuredOutputSchema, StructuredOutputSchemaError } from './structured-output-schema'
 import type { RubricModelOptions, StructuredModelRequest } from './runtime'
+import { createHash, randomUUID } from 'node:crypto'
+import { parseModelTokenUsage, type ModelTokenUsage } from './model-usage'
 
 const COGNITIVE_SCOPE = 'https://cognitiveservices.azure.com/.default'
 const TRANSIENT_STATUSES = [429, 502, 503, 504]
@@ -101,6 +103,10 @@ export async function invokeStructuredModel(
       let authenticated = false
       let failure: WorkerError
       let providerNotBefore: number | undefined
+      const usageStartedAt = clock.now().getTime()
+      let usageStatus: number | null = null
+      let usageModel: string | null = null
+      let usageTokens: ModelTokenUsage | null = null
       try {
         const result = await abortable(async () => {
           const token = await getToken(COGNITIVE_SCOPE)
@@ -111,6 +117,7 @@ export async function invokeStructuredModel(
             headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
             body: requestBody,
           })
+          usageStatus = response.status
           if (!response.ok) {
             const now = clock.now().getTime()
             const retryable = response.status >= 500 || response.status === 429
@@ -138,6 +145,9 @@ export async function invokeStructuredModel(
             if (error instanceof SyntaxError) throw new WorkerError('model-invalid-response', 'The model returned invalid JSON.', false, 'rubric')
             throw error
           }
+          usageTokens = parseModelTokenUsage(payload)
+          usageModel = typeof payload.model === 'string' && /^[a-zA-Z0-9][a-zA-Z0-9._:/-]{0,299}$/.test(payload.model)
+            ? payload.model : null
           const choice = payload?.choices?.[0]
           if (choice?.message?.refusal) throw new WorkerError('model-refused', `The model could not produce ${context.result} for this source.`, false, 'rubric')
           const content = choice?.message?.content
@@ -166,7 +176,18 @@ export async function invokeStructuredModel(
           httpStatus: failure.httpStatus,
           retryAt: new Date(clock.now().getTime() + modelRetryFallback(attempt, random)).toISOString(),
         })
-      } finally { clearTimeout(timer) }
+      } finally {
+        clearTimeout(timer)
+        await options.onModelAttempt?.({
+          id: randomUUID(), taskId: request.taskId ?? null,
+          deployment: task?.deploymentName ?? options.deployment,
+          configuredModel: task?.modelName ?? options.modelName, actualModel: usageModel,
+          requestSha256: createHash('sha256').update(requestBody).digest('hex'),
+          attempt: attempt + 1, httpStatus: usageStatus,
+          startedAt: new Date(usageStartedAt).toISOString(),
+          durationMilliseconds: Math.max(0, clock.now().getTime() - usageStartedAt), usage: usageTokens,
+        })
+      }
       pendingFailure = failure
       await abortable(async () => { await onRetry?.(failure) }, parent)
       check()

@@ -353,6 +353,43 @@ test('QC admission is rechecked after a request acquires its workspace mutation 
   assert.equal((await server.request('/reviews', 'PUT', feedback(f.contexts[0]))).status, 200)
 })
 
+for (const mode of ['admin-switch-off', 'pause']) {
+  test(`${mode} refuses every new QC mutation while preserving history, peer auditing and accepted cancellation`, async t => {
+    const f = await qcFixture(), created = await submittedPlan(f)
+    const accepted = await f.plans.request(f.caller('reviewer'), created.plan.id, 'plan', randomUUID(), created.etag)
+    const settings = clone(f.settings.settings)
+    if (mode === 'admin-switch-off') settings.features.qcReviews = false
+    else settings.maintenance.pauseNewWork = true
+    f.settings = api.captureProcessingSettings(settings, `qc-${mode}`, f.now)
+    const server = await qcHttp(f)
+    t.after(() => server.close())
+    const path = `/plans/${created.plan.id}`
+    const detail = await (await server.request(path)).json()
+    assert.equal(detail.canCancel, true)
+    const before = clone([...f.qc.store.values]), blobs = f.qc.blobs.values.size
+    for (const [suffix, method, body, role = 'reviewer'] of [
+      ['/reviews', 'PUT', feedback(f.contexts[0])],
+      ['/reviews/submit', 'POST', feedback(f.contexts[0])],
+      ['/batches', 'POST', { name: 'Blocked batch', comparisons: [f.contexts[0].scope] }, 'owner'],
+      ['/plans', 'POST', { name: 'Blocked plan', objective: 'No new work.', cases: created.plan.cases, excludedFeedback: [] }],
+      [path, 'PUT', { proposal: proposal(created.plan) }],
+      [`${path}/draft`, 'POST', {}],
+      [`${path}/evaluate`, 'POST', { confirmPaidWork: true }],
+      [`${path}/retry`, 'POST', {}],
+      [`${path}/activate`, 'POST', { confirm: true, reason: 'Blocked activation.' }, 'admin'],
+      ['/prompts/restore', 'POST', { revision: created.plan.baseline.revision, confirm: true, reason: 'Blocked restore.' }, 'admin'],
+    ]) assert.equal((await server.request(suffix, method, body, role, { 'If-Match': detail.etag })).status, 503, suffix)
+    assert.deepEqual([...f.qc.store.values], before)
+    assert.equal(f.qc.blobs.values.size, blobs)
+    assert.equal((await server.request(`${path}/history`)).status, 200)
+    assert.equal((await server.request(`/reviews/history?${new URLSearchParams(f.contexts[0].scope)}`)).status, 200)
+    assert.equal((await server.request('/peers', 'POST', f.contexts[0].scope)).status, 200)
+    const cancelled = await server.request(`${path}/cancel`, 'POST', {}, 'reviewer', { 'If-Match': detail.etag })
+    assert.equal(cancelled.status, 200)
+    assert.equal((await cancelled.json()).work.id, accepted.work.id)
+  })
+}
+
 test('archived evidence remains readable while writes and late worker publications are fenced', async t => {
   const f = await qcFixture(), server = await qcHttp(f)
   t.after(() => server.close())

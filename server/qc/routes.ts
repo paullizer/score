@@ -15,7 +15,8 @@ import { StoreConflictError } from '../store'
 import { withWorkspaceMutationLease } from '../lifecycle/lease'
 import type { RealAnalysesDeps } from '../analyses/store'
 import type { PromptRegistryService } from '../settings/prompts'
-import { requestProcessingSettings } from '../jobs/policy'
+import { newProcessingAllowed, requestProcessingSettings } from '../jobs/policy'
+import { qcReviewsAdmission } from '../settings/features'
 import type { QcDeps } from './store'
 import { QcService, type QcCaller } from './service'
 import { QcPlanService, qcReasonInputSchema, qcRestoreInputSchema } from './plans'
@@ -83,8 +84,13 @@ export function createQcRouter(deps: QcRouterDeps): Router {
   const router = express.Router(), base = '/workspaces/:workspaceId/qc'
   const qcRequestLimiter = rateLimit(userRateLimitOptions(QC_REQUEST_RATE_LIMIT))
   const admissionEnabled = () => deps.config.qcEnabled === true
-  const assertAdmission = () => {
-    if (!admissionEnabled()) throw unavailable('New QC reviews and improvement changes are disabled. Saved QC remains readable and accepted work can still be cancelled.')
+  const effectiveAdmission = async (req: Request) => {
+    const provider = requestProcessingSettings(req)
+    if (!admissionEnabled() || !newProcessingAllowed(provider)) return false
+    return qcReviewsAdmission(Boolean(deps.qc && deps.analyses), await provider(), true)
+  }
+  const assertAdmission = async (req: Request) => {
+    if (!await effectiveAdmission(req)) throw unavailable('New QC reviews and improvement changes are disabled by deployment readiness or application policy. Saved QC remains readable and accepted work can still be cancelled.')
   }
   const planDetail = async (result: Promise<QcPlanDetail>): Promise<QcPlanDetail> => {
     const detail = await result
@@ -115,7 +121,7 @@ export function createQcRouter(deps: QcRouterDeps): Router {
   }
   async function authorizePublication(req: Request): Promise<void> {
     const access = await authorize(req, true)
-    assertAdmission()
+    await assertAdmission(req)
     if (!access.caller.applicationAdmin) throw forbidden('Application-administrator access is required to publish prompt changes.')
   }
   // Reading a plan can record peer exposure. Cross-site navigations must not create false independence audits.
@@ -146,11 +152,11 @@ export function createQcRouter(deps: QcRouterDeps): Router {
     write: boolean, callback: (req: Request, caller: QcCaller) => Promise<unknown>, status = 200, admit = write,
   ): RequestHandler => async (req, res) => {
     await authorize(req, write)
-    if (admit) assertAdmission()
+    if (admit) await assertAdmission(req)
     try {
       const value = await withWorkspaceMutationLease(deps.state, param(req, 'workspaceId'), async () => {
         const access = await authorize(req, write)
-        if (admit) assertAdmission()
+        if (admit) await assertAdmission(req)
         const result = await callback(req, access.caller)
         await authorize(req, write)
         return result
@@ -173,7 +179,8 @@ export function createQcRouter(deps: QcRouterDeps): Router {
       coordinator: caller.role === 'owner' || caller.role === 'editor' || caller.applicationAdmin,
       writable: false, message: 'QC is not enabled for this deployment.',
     }
-    return service(req).capabilities(caller, writable, admissionEnabled())
+    return service(req).capabilities(caller, writable,
+      admissionEnabled() && newProcessingAllowed(requestProcessingSettings(req)))
   }))
   router.get(`${base}/context`, read(async (req, caller, writable) => {
     query(req, ['runId', 'comparisonId', 'resultRevision'])

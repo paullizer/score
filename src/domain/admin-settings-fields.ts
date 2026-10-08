@@ -58,6 +58,12 @@ field('features.rubricAssistant', 'Rubric AI assistant', 'intake', 'boolean',
 field('features.rubricExports', 'Rubric exports', 'intake', 'boolean',
   'Lets people with an Official export role download a real job rubric as PDF, Word, PowerPoint, Markdown or CSV, and adds an "Include job & rubric details" option to analysis report exports. Exports read saved rubrics and frozen analysis inputs in the browser and never call AI. Turning this off removes rubric downloads and the report option. Saved rubrics aren\'t affected, and analysis reports still export without rubric details.',
   { defaultValue: true })
+field('features.qcReviews', 'QC reviews and improvements', 'intake', 'boolean',
+  'Allows authorized workspace reviewers to save and submit human QC feedback, and coordinators to create or change improvement batches and plans. Turning this off stops new QC changes, including new AI planning and evaluations; saved evidence and feedback remain readable, and accepted work can finish or be cancelled. It does not create an ordinary-user model-disagreement queue or change published scores.',
+  { defaultValue: true })
+field('features.analysisEvidenceCorrections', 'Analysis evidence corrections', 'intake', 'boolean',
+  'Allows workspace owners and editors to request corrections or full reassessment of saved comparisons from their frozen evidence. Turning this off stops new requests; saved results, previews and correction history remain readable, and accepted corrections can finish or be cancelled. It does not change earlier results or enable the experimental scoring policy.',
+  { defaultValue: true })
 field('maintenance.pauseNewWork', 'Pause new work', 'intake', 'boolean', 'Stops new imports, ladder generations, analyses and summaries, not accepted work, reads, cleanup or cancellation.')
 field('maintenance.explanation', 'Maintenance explanation', 'intake', 'text', 'Optional plain-text explanation.', { max: 1000 })
 for (const kind of ['jobs', 'resumes'] as const) {
@@ -165,6 +171,8 @@ for (const item of fields) {
   if (item.path.startsWith('features.')) item.prerequisites = ['Corresponding deployed services are available', 'New-work admission is not paused']
   if (item.path === 'features.rubricAssistant') item.prerequisites = ['Real jobs and the job-rubric model deployment are configured', 'New-work admission is not paused']
   if (item.path === 'features.rubricExports') item.prerequisites = ['Real jobs are configured', 'The workspace role is in Official export roles', 'PDF, Word, PowerPoint and CSV also need the format in Report formats']
+  if (item.path === 'features.qcReviews') item.prerequisites = ['Private QC and real-analysis stores are configured', 'Verified QC deployment gate', 'New-work admission is not paused', 'AI planning and evaluation also require the dedicated QC worker']
+  if (item.path === 'features.analysisEvidenceCorrections') item.prerequisites = ['Verified evidence-correction API and analysis worker readers', 'New-work admission is not paused', 'Full reassessment also requires new analyses']
   if (item.path.endsWith('.allowedFormats')) item.prerequisites = ['Corresponding import services are available', 'DOCX/DOC require verified Word rollout capability']
   if (item.path === 'documents.formattedDocxPreviewEnabled') item.prerequisites = ['The reader has an allowed original-download workspace role']
   if (item.path === 'summaries.allowManualPublication') item.prerequisites = ['Exact saved draft and required disclosure', 'Authorized source-workspace role']

@@ -88,9 +88,12 @@ function settingsFor(f, change = () => {}, revision = 'correction-policy-v1') {
 }
 
 test('correction admissions enforce maintenance, inactive rollout, and unavailable settings without blocking frozen reads', async t => {
-  for (const mode of ['maintenance', 'inactive', 'unavailable']) await t.test(mode, async t => {
+  for (const mode of ['maintenance', 'inactive', 'unavailable', 'switch-off']) await t.test(mode, async t => {
     const { f, runId, comparisonId } = await setup()
-    const snapshot = settingsFor(f, settings => { settings.maintenance.pauseNewWork = mode === 'maintenance' })
+    const snapshot = settingsFor(f, settings => {
+      settings.maintenance.pauseNewWork = mode === 'maintenance'
+      if (mode === 'switch-off') settings.features.analysisEvidenceCorrections = false
+    })
     let policyReads = 0
     const http = await startHttp(f, true, {
       async capture() {
@@ -105,6 +108,22 @@ test('correction admissions enforce maintenance, inactive rollout, and unavailab
     const records = clone([...f.analysis.store.values]), blobs = clone([...f.analysis.blobs.values])
     const response = await http.request(path, 'POST', input(preview), {
       headers: { 'If-Match': preview.etag, 'Idempotency-Key': randomUUID() },
+    })
+
+    test('the evidence-correction Admin switch also refuses new full reassessments without changing frozen results', async t => {
+      const { f, runId, comparisonId } = await setup()
+      const snapshot = settingsFor(f, settings => { settings.features.analysisEvidenceCorrections = false })
+      const http = await startHttp(f, true, { capture: async () => snapshot })
+      t.after(http.close)
+      const path = `/${runId}/comparisons/${comparisonId}/corrections`
+      const preview = await (await http.request(`${path}/preview`)).json()
+      const before = clone([...f.analysis.store.values])
+      const response = await http.request(path, 'POST', reassess(preview), {
+        headers: { 'If-Match': preview.etag, 'Idempotency-Key': randomUUID() },
+      })
+      assert.equal(response.status, 503)
+      assert.match(JSON.stringify(await response.json()), /disabled by application policy/)
+      assert.deepEqual([...f.analysis.store.values], before)
     })
     assert.equal(response.status, 503)
     assert.deepEqual([...f.analysis.store.values], records)
