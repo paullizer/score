@@ -358,3 +358,66 @@ test('silver export is non-independent, requires exact frozen producer settings 
     await rm(folder, { recursive: true, force: true })
   }
 })
+
+test('gates CLI selects a targets version, reads panel reports and joins attempt costs without overwriting inputs', async () => {
+  const folder = await mkdtemp(join(tmpdir(), 'score-gates-cli-'))
+  try {
+    const suite = scoringSuiteSchema.parse({
+      schemaVersion: 1, id: 'gate-smoke', purpose: 'smoke', sourceVersion: 'fixtures-v1', repetitions: 2,
+      configurations: ['baseline', 'candidate'].map(id => ({ id, settingsSha256: 'a'.repeat(64), algorithmVersion: 'fixtures-v1' })),
+      cases: [{
+        id: 'case-1', familyId: 'family-1', jobId: 'gs-13', split: 'development',
+        inputSha256: 'b'.repeat(64), criterionIds: ['criterion-1'],
+      }],
+    })
+    const observations = suite.configurations.flatMap(config => [1, 2].map(repetition => ({
+      schemaVersion: 1, suiteSha256: evaluationHash(suite), caseId: 'case-1', configurationId: config.id, repetition,
+      durationMilliseconds: 10, result: { status: 'complete', overall: 40, criteria: [{ criterionId: 'criterion-1', score: 2 }] },
+    })))
+    const tally = truePositive => ({ failed: 0, truePositive, falseNegative: 0, falsePositive: 0, trueNegative: 0 })
+    const judge = {
+      schemaVersion: 1,
+      reports: [{ configurationId: 'reviewer', origin: 'planted', statistics: { all: tally(3), byExpectedIssue: {
+        none: tally(0), 'over-credit': tally(1), 'under-credit': tally(1), 'unsupported-fact': tally(1),
+      } } }],
+      verdictStability: [{ configurationId: 'reviewer', complete: true, pairs: 10, issueDisagreements: 1, outcomeDisagreements: 1 }],
+    }
+    const attempts = [1, 2].map(repetition => ({
+      id: `attempt-${repetition}`, taskId: 'assessment', deployment: 'deployment',
+      evaluation: { suiteSha256: evaluationHash(suite), caseId: 'case-1', configurationId: 'candidate', repetition },
+    }))
+    const ledger = attempts.map(attempt => ({
+      schemaVersion: 1, id: attempt.id, costItemId: attempt.id, suiteId: 'gate-smoke', category: 'inference',
+      mode: 'estimate', amountUsdMicros: 700, priceVersion: 'prices-v1', usage: null,
+    }))
+    const path = name => join(folder, name)
+    await Promise.all([
+      writeFile(path('suite.json'), JSON.stringify(suite)), writeFile(path('observations.json'), JSON.stringify(observations)),
+      writeFile(path('references.json'), '[]'), writeFile(path('judge.json'), JSON.stringify(judge)),
+      writeFile(path('attempts.jsonl'), `${attempts.map(row => JSON.stringify(row)).join('\n')}\n`),
+      writeFile(path('ledger.json'), JSON.stringify(ledger)),
+      writeFile(path('panels.json'), JSON.stringify({
+        fixedJudge: { configurationId: 'reviewer', report: 'judge.json' },
+        costs: { attempts: 'attempts.jsonl', ledger: 'ledger.json' },
+      })),
+    ])
+    const inputs = [path('suite.json'), path('observations.json'), path('references.json')]
+    assert.match((await run('gates', ...inputs, path('gates.json'), 'baseline', 'candidate',
+      'score-engineering-targets-v2', path('panels.json'))).stdout, /explicit promotion/)
+    const report = JSON.parse(await readFile(path('gates.json'), 'utf8'))
+    const check = id => report.checks.find(row => row.id === id)
+    assert.equal(report.schemaVersion, 2)
+    assert.equal(report.targetsStatus, 'draft')
+    assert.equal(check('reviewer-verdict-flip-rate').actual, 0.1)
+    assert.equal(check('reviewer-verdict-flip-rate').status, 'passed')
+    assert.equal(check('analysis-mean-usd-micros').actual, 700)
+    assert.equal(check('invariance-excess-disagreement').note, 'panel-not-supplied')
+    await run('gates', ...inputs, path('gates-v1.json'), 'baseline', 'candidate')
+    assert.equal(JSON.parse(await readFile(path('gates-v1.json'), 'utf8')).schemaVersion, 1)
+    await assert.rejects(run('gates', ...inputs, path('panels.json'), 'baseline', 'candidate',
+      'score-engineering-targets-v2', path('panels.json')), /cannot overwrite/)
+    await assert.rejects(run('gates', ...inputs, path('judge.json'), 'baseline', 'candidate',
+      'score-engineering-targets-v2', path('panels.json')), /cannot overwrite/)
+    assert.deepEqual(JSON.parse(await readFile(path('judge.json'), 'utf8')), judge)
+  } finally { await rm(folder, { recursive: true, force: true }) }
+})

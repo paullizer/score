@@ -16,6 +16,8 @@ export const scoringSuiteSchema = z.strictObject({
   })).min(1).max(8),
   cases: z.array(z.strictObject({
     id, familyId: id, jobId: id, split, inputSha256: hash,
+    /** Absent in suites frozen before grade targets existed; absent means a job rubric target. */
+    targetKind: z.enum(['job', 'grade']).optional(),
     criterionIds: z.array(id).min(1).max(20).refine(unique, 'Criterion IDs must be unique.'),
     excludedCriterionIds: z.array(id).max(20).refine(unique, 'Excluded criterion IDs must be unique.').optional(),
   })).min(1).max(500),

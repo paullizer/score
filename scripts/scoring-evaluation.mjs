@@ -7,6 +7,7 @@ import {
   prepareBlindSpotChecks,
   exportScorerDerivedReferences,
   measureExtractionPreservation, diagnoseLayoutFactPreservation, importBlindHumanLabels, evaluateScoringEngineeringGates,
+  joinAttemptCosts,
   exportSourceOnlyReferences,
   fixedJudgeStatistics,
   summarizePairedInvariance,
@@ -20,6 +21,29 @@ import {
 
 async function readJson(path) {
   return JSON.parse(await readFile(resolve(path), 'utf8'))
+}
+
+/** Panel report and cost paths are relative to the panels file; none may be the gate output. */
+async function readGatePanels(panelsPath, outputPath) {
+  const directory = dirname(resolve(panelsPath))
+  const { costs, ...manifest } = await readJson(panelsPath)
+  const source = path => {
+    if (typeof path !== 'string' || !path) throw new Error('Gate panel reports and cost files are paths relative to the panels file.')
+    const resolved = resolve(directory, path)
+    if (resolved === resolve(outputPath)) throw new Error('Engineering gate output cannot overwrite a panel input.')
+    return resolved
+  }
+  const withReport = async row => ({ ...row, report: await readJson(source(row?.report)) })
+  const panels = { ...manifest }
+  if (Array.isArray(manifest.rubricGeneration)) panels.rubricGeneration = await Promise.all(manifest.rubricGeneration.map(withReport))
+  for (const key of ['fixedJudge', 'monotonicity', 'invariance']) {
+    if (manifest[key] !== undefined) panels[key] = await withReport(manifest[key])
+  }
+  if (costs !== undefined) {
+    const attempts = (await readFile(source(costs?.attempts), 'utf8')).split(/\r?\n/).filter(line => line.trim()).map(line => JSON.parse(line))
+    panels.attemptCosts = joinAttemptCosts(attempts, await readJson(source(costs?.ledger)))
+  }
+  return panels
 }
 
 async function atomicWrite(path, value, immutable = false) {
@@ -229,15 +253,18 @@ async function main(args) {
     console.log('Source-bound human label revision saved separately; holdout labels must stay sealed.')
     return
   }
-  if (command === 'gates' && paths.length === 6) {
-    const [suitePath, observationsPath, referencesPath, outputPath, baselineId, candidateId] = paths
-    if ([suitePath, observationsPath, referencesPath].some(path => resolve(path) === resolve(outputPath))) {
+  if (command === 'gates' && paths.length >= 6 && paths.length <= 8) {
+    const [suitePath, observationsPath, referencesPath, outputPath, baselineId, candidateId, targetsVersion, panelsPath] = paths
+    if ([suitePath, observationsPath, referencesPath, ...(panelsPath ? [panelsPath] : [])].some(path => resolve(path) === resolve(outputPath))) {
       throw new Error('Engineering gate output cannot overwrite its input artifacts.')
     }
     const [suite, observations, references] = await Promise.all([
       readJson(suitePath), readJson(observationsPath), readJson(referencesPath),
     ])
-    await atomicWrite(outputPath, evaluateScoringEngineeringGates(suite, observations, references, baselineId, candidateId))
+    const panels = panelsPath ? await readGatePanels(panelsPath, outputPath) : undefined
+    await atomicWrite(outputPath, evaluateScoringEngineeringGates(suite, observations, references, baselineId, candidateId, {
+      ...(targetsVersion ? { targetsVersion } : {}), ...(panels ? { panels } : {}),
+    }))
     console.log('Engineering gates saved; external release requirements and explicit promotion still apply.')
     return
   }
