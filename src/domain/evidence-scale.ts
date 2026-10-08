@@ -1,5 +1,8 @@
+import { z } from 'zod'
+
 export const EVIDENCE_SCALE_VERSION = 'score-evidence-ladder-v1' as const
 export type EvidenceScaleVersion = typeof EVIDENCE_SCALE_VERSION
+export const EVIDENCE_SCALE_VERSIONS = [EVIDENCE_SCALE_VERSION] as const
 
 export type EvidenceLevel = 0 | 1 | 2 | 3 | 4 | 5
 export type ExampleLevel = 1 | 2 | 3 | 4 | 5
@@ -339,4 +342,59 @@ export function parseCriterionLevels(value: unknown): CriterionLevelExamples[] {
     level: item.level as ExampleLevel,
     examples: normalizeText(item.examples as string),
   }))
+}
+
+/** Strict persisted shape; `rubricScaleErrors` adds the cross-field rules. */
+export const criterionLevelsSchema = z.array(z.strictObject({
+  level: z.union(EXAMPLE_LEVELS.map(level => z.literal(level)) as [
+    z.ZodLiteral<1>, z.ZodLiteral<2>, z.ZodLiteral<3>, z.ZodLiteral<4>, z.ZodLiteral<5>,
+  ]),
+  examples: z.string().min(1).max(LEVEL_EXAMPLE_LIMITS.maxCharacters),
+})).length(EXAMPLE_LEVELS.length)
+export const evidenceScaleVersionSchema = z.enum(EVIDENCE_SCALE_VERSIONS)
+
+interface ScaledCriterion {
+  label?: unknown
+  guidance?: unknown
+  levels?: unknown
+  /** GS grade rows only; gaps and exclusions stay unscored and have no levels. */
+  support?: unknown
+}
+
+/**
+ * A rubric on the standard scale stores level examples for every scored criterion and code-renders their guidance,
+ * so readers that only understand `guidance` see the same scale. Rubrics without a scale version keep free-text guidance.
+ */
+export function rubricScaleErrors(rubric: { scaleVersion?: unknown; criteria: readonly ScaledCriterion[] }): string[] {
+  const errors: string[] = []
+  const name = (criterion: ScaledCriterion) => `Criterion "${typeof criterion.label === 'string' ? criterion.label : ''}"`
+  if (rubric.scaleVersion === undefined) {
+    if (rubric.criteria.some(criterion => criterion.levels !== undefined)) {
+      errors.push('Level examples need the rubric to name its evidence scale version.')
+    }
+    return errors
+  }
+  if (typeof rubric.scaleVersion !== 'string' || !(EVIDENCE_SCALE_VERSIONS as readonly string[]).includes(rubric.scaleVersion)) {
+    return [`Unknown evidence scale version "${String(rubric.scaleVersion)}".`]
+  }
+  const scale = evidenceScale(rubric.scaleVersion)
+  for (const criterion of rubric.criteria) {
+    if (criterion.support === 'gap' || criterion.support === 'not-applicable') {
+      if (criterion.levels !== undefined) errors.push(`${name(criterion)} is unscored, so it can't have level examples.`)
+      continue
+    }
+    const structural = checkCriterionLevels(criterion.levels).filter(item => item.severity === 'error')
+    if (structural.length) {
+      errors.push(...structural.map(item => `${name(criterion)}: ${item.message}`))
+      continue
+    }
+    const levels = criterion.levels as CriterionLevelExamples[]
+    const normalized = parseCriterionLevels(levels)
+    if (normalized.some((item, index) => item.examples !== levels[index].examples)) {
+      errors.push(`${name(criterion)} level examples must be trimmed, with single spaces.`)
+    } else if (criterion.guidance !== renderEvidenceGuidance(normalized, scale)) {
+      errors.push(`${name(criterion)} guidance must be generated from its level examples.`)
+    }
+  }
+  return errors
 }

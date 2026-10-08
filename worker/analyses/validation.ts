@@ -12,6 +12,7 @@ import {
   isPersonalTraitCriterion, type AnalysisEvidenceGapDecision,
 } from '../../src/domain/analysis-evidence-policy'
 import { RESUME_IMPORT_LIMITS } from '../../src/domain/real-resumes'
+import { rubricScaleErrors } from '../../src/domain/evidence-scale'
 import type { Citation } from '../../src/domain/types'
 import {
   assessmentInputSchema, assessmentSchemaForInput, groundingSchemaForInput,
@@ -147,6 +148,9 @@ export function validateAnalysisAssessmentInput(value: unknown): RealAnalysisAss
     })
   }
   validateWeights(input.rubric)
+  if (rubricScaleErrors(input.rubric).length) {
+    invalidInput('A saved rubric on the evidence scale must keep level examples for every scored criterion, with guidance generated from them.')
+  }
   if (input.rubric.kind === 'job' && input.qualifications.length) {
     invalidInput('Only saved grade targets may supply separate unscored grade qualifications.')
   }

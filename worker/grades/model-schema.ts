@@ -1,5 +1,6 @@
 import { z } from 'zod'
 import { GRADE_LADDER_LIMITS } from '../../src/domain/real-grades'
+import { criterionLevelsSchema, evidenceScaleVersionSchema } from '../../src/domain/evidence-scale'
 
 const identifier = z.string().min(1).max(200).regex(/^[a-zA-Z0-9][a-zA-Z0-9_-]*$/)
 const text = z.string().min(1).max(8_000)
@@ -126,7 +127,9 @@ export const savedRubricSchema = z.strictObject({
     interpretation: z.string().min(1).max(12_000),
     sourceParagraphId: identifier.optional(),
     requirementType: z.enum(['required', 'preferred']).optional(),
+    levels: criterionLevelsSchema.optional(),
   })).min(1).max(GRADE_LADDER_LIMITS.maxCriteria),
+  scaleVersion: evidenceScaleVersionSchema.optional(),
 })
 
 export type ModelIssue = z.infer<typeof issueSchema>

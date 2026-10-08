@@ -14,6 +14,7 @@ import {
   authHeaders, baseConfig, createFakeAccessStore, createFakeDirectoryStore, createFakeStateStore, membershipFor, seedWorkspace,
 } from './helpers.mjs'
 import { installGradeLifecycleFake, installGradeBlobLifecycleFake, gradeLifecycleTesting } from './grade-lifecycle-fakes.mjs'
+import { loadWorker } from '../worker-tests/shared-model-loader.mjs'
 
 const NOW = '2026-09-17T20:30:00.000Z'
 const WORD_TYPES = {
@@ -1908,6 +1909,53 @@ test('deterministic validators enforce strict stored shape, exact citations, pag
       assert.ok(validateGradeVersion(bad, detail.sourceSet, documents).length)
     }
     assert.equal(gradeContentHash({ a: 1, b: { x: 2, y: 3 } }), gradeContentHash({ b: { y: 3, x: 2 }, a: 1 }))
+  } finally { await api.close() }
+})
+
+test('scaled grade versions keep structured level examples, code-rendered guidance and unscored gaps', async () => {
+  const { EVIDENCE_SCALE_VERSION, renderEvidenceGuidance } = await loadWorker('../src/domain/evidence-scale.ts')
+  const api = await start()
+  try {
+    const { detail, document } = await generated(api)
+    const { version } = await publishGrade(api, detail, document)
+    const documents = await frozenDocuments(api, detail.sourceSet)
+    const levels = [
+      'Lists analytical methods from coursework or training.',
+      'Describes one program analysis the applicant completed.',
+      'Describes repeated or ongoing program analyses.',
+      'Describes choosing or adapting methods for varied assignments.',
+      'Describes leading analyses with stated program outcomes.',
+    ].map((examples, index) => ({ level: index + 1, examples }))
+    const scaled = clone(version)
+    scaled.rubric.scaleVersion = EVIDENCE_SCALE_VERSION
+    for (const criterion of scaled.rubric.criteria) {
+      if (criterion.support === 'direct' || criterion.support === 'derived') {
+        criterion.levels = levels
+        criterion.guidance = renderEvidenceGuidance(levels)
+      }
+    }
+    scaled.contentHash = gradeVersionHash(scaled)
+    assert.deepEqual(validateGradeVersion(scaled, detail.sourceSet, documents), [])
+    assert.deepEqual(validateGradeApproval(scaled, detail.sourceSet, documents), [])
+    for (const [label, mutate] of [
+      ['edited guidance', value => { value.rubric.criteria[0].guidance += ' Extra anchor.' }],
+      ['no scale version', value => { delete value.rubric.scaleVersion }],
+      ['unknown scale version', value => { value.rubric.scaleVersion = 'score-evidence-ladder-v9' }],
+    ]) {
+      const bad = clone(scaled)
+      mutate(bad)
+      bad.contentHash = gradeVersionHash(bad)
+      const errors = (() => { try { return validateGradeVersion(bad, detail.sourceSet, documents) } catch (error) { return [error.message] } })()
+      assert.ok(errors.length, label)
+    }
+    const gap = clone(scaled)
+    Object.assign(gap.rubric.criteria[0], { support: 'gap', gradeBasis: [], sourceCitations: [], guidance: 'Unscored until grading sources are added.' })
+    delete gap.rubric.criteria[0].levels
+    gap.contentHash = gradeVersionHash(gap)
+    assert.deepEqual(validateGradeVersion(gap, detail.sourceSet, documents), [])
+    gap.rubric.criteria[0].levels = levels
+    gap.contentHash = gradeVersionHash(gap)
+    assert.ok(validateGradeVersion(gap, detail.sourceSet, documents).some(error => error.includes('unscored')))
   } finally { await api.close() }
 })
 

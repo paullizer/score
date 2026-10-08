@@ -6,6 +6,7 @@ import { isSafeUploadedFilename } from '../../src/domain/source-files'
 import type { Citation, Rubric, SourceDocument } from '../../src/domain/types'
 import type { LifecycleMetadata } from '../../src/domain/lifecycle'
 import { normalizeDisplayName } from '../../src/domain/displayNames'
+import { rubricScaleErrors } from '../../src/domain/evidence-scale'
 import { invalidRequest } from '../errors'
 import { isValidWorkspaceId } from '../ids'
 import {
@@ -179,7 +180,7 @@ export function validateRealRubric(rubric: Rubric, document: SourceDocument, con
   const errors = validateRealSourceDocument(document, contentType)
   if (!isRecord(rubric)) return [...errors, 'Rubric must be an object.']
   if (!hasOnlyKeys(rubric as unknown as Record<string, unknown>, [
-    'id', 'groupId', 'kind', 'jobId', 'name', 'description', 'version', 'criteria', 'createdAt', 'dataKind', 'provenance',
+    'id', 'groupId', 'kind', 'jobId', 'name', 'description', 'version', 'criteria', 'createdAt', 'dataKind', 'provenance', 'scaleVersion',
   ])) {
     errors.push('Rubric contains unsupported fields.')
   }
@@ -208,7 +209,7 @@ export function validateRealRubric(rubric: Rubric, document: SourceDocument, con
   for (const criterion of rubric.criteria) {
     const context = `Criterion "${typeof criterion?.label === 'string' ? criterion.label : ''}"`
     if (!isRecord(criterion) || !hasOnlyKeys(criterion, [
-      'id', 'key', 'label', 'description', 'weight', 'guidance', 'sourceParagraphId', 'requirementType', 'sourceCitations',
+      'id', 'key', 'label', 'description', 'weight', 'guidance', 'sourceParagraphId', 'requirementType', 'sourceCitations', 'levels',
     ])) {
       errors.push(`${context} contains unsupported fields.`)
       continue
@@ -242,6 +243,7 @@ export function validateRealRubric(rubric: Rubric, document: SourceDocument, con
     }
   }
   if (Math.abs(weight - 100) > 0.000001) errors.push('Rubric criterion weights must total exactly 100.')
+  errors.push(...rubricScaleErrors(rubric))
   return errors
 }
 
@@ -262,7 +264,7 @@ export function validateStoredRealRubric(value: unknown): value is Rubric {
   const validCriteria = value.criteria.every((criterion) => {
     if (!isRecord(criterion) ||
       !hasOnlyKeys(criterion, [
-        'id', 'key', 'label', 'description', 'weight', 'guidance', 'sourceParagraphId', 'requirementType', 'sourceCitations',
+        'id', 'key', 'label', 'description', 'weight', 'guidance', 'sourceParagraphId', 'requirementType', 'sourceCitations', 'levels',
       ]) ||
       !isNonBlank(criterion.id) || criterion.key !== 'custom' || !isNonBlank(criterion.label) ||
       !isNonBlank(criterion.description) || typeof criterion.weight !== 'number' ||
@@ -278,7 +280,8 @@ export function validateStoredRealRubric(value: unknown): value is Rubric {
       isNonBlank(citation.paragraphId) && Number.isInteger(citation.page) && typeof citation.heading === 'string' &&
       isNonBlank(citation.quote))
   })
-  return validCriteria && Math.abs(totalWeight - 100) <= 0.000001
+  return validCriteria && Math.abs(totalWeight - 100) <= 0.000001 &&
+    rubricScaleErrors(value as { scaleVersion?: unknown; criteria: Record<string, unknown>[] }).length === 0
 }
 
 export function validateRealJobRecord(value: unknown): value is RealJobRecord {

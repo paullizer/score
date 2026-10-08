@@ -9,6 +9,7 @@ import {
   type QcCasePack, type QcEvaluation, type QcPlanRecord, type QcPromptSet,
 } from '../../src/domain/quality-improvement'
 import { processingSettingsSnapshotSchema } from '../../src/domain/admin-settings'
+import { criterionLevelsSchema, evidenceScaleVersionSchema } from '../../src/domain/evidence-scale'
 import { WORKSPACE_ID_PATTERN } from '../ids'
 import { conflict, invalidRequest, preconditionRequired } from '../errors'
 import {
@@ -363,8 +364,9 @@ export const qcTrialResultSchema = z.strictObject({
       sourceCitations: z.array(citationSchema).max(30).optional(),
       gradeBasis: z.array(citationSchema).max(30).optional(),
       competencyId: qcIdentifier.optional(), support: z.enum(['direct', 'derived', 'gap', 'not-applicable']).optional(),
-      interpretation: z.string().max(12_000).optional(),
+      interpretation: z.string().max(12_000).optional(), levels: criterionLevelsSchema.optional(),
     })).min(1).max(QC_LIMITS.criteria), description: z.string().max(12_000),
+    scaleVersion: evidenceScaleVersionSchema.optional(),
     qualifications: z.array(gradeQualificationSchema).max(50).optional(),
     issues: z.array(z.strictObject({
       id: qcIdentifier, code: qcIdentifier, severity: z.enum(['blocker', 'warning']),
