@@ -143,6 +143,7 @@ beforeEach(() => {
     if (path.endsWith('/analyses/targets')) return json({ targets: [] })
     if (path.endsWith('/analyses')) return json({ runs: [] })
     if (path === '/api/admin/settings' && method === 'GET') return json(response())
+    if (path === '/api/admin/settings/prompt-release' && method === 'GET') return json({ activeBundleId: 'pb-current', activeBundleSha256: 'a'.repeat(64), etag: '"prompt-1"', supported: true, generation: 'score-prompt-templates-v1', pending: false })
     if (path === '/api/admin/settings' && method === 'PATCH') {
       settings = JSON.parse(init.body); revision = `revision-${Number(revision.split('-')[1]) + 1}`
       return json(response())
@@ -211,6 +212,38 @@ async function reviewTitle(title) {
   assert.ok(dialog('Review application changes'))
 }
 const patches = () => requests.filter(item => item.method === 'PATCH' && item.path === '/api/admin/settings')
+
+test('admin prompt release panel activates a pending template release', async () => {
+  override = (path, init) => {
+    if (path === '/api/admin/settings/prompt-release' && (init.method ?? 'GET') === 'GET') return json({
+      activeBundleId: 'pb-old', activeBundleSha256: 'b'.repeat(64), etag: '"prompt-old"', supported: false,
+      generation: 'score-prompt-templates-v1', pending: true,
+    })
+    if (path === '/api/admin/settings/prompt-release' && init.method === 'POST') return json({
+      activeBundleId: 'pb-new', activeBundleSha256: 'c'.repeat(64), etag: '"prompt-new"', supported: true,
+      generation: 'score-prompt-templates-v1', pending: false,
+    })
+    return undefined
+  }
+  await renderAdmin()
+  await click(button('Environment & readiness'))
+  await until(() => document.body.textContent.includes('A new prompt release is installed.'), 'Pending prompt release is visible')
+  const panel = [...document.querySelectorAll('section')].find(item => item.getAttribute('aria-label') === 'Prompt release')
+  assert.ok(panel)
+  await edit(panel.querySelector('textarea'), 'Activate after offline prompt quality gate passed.')
+  const inputs = panel.querySelectorAll('input')
+  await edit(inputs[0], 'd'.repeat(64))
+  await edit(inputs[1], 'score-engineering-targets-v2')
+  await click(button('Activate prompt release', panel))
+  await until(() => document.body.textContent.includes('Activated the prompt release for new work.'), 'Prompt release activation status appears')
+  const post = requests.find(item => item.path === '/api/admin/settings/prompt-release' && item.method === 'POST')
+  assert.ok(post)
+  const headers = new Headers(post.init.headers)
+  assert.equal(headers.get('If-Match'), '"prompt-old"')
+  assert.deepEqual(JSON.parse(post.init.body), {
+    reason: 'Activate after offline prompt quality gate passed.', gateReportSha256: 'd'.repeat(64), targetsVersion: 'score-engineering-targets-v2',
+  })
+})
 
 test('direct application-admin settings is independent of workspace bootstrap and stays available when features fail', async () => {
   override = path => path === '/api/features' ? json({ error: { message: 'Public policy unavailable' } }, 503) : undefined

@@ -4,6 +4,7 @@ import { loadWorker } from '../worker-tests/shared-model-loader.mjs'
 
 const registry = await loadWorker('../server/settings/prompts.ts')
 const domain = await loadWorker('../src/domain/admin-settings.ts')
+const promptDomain = await loadWorker('../src/domain/prompt-versions.ts')
 const { ADMIN_SETTINGS_FIELDS } = await loadWorker('../src/domain/admin-settings-fields.ts')
 const policies = await loadWorker('../worker/settings.ts')
 const renderer = await loadWorker('../worker/prompts.ts')
@@ -19,7 +20,7 @@ const principal = {
   applicationRoles: ['Score.Admin'],
 }
 
-function cosmos() {
+function cosmos(options = {}) {
   const documents = new Map(), calls = []
   let version = 0
   let failReads = false, failBatch = false, loseAck = false
@@ -73,6 +74,8 @@ function cosmos() {
   const service = new registry.PromptRegistryService({
     store, now: () => new Date(at), newId: () => `test-${++sequence}`,
     authorizeActivation: actor => actor.oid === principal.oid,
+    ...(options.templates ? { templates: options.templates } : {}),
+    ...(options.generation ? { generation: options.generation } : {}),
   })
   return {
     container, documents, calls, store, service,
@@ -102,6 +105,14 @@ function activation(baseline, draft) {
   }
 }
 
+function olderTemplates() {
+  const copy = structuredClone(registry.DEFAULT_PROMPT_TEMPLATES)
+  copy.jobRubric = { ...copy.jobRubric, promptVersion: 'old-job-rubric-template-v1', system: `${copy.jobRubric.system}
+Older generation.` }
+  return copy
+}
+
+
 test('registry baseline is atomically initialized only on confirmed absence, beside settings records', async () => {
   const f = cosmos()
   f.documents.set('current', { id: 'current', applicationId: 'score', recordType: 'settings-current', _etag: '"untouched"' })
@@ -119,6 +130,106 @@ test('registry baseline is atomically initialized only on confirmed absence, bes
   const capture = await other.capture()
   assert.equal(Object.keys(capture.revisions).length, 7)
   assert.equal(capture.revisions.assessment.outputSchemaVersion, 'score-analysis-assessment-qc-v1')
+})
+
+test('activation schema accepts old records and rejects mixed release kinds', () => {
+  const old = {
+    schemaVersion: 1, activationId: 'pa-old', bundleId: 'pb-old', bundleSha256: 'a'.repeat(64),
+    parentBundleId: 'pb-parent', parentBundleSha256: 'b'.repeat(64), createdAt: at,
+    actor: { tenantId: principal.tenantId, oid: principal.oid }, reason: 'Evaluated release.',
+    evaluation: {
+      workspaceId: 'workspace-one', planId: 'plan-one', planRevisionId: 'plan-revision-one', planSha256: 'c'.repeat(64),
+      evaluationId: 'evaluation-one', evaluationSha256: 'd'.repeat(64), baselineBundleId: 'pb-parent', baselineBundleSha256: 'b'.repeat(64),
+      evaluatedBundleId: 'pb-old', evaluatedBundleSha256: 'a'.repeat(64),
+    },
+  }
+  assert.equal(promptDomain.promptActivationSchema.parse(old).templateRelease, undefined)
+  assert.throws(() => promptDomain.promptActivationSchema.parse({
+    ...old, evaluation: null, templateRelease: { generation: 'score-prompt-templates-v1', gateReportSha256: 'e'.repeat(64), targetsVersion: 'score-engineering-targets-v2' },
+    restoration: { requestId: 'restore-one', sourceActivationId: 'pa-old', expectedEtag: '"etag"' },
+  }), /exactly one/)
+  assert.throws(() => promptDomain.promptActivationSchema.parse({
+    ...old, templateRelease: { generation: 'score-prompt-templates-v1', gateReportSha256: 'e'.repeat(64), targetsVersion: 'score-engineering-targets-v2' },
+  }), /exactly one/)
+})
+
+test('template release status reports pending and release activates current compiled templates', async () => {
+  const f = cosmos({ templates: olderTemplates() })
+  const old = await f.service.current()
+  const service = new registry.PromptRegistryService({
+    store: f.store, now: () => new Date('2026-10-08T20:00:00.000Z'), newId: () => 'release-one',
+    authorizeActivation: actor => actor.oid === principal.oid,
+  })
+  await assert.rejects(service.current(), /new prompt release is installed but not activated yet/)
+  assert.deepEqual(await service.releaseStatus(), {
+    activeBundleId: old.bundle.bundleId, activeBundleSha256: old.bundle.bundleSha256, etag: old.etag,
+    supported: false, generation: 'score-prompt-templates-v1', pending: true,
+  })
+  await assert.rejects(service.releaseTemplates({ ...principal, oid: 'cccccccc-cccc-4ccc-8ccc-cccccccccccc' }, {
+    reason: 'Offline gate passed.', gateReportSha256: 'f'.repeat(64), targetsVersion: 'score-engineering-targets-v2',
+  }, old.etag), /administrator/)
+  for (const etag of [undefined, '*', 'W/"weak"', '"stale"']) {
+    await assert.rejects(service.releaseTemplates(principal, {
+      reason: 'Offline gate passed.', gateReportSha256: 'f'.repeat(64), targetsVersion: 'score-engineering-targets-v2',
+    }, etag))
+  }
+  const released = await service.releaseTemplates(principal, {
+    reason: 'Offline gate passed.', gateReportSha256: 'f'.repeat(64), targetsVersion: 'score-engineering-targets-v2',
+  }, old.etag)
+  assert.equal(released.activation.templateRelease.generation, 'score-prompt-templates-v1')
+  assert.equal(released.activation.templateRelease.gateReportSha256, 'f'.repeat(64))
+  assert.equal(released.activation.parentBundleId, old.bundle.bundleId)
+  assert.ok(released.bundle.bundleId.startsWith('pb-score-prompt-templates-v1-'))
+  const snapshot = await service.capture()
+  assert.equal(snapshot.bundle.bundleId, released.bundle.bundleId)
+  assert.equal(renderer.resolveAcceptedPrompt(domain.captureProcessingSettings(domain.createDefaultAdminSettings(), 'released', at, snapshot), 'jobRubric', JOB_RUBRIC_COMPILED_PROMPT).provenance.bundleId, released.bundle.bundleId)
+  assert.equal((await service.releaseStatus()).pending, false)
+  await assert.rejects(service.releaseTemplates(principal, {
+    reason: 'Already current.', gateReportSha256: 'f'.repeat(64), targetsVersion: 'score-engineering-targets-v2',
+  }, released.etag), /already uses this template generation/)
+  const history = await service.history(5)
+  assert.equal(history.activations[0].templateRelease.generation, 'score-prompt-templates-v1')
+})
+
+test('template release retry after lost acknowledgement is idempotent and older-generation restore is refused', async () => {
+  const f = cosmos({ templates: olderTemplates() })
+  const old = await f.service.current()
+  const service = new registry.PromptRegistryService({
+    store: f.store, now: () => new Date('2026-10-08T20:00:00.000Z'), newId: () => 'release-one',
+    authorizeActivation: actor => actor.oid === principal.oid,
+  })
+  f.loseAck()
+  const released = await service.releaseTemplates(principal, {
+    reason: 'Offline gate passed.', gateReportSha256: 'f'.repeat(64), targetsVersion: 'score-engineering-targets-v2',
+  }, old.etag)
+  assert.equal(released.bundle.parentBundleId, old.bundle.bundleId)
+  assert.equal((await service.current()).bundle.bundleId, released.bundle.bundleId)
+  await assert.rejects(service.published(old.bundle.bundleId), /unsupported/)
+  await assert.rejects(service.restore(principal, old.bundle.bundleId, 'Restore older templates.', released.etag, 'restore-old'), /unsupported/)
+})
+
+test('a template release that registered its bundle but failed to activate can be retried later', async () => {
+  const f = cosmos({ templates: olderTemplates() })
+  const old = await f.service.current()
+  const failing = Object.create(f.store)
+  failing.activate = async () => { throw new Error('Activation transport failed before commit.') }
+  const input = { reason: 'Offline gate passed.', gateReportSha256: 'f'.repeat(64), targetsVersion: 'score-engineering-targets-v2' }
+  const first = new registry.PromptRegistryService({
+    store: failing, now: () => new Date('2026-10-08T20:00:00.000Z'), newId: () => 'release-one',
+    authorizeActivation: actor => actor.oid === principal.oid,
+  })
+  await assert.rejects(first.releaseTemplates(principal, input, old.etag), /Activation transport failed/)
+  assert.equal((await f.store.getCurrent()).bundle.bundleId, old.bundle.bundleId)
+  const retry = new registry.PromptRegistryService({
+    store: f.store, now: () => new Date('2026-10-08T21:00:00.000Z'), newId: () => 'release-two',
+    authorizeActivation: actor => actor.oid === principal.oid,
+  })
+  const released = await retry.releaseTemplates(principal, input, old.etag)
+  // The retry reuses the first attempt's exact immutable bundle instead of colliding with its deterministic ID.
+  assert.equal(released.bundle.createdAt, '2026-10-08T20:00:00.000Z')
+  assert.equal(released.activation.createdAt, '2026-10-08T21:00:00.000Z')
+  assert.equal(released.activation.bundleSha256, released.bundle.bundleSha256)
+  assert.equal((await retry.current()).bundle.bundleId, released.bundle.bundleId)
 })
 
 test('failed reads, dangling pointers and immutable baseline collisions never become default initialization', async () => {
@@ -462,7 +573,7 @@ test('missing revisions, forged hashes, unsupported templates and version-two mi
   assert.throws(() => policies.validateProcessingSettings(corrupt), /integrity/)
   assert.throws(() => renderer.resolveAcceptedPrompt(accepted, 'jobRubric', {
     ...JOB_RUBRIC_COMPILED_PROMPT, system: `${JOB_RUBRIC_COMPILED_PROMPT.system}\nChanged policy`,
-  }), /missing, changed, or unsupported/)
+  }), /earlier prompt release/)
   f.documents.delete(`prompt:revision:${capture.revisions.jobRubric.revisionId}`)
   await assert.rejects(f.service.capture(), /revision is unavailable/)
   assert.equal(f.calls.filter(call => call[0] === 'batch').length, 1, 'dangling saved pins cannot initialize a new baseline')

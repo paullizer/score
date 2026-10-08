@@ -404,7 +404,7 @@ test('all four readers load execution tuning once and pause before any new claim
 
 test('all five runtime entry bundles expose the independent prompt-pin reader capability', async () => {
   const promptDomain = await loadWorker('../src/domain/prompt-versions.ts')
-  assert.equal(promptDomain.PROMPT_RUNTIME_VERSION, 'score-prompt-runtime-v1')
+  assert.equal(promptDomain.PROMPT_RUNTIME_VERSION, 'score-prompt-runtime-v2')
   const paths = [
     '../worker/runtime.ts', '../worker/grades/runtime.ts', '../worker/resumes/runtime.ts',
     '../worker/analyses/runtime.ts', '../worker/qc/runtime.ts',
@@ -414,6 +414,20 @@ test('all five runtime entry bundles expose the independent prompt-pin reader ca
     assert.equal(runtime.PROMPT_RUNTIME_VERSION, promptDomain.PROMPT_RUNTIME_VERSION, paths[index])
     assert.equal(runtime.RUNTIME_SETTINGS_VERSION, settingsDomain.RUNTIME_SETTINGS_VERSION, paths[index])
   }
+})
+
+test('stale accepted prompt pins report the hard-cutover restart message', async () => {
+  const registry = await loadWorker('../server/settings/prompts.ts')
+  const renderer = await loadWorker('../worker/prompts.ts')
+  const { JOB_RUBRIC_COMPILED_PROMPT } = await loadWorker('../worker/runtime.ts')
+  const templates = structuredClone(registry.DEFAULT_PROMPT_TEMPLATES)
+  templates.jobRubric = { ...templates.jobRubric, promptVersion: 'old-job-rubric-template-v1', system: `${templates.jobRubric.system}
+Older generation.` }
+  const accepted = settingsDomain.captureProcessingSettings(
+    settingsDomain.createDefaultAdminSettings(), 'old-prompt-release', '2026-10-08T20:00:00.000Z',
+    registry.createCompiledPromptBaseline('2026-10-08T20:00:00.000Z', templates),
+  )
+  assert.throws(() => renderer.resolveAcceptedPrompt(accepted, 'jobRubric', JOB_RUBRIC_COMPILED_PROMPT), /earlier prompt release.*Start it again/)
 })
 
 test('safe logging metadata cannot include private evidence, URLs or credentials', async t => {

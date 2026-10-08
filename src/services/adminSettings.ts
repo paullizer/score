@@ -4,6 +4,16 @@ import type {
 } from '../domain/admin-settings'
 import { cloudAccessRequestSignal, CloudApiError, CloudAuthError, reportCloudAccessFailure } from './cloudWorkspace'
 
+export interface PromptReleaseStatus {
+  activeBundleId: string | null
+  activeBundleSha256: string | null
+  etag: string | null
+  supported: boolean
+  generation: string
+  pending: boolean
+}
+export interface ActivatePromptReleaseInput { reason: string; gateReportSha256: string; targetsVersion: string }
+
 export class SettingsRequestError extends CloudApiError {
   readonly fields: SettingsFieldError[]
   constructor(status: number, message: string, fields: SettingsFieldError[] = []) {
@@ -72,4 +82,10 @@ export function testModelConfiguration(input: {
   const { settings, acknowledgeCost, ...selection } = input
   const body: ModelConfigurationTestRequest = { ...selection, draft: settings, confirmPaidProbe: acknowledgeCost }
   return request('/admin/deployments/test', { method: 'POST', body: JSON.stringify(body) })
+}
+export function readPromptRelease(signal?: AbortSignal): Promise<PromptReleaseStatus> {
+  return request('/admin/settings/prompt-release', { signal })
+}
+export function activatePromptRelease(input: ActivatePromptReleaseInput, etag: string): Promise<PromptReleaseStatus> {
+  return request('/admin/settings/prompt-release', { method: 'POST', headers: { 'If-Match': etag }, body: JSON.stringify(input) })
 }

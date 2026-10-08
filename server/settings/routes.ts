@@ -8,6 +8,7 @@ import type { Config } from '../config'
 import { forbidden, unavailable } from '../errors'
 import { getPrincipal } from '../request-context'
 import type { AdminSettingsService } from './service'
+import type { PromptRegistryService } from './prompts'
 
 const restoreBody = z.strictObject({ revision: z.string().min(1).max(128) })
 const importBody = z.strictObject({ document: z.unknown() })
@@ -17,13 +18,18 @@ const testBody = z.strictObject({
   deploymentId: z.string().min(1).max(128).optional(), draft: z.unknown().optional(),
   confirmPaidProbe: z.boolean().default(false),
 })
+const promptReleaseBody = z.strictObject({
+  reason: z.string().min(1).max(1000).regex(/\S/),
+  gateReportSha256: z.string().regex(/^[a-f0-9]{64}$/),
+  targetsVersion: z.string().min(1).max(128).regex(/^[A-Za-z0-9][A-Za-z0-9._-]*$/),
+})
 function body<T>(schema: z.ZodType<T>, value: unknown): T {
   const result = schema.safeParse(value)
   if (!result.success) throw settingsValidationError(result.error)
   return result.data
 }
 
-export function createAdminSettingsRouter(config: Config, service: AdminSettingsService | undefined): Router {
+export function createAdminSettingsRouter(config: Config, service: AdminSettingsService | undefined, promptRegistry?: PromptRegistryService): Router {
   const router = Router()
   router.use('/admin', (req, _res, next) => {
     if (!isApplicationAdmin(getPrincipal(req), config)) throw forbidden('Application administrator designation is required. Workspace ownership does not grant settings access.')
@@ -33,10 +39,24 @@ export function createAdminSettingsRouter(config: Config, service: AdminSettings
     if (!service) throw unavailable('Application settings storage is not configured or available. An operator must provision the isolated settings store.')
     return service
   }
+  const prompts = () => {
+    if (!promptRegistry) throw unavailable('Prompt registry storage is not configured or available. An operator must provision the isolated settings store.')
+    return promptRegistry
+  }
   router.get('/admin/settings', async (_req, res) => {
     const result = await settings().read()
     res.setHeader('ETag', result.etag)
     res.json(result)
+  })
+  router.get('/admin/settings/prompt-release', async (_req, res) => {
+    const result = await prompts().releaseStatus()
+    if (result.etag) res.setHeader('ETag', result.etag)
+    res.json(result)
+  })
+  router.post('/admin/settings/prompt-release', async (req, res) => {
+    const result = await prompts().releaseTemplates(getPrincipal(req), body(promptReleaseBody, req.body), req.header('if-match'))
+    res.setHeader('ETag', result.etag)
+    res.json(await prompts().releaseStatus())
   })
   router.patch('/admin/settings', async (req, res) => {
     const result = await settings().patch(getPrincipal(req), req.body, req.header('if-match'))

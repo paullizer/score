@@ -55,7 +55,7 @@ test('QC paid work requires explicit admission and verified model settings', () 
   assert.throws(() => loadConfig(configured), /verified prompt-aware worker/)
   const proof = {
     SCORE_RUNTIME_SETTINGS_WORKER_VERSION: RUNTIME_SETTINGS_VERSION,
-    SCORE_PROMPT_RUNTIME_WORKER_VERSION: 'score-prompt-runtime-v1',
+    SCORE_PROMPT_RUNTIME_WORKER_VERSION: 'score-prompt-runtime-v2',
     SCORE_RUNTIME_SETTINGS_VERIFIED_IMAGE: 'exampleregistry.azurecr.io/score-worker:verified-build',
     SCORE_RUNTIME_SETTINGS_VERIFIED_AT: '2026-09-21T12:00:00.000Z',
   }

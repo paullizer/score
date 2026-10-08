@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import { createServer } from 'node:http'
 import test from 'node:test'
 import {
-  ADMIN_SETTINGS_STORAGE_LIMITS, AdminSettingsService, MODEL_TASK_IDS, RUNTIME_SETTINGS_VERSION,
+  ADMIN_SETTINGS_STORAGE_LIMITS, AdminSettingsService, DEFAULT_PROMPT_TEMPLATES, MODEL_TASK_IDS, PromptRegistryService, RUNTIME_SETTINGS_VERSION,
   StoreConflictError, attachSettingsContext, captureProcessingSettings, createApp,
   createDefaultAdminSettings, effectiveFeatures, loadConfig, mergeAdminSettings, modelCapabilitiesFor,
   assertNewProcessingAllowed, getCurrentSettings, getPinnedAdmissionSettings, getProcessingAdmissionSettings,
@@ -75,6 +75,46 @@ function settingsConfig(runtimeEnabled = true) {
     },
   })
 }
+function promptStore() {
+  let current
+  let counter = 0
+  const bundles = new Map(), revisions = new Map(), activations = new Map()
+  return {
+    async getCurrent() { return current && { bundle: structuredClone(bundles.get(current.bundleId)), activation: structuredClone(activations.get(current.activationId)), etag: current.etag } },
+    async getBundle(id) { return structuredClone(bundles.get(id)) },
+    async getRevision(id) { return structuredClone(revisions.get(id)) },
+    async initialize(bundle, values, activation) {
+      if (current) return false
+      for (const revision of values) revisions.set(revision.revisionId, structuredClone(revision))
+      bundles.set(bundle.bundleId, structuredClone(bundle)); activations.set(activation.activationId, structuredClone(activation))
+      current = { bundleId: bundle.bundleId, activationId: activation.activationId, etag: `"prompt-${++counter}"` }
+      return true
+    },
+    async createDraft(bundle, values) {
+      if (bundles.has(bundle.bundleId) || values.some(revision => revisions.has(revision.revisionId))) throw new StoreConflictError()
+      for (const revision of values) revisions.set(revision.revisionId, structuredClone(revision))
+      bundles.set(bundle.bundleId, structuredClone(bundle))
+    },
+    async activate(bundle, activation, expectedEtag) {
+      if (current?.etag !== expectedEtag) throw new StoreConflictError()
+      if (activations.has(activation.activationId)) throw new StoreConflictError()
+      bundles.set(bundle.bundleId, structuredClone(bundle)); activations.set(activation.activationId, structuredClone(activation))
+      current = { bundleId: bundle.bundleId, activationId: activation.activationId, etag: `"prompt-${++counter}"` }
+      return { bundle: structuredClone(bundle), activation: structuredClone(activation), etag: current.etag }
+    },
+    async history(limit, before) {
+      const values = [...activations.values()].sort((a, b) => b.activationId.localeCompare(a.activationId)).filter(item => !before || item.activationId < before)
+      return { activations: structuredClone(values.slice(0, limit)), ...(values.length > limit ? { nextBefore: values[limit - 1].activationId } : {}) }
+    },
+  }
+}
+function olderPromptTemplates() {
+  const templates = structuredClone(DEFAULT_PROMPT_TEMPLATES)
+  templates.jobRubric = { ...templates.jobRubric, promptVersion: 'old-job-rubric-template-v1', system: `${templates.jobRubric.system}
+Older generation.` }
+  return templates
+}
+
 async function start(options = {}) {
   const store = options.store ?? fakeStore()
   const config = options.config ?? settingsConfig()
@@ -82,7 +122,7 @@ async function start(options = {}) {
   const state = options.state ?? createFakeStateStore()
   let id = 0
   const settings = new AdminSettingsService({ config, store, now, newId: () => `test-${++id}`, models: options.models })
-  const app = createApp({ config, directory, state, settings, accessStore: createFakeAccessStore(), jobs: options.jobs, distDir: FIXTURE_DIST_DIR, now })
+  const app = createApp({ config, directory, state, settings, prompts: options.prompts, accessStore: createFakeAccessStore(), jobs: options.jobs, distDir: FIXTURE_DIST_DIR, now })
   const server = createServer(app)
   await new Promise((resolve, reject) => { server.once('error', reject); server.listen(0, '127.0.0.1', resolve) })
   const base = `http://127.0.0.1:${server.address().port}`
@@ -95,7 +135,7 @@ async function start(options = {}) {
     return { response, body: await response.json() }
   }
   return {
-    app, store, settings, config, directory, state, request,
+    app, store, settings, config, directory, state, base, request,
     async close() { server.closeAllConnections(); await new Promise(resolve => server.close(resolve)) },
   }
 }
@@ -153,6 +193,37 @@ test('API bootstrap initializes settings before activation, is create-only, and 
     await assert.rejects(server.app.locals.bootstrapSettings(), /settings-offline/)
     assert.equal(server.store.counters.initializations, 1)
     assert.equal((await server.request('/api/session/identity')).response.status, 200)
+  } finally { await server.close() }
+})
+
+test('admin prompt-release route is admin and CSRF guarded, detects stale ETags, and activates releases', async () => {
+  const store = promptStore()
+  const old = new PromptRegistryService({ store, templates: olderPromptTemplates(), now, newId: () => 'old', authorizeActivation: () => true })
+  await old.current()
+  const prompts = new PromptRegistryService({ store, now, newId: () => 'release', authorizeActivation: actor => actor.oid === ALLOWED_OID })
+  const server = await start({ prompts })
+  try {
+    assert.equal((await server.request('/api/admin/settings/prompt-release', { oid: OTHER_ALLOWED_OID })).response.status, 403)
+    const missingCsrf = await fetch(`${server.base}/api/admin/settings/prompt-release`, {
+      method: 'POST', headers: { ...authHeaders({ roles: ['Score.Admin'] }), Origin: APP_ORIGIN, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ reason: 'Gate passed.', gateReportSha256: 'a'.repeat(64), targetsVersion: 'score-engineering-targets-v2' }),
+    })
+    assert.equal(missingCsrf.status, 403)
+    const status = await server.request('/api/admin/settings/prompt-release')
+    assert.equal(status.response.status, 200)
+    assert.equal(status.body.pending, true)
+    const stale = await server.request('/api/admin/settings/prompt-release', {
+      method: 'POST', headers: { 'If-Match': '"stale"' },
+      body: { reason: 'Gate passed.', gateReportSha256: 'a'.repeat(64), targetsVersion: 'score-engineering-targets-v2' },
+    })
+    assert.equal(stale.response.status, 409)
+    const success = await server.request('/api/admin/settings/prompt-release', {
+      method: 'POST', headers: { 'If-Match': status.body.etag },
+      body: { reason: 'Gate passed.', gateReportSha256: 'a'.repeat(64), targetsVersion: 'score-engineering-targets-v2' },
+    })
+    assert.equal(success.response.status, 200)
+    assert.equal(success.body.pending, false)
+    assert.equal(success.body.supported, true)
   } finally { await server.close() }
 })
 
@@ -914,7 +985,7 @@ test('configuration never designates runtime admins through legacy IDs and keeps
   }
   const evidence = {
     SCORE_RUNTIME_SETTINGS_WORKER_VERSION: RUNTIME_SETTINGS_VERSION,
-    SCORE_PROMPT_RUNTIME_WORKER_VERSION: 'score-prompt-runtime-v1',
+    SCORE_PROMPT_RUNTIME_WORKER_VERSION: 'score-prompt-runtime-v2',
     SCORE_RUNTIME_SETTINGS_VERIFIED_IMAGE: 'exampleregistry.azurecr.io/score-worker:verified-build',
     SCORE_RUNTIME_SETTINGS_VERIFIED_AT: '2026-09-21T12:00:00.000Z',
   }

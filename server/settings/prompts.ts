@@ -2,8 +2,8 @@ import { randomUUID } from 'node:crypto'
 import { z } from 'zod'
 import { processingSettingsSnapshotSchema, type ProcessingSettingsSnapshot } from '../../src/domain/admin-settings'
 import {
-  EDITABLE_PROMPT_FAMILIES, PROMPT_FAMILIES, PROMPT_REGISTRY_LIMITS, PROMPT_RENDERER_VERSION,
-  promptActivationSchema, promptActorSchema, promptBundleSnapshotSchema, promptEvaluationReferenceSchema,
+  EDITABLE_PROMPT_FAMILIES, PROMPT_FAMILIES, PROMPT_REGISTRY_LIMITS, PROMPT_RENDERER_VERSION, PROMPT_TEMPLATE_GENERATION,
+  promptActivationSchema, promptActorSchema, promptBundleSnapshotSchema, promptEvaluationReferenceSchema, promptTemplateReleaseSchema,
   promptGuidanceDraftSchema, promptHashSchema, promptIdentifierSchema,
   type CurrentPromptBundle, type PromptActivation, type PromptActor, type PromptBundleRevision, type PromptBundleSnapshot,
   type PromptFamily, type PromptGuidanceDraft, type PromptHistoryPage, type PromptRevision, type PublishedPromptBundle,
@@ -14,7 +14,7 @@ import { ANALYSIS_COMPILED_PROMPTS } from '../../worker/analyses/model'
 import { pinnedPromptTemplate, type CompiledPromptTemplate } from '../../worker/prompts'
 import { isApplicationAdmin, type AuthenticatedPrincipal } from '../auth'
 import type { Config } from '../config'
-import { conflict, forbidden, invalidRequest, notFound, preconditionRequired, unavailable } from '../errors'
+import { HttpError, conflict, forbidden, invalidRequest, notFound, preconditionRequired, unavailable } from '../errors'
 import { StoreConflictError } from '../store'
 import {
   promptBundleContentHash, promptObjectHash, promptRevisionContentHash, promptRevisionReference, promptTextHash,
@@ -27,7 +27,7 @@ export type { PromptPublicationGuard, PromptRegistryReader, PromptRegistryStore 
 export { promptObjectHash, promptTextHash, validatePromptBundle, validatePromptRevision, validatePromptSnapshot } from './prompt-integrity'
 export type * from '../../src/domain/prompt-versions'
 
-const templates: Record<PromptFamily, CompiledPromptTemplate> = {
+export const DEFAULT_PROMPT_TEMPLATES: Record<PromptFamily, CompiledPromptTemplate> = {
   jobRubric: JOB_RUBRIC_COMPILED_PROMPT, ...GRADE_COMPILED_PROMPTS, ...ANALYSIS_COMPILED_PROMPTS,
 }
 const baselineGuidance = {
@@ -54,8 +54,22 @@ const restoreInputSchema = z.strictObject({
   bundleId: promptIdentifierSchema, requestId: promptIdentifierSchema,
   reason: z.string().min(1).max(PROMPT_REGISTRY_LIMITS.reasonCharacters).regex(/\S/),
 })
+const templateReleaseInputSchema = z.strictObject({
+  reason: z.string().min(1).max(PROMPT_REGISTRY_LIMITS.reasonCharacters).regex(/\S/),
+  gateReportSha256: promptHashSchema,
+  targetsVersion: promptIdentifierSchema,
+})
 export type CreatePromptDraftInput = z.infer<typeof draftInputSchema>
 export type ActivatePromptBundleInput = z.infer<typeof activateInputSchema>
+export type ReleasePromptTemplatesInput = z.infer<typeof templateReleaseInputSchema>
+export interface PromptTemplateReleaseStatus {
+  activeBundleId: string | null
+  activeBundleSha256: string | null
+  etag: string | null
+  supported: boolean
+  generation: string
+  pending: boolean
+}
 export interface PromptRegistryCapture { capture(bundleId?: string): Promise<PromptBundleSnapshot> }
 export interface PromptRegistryServiceDeps {
   store: PromptRegistryStore
@@ -64,6 +78,8 @@ export interface PromptRegistryServiceDeps {
   authorizeActivation?: (principal: AuthenticatedPrincipal) => boolean | Promise<boolean>
   now?: () => Date
   newId?: () => string
+  templates?: Record<PromptFamily, CompiledPromptTemplate>
+  generation?: string
 }
 
 function assertExactEtag(ifMatch: string | undefined): asserts ifMatch is string {
@@ -75,9 +91,9 @@ function assertExactEtag(ifMatch: string | undefined): asserts ifMatch is string
 
 function createRevision(
   family: PromptFamily, revisionId: string, createdAt: string, actor: PromptActor, guidance: string | null,
-  parentRevisionId: string | null,
+  parentRevisionId: string | null, templateSet: Record<PromptFamily, CompiledPromptTemplate> = DEFAULT_PROMPT_TEMPLATES,
 ): PromptRevision {
-  const template = pinnedPromptTemplate(family, templates[family])
+  const template = pinnedPromptTemplate(family, templateSet[family])
   const content = {
     schemaVersion: 1 as const, family, revisionId, createdAt, actor, parentRevisionId, guidance,
     guidanceSha256: promptTextHash(guidance ?? ''), rendererVersion: PROMPT_RENDERER_VERSION,
@@ -97,24 +113,35 @@ function createBundle(
 }
 
 /** Used only after a confirmed absent active pointer; deployment never repoints an existing registry. */
-export function createCompiledPromptBaseline(createdAt = '2026-09-22T00:00:00.000Z'): PromptBundleSnapshot {
+export function createCompiledPromptBaseline(
+  createdAt = '2026-09-22T00:00:00.000Z', templateSet: Record<PromptFamily, CompiledPromptTemplate> = DEFAULT_PROMPT_TEMPLATES,
+): PromptBundleSnapshot {
   const actor = { system: 'initialization' } as const
   const revisions = Object.fromEntries(PROMPT_FAMILIES.map(family => [family, createRevision(
     family, `pr-baseline-${family}-v1`, createdAt, actor,
     (EDITABLE_PROMPT_FAMILIES as readonly string[]).includes(family) ? baselineGuidance[family as keyof typeof baselineGuidance] : null,
-    null,
+    null, templateSet,
   )])) as Record<PromptFamily, PromptRevision>
   return validatePromptSnapshot({
     schemaVersion: 1, revisions, bundle: createBundle('pb-baseline-v1', createdAt, actor, null, revisions),
   })
 }
-function assertSupported(snapshot: PromptBundleSnapshot): PromptBundleSnapshot {
+const unsupportedTemplateMessage = 'The selected immutable prompt renderer or schema is unsupported; no replacement was used.'
+const pendingTemplateReleaseMessage = 'A new prompt release is installed but not activated yet. An application administrator must activate it before new work can start.'
+function isUnsupportedTemplateError(error: unknown): boolean {
+  return error instanceof HttpError && error.message === unsupportedTemplateMessage
+}
+function assertSupported(
+  snapshot: PromptBundleSnapshot,
+  templateSet: Record<PromptFamily, CompiledPromptTemplate> = DEFAULT_PROMPT_TEMPLATES,
+  message = unsupportedTemplateMessage,
+): PromptBundleSnapshot {
   validatePromptSnapshot(snapshot)
   for (const family of PROMPT_FAMILIES) {
-    const template = pinnedPromptTemplate(family, templates[family])
+    const template = pinnedPromptTemplate(family, templateSet[family])
     const revision = snapshot.revisions[family]
     if (revision.templateVersion !== template.promptVersion || revision.templateSha256 !== promptTextHash(template.system) ||
-      revision.outputSchemaVersion !== template.schemaVersion) throw unavailable('The selected immutable prompt renderer or schema is unsupported; no replacement was used.')
+      revision.outputSchemaVersion !== template.schemaVersion) throw unavailable(message)
   }
   return snapshot
 }
@@ -122,8 +149,9 @@ function assertSupported(snapshot: PromptBundleSnapshot): PromptBundleSnapshot {
 /** Pure deterministic construction for private QC checkpoints; no global write or activation. */
 export function createPromptCandidate(
   baseline: PromptBundleSnapshot, guidance: PromptGuidanceDraft, actor: PromptActor, createdAt: string, bundleId: string,
+  templateSet: Record<PromptFamily, CompiledPromptTemplate> = DEFAULT_PROMPT_TEMPLATES,
 ): PromptBundleSnapshot {
-  assertSupported(baseline)
+  assertSupported(baseline, templateSet)
   const changes = promptGuidanceDraftSchema.parse(guidance)
   promptActorSchema.parse(actor)
   promptIdentifierSchema.parse(bundleId)
@@ -136,16 +164,38 @@ export function createPromptCandidate(
     const next = changes[family]
     if (next === undefined || next === revisions[family].guidance) continue
     const revisionId = `pr-${family}-${promptObjectHash({ bundleId, family, guidance: next })}`
-    revisions[family] = createRevision(family, revisionId, createdAt, actor, next, revisions[family].revisionId)
+    revisions[family] = createRevision(family, revisionId, createdAt, actor, next, revisions[family].revisionId, templateSet)
     changed = true
   }
   if (!changed) throw invalidRequest('A candidate must change at least one editable task-guidance family.')
   return assertSupported(validatePromptSnapshot({
     schemaVersion: 1, revisions, bundle: createBundle(bundleId, createdAt, actor, baseline.bundle.bundleId, revisions),
-  }))
+  }), templateSet)
 }
 
 /** Changes only prompt pins; evaluation retains the exact captured model and processing settings. */
+
+export function createTemplateReleaseSnapshot(
+  parent: PromptBundleRevision, generation: string, createdAt: string, actor: PromptActor,
+  templateSet: Record<PromptFamily, CompiledPromptTemplate> = DEFAULT_PROMPT_TEMPLATES,
+): PromptBundleSnapshot {
+  const parsedParent = validatePromptBundle(parent)
+  const parsedGeneration = promptIdentifierSchema.parse(generation)
+  const parsedActor = promptActorSchema.parse(actor)
+  if ('system' in parsedActor) throw invalidRequest('A template release needs an attributable application administrator.')
+  const suffix = parsedParent.bundleSha256.slice(0, 16)
+  const revisions = Object.fromEntries(PROMPT_FAMILIES.map(family => [family, createRevision(
+    family, `pr-${parsedGeneration}-${family}-${suffix}`, createdAt, parsedActor,
+    (EDITABLE_PROMPT_FAMILIES as readonly string[]).includes(family) ? baselineGuidance[family as keyof typeof baselineGuidance] : null,
+    parsedParent.revisions[family].revisionId, templateSet,
+  )])) as Record<PromptFamily, PromptRevision>
+  return assertSupported(validatePromptSnapshot({
+    schemaVersion: 1,
+    revisions,
+    bundle: createBundle(`pb-${parsedGeneration}-${suffix}`, createdAt, parsedActor, parsedParent.bundleId, revisions),
+  }), templateSet)
+}
+
 export function createPromptCandidateSettings(
   baseline: ProcessingSettingsSnapshot, guidance: PromptGuidanceDraft, actor: PromptActor, createdAt: string, bundleId: string,
 ): ProcessingSettingsSnapshot {
@@ -179,9 +229,13 @@ export async function readPromptBundleSnapshot(reader: PromptRegistryReader, bun
 export class PromptRegistryService implements PromptRegistryCapture {
   private readonly clock: () => Date
   private readonly newId: () => string
+  private readonly templates: Record<PromptFamily, CompiledPromptTemplate>
+  private readonly generation: string
   constructor(private readonly deps: PromptRegistryServiceDeps) {
     this.clock = deps.now ?? (() => new Date())
     this.newId = deps.newId ?? randomUUID
+    this.templates = deps.templates ?? DEFAULT_PROMPT_TEMPLATES
+    this.generation = promptIdentifierSchema.parse(deps.generation ?? PROMPT_TEMPLATE_GENERATION)
   }
   private actor(principal: AuthenticatedPrincipal): PromptActor {
     return promptActorSchema.parse({ tenantId: principal.tenantId, oid: principal.oid })
@@ -190,7 +244,7 @@ export class PromptRegistryService implements PromptRegistryCapture {
     const config = this.deps.config
     const allowed = this.deps.authorizeActivation ? await this.deps.authorizeActivation(principal)
       : Boolean(config && isApplicationAdmin(principal, config))
-    if (!allowed) throw forbidden('Only an application administrator can activate or restore a prompt bundle.')
+    if (!allowed) throw forbidden('Only an application administrator can activate, release, or restore a prompt bundle.')
   }
   private async findActivation(predicate: (activation: PromptActivation) => boolean): Promise<PromptActivation | undefined> {
     let before: string | undefined
@@ -231,7 +285,7 @@ export class PromptRegistryService implements PromptRegistryCapture {
   async current(): Promise<CurrentPromptBundle> {
     let current = await this.deps.store.getCurrent()
     if (!current) {
-      const baseline = createCompiledPromptBaseline(this.clock().toISOString())
+      const baseline = createCompiledPromptBaseline(this.clock().toISOString(), this.templates)
       const activation: PromptActivation = {
         schemaVersion: 1, activationId: 'pa-00000000000000000-baseline-v1', bundleId: baseline.bundle.bundleId,
         bundleSha256: baseline.bundle.bundleSha256, parentBundleId: null, parentBundleSha256: null,
@@ -242,6 +296,11 @@ export class PromptRegistryService implements PromptRegistryCapture {
       current = await this.deps.store.getCurrent()
       if (!current) throw unavailable('Prompt registry initialization could not be confirmed. No default was substituted.')
     }
+    const pointer = this.validatePointer(current)
+    await this.snapshot(pointer.bundle, pendingTemplateReleaseMessage)
+    return structuredClone(pointer)
+  }
+  private validatePointer(current: CurrentPromptBundle): CurrentPromptBundle {
     if (!current.etag || current.etag === '*' || current.etag.startsWith('W/') || current.etag.includes(',') || current.etag.trim() !== current.etag) {
       throw unavailable('The active prompt pointer has no exact concurrency version.')
     }
@@ -250,8 +309,74 @@ export class PromptRegistryService implements PromptRegistryCapture {
     if (activation.bundleId !== current.bundle.bundleId || activation.bundleSha256 !== current.bundle.bundleSha256) {
       throw unavailable('The prompt pointer and activation history have inconsistent bindings.')
     }
-    await this.snapshot(current.bundle)
-    return structuredClone(current)
+    return { ...current, activation }
+  }
+  private async bundleSupported(bundle: PromptBundleRevision): Promise<boolean> {
+    try { await this.snapshot(bundle); return true } catch (error) {
+      if (error instanceof HttpError && (error.message === pendingTemplateReleaseMessage || isUnsupportedTemplateError(error))) return false
+      throw error
+    }
+  }
+  async releaseStatus(): Promise<PromptTemplateReleaseStatus> {
+    const current = await this.deps.store.getCurrent()
+    if (!current) return { activeBundleId: null, activeBundleSha256: null, etag: null, supported: false, generation: this.generation, pending: false }
+    const pointer = this.validatePointer(current)
+    const supported = await this.bundleSupported(pointer.bundle)
+    return {
+      activeBundleId: pointer.bundle.bundleId, activeBundleSha256: pointer.bundle.bundleSha256, etag: pointer.etag,
+      supported, generation: this.generation, pending: !supported,
+    }
+  }
+  async releaseTemplates(
+    principal: AuthenticatedPrincipal, input: ReleasePromptTemplatesInput, ifMatch: string | undefined, beforePublish?: PromptPublicationGuard,
+  ): Promise<CurrentPromptBundle> {
+    await this.authorize(principal)
+    const request = templateReleaseInputSchema.parse(input)
+    assertExactEtag(ifMatch)
+    const saved = await this.deps.store.getCurrent()
+    if (!saved) throw unavailable('Initialize the prompt registry first.')
+    const current = this.validatePointer(saved)
+    if (current.etag !== ifMatch) throw conflict('The active prompt bundle changed. Reload the prompt release status before activation.')
+    if (await this.bundleSupported(current.bundle)) throw conflict('The active prompt release already uses this template generation.')
+    const createdAt = this.clock().toISOString()
+    const actor = this.actor(principal)
+    const fresh = createTemplateReleaseSnapshot(current.bundle, this.generation, createdAt, actor, this.templates)
+    // An earlier attempt may have registered this release without activating it. Its ID is deterministic, but its
+    // timestamp and actor are not, so reuse the exact saved content when it is the same release of the same parent.
+    const registered = await this.deps.store.getBundle(fresh.bundle.bundleId)
+    let candidate = fresh
+    if (registered) {
+      const existing = await this.snapshot(validatePromptBundle(registered))
+      const sameRelease = existing.bundle.parentBundleId === current.bundle.bundleId && PROMPT_FAMILIES.every(family => {
+        const [a, b] = [existing.revisions[family], fresh.revisions[family]]
+        return a.revisionId === b.revisionId && a.parentRevisionId === b.parentRevisionId && a.guidanceSha256 === b.guidanceSha256 &&
+          a.templateVersion === b.templateVersion && a.templateSha256 === b.templateSha256 && a.outputSchemaVersion === b.outputSchemaVersion
+      })
+      if (!sameRelease) throw conflict('The template-release bundle identity already contains different immutable content.')
+      candidate = existing
+    } else {
+      try { await this.deps.store.createDraft(fresh.bundle, Object.values(fresh.revisions)) } catch (error) {
+        const saved = await this.deps.store.getBundle(fresh.bundle.bundleId).catch(() => undefined)
+        if (!saved || promptObjectHash(saved) !== promptObjectHash(fresh.bundle)) throw error instanceof StoreConflictError
+          ? conflict('The template-release bundle identity already contains different immutable content.') : error
+        for (const revision of Object.values(fresh.revisions)) {
+          const existing = await this.deps.store.getRevision(revision.revisionId)
+          if (!existing || promptObjectHash(existing) !== promptObjectHash(revision)) {
+            throw conflict('The template-release revision identity already contains different immutable content.')
+          }
+        }
+      }
+      const persisted = await this.capture(fresh.bundle.bundleId)
+      if (promptObjectHash(persisted) !== promptObjectHash(fresh)) throw conflict('The registered template release differs from the compiled release snapshot.')
+    }
+    const activation = promptActivationSchema.parse({
+      schemaVersion: 1, activationId: `pa-${createdAt.replace(/[-:.TZ]/g, '')}-${this.newId()}`,
+      bundleId: candidate.bundle.bundleId, bundleSha256: candidate.bundle.bundleSha256,
+      parentBundleId: current.bundle.bundleId, parentBundleSha256: current.bundle.bundleSha256,
+      createdAt, actor, reason: request.reason, evaluation: null,
+      templateRelease: promptTemplateReleaseSchema.parse({ generation: this.generation, gateReportSha256: request.gateReportSha256, targetsVersion: request.targetsVersion }),
+    })
+    return this.publish(candidate.bundle, activation, ifMatch, beforePublish)
   }
   async read(): Promise<CurrentPromptBundle & { snapshot: PromptBundleSnapshot }> {
     const current = await this.current()
@@ -273,11 +398,11 @@ export class PromptRegistryService implements PromptRegistryCapture {
     if (validated.bundleId !== bundleId) throw unavailable('The immutable prompt bundle has inconsistent identity.')
     return validated
   }
-  private async snapshot(bundle: PromptBundleRevision): Promise<PromptBundleSnapshot> {
+  private async snapshot(bundle: PromptBundleRevision, unsupportedMessage = unsupportedTemplateMessage): Promise<PromptBundleSnapshot> {
     const entries = await Promise.all(PROMPT_FAMILIES.map(async family => [
       family, await this.revision(bundle.revisions[family].revisionId),
     ] as const))
-    return assertSupported(validatePromptSnapshot({ schemaVersion: 1, bundle, revisions: Object.fromEntries(entries) }))
+    return assertSupported(validatePromptSnapshot({ schemaVersion: 1, bundle, revisions: Object.fromEntries(entries) }), this.templates, unsupportedMessage)
   }
   async capture(bundleId?: string): Promise<PromptBundleSnapshot> {
     return this.snapshot(bundleId === undefined ? (await this.current()).bundle : await this.bundle(bundleId))
@@ -303,7 +428,7 @@ export class PromptRegistryService implements PromptRegistryCapture {
     if (baseline.bundle.bundleSha256 !== request.baseBundleSha256) throw conflict('The draft baseline does not match the captured prompt bundle.')
     const createdAt = this.clock().toISOString()
     const actor = this.actor(principal)
-    const candidate = createPromptCandidate(baseline, request.guidance, actor, createdAt, `pb-${this.newId()}`)
+    const candidate = createPromptCandidate(baseline, request.guidance, actor, createdAt, `pb-${this.newId()}`, this.templates)
     const { bundle, revisions } = candidate
     const changed = EDITABLE_PROMPT_FAMILIES.filter(family => revisions[family].revisionId !== baseline.revisions[family].revisionId)
       .map(family => revisions[family])
@@ -331,7 +456,7 @@ export class PromptRegistryService implements PromptRegistryCapture {
     assertExactEtag(ifMatch)
     const current = await this.current()
     if (current.etag !== ifMatch) throw conflict('The active prompt bundle changed. Review the new baseline and reevaluate before activation.')
-    const candidate = request.candidate ? assertSupported(validatePromptSnapshot(request.candidate)) : await this.capture(request.bundleId)
+    const candidate = request.candidate ? assertSupported(validatePromptSnapshot(request.candidate), this.templates) : await this.capture(request.bundleId)
     const evaluation = request.evaluation
     if (candidate.bundle.bundleId !== request.bundleId || candidate.bundle.bundleSha256 !== request.bundleSha256 ||
       evaluation.evaluatedBundleId !== candidate.bundle.bundleId || evaluation.evaluatedBundleSha256 !== candidate.bundle.bundleSha256 ||

@@ -42,7 +42,7 @@ export const appWiringOrder = [
   { id: 'api-auth', contains: "api.use(telemetryMiddleware('score.auth', createAuthMiddleware(config)))", reason: 'Every /api route must require a validated principal.' },
   { id: 'api-csrf', contains: "api.use(telemetryMiddleware('score.csrf', createCsrfMiddleware(config)))", reason: 'Mutating /api routes must reject cross-site requests before handlers run.' },
   { id: 'settings-context', contains: 'api.use(attachSettingsContext(config, deps.settings))', reason: 'Routes must observe the active settings revision after auth/CSRF.' },
-  { id: 'settings-router', contains: 'api.use(createAdminSettingsRouter(config, deps.settings))', reason: 'Admin settings routes are mounted before feature routers.' },
+  { id: 'settings-router', contains: 'api.use(createAdminSettingsRouter(config, deps.settings, deps.prompts))', reason: 'Admin settings routes are mounted before feature routers.' },
   { id: 'members-router', contains: 'api.use(createWorkspaceMembersRouter', reason: 'Reviewer access routes are part of the authenticated API surface.' },
   { id: 'qc-router', contains: 'api.use(createQcRouter', reason: 'QC routes are part of the authenticated API surface.' },
   { id: 'access-router', contains: 'api.use(createAccessRouter', reason: 'Access-management routes are part of the authenticated API surface.' },

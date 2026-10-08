@@ -71,7 +71,9 @@ export { isApplicationAdmin } from './auth'
 export { CreationAccessService, WorkspaceAccessService } from './access/service'
 export { createAccessStoreFromContainer } from './access/azure-store'
 export { AdminSettingsService } from './settings/service'
-export { PromptRegistryService, createPromptRegistryService, createCompiledPromptBaseline } from './settings/prompts'
+export {
+  DEFAULT_PROMPT_TEMPLATES, PromptRegistryService, createPromptRegistryService, createCompiledPromptBaseline, createTemplateReleaseSnapshot,
+} from './settings/prompts'
 export { createAzurePromptStore, createAzurePromptReader, createPromptStoreFromContainer } from './settings/prompt-azure-store'
 export { createSettingsStoreFromContainer, createAzureSettingsStore, createSettingsReaderFromContainer, createAzureSettingsReader } from './settings/azure-store'
 export { createAzureSettingsModelAdapter } from './settings/models'
@@ -223,7 +225,7 @@ export function createApp(deps: AppDeps): Express {
   api.use(telemetryMiddleware('score.auth', createAuthMiddleware(config)))
   api.use(telemetryMiddleware('score.csrf', createCsrfMiddleware(config)))
   api.use(attachSettingsContext(config, deps.settings))
-  api.use(createAdminSettingsRouter(config, deps.settings))
+  api.use(createAdminSettingsRouter(config, deps.settings, deps.prompts))
   api.use(createWorkspaceMembersRouter({ repository, directory, config, eligibleUsers: deps.eligibleUsers, now: deps.now }))
   api.use(createQcRouter({ repository, state, config, qc, analyses: analysisStorage, prompts: deps.prompts, now: deps.now }))
   api.use(createAccessRouter(creationAccess, workspaceAccess, deps.eligibleUsers))

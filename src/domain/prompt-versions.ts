@@ -6,6 +6,7 @@ export const PROMPT_FAMILIES = [...EDITABLE_PROMPT_FAMILIES, ...FIXED_PROMPT_FAM
 export type EditablePromptFamily = typeof EDITABLE_PROMPT_FAMILIES[number]
 export type PromptFamily = typeof PROMPT_FAMILIES[number]
 export const PROMPT_RENDERER_VERSION = 'score-prompt-renderer-v1' as const
+export const PROMPT_TEMPLATE_GENERATION = 'score-prompt-templates-v1' as const
 export const PINNED_ASSESSMENT_SCHEMA_VERSION = 'score-analysis-assessment-qc-v1' as const
 export const PROMPT_REGISTRY_LIMITS = { guidanceCharacters: 4_000, reasonCharacters: 1_000, snapshotBytes: 64 * 1024 } as const
 
@@ -106,6 +107,12 @@ export const promptRestorationReferenceSchema = z.strictObject({
   expectedEtag: z.string().min(1).max(256).refine(value =>
     value !== '*' && !value.startsWith('W/') && !value.includes(',') && value.trim() === value),
 })
+export const promptTemplateReleaseSchema = z.strictObject({
+  generation: promptIdentifierSchema,
+  gateReportSha256: promptHashSchema,
+  targetsVersion: promptIdentifierSchema,
+})
+export type PromptTemplateRelease = z.infer<typeof promptTemplateReleaseSchema>
 export const promptActivationSchema = z.strictObject({
   schemaVersion: z.literal(1),
   activationId: promptIdentifierSchema,
@@ -118,13 +125,20 @@ export const promptActivationSchema = z.strictObject({
   reason: nonblank(PROMPT_REGISTRY_LIMITS.reasonCharacters),
   evaluation: promptEvaluationReferenceSchema.nullable(),
   restoration: promptRestorationReferenceSchema.optional(),
+  templateRelease: promptTemplateReleaseSchema.optional(),
 }).superRefine((activation, ctx) => {
   const initialized = 'system' in activation.actor
-  const invalid = initialized
-    ? activation.parentBundleId !== null || activation.parentBundleSha256 !== null || activation.evaluation !== null || activation.restoration !== undefined
-    : activation.parentBundleId === null || activation.parentBundleSha256 === null ||
-      ((activation.evaluation === null) === (activation.restoration === undefined))
-  if (invalid) ctx.addIssue({ code: 'custom', message: 'An activation must be initialization, an evaluated release, or an explicitly audited restoration.' })
+  const hasParents = activation.parentBundleId !== null && activation.parentBundleSha256 !== null
+  const hasEvaluation = activation.evaluation !== null
+  const hasRestoration = activation.restoration !== undefined
+  const hasTemplateRelease = activation.templateRelease !== undefined
+  const kinds = [
+    initialized && !hasParents && !hasEvaluation && !hasRestoration && !hasTemplateRelease,
+    !initialized && hasParents && hasEvaluation && !hasRestoration && !hasTemplateRelease,
+    !initialized && hasParents && !hasEvaluation && hasRestoration && !hasTemplateRelease,
+    !initialized && hasParents && !hasEvaluation && !hasRestoration && hasTemplateRelease,
+  ].filter(Boolean).length
+  if (kinds !== 1) ctx.addIssue({ code: 'custom', message: 'An activation must be exactly one of initialization, evaluated release, audited restoration, or template release.' })
   if (activation.evaluation && (
     activation.evaluation.evaluatedBundleId !== activation.bundleId || activation.evaluation.evaluatedBundleSha256 !== activation.bundleSha256 ||
     activation.evaluation.baselineBundleId !== activation.parentBundleId || activation.evaluation.baselineBundleSha256 !== activation.parentBundleSha256
@@ -150,4 +164,4 @@ For score=null use confidence=null, explain the unscored or excluded state, and 
 ambiguity is a bounded list of specific {category, explanation} objects. Categories are rubric-anchors, evidence-scope, contradictory-evidence, source-clarity, or criterion-scope. Use [] when there is no genuine ambiguity; explain only uncertainty relevant to applying this rubric, never protected traits or speculation about the person.
 alternativeScores is a bounded list of distinct defensible integer ratings from 0 through 5, excluding the chosen score. Include only alternatives genuinely supported by the same document and saved anchors and explain that ambiguity; it is not a statistical confidence interval. Never invent support or use alternatives to evade a blocker.
 Diagnostics do not change scores, citation requirements, independent grounding authority, or the shared correction budget. Do not return diagnostics for qualifications.`
-export const PROMPT_RUNTIME_VERSION = 'score-prompt-runtime-v1'
+export const PROMPT_RUNTIME_VERSION = 'score-prompt-runtime-v2'

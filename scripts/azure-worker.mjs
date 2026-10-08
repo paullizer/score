@@ -7,7 +7,7 @@ import { client, environment, identifier, request, required, setEnvironment } fr
 export const WORD_WORKER_CAPABILITY = 'word-document-imports-v1'
 export const WORD_WORKER_EXTRACTION_VERSION = 'score-word-extraction-v1'
 export const RUNTIME_SETTINGS_VERSION = 'score-runtime-settings-v2'
-export const PROMPT_RUNTIME_VERSION = 'score-prompt-runtime-v1'
+export const PROMPT_RUNTIME_VERSION = 'score-prompt-runtime-v2'
 export const QC_RUNTIME_VERSION = 'score-qc-worker-v1'
 export const SETTINGS_WORKER_RUNTIMES = ['runtime.mjs', 'grade-runtime.mjs', 'resume-runtime.mjs', 'analysis-runtime.mjs', 'qc-runtime.mjs']
 export const WORD_WORKER_ARTIFACTS = [
