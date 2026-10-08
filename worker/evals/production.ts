@@ -25,6 +25,8 @@ const evaluationBindingSchema = z.strictObject({
   modelVersion: z.string().min(1).max(160),
   reasoningEffort: z.enum(['minimal', 'low', 'medium', 'high']),
 })
+type EvaluationBinding = z.infer<typeof evaluationBindingSchema>
+const GENERATION_TASKS = ['jobRubric', 'gradeCompetencies', 'gradeDraft', 'gradeReview'] as const
 
 export function createEvaluationSettings(raw: unknown) {
   const value = z.strictObject({
@@ -32,6 +34,9 @@ export function createEvaluationSettings(raw: unknown) {
     capturedAt: z.string().datetime(),
     assessor: evaluationBindingSchema,
     reviewer: evaluationBindingSchema,
+    /** Explicit bindings for rubric and grade generation; omitted tasks keep the application default. */
+    tasks: z.strictObject(Object.fromEntries(GENERATION_TASKS.map(task => [task, evaluationBindingSchema.optional()])) as
+      Record<typeof GENERATION_TASKS[number], z.ZodOptional<typeof evaluationBindingSchema>>).optional(),
   }).parse(raw)
   const settings = createDefaultAdminSettings({
     model: {
@@ -40,28 +45,44 @@ export function createEvaluationSettings(raw: unknown) {
       reasoningEffort: value.assessor.reasoningEffort,
     },
   })
-  const bindings = [value.assessor]
-  if (value.reviewer.deploymentName !== value.assessor.deploymentName) bindings.push(value.reviewer)
-  else if (value.reviewer.modelName !== value.assessor.modelName || value.reviewer.modelVersion !== value.assessor.modelVersion) {
-    throw new Error('One deployment cannot represent two different model identities.')
+  const bindings: EvaluationBinding[] = []
+  const deploymentFor = (binding: EvaluationBinding) => {
+    const index = bindings.findIndex(row => row.deploymentName === binding.deploymentName)
+    if (index < 0) {
+      bindings.push(binding)
+      return `evaluation-${bindings.length - 1}`
+    }
+    if (bindings[index].modelName !== binding.modelName || bindings[index].modelVersion !== binding.modelVersion) {
+      throw new Error('One deployment cannot represent two different model identities.')
+    }
+    return `evaluation-${index}`
   }
-  settings.ai.deployments = bindings.map((binding, index) => {
+  const assessorDeployment = deploymentFor(value.assessor), reviewerDeployment = deploymentFor(value.reviewer)
+  const generation = GENERATION_TASKS.flatMap(task => {
+    const binding = value.tasks?.[task]
+    return binding ? [{ task, binding, deploymentId: deploymentFor(binding) }] : []
+  })
+  for (const binding of [value.assessor, value.reviewer, ...generation.map(row => row.binding)]) {
     const capabilities = modelCapabilitiesFor(binding.modelName, binding.modelVersion)
     if (!capabilities.structuredOutputs || !capabilities.reasoningEfforts.includes(binding.reasoningEffort)) {
       throw new Error('Evaluation model/version/effort has no verified application adapter.')
     }
-    return {
-      id: `evaluation-${index}`, label: binding.deploymentName, description: 'Explicit offline evaluation binding.',
-      enabled: true, deploymentName: binding.deploymentName, modelName: binding.modelName,
-      modelVersion: binding.modelVersion, capabilities,
-      verification: 'deployment-config' as const, verifiedAt: null,
-    }
-  })
+  }
+  settings.ai.deployments = bindings.map((binding, index) => ({
+    id: `evaluation-${index}`, label: binding.deploymentName, description: 'Explicit offline evaluation binding.',
+    enabled: true, deploymentName: binding.deploymentName, modelName: binding.modelName,
+    modelVersion: binding.modelVersion, capabilities: modelCapabilitiesFor(binding.modelName, binding.modelVersion),
+    verification: 'deployment-config' as const, verifiedAt: null,
+  }))
   settings.ai.defaultDeploymentId = 'evaluation-0'
-  settings.ai.tasks.assessment.deploymentId = 'evaluation-0'
+  settings.ai.tasks.assessment.deploymentId = assessorDeployment
   settings.ai.tasks.assessment.reasoningEffort = value.assessor.reasoningEffort
-  settings.ai.tasks.assessmentReview.deploymentId = bindings.length === 1 ? 'evaluation-0' : 'evaluation-1'
+  settings.ai.tasks.assessmentReview.deploymentId = reviewerDeployment
   settings.ai.tasks.assessmentReview.reasoningEffort = value.reviewer.reasoningEffort
+  for (const { task, binding, deploymentId } of generation) {
+    settings.ai.tasks[task].deploymentId = deploymentId
+    settings.ai.tasks[task].reasoningEffort = binding.reasoningEffort
+  }
   return captureProcessingSettings(settings, value.revision, value.capturedAt, createCompiledPromptBaseline(value.capturedAt))
 }
 

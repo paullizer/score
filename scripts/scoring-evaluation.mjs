@@ -1,4 +1,4 @@
-import { readFile, writeFile, rename, mkdir, open, unlink, link } from 'node:fs/promises'
+import { readFile, writeFile, rename, mkdir, open, unlink, link, readdir } from 'node:fs/promises'
 import { dirname, resolve, basename } from 'node:path'
 import { randomUUID } from 'node:crypto'
 import {
@@ -17,6 +17,8 @@ import {
   QC_LIMITS,
   summarizeEvidenceMonotonicity,
   summarizeEvidenceSelections,
+  summarizeRubricRepeatability,
+  summarizeGradeGeneration,
 } from '../dist-worker/scoring-evaluation.mjs'
 
 async function readJson(path) {
@@ -253,6 +255,28 @@ async function main(args) {
     console.log('Source-bound human label revision saved separately; holdout labels must stay sealed.')
     return
   }
+  if ((command === 'rubric-report' || command === 'grade-report') && paths.length === 3) {
+    const [manifestPath, runDirectory, outputPath] = paths
+    const directory = resolve(runDirectory)
+    if (dirname(resolve(outputPath)) === directory || resolve(outputPath) === resolve(manifestPath)) {
+      throw new Error('Generation reports must be written outside the private run directory and cannot overwrite the manifest.')
+    }
+    const [manifest, observations] = await Promise.all([readJson(manifestPath), readJson(resolve(directory, 'observations.json'))])
+    const suffix = command === 'rubric-report' ? '.rubric.json' : '.grades.json'
+    const artifacts = await Promise.all((await readdir(directory)).filter(name => name.endsWith(suffix)).sort()
+      .map(name => readJson(resolve(directory, name))))
+    const report = command === 'rubric-report'
+      ? summarizeRubricRepeatability(manifest.suite, manifest.documents, observations,
+        artifacts.map(({ sourceId, configurationId, repetition, rubric }) => ({ sourceId, configurationId, repetition, rubric })),
+        manifest.references ?? [])
+      : summarizeGradeGeneration(manifest.suite, observations,
+        artifacts.map(({ sourceId, configurationId, repetition, grades }) => ({
+          sourceId, configurationId, repetition, grades: grades.map(row => ({ grade: row.grade, rubric: row.draft.rubric })),
+        })))
+    await atomicWrite(outputPath, report)
+    console.log('Generation repeatability saved; lexical alignment is not semantic equivalence, validity or rubric approval.')
+    return
+  }
   if (command === 'gates' && paths.length >= 6 && paths.length <= 8) {
     const [suitePath, observationsPath, referencesPath, outputPath, baselineId, candidateId, targetsVersion, panelsPath] = paths
     if ([suitePath, observationsPath, referencesPath, ...(panelsPath ? [panelsPath] : [])].some(path => resolve(path) === resolve(outputPath))) {
@@ -338,7 +362,7 @@ async function main(args) {
     }
     return
   }
-  throw new Error('Usage: scoring-evaluation.mjs <prepare-corpus|prepare-shards|merge-shards|spot-checks|silver-references|source-references|human-labels|extraction|layout-integrity|evidence-selection|judge|judge-report|invariance|monotonicity|gates|validate|report|costs|costs-ack> <paths...>. See docs\\scoring-quality-program.md for each command contract.')
+  throw new Error('Usage: scoring-evaluation.mjs <prepare-corpus|prepare-shards|merge-shards|spot-checks|silver-references|source-references|human-labels|extraction|layout-integrity|evidence-selection|judge|judge-report|invariance|monotonicity|rubric-report|grade-report|gates|validate|report|costs|costs-ack> <paths...>. See docs\\scoring-quality-program.md for each command contract.')
 }
 
 try {

@@ -177,6 +177,25 @@ A missing panel leaves its checks `insufficient` with the note `panel-not-suppli
 
 A four-job development trial (mini low, Luna low and Luna high, four repeats each) found that regeneration is itself a material source of variation. Within one configuration, typically 30-90% of criteria cited the same job requirement between two repeats, and criterion counts varied by up to three. Different models overlapped less (about 25-60%). Two generations rejected a position description as "not a job posting". On the longest job document, exact-quote validation failed for most mini and Luna-low attempts, even after the allowed correction, while Luna high completed every attempt. Treat a saved job rubric as part of the scoring configuration: compare analyses only when they use the same saved rubric, and do not regenerate rubrics to "retry" a score. These are lexical development measurements on four documents, not a model selection or a validated rubric quality ranking.
 
+### Running rubric and grade generation panels
+
+`scripts\scoring-evaluation-run.mjs` also runs generation panels, with the same identity, deadlines, cost ledger and resumable checkpoints as scoring runs:
+
+- A `"kind": "rubric-generation"` manifest supplies a `rubricRepeatabilitySuiteSchema` suite, `documents` (`[{ "sourceId", "document" }]`), `settings`, `prices` and an explicit `createdAt`.
+- A `"kind": "grade-generation"` manifest supplies a `gradeGenerationSuiteSchema` suite (`score-grade-generation-v1`), `fixtures` (`[{ "sourceId", "fixture": { "ladder", "seed", "sourceSet", "documents" } }]`) and the same other fields. A fixture is a privately frozen copy of one confirmed ladder: its record, captured seed job and rubric, confirmed source set and extracted reference documents.
+
+Preflight checks every frozen source hash, task binding, model version and price before any paid call. Each completed job writes a private `<hash>.rubric.json` or `<hash>.grades.json` artifact next to `observations.json`; failures keep a bounded private reason.
+
+```powershell
+node scripts\scoring-evaluation-run.mjs C:\private-evals\rubric-generation.json C:\private-evals\runs\rubrics --confirm-paid-inference
+node scripts\scoring-evaluation.mjs rubric-report C:\private-evals\rubric-generation.json C:\private-evals\runs\rubrics C:\private-evals\reports\rubric-repeatability-job.json
+node scripts\scoring-evaluation.mjs grade-report C:\private-evals\grade-generation.json C:\private-evals\runs\grades C:\private-evals\reports\rubric-repeatability-grade.json
+```
+
+Grade generation plans one competency set per repetition, then drafts every requested grade and runs the independent grade review on each draft. A grade counts as a valid generation only when its draft passes validation **and** the review returns `supported`; `needs-sources` outcomes and failures are counted separately. A broken frozen fixture stops the run instead of being recorded as a model failure. Report cells are one per job document, or one per ladder grade (`<ladder>:gs-<grade>`), and are the `rubricGeneration` panel inputs for `score-engineering-targets-v2`. Reports must be written outside the private run directory.
+
+`createEvaluationSettings` accepts optional `tasks` bindings for `jobRubric`, `gradeCompetencies`, `gradeDraft` and `gradeReview`. Without them it produces exactly the same snapshot as before.
+
 ## Executor contract
 
 Large offline scoring suites can be partitioned into bounded private runner manifests without buying inference:
