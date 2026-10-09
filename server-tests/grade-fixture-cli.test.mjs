@@ -49,6 +49,36 @@ test('identity comes from a current token for the configured tenant, not caller-
   ]) assert.throws(() => fixtureIdentity(value, tenant, now))
 })
 
+test('identity accepts only the Cosmos resource URI variants or its first-party application ID', () => {
+  for (const aud of [
+    'https://cosmos.azure.com', 'https://cosmos.azure.com/',
+    'a232010e-820c-4083-83bb-3ace5fc29d0b',
+  ]) assert.deepEqual(fixtureIdentity(token({ aud }), tenant, now), { tenantId: tenant, oid })
+  for (const aud of [
+    'https://graph.microsoft.com', '00000003-0000-0000-c000-000000000000',
+    'https://management.azure.com', 'https://storage.azure.com',
+    'https://cosmos.azure.com/.default', 'https://graph.microsoft.com/.default',
+    'https://cosmos.azure.com.evil.test', 'https://cosmos.windows-ppe.net',
+    'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', '',
+    ['a232010e-820c-4083-83bb-3ace5fc29d0b'], null, 1,
+  ]) assert.throws(() => fixtureIdentity(token({ aud }), tenant, now), /current Cosmos token/)
+})
+
+test('Cosmos application-ID audience still requires the configured tenant, a valid OID and both expirations', () => {
+  const cosmosToken = token({ aud: 'a232010e-820c-4083-83bb-3ace5fc29d0b' })
+  for (const change of [
+    { tid: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa' }, { tid: null },
+    { oid: 'not-an-object-id' }, { oid: null },
+    { exp: now / 1000 }, { exp: now / 1000 - 1 }, { exp: '1791507600' },
+  ]) {
+    assert.throws(() => fixtureIdentity(token({ aud: 'a232010e-820c-4083-83bb-3ace5fc29d0b', ...change }), tenant, now),
+      /current Cosmos token/)
+  }
+  for (const expiresOnTimestamp of [now, now - 1, undefined, NaN, Infinity, String(now + 3600_000)]) {
+    assert.throws(() => fixtureIdentity({ ...cosmosToken, expiresOnTimestamp }, tenant, now), /current Cosmos token/)
+  }
+})
+
 test('private output paths refuse both this checkout and other Git repositories', async () => {
   await assert.rejects(privateFixtureDestination(resolve('private-grade-fixture.json')), /outside every Git checkout/)
   const other = join(directory, 'other-repo')
