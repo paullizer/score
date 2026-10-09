@@ -152,7 +152,7 @@ function csvRecords(bytes, criterionCount) {
   assert.deepEqual(header, [
     'Candidate name', 'Job/grade', 'Overall score', 'Overall assessment',
     ...Array.from({ length: criterionCount }, (_, index) => `C${index + 1}`),
-    'Analysis date', 'Source', 'Analysis link', 'Resume link', 'Job/grade link',
+    'Analysis date', 'Source', 'Analysis link', 'Resume link', 'Job/grade link', 'Rubric version',
   ])
   return rows.map((row) => {
     assert.equal(row.length, header.length)

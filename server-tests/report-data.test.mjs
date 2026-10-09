@@ -496,6 +496,6 @@ test('grade headings use the frozen seed job title while approved grade/version 
   assert.equal(target.presentation.organization, job.record.job.organization)
   assert.equal(target.presentation.description, grade.version.rubric.description)
   assert.equal(target.presentation.grade, 'GS-9')
-  assert.equal(target.presentation.versionLabel, 'Approved GS-9 · rubric v1')
+  assert.equal(target.presentation.versionLabel, `Approved GS-9 · rubric v1 · ${grade.selection.versionHash.slice(0, 8)}`)
   assert.ok(!JSON.stringify(target.presentation).includes('draft'))
 })

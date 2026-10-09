@@ -114,6 +114,33 @@ Nonempty action bodies must use supported JSON and the exact action schema.
 Lifecycle actions always require the **run** ETag, never a comparison ETag.
 `RealAnalysisDetail` is an alias of the existing `RealAnalysisRunDetail`.
 
+### Approved job rubric targets
+
+While `features.rubricApprovalRequired` is on (the default), `GET /targets` lists
+only the approved version of each job rubric and reports how many ready jobs were
+left out in `unapprovedJobRubrics`, and `POST /` refuses any other job rubric
+version with HTTP 409. An approved target's selection carries the `approvalId`
+in force, and its summary carries `approvedAt` and `newerDraftAvailable`; a
+selection that names an approval that has since been superseded is stale. The
+frozen target snapshot keeps the selection, so every run records which approval
+authorized it. Replays and retries of accepted work re-validate their frozen
+selections without the approval check, so a later approval never strands them.
+GS grade targets were already limited to approved versions. Turning the switch
+off lets new work use any saved job rubric version again; it doesn't change
+earlier runs or approvals. `GET /targets` and `POST /` both read the switch from
+the request's current Admin settings.
+
+Scores are comparable only within one exact rubric version. Report targets label
+their version with the first 8 characters of the rubric hash (`Rubric v2 ·
+1a2b3c4d · source document v1`, `Approved GS-9 · rubric v1 · 1a2b3c4d`), and
+highlights and ranks stay within each exact target. When a run includes more
+than one rubric hash for the same job, or for the same grade of a ladder, report
+data adds a **Rubric versions differ** notice that the PDF, Word and PowerPoint
+writers show and CSV carries in **Report disclosures**. Every CSV row includes
+its exact version and short hash in **Rubric version**, even in single-target
+exports. `mixedRubricVersions()` in `src/domain/real-analyses.ts` decides
+this for reports and the analysis pages alike.
+
 ## Human QC and prompt calibration
 
 Human feedback is a separate API under `/api/workspaces/:workspaceId/qc`, never a

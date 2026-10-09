@@ -10,7 +10,7 @@ import {
   requireReportNarratives, targetNarrativeDisclosures, targetNarrativeParagraphs,
 } from './narratives'
 import {
-  criterionScoreLabel, evidenceStatusLabel, formatReportWeight, overallScoreLabel, reportTitle,
+  criterionScoreLabel, evidenceStatusLabel, formatReportWeight, mixedRubricReportNotice, overallScoreLabel, reportTitle,
 } from './presentation'
 import { readableAnalysisDate, readableCandidateName, readableCompletionNotice, selectKeyCriteria } from './readable'
 import type { ReadableCriterion } from './readable'
@@ -855,6 +855,8 @@ export async function generatePptxReport(report: AnalysisReport, options?: Repor
   validatedReportLinkContext(report, options)
   const deck = new ReportDeck(report, options, startedAt)
   opening(deck)
+  const mixedVersions = mixedRubricReportNotice(report.groups.map(group => group.target))
+  if (mixedVersions) reportNotice(deck, 'Rubric versions differ', [{ key: 'mixed-rubric-versions', text: mixedVersions }])
   const agenda = reserveAgenda(deck)
   const contentsByTarget = new Map(agenda.flatMap(page => page.entries.map(entry => [entry.group.target.id, page.number] as const)))
   const destinations = new Map<string, number>()

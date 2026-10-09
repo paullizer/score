@@ -3,7 +3,7 @@ import type {
 } from '../../domain/analysis-reports'
 import { getDisplayName } from '../../domain/displayNames'
 import {
-  evidenceStatusLabel, overallScoreLabel, REPORT_HUMAN_REVIEW_NOTICE,
+  evidenceStatusLabel, mixedRubricReportNotice, overallScoreLabel, REPORT_HUMAN_REVIEW_NOTICE,
   REPORT_TITLE,
 } from './presentation'
 import {
@@ -52,6 +52,8 @@ function writeIntroduction<Color>(layout: DocumentReportLayout<Color>, report: A
   ].join('\n'), { size: 12, leading: 19, bold: true, after: 12 })
   layout.paragraph(readableCompletionNotice(report.counts, report.groups.length > 1),
     { size: 11, leading: 16, bold: true, after: 8 })
+  const mixedVersions = mixedRubricReportNotice(sections.map(section => section.group.target))
+  if (mixedVersions) layout.paragraph(mixedVersions, { size: 11, leading: 16, bold: true, after: 8 })
   layout.paragraph(REPORT_HUMAN_REVIEW_NOTICE, { size: 9.5, leading: 14, color: layout.colors.muted, after: 8 })
   layout.paragraph('Links open the saved analysis and its source documents. Application access is required.',
     { size: 9.5, leading: 14, color: layout.colors.muted, after: 10 })
