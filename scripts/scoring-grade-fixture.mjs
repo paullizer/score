@@ -56,7 +56,7 @@ export function fixtureIdentity(token, tenantId, now = Date.now()) {
   if (!claims || typeof claims.tid !== 'string' || claims.tid.toLowerCase() !== tenantId.toLowerCase() ||
     typeof claims.oid !== 'string' ||
     !/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i.test(claims.oid ?? '') ||
-    !['https://cosmos.azure.com', 'https://cosmos.azure.com/'].includes(claims.aud) ||
+    !['https://cosmos.azure.com', 'https://cosmos.azure.com/', 'a232010e-820c-4083-83bb-3ace5fc29d0b'].includes(claims.aud) ||
     !Number.isSafeInteger(claims.exp) || claims.exp * 1000 <= now ||
     !Number.isFinite(token.expiresOnTimestamp) || token.expiresOnTimestamp <= now) {
     throw new Error('Azure CLI identity must be a current Cosmos token for the configured tenant.')

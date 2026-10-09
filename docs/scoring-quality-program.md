@@ -224,6 +224,18 @@ identity needs its existing Azure data-plane read access and workspace-owner
 membership. It cannot choose another object ID, infer application-admin roles,
 log in for you or grant permissions. Nothing writes to Score or invokes a model.
 
+The exporter requests only `https://cosmos.azure.com/.default`. Its identity
+check accepts the Cosmos resource URI (with or without a trailing slash) or
+the first-party Azure Cosmos DB application ID
+`a232010e-820c-4083-83bb-3ace5fc29d0b` as the token audience, never arbitrary
+application IDs or other resource scopes. Microsoft documents that the
+[`aud` claim can be a resource URI or application GUID](https://learn.microsoft.com/en-us/entra/identity-platform/access-token-claims-reference#payload-claims).
+Read-only `az ad sp show --id a232010e-820c-4083-83bb-3ace5fc29d0b`
+directory metadata identifies this application as Azure Cosmos DB and lists
+`https://cosmos.azure.com` among its service principal names. The configured
+tenant, object-ID format, JWT expiration and SDK expiration checks still apply
+to every accepted audience. Tokens are never printed for diagnosis.
+
 The export contains exactly `{ ladder, seed, sourceSet, documents }` for a
 confirmed, current source set. It uses the captured seed, not a newer live job
 or rubric, revalidates source ownership and integrity, rejects a ladder changed
