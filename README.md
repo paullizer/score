@@ -72,6 +72,8 @@ npm run preview
 
 `npm run security:check` runs the same supply-chain, XSS, access-control and outbound-request checks that run on pull requests, against your changes since `origin/main` (including uncommitted files). See [Security scanning](docs/security-scanning.md) for the rules and options.
 
+The [Microsoft-Decision-1 offline evidence spike](docs/decision-evaluation.md) includes a verified native choice adapter, source-bound manifests, dry-run/paid-run commands, and immutable cost/provenance captures. Two bounded synthetic panels were executed; private corpus data was only prepared and dry-run. **Current results are a production no-go**, not a model/task switch or validated corpus-quality claim. The normal explanatory assessor/reviewer and application settings remain unchanged.
+
 The application uses React 18, TypeScript, Vite, Tailwind CSS, React Router, and accessible Radix dialog primitives. Styling is custom: restrained glass surfaces, a warm light theme, and a charcoal dark theme. Theme colors are centralized in `index.html` as Clawpilot CSS variables. Light, Dark, and System preferences are supported; the host's `scoutTheme` query parameter takes precedence when supplied.
 
 ## Explore the workflow

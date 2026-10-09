@@ -8,6 +8,8 @@ The goal is repeatable document-evidence scores, not a required user workflow fo
 
 The initial program targets four existing jobs, 50 simulated resume families, 300 criterion references and 30 blind human spot checks. These are program targets, not implicit schema defaults. Resume families and all derived variants must stay in one split. Keep private evidence and labels outside this public repository.
 
+The separate [Microsoft-Decision-1 evidence-verification spike](decision-evaluation.md) uses the verified native decision endpoint rather than Chat Completions. It preserves the existing production pipeline and reports source-bound five-way evidence labels, failures, deferrals, probability diagnostics, and perturbations. The executed synthetic trials are a **production no-go**; the second prompt reused the same authored development cases and is not independent improvement evidence. Development corpus preparation/dry-run does not authorize private inference, and previous mini/Luna outputs are not human truth.
+
 ## Offline commands
 
 Build with the existing toolchain:
