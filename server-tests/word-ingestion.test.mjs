@@ -11,6 +11,14 @@ import {
 import { seedRealJob } from '../src/services/gradeLadders.test-support.mjs'
 import { docxFile, legacyDocFile } from './word-fixtures.mjs'
 
+const levels = [
+  { level: 1, examples: 'Lists related training or TypeScript as a skill.' },
+  { level: 2, examples: 'Documents one TypeScript project or task.' },
+  { level: 3, examples: 'Documents recurring TypeScript development duties.' },
+  { level: 4, examples: 'Documents independent TypeScript work across a larger service.' },
+  { level: 5, examples: 'Documents leading TypeScript work with team or product outcomes.' },
+]
+
 const MIME = { pdf: 'application/pdf', markdown: 'text/markdown', docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', doc: 'application/msword' }
 const resumeText = resumeParagraphs.map(paragraph => paragraph.text).join('\n')
 const jobText = 'Engineering specialist\nRequirements\nApply engineering methods to defined projects and communicate findings.'
@@ -72,9 +80,14 @@ function jobModel(fixture) {
     clock: fixture.clock, getToken: async () => 'synthetic-token',
     fetch: async (_url, init) => {
       const request = JSON.parse(init.body)
+      if (request.response_format.json_schema.name === 'score_job_rubric_review') {
+        return Response.json({ model: 'synthetic-model', choices: [{ message: { content: JSON.stringify({
+          summary: 'The rubric matches its job source and evidence scale.', findings: [],
+        }) } }] })
+      }
       const source = request.messages[1].content
-      const match = /<paragraph id="([^"]+)"[^>]*>(Apply engineering methods[^<]*)<\/paragraph>/.exec(source)
-      assert.ok(match, 'The generated rubric must quote the actual extracted Word requirement.')
+      const catalog = JSON.parse(source.replace(/^SOURCE PASSAGE CATALOG JSON:\n/, ''))
+      assert.ok(JSON.stringify(catalog).includes('Apply engineering methods'), 'The generated rubric must receive the actual extracted Word requirement.')
       return Response.json({ model: 'synthetic-model', choices: [{ message: { content: JSON.stringify({
         isJobPosting: true, rejectionReason: null, title: 'Engineering specialist',
         organization: null, location: null, arrangement: null, employmentType: null, grade: null, series: null,
@@ -82,8 +95,7 @@ function jobModel(fixture) {
         criteria: [{
           label: 'Engineering methods', description: 'Apply engineering methods within defined projects.',
           weight: 100, requirementType: 'required',
-          guidance: '0: none; 1: minimal; 2: limited; 3: independent; 4: advanced; 5: expert.',
-          sourceParagraphId: match[1], quote: match[2],
+          sourcePassageIds: [1], levels,
         }],
       }) } }] })
     },
@@ -100,6 +112,10 @@ async function processJob(fixture, bytes, text, options = {}) {
     model: jobModel(fixture), validateRealRubric: jobs.validateRealRubric,
     ...options,
   }, { maxJobs: 1 })
+  // A workspace owner approves each new rubric, as new analyses require by default.
+  for (const { record } of [...fixture.jobs.records.values()]) {
+    if (record.job.status === 'ready' && record.job.rubricId && !record.rubricApproval) fixture.jobs.store._approve(record.workspaceId, record.id)
+  }
 }
 
 for (const format of ['docx', 'doc']) {

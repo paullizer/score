@@ -3,12 +3,17 @@ import type { Citation } from './types'
 
 export const RUBRIC_QA_VERSION = 'score-rubric-qa-v1' as const
 
-export type RubricQaFindingCode =
-  | 'scale-structure'
-  | 'unobservable-wording'
-  | 'shared-source-text'
-  | 'similar-requirement'
-  | 'similar-label'
+/** Codes the model-free checks produce. */
+export const RUBRIC_QA_CHECK_CODES = [
+  'scale-structure', 'unobservable-wording', 'shared-source-text', 'similar-requirement', 'similar-label',
+] as const
+export type RubricQaCheckCode = typeof RUBRIC_QA_CHECK_CODES[number]
+
+/** Codes the rubric review (one model pass) may report. Review findings are always warnings. */
+export const RUBRIC_REVIEW_FINDING_CODES = ['same-capability', 'not-observable', 'scale-mismatch', 'unsupported-by-source'] as const
+export type RubricReviewFindingCode = typeof RUBRIC_REVIEW_FINDING_CODES[number]
+
+export type RubricQaFindingCode = RubricQaCheckCode | RubricReviewFindingCode
 
 export interface RubricQaFinding {
   code: RubricQaFindingCode

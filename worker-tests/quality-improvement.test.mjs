@@ -6,6 +6,14 @@ import {
   completeAssessmentTrial as completeTrial, queueAssessmentEvaluation as evaluationPlan,
 } from '../server-tests/qc.test-support.mjs'
 
+const levels = [
+  { level: 1, examples: 'Lists related training.' },
+  { level: 2, examples: 'Documents one relevant task.' },
+  { level: 3, examples: 'Documents recurring relevant work.' },
+  { level: 4, examples: 'Documents independent complex work.' },
+  { level: 5, examples: 'Documents leading relevant work with outcomes.' },
+]
+
 const model = {
   endpoint: 'https://score-unit.openai.azure.com', deployment: 'unit', modelName: 'unit',
   async getToken() { return 'unit-token' },
@@ -459,8 +467,8 @@ test('real job-rubric trials validate generated citations and weights without in
     isJobPosting: true, rejectionReason: null, title: target.document.title, organization: null, location: null,
     arrangement: null, employmentType: null, grade: null, series: null, description: 'An independently grounded proposed work rubric.', warnings: [],
     criteria: [{
-      label: 'Documented engineering analysis', description: paragraph.text, weight: 100, guidance: target.rubric.criteria[0].guidance,
-      requirementType: 'required', sourceParagraphId: paragraph.id, quote: paragraph.text,
+      label: 'Documented engineering analysis', description: paragraph.text, weight: 100,
+      requirementType: 'required', sourcePassageIds: [1], levels,
     }],
   }
   const requests = [], records = clone([...f.analysis.store.values]), sources = clone([...f.analysis.blobs.values])
@@ -485,7 +493,7 @@ test('real job-rubric trials validate generated citations and weights without in
   assert.equal((await api.runQcTrial(pack.cases[0], 'jobRubric', detail.plan.processingSettings,
     dependencies(f, { model: modelFor(invalid) }), new AbortController().signal)).trial.status, 'failed')
   invalid.criteria[0].weight = 100
-  invalid.criteria[0].sourceParagraphId = 'foreign-source-paragraph'
+  invalid.criteria[0].sourcePassageIds = [999]
   assert.equal((await api.runQcTrial(pack.cases[0], 'jobRubric', detail.plan.processingSettings,
     dependencies(f, { model: modelFor(invalid) }), new AbortController().signal)).trial.status, 'failed')
   assert.deepEqual([...f.analysis.store.values], records)
@@ -512,14 +520,24 @@ test('real GS trials reuse full source, qualification, exclusion, and independen
         seedCriterionIds: [], citations: row.sourceCitations,
       })), issues: [],
     }
-    else if (input.operation === 'draft-grade') output = {
-      description: 'Source-grounded draft with separate unscored qualifications.',
-      criteria: criteria.map(row => ({
-        competencyId: row.competencyId, key: row.key, description: row.description, weight: row.weight,
-        support: row.support, sourceCitations: row.sourceCitations, gradeBasis: row.gradeBasis,
-        interpretation: row.interpretation, guidance: row.guidance,
-      })),
-      qualifications: target.version.qualifications, issues: [],
+    else if (input.operation === 'draft-grade') {
+      // Draft prompts list passages with IDs; drafts cite every passage of each paragraph the saved version quotes.
+      const body = JSON.parse(request.user)
+      const passageIds = citation => body.sources.find(source => source.documentId === citation.documentId)?.sections
+        .flatMap(section => section.paragraphs).find(paragraph => paragraph.id === citation.paragraphId)?.passages
+        .map(passage => passage.passageId) ?? []
+      const refs = citations => citations.map(citation => ({ documentId: citation.documentId, passageIds: passageIds(citation) }))
+      output = {
+        description: 'Source-grounded draft with separate unscored qualifications.',
+        criteria: criteria.map(row => ({
+          competencyId: row.competencyId, key: row.key, description: row.description, weight: row.weight,
+          support: row.support, sourceCitations: refs(row.sourceCitations), gradeBasis: refs(row.gradeBasis),
+          interpretation: row.interpretation, guidance: row.guidance,
+          levels: row.support === 'direct' || row.support === 'derived' ? row.levels ?? levels : null,
+        })),
+        qualifications: target.version.qualifications.map(qualification => ({ ...qualification, citations: refs(qualification.citations) })),
+        issues: [],
+      }
     }
     else if (input.operation === 'independent-grounding-review') output = { outcome: reviewOutcome, issues: [] }
     else throw new Error(`Unexpected test stage ${input.operation}`)

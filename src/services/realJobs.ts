@@ -6,6 +6,8 @@ import {
   type RealJobsPage,
   type RealJobSummary,
 } from '../domain/real-jobs'
+import type { RubricCheckState } from '../domain/rubric-approval'
+import { ASSIST_LIMITS } from '../domain/assist'
 import { cloudJsonRequest, cloudLifecycleRequest } from './cloudWorkspace'
 import type { LifecycleAction, LifecycleImpact, LifecycleOperation } from '../domain/lifecycle'
 import { isSafeUploadedFilename, uploadedFileKind } from '../domain/source-files'
@@ -38,6 +40,8 @@ export async function fetchJobProcessingFeatures(signal?: AbortSignal): Promise<
     wordDocumentImports: features.realJobImports === true && features.wordDocumentImports === true,
     rubricAssistant: features.rubricAssistant === true,
     rubricExports: features.rubricExports === true,
+    rubricApprovalRequired: features.rubricApprovalRequired !== false,
+    rubricChecks: features.rubricChecks === true,
     limits: {
       ...JOB_IMPORT_LIMITS,
       ...features.limits,
@@ -179,6 +183,41 @@ export async function saveRealJobRubric(
     `${jobsPath(workspaceId)}/${encodeURIComponent(jobId)}/rubric`,
     { method: 'PUT', headers, body: JSON.stringify({ rubric }), signal },
   )
+  const detail = response.job
+  return { ...normalizeSummary(detail), document: detail.document, rubricVersions: detail.rubricVersions }
+}
+
+function rubricPath(workspaceId: string, jobId: string): string {
+  return `${jobsPath(workspaceId)}/${encodeURIComponent(jobId)}/rubric`
+}
+
+/** The checks and approval state of one exact saved version. */
+export async function getRealJobRubricChecks(
+  workspaceId: string, jobId: string, rubricId: string, version: number, signal?: AbortSignal,
+): Promise<RubricCheckState> {
+  const query = new URLSearchParams({ rubricId, version: String(version) })
+  const response = await cloudJsonRequest<{ review: RubricCheckState }>(`${rubricPath(workspaceId, jobId)}/checks?${query}`, { method: 'GET', signal })
+  return response.review
+}
+
+/** Runs the rubric checks once for a saved version; repeated calls return the stored results. Includes one model review. */
+export async function runRealJobRubricChecks(
+  workspaceId: string, jobId: string, rubricId: string, version: number, signal?: AbortSignal,
+): Promise<RubricCheckState> {
+  const response = await cloudJsonRequest<{ review: RubricCheckState }>(`${rubricPath(workspaceId, jobId)}/checks`, {
+    method: 'POST', body: JSON.stringify({ rubricId, version }), signal, timeoutMilliseconds: ASSIST_LIMITS.clientTimeoutMilliseconds,
+  })
+  return response.review
+}
+
+/** Owner-only: approves exactly the checked version, identified by its hash, against the job's current ETag. */
+export async function approveRealJobRubric(
+  workspaceId: string, jobId: string, review: Pick<RubricCheckState, 'rubricId' | 'version' | 'rubricHash'>, etag: string,
+): Promise<RealJobDetail> {
+  const response = await cloudJsonRequest<{ job: RealJobWireDetail }>(`${rubricPath(workspaceId, jobId)}/approve`, {
+    method: 'POST', headers: { 'If-Match': etag },
+    body: JSON.stringify({ rubricId: review.rubricId, version: review.version, rubricHash: review.rubricHash }),
+  })
   const detail = response.job
   return { ...normalizeSummary(detail), document: detail.document, rubricVersions: detail.rubricVersions }
 }

@@ -44,7 +44,10 @@ before(async () => {
   ;({ createRoot } = await import('react-dom/client'))
   await build({ stdin: { resolveDir: process.cwd(), loader: 'tsx', contents: `
     export { RubricPanel } from './src/features/rubrics/RubricPanel'
+    export { GradeDraftEditor } from './src/features/grade-ladders/GradeDraftEditor'
+    export { GradeLaddersContext } from './src/app/grade-ladders-context'
     export { WorkspaceContext } from './src/app/workspace-context'
+    export { EVIDENCE_SCALE_VERSION, renderEvidenceGuidance } from './src/domain/evidence-scale'
     export { BrowserRouter } from 'react-router-dom'
   ` }, outfile: join(output, 'ui.mjs'), bundle: true, packages: 'external', format: 'esm', platform: 'node', jsx: 'automatic', logLevel: 'silent' })
   ui = await import(pathToFileURL(join(output, 'ui.mjs')).href)
@@ -67,7 +70,7 @@ after(async () => {
 })
 
 const citation = (quote) => ({ documentId: 'doc-1', documentVersion: 1, paragraphId: 'p1', page: 1, heading: 'Duties', quote })
-const assistant = { promptVersion: 'score-rubric-assist-v1', model: 'fixture-model' }
+const assistant = { promptVersion: 'score-rubric-assist-v2', model: 'fixture-model' }
 const changed = (operations, reply = 'Updated the draft.') => ({ outcome: 'changed', reply, warnings: [], assistant, operations })
 
 function fixture() {
@@ -107,7 +110,7 @@ function context({ assist, rubricAssistant = true, role = 'owner' } = {}) {
         source: () => ({ kind: 'pdf', displayName: 'job.pdf', originalContentType: 'application/pdf' }),
         assistRubric: async (jobId, request, signal) => {
           assistCalls.push({ jobId, request, signal })
-          return assist ? assist(request, signal) : changed([{ type: 'updateCriterion', criterionId: 'criterion-1', changes: { label: 'Data analysis', citation: citation('Lead data analysis') } }], 'Updated the focused criterion.')
+          return assist ? assist(request, signal) : changed([{ type: 'updateCriterion', criterionId: 'criterion-1', changes: { label: 'Data analysis', citation: [citation('Lead data analysis')] } }], 'Updated the focused criterion.')
         },
       },
     },
@@ -138,6 +141,110 @@ function button(label, within = document) {
 const dialog = () => document.querySelector('[role="dialog"]')
 const field = (key, selector = 'input, textarea, select') => document.querySelector(`[data-change-key="${key}"]`)?.querySelector(selector)
 const highlight = (key) => document.querySelector(`[data-change-key="${key}"] .changed-field`)
+
+async function renderGradeDraft({ editable = true, scaled = true, sourceSet = {} } = {}) {
+  const levels = [
+    'Lists engineering coursework or training.',
+    'Describes one project applying engineering methods.',
+    'Documents repeated engineering project work.',
+    'Documents owning complex engineering work across a service.',
+    'Documents leading engineering programs with stated outcomes.',
+  ].map((examples, index) => ({ level: index + 1, examples }))
+  const level = {
+    head: { id: 'grade-head-one', grade: 9 }, etag: '"head-etag"',
+    version: { version: 1, sourceSetId: 'source-set-one',
+      rubric: {
+        id: 'grade-version-one', groupId: 'grade-head-one', kind: 'grade', dataKind: 'real', grade: 'GS-9',
+        name: 'Engineering grade rubric', description: 'Captured engineering work expectations.',
+        version: 1, createdAt: '2026-10-09T00:00:00.000Z',
+        provenance: { kind: 'generated', model: 'fixture', promptVersion: 'fixture' },
+        ...(scaled ? { scaleVersion: ui.EVIDENCE_SCALE_VERSION } : {}),
+        criteria: [{
+          id: 'engineering', competencyId: 'engineering', label: 'Engineering', description: 'Documented engineering projects.',
+          weight: 100, support: 'direct', interpretation: 'A reviewer checks the cited work-level evidence.',
+          gradeBasis: [], sourceCitations: [],
+          guidance: scaled ? ui.renderEvidenceGuidance(levels) : 'Legacy free-text guidance.',
+          ...(scaled ? { levels } : {}),
+        }, {
+          id: 'excluded', competencyId: 'excluded', label: 'Excluded work', description: 'The captured reference excludes this work.',
+          weight: 0, support: 'not-applicable', interpretation: 'The exclusion is supported by the captured source.',
+          gradeBasis: [], sourceCitations: [], guidance: 'Unscored because this work does not apply.',
+        }],
+      },
+      qualifications: [{ id: 'qualification-one', text: 'Education or experience are alternative paths.',
+        interpretation: 'These paths are separate and unscored.', support: 'direct', citations: [] }],
+    },
+  }
+  const calls = []
+  const original = structuredClone(level)
+  const api = {
+    canEdit: () => editable,
+    sourceSet: async () => sourceSet,
+    saveDraft: async (...args) => { calls.push(args) },
+  }
+  root ??= createRoot(document.getElementById('root'))
+  await act(async () => {
+    root.render(h(ui.BrowserRouter, null, h(ui.WorkspaceContext.Provider, { value: frontendWorkspaceContext() },
+      h(ui.GradeLaddersContext.Provider, { value: api }, h(ui.GradeDraftEditor, {
+        ladderId: 'ladder-one', level, onClose: () => {},
+      })))))
+    await pause()
+  })
+  return { calls, level, original }
+}
+
+function gradeLevelField(level) {
+  const label = [...document.querySelectorAll('.grade-editor-criterion label')].find(item =>
+    item.querySelector('.field-label')?.textContent.startsWith(`${level} · `))
+  assert.ok(label, `Editable grade level ${level} is visible`)
+  return label.querySelector('textarea')
+}
+
+test('grade drafts edit scale examples and save normalized code-rendered guidance without changing exclusions or qualifications', async () => {
+  const { calls, level, original } = await renderGradeDraft()
+  const examples = gradeLevelField(2)
+  assert.ok(examples.getAttribute('aria-describedby'), 'The fixed scale definition is associated with the input')
+  assert.equal(examples.maxLength, 600)
+  await act(async () => {
+    Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value').set.call(examples,
+      '  Describes one engineering project\n with documented calculations.  ')
+    examples.dispatchEvent(new window.Event('input', { bubbles: true }))
+  })
+  await click(button('Save draft and request review'))
+  assert.equal(calls.length, 1)
+  const [ladderId, grade, saved, etag] = calls[0]
+  assert.deepEqual([ladderId, grade, etag], ['ladder-one', 9, '"head-etag"'])
+  assert.equal(saved.rubric.criteria[0].levels[1].examples, 'Describes one engineering project with documented calculations.')
+  assert.equal(saved.rubric.criteria[0].guidance, ui.renderEvidenceGuidance(saved.rubric.criteria[0].levels))
+  assert.equal(saved.rubric.provenance, undefined)
+  assert.deepEqual(saved.rubric.criteria[1], original.version.rubric.criteria[1])
+  assert.deepEqual(saved.qualifications, original.version.qualifications)
+  assert.deepEqual(level, original, 'The saved version remains immutable')
+})
+
+test('a blank grade-level example stays in the draft with an inline error instead of submitting invalid work', async () => {
+  const { calls } = await renderGradeDraft()
+  const examples = gradeLevelField(2)
+  await act(async () => {
+    Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value').set.call(examples, '')
+    examples.dispatchEvent(new window.Event('input', { bubbles: true }))
+  })
+  await click(button('Save draft and request review'))
+  assert.equal(calls.length, 0)
+  assert.equal(examples.value, '')
+  assert.equal(examples.getAttribute('aria-invalid'), 'true')
+  assert.ok(document.querySelector('[role="alert"]'), 'The validation error is visible')
+})
+
+test('grade scale fields inherit read-only access and legacy grades retain free-text guidance', async () => {
+  await renderGradeDraft({ editable: false })
+  assert.equal(gradeLevelField(2).matches(':disabled'), true)
+  assert.equal(button('Save draft and request review').disabled, true)
+  await act(async () => { root.unmount(); await pause() }); root = null
+  await renderGradeDraft({ scaled: false })
+  assert.ok([...document.querySelectorAll('textarea')].some(item => item.value === 'Legacy free-text guidance.'))
+  assert.equal([...document.querySelectorAll('label')].some(item => item.querySelector('.field-label')?.textContent.startsWith('2 · ')), false)
+})
 const formFieldset = () => dialog().querySelector('form fieldset')
 function tab(label) {
   const found = [...document.querySelectorAll('[role="tab"]')].find((item) => item.textContent.startsWith(label))

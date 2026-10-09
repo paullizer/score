@@ -4,9 +4,11 @@ import type { JobProcessingFeatures, RealJobDetail, RealJobSummary } from '../do
 import type { RubricAssistRequest } from '../domain/rubric-assist'
 import { CloudAccessChangedError, CloudApiError, CloudConflictError, LifecycleOperationError, workspaceAccessStamp } from '../services/cloudWorkspace'
 import {
+  approveRealJobRubric,
   cancelRealJob,
   fetchJobProcessingFeatures,
   getRealJob,
+  getRealJobRubricChecks,
   importRealJobFile,
   importRealJobMarkdown,
   importRealJobPdf,
@@ -15,9 +17,11 @@ import {
   realJobOriginalUrl,
   renameRealJob,
   retryRealJob,
+  runRealJobRubricChecks,
   saveRealJobRubric,
   getRealJobLifecycleImpact, changeRealJobLifecycle,
 } from '../services/realJobs'
+import type { RubricCheckState } from '../domain/rubric-approval'
 import { requestRubricAssist } from '../services/rubricAssist'
 import type { Rubric } from '../domain/types'
 import { WorkspaceContext, type CloudWorkspaceStatus, type PendingLifecycleChange, type RenameEntityTarget, type WorkspaceContextValue } from './workspace-context'
@@ -385,6 +389,27 @@ export function RealJobsBridge({
     }
   }
 
+  async function runRubricChecks(jobId: string, rubricId: string, version: number, signal?: AbortSignal) {
+    const summary = summaries.find((item) => item.job.id === jobId)
+    requirePermission(summary?.rubric ? { kind: 'rubric', id: summary.rubric.groupId } : undefined)
+    return runRealJobRubricChecks(workspaceId, jobId, rubricId, version, signal)
+  }
+
+  async function approveRubric(jobId: string, review: RubricCheckState) {
+    const summary = summaries.find((item) => item.job.id === jobId)
+    if (!summary?.rubric) throw new Error('Load this job and its rubric before approving it.')
+    try {
+      await mutate(() => approveRealJobRubric(workspaceId, jobId, review, summary.etag), remember, { kind: 'rubric', id: summary.rubric.groupId })
+      base.notify(`Version ${review.version} approved. New analyses and grade ladders use this version.`)
+    } catch (error) {
+      if (error instanceof CloudConflictError) {
+        await Promise.all([refresh(), ensureDetail(jobId, true)])
+        throw new Error('This job or rubric changed in another session. The latest version is now shown; review its checks before approving.')
+      }
+      throw error
+    }
+  }
+
   async function assistRubric(jobId: string, request: RubricAssistRequest, signal?: AbortSignal) {
     const effectiveFeatures = features ? jobFeaturesWithPolicy(features, policy.settings) : null
     if (effectiveFeatures?.rubricAssistant !== true) throw new Error('The rubric assistant is not available for this workspace.')
@@ -483,6 +508,9 @@ export function RealJobsBridge({
     importFile,
     importUrl,
     assistRubric,
+    rubricChecks: (jobId, rubricId, version, signal) => getRealJobRubricChecks(workspaceId, jobId, rubricId, version, signal),
+    runRubricChecks,
+    approveRubric,
     originalUrl: (jobId) => realJobOriginalUrl(workspaceId, jobId),
   }
   const value: WorkspaceContextValue = {

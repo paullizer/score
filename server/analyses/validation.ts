@@ -97,6 +97,8 @@ export const analysisTargetSelectionSchema = z.discriminatedUnion('kind', [
   z.strictObject({
     kind: z.literal('job'), jobId: id('job'), rubricId: identifier, rubricVersion: integer, rubricHash: hash,
     documentId: identifier, documentVersion: integer, documentSha256: hash,
+    // Optional: selections frozen before rubric approval existed omit it.
+    approvalId: id('rubric-approval').optional(),
   }),
   z.strictObject({
     kind: z.literal('grade'), ladderId: id('ladder'), grade: z.number().int().min(1).max(15),
@@ -137,7 +139,10 @@ const targetSummaryBase = {
   criterionCount: z.number().int().min(1).max(20),
 }
 const targetSummarySchema = z.discriminatedUnion('kind', [
-  z.strictObject({ ...targetSummaryBase, kind: z.literal('job'), selection: analysisTargetSelectionSchema.options[0] }),
+  z.strictObject({
+    ...targetSummaryBase, kind: z.literal('job'), selection: analysisTargetSelectionSchema.options[0],
+    approvedAt: timestamp.optional(), newerDraftAvailable: z.boolean().optional(),
+  }),
   z.strictObject({
     ...targetSummaryBase, kind: z.literal('grade'), selection: analysisTargetSelectionSchema.options[1],
     context: gradeContextSchema, approvedAt: timestamp, newerDraftAvailable: z.boolean(),

@@ -526,6 +526,32 @@ test('rubric exports are an optional Admin switch that defaults on, needs real j
   } finally { await server.close() }
 })
 
+test('rubric approval is an optional Admin switch that defaults on and is shown with its effective default', async () => {
+  const defaults = createDefaultAdminSettings()
+  assert.equal('rubricApprovalRequired' in defaults.features, false, 'Compiled defaults and the legacy baseline keep their earlier shape')
+  assert.throws(() => parseAdminSettings({ ...defaults, features: { ...defaults.features, rubricApprovalRequired: 'yes' } }))
+  const server = await start()
+  try {
+    const first = await server.request('/api/admin/settings')
+    const field = first.body.fields.find(item => item.path === 'features.rubricApprovalRequired')
+    assert.ok(field, 'The switch is on the Admin settings page')
+    assert.equal(field.label, 'Require approved job rubrics')
+    assert.equal(field.control, 'boolean')
+    assert.equal(field.section, 'intake')
+    assert.equal(field.defaultValue, true, 'The effective default is reported even though the saved revision omits the key')
+    assert.match(field.description, /workspace owner approved/)
+    assert.ok(field.prerequisites.includes('Real jobs are configured'))
+    assert.equal(first.body.settings.features.rubricApprovalRequired, undefined)
+
+    const off = await server.request('/api/admin/settings', { method: 'PATCH', headers: { 'If-Match': first.body.etag }, body: { features: { rubricApprovalRequired: false } } })
+    assert.equal(off.response.status, 200)
+    assert.equal(off.body.settings.features.rubricApprovalRequired, false)
+    assert.equal(off.body.settings.features.rubricExports, undefined, 'Only the switched key changes')
+    const history = await server.request('/api/admin/settings/history?limit=1')
+    assert.equal(history.body.revisions[0].changes.find(change => change.path === 'features.rubricApprovalRequired')?.after, false)
+  } finally { await server.close() }
+})
+
 test('settings updates require exact ETags, publish atomic audit/history, and preserve stale drafts through conflicts', async () => {
   const server = await start()
   try {

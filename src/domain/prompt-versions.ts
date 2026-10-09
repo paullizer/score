@@ -6,7 +6,7 @@ export const PROMPT_FAMILIES = [...EDITABLE_PROMPT_FAMILIES, ...FIXED_PROMPT_FAM
 export type EditablePromptFamily = typeof EDITABLE_PROMPT_FAMILIES[number]
 export type PromptFamily = typeof PROMPT_FAMILIES[number]
 export const PROMPT_RENDERER_VERSION = 'score-prompt-renderer-v1' as const
-export const PROMPT_TEMPLATE_GENERATION = 'score-prompt-templates-v1' as const
+export const PROMPT_TEMPLATE_GENERATION = 'score-prompt-templates-v2' as const
 export const PINNED_ASSESSMENT_SCHEMA_VERSION = 'score-analysis-assessment-qc-v1' as const
 export const PROMPT_REGISTRY_LIMITS = { guidanceCharacters: 4_000, reasonCharacters: 1_000, snapshotBytes: 64 * 1024 } as const
 

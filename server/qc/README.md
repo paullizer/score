@@ -2,6 +2,13 @@
 
 QC records reviewer opinions and runs explicitly requested, isolated prompt experiments. It does **not** edit production scores, approve generated rubrics, train a model, rank people, or replace independent grounding.
 
+The rubric-foundation release preserves frozen scale versions, level examples
+and optional job approval IDs through the shared analysis readers. QC remains
+bound to the exact saved comparison and result revision; a newer rubric draft
+or approval does not replace that evidence. The production assessor and
+grounding review are unchanged until the separate R2 design and release gate
+have passed.
+
 ## Application integration
 
 Mount `createQcRouter` from `routes.ts` under `/api`, after authentication, JSON parsing, processing-policy admission, and same-origin CSRF middleware. Its dependencies are:

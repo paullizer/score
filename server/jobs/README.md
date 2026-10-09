@@ -76,8 +76,9 @@ returns one saved job rubric version as a JSON `RubricExportPayload`
 (`src/domain/rubric-exports.ts`). The browser validates it again and writes the
 file in a worker, so the API never generates documents or calls a model. The
 payload holds the job's facts, the rubric version with its criteria, guidance
-and posting quotes, the latest version number, and the current report policy
-with its settings revision. It contains no candidate data or source bytes.
+and posting quotes, the latest version number, the version's approval status
+(`approved`, `draft` or `superseded`), and the current report policy with its
+settings revision. It contains no candidate data or source bytes.
 
 Any workspace member may call it, subject to application policy, and archived
 jobs and rubrics remain exportable. Each API instance allows 60 rubric export
@@ -99,6 +100,51 @@ Excess requests return 429 through the standard error shape with
 only reads saved records. Rubric version content is immutable, so the export
 matches what the rubric page shows for that version.
 
+## Rubric checks and approval
+
+New analyses and grade ladders use only the version of a job rubric that a
+workspace owner approved, while `features.rubricApprovalRequired` is on (the
+default; an absent key means on). Approval locks one exact saved version: saving
+an edit creates a draft version and the approved version stays in use until a
+newer one is approved. Rubrics made before the evidence scale
+(`score-evidence-ladder-v1`) can't be approved; importing the job again creates a
+rubric that can.
+
+The import worker runs the model-free checks and the shared one-pass model
+review after generation. Its guarded transaction creates the rubric version and
+the hash-bound `rubric-qa` record together, then marks the job ready. A cancelled,
+failed or invalid review never publishes unchecked ready work. This does not
+approve the rubric: a workspace owner still reviews the findings and approves
+the exact saved version.
+
+Approval follows the rubric checks for that version:
+
+- `GET …/jobs/:jobId/rubric/checks?rubricId=…&version=…` (any member) returns
+  `{ review: RubricCheckState }`: the version's `rubricHash`, its status
+  (`approved`, `draft` or `superseded`), the reasons it can't be approved yet,
+  and the stored check results, or `null` when the checks haven't run.
+- `POST …/jobs/:jobId/rubric/checks` with `{ rubricId, version }` (owners and
+  editors) runs the checks once for an edited latest version and stores them as a
+  create-only `rubric-qa` record bound to the version's hash. Later calls return
+  the stored results. The checks are the model-free findings from
+  `src/domain/rubric-qa.ts` (scale problems block approval; overlap and wording
+  a résumé can't show are warnings) plus one review by the job-rubric model with
+  the code-owned prompt `score-job-rubric-review-v1`, whose findings are
+  warnings. The model call runs outside the workspace mutation lease, uses the
+  rubric assistant's per-user limits, and needs new-work admission (`/api/features`
+  reports `rubricChecks`). Changing the checks or the review prompt needs a new
+  `RUBRIC_QA_VERSION`. The API and worker share `worker/rubric-review.ts`; neither
+  substitutes a successful result for invalid, empty or failed model output.
+- `POST …/jobs/:jobId/rubric/approve` with `{ rubricId, version, rubricHash }` and
+  `If-Match` set to the job ETag is owner-only (application admins act as
+  owners). It approves only the latest version, on the scale, with stored checks
+  and no blockers, and only when `rubricHash` matches exactly the reviewed
+  content. One transaction creates a create-only `rubric-approval` record (rubric
+  version and hash, scale version, check record and its hash, the job document's
+  id, version and SHA-256, approver, time, and the approval it supersedes) and
+  moves the job's `rubricApproval` pointer. Other job writes can't change the
+  pointer, and deleting the rubric removes its checks and approvals with it.
+
 ## Storage and worker fencing
 
 Every normal Cosmos create, replacement/claim, and rubric publication includes an
@@ -107,10 +153,12 @@ changes use narrow internal methods; normal writes cannot clear lifecycle flags
 or resurrect a deleted rubric. Workers use that job-container guard, not directory
 or legacy-state permissions.
 
-Every mutating job handler runs entirely inside
-`repository.withWorkspaceMutation`: lifecycle requests use `manage`, other writes
-use `write`, and authorization is checked again after acquiring the durable
-workspace lease. Raw PDF, Markdown, and Word bodies are read only after initial
+Every mutating job handler persists under
+`repository.withWorkspaceMutation`: lifecycle requests use `manage`, approvals
+use the owner-only `approve` access, and other writes use `write`. Authorization
+is checked again after acquiring the durable workspace lease. On-demand rubric
+checks run their model call outside that lease, then acquire it to persist the
+immutable result. Raw PDF, Markdown, and Word bodies are read only after initial
 authorization. File validation, Word parsing, and persistence all run under the
 mutation lease, including the `/file` upload endpoint. The lease is held until the
 handler promise settles, even if the HTTP client disconnects. Publication and

@@ -177,6 +177,16 @@ A missing panel leaves its checks `insufficient` with the note `panel-not-suppli
 
 A four-job development trial (mini low, Luna low and Luna high, four repeats each) found that regeneration is itself a material source of variation. Within one configuration, typically 30-90% of criteria cited the same job requirement between two repeats, and criterion counts varied by up to three. Different models overlapped less (about 25-60%). Two generations rejected a position description as "not a job posting". On the longest job document, exact-quote validation failed for most mini and Luna-low attempts, even after the allowed correction, while Luna high completed every attempt. Treat a saved job rubric as part of the scoring configuration: compare analyses only when they use the same saved rubric, and do not regenerate rubrics to "retry" a score. These are lexical development measurements on four documents, not a model selection or a validated rubric quality ranking.
 
+Generator v2 responds to these findings. Job rubrics (`score-job-rubric-v4`, schema `score-job-rubric-schema-v2`) cite source passages by ID from a deterministic passage catalog, so code builds the exact quotes instead of checking quotes the model typed. The model writes job-specific examples for levels 1–5 of the evidence scale, and code renders each criterion's guidance from them. The prompt explicitly accepts single-role vacancy announcements and position descriptions. GS grade drafts (`score-grade-draft-v5`) and reviews (`score-grade-review-v4`) use the same scale and passage IDs. A workspace owner now approves one checked version of each job rubric, and while `features.rubricApprovalRequired` is on, new analyses and grade ladders use only that version. The trial above measured the earlier generator, so rerun the generation panels before relying on the new one.
+
+New app imports run `score-job-rubric-review-v1` after generation and atomically
+save the rubric and its immutable QA record before marking the job ready.
+Edited versions run the same review on demand. Invalid or failed reviews stay
+processing failures, never unchecked ready rubrics or approvals. Generation
+panels measure generator validity and repeatability separately; an offline
+artifact still needs completed QA and the owner's sign-off before it is a
+locked release-gate rubric.
+
 ### Running rubric and grade generation panels
 
 `scripts\scoring-evaluation-run.mjs` also runs generation panels, with the same identity, deadlines, cost ledger and resumable checkpoints as scoring runs:

@@ -17,6 +17,7 @@ import {
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
 const JOB_ID_PATTERN = new RegExp(`^job-${UUID_PATTERN.source.slice(1, -1)}$`, 'i')
 const DOCUMENT_ID_PATTERN = new RegExp(`^document-${UUID_PATTERN.source.slice(1, -1)}$`, 'i')
+const RUBRIC_APPROVAL_ID_PATTERN = new RegExp(`^rubric-approval-${UUID_PATTERN.source.slice(1, -1)}$`)
 const SAFE_BLOB_FILE_PATTERN = /^(?:original\.(?:pdf|docx|doc|html|md)|source-document\.json)$/
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -56,6 +57,19 @@ export function isUuid(value: string): boolean {
 
 export function isValidJobId(value: string): boolean {
   return JOB_ID_PATTERN.test(value)
+}
+
+export function isRubricApprovalId(value: unknown): value is string {
+  return typeof value === 'string' && RUBRIC_APPROVAL_ID_PATTERN.test(value)
+}
+
+function isRubricApprovalPointer(value: unknown): boolean {
+  return isRecord(value) &&
+    hasOnlyKeys(value, ['approvalId', 'rubricId', 'version', 'rubricHash', 'approvedBy', 'approvedAt']) &&
+    isRubricApprovalId(value.approvalId) && isNonBlank(value.rubricId) &&
+    Number.isInteger(value.version) && Number(value.version) >= 1 &&
+    typeof value.rubricHash === 'string' && /^[0-9a-f]{64}$/.test(value.rubricHash) &&
+    isNonBlank(value.approvedBy) && isTimestamp(value.approvedAt)
 }
 
 export function isValidDocumentId(value: string): boolean {
@@ -288,6 +302,7 @@ export function validateRealJobRecord(value: unknown): value is RealJobRecord {
   if (!isRecord(value) || !hasOnlyKeys(value, [
     'id', 'workspaceId', 'recordType', 'displayName', 'job', 'source', 'inputFingerprint', 'createdBy', 'updatedAt', 'attempts',
     'nextAttemptAt', 'lease', 'extractedBlobName', 'error', 'warnings', 'lifecycle', 'rubricLifecycle', 'processingSettings',
+    'rubricApproval',
   ]) || value.recordType !== 'job' || typeof value.id !== 'string' || !isValidJobId(value.id) ||
     typeof value.workspaceId !== 'string' || !isValidWorkspaceId(value.workspaceId) || !isRecord(value.job) ||
     !hasOnlyKeys(value.job, [
@@ -381,6 +396,9 @@ export function validateRealJobRecord(value: unknown): value is RealJobRecord {
     (!isTimestamp(job.rubricDeletedAt) || job.rubricId !== null || !value.rubricLifecycle?.deletedAt)) return false
   if (value.rubricLifecycle?.deletedAt && (!job.rubricDeletedAt || job.rubricId !== null)) return false
   if (value.job.status === 'ready' && value.job.rubricId === null && !job.rubricDeletedAt) return false
+  // The approved version always belongs to the job's current rubric; deleting the rubric clears the approval.
+  if (value.rubricApproval !== undefined && (!isRubricApprovalPointer(value.rubricApproval) ||
+    value.job.rubricId !== (value.rubricApproval as { rubricId: string }).rubricId)) return false
   if (value.nextAttemptAt !== undefined && !isTimestamp(value.nextAttemptAt)) return false
   if (value.lease !== undefined && (!isRecord(value.lease) || !hasOnlyKeys(value.lease, ['owner', 'expiresAt']) ||
     !isNonBlank(value.lease.owner) || !isTimestamp(value.lease.expiresAt))) {

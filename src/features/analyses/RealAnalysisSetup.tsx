@@ -10,13 +10,13 @@ import { ArchivedBadge, ArchiveStateFilter, LifecycleBanner } from '../../compon
 import { useLifecycleAccess } from '../../components/lifecycle/useLifecycleAccess'
 import type { CreateRealAnalysisInput, RealAnalysisRunDetail, RealAnalysisTargetSummary } from '../../domain/real-analyses'
 import type { RealResumeSummary } from '../../domain/real-resumes'
-import { ANALYSIS_LIMITS } from '../../domain/real-analyses'
+import { ANALYSIS_LIMITS, mixedRubricVersions, mixedRubricVersionsNotice } from '../../domain/real-analyses'
 import { Badge, Button, EmptyState, InlineError, PageHeader, SearchField, SegmentedControl, StepLabel } from '../../components/ui'
 import { readyRealResume, resumeName, resumeStatedName } from '../resumes/resumeImportUi'
 import { DISPLAY_NAME_MAX_LENGTH, defaultAnalysisName, getDisplayName, normalizeDisplayName } from '../../domain/displayNames'
 import {
   currentRealTarget, initialRealSelections, newerSavedJobTarget, realResumeSelection, resumeSelectionIssue, targetIdentity, targetSelectionIssue,
-  resolveRealAnalysisNavigation, targetVersionLabel, realTargetAvailable, realTargetArchived, realTargetRemoved, type SelectedRealResume, type SelectedRealTarget,
+  resolveRealAnalysisNavigation, targetVersionLabel, realTargetAvailable, realTargetArchived, realTargetFamilyLabel, realTargetRemoved, type SelectedRealResume, type SelectedRealTarget,
 } from './realAnalysisUi'
 
 export function RealAnalysisSetup() {
@@ -63,7 +63,12 @@ function RealAnalysisBuilder({ previous, params, fragment, transferred }: {
 }) {
   const api = useRealAnalyses()!
   const resumeApi = useRealResumes()!
-  const { workspace } = useWorkspace()
+  const { workspace, cloud } = useWorkspace()
+  // The server enforces the approval policy; the note only explains why some ready jobs aren't offered.
+  const approvalRequired = cloud.realJobs.features?.rubricApprovalRequired !== false
+  const unapprovedJobRubrics = approvalRequired ? cloud.realJobs.summaries.filter((summary) => summary.job.status === 'ready' &&
+    summary.job.rubricId && !summary.job.rubricDeletedAt && !summary.rubricApproval &&
+    !isEntityArchived(workspace, { kind: 'job', id: summary.job.id }) && !isEntityRemoved(workspace, { kind: 'job', id: summary.job.id })).length : 0
   const { canEdit } = useLifecycleAccess(previous ? { kind: 'analysis', id: previous.run.id } : undefined)
   const navigate = useNavigate()
   const currentTargets = api.targets.state === 'ready' ? api.targets.value : []
@@ -102,6 +107,8 @@ function RealAnalysisBuilder({ previous, params, fragment, transferred }: {
   const locked = starting || Boolean(attempt)
   const jobs = draft.targets.filter((target) => target.selection?.kind === 'job').length
   const grades = draft.targets.filter((target) => target.selection?.kind === 'grade').length
+  const mixedVersions = mixedRubricVersionsNotice(mixedRubricVersions(draft.targets, (target) => target.selection),
+    (target) => target.selection ? realTargetFamilyLabel(target.label, target.selection) : target.label)
   const suggestedName = defaultAnalysisName(draft.resumes.length, draft.targets.map((target) => target.label))
 
   function selectResume(summary: RealResumeSummary, replace = false) {
@@ -200,11 +207,16 @@ function RealAnalysisBuilder({ previous, params, fragment, transferred }: {
           </div>
           <div className="border-t px-5 py-3 text-[11px] text-muted">{ready.length} ready · public profiles may be sparse · imports do not automatically run analyses</div>
         </section>
-        <section className="panel"><div className="section-heading"><div><StepLabel number={2} complete={draft.targets.length > 0}>Choose exact real targets</StepLabel><p>All eligible saved job versions and approved GS targets, not only previously opened rubrics. Each selected version is a separate target.</p></div><Badge>{draft.targets.length} selected</Badge></div>
+        <section className="panel"><div className="section-heading"><div><StepLabel number={2} complete={draft.targets.length > 0}>Choose exact real targets</StepLabel><p>{approvalRequired
+          ? 'Approved job rubric versions and approved GS targets, not only previously opened rubrics. Each selected version is a separate target.'
+          : 'All eligible saved job versions and approved GS targets, not only previously opened rubrics. Each selected version is a separate target.'}</p></div><Badge>{draft.targets.length} selected</Badge></div>
           <div className="library-toolbar"><SegmentedControl label="Real target type" value={targetType} onChange={setTargetType}
             options={[{ value: 'job', label: 'Real jobs', count: activeTargets.filter((target) => target.kind === 'job').length }, { value: 'grade', label: 'Approved GS versions', count: activeTargets.filter((target) => target.kind === 'grade').length }]} />
             <SearchField value={targetSearch} onChange={setTargetSearch} placeholder="Search eligible targets…" label="Search real analysis targets" />
             <ArchiveStateFilter value={targetArchiveFilter} onChange={setTargetArchiveFilter} label="Real target input archive state" /></div>
+          {targetType === 'job' && unapprovedJobRubrics > 0 && <p className="px-5 pt-3 text-[11px] text-muted">
+            {unapprovedJobRubrics === 1 ? '1 ready job rubric isn’t approved yet, so it isn’t listed.' : `${unapprovedJobRubrics} ready job rubrics aren’t approved yet, so they aren’t listed.`} A workspace owner approves a rubric on its job page.
+          </p>}
           <div className="builder-options">{shownTargets.map((target) => <label className="selection-card" key={target.id}>
             <input type="checkbox" checked={draft.targets.some((item) => item.id === targetIdentity(target.selection))} disabled={locked || !canEdit || !api.canWrite || !realTargetAvailable(workspace, target.selection)}
               aria-label={`Include ${getDisplayName(target, target.label)}, ${targetVersionLabel(target.selection)}`} onChange={() => selectTarget(target)} />
@@ -212,7 +224,8 @@ function RealAnalysisBuilder({ previous, params, fragment, transferred }: {
             <div className="min-w-0"><strong className="block break-words text-[12px]">{getDisplayName(target, target.label)}</strong>{target.displayName && <span className="row-meta block">Source title: {target.label}</span>}<span className="row-meta block">{target.sublabel}</span>
               <div className="mt-2 flex flex-wrap gap-1.5"><Badge>{targetVersionLabel(target.selection)}</Badge><Badge>{target.criterionCount} criteria</Badge>
                 {realTargetArchived(workspace, target.selection) && <Badge tone="warning">Archived · read only</Badge>}
-                {target.kind === 'grade' && target.newerDraftAvailable && <Badge tone="warning">Newer draft exists · not selected</Badge>}</div>
+                {target.kind === 'job' && target.approvedAt && <Badge tone="success">Approved</Badge>}
+                {target.newerDraftAvailable && <Badge tone="warning">Newer draft exists · not selected</Badge>}</div>
               {target.kind === 'grade' && <p className="mt-2 text-[10px] text-muted">Approved {target.approvedAt} · series {target.context.series} · {target.context.agency || 'Agency not stated'} · {target.context.supervision}. Context belongs to this approved capture, not the newer draft.</p>}
             </div>
           </label>)}
@@ -266,6 +279,7 @@ function RealAnalysisBuilder({ previous, params, fragment, transferred }: {
           <div className="space-y-3 border-y py-4"><div className="metric-line"><span>Real resumes</span><strong>{draft.resumes.length}</strong></div><div className="metric-line"><span>Job rubrics</span><strong>{jobs}</strong></div><div className="metric-line"><span>Approved GS versions</span><strong>{grades}</strong></div></div>
           <div className="comparison-count" aria-live="polite"><strong>{count}</strong><span>individual comparisons<small>{retainedAttempt ? 'Original submitted count. No truncation.' : `Maximum ${limit}. No truncation.`}</small></span></div>
           {!retainedAttempt && count > limit && <InlineError>{count} comparisons exceeds the {limit}-comparison limit. Remove resumes or targets explicitly before running.</InlineError>}
+          {mixedVersions && <p className="text-[11px] text-muted" role="note">{mixedVersions}</p>}
           <p className="text-[11px] text-muted">Each pair is independent. Saved documents, versions, approvals, and source sets are frozen. Criterion assessments use real evidence; limited coverage can withhold the total. There is no cross-job ranking.</p>
           {error && <InlineError>{error}</InlineError>}
           {attempt && !starting && <div className="space-y-3 text-[11px] text-muted"><p>Trying again sends the exact same request, so it can’t start a second copy or switch to newer versions of your inputs.</p>

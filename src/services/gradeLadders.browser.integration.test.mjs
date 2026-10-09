@@ -72,7 +72,7 @@ test('browser creates an exact-version ladder and uploads real, page-ranged refe
     await until(() => page.getByRole('button', { name: 'Create grade ladder', exact: true }).isEnabled(), 'The real-job creation entry point should enable')
     await page.getByRole('button', { name: 'Create grade ladder', exact: true }).click()
     const dialog = await visible(page.getByRole('dialog', { name: 'Create grade ladder', exact: true }))
-    await dialog.getByLabel('Saved seed rubric version', { exact: true }).selectOption(`${seed.rubric.id}:1`)
+    await dialog.getByLabel('Saved seed rubric version', { exact: true }).selectOption(`${seed.rubric.id}:${seed.latestRubric.version}`)
     await dialog.getByLabel('Ladder family name', { exact: true }).fill('Browser-created engineering ladder')
     await dialog.getByLabel('I confirm this saved job/rubric version as the seed.').check()
     await dialog.getByLabel('Agency applicability', { exact: true }).selectOption('other-federal')
@@ -83,7 +83,7 @@ test('browser creates an exact-version ladder and uploads real, page-ranged refe
     await visible(page.getByRole('heading', { name: 'Browser-created engineering ladder', exact: true }))
     const ladderId = new URL(page.url()).pathname.split('/').at(-1)
     let detail = await (await fixture.request(`/api/workspaces/${fixture.workspaceId}/grade-ladders/${ladderId}`)).json()
-    assert.equal(detail.ladder.seedRubricVersion, 1)
+    assert.equal(detail.ladder.seedRubricVersion, seed.latestRubric.version, 'Ladders start from the approved seed version')
     assert.deepEqual(detail.ladder.grades, [1, 9, 15])
     assert.ok(detail.workItems.some((work) => work.input.kind === 'discover' && work.status === 'queued'))
     await finishWork(fixture, ladderId, ['discover'])
@@ -168,12 +168,26 @@ test('browser review keeps exact citations, protects unsaved and accepted drafts
     const quotation = await visible(page.getByRole('dialog', { name: 'Cite an exact captured passage', exact: true }))
     await quotation.getByRole('button', { name: 'Cancel quotation', exact: true }).click()
     assert.equal(await page.getByRole('dialog', { name: 'Unsaved changes', exact: true }).count(), 0, 'closing an untouched nested quotation does not discard the outer draft')
+    const levelTwo = editor.getByRole('textbox', { name: /^2 · / })
+    const correctedExample = 'Describes one defined engineering project with documented calculations.'
+    await levelTwo.fill(correctedExample)
+    for (const width of [1440, 390]) {
+      await page.setViewportSize({ width, height: 844 })
+      assert.equal(await editor.getByRole('textbox', { name: /^[1-5] · / }).count(), 5)
+      assert.equal(await levelTwo.inputValue(), correctedExample)
+      assert.equal(await editor.locator('.dialog-body').evaluate(node => node.scrollWidth <= node.clientWidth), true,
+        `The scale editor must not overflow horizontally at ${width}px`)
+    }
+    await page.setViewportSize({ width: 1440, height: 1000 })
     fixture.holdMutation(accepted.promise)
     await editor.getByRole('button', { name: 'Save draft and request review' }).click()
     await until(async () => {
       const current = await (await fixture.request(detailPath)).json()
       return current.levels.find((level) => level.head.grade === 9).version.version === 2
     }, 'The server should accept the draft while its response is held')
+    const savedDraft = (await (await fixture.request(detailPath)).json()).levels.find(level => level.head.grade === 9).version.rubric
+    assert.equal(savedDraft.criteria[0].levels[1].examples, correctedExample)
+    assert.equal(savedDraft.criteria[0].guidance, fixture.api.renderEvidenceGuidance(savedDraft.criteria[0].levels))
     await editor.getByRole('button', { name: 'Close draft', exact: true }).click()
     protection = await visible(page.getByRole('dialog', { name: 'Request in progress', exact: true }))
     assert.equal(await protection.getByRole('button', { name: /leave|Continue/ }).isDisabled(), true)

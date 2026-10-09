@@ -17,6 +17,13 @@ const document = {
   sample: false,
   paragraphs: [{ id: 'p-0001', page: 1, heading: 'Requirements', text: 'TypeScript experience is required.' }],
 }
+const levels = [
+  { level: 1, examples: 'Lists related training or TypeScript as a skill.' },
+  { level: 2, examples: 'Documents one TypeScript project or task.' },
+  { level: 3, examples: 'Documents recurring TypeScript development duties.' },
+  { level: 4, examples: 'Documents independent TypeScript work across a larger service.' },
+  { level: 5, examples: 'Documents leading TypeScript work with team or product outcomes.' },
+]
 const modelResult = {
   isJobPosting: true,
   rejectionReason: null,
@@ -33,10 +40,9 @@ const modelResult = {
     label: 'TypeScript',
     description: 'Professional TypeScript experience.',
     weight: 100,
-    guidance: '0: none; 1: minimal; 2: limited; 3: capable; 4: strong; 5: expert.',
     requirementType: 'required',
-    sourceParagraphId: 'p-0001',
-    quote: 'TypeScript experience is required.',
+    sourcePassageIds: [1],
+    levels,
   }],
 }
 
@@ -89,6 +95,7 @@ function fakeStore(initial, hooks = {}) {
   let current = structuredClone(initial)
   let version = 1
   let published
+  let publishedChecks
   let workspaceState = 'active'
   const writers = new Map()
   const locked = value => value?.archivedAt || value?.deletingAt || value?.deletedAt
@@ -115,12 +122,13 @@ function fakeStore(initial, hooks = {}) {
       version += 1
       return { record: structuredClone(current), etag: `"${version}"` }
     },
-    async publish(value, etag, rubric) {
+    async publish(value, etag, rubric, checks) {
       if (hooks.publish) await hooks.publish()
       assertWritable()
       if (etag !== `"${version}"`) throw Object.assign(new Error('publish conflict'), { name: 'StoreConflictError' })
       current = structuredClone(value)
       published = structuredClone(rubric)
+      publishedChecks = structuredClone(checks)
       version += 1
       return { record: structuredClone(current), etag: `"${version}"` }
     },
@@ -166,6 +174,7 @@ function fakeStore(initial, hooks = {}) {
     },
     state: () => structuredClone(current),
     published: () => structuredClone(published),
+    checks: () => structuredClone(publishedChecks),
   }
 }
 
@@ -196,7 +205,7 @@ function fakeBlobs(sourceDocument = document) {
   }
 }
 
-function dependencies(store, blobs, fetchImpl) {
+function dependencies(store, blobs, generationFetch, reviewFetch = async () => successfulModel({ summary: 'The rubric matches its job source and evidence scale.', findings: [] })) {
   return {
     store,
     blobs,
@@ -215,7 +224,12 @@ function dependencies(store, blobs, fetchImpl) {
       deployment: 'rubric',
       modelName: 'gpt-5-mini',
       getToken: async () => 'token',
-      fetch: fetchImpl,
+      fetch: (url, init) => {
+        const name = JSON.parse(init.body).response_format.json_schema.name
+        if (name === 'job_rubric') return generationFetch(url, init)
+        assert.equal(name, 'score_job_rubric_review')
+        return reviewFetch(url, init)
+      },
       clock: { now: () => new Date(now), sleep: async () => {} },
     },
     validateRealRubric: () => [],
@@ -394,9 +408,9 @@ test('Markdown job originals are extracted without OCR or public fetches and ret
   assert.equal(store.state().job.status, 'queued')
   const saved = await store.get()
   await store.replace({ ...saved.record, nextAttemptAt: now }, saved.etag)
-  deps.model.fetch = async () => successfulModel({
-    ...modelResult, criteria: modelResult.criteria.map(criterion => ({ ...criterion, sourceParagraphId: 'p-0002' })),
-  })
+  deps.model.fetch = async (_url, init) => successfulModel(JSON.parse(init.body).response_format.json_schema.name === 'score_job_rubric_review'
+    ? { summary: 'The rubric matches its job source and evidence scale.', findings: [] }
+    : { ...modelResult, criteria: modelResult.criteria.map(criterion => ({ ...criterion, sourcePassageIds: [2] })) })
   await runWorker(deps, { maxJobs: 1 })
   assert.equal(store.state().job.status, 'ready', JSON.stringify(store.state().error))
   assert.equal(store.state().source.extractionMethod, 'markdown')
@@ -404,6 +418,10 @@ test('Markdown job originals are extracted without OCR or public fetches and ret
   assert.deepEqual(writes, [`${workspaceId}/${jobId}/source-document.json`])
   assert.deepEqual(values.get(originalName).bytes, bytes)
   assert.equal(store.published().criteria[0].sourceCitations[0].quote, 'TypeScript experience is required.')
+  assert.equal(store.checks().rubricId, store.published().id)
+  assert.equal(store.checks().version, store.published().version)
+  assert.equal(store.checks().review.promptVersion, 'score-job-rubric-review-v1')
+  assert.deepEqual(store.checks().review.findings, [])
 })
 
 test('worker claims, reuses cached extraction, and atomically publishes a ready job', async () => {
@@ -417,6 +435,53 @@ test('worker claims, reuses cached extraction, and atomically publishes a ready 
   assert.equal(store.state().lease, undefined)
   assert.equal(store.state().job.rubricId, `rubric-${jobId}`)
   assert.equal(store.published().criteria[0].sourceCitations[0].quote, 'TypeScript experience is required.')
+})
+
+test('generation saves hash-bound QA once and uses the accepted model settings for both model steps', async () => {
+  const accepted = settingsSnapshot()
+  const store = fakeStore(record({ processingSettings: accepted }))
+  const requests = []
+  const response = async (_url, init) => {
+    const request = JSON.parse(init.body)
+    requests.push(request)
+    return successfulModel(request.response_format.json_schema.name === 'job_rubric' ? modelResult : {
+      summary: 'The criterion is grounded in the job source.', findings: [],
+    })
+  }
+  await runWorker(dependencies(store, fakeBlobs(), response, response), { maxJobs: 1 })
+  const { analysisHash } = await loadWorker('../server/analyses/deterministic.ts')
+  assert.equal(store.state().job.status, 'ready')
+  assert.deepEqual(requests.map(request => request.response_format.json_schema.name), ['job_rubric', 'score_job_rubric_review'])
+  assert.deepEqual(requests.map(request => request.model), ['deployment-jobRubric', 'deployment-jobRubric'])
+  assert.equal(store.checks().rubricHash, analysisHash(store.published()))
+  assert.equal(store.checks().createdBy, record().createdBy)
+  assert.deepEqual(store.checks().checks, [])
+  assert.equal(store.state().rubricApproval, undefined, 'Completed checks never approve the rubric automatically')
+})
+
+test('invalid post-generation QA fails explicitly without publishing a ready rubric', async () => {
+  const store = fakeStore(record())
+  let reviewCalls = 0
+  await runWorker(dependencies(store, fakeBlobs(), async () => successfulModel(), async () => {
+    reviewCalls++
+    return successfulModel({ summary: '', findings: [] })
+  }), { maxJobs: 1 })
+  assert.equal(store.state().job.status, 'error')
+  assert.equal(store.state().error.code, 'rubric-review-invalid-output')
+  assert.equal(reviewCalls, settingsDomain.createDefaultAdminSettings().ai.jobRubric.maxOutputCorrections + 1)
+  assert.equal(store.published(), undefined)
+  assert.equal(store.checks(), undefined)
+})
+
+test('cancellation during the post-generation review prevents both rubric and QA publication', async () => {
+  const store = fakeStore(record())
+  await runWorker(dependencies(store, fakeBlobs(), async () => successfulModel(), async () => {
+    store.setLifecycle('rubric', { archivedAt: now })
+    return successfulModel({ summary: 'No concerns.', findings: [] })
+  }), { maxJobs: 1 })
+  assert.equal(store.state().job.status, 'cancelled')
+  assert.equal(store.published(), undefined)
+  assert.equal(store.checks(), undefined)
 })
 
 for (const [kind, contentType] of [
@@ -570,7 +635,7 @@ test('immutable extraction conflicts use the durable document for generation and
       ...modelResult.criteria[0],
       label: 'Durable source experience',
       description: 'Experience stated by the durable source.',
-      quote: 'Durable source experience is required.',
+      sourcePassageIds: [1],
     }],
   }
   await runWorker(dependencies(store, blobs, async (_url, init) => {

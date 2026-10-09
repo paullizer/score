@@ -15,6 +15,7 @@ import {
   admittedProcessingSettings, newProcessingSettings, resolveAcceptedProcessingSettings,
   assertNewWork, currentProcessingSettings, newWorkProcessingSettings, type ProcessingSettingsProvider,
 } from '../jobs/policy'
+import { rubricApprovalRequired } from '../../src/domain/feature-switches'
 import { traceOperation } from '../telemetry-operations'
 import type { AnalysisBlob, AnalysisTransaction, RealAnalysesDeps } from './store'
 import {
@@ -143,8 +144,11 @@ export class RealAnalysisService {
     await mapWithConcurrency(request.resumes, ANALYSIS_SOURCE_CONCURRENCY, async (selection, index) => {
       await resolveAnalysisResume(this.sources.resumes, workspaceId, selection, analysisDeterministicId('snapshot', runId, `resume:${index}`), timestamp)
     })
+    // Accepted selections were approved when they were frozen; a later approval must not strand replays or retries.
     for (const selections of analysisTargetChunks(request.targets)) {
-      await mapWithConcurrency(selections, ANALYSIS_SOURCE_CONCURRENCY, async selection => { await this.targets.resolve(workspaceId, selection) })
+      await mapWithConcurrency(selections, ANALYSIS_SOURCE_CONCURRENCY, async selection => {
+        await this.targets.resolve(workspaceId, selection, { ignoreApproval: true })
+      })
     }
     assertWorkspaceMutationLease(workspaceId)
   }
@@ -172,7 +176,8 @@ export class RealAnalysisService {
   async listTargets(workspaceId: string, continuationToken?: string, limit = 50) {
     requireScope(workspaceId)
     await this.writable(workspaceId)
-    return this.targets.list(workspaceId, continuationToken, limit)
+    const approvalRequired = rubricApprovalRequired((await currentProcessingSettings(this.settings)).settings)
+    return this.targets.list(workspaceId, continuationToken, limit, { approvalRequired })
   }
 
   private winningManifest(
@@ -216,8 +221,10 @@ export class RealAnalysisService {
         }))
       }
       let offset = 0
+      const approvalRequired = rubricApprovalRequired(processingSettings.settings)
       for (const selections of analysisTargetChunks(request.targets)) {
-        const resolved = await mapWithConcurrency(selections, ANALYSIS_SOURCE_CONCURRENCY, selection => this.targets.resolve(workspaceId, selection))
+        const resolved = await mapWithConcurrency(selections, ANALYSIS_SOURCE_CONCURRENCY,
+          selection => this.targets.resolve(workspaceId, selection, { approvalRequired }))
         // Versions of one job, or grades of one ladder, can share content-addressed evidence; each copy is written once.
         const evidence = new Map(resolved.flatMap(target => analysisTargetEvidence(workspaceId, runId, target)).map(copy => [copy.name, copy]))
         const saved = new Map<string, AnalysisBlob>()

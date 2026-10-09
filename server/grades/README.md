@@ -14,13 +14,32 @@ containers. Feature discovery remains centralized in `server\app.ts` and preserv
 the real-job feature and limits.
 
 Every route requires workspace membership. Owners/editors may mutate; viewers may
-read. Existing same-origin and `X-Score-Request: workspace` CSRF checks apply to all
+read. Approving a grade version is owner-only (application admins act as owners),
+and only versions on the evidence scale (`score-evidence-ladder-v1`) can be
+approved; generate the ladder again to replace drafts made before the scale. While
+`features.rubricApprovalRequired` is on (the default), a new ladder can start only
+from the approved version of its seed job rubric; an idempotent replay keeps the
+seed it already captured. Existing same-origin and `X-Score-Request: workspace` CSRF checks apply to all
 mutations. Membership is checked before the raw PDF parser. Responses and original
 attachments are private, `no-store`, and never routed through legacy workspace state.
 Every mutating handler then runs through `repository.withWorkspaceMutation`,
-reauthorizing inside the durable workspace lease (`write` normally, `manage` for
-lifecycle). The lease stays held until the handler's promise settles, including
+reauthorizing inside the durable workspace lease (`write` normally, `approve` for
+approval, `manage` for lifecycle). The lease stays held until the handler's promise settles, including
 after a disconnected HTTP client; it is not released by response/close events.
+
+The independent grade review runs the shared deterministic rubric QA checks
+(scale conformance, unobservable wording and likely criterion overlap) before
+its semantic model pass. QA warnings are retained in the immutable review even
+when the model returns no issues. Gaps and not-applicable rows stay unscored and
+do not enter overlap comparisons. Structural errors require a corrected saved
+version, and a result exceeding the existing 150-issue storage limit fails
+explicitly rather than omitting findings.
+
+The grade draft editor exposes the same fixed-scale example fields as the job
+editor for direct and derived criteria. Saving validates and normalizes all five
+examples, code-renders their guidance, appends a version and requests a new
+independent review. Exclusions and gaps retain explanatory unscored guidance;
+the editor cannot change their support verdicts or approve its own edits.
 
 Mutations return `{ ladder: GradeLadderDetail }`; creation returns HTTP 202.
 Detail GETs return `GradeLadderDetail` directly. Lists and version histories are
@@ -210,7 +229,13 @@ string comparison, preserving array order and omitting only the root record's
 
 `validateGradeVersion` checks deterministic publication integrity, including exact
 citations in criteria, qualifications, and issues, plus supported-criterion weight
-bounds and distinct 0–5 guidance. Explicit gaps and blocker issues remain publishable,
+bounds and the standard evidence scale when a rubric names one. Generated grade drafts
+now hard-cut to `score-evidence-ladder-v1`: direct and derived work-level criteria
+store `scaleVersion`, five grade-specific résumé-observable examples for levels 1–5,
+and code-rendered guidance from the global 0–5 scale. Gap and `not-applicable` rows
+remain explicitly unscored, keep explanatory guidance, and must not carry level
+examples. Older saved versions without `scaleVersion` remain parseable with their
+legacy free-text guidance. Explicit gaps and blocker issues remain publishable,
 and publication does not require weights to total 100. Exact quotes attached to a gap
 are contextual evidence, not an assertion of grading authority. `validateGradeApproval`
 requires at least one direct/derived supported criterion, positive supported weights
@@ -223,6 +248,24 @@ issues affect only their grade; issues without a grade remain
 global. Workers persist incomplete drafts and use semantic review plus source/version
 issues to select `needs-sources`; they must not treat ordinary support gaps as transport
 or processing failures.
+
+Draft model citations use passage IDs instead of model-authored quote objects. The
+worker builds a per-document passage catalog from the frozen, selected source
+documents and exposes IDs as `documentId:pN` (for example `document-grading:p12`).
+The numeric `pN` is local to that document, while the `documentId:` prefix makes the
+combined catalog unambiguous across multiple references. The worker resolves selected
+passage IDs with the frozen catalog into exact `Citation` objects before validation.
+Unknown passage IDs, IDs from omitted context, unselected sources, ineligible
+grade-basis documents, seed-job grade-basis substitutions, and qualification-only
+passages are rejected with repair diagnostics; the model never gets to persist its
+own quote text.
+
+Independent review remains a separate immutable grounding pass. In addition to source
+support, applicability, qualifications, weights, exclusions, and semantic derivations,
+the review prompt now checks criterion overlap, whether level examples are observable
+in a résumé, whether they avoid work quality, error rates, supervision needs and
+attitude, and whether the examples follow `score-evidence-ladder-v1` for that grade.
+Findings use the existing grade issue mechanism.
 
 Draft edits append a new immutable version and independent semantic-review task.
 The rubric ID advances with the version ID; the grade-head group and common

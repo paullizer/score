@@ -5,6 +5,7 @@ import type { DocumentPagination } from '../../domain/document-formats'
 import { getDisplayName } from '../../domain/displayNames'
 import { SCORE_LEGEND } from '../../domain/rubric-exports'
 import type { RubricExportPayload } from '../../domain/rubric-exports'
+import type { RubricVersionStatus } from '../../domain/rubric-approval'
 import { reportReviewLinks, trustedApplicationOrigin } from './links'
 import { reportTargetPresentation } from './narratives'
 import { formatReportWeight, paginationLabel } from './presentation'
@@ -13,6 +14,11 @@ import { readableAnalysisDate, readableTargetSourceLabel } from './readable'
 export const RUBRIC_DETAILS_TITLE = 'Job & rubric details'
 export const RUBRIC_SECTION_SUBTITLE = 'How each criterion is defined and scored'
 export const RUBRIC_ROUNDED_WEIGHT_NOTE = '~ marks a weight rounded for display.'
+const RUBRIC_APPROVAL_LABELS: Record<RubricVersionStatus, string> = {
+  approved: 'Approved',
+  draft: 'Draft, not approved',
+  superseded: 'Superseded by a newer approved version',
+}
 
 export function rubricDetailsTitle(kind: 'job' | 'grade'): string {
   return kind === 'grade' ? 'Grade & rubric details' : RUBRIC_DETAILS_TITLE
@@ -190,8 +196,11 @@ export function rubricDocumentFromPayload(payload: RubricExportPayload, links: {
     organization: job.organization.trim(),
     rubricName: rubric.name,
     version: rubric.version,
-    versionLabel: rubric.version === rubric.latestVersion ? `Version ${rubric.version} (current)`
-      : `Version ${rubric.version} of ${rubric.latestVersion} — a newer version exists`,
+    versionLabel: [
+      rubric.version === rubric.latestVersion ? `Version ${rubric.version} (current)`
+        : `Version ${rubric.version} of ${rubric.latestVersion} — a newer version exists`,
+      ...(rubric.approval ? [RUBRIC_APPROVAL_LABELS[rubric.approval]] : []),
+    ].join(' · '),
     origin: rubric.provenance === 'edited' ? 'Edited by a reviewer' : 'Generated from the job posting',
     savedAt: readableDate(rubric.createdAt),
     exportedAt: readableDate(payload.generatedAt),

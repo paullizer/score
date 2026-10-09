@@ -6,7 +6,7 @@ import type {
   ReportPolicy, ReportStatusCounts, ReportTarget,
 } from '../../domain/analysis-reports'
 import type { Citation } from '../../domain/types'
-import { buildReportNotices, citationLocator } from './presentation'
+import { buildReportNotices, citationLocator, mixedRubricReportNotice } from './presentation'
 import {
   realCandidateNarrativeSchema, realNarrativeReportCaptureSchema, realTargetNarrativeSchema,
   reportCandidateNarrativeSchema, reportNarrativeCaptureSchema,
@@ -39,7 +39,7 @@ const limitation = z.strictObject({ code: id, message: requiredText, criterionId
 const selection = z.discriminatedUnion('kind', [
   z.strictObject({
     kind: z.literal('job'), jobId: id, rubricId: id, rubricVersion: version, rubricHash: sha256,
-    documentId: id, documentVersion: version, documentSha256: sha256,
+    documentId: id, documentVersion: version, documentSha256: sha256, approvalId: id.optional(),
   }),
   z.strictObject({
     kind: z.literal('grade'), ladderId: id, grade: z.number().int().min(1).max(15), versionId: id,
@@ -411,7 +411,7 @@ export function buildAnalysisReport(input: AnalysisReportInput, options: Analysi
     candidateCount: new Set(comparisons.map(comparison => comparison.candidate.id)).size,
     counts,
     partial: counts.complete !== counts.total,
-    notices: buildReportNotices(counts, settings.policy.additionalFooter),
+    notices: buildReportNotices(counts, settings.policy.additionalFooter, mixedRubricReportNotice(targets)),
     groups: targets.map(target => buildGroup(target, comparisons.filter(comparison => comparison.targetId === target.id), settings.policy)),
   }
   assertReportResourceLimits(report, limits.maxInputBytes)

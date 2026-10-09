@@ -136,6 +136,7 @@ test('rubric export returns exactly one saved job rubric version, the export pol
     const workspace = await seedWorkspace(server)
     const { jobId, rubricId, first, second } = await seedJob(server, workspace)
     const stored = (await server.jobs.store.get(workspace.id, jobId)).record
+    server.jobs.store._approve(workspace.id, jobId, 2)
     readOnly(server.jobs)
 
     const response = await get(server, exportPath(workspace.id, jobId, { rubricId, version: '1', format: 'pdf' }))
@@ -155,7 +156,7 @@ test('rubric export returns exactly one saved job rubric version, the export pol
       },
       rubric: {
         id: rubricId, version: 1, latestVersion: 2, name: first.name, description: first.description, createdAt: first.createdAt,
-        provenance: 'generated',
+        provenance: 'generated', approval: 'superseded',
         criteria: [{
           label: 'Distributed systems leadership', description: 'Leads distributed systems delivery.', weight: 60, guidance: GUIDANCE,
           requirementType: 'required',
@@ -180,6 +181,7 @@ test('rubric export returns exactly one saved job rubric version, the export pol
     assert.equal(latest.rubric.latestVersion, 2)
     assert.equal(latest.rubric.name, second.name)
     assert.equal(latest.rubric.provenance, 'edited')
+    assert.equal(latest.rubric.approval, 'approved')
     assert.equal(latest.rubric.criteria[0].label, 'Distributed systems delivery leadership')
   } finally { await server.close() }
 })

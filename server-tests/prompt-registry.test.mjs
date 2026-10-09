@@ -163,7 +163,7 @@ test('template release status reports pending and release activates current comp
   await assert.rejects(service.current(), /new prompt release is installed but not activated yet/)
   assert.deepEqual(await service.releaseStatus(), {
     activeBundleId: old.bundle.bundleId, activeBundleSha256: old.bundle.bundleSha256, etag: old.etag,
-    supported: false, generation: 'score-prompt-templates-v1', pending: true,
+    supported: false, generation: 'score-prompt-templates-v2', pending: true,
   })
   await assert.rejects(service.releaseTemplates({ ...principal, oid: 'cccccccc-cccc-4ccc-8ccc-cccccccccccc' }, {
     reason: 'Offline gate passed.', gateReportSha256: 'f'.repeat(64), targetsVersion: 'score-engineering-targets-v2',
@@ -176,10 +176,10 @@ test('template release status reports pending and release activates current comp
   const released = await service.releaseTemplates(principal, {
     reason: 'Offline gate passed.', gateReportSha256: 'f'.repeat(64), targetsVersion: 'score-engineering-targets-v2',
   }, old.etag)
-  assert.equal(released.activation.templateRelease.generation, 'score-prompt-templates-v1')
+  assert.equal(released.activation.templateRelease.generation, 'score-prompt-templates-v2')
   assert.equal(released.activation.templateRelease.gateReportSha256, 'f'.repeat(64))
   assert.equal(released.activation.parentBundleId, old.bundle.bundleId)
-  assert.ok(released.bundle.bundleId.startsWith('pb-score-prompt-templates-v1-'))
+  assert.ok(released.bundle.bundleId.startsWith('pb-score-prompt-templates-v2-'))
   const snapshot = await service.capture()
   assert.equal(snapshot.bundle.bundleId, released.bundle.bundleId)
   assert.equal(renderer.resolveAcceptedPrompt(domain.captureProcessingSettings(domain.createDefaultAdminSettings(), 'released', at, snapshot), 'jobRubric', JOB_RUBRIC_COMPILED_PROMPT).provenance.bundleId, released.bundle.bundleId)
@@ -188,7 +188,7 @@ test('template release status reports pending and release activates current comp
     reason: 'Already current.', gateReportSha256: 'f'.repeat(64), targetsVersion: 'score-engineering-targets-v2',
   }, released.etag), /already uses this template generation/)
   const history = await service.history(5)
-  assert.equal(history.activations[0].templateRelease.generation, 'score-prompt-templates-v1')
+  assert.equal(history.activations[0].templateRelease.generation, 'score-prompt-templates-v2')
 })
 
 test('template release retry after lost acknowledgement is idempotent and older-generation restore is refused', async () => {

@@ -19,7 +19,8 @@ let ui, dom, root, createRoot, navigate, location, calls
 
 function target({ kind = 'job', id = 'job-one', version = 1, label = 'Shared target', sublabel = 'Captured engineering scope' } = {}) {
   const common = { id: `target-${id}-${version}`, workspaceId, dataKind: 'real', kind, label, sublabel, rubricId: `rubric-${id}`, rubricVersion: version, criterionCount: 3 }
-  return kind === 'job' ? { ...common, selection: { kind, jobId: id, rubricId: common.rubricId, rubricVersion: version, rubricHash: hash,
+  // Each saved version of a rubric has its own hash.
+  return kind === 'job' ? { ...common, selection: { kind, jobId: id, rubricId: common.rubricId, rubricVersion: version, rubricHash: version === 1 ? hash : String(version).repeat(64),
     documentId: `document-${id}`, documentVersion: 1, documentSha256: hash } }
     : { ...common, selection: { kind, ladderId: id, grade: 9, versionId: `approved-${id}-${version}`, version, versionHash: hash,
       approvalId: `approval-${id}-${version}`, reviewId: `review-${id}-${version}`, sourceSetId: `sources-${id}`, sourceSetHash: hash },
@@ -372,9 +373,10 @@ test('real comparison headers and mobile selector share state, expose exact targ
   assert.match(dom.window.document.body.textContent, /Select one exact job or grade to sort scores/)
   const targetOptions = [...element('select[aria-label="Comparison target"]').options]
   assert.equal(targetOptions.length, 4)
-  assert.match(targetOptions[1].textContent, /Job rubric v1 · source v1/)
-  assert.match(targetOptions[2].textContent, /Job rubric v2 · source v1/)
+  assert.match(targetOptions[1].textContent, /Job rubric v1 · [0-9a-f]{8} · source v1/)
+  assert.match(targetOptions[2].textContent, /Job rubric v2 · [0-9a-f]{8} · source v1/)
   assert.match(targetOptions[3].textContent, /GS-9 · approved v1/)
+  assert.match(element('[role="note"]').textContent, /Rubric versions differ for Shared target \(v1 · aaaaaaaa, v2 · 22222222\)\. Scores are comparable only within one exact version/)
   assert.equal([...element('select[aria-label="Sort comparisons"]').options].filter((option) => option.disabled).length, 2)
   await sortHeader('Saved resume')
   assert.deepEqual(rowIndexes(), [1, 3, 4, 0, 2])

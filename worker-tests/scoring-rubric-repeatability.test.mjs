@@ -18,6 +18,13 @@ const document = {
     { id: 'p-0002', page: 1, heading: 'Duties', text: 'Prepares technical reports of findings and methods for program managers.' },
   ],
 }
+const levels = [
+  { level: 1, examples: 'Lists related training or TypeScript as a skill.' },
+  { level: 2, examples: 'Documents one TypeScript project or task.' },
+  { level: 3, examples: 'Documents recurring TypeScript development duties.' },
+  { level: 4, examples: 'Documents independent TypeScript work across a larger service.' },
+  { level: 5, examples: 'Documents leading TypeScript work with team or product outcomes.' },
+]
 const guidance = 'Score 0: The resume does not document this work. Score 1: Coursework. Score 2: One documented task. Score 3: Documented recurring work. Score 4: Documented complex work. Score 5: Documented leadership of the work.'
 const qualifier = 'Score 0: Not documented. Score 1: Needs close supervision. Score 2: Frequent errors. Score 3: Routine work of acceptable quality. Score 4: Independently. Score 5: Expert.'
 function modelRubric(criteria) {
@@ -27,8 +34,8 @@ function modelRubric(criteria) {
     description: 'Survey statistics duties.', warnings: [], criteria,
   }
 }
-const designs = { label: 'Survey design', description: 'Designs sample surveys.', guidance, requirementType: 'required', sourceParagraphId: 'p-0001', quote: 'Designs sample surveys' }
-const reports = { label: 'Technical reporting', description: 'Prepares technical reports.', guidance: qualifier, requirementType: 'required', sourceParagraphId: 'p-0002', quote: 'Prepares technical reports of findings' }
+const designs = { label: 'Survey design', description: 'Designs sample surveys.', requirementType: 'required', sourcePassageIds: [1], levels }
+const reports = { label: 'Technical reporting', description: 'Prepares technical reports.', requirementType: 'required', sourcePassageIds: [2], levels }
 function fixture() {
   const base = settingsSnapshot(settings => {
     for (const deployment of settings.ai.deployments) deployment.modelVersion = '2025-08-07'
@@ -80,7 +87,7 @@ test('rubric adapter uses the production generator, validator, captured settings
   assert.equal(result.rubricSha256, evaluationHash(run.rubrics[0].rubric))
   assert.equal(run.rubrics[0].rubric.jobId, jobId)
   assert.equal(run.rubrics[0].rubric.criteria[0].weight, 60)
-  assert.equal(run.rubrics[0].rubric.criteria[0].sourceCitations[0].quote, 'Designs sample surveys')
+  assert.equal(run.rubrics[0].rubric.criteria[0].sourceCitations[0].quote, 'Designs sample surveys and selects statistical methods for data collection programs.')
   assert.equal(run.rubrics[0].rubric.createdAt, '2026-10-08T00:00:00.000Z')
 })
 
@@ -157,7 +164,7 @@ test('repeatability summary binds rubric artifacts, aligns cited requirements an
   assert.equal(cell.repeats.meanCitedParagraphJaccard, 0.5)
   assert.equal(cell.repeats.meanAbsoluteAlignedWeightDifference, 40)
   assert.equal(cell.referenceAgreement.pairs, 2)
-  assert.deepEqual(cell.markers.map(row => row.performanceQualifierCriteria), [1, 0])
+  assert.deepEqual(cell.markers.map(row => row.performanceQualifierCriteria), [2, 1])
   assert.deepEqual(cell.markers.map(row => row.documentaryEvidenceCriteria), [2, 1])
   assert.equal(report.eligibleForRelease, false)
   assert.equal(compareGeneratedRubrics(generated[0], generated[0]).alignmentRate, 1)

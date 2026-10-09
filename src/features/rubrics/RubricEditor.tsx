@@ -5,6 +5,7 @@ import { usePublicSettings } from '../../app/public-settings-context'
 import { useGradeLeaveGuard } from '../../app/grade-navigation-context'
 import { Badge, Button, InlineError, Modal } from '../../components/ui'
 import { DocumentViewer } from '../../components/documents/DocumentViewer'
+import { checkCriterionLevels, renderEvidenceGuidance, type CriterionLevelExamples } from '../../domain/evidence-scale'
 import type { Criterion, Rubric } from '../../domain/types'
 import { validateRubric } from '../../domain/rubric-validation'
 import { LifecycleBanner } from '../../components/lifecycle/LifecycleControls'
@@ -28,7 +29,38 @@ import { ChangeHistoryPanel, type SavedAssistVersion } from '../assist/ChangeHis
 import { ChangedField, RemovedItemRow } from '../assist/ChangedField'
 import { useEditSession } from '../assist/useEditSession'
 import { describeRubricAssistOperations, rubricEditAdapter, rubricVersionChangeNote, summarizeRubricAssistOperations } from './rubricAssist'
+import { ScaleLevelEditor } from './ScaleLevelEditor'
 import '../../styles/assisted-editing.css'
+
+function normalizedLevels(levels: readonly CriterionLevelExamples[]): CriterionLevelExamples[] {
+  return levels.map(level => ({ ...level, examples: level.examples.trim().replace(/\s+/g, ' ') }))
+}
+
+/** Guidance on the scale is rendered from the level examples once they are complete; incomplete examples keep the old text. */
+function guidanceForLevels(levels: CriterionLevelExamples[], fallback = ''): string {
+  return checkCriterionLevels(levels).some(finding => finding.severity === 'error') ? fallback : renderEvidenceGuidance(levels)
+}
+
+/** The draft exactly as Save sends it: trimmed text, normalized level examples and their rendered guidance. */
+function normalizedDraft(draft: Rubric): Rubric {
+  return {
+    ...draft,
+    name: draft.name.trim(),
+    description: draft.description.trim(),
+    criteria: draft.criteria.map((criterion) => {
+      const levels = criterion.levels ? normalizedLevels(criterion.levels) : undefined
+      return {
+        ...criterion,
+        label: criterion.label.trim(),
+        description: criterion.description.trim(),
+        ...(levels ? { levels } : {}),
+        guidance: levels ? guidanceForLevels(levels, criterion.guidance.trim()) : criterion.guidance.trim(),
+        sourceParagraphId: criterion.sourceCitations?.[0]?.paragraphId,
+        sourceCitations: criterion.sourceCitations?.map((citation) => ({ ...citation, quote: citation.quote.trim() })),
+      }
+    }),
+  }
+}
 
 export function RubricEditor({ rubric, onClose, onSaved, initialPanel = null, initialFocusCriterionId = null }: {
   rubric: Rubric
@@ -69,6 +101,7 @@ export function RubricEditor({ rubric, onClose, onSaved, initialPanel = null, in
     : !document ? 'Load the job posting before asking AI assist.' : null
     : null
   const maxCriteria = Math.min(20, settings?.rubrics.jobs.maxCriteria ?? cloud.realJobs.features?.limits.maxCriteria ?? 20)
+  const scaled = Boolean(session.draft.scaleVersion)
 
   function versionId(version: Rubric): string {
     return `${version.id}:${version.version}`
@@ -167,7 +200,9 @@ export function RubricEditor({ rubric, onClose, onSaved, initialPanel = null, in
     return result
   })
   if (session.draft.criteria.length > maxCriteria && session.draft.criteria.some(criterion => !rubric.criteria.some(previous => previous.id === criterion.id))) realErrors.push(`Adding new criteria is limited to ${maxCriteria}. Existing saved criteria remain editable.`)
-  const errors = [...validateRubric(session.draft), ...realErrors]
+  // Validate exactly what Save sends, so spacing that Save normalizes never blocks it.
+  const savedDraft = normalizedDraft(session.draft)
+  const errors = [...validateRubric(savedDraft), ...realErrors]
   const total = session.draft.criteria.reduce((sum, criterion) => sum + criterion.weight, 0)
   const balanced = Number.isFinite(total) && Math.abs(total - 100) <= 0.000001
 
@@ -181,6 +216,10 @@ export function RubricEditor({ rubric, onClose, onSaved, initialPanel = null, in
     edit(keys, note, draft => ({ ...draft, criteria: draft.criteria.map((criterion) => criterion.id === id ? { ...criterion, ...patch } : criterion) }))
   }
 
+  function emptyLevels(): CriterionLevelExamples[] {
+    return [1, 2, 3, 4, 5].map(level => ({ level: level as 1 | 2 | 3 | 4 | 5, examples: '' }))
+  }
+
   function addCriterion() {
     if (session.draft.criteria.length >= maxCriteria) {
       setError(`Real job rubrics may contain no more than ${maxCriteria} criteria.`)
@@ -189,7 +228,7 @@ export function RubricEditor({ rubric, onClose, onSaved, initialPanel = null, in
     const id = crypto.randomUUID()
     edit([criterionPresenceKey(id)], 'Added criterion', draft => ({
       ...draft,
-      criteria: [...draft.criteria, { id, key: 'custom', label: '', description: '', guidance: '', weight: 0, requirementType: 'required' as const, sourceCitations: [] }],
+      criteria: [...draft.criteria, { id, key: 'custom', label: '', description: '', guidance: '', ...(scaled ? { levels: emptyLevels() } : {}), weight: 0, requirementType: 'required' as const, sourceCitations: [] }],
     }))
   }
 
@@ -260,18 +299,8 @@ export function RubricEditor({ rubric, onClose, onSaved, initialPanel = null, in
     setSaving(true)
     try {
       const id = await saveRubric({
-        ...session.draft,
+        ...savedDraft,
         ...(session.draft.provenance ? { provenance: { ...session.draft.provenance, kind: 'edited' as const } } : {}),
-        name: session.draft.name.trim(),
-        description: session.draft.description.trim(),
-        criteria: session.draft.criteria.map((criterion) => ({
-          ...criterion,
-          label: criterion.label.trim(),
-          description: criterion.description.trim(),
-          guidance: criterion.guidance.trim(),
-          sourceParagraphId: criterion.sourceCitations?.[0]?.paragraphId,
-          sourceCitations: criterion.sourceCitations?.map((citation) => ({ ...citation, quote: citation.quote.trim() })),
-        })),
       })
       guard.release()
       onSaved(id)
@@ -305,7 +334,7 @@ export function RubricEditor({ rubric, onClose, onSaved, initialPanel = null, in
     const labelKey = criterionFieldKey(criterion.id, 'label')
     const weightKey = criterionFieldKey(criterion.id, 'weight')
     const descriptionKey = criterionFieldKey(criterion.id, 'description')
-    const guidanceKey = criterionFieldKey(criterion.id, 'guidance')
+    const guidanceKey = criterionFieldKey(criterion.id, scaled ? 'levels' : 'guidance')
     const requirementKey = criterionFieldKey(criterion.id, 'requirementType')
     const citationKey = criterionFieldKey(criterion.id, 'citation')
     return <fieldset className={`criterion-card min-w-0 ${changed ? 'rubric-criterion-changed' : ''}`} key={criterion.id} data-change-key={presenceKey}>
@@ -322,14 +351,14 @@ export function RubricEditor({ rubric, onClose, onSaved, initialPanel = null, in
       {addedBy && assistantAvailable && !criterion.label.trim() && !criterion.description.trim() && !criterion.guidance.trim() && <DraftWithAi disabled={locked} onDraft={(text) => {
         setFocusCriterionId(criterion.id)
         setActivePanel('assist')
-        void conversation.send(`Draft criterion ${String(index + 1).padStart(2, '0')} to assess: ${text || 'a missing requirement from the posting'}. Fill the label, description, 0–5 score guidance, requirement type, exact source quote and weight, rebalancing other weights to total 100.`, criterion.id)
+        void conversation.send(`Draft criterion ${String(index + 1).padStart(2, '0')} to assess: ${text || 'a missing requirement from the posting'}. Fill the label, description, scale level examples, requirement type, cited source passages and weight, rebalancing other weights to total 100.`, criterion.id)
       }} />}
       <div className="grid gap-4 sm:grid-cols-[minmax(0,1fr)_108px]">
         {changedField(labelKey, 'Label', describedBy => <label className="field"><span className="field-label">Label</span><input className="input" value={criterion.label} onBlur={session.endGroup} onChange={(event) => updateCriterion(criterion.id, { label: event.target.value }, [labelKey], 'Edited criterion label')} placeholder="What are you looking for?" required aria-describedby={describedBy} aria-invalid={attempted && !criterion.label.trim()} /></label>, Boolean(addedBy))}
         {changedField(weightKey, 'Weight', describedBy => <label className="block"><span className="field-label">Weight (%)</span><input className="input" type="number" min={0} max={100} step="any" value={Number.isFinite(criterion.weight) ? criterion.weight : ''} onBlur={session.endGroup} onChange={(event) => updateCriterion(criterion.id, { weight: event.target.valueAsNumber }, [weightKey], 'Edited criterion weight')} aria-describedby={[weightHintId, describedBy].filter(Boolean).join(' ') || undefined} aria-invalid={attempted && (!Number.isFinite(criterion.weight) || criterion.weight < 0 || criterion.weight > 100)} required /></label>, Boolean(addedBy))}
       </div>
       {changedField(descriptionKey, 'Description', describedBy => <label className="field mt-4"><span className="field-label">Description</span><textarea className="input" rows={2} value={criterion.description} onBlur={session.endGroup} onChange={(event) => updateCriterion(criterion.id, { description: event.target.value }, [descriptionKey], 'Edited criterion description')} placeholder="Describe the experience or evidence to consider." required aria-describedby={describedBy} aria-invalid={attempted && !criterion.description.trim()} /></label>, Boolean(addedBy))}
-      {changedField(guidanceKey, 'Score guidance', describedBy => <label className="field"><span className="field-label">Score guidance</span><textarea className="input" rows={3} value={criterion.guidance} onBlur={session.endGroup} onChange={(event) => updateCriterion(criterion.id, { guidance: event.target.value }, [guidanceKey], 'Edited score guidance')} placeholder="Explain what evidence supports different scores from 0 to 5." required aria-describedby={describedBy} aria-invalid={attempted && !criterion.guidance.trim()} /></label>, Boolean(addedBy))}
+      {scaled ? changedField(guidanceKey, 'Level examples', describedBy => <ScaleLevelEditor criterion={criterion} attempted={attempted} describedBy={describedBy} onBlur={session.endGroup} onChange={(levels) => updateCriterion(criterion.id, { levels, guidance: guidanceForLevels(levels, criterion.guidance) }, [guidanceKey], 'Edited level examples')} />, Boolean(addedBy)) : changedField(guidanceKey, 'Score guidance', describedBy => <label className="field"><span className="field-label">Score guidance</span><textarea className="input" rows={3} value={criterion.guidance} onBlur={session.endGroup} onChange={(event) => updateCriterion(criterion.id, { guidance: event.target.value }, [guidanceKey], 'Edited score guidance')} placeholder="Explain what evidence supports different scores from 0 to 5." required aria-describedby={describedBy} aria-invalid={attempted && !criterion.guidance.trim()} /></label>, Boolean(addedBy))}
       <div className="mt-4 grid gap-4 sm:grid-cols-2">
         {changedField(requirementKey, 'Requirement type', describedBy => <label className="field"><span className="field-label">Requirement type</span><select className="input" value={criterion.requirementType ?? ''} required aria-describedby={describedBy} onChange={(event) => updateCriterion(criterion.id, { requirementType: event.target.value === 'preferred' ? 'preferred' : 'required' }, [requirementKey], 'Edited requirement type')}><option value="required">Required</option><option value="preferred">Preferred</option></select></label>, Boolean(addedBy))}
         {changedField(citationKey, 'Source quote', describedBy => <label className="field"><span className="field-label">Source paragraph</span><select className="input" value={criterion.sourceCitations?.[0]?.paragraphId ?? ''} required aria-describedby={describedBy} aria-invalid={attempted && !criterion.sourceCitations?.[0]?.paragraphId} onChange={(event) => updateCriterion(criterion.id, citationPatch(criterion, event.target.value || undefined), [citationKey], 'Edited source quote')}><option value="">Choose a paragraph</option>{document?.paragraphs.map((paragraph) => <option key={paragraph.id} value={paragraph.id}>Page {paragraph.page} / {paragraph.heading}</option>)}</select></label>, Boolean(addedBy))}
@@ -373,6 +402,7 @@ export function RubricEditor({ rubric, onClose, onSaved, initialPanel = null, in
   </Modal>
 }
 
+
 function focusLabel(rubric: Rubric, id: string): string {
   const index = rubric.criteria.findIndex((item) => item.id === id)
   const criterion = rubric.criteria[index]
@@ -382,11 +412,11 @@ function focusLabel(rubric: Rubric, id: string): string {
 function quickActions(focusId: string | null) {
   const suffix = focusId ? ' for the focused criterion' : ''
   return [
-    { id: 'draft-guidance', label: 'Draft score guidance', instruction: `Draft clearer 0–5 score guidance${suffix}, grounded in the posting.` },
+    { id: 'draft-guidance', label: 'Draft level examples', instruction: `Draft clearer scale level examples${suffix}, grounded in the posting.` },
     { id: 'tighten', label: 'Tighten wording', instruction: `Tighten the wording${suffix} without changing the meaning.` },
     { id: 'rebalance', label: 'Rebalance weights', instruction: 'Rebalance the criterion weights so they total 100 while preserving the relative importance implied by the posting.' },
     { id: 'missing', label: 'Suggest missing requirements from the posting', instruction: 'Suggest missing requirements from the posting and add supported criteria with exact quotes if appropriate.' },
-    { id: 'consistency', label: 'Check consistency across criteria', instruction: 'Check consistency across criteria, including labels, descriptions, guidance, requirement types, citations and weights.' },
+    { id: 'consistency', label: 'Check consistency across criteria', instruction: 'Check consistency across criteria, including labels, descriptions, level examples, guidance, requirement types, citations and weights.' },
     { id: 'rebuild', label: 'Rebuild from the posting', instruction: 'Rebuild the rubric from the posting, preserving only criteria still strongly supported by exact source quotes and rebalancing weights to total 100.' },
   ]
 }

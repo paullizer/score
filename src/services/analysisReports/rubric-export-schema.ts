@@ -36,6 +36,7 @@ export const rubricExportPayloadSchema: z.ZodType<RubricExportPayload> = z.stric
   rubric: z.strictObject({
     id, version, latestVersion: version, name: requiredText, description: text, createdAt: timestamp,
     provenance: z.enum(['generated', 'edited']),
+    approval: z.enum(['approved', 'draft', 'superseded']).optional(),
     criteria: z.array(criterion).min(1).max(REPORT_LIMITS.maxCriteriaPerTarget),
   }).refine(rubric => rubric.version <= rubric.latestVersion, 'The exported rubric version must not be newer than the latest version.'),
 })

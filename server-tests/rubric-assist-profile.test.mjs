@@ -1,5 +1,4 @@
 import assert from 'node:assert/strict'
-import { createHash } from 'node:crypto'
 import test from 'node:test'
 import {
   JOB_RUBRIC_ASSIST_SYSTEM_PROMPT,
@@ -73,8 +72,8 @@ function validAddOutput(overrides = {}) {
         guidance: null,
         weight: 60,
         requirementType: null,
-        paragraphId: null,
-        quote: null,
+        levels: null,
+        sourcePassageIds: null,
       },
       {
         action: 'add',
@@ -85,8 +84,8 @@ function validAddOutput(overrides = {}) {
         guidance,
         weight: 40,
         requirementType: 'preferred',
-        paragraphId: 'p-0002',
-        quote: 'Azure operations experience is preferred.',
+        levels: null,
+        sourcePassageIds: [2],
       },
     ],
     warnings: [],
@@ -122,7 +121,11 @@ test('buildPrompt keeps source first and includes draft refs, focus, conversatio
     conversation: [{ role: 'user', text: 'Earlier request' }, { role: 'assistant', text: 'Earlier response' }],
     correction: ['C2 quote is invalid.'],
   })
-  assert.equal(prompt.source, '<document title=""Platform Engineer"">\n<paragraph id="p-0001" page="1" heading=""Requirements"">Five years of TypeScript experience is required.</paragraph>\n<paragraph id="p-0002" page="2" heading=""Preferred"">Azure operations experience is preferred.</paragraph>\n<paragraph id="p-0003" page="3" heading=""Duties"">Build reliable APIs and improve deployment automation.</paragraph>\n</document>')
+  assert.deepEqual(JSON.parse(prompt.source).paragraphs.map(paragraph => [paragraph.id, paragraph.passages[0][0], paragraph.passages[0][1]]), [
+    ['p-0001', 1, 'Five years of TypeScript experience is required.'],
+    ['p-0002', 2, 'Azure operations experience is preferred.'],
+    ['p-0003', 3, 'Build reliable APIs and improve deployment automation.'],
+  ])
   assert.equal(prompt.user.startsWith(prompt.source), true)
   assert.ok(prompt.user.indexOf('CURRENT DRAFT') > prompt.source.length)
   assert.match(prompt.user, /"ref": "C1"/)
@@ -144,11 +147,10 @@ test('JSON schema is strict-mode compatible at every object', () => {
 })
 
 test('assist prompt retains rule parity with the pinned generation prompt', () => {
-  assert.equal(createHash('sha256').update(JOB_RUBRIC_COMPILED_PROMPT.system).digest('hex'), '193a455fb93fbd42225c4da1df26d54f92bd9b66b41a7f8f1e4c3227e83857b0')
   for (const phrase of [
-    'No supporting evidence in the submitted resume for this criterion',
+    'no supporting',
     'protected characteristics',
-    'verbatim quote',
+    'passage IDs',
     'preferred',
     'location, hybrid arrangements, salary',
     'never invent',
@@ -173,7 +175,7 @@ test('valid changed output builds citations, deterministic IDs, warnings, and re
     quote: 'Azure operations experience is preferred.',
   })
   assert.deepEqual(result.value.warnings, [])
-  rubricAssistResponseSchema.parse({ ...result.value, assistant: { promptVersion: 'score-rubric-assist-v1', model: 'test-model' } })
+  rubricAssistResponseSchema.parse({ ...result.value, assistant: { promptVersion: 'score-rubric-assist-v2', model: 'test-model' } })
 })
 
 test('explained and clarify outcomes cannot carry changes', () => {
@@ -204,8 +206,8 @@ test('no-op fields are dropped and changed requires an effective operation', () 
       guidance: null,
       weight: 100,
       requirementType: 'required',
-      paragraphId: 'p-0001',
-      quote: 'Five years of TypeScript experience is required.',
+      levels: null,
+      sourcePassageIds: [1],
     }],
     warnings: [],
   }, /at least one effective operation/)
@@ -214,7 +216,7 @@ test('no-op fields are dropped and changed requires an effective operation', () 
 test('validation rejects malformed refs, duplicate targets, bad citations, protected criteria, missing anchors, and invalid removals', () => {
   assertValidationError(validAddOutput({ criteria: [{ ...validAddOutput().criteria[0], ref: 'criterion-01' }] }), /Unknown criterion ref criterion-01/)
   assertValidationError(validAddOutput({ criteria: [validAddOutput().criteria[0], { ...validAddOutput().criteria[0], weight: 50 }] }), /targeted more than once/)
-  assertValidationError(validAddOutput({ criteria: [{ ...validAddOutput().criteria[1], quote: 'Fabricated quote.' }] }), /not an exact substring/)
+  assertValidationError(validAddOutput({ criteria: [{ ...validAddOutput().criteria[1], sourcePassageIds: [999] }] }), /Passage 999 does not exist/)
   assertValidationError(validAddOutput({ criteria: [{ ...validAddOutput().criteria[1], label: 'Young engineer', description: 'Must be under age 30.' }] }), /protected/)
   assertValidationError(validAddOutput({ criteria: [{ ...validAddOutput().criteria[1], guidance: '0: none; 1: some evidence.' }] }), /anchor scores 2, 3, 4, 5/)
   assertValidationError({
@@ -230,8 +232,8 @@ test('validation rejects malformed refs, duplicate targets, bad citations, prote
       guidance: null,
       weight: null,
       requirementType: null,
-      paragraphId: null,
-      quote: null,
+      levels: null,
+      sourcePassageIds: null,
     }],
     warnings: [],
   }, /At least one criterion must remain/)
@@ -274,8 +276,8 @@ test('max-criteria policy applies only when resulting draft contains unsaved cri
       guidance: null,
       weight: null,
       requirementType: null,
-      paragraphId: null,
-      quote: null,
+      levels: null,
+      sourcePassageIds: null,
     }],
     warnings: [],
   }

@@ -74,6 +74,8 @@ export interface RealJobTargetSelection {
   documentId: string
   documentVersion: number
   documentSha256: string
+  /** Present when this is the job's approved rubric version, so a later approval makes the selection stale. */
+  approvalId?: string
 }
 
 export interface RealGradeTargetSelection {
@@ -91,6 +93,44 @@ export interface RealGradeTargetSelection {
 
 export type RealAnalysisTargetSelection = RealJobTargetSelection | RealGradeTargetSelection
 
+/** One job, or one GS grade of a ladder, that appears with more than one saved rubric hash. */
+export interface MixedRubricVersions<T> {
+  kind: 'job' | 'grade'
+  /** The first item for this job or grade, used to label the warning. */
+  first: T
+  versions: { version: number; hash: string }[]
+}
+
+/**
+ * Scores are comparable only within one exact rubric version. Views, reports and exports use this to warn when they
+ * show more than one version of the same job or GS grade, instead of comparing or ranking across them.
+ */
+export function mixedRubricVersions<T>(
+  items: readonly T[], selectionOf: (item: T) => RealAnalysisTargetSelection | null | undefined,
+): MixedRubricVersions<T>[] {
+  const families = new Map<string, MixedRubricVersions<T>>()
+  for (const item of items) {
+    const selection = selectionOf(item)
+    if (!selection) continue
+    const key = selection.kind === 'job' ? `job:${selection.jobId}` : `grade:${selection.ladderId}:${selection.grade}`
+    const version = selection.kind === 'job' ? selection.rubricVersion : selection.version
+    const hash = selection.kind === 'job' ? selection.rubricHash : selection.versionHash
+    const family = families.get(key)
+    if (!family) families.set(key, { kind: selection.kind, first: item, versions: [{ version, hash }] })
+    else if (!family.versions.some((entry) => entry.hash === hash)) family.versions.push({ version, hash })
+  }
+  return [...families.values()].filter((family) => family.versions.length > 1).map((family) => ({
+    ...family, versions: [...family.versions].sort((left, right) => left.version - right.version || left.hash.localeCompare(right.hash)),
+  }))
+}
+
+export function mixedRubricVersionsNotice<T>(families: readonly MixedRubricVersions<T>[], label: (item: T) => string): string | null {
+  if (!families.length) return null
+  const entries = families.map((family) =>
+    `${label(family.first)} (${family.versions.map((entry) => `v${entry.version} · ${entry.hash.slice(0, 8)}`).join(', ')})`)
+  return `Rubric versions differ for ${entries.join('; ')}. Scores are comparable only within one exact version, so don’t rank or compare them across versions.`
+}
+
 export interface RealAnalysisTargetSummaryBase {
   id: string
   workspaceId: string
@@ -106,6 +146,10 @@ export interface RealAnalysisTargetSummaryBase {
 export interface RealJobTargetSummary extends RealAnalysisTargetSummaryBase {
   kind: 'job'
   selection: RealJobTargetSelection
+  /** Set for the job's approved rubric version. */
+  approvedAt?: string
+  /** The approved version has newer saved drafts that are not approved yet. */
+  newerDraftAvailable?: boolean
 }
 
 export interface RealGradeTargetSummary extends RealAnalysisTargetSummaryBase {
@@ -122,6 +166,11 @@ export type RealAnalysisTargetSummary = RealJobTargetSummary | RealGradeTargetSu
 export interface RealAnalysisTargetsPage {
   targets: RealAnalysisTargetSummary[]
   continuationToken?: string
+  /**
+   * Present while Admin settings require approved job rubrics: ready jobs left out of the targets because no
+   * rubric version is approved yet.
+   */
+  unapprovedJobRubrics?: number
 }
 
 export interface RealAnalysisResumeSummary {

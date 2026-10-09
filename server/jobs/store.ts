@@ -1,6 +1,7 @@
 import type { RealJobRecord, VersionedRealJob } from '../../src/domain/real-jobs'
 import type { Rubric } from '../../src/domain/types'
 import type { LifecycleAction } from '../../src/domain/lifecycle'
+import type { RubricApprovalRecord, RubricQaRecord } from '../../src/domain/rubric-approval'
 import type { WorkspaceLifecycleControl, WorkspaceLifecycleState } from '../lifecycle/contracts'
 
 export type JobLifecycleScope = 'job' | 'rubric'
@@ -32,7 +33,14 @@ export interface RealJobStore {
   listLifecyclePending(workspaceId: string, continuationToken?: string): Promise<{ jobs: VersionedRealJob[]; continuationToken?: string }>
   getRubric(workspaceId: string, rubricId: string): Promise<Rubric | undefined>
   listRubrics(workspaceId: string, jobId: string): Promise<Rubric[]>
-  publish(record: RealJobRecord, expectedEtag: string, rubric: Rubric): Promise<VersionedRealJob>
+  /** Generation publishes the rubric and its completed QA in the same transaction; edits await on-demand checks. */
+  publish(record: RealJobRecord, expectedEtag: string, rubric: Rubric, checks?: RubricQaRecord): Promise<VersionedRealJob>
+  /** The rubric check results for one exact saved version, if they have run. */
+  getRubricQa(workspaceId: string, jobId: string, rubricId: string, version: number): Promise<RubricQaRecord | undefined>
+  /** Create-only; returns the stored record when one already exists for the version. */
+  createRubricQa(record: RubricQaRecord): Promise<RubricQaRecord>
+  /** Atomically creates the approval record and moves the job's approval pointer to it. */
+  approveRubric(record: RealJobRecord, expectedEtag: string, approval: RubricApprovalRecord): Promise<VersionedRealJob>
   getWorkspaceLifecycle(workspaceId: string): Promise<WorkspaceLifecycleControl>
   setWorkspaceLifecycle(workspaceId: string, state: WorkspaceLifecycleState, timestamp: string): Promise<void>
   cancelWorkspace(workspaceId: string, timestamp: string): Promise<void>

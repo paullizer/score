@@ -510,7 +510,7 @@ function markdownComparison(kind) {
   const rubric = { version: 2, criteria: [criterion] }
   const target = {
     kind, summary: { id: `target-${kind}`, label: 'Saved requirements', sublabel: 'Exact Markdown source' },
-    selection: kind === 'job' ? { kind, rubricVersion: 2, documentVersion: 3 } : { kind, grade: 9, version: 2 },
+    selection: kind === 'job' ? { kind, rubricVersion: 2, rubricHash: hash, documentVersion: 3 } : { kind, grade: 9, version: 2, versionHash: hash },
     requirementEvidence: [{ kind: 'criterion', criterionId: criterion.id, citations: [requirementCitation] }],
     ...(kind === 'job' ? { rubric, document: jobDocument, original: { contentType: 'text/markdown' } }
       : { version: { id: 'approved-version', rubric, qualifications: [] }, approval: { id: 'approval' }, review: { id: 'review' },

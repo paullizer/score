@@ -29,7 +29,7 @@ const resumeSelection = z.strictObject({ resumeId: id, documentId: id, documentV
 const targetSelection = z.discriminatedUnion('kind', [
   z.strictObject({
     kind: z.literal('job'), jobId: id, rubricId: id, rubricVersion: version, rubricHash: hash,
-    documentId: id, documentVersion: version, documentSha256: hash,
+    documentId: id, documentVersion: version, documentSha256: hash, approvalId: id.optional(),
   }),
   z.strictObject({
     kind: z.literal('grade'), ladderId: id, grade: z.number().int().min(1).max(15),

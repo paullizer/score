@@ -63,6 +63,8 @@ function criterion(id, label, weight, extra = {}) {
     requirementType: extra.requirementType ?? 'required',
     sourceParagraphId: extra.sourceParagraphId ?? 'p1',
     sourceCitations: extra.sourceCitations ?? [citation()],
+    ...(extra.levels ? { levels: extra.levels } : {}),
+    ...(extra.guidance ? { guidance: extra.guidance } : {}),
   }
 }
 
@@ -252,6 +254,25 @@ test('summaries and rubric operation descriptions are compact and keyed to edita
   assert.match(ui.summarizeChanges(changes), /Score guidance · Criterion 01/)
 })
 
+
+test('scaled rubric level examples are editable, highlighted, and render guidance', async () => {
+  const baseLevels = [1, 2, 3, 4, 5].map(level => ({ level, examples: `Original example ${level}` }))
+  const base = rubric({
+    scaleVersion: 'score-evidence-ladder-v1',
+    criteria: [criterion('c1', 'Data analysis', 100, { key: 'custom', levels: baseLevels, guidance: 'old generated guidance' })],
+  })
+  const session = await renderSession(base)
+  const nextLevels = baseLevels.map(item => item.level === 3 ? { ...item, examples: 'Documents recurring analysis duties.' } : item)
+  const levelsKey = ui.criterionFieldKey('c1', 'levels')
+  const next = ui.applyRubricAssistOperations(base, [{ type: 'updateCriterion', criterionId: 'c1', changes: { levels: nextLevels } }])
+  await sessionAct(api => api.applyAssist(next, { keys: [levelsKey], note: 'Level examples · Criterion 01', turnId: 'turn-levels' }))
+  assert.equal(session().highlight(levelsKey), 'ai')
+  assert.deepEqual(session().draft.criteria[0].levels, nextLevels)
+  assert.match(session().draft.criteria[0].guidance, /Documents recurring analysis duties\./)
+  await sessionAct(api => api.revert(levelsKey))
+  assert.deepEqual(session().draft.criteria[0].levels, baseLevels)
+})
+
 test('rubricVersionChangeNote distinguishes generated, edited, structural, and unchanged versions', () => {
   const generated = rubric()
   assert.equal(ui.rubricVersionChangeNote(undefined, generated), 'Generated')
@@ -273,7 +294,7 @@ test('end-to-end server-shaped operations apply as one AI entry and undo by turn
   const session = await renderSession(base)
   const operations = [
     { type: 'updateRubric', description: 'Updated from the posting' },
-    { type: 'updateCriterion', criterionId: 'c1', changes: { citation: citation('p9', 'Analyzes workforce data'), requirementType: 'preferred' } },
+    { type: 'updateCriterion', criterionId: 'c1', changes: { citation: [citation('p9', 'Analyzes workforce data')], requirementType: 'preferred' } },
   ]
   const next = ui.applyRubricAssistOperations(base, operations)
   const keys = operations.flatMap(operation => ui.rubricAssistOperationFieldKeys(operation))

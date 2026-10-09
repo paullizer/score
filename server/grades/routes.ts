@@ -137,15 +137,17 @@ export function createRealGradesRouter(deps: GradeRouterDeps): Router {
   }
   const authorize: RequestHandler = async (req, _res, next) => {
     try {
+      // Approving a grade version is owner-only, like approving a job rubric.
       await deps.repository.authorizeWorkspace(getPrincipal(req), workspaceId(req),
-        /\/lifecycle\/?$/.test(req.path) ? 'manage' : req.method === 'GET' ? 'read' : 'write')
+        /\/lifecycle\/?$/.test(req.path) ? 'manage' : req.method === 'GET' ? 'read'
+          : /\/grades\/[^/]+\/approve\/?$/.test(req.path) ? 'approve' : 'write')
       requireService()
       next()
     } catch (error) { next(error) }
   }
   router.use(base, authorize)
   const mutating = (
-    access: 'write' | 'manage', callback: (req: Request, res: express.Response) => Promise<void>,
+    access: 'write' | 'manage' | 'approve', callback: (req: Request, res: express.Response) => Promise<void>,
   ): RequestHandler => async (req, res, next) => {
     try {
       await deps.repository.withWorkspaceMutation(getPrincipal(req), workspaceId(req), access, () => callback(req, res))
@@ -153,7 +155,8 @@ export function createRealGradesRouter(deps: GradeRouterDeps): Router {
   }
   const mutation = (
     callback: (service: GradeService, req: Request) => ReturnType<GradeService['detail']>, status = 200,
-  ): RequestHandler => mutating('write', async (req, res) => {
+    access: 'write' | 'approve' = 'write',
+  ): RequestHandler => mutating(access, async (req, res) => {
     const detail = await callback(requireService(req), req)
     res.setHeader('ETag', detail.etag)
     res.status(status).json({ ladder: detail })
@@ -275,7 +278,7 @@ export function createRealGradesRouter(deps: GradeRouterDeps): Router {
   )))
   router.post(`${base}/:ladderId/grades/:grade/approve`, mutation((service, req) => service.approve(
     workspaceId(req), ladderId(req), grade(req), parse(approveGradeInputSchema, req.body), actor(req), etag(req),
-  )))
+  ), 200, 'approve'))
   router.get(`${base}/:ladderId/grades/:grade/versions`, async (req, res) => {
     const options = page(req)
     res.json(await requireService().versions(workspaceId(req), ladderId(req), grade(req), options.continuationToken, options.limit))

@@ -649,11 +649,13 @@ export function startRealAnalysisSubmission(workspaceId: string, input: CreateRe
   })
   const targets = input.targets.map((item): RealAnalysisTargetSelection => {
     if (item.kind === 'job') {
-      if (!item.jobId || !item.rubricId || !positive(item.rubricVersion) || !hash(item.rubricHash) || !item.documentId || !positive(item.documentVersion) || !hash(item.documentSha256)) {
+      if (!item.jobId || !item.rubricId || !positive(item.rubricVersion) || !hash(item.rubricHash) || !item.documentId || !positive(item.documentVersion) || !hash(item.documentSha256)
+        || (item.approvalId !== undefined && !/^rubric-approval-[\da-f]{8}-[\da-f]{4}-[\da-f]{4}-[\da-f]{4}-[\da-f]{12}$/.test(item.approvalId))) {
         throw new Error('Select an exact saved real job rubric and source version.')
       }
       return { kind: 'job', jobId: item.jobId, rubricId: item.rubricId, rubricVersion: item.rubricVersion, rubricHash: item.rubricHash,
-        documentId: item.documentId, documentVersion: item.documentVersion, documentSha256: item.documentSha256 }
+        documentId: item.documentId, documentVersion: item.documentVersion, documentSha256: item.documentSha256,
+        ...(item.approvalId ? { approvalId: item.approvalId } : {}) }
     }
     if (item.kind !== 'grade' || !item.ladderId || !positive(item.grade) || item.grade > 15 || !item.versionId || !positive(item.version)
       || !hash(item.versionHash) || !item.approvalId || !item.reviewId || !item.sourceSetId || !hash(item.sourceSetHash)) {

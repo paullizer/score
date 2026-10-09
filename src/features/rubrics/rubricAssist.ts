@@ -38,6 +38,8 @@ function criterionFieldDisplay(criterion: Criterion, field: RubricCriterionField
     case 'description':
     case 'guidance':
       return { value: criterion[field], display: criterion[field] || 'Blank' }
+    case 'levels':
+      return { value: criterion.levels ?? null, display: criterion.levels?.map(level => `${level.level}: ${level.examples || 'Blank'}`).join(' | ') ?? 'No level examples' }
     case 'weight':
       return { value: Number.isFinite(criterion.weight) ? criterion.weight : null, display: formatPercent(criterion.weight) }
     case 'requirementType':
@@ -46,10 +48,10 @@ function criterionFieldDisplay(criterion: Criterion, field: RubricCriterionField
         display: criterion.requirementType === 'required' ? 'Required' : criterion.requirementType === 'preferred' ? 'Preferred' : 'Not set',
       }
     case 'citation': {
-      const citation = criterion.sourceCitations?.[0]
+      const citations = criterion.sourceCitations ?? []
       return {
-        value: citation ? { paragraphId: citation.paragraphId, quote: citation.quote } : null,
-        display: citation?.quote || 'No source quote',
+        value: citations.length ? citations.map(citation => ({ paragraphId: citation.paragraphId, quote: citation.quote })) : null,
+        display: citations.map(citation => citation.quote).filter(Boolean).join(' … ') || 'No source quote',
       }
     }
   }
@@ -63,6 +65,8 @@ function fieldLabel(field: RubricCriterionField): string {
       return 'Description'
     case 'guidance':
       return 'Score guidance'
+    case 'levels':
+      return 'Level examples'
     case 'weight':
       return 'Weight'
     case 'requirementType':
@@ -114,7 +118,7 @@ function restoreCriterionField(draft: Rubric, source: Rubric, criterionId: strin
 }
 
 function parseCriterionFieldKey(key: string): { criterionId: string; field: RubricCriterionField } | null {
-  const match = /^criterion:(.+):(label|description|guidance|weight|requirementType|citation)$/.exec(key)
+  const match = /^criterion:(.+):(label|description|guidance|levels|weight|requirementType|citation)$/.exec(key)
   if (!match) return null
   return { criterionId: match[1]!, field: match[2] as RubricCriterionField }
 }
@@ -174,8 +178,8 @@ function describeCriterionField(before: Rubric, criterion: Criterion, field: Rub
   const current = criterionFieldDisplay(criterion, field)
   const nextCriterion = { ...criterion }
   if (field === 'citation') {
-    const citation = nextValue as Citation | undefined
-    nextCriterion.sourceCitations = citation ? [citation] : undefined
+    const citations = nextValue as Citation[] | undefined
+    nextCriterion.sourceCitations = citations?.length ? citations : undefined
   } else {
     ;(nextCriterion as unknown as Record<string, unknown>)[field] = nextValue
   }
@@ -274,7 +278,7 @@ export function summarizeRubricAssistOperations(operations: readonly RubricAssis
       const index = criterionIndex(current, operation.criterionId)
       for (const field of RUBRIC_CRITERION_FIELDS) {
         if (operation.changes[field] !== undefined) {
-          const label = field === 'guidance' ? 'Guidance' : field === 'weight' ? 'Weights' : fieldLabel(field)
+          const label = field === 'guidance' ? 'Guidance' : field === 'levels' ? 'Level examples' : field === 'weight' ? 'Weights' : fieldLabel(field)
           groups.set(label, [...(groups.get(label) ?? []), index + 1])
         }
       }

@@ -17,7 +17,10 @@ import {
   type OriginalContentType,
 } from '../../src/domain/document-formats'
 import { isSafeUploadedFilename, MAX_MARKDOWN_BYTES } from '../../src/domain/source-files'
+import { EVIDENCE_SCALE_VERSION } from '../../src/domain/evidence-scale'
+import { rubricApprovalRequired } from '../../src/domain/feature-switches'
 import type { RealJobsDeps } from '../jobs/routes'
+import { analysisHash } from '../analyses/deterministic'
 import {
   extractedBlobName, isBlobInJobPrefix, originalBlobName, validateRealJobRecord,
   validateRealRubric, validateRealSourceDocument,
@@ -472,8 +475,8 @@ export class GradeService {
     }
     const initializationName = `${workspaceId}/${ladderId}/initialization.json`
     let initializationBlob = await this.blobs.read(initializationName)
-    const processingSettings = initializationBlob ? undefined
-      : newProcessingSettings(this.settings, await this.admission(input.grades))
+    const admission = initializationBlob ? undefined : await this.admission(input.grades)
+    const processingSettings = admission ? newProcessingSettings(this.settings, admission) : undefined
     const previousControl = await this.store.getControl(workspaceId, ladderId)
     if ((initializationBlob && initializationSchema.parse(json(initializationBlob)).inputFingerprint !== fingerprint) ||
       (previousControl?.record.preparation && previousControl.record.preparation.inputFingerprint !== fingerprint)) {
@@ -501,6 +504,13 @@ export class GradeService {
       }
     }
     const { current, rubric } = await liveSeed()
+    // Only the first acceptance checks approval; an idempotent replay keeps the seed it already captured.
+    if (admission && rubricApprovalRequired(admission.settings)) {
+      const approval = current.record.rubricApproval
+      if (!approval || approval.rubricId !== rubric.id || approval.version !== rubric.version || approval.rubricHash !== analysisHash(rubric)) {
+        throw conflict('Grade ladders can start only from the approved version of a job rubric. A workspace owner approves rubrics on the job\'s rubric page.')
+      }
+    }
     await updateGradeControl(this.store, workspaceId, ladderId, control => {
       if (control.preparation && control.preparation.inputFingerprint !== fingerprint) {
         throw conflict('This idempotency key was used for different ladder input.')
@@ -1130,6 +1140,9 @@ export class GradeService {
     }
     if (gradeIssuesFor([...current.ladder.record.issues, ...head.issues, ...review.issues], grade)
       .some(issue => issue.severity === 'blocker')) throw conflict('Unresolved content, source, or applicability blockers prevent approval.')
+    if (version.rubric.scaleVersion !== EVIDENCE_SCALE_VERSION) {
+      throw conflict('This grade rubric was drafted before the evidence scale, so it can\'t be approved. Generate the ladder again to draft grade rubrics that use the scale.')
+    }
     const documents = await Promise.all(current.sourceSet.record.sources.map(source => this.readReference(workspaceId, ladderId, source)))
     const errors = validateGradeApproval(version, current.sourceSet.record, documents)
     if (errors.length) throw conflict(`Approval is blocked: ${errors.slice(0, 20).join(' ')}`)

@@ -64,6 +64,9 @@ field('features.qcReviews', 'QC reviews and improvements', 'intake', 'boolean',
 field('features.analysisEvidenceCorrections', 'Analysis evidence corrections', 'intake', 'boolean',
   'Allows workspace owners and editors to request corrections or full reassessment of saved comparisons from their frozen evidence. Turning this off stops new requests; saved results, previews and correction history remain readable, and accepted corrections can finish or be cancelled. It does not change earlier results or enable the experimental scoring policy.',
   { defaultValue: true })
+field('features.rubricApprovalRequired', 'Require approved job rubrics', 'intake', 'boolean',
+  'New analyses and grade ladders can use only the version of a job rubric that a workspace owner approved, so every score in a comparison uses the same reviewed rubric. Owners approve on the job\'s rubric page after the rubric checks run; edits create a draft and the approved version stays in use until a newer one is approved. Turning this off lets new work use any saved rubric version, approved or not. Earlier analyses and approvals are not changed.',
+  { defaultValue: true })
 field('maintenance.pauseNewWork', 'Pause new work', 'intake', 'boolean', 'Stops new imports, ladder generations, analyses and summaries, not accepted work, reads, cleanup or cancellation.')
 field('maintenance.explanation', 'Maintenance explanation', 'intake', 'text', 'Optional plain-text explanation.', { max: 1000 })
 for (const kind of ['jobs', 'resumes'] as const) {
@@ -173,6 +176,7 @@ for (const item of fields) {
   if (item.path === 'features.rubricExports') item.prerequisites = ['Real jobs are configured', 'The workspace role is in Official export roles', 'PDF, Word, PowerPoint and CSV also need the format in Report formats']
   if (item.path === 'features.qcReviews') item.prerequisites = ['Private QC and real-analysis stores are configured', 'Verified QC deployment gate', 'New-work admission is not paused', 'AI planning and evaluation also require the dedicated QC worker']
   if (item.path === 'features.analysisEvidenceCorrections') item.prerequisites = ['Verified evidence-correction API and analysis worker readers', 'New-work admission is not paused', 'Full reassessment also requires new analyses']
+  if (item.path === 'features.rubricApprovalRequired') item.prerequisites = ['Real jobs are configured', 'Approval needs a rubric on the evidence scale and completed rubric checks, which use the job-rubric model deployment']
   if (item.path.endsWith('.allowedFormats')) item.prerequisites = ['Corresponding import services are available', 'DOCX/DOC require verified Word rollout capability']
   if (item.path === 'documents.formattedDocxPreviewEnabled') item.prerequisites = ['The reader has an allowed original-download workspace role']
   if (item.path === 'summaries.allowManualPublication') item.prerequisites = ['Exact saved draft and required disclosure', 'Authorized source-workspace role']

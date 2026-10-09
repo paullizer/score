@@ -8,14 +8,14 @@ The pattern follows the assisted editors in [SimpleChat](https://github.com/micr
 
 Open a real job rubric and choose **Edit with AI**. You can also choose **Ask AI** on one criterion, or **Edit rubric** and then **AI assist**. The editor opens full screen: the rubric form fills the main pane, and a side panel has three tabs:
 
-- **Ask AI:** a conversation limited to this rubric. It includes quick actions (draft score guidance, tighten wording, rebalance weights, suggest missing requirements from the posting, check consistency, rebuild from the posting). You can also focus the conversation on one criterion. Each assistant turn lists what it changed, with **Jump to** links, the quoted posting passages, and **Undo this change**.
+- **Ask AI:** a conversation limited to this rubric. It includes quick actions (draft scale examples, tighten wording, rebalance weights, suggest missing requirements from the posting, check consistency, rebuild from the posting). You can also focus the conversation on one criterion. Each assistant turn lists what it changed, with **Jump to** links, the cited posting passages, and **Undo this change**.
 - **Job posting:** the parsed job source, with the focused criterion's cited paragraph highlighted.
 - **Changes:** three lists:
   - every unsaved change (before → after, who made it, **Jump** and **Revert**);
   - this session's history (**Restore to here**, which never deletes anything);
   - the saved versions (**Preview**, and **Use as starting point**).
 
-On a new, empty criterion, **Draft with AI** fills in its label, description, 0–5 guidance, requirement type, exact source quote, and weight.
+On a new, empty criterion, **Draft with AI** fills in its label, description, standard-scale level examples, requirement type, passage-ID citations, and weight.
 
 Every unsaved change stays highlighted until you save. **AI assist** changes are blue and **your edits** are violet. Each highlighted field also shows a text badge and its previous value, so color is never the only cue. Fields in a newly added criterion show who wrote them, with no previous value or per-field Revert; remove the criterion to undo the addition. Removed criteria stay visible as **Removed · Restore** rows. **Undo** and **Redo** in the editor header work across AI and manual changes; inside a text box, Ctrl/⌘+Z keeps the browser's own text undo. When AI changes are present, the first **Save version N** opens the **Changes** tab and asks you to **Confirm and save version N**. Saves with only your own edits still take one click.
 
@@ -25,7 +25,7 @@ Highlighting, session history, undo/redo, the saved-versions list and the Job po
 
 - **The assistant never saves.** It returns validated operations. Only **Save** persists a change, through the existing `PUT /jobs/:jobId/rubric` path, with its existing validation, job ETag check and immutable version append.
 - **Scoped context.** The model receives only the job's parsed posting, the current unsaved draft, this editor's recent conversation and the new instruction. It never sees other rubrics, resumes, analyses or workspace data. Posting, draft and conversation are presented as untrusted material, never as instructions.
-- **Grounded edits.** Every added criterion, and every change to what a criterion assesses, must quote the posting exactly. The server checks that the quote is an exact substring of the named paragraph. It then builds the citation's document ID, version, page and heading itself; the model never supplies them. AI-written guidance must anchor every score from 0 to 5 with documentary-evidence levels. Criteria for protected or questionable personal characteristics are rejected. If the posting doesn't support a request, the assistant explains instead of inventing requirements.
+- **Grounded edits.** Every added criterion, and every change to what a criterion assesses, must cite passage IDs from the job source catalog. The server resolves those IDs into exact citations, including merged quotes, document ID, version, page and heading; the model never types quotes or supplies citation metadata. Scaled rubrics use `score-evidence-ladder-v1`: level 0 is fixed, and AI-written edits provide job-specific examples for levels 1–5. The server renders saved guidance from those examples. Legacy rubrics without `scaleVersion` keep the old free-text guidance behavior. Criteria for protected or questionable personal characteristics are rejected. If the posting doesn't support a request, the assistant explains instead of inventing requirements.
 - **Invalid output never reaches the draft.** Output is validated against a strict schema and the rules above. One correction round (the configured `jobRubric` correction budget) may follow. If it still fails, the request fails and the draft is unchanged.
 - **Stale work is refused.** If a newer rubric version was saved after the editor opened, the assistant returns 409 and Save conflicts as before; your draft is kept. The form is locked while a request is in flight. **Cancel**, or closing the editor, aborts the request.
 - **Session-only conversation.** The conversation and the unsaved-change history live only in the open editor. Closing the editor discards them after the usual unsaved-changes warning, and a successful save clears them. **Saved rubric versions remain the permanent history.**
@@ -46,10 +46,10 @@ This is the first **synchronous** model call on private data from the Score API.
 | Rubric adapter | `src\features\rubrics\rubricAssist.ts`, `RubricEditor.tsx`, `RubricPanel.tsx` | Rubric field descriptors, change summaries, saved-version notes, and the rubric editor and its entry points |
 | Browser service | `src\services\rubricAssist.ts` | Request/response validation, a longer per-call timeout, typed errors for timeout, rate limiting, conflicts and invalid responses |
 | Server framework | `server\assist\runner.ts`, `limits.ts`, `model.ts`, `types.ts` | Budget fitting (oldest turns dropped, source never truncated), shared deadline, correction rounds, abort on disconnect, error mapping, per-user limits, model invocation through the worker transport |
-| Rubric profile | `server\assist\profiles\job-rubric.ts` | Code-owned prompt `score-rubric-assist-v1`, strict JSON schema, validation and citation construction |
+| Rubric profile | `server\assist\profiles\job-rubric.ts` | Code-owned prompt `score-rubric-assist-v2`, strict JSON schema, validation and citation construction |
 | Route | `server\jobs\routes.ts` | `POST /api/workspaces/:workspaceId/jobs/:jobId/rubric/assist` |
 
-The job-rubric **generation** prompt is unchanged. Its text is hashed into immutable prompt revisions, so the assistant has its own versioned prompt that restates the same rules. A test guards that the two keep the same key rules.
+The job-rubric **generation** prompt (`score-job-rubric-v4`) is separate. Its text is hashed into immutable prompt revisions, so the assistant has its own versioned prompt that restates the same rules, including the evidence scale and passage-ID citations. A test guards that the two keep the same key rules.
 
 ## API
 

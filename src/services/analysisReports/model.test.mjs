@@ -417,3 +417,37 @@ test('shared foundation bundles for the browser without Node-specific dependenci
   assert.equal(output.outputFiles.length, 2)
   assert.ok(output.outputFiles.every(file => file.contents.byteLength > 0))
 })
+
+function mixedVersionFixture() {
+  const input = realReportFixture({ targetCount: 2 })
+  for (const target of input.targets) {
+    target.rubricId = 'rubric-0'
+    Object.assign(target.selection, { jobId: 'job-0', rubricId: 'rubric-0' })
+  }
+  input.targets[1].selection.rubricHash = 'b'.repeat(64)
+  return input
+}
+
+test('reports warn when they mix rubric versions of one job, and rank each exact version on its own', () => {
+  const input = mixedVersionFixture()
+  const report = api.buildAnalysisReport(input)
+  const warning = report.notices.filter(notice => notice.startsWith('Rubric versions differ'))
+  assert.deepEqual(warning, ['Rubric versions differ for Same saved target label (v1 · aaaaaaaa, v2 · bbbbbbbb). ' +
+    'Scores are comparable only within one exact version, so don’t rank or compare them across versions.'])
+  assert.equal(report.groups.length, 2)
+  for (const group of report.groups) assert.deepEqual(group.comparisons.map(comparison => comparison.rank), [1, 2, 3])
+  assert.ok(!api.buildAnalysisReport(input, { targetId: input.targets[0].id }).notices.some(notice => notice.startsWith('Rubric versions differ')),
+    'One exact target never mixes versions')
+  input.targets[1].selection.rubricHash = input.targets[0].selection.rubricHash
+  assert.ok(!api.buildAnalysisReport(input).notices.some(notice => notice.startsWith('Rubric versions differ')), 'Equal hashes are the same rubric')
+  assert.ok(!api.buildAnalysisReport(realReportFixture({ targetCount: 2 })).notices.some(notice => notice.startsWith('Rubric versions differ')),
+    'Different jobs are separate targets, not mixed versions')
+})
+
+test('reports warn when they mix approved versions of one GS grade', () => {
+  const input = realReportFixture({ targetCount: 2, kind: 'grade' })
+  input.targets[1].selection.ladderId = input.targets[0].selection.ladderId
+  input.targets[1].selection.versionHash = 'c'.repeat(64)
+  const [warning] = api.buildAnalysisReport(input).notices.filter(notice => notice.startsWith('Rubric versions differ'))
+  assert.match(warning, /^Rubric versions differ for Same saved target label · GS-9 \(v1 · aaaaaaaa, v2 · cccccccc\)\./)
+})

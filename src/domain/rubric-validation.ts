@@ -1,3 +1,4 @@
+import { rubricScaleErrors } from './evidence-scale'
 import type { Rubric } from './types'
 
 const WEIGHT_TOLERANCE = 0.000001
@@ -27,5 +28,6 @@ export function validateRubric(rubric: Rubric): string[] {
   if (!Number.isFinite(total) || Math.abs(total - 100) > WEIGHT_TOLERANCE) {
     errors.push(`Criterion weights must total 100; the current total is ${Number.isFinite(total) ? Number(total.toFixed(6)) : 'invalid'}.`)
   }
+  errors.push(...rubricScaleErrors(rubric))
   return errors
 }

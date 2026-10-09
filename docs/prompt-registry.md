@@ -26,7 +26,13 @@ Reader-first rollout uses the independent shared `PROMPT_RUNTIME_VERSION = 'scor
 
 ## Template releases
 
-A prompt template generation is the code-owned set of compiled system templates, output schema versions and renderer bindings for all seven prompt families. `PROMPT_TEMPLATE_GENERATION='score-prompt-templates-v1'` names the current generation; future code changes bump it when the compiled templates or schemas change.
+A prompt template generation is the code-owned set of compiled system templates, output schema versions and renderer bindings for all seven prompt families. `PROMPT_TEMPLATE_GENERATION='score-prompt-templates-v2'` names the current generation; code changes bump it whenever the compiled templates or schemas change, because release bundle IDs are derived from it.
+
+Generation v2 moves rubric generation onto the standard evidence scale (`score-evidence-ladder-v1`) and passage-ID citations:
+
+- `jobRubric` is `score-job-rubric-v4` with `score-job-rubric-schema-v2`. It accepts one-role job postings and position descriptions, cites job text by passage ID, and writes job-specific examples for levels 1–5.
+- `gradeDraft` is `score-grade-draft-v5` with `score-grade-draft-schema-v4`. It cites reference passages by ID and writes grade-specific examples for scored rows.
+- `gradeReview` is `score-grade-review-v4`. It also checks overlapping criteria, examples a résumé can't show, and conformance to the scale.
 
 Score performs a hard cutover. API and workers support only the current generation. Work accepted with an older generation fails clearly and must be started again; the service does not dual-run or silently substitute old templates.
 

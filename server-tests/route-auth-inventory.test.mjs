@@ -37,7 +37,13 @@ async function fetchRoute(server, route, options = {}) {
 function routesForRuntime() {
   const routes = extractRoutes(process.cwd()).filter(route => route.fullPath.startsWith('/api/'))
   assert.ok(routes.length > 0, 'route inventory must not be empty')
-  for (const expected of ['GET /api/features', 'GET /api/session', 'POST /api/workspaces', 'GET /api/workspaces/:workspaceId/jobs']) {
+  for (const expected of [
+    'GET /api/features', 'GET /api/session', 'POST /api/workspaces', 'GET /api/workspaces/:workspaceId/jobs',
+    'GET /api/workspaces/:workspaceId/jobs/:jobId/rubric/checks',
+    'POST /api/workspaces/:workspaceId/jobs/:jobId/rubric/checks',
+    'POST /api/workspaces/:workspaceId/jobs/:jobId/rubric/approve',
+    'POST /api/workspaces/:workspaceId/grade-ladders/:ladderId/grades/:grade/approve',
+  ]) {
     assert.ok(routes.some(route => `${route.method} ${route.fullPath}` === expected), `route inventory includes ${expected}`)
   }
   return routes

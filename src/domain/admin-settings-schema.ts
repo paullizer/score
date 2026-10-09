@@ -86,6 +86,7 @@ const settingsObject = z.strictObject({
     rubricExports: z.boolean().optional(),
     qcReviews: z.boolean().optional(),
     analysisEvidenceCorrections: z.boolean().optional(),
+    rubricApprovalRequired: z.boolean().optional(),
   }),
   maintenance: z.strictObject({ pauseNewWork: z.boolean(), explanation: text(1000) }),
   imports: z.strictObject({

@@ -84,6 +84,9 @@ export function jobFeaturesWithPolicy(features: JobProcessingFeatures, settings?
     rubricAssistant: features.rubricAssistant === true && !admissionReason(settings) && (!settings || rubricAssistantEnabled(settings)),
     // Exports are reads, so pausing new work does not hide them.
     rubricExports: features.rubricExports === true && (!settings || rubricExportsEnabled(settings)),
+    // A policy the server enforces; an absent value is treated as the documented default.
+    rubricApprovalRequired: features.rubricApprovalRequired !== false,
+    rubricChecks: features.rubricChecks === true && !admissionReason(settings),
     limits: clampClientLimits(JOB_IMPORT_LIMITS, { ...limits, ...(intake ? {
       maxFileBytes: intake.maxFileBytes, maxPdfBytes: intake.maxFileBytes, maxMarkdownBytes: intake.maxFileBytes,
       maxPdfPages: intake.maxPdfPages, maxSourceCharacters: intake.maxSourceCharacters, maxBatchFiles: intake.maxBatchItems,

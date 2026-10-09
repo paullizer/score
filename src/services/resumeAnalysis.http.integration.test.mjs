@@ -589,7 +589,7 @@ test('real lifecycle preserves frozen model evidence, blocks retained dependenci
     const resumePath = `${base}/resumes/${imported.summary.resume.id}`
     const resume = await jsonResponse(await fixture.request(resumePath))
     const target = (await allPages(fixture, `${base}/analyses/targets`, 'targets'))
-      .find((item) => item.kind === 'job' && item.selection.jobId === job.job.id && item.selection.rubricVersion === job.rubric.version)
+      .find((item) => item.kind === 'job' && item.selection.jobId === job.job.id && item.selection.rubricVersion === job.latestRubric.version)
     assert.ok(target)
     const input = { name: 'Archive-safe real evidence', resumes: [resumeSelection(resume)], targets: [target.selection] }
     const create = async () => (await jsonResponse(await fixture.request(`${base}/analyses`, {
