@@ -110,10 +110,13 @@ export function GradeMatrix({ detail, selectedGrade, onGrade, canWrite, pending,
 
 export function GradeCriterionCell({ criterion, version, onSource }: { criterion: GradeCriterion; version: GradeRubricVersionRecord; onSource: (selection: GradeSourceSelection) => void }) {
   const exclusion = criterion.support === 'not-applicable'
+  const scaled = Boolean(version.rubric.scaleVersion && criterion.levels?.length)
   return <article className={`grade-criterion-cell ${criterion.support === 'gap' ? 'is-gap' : ''}`}>
     <div className="flex flex-wrap items-center justify-between gap-2"><Badge tone={criterion.support === 'gap' ? 'warning' : 'neutral'}>{criterion.support === 'gap' ? 'Evidence gap · draft' : exclusion ? 'Not applicable · exclusion' : `${criterion.support} support`}</Badge><strong>{exclusion && criterion.weight === 0 ? 'Unscored' : `${criterion.weight}%`}</strong></div>
     <p>{criterion.description}</p>
-    <details><summary>{exclusion ? 'Exclusion guidance (unscored)' : 'Evaluation guidance'}</summary><p>{criterion.guidance || 'Guidance remains incomplete.'}</p><p className="text-[10px] text-muted">{exclusion ? 'Excluded from weighting and scoring, not an applicant score of zero.' : 'Reviewer weighting, not OPM classification points.'}</p></details>
+    <details><summary>{exclusion ? 'Exclusion guidance (unscored)' : 'Evaluation guidance'}</summary>
+      {scaled ? <ol>{criterion.levels!.map((level) => <li key={level.level}><strong>{level.level}: </strong><span>{level.examples}</span></li>)}</ol> : <p>{criterion.guidance || 'Guidance remains incomplete.'}</p>}
+      <p className="text-[10px] text-muted">{exclusion ? 'Excluded from weighting and scoring, not an applicant score of zero.' : scaled ? `${version.rubric.scaleVersion} examples; reviewer weighting, not OPM classification points.` : 'Reviewer weighting, not OPM classification points.'}</p></details>
     <div className="grade-interpretation"><span className="grade-field-kicker">{exclusion ? 'Exclusion interpretation — not quotation' : 'Interpretation / grade distinction — not quotation'}</span><p>{criterion.interpretation || 'No supported interpretation provided.'}</p></div>
     <GradeCitations citations={[...criterion.gradeBasis, ...(criterion.sourceCitations ?? [])]} onOpen={(citation) => onSource({ citation, sourceSetId: version.sourceSetId })} />
   </article>

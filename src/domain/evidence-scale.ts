@@ -317,6 +317,15 @@ export function checkCriterionLevels(
   return findings
 }
 
+/** The fixed scale as plain text for model instructions, so every prompt states it the same way. */
+export function renderEvidenceScale(scale = EVIDENCE_SCALE_V1): string {
+  return [
+    ...scale.levels.map(item => `${item.level}: ${item.label}. ${item.description}`),
+    scale.tieRule,
+    scale.basis,
+  ].join('\n')
+}
+
 export function renderEvidenceGuidance(
   levels: readonly CriterionLevelExamples[],
   scale = EVIDENCE_SCALE_V1,

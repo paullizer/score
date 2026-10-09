@@ -5,7 +5,7 @@ import { promptExecutionProvenanceSchema } from '../../src/domain/prompt-version
 import { criterionLevelsSchema, evidenceScaleVersionSchema, rubricScaleErrors } from '../../src/domain/evidence-scale'
 import { assertAcceptedPromptBinding } from '../settings/prompt-integrity'
 import {
-  GRADE_LADDER_LIMITS as LIMITS, gradeHeadId,
+  GRADE_ISSUE_LIMIT, GRADE_LADDER_LIMITS as LIMITS, gradeHeadId,
   type GradeEntity, type GradeIssue, type GradeRubricVersionRecord, type GradeSourceSetRecord,
   type ReferenceDocument, type FrozenReferenceSource, type GradeSeedSnapshot, type GradeContext, type ReferenceCoverage,
 } from '../../src/domain/real-grades'
@@ -62,7 +62,7 @@ const issueSchema = z.strictObject({
   sourceId: sourceId.optional(), grade: grade.optional(), criterionId: identifier.optional(),
   citations: citations.optional(),
 })
-const issues = z.array(issueSchema).max(150)
+const issues = z.array(issueSchema).max(GRADE_ISSUE_LIMIT)
 const issueResolutions = z.array(z.strictObject({
   issue: issueSchema,
   reason: z.enum(['complete-source-extraction', 'captured-named-section', 'captured-reference-target']),
