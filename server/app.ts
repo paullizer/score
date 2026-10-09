@@ -45,12 +45,13 @@ export { WorkspaceRepository } from './repository'
 export { WorkspaceLifecycleService } from './lifecycle/service'
 export { createLifecycleDependencies } from './lifecycle/dependencies'
 export { StoreConflictError, StoreNotFoundError, WorkspaceMutationBusyError } from './store'
-export { createStateStoreFromContainer } from './azure-state-store'
-export { createDirectoryStoreFromContainer } from './azure-directory-store'
+export { createAzureStateStore, createStateStoreFromContainer } from './azure-state-store'
+export { createAzureDirectoryStore, createDirectoryStoreFromContainer } from './azure-directory-store'
 export { createJobStoreFromContainer, createJobBlobStoreFromContainer } from './jobs/azure-store'
 export {
   createAzureGradeStore, createAzureGradeBlobStore, createGradeStoreFromContainer, createGradeBlobStoreFromContainer,
 } from './grades/azure-store'
+export { captureGradeGenerationFixture } from './grades/evaluation-fixture'
 export {
   parseGradeEntity, validateReferenceDocument, validateGradeVersion, validateGradeApproval,
   gradeContentHash, gradeVersionHash, gradeSourceSetHash, gradeRecordHash, gradeIssuesFor, parseGradeSeedSnapshot,

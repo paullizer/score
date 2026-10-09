@@ -206,6 +206,39 @@ Grade generation plans one competency set per repetition, then drafts every requ
 
 `createEvaluationSettings` accepts optional `tasks` bindings for `jobRubric`, `gradeCompetencies`, `gradeDraft` and `gradeReview`. Without them it produces exactly the same snapshot as before.
 
+### Exporting private GS fixtures
+
+Prepare one reviewed ladder per corpus job in Score and confirm its source set.
+Build the local readers, select the existing `azd` environment, and export with
+the signed-in Azure CLI identity:
+
+```powershell
+npm run build:server
+npm run build:worker
+$env:AZURE_ENV_NAME = 'your-existing-environment'
+node scripts\scoring-grade-fixture.mjs <workspace-id> <ladder-id> C:\private-evals\grade-fixtures\ladder.json
+```
+
+This is local operator tooling, not a new product route or feature switch. The
+identity needs its existing Azure data-plane read access and workspace-owner
+membership. It cannot choose another object ID, infer application-admin roles,
+log in for you or grant permissions. Nothing writes to Score or invokes a model.
+
+The export contains exactly `{ ladder, seed, sourceSet, documents }` for a
+confirmed, current source set. It uses the captured seed, not a newer live job
+or rubric, revalidates source ownership and integrity, rejects a ladder changed
+during capture, and rechecks ownership before returning the data. Source gaps
+remain gaps; export does not declare the rubric valid or approved.
+
+The command prints the `fixtureSha256` used by `gradeGenerationSuiteSchema`,
+the selected source-set ID and grades. Put the exported object under a
+manifest's `fixtures` entry (`{ sourceId, fixture }`) and use its printed hash
+in the matching suite source. The immutable output must be outside every Git
+checkout and cannot overwrite an earlier capture. Complete sources are never
+omitted to fit the 32 MiB file limit. Keep the destination directory private;
+Windows inherits its ACL, while new files on Unix use owner-only permissions.
+Credentials and tokens are never exported.
+
 ## Executor contract
 
 Large offline scoring suites can be partitioned into bounded private runner manifests without buying inference:

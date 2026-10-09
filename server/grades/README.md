@@ -41,6 +41,14 @@ examples, code-renders their guidance, appends a version and requests a new
 independent review. Exclusions and gaps retain explanatory unscored guidance;
 the editor cannot change their support verdicts or approve its own edits.
 
+`captureGradeGenerationFixture` is a read-only helper for the local offline-gate
+export command, not an API route. It requires owner access before and after
+capture and returns the exact confirmed source set, captured seed and verified
+reference documents. Missing, corrupt, foreign or concurrently changed inputs
+fail explicitly. No live job substitution, application mutation, model call or
+new access grant is allowed. See the private-fixture runbook in
+`docs/scoring-quality-program.md`.
+
 Mutations return `{ ladder: GradeLadderDetail }`; creation returns HTTP 202.
 Detail GETs return `GradeLadderDetail` directly. Lists and version histories are
 paged using `continuationToken` and an optional `limit` between 1 and 100.

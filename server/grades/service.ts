@@ -2,6 +2,7 @@ import { createHash, randomUUID } from 'node:crypto'
 import { z } from 'zod'
 import type { ProcessingSettingsSnapshot } from '../../src/domain/admin-settings'
 import { processingSettingsSnapshotSchema } from '../../src/domain/admin-settings-schema'
+import type { GradeGenerationFixture } from '../../worker/evals/grade-generation'
 import { urlAllowedBySettings } from '../../src/domain/admin-settings-resolver'
 import {
   GRADE_LADDER_LIMITS as LIMITS, gradeHeadId,
@@ -420,7 +421,10 @@ export class GradeService {
     return { ...base, levels, sources: sources.map(source => source.record), sourceSet: sourceSet?.record ?? null, workItems }
   }
 
-  private validateSeed(value: unknown, workspaceId: string, ladderId: string, input: CreateInput): GradeSeedSnapshot {
+  private validateSeed(
+    value: unknown, workspaceId: string, ladderId: string,
+    input: Pick<CreateInput, 'jobId' | 'rubricId' | 'rubricVersion'>,
+  ): GradeSeedSnapshot {
     const parsed = parseGradeSeedSnapshot(value)
     if (!parsed.job || !parsed.source || !parsed.document || !parsed.rubric ||
       parsed.job.id !== input.jobId || parsed.rubric.id !== input.rubricId ||
@@ -803,6 +807,29 @@ export class GradeService {
   async sourceSet(workspaceId: string, ladderId: string, sourceSetId: string): Promise<GradeSourceSetRecord> {
     await this.get(workspaceId, ladderId, 'grade-ladder')
     return (await this.get(workspaceId, sourceSetId, 'grade-source-set', ladderId)).record
+  }
+
+  /** Read-only operator capture; the caller must authorize ownership before and after this read. */
+  async generationFixture(workspaceId: string, ladderId: string): Promise<GradeGenerationFixture> {
+    const current = await this.get(workspaceId, ladderId, 'grade-ladder')
+    const ladder = current.record
+    if (!ladder.sourceSetId) throw conflict('Confirm the ladder source set before exporting an evaluation fixture.')
+    const sourceSet = (await this.get(workspaceId, ladder.sourceSetId, 'grade-source-set', ladderId)).record
+    currentSourceSet(ladder, sourceSet)
+    if (!sourceSet.context.confirmed || sourceSet.seedBlobName !== ladder.seedBlobName ||
+      ladder.seedBlobName !== `${workspaceId}/${ladderId}/seed.json`) {
+      throw unavailable('The confirmed source set has invalid seed ownership or context.')
+    }
+    const blob = await this.blobs.read(ladder.seedBlobName)
+    if (!blob) throw unavailable('The captured ladder seed is unavailable; live job data cannot substitute for it.')
+    const seed = this.validateSeed(json(blob), workspaceId, ladderId, {
+      jobId: ladder.seedJobId, rubricId: ladder.seedRubricId, rubricVersion: ladder.seedRubricVersion,
+    })
+    const documents = await Promise.all(sourceSet.sources.map(source => this.readReference(workspaceId, ladderId, source)))
+    const latest = await this.get(workspaceId, ladderId, 'grade-ladder')
+    if (latest.etag !== current.etag) throw conflict('The ladder changed while its fixture was being captured. Retry the export.')
+    currentSourceSet(latest.record, sourceSet)
+    return { ladder: copy(ladder), seed: copy(seed), sourceSet: copy(sourceSet), documents: copy(documents) }
   }
 
   private async readReference(workspaceId: string, ladderId: string, source: FrozenReferenceSource): Promise<ReferenceDocument> {
