@@ -13,9 +13,10 @@ before(async () => {
   await build({
     stdin: { resolveDir: process.cwd(), loader: 'ts', contents: `
       export { createJobStoreFromContainer } from './server/jobs/azure-store.ts'
+      export { validateRealRubric } from './server/jobs/validation.ts'
       export { analysisHash } from './server/analyses/deterministic.ts'
       export { EVIDENCE_SCALE_VERSION, renderEvidenceGuidance } from './src/domain/evidence-scale.ts'
-      export { RUBRIC_QA_VERSION } from './src/domain/rubric-qa.ts'
+      export { RUBRIC_QA_VERSION, rubricQaChecks } from './src/domain/rubric-qa.ts'
       export { RUBRIC_REVIEW_PROMPT_VERSION, rubricQaRecordId } from './src/domain/rubric-approval.ts'
     ` },
     outfile: output, bundle: true, platform: 'node', format: 'esm', packages: 'external', logLevel: 'silent',
@@ -101,6 +102,30 @@ test('atomic generation rejects mismatched QA without publishing a job or rubric
   assert.equal((await store.get(workspaceId, jobId)).record.job.status, 'queued')
   assert.deepEqual(await store.listRubrics(workspaceId, jobId), [])
   assert.ok(![...cosmos.records.values()].some(record => record.recordType === 'rubric-qa'))
+})
+
+test('long valid shared quotations retain their full evidence without overflowing the persisted QA diagnostic', async () => {
+  const cosmos = fakeJobCosmos()
+  const store = api.createJobStoreFromContainer(cosmos.container)
+  const created = await store.create(realJobRecord())
+  const rubric = rubricFor(created.value.record)
+  const quote = 'Experience required for documented program delivery. '.repeat(500).trim()
+  assert.ok(quote.length > 20_000, 'The fixture exceeds the persisted diagnostic bound')
+  rubric.criteria[0].sourceCitations[0].quote = quote
+  rubric.criteria[0].weight = 50
+  rubric.criteria.push({ ...structuredClone(rubric.criteria[0]), id: 'criterion-two' })
+  assert.deepEqual(api.validateRealRubric(rubric, {
+    id: created.value.record.job.documentId, title: 'Test role', kind: 'job', version: 1, sample: false,
+    paragraphs: [{ id: 'p1', page: 1, heading: '', text: quote }],
+  }), [], 'This is valid source evidence, not malformed input')
+  const checks = { ...qaFor(rubric), checks: api.rubricQaChecks(rubric) }
+  const record = { ...created.value.record, job: { ...created.value.record.job, status: 'ready', rubricId: rubric.id } }
+  await store.publish(record, created.value.etag, rubric, checks)
+  const stored = await store.getRubricQa(workspaceId, jobId, rubric.id, 1)
+  const overlap = stored.checks.find(finding => finding.code === 'shared-source-text')
+  assert.equal(overlap.severity, 'warning')
+  assert.ok(overlap.match.length <= 20_000)
+  assert.equal((await store.listRubrics(workspaceId, jobId))[0].criteria[0].sourceCitations[0].quote, quote)
 })
 
 test('on-demand QA is create-only, bound to a saved hash, and rejects corrupt stored results', async () => {

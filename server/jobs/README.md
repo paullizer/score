@@ -135,6 +135,8 @@ Approval follows the rubric checks for that version:
   reports `rubricChecks`). Changing the checks or the review prompt needs a new
   `RUBRIC_QA_VERSION`. The API and worker share `worker/rubric-review.ts`; neither
   substitutes a successful result for invalid, empty or failed model output.
+  Shared-source diagnostics carry bounded, Unicode-safe excerpts; complete
+  authoritative quotations remain unchanged in the rubric's source citations.
 - `POST …/jobs/:jobId/rubric/approve` with `{ rubricId, version, rubricHash }` and
   `If-Match` set to the job ETag is owner-only (application admins act as
   owners). It approves only the latest version, on the scale, with stored checks

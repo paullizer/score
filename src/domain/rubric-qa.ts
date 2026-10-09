@@ -21,6 +21,7 @@ export interface RubricQaFinding {
   severity: 'blocker' | 'warning'
   criterionIds: string[]
   message: string
+  /** Diagnostic excerpt only; complete authoritative quotations remain in the rubric's source citations. */
   match?: string
   similarity?: number
 }
@@ -41,6 +42,7 @@ export interface RubricQaInput {
 }
 
 export const RUBRIC_QA_THRESHOLDS = Object.freeze({ similarRequirement: 0.6, similarLabel: 0.6 })
+const SHARED_SOURCE_EXCERPT_CHARACTERS = 2_000
 
 const STOP_WORDS = new Set([
   'a', 'an', 'and', 'as', 'at', 'by', 'for', 'from', 'in', 'into', 'of', 'on', 'or', 'the', 'to', 'with', 'within',
@@ -77,6 +79,12 @@ function rounded(value: number): number {
   return Math.round(value * 100) / 100
 }
 
+function sharedSourceExcerpt(quote: string): string {
+  const characters = Array.from(quote)
+  return characters.length <= SHARED_SOURCE_EXCERPT_CHARACTERS ? quote
+    : `${characters.slice(0, SHARED_SOURCE_EXCERPT_CHARACTERS - 3).join('')}...`
+}
+
 /**
  * Deterministic, model-free rubric checks run before approval. They flag likely overlap and wording a resume
  * can't show; conceptual overlap that shares no words needs the separate rubric review.
@@ -105,7 +113,7 @@ export function rubricQaChecks(rubric: RubricQaInput): RubricQaFinding[] {
       const quote = sharedQuote(a.sourceCitations ?? [], b.sourceCitations ?? [])
       if (quote !== null) {
         findings.push({
-          code: 'shared-source-text', severity: 'warning', criterionIds: ids, match: quote,
+          code: 'shared-source-text', severity: 'warning', criterionIds: ids, match: sharedSourceExcerpt(quote),
           message: `${name(a)} and ${name(b)} cite the same job text, so they may assess the same requirement. Merge them, or make each cite the part it assesses.`,
         })
       }

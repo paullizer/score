@@ -73,6 +73,23 @@ test('criteria citing the same or nested job text are flagged as possible overla
   assert.deepEqual(rubricQaChecks(separate), [])
 })
 
+test('long shared-source diagnostics are bounded and Unicode-safe without changing complete citations', () => {
+  const rubric = distinct()
+  const quote = '\ud83d\ude00 Relevant source evidence. '.repeat(1000)
+  assert.ok(quote.length > 20_000)
+  rubric.criteria[0].sourceCitations = [citation('shared', quote)]
+  rubric.criteria[1].sourceCitations = [citation('shared', quote)]
+  const [finding] = rubricQaChecks(rubric)
+  assert.equal(finding.code, 'shared-source-text')
+  assert.equal(finding.severity, 'warning')
+  assert.deepEqual(finding.criterionIds, ['sampling', 'reporting'])
+  assert.ok(Array.from(finding.match).length <= 2000)
+  assert.ok(finding.match.endsWith('...'))
+  assert.equal(finding.match.isWellFormed(), true)
+  assert.equal(rubric.criteria[0].sourceCitations[0].quote, quote)
+  assert.equal(rubric.criteria[1].sourceCitations[0].quote, quote)
+})
+
 test('near-duplicate requirements and nested labels are flagged with their similarity', () => {
   const rubric = distinct()
   rubric.criteria.push(criterion('sampling-advanced', 'Advanced survey sampling',
