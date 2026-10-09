@@ -266,7 +266,8 @@ test('browser approved GS analysis opens copied reference evidence through its e
 })
 
 test('browser preserves 103 resumes across navigation and reload and submits all 412 comparisons against four jobs', { timeout: 120_000 }, async (t) => {
-  const fixture = await startResumeAnalysisFixture(runtime, { injectAuth: true, pageSize: 25 })
+  // Two saved versions per job are selectable only while the Admin approval requirement is off.
+  const fixture = await startResumeAnalysisFixture(runtime, { injectAuth: true, pageSize: 25, rubricApprovalRequired: false })
   t.after(() => fixture.close())
   for (let index = 0; index < 4; index++) await seedRealJob(fixture)
   const bytes = await (await resumePdf()).arrayBuffer()
@@ -327,7 +328,8 @@ test('browser resumes a paused cancellation without scoring or replacing its cap
   const stubs = processingStubs(fixture)
   await processAllResumes(fixture, stubs)
   const resume = await jsonResponse(await fixture.request(`/api/workspaces/${fixture.workspaceId}/resumes/${imported.summary.resume.id}`))
-  for (let index = 0; index < 15; index++) await seedRealJob(fixture)
+  // Each seeded job offers its one approved version.
+  for (let index = 0; index < 30; index++) await seedRealJob(fixture)
   const targets = await allPages(fixture, `/api/workspaces/${fixture.workspaceId}/analyses/targets`, 'targets')
   assert.equal(targets.length, 30)
   const created = (await jsonResponse(await fixture.request(`/api/workspaces/${fixture.workspaceId}/analyses`, {
@@ -353,7 +355,8 @@ test('browser resumes a paused cancellation without scoring or replacing its cap
   try {
     await page.goto(`${fixture.origin}/workspaces/${fixture.workspaceId}/analyses/${created.run.id}`)
     await visible(page.getByRole('heading', { name: 'Paused cancellation recovery', exact: true }))
-    await visible(page.getByText('Cancellation paused', { exact: true }))
+    // The status badge and, until summary progress loads, the progress heading both read exactly this.
+    await visible(page.getByText('Cancellation paused', { exact: true }).first())
     assert.equal(await page.getByRole('button', { name: /^Retry comparison 1 with saved inputs$/ }).isDisabled(), true)
     await page.getByRole('button', { name: 'Resume cancellation', exact: true }).click()
     await visible(page.getByText('30 / 30 comparisons finished', { exact: true }))
@@ -620,7 +623,7 @@ test('browser legacy and unavailable failures keep source access and discard lat
 })
 
 test('browser comparison browsing searches every page, scopes score sorting, and preserves keyboard/mobile navigation', { timeout: 120_000 }, async (t) => {
-  const fixture = await startResumeAnalysisFixture(runtime, { injectAuth: true, pageSize: 2 })
+  const fixture = await startResumeAnalysisFixture(runtime, { injectAuth: true, pageSize: 2, rubricApprovalRequired: false })
   t.after(() => fixture.close())
   const { resumes, targets, stubs } = await seedBrowsingInputs(fixture)
   const created = await createBrowsingRun(fixture, resumes, targets, 'Searchable evidence review')
@@ -722,7 +725,7 @@ test('browser comparison browsing searches every page, scopes score sorting, and
 })
 
 test('browser processing-status sorting preserves filters during refresh and cancels the reordered saved pair', { timeout: 120_000 }, async (t) => {
-  const fixture = await startResumeAnalysisFixture(runtime, { injectAuth: true, pageSize: 2 })
+  const fixture = await startResumeAnalysisFixture(runtime, { injectAuth: true, pageSize: 2, rubricApprovalRequired: false })
   t.after(() => fixture.close())
   const { resumes, targets, stubs } = await seedBrowsingInputs(fixture)
   const created = await createBrowsingRun(fixture, resumes, targets.slice(0, 1), 'Processing status review')

@@ -4,6 +4,7 @@ import { ANALYSIS_DIAGNOSTIC_LIMITS, ANALYSIS_REVIEW_ISSUE_CODES } from '../../s
 import { ANALYSIS_CRITERION_BLOCKER_CODES } from '../../src/domain/analysis-evidence-policy'
 import { promptExecutionProvenanceSchema } from '../../src/domain/prompt-versions'
 import { modelCriterionQcDiagnosticSchema } from '../../src/domain/analysis-qc-diagnostics'
+import { criterionLevelsSchema, evidenceScaleVersionSchema } from '../../src/domain/evidence-scale'
 import { strictStructuredOutputSchema } from '../structured-output-schema'
 
 export { ANALYSIS_CRITERION_BLOCKER_CODES } from '../../src/domain/analysis-evidence-policy'
@@ -56,6 +57,7 @@ const savedCriterion = z.strictObject({
   sourceParagraphId: identifier.optional(),
   requirementType: z.enum(['required', 'preferred']).optional(),
   sourceCitations: savedCitations.optional(),
+  levels: criterionLevelsSchema.optional(),
 })
 const savedRubric = z.strictObject({
   id: identifier,
@@ -71,6 +73,7 @@ const savedRubric = z.strictObject({
     promptVersion: nonblank(200),
     prompt: promptExecutionProvenanceSchema.optional(),
   }).optional(),
+  scaleVersion: evidenceScaleVersionSchema.optional(),
 })
 
 export const assessmentInputSchema = z.strictObject({

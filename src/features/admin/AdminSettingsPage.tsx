@@ -67,6 +67,11 @@ export function AdminSettingsPage({ onLeave, onOpenUsers }: { onLeave: () => voi
   const [probeDeployment, setProbeDeployment] = useState('')
   const [costAcknowledged, setCostAcknowledged] = useState(false)
   const [probe, setProbe] = useState<ModelTestResult | null>(null)
+  const [promptRelease, setPromptRelease] = useState<service.PromptReleaseStatus | null>(null)
+  const [promptReleaseError, setPromptReleaseError] = useState('')
+  const [releaseReason, setReleaseReason] = useState('')
+  const [releaseGateSha, setReleaseGateSha] = useState('')
+  const [releaseTargetsVersion, setReleaseTargetsVersion] = useState('score-engineering-targets-v2')
   const [importOpen, setImportOpen] = useState(false)
   const [importText, setImportText] = useState('')
   const live = useRef(true)
@@ -77,13 +82,15 @@ export function AdminSettingsPage({ onLeave, onOpenUsers }: { onLeave: () => voi
   useEffect(() => {
     live.current = true
     const controller = new AbortController()
-    void service.readAdminSettings(controller.signal).then(response => {
+    void Promise.allSettled([service.readAdminSettings(controller.signal), service.readPromptRelease(controller.signal)]).then(results => {
       if (controller.signal.aborted) return
-      setBase(response); setDraft(structuredClone(response.settings)); setLoading(false)
-      setProbeDeployment(response.settings.ai.defaultDeploymentId)
-    }).catch(caught => {
-      if (controller.signal.aborted) return
-      setError(caught instanceof Error ? caught.message : 'Application settings could not be loaded.')
+      const settingsResult = results[0]
+      const releaseResult = results[1]
+      if (settingsResult.status === 'fulfilled') {
+        setBase(settingsResult.value); setDraft(structuredClone(settingsResult.value.settings)); setProbeDeployment(settingsResult.value.settings.ai.defaultDeploymentId)
+      } else setError(settingsResult.reason instanceof Error ? settingsResult.reason.message : 'Application settings could not be loaded.')
+      if (releaseResult.status === 'fulfilled') setPromptRelease(releaseResult.value)
+      else setPromptReleaseError(releaseResult.reason instanceof Error ? releaseResult.reason.message : 'Prompt release status could not be loaded.')
       setLoading(false)
     })
     return () => { live.current = false; controller.abort() }
@@ -202,6 +209,22 @@ export function AdminSettingsPage({ onLeave, onOpenUsers }: { onLeave: () => voi
     })
   }
 
+  async function activatePromptRelease() {
+    const releaseEtag = promptRelease?.etag
+    if (!releaseEtag) { setPromptReleaseError('Load the prompt release status before activating.'); return }
+    await action(async () => {
+      const result = await service.activatePromptRelease({
+        reason: releaseReason,
+        gateReportSha256: releaseGateSha,
+        targetsVersion: releaseTargetsVersion,
+      }, releaseEtag)
+      if (!live.current) return
+      setPromptRelease(result); setPromptReleaseError(''); setReleaseReason(''); setReleaseGateSha('')
+      setStatus('Activated the prompt release for new work.')
+      await policy.refresh()
+    })
+  }
+
   async function exportSettings() {
     await action(async () => {
       const exported = await service.exportAdminSettings()
@@ -291,6 +314,23 @@ export function AdminSettingsPage({ onLeave, onOpenUsers }: { onLeave: () => voi
         <h2>{search ? 'Matching settings' : sections.find(item => item.id === section)?.title}</h2>
         <div className="settings-grid">{fields.filter(field => !field.path.startsWith('ai.tasks.') && field.path !== 'ai.defaultDeploymentId').map(field =>
           <SettingsField key={field.path} field={field} settings={draft} saved={base.settings} defaults={base.defaults} errors={errors} onChange={update} disabled={pending} />)}</div>
+      </section>}
+      {section === 'environment' && !search && <section className="panel settings-section" aria-label="Prompt release">
+        <h2>Prompt release</h2>
+        {promptRelease ? <>
+          <dl className="settings-facts"><dt>Active bundle</dt><dd><code>{promptRelease.activeBundleId ?? 'Not initialized'}</code></dd>
+            <dt>Active bundle SHA-256</dt><dd><code className="break-all">{promptRelease.activeBundleSha256 ?? 'Not initialized'}</code></dd>
+            <dt>Build generation</dt><dd><code>{promptRelease.generation}</code></dd>
+            <dt>Template support</dt><dd>{promptRelease.supported ? 'Current' : 'Pending activation'}</dd></dl>
+          {promptRelease.pending && <div className="space-y-4">
+            <p>A new prompt release is installed. Activate it after its quality gate passes. New work is paused until you do.</p>
+            <label className="field"><span className="field-label">Reason</span><textarea className="input" rows={3} maxLength={1000} disabled={pending} value={releaseReason} onChange={event => setReleaseReason(event.target.value)} /></label>
+            <label className="field"><span className="field-label">Gate report SHA-256</span><input className="input" disabled={pending} value={releaseGateSha} onChange={event => setReleaseGateSha(event.target.value.trim())} /></label>
+            <label className="field"><span className="field-label">Targets version</span><input className="input" disabled={pending} value={releaseTargetsVersion} onChange={event => setReleaseTargetsVersion(event.target.value.trim())} /></label>
+            <Button variant="primary" disabled={pending || !releaseReason.trim() || !/^[a-f0-9]{64}$/.test(releaseGateSha) || !releaseTargetsVersion.trim()} onClick={() => void activatePromptRelease()}>Activate prompt release</Button>
+          </div>}
+        </> : <p>Prompt release status is not loaded.</p>}
+        {promptReleaseError && <InlineError>{promptReleaseError}</InlineError>}
       </section>}
       {(section === 'ai' || section === 'environment') && !search && <section className="panel settings-section" aria-label="Deployment discovery and synthetic tests">
         <h2>Inventory and explicit synthetic tests</h2><p>Inventory refresh reads existing deployments; it does not create deployments, save settings, or run inference. Tests are separate, use only synthetic nonprivate content, and never save the draft.</p>

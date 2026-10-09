@@ -6,6 +6,7 @@ import type {
 } from '../../domain/analysis-reports'
 import type { DocumentPagination } from '../../domain/document-formats'
 import { getDisplayName } from '../../domain/displayNames'
+import { mixedRubricVersions, mixedRubricVersionsNotice } from '../../domain/real-analyses'
 
 export const REPORT_TITLE = 'Analysis evidence report'
 export const REPORT_HUMAN_REVIEW_NOTICE = 'Highest evidence matches are not hiring recommendations or official GS eligibility findings. A qualified reviewer must inspect the evidence and limitations.'
@@ -70,6 +71,14 @@ export function targetName(target: ReportTarget): string {
   return getDisplayName(target, target.label)
 }
 
+export function reportRubricVersionLabel(target: Pick<ReportTarget, 'selection'>): string {
+  const selection = target.selection
+  if (!selection) throw new Error('The report target has no exact saved rubric identity.')
+  return selection.kind === 'job'
+    ? `Rubric v${selection.rubricVersion} · ${selection.rubricHash.slice(0, 8)} · source document v${selection.documentVersion}`
+    : `Approved GS-${selection.grade} · rubric v${selection.version} · ${selection.versionHash.slice(0, 8)}`
+}
+
 export function paginationLabel(pagination: DocumentPagination, page: number): string {
   switch (pagination) {
     case 'pdf-pages': return `PDF page ${page}`
@@ -93,13 +102,20 @@ export function reportStatusNotice(counts: ReportStatusCounts): string {
     `Partial report: ${description}; ${counts.queued} queued; ${counts.running} running; ${counts.failed} failed; ${counts.cancelled} cancelled.`
 }
 
-export function buildReportNotices(counts: ReportStatusCounts, additionalFooter = ''): string[] {
+export function buildReportNotices(counts: ReportStatusCounts, additionalFooter = '', rubricNotice: string | null = null): string[] {
   return [
     REPORT_HUMAN_REVIEW_NOTICE,
     reportStatusNotice(counts),
+    ...(rubricNotice ? [rubricNotice] : []),
     REPORT_CAPTURE_NOTICE,
     ...(additionalFooter ? [additionalFooter] : []),
   ]
+}
+
+/** Each exact target is ranked on its own. This warns when a report shows more than one rubric version of one job or GS grade. */
+export function mixedRubricReportNotice(targets: readonly ReportTarget[]): string | null {
+  return mixedRubricVersionsNotice(mixedRubricVersions(targets, (target) => target.selection), (target) =>
+    target.selection?.kind === 'grade' ? `${targetName(target)} · GS-${target.selection.grade}` : targetName(target))
 }
 
 export function highlightNotice(group: ReportGroup): string {

@@ -112,6 +112,8 @@ export interface AdminSettings {
     qcReviews?: boolean
     /** Optional for historical captures; absent means on. Read it with analysisEvidenceCorrectionsEnabled(). */
     analysisEvidenceCorrections?: boolean
+    /** Optional so earlier revisions and captures keep their exact shape; absent means on. Read it with rubricApprovalRequired(). */
+    rubricApprovalRequired?: boolean
   }
   maintenance: { pauseNewWork: boolean; explanation: string }
   imports: {
@@ -281,6 +283,13 @@ export interface PublicFeaturesResponse extends SettingsDeploymentCapabilities {
   rubricAssistant: boolean
   /** Real job rubrics can be exported and detailed in analysis reports. Exports are reads, so pausing new work does not affect this. */
   rubricExports: boolean
+  /**
+   * New analyses and grade ladders may use only the approved version of a job rubric. This is a policy that the
+   * analysis and grade-ladder routes enforce; pausing new work does not change it.
+   */
+  rubricApprovalRequired: boolean
+  /** The rubric checks that come before approval can run: the job-rubric model is deployed and new work is admitted. */
+  rubricChecks: boolean
   /** Private QC is deployed and currently admitting new reviews and improvement changes. */
   qcReviews: boolean
   limits: RuntimeNumericLimits<typeof JOB_IMPORT_LIMITS>
@@ -416,4 +425,6 @@ export {
   captureProcessingSettings, captureQcProcessingSettings, resolveTaskModel, projectPublicSettings,
   runtimeSettingsReadiness, diffAdminSettings, hostMatchesRule, urlAllowedBySettings,
 } from './admin-settings-resolver'
-export { rubricAssistantEnabled, rubricExportsEnabled, qcReviewsEnabled, analysisEvidenceCorrectionsEnabled } from './feature-switches'
+export {
+  rubricAssistantEnabled, rubricExportsEnabled, qcReviewsEnabled, analysisEvidenceCorrectionsEnabled, rubricApprovalRequired,
+} from './feature-switches'

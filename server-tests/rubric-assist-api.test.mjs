@@ -57,7 +57,7 @@ function changedLabelOutput(label = 'Platform leadership') {
     rubric: { name: null, description: null },
     criteria: [{
       action: 'update', ref: 'C1', afterRef: null, label, description: null, guidance: null, weight: null,
-      requirementType: null, paragraphId: null, quote: null,
+      requirementType: null, levels: null, sourcePassageIds: null,
     }],
     warnings: [],
   })
@@ -71,10 +71,10 @@ function addedCriterionOutput() {
     criteria: [{
       action: 'add', ref: null, afterRef: 'C1', label: 'Cloud operations',
       description: 'Operates Azure services for production workloads.', guidance: guidance('cloud operations evidence'),
-      weight: 50, requirementType: 'required', paragraphId: 'paragraph-2', quote: 'Must operate Azure services for production workloads.',
+      weight: 50, requirementType: 'required', levels: null, sourcePassageIds: [2],
     }, {
       action: 'update', ref: 'C1', afterRef: null, label: null, description: null, guidance: null, weight: 50,
-      requirementType: null, paragraphId: null, quote: null,
+      requirementType: null, levels: null, sourcePassageIds: null,
     }],
     warnings: ['Review the new weighting.'],
   })
@@ -398,7 +398,7 @@ test('rubric assistant succeeds without writing stores and builds citations serv
     assert.equal(response.status, 200, await response.clone().text())
     const body = await response.json()
     assert.equal(rubricAssistResponseSchema.safeParse(body).success, true)
-    assert.equal(body.assistant.promptVersion, 'score-rubric-assist-v1')
+    assert.equal(body.assistant.promptVersion, 'score-rubric-assist-v2')
     assert.equal(body.operations.some(operation => operation.type === 'addCriterion'), true)
     const added = body.operations.find(operation => operation.type === 'addCriterion').criterion
     assert.deepEqual(added.sourceCitations[0], {

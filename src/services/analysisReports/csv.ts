@@ -3,7 +3,7 @@ import { reportReviewLinks } from './links'
 import { assertReportResourceLimits } from './model'
 import { assessmentSummary, readableAnalysisDate, readableCandidateSourceName, readableTargetSourceLabel } from './readable'
 import { reportGenerationPolicy, reportLimits, snapshotReportPolicy } from './policy'
-import { buildReportNotices, REPORT_TITLE, reportTitle } from './presentation'
+import { buildReportNotices, mixedRubricReportNotice, REPORT_TITLE, reportRubricVersionLabel, reportTitle } from './presentation'
 
 export type CsvCell = string | number | null
 
@@ -25,14 +25,18 @@ export function generateCsvReport(report: AnalysisReport, options?: ReportGenera
   assertReportResourceLimits(report, limits.maxInputBytes)
   const customized = policy.title !== REPORT_TITLE || policy.additionalFooter !== ''
   const displayLabels = report.groups.some(group => group.target.displayName || group.comparisons.some(comparison => comparison.candidate.displayName))
+  const mixedVersions = mixedRubricReportNotice(report.groups
+    .filter(group => group.comparisons.some(comparison => comparison.status === 'complete')).map(group => group.target))
+  const disclosures = customized || mixedVersions !== null
   const criterionCount = Math.max(0, ...report.groups.map(group => group.target.criteria.length))
   const header: CsvCell[] = [
     'Candidate name',
     'Job/grade', 'Overall score', 'Overall assessment',
     ...Array.from({ length: criterionCount }, (_, index) => `C${index + 1}`),
-    'Analysis date', 'Source', 'Analysis link', 'Resume link', 'Job/grade link',
+    'Analysis date', 'Source', 'Analysis link', 'Resume link', 'Job/grade link', 'Rubric version',
     ...(displayLabels ? ['Candidate display label', 'Job/grade display title'] : []),
-    ...(customized ? ['Report title', 'Report disclosures'] : []),
+    ...(customized ? ['Report title'] : []),
+    ...(disclosures ? ['Report disclosures'] : []),
   ]
   const encoder = new TextEncoder()
   const chunks: Uint8Array[] = [Uint8Array.of(0xef, 0xbb, 0xbf)]
@@ -74,9 +78,10 @@ export function generateCsvReport(report: AnalysisReport, options?: ReportGenera
         readableCandidateSourceName(comparison.candidate), targetLabel, comparison.overall.score,
         assessmentSummary(target, comparison, 300), ...scores,
         readableAnalysisDate(comparison.analyzedAt), comparison.candidate.sourceLabel,
-        links.analysis, links.resume, links.target,
+        links.analysis, links.resume, links.target, reportRubricVersionLabel(target),
         ...(displayLabels ? [comparison.candidate.displayName ?? null, target.displayName ?? null] : []),
-        ...(customized ? [reportTitle(report), buildReportNotices(report.counts, policy.additionalFooter).join('\n\n')] : []),
+        ...(customized ? [reportTitle(report)] : []),
+        ...(disclosures ? [buildReportNotices(report.counts, policy.additionalFooter, mixedVersions).join('\n\n')] : []),
       ])
       rows++
       completed++

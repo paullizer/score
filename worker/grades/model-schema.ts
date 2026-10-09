@@ -1,5 +1,6 @@
 import { z } from 'zod'
 import { GRADE_LADDER_LIMITS } from '../../src/domain/real-grades'
+import { criterionLevelsSchema, evidenceScaleVersionSchema } from '../../src/domain/evidence-scale'
 
 const identifier = z.string().min(1).max(200).regex(/^[a-zA-Z0-9][a-zA-Z0-9_-]*$/)
 const text = z.string().min(1).max(8_000)
@@ -14,6 +15,11 @@ export const citationSchema = z.strictObject({
 })
 
 const citations = z.array(citationSchema).max(24)
+const passageCitationSchema = z.strictObject({
+  documentId: identifier,
+  passageIds: z.array(z.string().min(1).max(260).regex(/^[A-Za-z0-9][A-Za-z0-9_.:-]*:p[1-9][0-9]*$/)).min(1).max(24),
+})
+const passageCitations = z.array(passageCitationSchema).max(24)
 
 export const issueSchema = z.strictObject({
   code: z.string().min(1).max(100).regex(/^[a-z][a-z0-9-]*$/),
@@ -25,6 +31,8 @@ export const issueSchema = z.strictObject({
   criterionId: identifier.nullable(),
   citations,
 })
+
+const draftIssueSchema = issueSchema.extend({ citations: passageCitations })
 
 export const competencySchema = z.strictObject({
   id: identifier,
@@ -46,28 +54,49 @@ export const draftCriterionSchema = z.strictObject({
   weight: z.number().min(0).max(100),
   guidance: z.string().min(1).max(12_000),
   support: z.enum(['direct', 'derived', 'gap', 'not-applicable']),
+  levels: z.union([z.array(z.strictObject({
+    level: z.union([z.literal(1), z.literal(2), z.literal(3), z.literal(4), z.literal(5)]),
+    examples: z.string().min(1).max(300),
+  })).length(5), z.null()]),
+  sourceCitations: passageCitations,
+  gradeBasis: passageCitations,
+  interpretation: text,
+})
+
+export const savedCriterionSchema = z.strictObject({
+  competencyId: identifier,
+  key: z.enum(['technical', 'delivery', 'analysis', 'communication', 'leadership', 'policy', 'custom']),
+  description: text,
+  weight: z.number().min(0).max(100),
+  guidance: z.string().min(1).max(12_000),
+  support: z.enum(['direct', 'derived', 'gap', 'not-applicable']),
   sourceCitations: citations,
   gradeBasis: citations,
   interpretation: text,
+  levels: criterionLevelsSchema.optional(),
 })
 
 export const qualificationSchema = z.strictObject({
   id: identifier,
   text: z.string().min(1).max(32_000),
-  citations,
+  citations: passageCitations,
   interpretation: text,
   support: z.enum(['direct', 'derived', 'gap']),
 })
 
-export const savedQualificationSchema = qualificationSchema.extend({
+export const savedQualificationSchema = z.strictObject({
+  id: identifier,
+  text: z.string().min(1).max(32_000),
+  citations,
   interpretation: z.string().min(1).max(12_000),
+  support: z.enum(['direct', 'derived', 'gap']),
 })
 
 export const draftSchema = z.strictObject({
   description: text,
   criteria: z.array(draftCriterionSchema).min(1).max(GRADE_LADDER_LIMITS.maxCriteria),
   qualifications: z.array(qualificationSchema).max(40),
-  issues: z.array(issueSchema).max(80),
+  issues: z.array(draftIssueSchema).max(80),
 })
 
 interface IssueScope {
@@ -84,13 +113,21 @@ function scopedIssueSchema(scope: IssueScope) {
   })
 }
 
+function scopedDraftIssueSchema(scope: IssueScope) {
+  return draftIssueSchema.extend({
+    sourceId: scope.sourceIds.length ? z.enum(scope.sourceIds).nullable() : z.null(),
+    criterionId: scope.criterionIds.length ? z.enum(scope.criterionIds).nullable() : z.null(),
+    grade: z.literal(scope.grade).nullable(),
+  })
+}
+
 export function draftSchemaForDocuments(documentIds: string[], scope: IssueScope) {
   const gradeBasis = documentIds.length
-    ? z.array(citationSchema.extend({ documentId: z.enum(documentIds) })).max(24)
-    : z.array(citationSchema).max(0)
+    ? z.array(passageCitationSchema.extend({ documentId: z.enum(documentIds) })).max(24)
+    : z.array(passageCitationSchema).max(0)
   return draftSchema.extend({
     criteria: z.array(draftCriterionSchema.extend({ gradeBasis })).min(1).max(GRADE_LADDER_LIMITS.maxCriteria),
-    issues: z.array(scopedIssueSchema(scope)).max(80),
+    issues: z.array(scopedDraftIssueSchema(scope)).max(80),
   })
 }
 
@@ -120,20 +157,26 @@ export const savedRubricSchema = z.strictObject({
     promptVersion: z.string().min(1).max(200),
     prompt: promptExecutionProvenanceSchema.optional(),
   }).optional(),
-  criteria: z.array(draftCriterionSchema.extend({
+  criteria: z.array(savedCriterionSchema.extend({
     id: identifier,
     label: z.string().min(1).max(300),
     interpretation: z.string().min(1).max(12_000),
     sourceParagraphId: identifier.optional(),
     requirementType: z.enum(['required', 'preferred']).optional(),
   })).min(1).max(GRADE_LADDER_LIMITS.maxCriteria),
+  scaleVersion: evidenceScaleVersionSchema.optional(),
 })
 
 export type ModelIssue = z.infer<typeof issueSchema>
 export type ModelPlan = z.infer<typeof planSchema>
-export type ModelDraft = z.infer<typeof draftSchema>
+export type ModelDraft = {
+  description: string
+  criteria: Array<z.infer<typeof savedCriterionSchema>>
+  qualifications: Array<z.infer<typeof savedQualificationSchema>>
+  issues: Array<z.infer<typeof issueSchema>>
+}
 export type ModelCriterion = z.infer<typeof draftCriterionSchema>
-export type ModelQualification = z.infer<typeof qualificationSchema>
+export type ModelQualification = z.infer<typeof savedQualificationSchema>
 export type ModelReview = z.infer<typeof reviewSchema>
 
 export function structuredSchema(schema: z.ZodType): Record<string, unknown> {

@@ -8,6 +8,7 @@ const {
   extractHtml,
   generateGroundedRubric,
   validateModelRubric,
+  JOB_RUBRIC_COMPILED_PROMPT,
   workerConstants,
 } = await loadWorker('../worker/runtime.ts')
 
@@ -25,6 +26,13 @@ const document = {
 }
 
 const guidance = '0: No supporting evidence in the submitted resume for this criterion; 1: Documents a bounded example; 2: Documents practice with regular review; 3: Documents independent work within the stated scope; 4: Documents complex work with clear outcomes; 5: Documents repeated complex work with validated outcomes.'
+const levels = [
+  { level: 1, examples: 'Lists related training or TypeScript as a skill.' },
+  { level: 2, examples: 'Documents one TypeScript project or task.' },
+  { level: 3, examples: 'Documents recurring TypeScript development duties.' },
+  { level: 4, examples: 'Documents independent TypeScript work across a larger service.' },
+  { level: 5, examples: 'Documents leading TypeScript work with team or product outcomes.' },
+]
 const validResult = {
   isJobPosting: true,
   rejectionReason: null,
@@ -42,19 +50,17 @@ const validResult = {
       label: 'TypeScript experience',
       description: 'Professional TypeScript experience.',
       weight: 60,
-      guidance,
       requirementType: 'required',
-      sourceParagraphId: 'p-0001',
-      quote: 'Five years of TypeScript experience is required.',
+      sourcePassageIds: [1],
+      levels,
     },
     {
       label: 'Azure operations',
       description: 'Experience operating services on Azure.',
       weight: 40,
-      guidance,
       requirementType: 'preferred',
-      sourceParagraphId: 'p-0002',
-      quote: 'Azure operations experience is preferred.',
+      sourcePassageIds: [2],
+      levels,
     },
   ],
 }
@@ -128,6 +134,79 @@ test('job rubric resolves only its captured task and enforces the frozen criteri
   assert.equal(calls, 2)
 })
 
+
+test('position descriptions are accepted and listing pages are rejected', async () => {
+  const positionDocument = { ...document, title: 'Position Description: Platform Engineer' }
+  const generated = await generateGroundedRubric(positionDocument, {
+    endpoint: 'https://model.example', deployment: 'rubric', modelName: 'gpt-5-mini', getToken: async () => 'token',
+    fetch: async () => modelResponse(validResult),
+  }, () => [], jobId, '2026-09-17T12:00:00.000Z')
+  assert.equal(generated.metadata.isJobPosting, true)
+
+  await assert.rejects(generateGroundedRubric(document, {
+    endpoint: 'https://model.example', deployment: 'rubric', modelName: 'gpt-5-mini', getToken: async () => 'token',
+    fetch: async () => modelResponse({ ...validResult, isJobPosting: false, rejectionReason: 'This is a listing page.', criteria: [] }),
+  }, () => [], jobId, '2026-09-17T12:00:00.000Z'), error => error.code === 'not-a-job-posting' && /listing page/.test(error.message))
+})
+
+test('long paragraphs are cited by passage IDs and merged into exact source quotes', async () => {
+  const longText = `${'Requires cloud architecture experience across teams and services with documented ownership and integration scope, '.repeat(40)}and maintains infrastructure documentation.`
+  assert.ok(longText.length >= 3600)
+  const longDocument = { ...document, paragraphs: [{ id: 'long', page: 1, heading: 'Duties', text: longText }] }
+  const result = { ...validResult, title: 'Platform Engineer', criteria: [{
+    label: 'Cloud architecture', description: 'Cloud architecture across teams and services.', weight: 100,
+    requirementType: 'required', sourcePassageIds: [1, 2], levels,
+  }] }
+  const generated = await generateGroundedRubric(longDocument, {
+    endpoint: 'https://model.example', deployment: 'rubric', modelName: 'gpt-5-mini', getToken: async () => 'token',
+    fetch: async () => modelResponse(result),
+  }, () => [], jobId, '2026-09-17T12:00:00.000Z')
+  assert.equal(generated.rubric.criteria[0].sourceCitations.length, 1)
+  assert.equal(generated.rubric.criteria[0].sourceCitations[0].quote, longText.slice(0, generated.rubric.criteria[0].sourceCitations[0].quote.length).trim())
+  assert.ok(generated.rubric.criteria[0].sourceCitations[0].quote.length > 600)
+})
+
+test('passage ID and level corrections are specific and succeed after one repair', async () => {
+  const invalid = structuredClone(validResult)
+  invalid.criteria[0].sourcePassageIds = [999]
+  invalid.criteria[0].levels = [{ level: 1, examples: 'One' }, { level: 1, examples: 'Duplicate' }]
+  invalid.criteria[1].sourcePassageIds = [2, 2]
+  const corrections = []
+  let calls = 0
+  const generated = await generateGroundedRubric(document, {
+    endpoint: 'https://model.example', deployment: 'rubric', modelName: 'gpt-5-mini', getToken: async () => 'token',
+    fetch: async (_url, init) => {
+      calls++
+      corrections.push(JSON.parse(init.body).messages[1].content)
+      return modelResponse(calls === 1 ? invalid : validResult)
+    },
+  }, () => [], jobId, '2026-09-17T12:00:00.000Z')
+  assert.equal(calls, 2)
+  assert.match(corrections[1], /Criterion 1 \(TypeScript experience\).*Passage 999 does not exist/s)
+  assert.match(corrections[1], /Criterion 1 \(TypeScript experience\) levels are invalid/s)
+  assert.match(corrections[1], /Criterion 2 \(Azure operations\).*selected more than once/s)
+  assert.equal(generated.rubric.criteria.length, 2)
+})
+
+test('level wording warnings do not block and scaled rubrics pass domain validation', async () => {
+  const warned = structuredClone(validResult)
+  warned.criteria[0].levels[0].examples = 'Documents TypeScript work with minimal supervision.'
+  const generated = await generateGroundedRubric(document, {
+    endpoint: 'https://model.example', deployment: 'rubric', modelName: 'gpt-5-mini', getToken: async () => 'token',
+    fetch: async () => modelResponse(warned),
+  }, () => [], jobId, '2026-09-17T12:00:00.000Z')
+  const { validateRealRubric } = await loadWorker('../server/jobs/validation.ts')
+  const { rubricScaleErrors } = await loadWorker('../src/domain/evidence-scale.ts')
+  assert.deepEqual(validateRealRubric(generated.rubric, document), [])
+  assert.deepEqual(rubricScaleErrors(generated.rubric), [])
+})
+
+test('job rubric prompt includes the standard evidence scale text', () => {
+  assert.match(JOB_RUBRIC_COMPILED_PROMPT.system, /score-evidence-ladder-v1/)
+  assert.match(JOB_RUBRIC_COMPILED_PROMPT.system, /0: No relevant evidence/)
+  assert.match(JOB_RUBRIC_COMPILED_PROMPT.system, /When evidence falls between two levels, choose the lower level/)
+})
+
 test('Document Intelligence layout preserves page-aware paragraphs and table rows', () => {
   const paragraphs = documentIntelligenceParagraphs({
     status: 'succeeded',
@@ -198,9 +277,9 @@ test('grounded rubric generation repairs protected criteria once and preserves e
       assert.equal(body.model, 'rubric-deployment')
       assert.equal(body.reasoning_effort, 'low')
       assert.equal(body.response_format.json_schema.strict, true)
-      assert.match(body.messages[0].content, /Anchor 0 means "No supporting evidence in the submitted resume for this criterion"/)
-      assert.match(body.messages[0].content, /Anchors 1 through 5 describe progressively stronger documented examples/)
-      assert.match(body.messages[0].content, /never use "No understanding", "No awareness\/practice", "No advisory experience"/)
+      assert.match(body.messages[0].content, /score-evidence-ladder-v1/)
+      assert.match(body.messages[0].content, /0: No relevant evidence/)
+      assert.match(body.messages[0].content, /For each criterion write job-specific examples for levels 1 through 5 only/)
       assert.match(body.messages[0].content, /confidentiality, legal\/data-protection practice, and statistical advising/)
       assert.match(body.messages[0].content, /Genuine unusable-source or processing failures are not completed zeros/)
       if (calls === 2) {
@@ -223,7 +302,7 @@ test('grounded rubric generation repairs protected criteria once and preserves e
   assert.deepEqual(generated.rubric.provenance, {
     kind: 'generated',
     model: 'gpt-5-mini-2026-08-01',
-    promptVersion: 'score-job-rubric-v3',
+    promptVersion: 'score-job-rubric-v4',
   })
   assert.deepEqual(generated.warnings, ['Location is not stated.'])
 })
@@ -231,10 +310,10 @@ test('grounded rubric generation repairs protected criteria once and preserves e
 test('invalid weights or fabricated quotes remain errors after one repair attempt', async () => {
   const invalid = structuredClone(validResult)
   invalid.criteria[0].weight = 50
-  invalid.criteria[0].quote = 'A qualification not found in the source.'
+  invalid.criteria[0].sourcePassageIds = [999]
   const errors = validateModelRubric(invalid, document).join(' ')
   assert.match(errors, /not 100/)
-  assert.match(errors, /not an exact substring/)
+  assert.match(errors, /Passage 999 does not exist/)
   let calls = 0
   await assert.rejects(generateGroundedRubric(document, {
     endpoint: 'https://model.example',

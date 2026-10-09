@@ -1031,3 +1031,18 @@ test('PDF: writer bundles for the browser without Node filesystem access, font f
   const source = await readFile(resolve('src', 'services', 'analysisReports', 'pdf.ts'), 'utf8')
   assert.doesNotMatch(source, /node:fs|readFile|fetch\s*\(|https?:\/\//)
 })
+
+test('PDF: a report that mixes rubric versions of one job warns in its introduction', async () => {
+  const input = readablePdfFixture({ scores: [80], targetCount: 2, criterionCount: 1 })
+  for (const target of input.targets) {
+    target.rubricId = 'rubric-0'
+    Object.assign(target.selection, { jobId: 'job-0', rubricId: 'rubric-0' })
+  }
+  input.targets[1].selection.rubricHash = 'b'.repeat(64)
+  const pdf = await generate(input)
+  const introduction = pdf.pages.filter(page => page.section.endsWith('Introduction')).map(page => page.body).join(' ')
+  assert.match(introduction, /Rubric versions differ for/)
+  assertNoClipping(pdf)
+  const single = await generate(readablePdfFixture({ scores: [80], targetCount: 2, criterionCount: 1 }))
+  assert.ok(!single.body.includes('Rubric versions differ'))
+})

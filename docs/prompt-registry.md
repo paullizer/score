@@ -22,7 +22,29 @@ The Azure constructors take the existing application-settings configuration (`co
 
 Baseline initialization atomically creates all seven revisions, a bundle, an activation audit and the active pointer **only after a confirmed absent pointer**. Failed reads, corrupt pointers, missing history, and immutable-record collisions are errors, not permission to reset saved choices.
 
-Reader-first rollout uses the independent shared `PROMPT_RUNTIME_VERSION = 'score-prompt-runtime-v1'`, re-exported by the job, grade, resume, analysis, and QC runtime entry bundles. The existing settings capability alone does not prove prompt-pin awareness. Deployment must probe all five runtime exports before recording `SCORE_PROMPT_RUNTIME_WORKER_VERSION` proof or admitting pinned paid work. This capability marker does not require changing stored settings or their runtime version.
+Reader-first rollout uses the independent shared `PROMPT_RUNTIME_VERSION = 'score-prompt-runtime-v2'`, re-exported by the job, grade, resume, analysis, and QC runtime entry bundles. The existing settings capability alone does not prove prompt-pin awareness. Deployment must probe all five runtime exports before recording `SCORE_PROMPT_RUNTIME_WORKER_VERSION` proof or admitting pinned paid work. This capability marker does not require changing stored settings or their runtime version.
+
+## Template releases
+
+A prompt template generation is the code-owned set of compiled system templates, output schema versions and renderer bindings for all seven prompt families. `PROMPT_TEMPLATE_GENERATION='score-prompt-templates-v2'` names the current generation; code changes bump it whenever the compiled templates or schemas change, because release bundle IDs are derived from it.
+
+Generation v2 moves rubric generation onto the standard evidence scale (`score-evidence-ladder-v1`) and passage-ID citations:
+
+- `jobRubric` is `score-job-rubric-v4` with `score-job-rubric-schema-v2`. It accepts one-role job postings and position descriptions, cites job text by passage ID, and writes job-specific examples for levels 1–5.
+- `gradeDraft` is `score-grade-draft-v5` with `score-grade-draft-schema-v4`. It cites reference passages by ID and writes grade-specific examples for scored rows.
+- `gradeReview` is `score-grade-review-v4`. It also checks overlapping criteria, examples a résumé can't show, and conformance to the scale.
+
+Score performs a hard cutover. API and workers support only the current generation. Work accepted with an older generation fails clearly and must be started again; the service does not dual-run or silently substitute old templates.
+
+When a deployment contains newer compiled templates than the active prompt bundle, `current()` and new-work admission fail closed with: "A new prompt release is installed but not activated yet. An application administrator must activate it before new work can start." Application administrators can inspect `GET /api/admin/settings/prompt-release` or the Admin settings **Prompt release** panel. After the offline quality gate passes, they activate with `POST /api/admin/settings/prompt-release` and an exact `If-Match`, providing:
+
+- `reason`;
+- `gateReportSha256` for the offline gate report;
+- `targetsVersion` for the engineering target pack evaluated by that report.
+
+The activation audit stores `templateRelease: { generation, gateReportSha256, targetsVersion }`, the previous bundle id/SHA, actor, reason and timestamp. The release creates fresh immutable revisions for every family from the compiled templates; editable families reset to the code-owned baseline guidance and fixed families retain null guidance.
+
+`PROMPT_RUNTIME_VERSION='score-prompt-runtime-v2'` is the reader-first marker for template-release activations. Deploy the API and all workers together, verify the worker runtime marker, then activate the template release. New work is paused between deployment and activation. After activation, do not roll the API or workers back to builds that cannot read template-release activations or current generation pins.
 
 The separate QC-policy upgrade advertises `RUNTIME_SETTINGS_VERSION = 'score-runtime-settings-v2'` for the **reader**, supporting both original v1 settings and explicit v2 QC policies. This runtime marker was never a field in `ProcessingSettingsSnapshot`; it must not be injected into historical captures. Original v1 envelopes retain their exact serialized shape/hashes, both version-1 schema fields, and absence of `qcPlan`, `processing.qc`, `workers.qc`, and `promptBundle`. `captureQcProcessingSettings` is an explicit **new QC admission** operation, not a retry/history reconstruction step. Deployment settings-reader verification must match the v2 emitted reader marker independently of prompt-reader verification.
 

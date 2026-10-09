@@ -1,5 +1,6 @@
 import type { AnalysisReportFormat, ReportFontData, ReportPolicy, ReportSettingsCapture } from './analysis-reports'
 import type { DocumentPagination } from './document-formats'
+import type { RubricVersionStatus } from './rubric-approval'
 
 export const RUBRIC_EXPORT_SCHEMA_VERSION = 1 as const
 
@@ -93,6 +94,8 @@ export interface RubricExportRubric {
   description: string
   createdAt: string
   provenance: 'generated' | 'edited'
+  /** Approval status of this exact version when it was exported. Absent from payloads made before rubric approval. */
+  approval?: RubricVersionStatus
   criteria: RubricExportCriterion[]
 }
 

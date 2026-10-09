@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { createHash, randomUUID } from 'node:crypto'
-import { StoreConflictError } from '../dist-server/app.mjs'
+import { StoreConflictError, analysisHash } from '../dist-server/app.mjs'
 
 const clone = value => structuredClone(value)
 const keyFor = (workspaceId, jobId) => `${workspaceId}/${jobId}`
@@ -29,6 +29,9 @@ function assertLifecycleUnchanged(record, current) {
     record.job.rubricDeletedAt !== current.job.rubricDeletedAt) {
     throw new StoreConflictError('Lifecycle metadata must be changed through lifecycle management.')
   }
+  if (JSON.stringify(record.rubricApproval) !== JSON.stringify(current.rubricApproval)) {
+    throw new StoreConflictError('Only rubric approval can change the approved rubric version.')
+  }
 }
 
 function cancel(record, timestamp) {
@@ -44,6 +47,8 @@ function cancel(record, timestamp) {
 export function createFakeRealJobs() {
   const records = new Map()
   const rubrics = new Map()
+  const rubricQa = new Map()
+  const approvals = new Map()
   const blobs = new Map()
   const tombstones = new Set()
   const controls = new Map()
@@ -149,7 +154,7 @@ export function createFakeRealJobs() {
       if (!owner || owner.lifecycle?.deletedAt || owner.rubricLifecycle?.deletedAt) return []
       return (rubrics.get(keyFor(workspaceId, jobId)) ?? []).slice().sort((a, b) => a.version - b.version).map(clone)
     },
-    async publish(record, etag, rubric) {
+    async publish(record, etag, rubric, checks) {
       const value = current(record.workspaceId, record.id, etag)
       writable(record.workspaceId, value.record)
       writable(record.workspaceId, record)
@@ -157,7 +162,43 @@ export function createFakeRealJobs() {
       const key = keyFor(record.workspaceId, record.id)
       const versions = rubrics.get(key) ?? []
       if (versions.some(value => value.id === rubric.id && value.version === rubric.version)) throw new StoreConflictError()
+      if (checks) {
+        assert.equal(checks.rubricHash, analysisHash(rubric))
+        const saved = rubricQa.get(key) ?? new Map()
+        if (saved.has(`${rubric.id}:${rubric.version}`)) throw new StoreConflictError()
+        saved.set(`${rubric.id}:${rubric.version}`, clone(checks))
+        rubricQa.set(key, saved)
+      }
       rubrics.set(key, [...versions, clone(rubric)])
+      return save(record)
+    },
+    async getRubricQa(workspaceId, jobId, rubricId, version) {
+      const value = rubricQa.get(keyFor(workspaceId, jobId))?.get(`${rubricId}:${version}`)
+      return value ? clone(value) : undefined
+    },
+    async createRubricQa(record) {
+      const value = current(record.workspaceId, record.jobId)
+      writable(record.workspaceId, value.record)
+      if (value.record.job.rubricId !== record.rubricId) throw new StoreConflictError('The job rubric changed.')
+      const key = keyFor(record.workspaceId, record.jobId)
+      const versions = rubricQa.get(key) ?? new Map()
+      const existing = versions.get(`${record.rubricId}:${record.version}`)
+      if (existing) return clone(existing)
+      versions.set(`${record.rubricId}:${record.version}`, clone(record))
+      rubricQa.set(key, versions)
+      return clone(record)
+    },
+    async approveRubric(record, etag, approval) {
+      const value = current(record.workspaceId, record.id, etag)
+      writable(record.workspaceId, value.record)
+      writable(record.workspaceId, record)
+      assert.equal(record.rubricApproval?.approvalId, approval.id)
+      const { rubricApproval: _before, updatedAt: _beforeAt, ...rest } = value.record
+      const { rubricApproval: _after, updatedAt: _afterAt, ...next } = record
+      if (JSON.stringify(rest) !== JSON.stringify(next)) throw new StoreConflictError('Approval can change only the approved rubric version.')
+      if (value.record.rubricApproval?.approvalId !== approval.supersedes) throw new StoreConflictError('Another approval was saved for this rubric.')
+      const key = keyFor(record.workspaceId, record.id)
+      approvals.set(key, [...(approvals.get(key) ?? []), clone(approval)])
       return save(record)
     },
     async getWorkspaceLifecycle(workspaceId) { return clone(control(workspaceId)) },
@@ -187,9 +228,11 @@ export function createFakeRealJobs() {
     },
     async completeRubricDeletion(workspaceId, jobId, etag, timestamp) {
       const value = current(workspaceId, jobId, etag)
-      if (!value.record.rubricLifecycle?.deletingAt || (rubrics.get(keyFor(workspaceId, jobId)) ?? []).length) throw new StoreConflictError()
+      if (!value.record.rubricLifecycle?.deletingAt || (rubrics.get(keyFor(workspaceId, jobId)) ?? []).length ||
+        rubricQa.has(keyFor(workspaceId, jobId)) || approvals.has(keyFor(workspaceId, jobId))) throw new StoreConflictError()
+      const { rubricApproval: _approval, ...record } = value.record
       return save({
-        ...cancel(value.record, timestamp), error: undefined,
+        ...cancel(record, timestamp), error: undefined,
         job: { ...value.record.job, status: 'ready', rubricId: null, rubricDeletedAt: timestamp, error: undefined, errorStage: undefined },
         rubricLifecycle: { parentKey: `job:${jobId}`, deletedAt: timestamp },
       })
@@ -197,11 +240,15 @@ export function createFakeRealJobs() {
     async purgeRubrics(workspaceId, jobId) {
       assertCleanup(workspaceId, jobId, true)
       rubrics.delete(keyFor(workspaceId, jobId))
+      rubricQa.delete(keyFor(workspaceId, jobId))
+      approvals.delete(keyFor(workspaceId, jobId))
     },
     async purgeJobRecords(workspaceId, jobId) {
       assertCleanup(workspaceId, jobId)
       if ([...writers.values()].some(writer => writer.workspaceId === workspaceId && writer.jobId === jobId && Date.parse(writer.expiresAt) > Date.now())) throw new StoreConflictError()
       rubrics.delete(keyFor(workspaceId, jobId))
+      rubricQa.delete(keyFor(workspaceId, jobId))
+      approvals.delete(keyFor(workspaceId, jobId))
       records.delete(keyFor(workspaceId, jobId))
       tombstones.add(keyFor(workspaceId, jobId))
       for (const [id, writer] of writers) if (writer.workspaceId === workspaceId && writer.jobId === jobId) writers.delete(id)
@@ -213,6 +260,8 @@ export function createFakeRealJobs() {
       }
       for (const value of [...records.values()]) if (value.record.workspaceId === workspaceId) await store.purgeJobRecords(workspaceId, value.record.id)
       for (const key of [...rubrics.keys()]) if (key.startsWith(`${workspaceId}/`)) rubrics.delete(key)
+      for (const key of [...rubricQa.keys()]) if (key.startsWith(`${workspaceId}/`)) rubricQa.delete(key)
+      for (const key of [...approvals.keys()]) if (key.startsWith(`${workspaceId}/`)) approvals.delete(key)
       for (const [id, writer] of writers) if (writer.workspaceId === workspaceId) writers.delete(id)
     },
     async beginBlobWrite(workspaceId, jobId, blobName, owner) {
@@ -240,9 +289,22 @@ export function createFakeRealJobs() {
       return [...writers.values()].filter(writer => writer.workspaceId === workspaceId && (jobId === undefined || writer.jobId === jobId)).map(clone)
     },
     _failNextReplace() { failNextReplace = true },
+    /** Test shortcut for an owner's approval of one saved version (the latest by default), as fixtures need it. */
+    _approve(workspaceId, jobId, version) {
+      const value = records.get(keyFor(workspaceId, jobId))
+      const versions = rubrics.get(keyFor(workspaceId, jobId)) ?? []
+      const rubric = version === undefined ? versions.at(-1) : versions.find(item => item.version === version)
+      assert.ok(value && rubric && value.record.job.rubricId === rubric.id, 'Only a saved version of the job rubric can be approved')
+      return save({ ...value.record, rubricApproval: {
+        approvalId: `rubric-approval-${randomUUID()}`, rubricId: rubric.id, version: rubric.version,
+        rubricHash: analysisHash(rubric), approvedBy: value.record.createdBy, approvedAt: value.record.updatedAt,
+      } })
+    },
     _expireWriters() { for (const value of writers.values()) value.expiresAt = new Date(0).toISOString() },
     _records: records,
     _rubrics: rubrics,
+    _rubricQa: rubricQa,
+    _approvals: approvals,
     _tombstones: tombstones,
   }
   const blobStore = {

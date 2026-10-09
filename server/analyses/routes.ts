@@ -149,7 +149,7 @@ export function createRealAnalysesRouter(deps: RealAnalysesRouterDeps): Router {
   router.use(base, authorize)
   router.get(`${base}/targets`, async (req, res) => {
     const options = page(req)
-    res.json(await requireService().listTargets(param(req, 'workspaceId'), options.continuationToken, options.limit))
+    res.json(await requireService(req).listTargets(param(req, 'workspaceId'), options.continuationToken, options.limit))
   })
   router.get(base, async (req, res) => {
     const options = page(req)

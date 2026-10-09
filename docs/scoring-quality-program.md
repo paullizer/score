@@ -122,6 +122,53 @@ Reports separate split, origin, exposure and repetition. Selection precision is 
 
 `gates` applies the frozen engineering targets to two configurations, requires six repeats and at least 20 families/four jobs, and rejects missing/null criterion panels. Human quality requires at least 30 determinate blind human items and paired complete outputs. It checks MAE <=0.5 and conservatively requires the family-clustered upper confidence bound on error increase to be <=0; this is not a claim that 30 checks certify population quality. It always retains `eligibleForRelease: false`: rubric signoff, judge qualification, perturbation/noise-floor experiments, compatible readers and explicit promotion remain external prerequisites. Stable but incorrect scores cannot pass through model agreement alone.
 
+### Versioned targets
+
+`gates` accepts an optional targets version and panels file after the two configuration IDs:
+
+```powershell
+node scripts\scoring-evaluation.mjs gates C:\private-evals\suite.json C:\private-evals\observations.json C:\private-evals\human-references.json C:\private-evals\gates-v2.json baseline candidate score-engineering-targets-v2 C:\private-evals\gate-panels.json
+```
+
+Without a version, `gates` applies `score-engineering-targets-v1` exactly as before. Target sets are registered in `worker\evals\gates.ts` (`SCORING_ENGINEERING_TARGET_SETS`). A frozen set is never edited; a change gets a new version.
+
+`score-engineering-targets-v2` keeps every v1 threshold and adds the scoring-stability targets. It applies to job and GS grade rubrics:
+
+| Area | Check | Target |
+|---|---|---|
+| Stability, per target kind | Completion, criterion disagreement, disagreement by more than one level, median overall SD, P95 overall range, incomplete items | The v1 thresholds |
+| Coverage, per target kind | Cases, resume families, rubric targets | At least 1 case, 20 families and 4 targets |
+| Rubric generation, job and grade | Valid generations across repeats | 100%, with at least 6 repeats of at least 4 sources |
+| Reviewer | Verdict flips on fixed proposals (repeats that disagree about whether an issue exists) | At most 10% |
+| Reviewer | Planted-defect recall | 100%, with no failed reviews |
+| Reviewer | Gap between over-credit and under-credit recall | Set from the baseline |
+| Monotonicity | Expected-supporting criteria whose mean score falls, and drops of more than one level | 0 and 0 |
+| Invariance | Worst family-mean excess disagreement over unchanged-input noise for identity, format and irrelevant-detail edits | Set from the baseline |
+| Cross-model gap | Mean per-criterion and overall gap between two model configurations on the same locked rubric | Set from the baseline |
+| Cost and latency | Mean cost per analysis, P95 analysis time | Set from the baseline |
+
+Suites mark GS grade-rubric cases with `targetKind: "grade"`. Cases without it are job cases, so suites frozen earlier keep their hash. Human checks stay pooled across kinds, with at least 30 blind items.
+
+v2 is a **draft** until the recorded baseline fills the thresholds marked "Set from the baseline". A draft never meets the targets: its unset checks report `insufficient` with the note `target-not-frozen`. Freezing sets `status` to `frozen` in the same version before any candidate runs. To explore thresholds, the library also accepts what-if `targets`; reports mark them `targetsRegistered: false`, and they can never meet the targets.
+
+The panels file binds separately produced reports to the configuration they measure. Report and cost paths are relative to the panels file:
+
+```json
+{
+  "rubricGeneration": [
+    { "targetKind": "job", "configurationId": "generator", "report": "rubric-repeatability-job.json" },
+    { "targetKind": "grade", "configurationId": "generator", "report": "rubric-repeatability-grade.json" }
+  ],
+  "fixedJudge": { "configurationId": "reviewer", "report": "judge-report.json" },
+  "monotonicity": { "configurationId": "candidate", "report": "monotonicity.json" },
+  "invariance": { "configurationId": "candidate", "report": "invariance.json" },
+  "crossModel": { "leftConfigurationId": "candidate-mini", "rightConfigurationId": "candidate-luna" },
+  "costs": { "attempts": "run\\model-attempts.jsonl", "ledger": "costs\\program.ledger.json" }
+}
+```
+
+A missing panel leaves its checks `insufficient` with the note `panel-not-supplied`. Costs join each model attempt to its ledger entry; one unpriced attempt makes the mean cost unknown.
+
 ## Rubric-generation repeatability
 
 `executeRubricGeneration` measures job-rubric generation separately from scoring. It calls the production `generateGroundedRubric` with the captured `jobRubric` task binding, its correction budget and the production `validateRealRubric` checks. A suite (`rubricRepeatabilitySuiteSchema`) binds each job document hash, real job ID, original content type, configuration settings hash and `score-rubric-generation-v1`. Preflight rejects stale documents, settings, missing prices and other algorithms before paid admission. Responding-model identity and costs use the shared attempt recorder, so a different model version stops the run with an unknown cost. Invalid generations become `failed` observations, never empty rubrics. Their private failure artifact keeps a bounded generator message (for example, the citation or weight check that failed) for diagnosis. `executeRubricRepeatabilitySuite` checkpoints repetition-major so partial runs stay balanced, and resumes only missing generations.
@@ -129,6 +176,68 @@ Reports separate split, origin, exposure and repetition. Selection precision is 
 `summarizeRubricRepeatability` binds every completed observation to exactly one private rubric artifact by canonical hash and revalidates it against the frozen document. Criteria align only when they cite overlapping job text: same source paragraph and contained or at least 50% word-overlapping quotes. Labels that merely sound alike do not align. Reports give criterion counts, within-configuration repeat alignment, cited-paragraph Jaccard overlap, aligned weight differences, cross-configuration alignment and optional agreement with saved reference rubrics. Lexical anchor markers count guidance that uses performance-quality wording (supervision, errors, quality, routine, independently) or documentary-evidence wording. These are lexical diagnostics: they do not establish semantic equivalence, requirement coverage, anchor validity or rubric approval. Saved rubrics are comparison artifacts, not human truth. Production rubrics, jobs and historical scores are never rewritten.
 
 A four-job development trial (mini low, Luna low and Luna high, four repeats each) found that regeneration is itself a material source of variation. Within one configuration, typically 30-90% of criteria cited the same job requirement between two repeats, and criterion counts varied by up to three. Different models overlapped less (about 25-60%). Two generations rejected a position description as "not a job posting". On the longest job document, exact-quote validation failed for most mini and Luna-low attempts, even after the allowed correction, while Luna high completed every attempt. Treat a saved job rubric as part of the scoring configuration: compare analyses only when they use the same saved rubric, and do not regenerate rubrics to "retry" a score. These are lexical development measurements on four documents, not a model selection or a validated rubric quality ranking.
+
+Generator v2 responds to these findings. Job rubrics (`score-job-rubric-v4`, schema `score-job-rubric-schema-v2`) cite source passages by ID from a deterministic passage catalog, so code builds the exact quotes instead of checking quotes the model typed. The model writes job-specific examples for levels 1–5 of the evidence scale, and code renders each criterion's guidance from them. The prompt explicitly accepts single-role vacancy announcements and position descriptions. GS grade drafts (`score-grade-draft-v5`) and reviews (`score-grade-review-v4`) use the same scale and passage IDs. A workspace owner now approves one checked version of each job rubric, and while `features.rubricApprovalRequired` is on, new analyses and grade ladders use only that version. The trial above measured the earlier generator, so rerun the generation panels before relying on the new one.
+
+New app imports run `score-job-rubric-review-v1` after generation and atomically
+save the rubric and its immutable QA record before marking the job ready.
+Edited versions run the same review on demand. Invalid or failed reviews stay
+processing failures, never unchecked ready rubrics or approvals. Generation
+panels measure generator validity and repeatability separately; an offline
+artifact still needs completed QA and the owner's sign-off before it is a
+locked release-gate rubric.
+
+### Running rubric and grade generation panels
+
+`scripts\scoring-evaluation-run.mjs` also runs generation panels, with the same identity, deadlines, cost ledger and resumable checkpoints as scoring runs:
+
+- A `"kind": "rubric-generation"` manifest supplies a `rubricRepeatabilitySuiteSchema` suite, `documents` (`[{ "sourceId", "document" }]`), `settings`, `prices` and an explicit `createdAt`.
+- A `"kind": "grade-generation"` manifest supplies a `gradeGenerationSuiteSchema` suite (`score-grade-generation-v1`), `fixtures` (`[{ "sourceId", "fixture": { "ladder", "seed", "sourceSet", "documents" } }]`) and the same other fields. A fixture is a privately frozen copy of one confirmed ladder: its record, captured seed job and rubric, confirmed source set and extracted reference documents.
+
+Preflight checks every frozen source hash, task binding, model version and price before any paid call. Each completed job writes a private `<hash>.rubric.json` or `<hash>.grades.json` artifact next to `observations.json`; failures keep a bounded private reason.
+
+```powershell
+node scripts\scoring-evaluation-run.mjs C:\private-evals\rubric-generation.json C:\private-evals\runs\rubrics --confirm-paid-inference
+node scripts\scoring-evaluation.mjs rubric-report C:\private-evals\rubric-generation.json C:\private-evals\runs\rubrics C:\private-evals\reports\rubric-repeatability-job.json
+node scripts\scoring-evaluation.mjs grade-report C:\private-evals\grade-generation.json C:\private-evals\runs\grades C:\private-evals\reports\rubric-repeatability-grade.json
+```
+
+Grade generation plans one competency set per repetition, then drafts every requested grade and runs the independent grade review on each draft. A grade counts as a valid generation only when its draft passes validation **and** the review returns `supported`; `needs-sources` outcomes and failures are counted separately. A broken frozen fixture stops the run instead of being recorded as a model failure. Report cells are one per job document, or one per ladder grade (`<ladder>:gs-<grade>`), and are the `rubricGeneration` panel inputs for `score-engineering-targets-v2`. Reports must be written outside the private run directory.
+
+`createEvaluationSettings` accepts optional `tasks` bindings for `jobRubric`, `gradeCompetencies`, `gradeDraft` and `gradeReview`. Without them it produces exactly the same snapshot as before.
+
+### Exporting private GS fixtures
+
+Prepare one reviewed ladder per corpus job in Score and confirm its source set.
+Build the local readers, select the existing `azd` environment, and export with
+the signed-in Azure CLI identity:
+
+```powershell
+npm run build:server
+npm run build:worker
+$env:AZURE_ENV_NAME = 'your-existing-environment'
+node scripts\scoring-grade-fixture.mjs <workspace-id> <ladder-id> C:\private-evals\grade-fixtures\ladder.json
+```
+
+This is local operator tooling, not a new product route or feature switch. The
+identity needs its existing Azure data-plane read access and workspace-owner
+membership. It cannot choose another object ID, infer application-admin roles,
+log in for you or grant permissions. Nothing writes to Score or invokes a model.
+
+The export contains exactly `{ ladder, seed, sourceSet, documents }` for a
+confirmed, current source set. It uses the captured seed, not a newer live job
+or rubric, revalidates source ownership and integrity, rejects a ladder changed
+during capture, and rechecks ownership before returning the data. Source gaps
+remain gaps; export does not declare the rubric valid or approved.
+
+The command prints the `fixtureSha256` used by `gradeGenerationSuiteSchema`,
+the selected source-set ID and grades. Put the exported object under a
+manifest's `fixtures` entry (`{ sourceId, fixture }`) and use its printed hash
+in the matching suite source. The immutable output must be outside every Git
+checkout and cannot overwrite an earlier capture. Complete sources are never
+omitted to fit the 32 MiB file limit. Keep the destination directory private;
+Windows inherits its ACL, while new files on Unix use owner-only permissions.
+Credentials and tokens are never exported.
 
 ## Executor contract
 

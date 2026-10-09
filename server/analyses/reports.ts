@@ -17,7 +17,7 @@ import type { WorkspaceRole } from '../../src/domain/cloud'
 import type { Citation } from '../../src/domain/types'
 import { gradeSourcePagination } from '../../src/features/grade-ladders/gradeUi'
 import { createReportCitation, parseRealReportBatchResponse } from '../../src/services/analysisReports/model'
-import { unavailableOverallScore } from '../../src/services/analysisReports/presentation'
+import { reportRubricVersionLabel, unavailableOverallScore } from '../../src/services/analysisReports/presentation'
 import { forbidden, invalidRequest, notFound, unavailable } from '../errors'
 import { createAnalysisSnapshotReader, type AnalysisSnapshots } from './snapshots'
 import type { AnalysisBlobStore } from './store'
@@ -171,8 +171,7 @@ function targetFacts(target: FrozenRealAnalysisTargetSnapshot): ReportFact[] {
 
 function reportTarget(comparison: RealAnalysisComparisonRecord, target: FrozenRealAnalysisTargetSnapshot): RealReportTarget {
   const rubric = target.kind === 'job' ? target.rubric : target.version.rubric
-  const versionLabel = target.kind === 'grade' ? `Approved GS-${target.selection.grade} · rubric v${rubric.version}`
-    : `Rubric v${rubric.version} · source document v${target.document.version}`
+  const versionLabel = reportRubricVersionLabel(target)
   return {
     id: target.summary.id, dataKind: 'real', kind: target.kind,
     label: target.summary.label, sublabel: target.summary.sublabel,

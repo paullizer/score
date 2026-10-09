@@ -2,6 +2,13 @@
 
 QC records reviewer opinions and runs explicitly requested, isolated prompt experiments. It does **not** edit production scores, approve generated rubrics, train a model, rank people, or replace independent grounding.
 
+The rubric-foundation release preserves frozen scale versions, level examples
+and optional job approval IDs through the shared analysis readers. QC remains
+bound to the exact saved comparison and result revision; a newer rubric draft
+or approval does not replace that evidence. The production assessor and
+grounding review are unchanged until the separate R2 design and release gate
+have passed.
+
 ## Application integration
 
 Mount `createQcRouter` from `routes.ts` under `/api`, after authentication, JSON parsing, processing-policy admission, and same-origin CSRF middleware. Its dependencies are:
@@ -126,7 +133,7 @@ Runtime settings readers must advertise **`score-runtime-settings-v2`** before a
 
 For an existing v1 policy, the admin editor's **Add QC settings to draft** action prepares the complete v2 upgrade without changing the saved policy. QC controls appear in that draft; the upgrade takes effect only after ordinary review and publication. Discarding the draft preserves the saved v1 policy. Synthetic model probes still require their separate paid-work confirmation.
 
-The reader capability marker is not a serialized snapshot field. Historical v1 captures retain both schema versions, their eleven task bindings, revision, timestamp, JSON bytes, and content hash; readers do not insert `runtimeVersion`, `runtimeSettingsVersion`, QC bindings, or current prompt pins. The outer processing-snapshot schema version describes prompt-pin capture, while the inner AdminSettings schema version describes QC task/policy support. Neither is rewritten to match a reader marker, and `PROMPT_RUNTIME_VERSION='score-prompt-runtime-v1'` remains an independent deployment capability.
+The reader capability marker is not a serialized snapshot field. Historical v1 captures retain both schema versions, their eleven task bindings, revision, timestamp, JSON bytes, and content hash; readers do not insert `runtimeVersion`, `runtimeSettingsVersion`, QC bindings, or current prompt pins. The outer processing-snapshot schema version describes prompt-pin capture, while the inner AdminSettings schema version describes QC task/policy support. Neither is rewritten to match a reader marker, and `PROMPT_RUNTIME_VERSION='score-prompt-runtime-v2'` remains an independent deployment capability.
 
 Default QC planning uses a 16,384-token output ceiling, 240,000-byte input and 300,000-byte request budgets, and a 2,048-token safety reserve. Default QC processing allows three attempts, with 30-second base and 300-second maximum backoff. Captured task/model/retry settings govern accepted work. Current `workers.qc` controls claiming, pause, item count, and execution budget, within deployment hard ceilings; analyses-worker settings are not borrowed. Global maintenance prevents new admission without cancelling already accepted work.
 

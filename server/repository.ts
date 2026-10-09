@@ -180,11 +180,11 @@ export class WorkspaceRepository {
     return this.requireWorkspaceRole(principal, workspaceId, true)
   }
 
-  /** Shared authorization gate for workspace-scoped feature routers. */
+  /** Shared authorization gate for workspace-scoped feature routers. `approve` is owner-only, like `members`. */
   async authorizeWorkspace(
     principal: AuthenticatedPrincipal,
     workspaceId: string,
-    access: 'read' | 'write' | 'manage' | 'members',
+    access: 'read' | 'write' | 'manage' | 'members' | 'approve',
     allowPendingLifecycle = false,
   ): Promise<WorkspaceRole> {
     if (!isValidWorkspaceId(workspaceId)) throw notFound()
@@ -193,13 +193,14 @@ export class WorkspaceRepository {
       throw forbidden('Only workspace owners and editors can change ordinary workspace content.')
     }
     if (access === 'members' && role !== 'owner') throw forbidden('Only workspace owners and application admins can manage access.')
+    if (access === 'approve' && role !== 'owner') throw forbidden('Only workspace owners and application admins can approve rubrics.')
     if (access !== 'read') {
       const stored = await this.directory.getMetadata(workspaceId)
       if (!stored || stored.metadata.deletedAt) throw notFound()
       if (!allowPendingLifecycle && stored.metadata.lifecycleOperation && stored.metadata.lifecycleOperation.status !== 'complete') {
         throw conflict('A workspace lifecycle operation must finish or be retried before other changes can be made.')
       }
-      if (access === 'write' && stored.metadata.archivedAt) {
+      if ((access === 'write' || access === 'approve') && stored.metadata.archivedAt) {
         throw conflict('This workspace is archived. Unarchive it before editing or starting work.')
       }
     }
@@ -216,7 +217,7 @@ export class WorkspaceRepository {
   async withWorkspaceMutation<T>(
     principal: AuthenticatedPrincipal,
     workspaceId: string,
-    access: 'write' | 'manage' | 'members',
+    access: 'write' | 'manage' | 'members' | 'approve',
     operation: () => Promise<T>,
     allowPendingLifecycle = false,
   ): Promise<T> {

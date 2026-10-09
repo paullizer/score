@@ -38,7 +38,7 @@ function validResponse(overrides = {}) {
     reply: 'I updated the rubric name.',
     operations: [{ type: 'updateRubric', name: 'Tighter rubric' }],
     warnings: [],
-    assistant: { promptVersion: 'score-rubric-assist-v1', model: 'test-model' },
+    assistant: { promptVersion: 'score-rubric-assist-v2', model: 'test-model' },
     ...overrides,
   }
 }

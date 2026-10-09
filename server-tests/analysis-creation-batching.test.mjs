@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
 import test from 'node:test'
-import { api, fixture, seedResume, seedJob, seedGrade, ACTOR, clone, sha } from './real-analyses.test-support.mjs'
+import { api, fixture, seedResume, seedJob, seedGrade, ACTOR, clone, sha, allowUnapprovedRubrics } from './real-analyses.test-support.mjs'
 
 const pause = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds))
 
@@ -218,9 +218,10 @@ test('a writer batch is bounded to its own run snapshots and evidence, and names
 })
 
 test('two saved versions of one job share a single evidence copy', async () => {
-  const f = fixture()
+  // Two versions of one job can be compared only while Admin settings allow unapproved rubric versions.
+  const f = allowUnapprovedRubrics(fixture())
   const resume = await seedResume(f)
-  const job = await seedJob(f)
+  const job = await seedJob(f, 'Engineering role', randomUUID(), { approved: false })
   const newer = { ...clone(job.rubric), id: `rubric-${randomUUID()}`, version: 2, name: 'Saved newer rubric' }
   f.rubricValues.set(`${f.workspaceId}/${job.record.id}`, [job.rubric, newer])
   const second = { ...job.selection, rubricId: newer.id, rubricVersion: 2, rubricHash: api.analysisHash(newer) }

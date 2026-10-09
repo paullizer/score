@@ -1,15 +1,16 @@
 import { useEffect, useRef, useState } from 'react'
 import { Link, useNavigate, useSearchParams } from 'react-router-dom'
-import { ArrowLeft, ArrowUpRight, Layers3, LoaderCircle, RotateCcw, ShieldCheck, X } from 'lucide-react'
+import { AlertTriangle, ArrowLeft, ArrowUpRight, Layers3, LoaderCircle, RotateCcw, ShieldCheck, X } from 'lucide-react'
 import { useRealAnalyses } from '../../app/real-analyses-context'
 import { savedReviewView, type SavedReviewView } from '../../app/saved-review-navigation'
 import type { RealAnalysisComparisonSummary, RealAnalysisRunSummary } from '../../domain/real-analyses'
+import { mixedRubricVersions, mixedRubricVersionsNotice } from '../../domain/real-analyses'
 import { dateLabel } from '../../domain/selectors'
 import { Badge, Button, EmptyState, InlineError, PageHeader, Score, SearchField } from '../../components/ui'
 import { SortableHeader, TableSortSelect } from '../../components/ui/TableSorting'
 import type { TableSort } from '../../domain/tableSorting'
 import { RealAnalysisStatus } from './RealAnalysesPage'
-import { analysisDiagnosticNotice, analysisFailureStages, currentAnalysisDiagnostic, realAnalysisCancellationPaused, realAnalysisCancellationPending, realAnalysisLink, targetIdentity, targetVersionLabel } from './realAnalysisUi'
+import { analysisDiagnosticNotice, analysisFailureStages, currentAnalysisDiagnostic, realAnalysisCancellationPaused, realAnalysisCancellationPending, realAnalysisLink, realTargetFamilyLabel, targetIdentity, targetVersionLabel } from './realAnalysisUi'
 import {
   distinctTargetLabels, realComparisonSortOptions, realComparisonTargetLabel, selectRealComparisons, targetScoreSortExplanation, type RealComparisonSortKey,
 } from './analysisTableBrowsing'
@@ -191,6 +192,8 @@ function RealAnalysisView({ id }: { id: string }) {
     : detail.targets.find((target) => targetIdentity(target.selection) === targetId))
     ?? (detail.targets.length === 1 ? detail.targets[0] : undefined)
   const targetLabels = distinctTargetLabels(browsing.targets, realComparisonTargetLabel)
+  const mixedVersions = mixedRubricVersionsNotice(mixedRubricVersions(browsing.targets, (target) => target.selection),
+    (target) => realTargetFamilyLabel(getDisplayName(target, target.label), target.selection))
   const sortOptions = realComparisonSortOptions.map((option) => ({
     ...option, disabled: option.key === 'score' && !browsing.scoreEnabled,
     title: option.key === 'score' && !browsing.scoreEnabled ? targetScoreSortExplanation : undefined,
@@ -238,6 +241,7 @@ function RealAnalysisView({ id }: { id: string }) {
       {correctionProgress && <p>{correctionProgress}</p>}
       {realAnalysisCancellationPending(summary) && <p>Cancellation is progressing in bounded batches. This view keeps polling until the server confirms completion.</p>}
     </section>
+    {mixedVersions && <div className="info-callout mt-5" role="note"><AlertTriangle size={18} aria-hidden="true" /><div><strong>Rubric versions differ</strong><p>{mixedVersions}</p></div></div>}
     {viewedTarget && <RealTargetNarrative runId={id} target={viewedTarget} />}
     {selectedId ? <SelectedRealComparison runId={id} comparisonId={selectedId} initialView={sourceView} /> : <section className="panel mt-5" aria-label="Real comparisons">
       <div className="section-heading"><div><h2>Separate comparisons, not a cross-job ranking</h2><p>Open a result for the complete criterion breakdown and exact source quotations.</p></div>

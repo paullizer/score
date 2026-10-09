@@ -34,11 +34,28 @@ export async function importMarkdown(fixture, kind, bytes, name, { key = randomU
 }
 
 export function markdownProcessingStubs(fixture) {
+  const levels = [
+    'Lists engineering methods from coursework or training.',
+    'Describes one defined project that applied engineering methods.',
+    'Describes repeated or ongoing engineering project work.',
+    'Describes choosing or adapting methods for complex projects.',
+    'Describes leading engineering projects with stated outcomes.',
+  ].map((examples, index) => ({ level: index + 1, examples }))
   const stubs = processingStubs(fixture, {
     onModelRequest(request) {
+      if (request.response_format.json_schema.name === 'score_job_rubric_review') {
+        return Response.json({
+          model: 'gpt-5-mini-markdown-fixture',
+          choices: [{ finish_reason: 'stop', message: { content: JSON.stringify({
+            summary: 'The rubric matches its job source and evidence scale.', findings: [],
+          }) } }],
+        })
+      }
       if (request.response_format.json_schema.name !== 'job_rubric') return undefined
-      const paragraphs = [...request.messages[1].content.matchAll(/<paragraph id="([^"]+)"[^>]*>([\s\S]*?)<\/paragraph>/g)]
-      const requirement = paragraphs.find(([, , text]) => text === jobRequirement)
+      // The generator sends a passage catalog; the rubric cites the requirement by passage ID.
+      const content = request.messages[1].content
+      const catalog = JSON.parse(content.slice(content.lastIndexOf('SOURCE PASSAGE CATALOG JSON:\n') + 'SOURCE PASSAGE CATALOG JSON:\n'.length))
+      const requirement = catalog.paragraphs.find(paragraph => paragraph.passages.map(([, text]) => text).join('').trim() === jobRequirement)
       assert.ok(requirement, 'The rubric must cite the actual extracted Markdown requirement.')
       return Response.json({
         model: 'gpt-5-mini-markdown-fixture',
@@ -48,8 +65,7 @@ export function markdownProcessingStubs(fixture) {
           description: 'Evaluate the stated independent engineering work.', warnings: [],
           criteria: [{
             label: 'Engineering methods', description: jobRequirement, weight: 100, requirementType: 'required',
-            guidance: '0: No evidence. 1: Observed work. 2: Assisted work. 3: Independent work. 4: Complex work. 5: Sustained broad work.',
-            sourceParagraphId: requirement[1], quote: jobRequirement,
+            sourcePassageIds: requirement.passages.map(([id]) => id), levels,
           }],
         }) } }],
       })
@@ -77,7 +93,13 @@ export function markdownProcessingStubs(fixture) {
 
 export async function processMarkdownJobs(fixture, stubs) {
   for (let pass = 0; pass < 10; pass++) {
-    if (![...fixture.jobs.records.values()].some(({ record }) => ['queued', 'parsing', 'generating'].includes(record.job.status))) return
+    if (![...fixture.jobs.records.values()].some(({ record }) => ['queued', 'parsing', 'generating'].includes(record.job.status))) {
+      // A workspace owner approves each new rubric, as new analyses and ladders require by default.
+      for (const { record } of [...fixture.jobs.records.values()]) {
+        if (record.job.status === 'ready' && record.job.rubricId && !record.rubricApproval) fixture.jobs.store._approve(record.workspaceId, record.id)
+      }
+      return
+    }
     await fixture.runtime.api.jobWorker.runWorker(stubs.jobs, { maxJobs: 10 })
     fixture.advanceClock(120_000)
   }

@@ -45,6 +45,8 @@ export const WORKSPACE = 'workspace-one'
 export const ACTOR = 'analysis-test-owner'
 export const clone = value => structuredClone(value)
 export const sha = value => createHash('sha256').update(value).digest('hex')
+/** The fixture's deterministic approval of a job's latest rubric version. */
+export const approvalIdFor = jobId => `rubric-approval-${jobId.slice('job-'.length)}`
 export const jsonBytes = value => Buffer.from(JSON.stringify(value))
 export const citation = (document, paragraph = document.paragraphs[0]) => ({
   documentId: document.id, documentVersion: document.version,
@@ -300,7 +302,7 @@ export function fixture(workspaceId = WORKSPACE) {
   const jobs = {
     blobs: blobs(),
     store: {
-      async get(ws, id) { return clone(jobValues.get(`${ws}/${id}`)) },
+      async get(ws, id) { return withApproval(clone(jobValues.get(`${ws}/${id}`))) },
       async getWorkspaceLifecycle() { return { state: 'active', updatedAt: NOW } },
       async countActive(ws) {
         return [...jobValues.values()].filter(({ record }) => record.workspaceId === ws && record.recordType === 'job' &&
@@ -309,11 +311,24 @@ export function fixture(workspaceId = WORKSPACE) {
       async list(ws, token) {
         const values = [...jobValues.values()].filter(item => item.record.workspaceId === ws)
         const start = Number(token ?? 0)
-        return { jobs: clone(values.slice(start, start + 2)), ...(start + 2 < values.length ? { continuationToken: `${start + 2}` } : {}) }
+        return { jobs: clone(values.slice(start, start + 2)).map(withApproval), ...(start + 2 < values.length ? { continuationToken: `${start + 2}` } : {}) }
       },
       async listRubrics(ws, id) { return clone(rubricValues.get(`${ws}/${id}`) ?? []) },
       async getRubric() { throw new Error('Do not silently pick the latest job rubric') },
     },
+  }
+  const unapprovedJobs = new Set()
+  // Fixtures model the production default: a workspace owner approved the job's latest saved rubric version.
+  // Tests that need an unapproved rubric add the job to `unapprovedJobs` or store their own pointer.
+  function withApproval(value) {
+    if (!value || value.record.recordType !== 'job' || value.record.rubricApproval ||
+      unapprovedJobs.has(`${value.record.workspaceId}/${value.record.id}`)) return value
+    const latest = (rubricValues.get(`${value.record.workspaceId}/${value.record.id}`) ?? []).at(-1)
+    if (!latest || value.record.job.status !== 'ready' || value.record.job.rubricId !== latest.id) return value
+    return { ...value, record: { ...value.record, rubricApproval: {
+      approvalId: approvalIdFor(value.record.id), rubricId: latest.id, version: latest.version,
+      rubricHash: api.analysisHash(latest), approvedBy: ACTOR, approvedAt: NOW,
+    } } }
   }
   const grades = {
     blobs: blobs(),
@@ -329,11 +344,23 @@ export function fixture(workspaceId = WORKSPACE) {
     },
   }
   const value = {
-    workspaceId, analysis, resumes, jobs, grades, resumeValues, jobValues, rubricValues, gradeValues,
+    workspaceId, analysis, resumes, jobs, grades, resumeValues, jobValues, rubricValues, gradeValues, unapprovedJobs,
     now: NOW,
   }
   value.service = new api.RealAnalysisService(analysis, { resumes, jobs, grades }, () => new Date(value.now))
   return value
+}
+
+/**
+ * Rebuilds the fixture's service with Admin settings that let new analyses use any saved job rubric version.
+ * Like the default fixture, it doesn't pin settings into accepted work.
+ */
+export function allowUnapprovedRubrics(f) {
+  const policy = api.createDefaultAdminSettings()
+  policy.features.rubricApprovalRequired = false
+  const provider = Object.assign(async () => api.captureProcessingSettings(policy, 'approval-off', NOW), { pinNewAdmissions: false })
+  f.service = new api.RealAnalysisService(f.analysis, { resumes: f.resumes, jobs: f.jobs, grades: f.grades }, () => new Date(f.now), provider)
+  return f
 }
 let originalPdf
 async function pdf() {
@@ -461,10 +488,12 @@ export async function seedJob(f, title = 'Engineering role', key = randomUUID(),
   }
   f.jobValues.set(`${f.workspaceId}/${id}`, { record, etag: '"job-ready"' })
   f.rubricValues.set(`${f.workspaceId}/${id}`, [rubric])
+  if (options.approved === false) f.unapprovedJobs.add(`${f.workspaceId}/${id}`)
   return {
     record, document, rubric, original,
     selection: { kind: 'job', jobId: id, rubricId: rubric.id, rubricVersion: 1, rubricHash: api.analysisHash(rubric),
-      documentId: document.id, documentVersion: 1, documentSha256: documentRef.sha256 },
+      documentId: document.id, documentVersion: 1, documentSha256: documentRef.sha256,
+      ...(options.approved === false ? {} : { approvalId: approvalIdFor(id) }) },
   }
 }
 export async function seedGrade(f, job, options = {}) {

@@ -28,10 +28,13 @@ export interface Criterion {
   label: string
   description: string
   weight: number
+  /** On a rubric with a scale version, code renders this from `levels`; older rubrics keep free text. */
   guidance: string
   sourceParagraphId?: string
   requirementType?: 'required' | 'preferred'
   sourceCitations?: Citation[]
+  /** Job- or grade-specific examples for levels 1-5 of the rubric's scale; never a redefinition of the levels. */
+  levels?: CriterionLevelExamples[]
 }
 
 export interface Rubric {
@@ -48,6 +51,8 @@ export interface Rubric {
   createdAt: string
   dataKind?: 'real'
   provenance?: { kind: 'generated' | 'edited'; model: string; promptVersion: string; prompt?: PromptExecutionProvenance }
+  /** Absent on rubrics created before the standard evidence scale. */
+  scaleVersion?: EvidenceScaleVersion
 }
 
 export interface Job {
@@ -90,3 +95,4 @@ export interface Workspace {
   rubrics: Rubric[]
 }
 import type { PromptExecutionProvenance } from './prompt-versions'
+import type { CriterionLevelExamples, EvidenceScaleVersion } from './evidence-scale'

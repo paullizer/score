@@ -40,7 +40,7 @@ export function resolveAcceptedPrompt(
   const template = pinnedPromptTemplate(family, legacy)
   if (revision.rendererVersion !== PROMPT_RENDERER_VERSION || revision.templateVersion !== template.promptVersion ||
     revision.outputSchemaVersion !== template.schemaVersion || revision.templateSha256 !== promptTextHash(template.system)) {
-    throw new PromptPinError('The accepted prompt template is missing, changed, or unsupported. No replacement was substituted.')
+    throw new PromptPinError('This work was accepted with an earlier prompt release that this version of Score no longer runs. Start it again to use the current release.')
   }
   const system = renderPolicy(template.system) + (revision.guidance === null ? '' : `
 

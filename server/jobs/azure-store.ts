@@ -9,14 +9,17 @@ import type { TokenCredential } from '@azure/identity'
 import { JOB_IMPORT_LIMITS } from '../../src/domain/real-jobs'
 import type { RealJobRecord, VersionedRealJob } from '../../src/domain/real-jobs'
 import type { Rubric } from '../../src/domain/types'
+import { rubricQaRecordId, type RubricApprovalRecord, type RubricQaRecord } from '../../src/domain/rubric-approval'
 import { UPLOAD_CONTENT_TYPES } from '../../src/domain/document-formats'
 import type { WorkspaceLifecycleControl } from '../lifecycle/contracts'
 import { assertWorkspaceMutationLease } from '../lifecycle/lease'
+import { analysisHash } from '../analyses/deterministic'
 import { isValidWorkspaceId } from '../ids'
 import { StoreConflictError } from '../store'
 import type { JobBlob, JobBlobStore, JobBlobWriter, JobBlobWriteFence, RealJobsConfig, RealJobStore } from './store'
 import { assertJobWritable, cancelJobWork, isJobReadOnly } from './guards'
 import { fetchCosmosCount, fetchCosmosPage } from '../cosmos-query'
+import { parseRubricApprovalRecord, parseRubricQaRecord, rubricApprovalRecordSchema, rubricQaRecordSchema } from './rubric-records'
 import {
   isBlobInJobPrefix,
   isJobBlobInScope,
@@ -70,6 +73,8 @@ interface JobBatchAdmission {
 
 const LIST_PAGE_SIZE = 50
 const GUARD_ID = 'job-workspace-lifecycle'
+// Rubric versions, their check results and approvals are removed together when a rubric is deleted.
+const RUBRIC_RECORD_TYPES = ['rubric-version', 'rubric-qa', 'rubric-approval']
 const WRITER_MILLISECONDS = 120_000
 const BLOB_LEASE_SECONDS = 60
 const BLOB_REQUEST_MILLISECONDS = 30_000
@@ -138,6 +143,12 @@ function validateWriteRecord(record: RealJobRecord): void {
 function validateWriteRubric(record: RealJobRecord, rubric: Rubric): void {
   if (!validateStoredRealRubric(rubric) || rubric.jobId !== record.id || record.job.rubricId !== rubric.id) {
     throw new Error('Refusing to publish an invalid or mismatched real rubric.')
+  }
+}
+
+function assertApprovalUnchanged(record: RealJobRecord, current: RealJobRecord): void {
+  if (JSON.stringify(record.rubricApproval) !== JSON.stringify(current.rubricApproval)) {
+    throw new StoreConflictError('Only rubric approval can change the approved rubric version.')
   }
 }
 
@@ -313,7 +324,7 @@ export function createJobStoreFromContainer(container: Pick<Container, 'items' |
   }
 
   function recordsQuery(workspaceId: string, types: string[], jobId?: string, continuationToken?: string) {
-    return container.items.query<CosmosDoc<RubricVersionRecord | BlobWriterRecord | RealJobRecord | JobBatchAdmission>>({
+    return container.items.query<CosmosDoc<RubricVersionRecord | BlobWriterRecord | RealJobRecord | JobBatchAdmission | RubricQaRecord | RubricApprovalRecord>>({
       query: `SELECT * FROM c WHERE ARRAY_CONTAINS(@types, c.recordType)
         ${jobId === undefined ? '' : 'AND c.jobId = @jobId'} ORDER BY c.id ASC`,
       parameters: [
@@ -340,10 +351,12 @@ export function createJobStoreFromContainer(container: Pick<Container, 'items' |
   async function deleteRecords(workspaceId: string, types: string[], jobId?: string) {
     for (;;) {
       const removed = await guarded(workspaceId, false, async control => {
-        await cleanupAllowed(workspaceId, jobId, control, types.every(type => type === 'rubric-version'))
+        await cleanupAllowed(workspaceId, jobId, control, types.every(type => RUBRIC_RECORD_TYPES.includes(type)))
         const resources = await cleanupPage(workspaceId, types, jobId)
         for (const value of resources) {
           if (value.recordType === 'rubric-version') decodeRubricRecord(value, workspaceId, jobId)
+          else if (value.recordType === 'rubric-qa') parseRubricQaRecord(omitCosmosFields(value), { workspaceId, jobId })
+          else if (value.recordType === 'rubric-approval') parseRubricApprovalRecord(omitCosmosFields(value), { workspaceId, jobId })
           else if (value.recordType === 'blob-writer') {
             const writer = writerRecord(value, workspaceId, jobId)
             if (Date.parse(writer.expiresAt) > Date.now()) throw new StoreConflictError('Job Blob writers have not drained.')
@@ -431,6 +444,7 @@ export function createJobStoreFromContainer(container: Pick<Container, 'items' |
           record.job.rubricDeletedAt !== current.record.job.rubricDeletedAt) {
           throw new StoreConflictError('Lifecycle metadata must be changed through lifecycle management.')
         }
+        assertApprovalUnchanged(record, current.record)
         if (record.displayName !== current.record.displayName &&
           !isDeepStrictEqual({ ...current.record, displayName: record.displayName, updatedAt: record.updatedAt }, record)) {
           throw new StoreConflictError('Display-name edits cannot change job sources, evidence, or processing state.')
@@ -551,9 +565,15 @@ export function createJobStoreFromContainer(container: Pick<Container, 'items' |
       return response.resources.map((value) => decodeRubricRecord(value, workspaceId, jobId).rubric)
     },
 
-    async publish(record, expectedEtag, rubric) {
+    async publish(record, expectedEtag, rubric, checks) {
       validateWriteRecord(record)
       validateWriteRubric(record, rubric)
+      if (checks && (!rubricQaRecordSchema.safeParse(checks).success ||
+        checks.workspaceId !== record.workspaceId || checks.jobId !== record.id ||
+        checks.rubricId !== rubric.id || checks.version !== rubric.version ||
+        checks.rubricHash !== analysisHash(rubric))) {
+        throw new Error('Refusing to publish rubric checks that do not match the generated version.')
+      }
       const rubricRecord: RubricVersionRecord = {
         id: rubricRecordId(rubric),
         workspaceId: record.workspaceId,
@@ -576,9 +596,73 @@ export function createJobStoreFromContainer(container: Pick<Container, 'items' |
           record.displayName !== current.record.displayName) {
           throw new StoreConflictError('Publication cannot change lifecycle or display-name metadata.')
         }
+        assertApprovalUnchanged(record, current.record)
         return {
           operations: [
             { operationType: 'Create', resourceBody: rubricRecord as unknown as JSONObject },
+            ...(checks ? [{ operationType: 'Create' as const, resourceBody: checks as unknown as JSONObject }] : []),
+            replacement(record, expectedEtag),
+          ],
+          result: results => written(record, results, checks ? 2 : 1),
+        }
+      })
+    },
+
+    async getRubricQa(workspaceId, jobId, rubricId, version) {
+      if (!isValidJobId(jobId)) throw new Error('Invalid job id.')
+      const value = await read<RubricQaRecord>(workspaceId, rubricQaRecordId(rubricId, version))
+      if (!value) return undefined
+      const record = parseRubricQaRecord(omitCosmosFields(value), { workspaceId, jobId })
+      if (record.rubricId !== rubricId || record.version !== version) throw new Error('Stored rubric check results do not match their version.')
+      return record
+    },
+
+    async createRubricQa(record) {
+      const parsed = rubricQaRecordSchema.safeParse(record)
+      if (!parsed.success) throw new Error('Refusing to write invalid rubric check results.')
+      return guarded(record.workspaceId, true, async () => {
+        const current = await currentJob(record.workspaceId, record.jobId)
+        assertJobWritable(current.record)
+        if (current.record.job.rubricId !== record.rubricId) throw new StoreConflictError('The job rubric changed.')
+        const saved = await read<RubricVersionRecord>(record.workspaceId, `rubric-version:${record.rubricId}:${record.version}`)
+        if (!saved) throw new StoreConflictError('The saved rubric version is unavailable.')
+        const rubric = decodeRubricRecord(saved, record.workspaceId, record.jobId).rubric
+        if (analysisHash(rubric) !== record.rubricHash) throw new Error('Rubric checks do not match the saved version.')
+        const existing = await read<RubricQaRecord>(record.workspaceId, record.id)
+        if (existing) {
+          const stored = parseRubricQaRecord(omitCosmosFields(existing), { workspaceId: record.workspaceId, jobId: record.jobId })
+          return { operations: [], result: () => stored }
+        }
+        return {
+          operations: [{ operationType: 'Create', resourceBody: record as unknown as JSONObject }],
+          result: () => record,
+        }
+      })
+    },
+
+    async approveRubric(record, expectedEtag, approval) {
+      validateWriteRecord(record)
+      if (!rubricApprovalRecordSchema.safeParse(approval).success || approval.workspaceId !== record.workspaceId ||
+        approval.jobId !== record.id || record.rubricApproval?.approvalId !== approval.id ||
+        record.rubricApproval.rubricId !== approval.rubricId || record.rubricApproval.version !== approval.version ||
+        record.rubricApproval.rubricHash !== approval.rubricHash || record.rubricApproval.approvedAt !== approval.approvedAt ||
+        record.rubricApproval.approvedBy !== approval.approvedBy) {
+        throw new Error('Refusing to write an invalid or mismatched rubric approval.')
+      }
+      return guarded(record.workspaceId, true, async () => {
+        const current = await currentJob(record.workspaceId, record.id, expectedEtag)
+        assertJobWritable(current.record)
+        assertJobWritable(record)
+        if (!isDeepStrictEqual({ ...current.record, rubricApproval: record.rubricApproval, updatedAt: record.updatedAt }, record)) {
+          throw new StoreConflictError('Approval can change only the approved rubric version.')
+        }
+        if (record.updatedAt < current.record.updatedAt) throw new StoreConflictError('Job update timestamps cannot move backwards.')
+        if (current.record.rubricApproval?.approvalId !== approval.supersedes) {
+          throw new StoreConflictError('Another approval was saved for this rubric.')
+        }
+        return {
+          operations: [
+            { operationType: 'Create', resourceBody: approval as unknown as JSONObject },
             replacement(record, expectedEtag),
           ],
           result: results => written(record, results, 1),
@@ -662,7 +746,7 @@ export function createJobStoreFromContainer(container: Pick<Container, 'items' |
       return guarded(workspaceId, false, async () => {
         const current = await currentJob(workspaceId, jobId, expectedEtag)
         if (!current.record.rubricLifecycle?.deletingAt) throw new StoreConflictError('Rubric deletion is not pending.')
-        const remaining = await cleanupPage(workspaceId, ['rubric-version'], jobId)
+        const remaining = await cleanupPage(workspaceId, RUBRIC_RECORD_TYPES, jobId)
         if (remaining.length) throw new StoreConflictError('Rubric cleanup has not completed.')
         const record: RealJobRecord = {
           ...cancelJobWork(current.record, timestamp),
@@ -670,19 +754,20 @@ export function createJobStoreFromContainer(container: Pick<Container, 'items' |
           error: undefined,
           rubricLifecycle: { parentKey: `job:${jobId}`, deletedAt: timestamp },
         }
+        delete record.rubricApproval
         return { operations: [replacement(record, current.etag)], result: results => written(record, results) }
       })
     },
 
     async purgeRubrics(workspaceId, jobId) {
-      await deleteRecords(workspaceId, ['rubric-version'], jobId)
+      await deleteRecords(workspaceId, RUBRIC_RECORD_TYPES, jobId)
     },
 
     async purgeJobRecords(workspaceId, jobId, timestamp) {
-      await deleteRecords(workspaceId, ['rubric-version', 'blob-writer'], jobId)
+      await deleteRecords(workspaceId, [...RUBRIC_RECORD_TYPES, 'blob-writer'], jobId)
       await guarded(workspaceId, false, async control => {
         await cleanupAllowed(workspaceId, jobId, control)
-        const remaining = await cleanupPage(workspaceId, ['rubric-version', 'blob-writer'], jobId)
+        const remaining = await cleanupPage(workspaceId, [...RUBRIC_RECORD_TYPES, 'blob-writer'], jobId)
         if (remaining.length) throw new StoreConflictError('Job cleanup has not completed.')
         const raw = await rawJob(workspaceId, jobId)
         if (raw?.recordType === 'job-tombstone') return { operations: [], result: () => undefined }
@@ -696,11 +781,11 @@ export function createJobStoreFromContainer(container: Pick<Container, 'items' |
     },
 
     async purgeWorkspaceRecords(workspaceId, timestamp) {
-      await deleteRecords(workspaceId, ['rubric-version', 'blob-writer', 'job-batch'])
+      await deleteRecords(workspaceId, [...RUBRIC_RECORD_TYPES, 'blob-writer', 'job-batch'])
       for (;;) {
         const removed = await guarded(workspaceId, false, async control => {
           await cleanupAllowed(workspaceId, undefined, control)
-          const remaining = await cleanupPage(workspaceId, ['rubric-version', 'blob-writer', 'job-batch'])
+          const remaining = await cleanupPage(workspaceId, [...RUBRIC_RECORD_TYPES, 'blob-writer', 'job-batch'])
           if (remaining.length) throw new StoreConflictError('Workspace job cleanup has not completed.')
           const records = await cleanupPage(workspaceId, ['job'])
           const operations: OperationInput[] = records.map(raw => {

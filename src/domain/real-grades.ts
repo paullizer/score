@@ -19,6 +19,8 @@ export const GRADE_LADDER_LIMITS = {
   maxGrades: 15,
 } as const
 
+export const GRADE_ISSUE_LIMIT = 150
+
 export type GradeSupervision = 'nonsupervisory' | 'supervisor' | 'leader' | 'unknown'
 export type GradeFunction = 'research' | 'development' | 'test-evaluation'
 export type GradeAgencyType = 'dod' | 'other-federal' | 'non-federal' | 'unknown'

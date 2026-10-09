@@ -2,6 +2,7 @@ import { createHash, randomUUID } from 'node:crypto'
 import { z } from 'zod'
 import type { ProcessingSettingsSnapshot } from '../../src/domain/admin-settings'
 import { processingSettingsSnapshotSchema } from '../../src/domain/admin-settings-schema'
+import type { GradeGenerationFixture } from '../../worker/evals/grade-generation'
 import { urlAllowedBySettings } from '../../src/domain/admin-settings-resolver'
 import {
   GRADE_LADDER_LIMITS as LIMITS, gradeHeadId,
@@ -17,7 +18,10 @@ import {
   type OriginalContentType,
 } from '../../src/domain/document-formats'
 import { isSafeUploadedFilename, MAX_MARKDOWN_BYTES } from '../../src/domain/source-files'
+import { EVIDENCE_SCALE_VERSION } from '../../src/domain/evidence-scale'
+import { rubricApprovalRequired } from '../../src/domain/feature-switches'
 import type { RealJobsDeps } from '../jobs/routes'
+import { analysisHash } from '../analyses/deterministic'
 import {
   extractedBlobName, isBlobInJobPrefix, originalBlobName, validateRealJobRecord,
   validateRealRubric, validateRealSourceDocument,
@@ -417,7 +421,10 @@ export class GradeService {
     return { ...base, levels, sources: sources.map(source => source.record), sourceSet: sourceSet?.record ?? null, workItems }
   }
 
-  private validateSeed(value: unknown, workspaceId: string, ladderId: string, input: CreateInput): GradeSeedSnapshot {
+  private validateSeed(
+    value: unknown, workspaceId: string, ladderId: string,
+    input: Pick<CreateInput, 'jobId' | 'rubricId' | 'rubricVersion'>,
+  ): GradeSeedSnapshot {
     const parsed = parseGradeSeedSnapshot(value)
     if (!parsed.job || !parsed.source || !parsed.document || !parsed.rubric ||
       parsed.job.id !== input.jobId || parsed.rubric.id !== input.rubricId ||
@@ -472,8 +479,8 @@ export class GradeService {
     }
     const initializationName = `${workspaceId}/${ladderId}/initialization.json`
     let initializationBlob = await this.blobs.read(initializationName)
-    const processingSettings = initializationBlob ? undefined
-      : newProcessingSettings(this.settings, await this.admission(input.grades))
+    const admission = initializationBlob ? undefined : await this.admission(input.grades)
+    const processingSettings = admission ? newProcessingSettings(this.settings, admission) : undefined
     const previousControl = await this.store.getControl(workspaceId, ladderId)
     if ((initializationBlob && initializationSchema.parse(json(initializationBlob)).inputFingerprint !== fingerprint) ||
       (previousControl?.record.preparation && previousControl.record.preparation.inputFingerprint !== fingerprint)) {
@@ -501,6 +508,13 @@ export class GradeService {
       }
     }
     const { current, rubric } = await liveSeed()
+    // Only the first acceptance checks approval; an idempotent replay keeps the seed it already captured.
+    if (admission && rubricApprovalRequired(admission.settings)) {
+      const approval = current.record.rubricApproval
+      if (!approval || approval.rubricId !== rubric.id || approval.version !== rubric.version || approval.rubricHash !== analysisHash(rubric)) {
+        throw conflict('Grade ladders can start only from the approved version of a job rubric. A workspace owner approves rubrics on the job\'s rubric page.')
+      }
+    }
     await updateGradeControl(this.store, workspaceId, ladderId, control => {
       if (control.preparation && control.preparation.inputFingerprint !== fingerprint) {
         throw conflict('This idempotency key was used for different ladder input.')
@@ -793,6 +807,29 @@ export class GradeService {
   async sourceSet(workspaceId: string, ladderId: string, sourceSetId: string): Promise<GradeSourceSetRecord> {
     await this.get(workspaceId, ladderId, 'grade-ladder')
     return (await this.get(workspaceId, sourceSetId, 'grade-source-set', ladderId)).record
+  }
+
+  /** Read-only operator capture; the caller must authorize ownership before and after this read. */
+  async generationFixture(workspaceId: string, ladderId: string): Promise<GradeGenerationFixture> {
+    const current = await this.get(workspaceId, ladderId, 'grade-ladder')
+    const ladder = current.record
+    if (!ladder.sourceSetId) throw conflict('Confirm the ladder source set before exporting an evaluation fixture.')
+    const sourceSet = (await this.get(workspaceId, ladder.sourceSetId, 'grade-source-set', ladderId)).record
+    currentSourceSet(ladder, sourceSet)
+    if (!sourceSet.context.confirmed || sourceSet.seedBlobName !== ladder.seedBlobName ||
+      ladder.seedBlobName !== `${workspaceId}/${ladderId}/seed.json`) {
+      throw unavailable('The confirmed source set has invalid seed ownership or context.')
+    }
+    const blob = await this.blobs.read(ladder.seedBlobName)
+    if (!blob) throw unavailable('The captured ladder seed is unavailable; live job data cannot substitute for it.')
+    const seed = this.validateSeed(json(blob), workspaceId, ladderId, {
+      jobId: ladder.seedJobId, rubricId: ladder.seedRubricId, rubricVersion: ladder.seedRubricVersion,
+    })
+    const documents = await Promise.all(sourceSet.sources.map(source => this.readReference(workspaceId, ladderId, source)))
+    const latest = await this.get(workspaceId, ladderId, 'grade-ladder')
+    if (latest.etag !== current.etag) throw conflict('The ladder changed while its fixture was being captured. Retry the export.')
+    currentSourceSet(latest.record, sourceSet)
+    return { ladder: copy(ladder), seed: copy(seed), sourceSet: copy(sourceSet), documents: copy(documents) }
   }
 
   private async readReference(workspaceId: string, ladderId: string, source: FrozenReferenceSource): Promise<ReferenceDocument> {
@@ -1130,6 +1167,9 @@ export class GradeService {
     }
     if (gradeIssuesFor([...current.ladder.record.issues, ...head.issues, ...review.issues], grade)
       .some(issue => issue.severity === 'blocker')) throw conflict('Unresolved content, source, or applicability blockers prevent approval.')
+    if (version.rubric.scaleVersion !== EVIDENCE_SCALE_VERSION) {
+      throw conflict('This grade rubric was drafted before the evidence scale, so it can\'t be approved. Generate the ladder again to draft grade rubrics that use the scale.')
+    }
     const documents = await Promise.all(current.sourceSet.record.sources.map(source => this.readReference(workspaceId, ladderId, source)))
     const errors = validateGradeApproval(version, current.sourceSet.record, documents)
     if (errors.length) throw conflict(`Approval is blocked: ${errors.slice(0, 20).join(' ')}`)

@@ -6,6 +6,7 @@ import { isSafeUploadedFilename } from '../../src/domain/source-files'
 import type { Citation, Rubric, SourceDocument } from '../../src/domain/types'
 import type { LifecycleMetadata } from '../../src/domain/lifecycle'
 import { normalizeDisplayName } from '../../src/domain/displayNames'
+import { rubricScaleErrors } from '../../src/domain/evidence-scale'
 import { invalidRequest } from '../errors'
 import { isValidWorkspaceId } from '../ids'
 import {
@@ -16,6 +17,7 @@ import {
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
 const JOB_ID_PATTERN = new RegExp(`^job-${UUID_PATTERN.source.slice(1, -1)}$`, 'i')
 const DOCUMENT_ID_PATTERN = new RegExp(`^document-${UUID_PATTERN.source.slice(1, -1)}$`, 'i')
+const RUBRIC_APPROVAL_ID_PATTERN = new RegExp(`^rubric-approval-${UUID_PATTERN.source.slice(1, -1)}$`)
 const SAFE_BLOB_FILE_PATTERN = /^(?:original\.(?:pdf|docx|doc|html|md)|source-document\.json)$/
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -55,6 +57,19 @@ export function isUuid(value: string): boolean {
 
 export function isValidJobId(value: string): boolean {
   return JOB_ID_PATTERN.test(value)
+}
+
+export function isRubricApprovalId(value: unknown): value is string {
+  return typeof value === 'string' && RUBRIC_APPROVAL_ID_PATTERN.test(value)
+}
+
+function isRubricApprovalPointer(value: unknown): boolean {
+  return isRecord(value) &&
+    hasOnlyKeys(value, ['approvalId', 'rubricId', 'version', 'rubricHash', 'approvedBy', 'approvedAt']) &&
+    isRubricApprovalId(value.approvalId) && isNonBlank(value.rubricId) &&
+    Number.isInteger(value.version) && Number(value.version) >= 1 &&
+    typeof value.rubricHash === 'string' && /^[0-9a-f]{64}$/.test(value.rubricHash) &&
+    isNonBlank(value.approvedBy) && isTimestamp(value.approvedAt)
 }
 
 export function isValidDocumentId(value: string): boolean {
@@ -179,7 +194,7 @@ export function validateRealRubric(rubric: Rubric, document: SourceDocument, con
   const errors = validateRealSourceDocument(document, contentType)
   if (!isRecord(rubric)) return [...errors, 'Rubric must be an object.']
   if (!hasOnlyKeys(rubric as unknown as Record<string, unknown>, [
-    'id', 'groupId', 'kind', 'jobId', 'name', 'description', 'version', 'criteria', 'createdAt', 'dataKind', 'provenance',
+    'id', 'groupId', 'kind', 'jobId', 'name', 'description', 'version', 'criteria', 'createdAt', 'dataKind', 'provenance', 'scaleVersion',
   ])) {
     errors.push('Rubric contains unsupported fields.')
   }
@@ -208,7 +223,7 @@ export function validateRealRubric(rubric: Rubric, document: SourceDocument, con
   for (const criterion of rubric.criteria) {
     const context = `Criterion "${typeof criterion?.label === 'string' ? criterion.label : ''}"`
     if (!isRecord(criterion) || !hasOnlyKeys(criterion, [
-      'id', 'key', 'label', 'description', 'weight', 'guidance', 'sourceParagraphId', 'requirementType', 'sourceCitations',
+      'id', 'key', 'label', 'description', 'weight', 'guidance', 'sourceParagraphId', 'requirementType', 'sourceCitations', 'levels',
     ])) {
       errors.push(`${context} contains unsupported fields.`)
       continue
@@ -242,6 +257,7 @@ export function validateRealRubric(rubric: Rubric, document: SourceDocument, con
     }
   }
   if (Math.abs(weight - 100) > 0.000001) errors.push('Rubric criterion weights must total exactly 100.')
+  errors.push(...rubricScaleErrors(rubric))
   return errors
 }
 
@@ -262,7 +278,7 @@ export function validateStoredRealRubric(value: unknown): value is Rubric {
   const validCriteria = value.criteria.every((criterion) => {
     if (!isRecord(criterion) ||
       !hasOnlyKeys(criterion, [
-        'id', 'key', 'label', 'description', 'weight', 'guidance', 'sourceParagraphId', 'requirementType', 'sourceCitations',
+        'id', 'key', 'label', 'description', 'weight', 'guidance', 'sourceParagraphId', 'requirementType', 'sourceCitations', 'levels',
       ]) ||
       !isNonBlank(criterion.id) || criterion.key !== 'custom' || !isNonBlank(criterion.label) ||
       !isNonBlank(criterion.description) || typeof criterion.weight !== 'number' ||
@@ -278,13 +294,15 @@ export function validateStoredRealRubric(value: unknown): value is Rubric {
       isNonBlank(citation.paragraphId) && Number.isInteger(citation.page) && typeof citation.heading === 'string' &&
       isNonBlank(citation.quote))
   })
-  return validCriteria && Math.abs(totalWeight - 100) <= 0.000001
+  return validCriteria && Math.abs(totalWeight - 100) <= 0.000001 &&
+    rubricScaleErrors(value as { scaleVersion?: unknown; criteria: Record<string, unknown>[] }).length === 0
 }
 
 export function validateRealJobRecord(value: unknown): value is RealJobRecord {
   if (!isRecord(value) || !hasOnlyKeys(value, [
     'id', 'workspaceId', 'recordType', 'displayName', 'job', 'source', 'inputFingerprint', 'createdBy', 'updatedAt', 'attempts',
     'nextAttemptAt', 'lease', 'extractedBlobName', 'error', 'warnings', 'lifecycle', 'rubricLifecycle', 'processingSettings',
+    'rubricApproval',
   ]) || value.recordType !== 'job' || typeof value.id !== 'string' || !isValidJobId(value.id) ||
     typeof value.workspaceId !== 'string' || !isValidWorkspaceId(value.workspaceId) || !isRecord(value.job) ||
     !hasOnlyKeys(value.job, [
@@ -378,6 +396,9 @@ export function validateRealJobRecord(value: unknown): value is RealJobRecord {
     (!isTimestamp(job.rubricDeletedAt) || job.rubricId !== null || !value.rubricLifecycle?.deletedAt)) return false
   if (value.rubricLifecycle?.deletedAt && (!job.rubricDeletedAt || job.rubricId !== null)) return false
   if (value.job.status === 'ready' && value.job.rubricId === null && !job.rubricDeletedAt) return false
+  // The approved version always belongs to the job's current rubric; deleting the rubric clears the approval.
+  if (value.rubricApproval !== undefined && (!isRubricApprovalPointer(value.rubricApproval) ||
+    value.job.rubricId !== (value.rubricApproval as { rubricId: string }).rubricId)) return false
   if (value.nextAttemptAt !== undefined && !isTimestamp(value.nextAttemptAt)) return false
   if (value.lease !== undefined && (!isRecord(value.lease) || !hasOnlyKeys(value.lease, ['owner', 'expiresAt']) ||
     !isNonBlank(value.lease.owner) || !isTimestamp(value.lease.expiresAt))) {

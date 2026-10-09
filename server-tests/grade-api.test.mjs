@@ -7,13 +7,14 @@ import { docxFile, legacyDocFile } from './word-fixtures.mjs'
 import {
   createApp, StoreConflictError, parseGradeEntity, gradeContentHash, gradeVersionHash, gradeSourceSetHash, gradeRecordHash,
   parseGradeSeedSnapshot, validateGradeVersion, validateGradeApproval, validateReferenceDocument, loadConfig, WorkspaceRepository,
-  createDefaultAdminSettings, captureProcessingSettings,
+  createDefaultAdminSettings, captureProcessingSettings, analysisHash,
 } from '../dist-server/app.mjs'
 import {
   ALLOWED_OID, OTHER_ALLOWED_OID, APP_ORIGIN, TENANT_ID,
   authHeaders, baseConfig, createFakeAccessStore, createFakeDirectoryStore, createFakeStateStore, membershipFor, seedWorkspace,
 } from './helpers.mjs'
 import { installGradeLifecycleFake, installGradeBlobLifecycleFake, gradeLifecycleTesting } from './grade-lifecycle-fakes.mjs'
+import { loadWorker } from '../worker-tests/shared-model-loader.mjs'
 
 const NOW = '2026-09-17T20:30:00.000Z'
 const WORD_TYPES = {
@@ -43,6 +44,18 @@ const guidance = [
   '4: Resolves complex assignments with limited guidance.',
   '5: Integrates complex evidence and explains defensible decisions.',
 ].join('\n')
+const evidenceScale = await loadWorker('../src/domain/evidence-scale.ts')
+const SCALE_LEVELS = [
+  'Lists engineering analysis from coursework or training.',
+  'Describes one engineering system evaluation.',
+  'Describes repeated or ongoing engineering system evaluations.',
+  'Describes choosing or adapting evaluation methods for complex systems.',
+  'Describes leading engineering evaluations with stated program outcomes.',
+].map((examples, index) => ({ level: index + 1, examples }))
+/** Published grade versions use the evidence scale, as only those can be approved. Gaps and exclusions stay unscored. */
+const onScale = criterion => criterion.support === 'direct' || criterion.support === 'derived'
+  ? { ...criterion, levels: clone(SCALE_LEVELS), guidance: evidenceScale.renderEvidenceGuidance(SCALE_LEVELS) }
+  : criterion
 
 function blobs() {
   const values = new Map()
@@ -231,6 +244,11 @@ async function seed(api, title = 'Engineer', options = {}) {
     },
     inputFingerprint: sha(Buffer.from(id)), createdBy: 'test-seed', updatedAt: NOW,
     attempts: 1, warnings: [], extractedBlobName: `${workspaceId}/${id}/source-document.json`,
+    // Seeds model the production default: a workspace owner approved the seeded rubric version.
+    ...(options.approved === false ? {} : { rubricApproval: {
+      approvalId: `rubric-approval-${key}`, rubricId: rubric.id, version: rubric.version,
+      rubricHash: analysisHash(rubric), approvedBy: 'test-seed', approvedAt: NOW,
+    } }),
   }
   api.jobRecords.set(`${workspaceId}/${id}`, { record, etag: '"job-seed"' })
   api.jobRubrics.set(`${workspaceId}/${id}`, [rubric])
@@ -614,7 +632,8 @@ async function generated(api, options = {}) {
   return value
 }
 
-async function publishGrade(api, detail, document, grade = 9, overrides = {}, extraCriteria = []) {
+async function publishGrade(api, detail, document, grade = 9, overrides = {}, extraCriteria = [], { legacy = false } = {}) {
+  const scale = legacy ? criterion => criterion : onScale
   const ladder = detail.ladder
   const head = await stored(api, headId(ladder.id, grade))
   const id = `grade-version-${randomUUID()}`
@@ -630,12 +649,13 @@ async function publishGrade(api, detail, document, grade = 9, overrides = {}, ex
       ladder: ladder.name, grade: `GS-${grade}`, name: `${ladder.name} · GS-${grade}`,
       description: 'Source-grounded reviewer interpretation.', version: 1, createdAt: NOW,
       provenance: { kind: 'generated', model: 'grade-model', promptVersion: 'grade-v1' },
-      criteria: [{
+      ...(legacy ? {} : { scaleVersion: evidenceScale.EVIDENCE_SCALE_VERSION }),
+      criteria: [scale({
         id: 'engineering', competencyId: 'engineering', key: 'custom', label: 'Engineering analysis',
         description: 'Evaluate engineering systems independently and explain evidence-based recommendations.',
         weight: 100, guidance, support: 'direct', interpretation: 'Agency-scoped expectation interpreted from the captured work description.',
         sourceCitations: [citation], gradeBasis: [citation],
-      }, ...clone(extraCriteria)],
+      }), ...clone(extraCriteria).map(scale)],
     },
     qualifications: [], issues: [], createdBy: 'grade-worker', contentHash: '',
     ...overrides,
@@ -1119,9 +1139,12 @@ test('legacy job PDF basenames remain valid grade seeds through freeze, reload a
 })
 
 test('historical rubric selection snapshots the selected ID without changing the live job rubric pointer', async () => {
-  const api = await start()
+  // Only possible with approval turned off: while it is required, ladders start from the approved version.
+  const policy = createDefaultAdminSettings()
+  policy.features.rubricApprovalRequired = false
+  const api = await start({ settings: { async capture() { return captureProcessingSettings(policy, 'approval-off', NOW) } } })
   try {
-    const seeded = await seed(api)
+    const seeded = await seed(api, 'Engineer', { approved: false })
     const jobKey = `${api.workspaceId}/${seeded.record.id}`
     const latest = { ...clone(seeded.rubric), id: `rubric-${randomUUID()}`, version: 2, name: 'Regenerated current rubric' }
     api.jobRubrics.get(jobKey).push(latest)
@@ -1880,6 +1903,7 @@ test('deterministic validators enforce strict stored shape, exact citations, pag
     unsupported.rubric.criteria[0].gradeBasis = []
     unsupported.rubric.criteria[0].sourceCitations = []
     unsupported.rubric.criteria[0].guidance = ''
+    delete unsupported.rubric.criteria[0].levels
     unsupported.contentHash = gradeVersionHash(unsupported)
     assert.deepEqual(validateGradeVersion(unsupported, detail.sourceSet, documents), [])
     assert.ok(validateGradeApproval(unsupported, detail.sourceSet, documents).length > 0)
@@ -1908,6 +1932,53 @@ test('deterministic validators enforce strict stored shape, exact citations, pag
       assert.ok(validateGradeVersion(bad, detail.sourceSet, documents).length)
     }
     assert.equal(gradeContentHash({ a: 1, b: { x: 2, y: 3 } }), gradeContentHash({ b: { y: 3, x: 2 }, a: 1 }))
+  } finally { await api.close() }
+})
+
+test('scaled grade versions keep structured level examples, code-rendered guidance and unscored gaps', async () => {
+  const { EVIDENCE_SCALE_VERSION, renderEvidenceGuidance } = await loadWorker('../src/domain/evidence-scale.ts')
+  const api = await start()
+  try {
+    const { detail, document } = await generated(api)
+    const { version } = await publishGrade(api, detail, document)
+    const documents = await frozenDocuments(api, detail.sourceSet)
+    const levels = [
+      'Lists analytical methods from coursework or training.',
+      'Describes one program analysis the applicant completed.',
+      'Describes repeated or ongoing program analyses.',
+      'Describes choosing or adapting methods for varied assignments.',
+      'Describes leading analyses with stated program outcomes.',
+    ].map((examples, index) => ({ level: index + 1, examples }))
+    const scaled = clone(version)
+    scaled.rubric.scaleVersion = EVIDENCE_SCALE_VERSION
+    for (const criterion of scaled.rubric.criteria) {
+      if (criterion.support === 'direct' || criterion.support === 'derived') {
+        criterion.levels = levels
+        criterion.guidance = renderEvidenceGuidance(levels)
+      }
+    }
+    scaled.contentHash = gradeVersionHash(scaled)
+    assert.deepEqual(validateGradeVersion(scaled, detail.sourceSet, documents), [])
+    assert.deepEqual(validateGradeApproval(scaled, detail.sourceSet, documents), [])
+    for (const [label, mutate] of [
+      ['edited guidance', value => { value.rubric.criteria[0].guidance += ' Extra anchor.' }],
+      ['no scale version', value => { delete value.rubric.scaleVersion }],
+      ['unknown scale version', value => { value.rubric.scaleVersion = 'score-evidence-ladder-v9' }],
+    ]) {
+      const bad = clone(scaled)
+      mutate(bad)
+      bad.contentHash = gradeVersionHash(bad)
+      const errors = (() => { try { return validateGradeVersion(bad, detail.sourceSet, documents) } catch (error) { return [error.message] } })()
+      assert.ok(errors.length, label)
+    }
+    const gap = clone(scaled)
+    Object.assign(gap.rubric.criteria[0], { support: 'gap', gradeBasis: [], sourceCitations: [], guidance: 'Unscored until grading sources are added.' })
+    delete gap.rubric.criteria[0].levels
+    gap.contentHash = gradeVersionHash(gap)
+    assert.deepEqual(validateGradeVersion(gap, detail.sourceSet, documents), [])
+    gap.rubric.criteria[0].levels = levels
+    gap.contentHash = gradeVersionHash(gap)
+    assert.ok(validateGradeVersion(gap, detail.sourceSet, documents).some(error => error.includes('unscored')))
   } finally { await api.close() }
 })
 
@@ -1952,6 +2023,7 @@ test('publication stores explicit support gaps and incomplete totals without app
       guidance: 'Unscored pending applicable work-level evidence.',
       interpretation: 'The captured passage is context only; it does not establish this grade expectation.',
     }
+    delete gap.rubric.criteria[0].levels
     gap.issues = [{
       id: 'criterion-support-gap', code: 'criterion-support-gap', severity: 'blocker', scope: 'criterion',
       criterionId: 'engineering', grade: 9, message: 'Additional grading evidence is required.',
@@ -1982,6 +2054,7 @@ test('incomplete drafts cannot hide fabricated citations in gaps or issues, or i
     gap.rubric.criteria[0].weight = 0
     gap.rubric.criteria[0].guidance = 'Additional evidence is required; this criterion is unscored.'
     gap.rubric.criteria[0].gradeBasis = []
+    delete gap.rubric.criteria[0].levels
     gap.issues = [{
       id: 'missing-evidence', code: 'support-gap', scope: 'grade', grade: 9, severity: 'blocker',
       message: 'The grade needs additional supporting evidence.', citations: [clone(gap.rubric.criteria[0].sourceCitations[0])],
@@ -2182,6 +2255,50 @@ test('grade lifecycle routes enforce exact target ETags and preserve independent
   } finally { await api.close() }
 })
 
+test('only workspace owners approve grade versions, and versions drafted before the evidence scale are refused', async () => {
+  const api = await start()
+  try {
+    const { detail, document } = await generated(api)
+    const address = `${api.base}/${detail.ladder.id}`
+    const scaled = await publishGrade(api, detail, document, 9)
+    const legacy = await publishGrade(api, detail, document, 12, {}, [], { legacy: true })
+    const approve = (published, oid = ALLOWED_OID) => api.request(`${address}/grades/${published.version.grade}/approve`, 'POST',
+      { versionId: published.version.id, reviewId: published.review.id }, { 'if-match': published.head.etag }, oid)
+    for (const role of ['editor', 'viewer', 'reviewer']) {
+      api.directory._addMembership(api.workspaceId, membershipFor(api.workspaceId, { oid: OTHER_ALLOWED_OID, role }))
+      assert.equal((await approve(scaled, OTHER_ALLOWED_OID)).status, 403, `${role} cannot approve`)
+    }
+    const refused = await approve(legacy)
+    assert.equal(refused.status, 409)
+    assert.match((await refused.json()).error.message, /before the evidence scale/)
+    const approved = await approve(scaled)
+    assert.equal(approved.status, 200, await approved.clone().text())
+    assert.equal((await approved.json()).ladder.levels.find(level => level.head.grade === 9).head.status, 'approved')
+  } finally { await api.close() }
+})
+
+test('new ladders start only from the approved job rubric version unless Admin settings allow any saved version', async () => {
+  const api = await start()
+  try {
+    const unapproved = await seed(api, 'Engineer', { approved: false })
+    const refused = await create(api, { seed: unapproved, allowFailure: true })
+    assert.equal(refused.response.status, 409)
+    assert.match(refused.body.error.message, /approved version of a job rubric/)
+    const seeded = await seed(api)
+    api.jobRubrics.get(`${api.workspaceId}/${seeded.record.id}`).push({ ...seeded.rubric, version: 2, name: 'Newer draft' })
+    const draft = await create(api, { seed: seeded, input: { rubricVersion: 2 }, allowFailure: true })
+    assert.equal(draft.response.status, 409, 'A newer unapproved draft cannot seed a ladder')
+    assert.equal((await create(api, { seed: seeded })).response.status, 202, 'The approved version still can')
+  } finally { await api.close() }
+  const policy = createDefaultAdminSettings()
+  policy.features.rubricApprovalRequired = false
+  const relaxed = await start({ settings: { async capture() { return captureProcessingSettings(policy, 'approval-off', NOW) } } })
+  try {
+    const unapproved = await seed(relaxed, 'Engineer', { approved: false })
+    assert.equal((await create(relaxed, { seed: unapproved })).response.status, 202)
+  } finally { await relaxed.close() }
+})
+
 test('archived seed jobs and archived or removed logical seed rubrics cannot initialize a new ladder', async () => {
   const api = await start()
   try {
@@ -2197,6 +2314,7 @@ test('archived seed jobs and archived or removed logical seed rubrics cannot ini
     seeded.record.rubricLifecycle = { deletedAt: NOW }
     seeded.record.job.rubricDeletedAt = NOW
     seeded.record.job.rubricId = null
+    delete seeded.record.rubricApproval
     api.jobRecords.set(`${api.workspaceId}/${seeded.record.id}`, { record: seeded.record, etag: '"removed-seed-rubric"' })
     assert.equal((await create(api, { seed: seeded, allowFailure: true })).response.status, 409)
   } finally { await api.close() }
@@ -2638,7 +2756,7 @@ test('every grade mutation handler runs inside the workspace lease with the corr
       [`${address}/sources/${detail.sources[0].id}`, 'PATCH', 'write'],
       [`${address}/source-set`, 'POST', 'write'], [`${address}/generate`, 'POST', 'write'],
       [`${address}/cancel`, 'POST', 'write'], [`${address}/retry`, 'POST', 'write'],
-      [`${address}/grades/9/draft`, 'PUT', 'write'], [`${address}/grades/9/approve`, 'POST', 'write'],
+      [`${address}/grades/9/draft`, 'PUT', 'write'], [`${address}/grades/9/approve`, 'POST', 'approve'],
       [`${address}/lifecycle`, 'POST', 'manage'],
     ]) {
       calls.length = 0
@@ -2946,6 +3064,7 @@ for (const change of ['deleted job', 'deleted rubric', 'missing saved version', 
         current.record.rubricLifecycle = { deletedAt: NOW }
         current.record.job.rubricId = null
         current.record.job.rubricDeletedAt = NOW
+        delete current.record.rubricApproval
         api.jobRubrics.set(jobKey, [])
       } else if (change === 'missing saved version') {
         api.jobRubrics.set(jobKey, [{ ...seeded.rubric, version: 2 }])
@@ -3002,6 +3121,7 @@ for (const change of ['deleted job', 'deleted rubric', 'missing saved version', 
             current.rubricLifecycle = { deletedAt: NOW }
             current.job.rubricId = null
             current.job.rubricDeletedAt = NOW
+            delete current.rubricApproval
             api.jobRubrics.set(jobKey, [])
           } else if (change === 'missing saved version') {
             api.jobRubrics.set(jobKey, [{ ...seeded.rubric, version: 2 }])

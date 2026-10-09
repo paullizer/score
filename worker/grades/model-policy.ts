@@ -1,5 +1,6 @@
 import type { GradeCompetency, GradeIssue } from '../../src/domain/real-grades'
 import type { Citation } from '../../src/domain/types'
+import { checkCriterionLevels } from '../../src/domain/evidence-scale'
 import {
   citationErrors, citationParagraph, citationSection, isGradeEvidence, issue, mergeIssues,
   type ModelEvidence,
@@ -65,19 +66,6 @@ function qualificationPassage(citation: Citation, evidence: ModelEvidence): bool
   return /\b(?:minimum qualifications?|qualification (?:requirements?|standards?)|basic (?:education(?:al)? )?requirements?|education(?:al)?\s+(?:and|or)\s+(?:specialized\s+)?experience(?:\s+requirements?)?)\b/i.test(headings) ||
     /^(?:GS[-\s]*\d+\s*[-–:]?\s*)?qualifications?\s*$/i.test(paragraph.heading.trim()) ||
     qualificationClaim(paragraph.text)
-}
-
-function guidanceErrors(guidance: string): string[] {
-  const matches = [...guidance.matchAll(/(?:^|[\n;|]|[.!?]\s+)\s*(?:score\s+)?([0-5])\s*[:.)=\-–—]\s*/gi)]
-  if (matches.length !== 6 || matches.some((value, index) => Number(value[1]) !== index)) {
-    return ['Guidance must explicitly label each of scores 0, 1, 2, 3, 4, and 5 once, in order.']
-  }
-  const anchors = matches.map((value, index) =>
-    guidance.slice(value.index! + value[0].length, matches[index + 1]?.index ?? guidance.length).trim())
-  if (anchors.some(value => !meaningful(value, 4)) || new Set(anchors.map(value => value.toLowerCase())).size !== 6) {
-    return ['Each 0–5 guidance anchor needs meaningful, distinct evidence-based text, not placeholders.']
-  }
-  return []
 }
 
 function validateCitations(
@@ -214,6 +202,7 @@ export function validateDraft(
       }
     }
     if (!isSupported) {
+      if (criterion.levels !== undefined && criterion.levels !== null) result.errors.push(`${prefix} is unscored: gaps/not-applicable rows must not include evidence-scale level examples.`)
       if (criterion.weight !== 0 || criterion.gradeBasis.length > 0 ||
         /(?:^|\n)\s*(?:score\s*)?[0-5]\s*[:.)=\-–—]/i.test(criterion.guidance)) {
         result.errors.push(`${prefix} is unscored: gaps/not-applicable rows need weight 0, no asserted gradeBasis, and explanatory guidance rather than a zero score or numeric score anchors.`)
@@ -237,7 +226,8 @@ export function validateDraft(
     if (criterion.weight <= 0 || criterion.sourceCitations.length === 0 || criterion.gradeBasis.length === 0) {
       result.errors.push(`${prefix} requires a positive proposed weight, sourceCitations, and gradeBasis.`)
     }
-    result.errors.push(...guidanceErrors(criterion.guidance).map(error => `${prefix}: ${error}`))
+    const levelFindings = checkCriterionLevels(criterion.levels).filter(finding => finding.severity === 'error')
+    result.errors.push(...levelFindings.map(finding => `${prefix}: ${finding.message}`))
     result.errors.push(...demographicScoringErrors(competency?.label ?? '', `${competency?.label ?? ''}. ${criterion.description}. ${criterion.guidance}. ${criterion.interpretation}`))
     if (qualificationClaim(criterion.description) || /^(?:minimum qualifications?|basic eligibility|education requirements?)$/i.test(competency?.label ?? '') ||
       criterion.sourceCitations.some(citation => qualificationPassage(citation, evidence))) {

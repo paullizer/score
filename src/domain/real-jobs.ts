@@ -3,6 +3,7 @@ import type { LifecycleMetadata } from './lifecycle'
 import type { OriginalContentType, UploadFormat, WordImportFeatures } from './document-formats'
 import { MAX_MARKDOWN_BYTES } from './source-files'
 import type { ProcessingSettingsSnapshot } from './admin-settings'
+import type { RubricApprovalPointer } from './rubric-approval'
 
 export const JOB_IMPORT_LIMITS = {
   maxFileBytes: 10 * 1024 * 1024,
@@ -53,6 +54,8 @@ export interface RealJobRecord {
   lifecycle?: LifecycleMetadata
   rubricLifecycle?: LifecycleMetadata
   processingSettings?: ProcessingSettingsSnapshot
+  /** The approved rubric version, set only by a workspace owner's approval. */
+  rubricApproval?: RubricApprovalPointer
 }
 
 export interface VersionedRealJob {
@@ -72,6 +75,7 @@ export interface RealJobSummary {
   warnings: string[]
   lifecycle?: LifecycleMetadata
   rubricLifecycle?: LifecycleMetadata
+  rubricApproval?: RubricApprovalPointer
 }
 
 export interface RealJobDetail extends RealJobSummary {
@@ -90,6 +94,10 @@ export interface JobProcessingFeatures extends WordImportFeatures {
   rubricAssistant: boolean
   /** Rubric-page downloads and report rubric details; exports are reads, so this ignores new-work admission. */
   rubricExports: boolean
+  /** New analyses and grade ladders use only approved job rubric versions. This is a policy, not an admission. */
+  rubricApprovalRequired: boolean
+  /** The checks before approval can run (job-rubric model deployed and new work admitted). */
+  rubricChecks: boolean
   limits: { [K in keyof typeof JOB_IMPORT_LIMITS]: number }
 }
 

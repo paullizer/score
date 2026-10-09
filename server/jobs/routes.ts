@@ -28,8 +28,16 @@ import type { AssistLimiter } from '../assist/limits'
 import { AssistCancelledError, runAssist } from '../assist/runner'
 import type { AssistModelInvoker } from '../assist/types'
 import { jobRubricAssistProfile } from '../assist/profiles/job-rubric'
+import { analysisHash } from '../analyses/deterministic'
+import { EVIDENCE_SCALE_VERSION, rubricScaleErrors } from '../../src/domain/evidence-scale'
+import { RUBRIC_QA_VERSION, rubricQaChecks } from '../../src/domain/rubric-qa'
+import {
+  rubricQaRecordId, rubricVersionStatus,
+  type RubricApprovalRecord, type RubricCheckState, type RubricQaRecord,
+} from '../../src/domain/rubric-approval'
+import { reviewJobRubric, RubricReviewCancelledError } from './rubric-review'
 import type { JobBlobStore, JobLifecycleScope, RealJobStore } from './store'
-import { assertJobWritable, putJobBlob } from './guards'
+import { assertJobWritable, isJobReadOnly, putJobBlob } from './guards'
 import {
   assertImportPolicy, assertOriginalDownload, assertRubricExport, newProcessingSettings, newWorkProcessingSettings,
   requestProcessingSettings, resolveAcceptedProcessingSettings,
@@ -270,6 +278,7 @@ function summaryMetadata(value: VersionedRealJob, rubric: Rubric | null = null):
     warnings: value.record.warnings,
     ...(value.record.lifecycle ? { lifecycle: value.record.lifecycle } : {}),
     ...(value.record.rubricLifecycle ? { rubricLifecycle: value.record.rubricLifecycle } : {}),
+    ...(value.record.rubricApproval ? { rubricApproval: value.record.rubricApproval } : {}),
   }
 }
 
@@ -283,6 +292,10 @@ async function summary(store: RealJobStore, value: Awaited<ReturnType<RealJobSto
 }
 
 async function readDocument(blobs: JobBlobStore, record: RealJobRecord): Promise<SourceDocument | null> {
+  return (await readDocumentBlob(blobs, record))?.document ?? null
+}
+
+async function readDocumentBlob(blobs: JobBlobStore, record: RealJobRecord): Promise<{ document: SourceDocument; sha256: string } | null> {
   if (!record.extractedBlobName || record.lifecycle?.deletingAt || record.lifecycle?.deletedAt) return null
   const blob = await blobs.read(record.extractedBlobName)
   if (!blob) throw unavailable('The extracted job document is temporarily unavailable.')
@@ -297,7 +310,7 @@ async function readDocument(blobs: JobBlobStore, record: RealJobRecord): Promise
   if (errors.length || (parsed as SourceDocument).id !== record.job.documentId) {
     throw unavailable('The extracted job document has an invalid stored shape.')
   }
-  return parsed as SourceDocument
+  return { document: parsed as SourceDocument, sha256: hash(blob.bytes) }
 }
 
 async function detail(jobs: RealJobsDeps, value: Awaited<ReturnType<RealJobStore['get']>>): Promise<RealJobDetail> {
@@ -311,7 +324,7 @@ async function detail(jobs: RealJobsDeps, value: Awaited<ReturnType<RealJobStore
   return { ...base, document, rubricVersions }
 }
 
-function authorize(repository: WorkspaceRepository, access: 'read' | 'write' | 'manage'): RequestHandler {
+function authorize(repository: WorkspaceRepository, access: 'read' | 'write' | 'manage' | 'approve'): RequestHandler {
   return async (req, _res, next) => {
     try {
       await repository.authorizeWorkspace(getPrincipal(req), pathParam(req, 'workspaceId'), access)
@@ -359,6 +372,64 @@ function attachmentHeader(filename: string): string {
 
 type AsyncJobHandler = (req: Request, res: Response, next: NextFunction) => Promise<void>
 
+function rubricVersionInput(rubricId: unknown, version: unknown): { rubricId: string; version: number } {
+  if (typeof rubricId !== 'string' || !rubricId || rubricId.length > 1024 || rubricId !== rubricId.trim()) {
+    throw invalidRequest('rubricId must identify one saved rubric.')
+  }
+  const parsed = typeof version === 'string' && /^[1-9]\d{0,8}$/.test(version) ? Number(version) : version
+  if (typeof parsed !== 'number' || !Number.isInteger(parsed) || parsed < 1 || parsed > 999_999_999) {
+    throw invalidRequest('version must be a saved rubric version number.')
+  }
+  return { rubricId, version: parsed }
+}
+
+/** Loads one exact saved version of the job's current rubric. Removed rubrics are not found. */
+async function savedRubricVersion(jobs: RealJobsDeps, workspaceId: string, jobId: string, rubricId: string, version: number) {
+  const current = await jobs.store.get(workspaceId, jobId)
+  if (!current) throw notFound('The requested job was not found.')
+  const { record } = current
+  if (record.lifecycle?.deletingAt || record.lifecycle?.deletedAt || record.job.rubricDeletedAt ||
+    record.rubricLifecycle?.deletingAt || record.rubricLifecycle?.deletedAt) {
+    throw notFound('This rubric has been removed.')
+  }
+  if (record.job.status !== 'ready' || record.job.rubricId !== rubricId) throw notFound('The requested rubric version was not found.')
+  const versions = await jobs.store.listRubrics(workspaceId, jobId)
+  const rubric = versions.find(item => item.id === rubricId && item.version === version)
+  const latest = versions.at(-1)
+  if (!rubric || !latest) throw notFound('The requested rubric version was not found.')
+  if (!validateStoredRealRubric(rubric) || rubric.jobId !== record.id) throw unavailable('The rubric version has invalid stored data.')
+  return { current, rubric, latest }
+}
+
+/** Reasons a version can't be approved, apart from checks that haven't run. Empty for the approved version. */
+function approvalBlockers(record: RealJobRecord, rubric: Rubric, latest: Rubric, checks: RubricQaRecord | undefined): string[] {
+  if (rubricVersionStatus(rubric, record.rubricApproval) === 'approved') return []
+  const blockers: string[] = []
+  if (isJobReadOnly(record)) blockers.push('Archived jobs and rubrics can\'t be approved. Unarchive it first.')
+  if (rubric.version !== latest.version) blockers.push(`Version ${latest.version} was saved after this one. Review and approve the latest version.`)
+  if (rubric.scaleVersion !== EVIDENCE_SCALE_VERSION) {
+    blockers.push('This rubric was made before the evidence scale, so it can\'t be approved. Import the job again to create a rubric that uses the scale.')
+  } else {
+    blockers.push(...rubricScaleErrors(rubric))
+  }
+  if (checks) blockers.push(...checks.checks.filter(finding => finding.severity === 'blocker').map(finding => finding.message))
+  return blockers
+}
+
+function rubricCheckState(record: RealJobRecord, rubric: Rubric, latest: Rubric, stored: RubricQaRecord | undefined): RubricCheckState {
+  const rubricHash = analysisHash(rubric)
+  // Versions are immutable, so a hash mismatch means corrupt data; never let it stand in for checks.
+  if (stored && stored.rubricHash !== rubricHash) throw unavailable('Stored rubric check results do not match this version.')
+  return {
+    rubricId: rubric.id,
+    version: rubric.version,
+    rubricHash,
+    status: rubricVersionStatus(rubric, record.rubricApproval),
+    blockers: approvalBlockers(record, rubric, latest, stored),
+    checks: stored ?? null,
+  }
+}
+
 function asyncHandler(handler: AsyncJobHandler): RequestHandler {
   return (req, res, next) => {
     void handler(req, res, next).catch(error => {
@@ -372,7 +443,7 @@ export function createRealJobsRouter(deps: RealJobsRouterDeps): Router {
   const clock = deps.now ?? (() => new Date())
   const jobRequestLimiter = rateLimit(userRateLimitOptions(JOB_REQUEST_RATE_LIMIT))
   const rubricExportLimiter = rateLimit(userRateLimitOptions(RUBRIC_EXPORT_RATE_LIMIT))
-  const mutation = (access: 'write' | 'manage', handler: AsyncJobHandler): RequestHandler => asyncHandler(
+  const mutation = (access: 'write' | 'manage' | 'approve', handler: AsyncJobHandler): RequestHandler => asyncHandler(
     (req, res, next) => deps.repository.withWorkspaceMutation(
       getPrincipal(req), pathParam(req, 'workspaceId'), access, () => handler(req, res, next),
     ),
@@ -764,6 +835,10 @@ export function createRealJobsRouter(deps: RealJobsRouterDeps): Router {
     }
     const document = await readDocument(jobs.blobs, current.record)
     if (!document) throw conflict('The job has no extracted source document.')
+    // The saved rubric, not the browser, decides whether the draft uses the evidence scale.
+    const draft = { ...request.draft }
+    delete draft.scaleVersion
+    if (latest.scaleVersion) draft.scaleVersion = latest.scaleVersion
 
     const release = assist.limiter.acquire(getPrincipal(req).principalKey)
     const controller = new AbortController()
@@ -776,7 +851,7 @@ export function createRealJobsRouter(deps: RealJobsRouterDeps): Router {
         context: {
           document,
           jobTitle: current.record.displayName ?? current.record.job.title,
-          draft: request.draft,
+          draft,
           focusCriterionId: request.focusCriterionId,
           maxCriteria: snapshot.settings.rubrics.jobs.maxCriteria,
           savedCriterionIds: new Set(latest.criteria.map(criterion => criterion.id)),
@@ -849,6 +924,8 @@ export function createRealJobsRouter(deps: RealJobsRouterDeps): Router {
         promptVersion: latest.provenance?.promptVersion ?? '',
         ...(latest.provenance?.prompt ? { prompt: latest.provenance.prompt } : {}),
       },
+      // The scale is fixed by the saved rubric: edits keep it, and a rubric made before the scale stays that way.
+      ...(latest.scaleVersion ? { scaleVersion: latest.scaleVersion } : {}),
     }
     const errors = validateRealRubric(rubric, document, current.record.source.originalContentType)
     if (errors.length) throw invalidRequest(errors.join(' '))
@@ -862,6 +939,165 @@ export function createRealJobsRouter(deps: RealJobsRouterDeps): Router {
       throw error
     }
     res.json({ job: await detail(jobs, updated) })
+  }))
+
+  router.get(`${base}/:jobId/rubric/checks`, authorize(deps.repository, 'read'), available(deps.jobs), asyncHandler(async (req, res) => {
+    const jobs = requireJobs(deps.jobs)
+    const unexpected = Object.keys(req.query).filter(key => !['rubricId', 'version'].includes(key))
+    if (unexpected.length) throw invalidRequest(`Rubric checks do not accept query parameter(s): ${unexpected.join(', ')}.`)
+    const { rubricId, version } = rubricVersionInput(req.query.rubricId, req.query.version)
+    const workspaceId = pathParam(req, 'workspaceId')
+    const jobId = jobParam(req)
+    const { current, rubric, latest } = await savedRubricVersion(jobs, workspaceId, jobId, rubricId, version)
+    const checks = await jobs.store.getRubricQa(workspaceId, jobId, rubric.id, rubric.version)
+    res.json({ review: rubricCheckState(current.record, rubric, latest, checks) })
+  }))
+
+  // Runs the model-free checks and one model review on a saved version. The model call happens outside the
+  // workspace mutation lease; only the create-only result write takes it.
+  router.post(`${base}/:jobId/rubric/checks`, authorize(deps.repository, 'write'), available(deps.jobs), asyncHandler(async (req, res) => {
+    const jobs = requireJobs(deps.jobs)
+    const assist = deps.assist
+    if (!assist) throw unavailable('Rubric checks need the job-rubric model, which isn\'t configured for this deployment.')
+    const body = bodyRecord(req.body, ['rubricId', 'version'])
+    const { rubricId, version } = rubricVersionInput(body.rubricId, body.version)
+    const workspaceId = pathParam(req, 'workspaceId')
+    const jobId = jobParam(req)
+    let { current, rubric, latest } = await savedRubricVersion(jobs, workspaceId, jobId, rubricId, version)
+    const existing = await jobs.store.getRubricQa(workspaceId, jobId, rubric.id, rubric.version)
+    if (existing) {
+      res.json({ review: rubricCheckState(current.record, rubric, latest, existing) })
+      return
+    }
+    await requireMutableWorkspace(jobs.store, workspaceId)
+    assertJobWritable(current.record)
+    if (rubric.scaleVersion !== EVIDENCE_SCALE_VERSION) {
+      throw conflict('This rubric was made before the evidence scale, so it can\'t be checked or approved. Import the job again to create a rubric that uses the scale.')
+    }
+    if (rubric.version !== latest.version) throw conflict(`Version ${latest.version} was saved after this one. Check the latest version instead.`)
+    assertNewProcessingAllowed(req)
+    const snapshot = await getAdmissionSettings(req)
+    if (snapshot.settings.maintenance.pauseNewWork) {
+      throw unavailable(snapshot.settings.maintenance.explanation || 'New work is temporarily paused by application policy.')
+    }
+    const pinned = runtimeSettingsEnabled(req) ? snapshot : undefined
+    const principal = getPrincipal(req)
+    const release = assist.limiter.acquire(principal.principalKey)
+    const controller = new AbortController()
+    res.on('close', () => {
+      if (!res.writableFinished) controller.abort()
+    })
+    let review: RubricQaRecord['review']
+    try {
+      review = await reviewJobRubric({
+        rubric,
+        jobTitle: current.record.displayName ?? current.record.job.title,
+        invoke: assist.invoke,
+        processingSettings: pinned,
+        maxCorrections: snapshot.settings.ai.jobRubric.maxOutputCorrections,
+        signal: controller.signal,
+      })
+    } catch (error) {
+      if (error instanceof RubricReviewCancelledError) {
+        if (!res.headersSent && !res.destroyed) res.end()
+        return
+      }
+      throw error
+    } finally {
+      release()
+    }
+    const record: RubricQaRecord = {
+      id: rubricQaRecordId(rubric.id, rubric.version),
+      workspaceId,
+      recordType: 'rubric-qa',
+      jobId,
+      rubricId: rubric.id,
+      version: rubric.version,
+      rubricHash: analysisHash(rubric),
+      qaVersion: RUBRIC_QA_VERSION,
+      checks: rubricQaChecks(rubric),
+      review,
+      createdBy: principal.principalKey,
+      createdAt: clock().toISOString(),
+    }
+    let stored: RubricQaRecord
+    try {
+      stored = await deps.repository.withWorkspaceMutation(principal, workspaceId, 'write', async () => {
+        assertWorkspaceMutationLease(workspaceId)
+        return jobs.store.createRubricQa(record)
+      })
+    } catch (error) {
+      // A concurrent request may have stored results for the same version first; those win.
+      if (!(error instanceof StoreConflictError)) throw error
+      const winner = await jobs.store.getRubricQa(workspaceId, jobId, rubric.id, rubric.version)
+      if (!winner) throw conflict('This job or rubric changed while the checks ran. Reload and try again.')
+      stored = winner
+    }
+    ;({ current, rubric, latest } = await savedRubricVersion(jobs, workspaceId, jobId, rubricId, version))
+    res.json({ review: rubricCheckState(current.record, rubric, latest, stored) })
+  }))
+
+  router.post(`${base}/:jobId/rubric/approve`, authorize(deps.repository, 'approve'), mutation('approve', async (req, res) => {
+    const jobs = requireJobs(deps.jobs)
+    const expectedEtag = requireEtag(req)
+    const body = bodyRecord(req.body, ['rubricId', 'version', 'rubricHash'])
+    const { rubricId, version } = rubricVersionInput(body.rubricId, body.version)
+    if (typeof body.rubricHash !== 'string' || !/^[0-9a-f]{64}$/.test(body.rubricHash)) {
+      throw invalidRequest('rubricHash must be the SHA-256 of the rubric version you reviewed.')
+    }
+    const workspaceId = pathParam(req, 'workspaceId')
+    const jobId = jobParam(req)
+    await requireMutableWorkspace(jobs.store, workspaceId)
+    const { current, rubric, latest } = await savedRubricVersion(jobs, workspaceId, jobId, rubricId, version)
+    assertJobWritable(current.record)
+    if (current.etag !== expectedEtag) throw conflict('This job changed since you last loaded it.')
+    const rubricHash = analysisHash(rubric)
+    if (rubricHash !== body.rubricHash) throw conflict('This isn\'t the rubric version you reviewed. Reload it before approving.')
+    if (rubricVersionStatus(rubric, current.record.rubricApproval) === 'approved') throw conflict('This rubric version is already approved.')
+    const checks = await jobs.store.getRubricQa(workspaceId, jobId, rubric.id, rubric.version)
+    const state = rubricCheckState(current.record, rubric, latest, checks)
+    if (!checks) throw conflict('Run the rubric checks on this version before approving it.')
+    if (state.blockers.length) throw conflict(`This version can't be approved yet. ${state.blockers.slice(0, 5).join(' ')}`)
+    const source = await readDocumentBlob(jobs.blobs, current.record)
+    if (!source) throw conflict('The job has no extracted source document.')
+    const errors = validateRealRubric(rubric, source.document, current.record.source.originalContentType)
+    if (errors.length) throw conflict(`This version can't be approved because its citations no longer match the job text. ${errors.slice(0, 3).join(' ')}`)
+    const principal = getPrincipal(req)
+    const timestamp = clock().toISOString()
+    const approval: RubricApprovalRecord = {
+      id: `rubric-approval-${randomUUID()}`,
+      workspaceId,
+      recordType: 'rubric-approval',
+      jobId,
+      rubricId: rubric.id,
+      version: rubric.version,
+      rubricHash,
+      scaleVersion: EVIDENCE_SCALE_VERSION,
+      qa: { id: checks.id, sha256: analysisHash(checks) },
+      document: { id: source.document.id, version: source.document.version, sha256: source.sha256 },
+      approvedBy: principal.principalKey,
+      approvedAt: timestamp,
+      ...(current.record.rubricApproval ? { supersedes: current.record.rubricApproval.approvalId } : {}),
+    }
+    const record: RealJobRecord = {
+      ...current.record,
+      rubricApproval: {
+        approvalId: approval.id, rubricId: rubric.id, version: rubric.version, rubricHash,
+        approvedBy: approval.approvedBy, approvedAt: timestamp,
+      },
+      updatedAt: [timestamp, current.record.updatedAt].sort().at(-1)!,
+    }
+    let updated
+    try {
+      assertWorkspaceMutationLease(workspaceId)
+      updated = await jobs.store.approveRubric(record, expectedEtag, approval)
+    } catch (error) {
+      if (error instanceof StoreConflictError) throw conflict('This job or rubric changed since you last loaded it.')
+      throw error
+    }
+    const job = await detail(jobs, updated)
+    res.setHeader('ETag', job.etag)
+    res.json({ job })
   }))
 
   router.get(`${base}/:jobId/original`, authorize(deps.repository, 'read'), asyncHandler(async (req, res) => {
@@ -942,6 +1178,7 @@ export function createRealJobsRouter(deps: RealJobsRouterDeps): Router {
         description: rubric.description,
         createdAt: rubric.createdAt,
         provenance: rubric.provenance?.kind === 'edited' ? 'edited' : 'generated',
+        approval: rubricVersionStatus(rubric, record.rubricApproval),
         criteria: rubric.criteria.map(criterion => ({
           label: criterion.label,
           description: criterion.description,

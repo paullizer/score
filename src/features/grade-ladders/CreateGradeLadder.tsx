@@ -43,7 +43,15 @@ export function CreateGradeLadder() {
     !isEntityArchived(workspace, { kind: 'job', id: job.id }) && workspace.rubrics.some((rubric) => rubric.id === job.rubricId && !isEntityArchived(workspace, { kind: 'rubric', id: rubric.groupId })))
   const job = jobs.find((item) => item.id === jobId)
   const detail = cloud?.realJobs.detail(jobId)
-  const selectedRubric = job && detail?.state === 'ready' ? (rubricId ? [...detail.value.rubricVersions].sort((a, b) => b.version - a.version).find((rubric) => rubric.id === rubricId && (!rubricVersion || rubric.version === rubricVersion) && !isEntityArchived(workspace, { kind: 'rubric', id: rubric.groupId })) : detail.value.rubric) : null
+  // While approval is required (the server enforces it), only the approved version can seed a ladder.
+  const approvalRequired = cloud?.realJobs.features?.rubricApprovalRequired !== false
+  const approval = detail?.state === 'ready' ? detail.value.rubricApproval : undefined
+  const isApproved = (rubric: { id: string; version: number }) => approval?.rubricId === rubric.id && approval.version === rubric.version
+  const seedVersions = detail?.state === 'ready' ? [...detail.value.rubricVersions].sort((a, b) => b.version - a.version)
+    .filter((rubric) => !approvalRequired || isApproved(rubric)) : []
+  const selectedRubric = job && detail?.state === 'ready' ? (rubricId
+    ? seedVersions.find((rubric) => rubric.id === rubricId && (!rubricVersion || rubric.version === rubricVersion) && !isEntityArchived(workspace, { kind: 'rubric', id: rubric.groupId }))
+    : approvalRequired ? seedVersions[0] : detail.value.rubric) ?? null : null
   const ensureJob = cloud?.realJobs.ensureDetail
 
   useEffect(() => { live.current = true; return () => { live.current = false } }, [])
@@ -104,13 +112,14 @@ export function CreateGradeLadder() {
           {!jobs.length && <p className="text-[12px] text-muted">{cloud?.realJobs.phase === 'loading' ? 'Loading real jobs…' : 'Import a real job and wait for its source-grounded rubric before starting.'}</p>}
           {jobId && detail?.state === 'error' && <InlineError>{detail.error}<button type="button" className="ml-2 underline" onClick={() => void ensureJob?.(jobId, true)}>Retry seed loading</button></InlineError>}
           {jobId && detail?.state !== 'ready' && detail?.state !== 'error' && <p role="status" className="text-[12px] text-muted">Loading the captured job source and saved rubric versions…</p>}
-          {job && detail?.state === 'ready' && <label className="field"><span className="field-label">Saved seed rubric version</span><select className="input" aria-label="Saved seed rubric version" value={selectedRubric ? `${selectedRubric.id}:${selectedRubric.version}` : ''} onChange={(event) => {
-            const selected = detail.value.rubricVersions.find((rubric) => `${rubric.id}:${rubric.version}` === event.target.value)
+          {job && detail?.state === 'ready' && approvalRequired && !approval && <InlineError>This job’s rubric isn’t approved yet, so it can’t seed a ladder. A workspace owner approves it on the <Link className="underline" to={`/jobs/${job.id}`}>job page</Link>.</InlineError>}
+          {job && detail?.state === 'ready' && seedVersions.length > 0 && <label className="field"><span className="field-label">Saved seed rubric version</span><select className="input" aria-label="Saved seed rubric version" value={selectedRubric ? `${selectedRubric.id}:${selectedRubric.version}` : ''} onChange={(event) => {
+            const selected = seedVersions.find((rubric) => `${rubric.id}:${rubric.version}` === event.target.value)
             if (selected) { setRubricId(selected.id); setRubricVersion(selected.version) }
             setSeedConfirmed(false); setDirty(true)
           }}>
-            {[...detail.value.rubricVersions].sort((a, b) => b.version - a.version).map((rubric) => <option key={`${rubric.id}:${rubric.version}`} value={`${rubric.id}:${rubric.version}`}>v{rubric.version} · {rubric.name}</option>)}
-          </select></label>}
+            {seedVersions.map((rubric) => <option key={`${rubric.id}:${rubric.version}`} value={`${rubric.id}:${rubric.version}`}>v{rubric.version} · {rubric.name}{isApproved(rubric) ? ' · approved' : ''}</option>)}
+          </select>{approvalRequired && <span className="field-hint">Only the approved version can seed a ladder while Admin settings require approved job rubrics.</span>}</label>}
           {selectedRubric && <div className="grade-seed-summary"><Badge tone="accent">Real seed · v{selectedRubric.version}</Badge><p>{selectedRubric.criteria.length} source-linked criteria. This exact saved version, job, and original evidence are captured without changing the job rubric.</p></div>}
           <label className="check-label"><input type="checkbox" checked={seedConfirmed} disabled={!selectedRubric} onChange={(event) => { setSeedConfirmed(event.target.checked); setDirty(true) }} />I confirm this saved job/rubric version as the seed.</label>
         </fieldset>

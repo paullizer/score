@@ -33,9 +33,10 @@ export async function buildGradeTestRuntime({ browser = false, productionBrowser
       'word-parser': join('server', 'documents', 'word-parser-worker.ts'),
     }
     await Promise.all(Object.entries(entries).map(([name, entry]) => build({
-      ...(name === 'server' && serverExports ? {
+      // The server bundle also exposes the evidence-scale renderer so fixtures can publish versions on the scale.
+      ...(name === 'server' ? {
         stdin: {
-          contents: `export * from './server/app.ts'\n${serverExports}`,
+          contents: `export * from './server/app.ts'\nexport { EVIDENCE_SCALE_VERSION, renderEvidenceGuidance } from './src/domain/evidence-scale.ts'\n${serverExports}`,
           resolveDir: resolve('.'), sourcefile: 'integration-runtime.ts', loader: 'ts',
         },
       } : { entryPoints: [entry] }),
@@ -220,8 +221,21 @@ function memoryWorkspace(api) {
   return { directory, state }
 }
 
-export async function startGradeFixture(runtime, { injectAuth = false, resumes, analyses, configOverrides = {} } = {}) {
+// An administrator turned off "Require approved job rubrics". New work pins this policy, as a deployment with runtime settings does.
+function approvalOptionalSettings(api) {
+  const policy = api.createDefaultAdminSettings()
+  policy.features.rubricApprovalRequired = false
+  return {
+    async capture() { return api.captureProcessingSettings(policy, 'rubric-approval-optional', '2026-09-17T19:00:00.000Z') },
+    async captureLegacy() {
+      return api.captureProcessingSettings(api.createDefaultAdminSettings(), api.LEGACY_SETTINGS_REVISION, api.LEGACY_SETTINGS_CAPTURED_AT)
+    },
+  }
+}
+
+export async function startGradeFixture(runtime, { injectAuth = false, resumes, analyses, configOverrides = {}, rubricApprovalRequired = true } = {}) {
   const { api } = runtime
+  const settings = rubricApprovalRequired ? undefined : approvalOptionalSettings(api)
   const grades = memoryGrades(api), jobs = memoryJobs(runtime.jobFakes), { directory, state } = memoryWorkspace(api)
   const accessStore = runtime.createFakeAccessStore()
   let clock = Math.max(Date.now(), Date.parse('2026-09-17T19:00:00.000Z'))
@@ -242,9 +256,10 @@ export async function startGradeFixture(runtime, { injectAuth = false, resumes, 
     cosmos: { endpoint: serviceConfig.cosmosEndpoint, database: 'score', container: 'workspaces' }, storage: { accountUrl: serviceConfig.storageAccountUrl, containerName: 'workspace-state' },
     realJobs: { ...serviceConfig, container: 'job-records', blobContainer: 'job-sources' },
     realGrades: { ...serviceConfig, container: 'grade-records', blobContainer: 'grade-sources' },
+    ...(settings ? { settings: { runtimeEnabled: true } } : {}),
     ...configOverrides,
   }
-  const app = api.createApp({ config, directory, state, accessStore, jobs, grades, resumes, analyses, now, distDir: runtime.directory })
+  const app = api.createApp({ config, directory, state, accessStore, jobs, grades, resumes, analyses, now, distDir: runtime.directory, settings })
   const requests = []
   const pendingRequests = new Set()
   let holdNextMutation
@@ -339,6 +354,8 @@ export async function seedRealJob(fixture) {
   await jobs.store.create(record)
   const second = { ...clone(rubric), version: 2, name: 'Engineering work rubric · latest', createdAt: now().toISOString(), provenance: { ...rubric.provenance, kind: 'edited' } }
   jobs.rubrics.set(`${workspaceId}/${jobId}`, [rubric, second])
+  // A workspace owner approved the latest version, as new analyses and ladders require by default.
+  jobs.store._approve(workspaceId, jobId)
   return { job, rubric, latestRubric: second, document }
 }
 
@@ -385,6 +402,14 @@ export async function publishGrade(fixture, detail, document, grade = 9, support
   const timestamp = fixture.now().toISOString(), id = `grade-version-${randomUUID()}`
   const exact = (paragraph) => ({ documentId: document.id, documentVersion: document.version, paragraphId: paragraph.id, page: paragraph.page, heading: paragraph.heading, quote: paragraph.text })
   const work = exact(document.paragraphs[0]), prerequisite = exact(document.paragraphs[1])
+  // Published versions use the evidence scale, as only those can be approved.
+  const levels = [
+    'Lists engineering methods from coursework or training.',
+    'Describes one defined project that applied engineering methods.',
+    'Describes repeated or ongoing defined engineering projects.',
+    'Describes choosing or adapting methods across defined projects.',
+    'Describes leading defined engineering projects with stated outcomes.',
+  ].map((examples, index) => ({ level: index + 1, examples }))
   const issues = supported ? [] : [{ id: `missing-grade-${grade}`, code: 'missing-grade-evidence', severity: 'blocker', scope: 'grade', grade, message: `GS-${grade} has no supporting work-level distinction in the captured set.` }]
   const version = {
     id, recordType: 'grade-version', workspaceId: fixture.workspaceId, ladderId: detail.ladder.id, createdAt: timestamp, updatedAt: timestamp,
@@ -392,10 +417,11 @@ export async function publishGrade(fixture, detail, document, grade = 9, support
     rubric: { id, groupId: `grade-head-${detail.ladder.id.slice(7)}-${grade}`, kind: 'grade', dataKind: 'real',
       ladder: detail.ladder.name, grade: `GS-${grade}`, version: 1, createdAt: timestamp, name: `GS-${grade} engineering expectations`, description: 'Review-only integration fixture, not OPM classification.',
       provenance: { kind: 'generated', model: 'test-publication', promptVersion: 'test-grade-v1' },
+      scaleVersion: fixture.api.EVIDENCE_SCALE_VERSION,
       criteria: [{ id: 'shared-engineering-methods', key: 'technical', competencyId: 'shared-engineering-methods', label: 'Engineering methods', description: supported ? work.quote : 'Supporting grade expectations remain unresolved.',
         weight: supported ? 100 : 0, support: supported ? 'direct' : 'gap', gradeBasis: supported ? [work] : [], sourceCitations: supported ? [work] : [],
         interpretation: supported ? 'The explicit GS-9 scope supports applying engineering methods to defined projects, not an inferred GS-11 expansion.' : '',
-        guidance: supported ? '0: No demonstrated application.\n1: Observes a defined task.\n2: Applies methods with assistance.\n3: Applies methods independently.\n4: Handles complex defined tasks.\n5: Sustains application across defined projects.' : 'Unscored until captured evidence supports this grade expectation.' }],
+        ...(supported ? { levels, guidance: fixture.api.renderEvidenceGuidance(levels) } : { guidance: 'Unscored until captured evidence supports this grade expectation.' }) }],
     },
     qualifications: supported ? [{ id: 'engineering-degree', text: prerequisite.quote, support: 'direct', citations: [prerequisite], interpretation: 'The source preserves an engineering degree or equivalent alternative as an unscored prerequisite.' }] : [],
   }
@@ -436,7 +462,7 @@ export async function seededLadder(fixture) {
   const restoreFetch = fixture.installClientFetch()
   try {
     const seed = await seedRealJob(fixture)
-    const input = { name: 'Engineering grade family', jobId: seed.job.id, rubricId: seed.rubric.id, rubricVersion: 1,
+    const input = { name: 'Engineering grade family', jobId: seed.job.id, rubricId: seed.rubric.id, rubricVersion: seed.latestRubric.version,
       context: { series: '0801', agency: 'Integration test agency', agencyType: 'other-federal', supervision: 'nonsupervisory', functions: [], specialty: 'Defined engineering projects', confirmed: true, answers: {} }, grades: [9, 11] }
     let detail = await client.createGradeLadder(fixture.workspaceId, input, randomUUID())
     await finishWork(fixture, detail.ladder.id, ['discover'])

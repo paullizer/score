@@ -33,7 +33,19 @@ before(async () => {
 after(async () => runtime?.close())
 
 const guidance = '0: No demonstrated analytical work; 1: Observes a defined analytical task; 2: Assists with documented methods; 3: Applies established methods within the cited scope; 4: Explains defensible analytical choices; 5: Sustains evidence-based outcomes across applicable assignments'
+const levels = [
+  'Lists analytical methods from coursework or training.',
+  'Describes one program project using established analytical methods.',
+  'Describes repeated or ongoing analytical work on program projects.',
+  'Describes choosing or adapting analytical methods for varied assignments.',
+  'Describes leading program analyses with stated outcomes.',
+].map((examples, index) => ({ level: index + 1, examples }))
 const clone = value => structuredClone(value)
+// Draft prompts supply passages with IDs instead of paragraph text, and drafts cite passage IDs.
+const textOf = paragraph => paragraph.text ?? paragraph.passages.map(passage => passage.text).join('')
+const passageRef = (source, paragraphs) => ({
+  documentId: source.documentId, passageIds: paragraphs.flatMap(paragraph => paragraph.passages.map(passage => passage.passageId)),
+})
 
 function modelInvoker(calls) {
   return async request => {
@@ -55,37 +67,31 @@ function modelInvoker(calls) {
     } else if (input.operation === 'draft-grade') {
       const source = body.sources.find(source => source.purpose === 'grading')
       const paragraph = source.sections.flatMap(section => section.paragraphs)
-        .find(paragraph => paragraph.heading === `GS-${input.grade}` && paragraph.text.includes('analytical methods'))
+        .find(paragraph => paragraph.heading === `GS-${input.grade}` && textOf(paragraph).includes('analytical methods'))
       assert.ok(paragraph, 'The actual PDF extractor must preserve the grade heading and OCR passage.')
-      const citation = {
-        documentId: source.documentId, documentVersion: source.documentVersion,
-        paragraphId: paragraph.id, page: paragraph.page, heading: paragraph.heading, quote: paragraph.text,
-      }
+      const citation = passageRef(source, [paragraph])
       const qualificationSource = body.sources.find(source => source.purpose === 'qualification')
       const qualificationParagraphs = qualificationSource.sections.flatMap(section => section.paragraphs)
       const qualificationParagraph = qualificationParagraphs
-        .find(paragraph => new RegExp(`\\bGS[-\\s]*${input.grade}\\b`).test(paragraph.text))
+        .find(paragraph => new RegExp(`\\bGS[-\\s]*${input.grade}\\b`).test(textOf(paragraph)))
       assert.ok(qualificationParagraph, 'The actual HTML extractor must retain the selected qualification-group grade row.')
-      const qualificationCitations = qualificationParagraphs.filter(paragraph =>
-        paragraph === qualificationParagraph || paragraph.table?.row === 1 || /\bcombination\b/i.test(paragraph.text))
-        .map(paragraph => ({
-          documentId: qualificationSource.documentId, documentVersion: qualificationSource.documentVersion,
-          paragraphId: paragraph.id, page: paragraph.page, heading: paragraph.heading, quote: paragraph.text,
-        }))
+      const qualificationCited = qualificationParagraphs.filter(paragraph =>
+        paragraph === qualificationParagraph || paragraph.table?.row === 1 || /\bcombination\b/i.test(textOf(paragraph)))
       const gap = input.grade === 11
       value = {
         description: `Source-grounded analytical work interpretation for GS-${input.grade}.`,
         criteria: [{
           competencyId: 'analysis-methods', key: 'analysis',
-          description: gap ? 'Additional applicable work-level evidence is required before establishing this grade expectation.' : citation.quote,
+          description: gap ? 'Additional applicable work-level evidence is required before establishing this grade expectation.' : textOf(paragraph),
           weight: gap ? 0 : 100, guidance: gap ? 'Unscored while applicable grade evidence remains unresolved.' : guidance,
-          support: gap ? 'gap' : 'direct', sourceCitations: gap ? [] : [citation], gradeBasis: gap ? [] : [citation],
+          support: gap ? 'gap' : 'direct', levels: gap ? null : levels,
+          sourceCitations: gap ? [] : [citation], gradeBasis: gap ? [] : [citation],
           interpretation: gap ? 'Reviewer-confirmed source applicability does not establish support for this grade; no custom rule is substituted.'
             : 'This reviewer-facing interpretation applies the cited analytical work scope without claiming official classification or eligibility.',
         }],
         qualifications: [{
-          id: 'qualification-alternatives', text: qualificationCitations.map(citation => citation.quote).join('\n'),
-          citations: qualificationCitations, support: 'direct',
+          id: 'qualification-alternatives', text: qualificationCited.map(textOf).join('\n'),
+          citations: [passageRef(qualificationSource, qualificationCited)], support: 'direct',
           interpretation: 'This is a separate unscored source requirement. Preserve the education OR experience alternatives and any stated combination provision; scoring cannot replace eligibility.',
         }],
         issues: [],
@@ -158,7 +164,7 @@ async function discoverAndExtract(fixture) {
     ...stored.record, job: { ...stored.record.job, series: '0343', title: 'Management and program analyst' },
   }, stored.etag)
   let detail = await runtime.client.createGradeLadder(fixture.workspaceId, {
-    name: 'Reviewed 0343 source family', jobId: seed.job.id, rubricId: seed.rubric.id, rubricVersion: 1,
+    name: 'Reviewed 0343 source family', jobId: seed.job.id, rubricId: seed.rubric.id, rubricVersion: seed.latestRubric.version,
     grades: [9, 11], context: opmContext('0343'),
   }, randomUUID())
   const discovered = await pipeline.runGradeWorker(deps, { maxItems: 20 })

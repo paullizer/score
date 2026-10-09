@@ -817,3 +817,20 @@ test('the CSV bundle pairs the unchanged analysis CSV with a rubric CSV that joi
   const tight = { ...report, capture: { ...report.capture, settings: { ...report.capture.settings, policy: { ...policy, maxOutputBytes: 2500 } } } }
   await assert.rejects(api.generateCsvBundle(tight, options), /exceeds the (export|report download) size limit/)
 })
+
+test('rubric exports state whether the exported version is the approved one', () => {
+  for (const [approval, label] of [
+    ['approved', 'Version 2 (current) · Approved'],
+    ['draft', 'Version 2 (current) · Draft, not approved'],
+  ]) {
+    const value = rubricPayload()
+    value.rubric.approval = approval
+    assert.equal(documentFor(value).versionLabel, label)
+  }
+  const superseded = rubricPayload()
+  Object.assign(superseded.rubric, { version: 1, latestVersion: 3, approval: 'superseded' })
+  assert.equal(documentFor(superseded).versionLabel, 'Version 1 of 3 — a newer version exists · Superseded by a newer approved version')
+  const unknown = rubricPayload()
+  unknown.rubric.approval = 'pending'
+  assert.throws(() => api.parseRubricExportPayload(unknown))
+})

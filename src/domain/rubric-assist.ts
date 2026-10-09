@@ -4,6 +4,7 @@ import {
   type AssistResponse,
 } from './assist'
 import { JOB_IMPORT_LIMITS } from './real-jobs'
+import { criterionLevelsSchema, renderEvidenceGuidance, type CriterionLevelExamples } from './evidence-scale'
 import type { Citation, Criterion, Rubric } from './types'
 
 /**
@@ -14,7 +15,7 @@ import type { Citation, Criterion, Rubric } from './types'
  * preview, the highlights and any server-side checks agree on the resulting draft.
  */
 export const RUBRIC_ASSIST_KIND = 'jobRubric' as const
-export const RUBRIC_ASSIST_PROMPT_VERSION = 'score-rubric-assist-v1'
+export const RUBRIC_ASSIST_PROMPT_VERSION = 'score-rubric-assist-v2'
 
 export const RUBRIC_ASSIST_LIMITS = Object.freeze({
   maxCriteria: JOB_IMPORT_LIMITS.maxCriteria,
@@ -25,6 +26,7 @@ export const RUBRIC_ASSIST_LIMITS = Object.freeze({
   maxDraftLabelCharacters: 1_000,
   maxDraftCriterionDescriptionCharacters: 10_000,
   maxDraftGuidanceCharacters: 20_000,
+  maxDraftLevelExamplesCharacters: 600,
   maxDraftQuoteCharacters: 10_000,
   maxDraftSerializedCharacters: 200_000,
   maxWrittenNameCharacters: 200,
@@ -32,6 +34,7 @@ export const RUBRIC_ASSIST_LIMITS = Object.freeze({
   maxWrittenLabelCharacters: 200,
   maxWrittenCriterionDescriptionCharacters: 1_500,
   maxWrittenGuidanceCharacters: 4_000,
+  maxWrittenLevelExamplesCharacters: 600,
   maxWrittenQuoteCharacters: 4_000,
 })
 const L = RUBRIC_ASSIST_LIMITS
@@ -50,12 +53,18 @@ export const rubricAssistDraftCitationSchema = z.strictObject({
   quote: z.string().max(L.maxDraftQuoteCharacters),
 })
 
+const draftLevelExamplesSchema = z.strictObject({
+  level: z.union([z.literal(1), z.literal(2), z.literal(3), z.literal(4), z.literal(5)]),
+  examples: z.string().max(L.maxDraftLevelExamplesCharacters),
+})
+
 /** A draft criterion may be incomplete; the reviewer can be mid-edit. */
 export const rubricAssistDraftCriterionSchema = z.strictObject({
   id: identifier,
   label: z.string().max(L.maxDraftLabelCharacters),
   description: z.string().max(L.maxDraftCriterionDescriptionCharacters),
   guidance: z.string().max(L.maxDraftGuidanceCharacters),
+  levels: z.array(draftLevelExamplesSchema).length(5).optional(),
   /** Null when the weight input is empty or not a number. */
   weight: z.number().nullable(),
   requirementType: requirementType.nullable(),
@@ -67,6 +76,7 @@ export type RubricAssistDraftCriterion = z.infer<typeof rubricAssistDraftCriteri
 export const rubricAssistDraftSchema = z.strictObject({
   name: z.string().max(L.maxDraftNameCharacters),
   description: z.string().max(L.maxDraftDescriptionCharacters),
+  scaleVersion: z.string().optional(),
   criteria: z.array(rubricAssistDraftCriterionSchema).max(L.maxCriteria),
 }).superRefine((draft, ctx) => {
   const ids = new Set<string>()
@@ -112,9 +122,11 @@ export const rubricCriterionChangesSchema = z.strictObject({
   label: writtenText(L.maxWrittenLabelCharacters).optional(),
   description: writtenText(L.maxWrittenCriterionDescriptionCharacters).optional(),
   guidance: writtenText(L.maxWrittenGuidanceCharacters).optional(),
+  levels: criterionLevelsSchema.optional(),
   weight: z.number().int().min(1).max(100).optional(),
   requirementType: requirementType.optional(),
-  citation: rubricAssistCitationSchema.optional(),
+  /** The criterion's complete new citation list; it replaces every earlier citation. */
+  citation: z.array(rubricAssistCitationSchema).min(1).max(8).optional(),
 }).refine(changes => Object.values(changes).some(value => value !== undefined), 'An update must change at least one field.')
 export type RubricCriterionChanges = z.infer<typeof rubricCriterionChangesSchema>
 
@@ -124,10 +136,11 @@ export const rubricAssistAddedCriterionSchema = z.strictObject({
   label: writtenText(L.maxWrittenLabelCharacters),
   description: writtenText(L.maxWrittenCriterionDescriptionCharacters),
   guidance: writtenText(L.maxWrittenGuidanceCharacters),
+  levels: criterionLevelsSchema.optional(),
   weight: z.number().int().min(1).max(100),
   requirementType,
   sourceParagraphId: identifier,
-  sourceCitations: z.array(rubricAssistCitationSchema).length(1),
+  sourceCitations: z.array(rubricAssistCitationSchema).min(1).max(8),
 }).refine(criterion => criterion.sourceCitations[0]?.paragraphId === criterion.sourceParagraphId,
   'The source paragraph must match the criterion citation.')
 
@@ -154,7 +167,7 @@ export type RubricAssistResponse = AssistResponse<RubricAssistOperation>
 // ---------------------------------------------------------------------------------------------
 // Field keys shared by change tracking, attribution and highlighting.
 
-export const RUBRIC_CRITERION_FIELDS = ['label', 'description', 'guidance', 'weight', 'requirementType', 'citation'] as const
+export const RUBRIC_CRITERION_FIELDS = ['label', 'description', 'guidance', 'levels', 'weight', 'requirementType', 'citation'] as const
 export type RubricCriterionField = typeof RUBRIC_CRITERION_FIELDS[number]
 export const RUBRIC_NAME_KEY = 'rubric.name'
 export const RUBRIC_DESCRIPTION_KEY = 'rubric.description'
@@ -191,10 +204,11 @@ export function rubricAssistOperationFieldKeys(operation: RubricAssistOperation)
 // Conversions.
 
 /** The draft wire shape for an editor draft. Non-finite weights become null. */
-export function toRubricAssistDraft(rubric: Pick<Rubric, 'name' | 'description' | 'criteria'>): RubricAssistDraft {
+export function toRubricAssistDraft(rubric: Pick<Rubric, 'name' | 'description' | 'criteria' | 'scaleVersion'>): RubricAssistDraft {
   return {
     name: rubric.name,
     description: rubric.description,
+    ...(rubric.scaleVersion ? { scaleVersion: rubric.scaleVersion } : {}),
     criteria: rubric.criteria.map(criterion => {
       const citation = criterion.sourceCitations?.[0]
       return {
@@ -202,6 +216,7 @@ export function toRubricAssistDraft(rubric: Pick<Rubric, 'name' | 'description' 
         label: criterion.label,
         description: criterion.description,
         guidance: criterion.guidance,
+        ...(criterion.levels ? { levels: criterion.levels } : {}),
         weight: Number.isFinite(criterion.weight) ? criterion.weight : null,
         requirementType: criterion.requirementType ?? null,
         citation: citation ? { paragraphId: citation.paragraphId, quote: citation.quote } : null,
@@ -230,7 +245,7 @@ function cloneCitation(citation: Citation): Citation {
 /**
  * Applies validated operations in order and returns a new draft. Throws, applying nothing, when
  * an operation targets a criterion the draft no longer has, so a stale response is never merged.
- * The criterion's primary citation is replaced; any additional citations are preserved.
+ * A citation change replaces all of the criterion's citations, so it never keeps text the criterion no longer assesses.
  */
 export function applyRubricAssistOperations<T extends RubricAssistTarget>(target: T, operations: readonly RubricAssistOperation[]): T {
   let name = target.name
@@ -258,9 +273,13 @@ export function applyRubricAssistOperations<T extends RubricAssistTarget>(target
         for (const [field, value] of Object.entries(fields) as [keyof typeof fields, unknown][]) {
           if (value !== undefined) (next as unknown as Record<string, unknown>)[field] = value
         }
+        if (operation.changes.levels !== undefined) {
+          next.levels = operation.changes.levels as CriterionLevelExamples[]
+          next.guidance = renderEvidenceGuidance(next.levels)
+        }
         if (citation) {
-          next.sourceParagraphId = citation.paragraphId
-          next.sourceCitations = [cloneCitation(citation), ...(current.sourceCitations ?? []).slice(1)]
+          next.sourceParagraphId = citation[0]!.paragraphId
+          next.sourceCitations = citation.map(cloneCitation)
         }
         criteria[index] = next
         break

@@ -9,6 +9,10 @@ import {
   type SourceDecision,
 } from '../../src/domain/real-grades'
 import type { Citation } from '../../src/domain/types'
+import {
+  createSourcePassageCatalog, resolveSourceCitations, describeSourcePassageError,
+  type SourcePassageCatalog, type SourcePassageDocument, type SourcePassageView,
+} from '../source-passages'
 import type { GradeModelRequest } from './contracts'
 import { GradeModelError } from './model-errors'
 
@@ -356,6 +360,50 @@ export interface BoundedModelContext {
   user: string
   issues: GradeIssue[]
   included: ReadonlySet<string>
+  passageCatalogs: ReadonlyMap<string, { catalog: SourcePassageCatalog; document: SourcePassageDocument }>
+}
+
+export interface PassageCitationRef {
+  documentId: string
+  passageIds: string[]
+}
+
+export function formatSourcePassageId(documentId: string, passageId: number): string {
+  return `${documentId}:p${passageId}`
+}
+
+function parseSourcePassageId(documentId: string, value: string): number {
+  const escaped = documentId.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  const match = new RegExp(`^${escaped}:p([1-9][0-9]*)$`).exec(value)
+  if (!match) {
+    throw new GradeModelError('invalid-model-output', `Passage ID "${value}" is not valid for document ${documentId}. Use IDs exactly as supplied, such as ${formatSourcePassageId(documentId, 1)}.`)
+  }
+  return Number(match[1])
+}
+
+export function resolvePassageCitationRefs(
+  refs: PassageCitationRef[],
+  context: BoundedModelContext,
+  prefix: string,
+): { citations: Citation[]; errors: string[] } {
+  const citations: Citation[] = []
+  const errors: string[] = []
+  for (const ref of refs) {
+    const binding = context.passageCatalogs.get(ref.documentId)
+    if (!binding) {
+      errors.push(`${prefix}: document ${ref.documentId} was not supplied in the included passage catalog; choose a selected included document.`)
+      continue
+    }
+    let numericIds: number[]
+    try {
+      numericIds = ref.passageIds.map(value => parseSourcePassageId(ref.documentId, value))
+      citations.push(...resolveSourceCitations(binding.catalog, binding.document, numericIds))
+    } catch (error) {
+      const described = describeSourcePassageError(error)
+      errors.push(`${prefix}: ${described?.message ?? (error instanceof Error ? error.message : 'Passage IDs could not be resolved.')}`)
+    }
+  }
+  return { citations, errors }
 }
 
 function otherGrade(heading: string, source: FrozenReferenceSource, evidence: ModelEvidence): boolean {
@@ -378,11 +426,21 @@ export function boundModelContext(
   input: Record<string, unknown>,
   requiredCitations: Citation[] = [],
   maxCharacters: number = GRADE_LADDER_LIMITS.maxModelCharacters,
+  citationMode: 'exact' | 'passage-id' = 'exact',
 ): BoundedModelContext {
   const pinned = new Set([...requiredCitations, ...evidence.issues.flatMap(value => value.citations ?? [])].map(citationKey))
   const passages: Passage[] = []
+  const passageCatalogs = new Map<string, { catalog: SourcePassageCatalog; document: SourcePassageDocument; view: SourcePassageView }>()
   const sources = [...evidence.bindings.values()].filter(binding => binding.selected).map(binding => {
     const { source, document } = binding
+    if (citationMode === 'passage-id' && document) {
+      const passageDocument = {
+        id: document.id, version: document.version, title: document.title,
+        paragraphs: document.paragraphs.map(({ id, page, heading, text }) => ({ id, page, heading, text })),
+      }
+      const { catalog, view } = createSourcePassageCatalog(passageDocument)
+      passageCatalogs.set(document.id, { catalog, document: passageDocument, view })
+    }
     const groups = new Map<string, ReferenceParagraph[]>()
     for (const paragraph of document?.paragraphs ?? []) {
       const key = sectionKey(paragraph)
@@ -422,6 +480,25 @@ export function boundModelContext(
   })
   const limit = Math.min(maxCharacters, GRADE_LADDER_LIMITS.maxModelCharacters) - request.name.length - request.system.length -
     JSON.stringify(request.schema).length - REPAIR_CONTEXT_RESERVE
+  const serializeSources = () => citationMode === 'exact' ? sources : sources.map(source => ({
+    ...source,
+    citationScheme: 'Use passage IDs from passages[].passageId. A passage ID is globally unambiguous as documentId:pN and must be returned with its documentId.',
+    sections: source.sections.map(section => ({
+      ...section,
+      paragraphs: section.paragraphs.map(paragraph => {
+        const view = passageCatalogs.get(source.documentId)?.view.paragraphs.find(value => value.id === paragraph.id)
+        return {
+          id: paragraph.id, page: paragraph.page, heading: paragraph.heading,
+          ...(paragraph.sectionId ? { sectionId: paragraph.sectionId } : {}),
+          ...(paragraph.table ? { table: paragraph.table } : {}),
+          passages: (view?.passages ?? []).filter(value => value.passageId !== null).map(value => ({
+            passageId: formatSourcePassageId(source.documentId, value.passageId!),
+            text: value.text,
+          })),
+        }
+      }),
+    })),
+  }))
   const serialize = (issues: GradeIssue[]) => JSON.stringify({
     input,
     frozenSourceSet: {
@@ -429,7 +506,7 @@ export function boundModelContext(
       context: evidence.sourceSet.context, grades: evidence.sourceSet.grades,
     },
     evidencePolicy: 'Only included complete sections were supplied. Selected pages are not a claim of full-document extraction. Omitted relevant sections remain unresolved; never use omitted text or outside knowledge.',
-    sources,
+    sources: serializeSources(),
     unresolvedIssues: issues,
   })
   const result = (issues: GradeIssue[]): BoundedModelContext => {
@@ -439,7 +516,7 @@ export function boundModelContext(
         documentId: passage.binding.source.documentId, documentVersion: passage.binding.source.documentVersion, paragraphId: paragraph.id,
       }))
     }
-    return { user: serialize(issues), issues, included }
+    return { user: serialize(issues), issues, included, passageCatalogs }
   }
   if (serialize(evidence.issues).length <= limit) return result(evidence.issues)
 

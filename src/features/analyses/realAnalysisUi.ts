@@ -170,6 +170,11 @@ export function targetFamilyIdentity(selection: RealAnalysisTargetSelection): st
   return selection.kind === 'job' ? `job:${selection.jobId}:${selection.rubricId}` : `grade:${selection.ladderId}:${selection.grade}`
 }
 
+/** Names a job, or one GS grade of a ladder, in warnings about mixed rubric versions. */
+export function realTargetFamilyLabel(label: string, selection: RealAnalysisTargetSelection): string {
+  return selection.kind === 'grade' ? `${label} · GS-${selection.grade}` : label
+}
+
 export function realTargetLifecycleTargets(workspace: Workspace, selection: RealAnalysisTargetSelection): LifecycleTarget[] {
   if (selection.kind === 'grade') return [{ kind: 'ladder', id: selection.ladderId }, { kind: 'rubric', id: gradeHeadId(selection.ladderId, selection.grade) }]
   const rubric = workspace.rubrics.find((item) => item.id === selection.rubricId && item.jobId === selection.jobId)
@@ -209,6 +214,7 @@ export function sameResumeSelection(a: RealAnalysisResumeSelection, b: RealAnaly
 export function sameTargetSelection(a: RealAnalysisTargetSelection, b: RealAnalysisTargetSelection): boolean {
   if (a.kind === 'job' && b.kind === 'job') return a.jobId === b.jobId && a.rubricId === b.rubricId && a.rubricVersion === b.rubricVersion
     && a.rubricHash === b.rubricHash && a.documentId === b.documentId && a.documentVersion === b.documentVersion && a.documentSha256 === b.documentSha256
+    && a.approvalId === b.approvalId
   if (a.kind === 'grade' && b.kind === 'grade') return a.ladderId === b.ladderId && a.grade === b.grade && a.versionId === b.versionId
     && a.version === b.version && a.versionHash === b.versionHash && a.approvalId === b.approvalId && a.reviewId === b.reviewId
     && a.sourceSetId === b.sourceSetId && a.sourceSetHash === b.sourceSetHash
@@ -243,6 +249,7 @@ function exactLinkInput(input: RealAnalysisLinkInput): RealAnalysisLinkInput {
     ...(input.targets ? { targets: input.targets.map((item): RealAnalysisTargetSelection => item.kind === 'job' ? {
       kind: 'job', jobId: item.jobId, rubricId: item.rubricId, rubricVersion: item.rubricVersion, rubricHash: item.rubricHash,
       documentId: item.documentId, documentVersion: item.documentVersion, documentSha256: item.documentSha256,
+      ...(item.approvalId ? { approvalId: item.approvalId } : {}),
     } : {
       kind: 'grade', ladderId: item.ladderId, grade: item.grade, versionId: item.versionId, version: item.version, versionHash: item.versionHash,
       approvalId: item.approvalId, reviewId: item.reviewId, sourceSetId: item.sourceSetId, sourceSetHash: item.sourceSetHash,
@@ -299,9 +306,10 @@ export function resolveRealAnalysisNavigation(params: URLSearchParams, state: un
   return { params: restored, transferred: true, error: null }
 }
 
+/** The exact version and a short content hash, so views that show scores also show which rubric produced them. */
 export function targetVersionLabel(selection: RealAnalysisTargetSelection): string {
-  return selection.kind === 'job' ? `Job rubric v${selection.rubricVersion} · source v${selection.documentVersion}`
-    : `GS-${selection.grade} · approved v${selection.version}`
+  return selection.kind === 'job' ? `Job rubric v${selection.rubricVersion} · ${selection.rubricHash.slice(0, 8)} · source v${selection.documentVersion}`
+    : `GS-${selection.grade} · approved v${selection.version} · ${selection.versionHash.slice(0, 8)}`
 }
 
 const ids = (value: string | null) => (value ?? '').split(',').map((item) => item.trim()).filter(Boolean)
@@ -318,6 +326,7 @@ export function isRealTargetSelection(value: unknown): value is RealAnalysisTarg
   if (!object(value)) return false
   if (value.kind === 'job') return text(value.jobId) && text(value.rubricId) && version(value.rubricVersion)
     && hash(value.rubricHash) && text(value.documentId) && version(value.documentVersion) && hash(value.documentSha256)
+    && (value.approvalId === undefined || text(value.approvalId))
   return value.kind === 'grade' && text(value.ladderId) && version(value.grade) && Number(value.grade) <= 15
     && text(value.versionId) && version(value.version) && hash(value.versionHash) && text(value.approvalId) && text(value.reviewId)
     && text(value.sourceSetId) && hash(value.sourceSetHash)

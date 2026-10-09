@@ -10,7 +10,13 @@ import {
   validateObservations,
   executeFixedJudgeEvaluation, executeFixedJudgeSuite, validateFixedJudgeEvaluation,
   validateFixedJudgeProposals, validateFixedJudgeObservations,
+  rubricRepeatabilitySuiteSchema, validateRubricGeneration, validateRubricGenerationObservations,
+  executeRubricRepeatabilitySuite, executeRubricGeneration,
+  gradeGenerationSuiteSchema, validateGradeGeneration, validateGradeGenerationObservations,
+  executeGradeGenerationSuite, executeGradeGeneration,
 } from '../dist-worker/scoring-evaluation.mjs'
+
+const GENERATION_KINDS = ['rubric-generation', 'grade-generation']
 
 async function json(path) {
   return JSON.parse(await readFile(path, 'utf8'))
@@ -42,19 +48,25 @@ async function main() {
     throw new Error('Usage: scoring-evaluation-run.mjs <private-manifest.json> <private-output-directory> --confirm-paid-inference')
   }
   const manifest = await json(resolve(manifestPath))
-  const suite = scoringSuiteSchema.parse(manifest.suite)
   const kind = manifest.kind ?? 'scoring'
-  if (!['scoring', 'fixed-judge'].includes(kind)) throw new Error('Unknown evaluation manifest kind.')
+  if (!['scoring', 'fixed-judge', ...GENERATION_KINDS].includes(kind)) throw new Error('Unknown evaluation manifest kind.')
+  const generation = GENERATION_KINDS.includes(kind)
+  const suite = kind === 'rubric-generation' ? rubricRepeatabilitySuiteSchema.parse(manifest.suite)
+    : kind === 'grade-generation' ? gradeGenerationSuiteSchema.parse(manifest.suite) : scoringSuiteSchema.parse(manifest.suite)
   const proposals = kind === 'fixed-judge' ? validateFixedJudgeProposals(suite, manifest.proposals) : null
   const endpoint = new URL(manifest.endpoint)
   if (endpoint.protocol !== 'https:' || !endpoint.hostname.endsWith('.openai.azure.com') ||
     endpoint.username || endpoint.password || endpoint.port || endpoint.pathname !== '/' || endpoint.search || endpoint.hash) {
     throw new Error('Evaluation requires a fixed Azure OpenAI HTTPS account endpoint.')
   }
-  if (!Array.isArray(manifest.inputs) || !Array.isArray(manifest.settings)) throw new Error('Private input/settings arrays are required.')
-  const inputs = new Map(manifest.inputs.map(row => [row.id, row.input]))
+  // Scoring reads resume inputs, rubric generation reads job documents and grade generation reads frozen ladder fixtures.
+  const sourceKey = { 'rubric-generation': 'documents', 'grade-generation': 'fixtures' }[kind] ?? 'inputs'
+  if (!Array.isArray(manifest[sourceKey]) || !Array.isArray(manifest.settings)) throw new Error(`Private ${sourceKey}/settings arrays are required.`)
+  const inputs = new Map(manifest[sourceKey].map(row => generation
+    ? [row.sourceId, kind === 'rubric-generation' ? row.document : row.fixture] : [row.id, row.input]))
   const settings = new Map(manifest.settings.map(row => [row.id, row.snapshot]))
-  if (inputs.size !== manifest.inputs.length || settings.size !== manifest.settings.length) throw new Error('Duplicate private input/settings IDs.')
+  if (inputs.size !== manifest[sourceKey].length || settings.size !== manifest.settings.length) throw new Error(`Duplicate private ${sourceKey}/settings IDs.`)
+  if (generation && !Number.isFinite(Date.parse(manifest.createdAt))) throw new Error('Generation manifests require an explicit createdAt timestamp.')
   if (!Number.isInteger(manifest.concurrency) || manifest.concurrency < 1 || manifest.concurrency > 8) {
     throw new Error('Explicit evaluation concurrency must be one through eight.')
   }
@@ -73,13 +85,15 @@ async function main() {
     Number.isSafeInteger(value) && value >= 1000 && value <= 86_400_000)) {
     throw new Error('Evaluation and comparison deadlines must be 1000-86400000 milliseconds.')
   }
-  for (const item of suite.cases) for (const configuration of suite.configurations) {
-    const job = {
-      suiteSha256: evaluationHash(suite), case: item, configuration, repetition: 1,
-    }
-    const options = { input: inputs.get(item.id), processingSettings: settings.get(configuration.id), prices: manifest.prices }
-    if (kind === 'fixed-judge') validateFixedJudgeEvaluation(job, { ...options, ...proposals.get(item.id) })
-    else validateProductionEvaluation(job, options)
+  for (const item of generation ? suite.sources : suite.cases) for (const configuration of suite.configurations) {
+    const job = generation
+      ? { suiteSha256: evaluationHash(suite), source: item, configuration, repetition: 1 }
+      : { suiteSha256: evaluationHash(suite), case: item, configuration, repetition: 1 }
+    const options = { processingSettings: settings.get(configuration.id), prices: manifest.prices }
+    if (kind === 'rubric-generation') validateRubricGeneration(job, { ...options, document: inputs.get(item.id) })
+    else if (kind === 'grade-generation') validateGradeGeneration(job, { ...options, fixture: inputs.get(item.id) })
+    else if (kind === 'fixed-judge') validateFixedJudgeEvaluation(job, { ...options, input: inputs.get(item.id), ...proposals.get(item.id) })
+    else validateProductionEvaluation(job, { ...options, input: inputs.get(item.id) })
   }
   const initialMilestones = costMilestoneStateSchema.parse({
     schemaVersion: 1, programId: manifest.programId ?? suite.id, reportedThroughUsdMicros: 0, pending: [],
@@ -130,8 +144,9 @@ async function main() {
     const ledgerPath = resolve(costRoot, `${programKey}.ledger.json`)
     const milestonePath = resolve(costRoot, `${programKey}.state.json`)
     const prior = await loadOr(observationsPath, [])
-    const observations = kind === 'fixed-judge'
-      ? validateFixedJudgeObservations(suite, proposals, prior) : validateObservations(suite, prior)
+    const observations = kind === 'fixed-judge' ? validateFixedJudgeObservations(suite, proposals, prior)
+      : kind === 'rubric-generation' ? validateRubricGenerationObservations(suite, prior)
+        : kind === 'grade-generation' ? validateGradeGenerationObservations(suite, prior) : validateObservations(suite, prior)
     const executionPath = resolve(output, 'execution.json')
     const previousExecution = await loadOr(executionPath, null)
     const executionFiles = await Promise.all([
@@ -150,10 +165,12 @@ async function main() {
       nodeVersion: process.version, suiteSha256: evaluationHash(suite),
       endpoint: endpoint.href, pricesSha256: evaluationHash(manifest.prices),
       ...(kind === 'fixed-judge' ? { kind, proposalsSha256: evaluationHash(manifest.proposals) } : {}),
+      ...(generation ? { kind, sourcesSha256: evaluationHash(manifest[sourceKey]), createdAt: manifest.createdAt } : {}),
     }
     const legacy = previousExecution?.status === 'legacy-unverified' || !previousExecution && observations.length > 0
     if (legacy) {
-      if (observations.length !== suite.cases.length * suite.configurations.length * suite.repetitions) {
+      const expected = (generation ? suite.sources : suite.cases).length * suite.configurations.length * suite.repetitions
+      if (observations.length !== expected) {
         throw new Error('Legacy partial runs have no execution binding; use a separately versioned audited follow-up, not silent mixed-code resume.')
       }
       if (!previousExecution) await atomic(executionPath, { schemaVersion: 1, status: 'legacy-unverified' })
@@ -199,7 +216,10 @@ async function main() {
       writes = writes.then(operation)
       return writes
     }
-    const executeSuite = kind === 'fixed-judge' ? executeFixedJudgeSuite : executeScoringSuite
+    const executeSuite = {
+      'fixed-judge': executeFixedJudgeSuite, 'rubric-generation': executeRubricRepeatabilitySuite,
+      'grade-generation': executeGradeGenerationSuite,
+    }[kind] ?? executeScoringSuite
     await executeSuite(suite, {
       ...(kind === 'fixed-judge' ? { proposals: manifest.proposals } : {}),
       concurrency: manifest.concurrency, signal: controller.signal, priorObservations: observations,
@@ -210,55 +230,65 @@ async function main() {
         ), maxComparisonMilliseconds)
         const comparisonSignal = signal ? AbortSignal.any([signal, comparisonController.signal]) : comparisonController.signal
         const snapshot = settings.get(job.configuration.id)
-        const input = inputs.get(job.case.id)
+        // Generation jobs are keyed by their frozen source; scoring jobs by their case.
+        const itemId = generation ? job.source.id : job.case.id
+        const input = inputs.get(itemId)
+        const filename = evaluationHash([itemId, job.configuration.id, job.repetition])
+        const record = (suffix, value) => atomic(resolve(output, `${filename}.${suffix}.json`), value)
         try {
           if (snapshot === undefined || input === undefined) throw new Error('Missing private frozen evaluation artifacts.')
           const options = {
-          input, processingSettings: snapshot, prices: manifest.prices,
-          model: {
-            endpoint: endpoint.href, deployment: 'captured-task-only', modelName: 'captured-task-only',
-            getToken,
-          },
-          admitPaidWork: async () => { signal?.throwIfAborted() },
-          recordAttempt: (attempt, amountUsdMicros, priceVersion) => serialize(async () => {
-            await appendFile(resolve(output, 'model-attempts.jsonl'), `${JSON.stringify({
-              ...attempt, evaluation: {
-                suiteSha256: job.suiteSha256, caseId: job.case.id,
-                configurationId: job.configuration.id, repetition: job.repetition,
-              },
-            })}\n`, { mode: 0o600 })
-            ledger.push({
-              schemaVersion: 1, id: attempt.id, costItemId: attempt.id, suiteId: suite.id,
-              category: 'inference', mode: 'estimate', amountUsdMicros, priceVersion,
-              usage: attempt.usage && attempt.usage.cachedInputTokens !== null
-                ? attempt.usage : null,
-            })
-            await atomic(ledgerPath, ledger)
-            const advanced = advanceCostMilestones(milestones, ledger)
-            milestones = advanced.state
-            await atomic(milestonePath, milestones)
-            emitPendingMilestones(advanced)
-          }),
-          recordPrivateResult: async result => {
-            const filename = evaluationHash([job.case.id, job.configuration.id, job.repetition])
-            await atomic(resolve(output, `${filename}.result.json`), result)
-          },
-          recordPrivateDiagnostics: async diagnostics => {
-            const filename = evaluationHash([job.case.id, job.configuration.id, job.repetition])
-            await atomic(resolve(output, `${filename}.diagnostics.json`), diagnostics)
-          },
-          recordPrivateFailure: async failure => {
-            const filename = evaluationHash([job.case.id, job.configuration.id, job.repetition])
-            await atomic(resolve(output, `${filename}.failure.json`), failure)
-          },
-          }
-          const result = kind === 'fixed-judge' ? await executeFixedJudgeEvaluation(job, {
-            ...options, ...proposals.get(job.case.id),
-            recordPrivateReview: async review => {
-              const filename = evaluationHash([job.case.id, job.configuration.id, job.repetition])
-              await atomic(resolve(output, `${filename}.review.json`), review)
+            processingSettings: snapshot, prices: manifest.prices,
+            model: {
+              endpoint: endpoint.href, deployment: 'captured-task-only', modelName: 'captured-task-only',
+              getToken,
             },
-          }, comparisonSignal) : await executeProductionEvaluation(job, options, comparisonSignal)
+            admitPaidWork: async () => { signal?.throwIfAborted() },
+            recordAttempt: (attempt, amountUsdMicros, priceVersion) => serialize(async () => {
+              await appendFile(resolve(output, 'model-attempts.jsonl'), `${JSON.stringify({
+                ...attempt, evaluation: {
+                  suiteSha256: job.suiteSha256, caseId: itemId,
+                  configurationId: job.configuration.id, repetition: job.repetition,
+                },
+              })}\n`, { mode: 0o600 })
+              ledger.push({
+                schemaVersion: 1, id: attempt.id, costItemId: attempt.id, suiteId: suite.id,
+                category: 'inference', mode: 'estimate', amountUsdMicros, priceVersion,
+                usage: attempt.usage && attempt.usage.cachedInputTokens !== null
+                  ? attempt.usage : null,
+              })
+              await atomic(ledgerPath, ledger)
+              const advanced = advanceCostMilestones(milestones, ledger)
+              milestones = advanced.state
+              await atomic(milestonePath, milestones)
+              emitPendingMilestones(advanced)
+            }),
+            recordPrivateFailure: failure => record('failure', failure),
+          }
+          const binding = { sourceId: itemId, configurationId: job.configuration.id, repetition: job.repetition }
+          let result
+          if (kind === 'rubric-generation') {
+            result = await executeRubricGeneration(job, {
+              ...options, document: input, createdAt: manifest.createdAt,
+              recordPrivateRubric: generated => record('rubric', { ...binding, ...generated }),
+            }, comparisonSignal)
+          } else if (kind === 'grade-generation') {
+            result = await executeGradeGeneration(job, {
+              ...options, fixture: input, createdAt: manifest.createdAt,
+              recordPrivateGeneration: generated => record('grades', { ...binding, ...generated }),
+            }, comparisonSignal)
+          } else if (kind === 'fixed-judge') {
+            result = await executeFixedJudgeEvaluation(job, {
+              ...options, input, ...proposals.get(job.case.id),
+              recordPrivateReview: review => record('review', review),
+            }, comparisonSignal)
+          } else {
+            result = await executeProductionEvaluation(job, {
+              ...options, input,
+              recordPrivateResult: result => record('result', result),
+              recordPrivateDiagnostics: diagnostics => record('diagnostics', diagnostics),
+            }, comparisonSignal)
+          }
           comparisonSignal.throwIfAborted()
           return result
         } finally {

@@ -59,6 +59,22 @@ function validateJob(value: unknown, workspaceId: string, id?: string): RealJobR
   return value
 }
 
+/**
+ * New admissions enforce the approval policy and treat a moved approval as a stale selection. Re-validating
+ * already accepted work (replays and retries) ignores approval: the frozen version was approved when it was accepted.
+ */
+export interface TargetPolicy {
+  approvalRequired?: boolean
+  ignoreApproval?: boolean
+}
+
+function comparable(selection: RealJobTargetSelection, policy: TargetPolicy): RealJobTargetSelection {
+  if (!policy.ignoreApproval) return selection
+  const copy = { ...selection }
+  delete copy.approvalId
+  return copy
+}
+
 export class RealAnalysisTargets {
   constructor(private readonly deps: AnalysisSourceDeps) {}
 
@@ -76,7 +92,10 @@ export class RealAnalysisTargets {
     return record as Extract<GradeEntity, { recordType: K }>
   }
 
-  private async jobTarget(workspaceId: string, job: RealJobRecord, selection?: RealJobTargetSelection): Promise<ResolvedJob[]> {
+  private async jobTarget(
+    workspaceId: string, job: RealJobRecord, selection?: RealJobTargetSelection, options: TargetPolicy = {},
+  ): Promise<ResolvedJob[]> {
+    const approvalRequired = options.approvalRequired === true && options.ignoreApproval !== true
     if (!this.deps.jobs) throw unavailable('Real job targets are unavailable.')
     if ((await this.deps.jobs.store.getWorkspaceLifecycle(workspaceId)).state !== 'active') {
       throw conflict('The selected job workspace is archived or removed.')
@@ -99,23 +118,41 @@ export class RealAnalysisTargets {
     if (validateRealSourceDocument(document, source.originalContentType).length || document.id !== job.job.documentId) {
       throw unavailable('The selected job document has invalid captured evidence.')
     }
-    const rubrics = selection ? savedRubrics.filter(item => item.id === selection.rubricId && item.version === selection.rubricVersion) : savedRubrics
-    if (!rubrics.length || (selection && rubrics.length !== 1)) throw conflict('The exact selected saved job rubric version is unavailable.')
+    const approval = job.rubricApproval
+    const approved = (rubric: { id: string; version: number }) => approval?.rubricId === rubric.id && approval.version === rubric.version
+    if (!savedRubrics.length) throw conflict('The exact selected saved job rubric version is unavailable.')
+    if (approval && savedRubrics.filter(approved).length !== 1) throw unavailable('The approved job rubric version is unavailable.')
+    // While approval is required, discovery offers only the approved version and selections must name it.
+    const rubrics = selection ? savedRubrics.filter(item => item.id === selection.rubricId && item.version === selection.rubricVersion)
+      : approvalRequired ? savedRubrics.filter(approved) : savedRubrics
+    if (selection && rubrics.length !== 1) throw conflict('The exact selected saved job rubric version is unavailable.')
     if (new Set(rubrics.map(item => `${item.id}:${item.version}`)).size !== rubrics.length) throw unavailable('Saved job rubric versions are duplicated.')
+    const latestVersion = Math.max(...savedRubrics.map(item => item.version))
     return rubrics.map(rubric => {
       if (rubric.jobId !== job.id || validateRealRubric(rubric, document, source.originalContentType).length) {
         throw unavailable('The saved real job rubric has invalid source evidence.')
       }
+      const rubricHash = analysisHash(rubric)
+      const isApproved = approved(rubric)
+      if (isApproved && approval!.rubricHash !== rubricHash) throw unavailable('The approved job rubric version has invalid stored data.')
+      if (approvalRequired && !isApproved) {
+        throw conflict('This job rubric version isn\'t approved, so new analyses can\'t use it. A workspace owner approves rubrics on the job\'s rubric page.')
+      }
       const exact: RealJobTargetSelection = {
         kind: 'job', jobId: job.id, rubricId: rubric.id, rubricVersion: rubric.version,
-        rubricHash: analysisHash(rubric), documentId: document.id, documentVersion: document.version, documentSha256: documentBlob.sha256,
+        rubricHash, documentId: document.id, documentVersion: document.version, documentSha256: documentBlob.sha256,
+        ...(isApproved ? { approvalId: approval!.approvalId } : {}),
       }
-      if (selection && analysisHash(selection) !== analysisHash(exact)) throw conflict('The selected job rubric or source hash is stale. Refresh targets and choose an exact version.')
+      if (selection && analysisHash(comparable(selection, options)) !== analysisHash(comparable(exact, options))) {
+        throw conflict('The selected job rubric or source hash is stale. Refresh targets and choose an exact version.')
+      }
       const summary: RealJobTargetSummary = {
         kind: 'job', id: analysisTargetSummaryId(exact), workspaceId, dataKind: 'real', selection: exact,
         ...(job.displayName !== undefined ? { displayName: job.displayName } : {}),
-        label: job.job.title, sublabel: `${job.job.organization}${job.job.organization ? ' · ' : ''}${rubric.name} · v${rubric.version}`,
+        label: job.job.title,
+        sublabel: `${job.job.organization}${job.job.organization ? ' · ' : ''}${rubric.name} · ${isApproved ? 'approved ' : ''}v${rubric.version}`,
         rubricId: rubric.id, rubricVersion: rubric.version, criterionCount: rubric.criteria.length,
+        ...(isApproved ? { approvedAt: approval!.approvedAt, newerDraftAvailable: latestVersion > rubric.version } : {}),
       }
       parseAnalysisTargetSummary(summary)
       const frozenRubric = rubric as FrozenJobTargetSnapshot['rubric']
@@ -214,26 +251,32 @@ export class RealAnalysisTargets {
     return result
   }
 
-  async resolve(workspaceId: string, selection: RealAnalysisTargetSelection): Promise<ResolvedAnalysisTarget> {
+  async resolve(
+    workspaceId: string, selection: RealAnalysisTargetSelection, options: TargetPolicy = {},
+  ): Promise<ResolvedAnalysisTarget> {
     assertWorkspaceMutationLease(workspaceId)
     if (selection.kind === 'job') {
       if (!this.deps.jobs) throw unavailable('Real job targets are unavailable.')
       const value = await this.deps.jobs.store.get(workspaceId, selection.jobId)
       if (!value) throw notFound('The selected real job was not found.')
-      return (await this.jobTarget(workspaceId, validateJob(value.record, workspaceId, selection.jobId), selection))[0]
+      return (await this.jobTarget(workspaceId, validateJob(value.record, workspaceId, selection.jobId), selection, options))[0]
     }
     const head = await this.grade(workspaceId, gradeHeadId(selection.ladderId, selection.grade), 'grade-head', selection.ladderId)
     return this.gradeTarget(workspaceId, head, selection)
   }
 
-  async list(workspaceId: string, continuationToken?: string, limit = 50): Promise<RealAnalysisTargetsPage> {
+  async list(
+    workspaceId: string, continuationToken?: string, limit = 50, options: { approvalRequired?: boolean } = {},
+  ): Promise<RealAnalysisTargetsPage> {
     validateAnalysisPage(limit, continuationToken)
     const scope = { workspaceId, kind: 'targets' as const }
     const after = analysisPageCursor(scope, continuationToken)
     if (after && !/^target-[a-f0-9]{48}$/.test(after)) throw invalidRequest('The target page cursor is invalid.')
     if (!this.deps.jobs && !this.deps.grades) throw unavailable('Real analysis target libraries are unavailable.')
+    const approvalRequired = options.approvalRequired === true
     const summaries: RealAnalysisTargetSummary[] = []
     let count = 0
+    let unapprovedJobRubrics = 0
     if (this.deps.jobs && (await this.deps.jobs.store.getWorkspaceLifecycle(workspaceId)).state === 'active') {
       let token: string | undefined
       const seen = new Set<string>()
@@ -247,7 +290,11 @@ export class RealAnalysisTargets {
           if (first + index + 1 > 10_000) throw unavailable('The target library exceeds the safe discovery budget.')
           if (job.job.status !== 'ready' || analysisIsLocked(job.lifecycle) ||
             analysisIsLocked(job.rubricLifecycle) || job.job.rubricDeletedAt) return []
-          return (await this.jobTarget(workspaceId, job)).map(item => item.summary)
+          if (approvalRequired && !job.rubricApproval) {
+            unapprovedJobRubrics++
+            return []
+          }
+          return (await this.jobTarget(workspaceId, job, undefined, { approvalRequired })).map(item => item.summary)
         })
         for (const items of found) {
           summaries.push(...items)
@@ -281,7 +328,11 @@ export class RealAnalysisTargets {
     if (new Set(summaries.map(item => item.id)).size !== summaries.length) throw unavailable('Target discovery returned duplicate identities.')
     const ordered = summaries.sort((a, b) => a.id.localeCompare(b.id)).filter(item => !after || item.id > after)
     const targets = ordered.slice(0, limit)
-    return { targets, ...(ordered.length > limit ? { continuationToken: analysisPageToken(scope, targets.at(-1)!.id) } : {}) }
+    return {
+      targets,
+      ...(ordered.length > limit ? { continuationToken: analysisPageToken(scope, targets.at(-1)!.id) } : {}),
+      ...(approvalRequired ? { unapprovedJobRubrics } : {}),
+    }
   }
 }
 

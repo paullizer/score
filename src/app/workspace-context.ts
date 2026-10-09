@@ -3,6 +3,7 @@ import type { Rubric, Workspace } from '../domain/types'
 import type { CloudUser, WorkspaceSummary } from '../domain/cloud'
 import type { JobProcessingFeatures, RealJobDetail, RealJobSource, RealJobSummary } from '../domain/real-jobs'
 import type { RubricAssistRequest, RubricAssistResponse } from '../domain/rubric-assist'
+import type { RubricCheckState } from '../domain/rubric-approval'
 import type { LifecycleAction, LifecycleImpact, LifecycleOperation, LifecycleTarget } from '../domain/lifecycle'
 
 export interface PendingLifecycleChange {
@@ -50,6 +51,12 @@ export interface CloudWorkspaceStatus {
     importFile: (file: File, idempotencyKey: string, batchId?: string) => Promise<RealJobSummary>
     importUrl: (url: string, idempotencyKey: string, batchId?: string) => Promise<RealJobSummary>
     assistRubric: (jobId: string, request: RubricAssistRequest, signal?: AbortSignal) => Promise<RubricAssistResponse>
+    /** The checks and approval state of one exact saved rubric version. */
+    rubricChecks: (jobId: string, rubricId: string, version: number, signal?: AbortSignal) => Promise<RubricCheckState>
+    /** Runs the checks once for a saved version (one model review); later calls return the stored results. */
+    runRubricChecks: (jobId: string, rubricId: string, version: number, signal?: AbortSignal) => Promise<RubricCheckState>
+    /** Owner-only approval of exactly the checked version. */
+    approveRubric: (jobId: string, review: RubricCheckState) => Promise<void>
     originalUrl: (jobId: string) => string
   }
 }

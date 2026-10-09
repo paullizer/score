@@ -3,6 +3,7 @@ import { Link } from 'react-router-dom'
 import { FileSearch, Layers3, Pencil, ShieldCheck, Sparkles } from 'lucide-react'
 import { useWorkspace } from '../../app/workspace-context'
 import { Badge, Button, EmptyState, InlineError } from '../../components/ui'
+import { EVIDENCE_SCALE_V1 } from '../../domain/evidence-scale'
 import type { Citation, Criterion, Rubric } from '../../domain/types'
 import { documentPagination, isUploadFormat, UPLOAD_CONTENT_TYPES } from '../../domain/document-formats'
 import { RubricEditor } from './RubricEditor'
@@ -11,6 +12,8 @@ import { useLifecycleAccess } from '../../components/lifecycle/useLifecycleAcces
 import { workspaceCanEdit } from '../../domain/workspace-permissions'
 import { SCORE_LEGEND } from '../../domain/rubric-exports'
 import { RubricExport } from './RubricExport'
+import { RubricApprovalCard, RubricStatusBadge } from './RubricApproval'
+import { useRubricApproval } from './useRubricApproval'
 
 export function RubricPanel({ rubric, onSelectCriterion, onVersionSaved, readOnly = false }: {
   rubric: Rubric
@@ -37,6 +40,7 @@ export function RubricPanel({ rubric, onSelectCriterion, onVersionSaved, readOnl
   const assistantAvailable = Boolean(editable && job && detail?.state === 'ready' && document && cloud.realJobs.features?.rubricAssistant)
   const total = rubric.criteria.reduce((sum, criterion) => sum + criterion.weight, 0)
   const balanced = Number.isFinite(total) && Math.abs(total - 100) <= 0.000001
+  const { status: approvalStatus } = useRubricApproval(rubric)
 
   return <div className="min-w-0">
     <div className="section-heading">
@@ -50,6 +54,7 @@ export function RubricPanel({ rubric, onSelectCriterion, onVersionSaved, readOnl
       <div>
         <div className="mb-3 flex flex-wrap gap-2">
           <Badge tone="accent">{rubric.provenance?.kind === 'edited' ? 'Reviewer edited' : 'Generated from source'}</Badge>
+          {rubric.kind === 'job' && <RubricStatusBadge status={approvalStatus} />}
           {rubric.grade && <Badge>{rubric.grade}</Badge>}
           <ArchivedBadge target={{ kind: 'rubric', id: rubric.groupId }} />
           <Badge tone={balanced ? 'neutral' : 'warning'}>{Number.isFinite(total) ? `${Number(total.toFixed(6))}% total weight` : 'Invalid total weight'}</Badge>
@@ -73,6 +78,8 @@ export function RubricPanel({ rubric, onSelectCriterion, onVersionSaved, readOnl
           </div>
         </div>
       </div>
+
+      <RubricApprovalCard rubric={rubric} readOnly={readOnly} />
 
       {!readOnly && <div className="flex flex-wrap gap-2">
         <Button icon={Pencil} size="sm" disabled={!editable} onClick={() => { setError(''); setInitialEditorPanel(null); setInitialFocusCriterionId(null); setEditing(true) }}>Edit rubric</Button>
@@ -114,7 +121,11 @@ export function RubricPanel({ rubric, onSelectCriterion, onVersionSaved, readOnl
             </div>
             <details className="mt-3 border-t pt-3 text-[11px]">
               <summary className="cursor-pointer font-medium text-muted">Score guidance <span className="font-normal">(0–5)</span></summary>
-              <p className="mt-2 whitespace-pre-line text-muted">{criterion.guidance || 'No score guidance has been provided.'}</p>
+              {rubric.scaleVersion && criterion.levels ? <div className="mt-2 space-y-2 text-muted">
+                <p><strong>0 · {EVIDENCE_SCALE_V1.levels[0].label}.</strong> {EVIDENCE_SCALE_V1.levels[0].description}</p>
+                {criterion.levels.map((level, levelIndex) => <p key={level.level}><strong>{level.level} · {EVIDENCE_SCALE_V1.levels[levelIndex + 1].label}.</strong> {EVIDENCE_SCALE_V1.levels[levelIndex + 1].description} Examples: {level.examples}</p>)}
+                <p>{EVIDENCE_SCALE_V1.tieRule} {EVIDENCE_SCALE_V1.basis}</p>
+              </div> : <p className="mt-2 whitespace-pre-line text-muted">{criterion.guidance || 'No score guidance has been provided.'}</p>}
             </details>
             {citations.length > 0 && job && <div className="mt-3 space-y-3">{citations.map((citation, citationIndex) => {
               const citationSource = document?.paragraphs.find((paragraph) => paragraph.id === citation.paragraphId)

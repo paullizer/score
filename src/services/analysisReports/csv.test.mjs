@@ -74,7 +74,7 @@ test('custom labels get separate CSV columns without replacing source identity o
   const report = model.buildAnalysisReport(input)
   const original = JSON.stringify(report)
   const result = records(writer.generateCsvReport(report, options))
-  assert.equal(result.headers.length, 13)
+  assert.equal(result.headers.length, 14)
   assert.deepEqual(result.headers.slice(-2), ['Candidate display label', 'Job/grade display title'])
   const row = result.records[0]
   assert.equal(row['Candidate name'], input.comparisons[0].candidate.name)
@@ -97,7 +97,7 @@ test('mixed captured aliases append only two columns and leave canonical target 
     comparison.candidate.displayName = 'Captured resume label'
   }
   const result = records(writer.generateCsvReport(model.buildAnalysisReport(input), options))
-  assert.equal(result.headers.length, 13)
+  assert.equal(result.headers.length, 14)
   assert.equal(result.records[0]['Candidate name'], input.comparisons[0].candidate.sourceLabel)
   assert.equal(result.records[0]['Candidate display label'], 'Captured resume label')
   assert.equal(result.records[1]['Candidate display label'], '')
@@ -122,13 +122,14 @@ test('CSV uses the compact reader-facing schema and round-trips quoted Unicode s
   const result = records(bytes)
   assert.deepEqual(result.headers, [
     'Candidate name', 'Job/grade', 'Overall score', 'Overall assessment', 'C1', 'C2',
-    'Analysis date', 'Source', 'Analysis link', 'Resume link', 'Job/grade link',
+    'Analysis date', 'Source', 'Analysis link', 'Resume link', 'Job/grade link', 'Rubric version',
   ])
   assert.equal(result.records[0]['Candidate name'], input.comparisons[0].candidate.name)
   assert.equal(result.records[0].Source, input.comparisons[0].candidate.sourceLabel)
   assert.match(result.records[0]['Overall assessment'], /survey/)
   assert.ok(result.records[0]['Overall assessment'].length <= 300)
   assert.equal(result.records[0]['Overall score'], '92.75')
+  assert.equal(result.records[0]['Rubric version'], 'Rubric v1 · aaaaaaaa · source document v2')
   assert.equal(result.records[0]['Analysis date'], 'Sep 18, 2026')
   assert.equal(result.rows.length, input.comparisons.length)
   assert.equal(JSON.stringify(report), original)
@@ -215,7 +216,7 @@ test('all 500 completed comparisons are exported without ranking and tie metadat
   const report = model.buildAnalysisReport(realReportFixture({ scores: Array(500).fill(80) }))
   const result = records(writer.generateCsvReport(report, options))
   assert.equal(result.records.length, 500)
-  assert.equal(result.headers.length, 11)
+  assert.equal(result.headers.length, 12)
   assert.ok(!result.headers.some(header => /rank|highlight|cutoff|ties/i.test(header)))
   assert.equal(new Set(result.records.map(row => row['Analysis link'])).size, 500)
 })
@@ -255,4 +256,24 @@ test('document weight labels remain readable without concealing approximation or
   const original = JSON.stringify(report)
   assert.deepEqual(records(writer.generateCsvReport(report, options)).headers.slice(4, 7), ['C1', 'C2', 'C3'])
   assert.equal(JSON.stringify(report), original)
+})
+
+test('CSV exports that mix rubric versions of one job name each row’s version and carry the warning', () => {
+  const input = realReportFixture({ targetCount: 2 })
+  for (const target of input.targets) {
+    target.rubricId = 'rubric-0'
+    Object.assign(target.selection, { jobId: 'job-0', rubricId: 'rubric-0' })
+  }
+  input.targets[1].selection.rubricHash = 'b'.repeat(64)
+  input.targets[1].versionLabel = 'Rubric v2 · bbbbbbbb · source document v2'
+  const result = records(writer.generateCsvReport(model.buildAnalysisReport(input), options))
+  assert.equal(result.headers[result.headers.indexOf('Job/grade link') + 1], 'Rubric version')
+  assert.equal(result.headers.at(-1), 'Report disclosures')
+  assert.ok(!result.headers.includes('Report title'), 'A default title is not repeated')
+  assert.deepEqual([...new Set(result.records.map(row => row['Rubric version']))], [
+    'Rubric v1 · aaaaaaaa · source document v2', 'Rubric v2 · bbbbbbbb · source document v2',
+  ])
+  for (const row of result.records) assert.match(row['Report disclosures'], /Rubric versions differ for Same saved target label \(v1 · aaaaaaaa, v2 · bbbbbbbb\)/)
+  const single = records(writer.generateCsvReport(model.buildAnalysisReport(realReportFixture({ targetCount: 2 })), options))
+  assert.ok(single.headers.includes('Rubric version') && !single.headers.includes('Report disclosures'))
 })

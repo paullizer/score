@@ -79,7 +79,7 @@ test('real API/client lifecycle captures exact seed versions, real PDFs, frozen 
     restoreFetch = fixture.installClientFetch()
     const client = runtime.client, workspaceId = fixture.workspaceId, ladderId = seeded.detail.ladder.id
     let detail = seeded.detail
-    assert.equal(detail.ladder.seedRubricVersion, 1, 'a stable rubric ID does not silently select latest seed v2')
+    assert.equal(detail.ladder.seedRubricVersion, seeded.seed.latestRubric.version, 'the ladder starts from the approved seed version, not another saved version')
     assert.equal(detail.sources.filter((source) => source.origin !== 'seed-job').length, 1)
     assert.equal(detail.sources.length, 2, 'the seed is captured in addition to the supporting source')
     assert.equal(detail.levels.find((level) => level.head.grade === 9).head.status, 'ready-for-review')

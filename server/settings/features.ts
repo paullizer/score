@@ -1,6 +1,6 @@
 import {
   projectPublicSettings, rubricAssistantEnabled, rubricExportsEnabled, runtimeSettingsReadiness,
-  qcReviewsEnabled, analysisEvidenceCorrectionsEnabled,
+  qcReviewsEnabled, analysisEvidenceCorrectionsEnabled, rubricApprovalRequired as rubricApprovalSwitch,
 } from '../../src/domain/admin-settings'
 import type { ProcessingSettingsSnapshot, PublicFeaturesResponse, SettingsDeploymentCapabilities } from '../../src/domain/admin-settings'
 import { JOB_IMPORT_LIMITS } from '../../src/domain/real-jobs'
@@ -41,13 +41,17 @@ export function effectiveFeatures(
   const rubricAssistant = capabilities.rubricAssistant === true && admitting && rubricAssistantEnabled(settings)
   // Exports are reads: they need the real-job deployment and the Admin switch, but not new-work admission.
   const rubricExports = capabilities.realJobImports && rubricExportsEnabled(settings)
+  // A policy rather than an admission: new analyses and grade ladders enforce it, and pausing new work doesn't change it.
+  const rubricApprovalRequired = rubricApprovalSwitch(settings)
+  // The checks before approval call the job-rubric model, so they need its deployment and new-work admission.
+  const rubricChecks = capabilities.realJobImports && capabilities.rubricAssistant === true && admitting
   const reference = settings.grades.references
   const publicSettings = projectPublicSettings(snapshot, runtimeEnabled, settingsConfigured)
   publicSettings.features = {
     ...publicSettings.features, jobImports: realJobImports, resumeImports: realResumeImports,
     gradeLadders: realGradeLadders, newAnalyses: realAnalyses, summaryGeneration: analysisSummaryGeneration, rubricAssistant,
     rubricExports,
-    qcReviews, analysisEvidenceCorrections,
+    qcReviews, analysisEvidenceCorrections, rubricApprovalRequired,
   }
   for (const [kind, available] of [['jobs', realJobImports], ['resumes', realResumeImports]] as const) {
     publicSettings.imports[kind].allowedFormats = available
@@ -64,6 +68,8 @@ export function effectiveFeatures(
     analysisEvidenceCorrections, qcReviews,
     rubricAssistant,
     rubricExports,
+    rubricApprovalRequired,
+    rubricChecks,
     wordDocumentImports: capabilities.wordDocumentImports && (
       (realJobImports && jobPolicy.allowedFormats.some(format => format === 'doc' || format === 'docx')) ||
       (realResumeImports && resumePolicy.allowedFormats.some(format => format === 'doc' || format === 'docx'))

@@ -22,3 +22,11 @@ export function qcReviewsEnabled(settings: Pick<AdminSettings, 'features'>): boo
 export function analysisEvidenceCorrectionsEnabled(settings: Pick<AdminSettings, 'features'>): boolean {
   return settings.features.analysisEvidenceCorrections !== false
 }
+
+/**
+ * On unless an administrator turned it off; revisions saved before the switch existed omit the key. While on, new
+ * analyses and grade ladders may use only a job rubric version that a workspace owner approved.
+ */
+export function rubricApprovalRequired(settings: Pick<AdminSettings, 'features'>): boolean {
+  return settings.features.rubricApprovalRequired !== false
+}

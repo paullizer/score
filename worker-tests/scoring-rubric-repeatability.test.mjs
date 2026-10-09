@@ -18,6 +18,13 @@ const document = {
     { id: 'p-0002', page: 1, heading: 'Duties', text: 'Prepares technical reports of findings and methods for program managers.' },
   ],
 }
+const levels = [
+  { level: 1, examples: 'Lists related training or TypeScript as a skill.' },
+  { level: 2, examples: 'Documents one TypeScript project or task.' },
+  { level: 3, examples: 'Documents recurring TypeScript development duties.' },
+  { level: 4, examples: 'Documents independent TypeScript work across a larger service.' },
+  { level: 5, examples: 'Documents leading TypeScript work with team or product outcomes.' },
+]
 const guidance = 'Score 0: The resume does not document this work. Score 1: Coursework. Score 2: One documented task. Score 3: Documented recurring work. Score 4: Documented complex work. Score 5: Documented leadership of the work.'
 const qualifier = 'Score 0: Not documented. Score 1: Needs close supervision. Score 2: Frequent errors. Score 3: Routine work of acceptable quality. Score 4: Independently. Score 5: Expert.'
 function modelRubric(criteria) {
@@ -27,8 +34,8 @@ function modelRubric(criteria) {
     description: 'Survey statistics duties.', warnings: [], criteria,
   }
 }
-const designs = { label: 'Survey design', description: 'Designs sample surveys.', guidance, requirementType: 'required', sourceParagraphId: 'p-0001', quote: 'Designs sample surveys' }
-const reports = { label: 'Technical reporting', description: 'Prepares technical reports.', guidance: qualifier, requirementType: 'required', sourceParagraphId: 'p-0002', quote: 'Prepares technical reports of findings' }
+const designs = { label: 'Survey design', description: 'Designs sample surveys.', requirementType: 'required', sourcePassageIds: [1], levels }
+const reports = { label: 'Technical reporting', description: 'Prepares technical reports.', requirementType: 'required', sourcePassageIds: [2], levels }
 function fixture() {
   const base = settingsSnapshot(settings => {
     for (const deployment of settings.ai.deployments) deployment.modelVersion = '2025-08-07'
@@ -80,7 +87,7 @@ test('rubric adapter uses the production generator, validator, captured settings
   assert.equal(result.rubricSha256, evaluationHash(run.rubrics[0].rubric))
   assert.equal(run.rubrics[0].rubric.jobId, jobId)
   assert.equal(run.rubrics[0].rubric.criteria[0].weight, 60)
-  assert.equal(run.rubrics[0].rubric.criteria[0].sourceCitations[0].quote, 'Designs sample surveys')
+  assert.equal(run.rubrics[0].rubric.criteria[0].sourceCitations[0].quote, 'Designs sample surveys and selects statistical methods for data collection programs.')
   assert.equal(run.rubrics[0].rubric.createdAt, '2026-10-08T00:00:00.000Z')
 })
 
@@ -157,7 +164,7 @@ test('repeatability summary binds rubric artifacts, aligns cited requirements an
   assert.equal(cell.repeats.meanCitedParagraphJaccard, 0.5)
   assert.equal(cell.repeats.meanAbsoluteAlignedWeightDifference, 40)
   assert.equal(cell.referenceAgreement.pairs, 2)
-  assert.deepEqual(cell.markers.map(row => row.performanceQualifierCriteria), [1, 0])
+  assert.deepEqual(cell.markers.map(row => row.performanceQualifierCriteria), [2, 1])
   assert.deepEqual(cell.markers.map(row => row.documentaryEvidenceCriteria), [2, 1])
   assert.equal(report.eligibleForRelease, false)
   assert.equal(compareGeneratedRubrics(generated[0], generated[0]).alignmentRate, 1)
@@ -172,4 +179,56 @@ test('repeatability summary binds rubric artifacts, aligns cited requirements an
   const tampered = structuredClone(rubrics)
   tampered[1].rubric.criteria[0].weight = 99
   assert.throws(() => summarizeRubricRepeatability(data.suite, [{ sourceId: 'gs-13', document }], observations, tampered), /exactly match/)
+})
+
+test('the paid runner resumes rubric-generation manifests without inference, the report binds artifacts, and stale documents are refused', async () => {
+  const { mkdtemp, mkdir, readFile, writeFile, rm } = await import('node:fs/promises')
+  const { tmpdir } = await import('node:os')
+  const { join } = await import('node:path')
+  const { execFile } = await import('node:child_process')
+  const { promisify } = await import('node:util')
+  const { fileURLToPath } = await import('node:url')
+  const exec = promisify(execFile)
+  const runner = fileURLToPath(new URL('../scripts/scoring-evaluation-run.mjs', import.meta.url))
+  const cli = fileURLToPath(new URL('../scripts/scoring-evaluation.mjs', import.meta.url))
+  const data = fixture()
+  const root = await mkdtemp(join(tmpdir(), 'score-rubric-runner-'))
+  try {
+    const generated = []
+    for (const repetition of [1, 2]) {
+      const run = options(data, [() => reply(modelRubric([{ ...designs, weight: 60 }, { ...reports, weight: 40 }]))])
+      generated.push({ repetition, result: await executeRubricGeneration(job(data, repetition), run.value), artifact: run.rubrics[0] })
+    }
+    const manifest = {
+      kind: 'rubric-generation', suite: data.suite, endpoint: 'https://test-account.openai.azure.com/', programId: 'rubric-program',
+      concurrency: 1, createdAt: '2026-10-08T00:00:00.000Z', documents: [{ sourceId: 'gs-13', document }],
+      settings: [{ id: 'mini', snapshot: data.snapshot }], prices: data.prices,
+    }
+    const output = join(root, 'run'), manifestPath = join(root, 'manifest.json')
+    await mkdir(output)
+    await Promise.all([
+      writeFile(manifestPath, JSON.stringify(manifest)),
+      writeFile(join(output, 'observations.json'), JSON.stringify(generated.map(({ repetition, result }) => ({
+        schemaVersion: 1, suiteSha256: evaluationHash(data.suite), sourceId: 'gs-13', configurationId: 'mini',
+        repetition, durationMilliseconds: 1, result,
+      })))),
+      ...generated.map(({ repetition, artifact }) => writeFile(join(output, `${evaluationHash(['gs-13', 'mini', repetition])}.rubric.json`),
+        JSON.stringify({ sourceId: 'gs-13', configurationId: 'mini', repetition, ...artifact }))),
+    ])
+    const run = await exec(process.execPath, [runner, manifestPath, output, '--confirm-paid-inference'])
+    assert.match(run.stdout, /legacy-execution-unverified/)
+    assert.match(run.stdout, /evaluation-complete/)
+    await assert.rejects(readFile(join(output, 'model-attempts.jsonl')), error => error.code === 'ENOENT')
+    const reportPath = join(root, 'rubric-report.json')
+    assert.match((await exec(process.execPath, [cli, 'rubric-report', manifestPath, output, reportPath])).stdout, /not semantic equivalence/)
+    const report = JSON.parse(await readFile(reportPath, 'utf8'))
+    assert.equal(report.completed, 2)
+    assert.equal(report.cells[0].repeats.meanAlignmentRate, 1)
+    await assert.rejects(exec(process.execPath, [cli, 'rubric-report', manifestPath, output, join(output, 'report.json')]), /outside the private run directory/)
+    manifest.documents[0].document = { ...document, title: 'Changed after freezing' }
+    await writeFile(manifestPath, JSON.stringify(manifest))
+    await assert.rejects(exec(process.execPath, [runner, manifestPath, output, '--confirm-paid-inference']), /exact frozen job document/)
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
 })

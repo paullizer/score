@@ -4,10 +4,12 @@ import { useGradeLadders } from '../../app/grade-ladders-context'
 import { useGradeLeaveGuard } from '../../app/grade-navigation-context'
 import type { Citation } from '../../domain/types'
 import type { EditGradeDraftInput, GradeCriterion, GradeLevelDetail, GradeQualification, GradeSourceSetRecord } from '../../domain/real-grades'
+import { checkCriterionLevels, parseCriterionLevels, renderEvidenceGuidance, rubricScaleErrors } from '../../domain/evidence-scale'
 import { Badge, Button, InlineError, Modal } from '../../components/ui'
 import { GradeCitationPicker } from './GradeCitationPicker'
 import { gradeDraftWeightState } from './gradeUi'
 import { LifecycleBanner } from '../../components/lifecycle/LifecycleControls'
+import { ScaleLevelEditor } from '../rubrics/ScaleLevelEditor'
 
 type CitationTarget = { kind: 'criterion'; id: string; field: 'gradeBasis' | 'sourceCitations' } | { kind: 'qualification'; id: string }
 
@@ -20,6 +22,7 @@ export function GradeDraftEditor({ ladderId, level, onClose }: { ladderId: strin
   const [draft, setDraft] = useState<EditGradeDraftInput | null>(() => version ? structuredClone({ rubric: version.rubric, qualifications: version.qualifications }) : null)
   const [dirty, setDirty] = useState(false)
   const [saving, setSaving] = useState(false)
+  const [attempted, setAttempted] = useState(false)
   const [error, setError] = useState('')
   const [sourceSet, setSourceSet] = useState<GradeSourceSetRecord | null>(null)
   const [citationTarget, setCitationTarget] = useState<CitationTarget | null>(null)
@@ -51,18 +54,33 @@ export function GradeDraftEditor({ ladderId, level, onClose }: { ladderId: strin
   async function save(event: FormEvent) {
     event.preventDefault()
     if (!api || inFlight.current || !editable) return
+    setAttempted(true)
+    if (!sourceSet) { setError('Load the frozen source set before saving this draft.'); return }
     if (!editedDraft.rubric.name.trim() || !editedDraft.rubric.description.trim() ||
         editedDraft.rubric.criteria.some((item) => !item.label.trim() || !item.description.trim() || !item.guidance.trim()) ||
         editedDraft.qualifications.some((item) => !item.text.trim())) {
       setError('Complete the name, description, expectations, guidance, and qualification text. Evidence gaps still remain drafts.'); return
     }
     if (weights.errors.length) { setError(weights.errors.join(' ')); return }
+    const input = structuredClone(editedDraft)
+    if (input.rubric.scaleVersion) {
+      const levelErrors = input.rubric.criteria.flatMap(item => item.support === 'direct' || item.support === 'derived'
+        ? checkCriterionLevels(item.levels).filter(finding => finding.severity === 'error').map(finding => `${item.label}: ${finding.message}`)
+        : [])
+      if (levelErrors.length) { setError(levelErrors.join(' ')); return }
+      for (const item of input.rubric.criteria) {
+        if (item.support !== 'direct' && item.support !== 'derived') continue
+        item.levels = parseCriterionLevels(item.levels)
+        item.guidance = renderEvidenceGuidance(item.levels)
+      }
+      const scaleErrors = rubricScaleErrors(input.rubric)
+      if (scaleErrors.length) { setError(scaleErrors.join(' ')); return }
+    }
+    delete input.rubric.provenance
     inFlight.current = true
     setSaving(true)
     setError('')
     try {
-      const input = structuredClone(editedDraft)
-      delete input.rubric.provenance
       await api.saveDraft(ladderId, level.head.grade, input, headEtag.current)
       if (live.current) { guard.release(); onClose() }
     } catch (caught) { if (live.current) setError(caught instanceof Error ? caught.message : 'This draft was not saved.') }
@@ -71,6 +89,11 @@ export function GradeDraftEditor({ ladderId, level, onClose }: { ladderId: strin
   function citationList(citations: Citation[], remove: (index: number) => void) {
     return <ul className="grade-editor-quotes">{citations.map((citation, index) => <li key={`${citation.paragraphId}-${index}`}><div><blockquote>“{citation.quote}”</blockquote><span>Captured v{citation.documentVersion} · p. {citation.page} · {citation.heading}</span></div>
       <Button className="icon-button" size="sm" variant="ghost" icon={X} aria-label={`Remove quotation ${index + 1}`} disabled={saving || !editable} onClick={() => remove(index)} /></li>)}</ul>
+  }
+  function scaledGuidance(item: GradeCriterion) {
+    return editedDraft.rubric.scaleVersion && (item.support === 'direct' || item.support === 'derived')
+      ? <ScaleLevelEditor criterion={item} attempted={attempted} onChange={levels => criterion(item.id, { levels })} />
+      : <label className="field"><span className="field-label">Evaluation guidance</span><textarea className="input" rows={3} value={item.guidance} onChange={(event) => criterion(item.id, { guidance: event.target.value })} /></label>
   }
   return <Modal open onOpenChange={(open) => { if (!open) close() }} wide title={`Edit GS-${level.head.grade} draft`} description={`Saving appends version ${version.version + 1} and requests a new independent grounding review. It never changes the saved version or approves new claims.`}
     footer={<><span className="mr-auto text-[11px] text-muted">Unsaved changes stay only in this tab.</span><Button onClick={close}>Close draft</Button><Button type="submit" form="grade-draft-editor" icon={Save} variant="primary" disabled={saving || !dirty || !sourceSet || !editable}>{saving ? 'Saving and requesting review…' : 'Save draft and request review'}</Button></>}>
@@ -88,7 +111,7 @@ export function GradeDraftEditor({ ladderId, level, onClose }: { ladderId: strin
         <div className="grade-form-grid"><label className="field"><span className="field-label">Competency label</span><input className="input" value={item.label} onChange={(event) => criterion(item.id, { label: event.target.value })} /></label>
           <label className="field"><span className="field-label">Review weight (%)</span><input className="input" type="number" min={0} max={item.support === 'gap' || item.support === 'not-applicable' ? 0 : 100} step="any" value={Number.isFinite(item.weight) ? item.weight : ''} onChange={(event) => criterion(item.id, { weight: event.target.valueAsNumber })} /></label></div>
         <label className="field"><span className="field-label">Expected work at this grade</span><textarea className="input" rows={3} value={item.description} onChange={(event) => criterion(item.id, { description: event.target.value })} /></label>
-        <label className="field"><span className="field-label">Evaluation guidance</span><textarea className="input" rows={3} value={item.guidance} onChange={(event) => criterion(item.id, { guidance: event.target.value })} /></label>
+        {scaledGuidance(item)}
         <label className="field"><span className="field-label">Interpretation / supported grade distinction (not quotation)</span><textarea className="input" rows={3} value={item.interpretation} onChange={(event) => criterion(item.id, { interpretation: event.target.value })} /></label>
         <div><h4 className="grade-field-kicker">Grade-basis quotations</h4>{citationList(item.gradeBasis, (index) => criterion(item.id, { gradeBasis: item.gradeBasis.filter((_, position) => position !== index) }))}
           <Button size="sm" icon={FileSearch} disabled={!sourceSet} onClick={() => setCitationTarget({ kind: 'criterion', id: item.id, field: 'gradeBasis' })}>Cite captured grading evidence</Button></div>

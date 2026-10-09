@@ -2,9 +2,10 @@ import { createHash } from 'node:crypto'
 import { z } from 'zod'
 import { processingSettingsSnapshotSchema } from '../../src/domain/admin-settings-schema'
 import { promptExecutionProvenanceSchema } from '../../src/domain/prompt-versions'
+import { criterionLevelsSchema, evidenceScaleVersionSchema, rubricScaleErrors } from '../../src/domain/evidence-scale'
 import { assertAcceptedPromptBinding } from '../settings/prompt-integrity'
 import {
-  GRADE_LADDER_LIMITS as LIMITS, gradeHeadId,
+  GRADE_ISSUE_LIMIT, GRADE_LADDER_LIMITS as LIMITS, gradeHeadId,
   type GradeEntity, type GradeIssue, type GradeRubricVersionRecord, type GradeSourceSetRecord,
   type ReferenceDocument, type FrozenReferenceSource, type GradeSeedSnapshot, type GradeContext, type ReferenceCoverage,
 } from '../../src/domain/real-grades'
@@ -61,7 +62,7 @@ const issueSchema = z.strictObject({
   sourceId: sourceId.optional(), grade: grade.optional(), criterionId: identifier.optional(),
   citations: citations.optional(),
 })
-const issues = z.array(issueSchema).max(150)
+const issues = z.array(issueSchema).max(GRADE_ISSUE_LIMIT)
 const issueResolutions = z.array(z.strictObject({
   issue: issueSchema,
   reason: z.enum(['complete-source-extraction', 'captured-named-section', 'captured-reference-target']),
@@ -101,13 +102,14 @@ const criterion = z.strictObject({
   guidance: z.string().max(12_000), sourceParagraphId: identifier.optional(),
   requirementType: z.enum(['required', 'preferred']).optional(), sourceCitations: citations.optional(),
   competencyId: identifier, support: z.enum(['direct', 'derived', 'gap', 'not-applicable']),
-  gradeBasis: citations, interpretation: z.string().max(12_000),
+  gradeBasis: citations, interpretation: z.string().max(12_000), levels: criterionLevelsSchema.optional(),
 })
 export const editableGradeRubricSchema = z.strictObject({
   id: identifier, groupId: identifier, kind: z.literal('grade'), dataKind: z.literal('real'),
   jobId: id('job').optional(), ladder: text(300), grade: text(20),
   name: text(400), description: text(12_000), version: integer,
   criteria: z.array(criterion).max(LIMITS.maxCriteria), createdAt: timestamp,
+  scaleVersion: evidenceScaleVersionSchema.optional(),
 })
 const rubric = editableGradeRubricSchema.extend({ provenance })
 export const gradeQualificationSchema = z.strictObject({
@@ -668,6 +670,8 @@ function validateVersion(
   }
   if (!version.rubric.provenance) errors.push('Grade rubric must identify server-generated model/prompt provenance.')
   if (approval && !version.rubric.criteria.length) errors.push('A grade must contain nonempty supported criteria.')
+  // Scaled rubrics keep structured level examples; their code-rendered guidance replaces the free-text anchor check below.
+  errors.push(...rubricScaleErrors(version.rubric))
   for (const issue of [...sourceSet.issues, ...version.issues, ...sourceSet.sources.flatMap(source => source.issues)]) {
     for (const citation of issue.citations ?? []) checkCitation(citation, 'context')
   }
@@ -701,7 +705,7 @@ function validateVersion(
     if (criterion.sourceParagraphId && !(criterion.sourceCitations ?? []).some(citation => citation.paragraphId === criterion.sourceParagraphId)) {
       errors.push('Criterion sourceParagraphId must identify one of its exact citations.')
     }
-    if (supported) {
+    if (supported && !version.rubric.scaleVersion) {
       const anchors = labels.map((label, index) => criterion.guidance.slice(
         label.index! + label[0].length, labels[index + 1]?.index ?? criterion.guidance.length,
       ).trim().toLowerCase())

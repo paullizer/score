@@ -1193,3 +1193,19 @@ test('browser-worker bundle generates actual editable PPTX bytes without Node gl
   const entries = await unzipPptx(Uint8Array.from(bytes))
   assert.ok(entries.has('ppt/presentation.xml'))
 })
+
+test('a deck that mixes rubric versions of one job warns right after the cover', async () => {
+  const input = readablePptxFixture({ scores: [92.75], criterionCount: 2, targetCount: 2 })
+  for (const target of input.targets) {
+    target.rubricId = 'rubric-0'
+    Object.assign(target.selection, { jobId: 'job-0', rubricId: 'rubric-0' })
+  }
+  input.targets[1].selection.rubricHash = 'b'.repeat(64)
+  const result = await inspectReport(foundation.buildAnalysisReport(input))
+  const warning = matchingShapes(result.slides, /^mixed-rubric-versions-/).map(shape => shape.text).join('')
+  assert.match(warning, /^Rubric versions differ for .+\(v1 · aaaaaaaa, v2 · bbbbbbbb\)\. Scores are comparable only within one exact version/)
+  assert.ok(result.slides[1].shapes.some(shape => /^mixed-rubric-versions-/.test(shape.name)), 'The warning precedes the contents')
+  assertReadableGeometry(result.slides)
+  const single = await inspectReport(foundation.buildAnalysisReport(readablePptxFixture({ scores: [92.75], criterionCount: 2, targetCount: 2 })))
+  assert.equal(matchingShapes(single.slides, /^mixed-rubric-versions-/).length, 0)
+})
