@@ -12,9 +12,12 @@ const MAX_FIXTURE_BYTES = 32 * 1024 * 1024
 function fixedAzureEndpoint(value, suffix, name) {
   let url
   try { url = new URL(value) } catch { throw new Error(`${name} must be a fixed Azure HTTPS account endpoint.`) }
+  if (url.username.length > 0 || url.password.length > 0) {
+    throw new Error('Evaluation account endpoints must not contain credentials.')
+  }
   const account = url.hostname.slice(0, -suffix.length)
   if (url.protocol !== 'https:' || !url.hostname.endsWith(suffix) || !/^[a-z0-9][a-z0-9-]{1,62}$/.test(account) ||
-    url.username || url.password || url.port || url.pathname !== '/' || url.search || url.hash) {
+    url.port || url.pathname !== '/' || url.search || url.hash) {
     throw new Error(`${name} must be a fixed Azure HTTPS account endpoint.`)
   }
   return url.origin
