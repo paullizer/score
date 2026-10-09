@@ -224,6 +224,14 @@ identity needs its existing Azure data-plane read access and workspace-owner
 membership. It cannot choose another object ID, infer application-admin roles,
 log in for you or grant permissions. Nothing writes to Score or invokes a model.
 
+Cosmos access must come from an existing **data-plane** role assignment that
+allows account metadata reads (`Microsoft.DocumentDB/databaseAccounts/readMetadata`)
+and the required item reads and queries at the target resource scope. ARM
+Contributor alone is insufficient. An HTTP 403/substatus 5301 denying
+`readMetadata` is a missing data-plane permission, not an audience-validation
+failure. Stop and have an authorized administrator review the existing access;
+the exporter does not auto-grant roles or fall back to account keys.
+
 The exporter requests only `https://cosmos.azure.com/.default`. Its identity
 check accepts the Cosmos resource URI (with or without a trailing slash) or
 the first-party Azure Cosmos DB application ID
