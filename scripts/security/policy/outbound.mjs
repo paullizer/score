@@ -33,6 +33,11 @@ export const playwrightModules = [
 
 export const sanctionedTransports = [
   {
+    file: 'worker/evals/decision-transport.ts',
+    rules: ['outbound/global-fetch'],
+    reason: 'Offline-only verified Microsoft Decision choice adapter posts to the single scoped Score Foundry account with Entra cognitive-services tokens, redirect:error, byte bounds and per-attempt deadlines. Read-only ARM discovery uses a fixed account/deployment path and separate management scope; never imported by production workers.',
+  },
+  {
     file: 'worker/runtime.ts',
     rules: ['outbound/network-module', 'outbound/playwright-import', 'outbound/playwright-navigation', 'outbound/global-fetch'],
     reason: 'Worker public-source transport uses validatePublicUrl, urlMatchesPolicy, DNS pinning, public-address checks and bounded redirects before node:http/node:https or Playwright page navigation; model calls go through fixed Azure endpoints.',
@@ -141,4 +146,3 @@ export const knownModelTransportFiles = [
     reason: 'QC model adapter invokes the canonical structured model transport through injected dependencies for configured Azure endpoints.',
   },
 ]
-
