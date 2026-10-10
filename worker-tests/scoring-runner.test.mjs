@@ -8,12 +8,74 @@ import { promisify } from 'node:util'
 import { fileURLToPath } from 'node:url'
 import { createHash } from 'node:crypto'
 import { loadWorker } from './shared-model-loader.mjs'
+import { fixture as scaleFixture } from './scale-candidate-support.mjs'
 
 const exec = promisify(execFile)
 const { prepareResumeJobEvaluation, createEvaluationSettings, evaluationHash, scoringSuiteSchema, FIXED_JUDGE_VERSION } = await loadWorker('../worker/evals/index.ts')
-const { validateAnalysisAssessmentSelections, hashAnalysisAssessment } = await loadWorker('../worker/analyses/model.ts')
+const { validateAnalysisAssessmentInput, validateAnalysisAssessmentSelections, hashAnalysisAssessment } = await loadWorker('../worker/analyses/model.ts')
 const { createAnalysisEvidenceCatalog } = await loadWorker('../worker/analyses/evidence-passages.ts')
 const runner = fileURLToPath(new URL('../scripts/scoring-evaluation-run.mjs', import.meta.url))
+
+test('offline scale runner smoke binds all four candidate selectors without inference and rejects mixed-code resume', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'score-scale-runner-'))
+  try {
+    const fingerprint = async url => createHash('sha256').update(await readFile(url)).digest('hex')
+    for (const candidate of ['b1', 'b2']) for (const mode of ['assessor', 'reviewer']) {
+      const version = `score-scale-${candidate}-${mode}-v1`
+      const { input, snapshot, prices, job } = scaleFixture(version)
+      const suite = scoringSuiteSchema.parse({
+        schemaVersion: 1, id: version, purpose: 'smoke', sourceVersion: 'synthetic-scale-smoke-v1',
+        repetitions: 1, cases: [job.case], configurations: [job.configuration],
+      })
+      const manifest = {
+        suite, endpoint: 'https://test-account.openai.azure.com/', concurrency: 1,
+        inputs: [{ id: 'case', input }], settings: [{ id: 'candidate', snapshot }],
+        prices: mode === 'assessor' ? { assessor: prices.assessor } : prices,
+      }
+      const output = join(root, version), path = join(root, `${version}.json`)
+      await mkdir(output)
+      const execution = {
+        schemaVersion: 1, status: 'bound',
+        runnerSha256: await fingerprint(new URL('../scripts/scoring-evaluation-run.mjs', import.meta.url)),
+        bundleSha256: await fingerprint(new URL('../dist-worker/scoring-evaluation.mjs', import.meta.url)),
+        dependencyLockSha256: await fingerprint(new URL('../package-lock.json', import.meta.url)),
+        nodeVersion: process.version, suiteSha256: evaluationHash(suite),
+        endpoint: manifest.endpoint, pricesSha256: evaluationHash(manifest.prices),
+      }
+      await Promise.all([
+        writeFile(path, JSON.stringify(manifest)),
+        writeFile(join(output, 'execution.json'), JSON.stringify(execution)),
+        writeFile(join(output, 'observations.json'), JSON.stringify([{
+          schemaVersion: 1, suiteSha256: evaluationHash(suite), caseId: 'case', configurationId: 'candidate',
+          repetition: 1, durationMilliseconds: 1,
+          result: { status: 'complete', overall: 40, criteria: [{ criterionId: 'statistics', score: 2 }] },
+        }])),
+      ])
+      const invoke = () => exec(process.execPath, [runner, path, output, '--confirm-paid-inference'])
+      assert.match((await invoke()).stdout, /evaluation-complete/)
+      assert.deepEqual(JSON.parse(await readFile(join(output, 'execution.json'), 'utf8')), execution)
+      await assert.rejects(readFile(join(output, 'model-attempts.jsonl')), { code: 'ENOENT' })
+      await writeFile(join(output, 'execution.json'), JSON.stringify({ ...execution, bundleSha256: 'f'.repeat(64) }))
+      await assert.rejects(invoke(), /Execution identity changed/)
+      await writeFile(join(output, 'execution.json'), JSON.stringify(execution))
+      suite.configurations[0].algorithmVersion = `score-scale-${candidate === 'b1' ? 'b2' : 'b1'}-${mode}-v1`
+      await writeFile(path, JSON.stringify(manifest))
+      await assert.rejects(invoke(), /different frozen suite/)
+      suite.configurations[0].algorithmVersion = 'score-scale-unknown-v1'
+      await writeFile(path, JSON.stringify(manifest))
+      await assert.rejects(invoke(), /impersonate/)
+      suite.configurations[0].algorithmVersion = version
+      delete input.rubric.scaleVersion
+      delete input.rubric.criteria[0].levels
+      const legacy = validateAnalysisAssessmentInput(input)
+      suite.cases[0].inputSha256 = evaluationHash(legacy)
+      await writeFile(path, JSON.stringify(manifest))
+      await assert.rejects(invoke(), /legacy unscaled/)
+      await assert.rejects(readFile(join(output, 'model-attempts.jsonl')), { code: 'ENOENT' })
+      await assert.rejects(readFile(join(output, 'evaluation.lock')), { code: 'ENOENT' })
+    }
+  } finally { await rm(root, { recursive: true, force: true }) }
+})
 
 function fixture(id) {
   const input = prepareResumeJobEvaluation('Applied regression to survey data.', 'test-family', {
