@@ -93,9 +93,11 @@ The candidate tests inject model responses into the existing transport; they nev
 
 Remaining prerequisites are unchanged: exact responding-model baseline and noise-floor panels, qualified reviewer controls, approved and frozen corpus job/grade rubrics with exact hashes, blind human labels and spot checks, the development finalist comparison and cross-model gap, and separately admitted holdout/release gates. Offline implementation does not resolve the independently blocked R1/private-corpus gate or authorize Blob access, cloud permission changes, private/holdout corpus use, paid inference, deployment, human approval or promotion. The separate Decision-1 spike is not a dependency or a substitute for these prerequisites.
 
-### Offline narrow verifier and fixed-proposal panels
+### Pre-production scoring evaluation harness
 
-Phase 3's **unpromoted offline** implementation is `worker/evals/narrow-verifier.ts`. It stops before the one-pass resolver. There are no production assessor, prompt-template, settings, captured-schema, UI or deployment changes. Decision-1 probabilities/routing are not used. The adapter uses the existing verified structured transport and the captured `assessmentReview` binding (mini or Luna), with one model family per configuration.
+Phase 3's **pre-production scoring evaluation harness** tests reviewer changes on fixed assessment proposals before considering them for the live scoring app. It is development tooling, not an alternative customer-facing scoring mode. Earlier references to “offline” mean execution outside the production scoring workflow, **not** scoring without an internet connection: mock tests run locally without network access, but separately authorized real-model experiments require model access and may incur inference costs. Existing algorithm IDs and commands remain unchanged so frozen experiment identities stay stable.
+
+The unpromoted narrow verifier implementation is `worker/evals/narrow-verifier.ts`. It stops before the one-pass resolver. There are no production assessor, prompt-template, settings, captured-schema, UI or deployment changes. Decision-1 probabilities/routing are not used. The adapter uses the existing verified structured transport and the captured `assessmentReview` binding (mini or Luna), with one model family per configuration.
 
 | `configuration.algorithmVersion` | Fixed-proposal operation |
 | --- | --- |
