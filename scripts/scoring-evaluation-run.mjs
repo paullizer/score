@@ -14,6 +14,8 @@ import {
   executeRubricRepeatabilitySuite, executeRubricGeneration,
   gradeGenerationSuiteSchema, validateGradeGeneration, validateGradeGenerationObservations,
   executeGradeGenerationSuite, executeGradeGeneration,
+  validateNarrowEvaluation, validateNarrowObservations, executeNarrowSuite, executeNarrowEvaluation,
+  frozenScaleProposalSchema, verificationPolicySchema,
 } from '../dist-worker/scoring-evaluation.mjs'
 
 const GENERATION_KINDS = ['rubric-generation', 'grade-generation']
@@ -49,11 +51,14 @@ async function main() {
   }
   const manifest = await json(resolve(manifestPath))
   const kind = manifest.kind ?? 'scoring'
-  if (!['scoring', 'fixed-judge', ...GENERATION_KINDS].includes(kind)) throw new Error('Unknown evaluation manifest kind.')
+  if (!['scoring', 'fixed-judge', 'fixed-scale-review', ...GENERATION_KINDS].includes(kind)) throw new Error('Unknown evaluation manifest kind.')
+  const fixedScale = kind === 'fixed-scale-review'
   const generation = GENERATION_KINDS.includes(kind)
   const suite = kind === 'rubric-generation' ? rubricRepeatabilitySuiteSchema.parse(manifest.suite)
     : kind === 'grade-generation' ? gradeGenerationSuiteSchema.parse(manifest.suite) : scoringSuiteSchema.parse(manifest.suite)
-  const proposals = kind === 'fixed-judge' ? validateFixedJudgeProposals(suite, manifest.proposals) : null
+  const proposals = kind === 'fixed-judge' ? validateFixedJudgeProposals(suite, manifest.proposals)
+    : fixedScale ? new Map(frozenScaleProposalSchema.array().min(1).max(500).parse(manifest.proposals).map(row => [row.id, row])) : null
+  const policy = fixedScale ? verificationPolicySchema.parse(manifest.policy) : null
   const endpoint = new URL(manifest.endpoint)
   if (endpoint.protocol !== 'https:' || !endpoint.hostname.endsWith('.openai.azure.com') ||
     endpoint.username || endpoint.password || endpoint.port || endpoint.pathname !== '/' || endpoint.search || endpoint.hash) {
@@ -66,6 +71,7 @@ async function main() {
     ? [row.sourceId, kind === 'rubric-generation' ? row.document : row.fixture] : [row.id, row.input]))
   const settings = new Map(manifest.settings.map(row => [row.id, row.snapshot]))
   if (inputs.size !== manifest[sourceKey].length || settings.size !== manifest.settings.length) throw new Error(`Duplicate private ${sourceKey}/settings IDs.`)
+  if (fixedScale) validateNarrowObservations(suite, manifest.inputs, manifest.proposals, policy, [])
   if (generation && !Number.isFinite(Date.parse(manifest.createdAt))) throw new Error('Generation manifests require an explicit createdAt timestamp.')
   if (!Number.isInteger(manifest.concurrency) || manifest.concurrency < 1 || manifest.concurrency > 8) {
     throw new Error('Explicit evaluation concurrency must be one through eight.')
@@ -93,6 +99,7 @@ async function main() {
     if (kind === 'rubric-generation') validateRubricGeneration(job, { ...options, document: inputs.get(item.id) })
     else if (kind === 'grade-generation') validateGradeGeneration(job, { ...options, fixture: inputs.get(item.id) })
     else if (kind === 'fixed-judge') validateFixedJudgeEvaluation(job, { ...options, input: inputs.get(item.id), ...proposals.get(item.id) })
+    else if (fixedScale) validateNarrowEvaluation(job, { ...options, input: inputs.get(item.id), proposal: proposals.get(item.id), policy })
     else validateProductionEvaluation(job, { ...options, input: inputs.get(item.id) })
   }
   const initialMilestones = costMilestoneStateSchema.parse({
@@ -144,7 +151,8 @@ async function main() {
     const ledgerPath = resolve(costRoot, `${programKey}.ledger.json`)
     const milestonePath = resolve(costRoot, `${programKey}.state.json`)
     const prior = await loadOr(observationsPath, [])
-    const observations = kind === 'fixed-judge' ? validateFixedJudgeObservations(suite, proposals, prior)
+    const observations = fixedScale ? validateNarrowObservations(suite, manifest.inputs, manifest.proposals, policy, prior).rows
+      : kind === 'fixed-judge' ? validateFixedJudgeObservations(suite, proposals, prior)
       : kind === 'rubric-generation' ? validateRubricGenerationObservations(suite, prior)
         : kind === 'grade-generation' ? validateGradeGenerationObservations(suite, prior) : validateObservations(suite, prior)
     const executionPath = resolve(output, 'execution.json')
@@ -165,9 +173,14 @@ async function main() {
       nodeVersion: process.version, suiteSha256: evaluationHash(suite),
       endpoint: endpoint.href, pricesSha256: evaluationHash(manifest.prices),
       ...(kind === 'fixed-judge' ? { kind, proposalsSha256: evaluationHash(manifest.proposals) } : {}),
+      ...(fixedScale ? {
+        kind, proposalsSha256: evaluationHash(manifest.proposals), policySha256: evaluationHash(policy),
+        inputsSha256: evaluationHash(manifest.inputs),
+      } : {}),
       ...(generation ? { kind, sourcesSha256: evaluationHash(manifest[sourceKey]), createdAt: manifest.createdAt } : {}),
     }
     const legacy = previousExecution?.status === 'legacy-unverified' || !previousExecution && observations.length > 0
+    if (fixedScale && legacy) throw new Error('Fixed scale review requires exact executable identity; historical unbound observations cannot resume.')
     if (legacy) {
       const expected = (generation ? suite.sources : suite.cases).length * suite.configurations.length * suite.repetitions
       if (observations.length !== expected) {
@@ -219,9 +232,11 @@ async function main() {
     const executeSuite = {
       'fixed-judge': executeFixedJudgeSuite, 'rubric-generation': executeRubricRepeatabilitySuite,
       'grade-generation': executeGradeGenerationSuite,
+      'fixed-scale-review': executeNarrowSuite,
     }[kind] ?? executeScoringSuite
     await executeSuite(suite, {
       ...(kind === 'fixed-judge' ? { proposals: manifest.proposals } : {}),
+      ...(fixedScale ? { inputs: manifest.inputs, proposals: manifest.proposals, policy } : {}),
       concurrency: manifest.concurrency, signal: controller.signal, priorObservations: observations,
       execute: async (job, signal) => {
         const comparisonController = new AbortController()
@@ -280,6 +295,12 @@ async function main() {
           } else if (kind === 'fixed-judge') {
             result = await executeFixedJudgeEvaluation(job, {
               ...options, input, ...proposals.get(job.case.id),
+              recordPrivateReview: review => record('review', review),
+            }, comparisonSignal)
+          } else if (fixedScale) {
+            result = await executeNarrowEvaluation(job, {
+              ...options, input, proposal: proposals.get(itemId), policy,
+              recordPrivateArtifact: artifact => record(`verification-${artifact.correctionCount}`, { ...binding, ...artifact }),
               recordPrivateReview: review => record('review', review),
             }, comparisonSignal)
           } else {

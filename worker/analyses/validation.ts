@@ -204,7 +204,7 @@ function requirementCitations(input: RealAnalysisAssessmentInput, kind: 'criteri
   return evidence.citations.map(citation => ({ ...citation }))
 }
 
-function checkAssessmentLanguage(value: string, stage: AnalysisModelStage = 'assessment'): void {
+export function checkAssessmentLanguage(value: string, stage: AnalysisModelStage = 'assessment'): void {
   if (/\b(?:context (?:window|limit)|token (?:budget|limit)|model refus(?:ed|al)|service unavailable|processing failed)\b/i.test(value)) {
     invalidOutput('A model or processing failure must not be reported as a completed document-evidence assessment.', stage)
   }

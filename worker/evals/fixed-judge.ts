@@ -273,6 +273,7 @@ export async function executeFixedJudgeEvaluation(
   await options.admitPaidWork(job)
   signal?.throwIfAborted()
   const attempts = evaluationAttemptRecorder(processingSettings, prices, options)
+  let reviewWritePending = false
   try {
     const result = await reviewAnalysisAssessment(input, assessment, {
       signal, resumeSnapshotSha256: evaluationHash(input.resume),
@@ -282,13 +283,16 @@ export async function executeFixedJudgeEvaluation(
     if (result.assessmentSha256 !== options.assessmentSha256) {
       throw new Error('Fixed judge changed the proposal identity during review.')
     }
+    reviewWritePending = true
     await options.recordPrivateReview(structuredClone(result))
+    reviewWritePending = false
     signal?.throwIfAborted()
     return fixedJudgeResultSchema.parse({
       status: 'complete', issueFound: result.review.outcome !== 'supported',
       outcome: result.review.outcome, assessmentSha256: result.assessmentSha256,
     })
   } catch (error) {
+    if (reviewWritePending) throw error
     attempts.rethrowRecordingFailure()
     if (!(error instanceof AnalysisModelError) || error.cancelled || signal?.aborted) throw error
     await options.recordPrivateFailure?.({ code: error.code, stage: error.stage, reason: error.reason ?? null })

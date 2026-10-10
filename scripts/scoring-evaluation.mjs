@@ -19,6 +19,8 @@ import {
   summarizeEvidenceSelections,
   summarizeRubricRepeatability,
   summarizeGradeGeneration,
+  freezeScaleProposal, summarizeNarrowSuite, narrowAnswerSchema, NARROW_VERIFIER_VERSION,
+  NARROW_PROMPT_VERSION, NARROW_SCHEMA_VERSION,
 } from '../dist-worker/scoring-evaluation.mjs'
 
 async function readJson(path) {
@@ -68,6 +70,34 @@ async function atomicWrite(path, value, immutable = false) {
 
 async function main(args) {
   const [command, ...paths] = args
+  if (command === 'verifier-schema' && paths.length === 1) {
+    const { z } = await import('zod')
+    await atomicWrite(paths[0], {
+      algorithmVersion: NARROW_VERIFIER_VERSION, promptVersion: NARROW_PROMPT_VERSION, schemaVersion: NARROW_SCHEMA_VERSION,
+      schema: z.toJSONSchema(narrowAnswerSchema, { target: 'draft-7' }),
+    }, true)
+    console.log('Offline verifier answer schema saved; no inference or production promotion.')
+    return
+  }
+  if (command === 'freeze-scale-proposals' && paths.length === 2) {
+    if (resolve(paths[0]) === resolve(paths[1])) throw new Error('Frozen proposals cannot overwrite source choices.')
+    const rows = await readJson(paths[0])
+    if (!Array.isArray(rows) || !rows.length || rows.length > 500 || new Set(rows.map(row => row.id)).size !== rows.length ||
+      rows.some(row => Object.keys(row).some(key => !['id', 'input', 'choice', 'candidate'].includes(key)))) {
+      throw new Error('Expected unique exact {id,input,choice,candidate} rows.')
+    }
+    await atomicWrite(paths[1], rows.map(row => freezeScaleProposal(row.id, row.input, row.choice, row.candidate)), true)
+    console.log('Source-bound proposals frozen with shared mechanical checks; no inference or score rewriting.')
+    return
+  }
+  if (command === 'verifier-report' && paths.length === 3) {
+    if (paths.slice(0, -1).some(path => resolve(path) === resolve(paths[2]))) throw new Error('Verifier report cannot overwrite inputs.')
+    const [manifest, observations] = await Promise.all(paths.slice(0, -1).map(readJson))
+    if (manifest.kind !== 'fixed-scale-review') throw new Error('Verifier report requires a fixed-scale-review manifest.')
+    await atomicWrite(paths[2], summarizeNarrowSuite(manifest.suite, manifest.inputs, manifest.proposals, manifest.policy, observations))
+    console.log('Fixed-proposal reviewer diagnostics saved; provisional findings are not score corrections or release approval.')
+    return
+  }
   if (command === 'layout-integrity' && paths.length === 3) {
     const [responsePath, factsPath, outputPath] = paths
     if ([responsePath, factsPath].some(path => resolve(path) === resolve(outputPath))) {
@@ -362,7 +392,7 @@ async function main(args) {
     }
     return
   }
-  throw new Error('Usage: scoring-evaluation.mjs <prepare-corpus|prepare-shards|merge-shards|spot-checks|silver-references|source-references|human-labels|extraction|layout-integrity|evidence-selection|judge|judge-report|invariance|monotonicity|rubric-report|grade-report|gates|validate|report|costs|costs-ack> <paths...>. See docs\\scoring-quality-program.md for each command contract.')
+  throw new Error('Usage: scoring-evaluation.mjs <freeze-scale-proposals|verifier-schema|verifier-report|prepare-corpus|prepare-shards|merge-shards|spot-checks|silver-references|source-references|human-labels|extraction|layout-integrity|evidence-selection|judge|judge-report|invariance|monotonicity|rubric-report|grade-report|gates|validate|report|costs|costs-ack> <paths...>. See docs\\scoring-quality-program.md for each command contract.')
 }
 
 try {
