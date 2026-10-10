@@ -93,6 +93,64 @@ The candidate tests inject model responses into the existing transport; they nev
 
 Remaining prerequisites are unchanged: exact responding-model baseline and noise-floor panels, qualified reviewer controls, approved and frozen corpus job/grade rubrics with exact hashes, blind human labels and spot checks, the development finalist comparison and cross-model gap, and separately admitted holdout/release gates. Offline implementation does not resolve the independently blocked R1/private-corpus gate or authorize Blob access, cloud permission changes, private/holdout corpus use, paid inference, deployment, human approval or promotion. The separate Decision-1 spike is not a dependency or a substitute for these prerequisites.
 
+### Pre-production scoring evaluation harness
+
+Phase 3's **pre-production scoring evaluation harness** tests reviewer changes on fixed assessment proposals before considering them for the live scoring app. It is development tooling, not an alternative customer-facing scoring mode. Earlier references to “offline” mean execution outside the production scoring workflow, **not** scoring without an internet connection: mock tests run locally without network access, but separately authorized real-model experiments require model access and may incur inference costs. Existing algorithm IDs and commands remain unchanged so frozen experiment identities stay stable.
+
+The unpromoted narrow verifier implementation is `worker/evals/narrow-verifier.ts`. It stops before the one-pass resolver. There are no production assessor, prompt-template, settings, captured-schema, UI or deployment changes. Decision-1 probabilities/routing are not used. The adapter uses the existing verified structured transport and the captured `assessmentReview` binding (mini or Luna), with one model family per configuration.
+
+| `configuration.algorithmVersion` | Fixed-proposal operation |
+| --- | --- |
+| `score-narrow-verifier-v1` | Independently inspect selected citations, claims and omitted evidence |
+| `score-fixed-scale-current-reviewer-v1` | Run the unchanged incumbent grounding reviewer on the same derived assessment |
+
+`freezeScaleProposal` and `freeze-scale-proposals` accept **exact saved B1/B2 choices**, not a fresh assessor request. They reuse `deriveScaleCandidate` and the incumbent source/grade/qualification/policy validators for citation resolution, level/status consistency, scope constraints and code-calculated totals; nothing silently bypasses those checks. The strict proposal carries candidate, input hash, original validated choice, exact derived assessment and calculated summary, assessment hash and proposal hash. Every subsequent preflight re-derives mechanically and compares the entire frozen artifact. Neither reviewer regenerates assessment, resolves semantic findings, rewrites scores, supplies a hiring/ranking/GS eligibility judgment, vetoes publication or averages judgments.
+
+The narrow reviewer answers once per exact citation and per frozen claim reference. Rationale references are deterministic sentence spans (`<criterion>:rationale:<ordinal>`) with exact character offsets, not model-extracted assertions; every assertion in a span must be inspected, and several defects may refer to it. Level and B2 checklist references retain their fixed code meanings. Findings require an exact selected criterion/claim, an actual passage ID and (when about a selected citation) its exact citation ID. Code supplies claim text and literal source text, document/version, paragraph, offsets and catalog identity. Foreign IDs, invented quote fields, duplicates, inconsistent answer/finding combinations, missing coverage and prohibited policy language fail explicitly. A real citation can be irrelevant. The prompt asks symmetrically about over-credit, under-credit, negation, other actors, copied requirements, contradictory adjacent context and incomplete selection. These are provisional semantic judgments, not mechanically proven truth.
+
+The manifest must record a strict `policy`:
+
+```json
+{
+  "version": "score-verification-selection-v1",
+  "positiveScores": true,
+  "boundaryLevels": [1, 2, 3, 4, 5],
+  "missingEvidence": true
+}
+```
+
+This explicit default selects all positive scored criteria and all zero/missing criteria, and scans omitted evidence for zero/boundary levels. `boundaryLevels` is a deterministic, preselected set of integer levels, not an inferred confidence estimate or proof of nearness to a boundary. Altering it or either boolean changes the recorded scope/hash. Every selected operation still receives and attests inspection of the **complete lossless source**, including surrounding/contradictory context. A negative selected-passage answer cannot establish global absence. Bounds reject oversized complete scope; they never drop claims/passages to fit. Unselected criteria have reason `not-verified`, not assumed support; selected positives outside the boundary set do not receive an omitted-evidence scan. Genuine unusable-source/ambiguous-guidance/protected-trait blockers, saved grade not-applicable rows and separate unscored qualification notes remain outside narrow scoring scope with their existing evidence-only policies.
+
+`uncertain` answers are retained, not converted to support. Empty findings are allowed only after successful exact selected-scope coverage and complete-source inspection attestation; this is **not** a global clean bill of health. Reports list unverified criteria, uncertainty and selected scan scope. Finding-free uncertain or skipped-scope narrow reviews are indeterminate in paired detection comparisons. The private artifact's `verified` container means locally validated answers/resolved findings, not semantic certification. Complete-source inspection is a reviewer assertion, not independent proof.
+
+Versions are `score-narrow-verifier-prompt-v1`, `score-narrow-verifier-schema-v1` and `score-verification-selection-v1`. Artifacts bind exact input, rubric, resume/target snapshots, catalog, proposal/assessment, selection scope, settings, literal prompt/schema/raw-content hashes, model-call ID and actual transport provenance. The captured settings accompany the artifact: observation validation checks their hash, exact reviewer deployment/model/version/revision and consumed correction count, not merely a nonempty model name. Strict observations revalidate raw answers and resolved findings against the frozen source/proposal. The paid runner accepts only `kind: "fixed-scale-review"` for these identities, with exact `inputs`, `proposals`, `policy`, `suite`, captured `settings`, verified `prices`, endpoint and concurrency. It records a distinct kind plus proposal/policy/input hashes in the runner/bundle/dependency/runtime execution binding. Historical unbound observations cannot resume, even if complete. Separate configuration/repetition keys compare the **same proposal**, never separately regenerated assessments.
+
+Schema/JSON repairs share a single captured correction control, never reset by answer category; there is no semantic rescore/retry-until-supported stage. Invalid and accepted responses are saved as `<job-hash>.verification-<correction-count>.json`; incumbent findings are retained as `<job-hash>.review.json`. Refusal, authentication, service/transport, timeout, context/token exhaustion and malformed outputs remain explicit failures (or fatal identity/accounting errors), not finding-free successful zeros. Typed attempt/artifact/review/checkpoint storage failures remain fatal. The incumbent fixed judge's review writer now retains this same typed-storage distinction.
+
+**No credentials, network, private data or paid inference are needed for these commands:**
+
+```powershell
+npm run build:worker
+node --test --test-concurrency=1 worker-tests\scoring-narrow-verifier.test.mjs worker-tests\scoring-narrow-verifier-cli.test.mjs worker-tests\scoring-fixed-judge.test.mjs worker-tests\scoring-scale-candidates.test.mjs
+node scripts\scoring-evaluation.mjs verifier-schema C:\private-evals\narrow-answer-schema.json
+node scripts\scoring-evaluation.mjs freeze-scale-proposals C:\private-evals\frozen-choice-inputs.json C:\private-evals\frozen-proposals.json
+node scripts\scoring-evaluation.mjs verifier-report C:\private-evals\fixed-scale-manifest.json C:\private-evals\runs\fixed-scale\observations.json C:\private-evals\fixed-scale-report.json
+```
+
+The freeze command's input is a unique array of `{id,input,candidate,choice}` rows covering the future suite. Prepare the suite/configurations with existing `createEvaluationSettings`, `evaluationHash` and `scoringSuiteSchema` exports; use the same case/input/proposal identities across reviewers. Proposal/schema outputs are immutable and cannot overwrite source files. The CLI smoke injects a **test-only, fixed synthetic endpoint** transport and synthetic Azure credential, exercises both reviewers plus fresh checkpoint/resume/report paths, and rejects mixed executable, scope, algorithm and historical identity. It never contacts Azure or a model; mocked findings do not measure semantic detection or pass quality gates.
+
+Only **after separate explicit approval** for model use, source access and cost admission, a future operator may run:
+
+```powershell
+node scripts\scoring-evaluation-run.mjs C:\private-evals\fixed-scale-manifest.json C:\private-evals\runs\fixed-scale --confirm-paid-inference
+```
+
+No such execution is authorized or performed by this implementation. Prerequisites remain the independently verified current-model baseline/noise floor, a chosen/frozen B1/B2 assessment design, approved locked corpus rubrics, authorized source access, independent planted/human blind labels and development-only reviewer qualification. The current CLI user's Cosmos Reader scope does not authorize Blob grade-source access; zero matching four seed jobs, incomplete corpus access and absent blind labels still block the live R1 gate. There is no private/holdout authorization, deployment or promotion. Reports expose same-repetition finding/verdict disagreement and directional counts with missing/failed/uncertain work separate; these are **not score flip rates, defect-detection accuracy, false-rejection rates or release evidence**. Pair the saved findings with separately source/proposal-bound independent labels for later accuracy experiments; do not feed labels to either reviewer.
+
+**Next separate task:** the bounded one-pass resolver consumes these well-typed frozen findings and mechanically recomputes its result, without a verifier veto, averaging or failure-shaped zero. That resolver, planted 24/24 detection gate, direction-balance qualification, step ablations, human review and production integration are not implemented or claimed here.
+
+### Earlier evidence-first experiment
+
 `score-evidence-first-v1` maps supporting and contradictory source passage IDs for every criterion, scores against the complete source and saved anchors, then selectively verifies uncertainties, qualifications, extremes, inconsistencies and a fixed audit sample. A disputed assessment receives bounded automatic resolution, which can raise or lower a score. No averaging, higher-score preference, user disagreement action or retry-until-accepted loop is introduced.
 
 The candidate shares at most two repair/resolution calls across the comparison. It preserves source ownership, exact quotes, saved weights and private intermediate diagnostics. Its final resolver does not face a further independent veto; that is an experimental policy requiring evaluation, not a production guarantee. Malformed model output is an explicit failed observation; ledger/storage failures stop admission rather than becoming scores.
