@@ -15,6 +15,10 @@ import { assessmentInputSchema } from '../analyses/model-schema'
 import { analysisAssessmentHash, analysisRequirementEvidenceForInput } from '../../server/analyses/deterministic'
 import { assessEvidenceFirst, EVIDENCE_FIRST_VERSION } from './evidence-first'
 import { assessSourceOnlyReference, SOURCE_REFERENCE_VERSION } from './reference-model'
+import {
+  assessScaleCandidate, scaleCandidateAlgorithm, validateScaleCandidateInput,
+  type ScaleCandidateVersion, type ScaleCandidateArtifact,
+} from './scale-candidates'
 import type { AnalysisAssessmentDiagnostic } from '../../src/domain/analysis-diagnostics'
 import { evaluationAttemptRecorder } from './model-attempts'
 import type { ModelTaskId } from '../../src/domain/admin-settings'
@@ -136,6 +140,7 @@ export interface ProductionEvaluationOptions {
   recordPrivateResult: (result: Awaited<ReturnType<typeof assessResumeAgainstTarget>>) => Promise<void>
   recordPrivateDiagnostics?: (diagnostics: AnalysisAssessmentDiagnostic[]) => Promise<void>
   recordPrivateFailure?: (failure: { code: string; stage: string; reason: string | null }) => Promise<void>
+  recordPrivateScaleArtifact?: (artifact: ScaleCandidateArtifact) => Promise<void>
 }
 
 export function validateEvaluationCaseInput(item: ScoringSuite['cases'][number], rawInput: unknown) {
@@ -157,12 +162,14 @@ export function validateEvaluationCaseInput(item: ScoringSuite['cases'][number],
 export function validateProductionEvaluation(
   job: ScoringEvaluationJob, options: Pick<ProductionEvaluationOptions, 'input' | 'processingSettings' | 'prices'>,
 ) {
-  if (!['score-production-v1', EVIDENCE_FIRST_VERSION, SOURCE_REFERENCE_VERSION].includes(job.configuration.algorithmVersion)) {
+  const candidate = scaleCandidateAlgorithm(job.configuration.algorithmVersion)
+  if (!candidate && !['score-production-v1', EVIDENCE_FIRST_VERSION, SOURCE_REFERENCE_VERSION].includes(job.configuration.algorithmVersion)) {
     throw new Error('The production adapter cannot impersonate a different scoring algorithm.')
   }
   const { processingSettings, prices } = validateEvaluationModelSettings(job.configuration, options,
-    ['assessment', 'assessmentReview'])
+    candidate?.reviewMode === 'assessor-only' ? ['assessment'] : ['assessment', 'assessmentReview'])
   const input = validateEvaluationCaseInput(job.case, options.input)
+  if (candidate) validateScaleCandidateInput(input)
   return { input, processingSettings, prices }
 }
 
@@ -196,19 +203,30 @@ export async function executeProductionEvaluation(
   signal?.throwIfAborted()
   const attempts = evaluationAttemptRecorder(processingSettings, prices, options)
   const diagnostics: AnalysisAssessmentDiagnostic[] = []
+  // Even typed storage errors must bypass scoring-failure conversion.
+  let scaleArtifactWritePending = false
+  const scaleArtifactRecorder = options.recordPrivateScaleArtifact
+  const recordScaleArtifact = scaleArtifactRecorder ? async (artifact: ScaleCandidateArtifact) => {
+    scaleArtifactWritePending = true
+    await scaleArtifactRecorder(artifact)
+    scaleArtifactWritePending = false
+  } : undefined
   try {
     const assessor = job.configuration.algorithmVersion === SOURCE_REFERENCE_VERSION ? assessSourceOnlyReference
       : job.configuration.algorithmVersion === EVIDENCE_FIRST_VERSION ? assessEvidenceFirst : assessResumeAgainstTarget
-    const result = await assessor(input, {
+    const assessmentOptions = {
       signal,
-      onDiagnostic: diagnostic => { diagnostics.push(structuredClone(diagnostic)) },
+      onDiagnostic: (diagnostic: AnalysisAssessmentDiagnostic) => { diagnostics.push(structuredClone(diagnostic)) },
       resumeSnapshotSha256: evaluationHash(input.resume),
       targetSnapshotSha256: evaluationHash({ rubric: input.rubric, qualifications: input.qualifications }),
       model: {
         ...options.model, processingSettings,
         onModelAttempt: attempts.onModelAttempt,
       },
-    })
+    }
+    const result = scaleCandidateAlgorithm(job.configuration.algorithmVersion)
+      ? await assessScaleCandidate(input, assessmentOptions, job.configuration.algorithmVersion as ScaleCandidateVersion, recordScaleArtifact)
+      : await assessor(input, assessmentOptions)
     await options.recordPrivateResult(structuredClone(result))
     signal?.throwIfAborted()
     return {
@@ -218,6 +236,7 @@ export async function executeProductionEvaluation(
       criteria: result.assessment.criteria.map(row => ({ criterionId: row.criterionId, score: row.score })),
     }
   } catch (error) {
+    if (scaleArtifactWritePending) throw error
     attempts.rethrowRecordingFailure()
     if (!(error instanceof AnalysisModelError) || error.cancelled || signal?.aborted) throw error
     await options.recordPrivateFailure?.({ code: error.code, stage: error.stage, reason: error.reason ?? null })

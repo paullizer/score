@@ -445,7 +445,7 @@ function correctionDiagnostic(error: unknown): Pick<AnalysisModelError, 'code' |
   } : undefined
 }
 
-function prepareAnalysisContext(
+export function prepareAnalysisContext(
   input: RealAnalysisAssessmentInput, options: AnalysisAssessmentOptions, stage: AnalysisModelStage,
 ) {
   checkCancelled(options?.signal, stage)
@@ -482,7 +482,7 @@ function emitEvidenceCatalog(context: ReturnType<typeof prepareAnalysisContext>,
   })
 }
 
-function modelOutputControl(
+export function modelOutputControl(
   { options, frozen, clock, catalog }: {
     options: AnalysisAssessmentOptions; frozen: RealAnalysisAssessmentInput; clock: Clock; catalog: AnalysisEvidenceCatalog
   },
@@ -712,6 +712,16 @@ export async function reviewAnalysisAssessment(
   const assessmentSha256 = hashAnalysisAssessment(proposed)
   emitEvidenceCatalog(context, 'grounding')
   const control = modelOutputControl(context)
+  const review = await reviewAnalysisAssessmentWithControl(context, proposed, control)
+  return { review, correctionCount: control.correctionCount, assessmentSha256 }
+}
+
+/** Offline assessors can share the production review format-repair budget without changing frozen settings. */
+export async function reviewAnalysisAssessmentWithControl(
+  context: ReturnType<typeof prepareAnalysisContext>, proposed: RealAnalysisAssessmentOutput,
+  control: ReturnType<typeof modelOutputControl>,
+): Promise<RealAnalysisGroundingReview> {
+  const assessmentSha256 = hashAnalysisAssessment(validateAnalysisAssessmentForReview(proposed, context.frozen))
   let correction: Record<string, unknown> | undefined
   for (;;) {
     checkCancelled(context.options.signal, 'grounding')
@@ -733,7 +743,7 @@ export async function reviewAnalysisAssessment(
       control.outputEvent(response, 'grounding', 'validation-failed', groundingDisagreement(review))
     }
     checkCancelled(context.options.signal, 'grounding')
-    return { review, correctionCount: control.correctionCount, assessmentSha256 }
+    return review
   }
 }
 

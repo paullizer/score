@@ -287,6 +287,10 @@ async function main() {
               ...options, input,
               recordPrivateResult: result => record('result', result),
               recordPrivateDiagnostics: diagnostics => record('diagnostics', diagnostics),
+              recordPrivateScaleArtifact: artifact => record(`scale-choice-${artifact.correctionCount}`, {
+                suiteSha256: job.suiteSha256, caseId: itemId,
+                configurationId: job.configuration.id, repetition: job.repetition, ...artifact,
+              }),
             }, comparisonSignal)
           }
           comparisonSignal.throwIfAborted()

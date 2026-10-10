@@ -56,6 +56,43 @@ The blind batch contains 18 development, six calibration and six holdout cards. 
 
 ## Experimental evidence-first candidate
 
+### Offline B1/B2 scale candidates
+
+Phase 2 adds two **unpromoted** algorithms in `worker/evals/scale-candidates.ts`. They require a saved `score-evidence-ladder-v1` rubric and its exact per-criterion examples (saved examples are levels 1-5; the shared scale supplies neutral level 0). Baseline readers still accept historical unscaled rubrics without adding fields or rewriting their hashes. These candidates do not change the production assessor, saved result schemas, settings, templates, feature switches or deployment.
+
+| `configuration.algorithmVersion` | Criterion decision | Review |
+| --- | --- | --- |
+| `score-scale-b1-assessor-v1` | Model chooses integer 0-5 and labels supporting passages `mention` / `applied-example` | Assessor-only |
+| `score-scale-b1-reviewer-v1` | Same B1 choice | Same captured current grounding reviewer |
+| `score-scale-b2-assessor-v1` | Model supplies all six source-bound checklist answers; code maps to a fixed level | Assessor-only |
+| `score-scale-b2-reviewer-v1` | Same B2 checklist | Same captured current grounding reviewer |
+
+The level/status map is fixed: **0 missing, 1-2 partial, 3-5 supported**. B1 rejects a positive level without source support, an applied level (2-5) without an applied-example passage, level 1 with applied evidence, and zero with purported support. The model interprets the saved examples and chooses the lower level when evidence lies between levels; code checks consistency, not semantic truth.
+
+B2 asks whether the exact criterion has relevant evidence, one applied example, repeated/ongoing work, broad/complex work, leading/originating work, and described outcomes **or** organizational scale for that leading work. The checklist uses the authoritative `src/domain/evidence-scale.ts` wording and the supplied saved examples. Code chooses 5 for leading/originating plus its documented outcome/organizational-scope predicate, otherwise 4 for broad/complex, 3 for repeated/ongoing, 2 for applied, 1 for relevant mentions, or 0 for no relevant support. Broad/complex means **independent responsibility OR larger scope OR choosing/adapting methods**, not mandatory independence. Level 5 does not mandate outcomes when organizational scale is documented, and higher scope does not mandate every lower frequency predicate.
+
+Each yes answer needs source passage evidence; no answers have no supporting citations. Higher predicates require relevant applied evidence. The outcome/organizational-scale predicate must share an identified passage with leading/originating evidence; adjacent passages can also be selected for cross-paragraph support. A documented leading example without its level-5 scope keeps only the explicitly supported lower predicates, per the lower-level tie rule. Contradictory answers, uncertain/incomplete checklists, inconsistent labels, duplicate IDs or excessive combined citations fail explicitly; they are never silently rounded, averaged, lowered or turned into successful zeros. Shared passage IDs establish a mechanical connection, not semantic relevance or claim support: this remains an experiment to evaluate.
+
+Both candidates reuse the complete lossless resume catalog, literal citation resolver, protected-trait policy, saved weights, requirement evidence and unscored grade qualification validators. Applicable missing evidence is assessed zero; genuine blockers remain explicit not-assessed/null; only saved grade not-applicable exclusions are excluded. Unresolved saved grade/qualification support gaps are rejected at input, as in production. Qualification alternatives, substitutions and exceptions remain unscored document-evidence notes, never hiring or official GS eligibility judgments.
+
+Blocked rows may retain source context through separate `blockerCitations` passage selections, without labeling that context as supporting mention/applied evidence. Those context citations resolve through the same literal ownership checks; assessed and excluded rows must leave them empty.
+
+Assessor-only modes require only the assessor's verified price binding and never call the reviewer. Reviewer modes use the unchanged captured `assessmentReview` task and production grounding prompt. Candidate format repairs, review format repairs and full candidate reassessments share the captured `analyses.maxOutputCorrections` budget, with no stage reset. A disputed reassessment may move up or down and is reviewed again; exhausted budgets and processing/refusal/truncation failures remain failed observations, not accepted zeros. This is the current-reviewer completion experiment, not the later narrow-verifier/no-veto design in Phase 3.
+
+The existing runner accepts these four identities under `kind: "scoring"` with the existing input/settings/price preflight. Exact suite/settings/input hashes and runner/bundle/dependency/runtime fingerprints reject cross-algorithm or mixed-executable resume. No extra manifest review flag can impersonate another algorithm. Each returned raw candidate choice is saved separately as `<job-hash>.scale-choice-<correction-count>.json`, including invalid choices before repair or final failure, with suite/case/configuration/repetition bindings, raw-content hash, exact model provenance, prompt/schema fingerprints, catalog binding, the canonical R1 rubric SHA-256, and code-derived level/status/literal citations when valid. Final successful results also carry a `scaleCandidate` artifact bundle. Canonical rubric hashes use `analysisHash`; suite/input/catalog/schema hashes use the existing serialized-JSON `evaluationHash`, while raw text and prompt hashes cover literal UTF-8 bytes. Storage failure stops publication. These artifacts contain private source evidence and belong only in appropriately access-controlled offline directories.
+
+Run the deterministic tests and local runner smoke without credentials or inference:
+
+```powershell
+npm run build:worker
+node --test worker-tests\scoring-scale-candidates.test.mjs
+node --test --test-name-pattern="offline scale runner smoke" worker-tests\scoring-runner.test.mjs
+```
+
+The candidate tests inject model responses into the existing transport; they never contact a model. The runner smoke authors synthetic completed observations bound to the local executable, then exercises resume and fail-closed preflight for all four identities. It makes **no inference or token requests** and asserts that no model-attempt ledger appears; its synthetic observations are plumbing checks, not model results, a stability baseline or human labels. The runner's explicit admission argument is exercised only inside this completed synthetic smoke, not authorization for fresh paid work.
+
+Remaining prerequisites are unchanged: exact responding-model baseline and noise-floor panels, qualified reviewer controls, approved and frozen corpus job/grade rubrics with exact hashes, blind human labels and spot checks, the development finalist comparison and cross-model gap, and separately admitted holdout/release gates. Offline implementation does not resolve the independently blocked R1/private-corpus gate or authorize Blob access, cloud permission changes, private/holdout corpus use, paid inference, deployment, human approval or promotion. The separate Decision-1 spike is not a dependency or a substitute for these prerequisites.
+
 `score-evidence-first-v1` maps supporting and contradictory source passage IDs for every criterion, scores against the complete source and saved anchors, then selectively verifies uncertainties, qualifications, extremes, inconsistencies and a fixed audit sample. A disputed assessment receives bounded automatic resolution, which can raise or lower a score. No averaging, higher-score preference, user disagreement action or retry-until-accepted loop is introduced.
 
 The candidate shares at most two repair/resolution calls across the comparison. It preserves source ownership, exact quotes, saved weights and private intermediate diagnostics. Its final resolver does not face a further independent veto; that is an experimental policy requiring evaluation, not a production guarantee. Malformed model output is an explicit failed observation; ledger/storage failures stop admission rather than becoming scores.
