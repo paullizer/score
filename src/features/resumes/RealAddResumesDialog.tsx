@@ -20,7 +20,7 @@ export function RealAddResumesDialog({ open, onOpenChange }: { open: boolean; on
   const hintId = useId()
   const batch = api?.batches.find((item) => item.id === api.currentBatchId)
   const items = batch?.items ?? []
-  const uploading = items.some((item) => item.state === 'uploading')
+  const uploading = items.some((item) => item.state === 'waiting' || item.state === 'uploading')
   const accepted = items.filter((item) => item.state === 'accepted').length
   const valid = items.filter((item) => item.state === 'pending' || item.state === 'unconfirmed').length
   const limits = api?.features?.resumeLimits ?? RESUME_IMPORT_LIMITS
@@ -106,7 +106,7 @@ export function RealAddResumesDialog({ open, onOpenChange }: { open: boolean; on
               {item.source.kind === 'url' ? <Link2 size={17} className="mt-1 shrink-0 text-muted" aria-hidden="true" /> : <FileText size={17} className="mt-1 shrink-0 text-muted" aria-hidden="true" />}
               <div className="min-w-0 flex-1">
                 <p className="break-all text-[11px] font-semibold">{index + 1}. {item.label}</p>
-                <p className="mt-1 text-[10px] text-muted">{item.source.kind !== 'url' && `${item.source.kind.toUpperCase()} · `}{item.state === 'pending' ? 'Ready to send — not accepted yet' : item.state === 'uploading' ? 'Sending source — server acceptance not confirmed yet'
+                <p className="mt-1 text-[10px] text-muted">{item.source.kind !== 'url' && `${item.source.kind.toUpperCase()} · `}{item.state === 'pending' ? 'Ready to send — not accepted yet' : item.state === 'waiting' ? 'Waiting to upload — not sent yet' : item.state === 'uploading' ? 'Sending source — server acceptance not confirmed yet'
                   : item.state === 'accepted' ? `Accepted by the server · ${summary?.resume.status ?? 'processing status in library'}` : item.state === 'invalid' ? 'Invalid input — not sent' : 'Acceptance not confirmed — check the library or retry the unchanged request'}</p>
                 {item.error && <p className="mt-2 text-[11px] text-[var(--cp-danger)]" role="alert">{item.error}</p>}
                 {summary?.error && <p className="mt-2 text-[11px] text-[var(--cp-danger)]" role="alert">{resumeErrorMessage(summary)}</p>}
@@ -147,12 +147,13 @@ export function RealResumeImportActivity() {
   const items = api?.batches.flatMap((batch) => batch.items) ?? []
   if (!items.length) return null
   const uploading = items.filter((item) => item.state === 'uploading').length
+  const waiting = items.filter((item) => item.state === 'waiting').length
   const accepted = items.filter((item) => item.state === 'accepted').length
   const attention = items.filter((item) => item.state === 'unconfirmed' || item.state === 'invalid'
     || api?.summaries.some((summary) => summary.resume.id === item.resumeId && summary.resume.status === 'error')).length
   return <div className="info-callout mb-5" role="status" aria-live="polite">
-    {uploading ? <LoaderCircle size={18} className="motion-safe:animate-spin" aria-hidden="true" /> : <FileText size={18} aria-hidden="true" />}
-    <div><strong>Resume imports: {accepted} accepted{uploading > 0 ? ` · ${uploading} uploading (not yet acknowledged)` : ''}{attention > 0 ? ` · ${attention} need attention` : ''}</strong>
+    {uploading || waiting ? <LoaderCircle size={18} className="motion-safe:animate-spin" aria-hidden="true" /> : <FileText size={18} aria-hidden="true" />}
+    <div><strong>Resume imports: {accepted} accepted{uploading > 0 ? ` · ${uploading} uploading (not yet acknowledged)` : ''}{waiting > 0 ? ` · ${waiting} waiting to upload` : ''}{attention > 0 ? ` · ${attention} need attention` : ''}</strong>
       <p>Only accepted inputs are durable. <Link className="text-link" to="/resumes?imports=open">Review batches and server progress</Link></p></div>
   </div>
 }

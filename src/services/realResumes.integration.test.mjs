@@ -850,6 +850,155 @@ test('provider retains independent accepted/unconfirmed uploads after dialog unm
   assert.equal(dom.window.localStorage.length, 0)
 })
 
+for (const count of [4, 10]) {
+  test(`one drop of ${count} Markdown resumes is admitted in order exactly once without retries`, async () => {
+    const gates = Array.from({ length: count }, deferred)
+    const saved = []
+    let active = 0, peak = 0
+    globalThis.fetch = async (url, init) => {
+      requests.push({ url, init })
+      if (url === '/api/features') return json({ realResumeImports: true, markdownResumeImports: true })
+      if (init.method === 'GET') return json({ resumes: saved })
+      const index = requests.filter(request => request.init.method === 'POST').length - 1
+      active++
+      peak = Math.max(peak, active)
+      await gates[index].promise
+      active--
+      const record = summary(`accepted-${index}`, 'workspace-one', 'queued')
+      saved.push(record)
+      return json({ resume: record }, 202)
+    }
+    await mount('workspace-one', true, 'owner', true)
+    await settle(() => current?.phase === 'ready')
+    const files = Array.from({ length: count }, (_, index) =>
+      new File([`# Candidate ${index}\r\n\nEngineer.\n`], index < 2 ? 'same-name.md' : `candidate-${index}.md`))
+    const drop = new dom.window.Event('drop', { bubbles: true, cancelable: true })
+    Object.defineProperty(drop, 'dataTransfer', { value: { files } })
+    await act(async () => dom.window.document.querySelector('.drop-zone').dispatchEvent(drop))
+    const batch = current.batches[0]
+    let submission
+    await act(async () => {
+      submission = current.submitBatch(batch.id)
+      await new Promise(resolve => setTimeout(resolve, 0))
+    })
+    try {
+      await assert.rejects(current.submitBatch(batch.id), /still uploading|acknowledged/)
+      assert.throws(() => current.newBatch(), /active batch has not been replaced/)
+      for (let index = 0; index < count; index++) {
+        await settle(() => requests.filter(request => request.init.method === 'POST').length >= index + 1)
+        assert.equal(requests.filter(request => request.init.method === 'POST').length, index + 1, 'Later sources must wait for acknowledgment')
+        assert.equal(current.batches[0].items[index].state, 'uploading')
+        assert.ok(current.batches[0].items.slice(index + 1).every(item => item.state === 'waiting'))
+        if (index === 0) await mount('workspace-one', true, 'owner', false)
+        await act(async () => { gates[index].resolve(); await new Promise(resolve => setTimeout(resolve, 0)) })
+      }
+      await act(async () => submission)
+      assert.equal(peak, 1)
+      assert.equal(saved.length, count)
+      assert.equal(current.summaries.length, count)
+      const posts = requests.filter(request => request.init.method === 'POST')
+      assert.equal(posts.length, count)
+      assert.deepEqual(posts.map(request => request.init.headers.get('Idempotency-Key')), batch.items.map(item => item.key))
+      for (let index = 0; index < count; index++) {
+        assert.equal(posts[index].init.headers.get('X-Import-Batch'), batch.id)
+        assert.equal(posts[index].init.headers.get('X-Import-Count'), String(count))
+        assert.deepEqual(new Uint8Array(posts[index].init.body), new Uint8Array(await files[index].arrayBuffer()))
+      }
+      assert.equal(current.batches[0].items.every(item => item.source.file === null), true)
+      assert.equal(dom.window.localStorage.length, 0)
+    } finally {
+      gates.forEach(gate => gate.resolve())
+      await act(async () => submission)
+    }
+  })
+}
+
+for (const message of ['Another workspace change is in progress.', 'This idempotency key was already used for different input.',
+  'Every item in this batch must use the same declared input count.']) {
+  test(`resume import preserves the actual conflict: ${message}`, async () => {
+    globalThis.fetch = async (url, init) => {
+      requests.push({ url, init })
+      if (url === '/api/features') return json({ realResumeImports: true, markdownResumeImports: true })
+      if (init.method === 'GET') return json({ resumes: [] })
+      return json({ error: { code: 'conflict', message } }, 409)
+    }
+    await mount()
+    await settle(() => current?.phase === 'ready')
+    await act(async () => current.stage([ui.resumeFileInput(new File(['# Engineer'], 'resume.md'))]))
+    await act(async () => current.submitBatch(current.batches[0].id))
+    assert.equal(current.batches[0].items[0].error, message)
+    assert.equal(requests.filter(request => request.init.method === 'POST').length, 1)
+  })
+}
+
+test('resume submission stops unsent inputs when current public policy changes between acknowledgments', async () => {
+  const gate = deferred()
+  const available = effectiveResumeFeatures({ imports: true })
+  let policy = { cloud: true, phase: 'ready', settings: available.publicSettings, error: null, refresh: async () => {} }
+  globalThis.fetch = async (url, init) => {
+    requests.push({ url, init })
+    if (url === '/api/features') return json(available)
+    if (init.method === 'GET') return json({ resumes: [] })
+    await gate.promise
+    return json({ resume: summary('accepted-one', 'workspace-one', 'queued') }, 202)
+  }
+  const render = async () => {
+    root ??= createRoot(dom.window.document.getElementById('root'))
+    await act(async () => {
+      root.render(React.createElement(ui.PublicSettingsContext.Provider, { value: policy }, tree('workspace-one')))
+      await new Promise(resolve => setTimeout(resolve, 0))
+    })
+  }
+  await render()
+  await settle(() => current?.phase === 'ready')
+  const files = Array.from({ length: 3 }, (_, index) => new File(['%PDF-source'], `resume-${index}.pdf`))
+  await act(async () => current.stage(files.map(ui.resumeFileInput)))
+  let submission
+  await act(async () => { submission = current.submitBatch(current.batches[0].id).catch(error => error); await new Promise(resolve => setTimeout(resolve, 0)) })
+  policy = { ...policy, settings: { ...policy.settings, features: { ...policy.settings.features, resumeImports: false } } }
+  await render()
+  let stopped
+  await act(async () => { gate.resolve(); stopped = await submission })
+  assert.ok(stopped instanceof Error)
+  assert.equal(requests.filter(request => request.init.method === 'POST').length, 1)
+  assert.deepEqual(current.batches[0].items.map(item => item.state), ['accepted', 'pending', 'pending'])
+  assert.equal(current.batches[0].items[1].source.file, files[1])
+  assert.match(current.batches[0].items[1].error, /disabled|paused|not.*enabled/i)
+})
+
+for (const change of ['workspace switch', 'read-only access', 'server denial']) {
+  test(`resume submission stops later uploads after ${change}`, async () => {
+    const gate = deferred()
+    globalThis.fetch = async (url, init) => {
+      requests.push({ url, init })
+      if (url === '/api/features') return json({ realResumeImports: true })
+      if (init.method === 'GET') return json({ resumes: [] })
+      await gate.promise
+      return change === 'server denial' ? json({ error: { code: 'forbidden', message: 'Write access was revoked.' } }, 403)
+        : json({ resume: summary('accepted-one', 'workspace-one', 'queued') }, 202)
+    }
+    await mount()
+    await settle(() => current?.phase === 'ready')
+    const files = Array.from({ length: 3 }, (_, index) => new File(['%PDF-source'], `resume-${index}.pdf`))
+    await act(async () => current.stage(files.map(ui.resumeFileInput)))
+    let submission
+    await act(async () => { submission = current.submitBatch(current.batches[0].id).catch(error => error); await new Promise(resolve => setTimeout(resolve, 0)) })
+    if (change === 'workspace switch') await mount('workspace-two')
+    if (change === 'read-only access') await mount('workspace-one', true, 'viewer')
+    await act(async () => { gate.resolve(); await submission })
+    assert.equal(requests.filter(request => request.init.method === 'POST').length, 1)
+    if (change === 'workspace switch') {
+      assert.equal(current.workspaceId, 'workspace-two')
+      assert.equal(current.batches.length, 0)
+      assert.equal(current.summaries.length, 0)
+    } else {
+      assert.deepEqual(current.batches[0].items.map(item => item.state), ['unconfirmed', 'pending', 'pending'])
+      assert.equal(current.batches[0].items[1].source.file, files[1])
+      assert.match(current.batches[0].items[1].error, /Not sent/)
+    }
+  })
+}
+
 test('provider releases acknowledged DOCX/DOC files and retries an unconfirmed Word source with unchanged keys and bytes', async () => {
   let wordAttempts = 0
   globalThis.fetch = async (url, init) => {

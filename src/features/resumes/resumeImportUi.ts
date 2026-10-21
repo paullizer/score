@@ -17,7 +17,7 @@ export interface RealResumeImportItem {
   key: string
   source: RealResumeImportSource | { kind: UploadedSourceKind; file: null }
   label: string
-  state: 'pending' | 'invalid' | 'uploading' | 'accepted' | 'unconfirmed'
+  state: 'pending' | 'invalid' | 'waiting' | 'uploading' | 'accepted' | 'unconfirmed'
   error?: string
   warning?: string
   resumeId?: string
