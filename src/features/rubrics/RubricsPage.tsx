@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import { Link, Navigate, useNavigate, useParams, useSearchParams } from 'react-router-dom'
-import { ArrowLeft, ArrowRight, BriefcaseBusiness, FileSearch, Layers3, LoaderCircle, ShieldCheck } from 'lucide-react'
+import { ArrowLeft, ArrowRight, BadgeCheck, BriefcaseBusiness, FileSearch, Layers3, LoaderCircle, ShieldCheck } from 'lucide-react'
 import { useWorkspace } from '../../app/workspace-context'
 import { useLibraryViewState } from '../../app/library-view-state'
 import { DocumentViewer } from '../../components/documents/DocumentViewer'
@@ -15,9 +15,12 @@ import { gradeLadderLink } from '../grade-ladders/gradeUi'
 import { isEntityArchived, isEntityRemoved, matchesArchiveFilter, type ArchiveFilter } from '../../domain/lifecycle'
 import { ArchivedBadge, ArchiveStateFilter, EntityLifecycleActions, LifecycleBanner } from '../../components/lifecycle/LifecycleControls'
 import { useLifecycleAccess } from '../../components/lifecycle/useLifecycleAccess'
-import { useRealAnalyses } from '../../app/real-analyses-context'
+import { useAnalysisTargetSubscription, useRealAnalyses } from '../../app/real-analyses-context'
 import { realAnalysisLink } from '../analyses/realAnalysisUi'
 import type { RealAnalysisTargetSelection, RealAnalysisTargetSummary } from '../../domain/real-analyses'
+import { useRubricApprovals } from './useRubricApproval'
+import { PendingRubricNotice } from './PendingRubricNotice'
+import { BulkRubricApproval } from './BulkRubricApproval'
 
 function rubricReady(rubric: Rubric, workspace: Workspace, targets: RealAnalysisTargetSummary[] = []): boolean {
   if (isEntityArchived(workspace, { kind: 'rubric', id: rubric.groupId }) || isEntityRemoved(workspace, { kind: 'rubric', id: rubric.groupId })) return false
@@ -35,10 +38,16 @@ function RubricsLibrary() {
   const [params, setParams] = useSearchParams()
   const gradeLadders = useGradeLadders()
   const analyses = useRealAnalyses()
+  useAnalysisTargetSubscription()
+  const approvals = useRubricApprovals()
   const eligible = analyses?.canWrite && analyses.phase === 'ready' && analyses.features?.realAnalyses && analyses.targets.state === 'ready' && !analyses.targets.error ? analyses.targets.value : []
   const kind = params.get('kind') === 'grade' ? 'grade' : 'job'
+  const pendingOnly = params.get('approval') === 'pending'
+  const mode = approvals.canApprove && (params.get('action') === 'approve' || (pendingOnly && params.get('action') !== 'analyze')) ? 'approve' : 'analyze'
   const [search, setSearch] = useLibraryViewState('rubrics:query', '')
   const [selection, setSelection] = useState<string[]>([])
+  const [approvalVersions, setApprovalVersions] = useState<Record<string, Rubric>>({})
+  const [batch, setBatch] = useState<Rubric[] | null>(null)
   const [archiveFilter, setArchiveFilter] = useLibraryViewState<ArchiveFilter>('rubrics:archive', 'default')
   const { canEdit } = useLifecycleAccess()
   const [exactTargets, setExactTargets] = useState<Record<string, RealAnalysisTargetSelection>>({})
@@ -46,14 +55,14 @@ function RubricsLibrary() {
   const query = search.trim().toLocaleLowerCase()
   const visible = rubrics.filter((rubric) => {
     const job = workspace.jobs.find((item) => item.id === rubric.jobId)
-    return matchesArchiveFilter(isEntityArchived(workspace, { kind: 'rubric', id: rubric.groupId }), search, archiveFilter) && [
+    return (!pendingOnly || approvals.forRubric(rubric).pending) && matchesArchiveFilter(isEntityArchived(workspace, { kind: 'rubric', id: rubric.groupId }), search, archiveFilter) && [
       rubric.name, rubric.description, rubric.ladder, rubric.grade, job?.title, job?.organization,
       ...rubric.criteria.map((criterion) => criterion.label),
     ].filter(Boolean).join(' ').toLocaleLowerCase().includes(query)
   })
-  const selected = rubrics.filter((rubric) => selection.includes(rubric.id))
+  const selected = mode === 'approve' ? selection.flatMap((id) => approvalVersions[id] ? [approvalVersions[id]] : []) : rubrics.filter((rubric) => selection.includes(rubric.id))
   const hiddenCount = selected.filter((rubric) => !visible.some((item) => item.id === rubric.id)).length
-  const readyVisible = visible.filter((rubric) => canEdit && rubricReady(rubric, workspace, eligible))
+  const readyVisible = visible.filter((rubric) => mode === 'approve' ? approvals.forRubric(rubric).canApprove : canEdit && rubricReady(rubric, workspace, eligible))
   const allVisibleSelected = readyVisible.length > 0 && readyVisible.every((rubric) => selection.includes(rubric.id))
   const gradeCount = gradeLadders?.summaries.reduce((count, family) => count + family.levels.filter((level) => !isEntityArchived(workspace, { kind: 'rubric', id: level.head.id }) && !isEntityRemoved(workspace, { kind: 'rubric', id: level.head.id })).length, 0) ?? 0
 
@@ -63,11 +72,33 @@ function RubricsLibrary() {
 
   function choose(ids: string[]) {
     setSelection(ids)
+    setApprovalVersions((current) => Object.fromEntries(ids.flatMap((id) => {
+      const rubric = current[id] ?? rubrics.find((item) => item.id === id)
+      return rubric ? [[id, rubric]] : []
+    })))
     setExactTargets((current) => Object.fromEntries(ids.flatMap((id) => {
       const shownVersion = rubrics.find((item) => item.id === id)?.version
       const target = current[id] ?? eligible.find((item) => item.rubricId === id && item.rubricVersion === shownVersion)?.selection
       return target ? [[id, target]] : []
     })))
+  }
+
+  function updateParams(changes: Record<string, string | null>) {
+    choose([])
+    const next = new URLSearchParams(params)
+    for (const [key, value] of Object.entries(changes)) { if (value === null) next.delete(key); else next.set(key, value) }
+    setParams(next, { replace: true })
+  }
+
+  function unavailableReason(rubric: Rubric) {
+    const state = approvals.forRubric(rubric)
+    if (!state.active) return 'This job or rubric is archived, removed, or still processing. Open it to review its status.'
+    if (!canEdit || !analyses?.canWrite) return 'Only an owner or editor in an active workspace can start analyses.'
+    if (approvals.required && state.status !== 'approved') return state.message
+    if (!analyses?.features?.realAnalyses) return 'New analysis processing is currently unavailable. Approval does not start an analysis.'
+    if (analyses.targets.state === 'error' || (analyses.targets.state === 'ready' && analyses.targets.error)) return 'Analysis availability could not be refreshed. Retry loading available targets.'
+    if (analyses.targets.state !== 'ready') return 'Checking this exact version’s analysis availability…'
+    return 'This exact version is not offered by the server. Open the rubric to review its source and current version.'
   }
 
   function analyze(items: Rubric[], preserveSelection = false) {
@@ -94,20 +125,26 @@ function RubricsLibrary() {
       eyebrow="THE STANDARD, MADE VISIBLE"
       title="Rubrics"
       description="Inspect the criteria before the comparison. Reuse a grade standard, or work from a specific job."
-      actions={<Button
+      actions={kind === 'job' && (mode === 'approve' ? <Button icon={BadgeCheck} variant="primary"
+        disabled={!approvals.canApprove || !selected.length || selected.some((item) => !approvals.forRubric(item).canApprove)}
+        onClick={() => setBatch(selected)}>Approve selected{selected.length ? ` (${selected.length})` : ''}</Button> : <Button
         icon={ArrowRight}
         variant="primary"
         disabled={!canEdit || !selected.length || selected.length !== selection.length || selected.some((item) => !rubricReady(item, workspace, eligible)) || !analyses?.canWrite || analyses.phase !== 'ready' || !analyses.features?.realAnalyses}
         onClick={() => analyze(selected, true)}
-      >Analyze selected{selected.length ? ` (${selected.length})` : ''}</Button>}
+      >Analyze selected{selected.length ? ` (${selected.length})` : ''}</Button>)}
     />
+    {kind === 'job' && <PendingRubricNotice onApproveAll={() => setBatch(approvals.pending)} />}
+    {batch && <BulkRubricApproval rubrics={batch} onClose={() => { setBatch(null); choose([]) }} />}
+    {analyses && (analyses.targets.state === 'error' || (analyses.targets.state === 'ready' && analyses.targets.error)) &&
+      <div className="mb-5"><InlineError>Analysis availability could not be loaded. <button className="underline" onClick={() => void analyses.refreshTargets()}>Retry available targets</button></InlineError></div>}
 
     <section className="panel">
       <div className="library-toolbar">
         <SegmentedControl<'job' | 'grade'>
           label="Rubric type"
           value={kind}
-          onChange={(value) => { choose([]); setParams({ kind: value }, { replace: true }) }}
+          onChange={(value) => updateParams({ kind: value, approval: null, action: null })}
           options={[
             { value: 'job', label: 'Job rubrics', count: rubrics.filter((rubric) => !isEntityArchived(workspace, { kind: 'rubric', id: rubric.groupId })).length },
             { value: 'grade', label: 'GS / grade rubrics', count: gradeCount },
@@ -117,10 +154,22 @@ function RubricsLibrary() {
       </div>
 
       {kind === 'job' && <><div className="flex flex-wrap items-center justify-between gap-3 border-b px-5 py-3">
+        <div className="flex flex-wrap items-center gap-3">
+          <SegmentedControl<'analyze' | 'approve'> label="Rubric selection action" value={mode}
+            onChange={(value) => updateParams({ action: value })}
+            options={[{ value: 'analyze', label: 'For analysis' }, ...(approvals.canApprove ? [{ value: 'approve' as const, label: 'For approval' }] : [])]} />
+          <select className="filter-select" aria-label="Filter rubric approval status" value={pendingOnly ? 'pending' : 'all'}
+            onChange={(event) => updateParams({ approval: event.target.value === 'pending' ? 'pending' : null, action: null })}>
+            <option value="all">All approval states</option><option value="pending">Needs approval ({approvals.pending.length})</option>
+          </select>
+        </div>
         <p className="text-[11px] text-muted" role="status" aria-live="polite">
           {selected.length > 0
             ? <><strong className="font-semibold text-accent">{selected.length} selected</strong>{hiddenCount > 0 && ` · ${hiddenCount} outside this view`}</>
-            : 'Select eligible real job rubrics for manual analysis, or inspect approved GS versions in their grade families.'}
+            : mode === 'approve' ? 'Select pending rubrics to review their checks and approve exact versions together.'
+              : !approvals.required ? 'Select available saved rubrics for analysis. Approval is optional under current Admin settings.'
+                : approvals.canApprove ? 'Select approved, available rubrics for analysis. Use For approval to select pending drafts.'
+                  : 'Select available approved rubrics for analysis. Pending drafts need a workspace owner’s approval.'}
         </p>
         <div className="flex items-center gap-4">
           {selected.length > 0 && <button type="button" className="link-button text-[11px]" onClick={() => choose([])}>Clear selection</button>}
@@ -140,6 +189,8 @@ function RubricsLibrary() {
             {[...visible].sort((left, right) => (left.grade ?? left.name).localeCompare(right.grade ?? right.name, undefined, { numeric: true })).map((rubric) => {
               const job = workspace.jobs.find((item) => item.id === rubric.jobId)
               const ready = canEdit && rubricReady(rubric, workspace, eligible)
+              const approval = approvals.forRubric(rubric)
+              const selectable = mode === 'approve' ? approval.canApprove : ready
               const checked = selected.some((item) => item.id === rubric.id)
               return <article className={`rubric-card flex min-w-0 flex-col ${checked ? 'border-accent bg-accent-soft' : ''}`} key={rubric.id}>
                 <div className="mb-3 flex items-start justify-between gap-3">
@@ -148,14 +199,15 @@ function RubricsLibrary() {
                     <Badge>{rubric.grade ?? job?.grade ?? 'Job-specific'}</Badge>
                     <ArchivedBadge target={{ kind: 'rubric', id: rubric.groupId }} />
                     <span className="text-[10px] text-muted">v{rubric.version}</span>
+                    {approval.known && <Badge dot tone={approval.status === 'approved' ? 'success' : 'warning'}>{approval.label}</Badge>}
                   </div>
                   <input
                     type="checkbox"
                     checked={checked}
                     onChange={() => toggle(rubric.id)}
-                    disabled={!ready}
+                    disabled={!checked && !selectable}
                     aria-label={`Select ${rubric.name}`}
-                    title={ready ? `Select ${rubric.name}, version ${rubric.version}` : 'Real analysis requires an eligible saved target, available processing, and write access.'}
+                    title={selectable ? `Select ${rubric.name}, version ${rubric.version} for ${mode === 'approve' ? 'approval' : 'analysis'}` : mode === 'approve' ? !approval.supported ? 'Import this legacy job again to create a rubric on the evidence scale.' : 'Only a workspace owner can select active pending drafts for approval.' : unavailableReason(rubric)}
                   />
                 </div>
                 <h3><Link to={rubricLink(rubric)} className="row-title text-[14px] leading-5">{rubric.name}</Link></h3>
@@ -172,10 +224,14 @@ function RubricsLibrary() {
                   </ol>
                   {rubric.criteria.length > 3 && <p className="mt-2 text-[10px] text-muted">+ {rubric.criteria.length - 3} more to inspect</p>}
                 </div>
-                {!ready && <p className="mb-3 text-[10px] text-muted">This exact real version is not currently eligible, or analysis processing/write access is unavailable.</p>}
+                {!ready && <p className="mb-3 text-[12px] text-muted">{unavailableReason(rubric)}</p>}
+                {approval.approval && approval.status !== 'approved' && <Link className="text-link mb-3 text-[12px]" to={`/rubrics/${encodeURIComponent(approval.approval.rubricId)}?${new URLSearchParams({ job: rubric.jobId!, version: String(approval.approval.version) })}`}>
+                  Inspect approved version {approval.approval.version}
+                </Link>}
                 <div className="mt-auto flex flex-wrap items-center justify-between gap-2">
                   <Link to={rubricLink(rubric)} className="text-link text-[11px]">Inspect rubric <ArrowRight size={13} aria-hidden="true" /></Link>
-                  <Button size="sm" variant="ghost" disabled={!ready} onClick={() => analyze([rubric])}>Use rubric</Button>
+                  {approval.canApprove && <Button size="sm" icon={BadgeCheck} onClick={() => setBatch([rubric])}>Check and approve</Button>}
+                  {(!approval.canApprove || ready) && <Button size="sm" variant="ghost" disabled={!ready} title={!ready ? unavailableReason(rubric) : undefined} onClick={() => analyze([rubric])}>Use rubric</Button>}
                 </div>
                 <div className="mt-3"><EntityLifecycleActions target={{ kind: 'rubric', id: rubric.groupId }} name={rubric.name} /></div>
               </article>
@@ -184,11 +240,11 @@ function RubricsLibrary() {
         </section>
       </div> : <EmptyState
         icon={Layers3}
-        title={query ? 'No matching rubrics' : 'No job rubrics yet'}
-        description={query
+        title={pendingOnly ? 'No pending rubrics in this view' : query ? 'No matching rubrics' : 'No job rubrics yet'}
+        description={pendingOnly ? 'No active drafts match these filters. Approved rubrics remain available in the full library.' : query
           ? 'Try a different name, criterion, family, or grade. Selections outside this view are kept.'
           : 'Import a job to prepare its linked, source-grounded rubric.'}
-        action={query
+        action={/* security-reviewed: xss/nonliteral-url -- EmptyState.action is a ReactNode slot, not a DOM URL. */ pendingOnly ? <Button onClick={() => { setSearch(''); setArchiveFilter('default'); updateParams({ approval: null, action: null }) }}>Show all rubrics</Button> : query
           ? <Button onClick={() => setSearch('')}>Clear search</Button>
           : <Button onClick={() => navigate('/jobs')}>Open jobs</Button>}
       />}
@@ -205,14 +261,18 @@ function RubricDetail({ id }: { id: string }) {
   const navigate = useNavigate()
   const gradeLadders = useGradeLadders()
   const analyses = useRealAnalyses()
+  useAnalysisTargetSubscription()
+  const approvals = useRubricApprovals()
   const eligible = analyses?.canWrite && analyses.phase === 'ready' && analyses.features?.realAnalyses && analyses.targets.state === 'ready' && !analyses.targets.error ? analyses.targets.value : []
   const [params] = useSearchParams()
   const [sourceSelection, setSourceSelection] = useState<{ criterion: Criterion; citation?: Citation } | null>(null)
-  const rubric = workspace.rubrics.find((item) => item.id === id)
+  const requestedJobId = params.get('job') ?? workspace.rubrics.find((item) => item.id === id)?.jobId
+  const realDetail = requestedJobId ? cloud.realJobs.detail(requestedJobId) : undefined
+  const rubric = [...(realDetail?.state === 'ready' ? realDetail.value.rubricVersions : workspace.rubrics)].sort((a, b) => b.version - a.version).find((item) =>
+    item.id === id && (!params.has('version') || String(item.version) === params.get('version')))
   const job = workspace.jobs.find((item) => item.id === rubric?.jobId)
   const document = workspace.documents.find((item) => item.id === job?.documentId)
-  const requestedJobId = params.get('job') ?? job?.id
-  const realDetail = requestedJobId ? cloud.realJobs.detail(requestedJobId) : undefined
+  const [batch, setBatch] = useState<Rubric[] | null>(null)
   const { canEdit } = useLifecycleAccess({ kind: 'rubric', id: rubric?.groupId ?? id })
 
   useEffect(() => {
@@ -239,6 +299,7 @@ function RubricDetail({ id }: { id: string }) {
   const historic = rubric.id !== current.id || rubric.version !== current.version
   const realTarget = eligible.find((target) => target.rubricId === rubric.id && target.rubricVersion === rubric.version)
   const ready = canEdit && rubricReady(rubric, workspace, eligible)
+  const approval = approvals.forRubric(rubric)
 
   return <>
     <Link className="back-link" to={`/rubrics?kind=${rubric.kind}`}><ArrowLeft size={14} aria-hidden="true" />Back to rubrics</Link>
@@ -248,7 +309,7 @@ function RubricDetail({ id }: { id: string }) {
       description={rubric.kind === 'grade'
         ? 'A reusable set of expectations. Compare directly to this grade, with or without a job.'
         : 'A job-specific standard, with traceable source references and preserved version history.'}
-      actions={<>{rubric.kind === 'job' && <Button icon={Layers3} disabled={!canEdit || !gradeLadders?.canWrite || gradeLadders.phase !== 'ready' || job?.status !== 'ready' || Boolean(job?.rubricDeletedAt)}
+      actions={<>{approval.canApprove && <Button icon={BadgeCheck} onClick={() => setBatch([rubric])}>Check and approve</Button>}{rubric.kind === 'job' && <Button icon={Layers3} disabled={!canEdit || !gradeLadders?.canWrite || gradeLadders.phase !== 'ready' || job?.status !== 'ready' || Boolean(job?.rubricDeletedAt) || (approvals.required && approval.status !== 'approved')}
         title={!gradeLadders?.canWrite ? 'Only an owner or editor in a grade-enabled workspace can create a ladder.' : 'Capture this exact saved job rubric version as a new GS family.'}
         onClick={() => navigate(`/grade-ladders/new?${new URLSearchParams({ job: job!.id, rubric: rubric.id, rubricVersion: String(rubric.version) })}`)}>Create grade ladder</Button>}
         <Button variant="primary" icon={ArrowRight} disabled={!ready} title="Use this exact saved version in a separate analysis; no newer version is substituted." onClick={() => {
@@ -257,9 +318,11 @@ function RubricDetail({ id }: { id: string }) {
           navigate(link.to, { state: link.state })
         }}>Analyze with this rubric</Button></>}
     />
+    {batch && <BulkRubricApproval rubrics={batch} onClose={() => setBatch(null)} />}
     <LifecycleBanner target={{ kind: 'rubric', id: rubric.groupId }} />
     <div className="detail-metadata">
       <Badge tone="accent">{rubric.kind === 'grade' ? 'Grade rubric' : 'Job rubric'}</Badge>
+      {rubric.kind === 'job' && approval.known && <Badge dot tone={approval.status === 'approved' ? 'success' : 'warning'}>{approval.label}</Badge>}
       <ArchivedBadge target={{ kind: 'rubric', id: rubric.groupId }} />
       {rubric.ladder && <span>{rubric.ladder}</span>}
       {(rubric.grade ?? job?.grade) && <span>{rubric.grade ?? job?.grade}</span>}
@@ -270,13 +333,22 @@ function RubricDetail({ id }: { id: string }) {
       <Layers3 size={18} aria-hidden="true" />
       <div><strong>You’re inspecting a preserved version.</strong><p>Past results keep this version unchanged. To edit the rubric, use <Link className="link-button" to={rubricLink(current)}>version {current.version}</Link>. An eligible saved version can be selected explicitly for a new analysis without substituting newer criteria.</p></div>
     </div>}
-    {!ready && <div className="info-callout mb-5"><BriefcaseBusiness size={18} aria-hidden="true" /><div><strong>This exact version is not available for real analysis.</strong><p>Confirm real analysis availability and write access, or review the current eligible version. No newer version will be silently substituted.</p></div></div>}
+    {!ready && <div className="info-callout mb-5"><BriefcaseBusiness size={18} aria-hidden="true" /><div>
+      <strong>{approvals.required && approval.status === 'draft' ? approval.label : 'This exact version is not available for real analysis.'}</strong>
+      <p>{approvals.required && approval.status !== 'approved' ? approval.message
+        : !canEdit || !analyses?.canWrite ? 'Only an owner or editor in an active workspace can start analyses.'
+          : !analyses?.features?.realAnalyses ? 'New analysis processing is currently unavailable.'
+            : analyses.targets.state !== 'ready' ? 'Checking this exact version’s analysis availability…'
+              : 'The server has not confirmed this exact version as available. Review its source and current availability. No newer version will be substituted.'}</p>
+      {approval.status === 'draft' && <a className="text-link mt-2" href="#rubric-approval">Review approval and checks</a>}
+      {analyses?.features?.realAnalyses && <Button size="sm" className="mt-2" onClick={() => void analyses.refreshTargets()}>Refresh analysis availability</Button>}
+    </div></div>}
     {realDetail?.state === 'error' && <div className="mb-5"><InlineError>{realDetail.error} <button className="ml-2 underline" onClick={() => requestedJobId && void cloud.realJobs.ensureDetail(requestedJobId, true)}>Retry loading</button></InlineError></div>}
 
     <div className="grid items-start gap-5 xl:grid-cols-[minmax(0,1fr)_280px]">
       <section className="detail-panel">
         <RubricPanel
-          key={rubric.id}
+          key={`${rubric.id}:${rubric.version}`}
           rubric={rubric}
           readOnly={historic || !canEdit}
           onSelectCriterion={(criterion, citation) => setSourceSelection({ criterion, citation })}
@@ -307,12 +379,12 @@ function RubricDetail({ id }: { id: string }) {
           <div className="section-heading"><div><h2>Version history</h2><p>Every save creates a new version</p></div></div>
           <nav className="max-h-64 overflow-y-auto p-3" aria-label="Rubric versions">
             {versions.map((version) => <Link
-              key={version.id}
-              to={rubricLink(version)}
-              aria-current={version.id === rubric.id ? 'page' : undefined}
-              className={`flex items-center justify-between gap-3 rounded-lg px-3 py-3 text-[11px] ${version.id === rubric.id ? 'bg-accent-soft text-accent' : 'hover:bg-soft'}`}
+              key={`${version.id}:${version.version}`}
+              to={`${rubricLink(version)}${version.jobId ? '&' : '?'}version=${version.version}`}
+              aria-current={version.id === rubric.id && version.version === rubric.version ? 'page' : undefined}
+              className={`flex items-center justify-between gap-3 rounded-lg px-3 py-3 text-[11px] ${version.id === rubric.id && version.version === rubric.version ? 'bg-accent-soft text-accent' : 'hover:bg-soft'}`}
             >
-              <span className="flex items-center gap-2"><span className="font-medium">Version {version.version}</span>{version.id === current.id && <Badge>Latest</Badge>}</span>
+              <span className="flex items-center gap-2"><span className="font-medium">Version {version.version}</span>{version.id === current.id && version.version === current.version && <Badge>Latest</Badge>}</span>
               <span className="text-[10px] text-muted">{dateLabel(version.createdAt)}</span>
             </Link>)}
           </nav>

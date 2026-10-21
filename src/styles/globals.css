@@ -45,6 +45,11 @@
   .nav-item > svg { @apply shrink-0; }
   .nav-label { @apply min-w-0 truncate; }
   .nav-count { @apply ml-auto shrink-0 text-[10px]; opacity: .75; font-variant-numeric: tabular-nums; }
+  .nav-approval-count { @apply ml-auto shrink-0 rounded-md px-1.5 py-0.5 text-[10px] font-semibold; color: var(--cp-accent); background: var(--cp-accent-soft); }
+  .nav-approval-count + .nav-count { margin-left: 0; }
+  .sidebar.is-collapsed .nav-item { position: relative; }
+  .sidebar.is-collapsed .nav-approval-count { position: absolute; right: -5px; top: 0; font-size: 9px; }
+  .sidebar.is-collapsed .nav-approval-label { @apply sr-only; }
   .nav-external { margin-left: -8px; opacity: .7; }
   .sidebar-home { @apply mb-3; }
   /* The auto margin is the flexible spacer; the padding keeps the links apart from the navigation when space runs out. */

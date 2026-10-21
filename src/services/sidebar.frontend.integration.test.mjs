@@ -82,15 +82,19 @@ after(async () => {
   await rm(output, { recursive: true, force: true })
 })
 
-function Shell({ admin = true, help = true, application = true, title }) {
+function Shell({ admin = true, help = true, application = true, title, pending = false }) {
   const settings = ui.createDefaultAdminSettings()
   if (help) { settings.help.supportUrl = 'https://agency.example/support'; settings.help.documentationUrl = 'https://agency.example/help' }
   if (title) settings.appearance.applicationTitle = title
   const policy = { settings: ui.projectPublicSettings(ui.captureProcessingSettings(settings, 'revision-1', timestamp)), phase: 'ready', error: null, cloud: true, refresh: async () => {} }
   const navigation = { applicationAdmin: admin, workspaceHomePath: '/', directoryError: null,
     openAdminSettings: async () => { calls.push('settings') }, openAdminUsers: async () => { calls.push('users') }, openWorkspaceHome: async () => { calls.push('home') } }
+  const workspace = testWorkspace()
   return h(ui.PublicSettingsContext.Provider, { value: policy },
-    h(ui.WorkspaceContext.Provider, { value: frontendWorkspaceContext({ workspace: testWorkspace() }) },
+    h(ui.WorkspaceContext.Provider, { value: frontendWorkspaceContext({ workspace, ...(pending ? { cloud: { realJobs: {
+      summaries: [{ job: workspace.jobs[0], rubric: workspace.rubrics[0], etag: '"job"' }],
+      features: { rubricApprovalRequired: true },
+    } } } : {}) }) },
       h(ui.ApplicationNavigationContext.Provider, { value: application ? navigation : null },
         h(ui.MemoryRouter, { initialEntries: ['/jobs'], future: { v7_startTransition: true, v7_relativeSplatPath: true } }, h(ui.App)))))
 }
@@ -155,6 +159,16 @@ test('the collapse toggle persists, keeps accessible names and focus, and restor
   assert.equal(sidebar().querySelector('.workspace-switcher-trigger').hasAttribute('title'), false)
   await remount()
   assert.equal(sidebar().classList.contains('is-collapsed'), false)
+})
+
+test('pending rubric approvals keep their own accessible count in expanded and collapsed navigation', async () => {
+  await render({ pending: true })
+  const link = sidebar().querySelector('nav a[href="/rubrics"]')
+  assert.equal(link.querySelector('.nav-count').textContent, '1', 'The library total is preserved')
+  assert.equal(link.querySelector('.nav-approval-count').getAttribute('aria-label'), '1 job rubrics need approval')
+  await click(toggle())
+  assert.equal(link.title, 'Rubrics · 1 · 1 need approval')
+  assert.equal(link.querySelector('.nav-approval-count').textContent, '1 pending')
 })
 
 test('an unavailable preference store never blocks collapsing for the visit', async () => {
