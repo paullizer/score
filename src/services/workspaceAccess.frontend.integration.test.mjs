@@ -18,7 +18,7 @@ const firstPerson = { id: 'person-one', name: 'Pat Eligible', email: 'pat@exampl
 const preLogin = { id: 'person-never-signed-in', name: 'New Reader', email: 'new@example.test', applicationRoles: ['Score.User'] }
 const adminPerson = { id: 'admin-person', name: 'App Administrator', email: 'admin@example.test', applicationRoles: ['Score.Admin'] }
 const json = (value, status = 200) => Response.json(value, { status })
-let ui, dom, root, createRoot, requests, override, capabilities, workspaces, members, grant, settings
+let ui, dom, root, createRoot, requests, override, capabilities, workspaces, members, grant, settings, popupCalls, channels
 
 function deferred() {
   let resolve
@@ -64,6 +64,7 @@ before(async () => {
   await build({
     stdin: { resolveDir: process.cwd(), loader: 'tsx', contents: `
       export { CloudApplication } from './src/app/CloudApplication';
+      export { SessionRecovery } from './src/app/SessionRecovery';
       export { CloudWorkspaceProvider } from './src/app/CloudWorkspaceProvider';
       export { GradeNavigationProtectionProvider } from './src/app/GradeNavigationProtection';
       export { useGradeLeaveGuard } from './src/app/grade-navigation-context';
@@ -77,7 +78,9 @@ before(async () => {
       export { describeSettingValue } from './src/features/admin/settingsForm';
       export { SettingsField } from './src/features/admin/SettingsField';
       export * from './src/services/cloudWorkspace';
+      export * from './src/services/sessionRecovery';
       export * from './src/services/workspaceAccess';
+      export * as adminClient from './src/services/adminSettings';
     ` },
     outfile: join(output, 'ui.mjs'), bundle: true, packages: 'external', format: 'esm', platform: 'node',
     jsx: 'automatic', logLevel: 'silent', loader: { '.css': 'empty' },
@@ -87,6 +90,13 @@ before(async () => {
 
 beforeEach(() => {
   requests = []; override = null
+  popupCalls = []; channels = []
+  dom.window.open = (...args) => { popupCalls.push(args); return { opener: {} } }
+  dom.window.BroadcastChannel = class {
+    constructor(name) { this.name = name; channels.push(this) }
+    close() { this.closed = true }
+    postMessage(message) { this.message = message }
+  }
   capabilities = { applicationAdmin: false, canCreateWorkspaces: false }
   workspaces = []; settings = ui.createDefaultAdminSettings()
   members = { members: [{ id: user.id, name: user.name, email: user.email, role: 'owner' }], etag: '"members-1"' }
@@ -359,7 +369,8 @@ test('home count authentication failures suspend access without discarding an un
     pendingCounts.resolve(json({ error: { code: 'unauthorized', message: 'Sign in again to refresh access.' } }, 401))
     await pause()
   })
-  await until(() => dialog('Manage access')?.textContent.includes('no longer has permission to manage'), 'Access is suspended')
+  await until(() => document.querySelector('h1')?.textContent === 'Sign in again to restore access', 'Session recovery is shown instead of revocation')
+  assert.equal(dialog('Manage access'), undefined, 'Private membership choices are hidden until authentication is restored.')
   assert.ok(document.querySelector('.workspace-home'), 'The draft-owning home remains mounted.')
   assert.equal(requests.filter(item => item.method === 'PUT').length, 0)
   override = null
@@ -368,6 +379,201 @@ test('home count authentication failures suspend access without discarding an un
   assert.equal(document.querySelector('[aria-label="New member role"]').value, 'viewer')
   assert.match(dialog('Manage access').textContent, /Pat Eligible/)
   assert.equal(requests.filter(item => item.method === 'PUT').length, 0)
+})
+
+test('expired API HTML opens sign-in only on click and preserves the workspace URL and component tree', async () => {
+  workspaces = [metadata]
+  const path = '/workspaces/workspace-one/jobs?scoutTheme=dark#retained'
+  dom.window.history.replaceState(null, '', path)
+  await render(element(ui.CloudApplication))
+  await until(() => document.querySelector('.app-layout'), 'Workspace ready')
+  const application = document.querySelector('.app-layout')
+  let expired = true
+  override = route => route === '/api/session' && expired ? new Response('<html>Sign in</html>', { headers: { 'Content-Type': 'text/html' } }) : undefined
+  await focus()
+  await until(() => document.querySelector('h1')?.textContent === 'Sign in again to restore access', 'HTML session response is recoverable')
+  assert.equal(popupCalls.length, 0, 'Background refresh never opens a window.')
+  assert.equal(location.pathname + location.search + location.hash, path)
+  assert.equal(document.querySelector('.app-layout'), application)
+  assert.equal(application.closest('[hidden]') !== null, true)
+  await click(button('Refresh access'))
+  assert.equal(popupCalls.length, 1)
+  const login = new URL(popupCalls[0][0], location.origin)
+  assert.equal(login.pathname, '/.auth/login/aad')
+  assert.match(login.searchParams.get('post_login_redirect_uri'), /^\/auth\/recovery\?attempt=/)
+  await click(button('Refresh access'))
+  assert.equal(popupCalls.length, 1, 'Duplicate clicks do not create sign-in attempts.')
+  expired = false
+  await act(async () => {
+    const channel = channels.find(item => !item.closed)
+    channel.onmessage({ data: { type: 'score-session-recovery-complete', attempt: channel.name.split(':').at(-1) } })
+    await pause()
+  })
+  await until(() => !application.closest('[hidden]'), 'Same-account API verification restores access')
+  assert.equal(document.querySelector('.app-layout'), application)
+  assert.equal(location.pathname + location.search + location.hash, path)
+  assert.equal(requests.filter(item => !['GET', 'HEAD'].includes(item.method)).length, 0)
+  assert.ok(channels.every(item => item.closed))
+})
+
+test('wrong-account and reduced-permission recovery never restore old access or submit drafts', async () => {
+  workspaces = [metadata]
+  dom.window.history.replaceState(null, '', '/workspaces/workspace-one/jobs')
+  await render(element(ui.CloudApplication))
+  await until(() => document.querySelector('.app-layout'), 'Workspace ready')
+  const application = document.querySelector('.app-layout')
+  override = path => path === '/api/session' ? json({ ...session(), user: { ...user, id: 'different-user' } }) : undefined
+  await focus()
+  await until(() => document.body.textContent.includes('A different account is now signed in'), 'Different account remains locked')
+  assert.ok(application.closest('[hidden]'))
+  assert.throws(() => ui.cloudAccessRequestSignal('/workspaces/workspace-one/jobs', { method: 'POST' }), /no longer available/)
+  override = null
+  workspaces = [{ ...metadata, role: 'viewer' }]
+  await click(button('Check access'))
+  await until(() => !application.closest('[hidden]'), 'Original account returns with reduced access')
+  assert.equal(button('New analysis').disabled, true)
+  assert.throws(() => ui.cloudAccessRequestSignal('/workspaces/workspace-one/jobs', { method: 'POST' }), /Reader and Reviewer/)
+  assert.equal(requests.filter(item => item.method !== 'GET').length, 0)
+})
+
+test('authoritative membership loss is not authentication recovery, and service failures do not open sign-in', async () => {
+  workspaces = [metadata]
+  dom.window.history.replaceState(null, '', '/workspaces/workspace-one/jobs')
+  await render(element(ui.CloudApplication))
+  await until(() => document.querySelector('.app-layout'), 'Workspace ready')
+  for (const status of [409, 503]) {
+    override = path => path === '/api/session' ? json({ error: { code: status === 409 ? 'conflict' : 'unavailable', message: `Service returned ${status}` } }, status) : undefined
+    await focus()
+    assert.equal(document.querySelector('.app-layout').closest('[hidden]'), null)
+    assert.equal(popupCalls.length, 0)
+  }
+  override = path => path === '/api/session' ? json({ error: { code: 'forbidden', message: 'Application admission denied.' } }, 403) : undefined
+  await focus()
+  await until(() => document.querySelector('h1')?.textContent === 'Workspace access is no longer available', 'Admission denial does not require interactive sign-in')
+  assert.equal(document.body.textContent.includes('Sign in again to restore access'), false)
+  assert.equal(popupCalls.length, 0)
+  override = null; workspaces = []
+  await focus()
+  await until(() => document.querySelector('h1')?.textContent === 'Workspace access is no longer available', 'Real membership loss remains distinct')
+  assert.equal(document.body.textContent.includes('Sign in again to restore access'), false)
+  await click(button('Refresh access'))
+  assert.equal(popupCalls.length, 0)
+})
+
+test('recovery waits for effective policy and ignores superseded session responses', async () => {
+  workspaces = [metadata]
+  dom.window.history.replaceState(null, '', '/workspaces/workspace-one/jobs')
+  await render(element(ui.CloudApplication))
+  await until(() => document.querySelector('.app-layout'), 'Workspace ready')
+  const application = document.querySelector('.app-layout')
+  override = path => path === '/api/session' ? json({ error: { code: 'unauthorized', message: 'Expired.' } }, 401) : undefined
+  await focus()
+  await until(() => document.querySelector('h1')?.textContent === 'Sign in again to restore access', 'Access suspended')
+  const policy = deferred()
+  override = path => path === '/api/features' ? policy.promise : undefined
+  await click(button('Check access'))
+  assert.ok(application.closest('[hidden]'), 'Verifying identity alone does not bypass policy refresh.')
+  assert.throws(() => ui.cloudAccessRequestSignal('/workspaces/workspace-one/jobs', { method: 'POST' }), /no longer available/)
+  await act(async () => {
+    policy.resolve(json({ realJobImports: true, realGradeLadders: true, realResumeImports: true, realAnalyses: true, publicSettings: publicSettings() }))
+    await pause()
+  })
+  await until(() => !application.closest('[hidden]'), 'Effective policy refresh finishes recovery')
+
+  override = path => path === '/api/session' ? json({ error: { code: 'unauthorized', message: 'Expired again.' } }, 401) : undefined
+  await focus()
+  await until(() => document.querySelector('h1')?.textContent === 'Sign in again to restore access', 'Second suspension')
+  const stale = deferred()
+  let reads = 0
+  override = path => path === '/api/session' && reads++ === 0 ? stale.promise : undefined
+  await click(button('Check access'))
+  await focus()
+  await until(() => !application.closest('[hidden]'), 'Newer focus verification restores access')
+  await act(async () => {
+    stale.resolve(json({ ...session(), user: { ...user, id: 'stale-wrong-account' } }))
+    await pause()
+  })
+  assert.equal(application.closest('[hidden]'), null)
+  assert.equal(document.body.textContent.includes('A different account is now signed in'), false)
+  assert.equal(requests.filter(item => item.method !== 'GET').length, 0)
+})
+
+test('blocked or cancelled sign-in leaves an explicit link, manual check and retry without changing the page', async () => {
+  let verified = 0
+  dom.window.open = (...args) => { popupCalls.push(args); return null }
+  await render(element(ui.SessionRecovery, { message: 'Your session expired.', verify: async () => { verified++ }, leave: async () => {} }))
+  await click(button('Refresh access'))
+  assert.match(document.body.textContent, /browser blocked/)
+  const link = [...document.querySelectorAll('a')].find(item => item.textContent === 'Open sign-in link')
+  assert.deepEqual([link.target, link.rel], ['_blank', 'noopener noreferrer'])
+  assert.equal(new URL(link.href).origin, location.origin)
+  await click(button('Check access'))
+  assert.equal(verified, 1)
+  await click(button('Stop waiting'))
+  assert.match(document.body.textContent, /Stopped waiting/)
+  assert.equal(channels[0].closed, true)
+  assert.equal(button('Refresh access').disabled, false)
+  await click(button('Refresh access'))
+  assert.equal(popupCalls.length, 2)
+  await act(async () => { root.unmount(); root = null })
+  assert.ok(channels.every(item => item.closed))
+})
+
+test('discarding recovery drafts requires confirmation and honors a cancelled existing leave guard', async () => {
+  let left = 0
+  await render(element(ui.SessionRecovery, { message: 'Expired.', verify: async () => {}, leave: async () => { left++; throw new Error('Leaving was cancelled. Your drafts remain in this tab.') } }))
+  await click(button('Discard drafts and leave'))
+  assert.ok(dialog('Discard unsaved drafts and reload?'))
+  assert.equal(left, 0)
+  await click(button('Keep this tab'))
+  assert.equal(left, 0)
+  await click(button('Discard drafts and leave'))
+  await click(button('Discard drafts and reload'))
+  await until(() => document.body.textContent.includes('Leaving was cancelled.'), 'Existing protection can still cancel discard')
+  assert.equal(left, 1)
+  assert.equal(button('Refresh access').disabled, false)
+})
+
+test('administration choices survive session expiry and same-account verification without saves', async () => {
+  capabilities = { applicationAdmin: true, canCreateWorkspaces: true }
+  dom.window.history.replaceState(null, '', '/admin/users')
+  await render(element(ui.CloudApplication))
+  await until(() => document.body.textContent.includes('Pat Eligible'), 'People load')
+  await click(button('Select Pat Eligible'))
+  await until(() => document.querySelector('input[type="checkbox"]'), 'Permission loads')
+  await click(document.querySelector('input[type="checkbox"]'))
+  const page = document.querySelector('#admin-users-content')
+  override = path => path === '/api/session' ? json({ error: { code: 'unauthorized', message: 'Session expired.' } }, 401) : undefined
+  await focus()
+  await until(() => document.querySelector('h1')?.textContent === 'Sign in again to restore access', 'Admin session recovery is offered')
+  assert.ok(page.closest('[hidden]'))
+  override = null
+  await click(button('Check access'))
+  await until(() => !page.closest('[hidden]'), 'Admin access is verified')
+  assert.equal(document.querySelector('#admin-users-content'), page)
+  assert.equal(document.querySelector('input[type="checkbox"]').checked, true)
+  assert.equal(writes('/api/admin/users/person-one/workspace-creation').length, 0)
+})
+
+test('recovery completion mounts no workspace application and makes no API requests', async () => {
+  dom.window.history.replaceState(null, '', `/auth/recovery?attempt=${randomUUID()}`)
+  await render(element(ui.CloudApplication))
+  assert.equal(document.querySelector('h1')?.textContent, 'Return to your original Score tab')
+  assert.equal(requests.length, 0)
+  assert.equal(channels.length, 1)
+  assert.equal(channels[0].closed, true)
+})
+
+test('settings clients classify successful HTML as recoverable sign-in, not permission or service failure', async () => {
+  for (const [response, name, status] of [
+    [new Response('<html>Sign in</html>', { headers: { 'Content-Type': 'text/html' } }), 'CloudAuthError', 401],
+    [new Response('Service unavailable', { status: 503 }), 'SettingsRequestError', 503],
+    [json({ error: { code: 'forbidden', message: 'Application administrator required.' } }, 403), 'SettingsRequestError', 403],
+  ]) {
+    override = () => response
+    await assert.rejects(ui.adminClient.readAdminSettings(), error => error.name === name && error.status === status)
+  }
+  assert.equal(requests.length, 3, 'No settings requests were replayed.')
 })
 
 test('owner is not application admin; direct user access is reachable for admins with no workspace', async () => {

@@ -35,7 +35,10 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
       ...init, headers, credentials: 'same-origin', mode: 'same-origin', cache: 'no-store', redirect: 'manual', signal,
     })
     if (response.redirected || response.type === 'opaqueredirect' || response.status === 401) throw new CloudAuthError('Sign in again to manage application settings. Your draft has not been discarded.')
-    if (!response.headers.get('content-type')?.toLowerCase().includes('application/json')) throw new SettingsRequestError(response.status, 'The settings service did not return API data. No changes have been acknowledged.')
+    if (!response.headers.get('content-type')?.toLowerCase().includes('application/json')) {
+      if (response.ok) throw new CloudAuthError('The settings service returned a non-API response. Sign in again to check access. Your draft has not been discarded.')
+      throw new SettingsRequestError(response.status, 'The settings service did not return API data. No changes have been acknowledged.')
+    }
     const body = await response.json()
     signal.throwIfAborted()
     if (!response.ok) throw new SettingsRequestError(response.status, body?.error?.message ?? `Settings request failed (HTTP ${response.status}).`, Array.isArray(body?.error?.fields) ? body.error.fields : [])

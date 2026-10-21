@@ -727,6 +727,10 @@ Owners and application Admins use **Manage access** to add eligible **individual
 
 Workspace access is checked server-side, not inferred from visible buttons. The browser refreshes access on focus, directory opening, permission changes, and authorization errors, and stops unauthorized writes on downgrade/removal. Existing accepted work remains workspace-owned: removing its submitter neither cancels others' processing nor deletes results.
 
+If a session expires, Score shows **Sign in again to restore access**, not a membership-removal notice. **Refresh access** opens Microsoft sign-in in a separate window so the original tab, workspace URL, and unsaved drafts stay in place. Sign in with the **same account**, then return to the original tab. Score checks the current session, permissions, and application policy before making work available again; it never automatically resubmits uploads or saves drafts. Background checks never open sign-in windows.
+
+If the window is blocked, use **Open sign-in link**, then **Check access** in the original tab. If you close or abandon sign-in, **Stop waiting** lets you start again; an unconfirmed attempt also times out. Keep the original tab open: drafts live only in memory and are lost on reload or close. **Discard drafts and leave** offers an explicit, leave-protected reload if you want to abandon that session. A different signed-in account cannot unlock the original account's drafts, and signing in does not restore revoked membership or elevated roles.
+
 QC does not inherit implicit application-admin workspace access. Its APIs require a current explicit membership, and the client clears private QC state when that membership is removed even if ordinary admin access remains. The reviewer-only compatibility API accepts exact Entra object IDs and verifies current application-role eligibility; it never relies on deprecated OID allowlists or changes sign-in admission.
 
 ### Archive, search, and permanent deletion
