@@ -19,7 +19,7 @@ export function WorkspaceSwitcher({ cloud, empty = false, compact = false }: { c
       <div><strong>{name}</strong><span>{detail}</span></div>
       <ChevronsUpDown size={14} className="workspace-switcher-caret" aria-hidden="true" />
     </button>
-    <Modal open={open} onOpenChange={setOpen} dismissDisabled={busy} title="My workspaces"
+    <Modal open={open} onOpenChange={setOpen} dismissDisabled={busy} wide title="My workspaces"
       description="Switch between accessible Score workspaces. Each keeps its own jobs, resumes, rubrics, analyses, and members.">
       {open && <WorkspaceDirectory cloud={cloud} initialFilter={current?.archivedAt ? 'all' : 'default'} onSelected={() => setOpen(false)} onBusyChange={setBusy} />}
     </Modal>

@@ -461,6 +461,106 @@ test('mobile workspace home shares access, prunes self-removal, and preserves im
   assert.equal(new URL(page.url()).pathname, '/admin/users')
 })
 
+for (const [width, theme] of [[1440, 'light'], [900, 'light'], [600, 'light'], [390, 'light'], [320, 'light'], [1440, 'dark'], [390, 'dark']]) {
+  test(`workspace switcher keeps full names readable at ${width}px in ${theme} mode`, { timeout: 60000 }, async (t) => {
+    const current = { ...workspaceSummary('workspace-one', 'Regional recruitment review for field operations and program delivery candidates'), accessSource: 'application-admin' }
+    const longest = { ...workspaceSummary('workspace-long', 'Workspace for cross-agency hiring and program evaluation '.padEnd(80, 'W')), accessSource: 'application-admin' }
+    const unbroken = { ...workspaceSummary('workspace-unbroken', 'W'.repeat(80)), accessSource: 'application-admin' }
+    const reader = workspaceSummary('workspace-reader', 'Reader access to policy and program evaluation workspace', 'viewer')
+    const archived = { ...workspaceSummary('workspace-archived', 'Archived recruitment review with reference evidence retained'), archivedAt: timestamp, accessSource: 'application-admin' }
+    const pending = { ...workspaceSummary('workspace-pending', 'Recruitment review awaiting archive completion'), lifecycleOperation: { id: 'pending', action: 'archive', status: 'running', updatedAt: timestamp } }
+    const fixture = cloudFixture(testWorkspace(), [current, longest, unbroken, reader, archived, pending,
+      ...Array.from({ length: 8 }, (_, index) => workspaceSummary(`workspace-extra-${index}`, `Additional regional recruitment review workspace ${index + 1}`))])
+    const page = await pageFor(t)
+    await fixture.install(page)
+    await page.addInitScript(theme => localStorage.setItem('score-theme', theme), theme)
+    await page.goto(`${cloudServer.origin}/workspaces/workspace-one/jobs`)
+    const trigger = page.locator('.sidebar .workspace-switcher-trigger')
+    await trigger.click()
+    const picker = page.getByRole('dialog', { name: 'My workspaces', exact: true })
+    await picker.getByRole('button', { name: current.name, exact: true }).waitFor()
+    await page.setViewportSize({ width, height: 844 })
+    await picker.getByRole('combobox', { name: 'Workspace archive state', exact: true }).selectOption('all')
+    await picker.getByRole('button', { name: archived.name, exact: true }).waitFor()
+
+    const geometry = await picker.evaluate(dialog => {
+      const body = dialog.querySelector('.dialog-body')
+      const rect = node => node.getBoundingClientRect()
+      return {
+        width: rect(dialog).width, left: rect(dialog).left, right: rect(dialog).right,
+        overflow: body.scrollWidth - body.clientWidth, scrollable: body.scrollHeight > body.clientHeight,
+        rows: [...dialog.querySelectorAll('.workspace-switcher-item')].map(row => {
+          const name = row.querySelector('.workspace-switcher-name')
+          const text = name.lastElementChild
+          const range = document.createRange()
+          range.selectNodeContents(text)
+          const rowBox = rect(row), nameBox = rect(name), textBox = rect(text)
+          const controls = [...row.querySelectorAll('.badge, .workspace-row-actions button')]
+          return {
+            name: name.getAttribute('aria-label'), rowWidth: rowBox.width, nameWidth: nameBox.width,
+            overflow: row.scrollWidth - row.clientWidth,
+            ellipsis: getComputedStyle(text).textOverflow === 'ellipsis',
+            textFits: [...range.getClientRects()].every(box => box.left >= textBox.left - 1 && box.right <= textBox.right + 1 && box.top >= nameBox.top - 1 && box.bottom <= nameBox.bottom + 1),
+            controlsFit: controls.every(node => { const box = rect(node); return box.left >= rowBox.left && box.right <= rowBox.right && box.top >= rowBox.top && box.bottom <= rowBox.bottom }),
+            overlaps: controls.some(node => { const box = rect(node); return box.left < nameBox.right && box.right > nameBox.left && box.top < nameBox.bottom && box.bottom > nameBox.top }),
+            controlsBelow: controls.every(node => rect(node).top >= nameBox.bottom - 1),
+          }
+        }),
+      }
+    })
+    assert.equal(geometry.width, width > 600 ? 820 : width, 'Uses the existing wide dialog with mobile viewport bounds')
+    assert.ok(geometry.left >= -1 && geometry.right <= width + 1, 'Dialog stays within the viewport')
+    assert.ok(geometry.overflow <= 1, 'Dialog body has no horizontal overflow')
+    assert.equal(geometry.scrollable, true, 'Long directories scroll vertically')
+    assert.equal(geometry.rows.length, fixture.summaries.length)
+    for (const row of geometry.rows) {
+      assert.ok(row.nameWidth >= Math.min(240, row.rowWidth - 24), `${row.name}: name keeps meaningful width`)
+      assert.ok(row.overflow <= 1, `${row.name}: row has no horizontal overflow`)
+      assert.equal(row.ellipsis, false, `${row.name}: name is not ellipsized`)
+      assert.equal(row.textFits, true, `${row.name}: every text line fits inside the name button`)
+      assert.equal(row.controlsFit, true, `${row.name}: badges and actions stay inside the row`)
+      assert.equal(row.overlaps, false, `${row.name}: name does not overlap metadata or actions`)
+      if (width <= 760) assert.equal(row.controlsBelow, true, `${row.name}: narrow rows put metadata and actions below the name`)
+    }
+    assert.equal(await picker.getByRole('button', { name: current.name, exact: true }).getAttribute('aria-current'), 'true')
+    assert.equal(await picker.getByRole('button', { name: `Manage access to ${reader.name}`, exact: true }).count(), 0)
+    assert.equal(await picker.getByRole('button', { name: `Rename ${archived.name}`, exact: true }).isDisabled(), true)
+    await picker.getByRole('status').filter({ hasText: 'archive · running' }).waitFor()
+    if (process.env.SCORE_TEST_SCREENSHOT_DIR) {
+      await mkdir(process.env.SCORE_TEST_SCREENSHOT_DIR, { recursive: true })
+      await picker.locator('.dialog-body').evaluate(body => { body.scrollTop = 0 })
+      await page.screenshot({ path: join(process.env.SCORE_TEST_SCREENSHOT_DIR, `workspace-switcher-${width}-${theme}.png`), animations: 'disabled' })
+    }
+
+    await picker.getByRole('button', { name: `Rename ${longest.name}`, exact: true }).click()
+    const rename = picker.getByRole('textbox', { name: `Rename ${longest.name}`, exact: true })
+    assert.equal(await rename.inputValue(), longest.name)
+    assert.equal(await rename.evaluate(input => input === document.activeElement), true)
+    assert.equal(await rename.locator('..').evaluate(form => {
+      const box = form.closest('li').getBoundingClientRect()
+      return [...form.children].every(node => { const child = node.getBoundingClientRect(); return child.width >= 32 && child.left >= box.left && child.right <= box.right })
+    }), true, 'Inline rename and Save/Cancel fit within the row')
+    await picker.getByRole('button', { name: 'Cancel', exact: true }).click()
+
+    await picker.getByRole('searchbox', { name: 'Search workspaces', exact: true }).fill('Reader access')
+    assert.equal(await picker.locator('.workspace-switcher-item').count(), 1)
+    const destination = picker.getByRole('button', { name: reader.name, exact: true })
+    await destination.focus()
+    await page.keyboard.press('Enter')
+    await picker.waitFor({ state: 'hidden' })
+    await until(() => Promise.resolve(new URL(page.url()).pathname === '/workspaces/workspace-reader/jobs'), 'Keyboard selection switches to the named workspace')
+    assert.equal(fixture.mutations.length, 0, 'Browsing, canceling rename, and switching do not mutate workspaces')
+
+    if (width === 1440) {
+      await trigger.click()
+      await picker.waitFor()
+      await page.keyboard.press('Escape')
+      await picker.waitFor({ state: 'hidden' })
+      await until(() => trigger.evaluate(button => button === document.activeElement), 'Closing the picker restores trigger focus')
+    }
+  })
+}
+
 test('archiving the current workspace returns home rather than entering another available workspace', { timeout: 60000 }, async (t) => {
   const first = workspaceSummary('workspace-one', 'Current review')
   const other = workspaceSummary('workspace-two', 'Another review')
