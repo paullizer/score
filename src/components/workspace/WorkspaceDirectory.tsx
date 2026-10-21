@@ -114,8 +114,11 @@ export function WorkspaceDirectory({ cloud, initialFilter = 'default', cards = f
                 {isBusy ? <Loader2 size={14} className="motion-safe:animate-spin" aria-hidden="true" /> : isCurrent ? <Check size={14} aria-hidden="true" /> : !cards && <span className="workspace-switcher-name-spacer" aria-hidden="true" />}
                 <span>{item.name}</span>{cards && <ArrowUpRight size={18} aria-hidden="true" />}
               </button>
-              {item.archivedAt && <Badge tone="warning">Archived{cards && ' · read only'}</Badge>}
-              {!cards && <><Badge>{workspaceRoleLabel(item.role)}</Badge>{item.accessSource === 'application-admin' && <Badge tone="accent">Application administrator</Badge>}</>}
+              {cards && item.archivedAt && <Badge tone="warning">Archived · read only</Badge>}
+              {!cards && <div className="workspace-switcher-badges">
+                {item.archivedAt && <Badge tone="warning">Archived</Badge>}
+                <Badge>{workspaceRoleLabel(item.role)}</Badge>{item.accessSource === 'application-admin' && <Badge tone="accent">Application administrator</Badge>}
+              </div>}
               {cards && renderDetails?.(item)}
               <fieldset className={cards ? 'workspace-card-actions' : 'workspace-row-actions'} disabled={busy}>
               {item.role === 'owner' && <Button size="sm" variant="ghost" icon={Users} aria-label={`Manage access to ${item.name}`} disabled={busy || Boolean(incomplete)}

@@ -162,7 +162,7 @@
   .workspace-card-note, .workspace-count-error p { @apply text-[11px]; color: var(--cp-text-muted); overflow-wrap: anywhere; }
   .workspace-count-error { @apply mt-3; }
   .workspace-count-error .button { @apply mt-2; }
-  .workspace-row-actions { @apply inline-flex items-center gap-1; min-width: 0; }
+  .workspace-row-actions { @apply ml-auto inline-flex flex-wrap items-center gap-1; min-width: 0; max-width: 100%; }
   .workspace-card-actions { @apply mt-auto flex flex-wrap items-center justify-end gap-1 border-t pt-3; min-width: 0; }
   .workspace-card-actions:empty { display: none; }
   .workspace-home-card .workspace-switcher-rename { @apply flex-wrap; }
@@ -451,12 +451,17 @@
   .workspace-switcher-list { @apply space-y-2; }
   .workspace-switcher-item { @apply flex flex-wrap items-center gap-2 rounded-xl border p-2.5; background: var(--cp-surface); }
   .workspace-switcher-item.is-current { border-color: var(--cp-accent-soft); background: var(--cp-accent-soft); }
-  .workspace-switcher-name { @apply flex min-w-0 flex-1 items-center gap-2 rounded-lg px-2 py-1.5 text-left text-[12px] font-medium; color: var(--cp-text); }
+  .workspace-switcher-name { @apply flex min-w-0 items-start gap-2 rounded-lg px-2 py-1.5 text-left text-[12px] font-medium; flex: 1 1 16rem; color: var(--cp-text); }
   .workspace-switcher-name:hover:not(:disabled) { color: var(--cp-accent); }
-  .workspace-switcher-name span { @apply truncate; }
+  .workspace-switcher-name > span:not(.workspace-switcher-name-spacer) { @apply min-w-0; overflow-wrap: anywhere; }
+  .workspace-switcher-name > svg { @apply mt-0.5 shrink-0; }
+  .workspace-switcher-badges { @apply flex min-w-0 flex-wrap items-center gap-2; }
   .workspace-switcher-name-spacer { @apply inline-block h-3.5 w-3.5 shrink-0; }
-  .workspace-switcher-rename { @apply flex flex-1 items-center gap-2; }
-  .workspace-switcher-rename .input { @apply py-1.5; }
+  .workspace-switcher-rename { @apply flex min-w-0 flex-1 flex-wrap items-center gap-2; }
+  .workspace-switcher-rename .input { @apply min-w-0 py-1.5; flex: 1 1 16rem; }
+  @media (max-width: 760px) {
+    .workspace-switcher-name { flex-basis: 100%; }
+  }
   .workspace-switcher-create { @apply mt-4 flex items-center gap-2; }
   .account-panel { @apply mb-4 flex items-center gap-2.5 border-t px-1 pt-4; }
   .account-panel .avatar { color: var(--cp-accent); }
