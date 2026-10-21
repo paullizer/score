@@ -22,6 +22,8 @@ The Azure constructors take the existing application-settings configuration (`co
 
 Baseline initialization atomically creates all seven revisions, a bundle, an activation audit and the active pointer **only after a confirmed absent pointer**. Failed reads, corrupt pointers, missing history, and immutable-record collisions are errors, not permission to reset saved choices.
 
+Prompt-history queries use `c["value"].activationId` for both ordering and the continuation boundary: `VALUE` is a Cosmos SQL keyword and must be escaped. Deployment recovery reads this history to verify legacy QC guidance provenance before publishing new instructions.
+
 Reader-first rollout uses the independent shared `PROMPT_RUNTIME_VERSION = 'score-prompt-runtime-v3'`, re-exported by the job, grade, resume, analysis, and QC runtime entry bundles. Version 3 adds readers for deployment-attributed releases and explicit guidance provenance; historical records retain their original shape. The existing settings capability alone does not prove prompt-pin awareness. Deployment must probe all five runtime exports before recording `SCORE_PROMPT_RUNTIME_WORKER_VERSION` proof or admitting pinned paid work. This capability marker does not require changing stored settings or their runtime version.
 
 ## Template releases

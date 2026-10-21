@@ -60,6 +60,7 @@ function cosmos(options = {}) {
       },
       query(specification, options) {
         assert.equal(options.partitionKey, 'score')
+        calls.push(['query', structuredClone(specification)])
         return { async fetchAll() {
           const params = new Map(specification.parameters.map(value => [value.name, value.value]))
           return { resources: [...documents.values()].filter(doc => doc.recordType === params.get('@type') &&
@@ -440,7 +441,16 @@ test('activation requires an authorized admin, an exact evaluated bundle and exa
   assert.equal(writes[1].operationType, 'Create')
   const first = await f.service.history(1)
   assert.equal(first.activations[0].bundleId, draft.bundle.bundleId)
+  assert.deepEqual(f.calls.filter(call => call[0] === 'query').at(-1)[1], {
+    query: 'SELECT TOP @limit * FROM c WHERE c.recordType = @type ORDER BY c["value"].activationId DESC',
+    parameters: [{ name: '@limit', value: 2 }, { name: '@type', value: 'prompt-activation' }],
+  })
   assert.equal((await f.service.history(1, first.nextBefore)).activations[0].bundleId, baseline.bundle.bundleId)
+  assert.deepEqual(f.calls.filter(call => call[0] === 'query').at(-1)[1], {
+    query: 'SELECT TOP @limit * FROM c WHERE c.recordType = @type AND c["value"].activationId < @before ORDER BY c["value"].activationId DESC',
+    parameters: [{ name: '@limit', value: 2 }, { name: '@type', value: 'prompt-activation' },
+      { name: '@before', value: first.nextBefore }],
+  })
 })
 
 test('private QC candidates are deterministic, independent captures with no global writes or mutable fixed revisions', async () => {
