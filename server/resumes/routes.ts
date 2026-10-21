@@ -6,7 +6,7 @@ import type { WorkspaceRepository } from '../repository'
 import type { LifecycleDependencies } from '../lifecycle/contracts'
 import { getPrincipal, getRequestSettings } from '../request-context'
 import { assertOriginalDownload, requestProcessingSettings } from '../jobs/policy'
-import { RealResumeService, type ResumeImportRequest } from './service'
+import { RealResumeService, type ResumeImportRequest, type ResumeImportResult } from './service'
 import type { RealResumesDeps } from './store'
 import { isResumeUuid, isSafeResumeFilename, isValidResumeId } from './validation'
 import { ResumeLifecycleService } from './lifecycle'
@@ -119,6 +119,14 @@ export function createRealResumesRouter(deps: RealResumesRouterDeps): Router {
   router.use(base, authorize)
   const mutate = (access: 'write' | 'manage', handler: (req: Request, res: Response) => Promise<void>): RequestHandler =>
     (req, res) => deps.repository.withWorkspaceMutation(getPrincipal(req), param(req, 'workspaceId'), access, () => handler(req, res))
+  const admission = (handler: (req: Request) => Promise<ResumeImportResult>): RequestHandler => async (req, res) => {
+    const result = await deps.repository.withWorkspaceMutation(
+      getPrincipal(req), param(req, 'workspaceId'), 'write', () => handler(req),
+      false, { requireRelease: true },
+    )
+    res.setHeader('ETag', result.resume.etag)
+    res.status(result.created ? 202 : 200).json({ resume: result.resume })
+  }
 
   router.get(base, async (req, res) => {
     const options = page(req)
@@ -227,14 +235,12 @@ export function createRealResumesRouter(deps: RealResumesRouterDeps): Router {
         type: route === 'file' ? Object.values(UPLOAD_CONTENT_TYPES) : UPLOAD_CONTENT_TYPES[route],
         limit: route === 'markdown' ? RESUME_IMPORT_LIMITS.maxMarkdownBytes : RESUME_IMPORT_LIMITS.maxFileBytes, inflate: false,
       }),
-      mutate('write', async (req: Request, res: Response) => {
+      admission(async req => {
         const kind = fileKind(req)
         if (!Buffer.isBuffer(req.body)) throw invalidRequest('The request must contain raw document bytes.')
-        const result = await requireService(req).importFile(
+        return requireService(req).importFile(
           param(req, 'workspaceId'), importRequest(req), filename(req, kind), req.body, UPLOAD_CONTENT_TYPES[kind],
         )
-        res.setHeader('ETag', result.resume.etag)
-        res.status(result.created ? 202 : 200).json({ resume: result.resume })
       }),
       (error: unknown, _req: Request, _res: Response, next: NextFunction) => {
         if (typeof error === 'object' && error !== null && 'type' in error && error.type === 'entity.too.large') {
@@ -252,14 +258,12 @@ export function createRealResumesRouter(deps: RealResumesRouterDeps): Router {
       } catch (error) { next(error) }
     },
     express.json({ limit: '32kb', inflate: false }),
-    mutate('write', async (req, res) => {
+    admission(async req => {
       if (!req.body || typeof req.body !== 'object' || Array.isArray(req.body) ||
         Object.keys(req.body).length !== 1 || !Object.hasOwn(req.body, 'url')) {
         throw invalidRequest('A URL import body must contain only a url field.')
       }
-      const result = await requireService(req).importUrl(param(req, 'workspaceId'), importRequest(req), req.body.url)
-      res.setHeader('ETag', result.resume.etag)
-      res.status(result.created ? 202 : 200).json({ resume: result.resume })
+      return requireService(req).importUrl(param(req, 'workspaceId'), importRequest(req), req.body.url)
     }),
   )
   for (const action of ['retry', 'cancel'] as const) {
