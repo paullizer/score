@@ -21,11 +21,13 @@ import { useGradeLadders } from '../../app/grade-ladders-context'
 import { getEntityLifecycle, isEntityArchived, isEntityRemoved, matchesArchiveFilter, type ArchiveFilter } from '../../domain/lifecycle'
 import { ArchivedBadge, ArchiveStateFilter, EntityLifecycleActions, LifecycleBanner } from '../../components/lifecycle/LifecycleControls'
 import { useLifecycleAccess } from '../../components/lifecycle/useLifecycleAccess'
-import { useRealAnalyses } from '../../app/real-analyses-context'
+import { useAnalysisTargetSubscription, useRealAnalyses } from '../../app/real-analyses-context'
 import { realAnalysisLink } from '../analyses/realAnalysisUi'
 import type { RealAnalysisTargetSelection } from '../../domain/real-analyses'
 import { getDisplayName } from '../../domain/displayNames'
 import { RenameEntityButton, RenameEntityProvider } from '../../components/ui/RenameEntityButton'
+import { useRubricApprovals } from '../rubrics/useRubricApproval'
+import { PendingRubricNotice } from '../rubrics/PendingRubricNotice'
 
 const sourceNames = { pdf: 'PDF document', markdown: 'Markdown document', docx: 'Word DOCX', doc: 'Word DOC (97–2003)', url: 'Direct URL', website: 'Website' }
 const sourceIcons = { pdf: FileText, markdown: FileText, docx: FileText, doc: FileText, url: Link2, website: Globe2 }
@@ -52,6 +54,9 @@ function JobsLibrary() {
   const canImport = Boolean(cloud.realJobs.features?.realJobImports && !importReason)
   const navigate = useNavigate()
   const analyses = useRealAnalyses()
+  useAnalysisTargetSubscription()
+  const approvals = useRubricApprovals()
+  const pendingJobs = new Set(approvals.pending.map((rubric) => rubric.jobId))
   const [query, setQuery] = useLibraryViewState('jobs:query', '')
   const [filter, setFilter] = useLibraryViewState<'all' | 'ready' | 'attention'>('jobs:status', 'all')
   const [source, setSource] = useLibraryViewState<'all' | SourceKind>('jobs:source', 'all')
@@ -69,7 +74,7 @@ function JobsLibrary() {
   const activeJobs = libraryJobs.filter((job) => !isEntityArchived(workspace, { kind: 'job', id: job.id }) && !isEntityRemoved(workspace, { kind: 'job', id: job.id }))
   const scopedCount = libraryJobs.filter((job) => matchesArchiveFilter(isEntityArchived(workspace, { kind: 'job', id: job.id }), query, archiveFilter)).length
   const readyCount = activeJobs.filter((job) => job.status === 'ready' && !job.rubricDeletedAt && workspace.rubrics.some((rubric) => rubric.id === job.rubricId)).length
-  const attentionCount = activeJobs.filter((job) => !job.rubricDeletedAt && (job.status === 'error' || job.status === 'cancelled')).length
+  const attentionCount = activeJobs.filter((job) => !job.rubricDeletedAt && (job.status === 'error' || job.status === 'cancelled' || pendingJobs.has(job.id))).length
   const realTargets = analyses?.targets.state === 'ready' && !analyses.targets.error ? analyses.targets.value : []
   const canSelectReal = canEdit && analyses?.canWrite && analyses.phase === 'ready' && analyses.features?.realAnalyses
   function jobName(job: Job) {
@@ -87,7 +92,7 @@ function JobsLibrary() {
     const matchesQuery = `${jobName(job)} ${job.title} ${job.organization} ${job.grade} ${job.location} ${job.sourceLabel}`.toLowerCase().includes(query.trim().toLowerCase())
     const deleting = Boolean(getEntityLifecycle(workspace, { kind: 'job', id: job.id })?.deletingAt)
     return matchesQuery && matchesArchiveFilter(isEntityArchived(workspace, { kind: 'job', id: job.id }), query, archiveFilter) && (source === 'all' || job.source === source) &&
-      (deleting || filter === 'all' || (filter === 'ready' ? job.status === 'ready' && !job.rubricDeletedAt && workspace.rubrics.some((rubric) => rubric.id === job.rubricId) : !job.rubricDeletedAt && (job.status === 'error' || job.status === 'cancelled')))
+      (deleting || filter === 'all' || (filter === 'ready' ? job.status === 'ready' && !job.rubricDeletedAt && workspace.rubrics.some((rubric) => rubric.id === job.rubricId) : !job.rubricDeletedAt && (job.status === 'error' || job.status === 'cancelled' || pendingJobs.has(job.id))))
   }), activeSort, (job, key) => {
     switch (key) {
       case 'title': return jobName(job)
@@ -117,6 +122,9 @@ function JobsLibrary() {
   return <>
     <PageHeader eyebrow="A CLEARER STARTING POINT" title="Your jobs" description="Bring the roles together. Define what a great match looks like."
       actions={<><Button icon={Layers3} onClick={() => navigate('/rubrics')}>Rubric library</Button><Button variant="primary" icon={Plus} disabled={!canEdit || !canImport} title={importReason ?? undefined} onClick={() => setImportOpen(true)}>Add jobs</Button></>} />
+    <PendingRubricNotice />
+    {analyses && (analyses.targets.state === 'error' || (analyses.targets.state === 'ready' && analyses.targets.error)) &&
+      <div className="mb-5"><InlineError>Analysis availability could not be loaded. <button className="underline" onClick={() => void analyses.refreshTargets()}>Retry available targets</button></InlineError></div>}
     {!canImport && <p className="mb-4 text-[12px] text-muted" role="status">{importReason ?? 'New job imports are unavailable.'} Saved jobs, rubrics, and evidence remain available.</p>}
     <div className="welcome-panel">
       <div className="flex items-center"><span className="welcome-symbol"><ScanLine size={25} strokeWidth={1.4} /></span><div><h2>Good matches start with clear criteria.</h2><p>Every job gets its own rubric. Every score leads back to evidence. Nothing important stays a black box.</p></div></div>
@@ -127,7 +135,7 @@ function JobsLibrary() {
     <section className="panel" aria-label="Job library">
       <div className="library-toolbar">
         <SegmentedControl label="Filter jobs by status" value={filter} onChange={setFilter} options={[
-          { value: 'all', label: 'All jobs', count: activeJobs.length }, { value: 'ready', label: 'Ready', count: readyCount }, { value: 'attention', label: 'Needs attention', count: attentionCount },
+          { value: 'all', label: 'All jobs', count: activeJobs.length }, { value: 'ready', label: 'Processed', count: readyCount }, { value: 'attention', label: 'Needs attention', count: attentionCount },
         ]} />
         <div className="toolbar"><SearchField value={query} onChange={setQuery} placeholder="Search jobs, organizations..." />
           <ArchiveStateFilter value={archiveFilter} onChange={setArchiveFilter} label="Job archive state" />
@@ -158,6 +166,7 @@ function JobsLibrary() {
         <tbody>{filtered.map((job) => {
           const Icon = sourceIcons[job.source]
           const rubric = workspace.rubrics.find((item) => item.id === job.rubricId)
+          const approval = rubric ? approvals.forRubric(rubric) : undefined
           const summary = cloud.realJobs.summaries.find((item) => item.job.id === job.id)
           const rubricRemoving = summary?.rubricLifecycle?.deletingAt
           const name = jobName(job)
@@ -165,16 +174,18 @@ function JobsLibrary() {
           const editable = canEdit && !isEntityArchived(workspace, { kind: 'job', id: job.id }) && !isEntityRemoved(workspace, { kind: 'job', id: job.id })
           const canRetry = editable && !rubricRemoving && !job.rubricDeletedAt && (!rubric || !isEntityArchived(workspace, { kind: 'rubric', id: rubric.groupId }))
           const processing = job.status === 'queued' || job.status === 'parsing' || job.status === 'generating'
-          const statusBadge = deleting ? <Badge tone="warning">Deletion pending</Badge> : rubricRemoving ? <Badge tone="warning">Rubric deletion pending</Badge> : job.rubricDeletedAt ? <Badge>No rubric</Badge> : <StatusBadge status={job.status} />
+          const statusBadge = deleting ? <Badge tone="warning">Deletion pending</Badge> : rubricRemoving ? <Badge tone="warning">Rubric deletion pending</Badge> : job.rubricDeletedAt ? <Badge>No rubric</Badge>
+            : job.status === 'ready' ? approval?.known ? <Badge dot tone={approval.status === 'approved' ? 'success' : 'warning'}>{approval.label}</Badge> : <Badge>Processed</Badge> : <StatusBadge status={job.status} />
           return <tr key={job.id} className={selected.includes(job.id) ? 'row-selected' : ''}>
-            <td className="checkbox-cell"><input type="checkbox" aria-label={`Select ${name}`} disabled={!selectable(job) && !selected.includes(job.id)} checked={selected.includes(job.id)} title={!editable ? 'Archived content and Reader access are read-only.' : 'Select this exact saved target for manual analysis with ready resumes.'} onChange={() => toggle(job.id)} /></td>
+            <td className="checkbox-cell"><input type="checkbox" aria-label={`Select ${name}`} disabled={!selectable(job) && !selected.includes(job.id)} checked={selected.includes(job.id)} title={!editable ? 'Archived content and Reader access are read-only.' : approval?.pending ? approval.message : 'Select this exact saved target for manual analysis with ready resumes.'} onChange={() => toggle(job.id)} /></td>
             <td><div className="job-cell"><span className="job-monogram"><Building2 size={19} strokeWidth={1.4} /></span><div><Link to={`/jobs/${job.id}`} className="row-title">{name}</Link> <ArchivedBadge target={{ kind: 'job', id: job.id }} />{(summary?.displayName || job.displayName) && <><div className="row-meta">Source title: {job.title}</div><div className="row-meta break-words">Source: {job.sourceLabel}</div></>}<div className="row-meta">{job.organization}</div>{(job.grade || job.arrangement) && <div className="job-submeta">{[job.grade, job.arrangement].filter(Boolean).join(' / ')}</div>}<div className="job-mobile-status">{statusBadge}<span className="source-type"><Icon size={12} />{sourceNames[job.source]}</span></div></div></div></td>
             <td className="mobile-hide"><span className="source-type"><Icon size={13} />{sourceNames[job.source]}</span><div className="row-meta">Private source</div></td>
-            <td className="mobile-hide">{statusBadge}{rubric && <ArchivedBadge target={{ kind: 'rubric', id: rubric.groupId }} />}<div className="row-meta">{deleting || rubricRemoving ? 'Cleanup is incomplete · retry the lifecycle operation' : job.rubricDeletedAt ? 'Permanently removed · source retained' : rubric ? `${rubric.criteria.length} criteria / v${rubric.version}` : job.status === 'error' ? `${job.errorStage === 'rubric' ? 'Rubric' : 'Document'} needs a retry` : processing ? 'Server processing in progress' : 'Not yet assessed'}</div></td>
+            <td className="mobile-hide">{statusBadge}{rubric && <ArchivedBadge target={{ kind: 'rubric', id: rubric.groupId }} />}<div className="row-meta">{deleting || rubricRemoving ? 'Cleanup is incomplete · retry the lifecycle operation' : job.rubricDeletedAt ? 'Permanently removed · source retained' : rubric ? `Import complete · ${rubric.criteria.length} criteria / v${rubric.version}${approval?.approval && approval.status !== 'approved' ? ` · approved v${approval.approval.version} stays available` : ''}` : job.status === 'error' ? `${job.errorStage === 'rubric' ? 'Rubric' : 'Document'} needs a retry` : processing ? 'Server processing in progress' : 'Not yet assessed'}</div></td>
             <td className="mobile-hide"><span className="text-[11px] text-muted">{dateLabel(job.createdAt)}</span></td>
             <td><div className="flex flex-wrap items-center gap-1">{deleting ? <Link to={`/jobs/${job.id}`} className="button button-ghost button-sm">View cleanup</Link> : processing ? <Button size="sm" variant="ghost" disabled={!editable} aria-label={`Cancel ${name} import`} icon={X} onClick={() => void cancelJob(job.id)}>Cancel</Button>
               : !job.rubricDeletedAt && (job.status === 'error' || job.status === 'cancelled') ? <Button size="sm" disabled={!canRetry} icon={RotateCcw} onClick={() => void retryJob(job.id)}>Retry</Button>
-                : <Link to={`/jobs/${job.id}`} className="button button-ghost icon-button" aria-label={`Open ${name}`}><ArrowUpRight size={16} /></Link>}
+                : approval?.pending && rubric ? <Link to={`/rubrics/${encodeURIComponent(rubric.id)}?job=${encodeURIComponent(job.id)}`} className="button button-secondary button-sm">Review approval</Link>
+                  : <Link to={`/jobs/${job.id}`} className="button button-ghost icon-button" aria-label={`Open ${name}`}><ArrowUpRight size={16} /></Link>}
               <RenameEntityButton target={{ kind: 'job', id: job.id }} name={name} etag={summary?.etag}
                 disabled={cloud.realJobs.phase !== 'ready' || !summary?.etag} compact />
               <EntityLifecycleActions target={{ kind: 'job', id: job.id }} name={name} compact /></div></td>
@@ -208,6 +219,8 @@ function JobDetailView() {
   const navigate = useNavigate()
   const gradeLadders = useGradeLadders()
   const analyses = useRealAnalyses()
+  useAnalysisTargetSubscription()
+  const approvals = useRubricApprovals()
   const [highlighted, setHighlighted] = useState<{ id: string; quote?: string }>()
   const [pane, setPane] = useState<'document' | 'rubric'>('document')
   const job = workspace.jobs.find((item) => item.id === id)
@@ -231,6 +244,7 @@ function JobDetailView() {
   if (!job) return <EmptyState title="This job is not in your workspace" description="Your other jobs are available in the library." action={<Button onClick={() => navigate('/jobs')}>Back to jobs</Button>} />
   const document = workspace.documents.find((item) => item.id === job.documentId)
   const rubric = workspace.rubrics.find((item) => item.id === job.rubricId)
+  const approval = rubric ? approvals.forRubric(rubric) : undefined
   const target = analyses?.targets.state === 'ready' ? analyses.targets.value.find((item) => item.kind === 'job' && item.selection.jobId === job.id && item.selection.rubricId === rubric?.id && item.selection.rubricVersion === rubric?.version) : undefined
   const analysisReady = canEdit && job.status === 'ready' && !job.rubricDeletedAt && rubric && !isEntityArchived(workspace, { kind: 'rubric', id: rubric.groupId }) && !isEntityRemoved(workspace, { kind: 'rubric', id: rubric.groupId }) && target && analyses?.phase === 'ready' && analyses.canWrite && analyses.features?.realAnalyses && analyses.targets.state === 'ready' && !analyses.targets.error
   const processing = job.status === 'queued' || job.status === 'parsing' || job.status === 'generating'
@@ -252,10 +266,10 @@ function JobDetailView() {
   return <>
     <Link className="back-link" to="/jobs"><ArrowLeft size={14} />Back to jobs</Link>
     <PageHeader eyebrow="JOB WORKSPACE" title={name} description={job.organization}
-      actions={<><RenameEntityButton target={{ kind: 'job', id: job.id }} name={name} etag={summary?.etag} disabled={cloud.realJobs.phase !== 'ready' || !summary?.etag} /><EntityLifecycleActions target={{ kind: 'job', id: job.id }} name={name} onComplete={(action) => { if (action === 'delete') navigate('/jobs') }} /><Button icon={Layers3} disabled={!ready || !gradeLadders?.canWrite || gradeLadders.phase !== 'ready'}
+      actions={<><RenameEntityButton target={{ kind: 'job', id: job.id }} name={name} etag={summary?.etag} disabled={cloud.realJobs.phase !== 'ready' || !summary?.etag} /><EntityLifecycleActions target={{ kind: 'job', id: job.id }} name={name} onComplete={(action) => { if (action === 'delete') navigate('/jobs') }} /><Button icon={Layers3} disabled={!ready || !gradeLadders?.canWrite || gradeLadders.phase !== 'ready' || (approvals.required && approval?.status !== 'approved')}
         title={!gradeLadders?.canWrite ? 'An owner or editor in a grade-enabled workspace can create a ladder.' : job.status !== 'ready' || !rubric ? 'Wait for the real job and saved rubric to be ready.' : gradeLadders.phase !== 'ready' ? 'Real grade processing is not currently available.' : 'Capture this real job and exact saved rubric version as a new grade family.'}
         onClick={() => navigate(`/grade-ladders/new?${new URLSearchParams({ job: job.id, rubric: rubric!.id, rubricVersion: String(rubric!.version) })}`)}>Create grade ladder</Button>
-        <Button variant="primary" icon={Sparkles} disabled={!analysisReady} title="Requires an eligible saved target and write access to analyses."
+        <Button variant="primary" icon={Sparkles} disabled={!analysisReady} title={approval?.pending ? approval.message : 'Requires an eligible saved target and write access to analyses.'}
           onClick={() => {
             if (!target || !analyses) return
             const link = realAnalysisLink({ targets: [target.selection] }, analyses.workspaceId)
@@ -263,6 +277,10 @@ function JobDetailView() {
           }}>Analyze applicants</Button></>} />
     {(summary?.displayName || job.displayName) && <p className="mb-4 break-words text-[12px] text-muted">Source title: {job.title} · Original source: {source?.displayName ?? job.sourceLabel}</p>}
     <LifecycleBanner target={{ kind: 'job', id: job.id }} />
+    {approval?.pending && rubric && <div className="info-callout mb-5"><Layers3 size={18} aria-hidden="true" /><div>
+      <strong>{approval.label}</strong><p>{approval.message}</p>
+      <Link className="text-link mt-2" to={`/rubrics/${encodeURIComponent(rubric.id)}?job=${encodeURIComponent(job.id)}`}>Review approval and checks</Link>
+    </div></div>}
     <div className="detail-metadata">{job.location && <span><MapPin size={13} />{job.location}</span>}{(job.arrangement || job.employmentType) && <span><BriefcaseBusiness size={13} />{[job.arrangement, job.employmentType].filter(Boolean).join(' / ')}</span>}{job.grade && <Badge>{job.grade}</Badge>}{job.series && <Badge>Series {job.series}</Badge>}{statusBadge}<ArchivedBadge target={{ kind: 'job', id: job.id }} /></div>
     <div className="info-callout mb-5"><ShieldCheck size={18} /><div><strong>Generated from the private source</strong><p>This job and rubric are server-owned. Analyze applicants opens a separate, manual analysis with this exact saved version.</p></div></div>
     {job.error && !job.rubricDeletedAt && !rubricRemoving && <div className="mb-5"><InlineError>

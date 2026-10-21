@@ -82,6 +82,22 @@ export function rubricVersionStatus(
   return rubric.version < approval.version ? 'superseded' : 'draft'
 }
 
+export function rubricApprovalPresentation(
+  rubric: { id: string; version: number }, approval: RubricApprovalPointer | undefined, required: boolean,
+) {
+  const status = rubricVersionStatus(rubric, approval)
+  const label = status === 'approved' ? 'Approved'
+    : status === 'superseded' ? 'Superseded'
+      : !required ? 'Draft · approval optional'
+        : approval ? 'Changes need approval' : 'Needs approval'
+  const message = status === 'approved' ? `Version ${rubric.version} is approved for new analyses.`
+    : status === 'superseded' ? `Approved version ${approval!.version} is used for new work.`
+      : !required ? 'Approval is optional under current Admin settings. Analysis availability is checked separately.'
+        : approval ? `This draft is not approved. Approved version ${approval.version} stays in use.`
+          : 'Approve this rubric before using it in a new analysis or grade ladder.'
+  return { status, label, message }
+}
+
 export function rubricQaRecordId(rubricId: string, version: number): string {
   return `rubric-qa:${rubricId}:${version}:${RUBRIC_QA_VERSION}`
 }

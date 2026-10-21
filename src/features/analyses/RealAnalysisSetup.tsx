@@ -18,6 +18,8 @@ import {
   currentRealTarget, initialRealSelections, newerSavedJobTarget, realResumeSelection, resumeSelectionIssue, targetIdentity, targetSelectionIssue,
   resolveRealAnalysisNavigation, targetVersionLabel, realTargetAvailable, realTargetArchived, realTargetFamilyLabel, realTargetRemoved, type SelectedRealResume, type SelectedRealTarget,
 } from './realAnalysisUi'
+import { PendingRubricNotice } from '../rubrics/PendingRubricNotice'
+import { PENDING_RUBRICS_LINK, useRubricApprovals } from '../rubrics/useRubricApproval'
 
 export function RealAnalysisSetup() {
   const api = useRealAnalyses()
@@ -63,12 +65,10 @@ function RealAnalysisBuilder({ previous, params, fragment, transferred }: {
 }) {
   const api = useRealAnalyses()!
   const resumeApi = useRealResumes()!
-  const { workspace, cloud } = useWorkspace()
-  // The server enforces the approval policy; the note only explains why some ready jobs aren't offered.
-  const approvalRequired = cloud.realJobs.features?.rubricApprovalRequired !== false
-  const unapprovedJobRubrics = approvalRequired ? cloud.realJobs.summaries.filter((summary) => summary.job.status === 'ready' &&
-    summary.job.rubricId && !summary.job.rubricDeletedAt && !summary.rubricApproval &&
-    !isEntityArchived(workspace, { kind: 'job', id: summary.job.id }) && !isEntityRemoved(workspace, { kind: 'job', id: summary.job.id })).length : 0
+  const { workspace } = useWorkspace()
+  const approvals = useRubricApprovals()
+  const approvalRequired = approvals.required
+  const unapprovedJobRubrics = approvals.pending.filter((rubric) => !approvals.forRubric(rubric).approval).length
   const { canEdit } = useLifecycleAccess(previous ? { kind: 'analysis', id: previous.run.id } : undefined)
   const navigate = useNavigate()
   const currentTargets = api.targets.state === 'ready' ? api.targets.value : []
@@ -214,9 +214,7 @@ function RealAnalysisBuilder({ previous, params, fragment, transferred }: {
             options={[{ value: 'job', label: 'Real jobs', count: activeTargets.filter((target) => target.kind === 'job').length }, { value: 'grade', label: 'Approved GS versions', count: activeTargets.filter((target) => target.kind === 'grade').length }]} />
             <SearchField value={targetSearch} onChange={setTargetSearch} placeholder="Search eligible targets…" label="Search real analysis targets" />
             <ArchiveStateFilter value={targetArchiveFilter} onChange={setTargetArchiveFilter} label="Real target input archive state" /></div>
-          {targetType === 'job' && unapprovedJobRubrics > 0 && <p className="px-5 pt-3 text-[11px] text-muted">
-            {unapprovedJobRubrics === 1 ? '1 ready job rubric isn’t approved yet, so it isn’t listed.' : `${unapprovedJobRubrics} ready job rubrics aren’t approved yet, so they aren’t listed.`} A workspace owner approves a rubric on its job page.
-          </p>}
+          {targetType === 'job' && <div className="px-5 pt-3"><PendingRubricNotice /></div>}
           <div className="builder-options">{shownTargets.map((target) => <label className="selection-card" key={target.id}>
             <input type="checkbox" checked={draft.targets.some((item) => item.id === targetIdentity(target.selection))} disabled={locked || !canEdit || !api.canWrite || !realTargetAvailable(workspace, target.selection)}
               aria-label={`Include ${getDisplayName(target, target.label)}, ${targetVersionLabel(target.selection)}`} onChange={() => selectTarget(target)} />
@@ -229,9 +227,11 @@ function RealAnalysisBuilder({ previous, params, fragment, transferred }: {
               {target.kind === 'grade' && <p className="mt-2 text-[10px] text-muted">Approved {target.approvedAt} · series {target.context.series} · {target.context.agency || 'Agency not stated'} · {target.context.supervision}. Context belongs to this approved capture, not the newer draft.</p>}
             </div>
           </label>)}
-            {!shownTargets.length && <div className="col-span-full"><EmptyState title="No eligible targets in this view" description={targetType === 'grade'
+            {!shownTargets.length && <div className="col-span-full"><EmptyState title={targetType === 'job' && unapprovedJobRubrics > 0 ? 'Job rubrics are waiting for approval' : 'No eligible targets in this view'} description={targetType === 'grade'
               ? 'Only exact approved, supported GS versions are offered. Unapproved or incomplete drafts remain unavailable. Try another filter or review a real ladder.'
-              : 'A real job and its saved rubric must be ready. Import or finish processing a job, then refresh available inputs.'} /></div>}
+              : unapprovedJobRubrics > 0 ? `${unapprovedJobRubrics} processed job ${unapprovedJobRubrics === 1 ? 'rubric needs' : 'rubrics need'} a workspace owner’s approval before appearing here. Review pending rubrics, then refresh available inputs.`
+                : 'A real job and its saved rubric must be ready. Check the filters or finish processing a job, then refresh available inputs.'}
+              action={/* security-reviewed: xss/nonliteral-url -- EmptyState.action is a ReactNode slot; the Link uses a fixed same-origin route. */ targetType === 'job' && unapprovedJobRubrics > 0 ? <Link className="button button-secondary button-md" to={PENDING_RUBRICS_LINK}>Review pending rubrics</Link> : undefined} /></div>}
           </div>
         </section>
         {(draft.resumes.length > 0 || draft.targets.length > 0) && <section className="panel" aria-label="Review exact selected inputs">
