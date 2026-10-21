@@ -10,6 +10,7 @@ import { LifecycleDialogProvider } from '../../components/lifecycle/LifecycleCon
 import { Button, InlineError, PageHeader } from '../../components/ui'
 import { isActiveWorkspace, type RecentWorkspace } from '../../services/workspaceRecents'
 import { useWorkspaceCounts, type WorkspaceCountsState } from './useWorkspaceCounts'
+import type { CloudAuthError } from '../../services/cloudWorkspace'
 
 export function WorkspaceHomePage({ user, directory, recents, directoryRevision, directoryError, directoryReady, applicationAdmin, openAdminSettings, openAdminUsers, signOut, onAuthError }: {
   user: CloudUser
@@ -22,7 +23,7 @@ export function WorkspaceHomePage({ user, directory, recents, directoryRevision,
   openAdminSettings: () => Promise<void>
   openAdminUsers: () => Promise<void>
   signOut: () => Promise<void>
-  onAuthError: (message: string) => void
+  onAuthError: (error: CloudAuthError) => void
 }) {
   const policy = usePublicSettings()
   const [visibleIds, setVisibleIds] = useState<string[]>([])

@@ -10,7 +10,7 @@ export type WorkspaceCountsState =
   | { status: 'ready'; value: WorkspaceCounts }
   | { status: 'error'; message: string }
 
-export function useWorkspaceCounts(scope: string, workspaces: WorkspaceSummary[], visibleIds: string[], revision: number, onAuthError: (message: string) => void) {
+export function useWorkspaceCounts(scope: string, workspaces: WorkspaceSummary[], visibleIds: string[], revision: number, onAuthError: (error: CloudAuthError) => void) {
   const [states, setStates] = useState<Record<string, WorkspaceCountsState>>({})
   const [retry, setRetry] = useState(0)
   const cache = useRef(new Map<string, { key: string; state: WorkspaceCountsState }>())
@@ -43,7 +43,7 @@ export function useWorkspaceCounts(scope: string, workspaces: WorkspaceSummary[]
           state = { status: 'ready', value: await fetchWorkspaceCounts(id, controller.signal) }
         } catch (caught) {
           if (controller.signal.aborted) return
-          if (caught instanceof CloudAuthError) { authError.current(caught.message); return }
+          if (caught instanceof CloudAuthError) { authError.current(caught); return }
           state = { status: 'error', message: caught instanceof Error ? caught.message : 'Workspace counts could not be loaded. Try again.' }
         }
         if (controller.signal.aborted) return

@@ -27,6 +27,8 @@ import { ApplicationNavigationContext } from './application-navigation-context'
 import { AdminSettingsPage } from '../features/admin/AdminSettingsPage'
 import { AdminUsersPage } from '../features/admin/AdminUsersPage'
 import { AccessSuspendedContext } from './access-suspended-context'
+import { SessionRecovery, SessionRecoveryComplete } from './SessionRecovery'
+import { SESSION_RECOVERY_PATH } from '../services/sessionRecovery'
 import { defaultApplicationPage } from '../services/publicSettings'
 import { WorkspaceHomePage } from '../features/workspaces/WorkspaceHomePage'
 import { pruneRecentWorkspaces, readRecentWorkspaces, recordWorkspaceVisit, writeRecentWorkspaces, type RecentWorkspace } from '../services/workspaceRecents'
@@ -71,6 +73,7 @@ function resolveRequestedWorkspaceId(): string | null {
  *  - workspace list/create/rename/switch and the leave-protected sign-out flow.
  */
 export function CloudApplication() {
+  if (window.location.pathname === SESSION_RECOVERY_PATH) return <SessionRecoveryComplete />
   return <PublicSettingsProvider><CloudApplicationContent /></PublicSettingsProvider>
 }
 
@@ -81,6 +84,8 @@ function CloudApplicationContent() {
   const [recents, setRecents] = useState<RecentWorkspace[]>([])
   const [directoryRevision, setDirectoryRevision] = useState(0)
   const [directoryError, setDirectoryError] = useState<string | null>(null)
+  const [signInMessage, setSignInMessage] = useState<string | null>(null)
+  const requiresSignIn = signInMessage !== null
   const [directoryReady, setDirectoryReady] = useState(false)
   const recentsRef = useRef(recents)
   const recentsOwnerRef = useRef<string | null>(null)
@@ -91,6 +96,8 @@ function CloudApplicationContent() {
   const lastPathRef = useRef(window.location.pathname + window.location.search + window.location.hash)
   const sessionRef = useRef(session)
   sessionRef.current = session
+  const signInRequiredRef = useRef(false)
+  signInRequiredRef.current = requiresSignIn
   const phaseRef = useRef(phase)
   phaseRef.current = phase
   const metadataSequence = useRef(0)
@@ -329,9 +336,16 @@ function CloudApplicationContent() {
       if (!currentSession) return
       if (next.user.id !== currentSession.user.id || next.user.tenantId !== currentSession.user.tenantId) {
         publishDirectory({ ...currentSession, capabilities: { applicationAdmin: false, canCreateWorkspaces: false }, workspaces: [] })
-        throw new Error('A different account is now signed in. Previous drafts are retained in this tab and will not be uploaded. Sign back in with the original account, or explicitly discard them before leaving.')
+        const message = 'A different account is now signed in. Previous drafts are retained in this tab and will not be uploaded. Sign back in with the original account, or explicitly discard them before leaving.'
+        setSignInMessage(message)
+        throw new Error(message)
+      }
+      if (signInRequiredRef.current) {
+        await policyRef.current.refresh()
+        if (!aliveRef.current || sequence !== metadataSequence.current) return
       }
       publishDirectory(next)
+      setSignInMessage(null)
       const currentPhase = phaseRef.current
       if (currentPhase.kind === 'workspace-unavailable' && next.workspaces.some(item => item.id === currentPhase.requestedId && !item.deletedAt)) {
         const requested = currentPhase.requestedId
@@ -342,6 +356,7 @@ function CloudApplicationContent() {
       if (caught instanceof CloudAuthError || (caught instanceof CloudApiError && [401, 403].includes(caught.status))) {
         const current = sessionRef.current
         if (current) publishDirectory({ ...current, capabilities: { applicationAdmin: false, canCreateWorkspaces: false }, workspaces: [] })
+        setSignInMessage(caught.status === 401 ? caught.message : null)
       }
       const message = caught instanceof Error ? caught.message : 'Current workspace access could not be refreshed. Keep this tab open and try again.'
       setDirectoryError(message)
@@ -358,8 +373,14 @@ function CloudApplicationContent() {
       }).finally(() => { refreshing.current = null })
     }
     window.addEventListener('focus', refresh)
+    const visible = () => { if (document.visibilityState === 'visible') refresh() }
+    document.addEventListener('visibilitychange', visible)
     window.addEventListener(CLOUD_ACCESS_REFRESH_EVENT, refresh)
-    return () => { window.removeEventListener('focus', refresh); window.removeEventListener(CLOUD_ACCESS_REFRESH_EVENT, refresh) }
+    return () => {
+      window.removeEventListener('focus', refresh)
+      document.removeEventListener('visibilitychange', visible)
+      window.removeEventListener(CLOUD_ACCESS_REFRESH_EVENT, refresh)
+    }
   }, [])
   useEffect(() => {
     if (phase.kind !== 'home') return
@@ -444,7 +465,7 @@ function CloudApplicationContent() {
       const switched = await switchWorkspace(created.id, updatedSession, true)
       return switched.ok ? switched : { ok: false, message: `The workspace was created, but switching was stopped: ${switched.message}` }
     } catch (error) {
-      if (error instanceof CloudAuthError) { onAuthError(error.message); return { ok: false, message: error.message } }
+      if (error instanceof CloudAuthError) { onAuthError(error); return { ok: false, message: error.message } }
       const message = error instanceof CloudApiError ? error.message : 'Score could not create a new workspace. Try again.'
       return { ok: false, message }
     } finally { navigationPending.current = false }
@@ -466,7 +487,7 @@ function CloudApplicationContent() {
       if (latest) publishDirectory({ ...latest, workspaces: latest.workspaces.map(item => item.id === id ? updated : item) })
       return { ok: true }
     } catch (error) {
-      if (error instanceof CloudAuthError) { onAuthError(error.message); return { ok: false, message: error.message } }
+      if (error instanceof CloudAuthError) { onAuthError(error); return { ok: false, message: error.message } }
       if (error instanceof CloudConflictError) {
         try {
           await refreshWorkspaces()
@@ -481,10 +502,13 @@ function CloudApplicationContent() {
     }
   }
 
-  function onAuthError(message: string) {
+  function onAuthError(error: CloudAuthError) {
+    const message = error.message
+    ++metadataSequence.current
     const current = sessionRef.current
     if (!current) { setPhase({ kind: 'sign-in', message }); return }
     publishDirectory({ ...current, capabilities: { applicationAdmin: false, canCreateWorkspaces: false }, workspaces: [] })
+    setSignInMessage(error.status === 401 ? message : null)
     setDirectoryError(message)
   }
 
@@ -496,7 +520,18 @@ function CloudApplicationContent() {
   const refreshAccess = () => {
     void refreshWorkspaces().catch(caught => console.warn('Access refresh failed:', caught instanceof Error ? caught.message : caught))
   }
-  const accessNotice = directoryError && <div className="storage-banner" role="alert"><span>Access refresh: {directoryError}</span><Button size="sm" onClick={refreshAccess}>Refresh access</Button></div>
+  async function leaveExpiredSession() {
+    if (navigationPending.current || lifecyclePending.current) throw new Error('Wait for the current workspace request to finish.')
+    const prepared = phaseRef.current.kind === 'admin'
+      ? await adminLeaveRef.current?.confirmLeave(undefined, true) ?? true
+      : (await providerApiRef.current?.prepareToLeave())?.ok ?? await gradeLeaveRef.current?.confirmLeave(undefined, true) ?? true
+    if (!prepared || !aliveRef.current) throw new Error('Leaving was cancelled. Your drafts remain in this tab.')
+    adminLeaveRef.current?.releaseForLeave()
+    gradeLeaveRef.current?.releaseForLeave()
+    window.location.assign(homePath())
+  }
+  const accessNotice = !requiresSignIn && directoryError && <div className="storage-banner" role="alert"><span>Access refresh: {directoryError}</span><Button size="sm" onClick={refreshAccess}>Refresh access</Button></div>
+  const sessionRecovery = requiresSignIn ? <SessionRecovery message={signInMessage} verify={refreshWorkspaces} leave={leaveExpiredSession} /> : null
 
   async function signOutFromHome() {
     if (navigationPending.current || lifecyclePending.current) throw new Error('Wait for the current workspace request to be acknowledged before signing out.')
@@ -508,7 +543,7 @@ function CloudApplicationContent() {
   if (phase.kind === 'admin' && session) {
     const authorized = session.capabilities?.applicationAdmin === true
     if (authorized) adminMounted.current = true
-    const denial = <CloudGateShell tone="error">
+    const denial = sessionRecovery || <CloudGateShell tone="error">
       <ShieldCheck size={30} /><h1>Application administrator access required</h1>
       <p>Your signed-in account is not designated as an application administrator. Owning a workspace does not grant access to application settings or user access.</p>
       {adminMounted.current && <p>Unsaved administration choices are retained in this tab, but cannot be saved without administrator access.</p>}
@@ -531,7 +566,7 @@ function CloudApplicationContent() {
     <ShieldCheck size={30} className="mb-1" />
     <h1>Sign in to Score</h1>
     <p>{phase.message}</p>
-    <Button variant="primary" icon={LogIn} onClick={() => window.location.assign(authLoginUrl(safeSameOriginPath(window.location.pathname + window.location.search)))}>
+    <Button variant="primary" icon={LogIn} onClick={() => window.location.assign(authLoginUrl(safeSameOriginPath(window.location.pathname + window.location.search + window.location.hash)))}>
       Sign in with Microsoft Entra ID
     </Button>
   </CloudGateShell>
@@ -543,7 +578,7 @@ function CloudApplicationContent() {
     <Button variant="primary" onClick={() => window.location.reload()}>Try again</Button>
   </CloudGateShell>
 
-  if (phase.kind === 'workspace-unavailable') return <CloudGateShell tone="error">
+  if (phase.kind === 'workspace-unavailable') return sessionRecovery || <CloudGateShell tone="error">
     <AlertTriangle size={30} className="mb-1" />
     <h1>This workspace is unavailable</h1>
     <p>The workspace in this link doesn't exist, or your account no longer has access to it. Ask a workspace owner or application administrator for access, then refresh. Nothing was changed.</p>
@@ -554,12 +589,15 @@ function CloudApplicationContent() {
   </CloudGateShell>
 
   if (phase.kind === 'home' && session) return <GradeNavigationProtectionProvider key={JSON.stringify([session.user.tenantId, session.user.id])}
-    workspaceId="workspace-directory" routePrefix="/" apiRef={gradeLeaveRef}><WorkspaceHomePage
+    workspaceId="workspace-directory" routePrefix="/" apiRef={gradeLeaveRef}>
+    {sessionRecovery}
+    <AccessSuspendedContext.Provider value={requiresSignIn}><div className="access-suspended" hidden={requiresSignIn}><WorkspaceHomePage
     user={session.user} directory={{ workspaces: session.workspaces, currentWorkspaceId: '', switchWorkspace, createWorkspace, renameWorkspace,
       canCreateWorkspaces: session.capabilities?.canCreateWorkspaces === true,
       refreshWorkspaces, getWorkspaceLifecycleImpact, changeWorkspaceLifecycle }}
     recents={recents} directoryRevision={directoryRevision} directoryError={directoryError} directoryReady={directoryReady} applicationAdmin={session.capabilities?.applicationAdmin === true}
     openAdminSettings={openAdminSettings} openAdminUsers={openAdminUsers} signOut={signOutFromHome} onAuthError={onAuthError} />
+    </div></AccessSuspendedContext.Provider>
   </GradeNavigationProtectionProvider>
 
   if (phase.kind !== 'ready') return null
@@ -575,6 +613,7 @@ function CloudApplicationContent() {
         workspaceId={workspaceId}
         user={activeSession.user}
         workspaces={activeSession.workspaces}
+        sessionRecovery={sessionRecovery}
         canCreateWorkspaces={activeSession.capabilities?.canCreateWorkspaces === true}
         apiRef={providerApiRef}
         leaveProtectionRef={gradeLeaveRef}

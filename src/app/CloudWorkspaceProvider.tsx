@@ -41,11 +41,13 @@ export function CloudWorkspaceProvider({
   refreshWorkspaces, getWorkspaceLifecycleImpact, changeWorkspaceLifecycle,
   leaveUnavailableWorkspace,
   canCreateWorkspaces = false,
+  sessionRecovery,
 }: {
   workspaceId: string
   user: CloudUser
   workspaces: WorkspaceSummary[]
   canCreateWorkspaces?: boolean
+  sessionRecovery?: ReactNode
   apiRef: { current: CloudWorkspaceProviderApi | null }
   leaveProtectionRef?: { current: GradeLeaveProtectionApi | null }
   switchWorkspace: (id: string) => Promise<Result>
@@ -66,7 +68,7 @@ export function CloudWorkspaceProvider({
   const metadata = workspaces.find((item) => item.id === workspaceId)
   const metadataRef = useRef(metadata)
   metadataRef.current = metadata
-  const unavailable = !metadata || Boolean(metadata.deletedAt)
+  const unavailable = !metadata || Boolean(metadata.deletedAt) || Boolean(sessionRecovery)
   const archivedAt = metadata?.archivedAt
 
   useEffect(() => {
@@ -132,7 +134,7 @@ export function CloudWorkspaceProvider({
     lifecycleOperations: [],
   }
   return <>
-    {unavailable && <main className="recovery-page"><div className="panel recovery-card">
+    {unavailable && (sessionRecovery || <main className="recovery-page"><div className="panel recovery-card">
       <ShieldCheck size={30} /><h1>Workspace access is no longer available</h1>
       <p>This workspace was removed or your membership changed. Workspace content is hidden and new requests and writes are stopped. Ask an Owner or application administrator for access.</p>
       <p>Unsaved drafts remain in memory in this tab. They do not grant continued access and will not be uploaded automatically. Refresh access to check for a restored grant, or explicitly discard them before leaving.</p>
@@ -141,7 +143,7 @@ export function CloudWorkspaceProvider({
         setAccessError('')
         void refreshWorkspaces().catch(caught => setAccessError(caught instanceof Error ? caught.message : 'Current access could not be refreshed.'))
       }}>Refresh access</Button><Button onClick={() => setConfirmLeave(true)}>Choose another workspace</Button></div>
-    </div></main>}
+    </div></main>)}
     <AccessSuspendedContext.Provider value={unavailable}><div className="access-suspended" hidden={unavailable}>{children(value, cloud)}</div></AccessSuspendedContext.Provider>
     <Modal open={confirmLeave} onOpenChange={setConfirmLeave} dismissDisabled={leaving} title="Discard unsaved changes and leave?"
       description="Access has changed. This explicitly discards unsaved drafts kept only in this tab. Drafts with their own leave protection still ask for confirmation."

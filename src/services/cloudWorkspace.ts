@@ -147,7 +147,8 @@ export function cloudAccessRequestSignal(path: string, init: RequestInit = {}): 
 export function reportCloudAccessFailure(path: string, error: unknown) {
   if (!sessionAccess || !(error instanceof CloudApiError) || error instanceof CloudAccessChangedError || ![401, 403, 404].includes(error.status)) return
   const match = /^\/workspaces\/([^/?]+)/.exec(path)
-  if (!match && !(path.startsWith('/admin/') && error.status !== 404)) return
+  if (!match && !(path.startsWith('/admin/') && error.status !== 404) &&
+    !(error.status === 401 && path !== '/session' && path !== '/session/identity')) return
   if (match && error.status !== 404) accessRefreshRequired.add(decodeURIComponent(match[1]))
   if (typeof window !== 'undefined') window.dispatchEvent(new window.Event(CLOUD_ACCESS_REFRESH_EVENT))
 }

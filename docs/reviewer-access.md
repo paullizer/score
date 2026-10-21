@@ -29,6 +29,30 @@ Original downloads and report exports retain their separate role allowlists.
 Rubric exports use the report export allowlist (**Official export roles**).
 Adding the reviewer role does not add it to defaults or to existing saved policies.
 
+## Recovering an expired session
+
+An expired sign-in is different from a removed workspace membership. Score hides
+workspace content and pauses changes while retaining mounted editors and their
+unsaved drafts. Choose **Refresh access** on **Sign in again to restore access**
+to open Microsoft sign-in in a separate window. Use the same Microsoft account;
+the original tab verifies both tenant/user identity and current permissions
+before restoring access. The original workspace URL and in-memory drafts remain
+in place. Sign-in never saves drafts or replays failed or unacknowledged writes.
+
+If your browser blocks the window, use **Open sign-in link**, finish signing in,
+and return to the original tab to choose **Check access**. Returning to the tab
+also checks access, even when automatic completion notifications are unavailable.
+**Stop waiting** allows a new sign-in attempt after closing or abandoning the
+window; an unconfirmed attempt expires after five minutes.
+
+Keep the original tab open: drafts are not backed up in browser storage.
+**Discard drafts and leave** explicitly confirms abandoning this session and
+uses existing draft-leave protection before reloading workspace home. Signing in
+as another account cannot expose the retained drafts. A verified session without
+the membership still shows the ordinary workspace-access denial, and a reduced
+role remains read-only. Genuine import conflicts and service errors do not
+trigger interactive sign-in.
+
 ## API contracts
 
 The sharing UI uses `GET /api/workspaces/:workspaceId/share-candidates`,

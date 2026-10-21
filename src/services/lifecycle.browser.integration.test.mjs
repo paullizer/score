@@ -133,7 +133,7 @@ function cloudFixture(workspace = testWorkspace(), summaries = []) {
     members: { members: [{ id: user.id, name: user.name, email: user.email, role: 'owner' }], etag: '"members-1"' },
     creationGrant: { userId: 'never-signed-in', canCreateWorkspaces: false, etag: '"unassigned"' }, memberFailure: null,
     beforeRead: null, beforeSave: null, saveFailures: [], jobPending: [], gradePending: [], gradeFailureStatus: 503,
-    lifecycleFailure: null, impactFailures: 0, jobDetailFailures: 0, jobDetailFailureStatus: 503,
+    lifecycleFailure: null, impactFailures: 0, jobDetailFailures: 0, jobDetailFailureStatus: 503, sessionFailure: null, sessionUser: user,
     gradeImpactFailures: 0, hideDeletingFamilies: false, stateMissing: false, summaryCounts: {},
   }
   const response = (route, body, status = 200, headers = {}) => route.fulfill({ status, contentType: 'application/json', headers, body: JSON.stringify(body) })
@@ -144,7 +144,12 @@ function cloudFixture(workspace = testWorkspace(), summaries = []) {
       const path = decodeURIComponent(url.pathname), body = method === 'POST' || method === 'PUT' || method === 'PATCH' ? request.postDataJSON() : undefined
       state.requests.push([method, path])
       if (method !== 'GET') state.mutations.push({ method, path, body, etag: request.headers()['if-match'] })
-      if (path === '/api/session') return response(route, { mode: 'cloud', user, capabilities: clone(state.capabilities), workspaces: clone(state.summaries) })
+      if (path === '/api/session') {
+        if (state.sessionFailure === 'html') return route.fulfill({ contentType: 'text/html', body: '<html><body>Sign in</body></html>' })
+        if (state.sessionFailure === 'redirect') return route.fulfill({ status: 302, headers: { Location: '/.auth/login/aad' } })
+        if (state.sessionFailure === 'unauthorized') return response(route, { error: { code: 'unauthorized', message: 'Your Score session expired.' } }, 401)
+        return response(route, { mode: 'cloud', user: state.sessionUser, capabilities: clone(state.capabilities), workspaces: clone(state.summaries) })
+      }
       if (path === '/api/session/identity') return response(route, { mode: 'cloud', user, capabilities: clone(state.capabilities) })
       if (path === '/api/admin/users' || path.endsWith('/share-candidates')) {
         const query = url.searchParams.get('query')?.toLowerCase()
@@ -674,6 +679,141 @@ test('workspace access browser: revoked grade drafts remain protected and restor
   const protection = page.getByRole('dialog', { name: 'Unsaved changes', exact: true })
   await protection.getByRole('button', { name: 'Stay here', exact: true }).click()
   await page.getByRole('heading', { name: 'Workspace access is no longer available', exact: true }).waitFor()
+  assert.equal(fixture.mutations.length, 0)
+})
+
+async function expiredGradeDraft(t, failure) {
+  const sample = testWorkspace(), fixture = cloudFixture(sample, [workspaceSummary()])
+  fixture.ladders = [realLadder(sample)]
+  const family = fixture.ladders[0]
+  family.ladder.sourceSetId = 'set-one'; family.ladder.generationId = 'generation-one'
+  family.sourceSet = { id: 'set-one', sources: [], decisions: [], issues: [], context: family.ladder.context, grades: [9, 11], revision: 1, createdAt: timestamp }
+  const page = await pageFor(t)
+  await fixture.install(page)
+  const path = `/workspaces/workspace-one/grade-ladders/${family.ladder.id}?scoutTheme=light#draft`
+  await page.goto(`${cloudServer.origin}${path}`)
+  const column = page.locator('.grade-matrix thead th').filter({ has: page.getByRole('heading', { name: 'GS-9', exact: true }) })
+  await column.getByRole('button', { name: 'Edit draft', exact: true }).click()
+  const editor = page.getByRole('dialog', { name: 'Edit GS-9 draft', exact: true })
+  await editor.getByRole('textbox', { name: 'Grade rubric name', exact: true }).fill('Keep this exact unsaved session draft')
+  await page.evaluate(() => { window.recoveryOriginalDocument = document })
+  fixture.sessionFailure = failure
+  await page.evaluate(() => window.dispatchEvent(new Event('focus')))
+  await page.getByRole('heading', { name: 'Sign in again to restore access', exact: true }).waitFor()
+  assert.equal(await editor.isVisible(), false)
+  assert.equal(await page.getByRole('heading', { name: 'Workspace access is no longer available', exact: true }).count(), 0)
+  return { fixture, page, path, editor }
+}
+
+for (const failure of ['unauthorized', 'redirect', 'html']) {
+  test(`session recovery browser: ${failure} starts separate sign-in and restores the original unsaved draft`, { timeout: 60000 }, async (t) => {
+    const { fixture, page, path, editor } = await expiredGradeDraft(t, failure)
+    assert.equal(page.context().pages().length, 1, 'Expiry alone must not open a popup.')
+    await page.context().route(/\/\.auth\/login\/aad\?/, route => route.fulfill({
+      contentType: 'text/plain', body: 'Simulated Microsoft sign-in. No credentials are collected.',
+    }))
+    const popupReady = page.waitForEvent('popup')
+    await page.getByRole('button', { name: 'Refresh access', exact: true }).click()
+    const popup = await popupReady
+    await popup.waitForLoadState()
+    const login = new URL(popup.url())
+    assert.equal(login.origin, cloudServer.origin)
+    assert.equal(login.pathname, '/.auth/login/aad')
+    assert.equal(await popup.evaluate(() => window.opener), null)
+    const completion = login.searchParams.get('post_login_redirect_uri')
+    assert.match(completion, /^\/auth\/recovery\?attempt=[0-9a-f-]+$/)
+    assert.equal(page.url(), `${cloudServer.origin}${path}`)
+    fixture.sessionFailure = null
+    await popup.goto(`${cloudServer.origin}${completion}`)
+    await popup.getByRole('heading', { name: 'Return to your original Score tab', exact: true }).waitFor()
+    await editor.waitFor()
+    assert.equal(await editor.getByRole('textbox', { name: 'Grade rubric name', exact: true }).inputValue(), 'Keep this exact unsaved session draft')
+    assert.equal(await page.evaluate(() => window.recoveryOriginalDocument === document), true, 'Original tab did not reload.')
+    assert.equal(page.url(), `${cloudServer.origin}${path}`)
+    assert.equal(fixture.mutations.length, 0, 'Sign-in never replays or saves drafts.')
+    assert.equal(await popup.locator('.app-layout').count(), 0, 'Completion must not start a workspace application.')
+  })
+}
+
+test('session recovery browser: a different account cannot unlock the original draft, and a closed popup is retryable', { timeout: 60000 }, async (t) => {
+  const { fixture, page, editor } = await expiredGradeDraft(t, 'unauthorized')
+  await page.context().route(/\/\.auth\/login\/aad\?/, route => route.fulfill({ contentType: 'text/plain', body: 'Simulated sign-in.' }))
+  const popupReady = page.waitForEvent('popup')
+  await page.getByRole('button', { name: 'Refresh access', exact: true }).click()
+  const popup = await popupReady
+  await popup.close()
+  await page.getByRole('button', { name: 'Stop waiting', exact: true }).click()
+  await page.getByRole('button', { name: 'Refresh access', exact: true }).waitFor({ state: 'visible' })
+  assert.equal(await page.getByRole('button', { name: 'Refresh access', exact: true }).isEnabled(), true)
+  fixture.sessionFailure = null
+  fixture.sessionUser = { ...fixture.user, tenantId: 'other-tenant' }
+  await page.getByRole('button', { name: 'Check access', exact: true }).click()
+  await page.getByText(/A different account is now signed in/).first().waitFor()
+  assert.equal(await editor.isVisible(), false)
+  assert.equal(fixture.mutations.length, 0)
+  fixture.sessionUser = fixture.user
+  fixture.summaries[0] = { ...fixture.summaries[0], role: 'viewer' }
+  await page.getByRole('button', { name: 'Check access', exact: true }).click()
+  await editor.waitFor()
+  assert.equal(await editor.getByRole('textbox', { name: 'Grade rubric name', exact: true }).inputValue(), 'Keep this exact unsaved session draft')
+  assert.equal(await editor.getByRole('button', { name: 'Save draft and request review', exact: true }).isDisabled(), true)
+  assert.equal(fixture.mutations.length, 0)
+})
+
+test('session recovery browser: blocked popup and no signaling remain usable at desktop and mobile widths', { timeout: 60000 }, async (t) => {
+  const { fixture, page, editor } = await expiredGradeDraft(t, 'html')
+  await page.evaluate(() => { window.open = () => null; window.BroadcastChannel = undefined })
+  await page.getByRole('button', { name: 'Refresh access', exact: true }).click()
+  await page.getByText(/browser blocked the sign-in window/).waitFor()
+  const fallback = page.getByRole('link', { name: 'Open sign-in link', exact: true })
+  assert.equal(await fallback.getAttribute('rel'), 'noopener noreferrer')
+  for (const width of [1440, 390]) {
+    await page.setViewportSize({ width, height: 1000 })
+    const layout = await page.locator('.recovery-card').evaluate(card => {
+      const controls = [...card.querySelectorAll('button, a')].filter(control => control.getClientRects().length > 0)
+      const box = card.getBoundingClientRect()
+      return {
+        overflows: document.documentElement.scrollWidth > window.innerWidth,
+        cardInsideViewport: box.left >= 0 && box.right <= window.innerWidth,
+        controlsInsideCard: controls.every(control => {
+          const rect = control.getBoundingClientRect()
+          return rect.left >= box.left && rect.right <= box.right
+        }),
+        textColor: getComputedStyle(card.querySelector('p')).color,
+        background: getComputedStyle(card).backgroundColor,
+      }
+    })
+    assert.equal(layout.overflows, false, `No horizontal overflow at ${width}px`)
+    assert.equal(layout.cardInsideViewport, true)
+    assert.equal(layout.controlsInsideCard, true, 'Recovery controls wrap within the existing card.')
+    assert.notEqual(layout.textColor, layout.background)
+  }
+  fixture.sessionFailure = null
+  await page.getByRole('button', { name: 'Check access', exact: true }).click()
+  await editor.waitFor()
+  assert.equal(await editor.getByRole('textbox', { name: 'Grade rubric name', exact: true }).inputValue(), 'Keep this exact unsaved session draft')
+  assert.equal(fixture.mutations.length, 0)
+})
+
+test('session recovery browser: explicit discard honors the draft guard before reloading under a new account', { timeout: 60000 }, async (t) => {
+  const { fixture, page } = await expiredGradeDraft(t, 'unauthorized')
+  await page.getByRole('button', { name: 'Discard drafts and leave', exact: true }).click()
+  await page.getByRole('dialog', { name: 'Discard unsaved drafts and reload?', exact: true })
+    .getByRole('button', { name: 'Discard drafts and reload', exact: true }).click()
+  const guard = page.getByRole('dialog', { name: 'Unsaved changes', exact: true })
+  await guard.getByRole('button', { name: 'Stay here', exact: true }).click()
+  await page.getByText('Leaving was cancelled. Your drafts remain in this tab.', { exact: true }).waitFor()
+  assert.equal(await page.evaluate(() => window.recoveryOriginalDocument === document), true)
+  fixture.sessionFailure = null
+  fixture.sessionUser = { ...fixture.user, id: 'new-account' }
+  fixture.summaries = []
+  await page.getByRole('button', { name: 'Discard drafts and leave', exact: true }).click()
+  await page.getByRole('dialog', { name: 'Discard unsaved drafts and reload?', exact: true })
+    .getByRole('button', { name: 'Discard drafts and reload', exact: true }).click()
+  await guard.getByRole('button', { name: 'Discard unsaved changes and leave', exact: true }).click()
+  await page.waitForURL(`${cloudServer.origin}/?scoutTheme=light`)
+  await page.getByRole('heading', { name: 'My workspaces', exact: true }).waitFor()
+  assert.equal(await page.evaluate(() => 'recoveryOriginalDocument' in window), false, 'Explicit discard reloads the original session only after approval.')
   assert.equal(fixture.mutations.length, 0)
 })
 

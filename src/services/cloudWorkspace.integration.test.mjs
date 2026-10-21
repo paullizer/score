@@ -135,6 +135,27 @@ test('non-timeout body and network failures are not swallowed or converted to ac
   await assert.rejects(client.cloudLifecycleRequest('/workspaces/test/lifecycle', { method: 'POST' }), (caught) => caught === error)
 })
 
+test('expired sessions remain distinct from permission denials, conflicts and service errors without replay', async () => {
+  for (const response of [
+    { status: 0, type: 'opaqueredirect', redirected: false },
+    { status: 200, redirected: true },
+    Response.json({ error: { code: 'unauthorized', message: 'Session expired.' } }, { status: 401 }),
+    new Response('<html>Microsoft sign-in</html>', { headers: { 'Content-Type': 'text/html' } }),
+  ]) {
+    let calls = 0
+    globalThis.fetch = async () => { calls++; return response }
+    await assert.rejects(client.cloudJsonRequest('/session'), error => error instanceof client.CloudAuthError && error.status === 401)
+    assert.equal(calls, 1)
+  }
+  for (const [status, code] of [[403, 'forbidden'], [404, 'not_found'], [409, 'conflict'], [503, 'unavailable']]) {
+    globalThis.fetch = async () => Response.json({ error: { code, message: 'An explicit API failure.' } }, { status })
+    await assert.rejects(client.cloudJsonRequest('/session'), error => error instanceof client.CloudApiError &&
+      !(error instanceof client.CloudAuthError) && error.status === status)
+  }
+  globalThis.fetch = async () => new Response('Access denied', { status: 403 })
+  await assert.rejects(client.cloudJsonRequest('/session'), error => error.status === 403)
+})
+
 function virtualClock() {
   const clock = { now: 0, waits: [] }
   client.cloudRetryClock.now = () => clock.now
