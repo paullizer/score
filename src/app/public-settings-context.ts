@@ -7,6 +7,7 @@ export interface PublicSettingsContextValue {
   phase: 'loading' | 'ready' | 'error'
   error: string | null
   cloud: boolean
+  refreshing?: boolean
   hostTheme?: 'light' | 'dark' | null
   refresh: () => Promise<void>
 }
@@ -28,7 +29,7 @@ export function originalDownloadReason(policy: PublicSettingsContextValue, role?
 }
 
 export function clientAdmissionReason(policy: PublicSettingsContextValue, kind?: NewWorkKind): string | null {
-  if (policy.cloud && policy.phase !== 'ready') return policy.error ?? 'Checking current application policy before starting new work.'
+  if (policy.cloud && policy.phase !== 'ready') return policy.error ?? 'Checking application settings before starting new work.'
   return admissionReason(policy.settings, kind)
 }
 

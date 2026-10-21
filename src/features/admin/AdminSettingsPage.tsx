@@ -15,6 +15,7 @@ import { Badge, Button, InlineError, Modal, PageHeader, SearchField } from '../.
 import { ModelSettingsEditor, type DeploymentDiscovery } from './ModelSettingsEditor'
 import { SettingsField } from './SettingsField'
 import { changeSetting, defaultsCandidate, describeChangeValue, rebaseSettingsDraft } from './settingsForm'
+import { ApplicationStatus } from './ApplicationStatus'
 
 const sections: { id: SettingsSection; title: string }[] = [
   { id: 'ai', title: 'AI deployments & tasks' }, { id: 'intake', title: 'Features & intake' }, { id: 'grades', title: 'GS ladders & references' },
@@ -67,11 +68,6 @@ export function AdminSettingsPage({ onLeave, onOpenUsers }: { onLeave: () => voi
   const [probeDeployment, setProbeDeployment] = useState('')
   const [costAcknowledged, setCostAcknowledged] = useState(false)
   const [probe, setProbe] = useState<ModelTestResult | null>(null)
-  const [promptRelease, setPromptRelease] = useState<service.PromptReleaseStatus | null>(null)
-  const [promptReleaseError, setPromptReleaseError] = useState('')
-  const [releaseReason, setReleaseReason] = useState('')
-  const [releaseGateSha, setReleaseGateSha] = useState('')
-  const [releaseTargetsVersion, setReleaseTargetsVersion] = useState('score-engineering-targets-v2')
   const [importOpen, setImportOpen] = useState(false)
   const [importText, setImportText] = useState('')
   const live = useRef(true)
@@ -82,15 +78,12 @@ export function AdminSettingsPage({ onLeave, onOpenUsers }: { onLeave: () => voi
   useEffect(() => {
     live.current = true
     const controller = new AbortController()
-    void Promise.allSettled([service.readAdminSettings(controller.signal), service.readPromptRelease(controller.signal)]).then(results => {
+    void Promise.allSettled([service.readAdminSettings(controller.signal)]).then(results => {
       if (controller.signal.aborted) return
       const settingsResult = results[0]
-      const releaseResult = results[1]
       if (settingsResult.status === 'fulfilled') {
         setBase(settingsResult.value); setDraft(structuredClone(settingsResult.value.settings)); setProbeDeployment(settingsResult.value.settings.ai.defaultDeploymentId)
       } else setError(settingsResult.reason instanceof Error ? settingsResult.reason.message : 'Application settings could not be loaded.')
-      if (releaseResult.status === 'fulfilled') setPromptRelease(releaseResult.value)
-      else setPromptReleaseError(releaseResult.reason instanceof Error ? releaseResult.reason.message : 'Prompt release status could not be loaded.')
       setLoading(false)
     })
     return () => { live.current = false; controller.abort() }
@@ -209,22 +202,6 @@ export function AdminSettingsPage({ onLeave, onOpenUsers }: { onLeave: () => voi
     })
   }
 
-  async function activatePromptRelease() {
-    const releaseEtag = promptRelease?.etag
-    if (!releaseEtag) { setPromptReleaseError('Load the prompt release status before activating.'); return }
-    await action(async () => {
-      const result = await service.activatePromptRelease({
-        reason: releaseReason,
-        gateReportSha256: releaseGateSha,
-        targetsVersion: releaseTargetsVersion,
-      }, releaseEtag)
-      if (!live.current) return
-      setPromptRelease(result); setPromptReleaseError(''); setReleaseReason(''); setReleaseGateSha('')
-      setStatus('Activated the prompt release for new work.')
-      await policy.refresh()
-    })
-  }
-
   async function exportSettings() {
     await action(async () => {
       const exported = await service.exportAdminSettings()
@@ -237,9 +214,10 @@ export function AdminSettingsPage({ onLeave, onOpenUsers }: { onLeave: () => voi
     })
   }
 
-  if (loading) return <main className="recovery-page"><p role="status">Loading application settings…</p></main>
+  if (loading) return <main className="recovery-page"><h1>Application settings</h1><ApplicationStatus /><p role="status">Loading application settings…</p></main>
   if (!base || !draft) return <main className="recovery-page"><div className="panel recovery-card">
     <h1>Application settings unavailable</h1><InlineError>{error || 'The server did not return settings. No local substitute was created.'}</InlineError>
+    <ApplicationStatus />
     <Button onClick={onLeave}>Back to workspaces</Button><Button onClick={() => window.location.reload()}>Retry settings</Button>
   </div></main>
   const availableFields = base.fields.filter(field => draft.schemaVersion !== 1 || !/^(?:ai\.tasks\.qcPlan|processing\.qc|workers\.qc)(?:\.|$)/.test(field.path))
@@ -264,6 +242,7 @@ export function AdminSettingsPage({ onLeave, onOpenUsers }: { onLeave: () => voi
       <PageHeader eyebrow="APPLICATION-WIDE · NOT A WORKSPACE ROLE" title="Application settings"
         description="Versioned policies for new work. Saved evidence, approvals, and historical results are never rewritten by changing these settings."
         actions={<><Button icon={Download} disabled={pending} onClick={() => void exportSettings()}>Export saved settings</Button><Button icon={Upload} disabled={pending} onClick={() => setImportOpen(true)}>Import settings</Button></>} />
+      <ApplicationStatus />
       <div className="settings-savebar">
         <p><strong>{changes.length} unsaved {changes.length === 1 ? 'change' : 'changes'}</strong> · Saved revision <code>{base.revision}</code> · {base.createdAt}</p>
         <div className="flex flex-wrap gap-2"><Button disabled={pending || !changes.length} onClick={() => setDiscard(true)}>Discard</Button>
@@ -314,23 +293,6 @@ export function AdminSettingsPage({ onLeave, onOpenUsers }: { onLeave: () => voi
         <h2>{search ? 'Matching settings' : sections.find(item => item.id === section)?.title}</h2>
         <div className="settings-grid">{fields.filter(field => !field.path.startsWith('ai.tasks.') && field.path !== 'ai.defaultDeploymentId').map(field =>
           <SettingsField key={field.path} field={field} settings={draft} saved={base.settings} defaults={base.defaults} errors={errors} onChange={update} disabled={pending} />)}</div>
-      </section>}
-      {section === 'environment' && !search && <section className="panel settings-section" aria-label="Prompt release">
-        <h2>Prompt release</h2>
-        {promptRelease ? <>
-          <dl className="settings-facts"><dt>Active bundle</dt><dd><code>{promptRelease.activeBundleId ?? 'Not initialized'}</code></dd>
-            <dt>Active bundle SHA-256</dt><dd><code className="break-all">{promptRelease.activeBundleSha256 ?? 'Not initialized'}</code></dd>
-            <dt>Build generation</dt><dd><code>{promptRelease.generation}</code></dd>
-            <dt>Template support</dt><dd>{promptRelease.supported ? 'Current' : 'Pending activation'}</dd></dl>
-          {promptRelease.pending && <div className="space-y-4">
-            <p>A new prompt release is installed. Activate it after its quality gate passes. New work is paused until you do.</p>
-            <label className="field"><span className="field-label">Reason</span><textarea className="input" rows={3} maxLength={1000} disabled={pending} value={releaseReason} onChange={event => setReleaseReason(event.target.value)} /></label>
-            <label className="field"><span className="field-label">Gate report SHA-256</span><input className="input" disabled={pending} value={releaseGateSha} onChange={event => setReleaseGateSha(event.target.value.trim())} /></label>
-            <label className="field"><span className="field-label">Targets version</span><input className="input" disabled={pending} value={releaseTargetsVersion} onChange={event => setReleaseTargetsVersion(event.target.value.trim())} /></label>
-            <Button variant="primary" disabled={pending || !releaseReason.trim() || !/^[a-f0-9]{64}$/.test(releaseGateSha) || !releaseTargetsVersion.trim()} onClick={() => void activatePromptRelease()}>Activate prompt release</Button>
-          </div>}
-        </> : <p>Prompt release status is not loaded.</p>}
-        {promptReleaseError && <InlineError>{promptReleaseError}</InlineError>}
       </section>}
       {(section === 'ai' || section === 'environment') && !search && <section className="panel settings-section" aria-label="Deployment discovery and synthetic tests">
         <h2>Inventory and explicit synthetic tests</h2><p>Inventory refresh reads existing deployments; it does not create deployments, save settings, or run inference. Tests are separate, use only synthetic nonprivate content, and never save the draft.</p>

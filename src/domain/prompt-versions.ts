@@ -15,7 +15,7 @@ export const promptHashSchema = z.string().regex(/^[a-f0-9]{64}$/)
 const nonblank = (max: number) => z.string().min(1).max(max).regex(/\S/)
 export const promptActorSchema = z.union([
   z.strictObject({ tenantId: z.uuid(), oid: z.uuid() }),
-  z.strictObject({ system: z.literal('initialization') }),
+  z.strictObject({ system: z.enum(['initialization', 'deployment']) }),
 ])
 export const promptGuidanceSchema = nonblank(PROMPT_REGISTRY_LIMITS.guidanceCharacters).refine(
   value => !/\{\{|\}\}|\$\{|<%|%>|\{[A-Za-z_][A-Za-z0-9_.-]*\}/.test(value) &&
@@ -39,6 +39,7 @@ export const promptRevisionSchema = promptRevisionReferenceSchema.extend({
   parentRevisionId: promptIdentifierSchema.nullable(),
   guidance: promptGuidanceSchema.nullable(),
   guidanceSha256: promptHashSchema,
+  guidanceSource: z.enum(['code', 'qc']).optional(),
 }).superRefine((revision, ctx) => {
   const editable = (EDITABLE_PROMPT_FAMILIES as readonly string[]).includes(revision.family)
   if (editable !== (revision.guidance !== null)) {
@@ -113,6 +114,13 @@ export const promptTemplateReleaseSchema = z.strictObject({
   targetsVersion: promptIdentifierSchema,
 })
 export type PromptTemplateRelease = z.infer<typeof promptTemplateReleaseSchema>
+export const promptDeploymentReleaseSchema = z.strictObject({
+  releaseId: promptHashSchema,
+  contractSha256: promptHashSchema,
+  workerImage: z.string().min(1).max(512),
+  verifiedAt: z.iso.datetime(),
+})
+export type PromptDeploymentRelease = z.infer<typeof promptDeploymentReleaseSchema>
 export const promptActivationSchema = z.strictObject({
   schemaVersion: z.literal(1),
   activationId: promptIdentifierSchema,
@@ -126,19 +134,23 @@ export const promptActivationSchema = z.strictObject({
   evaluation: promptEvaluationReferenceSchema.nullable(),
   restoration: promptRestorationReferenceSchema.optional(),
   templateRelease: promptTemplateReleaseSchema.optional(),
+  deploymentRelease: promptDeploymentReleaseSchema.optional(),
 }).superRefine((activation, ctx) => {
-  const initialized = 'system' in activation.actor
+  const system = 'system' in activation.actor ? activation.actor.system : null
+  const initialized = system === 'initialization'
   const hasParents = activation.parentBundleId !== null && activation.parentBundleSha256 !== null
   const hasEvaluation = activation.evaluation !== null
   const hasRestoration = activation.restoration !== undefined
   const hasTemplateRelease = activation.templateRelease !== undefined
+  const hasDeploymentRelease = activation.deploymentRelease !== undefined
   const kinds = [
-    initialized && !hasParents && !hasEvaluation && !hasRestoration && !hasTemplateRelease,
-    !initialized && hasParents && hasEvaluation && !hasRestoration && !hasTemplateRelease,
-    !initialized && hasParents && !hasEvaluation && hasRestoration && !hasTemplateRelease,
-    !initialized && hasParents && !hasEvaluation && !hasRestoration && hasTemplateRelease,
+    initialized && !hasParents && !hasEvaluation && !hasRestoration && !hasTemplateRelease && !hasDeploymentRelease,
+    !system && hasParents && hasEvaluation && !hasRestoration && !hasTemplateRelease && !hasDeploymentRelease,
+    !system && hasParents && !hasEvaluation && hasRestoration && !hasTemplateRelease && !hasDeploymentRelease,
+    !system && hasParents && !hasEvaluation && !hasRestoration && hasTemplateRelease && !hasDeploymentRelease,
+    system === 'deployment' && hasParents && !hasEvaluation && !hasRestoration && !hasTemplateRelease && hasDeploymentRelease,
   ].filter(Boolean).length
-  if (kinds !== 1) ctx.addIssue({ code: 'custom', message: 'An activation must be exactly one of initialization, evaluated release, audited restoration, or template release.' })
+  if (kinds !== 1) ctx.addIssue({ code: 'custom', message: 'An activation must be exactly one of initialization, evaluated release, audited restoration, template release, or verified deployment.' })
   if (activation.evaluation && (
     activation.evaluation.evaluatedBundleId !== activation.bundleId || activation.evaluation.evaluatedBundleSha256 !== activation.bundleSha256 ||
     activation.evaluation.baselineBundleId !== activation.parentBundleId || activation.evaluation.baselineBundleSha256 !== activation.parentBundleSha256
@@ -164,4 +176,4 @@ For score=null use confidence=null, explain the unscored or excluded state, and 
 ambiguity is a bounded list of specific {category, explanation} objects. Categories are rubric-anchors, evidence-scope, contradictory-evidence, source-clarity, or criterion-scope. Use [] when there is no genuine ambiguity; explain only uncertainty relevant to applying this rubric, never protected traits or speculation about the person.
 alternativeScores is a bounded list of distinct defensible integer ratings from 0 through 5, excluding the chosen score. Include only alternatives genuinely supported by the same document and saved anchors and explain that ambiguity; it is not a statistical confidence interval. Never invent support or use alternatives to evade a blocker.
 Diagnostics do not change scores, citation requirements, independent grounding authority, or the shared correction budget. Do not return diagnostics for qualifications.`
-export const PROMPT_RUNTIME_VERSION = 'score-prompt-runtime-v2'
+export const PROMPT_RUNTIME_VERSION = 'score-prompt-runtime-v3'

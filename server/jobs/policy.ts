@@ -13,6 +13,7 @@ import { forbidden, HttpError, invalidRequest, unavailable } from '../errors'
 import {
   getAdmissionSettings, getProcessingAdmissionSettings, getRuntimeSettingsReadiness,
   getSettingsForAcceptedWork, runtimeSettingsEnabled,
+  getSavedSettings,
 } from '../settings/request-context'
 
 export type ProcessingSettingsProvider = (() => Promise<ProcessingSettingsSnapshot>) & {
@@ -20,6 +21,7 @@ export type ProcessingSettingsProvider = (() => Promise<ProcessingSettingsSnapsh
   admission?: () => Promise<ProcessingSettingsSnapshot>
   newProcessingAllowed?: () => boolean
   pinNewAdmissions?: boolean
+  policy?: () => Promise<Pick<ProcessingSettingsSnapshot, 'settings' | 'revision'>>
 }
 
 export function requestProcessingSettings(req: Request): ProcessingSettingsProvider {
@@ -30,6 +32,7 @@ export function requestProcessingSettings(req: Request): ProcessingSettingsProvi
     pinNewAdmissions: runtimeSettingsEnabled(req),
     accepted: (snapshot?: ProcessingSettingsSnapshot) => snapshot
       ? getSettingsForAcceptedWork(req, snapshot) : legacy ??= getSettingsForAcceptedWork(req),
+    policy: () => getSavedSettings(req),
   })
 }
 
@@ -67,6 +70,10 @@ export function preservesProcessingSettings(
 
 export async function currentProcessingSettings(provider?: ProcessingSettingsProvider): Promise<ProcessingSettingsSnapshot> {
   return provider ? provider() : compatibilitySettings
+}
+
+export async function currentPolicySettings(provider?: ProcessingSettingsProvider): Promise<Pick<ProcessingSettingsSnapshot, 'settings' | 'revision'>> {
+  return provider?.policy ? provider.policy() : currentProcessingSettings(provider)
 }
 
 export async function newWorkProcessingSettings(provider?: ProcessingSettingsProvider): Promise<ProcessingSettingsSnapshot> {
@@ -112,7 +119,7 @@ export function assertImportPolicy(
   }
 }
 
-export function assertOriginalDownload(snapshot: ProcessingSettingsSnapshot, role: WorkspaceRole, preview = false): void {
+export function assertOriginalDownload(snapshot: Pick<ProcessingSettingsSnapshot, 'settings'>, role: WorkspaceRole, preview = false): void {
   if (!snapshot.settings.documents.originalDownloadRoles.includes(role)) {
     throw forbidden('Application policy does not allow your workspace role to download original source bytes.')
   }
@@ -122,7 +129,7 @@ export function assertOriginalDownload(snapshot: ProcessingSettingsSnapshot, rol
 }
 
 /** Rubric exports follow the Admin switch, then the report roles and formats. Pausing new work doesn't affect them. */
-export function assertRubricExport(snapshot: ProcessingSettingsSnapshot, role: WorkspaceRole, format: RubricExportFormat): void {
+export function assertRubricExport(snapshot: Pick<ProcessingSettingsSnapshot, 'settings'>, role: WorkspaceRole, format: RubricExportFormat): void {
   if (!rubricExportsEnabled(snapshot.settings)) throw forbidden('Rubric exports are turned off in Admin settings.')
   if (!snapshot.settings.reports.allowedRoles.includes(role)) {
     throw forbidden('Application policy does not allow your workspace role to export rubrics.')

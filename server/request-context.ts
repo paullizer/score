@@ -1,7 +1,7 @@
 import type { Request } from 'express'
 import type { AuthenticatedPrincipal } from './auth'
 export {
-  getAdmissionSettings as getRequestSettings, getCurrentSettings, getPinnedAdmissionSettings,
+  getSavedSettings as getRequestSettings, getCurrentSettings, getPinnedAdmissionSettings,
   getSettingsForAcceptedWork, runtimeSettingsEnabled, assertNewProcessingAllowed, getProcessingAdmissionSettings,
   getRuntimeSettingsReadiness,
 } from './settings/request-context'

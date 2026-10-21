@@ -121,7 +121,8 @@ export class QcPlanService {
       const captured = await this.prompts.capture(activation.bundleId)
       items.push({
         revision: activation.bundleId, createdAt: activation.createdAt,
-        actor: 'system' in activation.actor ? 'System initialization' : `${activation.actor.tenantId}:${activation.actor.oid}`,
+        actor: 'system' in activation.actor ? activation.actor.system === 'deployment' ? 'Verified deployment' : 'System initialization'
+          : `${activation.actor.tenantId}:${activation.actor.oid}`,
         reason: activation.reason, guidance: qcPromptSet(captured, 'history').guidance,
       })
     }

@@ -55,7 +55,7 @@ export function captureQcProcessingSettings(snapshot: ProcessingSettingsSnapshot
 
 /** Explicit allowlist: never serialize the admin response or deployment/environment object here. */
 export function projectPublicSettings(
-  snapshot: ProcessingSettingsSnapshot, runtimeEnabled = true, settingsConfigured = runtimeEnabled,
+  snapshot: Pick<ProcessingSettingsSnapshot, 'settings' | 'revision'>, runtimeEnabled = true, settingsConfigured = runtimeEnabled,
 ): PublicSettings {
   const settings = snapshot.settings
   return structuredClone({
@@ -83,7 +83,7 @@ export function runtimeSettingsReadiness(runtimeEnabled: boolean, configured: bo
   return {
     configured, newProcessingAllowed,
     reason: newProcessingAllowed ? null : 'worker-verification-required',
-    message: newProcessingAllowed ? null : 'New processing is paused until all four worker readers are verified and settings-driven admissions are enabled.',
+    message: newProcessingAllowed ? null : 'AI processing is paused until the deployment verifies all five workers. You can still create workspaces and read saved work. An operator must finish the deployment.',
   }
 }
 

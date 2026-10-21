@@ -13,6 +13,7 @@ interface SettingsRequest extends Request {
     config: Config
     service?: AdminSettingsService
     admission?: Promise<ProcessingSettingsSnapshot>
+    policy?: Promise<Pick<ProcessingSettingsSnapshot, 'settings' | 'revision'>>
   }
 }
 
@@ -29,7 +30,7 @@ export function getAdmissionSettings(req: Request): Promise<ProcessingSettingsSn
   const context = (req as SettingsRequest).applicationSettings
   if (!context) throw new Error('Settings context must be attached after authentication.')
   context.admission ??= (async () => {
-    if (context.service) return context.service.capture()
+    if (context.service) return context.service.capture(context.policy ? await context.policy : undefined)
     if (context.config.settings) throw unavailable('Current application policy is unavailable; no bootstrap defaults were substituted.')
     return captureProcessingSettings(createDefaultAdminSettings(), LEGACY_SETTINGS_REVISION, LEGACY_SETTINGS_CAPTURED_AT)
   })()
@@ -37,7 +38,27 @@ export function getAdmissionSettings(req: Request): Promise<ProcessingSettingsSn
 }
 
 export async function getCurrentSettings(req: Request): Promise<AdminSettings> {
-  return (await getAdmissionSettings(req)).settings
+  return (await getSavedSettings(req)).settings
+}
+
+export function getSavedSettings(req: Request): Promise<Pick<ProcessingSettingsSnapshot, 'settings' | 'revision'>> {
+  const context = (req as SettingsRequest).applicationSettings
+  if (!context) throw new Error('Settings context must be attached after authentication.')
+  context.policy ??= context.admission ? context.admission.then(snapshot => ({
+    settings: snapshot.settings, revision: snapshot.revision,
+  })) : (async () => {
+    // Older injected providers expose only capture; the production service separates policy reads.
+    if (context.service) return context.service.policy?.() ?? context.service.capture()
+    if (context.config.settings) throw unavailable('Application settings could not be loaded. An operator must restore the settings service.')
+    return { settings: createDefaultAdminSettings(), revision: LEGACY_SETTINGS_REVISION }
+  })()
+  return context.policy
+}
+
+export async function getProcessingReadiness(req: Request): Promise<RuntimeSettingsReadiness> {
+  const context = (req as SettingsRequest).applicationSettings
+  if (!context) throw new Error('Settings context must be attached after authentication.')
+  return context.service?.readiness?.() ?? getRuntimeSettingsReadiness(req)
 }
 
 /** Deployment rollout readiness only; synchronous, immutable, and independent of settings-store health. */

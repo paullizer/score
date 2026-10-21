@@ -157,6 +157,11 @@ function workerVerification(env: NodeJS.ProcessEnv): RuntimeSettingsWorkerVerifi
   const promptVersion = optional(env, 'SCORE_PROMPT_RUNTIME_WORKER_VERSION')
   const image = optional(env, 'SCORE_RUNTIME_SETTINGS_VERIFIED_IMAGE')
   const verifiedAt = optional(env, 'SCORE_RUNTIME_SETTINGS_VERIFIED_AT')
+  const releaseId = optional(env, 'SCORE_DEPLOYMENT_RELEASE_ID')
+  const contractSha256 = optional(env, 'SCORE_DEPLOYMENT_CONTRACT_SHA256')
+  if ((releaseId || contractSha256) && (!/^[a-f0-9]{64}$/.test(releaseId ?? '') || !/^[a-f0-9]{64}$/.test(contractSha256 ?? ''))) {
+    throw new ConfigError('Deployment release and contract hashes must be supplied together as SHA-256 values.')
+  }
   if (!workerVersion && !promptVersion && !image && !verifiedAt) return undefined
   if (!workerVersion || !promptVersion || !image || !verifiedAt) {
     throw new ConfigError('Runtime-settings and prompt worker versions, verified image and verified timestamp must be supplied together or all cleared.')
@@ -173,7 +178,8 @@ function workerVerification(env: NodeJS.ProcessEnv): RuntimeSettingsWorkerVerifi
   if (!z.iso.datetime({ offset: true }).safeParse(verifiedAt).success) {
     throw new ConfigError('SCORE_RUNTIME_SETTINGS_VERIFIED_AT must be an ISO timestamp.')
   }
-  return { workerVersion, image, verifiedAt, verificationTimeOnly: true, liveHealth: false }
+  return { workerVersion, image, verifiedAt, verificationTimeOnly: true, liveHealth: false,
+    ...(releaseId && contractSha256 ? { releaseId, contractSha256 } : {}) }
 }
 
 function settingsConfiguration(env: NodeJS.ProcessEnv, cosmos: CosmosConfig): SettingsConfig | undefined {

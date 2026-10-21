@@ -13,7 +13,7 @@ import { StoreConflictError, StoreNotFoundError } from '../store'
 import { assertWorkspaceMutationLease } from '../lifecycle/lease'
 import {
   admittedProcessingSettings, newProcessingSettings, resolveAcceptedProcessingSettings,
-  assertNewWork, currentProcessingSettings, newWorkProcessingSettings, type ProcessingSettingsProvider,
+  assertNewWork, currentPolicySettings, newWorkProcessingSettings, type ProcessingSettingsProvider,
 } from '../jobs/policy'
 import { rubricApprovalRequired } from '../../src/domain/feature-switches'
 import { traceOperation } from '../telemetry-operations'
@@ -176,7 +176,7 @@ export class RealAnalysisService {
   async listTargets(workspaceId: string, continuationToken?: string, limit = 50) {
     requireScope(workspaceId)
     await this.writable(workspaceId)
-    const approvalRequired = rubricApprovalRequired((await currentProcessingSettings(this.settings)).settings)
+    const approvalRequired = rubricApprovalRequired((await currentPolicySettings(this.settings)).settings)
     return this.targets.list(workspaceId, continuationToken, limit, { approvalRequired })
   }
 
@@ -443,7 +443,7 @@ export class RealAnalysisService {
   ) {
     const run = await this.run(workspaceId, runId, false, signal)
     const manifest = await readAnalysisManifest(this.deps.blobs, run.record, signal)
-    const settings = await currentProcessingSettings(this.settings)
+    const settings = await currentPolicySettings(this.settings)
     signal?.throwIfAborted()
     return captures.capture(settings, role, actor, run.record, manifest, format, targetId, rubricDetails)
   }

@@ -5,7 +5,7 @@ import { MODEL_TASK_IDS, SettingsValidationError } from '../../src/domain/admin-
 import { settingsValidationError } from '../../src/domain/admin-settings-schema'
 import { isApplicationAdmin } from '../auth'
 import type { Config } from '../config'
-import { forbidden, unavailable } from '../errors'
+import { forbidden, invalidRequest, unavailable } from '../errors'
 import { getPrincipal } from '../request-context'
 import type { AdminSettingsService } from './service'
 import type { PromptRegistryService } from './prompts'
@@ -18,11 +18,7 @@ const testBody = z.strictObject({
   deploymentId: z.string().min(1).max(128).optional(), draft: z.unknown().optional(),
   confirmPaidProbe: z.boolean().default(false),
 })
-const promptReleaseBody = z.strictObject({
-  reason: z.string().min(1).max(1000).regex(/\S/),
-  gateReportSha256: z.string().regex(/^[a-f0-9]{64}$/),
-  targetsVersion: z.string().min(1).max(128).regex(/^[A-Za-z0-9][A-Za-z0-9._-]*$/),
-})
+const promptReleaseBody = z.strictObject({})
 function body<T>(schema: z.ZodType<T>, value: unknown): T {
   const result = schema.safeParse(value)
   if (!result.success) throw settingsValidationError(result.error)
@@ -54,7 +50,10 @@ export function createAdminSettingsRouter(config: Config, service: AdminSettings
     res.json(result)
   })
   router.post('/admin/settings/prompt-release', async (req, res) => {
-    const result = await prompts().releaseTemplates(getPrincipal(req), body(promptReleaseBody, req.body), req.header('if-match'))
+    body(promptReleaseBody, req.body)
+    const expected = req.header('if-match')
+    if (!expected) throw invalidRequest('Refresh application status before retrying this update.')
+    const result = await prompts().finishDeployment(expected)
     res.setHeader('ETag', result.etag)
     res.json(await prompts().releaseStatus())
   })

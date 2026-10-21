@@ -14,6 +14,8 @@ function runtimePolicy() {
       if (this.unavailable) throw api.unavailable('Settings read failed.')
       return api.captureProcessingSettings(this.value, this.revision, NOW)
     },
+    async policy() { return this.capture() },
+    async readiness() { return api.runtimeSettingsReadiness(true, true) },
   }
 }
 

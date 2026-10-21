@@ -724,7 +724,7 @@ function RealAnalysesProvider({ workspaceId, children }: { workspaceId: string; 
     return () => scope.close()
   }, [refresh, scope])
 
-  useEffect(() => { void refresh() }, [policy.settings?.revision, refresh])
+  useEffect(() => { void refresh() }, [policy.settings?.revision, policy.settings?.runtimeReadiness.newProcessingAllowed, policy.phase, refresh])
   useEffect(() => { void refresh() }, [accessStamp, refresh])
 
   useEffect(() => {

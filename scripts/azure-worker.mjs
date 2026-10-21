@@ -3,11 +3,12 @@ import { execFileSync } from 'node:child_process'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { isDeepStrictEqual } from 'node:util'
 import { client, environment, identifier, request, required, setEnvironment } from './azure-common.mjs'
+import { checkedDeploymentManifest } from './deployment-release.mjs'
 
 export const WORD_WORKER_CAPABILITY = 'word-document-imports-v1'
 export const WORD_WORKER_EXTRACTION_VERSION = 'score-word-extraction-v1'
 export const RUNTIME_SETTINGS_VERSION = 'score-runtime-settings-v2'
-export const PROMPT_RUNTIME_VERSION = 'score-prompt-runtime-v2'
+export const PROMPT_RUNTIME_VERSION = 'score-prompt-runtime-v3'
 export const QC_RUNTIME_VERSION = 'score-qc-worker-v1'
 export const SETTINGS_WORKER_RUNTIMES = ['runtime.mjs', 'grade-runtime.mjs', 'resume-runtime.mjs', 'analysis-runtime.mjs', 'qc-runtime.mjs']
 export const WORD_WORKER_ARTIFACTS = [
@@ -71,13 +72,18 @@ export function validateWorkerImage(env, image) {
   }
 }
 
-export function wordWorkerVerificationArgs(definition) {
+export function wordWorkerVerificationArgs(definition, release) {
   if (!WORKER_DEFINITIONS.includes(definition)) throw new Error('Unknown worker definition.')
   // The manifest is produced by this Dockerfile's packaging check, not inferred from a tag.
   const script = [
     "import { readFileSync } from 'node:fs';",
     "import { createHash } from 'node:crypto';",
     "import { spawn } from 'node:child_process';",
+    "let release;",
+    "if (process.argv.length > 1) {",
+    "release = JSON.parse(readFileSync('dist-worker/deployment.json', 'utf8'));",
+    "if (release.releaseId !== process.argv[1] || release.contractSha256 !== process.argv[2]) throw new Error('The worker does not match the checked API release.');",
+    "}",
     "const manifest = JSON.parse(readFileSync('dist-worker/word-imports.json', 'utf8'));",
     `const names = ${JSON.stringify(WORD_WORKER_ARTIFACTS)};`,
     `if (manifest.schemaVersion !== 1 || manifest.capability !== ${JSON.stringify(WORD_WORKER_CAPABILITY)} ||`,
@@ -105,6 +111,7 @@ export function wordWorkerVerificationArgs(definition) {
     "throw new Error('The worker does not provide the required runtime settings reader: ' + name);",
     `if (reader.PROMPT_RUNTIME_VERSION !== ${JSON.stringify(PROMPT_RUNTIME_VERSION)})`,
     "throw new Error('The worker does not provide the required prompt version reader: ' + name);",
+    "if (release && reader.PROMPT_TEMPLATE_GENERATION !== release.generation) throw new Error('The worker template generation does not match its deployment: ' + name);",
     '}',
     // A normal child invocation preserves entry-point guards and parser-thread execArgv.
     `const child = spawn(process.execPath, [${JSON.stringify(definition.entryPoint)}], { stdio: 'inherit' });`,
@@ -114,12 +121,14 @@ export function wordWorkerVerificationArgs(definition) {
     "child.once('exit', code => resolve(code ?? 1));",
     '});',
   ].join('\n')
-  return ['--input-type=module', '--eval', script]
+  return ['--input-type=module', '--eval', script, ...(release ? [release.releaseId, release.contractSha256] : [])]
 }
 
 function hasNodeArgs(container, args) {
   return container.command?.length === 1 && container.command[0] === 'node' &&
-    JSON.stringify(container.args) === JSON.stringify(args)
+    (JSON.stringify(container.args) === JSON.stringify(args) ||
+      args.length === 3 && container.args?.length === 5 &&
+      JSON.stringify(container.args.slice(0, 3)) === JSON.stringify(args) && container.args.slice(3).every(value => /^[a-f0-9]{64}$/.test(value)))
 }
 
 export function validateWorkerTemplate(env, existing, definition) {
@@ -280,7 +289,7 @@ export async function configureScheduledWorker(env, credential, definition, imag
         containers: [{
           name: containerName, image, resources: container.resources,
           env: definition.kind === 'analysis' ? analysisCorrectionEnvironment(container, false) : container.env,
-          command: ['node'], args: wordWorkerVerificationArgs(definition),
+          command: ['node'], args: wordWorkerVerificationArgs(definition, hooks.release),
         }],
       },
     },
@@ -397,13 +406,15 @@ async function updateRuntimeSettingsAdmission(env, credential, enabled, hooks, v
     SCORE_PROMPT_RUNTIME_WORKER_VERSION: enabled ? PROMPT_RUNTIME_VERSION : '',
     SCORE_RUNTIME_SETTINGS_VERIFIED_IMAGE: enabled ? verifiedImage : '',
     SCORE_RUNTIME_SETTINGS_VERIFIED_AT: enabled ? new Date().toISOString() : '',
+    SCORE_DEPLOYMENT_RELEASE_ID: enabled ? hooks.release?.releaseId ?? '' : '',
+    SCORE_DEPLOYMENT_CONTRACT_SHA256: enabled ? hooks.release?.contractSha256 ?? '' : '',
     QC_WORKER_ENABLED: enabled ? settings.properties.QC_WORKER_ENABLED ?? 'false' : 'false',
   }
   if (Object.keys(properties).some(key => settings.properties[key] !== properties[key])) {
     await send(credential, 'https://management.azure.com', `${endpoint}?api-version=2024-11-01`, 'PUT', { properties })
   }
   const saved = await send(credential, 'https://management.azure.com', listUrl, 'POST')
-  for (const name of ['SCORE_RUNTIME_SETTINGS_ENABLED', 'SCORE_RUNTIME_SETTINGS_WORKER_VERSION', 'SCORE_PROMPT_RUNTIME_WORKER_VERSION', 'SCORE_RUNTIME_SETTINGS_VERIFIED_IMAGE', 'SCORE_RUNTIME_SETTINGS_VERIFIED_AT', 'QC_WORKER_ENABLED']) {
+  for (const name of ['SCORE_RUNTIME_SETTINGS_ENABLED', 'SCORE_RUNTIME_SETTINGS_WORKER_VERSION', 'SCORE_PROMPT_RUNTIME_WORKER_VERSION', 'SCORE_RUNTIME_SETTINGS_VERIFIED_IMAGE', 'SCORE_RUNTIME_SETTINGS_VERIFIED_AT', 'SCORE_DEPLOYMENT_RELEASE_ID', 'SCORE_DEPLOYMENT_CONTRACT_SHA256', 'QC_WORKER_ENABLED']) {
     if (saved?.properties?.[name] !== properties[name]) {
       throw new Error(`App Service did not confirm runtime settings ${enabled ? 'enabled' : 'disabled'}; rollout is blocked.`)
     }
@@ -624,6 +635,9 @@ export async function verifyWordWorkerReadiness(env, credential, image, verified
       `${workerBase}/executions/${encodeURIComponent(result.executionName)}?api-version=2024-03-01`)
     if (execution.properties?.status !== 'Succeeded') throw new Error(`The ${definition.containerName} Word verification is not successful.`)
     validateWordExecution(execution, definition, image, true)
+    if (hooks.release && !hasNodeArgs(execution.properties.template.containers[0], wordWorkerVerificationArgs(definition, hooks.release))) {
+      throw new Error('The successful worker execution did not verify this exact release.')
+    }
 
     // Updating a template does not stop a previous image's in-flight execution.
     await visitActiveWorkerExecutions(credential, workerBase, send, active => validateWordExecution(active, definition, image))
@@ -802,6 +816,7 @@ async function main() {
   const mode = process.argv[2]
   if (mode === 'prepare-web-deploy') {
     if (process.argv[3]) throw new Error('Usage: node scripts\\azure-worker.mjs prepare-web-deploy')
+    await checkedDeploymentManifest()
     await prepareWebDeployment(env, client(env))
     return
   }
@@ -845,7 +860,7 @@ async function main() {
   }
   await configureWorkerDeployment(env, client(env), {
     image, rendererImage: rendererOnly ? process.argv[3] : process.argv[4], rendererOnly,
-  })
+  }, rendererOnly ? {} : { release: await checkedDeploymentManifest() })
 }
 
 if (process.argv[1] && pathToFileURL(process.argv[1]).href === import.meta.url) {

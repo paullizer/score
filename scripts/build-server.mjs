@@ -1,4 +1,5 @@
 import { build } from 'esbuild'
+import { writeDeploymentManifest } from './deployment-release.mjs'
 
 await build({
   entryPoints: ['server/telemetry.ts'],
@@ -40,3 +41,4 @@ await build({
   format: 'esm',
   target: 'node24',
 })
+await writeDeploymentManifest('dist-server')

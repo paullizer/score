@@ -21,6 +21,8 @@ hooks:
   predeploy:
     shell: pwsh
     run: |
+      node scripts\deployment-check.mjs
+      if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       node scripts\azure-before-deploy.mjs
       if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       node scripts\azure-worker.mjs prepare-web-deploy

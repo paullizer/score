@@ -404,7 +404,7 @@ test('all four readers load execution tuning once and pause before any new claim
 
 test('all five runtime entry bundles expose the independent prompt-pin reader capability', async () => {
   const promptDomain = await loadWorker('../src/domain/prompt-versions.ts')
-  assert.equal(promptDomain.PROMPT_RUNTIME_VERSION, 'score-prompt-runtime-v2')
+  assert.equal(promptDomain.PROMPT_RUNTIME_VERSION, 'score-prompt-runtime-v3')
   const paths = [
     '../worker/runtime.ts', '../worker/grades/runtime.ts', '../worker/resumes/runtime.ts',
     '../worker/analyses/runtime.ts', '../worker/qc/runtime.ts',
@@ -412,6 +412,7 @@ test('all five runtime entry bundles expose the independent prompt-pin reader ca
   const modules = await Promise.all(paths.map(path => loadWorker(path)))
   for (const [index, runtime] of modules.entries()) {
     assert.equal(runtime.PROMPT_RUNTIME_VERSION, promptDomain.PROMPT_RUNTIME_VERSION, paths[index])
+    assert.equal(runtime.PROMPT_TEMPLATE_GENERATION, promptDomain.PROMPT_TEMPLATE_GENERATION, paths[index])
     assert.equal(runtime.RUNTIME_SETTINGS_VERSION, settingsDomain.RUNTIME_SETTINGS_VERSION, paths[index])
   }
 })
