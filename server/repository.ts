@@ -220,6 +220,7 @@ export class WorkspaceRepository {
     access: 'write' | 'manage' | 'members' | 'approve',
     operation: () => Promise<T>,
     allowPendingLifecycle = false,
+    options: { requireRelease?: boolean } = {},
   ): Promise<T> {
     if (!isValidWorkspaceId(workspaceId)) throw notFound()
     await this.authorizeWorkspace(principal, workspaceId, access, allowPendingLifecycle)
@@ -227,7 +228,7 @@ export class WorkspaceRepository {
       return await withWorkspaceMutationLease(this.state, workspaceId, async () => {
         await this.authorizeWorkspace(principal, workspaceId, access, allowPendingLifecycle)
         return operation()
-      })
+      }, options)
     } catch (error) {
       if (error instanceof WorkspaceMutationBusyError) throw workspaceBusy(error.message)
       if (error instanceof StoreConflictError) throw conflict(error.message)

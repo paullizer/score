@@ -31,7 +31,7 @@ export const DEFAULT_PROMPT_TEMPLATES: Record<PromptFamily, CompiledPromptTempla
   jobRubric: JOB_RUBRIC_COMPILED_PROMPT, ...GRADE_COMPILED_PROMPTS, ...ANALYSIS_COMPILED_PROMPTS,
 }
 const baselineGuidance = {
-  jobRubric: 'Organize the actual posting into distinct professional work criteria. Preserve role-specific requirements and use concrete documentary evidence anchors rather than generic skill labels.',
+  jobRubric: 'Organize the substantive single-role description into distinct professional work criteria, including fictional or synthetic fixtures and internal or non-live descriptions. Preserve role-specific requirements and use concrete documentary evidence anchors rather than generic skill labels.',
   gradeCompetencies: 'Align a concise common competency structure to the frozen role and source context. Keep competency meanings stable across requested grades without assuming unsupported grade distinctions.',
   gradeDraft: 'Explain the work-level meaning of the cited sources clearly. Distinguish scope, responsibility and complexity under the requested grade while preserving all source limitations.',
   assessment: 'Apply each exact saved criterion and its documentary evidence anchors consistently. Explain the decisive evidence and any genuine borderline interpretation, without treating silence as personal inability.',

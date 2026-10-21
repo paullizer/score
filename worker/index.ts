@@ -119,7 +119,7 @@ export async function main(): Promise<void> {
     }
     phase = 'processing'
     const result = await runWorker(dependencies, { maxJobs: config.maxJobs })
-    console.log(`Score job worker completed ${result.completed} claimed job(s).`)
+    console.log(`Score job worker processed ${result.completed} claimed job(s); see job-outcome events for ready and failed results.`)
   } catch (error) {
     throw workerStartupFailure(phase, error)
   }
