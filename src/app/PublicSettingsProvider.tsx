@@ -7,20 +7,22 @@ export function PublicSettingsProvider({ children }: { children: ReactNode }) {
     const value = new URLSearchParams(window.location.search).get('scoutTheme')
     return value === 'light' || value === 'dark' ? value : null
   })
-  const [state, setState] = useState<Omit<PublicSettingsContextValue, 'refresh' | 'cloud'>>({ settings: null, phase: 'loading', error: null })
+  const [state, setState] = useState<Omit<PublicSettingsContextValue, 'refresh' | 'cloud'>>({ settings: null, phase: 'loading', error: null, refreshing: false })
   const controller = useRef<AbortController | null>(null)
   const refresh = useCallback(async () => {
     controller.current?.abort()
     const current = new AbortController()
     controller.current = current
+    setState(previous => ({ ...previous, refreshing: true }))
     try {
       const response = await fetchPublicFeatures(current.signal)
       if (current.signal.aborted) return
-      if (!response.publicSettings) throw new Error('The cloud service did not provide effective application policy. New actions are unavailable until policy can be refreshed.')
-      setState({ settings: response.publicSettings, phase: 'ready', error: null })
+      if (!response.publicSettings) throw new Error('Score could not load application settings. Check again before starting new actions.')
+      setState({ settings: response.publicSettings, phase: 'ready', error: null, refreshing: false })
     } catch (caught) {
       if (current.signal.aborted) return
-      setState(previous => ({ ...previous, phase: 'error', error: caught instanceof Error ? caught.message : 'Current application policy could not be checked. New actions are disabled until it is refreshed.' }))
+      setState(previous => ({ ...previous, phase: 'error', refreshing: false,
+        error: caught instanceof Error ? caught.message : 'Score could not load application settings. Check again before starting new actions.' }))
     }
   }, [])
   useEffect(() => {

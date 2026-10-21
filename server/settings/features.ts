@@ -2,7 +2,7 @@ import {
   projectPublicSettings, rubricAssistantEnabled, rubricExportsEnabled, runtimeSettingsReadiness,
   qcReviewsEnabled, analysisEvidenceCorrectionsEnabled, rubricApprovalRequired as rubricApprovalSwitch,
 } from '../../src/domain/admin-settings'
-import type { ProcessingSettingsSnapshot, PublicFeaturesResponse, SettingsDeploymentCapabilities } from '../../src/domain/admin-settings'
+import type { ProcessingSettingsSnapshot, PublicFeaturesResponse, RuntimeSettingsReadiness, SettingsDeploymentCapabilities } from '../../src/domain/admin-settings'
 import { JOB_IMPORT_LIMITS } from '../../src/domain/real-jobs'
 import { RESUME_IMPORT_LIMITS } from '../../src/domain/real-resumes'
 import { GRADE_LADDER_LIMITS } from '../../src/domain/real-grades'
@@ -11,18 +11,19 @@ import { ANALYSIS_LIMITS } from '../../src/domain/real-analyses'
 export type { SettingsDeploymentCapabilities } from '../../src/domain/admin-settings'
 
 export function qcReviewsAdmission(
-  deploymentAvailable: boolean, snapshot: ProcessingSettingsSnapshot, newProcessingAllowed: boolean,
+  deploymentAvailable: boolean, snapshot: Pick<ProcessingSettingsSnapshot, 'settings'>, newProcessingAllowed: boolean,
 ): boolean {
   return deploymentAvailable && newProcessingAllowed && !snapshot.settings.maintenance.pauseNewWork &&
     qcReviewsEnabled(snapshot.settings)
 }
 
 export function effectiveFeatures(
-  capabilities: SettingsDeploymentCapabilities, snapshot: ProcessingSettingsSnapshot, runtimeEnabled: boolean,
+  capabilities: SettingsDeploymentCapabilities, snapshot: Pick<ProcessingSettingsSnapshot, 'settings' | 'revision'>, runtimeEnabled: boolean,
   settingsConfigured = runtimeEnabled,
+  readiness?: RuntimeSettingsReadiness,
 ): PublicFeaturesResponse {
   const settings = snapshot.settings
-  const runtimeReadiness = runtimeSettingsReadiness(runtimeEnabled, settingsConfigured)
+  const runtimeReadiness = readiness ?? runtimeSettingsReadiness(runtimeEnabled, settingsConfigured)
   const admitting = runtimeReadiness.newProcessingAllowed && !settings.maintenance.pauseNewWork
   const jobPolicy = settings.imports.jobs
   const resumePolicy = settings.imports.resumes
@@ -47,6 +48,7 @@ export function effectiveFeatures(
   const rubricChecks = capabilities.realJobImports && capabilities.rubricAssistant === true && admitting
   const reference = settings.grades.references
   const publicSettings = projectPublicSettings(snapshot, runtimeEnabled, settingsConfigured)
+  publicSettings.runtimeReadiness = runtimeReadiness
   publicSettings.features = {
     ...publicSettings.features, jobImports: realJobImports, resumeImports: realResumeImports,
     gradeLadders: realGradeLadders, newAnalyses: realAnalyses, summaryGeneration: analysisSummaryGeneration, rubricAssistant,

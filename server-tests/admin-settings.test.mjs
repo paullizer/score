@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import { createServer } from 'node:http'
 import test from 'node:test'
 import {
-  ADMIN_SETTINGS_STORAGE_LIMITS, AdminSettingsService, DEFAULT_PROMPT_TEMPLATES, MODEL_TASK_IDS, PromptRegistryService, RUNTIME_SETTINGS_VERSION,
+  ADMIN_SETTINGS_STORAGE_LIMITS, AdminSettingsService, DEFAULT_PROMPT_TEMPLATES, compiledPromptContractHash, MODEL_TASK_IDS, PromptRegistryService, RUNTIME_SETTINGS_VERSION,
   StoreConflictError, attachSettingsContext, captureProcessingSettings, createApp,
   createDefaultAdminSettings, effectiveFeatures, loadConfig, mergeAdminSettings, modelCapabilitiesFor,
   assertNewProcessingAllowed, getCurrentSettings, getPinnedAdmissionSettings, getProcessingAdmissionSettings,
@@ -121,8 +121,8 @@ async function start(options = {}) {
   const directory = options.directory ?? createFakeDirectoryStore()
   const state = options.state ?? createFakeStateStore()
   let id = 0
-  const settings = new AdminSettingsService({ config, store, now, newId: () => `test-${++id}`, models: options.models })
-  const app = createApp({ config, directory, state, settings, prompts: options.prompts, accessStore: createFakeAccessStore(), jobs: options.jobs, distDir: FIXTURE_DIST_DIR, now })
+  const settings = new AdminSettingsService({ config, store, now, newId: () => `test-${++id}`, models: options.models, prompts: options.prompts })
+  const app = createApp({ config, directory, state, settings, prompts: options.prompts, deploymentBuild: options.deploymentBuild, accessStore: createFakeAccessStore(), jobs: options.jobs, distDir: FIXTURE_DIST_DIR, now })
   const server = createServer(app)
   await new Promise((resolve, reject) => { server.once('error', reject); server.listen(0, '127.0.0.1', resolve) })
   const base = `http://127.0.0.1:${server.address().port}`
@@ -200,7 +200,8 @@ test('admin prompt-release route is admin and CSRF guarded, detects stale ETags,
   const store = promptStore()
   const old = new PromptRegistryService({ store, templates: olderPromptTemplates(), now, newId: () => 'old', authorizeActivation: () => true })
   await old.current()
-  const prompts = new PromptRegistryService({ store, now, newId: () => 'release', authorizeActivation: actor => actor.oid === ALLOWED_OID })
+  const proof = { releaseId: 'c'.repeat(64), contractSha256: compiledPromptContractHash(), workerImage: 'score.azurecr.io/worker:verified', verifiedAt: now().toISOString() }
+  const prompts = new PromptRegistryService({ store, now, newId: () => 'release', build: proof, deployment: proof })
   const server = await start({ prompts })
   try {
     assert.equal((await server.request('/api/admin/settings/prompt-release', { oid: OTHER_ALLOWED_OID })).response.status, 403)
@@ -214,16 +215,77 @@ test('admin prompt-release route is admin and CSRF guarded, detects stale ETags,
     assert.equal(status.body.pending, true)
     const stale = await server.request('/api/admin/settings/prompt-release', {
       method: 'POST', headers: { 'If-Match': '"stale"' },
-      body: { reason: 'Gate passed.', gateReportSha256: 'a'.repeat(64), targetsVersion: 'score-engineering-targets-v2' },
+      body: {},
     })
     assert.equal(stale.response.status, 409)
     const success = await server.request('/api/admin/settings/prompt-release', {
       method: 'POST', headers: { 'If-Match': status.body.etag },
-      body: { reason: 'Gate passed.', gateReportSha256: 'a'.repeat(64), targetsVersion: 'score-engineering-targets-v2' },
+      body: {},
     })
     assert.equal(success.response.status, 200)
     assert.equal(success.body.pending, false)
     assert.equal(success.body.supported, true)
+  } finally { await server.close() }
+})
+
+test('an unfinished AI release does not break saved settings or empty workspace creation', async () => {
+  const store = promptStore()
+  await new PromptRegistryService({ store, templates: olderPromptTemplates(), now }).current()
+  const prompts = new PromptRegistryService({ store, now })
+  const server = await start({ prompts })
+  try {
+    const features = await server.request('/api/features')
+    assert.equal(features.response.status, 200)
+    assert.equal(features.body.publicSettings.workspaces.allowCreation, true)
+    assert.equal(features.body.runtimeReadiness.reason, 'update-required')
+    assert.equal(features.body.runtimeReadiness.newProcessingAllowed, false)
+    const created = await server.request('/api/workspaces', { method: 'POST', body: { name: 'During update' } })
+    assert.equal(created.response.status, 201, JSON.stringify(created.body))
+    await assert.rejects(server.settings.capture(), /update|release/)
+    server.store.failRead(new Error('Settings offline'))
+    assert.equal((await server.request('/api/workspaces', { method: 'POST', body: { name: 'Must not use defaults' } })).response.status, 503)
+  } finally { await server.close() }
+})
+
+test('storage health is not deployment completion and public settings survive an unreadable prompt registry', async () => {
+  const proof = { releaseId: 'c'.repeat(64), contractSha256: compiledPromptContractHash() }
+  const prompts = new PromptRegistryService({ store: promptStore(), now })
+  await prompts.current()
+  const server = await start({ prompts, deploymentBuild: proof })
+  try {
+    let health = await server.request('/healthz')
+    assert.equal(health.response.status, 200)
+    assert.equal(health.body.deployment.complete, false)
+    server.config.settings.workerVerification = { ...proof, workerVersion: RUNTIME_SETTINGS_VERSION,
+      image: 'score.azurecr.io/worker:verified', verifiedAt: now().toISOString(), verificationTimeOnly: true, liveHealth: false }
+    health = await server.request('/healthz')
+    assert.equal(health.body.deployment.complete, true)
+    const releaseStatus = prompts.releaseStatus
+    prompts.releaseStatus = async () => { throw new Error('Private storage details must not be shown') }
+    const features = await server.request('/api/features')
+    assert.equal(features.response.status, 200)
+    assert.equal(features.body.runtimeReadiness.reason, 'update-failed')
+    assert.doesNotMatch(JSON.stringify(features.body), /Private storage/)
+    assert.equal(features.body.publicSettings.workspaces.allowCreation, true)
+    prompts.releaseStatus = releaseStatus
+  } finally { await server.close() }
+})
+
+test('one request retains one saved settings revision whether processing or policy is read first', async () => {
+  const server = await start()
+  try {
+    const request = {}
+    attachSettingsContext(server.config, server.settings)(request, {}, () => {})
+    const captured = await getProcessingAdmissionSettings(request)
+    const current = await server.settings.read()
+    await server.settings.patch(principal, { workspaces: { allowCreation: false } }, current.etag)
+    assert.equal((await getCurrentSettings(request)).workspaces.allowCreation, captured.settings.workspaces.allowCreation)
+    const second = {}
+    attachSettingsContext(server.config, server.settings)(second, {}, () => {})
+    assert.equal((await getCurrentSettings(second)).workspaces.allowCreation, false)
+    const updated = await server.settings.read()
+    await server.settings.patch(principal, { workspaces: { allowCreation: true } }, updated.etag)
+    assert.equal((await getProcessingAdmissionSettings(second)).settings.workspaces.allowCreation, false)
   } finally { await server.close() }
 })
 
@@ -789,7 +851,7 @@ test('configured rollout pause closes new processing without reverting access, i
     const context = {}
     attachSettingsContext(disabledConfig, disabled.settings)(context, {}, () => {})
     assert.deepEqual((await getCurrentSettings(context)).documents.originalDownloadRoles, ['owner'])
-    await assert.rejects(getProcessingAdmissionSettings(context), error => error.status === 503 && /worker readers/.test(error.message))
+    await assert.rejects(getProcessingAdmissionSettings(context), error => error.status === 503 && /five workers/.test(error.message))
     await assert.rejects(getPinnedAdmissionSettings(context), error => error.status === 503)
     const original = `/api/workspaces/${workspaceId}/jobs/job-${ALLOWED_OID}/original`
     const denied = await disabled.request(original, { oid: OTHER_ALLOWED_OID })
@@ -1011,7 +1073,7 @@ test('configuration never designates runtime admins through legacy IDs and keeps
   }
   const evidence = {
     SCORE_RUNTIME_SETTINGS_WORKER_VERSION: RUNTIME_SETTINGS_VERSION,
-    SCORE_PROMPT_RUNTIME_WORKER_VERSION: 'score-prompt-runtime-v2',
+    SCORE_PROMPT_RUNTIME_WORKER_VERSION: 'score-prompt-runtime-v3',
     SCORE_RUNTIME_SETTINGS_VERIFIED_IMAGE: 'exampleregistry.azurecr.io/score-worker:verified-build',
     SCORE_RUNTIME_SETTINGS_VERIFIED_AT: '2026-09-21T12:00:00.000Z',
   }

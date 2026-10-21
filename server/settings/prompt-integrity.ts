@@ -20,7 +20,8 @@ export function promptRevisionReference(revision: PromptRevision): PromptRevisio
 }
 export function promptRevisionContentHash(revision: Omit<PromptRevision, 'contentSha256'> | PromptRevision): string {
   const { family, templateVersion, templateSha256, outputSchemaVersion, rendererVersion, guidance, guidanceSha256 } = revision
-  return promptObjectHash({ family, templateVersion, templateSha256, outputSchemaVersion, rendererVersion, guidance, guidanceSha256 })
+  return promptObjectHash({ family, templateVersion, templateSha256, outputSchemaVersion, rendererVersion, guidance, guidanceSha256,
+    ...(revision.guidanceSource === undefined ? {} : { guidanceSource: revision.guidanceSource }) })
 }
 export function promptBundleContentHash(bundle: Pick<PromptBundleRevision, 'revisions'>): string {
   return promptObjectHash({ schemaVersion: 1, revisions: bundle.revisions })

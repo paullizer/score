@@ -28,7 +28,7 @@ import {
 } from '../settings'
 import { enforceReferenceCharacters } from '../references/html'
 export { RUNTIME_SETTINGS_VERSION } from '../../src/domain/admin-settings'
-export { PROMPT_RUNTIME_VERSION } from '../../src/domain/prompt-versions'
+export { PROMPT_RUNTIME_VERSION, PROMPT_TEMPLATE_GENERATION } from '../../src/domain/prompt-versions'
 
 const LEASE_MS = 120_000
 const HEARTBEAT_MS = 25_000

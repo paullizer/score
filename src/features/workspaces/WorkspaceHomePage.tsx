@@ -67,7 +67,7 @@ export function WorkspaceHomePage({ user, directory, recents, directoryRevision,
         <ThemeControl /><AccountPanel user={user} signOut={signOut} />
       </div>
     </header>
-    <ApplicationPolicyBanners />
+    <ApplicationPolicyBanners onOpenSettings={applicationAdmin ? openAdminSettings : undefined} />
     <main ref={main} id="main-content" className="workspace-home-main">
       <PageHeader eyebrow="YOUR WORK, ORGANIZED" title="My workspaces" description="Choose a workspace to pick up where you left off, or make room for something new."
         actions={<WorkspaceCreateButton primary cloud={directory} disabled={!directoryReady || directoryBusy || opening} onBusyChange={setCreating} />} />

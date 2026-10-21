@@ -14,8 +14,8 @@ export type WorkspaceDirectoryActions = Pick<CloudWorkspaceStatus, 'workspaces' 
 function useCreationReason(canCreateWorkspaces: boolean) {
   const policy = usePublicSettings()
   return !canCreateWorkspaces ? 'Ask an application administrator for permission to create workspaces. Existing ownership does not grant creation permission.'
-    : policy.cloud && policy.phase !== 'ready' ? policy.error ?? 'Checking current application policy before enabling workspace creation.'
-      : policy.settings?.workspaces.allowCreation === false ? 'Creating new workspaces is disabled by application policy, including for application administrators.' : null
+    : policy.cloud && policy.phase !== 'ready' ? policy.error ?? 'Checking application settings before enabling workspace creation.'
+      : policy.settings?.workspaces.allowCreation === false ? 'Workspace creation is turned off in Application settings, including for administrators.' : null
 }
 
 export function WorkspaceDirectory({ cloud, initialFilter = 'default', cards = false, disabled = false, showCreate = true,

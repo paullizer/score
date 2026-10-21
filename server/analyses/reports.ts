@@ -44,7 +44,7 @@ export class AnalysisReportCaptures {
   constructor(private readonly clock: () => Date = () => new Date()) {}
 
   capture(
-    snapshot: ProcessingSettingsSnapshot, role: WorkspaceRole, actor: string,
+    snapshot: Pick<ProcessingSettingsSnapshot, 'settings' | 'revision'>, role: WorkspaceRole, actor: string,
     run: RealAnalysisRunRecord, manifest: RealAnalysisInitializationManifest,
     format: AnalysisReportFormat, targetId?: string, rubricDetails = false,
   ) {

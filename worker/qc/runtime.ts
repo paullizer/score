@@ -27,7 +27,7 @@ import {
 } from './model'
 
 export { RUNTIME_SETTINGS_VERSION } from '../../src/domain/admin-settings'
-export { PROMPT_RUNTIME_VERSION } from '../../src/domain/prompt-versions'
+export { PROMPT_RUNTIME_VERSION, PROMPT_TEMPLATE_GENERATION } from '../../src/domain/prompt-versions'
 export const QC_RUNTIME_VERSION = 'score-qc-worker-v1'
 export const QC_WORKER_VERSION = QC_RUNTIME_VERSION
 const HEARTBEAT_MILLISECONDS = 15_000

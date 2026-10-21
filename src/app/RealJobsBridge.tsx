@@ -201,7 +201,7 @@ export function RealJobsBridge({
     return () => window.clearInterval(timer)
   }, [phase, pollingInterval, refresh, summaries])
 
-  useEffect(() => { void refresh() }, [policy.settings?.revision, refresh])
+  useEffect(() => { void refresh() }, [policy.settings?.revision, policy.settings?.runtimeReadiness.newProcessingAllowed, policy.phase, refresh])
   useEffect(() => { void refresh() }, [accessStamp, refresh])
 
   useEffect(() => {

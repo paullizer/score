@@ -6,7 +6,7 @@ import {
 } from '../../src/domain/admin-settings'
 import type {
   AdminSettings, AdminSettingsResponse, DeploymentInventory, ModelDeployment, ModelTaskId, ModelTestResult,
-  ProcessingSettingsSnapshot, SettingsEnvironment, SettingsExport, SettingsImportPreview, SettingsRevision,
+  ProcessingSettingsSnapshot, RuntimeSettingsReadiness, SettingsEnvironment, SettingsExport, SettingsImportPreview, SettingsRevision,
 } from '../../src/domain/admin-settings'
 import type { AuthenticatedPrincipal } from '../auth'
 import type { Config } from '../config'
@@ -123,12 +123,31 @@ export class AdminSettingsService {
   }
 
   /** Saved policy stays authoritative even while rollout temporarily closes new processing. */
-  async capture(): Promise<ProcessingSettingsSnapshot> {
+  async policy(): Promise<Pick<ProcessingSettingsSnapshot, 'settings' | 'revision'>> {
     const stored = await this.current()
+    return { settings: structuredClone(stored.revision.settings), revision: stored.revision.revision }
+  }
+
+  async readiness(): Promise<RuntimeSettingsReadiness> {
+    const readiness = runtimeSettingsReadiness(this.runtimeEnabled, true)
+    if (!readiness.newProcessingAllowed || !this.prompts?.releaseStatus) return readiness
+    try {
+      const release = await this.prompts.releaseStatus()
+      return release.supported && release.deploymentVerified !== false ? readiness : { ...readiness, newProcessingAllowed: false,
+        reason: release.deploymentVerified === false ? 'worker-verification-required' : 'update-required', message: release.message }
+    } catch (error) {
+      console.error('AI release status could not be checked:', { name: error instanceof Error ? error.name : 'UnknownError' })
+      return { ...readiness, newProcessingAllowed: false, reason: 'update-failed',
+        message: 'AI processing is unavailable because the update status could not be checked. An administrator can view update details. Workspaces and saved work remain available.' }
+    }
+  }
+
+  async capture(policy?: Pick<ProcessingSettingsSnapshot, 'settings' | 'revision'>): Promise<ProcessingSettingsSnapshot> {
+    const saved = policy ?? await this.policy()
     const promptBundle = this.prompts ? await this.prompts.capture() : undefined
     if (this.prompts && !promptBundle) throw unavailable('The configured accepted-work prompt bundle is unavailable. No compiled default was substituted.')
     if (promptBundle) validatePromptSnapshot(promptBundle)
-    return captureProcessingSettings(stored.revision.settings, stored.revision.revision, this.clock().toISOString(), promptBundle)
+    return captureProcessingSettings(saved.settings, saved.revision, this.clock().toISOString(), promptBundle)
   }
 
   /** Accepted legacy work uses the immutable persisted baseline, never today's admin or env defaults. */

@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
 import { after, before, test } from 'node:test'
+import { readFile } from 'node:fs/promises'
 import { chromium } from 'playwright'
 import { buildGradeTestRuntime, completeReference, finishWork, publishNeedsSourcesReview, referencePdf, seededLadder, seedRealJob, startGradeFixture } from './gradeLadders.test-support.mjs'
 
@@ -38,6 +39,73 @@ before(async () => {
 })
 after(async () => { await browser?.close(); await runtime?.close() })
 
+test('browser: ordinary update recovery is visible, role-aware, responsive, and retains settings drafts', { timeout: 90000 }, async t => {
+  const fixture = await startGradeFixture(runtime, { injectAuth: true })
+  t.after(() => fixture.close())
+  const saved = runtime.api.createDefaultAdminSettings()
+  const publicSettings = runtime.api.projectPublicSettings({ settings: saved, revision: 'saved-settings' })
+  const adminSettings = {
+    settings: saved, defaults: saved, fields: runtime.api.ADMIN_SETTINGS_FIELDS,
+    revision: 'saved-settings', etag: '"saved-settings"', createdAt: '2026-10-21T12:00:00.000Z',
+    environment: { runtimeEnabled: true, storeConfigured: true, model: { inventoryAvailable: false }, administratorUserIds: [], tenantId: fixture.session.user.tenantId },
+  }
+  for (const width of [1440, 390]) {
+    const { context, page, errors } = await newPage(fixture)
+    let complete = false, fail = true, admin = true
+    const mutations = []
+    try {
+      await page.setViewportSize({ width, height: 1000 })
+      await page.route('**/api/session*', route => route.fulfill({ json: {
+        ...fixture.session, capabilities: { applicationAdmin: admin, canCreateWorkspaces: true },
+      } }))
+      await page.route('**/api/features', route => route.fulfill({ json: {
+        realJobImports: complete, realGradeLadders: complete, realResumeImports: false, realAnalyses: false,
+        publicSettings: { ...publicSettings, runtimeReadiness: { configured: true, newProcessingAllowed: complete,
+          reason: complete ? null : 'update-required', message: complete ? null : 'AI processing is paused while an update finishes. Workspaces and saved work remain available.' } },
+      } }))
+      await page.route('**/api/admin/settings', route => route.fulfill({ json: adminSettings }))
+      await page.route('**/api/admin/settings/prompt-release', route => {
+        if (route.request().method() === 'POST') {
+          mutations.push(route.request().postDataJSON())
+          if (fail) return route.fulfill({ status: 503, json: { error: { code: 'unavailable', message: 'Update publication could not be confirmed. Check status and retry.' } } })
+          complete = true
+        }
+        return route.fulfill({ json: { activeBundleId: complete ? 'current' : 'old', activeBundleSha256: 'a'.repeat(64),
+          etag: '"release"', generation: 'score-prompt-templates-v3', supported: complete, pending: !complete,
+          retryAllowed: !complete, message: complete ? 'AI instructions are up to date.' : 'The verified update is ready to finish.' } })
+      })
+      await page.goto(fixture.origin)
+      await visible(page.getByRole('heading', { name: 'My workspaces', exact: true }))
+      assert.equal(await page.getByRole('button', { name: 'New workspace', exact: true }).isEnabled(), true)
+      await page.getByRole('button', { name: 'View update details', exact: true }).click()
+      await page.addStyleTag({ content: await readFile(new URL('../styles/admin-settings.css', import.meta.url), 'utf8') })
+      await visible(page.getByRole('heading', { name: 'Application status', exact: true }))
+      assert.equal(await page.getByLabel('Gate report SHA-256', { exact: true }).count(), 0)
+      await page.getByRole('button', { name: 'Appearance & reports', exact: true }).click()
+      const titleField = page.getByRole('textbox', { name: /^Application title/ })
+      await titleField.fill('Unsaved review title')
+      await page.getByRole('button', { name: 'Retry finishing update', exact: true }).click()
+      await visible(page.getByText('Update publication could not be confirmed. Check status and retry.', { exact: true }))
+      assert.equal(await titleField.inputValue(), 'Unsaved review title')
+      if (width === 390) await page.evaluate(() => { document.documentElement.style.fontSize = '200%' })
+      await page.locator('#application-status').scrollIntoViewIfNeeded()
+      if (process.env.SCORE_TEST_SCREENSHOTS) await page.screenshot({ path: `${process.env.SCORE_TEST_SCREENSHOTS}\\update-recovery-${width}.png` })
+      fail = false
+      await page.getByRole('button', { name: 'Retry finishing update', exact: true }).click()
+      await visible(page.getByText('The update is complete. Your settings and approved QC guidance are unchanged.', { exact: true }))
+      assert.equal(await titleField.inputValue(), 'Unsaved review title')
+      assert.deepEqual(mutations, [{}, {}])
+      assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth), true)
+      admin = false; complete = false
+      await page.goto(fixture.origin)
+      await visible(page.getByRole('heading', { name: 'My workspaces', exact: true }))
+      assert.equal(await page.getByRole('button', { name: 'View update details', exact: true }).count(), 0)
+      assert.equal(await page.getByRole('button', { name: 'New workspace', exact: true }).isEnabled(), true)
+      assert.deepEqual(errors, [])
+    } finally { await context.close() }
+  }
+})
+
 test('direct grade links preserve saved evidence during feature-policy errors and recover new admissions explicitly', { timeout: 90000 }, async (t) => {
   const fixture = await startGradeFixture(runtime, { injectAuth: true })
   t.after(() => fixture.close())
@@ -54,8 +122,8 @@ test('direct grade links preserve saved evidence during feature-policy errors an
     assert.equal(await page.getByRole('button', { name: 'Rediscover OPM sources', exact: true }).isDisabled(), true)
     assert.equal(await page.getByRole('heading', { name: 'Loading private grade ladder', exact: true }).count(), 0)
     unavailable = false
-    await page.getByRole('button', { name: 'Refresh application policy', exact: true }).click()
-    await until(async () => await page.getByRole('button', { name: 'Refresh application policy', exact: true }).count() === 0, 'The effective policy refresh should recover without replacing saved evidence')
+    await page.getByRole('button', { name: 'Check settings again', exact: true }).click()
+    await until(async () => await page.getByRole('button', { name: 'Check settings again', exact: true }).count() === 0, 'The settings refresh should recover without replacing saved evidence')
     await visible(page.getByRole('heading', { name: detail.ladder.name, exact: true }))
     assert.deepEqual(errors, [])
   } finally { await context.close() }

@@ -160,7 +160,7 @@ export function App() {
                 onClick={() => navigate('/analyses/new')}>New analysis</Button></>}
         </div>
       </header>
-      <ApplicationPolicyBanners />
+      <ApplicationPolicyBanners onOpenSettings={application?.applicationAdmin ? application.openAdminSettings : undefined} />
       {(navigationError || application?.directoryError) && <div className="storage-banner" role="alert">{navigationError || application?.directoryError}</div>}
       <main id="main-content" className="main-content">
         <LifecycleBanner />

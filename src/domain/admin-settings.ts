@@ -240,7 +240,7 @@ export type AdminSettingsPatch = DeepSettingsPatch<AdminSettings>
 export interface RuntimeSettingsReadiness {
   configured: boolean
   newProcessingAllowed: boolean
-  reason: 'worker-verification-required' | null
+  reason: 'worker-verification-required' | 'update-required' | 'update-failed' | null
   message: string | null
 }
 export interface PublicSettings {
@@ -344,6 +344,8 @@ export interface RuntimeSettingsWorkerVerification {
   verifiedAt: string
   verificationTimeOnly: true
   liveHealth: false
+  releaseId?: string
+  contractSha256?: string
 }
 export interface SettingsEnvironment {
   runtimeEnabled: boolean

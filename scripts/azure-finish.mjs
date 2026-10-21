@@ -1,9 +1,11 @@
 import { setTimeout as delay } from 'node:timers/promises'
 import { client, environment, identifier, redactUrl, request, required, setEnvironment } from './azure-common.mjs'
 import { admissionStage, verifyRoleAwareDeployment } from './azure-access.mjs'
+import { checkedDeploymentManifest } from './deployment-release.mjs'
 
 async function main() {
   const env = environment()
+  const release = await checkedDeploymentManifest()
   const credential = client(env)
   const subscription = identifier(required(env, 'AZURE_SUBSCRIPTION_ID'), 'Subscription')
   const resourceGroup = required(env, 'AZURE_RESOURCE_GROUP')
@@ -26,17 +28,18 @@ async function main() {
     }
     if (response?.ok) {
       const health = await response.json()
-      if (health.status === 'ok' || health.status === 'ready') {
+      if ((health.status === 'ok' || health.status === 'ready') && health.deployment?.complete === true &&
+        health.deployment.releaseId === release.releaseId && health.deployment.contractSha256 === release.contractSha256) {
         if (admissionStage(env) === 'roles') {
           const proof = await verifyRoleAwareDeployment(env, image.slice('DOCKER|'.length))
           setEnvironment('AZURE_SCORE_ROLE_VERIFIED_IMAGE', proof.image)
           setEnvironment('AZURE_SCORE_ROLE_VERIFIED_AT', proof.verifiedAt)
         }
-        console.log(`Score is running at ${shownUrl}; cloud storage readiness succeeded.`)
+        console.log(`Score is running at ${shownUrl}; the matching API, five workers, and automatic AI release handoff are complete. Admin pauses and feature choices are unchanged.`)
         return
       }
     }
-    if (attempt === 59) throw new Error(`The deployed application is not ready at ${shownUrl}/healthz. Inspect its managed-identity permissions and App Service logs.`)
+    if (attempt === 59) throw new Error(`Deployment did not complete at ${shownUrl}. Storage health alone is not success. Open Application settings for update details and inspect the API/worker release verification; no additional QC approval is required.`)
     if (attempt === 0) console.log('Waiting for the container and managed-identity storage access to become ready...')
     await delay(10000)
   }

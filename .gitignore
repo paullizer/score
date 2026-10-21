@@ -18,3 +18,4 @@ node_modules/
 .word-preview-browser-*/
 .summary-browser-tests-*/
 .telemetry-tests-*/
+/.score-deployment-checks.json

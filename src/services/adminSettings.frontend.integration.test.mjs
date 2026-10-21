@@ -213,36 +213,30 @@ async function reviewTitle(title) {
 }
 const patches = () => requests.filter(item => item.method === 'PATCH' && item.path === '/api/admin/settings')
 
-test('admin prompt release panel activates a pending template release', async () => {
+test('application status finishes a verified update without hash entry or QC approval', async () => {
   override = (path, init) => {
     if (path === '/api/admin/settings/prompt-release' && (init.method ?? 'GET') === 'GET') return json({
       activeBundleId: 'pb-old', activeBundleSha256: 'b'.repeat(64), etag: '"prompt-old"', supported: false,
-      generation: 'score-prompt-templates-v1', pending: true,
+      generation: 'score-prompt-templates-v1', pending: true, retryAllowed: true, message: 'The verified update is ready to finish.',
     })
     if (path === '/api/admin/settings/prompt-release' && init.method === 'POST') return json({
       activeBundleId: 'pb-new', activeBundleSha256: 'c'.repeat(64), etag: '"prompt-new"', supported: true,
-      generation: 'score-prompt-templates-v1', pending: false,
+      generation: 'score-prompt-templates-v1', pending: false, retryAllowed: false, message: 'AI instructions are up to date.',
     })
     return undefined
   }
   await renderAdmin()
-  await click(button('Environment & readiness'))
-  await until(() => document.body.textContent.includes('A new prompt release is installed.'), 'Pending prompt release is visible')
-  const panel = [...document.querySelectorAll('section')].find(item => item.getAttribute('aria-label') === 'Prompt release')
+  await until(() => document.body.textContent.includes('The verified update is ready to finish.'), 'Update status is visible without changing tabs')
+  const panel = document.querySelector('#application-status')
   assert.ok(panel)
-  await edit(panel.querySelector('textarea'), 'Activate after offline prompt quality gate passed.')
-  const inputs = panel.querySelectorAll('input')
-  await edit(inputs[0], 'd'.repeat(64))
-  await edit(inputs[1], 'score-engineering-targets-v2')
-  await click(button('Activate prompt release', panel))
-  await until(() => document.body.textContent.includes('Activated the prompt release for new work.'), 'Prompt release activation status appears')
+  assert.equal(panel.querySelectorAll('input,textarea').length, 0)
+  await click(button('Retry finishing update', panel))
+  await until(() => document.body.textContent.includes('The update is complete.'), 'Update completion appears')
   const post = requests.find(item => item.path === '/api/admin/settings/prompt-release' && item.method === 'POST')
   assert.ok(post)
   const headers = new Headers(post.init.headers)
   assert.equal(headers.get('If-Match'), '"prompt-old"')
-  assert.deepEqual(JSON.parse(post.init.body), {
-    reason: 'Activate after offline prompt quality gate passed.', gateReportSha256: 'd'.repeat(64), targetsVersion: 'score-engineering-targets-v2',
-  })
+  assert.deepEqual(JSON.parse(post.init.body), {})
 })
 
 test('direct application-admin settings is independent of workspace bootstrap and stays available when features fail', async () => {
@@ -681,7 +675,7 @@ test('missing cloud projection fails closed; only an explicitly unconfigured dep
   await render(element(ui.PublicSettingsProvider, null, element(PolicyProbe)))
   await until(() => observedPolicy?.phase === 'error', 'Missing cloud policy is not treated as a demo or acknowledged legacy response')
   assert.equal(observedPolicy.settings, null)
-  assert.match(ui.clientAdmissionReason(observedPolicy, 'jobImports'), /did not provide effective application policy/)
+  assert.match(ui.clientAdmissionReason(observedPolicy, 'jobImports'), /could not load application settings/)
   const legacy = ui.effectiveFeatures({
     realJobImports: true, realGradeLadders: true, realResumeImports: true, realAnalyses: true,
     analysisSummaryGeneration: true, wordDocumentImports: true,

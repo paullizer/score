@@ -13,6 +13,7 @@ import { createAzureSettingsStore } from './settings/azure-store'
 import { AdminSettingsService } from './settings/service'
 import { PromptRegistryService } from './settings/prompts'
 import { createAzurePromptStore } from './settings/prompt-azure-store'
+import { readDeploymentBuild, deploymentProof } from './settings/deployment'
 import { createAzureQcStore, createAzureQcBlobStore } from './qc/azure-store'
 import { createAzureSettingsModelAdapter } from './settings/models'
 import type { StoredSettings } from './settings/store'
@@ -44,7 +45,7 @@ function readPort(): number {
   return parsed
 }
 
-function main(): void {
+async function main(): Promise<void> {
   if (process.env.APPLICATIONINSIGHTS_CONNECTION_STRING?.trim() && !telemetryPreloaded()) {
     console.error('Score telemetry preload is required. Start the server with npm start or the packaged container command.')
     process.exitCode = 1
@@ -94,8 +95,10 @@ function main(): void {
         evidenceCorrectionsEnabled: analysisStorage.evidenceCorrectionsEnabled === true,
       }
     : undefined
+  const deploymentBuild = await readDeploymentBuild()
   const prompts = config.settings ? new PromptRegistryService({
     config, store: createAzurePromptStore(config.settings, credential),
+    build: deploymentBuild, deployment: deploymentProof(config.settings),
   }) : undefined
   const qcStore = config.qc ? createAzureQcStore(config.qc, credential) : undefined
   const qc = config.qc && qcStore ? {
@@ -118,10 +121,13 @@ function main(): void {
   } : undefined
   const accessStore = config.access ? createAzureAccessStore(config.cosmos, config.access.container, credential) : undefined
   const eligibleUsers = config.access ? createEntraDirectory(config.access, credential) : undefined
-  const app = createApp({ config, directory, state, jobs, grades, resumes, analyses, settings, prompts, qc, assist, accessStore, eligibleUsers })
+  const app = createApp({ config, directory, state, jobs, grades, resumes, analyses, settings, prompts, qc, assist, accessStore, eligibleUsers, deploymentBuild })
   const bootstrapSettings = app.locals.bootstrapSettings as () => Promise<StoredSettings | undefined>
   const initializeSettings = (): void => {
-    void bootstrapSettings().then(current => {
+    void (async () => {
+      if (prompts && deploymentProof(config.settings)) await prompts.finishDeployment()
+      return bootstrapSettings()
+    })().then(current => {
       if (current) console.info('Application settings store initialized:', {
         revision: current.revision.revision, runtimeSettingsVersion: RUNTIME_SETTINGS_VERSION,
         promptRuntimeVersion: PROMPT_RUNTIME_VERSION,
@@ -171,4 +177,7 @@ function main(): void {
   process.once('SIGINT', stop)
 }
 
-main()
+void main().catch((error: unknown) => {
+  console.error('Score could not start:', { name: error instanceof Error ? error.name : 'UnknownError' })
+  process.exitCode = 1
+})

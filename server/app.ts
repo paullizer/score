@@ -23,7 +23,7 @@ import type { PromptRegistryService } from './settings/prompts'
 import type { QcDeps } from './qc/store'
 import { createQcRouter } from './qc/routes'
 import { createQcLifecycleParticipant, createQcRunLifecycleHooks } from './qc/lifecycle'
-import { attachSettingsContext, getAdmissionSettings, getCurrentSettings } from './settings/request-context'
+import { attachSettingsContext, getSavedSettings, getProcessingReadiness, getCurrentSettings } from './settings/request-context'
 import { effectiveFeatures } from './settings/features'
 import type { DirectoryStore, StateStore } from './store'
 import { createLifecycleDependencies } from './lifecycle/dependencies'
@@ -73,7 +73,7 @@ export { CreationAccessService, WorkspaceAccessService } from './access/service'
 export { createAccessStoreFromContainer } from './access/azure-store'
 export { AdminSettingsService } from './settings/service'
 export {
-  DEFAULT_PROMPT_TEMPLATES, PromptRegistryService, createPromptRegistryService, createCompiledPromptBaseline, createTemplateReleaseSnapshot,
+  DEFAULT_PROMPT_TEMPLATES, compiledPromptContractHash, PromptRegistryService, createPromptRegistryService, createCompiledPromptBaseline, createTemplateReleaseSnapshot,
 } from './settings/prompts'
 export { createAzurePromptStore, createAzurePromptReader, createPromptStoreFromContainer } from './settings/prompt-azure-store'
 export { createSettingsStoreFromContainer, createAzureSettingsStore, createSettingsReaderFromContainer, createAzureSettingsReader } from './settings/azure-store'
@@ -109,6 +109,7 @@ export interface AppDeps {
   readonly analyses?: RealAnalysesDeps
   readonly settings?: AdminSettingsService
   readonly prompts?: PromptRegistryService
+  readonly deploymentBuild?: { releaseId: string; contractSha256: string }
   readonly qc?: QcDeps
   readonly assist?: { readonly invoke: AssistModelInvoker; readonly limiter: AssistLimiter }
   readonly accessStore?: AccessStore
@@ -218,7 +219,14 @@ export function createApp(deps: AppDeps): Express {
   app.get('/healthz', noStore, async (_req, res) => {
     const status = await checkHealth()
     if (config.authMode === 'easyauth') res.setHeader('X-Score-Access-Control', 'entra-roles-v1')
-    res.status(status === 'ready' ? 200 : 503).json({ status })
+    const release = deps.deploymentBuild && deps.prompts ? await deps.prompts.releaseStatus().catch((error: unknown) => {
+      console.error('Deployment completion could not be checked:', { name: error instanceof Error ? error.name : 'UnknownError' })
+      return undefined
+    }) : undefined
+    res.status(status === 'ready' ? 200 : 503).json({ status,
+      ...(deps.deploymentBuild ? { deployment: { ...deps.deploymentBuild, complete: release?.supported === true &&
+        config.settings?.runtimeEnabled === true && config.settings.workerVerification?.releaseId === deps.deploymentBuild.releaseId &&
+        config.settings.workerVerification.contractSha256 === deps.deploymentBuild.contractSha256 } } : {}) })
   })
 
   const api = express.Router()
@@ -231,14 +239,14 @@ export function createApp(deps: AppDeps): Express {
   api.use(createQcRouter({ repository, state, config, qc, analyses: analysisStorage, prompts: deps.prompts, now: deps.now }))
   api.use(createAccessRouter(creationAccess, workspaceAccess, deps.eligibleUsers))
   api.get('/features', async (req, res) => {
-    const snapshot = await getAdmissionSettings(req)
+    const snapshot = await getSavedSettings(req)
     res.json(effectiveFeatures({
       realJobImports: Boolean(jobs), realGradeLadders: Boolean(grades), realResumeImports: Boolean(resumes),
       realAnalyses: canCreateAnalyses, analysisSummaryGeneration: Boolean(analyses),
       analysisEvidenceCorrections: Boolean(analyses?.evidenceCorrectionsEnabled),
       qcReviews: config.qcEnabled === true && Boolean(qc && analysisStorage),
       wordDocumentImports: wordDocumentImports && Boolean(jobs || resumes), rubricAssistant: Boolean(assist),
-    }, snapshot, config.settings?.runtimeEnabled === true, Boolean(config.settings || deps.settings)))
+    }, snapshot, config.settings?.runtimeEnabled === true, Boolean(config.settings || deps.settings), await getProcessingReadiness(req)))
   })
   api.use(createRealJobsRouter({ repository, jobs, lifecycle, now: deps.now, wordDocumentImports, assist }))
   api.use(createRealGradesRouter({ repository, grades, jobs, lifecycle, now: deps.now }))

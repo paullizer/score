@@ -1,4 +1,5 @@
 import { build } from 'esbuild'
+import { writeDeploymentManifest } from './deployment-release.mjs'
 
 for (const [entry, output] of [
   ['server/documents/word-parser-worker.ts', 'dist-worker/word-parser.mjs'],
@@ -25,3 +26,4 @@ for (const [entry, output] of [
     sourcemap: true,
   })
 }
+await writeDeploymentManifest('dist-worker')

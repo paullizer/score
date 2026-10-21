@@ -41,7 +41,7 @@ export { systemClock, type Clock } from './clock'
 export { WorkerError } from './errors'
 export { invokeStructuredModel } from './model-transport'
 export { RUNTIME_SETTINGS_VERSION } from '../src/domain/admin-settings'
-export { PROMPT_RUNTIME_VERSION } from '../src/domain/prompt-versions'
+export { PROMPT_RUNTIME_VERSION, PROMPT_TEMPLATE_GENERATION } from '../src/domain/prompt-versions'
 
 const COGNITIVE_SCOPE = 'https://cognitiveservices.azure.com/.default'
 const DOCUMENT_API_VERSION = '2024-11-30'

@@ -12,6 +12,7 @@ const { JOB_RUBRIC_COMPILED_PROMPT } = await loadWorker('../worker/runtime.ts')
 const { createSettingsStoreFromContainer } = await loadWorker('../server/settings/azure-store.ts')
 const { AdminSettingsService } = await loadWorker('../server/settings/service.ts')
 const requestSettings = await loadWorker('../server/settings/request-context.ts')
+const integrity = await loadWorker('../server/settings/prompt-integrity.ts')
 const jobPolicy = await loadWorker('../server/jobs/policy.ts')
 const at = '2026-09-22T12:00:00.000Z'
 const principal = {
@@ -84,6 +85,129 @@ function cosmos(options = {}) {
     loseAck() { loseAck = true },
   }
 }
+function deployedService(f, options = {}) {
+  const templates = options.templates ?? registry.DEFAULT_PROMPT_TEMPLATES
+  const proof = { releaseId: 'd'.repeat(64), contractSha256: registry.compiledPromptContractHash(templates),
+    workerImage: 'score.azurecr.io/worker:verified', verifiedAt: '2026-10-21T16:00:00.000Z', ...options.proof }
+  return new registry.PromptRegistryService({ store: options.store ?? f.store, templates, build: proof, deployment: proof })
+}
+
+test('ordinary deployments preserve approved QC guidance, ignore pending candidates, and never rewrite history', async () => {
+  const f = cosmos({ templates: olderTemplates() })
+  const { baseline, draft } = await candidate(f, 'assessment', 'Retain this explicitly approved evidence guidance.')
+  const approved = await f.service.activate(principal, activation(baseline, draft), baseline.etag)
+  await f.service.createDraft(principal, {
+    baseBundleId: approved.bundle.bundleId, baseBundleSha256: approved.bundle.bundleSha256,
+    guidance: { assessment: 'This candidate is not approved.' }, generalized: true,
+  })
+  const before = new Map([...f.documents].filter(([key]) => key !== 'prompt:current').map(([key, value]) => [key, JSON.stringify(value)]))
+  const service = deployedService(f)
+  const completed = await service.finishDeployment()
+  const snapshot = await service.capture()
+  assert.equal(snapshot.revisions.assessment.guidance, 'Retain this explicitly approved evidence guidance.')
+  assert.equal(snapshot.revisions.assessment.guidanceSource, 'qc')
+  assert.equal(snapshot.revisions.jobRubric.templateVersion, 'score-job-rubric-v5')
+  assert.deepEqual(completed.activation.actor, { system: 'deployment' })
+  assert.equal(completed.activation.evaluation, null)
+  assert.equal(completed.activation.templateRelease, undefined)
+  assert.equal(completed.activation.deploymentRelease.releaseId, 'd'.repeat(64))
+  await assert.rejects(service.published(completed.bundle.bundleId), /not a QC evaluation/)
+  for (const [key, value] of before) assert.equal(JSON.stringify(f.documents.get(key)), value, key)
+  const writes = f.calls.filter(call => call[0] === 'batch').length
+  assert.deepEqual(await service.finishDeployment(), completed)
+  assert.equal(f.calls.filter(call => call[0] === 'batch').length, writes, 'compatible redeploy is a no-op')
+})
+
+test('legacy QC attribution is resolved through immutable authoring history, not text equality', async () => {
+  const f = cosmos({ templates: olderTemplates() })
+  const { baseline, draft } = await candidate(f, 'assessment', 'Legacy approved guidance.')
+  const revision = draft.revisions.assessment
+  delete revision.guidanceSource
+  revision.contentSha256 = integrity.promptRevisionContentHash(revision)
+  draft.bundle.revisions.assessment = integrity.promptRevisionReference(revision)
+  draft.bundle.bundleSha256 = integrity.promptBundleContentHash(draft.bundle)
+  for (const [id, value] of [[`prompt:revision:${revision.revisionId}`, revision], [`prompt:bundle:${draft.bundle.bundleId}`, draft.bundle]]) {
+    f.documents.get(id).value = structuredClone(value)
+  }
+  await f.service.activate(principal, activation(baseline, draft), baseline.etag)
+  const service = deployedService(f)
+  await service.finishDeployment()
+  assert.equal((await service.capture()).revisions.assessment.guidance, 'Legacy approved guidance.')
+})
+
+test('code-owned default guidance advances even when compiled templates are unchanged', async () => {
+  const f = cosmos()
+  const original = await f.service.current()
+  const saved = await f.service.capture()
+  const old = structuredClone(saved)
+  const revision = old.revisions.jobRubric
+  revision.guidance = 'An earlier code-owned default.'
+  revision.guidanceSha256 = registry.promptTextHash(revision.guidance)
+  revision.contentSha256 = integrity.promptRevisionContentHash(revision)
+  old.bundle.revisions.jobRubric = integrity.promptRevisionReference(revision)
+  old.bundle.bundleSha256 = integrity.promptBundleContentHash(old.bundle)
+  f.documents.get(`prompt:revision:${revision.revisionId}`).value = revision
+  f.documents.get(`prompt:bundle:${old.bundle.bundleId}`).value = old.bundle
+  f.documents.get(`prompt:activation:${original.activation.activationId}`).value.bundleSha256 = old.bundle.bundleSha256
+  const service = deployedService(f)
+  assert.equal((await service.releaseStatus()).pending, true)
+  await service.finishDeployment()
+  assert.equal((await service.capture()).revisions.jobRubric.guidance, saved.revisions.jobRubric.guidance)
+  assert.equal(f.documents.get(`prompt:revision:${revision.revisionId}`).value.guidance, 'An earlier code-owned default.')
+})
+
+test('compatible templates cannot admit new work with unverified deployment proof', async () => {
+  const f = cosmos()
+  await f.service.current()
+  const service = new registry.PromptRegistryService({ store: f.store,
+    build: { releaseId: 'c'.repeat(64), contractSha256: registry.compiledPromptContractHash() } })
+  const status = await service.releaseStatus()
+  assert.equal(status.supported, true)
+  assert.equal(status.deploymentVerified, false)
+  assert.equal(status.retryAllowed, false)
+  await assert.rejects(service.capture(), /five workers are verified/)
+})
+
+test('unverified or mismatched deployments cannot publish, even for an administrator', async () => {
+  const f = cosmos({ templates: olderTemplates() })
+  await f.service.current()
+  const before = JSON.stringify([...f.documents])
+  const build = { releaseId: 'd'.repeat(64), contractSha256: registry.compiledPromptContractHash() }
+  for (const service of [
+    new registry.PromptRegistryService({ store: f.store }),
+    new registry.PromptRegistryService({ store: f.store, build }),
+    new registry.PromptRegistryService({ store: f.store, build, deployment: { ...build, releaseId: 'e'.repeat(64),
+      workerImage: 'score.azurecr.io/worker:wrong', verifiedAt: at } }),
+    deployedService(f, { proof: { contractSha256: 'f'.repeat(64) } }),
+  ]) await assert.rejects(service.finishDeployment(), /verified deployment/)
+  assert.equal(JSON.stringify([...f.documents]), before)
+})
+
+test('concurrent API instances converge on one verified release and stale admin retries cannot overwrite', async () => {
+  const f = cosmos({ templates: olderTemplates() })
+  await f.service.current()
+  const first = deployedService(f), second = deployedService(f)
+  const values = await Promise.all([first.finishDeployment(), second.finishDeployment()])
+  assert.equal(values[0].bundle.bundleSha256, values[1].bundle.bundleSha256)
+  const history = await first.history()
+  assert.equal(history.activations.filter(item => item.deploymentRelease).length, 1)
+  const g = cosmos({ templates: olderTemplates() })
+  await g.service.current()
+  await assert.rejects(deployedService(g).finishDeployment('"stale"'), /changed/)
+})
+
+test('interrupted release registration survives a later deployment verification without immutable collisions', async () => {
+  const f = cosmos({ templates: olderTemplates() })
+  await f.service.current()
+  const store = Object.create(f.store)
+  store.activate = async () => { throw new Error('Interrupted before activation') }
+  await assert.rejects(deployedService(f, { store }).finishDeployment(), /Interrupted/)
+  const retry = deployedService(f, { proof: { verifiedAt: '2026-10-21T17:00:00.000Z' } })
+  const result = await retry.finishDeployment()
+  assert.equal(result.bundle.createdAt, '2026-10-21T16:00:00.000Z')
+  assert.equal(result.activation.deploymentRelease.verifiedAt, '2026-10-21T17:00:00.000Z')
+})
+
 async function candidate(f, family = 'assessment', guidance = 'Explain genuine borderline documentary-evidence distinctions under the exact saved anchors.') {
   const baseline = await f.service.current()
   const draft = await f.service.createDraft(principal, {
@@ -161,10 +285,11 @@ test('template release status reports pending and release activates current comp
     store: f.store, now: () => new Date('2026-10-08T20:00:00.000Z'), newId: () => 'release-one',
     authorizeActivation: actor => actor.oid === principal.oid,
   })
-  await assert.rejects(service.current(), /new prompt release is installed but not activated yet/)
+  await assert.rejects(service.current(), /software update finishes/)
   assert.deepEqual(await service.releaseStatus(), {
     activeBundleId: old.bundle.bundleId, activeBundleSha256: old.bundle.bundleSha256, etag: old.etag,
-    supported: false, generation: 'score-prompt-templates-v3', pending: true,
+    supported: false, generation: 'score-prompt-templates-v3', pending: true, retryAllowed: false,
+    message: 'AI processing is paused while the update finishes. An operator must deploy and verify the matching API and all five workers. No approval or policy change is needed.',
   })
   await assert.rejects(service.releaseTemplates({ ...principal, oid: 'cccccccc-cccc-4ccc-8ccc-cccccccccccc' }, {
     reason: 'Offline gate passed.', gateReportSha256: 'f'.repeat(64), targetsVersion: 'score-engineering-targets-v2',

@@ -410,6 +410,7 @@ test('the in-container probe rejects old, incomplete, or modified artifacts befo
         ? `${name === 'runtime.mjs' ? `export const WORD_EXTRACTION_VERSION = ${JSON.stringify(WORD_WORKER_EXTRACTION_VERSION)};\n` : ''}${name === 'qc-runtime.mjs' ? `export const QC_RUNTIME_VERSION = ${JSON.stringify(QC_RUNTIME_VERSION)};\n` : ''}export const RUNTIME_SETTINGS_VERSION = ${JSON.stringify(RUNTIME_SETTINGS_VERSION)};\nexport const PROMPT_RUNTIME_VERSION = ${JSON.stringify(PROMPT_RUNTIME_VERSION)};\n`
         : `// ${name}\n`,
   ]))
+  for (const name of SETTINGS_WORKER_RUNTIMES) files[name] += "export const PROMPT_TEMPLATE_GENERATION = 'score-prompt-templates-v3';\n"
   const manifest = {
     schemaVersion: 1, capability: WORD_WORKER_CAPABILITY,
     runtimeSettingsVersion: RUNTIME_SETTINGS_VERSION,
@@ -427,6 +428,13 @@ test('the in-container probe rejects old, incomplete, or modified artifacts befo
     return spawnSync(process.execPath, wordWorkerVerificationArgs(definition), { cwd: root, encoding: 'utf8', timeout: 10_000 })
   }
   reset()
+  const release = { releaseId: 'a'.repeat(64), contractSha256: 'b'.repeat(64), generation: 'score-prompt-templates-v3' }
+  writeFileSync(join(root, 'dist-worker', 'deployment.json'), JSON.stringify(release))
+  const checked = spawnSync(process.execPath, wordWorkerVerificationArgs(definition, release), { cwd: root, encoding: 'utf8', timeout: 10_000 })
+  assert.equal(checked.status, 0, checked.stderr)
+  const mismatched = spawnSync(process.execPath, wordWorkerVerificationArgs(definition, { ...release, releaseId: 'c'.repeat(64) }), { cwd: root, encoding: 'utf8', timeout: 10_000 })
+  assert.notEqual(mismatched.status, 0)
+  assert.doesNotMatch(mismatched.stdout, /worker-entry-started/)
   const docker = readFileSync(new URL('../Dockerfile.worker', import.meta.url), 'utf8')
   const packaging = docker.split('\n').find(line => line.includes('word-imports.json')).match(/-e "(.*)"/)[1]
   const packaged = spawnSync(process.execPath, ['--input-type=module', '--eval', packaging], {
@@ -1290,6 +1298,21 @@ test('settings and access infrastructure isolate runtime permission writes from 
   assert.match(provision, /PSBoundParameters\.ContainsKey\('BootstrapAdminUserIds'\)/)
   assert.match(provision, /get-value AZURE_BOOTSTRAP_ADMIN_USER_IDS --environment \$EnvironmentName/)
   assert.match(provision, /Legacy AZURE_ADMIN_USER_IDS and the operator are not migrated implicitly/)
+})
+
+test('deployment proof binds all five actual executions to the checked source and is cleared when paused', async () => {
+  const { hooks, settings, executions } = rolloutHarness()
+  hooks.release = { releaseId: 'a'.repeat(64), contractSha256: 'b'.repeat(64) }
+  await configureWorkerDeployment(env, {}, { image, rendererImage }, hooks)
+  assert.equal(settings().SCORE_DEPLOYMENT_RELEASE_ID, hooks.release.releaseId)
+  assert.equal(settings().SCORE_DEPLOYMENT_CONTRACT_SHA256, hooks.release.contractSha256)
+  for (const definition of WORKER_DEFINITIONS) assert.deepEqual(
+    executions.get(definition.kind).properties.template.containers[0].args,
+    wordWorkerVerificationArgs(definition, hooks.release),
+  )
+  await disableRuntimeSettingsAdmission(env, {}, hooks)
+  assert.equal(settings().SCORE_DEPLOYMENT_RELEASE_ID, '')
+  assert.equal(settings().SCORE_DEPLOYMENT_CONTRACT_SHA256, '')
 })
 
 test('QC shutdown preserves human feedback access while activation requires verified prompt readers', async () => {

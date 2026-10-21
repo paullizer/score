@@ -11,8 +11,10 @@ export interface PromptReleaseStatus {
   supported: boolean
   generation: string
   pending: boolean
+  retryAllowed: boolean
+  message: string
+  deploymentVerified?: boolean
 }
-export interface ActivatePromptReleaseInput { reason: string; gateReportSha256: string; targetsVersion: string }
 
 export class SettingsRequestError extends CloudApiError {
   readonly fields: SettingsFieldError[]
@@ -89,6 +91,6 @@ export function testModelConfiguration(input: {
 export function readPromptRelease(signal?: AbortSignal): Promise<PromptReleaseStatus> {
   return request('/admin/settings/prompt-release', { signal })
 }
-export function activatePromptRelease(input: ActivatePromptReleaseInput, etag: string): Promise<PromptReleaseStatus> {
-  return request('/admin/settings/prompt-release', { method: 'POST', headers: { 'If-Match': etag }, body: JSON.stringify(input) })
+export function finishDeploymentUpdate(etag: string): Promise<PromptReleaseStatus> {
+  return request('/admin/settings/prompt-release', { method: 'POST', headers: { 'If-Match': etag }, body: '{}' })
 }
