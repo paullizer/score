@@ -49,7 +49,7 @@ This is the first **synchronous** model call on private data from the Score API.
 | Rubric profile | `server\assist\profiles\job-rubric.ts` | Code-owned prompt `score-rubric-assist-v2`, strict JSON schema, validation and citation construction |
 | Route | `server\jobs\routes.ts` | `POST /api/workspaces/:workspaceId/jobs/:jobId/rubric/assist` |
 
-The job-rubric **generation** prompt (`score-job-rubric-v4`) is separate. Its text is hashed into immutable prompt revisions, so the assistant has its own versioned prompt that restates the same rules, including the evidence scale and passage-ID citations. A test guards that the two keep the same key rules.
+The job-rubric **generation** prompt (`score-job-rubric-v5`) is separate. Its text is hashed into immutable prompt revisions, so the assistant has its own versioned prompt that restates the same rules, including the evidence scale and passage-ID citations. A test guards that the two keep the same key rules.
 
 ## API
 

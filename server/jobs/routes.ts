@@ -448,6 +448,15 @@ export function createRealJobsRouter(deps: RealJobsRouterDeps): Router {
       getPrincipal(req), pathParam(req, 'workspaceId'), access, () => handler(req, res, next),
     ),
   )
+  const admission = (handler: (req: Request) => Promise<{ status: 200 | 202; job: RealJobSummary }>): RequestHandler => asyncHandler(
+    async (req, res) => {
+      const result = await deps.repository.withWorkspaceMutation(
+        getPrincipal(req), pathParam(req, 'workspaceId'), 'write', () => handler(req),
+        false, { requireRelease: true },
+      )
+      res.status(result.status).json({ job: result.job })
+    },
+  )
 
   const base = '/workspaces/:workspaceId/jobs'
 
@@ -613,7 +622,7 @@ export function createRealJobsRouter(deps: RealJobsRouterDeps): Router {
         limit: route === 'markdown' ? JOB_IMPORT_LIMITS.maxMarkdownBytes : JOB_IMPORT_LIMITS.maxFileBytes,
         inflate: route === 'pdf',
       }),
-      mutation('write', async (req, res) => {
+      admission(async req => {
         const jobs = requireJobs(deps.jobs)
         const workspaceId = pathParam(req, 'workspaceId')
         await requireMutableWorkspace(jobs.store, workspaceId)
@@ -647,8 +656,7 @@ export function createRealJobsRouter(deps: RealJobsRouterDeps): Router {
         if (existing) {
           assertJobWritable(existing.record)
           if (existing.record.inputFingerprint !== fingerprint) throw conflict('This idempotency key was already used for different input.')
-          res.status(200).json({ job: await summary(jobs.store, existing) })
-          return
+          return { status: 200, job: await summary(jobs.store, existing) }
         }
         const settings = requestProcessingSettings(req)
         const processingSettings = await newWorkProcessingSettings(settings)
@@ -696,7 +704,7 @@ export function createRealJobsRouter(deps: RealJobsRouterDeps): Router {
         if (!created.created && created.value.record.inputFingerprint !== fingerprint) {
           throw conflict('This idempotency key was already used for different input.')
         }
-        res.status(created.created ? 202 : 200).json({ job: await summary(jobs.store, created.value) })
+        return { status: created.created ? 202 : 200, job: await summary(jobs.store, created.value) }
       }),
       (error: unknown, _req: Request, _res: Response, next: NextFunction) => {
         if (typeof error === 'object' && error !== null && 'type' in error && error.type === 'entity.too.large') {
@@ -706,7 +714,7 @@ export function createRealJobsRouter(deps: RealJobsRouterDeps): Router {
     )
   }
 
-  router.post(`${base}/url`, authorize(deps.repository, 'write'), mutation('write', async (req, res) => {
+  router.post(`${base}/url`, authorize(deps.repository, 'write'), admission(async req => {
     const jobs = requireJobs(deps.jobs)
     const body = bodyRecord(req.body, ['url', 'batchId'])
     const url = validatePublicUrl(body.url)
@@ -720,8 +728,7 @@ export function createRealJobsRouter(deps: RealJobsRouterDeps): Router {
     if (existing) {
       assertJobWritable(existing.record)
       if (existing.record.inputFingerprint !== fingerprint) throw conflict('This idempotency key was already used for different input.')
-      res.status(200).json({ job: await summary(jobs.store, existing) })
-      return
+      return { status: 200, job: await summary(jobs.store, existing) }
     }
     const settings = requestProcessingSettings(req)
     const processingSettings = await newWorkProcessingSettings(settings)
@@ -747,7 +754,7 @@ export function createRealJobsRouter(deps: RealJobsRouterDeps): Router {
     if (!created.created && created.value.record.inputFingerprint !== fingerprint) {
       throw conflict('This idempotency key was already used for different input.')
     }
-    res.status(created.created ? 202 : 200).json({ job: await summary(jobs.store, created.value) })
+    return { status: created.created ? 202 : 200, job: await summary(jobs.store, created.value) }
   }))
 
   router.post(`${base}/:jobId/retry`, authorize(deps.repository, 'write'), mutation('write', async (req, res) => {

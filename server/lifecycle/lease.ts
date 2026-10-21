@@ -19,6 +19,7 @@ export async function withWorkspaceMutationLease<T>(
   state: StateStore,
   workspaceId: string,
   operation: () => Promise<T>,
+  options: { requireRelease?: boolean } = {},
 ): Promise<T> {
   if (context.getStore()) {
     assertWorkspaceMutationLease(workspaceId)
@@ -26,6 +27,7 @@ export async function withWorkspaceMutationLease<T>(
   }
   const lease = await state.acquireMutationLease(workspaceId)
   const current: MutationContext = { workspaceId }
+  let releaseFailed = false
   let renewal = Promise.resolve()
   const timer = setInterval(() => {
     renewal = renewal.then(async () => {
@@ -37,8 +39,9 @@ export async function withWorkspaceMutationLease<T>(
     })
   }, 20_000)
   timer.unref()
+  let result: T
   try {
-    return await context.run(current, async () => {
+    result = await context.run(current, async () => {
       const result = await operation()
       await renewal
       assertWorkspaceMutationLease(workspaceId)
@@ -53,6 +56,11 @@ export async function withWorkspaceMutationLease<T>(
       console.error('Workspace mutation lease release failed:', {
         workspaceId, name: error instanceof Error ? error.name : 'UnknownError',
       })
+      releaseFailed = true
     }
   }
+  if (releaseFailed && options.requireRelease) {
+    throw new StoreConflictError('The upload was saved, but its workspace lock release could not be confirmed. Verify its saved state before retrying with the same import key.')
+  }
+  return result
 }

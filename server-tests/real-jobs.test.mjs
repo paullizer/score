@@ -246,6 +246,77 @@ async function importUrl(server, workspaceId, url, options = {}) {
   })
 }
 
+for (const kind of ['pdf', 'markdown', 'url']) {
+  test(`${kind} admission waits for lease release before acknowledgment, including idempotent replay`, async t => {
+    const server = await startRealJobsServer()
+    t.after(() => server.close())
+    const workspace = await seedWorkspace(server)
+    const other = await seedWorkspace(server, { name: 'Independent workspace' })
+    const acquire = server.state.acquireMutationLease.bind(server.state)
+    const send = (workspaceId, key) => kind === 'url'
+      ? importUrl(server, workspaceId, 'https://example.com/role', { key })
+      : kind === 'pdf' ? importPdf(server, workspaceId, { key }) : importMarkdown(server, workspaceId, { key })
+    const key = randomUUID()
+    for (const status of [202, 200]) {
+      let releaseEntered, finishRelease
+      const entered = new Promise(resolve => { releaseEntered = resolve })
+      const gate = new Promise(resolve => { finishRelease = resolve })
+      let held = false, acknowledged = false
+      server.state.acquireMutationLease = async workspaceId => {
+        const lease = await acquire(workspaceId)
+        if (workspaceId !== workspace.id) return lease
+        held = true
+        return {
+          renew: () => lease.renew(),
+          async release() { releaseEntered(); await gate; await lease.release(); held = false },
+        }
+      }
+      const pending = send(workspace.id, key).then(response => { acknowledged = true; return response })
+      await entered
+      try {
+        await new Promise(resolve => setTimeout(resolve, 25))
+        assert.equal(acknowledged, false, 'No success response may escape while the workspace is still locked')
+        assert.equal(held, true)
+        assert.equal((await send(workspace.id, randomUUID())).status, 409, 'Genuine independent contention stays explicit')
+        assert.equal((await send(other.id, randomUUID())).status, 202, 'Other workspaces remain independent')
+      } finally { finishRelease() }
+      const response = await pending
+      assert.equal(response.status, status, await response.clone().text())
+      assert.equal(held, false)
+      assert.equal((await response.json()).job.job.id, `job-${key}`)
+    }
+  })
+}
+
+for (const failure of ['renew', 'release', 'operation-and-release']) {
+  test(`upload ${failure} failure never reports a successful acknowledgment or masks the original error`, async t => {
+    const server = await startRealJobsServer()
+    t.after(() => server.close())
+    const workspace = await seedWorkspace(server)
+    const acquire = server.state.acquireMutationLease.bind(server.state)
+    server.state.acquireMutationLease = async id => {
+      const lease = await acquire(id)
+      return {
+        async renew() { if (failure === 'renew') throw new StoreConflictError('Final lease renewal failed.'); await lease.renew() },
+        async release() {
+          await lease.release()
+          if (failure !== 'renew') throw new Error('Release transport failed')
+        },
+      }
+    }
+    const key = randomUUID()
+    const response = await importPdf(server, workspace.id, { key, ...(failure === 'operation-and-release' ? { bytes: Buffer.from('not a PDF') } : {}) })
+    assert.equal(response.status, failure === 'operation-and-release' ? 400 : 409)
+    const body = await response.json()
+    assert.equal(body.job, undefined)
+    assert.match(body.error.message, failure === 'renew' ? /Final lease renewal failed/ : failure === 'release' ? /lock release could not be confirmed/ : /valid PDF header/)
+    server.state.acquireMutationLease = acquire
+    if (failure !== 'operation-and-release') {
+      assert.equal((await importPdf(server, workspace.id, { key })).status, 200, 'Explicit same-key replay reconciles a saved upload without duplication')
+    }
+  })
+}
+
 test('job metadata PATCH validates strict aliases, authorization and exact ETags without changing source or worker state', async () => {
   const server = await startRealJobsServer()
   try {

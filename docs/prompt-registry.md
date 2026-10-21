@@ -26,11 +26,13 @@ Reader-first rollout uses the independent shared `PROMPT_RUNTIME_VERSION = 'scor
 
 ## Template releases
 
-A prompt template generation is the code-owned set of compiled system templates, output schema versions and renderer bindings for all seven prompt families. `PROMPT_TEMPLATE_GENERATION='score-prompt-templates-v2'` names the current generation; code changes bump it whenever the compiled templates or schemas change, because release bundle IDs are derived from it.
+A prompt template generation is the code-owned set of compiled system templates, output schema versions and renderer bindings for all seven prompt families. `PROMPT_TEMPLATE_GENERATION='score-prompt-templates-v3'` names the current generation; code changes bump it whenever the compiled templates or schemas change, because release bundle IDs are derived from it.
 
-Generation v2 moves rubric generation onto the standard evidence scale (`score-evidence-ladder-v1`) and passage-ID citations:
+Generation v3 clarifies job acceptance without changing its schema, evidence scale or citation checks. `jobRubric` is now `score-job-rubric-v5`: it accepts substantive single-role descriptions even when fictional, synthetic, internal, expired or not currently advertised. Fixture disclaimers and lack of a live vacancy are not rejection grounds. Listing/search pages, multi-role collections and irrelevant/unusable material remain rejected. Default job guidance follows that same rule. Stored v1/v2 bundles and settings captures remain immutable; a deployment must explicitly activate a new compatible release, never replace their instructions in place.
 
-- `jobRubric` is `score-job-rubric-v4` with `score-job-rubric-schema-v2`. It accepts one-role job postings and position descriptions, cites job text by passage ID, and writes job-specific examples for levels 1–5.
+Generation v2 introduced the standard evidence scale (`score-evidence-ladder-v1`) and passage-ID citations, retained by v3:
+
+- `jobRubric` moved from `score-job-rubric-v4` to v5 with unchanged `score-job-rubric-schema-v2`. It cites job text by passage ID and writes job-specific examples for levels 1–5.
 - `gradeDraft` is `score-grade-draft-v5` with `score-grade-draft-schema-v4`. It cites reference passages by ID and writes grade-specific examples for scored rows.
 - `gradeReview` is `score-grade-review-v4`. It also checks overlapping criteria, examples a résumé can't show, and conformance to the scale.
 

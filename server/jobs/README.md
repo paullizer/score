@@ -1,5 +1,64 @@
 # Real job lifecycle
 
+## Import admission
+
+One browser batch submits each valid file or URL once, in order. Parallel inputs
+must not compete for the workspace-wide mutation lease. File/PDF/Markdown/Word
+and URL admissions compute their response under `withWorkspaceMutation` but send
+HTTP 202 (new) or 200 (identical replay) only after the final lease validation and
+confirmed release. A release transport failure returns an explicit uncertain
+acknowledgment, not success; the original key still identifies any durable record.
+The response boundary does not weaken authorization, source-write fencing, batch
+limits or real contention with another workspace mutation.
+
+The complete batch stays active while its submissions settle. A genuinely failed
+item remains visible and is not automatically retried; its valid neighbors are
+still attempted once. Explicit manual replay keeps the same key, source bytes,
+filename and batch. Unmount, workspace changes, lost write access or disabled
+admission stop remaining browser submissions. Acknowledged server work continues.
+
+Substantive single-role descriptions are accepted even when fictional, synthetic,
+internal, expired or not live vacancies. Multi-role collections, listing/search
+pages and irrelevant/unusable documents remain invalid. The code-owned v5 rubric
+prompt and generation-v3 immutable template release implement this contract;
+stored captures are not rewritten. Use `scripts\deploy.ps1` for coordinated API
+and all-worker deployment and the existing quality-gated Admin template
+activation before admitting new work. No old-job migration or automatic restart
+is performed.
+
+## Import diagnostics
+
+The import worker emits bounded JSON `score-job` events to the existing
+`ContainerAppConsoleLogs` table. `job-stage` tracks parsing, rubric generation,
+review and publication. `job-outcome` records `ready`, `failed`, `queued` or
+`abandoned`, correlated with workspace/job IDs, attempt, captured model/deployment,
+prompt/template versions, allowlisted error code and HTTP status when available.
+Unknown error codes become `processing-error`; arbitrary exception bodies and
+model rejection text are never logged. `failureWriteUnconfirmed: true` means the
+failure could not be saved (including lease loss), not a successful job. Inspect
+the private job record for the authorized user-facing explanation.
+`execution-outcome` separates processed claims from successful publications.
+
+```kusto
+ContainerAppConsoleLogs
+| where TimeGenerated > ago(1h)
+| where JobName startswith "job-score-import-"
+| extend event = parse_json(Log)
+| where event.component == "score-job"
+| project TimeGenerated, event.event, event.workspaceId, event.jobId,
+    event.attempt, event.stage, event.outcome, event.code, event.failureWriteUnconfirmed,
+    event.templateVersion, event.deployment
+| order by TimeGenerated asc
+```
+
+Validate first-pass model behavior with fresh disposable single-role fixtures
+and negative controls, the actual configured model/OCR services, one worker
+attempt, one transport attempt and no output corrections in that isolated
+validation capture. Require one acknowledgment per source and a validated,
+reviewed ready rubric without manual retries. Mocked regression tests alone do
+not establish live model acceptance. Deployment, activation, paid validation and
+test-record cleanup are separately approved operations.
+
 `GET /api/workspaces/:workspaceId/jobs/:jobId/lifecycle?scope=job|rubric`
 returns `{ impact }`. `POST` to the same path accepts `{ action, scope }`,
 where `action` is `archive`, `unarchive`, or `delete`, and requires the exact

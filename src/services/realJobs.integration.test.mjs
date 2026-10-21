@@ -508,6 +508,164 @@ async function clickButton(label) {
   await act(async () => { button.click(); await new Promise((resolve) => setTimeout(resolve, 0)) })
 }
 
+for (const count of [6, 10]) {
+  test(`one click admits ${count} files through the real client and API exactly once despite delayed lock release`, async () => {
+    const { authHeaders, APP_ORIGIN, baseConfig, createFakeStateStore, startTestServer } = await import('../../server-tests/helpers.mjs')
+    const { createFakeRealJobs } = await import('../../server-tests/job-lifecycle-fakes.mjs')
+    const jobs = createFakeRealJobs()
+    const state = createFakeStateStore()
+    const acquire = state.acquireMutationLease.bind(state)
+    let held = 0, maxHeld = 0, uploads = 0
+    state.acquireMutationLease = async id => {
+      const lease = await acquire(id)
+      maxHeld = Math.max(maxHeld, ++held)
+      return {
+        renew: () => lease.renew(),
+        async release() {
+          await new Promise(resolve => setTimeout(resolve, 10))
+          await lease.release()
+          held--
+        },
+      }
+    }
+    const server = await startTestServer({
+      state, jobs, seedWorkspace: true,
+      config: baseConfig({ realJobs: {
+        cosmosEndpoint: 'https://cosmos.example', database: 'score', container: 'job-records',
+        storageAccountUrl: 'https://storage.example', blobContainer: 'job-sources',
+      } }),
+    })
+    try {
+      globalThis.fetch = (url, init) => {
+        uploads++
+        const headers = new Headers(init.headers)
+        for (const [name, value] of Object.entries(authHeaders())) headers.set(name, value)
+        headers.set('origin', APP_ORIGIN)
+        return originalFetch(`${server.baseUrl}${url}`, { ...init, headers })
+      }
+      const value = workspaceValue()
+      value.cloud.realJobs.importFile = (file, key, batch) => client.importRealJobFile(server.fixtureWorkspace.id, file, key, batch)
+      await mount(React.createElement(ui.JobImport, { onClose() {} }), value)
+      const files = Array.from({ length: count }, (_, index) => index % 2
+        ? new File([`# Role ${index}\n\nMust design reliable data platforms.`], `role-${index}.md`)
+        : new File(['%PDF-source'], `role-${index}.pdf`))
+      await chooseFiles(files)
+      await act(async () => {
+        const button = [...document.querySelectorAll('button')].find(item => item.textContent.trim() === `Import ${count} jobs`)
+        button.click(); button.click()
+      })
+      const deadline = Date.now() + 10_000
+      while (!document.body.textContent.includes(`${count} queued / 0 unacknowledged`) && Date.now() < deadline) {
+        await act(async () => { await new Promise(resolve => setTimeout(resolve, 20)) })
+      }
+      assert.match(document.body.textContent, new RegExp(`${count} queued / 0 unacknowledged`))
+      assert.equal(uploads, count, 'No automatic resubmission or duplicate click')
+      assert.equal(held, 0)
+      assert.equal(maxHeld, 1)
+      const saved = await jobs.store.list(server.fixtureWorkspace.id)
+      assert.equal(saved.jobs.length, count)
+      assert.equal(new Set(saved.jobs.map(item => item.record.id)).size, count)
+    } finally {
+      globalThis.fetch = originalFetch
+      await server.close()
+    }
+  })
+}
+
+test('direct URLs are admitted in order once and an explicit retry retains the same URL, key and batch', async () => {
+  const value = workspaceValue()
+  const calls = []
+  let pending
+  value.cloud.realJobs.importUrl = (url, key, batch) => {
+    calls.push({ url, key, batch })
+    return new Promise((resolve, reject) => { pending = { resolve, reject } })
+  }
+  await mount(React.createElement(ui.JobImport, { onClose() {} }), value)
+  await clickButton('Direct URLs')
+  const urls = ['https://example.test/first', 'https://example.test/second', 'https://example.test/third']
+  const textarea = document.querySelector('textarea')
+  await act(async () => {
+    Object.getOwnPropertyDescriptor(dom.window.HTMLTextAreaElement.prototype, 'value').set.call(textarea, urls.join('\n'))
+    textarea.dispatchEvent(new dom.window.Event('input', { bubbles: true }))
+  })
+  await clickButton('Review URLs')
+  await act(async () => {
+    const button = [...document.querySelectorAll('button')].find(item => item.textContent.trim() === 'Import 3 jobs')
+    button.click(); button.click()
+  })
+  assert.equal(calls.length, 1)
+  assert.equal(textarea.disabled, true)
+  await act(async () => { pending.resolve(summary('first', '2026-09-17')) })
+  assert.equal(calls.length, 2)
+  await act(async () => { pending.reject(new Error('URL admission genuinely failed')) })
+  assert.equal(calls.length, 3)
+  await act(async () => { pending.resolve(summary('third', '2026-09-17')) })
+  assert.deepEqual(calls.map(call => call.url), urls)
+  assert.equal(new Set(calls.map(call => call.key)).size, 3)
+  assert.equal(new Set(calls.map(call => call.batch)).size, 1)
+  assert.match(document.body.textContent, /2 queued \/ 1 unacknowledged/)
+  await clickButton('Retry failed')
+  assert.equal(calls.length, 4)
+  assert.deepEqual(calls[3], calls[1])
+  await act(async () => { pending.resolve(summary('second', '2026-09-17')) })
+  assert.equal(calls.length, 4)
+  assert.match(document.body.textContent, /3 queued \/ 0 unacknowledged/)
+})
+
+test('an unacknowledged file is not automatically retried and does not prevent later files from being attempted once', async () => {
+  const value = workspaceValue()
+  const calls = []
+  let pending
+  value.cloud.realJobs.importFile = (file, key, batch) => {
+    calls.push({ file, key, batch })
+    return new Promise((resolve, reject) => { pending = { resolve, reject } })
+  }
+  await mount(React.createElement(ui.JobImport, { onClose() {} }), value)
+  const files = Array.from({ length: 3 }, (_, i) => new File(['%PDF-source'], `role-${i}.pdf`))
+  await chooseFiles(files)
+  await clickButton('Import 3 jobs')
+  assert.equal(calls.length, 1)
+  assert.equal(document.querySelector('input[type="file"]').disabled, true)
+  await act(async () => { pending.reject(new Error('Upload genuinely failed')); await new Promise(resolve => setTimeout(resolve, 0)) })
+  assert.equal(calls.length, 2)
+  await act(async () => { pending.resolve(summary('second', '2026-09-17')); await new Promise(resolve => setTimeout(resolve, 0)) })
+  assert.equal(calls.length, 3)
+  await act(async () => { pending.resolve(summary('third', '2026-09-17')); await new Promise(resolve => setTimeout(resolve, 0)) })
+  assert.deepEqual(calls.map(call => call.file), files)
+  assert.match(document.body.textContent, /2 queued \/ 1 unacknowledged/)
+  assert.match(document.body.textContent, /Upload genuinely failed/)
+})
+
+for (const change of ['workspace', 'unmount', 'read-only', 'unavailable']) {
+  test(`ordered admission stops before its next source after ${change}`, async () => {
+    const value = workspaceValue()
+    let release
+    let calls = 0
+    value.cloud.realJobs.importFile = () => {
+      calls++
+      return new Promise(resolve => { release = resolve })
+    }
+    await mount(React.createElement(ui.JobImport, { onClose() {} }), value)
+    await chooseFiles([new File(['%PDF-source'], 'first.pdf'), new File(['%PDF-source'], 'second.pdf')])
+    await clickButton('Import 2 jobs')
+    assert.equal(calls, 1)
+    if (change === 'unmount') {
+      await act(async () => root.unmount())
+      root = null
+    } else {
+      const next = workspaceValue()
+      next.cloud.realJobs.importFile = value.cloud.realJobs.importFile
+      if (change === 'workspace') next.cloud.currentWorkspaceId = 'workspace-two'
+      if (change === 'read-only') next.cloud.workspaces[0].role = 'viewer'
+      if (change === 'unavailable') next.cloud.realJobs.features.realJobImports = false
+      await mount(React.createElement(ui.JobImport, { onClose() {} }), next)
+    }
+    await act(async () => { release(summary('first', '2026-09-17')); await new Promise(resolve => setTimeout(resolve, 0)) })
+    assert.equal(calls, 1)
+    if (change === 'unavailable') assert.match(document.body.textContent, /Unsubmitted sources are retained/)
+  })
+}
+
 test('job picker and drop zone accept mixed PDF/Markdown files and retry the same source identity', async () => {
   const value = workspaceValue()
   const calls = []

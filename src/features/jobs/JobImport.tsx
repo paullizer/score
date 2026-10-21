@@ -1,4 +1,4 @@
-import { useRef, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { FileText, Link2, LoaderCircle, RotateCcw, ShieldCheck, UploadCloud } from 'lucide-react'
 import { useWorkspace } from '../../app/workspace-context'
 import { clientAdmissionReason, usePublicSettings } from '../../app/public-settings-context'
@@ -46,14 +46,21 @@ function RealJobImport({ onClose }: { onClose: () => void }) {
   const [error, setError] = useState('')
   const [batchId, setBatchId] = useState(() => crypto.randomUUID())
   const [locked, setLocked] = useState(false)
+  const [active, setActive] = useState(false)
   const submitting = useRef(false)
-  const active = items.some((item) => item.state === 'uploading')
+  const mounted = useRef(true)
   const queued = items.filter((item) => item.state === 'queued').length
   const failed = items.filter((item) => item.state === 'error').length
   const invalid = items.filter((item) => item.state === 'invalid').length
   const pending = items.filter((item) => item.state === 'pending').length
   const policyReason = clientAdmissionReason(policy, 'jobImports')
   const unavailable = realJobs.phase !== 'ready' || !realJobs.features?.realJobImports || Boolean(policyReason)
+  const admission = useRef({ unavailable, realJobs })
+  admission.current = { unavailable, realJobs }
+  useEffect(() => {
+    mounted.current = true
+    return () => { mounted.current = false }
+  }, [])
   const guard = useGradeLeaveGuard(items.some(item => item.state !== 'queued') || Boolean(urls.trim() && !locked), active, 'Unsubmitted job import sources')
   const close = () => { void guard.close(onClose) }
 
@@ -121,11 +128,13 @@ function RealJobImport({ onClose }: { onClose: () => void }) {
   async function upload(item: RealImportItem) {
     setItems((current) => current.map((candidate) => candidate.key === item.key ? { ...candidate, state: 'uploading', error: undefined } : candidate))
     try {
-      if (item.file) await realJobs.importFile(item.file, item.idempotencyKey, batchId)
-      else if (item.url) await realJobs.importUrl(item.url, item.idempotencyKey, batchId)
+      if (item.file) await admission.current.realJobs.importFile(item.file, item.idempotencyKey, batchId)
+      else if (item.url) await admission.current.realJobs.importUrl(item.url, item.idempotencyKey, batchId)
       else throw new Error('This import source is missing.')
+      if (!mounted.current) return
       setItems((current) => current.map((candidate) => candidate.key === item.key ? { ...candidate, state: 'queued', file: undefined, error: undefined } : candidate))
     } catch (caught) {
+      if (!mounted.current) return
       const message = caught instanceof Error ? caught.message : 'The source could not be queued.'
       setItems((current) => current.map((candidate) => candidate.key === item.key ? { ...candidate, state: 'error', error: message } : candidate))
     }
@@ -141,21 +150,30 @@ function RealJobImport({ onClose }: { onClose: () => void }) {
       }
     } catch (caught) { setError(caught instanceof Error ? caught.message : 'Current policy does not allow this batch. Your selection is retained.'); return }
     submitting.current = true
+    setActive(true)
     setLocked(true)
     setError('')
     try {
-      await Promise.all(selected.map(upload))
+      for (const item of selected) {
+        if (!mounted.current) break
+        if (admission.current.unavailable) {
+          setError('Import availability changed. Unsubmitted sources are retained; no further uploads were started.')
+          break
+        }
+        await upload(item)
+      }
     } finally {
       submitting.current = false
+      if (mounted.current) setActive(false)
     }
   }
 
   return <Modal open onOpenChange={(open) => { if (!open) close() }} title="Import real job descriptions" description="Score privately reads each source and prepares a source-grounded rubric." drawer
     footer={<>
       <span className="mr-auto text-[11px] text-muted">{active ? 'Uploading sources…' : queued || failed ? `${queued} queued / ${failed} unacknowledged` : `${pending} ready`}{invalid > 0 && ` / ${invalid} invalid`}</span>
-      {queued > 0 && failed === 0 && <Button onClick={close}>Done</Button>}
+      {queued > 0 && failed === 0 && !pending && !active && <Button onClick={close}>Done</Button>}
       {failed > 0 && <Button icon={RotateCcw} disabled={active || unavailable} onClick={() => void submit(items.filter((item) => item.state === 'error'))}>Retry failed</Button>}
-      {queued === 0 && <Button variant="primary" icon={active ? LoaderCircle : UploadCloud} disabled={active || unavailable || !pending} onClick={() => void submit()}>
+      {(queued === 0 || pending > 0) && <Button variant="primary" icon={active ? LoaderCircle : UploadCloud} disabled={active || unavailable || !pending} onClick={() => void submit(items.filter(item => item.state === 'pending'))}>
         {active ? 'Uploading…' : `Import ${pending || ''} ${pending === 1 ? 'job' : 'jobs'}`}
       </Button>}
     </>}>
@@ -200,7 +218,7 @@ function RealJobImport({ onClose }: { onClose: () => void }) {
       <Badge tone={['error', 'invalid'].includes(item.state) ? 'danger' : item.state === 'queued' ? 'success' : 'neutral'} dot={item.state !== 'pending'}>{item.state === 'error' ? 'Unacknowledged' : item.state}</Badge>
       {item.state === 'error' && <Button size="sm" variant="ghost" icon={RotateCcw} disabled={active || unavailable} aria-label={`Retry ${item.label}`} onClick={() => void submit([item])}>Retry</Button>}
     </div>)}</div>}
-    {locked && !active && failed === 0 && <div className="mt-4"><Button size="sm" onClick={() => {
+    {locked && !active && failed === 0 && !pending && <div className="mt-4"><Button size="sm" onClick={() => {
       if (submitting.current) return
       setBatchId(crypto.randomUUID()); setItems([]); setUrls(''); setError(''); setLocked(false)
     }}>Start another batch</Button></div>}

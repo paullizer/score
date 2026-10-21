@@ -243,6 +243,134 @@ function successfulModel(result = modelResult) {
   }), { status: 200 })
 }
 
+test('a fresh synthetic PDF is extracted, generated, reviewed and published on its first attempt without retry rescue', async t => {
+  const { createCompiledPromptBaseline } = await loadWorker('../server/settings/prompts.ts')
+  const { validateRealRubric } = await loadWorker('../server/jobs/validation.ts')
+  const policy = settingsSnapshot(settings => {
+    settings.processing.jobs.maxAutomaticAttempts = 1
+    settings.ai.transport.maxAttempts = 1
+    settings.ai.jobRubric.maxOutputCorrections = 0
+  })
+  const snapshot = settingsDomain.captureProcessingSettings(policy.settings, policy.revision, policy.capturedAt, createCompiledPromptBaseline(now))
+  const capturedBefore = JSON.stringify(snapshot)
+  const original = Buffer.from('%PDF-1.7\nsynthetic-role-fixture')
+  const originalName = `${workspaceId}/${jobId}/original.pdf`
+  const store = fakeStore(record({
+    extractedBlobName: undefined, processingSettings: snapshot,
+    source: {
+      kind: 'pdf', displayName: 'private-filename.pdf', originalBlobName: originalName,
+      originalContentType: 'application/pdf', sha256: createHash('sha256').update(original).digest('hex'), bytes: original.length,
+    },
+  }))
+  const blobs = new Map([[originalName, { bytes: original, contentType: 'application/pdf', sha256: store.state().source.sha256 }]])
+  const blobStore = {
+    async read(name) { return blobs.get(name) },
+    async putFenced(name, bytes, contentType, fence) {
+      await fence.assertActive()
+      assert.equal(blobs.has(name), false)
+      const blob = { bytes, contentType, sha256: createHash('sha256').update(bytes).digest('hex') }
+      blobs.set(name, blob)
+      return { created: true, blob }
+    },
+  }
+  let generation = 0, review = 0, ocrSubmissions = 0, ocrPolls = 0
+  const logs = []
+  t.mock.method(console, 'log', value => logs.push(value))
+  const deps = dependencies(store, blobStore, async (_url, init) => {
+    generation++
+    const body = JSON.parse(init.body)
+    assert.match(body.messages[0].content, /A live vacancy, real employer, or application process is not required/)
+    assert.match(body.messages[1].content, /Fictional evaluation fixture, not a live vacancy/)
+    assert.doesNotMatch(body.messages[1].content, /prior result was invalid/)
+    const catalog = JSON.parse(body.messages[1].content.split('SOURCE PASSAGE CATALOG JSON:\n')[1])
+    const passage = catalog.paragraphs.flatMap(row => row.passages).find(([, text]) => text.includes('TypeScript experience is required'))
+    assert.ok(passage)
+    return successfulModel({ ...modelResult, criteria: [{ ...modelResult.criteria[0], sourcePassageIds: [passage[0]] }] })
+  }, async () => { review++; return successfulModel({ summary: 'Source-grounded rubric.', findings: [] }) })
+  deps.validateRealRubric = validateRealRubric
+  deps.documentIntelligence.clock = deps.clock
+  deps.documentIntelligence.fetch = async (_url, init) => {
+    if (init.method === 'POST') {
+      ocrSubmissions++
+      assert.deepEqual(Buffer.from(init.body), original)
+      return new Response(null, { status: 202, headers: { 'operation-location': 'https://di.example/result/one' } })
+    }
+    ocrPolls++
+    return new Response(JSON.stringify({ status: 'succeeded', analyzeResult: {
+      pages: [{ pageNumber: 1 }],
+      paragraphs: [
+        { role: 'title', content: 'Platform Engineer' },
+        { content: 'TypeScript experience is required.' },
+        { content: 'Fictional evaluation fixture, not a live vacancy.' },
+      ].map((row, index) => ({ ...row, spans: [{ offset: index * 100 }], boundingRegions: [{ pageNumber: 1 }] })),
+    } }), { status: 200 })
+  }
+  assert.deepEqual(await runWorker(deps, { maxJobs: 1 }), { claimed: 1, completed: 1 })
+  assert.deepEqual({ generation, review, ocrSubmissions, ocrPolls }, { generation: 1, review: 1, ocrSubmissions: 1, ocrPolls: 1 })
+  assert.equal(store.state().attempts, 1)
+  assert.equal(store.state().job.status, 'ready')
+  assert.equal(store.state().error, undefined)
+  assert.ok(store.published())
+  assert.ok(store.checks())
+  assert.equal(JSON.stringify(store.state().processingSettings), capturedBefore)
+  assert.equal(store.published().provenance.prompt.templateVersion, 'score-job-rubric-v5')
+  const events = logs.map(line => JSON.parse(line))
+  assert.deepEqual(events.filter(event => event.event === 'job-stage').map(event => event.stage), ['parsing', 'rubric', 'review', 'publication'])
+  assert.equal(events.find(event => event.event === 'job-outcome').outcome, 'ready')
+  assert.deepEqual(events.find(event => event.event === 'execution-outcome'), {
+    component: 'score-job', event: 'execution-outcome', claimed: 1, processed: 1, ready: 1, failed: 0, queued: 0, abandoned: 0,
+  })
+  assert.doesNotMatch(JSON.stringify(events), /private-filename|synthetic-role-fixture|Fictional evaluation|TypeScript experience|Source-grounded rubric/)
+})
+
+test('job failure events retain safe stage and code without source text or model rejection prose', async t => {
+  const logs = []
+  t.mock.method(console, 'log', value => logs.push(JSON.parse(value)))
+  const store = fakeStore(record())
+  await runWorker(dependencies(store, fakeBlobs(), async () => successfulModel({
+    ...modelResult, isJobPosting: false, rejectionReason: 'private-model-rejection-text https://private.example', criteria: [],
+  })), { maxJobs: 1 })
+  const failure = logs.find(event => event.event === 'job-outcome')
+  assert.equal(failure.code, 'not-a-job-posting')
+  assert.equal(failure.stage, 'rubric')
+  assert.equal(failure.outcome, 'failed')
+  assert.equal(failure.attempt, 1)
+  assert.equal(failure.workspaceId, workspaceId)
+  assert.equal(failure.jobId, jobId)
+  assert.equal(store.state().job.status, 'error')
+  assert.match(store.state().error.message, /private-model-rejection-text/)
+  assert.doesNotMatch(JSON.stringify(logs), /private-model-rejection-text|private\.example/)
+  const { logJobEvent } = await loadWorker('../worker/job-telemetry.ts')
+  logJobEvent({ ...store.state(), id: 'unsafe/private-path', workspaceId: 'unsafe/private-workspace' }, settingsSnapshot(), 'safe-version', {
+    stage: 'rubric', outcome: 'failed', code: 'private-source-in-arbitrary-code', httpStatus: 9999,
+  })
+  assert.equal(logs.at(-1).code, 'processing-error')
+  assert.equal(logs.at(-1).httpStatus, undefined)
+  assert.equal(logs.at(-1).jobId, undefined)
+  assert.equal(logs.at(-1).workspaceId, undefined)
+})
+
+test('a failure that cannot be saved emits one abandoned outcome retaining its processing code', async t => {
+  const logs = []
+  t.mock.method(console, 'log', value => logs.push(JSON.parse(value)))
+  const store = fakeStore(record(), {
+    replace(value) {
+      if (value.error) throw new Error('private-persistence-error')
+    },
+  })
+  await runWorker(dependencies(store, fakeBlobs(), async () => successfulModel({
+    ...modelResult, isJobPosting: false, rejectionReason: 'private-rejection', criteria: [],
+  })), { maxJobs: 1 })
+  const outcomes = logs.filter(event => event.event === 'job-outcome')
+  assert.equal(outcomes.length, 1)
+  assert.equal(outcomes[0].outcome, 'abandoned')
+  assert.equal(outcomes[0].code, 'not-a-job-posting')
+  assert.equal(outcomes[0].failureWriteUnconfirmed, true)
+  assert.equal(store.state().error, undefined)
+  assert.equal(logs.find(event => event.event === 'execution-outcome').abandoned, 1)
+  assert.doesNotMatch(JSON.stringify(logs), /private-persistence-error|private-rejection/)
+})
+
 test('durable job retries retain accepted task, attempt cap and backoff after current settings change', async () => {
   const legacy = settingsSnapshot(settings => {
     settings.processing.jobs.maxAutomaticAttempts = 2

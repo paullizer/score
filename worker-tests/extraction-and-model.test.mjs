@@ -149,6 +149,50 @@ test('position descriptions are accepted and listing pages are rejected', async 
   }, () => [], jobId, '2026-09-17T12:00:00.000Z'), error => error.code === 'not-a-job-posting' && /listing page/.test(error.message))
 })
 
+for (const context of [
+  'Fictional evaluation fixture, not a live vacancy.',
+  'Synthetic evaluation fixture for an internal position description.',
+  'Expired job description; applications are closed.',
+]) {
+  test(`single-role acceptance contract explicitly covers ${context}`, async () => {
+    const fixture = { ...document, paragraphs: [...document.paragraphs, { id: 'notice', page: 1, heading: 'Context', text: context }] }
+    let calls = 0
+    const result = await generateGroundedRubric(fixture, {
+      endpoint: 'https://model.example', deployment: 'rubric', modelName: 'gpt-5-mini', getToken: async () => 'token',
+      processingSettings: settingsSnapshot(settings => {
+        settings.ai.jobRubric.maxOutputCorrections = 0
+        settings.ai.transport.maxAttempts = 1
+      }),
+      fetch: async (_url, init) => {
+        calls++
+        const { messages } = JSON.parse(init.body)
+        assert.match(messages[0].content, /Accept substantive single-role descriptions even when fictional, synthetic, evaluation fixtures, internal, expired, or not currently advertised/)
+        assert.match(messages[0].content, /A live vacancy, real employer, or application process is not required/)
+        assert.match(messages[0].content, /not grounds for rejection/)
+        assert.match(messages[0].content, /Still reject irrelevant or unusable material and multi-role collections/)
+        const source = JSON.parse(messages[1].content.split('SOURCE PASSAGE CATALOG JSON:\n')[1])
+        assert.equal(source.paragraphs.find(row => row.id === 'notice').passages.map(([, text]) => text).join(''), context)
+        assert.doesNotMatch(messages[1].content, /prior result was invalid/)
+        return modelResponse(validResult)
+      },
+    }, () => [], jobId, '2026-09-17T12:00:00.000Z')
+    assert.equal(result.metadata.isJobPosting, true)
+    assert.equal(calls, 1)
+    assert.equal(result.rubric.provenance.promptVersion, 'score-job-rubric-v5')
+  })
+}
+
+for (const reason of ['This is a multi-role collection.', 'This is irrelevant non-role material.', 'This source is unusable.']) {
+  test(`single-role contract retains rejection without retry: ${reason}`, async () => {
+    let calls = 0
+    await assert.rejects(generateGroundedRubric(document, {
+      endpoint: 'https://model.example', deployment: 'rubric', modelName: 'gpt-5-mini', getToken: async () => 'token',
+      fetch: async () => { calls++; return modelResponse({ ...validResult, isJobPosting: false, rejectionReason: reason, criteria: [] }) },
+    }, () => [], jobId, '2026-09-17T12:00:00.000Z'), error => error.code === 'not-a-job-posting' && error.message === reason)
+    assert.equal(calls, 1)
+  })
+}
+
 test('long paragraphs are cited by passage IDs and merged into exact source quotes', async () => {
   const longText = `${'Requires cloud architecture experience across teams and services with documented ownership and integration scope, '.repeat(40)}and maintains infrastructure documentation.`
   assert.ok(longText.length >= 3600)
@@ -302,7 +346,7 @@ test('grounded rubric generation repairs protected criteria once and preserves e
   assert.deepEqual(generated.rubric.provenance, {
     kind: 'generated',
     model: 'gpt-5-mini-2026-08-01',
-    promptVersion: 'score-job-rubric-v4',
+    promptVersion: 'score-job-rubric-v5',
   })
   assert.deepEqual(generated.warnings, ['Location is not stated.'])
 })
