@@ -691,7 +691,7 @@ test('job picker and drop zone accept mixed PDF/Markdown files and retry the sam
   }
   await mount(React.createElement(ui.JobImport, { onClose() {} }), value)
   const input = dom.window.document.querySelector('input[type="file"]')
-  assert.equal(input.getAttribute('aria-label'), 'Choose real job PDF or Markdown files')
+  assert.equal(input.getAttribute('aria-label'), 'Choose job PDF or Markdown files')
   for (const extension of ['.pdf', '.md', '.markdown']) assert.ok(input.accept.split(',').includes(extension))
   const files = [new File(['%PDF-source'], 'role.PDF'), new File(['# Duties\r\nExact bytes'], 'role.MD', { type: 'application/pdf' })]
   await chooseFiles(files)
@@ -721,7 +721,7 @@ test('job picker advertises Markdown and Word together without enabling either t
   value.cloud.realJobs.importFile = async (file, key, batchId) => { calls.push({ file, key, batchId }); return summary(file.name, '2026-09-17T00:00:00.000Z') }
   await mount(React.createElement(ui.JobImport, { onClose() {} }), value)
   const input = dom.window.document.querySelector('input[type="file"]')
-  assert.equal(input.getAttribute('aria-label'), 'Choose real job PDF or Markdown or Word files')
+  assert.equal(input.getAttribute('aria-label'), 'Choose job PDF or Markdown or Word files')
   for (const extension of ['.pdf', '.md', '.markdown', '.docx', '.doc']) assert.ok(input.accept.split(',').includes(extension))
   const files = [
     new File(['# Source'], 'role.MD', { type: 'application/pdf' }), new File([docxFile()], 'role.DOCX'),
@@ -743,7 +743,7 @@ test('job picker advertises Markdown and Word together without enabling either t
   isolated.cloud.realJobs.features.wordDocumentImports = true
   await mount(React.createElement(ui.JobImport, { onClose() {} }), isolated)
   const wordOnly = dom.window.document.querySelector('input[type="file"]')
-  assert.equal(wordOnly.getAttribute('aria-label'), 'Choose real job PDF or Word files')
+  assert.equal(wordOnly.getAttribute('aria-label'), 'Choose job PDF or Word files')
   assert.equal(wordOnly.accept.split(',').includes('.md'), false)
   assert.equal(wordOnly.accept.split(',').includes('.docx'), true)
 })

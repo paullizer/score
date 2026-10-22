@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { AlertTriangle, BadgeCheck, ListChecks, Pencil, Sparkles } from 'lucide-react'
+import { useAiTerminology } from '../../app/public-settings-context'
 import { useWorkspace } from '../../app/workspace-context'
 import { Badge, Button, InlineError, Modal } from '../../components/ui'
 import { EVIDENCE_SCALE_VERSION } from '../../domain/evidence-scale'
@@ -36,6 +37,7 @@ export function FindingList({
   onFixWithAi?: (finding: RubricQaFinding) => void
   onEditCriterion?: (criterionId: string) => void
 }) {
+  const terms = useAiTerminology()
   if (!findings.length) return null
   return <section className="space-y-2">
     <h3 className="text-[12px] font-semibold">{title} <Badge tone={tone}>{findings.length}</Badge></h3>
@@ -47,7 +49,7 @@ export function FindingList({
             {finding.criterionIds.length > 0 && <span className="text-[11px] font-medium text-muted">{criterionNames(rubric, finding)}</span>}
           </div>
           {(onFixWithAi || (onEditCriterion && finding.criterionIds[0])) && <div className="flex flex-wrap items-center gap-1.5">
-            {onFixWithAi && <Button size="sm" variant="secondary" icon={Sparkles} onClick={() => onFixWithAi(finding)}>Fix with AI</Button>}
+            {onFixWithAi && <Button size="sm" variant="secondary" icon={Sparkles} onClick={() => onFixWithAi(finding)}>{terms.fixWithAi}</Button>}
             {onEditCriterion && finding.criterionIds[0] && <Button size="sm" variant="ghost" icon={Pencil} onClick={() => onEditCriterion(finding.criterionIds[0]!)}>Edit</Button>}
           </div>}
         </div>
@@ -79,6 +81,7 @@ export function RubricApprovalCard({
   onChecksLoaded?: (state: RubricCheckState) => void
 }) {
   const { cloud } = useWorkspace()
+  const terms = useAiTerminology()
   const { jobId, approval, latestVersion, status, qaSummary, actionLabel } = useRubricApproval(rubric)
   const [open, setOpen] = useState(false)
   const [loadedState, setLoadedState] = useState<RubricCheckState | null>(null)
@@ -137,7 +140,7 @@ export function RubricApprovalCard({
           {canReview && <div className="flex flex-wrap items-center gap-2">
             {flaggedDraft && assistantAvailable && onFixWithAi && (
               <Button size="sm" variant="primary" icon={Sparkles} onClick={() => onFixWithAi(effectiveFindings, effectiveFindings[0]?.criterionIds[0] ?? null)}>
-                Fix with AI
+                {terms.fixWithAi}
               </Button>
             )}
             {flaggedDraft && editable && onEditManually && (
@@ -195,6 +198,7 @@ function RubricApprovalDialog({
   onClose: () => void
 }) {
   const { cloud } = useWorkspace()
+  const terms = useAiTerminology()
   const analyses = useRealAnalyses()
   const [state, setState] = useState<RubricCheckState | null>(null)
   const [busy, setBusy] = useState<'loading' | 'checking' | 'approving' | null>('loading')
@@ -258,7 +262,7 @@ function RubricApprovalDialog({
   const clean = Boolean(checks && findings.length === 0 && !blocked)
   return <Modal open onOpenChange={(next) => { if (!next && busy !== 'approving') onClose() }} wide dismissDisabled={busy === 'approving'}
     title={`Check and approve version ${rubric.version}`}
-    description="Review the rubric checks below. You can fix overlapping criteria with AI, edit them manually, or approve this version."
+    description={terms.text('Review the rubric checks below. You can fix overlapping criteria with AI, edit them manually, or approve this version.')}
     footer={<>
       <Button variant="ghost" onClick={onClose} disabled={busy === 'approving'}>Close</Button>
       {findings.length > 0 && editable && onEditManually && (
@@ -268,7 +272,7 @@ function RubricApprovalDialog({
       )}
       {findings.length > 0 && assistantAvailable && onFixWithAi && (
         <Button variant="secondary" icon={Sparkles} disabled={busy === 'approving'} onClick={() => onFixWithAi(findings, findings[0]?.criterionIds[0] ?? null)}>
-          Fix with AI ({findings.length})
+          {terms.fixWithAi} ({findings.length})
         </Button>
       )}
       {canApprove && <Button variant={clean ? 'success' : 'primary'} icon={BadgeCheck} onClick={() => void approve()}
@@ -282,7 +286,7 @@ function RubricApprovalDialog({
         <ul className="list-disc space-y-1 pl-4">{state.blockers.map((message, index) => <li key={`${index}-${message}`}>{message}</li>)}</ul>
       </InlineError>}
       {state && !checks && <div className="space-y-3 text-[12px]">
-        <p>The checks look for criteria that assess the same capability, level examples a résumé can’t show, and examples that don’t follow the evidence scale. They run once for this version, use AI for one review, and take up to a minute.</p>
+        <p>{terms.text('The checks look for criteria that assess the same capability, level examples a résumé can’t show, and examples that don’t follow the evidence scale. They run once for this version, use AI for one review, and take up to a minute.')}</p>
         {checksAvailable
           ? <Button icon={ListChecks} onClick={() => void runChecks()} disabled={busy !== null}>{busy === 'checking' ? 'Running checks…' : 'Run rubric checks'}</Button>
           : <p className="text-muted">Rubric checks aren’t available right now: they need the job-rubric model and are stopped while new work is paused.</p>}
@@ -293,7 +297,7 @@ function RubricApprovalDialog({
           <div className="rounded-xl border bg-soft p-3 text-[12px]">
             <p className="font-medium">How would you like to handle {findings.length === 1 ? 'this item' : `these ${findings.length} items`}?</p>
             <p className="mt-1 text-[11px] text-muted">
-              Use <strong>Fix with AI</strong> to automatically merge or separate overlapping criteria and preview the highlighted changes before saving a new version, or <strong>Approve version {rubric.version}</strong> to keep the rubric as-is.
+              Use <strong>{terms.fixWithAi}</strong> to automatically merge or separate overlapping criteria and preview the highlighted changes before saving a new version, or <strong>Approve version {rubric.version}</strong> to keep the rubric as-is.
             </p>
           </div>
         )}

@@ -2,6 +2,7 @@ import { useCallback } from 'react'
 import { Link, NavLink, Route, Routes } from 'react-router-dom'
 import { ClipboardCheck, LoaderCircle } from 'lucide-react'
 import { useWorkspace } from '../../app/workspace-context'
+import { useAiTerminology } from '../../app/public-settings-context'
 import { useApplicationNavigation } from '../../app/application-navigation-context'
 import { workspaceCanReview, workspaceQcRole } from '../../domain/workspace-permissions'
 import { getQcCapabilities } from '../../services/qualityControl'
@@ -32,6 +33,7 @@ export function QualityControlPage() {
 }
 
 function QcWorkspace({ workspaceId }: { workspaceId: string }) {
+  const terms = useAiTerminology()
   const load = useCallback(async (signal: AbortSignal) => {
     const [access, policy] = await Promise.allSettled([
       getQcCapabilities(workspaceId, signal), fetchPublicFeatures(signal),
@@ -62,7 +64,7 @@ function QcWorkspace({ workspaceId }: { workspaceId: string }) {
     {capabilities.policyError && <InlineError><p>{capabilities.policyError}</p><Button onClick={access.reload}>Check QC policy</Button></InlineError>}
     {!capabilities.admissionEnabled && <p className="qc-notice">{capabilities.message ?? 'New QC changes are disabled. Saved QC history and cancellation of accepted work remain available.'} This switch does not change normal workspace permissions.</p>}
     {!capabilities.writable && <p className="qc-notice">QC changes are read-only for this workspace. Saved QC history remains available.</p>}
-    {capabilities.admissionEnabled && !capabilities.improvements && <p className="qc-notice">{capabilities.message ?? 'New AI planning and evaluation work is unavailable; saved reviews and plans remain readable.'}</p>}
+    {capabilities.admissionEnabled && !capabilities.improvements && <p className="qc-notice">{terms.text(capabilities.message ?? 'New AI planning and evaluation work is unavailable; saved reviews and plans remain readable.')}</p>}
     <Routes>
       <Route index element={<QcReviews workspaceId={workspaceId} capabilities={capabilities} />} />
       <Route path="reviews/:runId/:comparisonId" element={<QcComparisonReview workspaceId={workspaceId} capabilities={capabilities} />} />

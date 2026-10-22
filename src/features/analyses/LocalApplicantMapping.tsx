@@ -1,4 +1,5 @@
 import { useEffect, useId, useMemo, useRef, useState } from 'react'
+import { useAiTerminology } from '../../app/public-settings-context'
 import { Button, CheckLabel, InlineError } from '../../components/ui'
 import type { ReportCandidate } from '../../domain/analysis-reports'
 import {
@@ -11,6 +12,7 @@ export function LocalApplicantMapping({ candidates, disabled, onChange }: {
   onChange: (rows: ApplicantMappingRow[] | null | undefined) => void
 }) {
   const id = useId()
+  const terms = useAiTerminology()
   const [enabled, setEnabled] = useState(false)
   const [workbook, setWorkbook] = useState<MappingWorkbook | null>(null)
   const [sheetIndex, setSheetIndex] = useState(0)
@@ -71,7 +73,7 @@ export function LocalApplicantMapping({ candidates, disabled, onChange }: {
       clear(); setEnabled(value => !value); onChange(enabled ? undefined : null)
     }}>Add applicant names from a local mapping file</CheckLabel>
     {enabled && <>
-      <p className="text-[12px] text-muted">Read on this computer only: not uploaded, saved in Score, or sent to AI. This download may contain personal information. Names are cleared when you close this dialog.</p>
+      <p className="text-[12px] text-muted">{terms.text('Read on this computer only: not uploaded, saved in Score, or sent to AI. This download may contain personal information. Names are cleared when you close this dialog.')}</p>
       <div className="space-y-2">
         <label className="block text-[12px] font-semibold" htmlFor={`${id}-file`}>Excel or CSV mapping</label>
         <input ref={input} id={`${id}-file`} type="file" accept=".xlsx,.csv" disabled={disabled}

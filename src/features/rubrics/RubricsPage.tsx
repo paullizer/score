@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import { Link, Navigate, useNavigate, useParams, useSearchParams } from 'react-router-dom'
-import { ArrowLeft, ArrowRight, BadgeCheck, BriefcaseBusiness, FileSearch, Layers3, LoaderCircle, ShieldCheck } from 'lucide-react'
+import { ArrowLeft, ArrowRight, BadgeCheck, BriefcaseBusiness, FileSearch, Layers3, LoaderCircle } from 'lucide-react'
 import { useWorkspace } from '../../app/workspace-context'
 import { useLibraryViewState } from '../../app/library-view-state'
 import { DocumentViewer } from '../../components/documents/DocumentViewer'
@@ -122,9 +122,7 @@ function RubricsLibrary() {
 
   return <>
     <PageHeader
-      eyebrow="THE STANDARD, MADE VISIBLE"
       title="Rubrics"
-      description="Inspect the criteria before the comparison. Reuse a grade standard, or work from a specific job."
       actions={kind === 'job' && (mode === 'approve' ? <Button icon={BadgeCheck} variant="primary"
         disabled={!approvals.canApprove || !selected.length || selected.some((item) => !approvals.forRubric(item).canApprove)}
         onClick={() => setBatch(selected)}>Approve selected{selected.length ? ` (${selected.length})` : ''}</Button> : <Button
@@ -183,7 +181,6 @@ function RubricsLibrary() {
         <section aria-label="Linked to your jobs">
           <div className="mb-4 flex flex-wrap items-baseline justify-between gap-2">
             <h2 className="text-[13px] font-semibold">Linked to your jobs</h2>
-            <span className="text-[10px] text-muted">Each rubric stays attached to its source job</span>
           </div>
           <div className="grid gap-4 lg:grid-cols-2 2xl:grid-cols-3">
             {[...visible].sort((left, right) => (left.grade ?? left.name).localeCompare(right.grade ?? right.name, undefined, { numeric: true })).map((rubric) => {
@@ -262,7 +259,6 @@ function RubricsLibrary() {
       </>}
       {kind === 'grade' && <GradeLadderLibrary search={search} archiveFilter={archiveFilter} />}
     </section>
-    <p className="library-note-text mt-5"><ShieldCheck size={16} aria-hidden="true" /><span>Job and grade rubrics are private and source-grounded. Every saved version remains inspectable, including the version used by a past analysis.</span></p>
   </>
 }
 
@@ -314,11 +310,7 @@ function RubricDetail({ id }: { id: string }) {
   return <>
     <Link className="back-link" to={`/rubrics?kind=${rubric.kind}`}><ArrowLeft size={14} aria-hidden="true" />Back to rubrics</Link>
     <PageHeader
-      eyebrow={rubric.kind === 'grade' ? 'REUSABLE GRADE STANDARD' : 'JOB-LINKED STANDARD'}
       title={rubric.name}
-      description={rubric.kind === 'grade'
-        ? 'A reusable set of expectations. Compare directly to this grade, with or without a job.'
-        : 'A job-specific standard, with traceable source references and preserved version history.'}
       actions={<>{approval.canApprove && <Button variant={approval.cleanReady ? 'success' : 'secondary'} icon={BadgeCheck} onClick={() => setBatch([rubric])}>{approval.actionLabel}</Button>}{rubric.kind === 'job' && <Button icon={Layers3} disabled={!canEdit || !gradeLadders?.canWrite || gradeLadders.phase !== 'ready' || job?.status !== 'ready' || Boolean(job?.rubricDeletedAt) || (approvals.required && approval.status !== 'approved')}
         title={!gradeLadders?.canWrite ? 'Only an owner or editor in a grade-enabled workspace can create a ladder.' : 'Capture this exact saved job rubric version as a new GS family.'}
         onClick={() => navigate(`/grade-ladders/new?${new URLSearchParams({ job: job!.id, rubric: rubric.id, rubricVersion: String(rubric.version) })}`)}>Create grade ladder</Button>}
@@ -370,19 +362,16 @@ function RubricDetail({ id }: { id: string }) {
           <div className="section-heading"><h2>Source &amp; context</h2><FileSearch size={16} className="text-muted" aria-hidden="true" /></div>
           <div className="space-y-4 p-5 text-[11px]">
             <dl className="space-y-4">
-              <div><dt className="mb-1 text-[10px] text-muted">Type</dt><dd>{rubric.kind === 'grade' ? 'Reusable grade rubric' : rubric.provenance?.kind === 'edited' ? 'Reviewer edited · linked to a real job' : 'Generated from source · linked to a real job'}</dd></div>
+              <div><dt className="mb-1 text-[10px] text-muted">Type</dt><dd>{rubric.kind === 'grade' ? 'Reusable grade rubric' : rubric.provenance?.kind === 'edited' ? 'Reviewer edited' : 'Generated from source'}</dd></div>
               {rubric.kind === 'grade' ? <>
                 <div><dt className="mb-1 text-[10px] text-muted">Grade family</dt><dd>{rubric.ladder || 'Not specified'}</dd></div>
                 <div><dt className="mb-1 text-[10px] text-muted">Grade</dt><dd>{rubric.grade || 'Not specified'}</dd></div>
               </> : <>
                 <div><dt className="mb-1 text-[10px] text-muted">Linked job</dt><dd>{job ? <><Link to={`/jobs/${job.id}`} className="link-button">{job.title}</Link> <ArchivedBadge target={{ kind: 'job', id: job.id }} /></> : 'Job unavailable'}</dd></div>
                 <div><dt className="mb-1 text-[10px] text-muted">Source label</dt><dd className="break-words">{job?.sourceLabel || 'Source label unavailable'}</dd></div>
-                <div><dt className="mb-1 text-[10px] text-muted">Reference content</dt><dd>{document ? 'Actual private source document' : realDetail?.state === 'loading' ? 'Loading private source' : 'Source document unavailable'}</dd></div>
+                <div><dt className="mb-1 text-[10px] text-muted">Reference content</dt><dd>{document ? 'Source document' : realDetail?.state === 'loading' ? 'Loading source' : 'Source document unavailable'}</dd></div>
               </>}
             </dl>
-            <p className="library-note-text border-t pt-4"><ShieldCheck size={16} aria-hidden="true" /><span>{rubric.kind === 'grade'
-              ? 'Grade guidance supports human review. It is not official qualification or eligibility advice.'
-              : 'Every criterion must cite an exact quotation from this parsed source. Saving appends a reviewer-edited version; it never overwrites prior versions.'}</span></p>
           </div>
         </section>
         <section className="detail-panel">
@@ -398,7 +387,6 @@ function RubricDetail({ id }: { id: string }) {
               <span className="text-[10px] text-muted">{dateLabel(version.createdAt)}</span>
             </Link>)}
           </nav>
-          <p className="border-t px-5 py-3 text-[10px] text-muted">Edits never rewrite prior analysis results.</p>
         </section>
       </aside>
     </div>

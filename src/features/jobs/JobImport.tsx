@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import { FileText, Link2, LoaderCircle, RotateCcw, ShieldCheck, UploadCloud } from 'lucide-react'
+import { FileText, Link2, LoaderCircle, RotateCcw, UploadCloud } from 'lucide-react'
 import { useWorkspace } from '../../app/workspace-context'
 import { clientAdmissionReason, usePublicSettings } from '../../app/public-settings-context'
 import { useGradeLeaveGuard } from '../../app/grade-navigation-context'
@@ -168,7 +168,7 @@ function RealJobImport({ onClose }: { onClose: () => void }) {
     }
   }
 
-  return <Modal open onOpenChange={(open) => { if (!open) close() }} title="Import real job descriptions" description="Score privately reads each source and prepares a source-grounded rubric." drawer
+  return <Modal open onOpenChange={(open) => { if (!open) close() }} title="Add jobs" description="Upload job descriptions or import posting URLs to generate rubrics." drawer
     footer={<>
       <span className="mr-auto text-[11px] text-muted">{active ? 'Uploading sources…' : queued || failed ? `${queued} queued / ${failed} unacknowledged` : `${pending} ready`}{invalid > 0 && ` / ${invalid} invalid`}</span>
       {queued > 0 && failed === 0 && !pending && !active && <Button onClick={close}>Done</Button>}
@@ -185,14 +185,14 @@ function RealJobImport({ onClose }: { onClose: () => void }) {
     <SegmentedControl value={mode} onChange={(value) => {
       if (locked || submitting.current) { setError('Submitted inputs are locked so retries keep their original keys and bytes. Close this panel to start a separate batch.'); return }
       setMode(value); setItems([]); setError('')
-    }} label="Real job source" options={[{ value: 'file', label: `${uploadPickerLabel(formats)} files` }, { value: 'url', label: 'Direct URLs' }]} />
+    }} label="Job source" options={[{ value: 'file', label: `${uploadPickerLabel(formats)} files` }, { value: 'url', label: 'Direct URLs' }]} />
     <div className="my-6">
       {mode === 'file' ? <>
         <label className="drop-zone" onDragOver={(event) => event.preventDefault()} onDrop={(event) => { event.preventDefault(); chooseFiles(event.dataTransfer.files) }}>
           <UploadCloud size={32} strokeWidth={1.4} /><strong>Drop job description {uploadPickerLabel(formats, ' or ')} files here</strong>
           <span>Up to {limits?.maxBatchFiles ?? 10} files. {formats.map((format) => `${uploadFormatNames([format])}: ${uploadFileByteLimit(format, limits) / 1024 / 1024} MiB`).join(' · ')}. PDFs only: {limits?.maxPdfPages ?? 50} printed pages.</span>
           <span>Each source may contain up to {(limits?.maxSourceCharacters ?? JOB_IMPORT_LIMITS.maxSourceCharacters).toLocaleString()} normalized characters.</span>
-          <input type="file" multiple accept={uploadAccept(formats)} className="sr-only" aria-label={`Choose real job ${uploadPickerLabel(formats, ' or ')} files`} disabled={active || locked || unavailable || !formats.length} onChange={(event) => {
+          <input type="file" multiple accept={uploadAccept(formats)} className="sr-only" aria-label={`Choose job ${uploadPickerLabel(formats, ' or ')} files`} disabled={active || locked || unavailable || !formats.length} onChange={(event) => {
             const files = Array.from(event.currentTarget.files ?? [])
             event.currentTarget.value = ''
             if (files.length) chooseFiles(files)
@@ -222,8 +222,6 @@ function RealJobImport({ onClose }: { onClose: () => void }) {
       if (submitting.current) return
       setBatchId(crypto.randomUUID()); setItems([]); setUrls(''); setError(''); setLocked(false)
     }}>Start another batch</Button></div>}
-    <div className="info-callout mt-5"><FileText size={18} /><div><strong>Processing continues on the server</strong><p>Only acknowledged uploads are durable queued records. Invalid files do not prevent valid files from importing. Keep this panel open until uploads are acknowledged, or retry unchanged inputs with their original keys. Extraction and rubric generation may take a minute to start; closing this panel does not cancel acknowledged work.</p></div></div>
-    <p className="library-note-text mt-5"><ShieldCheck size={16} aria-hidden="true" /><span>Job sources are read and stored privately. Import resumes separately, then manually choose ready inputs for an analysis.</span></p>
     {error && <div className="mt-5"><InlineError>{error}</InlineError></div>}
   </Modal>
 }

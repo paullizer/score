@@ -330,8 +330,8 @@ test('workspace/document changes abort original fetches and terminate stale work
 
 test('job picker accepts advertised uppercase Word files, keeps invalid neighbors, and preserves retry keys and PDF routes', { timeout: 60_000 }, async (t) => {
   const { page, fixture } = await open(t, { state: { mode: 'job-import' } })
-  const dialog = await visible(page.getByRole('dialog', { name: 'Import real job descriptions', exact: true }))
-  const input = dialog.getByLabel('Choose real job PDF or Word files', { exact: true })
+  const dialog = await visible(page.getByRole('dialog', { name: 'Add jobs', exact: true }))
+  const input = dialog.getByLabel('Choose job PDF or Word files', { exact: true })
   assert.match(await input.getAttribute('accept'), /\.docx.*\.doc,/)
   const docx = docxFile(), doc = legacyDocFile()
   await input.setInputFiles([
@@ -366,7 +366,7 @@ test('job picker accepts advertised uppercase Word files, keeps invalid neighbor
 
 test('resume drop handles mixed files/URLs with per-item errors and releases accepted files; old servers stay PDF-only', { timeout: 60_000 }, async (t) => {
   const { page, fixture } = await open(t, { state: { mode: 'resume-import' } })
-  const dialog = await visible(page.getByRole('dialog', { name: 'Add real resumes', exact: true }))
+  const dialog = await visible(page.getByRole('dialog', { name: 'Add resumes', exact: true }))
   await visible(dialog.getByRole('button', { name: 'Choose files', exact: true }))
   await page.waitForFunction(() => !document.querySelector('input[type=file]').disabled)
   const docx = docxFile(), doc = legacyDocFile()
@@ -403,7 +403,7 @@ test('resume drop handles mixed files/URLs with per-item errors and releases acc
 
 test('browser picker combines Markdown and Word in one batch without capability cross-enabling', { timeout: 60_000 }, async (t) => {
   const { page, fixture } = await open(t, { state: { mode: 'resume-import', markdownResumeEnabled: true, markdownJobEnabled: true, wordEnabled: true } })
-  const dialog = await visible(page.getByRole('dialog', { name: 'Add real resumes', exact: true }))
+  const dialog = await visible(page.getByRole('dialog', { name: 'Add resumes', exact: true }))
   const picker = dialog.getByLabel('Choose resume PDF or Markdown or Word files', { exact: true })
   await page.waitForFunction(() => !document.querySelector('input[type=file]').disabled)
   const accept = (await picker.getAttribute('accept')).split(',')

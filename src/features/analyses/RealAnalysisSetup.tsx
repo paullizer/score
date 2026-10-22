@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { Link, useLocation, useNavigate, useSearchParams } from 'react-router-dom'
-import { ArrowLeft, ArrowRight, BriefcaseBusiness, Check, Layers3, LoaderCircle, RotateCcw, ShieldCheck, Users } from 'lucide-react'
+import { ArrowLeft, ArrowRight, BriefcaseBusiness, Check, Layers3, LoaderCircle, RotateCcw, Users } from 'lucide-react'
 import { useRealAnalyses } from '../../app/real-analyses-context'
 import { useRealResumes } from '../../app/real-resumes-context'
 import { useWorkspace } from '../../app/workspace-context'
@@ -43,31 +43,30 @@ export function RealAnalysisSetup() {
   }, [navigation.error, subscribeTargets])
   useEffect(() => { if (previousId && api?.phase === 'ready') void ensure?.(previousId) }, [api?.phase, ensure, previous?.state, previousId])
   useEffect(() => { if (available) setPrepared(true) }, [available])
-  if (!api || !resumes) return <EmptyState title="Real analyses require a cloud workspace" description="Open this page from an authenticated workspace." />
+  if (!api || !resumes) return <EmptyState title="Analyses require a cloud workspace" description="Open this page from an authenticated workspace." />
   if (navigation.error) return <EmptyState title="Exact selections unavailable in this link" description={navigation.error}
     action={<><Link className="button button-secondary button-md" to="/resumes">Choose ready resumes again</Link><Link className="button button-secondary button-md" to="/analyses/new">Start a separate selection</Link></>} />
-  if (!prepared && ((api.features && !api.features.realAnalyses) || api.creationError)) return <EmptyState title="New real analyses are currently unavailable"
+  if (!prepared && ((api.features && !api.features.realAnalyses) || api.creationError)) return <EmptyState title="New analyses are currently unavailable"
     description={api.creationError ?? 'New-run source dependencies are not ready. Saved history and frozen evidence have separate availability.'}
     action={<><Link className="button button-secondary button-md" to="/analyses">Open saved analyses</Link><Button onClick={() => { void api.refresh(); void resumes.refresh() }}>Check new-run availability</Button></>} />
-  if (!prepared && (api.phase === 'unavailable' || resumes.phase === 'unavailable')) return <EmptyState title="Real analysis inputs are unavailable" description={api.error ?? resumes.error ?? 'This deployment has not enabled real resume and analysis processing.'}
+  if (!prepared && (api.phase === 'unavailable' || resumes.phase === 'unavailable')) return <EmptyState title="Analysis inputs are unavailable" description={api.error ?? resumes.error ?? 'This deployment has not enabled resume and analysis processing.'}
     action={<Button onClick={() => { void api.refresh(); void resumes.refresh() }}>Check availability</Button>} />
-  if (previousId && previous?.state === 'error') return <EmptyState title="The saved real run could not be opened" description={previous.error}
+  if (previousId && previous?.state === 'error') return <EmptyState title="The saved run could not be opened" description={previous.error}
     action={<><Button onClick={() => void ensure?.(previousId, true)}>Retry saved inputs</Button><Link className="button button-secondary button-md" to="/analyses/new">Start a separate selection</Link></>} />
   if (!available && !prepared) return <EmptyState icon={api.error || resumes.error || api.targets.state === 'error' ? Layers3 : LoaderCircle}
-    title={api.error || resumes.error || api.targets.state === 'error' ? 'Real selections could not be loaded' : 'Loading ready resumes and eligible real targets'}
-    description={api.error ?? resumes.error ?? (api.targets.state === 'error' ? api.targets.error : 'Checking every server page for real job rubrics and exact approved GS versions. No cached-only targets are substituted.')}
+    title={api.error || resumes.error || api.targets.state === 'error' ? 'Selections could not be loaded' : 'Loading resumes and targets'}
+    description={api.error ?? resumes.error ?? (api.targets.state === 'error' ? api.targets.error : 'Loading eligible job rubrics and approved GS versions.')}
     action={<Button onClick={() => { void api.refresh(); void api.refreshTargets(); void resumes.refresh(); if (previousId) void ensure?.(previousId, true) }}>Retry selections</Button>} />
-  return <RealAnalysisBuilder previous={previous?.state === 'ready' ? previous.value : undefined} params={navigation.params} fragment={location.hash} transferred={navigation.transferred} />
+  return <RealAnalysisBuilder previous={previous?.state === 'ready' ? previous.value : undefined} params={navigation.params} fragment={location.hash} />
 }
 
-function RealAnalysisBuilder({ previous, params, fragment, transferred }: {
-  previous?: RealAnalysisRunDetail; params: URLSearchParams; fragment: string; transferred: boolean
+function RealAnalysisBuilder({ previous, params, fragment }: {
+  previous?: RealAnalysisRunDetail; params: URLSearchParams; fragment: string
 }) {
   const api = useRealAnalyses()!
   const resumeApi = useRealResumes()!
   const { workspace } = useWorkspace()
   const approvals = useRubricApprovals()
-  const approvalRequired = approvals.required
   const unapprovedJobRubrics = approvals.pending.filter((rubric) => !approvals.forRubric(rubric).approval).length
   const { canEdit } = useLifecycleAccess(previous ? { kind: 'analysis', id: previous.run.id } : undefined)
   const navigate = useNavigate()
@@ -165,15 +164,13 @@ function RealAnalysisBuilder({ previous, params, fragment, transferred }: {
   }
 
   return <>
-    <Link className="back-link" to="/analyses"><ArrowLeft size={14} aria-hidden="true" />Back to real analyses</Link>
-    <PageHeader eyebrow="MANUAL, EVIDENCE-LED REVIEW" title="Build a real analysis" description="Select ready real resumes and exact saved job or approved GS targets. Nothing runs until you choose Run analysis."
+    <Link className="back-link" to="/analyses"><ArrowLeft size={14} aria-hidden="true" />Back to analyses</Link>
+    <PageHeader title="New analysis" description="Select resumes and job or GS grade targets to compare."
       actions={<Button icon={RotateCcw} disabled={starting} onClick={() => { void api.refreshTargets(); void resumeApi.refresh() }}>Refresh available inputs</Button>} />
     <LifecycleBanner target={previous ? { kind: 'analysis', id: previous.run.id } : undefined} />
     {previous && !canEdit && <InlineError>This saved analysis is read-only. Unarchive it and its workspace before creating a run from its selections, or open a separate analysis with active inputs.</InlineError>}
-    {transferred && <div className="info-callout mb-5"><Layers3 size={18} aria-hidden="true" /><div><strong>All exact selections were transferred with this navigation.</strong>
-      <p>The URL stays short; this history entry carries only IDs, versions, and hashes. A copied URL without that state cannot restore the selection. After you manually create a run, its saved-run link can be reopened normally.</p></div></div>}
-    {previous && <div className="info-callout mb-5"><Layers3 size={18} aria-hidden="true" /><div><strong>A new run, with reviewable selections.</strong>
-      <p>These are the saved inputs of “{getDisplayName(previous.run, previous.run.name)}”, not silently updated versions. Eligible historical job rubrics stay selected; newer saved versions are identified separately below. Changed or unavailable inputs require explicit review. Retry on the old run always reuses its original snapshots.</p></div></div>}
+    {previous && <div className="info-callout mb-5"><Layers3 size={18} aria-hidden="true" /><div><strong>Starting from “{getDisplayName(previous.run, previous.run.name)}”</strong>
+      <p>Review or adjust the selected resumes and targets before running.</p></div></div>}
     {unavailable && <div className="mb-5"><InlineError>{api.creationError ?? api.error ?? resumeApi.error ?? (api.targets.state === 'error' || api.targets.state === 'ready' ? api.targets.error : undefined) ?? 'Input availability is not confirmed. Refresh before submitting.'} Your selection has been kept.</InlineError></div>}
     {!api.canWrite && <div className="info-callout mb-5"><p>This workspace is read-only. Only an owner or editor can run, retry, or cancel an analysis.</p></div>}
     {(draft.errors.length > 0 || duplicateInputs) && <div className="mb-5"><InlineError>{draft.errors.map((message) => <p key={message}>{message}</p>)}
@@ -181,9 +178,9 @@ function RealAnalysisBuilder({ previous, params, fragment, transferred }: {
       <Button size="sm" disabled={locked} onClick={() => setDraft({ resumes: [], targets: [], errors: [] })}>Clear requested selections</Button></InlineError></div>}
     <div className="analysis-builder">
       <div className="space-y-5">
-        <section className="panel"><div className="section-heading"><div><StepLabel number={1} complete={draft.resumes.length > 0}>Choose ready real resumes</StepLabel><p>Missing profile metadata is not replaced by filenames.</p></div><Badge>{draft.resumes.length} selected</Badge></div>
+        <section className="panel"><div className="section-heading"><div><StepLabel number={1} complete={draft.resumes.length > 0}>Choose resumes</StepLabel></div><Badge>{draft.resumes.length} selected</Badge></div>
           <div className="library-toolbar"><SearchField value={resumeSearch} onChange={setResumeSearch} placeholder="Search labels, stated names, or sources…" label="Search analysis resumes" />
-            <ArchiveStateFilter value={resumeArchiveFilter} onChange={setResumeArchiveFilter} label="Real resume input archive state" />
+            <ArchiveStateFilter value={resumeArchiveFilter} onChange={setResumeArchiveFilter} label="Resume archive state" />
             <Button size="sm" variant="ghost" disabled={locked || !canEdit || !api.canWrite || !shownResumes.some(resumeReady)} onClick={() => {
               const visible = shownResumes.filter(resumeReady)
               setDraft((current) => {
@@ -202,18 +199,16 @@ function RealAnalysisBuilder({ previous, params, fragment, transferred }: {
                 <span className="row-meta block">{summary.resume.role ?? 'Role not stated'}</span><span className="row-meta block break-all">{summary.source.displayName}</span>
                 <div className="mt-2"><Badge tone={resumeReady(summary) ? 'success' : 'warning'}>{summary.resume.status}{summary.documentRef ? ` · document v${summary.documentRef.documentVersion}` : ''}</Badge><ArchivedBadge target={{ kind: 'resume', id: summary.resume.id }} /></div></div>
             </label>)}
-            {!shownResumes.length && <div className="col-span-full"><EmptyState title="No real resumes to show" description="Search or change the archive filter to inspect retained inputs. Only active, ready real sources can start new analyses; supported PDF, Markdown, Word and public URL imports remain in the real resume library."
-              action={<Link className="button button-secondary button-md" to="/resumes">Open real resumes</Link>} /></div>}
+            {!shownResumes.length && <div className="col-span-full"><EmptyState title="No resumes to show" description="Import resumes or adjust your search and archive filters."
+              action={<Link className="button button-secondary button-md" to="/resumes">Open resumes</Link>} /></div>}
           </div>
-          <div className="border-t px-5 py-3 text-[11px] text-muted">{ready.length} ready · public profiles may be sparse · imports do not automatically run analyses</div>
+          <div className="border-t px-5 py-3 text-[11px] text-muted">{ready.length} ready</div>
         </section>
-        <section className="panel"><div className="section-heading"><div><StepLabel number={2} complete={draft.targets.length > 0}>Choose exact real targets</StepLabel><p>{approvalRequired
-          ? 'Approved job rubric versions and approved GS targets, not only previously opened rubrics. Each selected version is a separate target.'
-          : 'All eligible saved job versions and approved GS targets, not only previously opened rubrics. Each selected version is a separate target.'}</p></div><Badge>{draft.targets.length} selected</Badge></div>
-          <div className="library-toolbar"><SegmentedControl label="Real target type" value={targetType} onChange={setTargetType}
-            options={[{ value: 'job', label: 'Real jobs', count: activeTargets.filter((target) => target.kind === 'job').length }, { value: 'grade', label: 'Approved GS versions', count: activeTargets.filter((target) => target.kind === 'grade').length }]} />
-            <SearchField value={targetSearch} onChange={setTargetSearch} placeholder="Search eligible targets…" label="Search real analysis targets" />
-            <ArchiveStateFilter value={targetArchiveFilter} onChange={setTargetArchiveFilter} label="Real target input archive state" /></div>
+        <section className="panel"><div className="section-heading"><div><StepLabel number={2} complete={draft.targets.length > 0}>Choose targets</StepLabel></div><Badge>{draft.targets.length} selected</Badge></div>
+          <div className="library-toolbar"><SegmentedControl label="Target type" value={targetType} onChange={setTargetType}
+            options={[{ value: 'job', label: 'Jobs', count: activeTargets.filter((target) => target.kind === 'job').length }, { value: 'grade', label: 'Approved GS grades', count: activeTargets.filter((target) => target.kind === 'grade').length }]} />
+            <SearchField value={targetSearch} onChange={setTargetSearch} placeholder="Search eligible targets…" label="Search analysis targets" />
+            <ArchiveStateFilter value={targetArchiveFilter} onChange={setTargetArchiveFilter} label="Target archive state" /></div>
           {targetType === 'job' && <div className="px-5 pt-3"><PendingRubricNotice /></div>}
           <div className="builder-options">{shownTargets.map((target) => <label className="selection-card" key={target.id}>
             <input type="checkbox" checked={draft.targets.some((item) => item.id === targetIdentity(target.selection))} disabled={locked || !canEdit || !api.canWrite || !realTargetAvailable(workspace, target.selection)}
@@ -276,11 +271,10 @@ function RealAnalysisBuilder({ previous, params, fragment, transferred }: {
           <label className="field"><span className="field-label">Analysis name (optional)</span><input className="input" value={name} maxLength={DISPLAY_NAME_MAX_LENGTH} disabled={locked || !canEdit || !api.canWrite}
             onChange={(event) => setName(event.target.value)} placeholder={attempt?.input.name ?? suggestedName} /></label>
           <p className="break-words text-[11px] text-muted">{attempt ? `Trying again uses the name “${attempt.input.name}”. To edit it, choose Change selections.` : `Leave blank to use “${suggestedName}”. Your own name will not change when selections change.`}</p>
-          <div className="space-y-3 border-y py-4"><div className="metric-line"><span>Real resumes</span><strong>{draft.resumes.length}</strong></div><div className="metric-line"><span>Job rubrics</span><strong>{jobs}</strong></div><div className="metric-line"><span>Approved GS versions</span><strong>{grades}</strong></div></div>
+          <div className="space-y-3 border-y py-4"><div className="metric-line"><span>Resumes</span><strong>{draft.resumes.length}</strong></div><div className="metric-line"><span>Job rubrics</span><strong>{jobs}</strong></div><div className="metric-line"><span>Approved GS versions</span><strong>{grades}</strong></div></div>
           <div className="comparison-count" aria-live="polite"><strong>{count}</strong><span>individual comparisons<small>{retainedAttempt ? 'Original submitted count. No truncation.' : `Maximum ${limit}. No truncation.`}</small></span></div>
           {!retainedAttempt && count > limit && <InlineError>{count} comparisons exceeds the {limit}-comparison limit. Remove resumes or targets explicitly before running.</InlineError>}
           {mixedVersions && <p className="text-[11px] text-muted" role="note">{mixedVersions}</p>}
-          <p className="text-[11px] text-muted">Each pair is independent. Saved documents, versions, approvals, and source sets are frozen. Criterion assessments use real evidence; limited coverage can withhold the total. There is no cross-job ranking.</p>
           {error && <InlineError>{error}</InlineError>}
           {attempt && !starting && <div className="space-y-3 text-[11px] text-muted"><p>Trying again sends the exact same request, so it can’t start a second copy or switch to newer versions of your inputs.</p>
             <Button size="sm" disabled={starting} onClick={() => { setAttempt(null); setError(''); void api.refresh(); void api.refreshTargets() }}>Change selections</Button></div>}
@@ -288,7 +282,6 @@ function RealAnalysisBuilder({ previous, params, fragment, transferred }: {
             disabled={starting || !canEdit || !api.canWrite || submissionUnavailable || (!attempt && (invalid || !draft.resumes.length || !draft.targets.length || count > limit))}
             onClick={() => void run()}>{starting ? 'Starting analysis…' : attempt ? 'Try again' : 'Run analysis'}</Button>
           {starting && <p className="text-[11px] text-muted" role="status">Setting up {count} {count === 1 ? 'comparison' : 'comparisons'}. Large analyses can take a minute or two, so keep this page open. If the connection drops, Score tries again on its own.</p>}
-          <div className="flex items-start gap-2 text-[10px] text-muted"><ShieldCheck size={15} className="shrink-0" aria-hidden="true" /><p>Human review only. Evidence gaps are not proof of missing skills. GS qualifications stay unscored and are not official eligibility decisions.</p></div>
         </div>
       </aside>
     </div>

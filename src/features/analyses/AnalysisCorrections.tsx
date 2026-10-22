@@ -2,7 +2,7 @@ import { useCallback, useEffect, useId, useMemo, useRef, useState } from 'react'
 import { History, LoaderCircle, RotateCcw, ShieldCheck, X } from 'lucide-react'
 import { useRealAnalyses, type RealAnalysesContextValue } from '../../app/real-analyses-context'
 import { useWorkspace } from '../../app/workspace-context'
-import { usePublicSettings } from '../../app/public-settings-context'
+import { useAiTerminology, usePublicSettings } from '../../app/public-settings-context'
 import { useLifecycleAccess } from '../../components/lifecycle/useLifecycleAccess'
 import { Badge, Button, InlineError, Modal, Score } from '../../components/ui'
 import {
@@ -320,6 +320,7 @@ function CorrectionReviewDialog({ runId, comparisons, initialCorrection, onClose
   const monitor = useCorrectionMonitor(access, runId, comparisons)
   const monitorRef = useRef(monitor)
   monitorRef.current = monitor
+  const terms = useAiTerminology()
   const fieldId = useId()
   const [rows, setRows] = useState<ReviewRow[]>(() => comparisons.map(summary => ({
     summary, preview: null, selected: false, loading: true, phase: 'review', error: '',
@@ -524,17 +525,17 @@ function CorrectionReviewDialog({ runId, comparisons, initialCorrection, onClose
         <label className="flex items-start gap-3"><input type="radio" className="mt-1" name={`${fieldId}-action`} checked={!reassess}
           onChange={() => choose('missing-evidence')} />
           <span><strong>Record verified missing evidence as 0 / 5</strong><span className="mt-1 block text-muted">
-            Keeps the saved assessment and existing numeric scores. AI verifies only the selected evidence gaps; each confirmed gap becomes 0 / 5 at its original weight.
+            {terms.text('Keeps the saved assessment and existing numeric scores. AI verifies only the selected evidence gaps; each confirmed gap becomes 0 / 5 at its original weight.')}
           </span></span></label>
       </fieldset>
-      {reassess ? <p className="text-[12px]">Opening this preview applies nothing, and no total can be predicted before the AI runs.
+      {reassess ? <p className="text-[12px]">{terms.text('Opening this preview applies nothing, and no total can be predicted before the AI runs.')}
         {' '}Under {ANALYSIS_REASSESSMENT_POLICY_VERSION}, only this comparison moves to the current rules; the other comparisons in this run keep the rules they were scored with.
         {' '}A re-score can still withhold the total when the evidence genuinely cannot be assessed. Unreadable sources, protected traits, and failed processing are never scored as zeros.
         {' '}If the re-score fails or does not pass grounding review, the current result stays in place. The original scores, rationale, source evidence, and history are retained.</p>
         : <><p className="text-[12px]">Only missing professional evidence in a successfully reviewed source may become <strong>0 / 5</strong>.
           {' '}Unreadable sources, protected traits, failed processing, and genuine interpretation blockers must remain unscored. Existing numeric scores and weights are unchanged.</p>
         <p className="text-[12px]">Opening this preview applies nothing. The original scores, rationale, source evidence, and history are retained.
-          {' '}For {ANALYSIS_CORRECTION_POLICY_VERSION}, AI verifies <strong>only the selected evidence gaps</strong>, not the whole assessment or unchanged numeric scores.
+          {' '}For {ANALYSIS_CORRECTION_POLICY_VERSION}, {terms.ai} verifies <strong>only the selected evidence gaps</strong>, not the whole assessment or unchanged numeric scores.
           {' '}Once every selected gap is confirmed missing, the server automatically publishes zeros at their original weights.
           {' '}Supporting evidence, genuine blockers, or processing and publication failures still prevent publication. Legacy requests retain full-assessment grounding review.</p></>}
       <p className="text-[11px] text-muted">Summary failures are separate and are not repaired by substituting scores. Private failure findings load only when opened, one comparison at a time.</p>
@@ -577,11 +578,11 @@ function CorrectionReviewDialog({ runId, comparisons, initialCorrection, onClose
                 : `Not eligible: ${row.preview.reassessment.blockedReason}`}</p>
               : <p><strong>Preview policy: {row.preview.policyVersion}.</strong>{' '}
                 {row.preview.policyVersion === ANALYSIS_CORRECTION_POLICY_VERSION
-                  ? 'Confirming authorizes selected-gap AI verification, then automatic server publication if every gap is confirmed missing. Existing numeric scores are not reapproved.'
+                  ? terms.text('Confirming authorizes selected-gap AI verification, then automatic server publication if every gap is confirmed missing. Existing numeric scores are not reapproved.')
                   : 'This legacy proposal requires a fresh full-assessment grounding review before it can publish.'}</p>}
             <div className="grid gap-4 sm:grid-cols-2"><div><h3 className="mb-2 font-semibold">Current saved result before this request</h3><SummaryValue summary={row.preview.before} /></div>
               <div><h3 className="mb-2 font-semibold">{reassess ? 'After the re-score' : 'Server preview — not published'}</h3>{reassess
-                ? <p>{row.preview.reassessment.eligible ? 'Determined by the re-score. No total is predicted before the AI runs.' : 'No re-score is available for this comparison.'}</p>
+                ? <p>{row.preview.reassessment.eligible ? terms.text('Determined by the re-score. No total is predicted before the AI runs.') : 'No re-score is available for this comparison.'}</p>
                 : row.preview.after ? <SummaryValue summary={row.preview.after} /> : <p>No selectable missing-evidence correction.</p>}</div></div>
             <ul className="space-y-3">{row.preview.criteria.map(criterion => <li key={criterion.criterionId} className="rounded-lg border p-3">
               <h4 className="font-semibold">{criterion.label} · {criterion.weight}% weight</h4>
@@ -632,8 +633,8 @@ function CorrectionReviewDialog({ runId, comparisons, initialCorrection, onClose
         checked={confirmed} disabled={!access.writable || submitting || awaitingPreview > 0 || selected.length === 0}
         onChange={event => setConfirmed(event.target.checked)} />
         <span>I reviewed all {selected.length} selected comparisons, {reassess ? 'their eligibility, and their current saved totals' : 'their affected criteria, blocked reasons, and server preview totals'}.
-          {reassess && selected.length > 0 && <> I authorize a full AI re-score of each selected comparison with the current rules and automatic server publication of any new result that passes grounding review, even if it changes existing numeric scores or still withholds the total.</>}
-          {scopedSelection && <> I authorize AI verification of only the selected evidence gaps and automatic server publication after every selected gap is confirmed missing, at original weights and without changing existing numeric scores.</>}
+          {reassess && selected.length > 0 && <> {terms.text('I authorize a full AI re-score of each selected comparison with the current rules and automatic server publication of any new result that passes grounding review, even if it changes existing numeric scores or still withholds the total.')}</>}
+          {scopedSelection && <> {terms.text('I authorize AI verification of only the selected evidence gaps and automatic server publication after every selected gap is confirmed missing, at original weights and without changing existing numeric scores.')}</>}
           {legacySelection && <> For selected legacy proposals, I authorize full-assessment grounding review; only a supported full review may publish.</>}
           {' '}Original source evidence and history must be retained. Confirmation or acknowledgement alone is not publication.</span>
       </label>
@@ -767,6 +768,7 @@ function CorrectionFailureFindings({ access, runId, correction, originalSha256, 
   access: Access; runId: string; correction: AnalysisCorrectionSummary; originalSha256?: string
   criterionLabels: Record<string, string>; onClose: () => void
 }) {
+  const terms = useAiTerminology()
   const current = useRef({ access, correction })
   current.current = { access, correction }
   const [entry, setEntry] = useState<AnalysisCorrectionHistoryPage['entries'][number] | null>(null)
@@ -817,7 +819,7 @@ function CorrectionFailureFindings({ access, runId, correction, originalSha256, 
     {entry && <>
       <p>Checkpoint saved {dateLabel(entry.createdAt)} · {entry.id}</p>
       {entry.review ? <CorrectionReviewFindings review={entry.review} policyVersion={entry.policyVersion} criterionLabels={criterionLabels} />
-        : <p>No AI review findings were saved for this request. Processing stopped without a recorded review; this is not an approval.</p>}
+        : <p>{terms.text('No AI review findings were saved for this request. Processing stopped without a recorded review; this is not an approval.')}</p>}
       {entry.error && <InlineError>{entry.error.stage} · {entry.error.code}: {entry.error.message}</InlineError>}
     </>}
     <p className="text-[11px] text-muted">Only the latest bounded history page was read. This view does not retry, rescore, or publish anything.</p>
@@ -827,6 +829,7 @@ function CorrectionFailureFindings({ access, runId, correction, originalSha256, 
 function CorrectionHistory({ runId, comparisonId, criterionLabels, originalSha256 }: {
   runId: string; comparisonId: string; criterionLabels: Record<string, string>; originalSha256?: string
 }) {
+  const terms = useAiTerminology()
   const access = useCorrectionAccess(runId)
   const current = useRef(access)
   current.current = access
@@ -926,7 +929,7 @@ function CorrectionHistory({ runId, comparisonId, criterionLabels, originalSha25
         {entry.review ? <CorrectionReviewFindings review={entry.review} policyVersion={entry.policyVersion} criterionLabels={criterionLabels} />
           : <p>{reassessed
             ? 'No independent grounding review was saved for this re-score. The saved processing error explains why it stopped; this is not an approval.'
-            : 'No AI verification or grounding review was recorded for this proposal. This is not an approval.'}</p>}
+            : terms.text('No AI verification or grounding review was recorded for this proposal. This is not an approval.')}</p>}
         {entry.error && <InlineError>{entry.error.stage} · {entry.error.code}: {entry.error.message}</InlineError>}
         {entry.outcome === 'ready' && entry.resultSha256 && <HistoricalCandidateNarrative runId={runId} comparisonId={comparisonId}
           resultRevisionId={entry.requestId} resultSha256={entry.resultSha256} label={reassessed ? 're-score revision narrative' : 'correction revision narrative'} />}

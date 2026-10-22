@@ -10,7 +10,6 @@ import { useGradeLeaveGuard } from '../../app/grade-navigation-context'
 import { Badge, Button, EmptyState, InlineError, Modal, PageHeader } from '../../components/ui'
 import type { GradeContext } from '../../domain/real-grades'
 import { GradeContextFields } from './GradeContextFields'
-import { GradeDisclaimer } from './GradeShared'
 import { contextErrors, gradeLadderLink } from './gradeUi'
 import { useGradeRequestKey } from './grade-request-hooks'
 import { isEntityArchived } from '../../domain/lifecycle'
@@ -91,25 +90,24 @@ export function CreateGradeLadder() {
     }
   }
 
-  if (!api || api.phase === 'unavailable') return <EmptyState icon={Layers3} title="Real grade ladders are unavailable" description="Open an authenticated workspace with grade processing enabled." action={<Link className="button button-secondary button-md" to="/rubrics?kind=grade">Back to rubrics</Link>} />
+  if (!api || api.phase === 'unavailable') return <EmptyState icon={Layers3} title="Grade ladders are unavailable" description="Open an authenticated workspace with grade processing enabled." action={<Link className="button button-secondary button-md" to="/rubrics?kind=grade">Back to rubrics</Link>} />
   const disabled = !api.canWrite || saving || api.mutationPending || api.phase !== 'ready' || !api.features?.realGradeLadders || Boolean(policyReason)
   const close = () => { void guard.close(() => navigate('/rubrics?kind=grade', { replace: true })) }
   return <>
-    <PageHeader eyebrow="PRIVATE GS GRADE LIBRARY" title="Create a grade ladder" description="Start from a saved real job, not an inferred occupational series." />
+    <PageHeader title="Create a grade ladder" />
     <LifecycleBanner />
-    <GradeDisclaimer />
     <Modal open onOpenChange={(open) => { if (!open) close() }} title="Create grade ladder" description="Capture a seed job and saved rubric version. Automatic OPM discovery continues durably on the server." wide
       footer={<><Button onClick={close}>Cancel</Button><Button variant="primary" type="submit" form="create-grade-ladder" icon={saving ? LoaderCircle : Layers3} disabled={disabled || !job || !selectedRubric}>{saving ? 'Capturing seed…' : 'Create and discover sources'}</Button></>}>
       {!api.canWrite && <InlineError>This workspace is read-only. An owner or editor can create a ladder.</InlineError>}
       {policyReason && <InlineError>{policyReason}</InlineError>}
       {api.error && <InlineError>{api.error} <button className="underline" onClick={() => void api.refresh()}>Retry availability</button></InlineError>}
-      {jobId && !job && <InlineError>The requested seed is archived, missing, or has no active rubric. Choose an active, ready real job. Archived selections from old links are not accepted.</InlineError>}
+      {jobId && !job && <InlineError>The requested seed is archived, missing, or has no active rubric. Choose an active, ready job. Archived selections from old links are not accepted.</InlineError>}
       <form id="create-grade-ladder" onSubmit={submit} noValidate className="space-y-5">
         <fieldset disabled={disabled} className="space-y-4">
-          <label className="field"><span className="field-label">Ready real job</span><select className="input" aria-label="Ready real job" value={jobId} required onChange={(event) => { setJobId(event.target.value); setRubricId(''); setRubricVersion(0); setSeedConfirmed(false); setDirty(true) }}>
-            <option value="">Choose a ready real job</option>{jobs.map((item) => <option key={item.id} value={item.id}>{item.title} · {item.organization}</option>)}
-          </select><span className="field-hint">Archived jobs or rubrics and unfinished imports cannot seed a real grade ladder.</span></label>
-          {!jobs.length && <p className="text-[12px] text-muted">{cloud?.realJobs.phase === 'loading' ? 'Loading real jobs…' : 'Import a real job and wait for its source-grounded rubric before starting.'}</p>}
+          <label className="field"><span className="field-label">Seed job</span><select className="input" aria-label="Ready real job" value={jobId} required onChange={(event) => { setJobId(event.target.value); setRubricId(''); setRubricVersion(0); setSeedConfirmed(false); setDirty(true) }}>
+            <option value="">Choose a ready job</option>{jobs.map((item) => <option key={item.id} value={item.id}>{item.title} · {item.organization}</option>)}
+          </select><span className="field-hint">Archived jobs or rubrics and unfinished imports cannot seed a grade ladder.</span></label>
+          {!jobs.length && <p className="text-[12px] text-muted">{cloud?.realJobs.phase === 'loading' ? 'Loading jobs…' : 'Import a job and wait for its rubric before starting.'}</p>}
           {jobId && detail?.state === 'error' && <InlineError>{detail.error}<button type="button" className="ml-2 underline" onClick={() => void ensureJob?.(jobId, true)}>Retry seed loading</button></InlineError>}
           {jobId && detail?.state !== 'ready' && detail?.state !== 'error' && <p role="status" className="text-[12px] text-muted">Loading the captured job source and saved rubric versions…</p>}
           {job && detail?.state === 'ready' && approvalRequired && !approval && <InlineError>This job’s rubric isn’t approved yet, so it can’t seed a ladder. A workspace owner approves it on the <Link className="underline" to={`/jobs/${job.id}`}>job page</Link>.</InlineError>}
@@ -120,7 +118,7 @@ export function CreateGradeLadder() {
           }}>
             {seedVersions.map((rubric) => <option key={`${rubric.id}:${rubric.version}`} value={`${rubric.id}:${rubric.version}`}>v{rubric.version} · {rubric.name}{isApproved(rubric) ? ' · approved' : ''}</option>)}
           </select>{approvalRequired && <span className="field-hint">Only the approved version can seed a ladder while Admin settings require approved job rubrics.</span>}</label>}
-          {selectedRubric && <div className="grade-seed-summary"><Badge tone="accent">Real seed · v{selectedRubric.version}</Badge><p>{selectedRubric.criteria.length} source-linked criteria. This exact saved version, job, and original evidence are captured without changing the job rubric.</p></div>}
+          {selectedRubric && <div className="grade-seed-summary"><Badge tone="accent">Seed · v{selectedRubric.version}</Badge><p>{selectedRubric.criteria.length} source-linked criteria. This exact saved version, job, and original evidence are captured without changing the job rubric.</p></div>}
           <label className="check-label"><input type="checkbox" checked={seedConfirmed} disabled={!selectedRubric} onChange={(event) => { setSeedConfirmed(event.target.checked); setDirty(true) }} />I confirm this saved job/rubric version as the seed.</label>
         </fieldset>
         <GradeContextFields name={name} context={context} grades={grades} disabled={disabled}

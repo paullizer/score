@@ -466,7 +466,7 @@ test('real HTML source rendering uses captured sections, actual text, and never 
   const html = renderToStaticMarkup(React.createElement(ui.DocumentViewer, {
     document: detail().document, pagination: 'html-sections', highlightedId: 'resume-p1', quote: 'accessible project documentation',
   }))
-  assert.match(html, /Actual source/)
+  assert.match(html, /Source document · v1/)
   assert.match(html, /Captured HTML section 1 of 1/)
   assert.match(html, /<mark>accessible project documentation<\/mark>/)
   assert.doesNotMatch(html, /Original page|Sample content|Fictional/)

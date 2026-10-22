@@ -30,3 +30,11 @@ export function analysisEvidenceCorrectionsEnabled(settings: Pick<AdminSettings,
 export function rubricApprovalRequired(settings: Pick<AdminSettings, 'features'>): boolean {
   return settings.features.rubricApprovalRequired !== false
 }
+
+/**
+ * Off unless an administrator turned it on; revisions saved before the switch existed omit the key. While on, user-facing
+ * AI labels and assistant references switch to SI (Superintelligence) terminology.
+ */
+export function siTerminologyEnabled(settings?: { features?: { siTerminology?: boolean } } | null): boolean {
+  return settings?.features?.siTerminology === true
+}

@@ -17,14 +17,14 @@ const scoreOption = { key: 'score', label: 'Evidence match', ascendingLabel: 'lo
 
 export const realAnalysisSortOptions: readonly TableSortOption<RealAnalysisSortKey>[] = [
   nameOption, statusOption,
-  { key: 'comparisons', label: 'Independent comparisons', ascendingLabel: 'fewest first', descendingLabel: 'most first' },
+  { key: 'comparisons', label: 'Comparisons', ascendingLabel: 'fewest first', descendingLabel: 'most first' },
   createdOption,
 ]
 
 export const realComparisonSortOptions: readonly TableSortOption<RealComparisonSortKey>[] = [
-  { ...nameOption, label: 'Saved resume' },
-  { key: 'target', label: 'Exact target', ascendingLabel: 'A to Z', descendingLabel: 'Z to A' },
-  { ...scoreOption, label: 'Assessment / evidence match' },
+  { ...nameOption, label: 'Resume' },
+  { key: 'target', label: 'Target', ascendingLabel: 'A to Z', descendingLabel: 'Z to A' },
+  { ...scoreOption, label: 'Score' },
   { ...statusOption, label: 'Status / actions' },
 ]
 

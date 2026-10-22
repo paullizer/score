@@ -1,7 +1,7 @@
 import { useEffect, useId, useMemo, useRef, useState, type FormEvent, type ReactNode } from 'react'
 import { FileText, History, Plus, Save, ShieldCheck, Sparkles, Trash2 } from 'lucide-react'
 import { useWorkspace } from '../../app/workspace-context'
-import { usePublicSettings } from '../../app/public-settings-context'
+import { useAiTerminology, usePublicSettings } from '../../app/public-settings-context'
 import { useGradeLeaveGuard } from '../../app/grade-navigation-context'
 import { Badge, Button, InlineError, Modal } from '../../components/ui'
 import { DocumentViewer } from '../../components/documents/DocumentViewer'
@@ -65,13 +65,14 @@ function normalizedDraft(draft: Rubric): Rubric {
 export function RubricEditor({ rubric, onClose, onSaved, initialPanel = null, initialFocusCriterionId = null, initialAssistInstruction = null }: {
   rubric: Rubric
   onClose: () => void
-  onSaved: (id: string) => void
+  onSaved: (id: string, savedRubric?: Rubric) => void
   initialPanel?: 'assist' | 'source' | 'changes' | null
   initialFocusCriterionId?: string | null
   initialAssistInstruction?: string | null
 }) {
   const { workspace, saveRubric, cloud } = useWorkspace()
   const { settings } = usePublicSettings()
+  const terms = useAiTerminology()
   const { canEdit } = useLifecycleAccess({ kind: 'rubric', id: rubric.groupId })
   const session = useEditSession({ baseline: rubric, adapter: rubricEditAdapter })
   const draftRef = useRef(session.draft)
@@ -97,9 +98,9 @@ export function RubricEditor({ rubric, onClose, onSaved, initialPanel = null, in
   const pagination = documentPagination(source?.originalContentType ?? (job && isUploadFormat(job.source) ? UPLOAD_CONTENT_TYPES[job.source] : undefined))
   const assistantAvailable = Boolean(job && document && detail?.state === 'ready' && cloud.realJobs.features?.rubricAssistant && canEdit)
   const assistantUnavailableReason = job && canEdit && !assistantAvailable
-    ? detail?.state !== 'ready' ? 'Load this real job before asking AI assist.'
-    : !cloud.realJobs.features?.rubricAssistant ? 'AI assist is not available for this workspace right now.'
-    : !document ? 'Load the job posting before asking AI assist.' : null
+    ? detail?.state !== 'ready' ? terms.text('Load this real job before asking AI assist.')
+    : !cloud.realJobs.features?.rubricAssistant ? terms.text('AI assist is not available for this workspace right now.')
+    : !document ? terms.text('Load the job posting before asking AI assist.') : null
     : null
   const maxCriteria = Math.min(20, settings?.rubrics.jobs.maxCriteria ?? cloud.realJobs.features?.limits?.maxCriteria ?? 20)
   const scaled = Boolean(session.draft.scaleVersion)
@@ -159,7 +160,7 @@ export function RubricEditor({ rubric, onClose, onSaved, initialPanel = null, in
       session.applyAssist(next, { keys, note: summary, turnId: turn.id })
       draftRef.current = next
       const criteriaCount = new Set(keys.map((key) => /^criterion:([^:]+)/.exec(key)?.[1]).filter(Boolean)).size
-      setLiveMessage(`AI assist made ${changes.length} ${changes.length === 1 ? 'change' : 'changes'}${criteriaCount ? ` across ${criteriaCount} ${criteriaCount === 1 ? 'criterion' : 'criteria'}` : ''}. Review the highlighted fields.`)
+      setLiveMessage(`${terms.assistantName} made ${changes.length} ${changes.length === 1 ? 'change' : 'changes'}${criteriaCount ? ` across ${criteriaCount} ${criteriaCount === 1 ? 'criterion' : 'criteria'}` : ''}. Review the highlighted fields.`)
       setConfirmingAiSave(false)
       return { outcome: response.outcome, reply: response.reply, changes, warnings: response.warnings ?? [], replaySummary: summary }
     },
@@ -305,12 +306,17 @@ export function RubricEditor({ rubric, onClose, onSaved, initialPanel = null, in
     guard.hold()
     setSaving(true)
     try {
+      const nextRubric: Rubric = {
+        ...savedDraft,
+        version: rubric.version + 1,
+        ...(session.draft.provenance ? { provenance: { ...session.draft.provenance, kind: 'edited' as const } } : {}),
+      }
       const id = await saveRubric({
         ...savedDraft,
         ...(session.draft.provenance ? { provenance: { ...session.draft.provenance, kind: 'edited' as const } } : {}),
       })
       guard.release()
-      onSaved(id)
+      onSaved(id, nextRubric)
     } catch (caught) {
       guard.settle()
       setError(caught instanceof Error ? caught.message : 'The rubric could not be saved. Your edits are still here; try again.')
@@ -348,10 +354,10 @@ export function RubricEditor({ rubric, onClose, onSaved, initialPanel = null, in
       <legend className="px-1 text-[11px] font-semibold text-muted">Criterion {String(index + 1).padStart(2, '0')}</legend>
       <div className="mb-4 flex flex-wrap items-center justify-between gap-2">
         <div className="flex flex-wrap items-center gap-2">
-          {addedBy && <Badge tone={addedBy === 'ai' ? 'accent' : 'neutral'}>New · {addedBy === 'ai' ? 'AI assist' : 'You'}</Badge>}
+          {addedBy && <Badge tone={addedBy === 'ai' ? 'accent' : 'neutral'}>New · {addedBy === 'ai' ? terms.assistBadge : 'You'}</Badge>}
         </div>
         <div className="flex flex-wrap items-center gap-2">
-          {assistantAvailable && <Button icon={Sparkles} size="sm" variant="ghost" aria-label={`Ask AI about criterion ${index + 1}`} onClick={() => { setFocusCriterionId(criterion.id); setActivePanel('assist') }}>Ask AI</Button>}
+          {assistantAvailable && <Button icon={Sparkles} size="sm" variant="ghost" aria-label={`${terms.askAi} about criterion ${index + 1}`} onClick={() => { setFocusCriterionId(criterion.id); setActivePanel('assist') }}>{terms.askAi}</Button>}
           <Button icon={Trash2} size="sm" variant="ghost" disabled={session.draft.criteria.length === 1 || locked} aria-label={`Remove criterion ${index + 1}${criterion.label ? `, ${criterion.label}` : ''}`} title={session.draft.criteria.length === 1 ? 'Keep at least one criterion.' : undefined} onClick={() => removeCriterion(criterion.id)}>Remove</Button>
         </div>
       </div>
@@ -377,7 +383,7 @@ export function RubricEditor({ rubric, onClose, onSaved, initialPanel = null, in
   const removedChanges = session.changes.filter((change) => change.kind === 'removed')
   const mainForm = <form id={formId} onSubmit={save} noValidate aria-describedby={(attempted && errors.length > 0) || error ? errorsId : undefined}>
     <fieldset disabled={locked} className="space-y-5">
-      {assistantAvailable && <div className="flex justify-end"><Button size="sm" variant="ghost" icon={Sparkles} onClick={() => setActivePanel('assist')}>AI assist</Button></div>}
+      {assistantAvailable && <div className="flex justify-end"><Button size="sm" variant="ghost" icon={Sparkles} onClick={() => setActivePanel('assist')}>{terms.assistBadge}</Button></div>}
       {changedField(RUBRIC_NAME_KEY, 'Rubric name', describedBy => <label className="field"><span className="field-label">Rubric name</span><input className="input" value={session.draft.name} onBlur={session.endGroup} onChange={(event) => edit([RUBRIC_NAME_KEY], 'Edited rubric name', draft => ({ ...draft, name: event.target.value }))} required aria-describedby={describedBy} aria-invalid={attempted && !session.draft.name.trim()} /></label>)}
       {changedField(RUBRIC_DESCRIPTION_KEY, 'Description', describedBy => <label className="field"><span className="field-label">Description</span><textarea className="input" value={session.draft.description} onBlur={session.endGroup} onChange={(event) => edit([RUBRIC_DESCRIPTION_KEY], 'Edited description', draft => ({ ...draft, description: event.target.value }))} rows={3} required aria-describedby={describedBy} aria-invalid={attempted && !session.draft.description.trim()} /></label>)}
       <div className="flex flex-wrap items-center justify-between gap-3 border-y py-4"><div><h3 className="text-[13px] font-semibold">Evaluation criteria</h3><p id={weightHintId} className="mt-1 text-[11px] text-muted">Rebalance weights after adding or removing a criterion.</p></div><span role="status" aria-live="polite"><Badge tone={balanced ? 'success' : 'warning'} dot>{Number.isFinite(total) ? `${Number(total.toFixed(6))}% / 100%` : 'Invalid weight'}</Badge></span></div>
@@ -392,14 +398,14 @@ export function RubricEditor({ rubric, onClose, onSaved, initialPanel = null, in
   </form>
 
   const panels: AssistedEditorPanel[] = [
-    ...(assistantAvailable || conversation.turns.length > 0 ? [{ id: 'assist', label: 'Ask AI', icon: Sparkles, content: <AssistConversation turns={conversation.turns} pending={conversation.pending} elapsedSeconds={conversation.elapsedSeconds} disabledReason={assistantAvailable ? null : assistantUnavailableReason ?? 'AI assist is not available right now.'} focus={focusCriterionId ? { label: focusLabel(session.draft, focusCriterionId), onClear: () => setFocusCriterionId(null) } : null} quickActions={quickActions(focusCriterionId)} onSend={(instruction) => void conversation.send(instruction, focusCriterionId)} onCancel={conversation.cancel} onRetry={conversation.retry} onUndoTurn={(turnId) => conversation.markUndone(turnId, session.undoTurn(turnId))} onJump={jumpTo} onQuote={(change) => showSourceForKey(change.key)} /> }] as AssistedEditorPanel[] : []),
+    ...(assistantAvailable || conversation.turns.length > 0 ? [{ id: 'assist', label: terms.askAi, icon: Sparkles, content: <AssistConversation turns={conversation.turns} pending={conversation.pending} elapsedSeconds={conversation.elapsedSeconds} disabledReason={assistantAvailable ? null : assistantUnavailableReason ?? terms.text('AI assist is not available right now.')} focus={focusCriterionId ? { label: focusLabel(session.draft, focusCriterionId), onClear: () => setFocusCriterionId(null) } : null} quickActions={quickActions(focusCriterionId)} onSend={(instruction) => void conversation.send(instruction, focusCriterionId)} onCancel={conversation.cancel} onRetry={conversation.retry} onUndoTurn={(turnId) => conversation.markUndone(turnId, session.undoTurn(turnId))} onJump={jumpTo} onQuote={(change) => showSourceForKey(change.key)} /> }] as AssistedEditorPanel[] : []),
     ...(document ? [{ id: 'source', label: 'Job posting', icon: FileText, content: <DocumentViewer document={document} highlightedId={sourceHighlight.paragraphId} quote={sourceHighlight.quote} pagination={pagination} compact /> }] as AssistedEditorPanel[] : []),
     { id: 'changes', label: 'Changes', icon: History, badge: session.changes.length || undefined, content: <ChangeHistoryPanel changes={session.changes} entries={session.entries} cursor={session.cursor} evictedEntries={session.evictedEntries} onJump={jumpTo} onRevert={session.revert} onRestore={session.restoreTo} disabled={locked} savedVersions={savedVersions} previewingVersionId={previewVersionId} onPreviewVersion={setPreviewVersionId} onUseVersion={(id) => { const version = savedRubrics.find((item) => versionId(item) === id); if (!version) return; setPreviewVersionId(null); session.loadVersion({ ...session.draft, name: version.name, description: version.description, criteria: structuredClone(version.criteria) }, `Loaded version ${version.version} as a starting point`) }} /> },
   ]
 
   return <Modal open onOpenChange={(open) => { if (!open) close() }} title="Edit rubric" description={`Save a new version of this rubric. Version ${rubric.version} and its existing analysis results will not change.`} fullscreen footer={<>
     <span className="mr-auto text-[11px] text-muted">Weights must total 100%.</span>
-    {confirmingAiSave && <div className="rubric-save-confirm" role="status"><span>Save version {rubric.version + 1} with {session.changes.length} changes ({session.aiChangeCount} from AI assist)?</span><Button size="sm" variant="ghost" onClick={() => setConfirmingAiSave(false)}>Keep reviewing</Button><Button size="sm" variant="primary" icon={Save} onClick={() => void runSave()} disabled={saving || !canEdit}>Confirm and save version {rubric.version + 1}</Button></div>}
+    {confirmingAiSave && <div className="rubric-save-confirm" role="status"><span>Save version {rubric.version + 1} with {session.changes.length} changes ({session.aiChangeCount} {terms.fromAssist})?</span><Button size="sm" variant="ghost" onClick={() => setConfirmingAiSave(false)}>Keep reviewing</Button><Button size="sm" variant="primary" icon={Save} onClick={() => void runSave()} disabled={saving || !canEdit}>Confirm and save version {rubric.version + 1}</Button></div>}
     <Button onClick={close} disabled={saving}>Cancel</Button>
     <Button type="submit" form={formId} icon={Save} variant="primary" disabled={saving || !canEdit || confirmingAiSave}>{saving ? 'Saving…' : `Save version ${rubric.version + 1}`}</Button>
   </>}>
@@ -429,8 +435,9 @@ function quickActions(focusId: string | null) {
 }
 
 function DraftWithAi({ onDraft, disabled }: { onDraft: (text: string) => void; disabled: boolean }) {
+  const terms = useAiTerminology()
   const [text, setText] = useState('')
-  return <div className="rubric-draft-with-ai"><label className="field"><span className="field-label">What should this criterion assess?</span><input className="input" value={text} onChange={(event) => setText(event.target.value)} placeholder="Example: stakeholder communication" /></label><Button size="sm" icon={Sparkles} onClick={() => onDraft(text.trim())} disabled={disabled}>Draft with AI</Button></div>
+  return <div className="rubric-draft-with-ai"><label className="field"><span className="field-label">What should this criterion assess?</span><input className="input" value={text} onChange={(event) => setText(event.target.value)} placeholder="Example: stakeholder communication" /></label><Button size="sm" icon={Sparkles} onClick={() => onDraft(text.trim())} disabled={disabled}>{terms.draftWithAi}</Button></div>
 }
 
 function RubricVersionPreview({ rubric, onBack }: { rubric: Rubric; onBack: () => void }) {

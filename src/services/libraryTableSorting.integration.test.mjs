@@ -381,7 +381,7 @@ test('real resume headers and selector sort nullable names, displayed source lab
   const initial = resumes.summaries.map((item) => item.resume.id)
   await renderPage(ui.RealResumesPage, { resumes, url: '/resumes?data=real' })
   order(initial)
-  assert.equal(selectedOption('Sort real resumes'), 'Default order')
+  assert.equal(selectedOption('Sort resumes'), 'Default order')
   assert.equal(document.querySelectorAll('th[aria-sort]').length, 0)
   await sortHeader('Resume / source profile')
   order(['r-a2', 'r-tie', 'r-a10', 'r-queue', 'r-cancel', 'r-parse', 'r-blank', 'r-null', 'r-z'])
@@ -395,16 +395,16 @@ test('real resume headers and selector sort nullable names, displayed source lab
     await sortHeader(heading)
     order(attentionResumes)
     activeHeader(heading, 'ascending')
-    assert.equal(selectedOption('Sort real resumes'), 'Processing status: Needs attention first')
+    assert.equal(selectedOption('Sort resumes'), 'Processing status: Needs attention first')
     await sortHeader(heading)
     order(completeResumes)
     activeHeader(heading, 'descending')
-    assert.equal(selectedOption('Sort real resumes'), 'Processing status: Complete first')
+    assert.equal(selectedOption('Sort resumes'), 'Processing status: Complete first')
   }
-  await choose('Sort real resumes', 'Processing status: Needs attention first')
+  await choose('Sort resumes', 'Processing status: Needs attention first')
   order(attentionResumes)
   activeHeader('Source / progress', 'ascending')
-  await choose('Sort real resumes', 'Processing status: Complete first')
+  await choose('Sort resumes', 'Processing status: Complete first')
   order(completeResumes)
   const choices = [
     ['Resume label / stated name: A–Z', ['r-a2', 'r-tie', 'r-a10', 'r-queue', 'r-cancel', 'r-parse', 'r-blank', 'r-null', 'r-z']],
@@ -414,9 +414,9 @@ test('real resume headers and selector sort nullable names, displayed source lab
     ['Added date: Oldest first', ['r-blank', 'r-tie', 'r-parse', 'r-queue', 'r-cancel', 'r-null', 'r-a10', 'r-a2', 'r-z']],
     ['Added date: Newest first', ['r-z', 'r-a10', 'r-a2', 'r-null', 'r-cancel', 'r-queue', 'r-parse', 'r-tie', 'r-blank']],
   ]
-  for (const [choice, expected] of choices) { await choose('Sort real resumes', choice); order(expected) }
+  for (const [choice, expected] of choices) { await choose('Sort resumes', choice); order(expected) }
   assert.equal(document.querySelectorAll('th[aria-sort]').length, 0, 'Source/date selector choices do not mislabel the status header')
-  await choose('Sort real resumes', 'Default order')
+  await choose('Sort resumes', 'Default order')
   order(initial)
   for (const label of ['Ready', 'Extracting profile', 'Could not process', 'Cancelled', 'Queued', 'Reading source']) {
     assert.ok(document.body.textContent.includes(label), `Exact processing label "${label}" stays visible`)
@@ -438,9 +438,9 @@ test('merged Markdown and Word resumes remain selectable and sortable with forma
   })))
   const resumes = resumesApi(summaries, { features: { realResumeImports: true, markdownResumeImports: false, wordDocumentImports: false } })
   await renderPage(ui.RealResumesPage, { resumes, url: '/resumes?data=real' })
-  await choose('Sort real resumes', 'Source label: A–Z')
+  await choose('Sort resumes', 'Source label: A–Z')
   order(['markdown', 'word-old', 'word-new', 'pdf'])
-  await choose('Sort real resumes', 'Source label: Z–A')
+  await choose('Sort resumes', 'Source label: Z–A')
   order(['pdf', 'word-new', 'word-old', 'markdown'])
   for (const { id } of formats) assert.equal(checkbox(id).disabled, false)
   assert.match(row('word-new').textContent, /DOCX · added/)
@@ -450,7 +450,7 @@ test('merged Markdown and Word resumes remain selectable and sortable with forma
   await search('Mara')
   order(['markdown'])
   assert.match(document.querySelector('[role="status"]').textContent, /1 selected · 1 hidden by search/)
-  await choose('Sort real resumes', 'Processing status: Complete first')
+  await choose('Sort resumes', 'Processing status: Complete first')
   await click(button('Build analysis (1)'))
   assert.deepEqual(JSON.parse(new URLSearchParams(navigation.search).get('resumeSelections')), [{
     resumeId: 'word-new', documentId: 'document-word-new', documentVersion: 1, documentSha256: hash,
@@ -465,7 +465,7 @@ test('real resumes keep ready-only exact selections through sorting, refresh ver
   for (const id of ['r-a10', 'r-null', 'r-cancel', 'r-queue', 'r-parse', 'r-blank']) assert.equal(checkbox(id).disabled, true)
   await click(button('Select ready visible'))
   assert.deepEqual([...document.querySelectorAll('tbody input:checked')].map((input) => idFromLink(input.closest('tr').querySelector('a.row-title'))), ['r-z', 'r-a2', 'r-tie'])
-  await choose('Sort real resumes', 'Source label: Z–A')
+  await choose('Sort resumes', 'Source label: Z–A')
   await search('  ZOE  ')
   order(['r-z'])
   assert.match(document.querySelector('[role="status"]').textContent, /3 selected · 2 hidden by search/)
@@ -473,11 +473,11 @@ test('real resumes keep ready-only exact selections through sorting, refresh ver
     ? { ...summary, resume: { ...summary.resume, documentVersion: 2 }, documentRef: { ...summary.documentRef, documentVersion: 2, sha256: 'b'.repeat(64) } } : summary)
   await renderPage(ui.RealResumesPage, { resumes: { ...resumes, summaries: refreshed }, url: '/resumes?data=real' })
   assert.equal(checkbox('r-z').checked, true)
-  assert.equal(selectedOption('Sort real resumes'), 'Source label: Z–A')
+  assert.equal(selectedOption('Sort resumes'), 'Source label: Z–A')
   await search('not in this library')
-  assert.match(document.body.textContent, /No matching real resumes/)
+  assert.match(document.body.textContent, /No matching resumes/)
   assert.match(document.querySelector('[role="status"]').textContent, /3 selected · 3 hidden by search/)
-  await choose('Sort real resumes', 'Processing status: Complete first')
+  await choose('Sort resumes', 'Processing status: Complete first')
   noMutations()
   await click(button('Build analysis (3)'))
   const expected = ['r-z', 'r-a2', 'r-tie'].map((id) => ({ resumeId: id, documentId: `document-${id}`, documentVersion: 1, documentSha256: hash }))
@@ -488,7 +488,7 @@ test('real resumes keep ready-only exact selections through sorting, refresh ver
 test('sorted real resume actions retain exact IDs and ETags, and pending/read-only/service guards remain unchanged', async () => {
   const resumes = resumesApi()
   await renderPage(ui.RealResumesPage, { resumes, url: '/resumes?data=real' })
-  await choose('Sort real resumes', 'Processing status: Complete first')
+  await choose('Sort resumes', 'Processing status: Complete first')
   noMutations()
   await click(button('Retry processing', row('r-null')))
   await click(button('Cancel processing', row('r-parse')))
@@ -499,14 +499,14 @@ test('sorted real resume actions retain exact IDs and ETags, and pending/read-on
   assert.equal(row('r-null').querySelector('a.text-link').getAttribute('href'), '/resumes/r-null')
   await renderPage(ui.RealResumesPage, { resumes: { ...resumes, pending: (id) => id === 'r-null' }, url: '/resumes?data=real' })
   assert.equal(button('Retry processing', row('r-null')).disabled, true)
-  await choose('Sort real resumes', 'Resume label / stated name: A–Z')
+  await choose('Sort resumes', 'Resume label / stated name: A–Z')
   assert.equal(button('Retry processing', row('r-null')).disabled, true)
   await renderPage(ui.RealResumesPage, { resumes: { ...resumes, canWrite: false }, analyses: analysesApi([], { canWrite: false }), url: '/resumes?data=real' })
   assert.equal(button('Add resumes').disabled, true)
   assert.equal(button('Build analysis').disabled, true)
   assert.equal(button('Retry processing', row('r-null')).disabled, true)
   assert.equal(button('Cancel processing', row('r-parse')).disabled, true)
-  await choose('Sort real resumes', 'Processing status: Needs attention first')
+  await choose('Sort resumes', 'Processing status: Needs attention first')
   order(attentionResumes)
   await click(button('Retry processing', row('r-null')))
   await click(button('Cancel processing', row('r-parse')))
@@ -514,14 +514,14 @@ test('sorted real resume actions retain exact IDs and ETags, and pending/read-on
   await renderPage(ui.RealResumesPage, { resumes: { ...resumes, phase: 'error', error: 'Controlled service interruption' }, url: '/resumes?data=real' })
   assert.equal(button('Retry processing', row('r-null')).disabled, true)
   await search('no matches')
-  await choose('Sort real resumes', 'Added date: Oldest first')
+  await choose('Sort resumes', 'Added date: Oldest first')
   assert.match(document.querySelector('[role="alert"]').textContent, /Controlled service interruption/)
   assert.equal(calls.length, 2)
 })
 
 for (const [page, label, option, url] of [
   ['JobsPage', 'Sort jobs', 'Processing status: Complete first', '/jobs'],
-  ['RealResumesPage', 'Sort real resumes', 'Source label: Z–A', '/resumes?data=real'],
+  ['RealResumesPage', 'Sort resumes', 'Source label: Z–A', '/resumes?data=real'],
 ]) test(`${page} keeps its sort selector available for an empty library and empty searches`, async () => {
   await renderPage(ui[page], { context: workspaceContext({ jobRows: [], resumeRows: [] }), resumes: resumesApi([]), url })
   order([])

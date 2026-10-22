@@ -1,6 +1,7 @@
 import { useState } from 'react'
 import { Link } from 'react-router-dom'
-import { AlertTriangle, FileSearch, Layers3, Pencil, ShieldCheck, Sparkles } from 'lucide-react'
+import { AlertTriangle, FileSearch, Layers3, Pencil, Sparkles } from 'lucide-react'
+import { useAiTerminology } from '../../app/public-settings-context'
 import { useWorkspace } from '../../app/workspace-context'
 import { Badge, Button, EmptyState, InlineError } from '../../components/ui'
 import { EVIDENCE_SCALE_V1 } from '../../domain/evidence-scale'
@@ -24,6 +25,7 @@ export function RubricPanel({ rubric, onSelectCriterion, onVersionSaved, readOnl
   readOnly?: boolean
 }) {
   const { workspace, cloud } = useWorkspace()
+  const terms = useAiTerminology()
   const [editing, setEditing] = useState(false)
   const [initialEditorPanel, setInitialEditorPanel] = useState<'assist' | 'source' | 'changes' | null>(null)
   const [initialFocusCriterionId, setInitialFocusCriterionId] = useState<string | null>(null)
@@ -69,7 +71,7 @@ export function RubricPanel({ rubric, onSelectCriterion, onVersionSaved, readOnl
 
   return <div className="min-w-0">
     <div className="section-heading">
-      <div><h2>Evaluation rubric</h2><p>{readOnly ? 'Saved version · read only' : 'Transparent criteria. Traceable expectations.'}</p></div>
+      <div><h2>Evaluation rubric</h2>{readOnly && <p>Saved version · read only</p>}</div>
       <div className="flex shrink-0 flex-wrap items-center justify-end gap-2"><RubricExport rubric={rubric} /><Badge>v{rubric.version}</Badge></div>
     </div>
 
@@ -99,27 +101,12 @@ export function RubricPanel({ rubric, onSelectCriterion, onVersionSaved, readOnl
         <p className="mt-2 text-[12px] text-muted">{rubric.description}</p>
       </div>
 
-      <div className="rounded-xl border bg-soft p-3.5">
-        <div className="flex items-start gap-2.5">
-          {rubric.kind === 'job'
-            ? <FileSearch size={16} className="mt-0.5 shrink-0 text-muted" aria-hidden="true" />
-            : <ShieldCheck size={16} className="mt-0.5 shrink-0 text-muted" aria-hidden="true" />}
-          <div className="min-w-0">
-            <p className="text-[11px] font-medium">Grounded in the private source document</p>
-            <p className="mt-1 text-[11px] text-muted">
-              {rubric.provenance?.kind === 'edited' ? 'A reviewer edited this immutable version.' : 'AI generated this draft from the displayed source.'} Exact quotations link every criterion to a parsed paragraph.
-            </p>
-            {job && <Link to={`/jobs/${job.id}`} className="text-link mt-2">{job.title}</Link>}
-            {rubric.kind === 'job' && !job && <p className="mt-2 text-[11px] text-muted">The linked job is unavailable in this workspace.</p>}
-          </div>
-        </div>
-      </div>
+      {rubric.kind === 'job' && (job ? <p className="text-[12px] text-muted">Linked job: <Link to={`/jobs/${job.id}`} className="text-link">{job.title}</Link></p> : <p className="text-[12px] text-muted">The linked job is unavailable in this workspace.</p>)}
 
       {!readOnly && <div className="flex flex-wrap gap-2">
         <Button icon={Pencil} size="sm" disabled={!editable} onClick={() => openManualEdit(null)}>Edit rubric</Button>
-        {assistantAvailable && <Button icon={Sparkles} size="sm" variant="ghost" onClick={() => { setError(''); setInitialEditorPanel('assist'); setInitialFocusCriterionId(null); setInitialAssistInstruction(null); setEditing(true) }}>Edit with AI</Button>}
+        {assistantAvailable && <Button icon={Sparkles} size="sm" variant="ghost" onClick={() => { setError(''); setInitialEditorPanel('assist'); setInitialFocusCriterionId(null); setInitialAssistInstruction(null); setEditing(true) }}>{terms.editWithAi}</Button>}
       </div>}
-      {!readOnly && !realGrade && <p className="text-[11px] text-muted">Edit rubric includes the name and description. Even a name-only save creates a new version; saved analyses keep their original rubric.</p>}
       {!readOnly && !editable && <p className="text-[11px] text-muted">{realGrade ? 'Open the real grade family to edit a draft with its separate grounding-review and approval safeguards.' : roleReadOnly ? 'This workspace is read-only. An owner or editor can change real rubrics.' : 'Finish the linked job import and load its source before editing this rubric.'}</p>}
       {error && <InlineError>{error}</InlineError>}
       {!balanced && <InlineError>These criterion weights do not total 100%. {readOnly ? 'Open the current version to review the rubric.' : 'Edit the rubric to correct its weights before analysis.'}</InlineError>}
@@ -143,12 +130,12 @@ export function RubricPanel({ rubric, onSelectCriterion, onVersionSaved, readOnl
                   <h4 className="text-[12px] font-semibold leading-5">{criterion.label}</h4>
                   <div className="flex shrink-0 flex-wrap items-center justify-end gap-2">
                     {criterionFindings.length > 0 && <Badge tone={criterionFindings.some((item) => item.severity === 'blocker') ? 'danger' : 'warning'}>{findingCategoryLabel(criterionFindings[0]!.code)}</Badge>}
-                    {assistantAvailable && <Button size="sm" variant="ghost" icon={Sparkles} aria-label={`Ask AI about ${criterion.label}`} onClick={() => {
+                    {assistantAvailable && <Button size="sm" variant="ghost" icon={Sparkles} aria-label={`${terms.askAi} about ${criterion.label}`} onClick={() => {
                       setInitialEditorPanel('assist')
                       setInitialFocusCriterionId(criterion.id)
                       setInitialAssistInstruction(null)
                       setEditing(true)
-                    }}>Ask AI</Button>}
+                    }}>{terms.askAi}</Button>}
                     <span className="text-[12px] font-semibold tabular-nums text-accent">{criterion.weight}%</span>
                   </div>
                 </div>
@@ -166,7 +153,7 @@ export function RubricPanel({ rubric, onSelectCriterion, onVersionSaved, readOnl
                     </div>
                     {assistantAvailable && (
                       <Button size="sm" variant="secondary" icon={Sparkles} onClick={() => openAiFix([finding], criterion.id)}>
-                        Fix with AI
+                        {terms.fixWithAi}
                       </Button>
                     )}
                   </div>
@@ -226,14 +213,21 @@ export function RubricPanel({ rubric, onSelectCriterion, onVersionSaved, readOnl
         </ol>
         <p className="mt-3 text-[10px] text-muted">Criterion weights produce an overall score out of 100. “Not assessed” means no score was assigned, not a zero.</p>
       </section>
-      <p className="library-note-text"><ShieldCheck size={16} aria-hidden="true" /><span>Generated and reviewer-edited rubric versions are source-grounded. Analysis freezes the exact selected version and requires human review.</span></p>
     </div>
 
     {editing && <RubricEditor
       key={rubric.id}
       rubric={rubric}
       onClose={() => setEditing(false)}
-      onSaved={(id) => { setEditing(false); onVersionSaved?.(id) }}
+      onSaved={(id, savedRubric) => {
+        setEditing(false)
+        if (job && savedRubric && savedRubric.scaleVersion === EVIDENCE_SCALE_V1.version && cloud.realJobs.features?.rubricChecks) {
+          void cloud.realJobs.runRubricChecks(job.id, savedRubric.id, savedRubric.version)
+            .then((next) => setLoadedChecks(next))
+            .catch(() => {})
+        }
+        onVersionSaved?.(id)
+      }}
       initialPanel={initialEditorPanel}
       initialFocusCriterionId={initialFocusCriterionId}
       initialAssistInstruction={initialAssistInstruction}

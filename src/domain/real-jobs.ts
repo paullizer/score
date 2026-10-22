@@ -99,6 +99,8 @@ export interface JobProcessingFeatures extends WordImportFeatures {
   rubricApprovalRequired: boolean
   /** The checks before approval can run (job-rubric model deployed and new work admitted). */
   rubricChecks: boolean
+  /** Whether user-facing AI terminology is switched to SI (Superintelligence). */
+  siTerminology?: boolean
   limits: { [K in keyof typeof JOB_IMPORT_LIMITS]: number }
 }
 

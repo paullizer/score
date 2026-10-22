@@ -1,11 +1,12 @@
 import { useEffect, useRef, useState } from 'react'
 import { RefreshCw } from 'lucide-react'
-import { usePublicSettings } from '../../app/public-settings-context'
+import { useAiTerminology, usePublicSettings } from '../../app/public-settings-context'
 import { Button, InlineError } from '../../components/ui'
 import { finishDeploymentUpdate, readPromptRelease, type PromptReleaseStatus } from '../../services/adminSettings'
 
 export function ApplicationStatus() {
   const policy = usePublicSettings()
+  const terms = useAiTerminology()
   const [release, setRelease] = useState<PromptReleaseStatus | null>(null)
   const [pending, setPending] = useState(true)
   const [error, setError] = useState('')
@@ -47,8 +48,8 @@ export function ApplicationStatus() {
   return <section id="application-status" className="panel settings-section" aria-labelledby="application-status-heading" aria-busy={pending}>
     <h2 id="application-status-heading">Application status</h2>
     {pending && <p role="status">Checking the application update...</p>}
-    {release && <><p><strong>{release.supported && release.deploymentVerified !== false ? 'AI instructions are up to date' : 'AI processing is paused while an update finishes'}</strong></p>
-      <p>{release.message}</p>
+    {release && <><p><strong>{terms.text(release.supported && release.deploymentVerified !== false ? 'AI instructions are up to date' : 'AI processing is paused while an update finishes')}</strong></p>
+      <p>{release.message ? terms.text(release.message) : release.message}</p>
       {release.pending && <p>You can still create workspaces and read saved work. Ordinary deployments need no approval here; evaluated changes are approved separately in Quality Control.</p>}
       <details><summary>Technical update details</summary><dl className="settings-facts">
         <dt>Installed generation</dt><dd><code>{release.generation}</code></dd>
@@ -57,12 +58,12 @@ export function ApplicationStatus() {
       </dl></details></>}
     {error && <InlineError>{error}</InlineError>}
     {policy.phase === 'error' && <InlineError>Score could not reload application settings. Saved work is unchanged. {policy.error}</InlineError>}
-    {message && <p role="status">{message}</p>}
+    {message && <p role="status">{terms.text(message)}</p>}
     <div className="flex flex-wrap gap-2">
       {release?.retryAllowed && release.etag && <Button variant="primary" disabled={pending} onClick={() => void check(true)}>Retry finishing update</Button>}
       <Button icon={RefreshCw} disabled={pending} onClick={() => void check()}>Check update status</Button>
     </div>
     {policy.settings?.maintenance.pauseNewWork && <p>New processing is also paused in Operations. Finishing the update will not change that setting.</p>}
-    {policy.settings?.runtimeReadiness.reason === 'worker-verification-required' && <p>{policy.settings.runtimeReadiness.message}</p>}
+    {policy.settings?.runtimeReadiness.reason === 'worker-verification-required' && policy.settings.runtimeReadiness.message && <p>{terms.text(policy.settings.runtimeReadiness.message)}</p>}
   </section>
 }

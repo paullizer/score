@@ -954,3 +954,97 @@ for (const [kind, contentType] of [
     }
   })
 }
+
+test('worker iteratively repairs overlapping criteria discovered during review until checks pass', async () => {
+  const multiParagraphDocument = {
+    ...document,
+    paragraphs: [
+      { id: 'p-0001', page: 1, heading: 'Requirements', text: 'TypeScript experience is required. Cloud infrastructure operations are required.' },
+    ],
+  }
+  const store = fakeStore(record())
+  const blobs = fakeBlobs(multiParagraphDocument)
+  const generationPrompts = []
+  let generationAttempt = 0
+  let reviewAttempt = 0
+  const overlappingCriteria = [
+    {
+      label: 'Cloud infrastructure delivery',
+      description: 'Deliver and operate cloud infrastructure.',
+      weight: 50,
+      requirementType: 'required',
+      sourcePassageIds: [1],
+      levels,
+    },
+    {
+      label: 'Infrastructure as code',
+      description: 'Provision cloud infrastructure with code.',
+      weight: 50,
+      requirementType: 'required',
+      sourcePassageIds: [2],
+      levels,
+    },
+  ]
+  const separatedCriteria = [
+    {
+      label: 'TypeScript service development',
+      description: 'Develop backend services in TypeScript.',
+      weight: 60,
+      requirementType: 'required',
+      sourcePassageIds: [1],
+      levels,
+    },
+    {
+      label: 'Cloud runtime operations',
+      description: 'Monitor and operate production cloud environments.',
+      weight: 40,
+      requirementType: 'required',
+      sourcePassageIds: [2],
+      levels,
+    },
+  ]
+  const deps = dependencies(
+    store,
+    blobs,
+    async (_url, init) => {
+      generationAttempt += 1
+      const userContent = JSON.parse(init.body).messages[1].content
+      generationPrompts.push(userContent)
+      return successfulModel({
+        ...modelResult,
+        criteria: generationAttempt === 1 ? overlappingCriteria : separatedCriteria,
+      })
+    },
+    async () => {
+      reviewAttempt += 1
+      if (reviewAttempt === 1) {
+        return successfulModel({
+          summary: 'Criteria C1 and C2 overlap on cloud provisioning.',
+          findings: [{
+            code: 'same-capability',
+            criteria: ['C1', 'C2'],
+            message: 'Provisioning cloud infrastructure can count in both C1 and C2.',
+          }],
+        })
+      }
+      return successfulModel({
+        summary: 'All criteria are distinct and grounded.',
+        findings: [],
+      })
+    },
+  )
+  assert.deepEqual(await runWorker(deps, { maxJobs: 1 }), { claimed: 1, completed: 1 })
+  assert.equal(generationAttempt, 2, 'Worker runs a second generation pass to fix review findings')
+  assert.equal(reviewAttempt, 2, 'Worker re-runs rubric review after AI repair')
+  assert.match(generationPrompts[1], /PREVIOUS RUBRIC DRAFT CRITERIA:/)
+  assert.match(generationPrompts[1], /Resolve these rubric review findings so no résumé evidence is counted twice/)
+  assert.match(generationPrompts[1], /Provisioning cloud infrastructure can count in both C1 and C2/)
+  assert.equal(store.published().version, 1)
+  assert.deepEqual(
+    store.published().criteria.map(criterion => criterion.label),
+    ['TypeScript service development', 'Cloud runtime operations'],
+  )
+  assert.deepEqual(store.checks().checks, [])
+  assert.deepEqual(store.checks().review.findings, [])
+})
+

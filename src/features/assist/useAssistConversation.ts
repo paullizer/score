@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
+import { useAiTerminology } from '../../app/public-settings-context'
 import { assistantReplayText, recentAssistTurns, type AssistConversationTurn, type AssistOutcome } from '../../domain/assist'
 
 export interface AssistAppliedChange {
@@ -78,6 +79,7 @@ export function useAssistConversation<TResponse>({
   now = () => Date.now(),
   newId = () => crypto.randomUUID(),
 }: UseAssistConversationOptions<TResponse>) {
+  const terms = useAiTerminology()
   const [turns, setTurns] = useState<AssistConversationUiTurn[]>([])
   const [pending, setPending] = useState(false)
   const [elapsedSeconds, setElapsedSeconds] = useState(0)
@@ -152,7 +154,8 @@ export function useAssistConversation<TResponse>({
           replaySummary: applied.replaySummary,
         } : turn))
       } catch (error) {
-        const described = describeError(error)
+        const raw = describeError(error)
+        const described = { ...raw, message: terms.text(raw.message) }
         setTurns(current => current.map(turn => turn.id === assistantTurn.id ? {
           ...turn,
           status: 'error',
@@ -165,7 +168,8 @@ export function useAssistConversation<TResponse>({
       if (controller.signal.aborted || isAbortError(error)) {
         setTurns(current => current.map(turn => turn.id === assistantTurn.id ? { ...turn, status: 'cancelled', text: 'Cancelled. Your draft is unchanged.' } : turn))
       } else {
-        const described = describeError(error)
+        const raw = describeError(error)
+        const described = { ...raw, message: terms.text(raw.message) }
         setTurns(current => current.map(turn => turn.id === assistantTurn.id ? {
           ...turn,
           status: 'error',
@@ -178,7 +182,7 @@ export function useAssistConversation<TResponse>({
       if (pendingTurnIdRef.current === assistantTurn.id) pendingTurnIdRef.current = null
       if (mountedRef.current) setPending(false)
     }
-  }, [describeError, newId, now, onResponse, sendRequest])
+  }, [describeError, newId, now, onResponse, sendRequest, terms])
 
   const cancel = useCallback(() => {
     const turnId = pendingTurnIdRef.current

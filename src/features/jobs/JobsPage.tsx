@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import { Link, useNavigate, useParams } from 'react-router-dom'
-import { ArrowLeft, ArrowRight, ArrowUpRight, BarChart3, BriefcaseBusiness, Building2, ChevronRight, Download, FileText, Globe2, Layers3, Link2, LoaderCircle, MapPin, Plus, RotateCcw, ScanLine, ShieldCheck, Sparkles, X } from 'lucide-react'
+import { ArrowLeft, ArrowUpRight, BriefcaseBusiness, Building2, Download, FileText, Globe2, Layers3, Link2, LoaderCircle, MapPin, Plus, RotateCcw, Sparkles, X } from 'lucide-react'
 import { useWorkspace } from '../../app/workspace-context'
 import { clientAdmissionReason, originalDownloadReason, usePublicSettings } from '../../app/public-settings-context'
 import { effectiveFormats } from '../../services/publicSettings'
@@ -122,23 +122,17 @@ function JobsLibrary() {
   function toggle(id: string) { selectJobs(selected.includes(id) ? selected.filter((value) => value !== id) : [...selected, id]) }
 
   return <>
-    <PageHeader eyebrow="A CLEARER STARTING POINT" title="Your jobs" description="Bring the roles together. Define what a great match looks like."
+    <PageHeader title="Your jobs"
       actions={<><Button icon={Layers3} onClick={() => navigate('/rubrics')}>Rubric library</Button><Button variant="primary" icon={Plus} disabled={!canEdit || !canImport} title={importReason ?? undefined} onClick={() => setImportOpen(true)}>Add jobs</Button></>} />
     <PendingRubricNotice onApproveAll={() => setBatch(approvals.pending)} />
     {batch && <BulkRubricApproval rubrics={batch} onClose={() => setBatch(null)} />}
     {analyses && (analyses.targets.state === 'error' || (analyses.targets.state === 'ready' && analyses.targets.error)) &&
       <div className="mb-5"><InlineError>Analysis availability could not be loaded. <button className="underline" onClick={() => void analyses.refreshTargets()}>Retry available targets</button></InlineError></div>}
     {!canImport && <p className="mb-4 text-[12px] text-muted" role="status">{importReason ?? 'New job imports are unavailable.'} Saved jobs, rubrics, and evidence remain available.</p>}
-    <div className="welcome-panel">
-      <div className="flex items-center"><span className="welcome-symbol"><ScanLine size={25} strokeWidth={1.4} /></span><div><h2>Good matches start with clear criteria.</h2><p>Every job gets its own rubric. Every score leads back to evidence. Nothing important stays a black box.</p></div></div>
-      <div className="welcome-action"><div className="mini-path" aria-hidden="true"><span><BriefcaseBusiness size={16} /></span><ChevronRight size={11} /><span><Layers3 size={16} /></span><ChevronRight size={11} /><span><BarChart3 size={16} /></span></div>
-        <Button size="sm" icon={ArrowUpRight} onClick={() => navigate('/analyses')}>Review analyses</Button>
-      </div>
-    </div>
     <section className="panel" aria-label="Job library">
       <div className="library-toolbar">
         <SegmentedControl label="Filter jobs by status" value={filter} onChange={setFilter} options={[
-          { value: 'all', label: 'All jobs', count: activeJobs.length }, { value: 'ready', label: 'Processed', count: readyCount }, { value: 'attention', label: 'Needs attention', count: attentionCount },
+          { value: 'all', label: 'All', count: activeJobs.length }, { value: 'ready', label: 'Processed', count: readyCount }, { value: 'attention', label: 'Needs attention', count: attentionCount },
         ]} />
         <div className="toolbar"><SearchField value={query} onChange={setQuery} placeholder="Search jobs, organizations..." />
           <ArchiveStateFilter value={archiveFilter} onChange={setArchiveFilter} label="Job archive state" />
@@ -182,7 +176,7 @@ function JobsLibrary() {
           return <tr key={job.id} className={selected.includes(job.id) ? 'row-selected' : ''}>
             <td className="checkbox-cell"><input type="checkbox" aria-label={`Select ${name}`} disabled={!selectable(job) && !selected.includes(job.id)} checked={selected.includes(job.id)} title={!editable ? 'Archived content and Reader access are read-only.' : approval?.pending ? approval.message : 'Select this exact saved target for manual analysis with ready resumes.'} onChange={() => toggle(job.id)} /></td>
             <td><div className="job-cell"><span className="job-monogram"><Building2 size={19} strokeWidth={1.4} /></span><div><Link to={`/jobs/${job.id}`} className="row-title">{name}</Link> <ArchivedBadge target={{ kind: 'job', id: job.id }} />{(summary?.displayName || job.displayName) && <><div className="row-meta">Source title: {job.title}</div><div className="row-meta break-words">Source: {job.sourceLabel}</div></>}<div className="row-meta">{job.organization}</div>{(job.grade || job.arrangement) && <div className="job-submeta">{[job.grade, job.arrangement].filter(Boolean).join(' / ')}</div>}<div className="job-mobile-status">{statusBadge}<span className="source-type"><Icon size={12} />{sourceNames[job.source]}</span></div></div></div></td>
-            <td className="mobile-hide"><span className="source-type"><Icon size={13} />{sourceNames[job.source]}</span><div className="row-meta">Private source</div></td>
+            <td className="mobile-hide"><span className="source-type"><Icon size={13} />{sourceNames[job.source]}</span></td>
             <td className="mobile-hide">{statusBadge}{rubric && <ArchivedBadge target={{ kind: 'rubric', id: rubric.groupId }} />}<div className="row-meta">{deleting || rubricRemoving ? 'Cleanup is incomplete · retry the lifecycle operation' : job.rubricDeletedAt ? 'Permanently removed · source retained' : rubric ? `Import complete · ${rubric.criteria.length} criteria / v${rubric.version}${approval?.approval && approval.status !== 'approved' ? ` · approved v${approval.approval.version} stays available` : ''}` : job.status === 'error' ? `${job.errorStage === 'rubric' ? 'Rubric' : 'Document'} needs a retry` : processing ? 'Server processing in progress' : 'Not yet assessed'}</div></td>
             <td className="mobile-hide"><span className="text-[11px] text-muted">{dateLabel(job.createdAt)}</span></td>
             <td><div className="flex flex-wrap items-center gap-1">{deleting ? <Link to={`/jobs/${job.id}`} className="button button-ghost button-sm">View cleanup</Link> : processing ? <Button size="sm" variant="ghost" disabled={!editable} aria-label={`Cancel ${name} import`} icon={X} onClick={() => void cancelJob(job.id)}>Cancel</Button>
@@ -195,15 +189,14 @@ function JobsLibrary() {
           </tr>
         })}</tbody>
       </table></div> : cloud.realJobs.phase === 'loading'
-        ? <EmptyState icon={LoaderCircle} title="Loading real jobs" description="Score is retrieving every page of server-owned job records for this workspace." />
+        ? <EmptyState icon={LoaderCircle} title="Loading jobs" description="Loading job records for this workspace." />
         : cloud.realJobs.phase !== 'ready'
-          ? <EmptyState icon={BriefcaseBusiness} title="Real job imports are unavailable" description={cloud.realJobs.error ?? 'This deployment does not have real job processing enabled. Saved history is unchanged.'} />
-          : <EmptyState icon={BriefcaseBusiness} title={libraryJobs.length ? 'No jobs match these filters' : 'Import your first real job'} description={libraryJobs.length ? 'Try another search or choose All jobs to see the rest of your library.' : `Upload an actual ${uploadFormatNames(formats)} file or enter a direct HTML/PDF posting URL. Score will create a durable queued job and source-grounded rubric.`}
+          ? <EmptyState icon={BriefcaseBusiness} title="Job imports are unavailable" description={cloud.realJobs.error ?? 'This deployment does not have real job processing enabled. Saved history is unchanged.'} />
+          : <EmptyState icon={BriefcaseBusiness} title={libraryJobs.length ? 'No jobs match these filters' : 'Import your first job'} description={libraryJobs.length ? 'Try another search or choose All to see the rest of your library.' : `Upload a ${uploadFormatNames(formats)} file or enter a direct job posting URL to generate a rubric.`}
             action={<>{libraryJobs.length > 0 && <Button onClick={() => { setQuery(''); setFilter('all'); setSource('all'); setArchiveFilter('default') }}>Clear filters</Button>}
-              <Button disabled={!canEdit && !libraryJobs.length} onClick={() => { if (!libraryJobs.length) setImportOpen(true); else { setQuery(''); setFilter('all'); setSource('all'); setArchiveFilter('all') } }}>{libraryJobs.length ? 'Show active and archived' : 'Import a real job'}</Button></>} />}
-      <div className="table-bottom"><span>Showing {filtered.length} of {scopedCount} real jobs in this archive view</span></div>
+              <Button disabled={!canEdit && !libraryJobs.length} onClick={() => { if (!libraryJobs.length) setImportOpen(true); else { setQuery(''); setFilter('all'); setSource('all'); setArchiveFilter('all') } }}>{libraryJobs.length ? 'Show active and archived' : 'Import a job'}</Button></>} />}
+      <div className="table-bottom"><span>Showing {filtered.length} of {scopedCount} {scopedCount === 1 ? 'job' : 'jobs'}</span></div>
     </section>
-    <div className="library-note"><p className="library-note-text"><ShieldCheck size={16} aria-hidden="true" /><span>Sources are private. Select ready resumes in the separate analysis builder, review exact target versions, then explicitly run evidence assessment.</span></p><Link className="text-link shrink-0 mobile-hide" to="/rubrics">How rubrics work <ArrowRight size={12} /></Link></div>
     {importOpen && <JobImport onClose={() => setImportOpen(false)} />}
   </>
 }
@@ -239,7 +232,7 @@ function JobDetailView() {
     if (job?.status === 'ready') void refreshTargets?.()
   }, [job?.id, job?.status, refreshTargets, savedRubricVersion])
   if (!job && id?.startsWith('job-') && cloud.realJobs.phase === 'loading') {
-    return <EmptyState icon={LoaderCircle} title="Loading the real job" description="Retrieving this workspace's server-owned job records." />
+    return <EmptyState icon={LoaderCircle} title="Loading job" description="Loading job details." />
   }
   if (!job && id?.startsWith('job-') && cloud.realJobs.phase === 'error') {
     return <EmptyState title="The job service is unavailable" description={cloud.realJobs.error ?? 'The job could not be loaded.'} action={<Button onClick={() => void cloud.realJobs.refresh()}>Retry loading</Button>} />
@@ -268,7 +261,7 @@ function JobDetailView() {
   }
   return <>
     <Link className="back-link" to="/jobs"><ArrowLeft size={14} />Back to jobs</Link>
-    <PageHeader eyebrow="JOB WORKSPACE" title={name} description={job.organization}
+    <PageHeader title={name} description={job.organization}
       actions={<><RenameEntityButton target={{ kind: 'job', id: job.id }} name={name} etag={summary?.etag} disabled={cloud.realJobs.phase !== 'ready' || !summary?.etag} /><EntityLifecycleActions target={{ kind: 'job', id: job.id }} name={name} onComplete={(action) => { if (action === 'delete') navigate('/jobs') }} /><Button icon={Layers3} disabled={!ready || !gradeLadders?.canWrite || gradeLadders.phase !== 'ready' || (approvals.required && approval?.status !== 'approved')}
         title={!gradeLadders?.canWrite ? 'An owner or editor in a grade-enabled workspace can create a ladder.' : job.status !== 'ready' || !rubric ? 'Wait for the real job and saved rubric to be ready.' : gradeLadders.phase !== 'ready' ? 'Real grade processing is not currently available.' : 'Capture this real job and exact saved rubric version as a new grade family.'}
         onClick={() => navigate(`/grade-ladders/new?${new URLSearchParams({ job: job.id, rubric: rubric!.id, rubricVersion: String(rubric!.version) })}`)}>Create grade ladder</Button>
@@ -285,7 +278,6 @@ function JobDetailView() {
       <Link className="text-link mt-2" to={`/rubrics/${encodeURIComponent(rubric.id)}?job=${encodeURIComponent(job.id)}`}>Review approval and checks</Link>
     </div></div>}
     <div className="detail-metadata">{job.location && <span><MapPin size={13} />{job.location}</span>}{(job.arrangement || job.employmentType) && <span><BriefcaseBusiness size={13} />{[job.arrangement, job.employmentType].filter(Boolean).join(' / ')}</span>}{job.grade && <Badge>{job.grade}</Badge>}{job.series && <Badge>Series {job.series}</Badge>}{statusBadge}<ArchivedBadge target={{ kind: 'job', id: job.id }} /></div>
-    <div className="info-callout mb-5"><ShieldCheck size={18} /><div><strong>Generated from the private source</strong><p>This job and rubric are server-owned. Analyze applicants opens a separate, manual analysis with this exact saved version.</p></div></div>
     {job.error && !job.rubricDeletedAt && !rubricRemoving && <div className="mb-5"><InlineError>
       <strong>{job.errorStage === 'rubric' ? 'The job is preserved; its rubric needs attention. ' : summary?.error?.code ? `${summary.error.code}: ` : ''}</strong>
       {job.error}
@@ -298,7 +290,7 @@ function JobDetailView() {
     <div className="pane-switcher"><SegmentedControl label="Job detail view" value={pane} onChange={setPane} options={[{ value: 'document', label: 'Job description' }, { value: 'rubric', label: 'Associated rubric' }]} /></div>
     <div className="split-layout">
       <section className={`detail-panel ${pane !== 'document' ? 'mobile-pane-hidden' : ''}`} aria-label="Job description">
-        <div className="section-heading"><div><h2>The role, in its own words</h2><p>Source context for every criterion</p></div><FileText size={17} className="text-muted" /></div>
+        <div className="section-heading"><div><h2>Job description</h2></div><FileText size={17} className="text-muted" /></div>
         {deleting ? <EmptyState title="Job deletion pending" description="Only recovery metadata remains available while cleanup finishes. Retry the lifecycle operation above; this source cannot be edited or reused." />
           : document ? source
           ? <PrivateDocumentViewer document={document} originalUrl={cloud.realJobs.originalUrl(job.id)} highlighted={highlighted}
@@ -307,7 +299,7 @@ function JobDetailView() {
           ? <EmptyState icon={LoaderCircle} title="Loading the parsed source" description="Score is retrieving the private source document and exact paragraph references." />
           : processing ? <EmptyState icon={LoaderCircle} title="Source processing is not complete" description="The worker is reading this source asynchronously. This page will refresh while the durable job remains queued." />
             : <EmptyState title="Source document unavailable" description={job.rubricDeletedAt ? 'The job and its original source are retained, but no parsed source was returned. Its deliberately removed rubric cannot be restored by retry.' : 'The server has not returned a parsed source document. Review the job error or retry the import.'} />}
-        <div className="source-footer"><span className="min-w-0">{source?.kind === 'url' && (source.finalUrl || source.url) ? <ExternalSource url={source.finalUrl ?? source.url!}>{source.displayName}</ExternalSource> : <span className="source-label">{source?.displayName ?? job.sourceLabel}</span>}</span><span>Private source / {sourceNames[job.source]}</span></div>
+        <div className="source-footer"><span className="min-w-0">{source?.kind === 'url' && (source.finalUrl || source.url) ? <ExternalSource url={source.finalUrl ?? source.url!}>{source.displayName}</ExternalSource> : <span className="source-label">{source?.displayName ?? job.sourceLabel}</span>}</span><span>{sourceNames[job.source]}</span></div>
         {source && !deleting && <div className="source-provenance">
           <div><strong>Source provenance</strong><span>{source.capturedAt ? `Captured ${dateLabel(source.capturedAt)}` : `Added ${dateLabel(job.createdAt)}`}</span>{source.bytes !== undefined && <span>{new Intl.NumberFormat('en', { style: 'unit', unit: 'byte', notation: 'compact' }).format(source.bytes)}</span>}{source.sha256 && <code title={source.sha256}>SHA-256 {source.sha256.slice(0, 12)}…</code>}{summary && <span>{summary.attempts} processing {summary.attempts === 1 ? 'attempt' : 'attempts'}</span>}</div>
           {downloadReason ? <span className="text-[11px] text-muted" role="status">{downloadReason}</span>
@@ -325,6 +317,5 @@ function JobDetailView() {
         </div>}
       </section>
     </div>
-    <p className="library-note-text mt-5"><ShieldCheck size={16} aria-hidden="true" /><span>This rubric was generated from the displayed source. Select a citation to locate its exact paragraph. Analyses use frozen sources and require human review.</span></p>
   </>
 }

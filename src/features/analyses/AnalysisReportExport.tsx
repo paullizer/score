@@ -3,12 +3,12 @@ import { useLocation } from 'react-router-dom'
 import { Download, LoaderCircle } from 'lucide-react'
 import { useWorkspace } from '../../app/workspace-context'
 import { useRealAnalyses } from '../../app/real-analyses-context'
-import { usePublicSettings } from '../../app/public-settings-context'
+import { useAiTerminology, usePublicSettings } from '../../app/public-settings-context'
 import { AccessSuspendedContext } from '../../app/access-suspended-context'
 import { REPORT_FORMATS, reportDownloadType, type AnalysisReport, type AnalysisReportFormat, type ReportCandidate } from '../../domain/analysis-reports'
 import { createDefaultAdminSettings } from '../../domain/admin-settings-defaults'
 import type { RealAnalysisComparisonSummary, RealAnalysisRunDetail } from '../../domain/real-analyses'
-import { Badge, Button, CheckLabel, InlineError, Modal } from '../../components/ui'
+import { Button, CheckLabel, InlineError, Modal } from '../../components/ui'
 import { AnalysisSummaryStatus } from './AnalysisSummaries'
 import { getDisplayName } from '../../domain/displayNames'
 import { LocalApplicantMapping } from './LocalApplicantMapping'
@@ -33,6 +33,7 @@ export function AnalysisReportExport({ source, onManageSummaries }: { source: Re
   const accessSuspended = useContext(AccessSuspendedContext)
   const { cloud } = useWorkspace()
   const publicSettings = usePublicSettings()
+  const terms = useAiTerminology()
   const reportPolicy = publicSettings.settings?.reports ?? createDefaultAdminSettings().reports
   const role = cloud?.workspaces.find(workspace => workspace.id === cloud.currentWorkspaceId)?.role
   const policyDisabledReason = publicSettings.cloud && (publicSettings.phase !== 'ready' || !publicSettings.settings)
@@ -214,7 +215,7 @@ export function AnalysisReportExport({ source, onManageSummaries }: { source: Re
       onClick={() => changeOpen(true)}>Export report</Button>
     {policyDisabledReason && <p className="text-[11px] text-muted" role="status">{policyDisabledReason}</p>}
     <Modal open={open} onOpenChange={changeOpen} title="Export analysis report"
-      description="Download the saved scores and evidence. Exporting does not run another AI assessment."
+      description={terms.text('Download the saved scores and evidence. Exporting does not run another AI assessment.')}
       footer={<>
         <Button onClick={() => changeOpen(false)}>{busy ? 'Cancel export' : 'Close'}</Button>
         <Button variant="primary" icon={busy ? LoaderCircle : Download}
@@ -224,7 +225,6 @@ export function AnalysisReportExport({ source, onManageSummaries }: { source: Re
         </Button>
       </>}>
       <div className="space-y-5">
-        <div className="flex flex-wrap gap-2"><Badge tone="accent">Saved real evidence</Badge></div>
         <div><label className="mb-2 block text-[12px] font-semibold" htmlFor={`${fieldId}-format`}>Report format</label>
           <select id={`${fieldId}-format`} className="filter-select w-full" value={format ?? ''} disabled={busy || reportPolicy.enabledFormats.length === 0} onChange={(event) => {
             const value = event.target.value

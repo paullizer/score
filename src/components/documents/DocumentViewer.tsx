@@ -3,7 +3,6 @@ import { FileText, ScanLine } from 'lucide-react'
 import type { SourceDocument } from '../../domain/types'
 import type { ReferenceDocument } from '../../domain/real-grades'
 import type { DocumentPagination } from '../../domain/source-files'
-import { Badge } from '../ui'
 
 export function DocumentViewer({ document, highlightedId, quote, compact = false, pagination = 'pdf-pages' }: {
   document: SourceDocument | ReferenceDocument; highlightedId?: string; quote?: string; compact?: boolean
@@ -22,7 +21,7 @@ export function DocumentViewer({ document, highlightedId, quote, compact = false
   const sectionLabel = pagination === 'markdown-sections' ? 'Markdown' : pagination === 'html-sections' ? 'Captured HTML' : 'Captured source'
   const pageCount = reference ? document.pageCount : Math.max(...pages, 0)
   return <div ref={container} className={`document-viewer ${compact ? 'document-compact' : ''}`}>
-    <div className="document-toolbar"><span><FileText size={15} />{reference ? 'Captured reference' : 'Source document'} · v{document.version}</span><Badge tone="accent">Actual source</Badge></div>
+    <div className="document-toolbar"><span><FileText size={15} />{reference ? 'Captured reference' : 'Source document'} · v{document.version}</span></div>
     {reference && <p className="reference-completeness" role="status">{document.completeness === 'complete' ? 'Complete extraction' : document.completeness === 'selected-pages' ? 'Selected-page extraction — omitted pages were not examined' : 'Incomplete extraction — do not assume full coverage'} · {pages.length} captured {paginated ? `${pages.length === 1 ? 'page' : 'pages'} of ${pageCount}` : 'section groups'}{document.selectedPages.length > 0 && <> · Selected original pages: {document.selectedPages.join(', ')}</>}</p>}
     <div className="document-scroll">
       {pages.map((page, pageIndex) => <article className="document-page" key={page} aria-label={`${document.title}, ${paginated ? 'page' : pagination === 'markdown-sections' ? 'Markdown section' : 'captured section'} ${page}`}>
@@ -38,7 +37,7 @@ export function DocumentViewer({ document, highlightedId, quote, compact = false
             <p>{match >= 0 && quote ? <>{paragraph.text.slice(0, match)}<mark>{quote}</mark>{paragraph.text.slice(match + quote.length)}</> : paragraph.text}</p>
           </section>
         })}
-        <footer><span>Private workspace source</span><span>{paginated ? `Original page ${page} of ${pageCount}` : `${sectionLabel} section ${pageIndex + 1} of ${pages.length}`}</span></footer>
+        <footer><span>{paginated ? `Original page ${page} of ${pageCount}` : `${sectionLabel} section ${pageIndex + 1} of ${pages.length}`}</span></footer>
       </article>)}
     </div>
   </div>
