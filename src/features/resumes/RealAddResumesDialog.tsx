@@ -1,5 +1,5 @@
 import { useId, useRef, useState } from 'react'
-import { Check, FileText, Link2, LoaderCircle, Plus, RotateCcw, UploadCloud, X } from 'lucide-react'
+import { FileText, Link2, LoaderCircle, Plus, RotateCcw, UploadCloud, X } from 'lucide-react'
 import { Link } from 'react-router-dom'
 import { useRealResumes } from '../../app/real-resumes-context'
 import { clientAdmissionReason, usePublicSettings } from '../../app/public-settings-context'
@@ -8,7 +8,7 @@ import { Badge, Button, EmptyState, InlineError, Modal, SegmentedControl } from 
 import { RESUME_IMPORT_LIMITS } from '../../domain/real-resumes'
 import { supportedUploadFormats, uploadAccept } from '../../domain/document-formats'
 import { uploadFileByteLimit, uploadFormatNames, uploadPickerLabel } from '../../services/documentUploads'
-import { resumeErrorMessage, resumeFileInput, resumeUrlLines, type RealResumeImportSource } from './resumeImportUi'
+import { resumeFileInput, resumeUrlLines, type RealResumeImportSource } from './resumeImportUi'
 
 export function RealAddResumesDialog({ open, onOpenChange }: { open: boolean; onOpenChange: (open: boolean) => void }) {
   const api = useRealResumes()
@@ -19,9 +19,9 @@ export function RealAddResumesDialog({ open, onOpenChange }: { open: boolean; on
   const fileInput = useRef<HTMLInputElement>(null)
   const hintId = useId()
   const batch = api?.batches.find((item) => item.id === api.currentBatchId)
-  const items = batch?.items ?? []
+  const items = batch?.items.filter(item => item.state !== 'accepted') ?? []
+  const batches = api?.batches.filter(entry => entry.inputCount === null || entry.items.some(item => item.state !== 'accepted')) ?? []
   const uploading = items.some((item) => item.state === 'waiting' || item.state === 'uploading')
-  const accepted = items.filter((item) => item.state === 'accepted').length
   const valid = items.filter((item) => item.state === 'pending' || item.state === 'unconfirmed').length
   const limits = api?.features?.resumeLimits ?? RESUME_IMPORT_LIMITS
   const formats = effectiveFormats(supportedUploadFormats({
@@ -52,10 +52,10 @@ export function RealAddResumesDialog({ open, onOpenChange }: { open: boolean; on
   return <Modal open={open} onOpenChange={onOpenChange} title="Add real resumes"
     description={`Upload actual ${uploadPickerLabel(formats, ' or ')} files or import publicly accessible resume/profile URLs. Each input is processed independently.`}
     footer={<>
-      <span className="mr-auto text-[11px] text-muted" role="status">{accepted} accepted / {items.length} inputs{uploading ? ' · Uploading — not yet accepted' : ''}</span>
+      <span className="mr-auto text-[11px] text-muted" role="status">{items.length ? `${items.length} ${items.length === 1 ? 'upload' : 'uploads'} remaining` : api?.uploadNotice ?? 'Choose files or add URLs to upload.'}</span>
       <Button onClick={() => onOpenChange(false)}>{uploading ? 'Close — keep uploading' : 'Close'}</Button>
-      <Button variant="primary" icon={uploading ? LoaderCircle : UploadCloud} disabled={unavailable || uploading || !valid}
-        onClick={() => submit()}>{uploading ? 'Awaiting acceptance…' : locked ? `Retry ${valid} unacknowledged` : `Import ${valid} valid ${valid === 1 ? 'input' : 'inputs'}`}</Button>
+      {(uploading || valid > 0) && <Button variant="primary" icon={uploading ? LoaderCircle : UploadCloud} disabled={unavailable || uploading}
+        onClick={() => submit()}>{uploading ? 'Uploading…' : locked ? `Retry ${valid} ${valid === 1 ? 'upload' : 'uploads'}` : `Upload ${valid} ${valid === 1 ? 'resume' : 'resumes'}`}</Button>}
     </>}>
     {!api ? <EmptyState title="A cloud workspace is required" description="Open this dialog from an authenticated workspace. Imports are never stored in your browser." /> : <>
       {api.phase !== 'ready' && <div className="mb-4"><InlineError>{api.error ?? 'Checking private import availability…'} <Button size="sm" onClick={() => void api.refresh()}>Check service</Button></InlineError></div>}
@@ -66,7 +66,7 @@ export function RealAddResumesDialog({ open, onOpenChange }: { open: boolean; on
       {error && <div className="mb-4"><InlineError>{error}</InlineError></div>}
       <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
         <SegmentedControl value={mode} onChange={setMode} label="Resume source type" options={[{ value: 'file', label: `${uploadPickerLabel(formats)} files` }, { value: 'url', label: 'Public URLs' }]} />
-        <Badge>{items.length} / {limits.maxBatchItems} total inputs</Badge>
+        <Badge>{locked ? `${items.length} remaining` : `${items.length} / ${limits.maxBatchItems} inputs`}</Badge>
       </div>
       <p className="mb-4 text-[11px] text-muted">Files and URLs share one batch limit. Changing this tab keeps the entire batch. Importing does not start an analysis.</p>
       {!unavailable && !markdownEnabled && <p className="mb-4 text-[11px] text-muted" role="status">Markdown imports are not enabled in this deployment. Advertised file formats and public HTML/PDF URLs remain available; Markdown inputs will be marked invalid and will not be sent.</p>}
@@ -98,26 +98,21 @@ export function RealAddResumesDialog({ open, onOpenChange }: { open: boolean; on
         <p className="text-[11px] text-muted">A public profile can be sparse compared with a full resume. Missing evidence is not invented. Nonpublic or blocked URLs cannot be processed; there is no sign-in or access-control workaround.</p>
       </div>}
       {items.length > 0 && <section className="mt-5" aria-label="Real resume import batch">
-        <h3 className="mb-3 text-[12px] font-semibold">{locked ? 'Submitted batch — input identities are locked' : 'Review each input before importing'}</h3>
+        <h3 className="mb-3 text-[12px] font-semibold">{uploading ? 'Uploading resumes' : locked ? 'Uploads needing attention' : 'Ready to upload'}</h3>
         <ul className="max-h-80 divide-y overflow-y-auto rounded-xl border">
           {items.map((item, index) => {
-            const summary = api.summaries.find((entry) => entry.resume.id === item.resumeId)
             return <li key={item.key} className="flex items-start gap-3 bg-surface p-3">
               {item.source.kind === 'url' ? <Link2 size={17} className="mt-1 shrink-0 text-muted" aria-hidden="true" /> : <FileText size={17} className="mt-1 shrink-0 text-muted" aria-hidden="true" />}
               <div className="min-w-0 flex-1">
                 <p className="break-all text-[11px] font-semibold">{index + 1}. {item.label}</p>
-                <p className="mt-1 text-[10px] text-muted">{item.source.kind !== 'url' && `${item.source.kind.toUpperCase()} · `}{item.state === 'pending' ? 'Ready to send — not accepted yet' : item.state === 'waiting' ? 'Waiting to upload — not sent yet' : item.state === 'uploading' ? 'Sending source — server acceptance not confirmed yet'
-                  : item.state === 'accepted' ? `Accepted by the server · ${summary?.resume.status ?? 'processing status in library'}` : item.state === 'invalid' ? 'Invalid input — not sent' : 'Acceptance not confirmed — check the library or retry the unchanged request'}</p>
+                <p className="mt-1 text-[10px] text-muted">{item.source.kind !== 'url' && `${item.source.kind.toUpperCase()} · `}{item.state === 'pending' ? 'Ready to upload' : item.state === 'waiting' ? 'Waiting to upload — not sent yet' : item.state === 'uploading' ? 'Uploading resume…'
+                  : item.state === 'invalid' ? 'Invalid input — not sent' : 'Upload not confirmed. Retry to check or finish this upload without creating a duplicate.'}</p>
                 {item.error && <p className="mt-2 text-[11px] text-[var(--cp-danger)]" role="alert">{item.error}</p>}
-                {summary?.error && <p className="mt-2 text-[11px] text-[var(--cp-danger)]" role="alert">{resumeErrorMessage(summary)}</p>}
                 {item.warning && <p className="mt-2 text-[11px] text-muted">{item.warning}</p>}
-                {summary?.duplicates.map((duplicate, duplicateIndex) => <p key={duplicateIndex} className="mt-2 text-[11px] text-muted">{duplicate.message} No records were merged.</p>)}
-                {summary?.warnings.map((warning, warningIndex) => <p key={warningIndex} className="mt-2 text-[11px] text-muted">{warning}</p>)}
-                {item.resumeId && <Link to={`/resumes/${encodeURIComponent(item.resumeId)}`} onClick={() => onOpenChange(false)} className="text-link mt-2 text-[11px]">Inspect accepted resume</Link>}
               </div>
               <div className="flex shrink-0 flex-col items-end gap-2">
                 <Badge>{item.source.kind === 'url' ? 'URL' : item.source.kind === 'unsupported' ? 'Unsupported file' : uploadFormatNames([item.source.kind])}</Badge>
-                <Badge tone={item.state === 'accepted' ? 'success' : ['invalid', 'unconfirmed'].includes(item.state) ? 'warning' : 'neutral'}>{item.state === 'accepted' ? <><Check size={11} />Accepted</> : item.state === 'unconfirmed' ? 'Not acknowledged' : item.state}</Badge>
+                <Badge tone={['invalid', 'unconfirmed'].includes(item.state) ? 'warning' : 'neutral'}>{item.state === 'unconfirmed' ? 'Not confirmed' : item.state === 'waiting' ? 'Waiting' : item.state === 'pending' ? 'Not sent' : item.state === 'uploading' ? 'Uploading' : 'Invalid'}</Badge>
                 {!locked && <Button size="sm" variant="ghost" icon={X} className="icon-button" aria-label={`Remove input ${index + 1}: ${item.label}`} onClick={() => api.removeItem(item.key)} />}
                 {item.state === 'unconfirmed' && <Button size="sm" icon={RotateCcw} disabled={unavailable || uploading} aria-label={`Retry input ${index + 1}: ${item.label}`} onClick={() => submit([item.key])}>Retry import</Button>}
               </div>
@@ -125,18 +120,18 @@ export function RealAddResumesDialog({ open, onOpenChange }: { open: boolean; on
           })}
         </ul>
       </section>}
-      <div className="info-callout mt-5"><FileText size={18} aria-hidden="true" /><div><strong>Acceptance and processing are different.</strong>
-        <p>Accepted inputs are private, durable server records. Processing continues after this dialog or browser closes. Uploading or unacknowledged inputs are not claimed as queued; keep this workspace open or retry with the same keys. This session keeps pending files only in memory, never browser storage.</p></div></div>
+      <div className="info-callout mt-5"><FileText size={18} aria-hidden="true" /><div><strong>Uploaded resumes move to your library.</strong>
+        <p>Check processing progress there, then use ready resumes in an analysis. No import approval is needed. Keep this workspace open until uploads finish; saved resumes continue processing after you leave. Pending files stay only in memory, never browser storage.</p></div></div>
       {locked && <div className="mt-4 flex flex-wrap items-center justify-between gap-3">
-        <p className="text-[11px] text-muted">Retries keep the original input and batch keys. To correct an invalid input, start a separate batch.</p>
+        <p className="text-[11px] text-muted">Retry only the uploads that remain. To replace an invalid input, start another upload.</p>
         <Button disabled={unavailable || uploading} icon={Plus} onClick={() => {
           try { api.newBatch(); setUrls(''); setError('') } catch (caught) { setError(caught instanceof Error ? caught.message : 'The current batch is still active.') }
-        }}>Start another batch</Button>
+        }}>Add more resumes</Button>
       </div>}
-      {api.batches.length > 1 && <label className="field mt-4"><span className="field-label">Batches in this session</span>
+      {(batches.length > 1 || (!batch && batches.length > 0)) && <label className="field mt-4"><span className="field-label">Unfinished uploads</span>
         <select className="input" value={api.currentBatchId ?? ''} disabled={uploading} onChange={(event) => {
           try { api.selectBatch(event.target.value); setError('') } catch (caught) { setError(caught instanceof Error ? caught.message : 'This batch is still active.') }
-        }}>{api.batches.map((entry, index) => <option key={entry.id} value={entry.id}>Batch {index + 1} · {entry.items.filter((item) => item.state === 'accepted').length} accepted / {entry.items.length} inputs</option>)}</select>
+        }}>{!batch && <option value="">New upload</option>}{batches.map((entry, index) => <option key={entry.id} value={entry.id}>Upload {index + 1} · {entry.items.filter((item) => item.state !== 'accepted').length} remaining</option>)}</select>
       </label>}
     </>}
   </Modal>
@@ -144,16 +139,15 @@ export function RealAddResumesDialog({ open, onOpenChange }: { open: boolean; on
 
 export function RealResumeImportActivity() {
   const api = useRealResumes()
-  const items = api?.batches.flatMap((batch) => batch.items) ?? []
-  if (!items.length) return null
+  const items = api?.batches.flatMap((batch) => batch.items).filter(item => item.state !== 'accepted') ?? []
+  if (!items.length) return api?.uploadNotice ? <span className="sr-only" role="status">{api.uploadNotice}</span> : null
   const uploading = items.filter((item) => item.state === 'uploading').length
   const waiting = items.filter((item) => item.state === 'waiting').length
-  const accepted = items.filter((item) => item.state === 'accepted').length
-  const attention = items.filter((item) => item.state === 'unconfirmed' || item.state === 'invalid'
-    || api?.summaries.some((summary) => summary.resume.id === item.resumeId && summary.resume.status === 'error')).length
+  const pending = items.filter(item => item.state === 'pending').length
+  const attention = items.filter((item) => item.state === 'unconfirmed' || item.state === 'invalid').length
   return <div className="info-callout mb-5" role="status" aria-live="polite">
     {uploading || waiting ? <LoaderCircle size={18} className="motion-safe:animate-spin" aria-hidden="true" /> : <FileText size={18} aria-hidden="true" />}
-    <div><strong>Resume imports: {accepted} accepted{uploading > 0 ? ` · ${uploading} uploading (not yet acknowledged)` : ''}{waiting > 0 ? ` · ${waiting} waiting to upload` : ''}{attention > 0 ? ` · ${attention} need attention` : ''}</strong>
-      <p>Only accepted inputs are durable. <Link className="text-link" to="/resumes?imports=open">Review batches and server progress</Link></p></div>
+    <div><strong>Resume uploads: {items.length} remaining{uploading > 0 ? ` · ${uploading} uploading` : ''}{waiting > 0 ? ` · ${waiting} waiting to upload` : ''}{pending > 0 ? ` · ${pending} not sent` : ''}{attention > 0 ? ` · ${attention} need attention` : ''}</strong>
+      <p><Link className="text-link" to="/resumes?imports=open">Review unfinished uploads</Link>. Saved resumes and processing progress are in your library.</p></div>
   </div>
 }

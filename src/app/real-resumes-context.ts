@@ -19,6 +19,7 @@ export interface RealResumesContextValue {
   cancel: (id: string, etag: string) => Promise<RealResumeSummary>
   originalUrl: (id: string) => string
   batches: RealResumeImportBatch[]
+  uploadNotice: string | null
   currentBatchId: string | null
   newBatch: () => string
   selectBatch: (id: string) => void

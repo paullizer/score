@@ -13,7 +13,7 @@ import {
 } from '../../domain/analysis-corrections'
 import type { RealAnalysisComparisonDetail, RealAnalysisComparisonSummary, RealAnalysisResultSummary } from '../../domain/real-analyses'
 import type { Citation } from '../../domain/types'
-import { getDisplayName } from '../../domain/displayNames'
+import { getDisplayName, getResumeDisplayName } from '../../domain/displayNames'
 import { dateLabel } from '../../domain/selectors'
 import { workspaceCanEdit } from '../../domain/workspace-permissions'
 import {
@@ -557,7 +557,7 @@ function CorrectionReviewDialog({ runId, comparisons, initialCorrection, onClose
         const state = monitor.states[pair.id]
         const correction = state?.correction ?? row.preview?.correction
         const pending = access.journal.get(pair.id)
-        const source = getDisplayName(pair.resume.summary, pair.resume.summary.name?.trim() || 'Name not stated')
+        const source = getResumeDisplayName(pair.resume.summary)
         const target = getDisplayName(pair.target.summary, pair.target.summary.label)
         const busy = row.loading || row.phase === 'submitting'
         const failureKey = correction ? JSON.stringify([pair.id, correction.requestId]) : null

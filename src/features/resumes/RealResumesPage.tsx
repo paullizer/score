@@ -100,7 +100,7 @@ function RealResumesLibrary() {
     [item.displayName, item.resume.name, item.resume.role, item.resume.location, item.resume.experience, item.resume.sourceLabel, item.source.displayName].join(' ').toLocaleLowerCase().includes(query)),
     sort, (summary, key) => {
       switch (key) {
-        case 'name': return summary.displayName ?? summary.resume.name
+        case 'name': return resumeName(summary)
         case 'source': return summary.source.displayName
         case 'status': case 'actions': return resumeStatusOrder[summary.resume.status]
         case 'added': return Date.parse(summary.resume.createdAt)
@@ -143,7 +143,7 @@ function RealResumesLibrary() {
             sort={sort?.key === 'actions' ? { ...sort, key: 'status' } : sort} onChange={setSort} label="Sort real resumes" />
           <Button size="sm" icon={RotateCcw} onClick={() => void api.refresh()}>Refresh</Button></div></div>
       <div className="flex flex-wrap items-center justify-between gap-3 border-b px-5 py-3">
-        <p className="text-[11px] text-muted" role="status">{selected.length ? `${selected.length} selected${hidden ? ` · ${hidden} hidden by search` : ''}` : 'Only ready sources can be selected. Unknown profile fields remain “Not stated”.'}</p>
+        <p className="text-[11px] text-muted" role="status">{selected.length ? `${selected.length} selected${hidden ? ` · ${hidden} hidden by search` : ''}` : 'Select ready resumes to build an analysis. A name is not required.'}</p>
         <div className="flex flex-wrap gap-4">{selected.length > 0 && <button className="text-link" onClick={() => setSelected([])}>Clear selection</button>}
           {readyVisible.length > 0 && <button className="text-link" onClick={() => setSelected((current) => allVisibleSelected
             ? current.filter((choice) => !readyVisible.some((item) => item.resume.id === choice.resumeId))
@@ -227,6 +227,7 @@ function RealResumeDetail({ id }: { id: string }) {
       ? 'The saved capture is preserved and will be reused, not fetched again. Import a new source separately if its content needs to change.'
       : summary.source.kind === 'url' ? 'No source has been captured yet. A manual retry can succeed if this URL has become publicly accessible; Score will not sign in or bypass restrictions.' : 'The same submitted file is reused; choose a new import if you need to supply a different file.'}</p>}</InlineError></div>}
     {(detail.source.kind === 'url' || summary.warnings.length > 0) && <div className="info-callout mb-5"><FileText size={18} aria-hidden="true" /><div><strong>Source limitations</strong>
+      {ready && <p>This resume is ready to use. Missing profile details do not block an analysis.</p>}
       {detail.source.kind === 'url' && <p>A public profile may be sparse. Missing names, roles, experience, or evidence are never inferred from a URL or filename.</p>}
       {summary.warnings.map((warning, index) => <p key={index}>{warning}</p>)}</div></div>}
     {summary.duplicates.map((warning, index) => <div className="info-callout mb-5" key={index}><p>{warning.message} <Link className="text-link" to={`/resumes/${encodeURIComponent(warning.resumeId)}`}>Inspect the other source</Link>. No profiles were merged or overwritten.</p></div>)}

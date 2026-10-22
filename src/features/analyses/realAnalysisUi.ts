@@ -10,7 +10,7 @@ import type { ReferenceDocument } from '../../domain/real-grades'
 import { gradeHeadId } from '../../domain/real-grades'
 import { isEntityArchived, isEntityRemoved, type LifecycleTarget } from '../../domain/lifecycle'
 import { readyRealResume, resumeName } from '../resumes/resumeImportUi'
-import { getDisplayName } from '../../domain/displayNames'
+import { getDisplayName, getResumeDisplayName } from '../../domain/displayNames'
 
 export interface SelectedRealResume {
   id: string
@@ -369,7 +369,7 @@ export function initialRealSelections(
   const exactResumes = parseSelections(params.get('resumeSelections'), isRealResumeSelection, 'resume', errors)
   const exactTargets = parseSelections(params.get('targetSelections'), isRealTargetSelection, 'target', errors)
   if (previous) {
-    chosenResumes.push(...previous.resumes.map((item) => ({ id: item.selection.resumeId, label: getDisplayName(item, item.name?.trim() || 'Name not stated'), selection: item.selection })))
+    chosenResumes.push(...previous.resumes.map((item) => ({ id: item.selection.resumeId, label: getResumeDisplayName(item), selection: item.selection })))
     chosenTargets.push(...previous.targets.map((item) => ({ id: targetIdentity(item.selection), label: getDisplayName(item, item.label), selection: item.selection, summary: item })))
     if (['resumes', 'rubrics', 'jobs', 'job', 'targets', 'ladder', 'resumeSelections', 'targetSelections'].some((key) => params.has(key))) {
       errors.push('This link combines a previous run with additional inputs. Start a new selection or use only the saved run inputs; nothing will be silently ignored.')

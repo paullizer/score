@@ -15,6 +15,10 @@ export function getDisplayName(value: { displayName?: string }, original: string
   return value.displayName ?? original
 }
 
+export function getResumeDisplayName(value: { displayName?: string; name: string | null; sourceLabel: string }): string {
+  return getDisplayName(value, value.name?.trim() || value.sourceLabel.trim() || 'Name not stated')
+}
+
 export function defaultAnalysisName(resumeCount: number, targetLabels: readonly string[]): string {
   const count = Number.isFinite(resumeCount) ? Math.max(0, Math.floor(resumeCount)) : 0
   const resumes = `${count} ${count === 1 ? 'resume' : 'resumes'}`

@@ -93,7 +93,7 @@ before(async () => {
       export { RealResumesContext, useRealResumes } from './src/app/real-resumes-context';
       export { DocumentViewer } from './src/components/documents/DocumentViewer';
       export { RealResumeStatus, RealResumeActions, RealResumesPage } from './src/features/resumes/RealResumesPage';
-      export { RealAddResumesDialog } from './src/features/resumes/RealAddResumesDialog';
+      export { RealAddResumesDialog, RealResumeImportActivity } from './src/features/resumes/RealAddResumesDialog';
       export { RealComparisonReview } from './src/features/analyses/RealComparisonReview';
       export { RealAnalysesContext } from './src/app/real-analyses-context';
       export { RESUME_IMPORT_LIMITS } from './src/domain/real-resumes';
@@ -390,9 +390,26 @@ test('PDF size/URL bounds are per-item; no credential or nonpublic fallback is p
   assert.match(ui.resumeErrorMessage(blocked), /cannot sign in or bypass/)
   const missing = { ...blocked, error: { code: 'not-found', message: 'This page was not found.', retryable: false } }
   assert.equal(ui.resumeErrorMessage(missing), 'This page was not found.')
-  assert.equal(ui.resumeName(summary()), 'Name not stated')
+  assert.equal(ui.resumeName(summary()), 'resume.pdf')
   assert.equal(ui.readyRealResume(summary()), true)
   assert.equal(ui.readyRealResume(summary('queued', 'w', 'queued')), false)
+})
+
+test('resume titles use labels, stated names, then original filenames without changing source identity or readiness', () => {
+  const original = summary()
+  original.source = { kind: 'markdown', displayName: 'candidate-001.md', fileName: 'candidate-001.md' }
+  original.resume.sourceLabel = 'candidate-001.md'
+  const before = JSON.stringify(original)
+  assert.equal(ui.resumeName(original), 'candidate-001.md')
+  assert.equal(ui.resumeStatedName(original), 'Name not stated')
+  assert.equal(ui.readyRealResume(original), true)
+  assert.equal(JSON.stringify(original), before)
+  assert.equal(ui.resumeName({ ...original, resume: { ...original.resume, name: '  ' } }), 'candidate-001.md')
+  const named = { ...original, resume: { ...original.resume, name: '  Jordan Example  ' } }
+  assert.equal(ui.resumeName(named), 'Jordan Example')
+  assert.equal(ui.resumeName({ ...named, displayName: 'Reviewer label' }), 'Reviewer label')
+  const url = { ...original, source: { kind: 'url', displayName: 'https://example.test/profile', url: 'https://example.test/profile' } }
+  assert.equal(ui.resumeName(url), 'https://example.test/profile')
 })
 
 test('mixed Word inputs are gated, retain valid neighbors, and never gain printed-page limits', () => {
@@ -664,7 +681,9 @@ function tree(workspaceId, showProbe = true, role = 'owner', showDialog = false)
     workspace: baseWorkspace, cloud: { currentWorkspaceId: workspaceId, workspaces: [{ id: workspaceId, role }] },
   }) }, React.createElement(ui.RealResumesBridge, { workspaceId },
     React.createElement(React.Fragment, null, showProbe ? React.createElement(Probe) : null,
-      showDialog ? React.createElement(ui.RealAddResumesDialog, { open: true, onOpenChange() {} }) : null))))
+      showDialog ? React.createElement(React.Fragment, null,
+        React.createElement(ui.RealAddResumesDialog, { open: true, onOpenChange() {} }),
+        React.createElement(ui.RealResumeImportActivity)) : null))))
 }
 async function mount(workspaceId = 'workspace-one', showProbe = true, role = 'owner', showDialog = false) {
   root ??= createRoot(dom.window.document.getElementById('root'))
@@ -839,6 +858,9 @@ test('provider retains independent accepted/unconfirmed uploads after dialog unm
   await mount()
   assert.deepEqual(current.batches[0].items.map((item) => item.state), ['accepted', 'unconfirmed'])
   await act(async () => current.submitBatch(batch.id, [batch.items[1].key]))
+  assert.equal(current.batches.length, 0, 'The final confirmed retry retires the completed upload batch')
+  assert.equal(current.currentBatchId, null)
+  assert.match(current.uploadNotice, /^2 resumes uploaded/)
   const uploads = requests.filter((item) => item.init.method === 'POST')
   assert.equal(uploads.length, 3)
   const urlRequests = uploads.filter((item) => item.url.endsWith('/url'))
@@ -890,6 +912,15 @@ for (const count of [4, 10]) {
         assert.equal(current.batches[0].items[index].state, 'uploading')
         assert.ok(current.batches[0].items.slice(index + 1).every(item => item.state === 'waiting'))
         if (index === 0) await mount('workspace-one', true, 'owner', false)
+        if (index === 1) await mount('workspace-one', true, 'owner', true)
+        if (index > 0) {
+          assert.equal(dom.window.document.querySelectorAll('[aria-label="Real resume import batch"] li').length, count - index,
+            'Saved uploads disappear immediately even while later inputs are waiting')
+          assert.equal(dom.window.document.querySelector('input[type=file]').disabled, true)
+          assert.match(dom.window.document.body.textContent, new RegExp(`Resume uploads: ${count - index} remaining`))
+          assert.doesNotMatch(dom.window.document.body.textContent, /Inspect accepted resume|Accepted by the server/)
+          assert.ok(current.batches[0].items.slice(0, index).every(item => item.source.file === null))
+        }
         await act(async () => { gates[index].resolve(); await new Promise(resolve => setTimeout(resolve, 0)) })
       }
       await act(async () => submission)
@@ -904,7 +935,18 @@ for (const count of [4, 10]) {
         assert.equal(posts[index].init.headers.get('X-Import-Count'), String(count))
         assert.deepEqual(new Uint8Array(posts[index].init.body), new Uint8Array(await files[index].arrayBuffer()))
       }
-      assert.equal(current.batches[0].items.every(item => item.source.file === null), true)
+      assert.equal(current.batches.length, 0, 'Fully uploaded batches are retired after the ordered submission settles')
+      assert.equal(current.currentBatchId, null)
+      assert.match(current.uploadNotice, new RegExp(`^${count} resumes uploaded`))
+      await mount('workspace-one', true, 'owner', true)
+      assert.equal(dom.window.document.querySelector('[aria-label="Real resume import batch"]'), null)
+      assert.doesNotMatch(dom.window.document.body.textContent, /accepted|Retry 0|Resume uploads:|Unfinished uploads|Submitted batch/i)
+      assert.equal(dom.window.document.querySelector('input[type=file]').disabled, false)
+      const nextFile = new File(['# Next candidate'], 'next.md')
+      await act(async () => current.stage([ui.resumeFileInput(nextFile)]))
+      assert.notEqual(current.currentBatchId, batch.id, 'A new selection starts a fresh batch without a reset button')
+      assert.equal(current.batches[0].items[0].source.file, nextFile)
+      assert.equal(current.uploadNotice, null)
       assert.equal(dom.window.localStorage.length, 0)
     } finally {
       gates.forEach(gate => gate.resolve())
@@ -912,6 +954,57 @@ for (const count of [4, 10]) {
     }
   })
 }
+
+test('finishing a later upload leaves an older unresolved batch accessible without blocking a fresh selection', async () => {
+  const saved = []
+  let failed = false
+  globalThis.fetch = async (url, init) => {
+    requests.push({ url, init })
+    if (url === '/api/features') return json({ realResumeImports: true, markdownResumeImports: true })
+    if (init.method === 'GET') return json({ resumes: saved })
+    if (!failed) {
+      failed = true
+      return json({ error: { code: 'unavailable', message: 'Upload response lost.' } }, 503)
+    }
+    const record = summary(`saved-${saved.length}`, 'workspace-one', 'queued')
+    saved.push(record)
+    return json({ resume: record }, 202)
+  }
+  await mount('workspace-one', true, 'owner', true)
+  await settle(() => current?.phase === 'ready')
+  const firstFile = new File(['# First candidate'], 'first.md')
+  await act(async () => current.stage([ui.resumeFileInput(firstFile)]))
+  const first = current.batches[0]
+  await act(async () => current.submitBatch(first.id))
+  await act(async () => {
+    current.newBatch()
+    current.stage([ui.resumeFileInput(new File(['# Second candidate'], 'second.md'))])
+  })
+  const secondId = current.currentBatchId
+  await act(async () => current.submitBatch(secondId))
+  assert.equal(current.batches.length, 1)
+  assert.equal(current.batches[0].id, first.id)
+  assert.equal(current.batches[0].items[0].source.file, firstFile)
+  assert.equal(current.currentBatchId, null)
+  assert.equal(dom.window.document.querySelector('input[type=file]').disabled, false)
+  const picker = dom.window.document.querySelector('select')
+  assert.equal(picker.value, '')
+  assert.ok([...picker.options].some(option => option.value === first.id), 'The earlier unfinished upload remains reachable')
+  await act(async () => {
+    picker.value = first.id
+    picker.dispatchEvent(new dom.window.Event('change', { bubbles: true }))
+  })
+  assert.equal(current.currentBatchId, first.id)
+  await act(async () => current.submitBatch(first.id))
+  assert.equal(current.batches.length, 0)
+  assert.equal(dom.window.document.querySelector('select'), null)
+  assert.doesNotMatch(dom.window.document.body.textContent, /Resume uploads:|Retry 0/)
+  const posts = requests.filter(request => request.init.method === 'POST')
+  assert.equal(posts.length, 3)
+  assert.equal(posts[0].init.headers.get('Idempotency-Key'), posts[2].init.headers.get('Idempotency-Key'))
+  assert.equal(posts[0].init.headers.get('X-Import-Batch'), posts[2].init.headers.get('X-Import-Batch'))
+  assert.equal(posts[2].init.headers.get('X-Import-Count'), '1')
+})
 
 for (const message of ['Another workspace change is in progress.', 'This idempotency key was already used for different input.',
   'Every item in this batch must use the same declared input count.']) {
@@ -1008,7 +1101,7 @@ test('provider releases acknowledged DOCX/DOC files and retries an unconfirmed W
     if (init.headers.get('Content-Type') === 'application/msword' && wordAttempts++ === 0) return json({ error: { code: 'unavailable', message: 'Response lost.' } }, 503)
     return json({ resume: summary(`word-${requests.length}`, 'workspace-one', 'queued') }, 202)
   }
-  await mount()
+  await mount('workspace-one', true, 'owner', true)
   await settle(() => current?.phase === 'ready')
   const docx = new File([docxFile()], 'same-name.DOCX')
   const doc = new File([legacyDocFile()], 'same-name.DOC')
@@ -1019,8 +1112,14 @@ test('provider releases acknowledged DOCX/DOC files and retries an unconfirmed W
   assert.equal(current.batches[0].items[0].source.file, null)
   assert.equal(current.batches[0].items[0].source.kind, 'docx')
   assert.equal(current.batches[0].items[1].source.file, doc)
+  const queue = dom.window.document.querySelector('[aria-label="Real resume import batch"]')
+  assert.equal(queue.querySelectorAll('li').length, 2)
+  assert.doesNotMatch(queue.textContent, /same-name\.DOCX|Accepted|Inspect accepted/)
+  assert.match(queue.textContent, /same-name\.DOC|bad\.docm/)
   await act(async () => current.submitBatch(first.id, [first.items[1].key]))
   assert.equal(current.batches[0].items[1].source.file, null)
+  assert.equal(queue.querySelectorAll('li').length, 1, 'Only the invalid input remains after the retry succeeds')
+  assert.doesNotMatch(dom.window.document.body.textContent, /Retry 0/)
   const attempts = requests.filter((request) => request.init.headers?.get('Content-Type') === 'application/msword')
   assert.equal(attempts.length, 2)
   assert.equal(attempts[0].init.headers.get('Idempotency-Key'), attempts[1].init.headers.get('Idempotency-Key'))
@@ -1195,7 +1294,7 @@ test('resume picker, drop zone and URL tab preserve one mixed batch with unknown
   assert.deepEqual(current.batches[0].items.slice(0, 2).map((item) => item.key), keys)
   assert.equal(current.batches[0].items[3].state, 'invalid')
   assert.match(dom.window.document.querySelector('[aria-label="Real resume import batch"]').textContent, /Unsupported file/)
-  assert.match(dom.window.document.body.textContent, /Import 4 valid inputs/)
+  assert.match(dom.window.document.body.textContent, /Upload 4 resumes/)
 })
 
 test('workspace switching ignores late library and action responses; viewers cannot mutate', async () => {
