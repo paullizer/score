@@ -5,12 +5,12 @@ import type { JobStatus } from '../../domain/types'
 import { AccessSuspendedContext } from '../../app/access-suspended-context'
 
 type ButtonProps = ButtonHTMLAttributes<HTMLButtonElement> & {
-  variant?: 'primary' | 'secondary' | 'ghost' | 'danger'
+  variant?: 'primary' | 'secondary' | 'ghost' | 'danger' | 'success'
   size?: 'sm' | 'md'
   icon?: LucideIcon
 }
 
-const buttonVariants = { primary: 'button-primary', secondary: 'button-secondary', ghost: 'button-ghost', danger: 'button-danger' }
+const buttonVariants = { primary: 'button-primary', secondary: 'button-secondary', ghost: 'button-ghost', danger: 'button-danger', success: 'button-success' }
 const buttonSizes = { sm: 'button-sm', md: 'button-md' }
 const badgeTones = { neutral: 'badge-neutral', accent: 'badge-accent', success: 'badge-success', warning: 'badge-warning', danger: 'badge-danger' }
 

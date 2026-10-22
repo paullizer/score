@@ -32,7 +32,7 @@ import { analysisHash } from '../analyses/deterministic'
 import { EVIDENCE_SCALE_VERSION, rubricScaleErrors } from '../../src/domain/evidence-scale'
 import { RUBRIC_QA_VERSION, rubricQaChecks } from '../../src/domain/rubric-qa'
 import {
-  rubricQaRecordId, rubricVersionStatus,
+  rubricQaRecordId, rubricVersionStatus, summarizeRubricQa,
   type RubricApprovalRecord, type RubricCheckState, type RubricQaRecord,
 } from '../../src/domain/rubric-approval'
 import { reviewJobRubric, RubricReviewCancelledError } from './rubric-review'
@@ -265,7 +265,7 @@ async function requireMutableWorkspace(store: RealJobStore, workspaceId: string)
   }
 }
 
-function summaryMetadata(value: VersionedRealJob, rubric: Rubric | null = null): RealJobSummary {
+function summaryMetadata(value: VersionedRealJob, rubric: Rubric | null = null, rubricQa?: RubricQaRecord): RealJobSummary {
   return {
     ...(value.record.displayName !== undefined ? { displayName: value.record.displayName } : {}),
     job: value.record.job,
@@ -279,16 +279,21 @@ function summaryMetadata(value: VersionedRealJob, rubric: Rubric | null = null):
     ...(value.record.lifecycle ? { lifecycle: value.record.lifecycle } : {}),
     ...(value.record.rubricLifecycle ? { rubricLifecycle: value.record.rubricLifecycle } : {}),
     ...(value.record.rubricApproval ? { rubricApproval: value.record.rubricApproval } : {}),
+    ...(rubricQa ? { rubricQaSummary: summarizeRubricQa(rubricQa) } : {}),
   }
 }
 
 async function summary(store: RealJobStore, value: Awaited<ReturnType<RealJobStore['get']>>): Promise<RealJobSummary> {
   if (!value) throw notFound('The requested job was not found.')
-  const rubric = value.record.job.rubricId && !value.record.lifecycle?.deletingAt && !value.record.lifecycle?.deletedAt &&
-    !value.record.rubricLifecycle?.deletingAt && !value.record.rubricLifecycle?.deletedAt
-    ? await store.getRubric(value.record.workspaceId, value.record.job.rubricId)
+  const active = Boolean(value.record.job.rubricId && !value.record.lifecycle?.deletingAt && !value.record.lifecycle?.deletedAt &&
+    !value.record.rubricLifecycle?.deletingAt && !value.record.rubricLifecycle?.deletedAt)
+  const rubric = active
+    ? await store.getRubric(value.record.workspaceId, value.record.job.rubricId!)
     : undefined
-  return summaryMetadata(value, rubric ?? null)
+  const rubricQa = active && rubric && store.getRubricQa
+    ? await store.getRubricQa(value.record.workspaceId, value.record.id, rubric.id, rubric.version).catch(() => undefined)
+    : undefined
+  return summaryMetadata(value, rubric ?? null, rubricQa)
 }
 
 async function readDocument(blobs: JobBlobStore, record: RealJobRecord): Promise<SourceDocument | null> {

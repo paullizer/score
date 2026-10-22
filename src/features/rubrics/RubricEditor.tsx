@@ -62,12 +62,13 @@ function normalizedDraft(draft: Rubric): Rubric {
   }
 }
 
-export function RubricEditor({ rubric, onClose, onSaved, initialPanel = null, initialFocusCriterionId = null }: {
+export function RubricEditor({ rubric, onClose, onSaved, initialPanel = null, initialFocusCriterionId = null, initialAssistInstruction = null }: {
   rubric: Rubric
   onClose: () => void
   onSaved: (id: string) => void
   initialPanel?: 'assist' | 'source' | 'changes' | null
   initialFocusCriterionId?: string | null
+  initialAssistInstruction?: string | null
 }) {
   const { workspace, saveRubric, cloud } = useWorkspace()
   const { settings } = usePublicSettings()
@@ -100,7 +101,7 @@ export function RubricEditor({ rubric, onClose, onSaved, initialPanel = null, in
     : !cloud.realJobs.features?.rubricAssistant ? 'AI assist is not available for this workspace right now.'
     : !document ? 'Load the job posting before asking AI assist.' : null
     : null
-  const maxCriteria = Math.min(20, settings?.rubrics.jobs.maxCriteria ?? cloud.realJobs.features?.limits.maxCriteria ?? 20)
+  const maxCriteria = Math.min(20, settings?.rubrics.jobs.maxCriteria ?? cloud.realJobs.features?.limits?.maxCriteria ?? 20)
   const scaled = Boolean(session.draft.scaleVersion)
 
   function versionId(version: Rubric): string {
@@ -183,7 +184,13 @@ export function RubricEditor({ rubric, onClose, onSaved, initialPanel = null, in
     },
   })
 
-  // Only saves are "pending" writes; an in-flight assistant request is read-only and is cancelled if the editor closes.
+  const autoSentRef = useRef(false)
+  useEffect(() => {
+    if (!initialAssistInstruction?.trim() || !assistantAvailable || autoSentRef.current) return
+    autoSentRef.current = true
+    setActivePanel('assist')
+    void conversation.send(initialAssistInstruction.trim(), initialFocusCriterionId)
+  }, [assistantAvailable, conversation, initialAssistInstruction, initialFocusCriterionId])
   const guard = useGradeLeaveGuard(session.dirty || conversation.turns.length > 0, saving, `Rubric: ${rubric.name}${conversation.turns.length > 0 ? ' (and assistant conversation)' : ''}`)
   const locked = saving || conversation.pending || !canEdit
   const realErrors = session.draft.criteria.flatMap((criterion, index) => {

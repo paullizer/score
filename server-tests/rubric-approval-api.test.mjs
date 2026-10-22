@@ -265,6 +265,14 @@ test('rubric checks run once per saved version and refuse rubrics made before th
     assert.deepEqual((await again.json()).review.checks, review.checks, 'Stored results are reused')
     assert.equal(server.invoke.calls.length, 2, 'Checks never run twice for one version')
     assert.deepEqual((await (await checks(seed)).json()).review.checks, review.checks)
+
+    const listed = await (await fetch(`${server.baseUrl}/api/workspaces/${seed.workspace.id}/jobs`, { headers: authHeaders() })).json()
+    const summaryItem = listed.jobs.find(item => item.job.id === seed.jobId)
+    assert.equal(summaryItem.rubricQaSummary.rubricId, seed.rubric.id)
+    assert.equal(summaryItem.rubricQaSummary.version, 1)
+    assert.equal(summaryItem.rubricQaSummary.blockerCount, 0)
+    assert.equal(summaryItem.rubricQaSummary.warningCount, 1)
+    assert.equal(summaryItem.rubricQaSummary.findings.length, 1)
   } finally { await server.close() }
 })
 

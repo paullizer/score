@@ -19,9 +19,10 @@ export function useRubricApprovals() {
     const summary = jobId ? cloud.realJobs.summaries.find((item) => item.job.id === jobId) : undefined
     const record = detail?.state === 'ready' ? detail.value : summary
     const approval: RubricApprovalPointer | undefined = record?.rubricApproval
+    const qaSummary = record?.rubricQaSummary ?? summary?.rubricQaSummary
     const versions = detail?.state === 'ready' ? (detail.value.rubricVersions ?? []).map((item) => item.version) : []
     const latestVersion = Math.max(rubric.version, summary?.rubric?.version ?? 0, ...versions)
-    const presentation = rubricApprovalPresentation(rubric, approval, required)
+    const presentation = rubricApprovalPresentation(rubric, approval, required, qaSummary)
     const active = Boolean(jobId && !access.archived && !access.removed && !access.deleting && !access.transitioning &&
       record?.job.status === 'ready' && !record.job.rubricDeletedAt &&
       !isEntityArchived(workspace, { kind: 'rubric', id: rubric.groupId }) &&

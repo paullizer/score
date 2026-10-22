@@ -103,6 +103,9 @@
   .button-ghost { border-color: transparent; background: transparent; color: var(--cp-text-muted); box-shadow: none; }
   .button-ghost:hover:not(:disabled) { background: var(--cp-surface-soft); color: var(--cp-text); }
   .button-danger { background: var(--cp-danger); border-color: var(--cp-danger); color: var(--cp-bg-elevated); }
+  .button-success { background: color-mix(in srgb, var(--cp-success) 82%, #000); border-color: color-mix(in srgb, var(--cp-success) 82%, #000); color: var(--cp-accent-fg); }
+  html[data-theme="dark"] .button-success { background: var(--cp-success); border-color: var(--cp-success); color: var(--cp-accent-fg); }
+  .button-success:hover:not(:disabled) { filter: brightness(0.93); }
   .button:disabled { opacity: .45; }
   .button:active:not(:disabled) { transform: translateY(1px); }
   .icon-button { @apply h-8 w-8 p-0; min-height: 32px; }
@@ -291,7 +294,16 @@
   .source-provenance code { font-family: Consolas, "Courier New", Courier, monospace; }
   .pane-switcher { @apply mb-4 hidden; }
   .criterion-card { @apply rounded-xl border p-4; background: var(--cp-surface); }
+  .criterion-card.is-flagged { border-color: var(--cp-warning); }
   .criterion-card + .criterion-card { @apply mt-3; }
+  .criterion-finding-callout { @apply mt-3 flex flex-wrap items-start justify-between gap-2 rounded-lg border p-3 text-[11px]; border-color: var(--cp-warning); background: color-mix(in srgb, var(--cp-warning) 7%, var(--cp-surface)); color: var(--cp-text); }
+  .approval-banner { @apply rounded-xl border p-4; background: var(--cp-surface-soft); color: var(--cp-text); }
+  .approval-banner.is-clean { border-color: var(--cp-success); background: color-mix(in srgb, var(--cp-success) 8%, var(--cp-surface)); }
+  .approval-banner.is-warning { border-color: var(--cp-warning); background: color-mix(in srgb, var(--cp-warning) 8%, var(--cp-surface)); }
+  .bulk-step-rail { @apply flex flex-wrap items-center gap-1.5; }
+  .bulk-step-pill { @apply inline-flex items-center gap-1.5 rounded-lg border px-2.5 py-1.5 text-[11px] font-medium; background: var(--cp-surface); color: var(--cp-text-muted); }
+  .bulk-step-pill.is-active { border-color: var(--cp-accent); background: var(--cp-accent-soft); color: var(--cp-accent); }
+  .bulk-step-pill.is-approved { border-color: var(--cp-success); color: var(--cp-text); }
   .source-quote { @apply rounded-lg border-l-2 px-3 py-2 text-[10px] leading-5; color: var(--cp-text-muted); background: var(--cp-surface-soft); border-left-color: var(--cp-accent); }
   .rubric-card, .resume-card { @apply rounded-2xl border p-5; background: var(--cp-panel); transition: border-color 150ms, box-shadow 150ms; }
   .rubric-card:hover, .resume-card:hover { border-color: var(--cp-border-strong); box-shadow: 0 2px 5px var(--cp-border); }
