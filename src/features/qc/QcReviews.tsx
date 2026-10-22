@@ -8,7 +8,7 @@ import {
   type QcCapabilities, type QcComparisonContext, type QcComparisonRef, type QcCriterionFeedback,
   type QcReviewSubmission, type VersionedQc, type QcReviewHead,
 } from '../../domain/quality-control'
-import { getDisplayName } from '../../domain/displayNames'
+import { getDisplayName, getResumeDisplayName } from '../../domain/displayNames'
 import { listAllRealAnalyses, listAllRealAnalysisComparisons } from '../../services/realAnalyses'
 import {
   createQcBatch, getQcContext, getQcPeers, getQcReviewHistory, listQcBatches, saveQcReview,
@@ -111,7 +111,7 @@ function QcQueueRow({ workspaceId, runId, comparisonId, onChoose, selected, limi
   const canChoose = context.writable && (!requirePeerAccess || context.canSeePeers || context.isCoordinator)
   return <article className="qc-card">
     <div className="qc-toolbar"><div className="qc-grow"><h3><Link to={qcReviewLink(context.scope)}>
-      {getDisplayName(comparison.resume.summary, comparison.resume.summary.name ?? 'Name not stated')} → {getDisplayName(comparison.target.summary, comparison.target.summary.label)}
+      {getResumeDisplayName(comparison.resume.summary)} → {getDisplayName(comparison.target.summary, comparison.target.summary.label)}
     </Link></h3><p className="qc-muted">Saved rubric v{comparison.target.summary.rubricVersion} · {context.scope.resultRevision}</p></div>
       {onChoose && <label className="qc-check"><input type="checkbox" checked={checked}
         disabled={disabled || !canChoose || (!checked && selected.length >= limit)} onChange={() => onChoose(context)} />Select exact result</label>}</div>

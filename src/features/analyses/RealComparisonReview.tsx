@@ -9,7 +9,7 @@ import { gradeSourcePagination } from '../grade-ladders/gradeUi'
 import { Badge, Button, EmptyState, InlineError, Score, SegmentedControl } from '../../components/ui'
 import { DocumentViewer } from '../../components/documents/DocumentViewer'
 import { RealCandidateNarrative } from './AnalysisSummaries'
-import { getDisplayName } from '../../domain/displayNames'
+import { getDisplayName, getResumeDisplayName } from '../../domain/displayNames'
 import { analysisFailureExplanation, analysisFailureStages, citationMatches, targetVersionLabel } from './realAnalysisUi'
 import { RealComparisonDiagnostics } from './RealComparisonDiagnostics'
 import { AnalysisCorrectionDetails } from './AnalysisCorrections'
@@ -40,7 +40,7 @@ export function RealComparisonReview({ detail, actions, initialView, qc }: {
 }) {
   const { comparison, resumeSnapshot: resume, targetSnapshot: target, result } = detail
   const savedResume = comparison.resume.summary
-  const resumeLabel = getDisplayName(savedResume, savedResume.name?.trim() || 'Name not stated')
+  const resumeLabel = getResumeDisplayName(savedResume)
   const rubric = target.kind === 'job' ? target.rubric : target.version.rubric
   const [expanded, setExpanded] = useState<string[]>(() => qc ? rubric.criteria.map(row => row.id) : rubric.criteria[0] ? [rubric.criteria[0].id] : [])
   const [selected, setSelected] = useState<EvidenceSelection | null>(null)

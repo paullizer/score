@@ -31,6 +31,7 @@ import { workspaceCanReview, workspaceQcRole } from '../domain/workspace-permiss
 import { QualityControlPage } from '../features/qc/QualityControlPage'
 import { ApplicationPolicyBanners } from './ApplicationPolicyBanners'
 import type { Workspace } from '../domain/types'
+import { useRubricApprovals } from '../features/rubrics/useRubricApproval'
 
 function active(workspace: Workspace, kind: 'job' | 'resume' | 'analysis', id: string): boolean {
   return !isEntityArchived(workspace, { kind, id }) && !isEntityRemoved(workspace, { kind, id })
@@ -56,6 +57,7 @@ function Navigation({ onNavigate, collapsed = false }: { onNavigate?: () => void
   const realResumes = useRealResumes()
   const realAnalyses = useRealAnalyses()
   const location = useLocation()
+  const pending = useRubricApprovals().pending.length
   const realGrades = gradeLadders?.summaries.reduce((count, family) => count + family.levels.filter((level) => level.head.latestVersionId && !isEntityRemoved(workspace, { kind: 'rubric', id: level.head.id }) && !isEntityArchived(workspace, { kind: 'rubric', id: level.head.id })).length, 0) ?? 0
   const items = [
     { to: '/jobs', label: 'Jobs', icon: BriefcaseBusiness, count: workspace.jobs.filter((job) => active(workspace, 'job', job.id)).length },
@@ -64,8 +66,10 @@ function Navigation({ onNavigate, collapsed = false }: { onNavigate?: () => void
     { to: '/analyses', label: 'Analyses', icon: BarChart3, count: (realAnalyses?.summaries ?? []).filter((item) => active(workspace, 'analysis', item.run.id)).length },
   ]
   return <nav className="main-nav" aria-label="Main navigation">{items.map(({ to, label, icon: Icon, count }) =>
-    <NavLink key={to} to={to} onClick={onNavigate} title={collapsed ? `${label} · ${count}` : undefined} className={({ isActive }) => navClass({ isActive: isActive || (to === '/rubrics' && location.pathname.startsWith('/grade-ladders')) })}>
-      <Icon size={18} strokeWidth={1.7} aria-hidden="true" /><span className="nav-label">{label}</span><span className="nav-count">{count}</span>
+    <NavLink key={to} to={to} onClick={onNavigate} title={collapsed ? `${label} · ${count}${to === '/rubrics' && pending ? ` · ${pending} need approval` : ''}` : undefined} className={({ isActive }) => navClass({ isActive: isActive || (to === '/rubrics' && location.pathname.startsWith('/grade-ladders')) })}>
+      <Icon size={18} strokeWidth={1.7} aria-hidden="true" /><span className="nav-label">{label}</span>
+      {to === '/rubrics' && pending > 0 && <span className="nav-approval-count" aria-label={`${pending} job rubrics need approval`}>{pending}<span className="nav-approval-label"> pending</span></span>}
+      <span className="nav-count">{count}</span>
     </NavLink>)}</nav>
 }
 

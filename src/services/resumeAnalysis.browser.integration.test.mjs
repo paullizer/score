@@ -75,8 +75,9 @@ test('browser imports actual PDF bytes, explicitly runs real analysis, opens cit
     await dialog.getByLabel('Choose resume PDF or Markdown files', { exact: true }).setInputFiles({
       name: file.name, mimeType: 'application/pdf', buffer: bytes,
     })
-    await dialog.getByRole('button', { name: 'Import 1 valid input', exact: true }).click()
-    await visible(dialog.getByText(/Accepted by the server/))
+    await dialog.getByRole('button', { name: 'Upload 1 resume', exact: true }).click()
+    await page.waitForFunction(() => !document.querySelector('input[type=file]').disabled)
+    assert.equal(await dialog.locator('[aria-label="Real resume import batch"]').count(), 0)
     await dialog.getByRole('button', { name: 'Close', exact: true }).click()
     await dialog.waitFor({ state: 'hidden' })
     const saved = [...fixture.resumes.store.values.values()].find(({ record }) => record.recordType === 'resume').record
@@ -144,8 +145,9 @@ test('browser multiline URLs keep good inputs, explain inaccessible LinkedIn, an
     await dialog.getByLabel('Public resume or profile URLs').fill(`${publicUrl}\n${blockedUrl}\nnot-a-url`)
     await dialog.getByRole('button', { name: 'Add URLs to batch', exact: true }).click()
     await visible(dialog.getByText(/Invalid input.*not sent/))
-    await dialog.getByRole('button', { name: 'Import 2 valid inputs', exact: true }).click()
-    await until(async () => await dialog.getByText(/Accepted by the server/).count() === 2, 'Both valid URL submissions should be accepted independently.')
+    await dialog.getByRole('button', { name: 'Upload 2 resumes', exact: true }).click()
+    await visible(dialog.getByText('1 upload remaining', { exact: true }))
+    assert.equal(await dialog.locator('[aria-label="Real resume import batch"] li').count(), 1)
     await dialog.getByRole('button', { name: 'Close', exact: true }).click()
     await processAllResumes(fixture, stubs)
     await page.getByRole('button', { name: 'Refresh', exact: true }).click()
@@ -163,6 +165,53 @@ test('browser multiline URLs keep good inputs, explain inaccessible LinkedIn, an
     assert.deepEqual(errors, [])
   } finally { await context.close() }
 })
+
+for (const width of [1440, 390]) {
+  test(`nameless resume leaves uploads and becomes usable under its filename without approval at ${width}px`, { timeout: 90_000 }, async t => {
+    const fixture = await startResumeAnalysisFixture(runtime, { injectAuth: true })
+    t.after(() => fixture.close())
+    const paragraphs = resumeParagraphs.slice(1)
+    const stubs = processingStubs(fixture, { ocrParagraphs: paragraphs })
+    const { context, page, errors } = await newPage()
+    await page.setViewportSize({ width, height: 1000 })
+    try {
+      await page.goto(`${fixture.origin}/workspaces/${fixture.workspaceId}/resumes`)
+      await page.getByRole('button', { name: 'Add resumes', exact: true }).click()
+      const dialog = await visible(page.getByRole('dialog', { name: 'Add real resumes', exact: true }))
+      const file = await resumePdf({ name: 'candidate-001.pdf', paragraphs })
+      await dialog.locator('input[type=file]').setInputFiles({
+        name: file.name, mimeType: 'application/pdf', buffer: Buffer.from(await file.arrayBuffer()),
+      })
+      await dialog.getByRole('button', { name: 'Upload 1 resume', exact: true }).click()
+      await page.waitForFunction(() => !document.querySelector('input[type=file]').disabled)
+      assert.equal(await dialog.locator('[aria-label="Real resume import batch"]').count(), 0)
+      assert.equal(await dialog.getByRole('button', { name: /^Retry/ }).count(), 0)
+      await dialog.getByRole('button', { name: 'Close', exact: true }).click()
+      const row = page.getByRole('row').filter({ has: page.getByRole('link', { name: file.name, exact: true }) })
+      await visible(row.getByText('Queued', { exact: true }))
+      assert.equal(await row.getByRole('checkbox').isEnabled(), false)
+      assert.equal(await page.getByText(/^Resume uploads:/).count(), 0)
+      await processAllResumes(fixture, stubs)
+      await page.getByRole('button', { name: 'Refresh', exact: true }).click()
+      await visible(row.getByText('Ready', { exact: true }))
+      const stored = [...fixture.resumes.store.values.values()].find(({ record }) => record.recordType === 'resume').record
+      assert.equal(stored.resume.name, null)
+      assert.equal(stored.resume.status, 'ready')
+      await row.getByRole('checkbox').check()
+      await page.getByRole('button', { name: 'Build analysis (1)', exact: true }).click()
+      await visible(page.getByRole('heading', { name: 'Build a real analysis', exact: true }))
+      assert.equal(await page.getByRole('checkbox', { name: `Include ${file.name} from ${file.name}`, exact: true }).isChecked(), true)
+      assert.equal(fixture.analyses.store.values.size, 0, 'Selecting a nameless resume needs no approval and does not automatically start scoring')
+      await page.goto(`${fixture.origin}/workspaces/${fixture.workspaceId}/resumes/${stored.id}`)
+      await visible(page.getByRole('heading', { name: file.name, level: 1, exact: true }))
+      const profile = page.getByRole('complementary', { name: 'Resume profile and capture provenance', exact: true })
+      assert.equal(await profile.locator('dl > div').filter({ has: page.locator('dt', { hasText: /^Name$/ }) }).locator('dd').textContent(), 'Not stated')
+      assert.equal(await page.getByText(/^Resume uploads:/).count(), 0)
+      assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth), true)
+      assert.deepEqual(errors, [])
+    } finally { await context.close() }
+  })
+}
 
 test('browser workspace switching ignores a late private resume response from the previous workspace', { timeout: 90_000 }, async (t) => {
   const fixture = await startResumeAnalysisFixture(runtime, { injectAuth: true })
@@ -653,10 +702,10 @@ test('browser comparison browsing searches every page, scopes score sorting, and
     await nameHeader.getByRole('button').focus()
     await page.keyboard.press('Enter')
     assert.equal(await nameHeader.getAttribute('aria-sort'), 'ascending')
-    assert.deepEqual(await names(), ['ada Example', 'ada Example', 'Morgan Example', 'Morgan Example', 'Zora Example', 'Zora Example', 'Name not stated', 'Name not stated'])
+    assert.deepEqual(await names(), ['ada Example', 'ada Example', 'Morgan Example', 'Morgan Example', 'resume-20.pdf', 'resume-20.pdf', 'Zora Example', 'Zora Example'])
     await page.keyboard.press('Space')
     assert.equal(await nameHeader.getAttribute('aria-sort'), 'descending')
-    assert.deepEqual(await names(), ['Zora Example', 'Zora Example', 'Morgan Example', 'Morgan Example', 'ada Example', 'ada Example', 'Name not stated', 'Name not stated'])
+    assert.deepEqual(await names(), ['Zora Example', 'Zora Example', 'resume-20.pdf', 'resume-20.pdf', 'Morgan Example', 'Morgan Example', 'ada Example', 'ada Example'])
 
     const targetOptions = await targetSelect.locator('option').evaluateAll((options) => options.map((option) => ({ value: option.value, label: option.textContent })))
     const versionTwo = targetOptions.find((option) => option.label.includes('Job rubric v2'))
@@ -666,17 +715,17 @@ test('browser comparison browsing searches every page, scopes score sorting, and
     assert.ok((await rows.locator('td:nth-child(2)').allTextContents()).every((text) => text.includes('Job rubric v2')))
     await scoreHeader.getByRole('button').click()
     assert.equal(await scoreHeader.getAttribute('aria-sort'), 'descending')
-    assert.deepEqual(await names(), ['Zora Example', 'ada Example', 'Morgan Example', 'Name not stated'])
+    assert.deepEqual(await names(), ['Zora Example', 'ada Example', 'Morgan Example', 'resume-20.pdf'])
     await scoreHeader.getByRole('button').click()
     assert.equal(await scoreHeader.getAttribute('aria-sort'), 'ascending')
-    assert.deepEqual(await names(), ['Morgan Example', 'Name not stated', 'ada Example', 'Zora Example'])
+    assert.deepEqual(await names(), ['Morgan Example', 'resume-20.pdf', 'ada Example', 'Zora Example'])
     assert.match(await rows.first().locator('td:nth-child(3)').textContent(), /0\s*\/\s*100/)
     assert.match(await rows.last().locator('td:nth-child(3)').textContent(), /60\s*\/\s*100/)
 
     for (const [query, expected] of [
       ['  ADA  ', ['ada Example']],
       ['rEsUmE-10.PdF', ['Zora Example']],
-      ['ENGINEERING SPECIALIST', ['Morgan Example', 'Name not stated', 'ada Example', 'Zora Example']],
+      ['ENGINEERING SPECIALIST', ['Morgan Example', 'resume-20.pdf', 'ada Example', 'Zora Example']],
     ]) {
       await search.fill(query)
       await until(async () => JSON.stringify(await names()) === JSON.stringify(expected), `Saved metadata search should match ${query}.`)

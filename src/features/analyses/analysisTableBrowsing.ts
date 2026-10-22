@@ -4,7 +4,7 @@ import type { RealAnalysisComparisonSummary, RealAnalysisRunSummary, RealAnalysi
 import { matchesTableSearch, sortTableRows, type TableSort } from '../../domain/tableSorting'
 import { realAnalysisCancellationPaused, realAnalysisCancellationPending, targetIdentity, targetVersionLabel } from './realAnalysisUi'
 import { realAnalysisCompletionRank, realAnalysisFullyComplete, realComparisonCompletionRank } from './realAnalysisCompletion'
-import { getDisplayName } from '../../domain/displayNames'
+import { getDisplayName, getResumeDisplayName } from '../../domain/displayNames'
 
 export type AnalysisHistoryFilter = 'all' | 'complete' | 'attention'
 export type RealAnalysisSortKey = 'name' | 'status' | 'comparisons' | 'created'
@@ -112,7 +112,7 @@ export function selectRealComparisons(
   const rows = sortTableRows(matches, sort, (pair, key) => {
     const comparison = pair.comparison
     switch (key) {
-      case 'name': return comparison.resume.summary.displayName ?? comparison.resume.summary.name
+      case 'name': return getResumeDisplayName(comparison.resume.summary)
       case 'target': return getDisplayName(comparison.target.summary, comparison.target.summary.label).trim() ? realComparisonTargetLabel(comparison.target.summary) : null
       case 'status': return realComparisonProcessingRank(pair, run, completion)
       case 'score': return comparison.status === 'complete' && comparison.resultSummary?.overall.status === 'available'

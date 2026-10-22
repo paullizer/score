@@ -8,6 +8,7 @@ import type { RubricQaFinding } from '../../domain/rubric-qa'
 import { dateLabel } from '../../domain/selectors'
 import type { Rubric } from '../../domain/types'
 import { useRubricApproval } from './useRubricApproval'
+import { useRealAnalyses } from '../../app/real-analyses-context'
 
 const STATUS_LABELS: Record<RubricVersionStatus, string> = { approved: 'Approved', draft: 'Draft', superseded: 'Superseded' }
 
@@ -22,7 +23,7 @@ function criterionNames(rubric: Rubric, finding: RubricQaFinding): string {
   }).join(' · ')
 }
 
-function FindingList({ rubric, title, findings, tone }: { rubric: Rubric; title: string; findings: RubricQaFinding[]; tone: 'warning' | 'danger' }) {
+export function FindingList({ rubric, title, findings, tone }: { rubric: Rubric; title: string; findings: RubricQaFinding[]; tone: 'warning' | 'danger' }) {
   if (!findings.length) return null
   return <section className="space-y-2">
     <h3 className="text-[12px] font-semibold">{title} <Badge tone={tone}>{findings.length}</Badge></h3>
@@ -61,7 +62,7 @@ export function RubricApprovalCard({ rubric, readOnly }: { rubric: Rubric; readO
           : required
             ? 'Not approved yet. New analyses and grade ladders can use this rubric only after a workspace owner approves it.'
             : 'Not approved yet. Admin settings let new analyses use rubrics without approval.'
-  return <div className="rounded-xl border bg-soft p-3.5">
+  return <div id="rubric-approval" className="rounded-xl border bg-soft p-3.5">
     <div className="flex items-start gap-2.5">
       <BadgeCheck size={16} className="mt-0.5 shrink-0 text-muted" aria-hidden="true" />
       <div className="min-w-0 flex-1">
@@ -78,6 +79,7 @@ export function RubricApprovalCard({ rubric, readOnly }: { rubric: Rubric; readO
 
 function RubricApprovalDialog({ rubric, jobId, canApprove, onClose }: { rubric: Rubric; jobId: string; canApprove: boolean; onClose: () => void }) {
   const { cloud } = useWorkspace()
+  const analyses = useRealAnalyses()
   const [state, setState] = useState<RubricCheckState | null>(null)
   const [busy, setBusy] = useState<'loading' | 'checking' | 'approving' | null>('loading')
   const [error, setError] = useState('')
@@ -115,6 +117,7 @@ function RubricApprovalDialog({ rubric, jobId, canApprove, onClose }: { rubric: 
     setError('')
     try {
       await cloud.realJobs.approveRubric(jobId, state)
+      await analyses?.refreshTargets()
       onClose()
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : 'The rubric could not be approved. Try again.')

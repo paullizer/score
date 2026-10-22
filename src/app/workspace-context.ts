@@ -56,7 +56,7 @@ export interface CloudWorkspaceStatus {
     /** Runs the checks once for a saved version (one model review); later calls return the stored results. */
     runRubricChecks: (jobId: string, rubricId: string, version: number, signal?: AbortSignal) => Promise<RubricCheckState>
     /** Owner-only approval of exactly the checked version. */
-    approveRubric: (jobId: string, review: RubricCheckState) => Promise<void>
+    approveRubric: (jobId: string, review: RubricCheckState, options?: { notify?: boolean }) => Promise<void>
     originalUrl: (jobId: string) => string
   }
 }

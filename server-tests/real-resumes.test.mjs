@@ -349,6 +349,7 @@ async function fixture(options = {}) {
   const leased = new Set()
   const state = new Proxy({
     async acquireMutationLease(workspaceId) {
+      if (options.failFastLeases && leased.has(workspaceId)) throw new api.WorkspaceMutationBusyError()
       while (leased.has(workspaceId)) await new Promise(resolve => setTimeout(resolve, 1))
       leased.add(workspaceId)
       return { async renew() { assert.ok(leased.has(workspaceId)) }, async release() { leased.delete(workspaceId) } }
@@ -448,6 +449,92 @@ async function bodyOf(response, expectedStatus) {
   const body = await response.json()
   assert.equal(response.status, expectedStatus, JSON.stringify(body))
   return body
+}
+
+for (const kind of ['pdf', 'markdown', 'file-pdf', 'file-markdown', 'file-docx', 'file-doc', 'url']) {
+  test(`${kind} resume admission acknowledges only after lease release, including replay`, async t => {
+    const server = await fixture({ failFastLeases: true, wordDocumentImports: true })
+    t.after(() => server.close())
+    const acquire = server.state.acquireMutationLease.bind(server.state)
+    const request = input()
+    const send = (workspaceId = WORKSPACE, identity = request) => {
+      const options = { workspaceId, input: identity, ...(workspaceId === OTHER_WORKSPACE ? { oid: OUTSIDER } : {}) }
+      if (kind === 'url') return importUrl(server, options)
+      if (kind === 'pdf') return importPdf(server, options)
+      if (kind === 'markdown') return importMarkdown(server, options)
+      const format = kind.slice(5)
+      const types = { pdf: 'application/pdf', markdown: 'text/markdown',
+        docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', doc: 'application/msword' }
+      return fetch(`${server.path(workspaceId)}/file`, {
+        method: 'POST',
+        headers: headers({
+          oid: options.oid, 'content-type': types[format],
+          'x-file-name': `resume.${format === 'markdown' ? 'md' : format}`,
+          'idempotency-key': identity.idempotencyKey, 'x-import-batch': identity.batchId, 'x-import-count': '1',
+        }),
+        body: format === 'pdf' ? pdfBytes : format === 'markdown' ? Buffer.from('# Example\n\nEngineer.\n')
+          : format === 'docx' ? docxFile() : legacyDocFile(),
+      })
+    }
+    for (const status of [202, 200]) {
+      let enteredRelease, finishRelease
+      const entered = new Promise(resolve => { enteredRelease = resolve })
+      const gate = new Promise(resolve => { finishRelease = resolve })
+      let held = false, acknowledged = false
+      server.state.acquireMutationLease = async workspaceId => {
+        const lease = await acquire(workspaceId)
+        if (workspaceId !== WORKSPACE) return lease
+        held = true
+        return {
+          renew: () => lease.renew(),
+          async release() { enteredRelease(); await gate; await lease.release(); held = false },
+        }
+      }
+      const pending = send().then(response => { acknowledged = true; return response })
+      await entered
+      try {
+        await new Promise(resolve => setTimeout(resolve, 25))
+        assert.equal(acknowledged, false, 'Success must not escape before the workspace lock is released')
+        assert.equal(held, true)
+        assert.equal((await send(WORKSPACE, input())).status, 409, 'Independent same-workspace contention remains explicit')
+        assert.equal((await send(OTHER_WORKSPACE, input())).status, 202, 'Other workspaces remain independent')
+      } finally { finishRelease() }
+      const response = await pending
+      const body = await bodyOf(response, status)
+      assert.equal(held, false)
+      assert.equal(response.headers.get('etag'), body.resume.etag)
+      assert.equal(body.resume.resume.id, `resume-${request.idempotencyKey}`)
+    }
+  })
+}
+
+for (const failure of ['renew', 'release', 'operation-and-release']) {
+  test(`resume ${failure} failure cannot acknowledge success or mask the original error`, async t => {
+    const server = await fixture({ failFastLeases: true })
+    t.after(() => server.close())
+    const acquire = server.state.acquireMutationLease.bind(server.state)
+    server.state.acquireMutationLease = async workspaceId => {
+      const lease = await acquire(workspaceId)
+      return {
+        async renew() { if (failure === 'renew') throw new api.StoreConflictError('Final lease renewal failed.'); await lease.renew() },
+        async release() { await lease.release(); if (failure !== 'renew') throw new Error('Release transport failed') },
+      }
+    }
+    const request = input()
+    const response = await importMarkdown(server, {
+      input: request, ...(failure === 'operation-and-release' ? { bytes: Buffer.from([0x80]) } : {}),
+    })
+    const body = await bodyOf(response, failure === 'operation-and-release' ? 400 : 409)
+    assert.equal(body.resume, undefined)
+    assert.match(body.error.message, failure === 'renew' ? /Final lease renewal failed/
+      : failure === 'release' ? /lock release could not be confirmed/ : /UTF-8/)
+    server.state.acquireMutationLease = acquire
+    if (failure !== 'operation-and-release') {
+      await bodyOf(await importMarkdown(server, { input: request }), 200)
+      const records = [...server.cosmos.values.values()].filter(value => value.recordType === 'resume')
+      assert.equal(records.length, 1, 'Explicit same-key replay must not duplicate the accepted resume')
+    }
+  })
 }
 
 for (const [oid, ordinaryStatus] of [[OUTSIDER, 404], [VIEWER, 403]]) {

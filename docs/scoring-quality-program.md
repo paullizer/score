@@ -278,6 +278,23 @@ Generator v2 responds to these findings. Job rubrics (`score-job-rubric-v4`, sch
 
 New app imports run `score-job-rubric-review-v1` after generation and atomically
 save the rubric and its immutable QA record before marking the job ready.
+Ready here means processing is complete, not that the rubric is approved.
+Jobs and the rubric library show pending approval explicitly, with a navigation
+count and links from analysis setup. Owners can select drafts **For approval**
+or choose **Approve all pending** across the active workspace, including drafts
+hidden by the library search. The batch displays exact versions, saved QA and
+warnings before one final approval confirmation. Missing checks run only after
+an explicit action; structural blockers cannot be bypassed. Editors can still
+run individual checks, but only workspace owners can approve.
+
+Bulk approval uses the existing exact-version approval route sequentially, not
+a weaker bulk write. Hash, ETag, source evidence, latest-version and lifecycle
+checks still apply to each approval, with an independent audit record. Partial
+success stays saved, failed items remain visible for explicit reload/retry,
+and unfinished browser batches do not continue as server jobs. A newer draft
+does not displace the previously approved version until it is approved. The
+Admin approval policy and frozen historical analyses are unchanged.
+
 Edited versions run the same review on demand. Invalid or failed reviews stay
 processing failures, never unchecked ready rubrics or approvals. Generation
 panels measure generator validity and repeatability separately; an offline

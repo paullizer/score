@@ -5,7 +5,7 @@ import type { UploadFormat } from '../../domain/document-formats'
 import { isSafeUploadedFilename, uploadedFileKind, type UploadedSourceKind } from '../../domain/source-files'
 import { uploadFileByteLimit, uploadFormatNames, validateUploadFile } from '../../services/documentUploads'
 import { lifecycleIsRemoved } from '../../domain/lifecycle'
-import { getDisplayName } from '../../domain/displayNames'
+import { getResumeDisplayName } from '../../domain/displayNames'
 
 export type RealResumeImportSource = { kind: UploadedSourceKind | 'unsupported'; file: File } | { kind: 'url'; url: string }
 
@@ -17,7 +17,7 @@ export interface RealResumeImportItem {
   key: string
   source: RealResumeImportSource | { kind: UploadedSourceKind; file: null }
   label: string
-  state: 'pending' | 'invalid' | 'uploading' | 'accepted' | 'unconfirmed'
+  state: 'pending' | 'invalid' | 'waiting' | 'uploading' | 'accepted' | 'unconfirmed'
   error?: string
   warning?: string
   resumeId?: string
@@ -93,7 +93,10 @@ export function readyRealResume(summary: RealResumeSummary): boolean {
 }
 
 export function resumeName(summary: RealResumeSummary): string {
-  return getDisplayName(summary, resumeStatedName(summary))
+  return getResumeDisplayName({
+    displayName: summary.displayName, name: summary.resume.name,
+    sourceLabel: summary.source.kind === 'url' ? summary.source.displayName : summary.source.fileName,
+  })
 }
 
 export function resumeStatedName(summary: RealResumeSummary): string {

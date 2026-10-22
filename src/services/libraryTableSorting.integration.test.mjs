@@ -384,12 +384,12 @@ test('real resume headers and selector sort nullable names, displayed source lab
   assert.equal(selectedOption('Sort real resumes'), 'Default order')
   assert.equal(document.querySelectorAll('th[aria-sort]').length, 0)
   await sortHeader('Resume / source profile')
-  order(['r-a2', 'r-tie', 'r-a10', 'r-queue', 'r-cancel', 'r-parse', 'r-z', 'r-null', 'r-blank'])
+  order(['r-a2', 'r-tie', 'r-a10', 'r-queue', 'r-cancel', 'r-parse', 'r-blank', 'r-null', 'r-z'])
   activeHeader('Resume / source profile', 'ascending')
   await sortHeader('Resume / source profile')
-  order(['r-z', 'r-parse', 'r-cancel', 'r-queue', 'r-a10', 'r-a2', 'r-tie', 'r-null', 'r-blank'])
+  order(['r-z', 'r-null', 'r-blank', 'r-parse', 'r-cancel', 'r-queue', 'r-a10', 'r-a2', 'r-tie'])
   activeHeader('Resume / source profile', 'descending')
-  assert.equal(row('r-null').querySelector('a.row-title').textContent, 'Name not stated')
+  assert.equal(row('r-null').querySelector('a.row-title').textContent, 'Source 1.pdf')
   assert.equal(row('r-blank').querySelector('a.row-title').textContent, 'Name not stated')
   for (const heading of ['Source / progress', 'Status / actions']) {
     await sortHeader(heading)
@@ -407,8 +407,8 @@ test('real resume headers and selector sort nullable names, displayed source lab
   await choose('Sort real resumes', 'Processing status: Complete first')
   order(completeResumes)
   const choices = [
-    ['Resume label / stated name: A–Z', ['r-a2', 'r-tie', 'r-a10', 'r-queue', 'r-cancel', 'r-parse', 'r-z', 'r-null', 'r-blank']],
-    ['Resume label / stated name: Z–A', ['r-z', 'r-parse', 'r-cancel', 'r-queue', 'r-a10', 'r-a2', 'r-tie', 'r-null', 'r-blank']],
+    ['Resume label / stated name: A–Z', ['r-a2', 'r-tie', 'r-a10', 'r-queue', 'r-cancel', 'r-parse', 'r-blank', 'r-null', 'r-z']],
+    ['Resume label / stated name: Z–A', ['r-z', 'r-null', 'r-blank', 'r-parse', 'r-cancel', 'r-queue', 'r-a10', 'r-a2', 'r-tie']],
     ['Source label: A–Z', ['r-queue', 'r-a2', 'r-null', 'r-a10', 'r-tie', 'r-z', 'r-cancel', 'r-parse', 'r-blank']],
     ['Source label: Z–A', ['r-parse', 'r-cancel', 'r-z', 'r-a10', 'r-tie', 'r-null', 'r-a2', 'r-queue', 'r-blank']],
     ['Added date: Oldest first', ['r-blank', 'r-tie', 'r-parse', 'r-queue', 'r-cancel', 'r-null', 'r-a10', 'r-a2', 'r-z']],

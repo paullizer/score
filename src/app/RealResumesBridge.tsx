@@ -6,12 +6,11 @@ import { assertClientAdmission, clientAdmissionReason, usePublicSettings } from 
 import { boundedPollingInterval, effectiveFormats, requireImportBatch, resumeFeaturesWithPolicy } from '../services/publicSettings'
 import { CloudApiError, CloudConflictError, LifecycleOperationError, workspaceAccessStamp } from '../services/cloudWorkspace'
 import { lifecycleIsRemoved, type LifecycleAction, type LifecycleTarget } from '../domain/lifecycle'
-import { appendResumeInputs, resumeWorkActive, type RealResumeImportBatch, type RealResumeImportSource } from '../features/resumes/resumeImportUi'
+import { appendResumeInputs, resumeName, resumeWorkActive, type RealResumeImportBatch, type RealResumeImportSource } from '../features/resumes/resumeImportUi'
 import { WorkspaceContext, useWorkspace, type PendingLifecycleChange, type RenameEntityTarget } from './workspace-context'
-import { getDisplayName } from '../domain/displayNames'
 import { useGradeLeaveGuard } from './grade-navigation-context'
 import { RealResumesContext, type RealResumesContextValue } from './real-resumes-context'
-import { RealRequestScope, realRequestError, type RealLoadState } from './real-request-scope'
+import { RealRequestScope, realRequestError, type RealLoadState, type RealMutationTicket } from './real-request-scope'
 import { assertRealLifecyclePermission, discoveredLifecycle, projectRealLifecycle, realWorkspaceWritable, reconcileLifecycleOperations } from './real-lifecycle'
 
 export function RealResumesBridge({ workspaceId, children }: { workspaceId: string; children: ReactNode }) {
@@ -31,6 +30,8 @@ function RealResumesProvider({ workspaceId, children }: { workspaceId: string; c
   const [features, setFeatures] = useState<api.ResumeServiceFeatures | null>(null)
   const featuresRef = useRef(features)
   const [phase, setPhase] = useState<RealResumesContextValue['phase']>('loading')
+  const admissionRef = useRef({ policy, phase })
+  admissionRef.current = { policy, phase }
   const [error, setError] = useState<string | null>(null)
   const [summaries, setSummaries] = useState<RealResumeSummary[]>([])
   const summariesRef = useRef(summaries)
@@ -39,6 +40,7 @@ function RealResumesProvider({ workspaceId, children }: { workspaceId: string; c
   const detailsRef = useRef(details)
   const [pendingCount, setPendingCount] = useState(0)
   const [batches, setBatches] = useState<RealResumeImportBatch[]>([])
+  const [uploadNotice, setUploadNotice] = useState<string | null>(null)
   const batchesRef = useRef(batches)
   const [currentBatchId, setCurrentBatchId] = useState<string | null>(null)
   const currentBatchRef = useRef(currentBatchId)
@@ -79,7 +81,7 @@ function RealResumesProvider({ workspaceId, children }: { workspaceId: string; c
 
   useEffect(() => {
     setPendingLifecycle(reconcileLifecycleOperations(pendingLifecycleRef.current, summaries.map((summary) =>
-      discoveredLifecycle({ kind: 'resume', id: summary.resume.id }, getDisplayName(summary, summary.resume.name ?? summary.source.displayName), summary.lifecycle, summary.lifecycleOperation))))
+      discoveredLifecycle({ kind: 'resume', id: summary.resume.id }, resumeName(summary), summary.lifecycle, summary.lifecycleOperation))))
   }, [setPendingLifecycle, summaries])
 
   const ensureDetail = useCallback(async function loadDetail(id: string, force = false): Promise<void> {
@@ -176,7 +178,7 @@ function RealResumesProvider({ workspaceId, children }: { workspaceId: string; c
 
   function assertWritable(id?: string) {
     if (!realWorkspaceWritable(parentRef.current, workspaceId)) throw new Error('This workspace is archived, read-only, or unavailable. An owner or editor must import, retry, or cancel resumes.')
-    if (phase !== 'ready') throw new Error('The saved resume service is unavailable. Refresh before submitting.')
+    if (admissionRef.current.phase !== 'ready') throw new Error('The saved resume service is unavailable. Refresh before submitting.')
     if (id) {
       const summary = summariesRef.current.find((item) => item.resume.id === id)
       if (!summary || summary.lifecycle?.archivedAt || lifecycleIsRemoved(summary.lifecycle) || pendingLifecycleRef.current.some((item) => item.target.id === id)) {
@@ -198,16 +200,23 @@ function RealResumesProvider({ workspaceId, children }: { workspaceId: string; c
       commit(summary, ticket.sequence)
       return summary
     } catch (caught) {
-      if (caught instanceof CloudConflictError) {
+      if (caught instanceof CloudConflictError && key.startsWith('resume:')) {
         throw new Error('This resume changed in another session. Reload and inspect its current state before retrying. No action was automatically resent with a new version.')
       }
       throw caught
     } finally {
-      const current = scope.mutationOwned(ticket)
-      scope.finishMutation(ticket)
-      if (current) {
-        setPendingCount((value) => value - 1)
-        if (!scope.busy) { leaveGuard.release(); void refresh() }
+      finishMutation(ticket)
+    }
+  }
+
+  function finishMutation(ticket: RealMutationTicket) {
+    const current = scope.mutationOwned(ticket)
+    scope.finishMutation(ticket)
+    if (current) {
+      setPendingCount((value) => value - 1)
+      if (!scope.busy) {
+        leaveGuard.release()
+        void refresh()
         void parentRef.current.cloud?.refreshWorkspaces().catch(caught => setError(`Workspace access refresh failed: ${realRequestError(caught, 'Try refreshing access again.')}`))
       }
     }
@@ -221,12 +230,13 @@ function RealResumesProvider({ workspaceId, children }: { workspaceId: string; c
   function newBatch(): string {
     assertWritable()
     assertNewImports()
-    if (batchesRef.current.some((batch) => batch.items.some((item) => item.state === 'uploading'))) {
+    if (scope.pending('$import-batch')) {
       throw new Error('Wait for uploads to be acknowledged before starting another batch. The active batch has not been replaced.')
     }
     const current = batchesRef.current.find((batch) => batch.id === currentBatchRef.current)
     if (current && current.inputCount === null) return current.id
     const batch: RealResumeImportBatch = { id: crypto.randomUUID(), inputCount: null, items: [] }
+    setUploadNotice(null)
     putBatches([...batchesRef.current, batch])
     currentBatchRef.current = batch.id
     setCurrentBatchId(batch.id)
@@ -257,42 +267,72 @@ function RealResumesProvider({ workspaceId, children }: { workspaceId: string; c
     const batch = batchesRef.current.find((item) => item.id === batchId)
     if (!batch) throw new Error('This batch is no longer open. Check the real library for acknowledged imports.')
     if (keys?.some((key) => !batch.items.some((item) => item.key === key))) throw new Error('The requested import item is not part of this batch.')
-    if (batch.items.some((item) => item.state === 'uploading')) throw new Error('This batch is still uploading. Wait for acknowledgement before retrying.')
+    if (scope.pending('$import-batch')) throw new Error('This batch is still uploading. Wait for acknowledgement before retrying.')
     const selected = batch.items.filter((item) => (!keys || keys.includes(item.key)) && ['pending', 'unconfirmed'].includes(item.state))
     if (!selected.length) throw new Error('No valid, unacknowledged inputs remain in this batch. Invalid entries were not submitted.')
     const inputCount = batch.inputCount ?? batch.items.length
-    requireImportBatch(inputCount, 'resumes', policy.settings)
+    requireImportBatch(inputCount, 'resumes', admissionRef.current.policy.settings)
+    const ticket = scope.mutate('$import-batch')
+    leaveGuard.hold()
+    setPendingCount((value) => value + 1)
     putBatches(batchesRef.current.map((item) => item.id === batchId
-      ? { ...item, inputCount, items: item.items.map((input) => selected.some((candidate) => candidate.key === input.key) ? { ...input, state: 'uploading', error: undefined } : input) } : item))
-    await Promise.all(selected.map(async (item) => {
-      try {
-        const summary = await mutate(`import:${item.key}`, () => {
-          if (item.source.kind === 'url') return api.importRealResumeUrl(workspaceId, item.source.url, item.key, batchId, inputCount, undefined, policy.settings)
-          if (item.source.kind === 'unsupported') throw new Error('This file type is not supported. It has not been sent.')
-          if (!item.source.file) throw new Error('The accepted file is now server-owned. Inspect its saved record instead of resending it.')
-          if (item.source.kind === 'markdown' && !featuresRef.current?.markdownResumeImports) {
-            throw new Error('Markdown resume imports are not enabled in this deployment. PDFs and public URLs are still supported.')
+      ? { ...item, inputCount, items: item.items.map((input) => selected.some((candidate) => candidate.key === input.key) ? { ...input, state: 'waiting', error: undefined } : input) } : item))
+    try {
+      for (const item of selected) {
+        if (!scope.isOpen) return
+        if (!scope.mutationCurrent(ticket)) throw new Error('Workspace access changed. Remaining inputs were not sent; review current access before submitting them.')
+        assertWritable()
+        assertNewImports()
+        updateItem(batchId, item.key, { state: 'uploading' })
+        try {
+          const summary = await mutate(`import:${item.key}`, () => {
+            const settings = admissionRef.current.policy.settings
+            if (item.source.kind === 'url') return api.importRealResumeUrl(workspaceId, item.source.url, item.key, batchId, inputCount, undefined, settings)
+            if (item.source.kind === 'unsupported') throw new Error('This file type is not supported. It has not been sent.')
+            if (!item.source.file) throw new Error('The accepted file is now server-owned. Inspect its saved record instead of resending it.')
+            if (item.source.kind === 'markdown' && !featuresRef.current?.markdownResumeImports) {
+              throw new Error('Markdown resume imports are not enabled in this deployment. PDFs and public URLs are still supported.')
+            }
+            if ((item.source.kind === 'docx' || item.source.kind === 'doc') && !featuresRef.current?.wordDocumentImports) {
+              throw new Error('Word document imports are not enabled in this deployment.')
+            }
+            return api.importRealResumeFile(workspaceId, item.source.file, item.key, batchId, inputCount, undefined, settings)
+          }, remember)
+          updateItem(batchId, item.key, {
+            state: 'accepted', resumeId: summary.resume.id, error: undefined,
+            source: item.source.kind === 'url' || item.source.kind === 'unsupported' ? item.source : { kind: item.source.kind, file: null },
+          })
+        } catch (caught) {
+          // A request can be accepted even when its response is lost. Retrying preserves both keys and bytes.
+          if (scope.isOpen && batchesRef.current.some((entry) => entry.id === batchId)) {
+            updateItem(batchId, item.key, { state: 'unconfirmed', error: realRequestError(caught, 'Acceptance could not be confirmed. Retry this unchanged input with its original request key.') })
           }
-          if ((item.source.kind === 'docx' || item.source.kind === 'doc') && !featuresRef.current?.wordDocumentImports) {
-            throw new Error('Word document imports are not enabled in this deployment.')
-          }
-          return api.importRealResumeFile(workspaceId, item.source.file, item.key, batchId, inputCount, undefined, policy.settings)
-        }, remember)
-        updateItem(batchId, item.key, {
-          state: 'accepted', resumeId: summary.resume.id, error: undefined,
-          source: item.source.kind === 'url' || item.source.kind === 'unsupported' ? item.source : { kind: item.source.kind, file: null },
-        })
-      } catch (caught) {
-        // A request can be accepted even when its response is lost. Retrying preserves both keys and bytes.
-        if (scope.isOpen && batchesRef.current.some((entry) => entry.id === batchId)) {
-          updateItem(batchId, item.key, { state: 'unconfirmed', error: realRequestError(caught, 'Acceptance could not be confirmed. Retry this unchanged input with its original request key.') })
+          if (caught instanceof CloudApiError && [401, 403, 404].includes(caught.status)) throw caught
         }
       }
-    }))
+    } catch (caught) {
+      if (scope.isOpen) {
+        const error = `Not sent. ${realRequestError(caught, 'Upload admission is unavailable. Review current access and settings before submitting.')}`
+        putBatches(batchesRef.current.map(batch => batch.id === batchId
+          ? { ...batch, items: batch.items.map(item => item.state === 'waiting' ? { ...item, state: 'pending', error } : item) } : batch))
+      }
+      throw caught
+    } finally {
+      finishMutation(ticket)
+      const completed = batchesRef.current.find(item => item.id === batchId)
+      if (scope.isOpen && completed?.items.length && completed.items.every(item => item.state === 'accepted')) {
+        putBatches(batchesRef.current.filter(item => item.id !== batchId))
+        if (currentBatchRef.current === batchId) {
+          currentBatchRef.current = null
+          setCurrentBatchId(null)
+        }
+        setUploadNotice(`${completed.items.length} ${completed.items.length === 1 ? 'resume uploaded' : 'resumes uploaded'}. Follow processing in your library.`)
+      }
+    }
   }
 
   function assertNewImports() {
-    assertClientAdmission(policy, 'resumeImports')
+    assertClientAdmission(admissionRef.current.policy, 'resumeImports')
     if (!featuresRef.current?.realResumeImports) throw new Error('New resume imports are unavailable. Saved history remains readable.')
   }
 
@@ -303,10 +343,10 @@ function RealResumesProvider({ workspaceId, children }: { workspaceId: string; c
     retry: (id, etag) => mutate(`resume:${id}`, () => api.retryRealResume(workspaceId, id, etag), remember, false, id),
     cancel: (id, etag) => mutate(`resume:${id}`, () => api.cancelRealResume(workspaceId, id, etag), remember, false, id),
     originalUrl: (id) => api.realResumeOriginalUrl(workspaceId, id),
-    batches, currentBatchId, newBatch, stage, submitBatch,
+    batches, uploadNotice, currentBatchId, newBatch, stage, submitBatch,
     selectBatch: (id) => {
       if (!batchesRef.current.some((batch) => batch.id === id)) throw new Error('This batch is not available.')
-      if (batchesRef.current.some((batch) => batch.items.some((item) => item.state === 'uploading'))) throw new Error('Wait for the active uploads before switching batches.')
+      if (scope.pending('$import-batch')) throw new Error('Wait for the active uploads before switching batches.')
       currentBatchRef.current = id
       setCurrentBatchId(id)
     },
@@ -348,7 +388,7 @@ function RealResumesProvider({ workspaceId, children }: { workspaceId: string; c
       if (response.operation && response.operation.status !== 'complete') {
         const summary = summariesRef.current.find((item) => item.resume.id === target.id)
         setPendingLifecycle(reconcileLifecycleOperations(pendingLifecycleRef.current, [{
-          target, name: summary ? getDisplayName(summary, summary.resume.name ?? summary.source.displayName) : pending?.name ?? 'Real resume', operation: response.operation,
+          target, name: summary ? resumeName(summary) : pending?.name ?? 'Real resume', operation: response.operation,
         }]))
         if (action === 'delete') putDetail(target.id, { state: 'error', error: 'Deletion is still incomplete. Retry the lifecycle operation; cached source content has been cleared.' })
       } else if (response.deleted) removeResume(target.id, sequence)

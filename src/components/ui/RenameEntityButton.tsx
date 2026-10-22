@@ -4,7 +4,7 @@ import { useWorkspace } from '../../app/workspace-context'
 import { useRealAnalyses } from '../../app/real-analyses-context'
 import { useRealResumes } from '../../app/real-resumes-context'
 import { useGradeLeaveGuard } from '../../app/grade-navigation-context'
-import { DISPLAY_NAME_MAX_LENGTH, getDisplayName, normalizeDisplayName } from '../../domain/displayNames'
+import { DISPLAY_NAME_MAX_LENGTH, getDisplayName, getResumeDisplayName, normalizeDisplayName } from '../../domain/displayNames'
 import { useLifecycleAccess } from '../lifecycle/useLifecycleAccess'
 import { Button, InlineError, Modal } from './index'
 
@@ -82,7 +82,8 @@ function RenameEntityDialog({ request, onClose }: { request: RenameRequest; onCl
     if (kind === 'resume') {
       const summary = resumes?.summaries.find((item) => item.resume.id === id)
       return summary && resumes?.phase === 'ready' && !resumes.error
-        ? { name: getDisplayName(summary, summary.resume.name?.trim() || 'Name not stated'), etag: summary.etag } : null
+        ? { name: getResumeDisplayName({ displayName: summary.displayName, name: summary.resume.name,
+          sourceLabel: summary.source.kind === 'url' ? summary.source.displayName : summary.source.fileName }), etag: summary.etag } : null
     }
     const summary = analyses?.summaries.find((item) => item.run.id === id)
     return summary && analyses?.phase === 'ready' && !analyses.error

@@ -395,12 +395,12 @@ export function RealJobsBridge({
     return runRealJobRubricChecks(workspaceId, jobId, rubricId, version, signal)
   }
 
-  async function approveRubric(jobId: string, review: RubricCheckState) {
-    const summary = summaries.find((item) => item.job.id === jobId)
+  async function approveRubric(jobId: string, review: RubricCheckState, options?: { notify?: boolean }) {
+    const summary = summariesRef.current.find((item) => item.job.id === jobId)
     if (!summary?.rubric) throw new Error('Load this job and its rubric before approving it.')
     try {
       await mutate(() => approveRealJobRubric(workspaceId, jobId, review, summary.etag), remember, { kind: 'rubric', id: summary.rubric.groupId })
-      base.notify(`Version ${review.version} approved. New analyses and grade ladders use this version.`)
+      if (options?.notify !== false) base.notify(`Version ${review.version} approved. New analyses and grade ladders use this version.`)
     } catch (error) {
       if (error instanceof CloudConflictError) {
         await Promise.all([refresh(), ensureDetail(jobId, true)])

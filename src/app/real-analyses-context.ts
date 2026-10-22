@@ -1,4 +1,4 @@
-import { createContext, useContext } from 'react'
+import { createContext, useContext, useEffect } from 'react'
 import type {
   AnalysisProcessingFeatures, CreateRealAnalysisInput, RealAnalysisComparisonDetail, RealAnalysisComparisonSummary,
   RealAnalysisDocumentResponse, RealAnalysisRunDetail, RealAnalysisRunSummary, RealAnalysisTargetSummary, RetryRealAnalysisInput,
@@ -65,3 +65,8 @@ export interface RealAnalysesContextValue {
 
 export const RealAnalysesContext = createContext<RealAnalysesContextValue | null>(null)
 export function useRealAnalyses() { return useContext(RealAnalysesContext) }
+
+export function useAnalysisTargetSubscription() {
+  const subscribe = useRealAnalyses()?.subscribeTargets
+  useEffect(() => subscribe?.(), [subscribe])
+}
