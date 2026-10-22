@@ -217,7 +217,15 @@ export function RubricPanel({ rubric, onSelectCriterion, onVersionSaved, readOnl
       key={rubric.id}
       rubric={rubric}
       onClose={() => setEditing(false)}
-      onSaved={(id) => { setEditing(false); onVersionSaved?.(id) }}
+      onSaved={(id, savedRubric) => {
+        setEditing(false)
+        if (job && savedRubric && savedRubric.scaleVersion === EVIDENCE_SCALE_V1.version && cloud.realJobs.features?.rubricChecks) {
+          void cloud.realJobs.runRubricChecks(job.id, savedRubric.id, savedRubric.version)
+            .then((next) => setLoadedChecks(next))
+            .catch(() => {})
+        }
+        onVersionSaved?.(id)
+      }}
       initialPanel={initialEditorPanel}
       initialFocusCriterionId={initialFocusCriterionId}
       initialAssistInstruction={initialAssistInstruction}
