@@ -6,6 +6,7 @@ import { join, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { build } from 'esbuild'
 import JSZip from 'jszip'
+import { SaxesParser } from 'saxes'
 import { loadReportFoundation, version2ReportFixture } from './test-support.mjs'
 import { mappingWorkbookBytes } from './mapping-test-support.mjs'
 import { readPdf } from './pdf-test-support.mjs'
@@ -187,6 +188,14 @@ test('CSV ZIP uses the identical mapped analyses.csv and leaves rubric data cand
   assert.doesNotMatch(await zip.file('rubrics.csv').async('string'), /Local HR Name|Applicant 093/)
 })
 
+function xmlText(xml) {
+  let text = ''
+  const parser = new SaxesParser()
+  parser.on('text', value => { text += value })
+  parser.write(xml).close()
+  return text
+}
+
 for (const format of ['pdf', 'docx', 'pptx']) test(`${format} includes matched names, unmatched identifiers, provenance and unchanged saved assessment text`, async () => {
   const { report, generation } = mappedReport({ long: true })
   const original = JSON.stringify(report)
@@ -197,15 +206,15 @@ for (const format of ['pdf', 'docx', 'pptx']) test(`${format} includes matched n
   else {
     const zip = await JSZip.loadAsync(bytes)
     const pattern = format === 'docx' ? /^word\/document.xml$/ : /^ppt\/slides\/slide\d+\.xml$/
-    text = (await Promise.all(Object.keys(zip.files).filter(name => pattern.test(name)).map(name => zip.file(name).async('string')))).join('\n')
-      .replace(/<[^>]*>/g, '')
+    text = (await Promise.all(Object.keys(zip.files).filter(name => pattern.test(name)).map(name => zip.file(name).async('string'))))
+      .map(xmlText).join('\n')
   }
   assert.ok(text.includes(generation.applicantIdentities[0].name), 'The entire mapped name must be present')
   assert.match(text, /Applicant 093/)
   assert.match(text, /Applicant 094/)
   assert.match(text, /attached locally/)
   assert.match(text, /92.75/)
-  assert.ok(text.includes(report.groups[0].comparisons[0].narrative.text.replace(/&/g, '&amp;')))
+  assert.ok(text.includes(report.groups[0].comparisons[0].narrative.text))
   assert.equal(JSON.stringify(report), original)
 })
 
@@ -223,7 +232,7 @@ test('named documents and decks keep source-stated names separate without requir
       const zip = await JSZip.loadAsync(bytes)
       const pattern = format === 'docx' ? /^word\/document.xml$/ : /^ppt\/slides\/slide\d+\.xml$/
       text = (await Promise.all(Object.keys(zip.files).filter(path => pattern.test(path)).map(path => zip.file(path).async('string'))))
-        .join('\n').replace(/<[^>]*>/g, '')
+        .map(xmlText).join('\n')
     }
     assert.match(text, /Local HR Name/)
     assert.match(text, /Source-stated name: Original source claim/)
@@ -245,6 +254,6 @@ test('PowerPoint preserves maximum-length mapped names and identifiers without a
     .map(path => zip.file(path).async('string')))
   const identityText = slides.flatMap(xml => [...xml.matchAll(/<p:sp>[\s\S]*?<\/p:sp>/g)].map(match => match[0]))
     .filter(shape => shape.includes('name="review-0-0-overview-name"'))
-    .map(shape => shape.replace(/<[^>]*>/g, '')).join('').replace(/\s/g, '')
+    .map(xmlText).join('').replace(/\s/g, '')
   assert.equal(identityText, `${name}${identifier}`, 'Every name and identifier character must be in visible identity text, not only a tooltip')
 })
