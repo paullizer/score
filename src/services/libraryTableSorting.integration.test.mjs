@@ -263,7 +263,7 @@ test('real jobs sort all meaningful headers and selector choices, with stable ti
   order(['j-parse', 'j-queue', 'j-cancel', 'j-a2', 'j-a10', 'j-tie', 'j-z'])
   await choose('Sort jobs', 'Newest first (default)')
   order(newestJobs)
-  for (const label of ['Rubric ready', 'Creating rubric', 'Needs attention', 'Cancelled', 'Queued', 'Reading source']) {
+  for (const label of ['Processed', 'Creating rubric', 'Needs attention', 'Cancelled', 'Queued', 'Reading source']) {
     assert.ok(document.body.textContent.includes(label), `Exact processing label "${label}" stays visible`)
   }
   assert.equal(JSON.stringify(context.workspace), snapshot)
@@ -282,7 +282,7 @@ test('jobs keep ready-only and hidden selections through source/status filters, 
   assert.doesNotMatch(document.querySelector('.selection-bar').textContent, /hidden/, 'Sorting preserves row references for filtered.includes')
   await search('  ALPHA 2  ')
   await choose('Filter by source', 'Direct URLs')
-  await segment('Filter jobs by status', 'Ready')
+  await segment('Filter jobs by status', 'Processed')
   order(['j-tie'])
   assert.match(document.querySelector('.selection-bar').textContent, /2 jobs selected \(including hidden rows\)/)
   await search('not-in-this-library')
