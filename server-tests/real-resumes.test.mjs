@@ -1914,13 +1914,13 @@ test('real resume archive and restore retain completed evidence without mutating
     await bodyOf(await action(server, imported.resume.id, 'lifecycle', ready.etag, { action: 'unarchive' }), 409)
     const impact = await bodyOf(await fetch(`${server.path()}/${imported.resume.id}/lifecycle`, { headers: headers({ write: false }) }), 200)
     assert.deepEqual(impact.impact.blockers, [retainedAnalysis])
-    await bodyOf(await action(server, imported.resume.id, 'lifecycle', archived.etag, { action: 'delete' }), 409)
-    assert.equal(server.blobContainer.values.size, 5)
     const restored = (await bodyOf(await action(server, imported.resume.id, 'lifecycle', archived.etag, { action: 'unarchive' }), 200)).resume
     assert.equal(restored.lifecycle?.archivedAt, undefined)
     assert.equal(restored.resume.status, 'ready')
     assert.deepEqual(restored.profile, before.profile)
     assert.equal(frozenAnalysis.status, 'running')
+    await bodyOf(await action(server, imported.resume.id, 'lifecycle', restored.etag, { action: 'delete' }), 200)
+    assert.equal(server.blobContainer.values.size, 0)
   } finally { await server.close() }
 })
 
@@ -1969,13 +1969,11 @@ test('archive cancels every file format and URL intake; restore never restarts p
   } finally { await server.close() }
 })
 
-test('resume deletion fails closed without the dependency provider and lifecycle routes require exact authorized input', async () => {
+test('resume lifecycle routes require exact authorized input and deletion succeeds without a dependency provider', async () => {
   const server = await fixture()
   try {
     const imported = (await bodyOf(await importUrl(server), 202)).resume
     const id = imported.resume.id
-    await bodyOf(await action(server, id, 'lifecycle', imported.etag, { action: 'delete' }), 503)
-    assert.equal((await server.store.getControl(WORKSPACE, id)).record.state, 'active')
     await bodyOf(await action(server, id, 'lifecycle', undefined, { action: 'archive' }), 428)
     for (const etag of ['*', 'W/"weak"', '"one","two"']) {
       await bodyOf(await action(server, id, 'lifecycle', etag, { action: 'archive' }), 400)
@@ -1985,6 +1983,8 @@ test('resume deletion fails closed without the dependency provider and lifecycle
     }
     await bodyOf(await action(server, id, 'lifecycle', imported.etag, { action: 'archive' }, auth(VIEWER)), 403)
     assert.equal((await server.store.get(WORKSPACE, id)).record.lifecycle, undefined)
+    await bodyOf(await action(server, id, 'lifecycle', imported.etag, { action: 'delete' }), 200)
+    assert.equal((await server.store.getControl(WORKSPACE, id)).record.state, 'deleted')
   } finally { await server.close() }
 })
 

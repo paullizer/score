@@ -216,6 +216,20 @@ test('uploads actual PDF bytes with stable request metadata', async () => {
   assert.equal(requests[0].init.headers.get('X-Import-Batch'), 'batch-key')
   assert.equal(requests[0].init.headers.get('X-Score-Request'), 'workspace')
   assert.deepEqual([...new Uint8Array(requests[0].init.body)], [37, 80, 68, 70])
+
+  requests = []
+  globalThis.fetch = async (url, init) => {
+    requests.push({ url, init })
+    return requests.length === 1
+      ? new Response(JSON.stringify({ error: { code: 'conflict', message: 'Another workspace change is in progress. Reload and retry.' } }), {
+        status: 409, headers: { 'Content-Type': 'application/json', 'Retry-After': '1' },
+      })
+      : json({ job: summary('pdf-job', '2026-09-17T00:00:00.000Z') }, 202)
+  }
+  await client.importRealJobPdf('workspace-1', file, 'stable-key', 'batch-key')
+  assert.equal(requests.length, 2)
+  assert.equal(requests[0].init.headers.get('Idempotency-Key'), requests[1].init.headers.get('Idempotency-Key'))
+  assert.deepEqual([...new Uint8Array(requests[0].init.body)], [...new Uint8Array(requests[1].init.body)])
 })
 
 test('Word capability is fail-closed and legacy byte limits remain compatible', async () => {

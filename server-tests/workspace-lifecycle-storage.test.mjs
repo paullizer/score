@@ -83,6 +83,43 @@ test('a lease held by another request is a busy workspace that callers may retry
   })
   await held.release()
   await (await store.acquireMutationLease('workspace-one')).release()
+
+  let clock = 0
+  const sleeps = []
+  let remainingBusy = 2
+  const waitingStore = createStateStoreFromContainer({
+    getBlockBlobClient() {
+      return {
+        async upload() { throw new RestError('Already present', { statusCode: 412 }) },
+        getBlobLeaseClient() {
+          return {
+            async acquireLease() {
+              if (remainingBusy > 0) {
+                remainingBusy--
+                throw new RestError('There is already a lease present.', { statusCode: 409 })
+              }
+            },
+            async renewLease() {},
+            async releaseLease() {},
+          }
+        },
+      }
+    },
+    async getProperties() {},
+  }, {
+    acquireWaitMs: 500,
+    acquirePollMs: 200,
+    now: () => clock,
+    sleep: async (ms) => { sleeps.push(ms); clock += ms },
+  })
+  await (await waitingStore.acquireMutationLease('workspace-one')).release()
+  assert.deepEqual(sleeps, [200, 200])
+
+  clock = 0
+  sleeps.length = 0
+  remainingBusy = 10
+  await assert.rejects(waitingStore.acquireMutationLease('workspace-one'), WorkspaceMutationBusyError)
+  assert.deepEqual(sleeps, [200, 200, 100])
 })
 
 test('unavailable leases and authorization errors fail closed rather than pretending serialization', async () => {

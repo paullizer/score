@@ -3023,6 +3023,99 @@ test('deduplicated qualification requirement evidence is accepted without changi
   assert.equal(result.assessmentSha256, analysisApi.analysisHash(result.assessment))
 })
 
+test('scoped grounding corrections preserve already-accepted rows and ignore shifting-goalpost objections on unchanged criteria', async () => {
+  const input = fixture()
+  const initial = qcOutput(selectedAssessment(input, [2, 2, 1]))
+  initial.qcDiagnostics.criteria[1].confidence = 'medium'
+  const round0Review = {
+    outcome: 'needs-correction',
+    issues: [{
+      code: 'unsupported-score',
+      message: 'The cited passage does not support calibration work; set this criterion to missing (score 0).',
+      criterionId: input.rubric.criteria[0].id,
+      qualificationId: null,
+      citations: [selection(input, 0)],
+    }],
+  }
+  const revised = qcOutput(selectedAssessment(input, [0, 3, 2]))
+  revised.qcDiagnostics.criteria[0].confidence = 'high'
+  revised.qcDiagnostics.criteria[1].confidence = 'low'
+  const round1ShiftedReview = {
+    outcome: 'needs-correction',
+    issues: [{
+      code: 'unsupported-rationale',
+      message: 'This criterion was accepted in round 0, so a new objection on an unchanged row must not block completion.',
+      criterionId: input.rubric.criteria[1].id,
+      qualificationId: null,
+      citations: [selection(input, 1)],
+    }],
+  }
+  const mock = pinQcModel(mockModel([initial, round0Review, revised, round1ShiftedReview]))
+  const result = await assessResumeAgainstTarget(input, mock.options)
+  assert.equal(result.correctionCount, 1)
+  assert.equal(mock.calls.length, 4)
+  assert.deepEqual(result.assessment.criteria.map(row => row.score), [0, 2, 1])
+  assert.equal(result.qcDiagnostics.criteria[0].confidence, 'high')
+  assert.equal(result.qcDiagnostics.criteria[1].confidence, 'medium')
+  assert.equal(result.groundingReviews.length, 2)
+  assert.equal(result.groundingReviews[1].outcome, 'supported')
+  assert.deepEqual(result.groundingReviews[1].issues, [])
+  for (const call of mock.calls) {
+    assert.match(call.request.messages[0].content, /not a literal keyword checklist/)
+  }
+  assert.match(mock.calls[1].request.messages[0].content, /do not issue a stylistic or borderline veto/)
+})
+
+test('revising a disputed criterion to missing or revising its rationale resolves residual needs-correction score or rationale nitpicks', async () => {
+  const input = fixture()
+  const initial = selectedAssessment(input, [2, 2, 1])
+  const round0Review = {
+    outcome: 'needs-correction',
+    issues: [
+      {
+        code: 'unsupported-score',
+        message: 'Passage 1 does not establish criterion 1; score 0 (missing) is required.',
+        criterionId: input.rubric.criteria[0].id,
+        qualificationId: null,
+        citations: [selection(input, 0)],
+      },
+      {
+        code: 'unsupported-rationale',
+        message: 'Clarify that criterion 2 is partial applied work.',
+        criterionId: input.rubric.criteria[1].id,
+        qualificationId: null,
+        citations: [selection(input, 1)],
+      },
+    ],
+  }
+  const revised = selectedAssessment(input, [0, 2, 1])
+  revised.criteria[1].rationale = 'The cited passage shows one applied tidal telemetry example with regular review, supporting partial level 2.'
+  const round1ResidualReview = {
+    outcome: 'needs-correction',
+    issues: [
+      {
+        code: 'unsupported-score',
+        message: 'Residual unsupported-score complaint on a criterion now scored 0 (missing).',
+        criterionId: input.rubric.criteria[0].id,
+        qualificationId: null,
+        citations: [],
+      },
+      {
+        code: 'unsupported-rationale',
+        message: 'Stylistic phrasing preference on the already-revised rationale for criterion 2.',
+        criterionId: input.rubric.criteria[1].id,
+        qualificationId: null,
+        citations: [selection(input, 1)],
+      },
+    ],
+  }
+  const mock = mockModel([initial, round0Review, revised, round1ResidualReview])
+  const result = await assessResumeAgainstTarget(input, mock.options)
+  assert.equal(result.correctionCount, 1)
+  assert.deepEqual(result.assessment.criteria.map(row => row.score), [0, 2, 1])
+  assert.equal(result.groundingReviews.at(-1).outcome, 'supported')
+})
+
 test('model input uses the same immutable requirement derivation and exact ordering as frozen API snapshots', async () => {
   const input = gradeFixture()
   const before = structuredClone(input)

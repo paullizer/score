@@ -165,7 +165,9 @@ export function createPromptStoreFromContainer(container: Pick<Container, 'item'
       if (!Number.isInteger(limit) || limit < 1 || limit > 100) throw new Error('Prompt history page size must be from 1 to 100.')
       if (before !== undefined) promptIdentifierSchema.parse(before)
       const response = await container.items.query<Record<string, unknown>>({
-        query: `SELECT TOP @limit * FROM c WHERE c.recordType = @type${before ? ' AND c["value"].activationId < @before' : ''} ORDER BY c["value"].activationId DESC`,
+        query: before
+          ? 'SELECT TOP @limit * FROM c WHERE c.recordType = @type AND c["value"].activationId < @before ORDER BY c["value"].activationId DESC'
+          : 'SELECT TOP @limit * FROM c WHERE c.recordType = @type ORDER BY c["value"].activationId DESC',
         parameters: [{ name: '@limit', value: limit + 1 }, { name: '@type', value: 'prompt-activation' },
           ...(before ? [{ name: '@before', value: before }] : [])],
       }, { partitionKey: SETTINGS_APPLICATION_ID }).fetchAll()

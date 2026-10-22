@@ -294,12 +294,6 @@ export class ResumeLifecycleService {
       etag.length > 1024 || current.etag !== etag) throw conflict('This resume changed. Reload its current ETag.')
     if (!['archive', 'unarchive', 'delete'].includes(action)) throw conflict('Unsupported resume lifecycle action.')
     if (action !== 'delete' && resumeIsRemoved(current.record.lifecycle)) throw conflict('Finish permanent deletion before changing this resume.')
-    if (action === 'delete') {
-      if (!this.dependencies) throw unavailable('Resume deletion requires the workspace dependency coordinator.')
-      if ((await this.impact(workspaceId, id)).blockers.length) {
-        throw conflict('Retained analyses reference this resume. Delete the blocking analyses, including archived analyses and old versions, first.')
-      }
-    }
     const timestamp = [this.now().toISOString(), current.record.updatedAt].sort().at(-1)!
     const operation: LifecycleOperation = { id, action, status: 'running', updatedAt: timestamp }
     let fenced = false

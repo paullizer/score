@@ -8,7 +8,7 @@ import {
 } from '../domain/real-jobs'
 import type { RubricCheckState } from '../domain/rubric-approval'
 import { ASSIST_LIMITS } from '../domain/assist'
-import { cloudJsonRequest, cloudLifecycleRequest } from './cloudWorkspace'
+import { cloudJsonRequest, cloudLifecycleRequest, cloudRetryAfterJsonRequest } from './cloudWorkspace'
 import type { LifecycleAction, LifecycleImpact, LifecycleOperation } from '../domain/lifecycle'
 import { isSafeUploadedFilename, uploadedFileKind } from '../domain/source-files'
 import { UPLOAD_CONTENT_TYPES, type UploadFormat } from '../domain/document-formats'
@@ -107,7 +107,7 @@ async function importRealJobUpload(
   signal?.throwIfAborted()
   const bytes = await file.arrayBuffer()
   signal?.throwIfAborted()
-  const response = await cloudJsonRequest<{ job: RealJobWireSummary }>(`${jobsPath(workspaceId)}/${kind === 'pdf' || kind === 'markdown' ? kind : 'file'}`, {
+  const response = await cloudRetryAfterJsonRequest<{ job: RealJobWireSummary }>(`${jobsPath(workspaceId)}/${kind === 'pdf' || kind === 'markdown' ? kind : 'file'}`, {
     method: 'POST',
     headers,
     body: bytes,
@@ -146,7 +146,7 @@ export async function importRealJobUrl(
 ): Promise<RealJobSummary> {
   requireImportUrl(url, 'jobs', settings)
   const headers = new Headers({ 'Idempotency-Key': idempotencyKey })
-  const response = await cloudJsonRequest<{ job: RealJobWireSummary }>(`${jobsPath(workspaceId)}/url`, {
+  const response = await cloudRetryAfterJsonRequest<{ job: RealJobWireSummary }>(`${jobsPath(workspaceId)}/url`, {
     method: 'POST',
     headers,
     body: JSON.stringify({ url, ...(batchId ? { batchId } : {}) }),

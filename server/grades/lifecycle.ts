@@ -380,11 +380,6 @@ export class GradeLifecycleService {
     const current = await managed(this.grades, workspaceId, ladderId, grade)
     if (!etag.trim() || etag === '*' || etag.includes(',') || current.etag !== etag) throw conflict('This lifecycle target changed. Reload its current ETag.')
     if (action !== 'delete' && current.record.lifecycle?.deletingAt) throw conflict('Finish permanent deletion before changing this item.')
-    if (action === 'delete') {
-      if (!this.dependencies) throw unavailable('Grade deletion requires the workspace dependency coordinator.')
-      const impact = await this.impact(workspaceId, ladderId, grade)
-      if (impact.blockers.length) throw conflict('Retained analyses reference this ladder or rubric. Delete the blocking analyses first.')
-    }
     const timestamp = this.now().toISOString()
     const operation: LifecycleOperation = { id: current.record.id, action, status: 'running', updatedAt: timestamp }
     let fenced = Boolean(current.record.lifecycle?.archivedAt || current.record.lifecycle?.deletingAt)

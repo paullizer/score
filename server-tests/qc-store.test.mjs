@@ -125,6 +125,8 @@ test('Cosmos QC pages use exact partition and parameterized scope, bound tokens,
   assert.equal(container.queries[0].options.partitionKey, f.workspaceId)
   assert.match(container.queries[0].statement.query, /c\.workspaceId = @workspaceId/)
   assert.match(container.queries[0].statement.query, /c\.scope\.resultRevision = @resultRevision/)
+  assert.match(container.queries[0].statement.query, /c\["value"\]\.cases/)
+  assert.doesNotMatch(container.queries[0].statement.query, /\bc\.value\b/)
   assert.ok(!container.queries[0].statement.query.includes(options.authorId))
   assert.equal(api.qcPageCursor(f.workspaceId, { ...options, continuationToken: result.continuationToken }), 'private-cosmos-cursor')
   await assert.rejects(store.list(f.workspaceId, { ...options, limit: 2, continuationToken: result.continuationToken }))

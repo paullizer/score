@@ -21,7 +21,7 @@ import {
   saveRealJobRubric,
   getRealJobLifecycleImpact, changeRealJobLifecycle,
 } from '../services/realJobs'
-import type { RubricCheckState } from '../domain/rubric-approval'
+import { summarizeRubricQa, type RubricCheckState } from '../domain/rubric-approval'
 import { requestRubricAssist } from '../services/rubricAssist'
 import type { Rubric } from '../domain/types'
 import { WorkspaceContext, type CloudWorkspaceStatus, type PendingLifecycleChange, type RenameEntityTarget, type WorkspaceContextValue } from './workspace-context'
@@ -389,10 +389,26 @@ export function RealJobsBridge({
     }
   }
 
+  function syncQaSummary(jobId: string, state: RubricCheckState) {
+    if (!state.checks || !aliveRef.current) return
+    const qaSummary = summarizeRubricQa(state.checks)
+    setSummaries((current) => current.map((item) =>
+      item.job.id === jobId && item.rubric?.id === state.rubricId && item.rubric?.version === state.version
+        ? { ...item, rubricQaSummary: qaSummary }
+        : item))
+    setDetails((current) => {
+      const entry = current[jobId]
+      if (entry?.state !== 'ready' || entry.value.rubric?.id !== state.rubricId || entry.value.rubric?.version !== state.version) return current
+      return { ...current, [jobId]: { state: 'ready', value: { ...entry.value, rubricQaSummary: qaSummary } } }
+    })
+  }
+
   async function runRubricChecks(jobId: string, rubricId: string, version: number, signal?: AbortSignal) {
     const summary = summaries.find((item) => item.job.id === jobId)
     requirePermission(summary?.rubric ? { kind: 'rubric', id: summary.rubric.groupId } : undefined)
-    return runRealJobRubricChecks(workspaceId, jobId, rubricId, version, signal)
+    const result = await runRealJobRubricChecks(workspaceId, jobId, rubricId, version, signal)
+    syncQaSummary(jobId, result)
+    return result
   }
 
   async function approveRubric(jobId: string, review: RubricCheckState, options?: { notify?: boolean }) {
@@ -508,7 +524,11 @@ export function RealJobsBridge({
     importFile,
     importUrl,
     assistRubric,
-    rubricChecks: (jobId, rubricId, version, signal) => getRealJobRubricChecks(workspaceId, jobId, rubricId, version, signal),
+    rubricChecks: async (jobId, rubricId, version, signal) => {
+      const result = await getRealJobRubricChecks(workspaceId, jobId, rubricId, version, signal)
+      syncQaSummary(jobId, result)
+      return result
+    },
     runRubricChecks,
     approveRubric,
     originalUrl: (jobId) => realJobOriginalUrl(workspaceId, jobId),

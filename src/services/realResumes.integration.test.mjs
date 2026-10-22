@@ -89,6 +89,7 @@ before(async () => {
       export { RealRequestScope } from './src/app/real-request-scope';
       export { WorkspaceContext, useWorkspace } from './src/app/workspace-context';
       export { PublicSettingsContext } from './src/app/public-settings-context';
+      export { cloudRetryClock } from './src/services/cloudWorkspace';
       export { RealResumesBridge } from './src/app/RealResumesBridge';
       export { RealResumesContext, useRealResumes } from './src/app/real-resumes-context';
       export { DocumentViewer } from './src/components/documents/DocumentViewer';
@@ -1023,6 +1024,44 @@ for (const message of ['Another workspace change is in progress.', 'This idempot
     assert.equal(requests.filter(request => request.init.method === 'POST').length, 1)
   })
 }
+
+test('resume batch upload automatically waits and retries Retry-After workspace-busy 409 responses with identical keys and bytes', async () => {
+  const originalSleep = ui.cloudRetryClock.sleep
+  const waits = []
+  ui.cloudRetryClock.sleep = async (ms, signal) => { signal?.throwIfAborted(); waits.push(ms) }
+  try {
+    const busySeen = new Set()
+    const saved = []
+    globalThis.fetch = async (url, init) => {
+      requests.push({ url, init })
+      if (url === '/api/features') return json({ realResumeImports: true, markdownResumeImports: true })
+      if (init.method === 'GET') return json({ resumes: saved })
+      const itemKey = init.headers.get('Idempotency-Key')
+      if (!busySeen.has(itemKey) && saved.length > 0) {
+        busySeen.add(itemKey)
+        return new Response(JSON.stringify({ error: { code: 'conflict', message: 'Another workspace change is in progress. Reload and retry.' } }), {
+          status: 409, headers: { 'Content-Type': 'application/json', 'Retry-After': '2' },
+        })
+      }
+      const record = summary(`accepted-${saved.length + 1}`, 'workspace-one', 'queued')
+      saved.push(record)
+      return json({ resume: record }, 202)
+    }
+    await mount()
+    await settle(() => current?.phase === 'ready')
+    const files = Array.from({ length: 4 }, (_, index) => new File([`# Candidate ${index + 1}`], `candidate-00${index + 1}.md`))
+    await act(async () => current.stage(files.map(ui.resumeFileInput)))
+    const batch = current.batches[0]
+    await act(async () => current.submitBatch(batch.id))
+    assert.equal(current.batches.length, 0)
+    assert.equal(saved.length, 4)
+    assert.deepEqual(waits, [2_000, 2_000, 2_000])
+    const posts = requests.filter(request => request.init.method === 'POST')
+    assert.equal(posts.length, 7)
+  } finally {
+    ui.cloudRetryClock.sleep = originalSleep
+  }
+})
 
 test('resume submission stops unsent inputs when current public policy changes between acknowledgments', async () => {
   const gate = deferred()

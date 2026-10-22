@@ -159,7 +159,7 @@ function LifecycleConfirmation({ target, name, inherited, restoreOnly, getImpact
   const verb = action === 'delete' ? 'Permanently delete' : action === 'archive' ? 'Archive' : 'Unarchive'
   return <Modal open={action !== null} onOpenChange={(open) => { if (!open && !busy) { request.current++; setAction(null); onDismiss() } }}
       title={`${verb} ${name}?`}
-      description={action === 'delete' ? 'Permanent deletion cannot be undone. Retained analyses and seed ladders, including archived records, are never deleted implicitly.'
+      description={action === 'delete' ? 'Permanent deletion cannot be undone. All owned records and artifacts in this scope will be permanently removed.'
         : action === 'archive' ? 'Hide this item from normal browsing and stop unfinished work it owns. Completed results and independent snapshots are preserved.'
           : restoreOnly ? 'Unarchive only the empty grade slot. Its rubric and history stay permanently deleted. Nothing restarts; explicitly generate a fresh revision after its parents are active.'
           : 'Make this item available again. Separately archived children stay archived. Cancelled work does not restart automatically.'}

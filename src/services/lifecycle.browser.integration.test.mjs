@@ -238,10 +238,9 @@ function cloudFixture(workspace = testWorkspace(), summaries = []) {
           await state.beforeRead?.(tail, snapshot); return response(route, snapshot).catch(() => undefined)
         }
         const scope = body?.scope ?? url.searchParams.get('scope')
-        const blockers = state.ladders.filter((family) => family.ladder.seedJobId === job.job.id).map(({ ladder }) => ({ kind: 'ladder', id: ladder.id, name: ladder.name, href: `/grade-ladders/${ladder.id}` }))
         if (method === 'GET') {
           if (state.impactFailures > 0) { state.impactFailures--; return response(route, { error: { code: 'unavailable', message: 'Impact refresh is unavailable.' } }, 503) }
-          return response(route, { impact: impact({ kind: scope, id: scope === 'job' ? job.job.id : job.rubric?.groupId }, scope === 'job' ? job.job.title : job.rubric?.name, { rubricVersions: job.rubricVersions.length }, blockers) })
+          return response(route, { impact: impact({ kind: scope, id: scope === 'job' ? job.job.id : job.rubric?.groupId }, scope === 'job' ? job.job.title : job.rubric?.name, { rubricVersions: job.rubricVersions.length }, []) })
         }
         assert.equal(request.headers()['if-match'], job.etag)
         if (state.lifecycleFailure) {
@@ -249,7 +248,6 @@ function cloudFixture(workspace = testWorkspace(), summaries = []) {
           state.impactFailures = failure.impactFailures
           return response(route, { error: { code: 'conflict', message: 'Injected lifecycle conflict; no changes were acknowledged.' } }, 409)
         }
-        if (body.action === 'delete' && blockers.length) return response(route, { error: { code: 'conflict', message: 'Retained seed ladders block this deletion.' } }, 409)
         const pending = body.action === 'delete' ? state.jobPending.shift() : undefined
         if (pending) {
           job[scope === 'job' ? 'lifecycle' : 'rubricLifecycle'] = { deletingAt: timestamp }
@@ -968,16 +966,11 @@ test('real grade family and per-grade archive states, seed blockers, and no-rubr
   await lifecycle(page, family.name, 'archive')
 
   await page.goto(`${cloudServer.origin}/workspaces/workspace-one/jobs/job-real-one`)
-  await page.getByRole('button', { name: 'Permanently delete Real job-real-one', exact: true }).click()
-  const blocker = page.getByRole('dialog', { name: 'Permanently delete Real job-real-one?', exact: true })
-  await blocker.getByRole('link', { name: family.name, exact: true }).waitFor()
-  assert.equal(await blocker.getByRole('button', { name: 'Permanently delete', exact: true }).isDisabled(), true)
-  await blocker.getByRole('link', { name: family.name, exact: true }).click()
-  await lifecycle(page, family.name, 'delete')
-  await page.goto(`${cloudServer.origin}/workspaces/workspace-one/jobs/job-real-one`)
   await lifecycle(page, 'Rubric job-real-one', 'delete')
   await page.getByRole('heading', { name: 'No rubric', exact: true }).waitFor()
   assert.equal(fixture.jobs[0].document !== null, true)
+  await page.goto(`${cloudServer.origin}/workspaces/workspace-one/grade-ladders/${family.id}`)
+  await lifecycle(page, family.name, 'delete')
   assert.equal(fixture.saves.length, 0, 'Real lifecycle overlays must never be written to legacy state autosave')
 })
 

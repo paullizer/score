@@ -72,10 +72,13 @@ test('workspace lifecycle impact is real-only and ignores missing or legacy stat
   assert.deepEqual(state._operations(), [])
 })
 
-test('analysis counts require real dependency checks before lifecycle management', async () => {
+test('workspace deletion succeeds with analysis counts even when optional dependency hooks are omitted', async () => {
   const { service, actor, workspace } = await fixture({ counts: { analyses: 1 } })
-  await assert.rejects(service.impact(actor, workspace.id), error => error.status === 503)
-  await assert.rejects(service.change(actor, workspace.id, 'delete', workspace.etag), error => error.status === 503)
+  const preview = await service.impact(actor, workspace.id)
+  assert.deepEqual(preview.impact.counts, { analyses: 1 })
+  assert.deepEqual(preview.impact.blockers, [])
+  const result = await service.change(actor, workspace.id, 'delete', workspace.etag)
+  assert.equal(result.deleted, true)
 })
 
 test('legacy sample runs no longer block deletion and legacy state is removed best-effort', async () => {

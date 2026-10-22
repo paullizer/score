@@ -1,7 +1,6 @@
 import { randomUUID } from 'node:crypto'
-import { gradeHeadId } from '../../src/domain/real-grades'
 import { getDisplayName } from '../../src/domain/displayNames'
-import type { LifecycleAction, LifecycleBlocker, LifecycleImpact, LifecycleOperation, LifecycleTarget } from '../../src/domain/lifecycle'
+import type { LifecycleAction, LifecycleBlocker, LifecycleImpact, LifecycleOperation } from '../../src/domain/lifecycle'
 import type { RealAnalysisDetail, RealAnalysisRunRecord, VersionedAnalysisEntity } from '../../src/domain/real-analyses'
 import type { WorkspaceLifecycleParticipant } from '../lifecycle/contracts'
 import { assertWorkspaceMutationLease } from '../lifecycle/lease'
@@ -11,10 +10,10 @@ import { WORKSPACE_ID_PATTERN } from '../ids'
 import type { AnalysisLifecycleControl, AnalysisTransaction, RealAnalysesDeps, StoredAnalysisControl } from './store'
 import { advanceAnalysisRun, loadAnalysisRun } from './lifecycle'
 import { analysisIsRemoved, newAnalysisControl, updateAnalysisControl } from './guards'
-import { parseAnalysisJson, readAnalysisBlob, readAnalysisManifest } from './snapshots'
+import { readAnalysisManifest } from './snapshots'
 import {
-  analysisBlobInRun, analysisCancellationNeedsRetry, analysisHash, assertAnalysis, isAnalysisId, MAX_ANALYSIS_TRANSACTION_BYTES,
-  parseAnalysisEntity, parseFrozenTargetSnapshot,
+  analysisBlobInRun, analysisCancellationNeedsRetry, assertAnalysis, isAnalysisId, MAX_ANALYSIS_TRANSACTION_BYTES,
+  parseAnalysisEntity,
 } from './validation'
 
 type Run = VersionedAnalysisEntity<RealAnalysisRunRecord>
@@ -74,61 +73,11 @@ async function controls(analyses: RealAnalysesDeps, workspaceId: string): Promis
   return values
 }
 
-/** Only immutable evidence determines historical references; live source heads are not required. */
-async function dependencyTargets(analyses: RealAnalysesDeps, run: RealAnalysisRunRecord): Promise<LifecycleTarget[]> {
-  const control = await analyses.store.getControl(run.workspaceId, run.id)
-  if (analysisIsRemoved(run.lifecycle) && control?.record.dependencies) {
-    assertAnalysis(control.record.state === 'deleting' && control.record.dependencies.manifestSha256 === run.manifest.sha256,
-      'Analysis dependency recovery does not match its immutable manifest.')
-    return control.record.dependencies.targets
-  }
-  const manifest = await readAnalysisManifest(analyses.blobs, run)
-  const targets = new Map<string, LifecycleTarget>()
-  const add = (kind: LifecycleTarget['kind'], id: string) => { targets.set(`${kind}:${id}`, { kind, id }) }
-  for (const ref of manifest.resumes) add('resume', ref.summary.selection.resumeId)
-  for (const ref of manifest.targets) {
-    const snapshot = parseFrozenTargetSnapshot(parseAnalysisJson(await readAnalysisBlob(
-      analyses.blobs, ref.blob, run.workspaceId, run.id,
-    )))
-    assertAnalysis(snapshot.workspaceId === run.workspaceId && snapshot.snapshotId === ref.snapshotId &&
-      snapshot.frozenAt === manifest.createdAt && analysisHash(snapshot.summary) === analysisHash(ref.summary),
-    'Dependency snapshot does not match the accepted manifest.')
-    if (snapshot.kind === 'job') {
-      assertAnalysis(analysisBlobInRun(snapshot.original.blobName, run.workspaceId, run.id), 'Dependency original belongs to another run.')
-      add('job', snapshot.selection.jobId)
-      add('rubric', snapshot.rubric.groupId)
-      add('rubric', snapshot.rubric.id)
-    } else {
-      assertAnalysis(snapshot.references.every(item => analysisBlobInRun(item.document.blobName, run.workspaceId, run.id)),
-        'Dependency reference belongs to another run.')
-      add('ladder', snapshot.selection.ladderId)
-      add('rubric', gradeHeadId(snapshot.selection.ladderId, snapshot.selection.grade))
-      add('rubric', snapshot.version.rubric.groupId)
-      add('rubric', snapshot.version.rubric.id)
-      add('job', snapshot.seed.job.id)
-      add('rubric', snapshot.seed.rubric.groupId)
-      add('rubric', snapshot.seed.rubric.id)
-    }
-  }
-  return [...targets.values()]
-}
-
 export async function realAnalysisDependencyBlockers(
-  analyses: RealAnalysesDeps, workspaceId: string, target: LifecycleTarget,
+  _analyses: RealAnalysesDeps, workspaceId: string,
 ): Promise<LifecycleBlocker[]> {
   scope(workspaceId)
-  if (target.kind === 'analysis') return []
-  try {
-    const blockers: LifecycleBlocker[] = []
-    for (const { record } of await runs(analyses, workspaceId)) {
-      if (target.kind !== 'workspace' && !(await dependencyTargets(analyses, record))
-        .some(value => value.kind === target.kind && value.id === target.id)) continue
-      blockers.push({ kind: 'analysis', id: record.id, name: getDisplayName(record, record.name), href: `/analyses/${encodeURIComponent(record.id)}` })
-    }
-    return blockers
-  } catch {
-    throw unavailable('Retained real analysis dependencies could not be verified. Source deletion is blocked until their storage is readable.')
-  }
+  return []
 }
 
 function timestampAfter(timestamp: string, run: RealAnalysisRunRecord): string {
@@ -187,7 +136,7 @@ async function startOperation(
     ...(control?.record ?? newAnalysisControl(workspaceId, now, id)), updatedAt: now, operation,
     state: record.lifecycle?.deletingAt ? 'deleting' : record.lifecycle?.archivedAt ? 'archived' : 'active',
     ...(action === 'delete' ? {
-      dependencies: { manifestSha256: record.manifest.sha256, targets: await dependencyTargets(analyses, current.record) },
+      dependencies: control?.record.dependencies ?? { manifestSha256: record.manifest.sha256, targets: [] },
     } : {}),
   }
   assertWorkspaceMutationLease(workspaceId)
@@ -423,6 +372,8 @@ export function createAnalysisLifecycleParticipant(analyses: RealAnalysesDeps): 
       }))
     },
     async cancel(workspaceId, timestamp) {
+      const workspace = await analyses.store.getControl(workspaceId)
+      if (workspace && ['deleting', 'deleted'].includes(workspace.record.state)) return
       let pending = false
       for (const current of await runs(analyses, workspaceId)) {
         if (analysisIsRemoved(current.record.lifecycle)) continue
@@ -445,8 +396,33 @@ export function createAnalysisLifecycleParticipant(analyses: RealAnalysesDeps): 
     async purge(workspaceId, timestamp) {
       const workspace = await analyses.store.getControl(workspaceId)
       if (!workspace || !['deleting', 'deleted'].includes(workspace.record.state)) throw new StoreConflictError('Workspace analysis deletion is not fenced.')
-      // Workspace deletion is never an implicit cascade of retained runs, including archived runs.
-      if ((await runs(analyses, workspaceId)).length) throw new StoreConflictError('Delete retained real analyses before deleting this workspace.')
+      let pending = false
+      for (const current of await runs(analyses, workspaceId)) {
+        const runId = current.record.id
+        const previous = (await analyses.store.getControl(workspaceId, runId))?.record.operation
+        const operation = previous?.action === 'delete' && previous.status !== 'complete' && analysisIsRemoved(current.record.lifecycle)
+          ? previous : await startOperation(analyses, current, 'delete', timestamp, 'workspace-lifecycle', true)
+        try {
+          let finished = false
+          for (let pass = 0; pass < 40; pass++) {
+            if (await finishOperation(analyses, workspaceId, runId, timestamp)) {
+              finished = true
+              break
+            }
+            const control = await analyses.store.getControl(workspaceId, runId)
+            if (Object.values(control?.record.writers ?? {}).some(writer => Date.parse(writer.expiresAt) > Date.now())) break
+          }
+          if (!finished) {
+            pending = true
+            await markPending(analyses, workspaceId, runId, operation, timestamp, false)
+          }
+        } catch {
+          if (await operationCompleted(analyses, workspaceId, runId, operation)) continue
+          pending = true
+          await markPending(analyses, workspaceId, runId, operation, timestamp, true)
+        }
+      }
+      if (pending || (await runs(analyses, workspaceId)).length) throw unavailable('Workspace analysis cleanup is still completing.')
       const families = new Set((await controls(analyses, workspaceId)).flatMap(value => value.record.runId ? [value.record.runId] : []))
       const seen = new Set<string>()
       let continuationToken: string | undefined

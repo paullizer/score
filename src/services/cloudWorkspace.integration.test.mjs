@@ -237,6 +237,22 @@ test('definite answers, caller cancellation and unsafe requests are never re-sen
   await assert.rejects(client.cloudIdempotentJsonRequest('/workspaces/test/analyses', { ...init(), body: new Blob(['{}']) }, patientWait), /replayable/)
   assert.equal(calls, 0)
   assert.equal(client.isCloudRetryableFailure(new client.CloudAccessChangedError()), false)
+
+  const bytes = new Uint8Array([35, 32, 82, 101, 115, 117, 109, 101]).buffer
+  const retryRequests = []
+  globalThis.fetch = async (url, reqInit) => {
+    retryRequests.push({ url, init: reqInit })
+    return retryRequests.length === 1
+      ? envelope(409, 'conflict', 'Another workspace change is in progress. Reload and retry.', { 'Retry-After': '2' })
+      : Response.json({ resume: { id: 'accepted' } }, { status: 202 })
+  }
+  const retryKey = randomUUID()
+  const retried = await client.cloudRetryAfterJsonRequest('/workspaces/test/resumes/markdown', {
+    method: 'POST', headers: { 'Idempotency-Key': retryKey, 'Content-Type': 'text/markdown' }, body: bytes,
+  })
+  assert.deepEqual(retried, { resume: { id: 'accepted' } })
+  assert.equal(retryRequests.length, 2)
+  assert.ok(retryRequests.every(({ init: reqInit }) => reqInit.body === bytes && reqInit.headers.get('Idempotency-Key') === retryKey))
 })
 
 test('an access change while waiting to resend stops every later try', async () => {

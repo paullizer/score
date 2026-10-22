@@ -1449,7 +1449,7 @@ for (const action of ['archive', 'delete']) {
         assert.equal(await run.store.get(WORKSPACE, id), undefined)
         assert.equal((await run.store.getControl(WORKSPACE, id)).record.state, 'deleted')
         assert.equal([...run.blobs.values.keys()].some(name => name.startsWith(`${WORKSPACE}/${id}/`)), false)
-        assert.equal(dependencyCalls, 1)
+        assert.equal(dependencyCalls, 0)
       }
       assert.equal(await run.blobs.read(resumeProfileBlobName(WORKSPACE, id)), undefined)
       assert.equal(frozen.status, 'running')

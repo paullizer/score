@@ -4,6 +4,7 @@ import {
 import { assertReportResourceLimits } from './model'
 import { requireReportNarratives } from './narratives'
 import { captureReportSettings, reportGenerationPolicy, reportLimits } from './policy'
+import { validateApplicantIdentities } from './applicant-mapping'
 
 Object.defineProperty(globalThis, 'fetch', { value: () => Promise.reject(new Error('Network access is disabled during report generation.')) })
 Object.defineProperty(globalThis, 'XMLHttpRequest', { value: () => { throw new Error('Network access is disabled during report generation.') } })
@@ -23,6 +24,7 @@ function handleReportMessage(event: MessageEvent<ReportWorkerRequest>) {
     request.report.capture.settings = captureReportSettings(request.report.capture.settings)
     const limits = reportLimits(reportGenerationPolicy(request.report, request.format))
     assertReportResourceLimits(request.report, limits.maxInputBytes)
+    validateApplicantIdentities(request.report, request.options)
     if (request.format !== 'csv') requireReportNarratives(request.report)
     const rubricDetails = request.options?.rubricDetails === true
     send({ type: 'progress', requestId: request.requestId, message: `Generating ${reportDownloadType(request.format, rubricDetails).label} from saved evidence` })
