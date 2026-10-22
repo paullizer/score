@@ -34,10 +34,10 @@ export function StatusBadge({ status }: { status: JobStatus }) {
 }
 
 export function PageHeader({ eyebrow, title, description, actions }: {
-  eyebrow?: string; title: string; description: string; actions?: ReactNode
+  eyebrow?: string; title: string; description?: string; actions?: ReactNode
 }) {
   return <div className="page-heading">
-    <div>{eyebrow && <div className="eyebrow">{eyebrow}</div>}<h1 tabIndex={-1}>{title}</h1><p>{description}</p></div>
+    <div>{eyebrow && <div className="eyebrow">{eyebrow}</div>}<h1 tabIndex={-1}>{title}</h1>{description && <p>{description}</p>}</div>
     {actions && <div className="heading-actions">{actions}</div>}
   </div>
 }

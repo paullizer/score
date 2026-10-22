@@ -187,7 +187,7 @@ export function App() {
           <Route path="*" element={<EmptyState title="This page is not in your workspace" description="Return to the jobs library to find your next review." action={<Button onClick={() => navigate('/jobs')}>Go to jobs</Button>} />} />
         </Routes>
         <footer className="workspace-footer">
-          <span><ShieldCheck size={13} />{isQc ? 'Private QC feedback and trial results stay separate from published scores and normal exports.' : 'Sources and analyses are private server records. A human makes the decision.'}</span>
+          {isQc && <span><ShieldCheck size={13} />QC feedback and trial results stay separate from published scores.</span>}
           {!isQc && <span>{activeJobs} active jobs / {activeResumes} active resumes</span>}
         </footer>
       </main>
@@ -209,13 +209,11 @@ export function App() {
       <SidebarLinks title={title} onLeave={() => setMobileNav(false)} onAbout={() => { aboutAfterDrawer.current = true; setMobileNav(false) }} />
       <div className="mobile-appearance"><span>Appearance</span><ThemeControl /></div>
     </Modal>
-    <Modal open={showAbout} onOpenChange={setShowAbout} title={`About ${title}`} description="How it works, current limits, and privacy"
+    <Modal open={showAbout} onOpenChange={setShowAbout} title={`About ${title}`} description="How it works and current limits"
       footer={<Button variant="primary" onClick={() => setShowAbout(false)}>Back to the workspace</Button>}>
       <div className="about-illustration"><BriefcaseBusiness /><ChevronRight /><Layers3 /><ChevronRight /><BarChart3 /></div>
-      <h3 className="mb-3 text-lg font-semibold">A job. A rubric. The evidence.</h3>
-      <p>Import resumes, inspect captured sources, then explicitly compare ready resumes against jobs or exact approved GS versions. Analyses use model-assisted evidence assessment and grounding review, with immutable snapshots and independent progress. Scores are review aids, not hiring decisions or official GS eligibility determinations.</p>
-      <div className="info-callout mt-5"><CircleHelp size={18} /><div><strong>Sources are read, processed, and retained privately.</strong><p>Current resume limits: {resumeLimits.maxBatchItems} inputs per batch, {resumeLimits.maxFileBytes / 1024 / 1024} MiB per file, {resumeLimits.maxPdfPages} PDF pages, and {resumeLimits.maxSourceCharacters.toLocaleString()} normalized characters. Current job limits: {jobLimits.maxBatchFiles} inputs, {jobLimits.maxFileBytes / 1024 / 1024} MiB per file, {jobLimits.maxPdfPages} PDF pages, and {jobLimits.maxSourceCharacters.toLocaleString()} characters. Allowed file formats and public URLs depend on current application policy and deployment support; the import dialog shows the effective choices. Markdown uploads use .md or .markdown files; their links and images are not fetched. Word citations use captured sections, not printed pages; any formatted DOCX preview is approximate, and extracted text remains authoritative. Score never signs in or bypasses access controls. Public profiles can be sparse. Each analysis starts manually and is limited to {realAnalyses?.features?.analysisLimits.maxComparisons ?? ANALYSIS_LIMITS.maxComparisons} independent comparisons. Larger analyses use the same processing rate and may take longer.</p><p>Accepted imports and analysis work continue on the server after browser close and retain their captured limits. Documents, profiles, and results are stored on the server, never in browser local storage. Disabled services never hide saved evidence.</p><p>Archive makes content read-only and stops unfinished work it owns, never independent saved analyses. Search includes archived records; restoring them does not restart processing. Permanent deletion requires confirmation and cannot remove an input retained by an analysis or seed ladder, including archived history.</p></div></div>
-      <div className="mt-5 flex flex-wrap gap-2"><Badge>Cloud workspace storage</Badge><Badge>Human review first</Badge><Badge>No automatic hiring decisions</Badge></div>
+      <p>Import jobs and resumes, review or edit the job rubric, and run analyses to compare resumes against job or GS grade criteria with source-linked citations.</p>
+      <div className="info-callout mt-5"><CircleHelp size={18} /><div><strong>Import and analysis limits</strong><p>Current resume limits: {resumeLimits.maxBatchItems} inputs per batch, {resumeLimits.maxFileBytes / 1024 / 1024} MiB per file, {resumeLimits.maxPdfPages} PDF pages, and {resumeLimits.maxSourceCharacters.toLocaleString()} normalized characters. Current job limits: {jobLimits.maxBatchFiles} inputs, {jobLimits.maxFileBytes / 1024 / 1024} MiB per file, {jobLimits.maxPdfPages} PDF pages, and {jobLimits.maxSourceCharacters.toLocaleString()} characters. Markdown uploads use .md or .markdown files. Each analysis is limited to {realAnalyses?.features?.analysisLimits.maxComparisons ?? ANALYSIS_LIMITS.maxComparisons} independent comparisons. Larger analyses use the same processing rate and may take longer.</p></div></div>
     </Modal>
   </div></LifecycleDialogProvider>
 }

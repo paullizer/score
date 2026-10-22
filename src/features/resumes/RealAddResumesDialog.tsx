@@ -49,8 +49,8 @@ export function RealAddResumesDialog({ open, onOpenChange }: { open: boolean; on
     void api.submitBatch(batch.id, keys).catch((caught: unknown) => setError(caught instanceof Error ? caught.message : 'The batch could not be submitted.'))
   }
 
-  return <Modal open={open} onOpenChange={onOpenChange} title="Add real resumes"
-    description={`Upload actual ${uploadPickerLabel(formats, ' or ')} files or import publicly accessible resume/profile URLs. Each input is processed independently.`}
+  return <Modal open={open} onOpenChange={onOpenChange} title="Add resumes"
+    description={`Upload ${uploadPickerLabel(formats, ' or ')} files or import public resume URLs.`}
     footer={<>
       <span className="mr-auto text-[11px] text-muted" role="status">{items.length ? `${items.length} ${items.length === 1 ? 'upload' : 'uploads'} remaining` : api?.uploadNotice ?? 'Choose files or add URLs to upload.'}</span>
       <Button onClick={() => onOpenChange(false)}>{uploading ? 'Close — keep uploading' : 'Close'}</Button>
@@ -120,8 +120,6 @@ export function RealAddResumesDialog({ open, onOpenChange }: { open: boolean; on
           })}
         </ul>
       </section>}
-      <div className="info-callout mt-5"><FileText size={18} aria-hidden="true" /><div><strong>Uploaded resumes move to your library.</strong>
-        <p>Check processing progress there, then use ready resumes in an analysis. No import approval is needed. Keep this workspace open until uploads finish; saved resumes continue processing after you leave. Pending files stay only in memory, never browser storage.</p></div></div>
       {locked && <div className="mt-4 flex flex-wrap items-center justify-between gap-3">
         <p className="text-[11px] text-muted">Retry only the uploads that remain. To replace an invalid input, start another upload.</p>
         <Button disabled={unavailable || uploading} icon={Plus} onClick={() => {

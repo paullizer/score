@@ -53,7 +53,7 @@ for (const [count, width] of [[4, 1440], [10, 390]]) {
     try {
       await page.goto(`${fixture.origin}/workspaces/${fixture.workspaceId}/resumes`)
       await page.getByRole('button', { name: 'Add resumes', exact: true }).click()
-      const dialog = page.getByRole('dialog', { name: 'Add real resumes', exact: true })
+      const dialog = page.getByRole('dialog', { name: 'Add resumes', exact: true })
       const storageBefore = await page.evaluate(() => ({
         local: { ...localStorage }, session: { ...sessionStorage },
       }))
@@ -126,7 +126,7 @@ test('browser imports Markdown through job drop and resume picker, then highligh
     await about.getByRole('button', { name: 'Back to the workspace', exact: true }).click()
     await about.waitFor({ state: 'hidden' })
     await page.getByRole('button', { name: 'Add jobs', exact: true }).click()
-    const jobsDialog = page.getByRole('dialog', { name: 'Import real job descriptions', exact: true })
+    const jobsDialog = page.getByRole('dialog', { name: 'Add jobs', exact: true })
     await jobsDialog.waitFor({ state: 'visible' })
     assert.match(await jobsDialog.locator('input[type=file]').getAttribute('accept'), /\.md(?:,|$)/)
     assert.match(await jobsDialog.locator('input[type=file]').getAttribute('accept'), /\.markdown(?:,|$)/)
@@ -152,7 +152,7 @@ test('browser imports Markdown through job drop and resume picker, then highligh
     // A legacy data parameter from an old link is ignored and still opens the real library.
     await page.goto(`${fixture.origin}/workspaces/${fixture.workspaceId}/resumes?${new URLSearchParams({ data: 'samples' })}`)
     await page.getByRole('button', { name: 'Add resumes', exact: true }).click()
-    const resumesDialog = page.getByRole('dialog', { name: 'Add real resumes', exact: true })
+    const resumesDialog = page.getByRole('dialog', { name: 'Add resumes', exact: true })
     await resumesDialog.waitFor({ state: 'visible' })
     await resumesDialog.locator('input[type=file]').setInputFiles({
       name: 'resume.MD', mimeType: 'application/octet-stream', buffer: markdownResume,

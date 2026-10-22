@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import { ArrowRight, Clock3, Layers3, RefreshCw, Settings, ShieldCheck, Users } from 'lucide-react'
+import { ArrowRight, Clock3, Layers3, RefreshCw, Settings, Users } from 'lucide-react'
 import type { CloudUser, WorkspaceSummary } from '../../domain/cloud'
 import { ThemeControl } from '../../app/ThemeControl'
 import { ApplicationPolicyBanners } from '../../app/ApplicationPolicyBanners'
@@ -69,7 +69,7 @@ export function WorkspaceHomePage({ user, directory, recents, directoryRevision,
     </header>
     <ApplicationPolicyBanners onOpenSettings={applicationAdmin ? openAdminSettings : undefined} />
     <main ref={main} id="main-content" className="workspace-home-main">
-      <PageHeader eyebrow="YOUR WORK, ORGANIZED" title="My workspaces" description="Choose a workspace to pick up where you left off, or make room for something new."
+      <PageHeader title="My workspaces" description="Select a workspace or create a new one."
         actions={<WorkspaceCreateButton primary cloud={directory} disabled={!directoryReady || directoryBusy || opening} onBusyChange={setCreating} />} />
       {directoryError && <div className="mb-5"><InlineError>{directoryError}<Button size="sm" disabled={busy} icon={RefreshCw}
         onClick={() => { void directory.refreshWorkspaces().catch((caught) => setError(caught instanceof Error ? caught.message : 'The workspace directory could not be refreshed.')) }}>Retry workspace list</Button></InlineError></div>}
@@ -96,7 +96,6 @@ export function WorkspaceHomePage({ user, directory, recents, directoryRevision,
           renderDetails={(item) => <WorkspaceCardCounts workspace={item} state={states[item.id]} retry={() => retryCounts(item.id)} />} />
       </section>}
       <footer className="workspace-home-footer">
-        <span><ShieldCheck size={14} aria-hidden="true" />Access-controlled workspaces. Clear criteria. A human makes the decision.</span>
         <div>{policy.settings?.help.supportUrl && <a className="text-link" href={policy.settings.help.supportUrl} target="_blank" rel="noopener noreferrer">Support</a>}
           {policy.settings?.help.documentationUrl && <a className="text-link" href={policy.settings.help.documentationUrl} target="_blank" rel="noopener noreferrer">Documentation</a>}</div>
       </footer>

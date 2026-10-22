@@ -639,7 +639,7 @@ test('saved comparison navigation never discovers live new-run targets; actual s
   const targetReads = () => state.requests.filter((request) => request.path.endsWith('/analyses/targets')).length
   await visible(page.getByText('Original immutable scoring explanation.', { exact: true }))
   assert.equal(targetReads(), 0)
-  await page.getByRole('link', { name: 'All saved comparisons', exact: true }).click()
+  await page.getByRole('link', { name: 'All comparisons', exact: true }).click()
   await page.getByRole('button', { name: /^Review comparison 2:/ }).click()
   await visible(page.getByText('Original immutable scoring explanation.', { exact: true }))
   await page.getByRole('button', { name: 'Refresh fixture history', exact: true }).click()
@@ -647,7 +647,7 @@ test('saved comparison navigation never discovers live new-run targets; actual s
   await page.waitForTimeout(200)
   assert.equal(targetReads(), 0, 'Features, history refreshes, focus and comparison location keys cannot fan out to live source validation.')
   await page.getByRole('button', { name: 'Open fixture real setup', exact: true }).click()
-  await visible(page.getByRole('heading', { name: 'Build a real analysis', exact: true }))
+  await visible(page.getByRole('heading', { name: 'New analysis', exact: true }))
   assert.equal(targetReads(), 1)
   state.liveTargets[0].displayName = 'Latest live job option'
   await page.getByRole('button', { name: 'Refresh available inputs', exact: true }).click()

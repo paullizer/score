@@ -1,4 +1,4 @@
-import { AlertTriangle, FileSearch, ShieldCheck } from 'lucide-react'
+import { AlertTriangle, FileSearch } from 'lucide-react'
 import { Badge, ExternalSource } from '../../components/ui'
 import type { Citation } from '../../domain/types'
 import type { GradeIssue, GradeLevelStatus, ReferenceIssueResolution } from '../../domain/real-grades'
@@ -8,10 +8,7 @@ export function GradeStatus({ status }: { status: GradeLevelStatus }) {
   return <Badge dot tone={status === 'approved' || status === 'ready-for-review' ? 'success' : status === 'needs-sources' ? 'warning' : status === 'error' ? 'danger' : 'neutral'}>{gradeStatusLabels[status]}</Badge>
 }
 
-export function GradeDisclaimer() {
-  return <div className="info-callout grade-disclaimer"><ShieldCheck size={18} aria-hidden="true" /><div><strong>Source-grounded work for human review</strong>
-    <p>Reviewer approval is not OPM certification, an official position classification, or an eligibility decision. Weights are review choices, not federal classification points.</p></div></div>
-}
+export function GradeDisclaimer() { return null }
 
 export function GradeIssues({ issues, title = 'Unresolved evidence and applicability' }: { issues: GradeIssue[]; title?: string }) {
   const unique = [...new Map(issues.map((issue) => [issue.id, issue])).values()]

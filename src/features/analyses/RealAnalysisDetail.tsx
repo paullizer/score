@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { Link, useNavigate, useSearchParams } from 'react-router-dom'
-import { AlertTriangle, ArrowLeft, ArrowUpRight, Layers3, LoaderCircle, RotateCcw, ShieldCheck, X } from 'lucide-react'
+import { AlertTriangle, ArrowLeft, ArrowUpRight, Layers3, LoaderCircle, RotateCcw, X } from 'lucide-react'
 import { useRealAnalyses } from '../../app/real-analyses-context'
 import { savedReviewView, type SavedReviewView } from '../../app/saved-review-navigation'
 import type { RealAnalysisComparisonSummary, RealAnalysisRunSummary } from '../../domain/real-analyses'
@@ -155,13 +155,13 @@ function RealAnalysisView({ id }: { id: string }) {
     if (!summaryScope && summaryWasOpen.current) summaryTrigger.current?.focus()
     summaryWasOpen.current = summaryScope !== null
   }, [summaryScope])
-  if (!api) return <EmptyState title="Real analyses require a cloud workspace" description="Open this analysis from an authenticated workspace." />
-  const back = <Link className="back-link" to={selectedId ? `/analyses/${encodeURIComponent(id)}` : '/analyses'}><ArrowLeft size={14} aria-hidden="true" />{selectedId ? 'All saved comparisons' : 'Back to real analyses'}</Link>
+  if (!api) return <EmptyState title="Analyses require a cloud workspace" description="Open this analysis from an authenticated workspace." />
+  const back = <Link className="back-link" to={selectedId ? `/analyses/${encodeURIComponent(id)}` : '/analyses'}><ArrowLeft size={14} aria-hidden="true" />{selectedId ? 'All comparisons' : 'Back to analyses'}</Link>
   if (deleting || (removed && entry?.state === 'ready')) return <>{back}<LifecycleBanner target={{ kind: 'analysis', id }} /><EmptyState title="Analysis cleanup or removal" description="Cached comparisons, snapshots, and downloads are no longer available. Retry the lifecycle operation above if permanent cleanup is incomplete." /></>
-  if (api.phase === 'unavailable') return <>{back}<EmptyState title="Saved real analysis history is unavailable" description={api.error ?? 'The private history service is unavailable.'} action={<Button onClick={() => void api.refresh()}>Check service</Button>} /></>
+  if (api.phase === 'unavailable') return <>{back}<EmptyState title="Analysis history is unavailable" description={api.error ?? 'The private history service is unavailable.'} action={<Button onClick={() => void api.refresh()}>Check service</Button>} /></>
   if (entry?.state !== 'ready') return <>{back}<EmptyState icon={entry?.state === 'error' || api.phase === 'error' ? Layers3 : LoaderCircle}
-    title={entry?.state === 'error' || api.phase === 'error' ? 'This real analysis could not be opened' : 'Opening saved real analysis'}
-    description={entry?.state === 'error' ? entry.error : api.error ?? 'Loading the authorized run and immutable input manifest, not the current live documents.'}
+    title={entry?.state === 'error' || api.phase === 'error' ? 'This analysis could not be opened' : 'Opening analysis'}
+    description={entry?.state === 'error' ? entry.error : api.error ?? 'Loading analysis details.'}
     action={<Button onClick={() => { void api.refresh(); void api.ensureDetail(id, true) }}>Retry analysis</Button>} /></>
   const detail = entry.value
   const summary = api.summaries.find((item) => item.run.id === id) ?? detail
@@ -211,7 +211,7 @@ function RealAnalysisView({ id }: { id: string }) {
     setParams(next)
   }
   return <>{back}
-    <PageHeader eyebrow="REAL EVIDENCE · FROZEN INPUTS" title={getDisplayName(run, run.name)} description="Review each saved resume/target pair independently. Completion, coverage, and overall-score availability are separate."
+    <PageHeader title={getDisplayName(run, run.name)} description="Review resume and target comparisons."
       actions={<><RenameEntityButton target={{ kind: 'analysis', id }} name={getDisplayName(run, run.name)} etag={summary.etag} disabled={!api.canWrite || api.phase !== 'ready' || !summary.etag || api.pending(id)} /><EntityLifecycleActions target={{ kind: 'analysis', id }} name={getDisplayName(run, run.name)} onComplete={(action) => { if (action === 'delete') navigate('/analyses') }} /><RealRunActions summary={summary} />
         <ReviewWithheldScores runId={id} comparisons={savedPairs} available={pairs?.state === 'ready' && !pairs.error && api.phase === 'ready'} />
         <Button ref={summaryTrigger} onClick={() => setSummaryScope({ targetId: viewedTarget?.id })}>Manage summaries</Button><AnalysisReportExport source={{
@@ -221,7 +221,7 @@ function RealAnalysisView({ id }: { id: string }) {
         ? <Link className="button button-secondary button-md" {...realAnalysisLink({ from: id }, api.workspaceId)}><Layers3 size={15} aria-hidden="true" />New run with these inputs</Link>
         : <Button icon={Layers3} disabled title={!canEdit ? 'Unarchive this analysis and its workspace before creating another run.' : api.creationError ?? 'New-run readiness has not been confirmed.'}>New run with these inputs</Button>}</>} />
     <LifecycleBanner target={{ kind: 'analysis', id }} />
-    <div className="analysis-meta"><Badge tone="accent">Real evidence assessment</Badge><RealAnalysisStatus summary={summary} /><ArchivedBadge target={{ kind: 'analysis', id }} /><span>{detail.resumes.length} resumes</span><span>{detail.targets.length} separate targets</span><span>{dateLabel(run.createdAt)}</span><span className="flex items-center gap-1.5"><ShieldCheck size={13} aria-hidden="true" />Immutable snapshots</span></div>
+    <div className="analysis-meta"><RealAnalysisStatus summary={summary} /><ArchivedBadge target={{ kind: 'analysis', id }} /><span>{detail.resumes.length} resumes</span><span>{detail.targets.length} {detail.targets.length === 1 ? 'target' : 'targets'}</span><span>{dateLabel(run.createdAt)}</span></div>
     {(entry.error || api.error) && <div className="mb-5"><InlineError>{entry.error ?? api.error} The last acknowledged run is shown. <Button size="sm" onClick={() => { void api.refresh(); void api.ensureDetail(id, true) }}>Reload progress</Button></InlineError></div>}
     {!api.features?.realAnalyses && <p className="mb-5 text-[11px] text-muted">{api.creationError ?? 'Checking new-run readiness.'} This saved run and its frozen evidence are independent of new-run readiness.</p>}
     {run.error && <div className="mb-5"><InlineError>{run.error.code}: {run.error.message} Processing failures are not zero scores.</InlineError></div>}
@@ -230,21 +230,20 @@ function RealAnalysisView({ id }: { id: string }) {
       {combined ? <progress max={Math.max(1, combined.total)} value={combined.finished} aria-label="Finished analysis and summary steps" />
         : checking ? <progress aria-label="Checking summary progress" />
           : <progress max={Math.max(1, run.progress.total)} value={finished} aria-label="Finished comparisons" />}
-      {combined && <p>A comparison counts as finished when its score and its candidate summary are both done. Each job or grade overview counts once.</p>}
       {checking && <p>Checking summary progress…</p>}
       <p>Analysis: <span>{finished} / {run.progress.total} comparisons finished</span> · {run.progress.complete} complete · {run.progress.running} assessing · {run.progress.queued} queued · {run.progress.failed} failed · {run.progress.cancelled} cancelled</p>
       {progress && <p>{summaryTallyLine('Candidate summaries', progress.candidates, automatic)}</p>}
       {progress && progress.overviews.required > 0 && <p>{summaryTallyLine('Job / grade overviews', progress.overviews, automatic)}</p>}
       {statusError && <p>{statusError} <Button size="sm" variant="ghost" onClick={() => void api.ensureSummaryStatus(id, true)}>Check summary progress</Button></p>}
       {exportHint && <p>{exportHint}</p>}
-      <p>{run.progress.scored} with a server-calculated score · {run.progress.unscored} completed without an overall score. Saved results are never overwritten when other pairs retry.</p>
+      <p>{run.progress.scored} scored · {run.progress.unscored} without an overall score</p>
       {correctionProgress && <p>{correctionProgress}</p>}
       {realAnalysisCancellationPending(summary) && <p>Cancellation is progressing in bounded batches. This view keeps polling until the server confirms completion.</p>}
     </section>
     {mixedVersions && <div className="info-callout mt-5" role="note"><AlertTriangle size={18} aria-hidden="true" /><div><strong>Rubric versions differ</strong><p>{mixedVersions}</p></div></div>}
     {viewedTarget && <RealTargetNarrative runId={id} target={viewedTarget} />}
     {selectedId ? <SelectedRealComparison runId={id} comparisonId={selectedId} initialView={sourceView} /> : <section className="panel mt-5" aria-label="Real comparisons">
-      <div className="section-heading"><div><h2>Separate comparisons, not a cross-job ranking</h2><p>Open a result for the complete criterion breakdown and exact source quotations.</p></div>
+      <div className="section-heading"><div><h2>Comparisons</h2></div>
         <Button size="sm" icon={RotateCcw} onClick={() => { void api.ensureDetail(id, true); void api.ensureComparisons(id, true); void ensureStatus?.(id, true) }}>Refresh pairs</Button></div>
       <div className="library-toolbar">
         <SearchField label="Search comparisons" value={query} onChange={setQuery} placeholder="Find a candidate, document, or target…" />
@@ -282,9 +281,8 @@ function RealAnalysisView({ id }: { id: string }) {
         action={<Button onClick={() => { setQuery(''); chooseTarget('') }}>Clear comparison filters</Button>} />
         : <EmptyState icon={listError ? Layers3 : LoaderCircle} title={listError ? 'The comparison list could not be loaded' : pairs?.state === 'ready' ? 'Comparison initialization is still pending' : 'Loading independent comparisons'}
           description={listError ? 'Retry the real comparison service.' : 'The server materializes the frozen comparison plan in bounded batches. No scores or source snapshots are fabricated while work is pending.'} />}
-      <div className="table-bottom"><span>Showing {browsing.rows.length} of {savedPairs.length} saved comparison records / {run.progress.total} planned</span><span>Retries reuse saved inputs, not current live sources.</span></div>
+      <div className="table-bottom"><span>Showing {browsing.rows.length} of {savedPairs.length} comparisons ({run.progress.total} planned)</span></div>
     </section>}
-    <div className="info-callout mt-5"><ShieldCheck size={18} aria-hidden="true" /><p>Human review only. Scores describe evidence in the submitted document, not a person’s intrinsic ability. Missing evidence is not proof of missing skills; GS assessments are not official qualification or eligibility determinations.</p></div>
     {summaryScope && <ManageAnalysisSummaries detail={detail} open initialTargetId={summaryScope.targetId}
       onOpenChange={(open) => { if (!open) setSummaryScope(null) }} />}
   </>

@@ -503,7 +503,7 @@ test('results display server totals, limited completion, exact statuses and unsc
   const renderReview = () => renderToStaticMarkup(React.createElement(ui.WorkspaceContext.Provider, { value: frontendWorkspaceContext() },
     React.createElement(ui.RealComparisonReview, { detail })))
   let html = renderReview()
-  assert.match(html, /SERVER-CALCULATED EVIDENCE MATCH/)
+  assert.match(html, /OVERALL SCORE/)
   assert.match(html, />36<\/strong>/)
   assert.match(html, /Complete · limited assessment/)
   assert.match(html, /Supported/)

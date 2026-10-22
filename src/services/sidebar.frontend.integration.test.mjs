@@ -209,7 +209,7 @@ test('administration, About, and configured help share the navigation item styli
   await click(button('About Score', links))
   const about = [...document.querySelectorAll('[role="dialog"]')].find(item => item.querySelector('h2')?.textContent === 'About Score')
   assert.ok(about, 'About opens from the sidebar')
-  assert.match(about.textContent, /How it works, current limits, and privacy/)
+  assert.match(about.textContent, /How it works and current limits/)
   assert.doesNotMatch(about.textContent, /UI preview|interactive preview|clearer way to see the fit/i)
   await click(button('Back to the workspace', about))
 
