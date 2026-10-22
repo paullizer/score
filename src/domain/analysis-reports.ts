@@ -342,6 +342,18 @@ export interface ReportGenerationOptions {
   links?: ReportLinkContext
   /** Adds a job & rubric details section to each target; CSV becomes a ZIP with analyses.csv and rubrics.csv. Absent means off. */
   rubricDetails?: boolean
+  /** Local export presentation only; never persisted or sent to the API/model. */
+  applicantIdentities?: ReportApplicantIdentity[]
+}
+
+export interface ReportApplicantIdentity {
+  resumeId: string
+  documentId: string
+  documentVersion: number
+  documentSha256: string | null
+  sourceLabel: string
+  identifier: string
+  name: string | null
 }
 
 export type AnalysisReportWriter = (report: AnalysisReport, options?: ReportGenerationOptions) => Uint8Array | Promise<Uint8Array>
