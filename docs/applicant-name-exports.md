@@ -5,6 +5,17 @@ without uploading the identifier-to-name mapping or sending it to a model.
 This is useful when a separate redaction tool produces resumes such as
 `Applicant 093.pdf` and an Excel spreadsheet linking those identifiers to names.
 
+Even when unredacted resumes are imported directly into Score, extracted candidate
+metadata (`name`, `location`, `displayName`, and filenames) is used only for
+workspace UI display and is never passed to the analytical scoring or summary
+models; `worker/analyses/pii-redaction.ts` also redacts candidate names (replacing
+them with neutral `"They"` / `"their"` phrasing), email addresses, phone numbers,
+street addresses, and locations from model-facing passages before assessment,
+grounding review, and summary generation while resolving integer `passageId`
+citations back to the original resume text for UI inspection. Combining pre-upload
+redaction with local applicant-name mapping provides an additional boundary when
+organizations want candidate identifiers rather than names stored in workspace records.
+
 ## Export workflow
 
 1. Open a saved analysis and choose **Export report**. Select the report format

@@ -23,6 +23,9 @@ import { NARRATIVE_MODEL_LIMITS } from './narrative-model-schema'
 import { emitSummaryTelemetry, summaryTransportTelemetry, type SummaryTelemetrySink, type SummaryTelemetryEvent } from './summary-telemetry'
 import { modelProcessingSettings, taskModelOptions } from '../settings'
 import type { ModelTaskId } from '../../src/domain/admin-settings'
+import { redactModelResumeText, type AnalysisResumePiiContext } from './pii-redaction'
+
+export { resumePiiFromSnapshot, type AnalysisResumePiiContext } from './pii-redaction'
 
 export interface SummaryModelOptions {
   model: RubricModelOptions
@@ -32,6 +35,8 @@ export interface SummaryModelOptions {
   deadlineAt?: number
   steps?: readonly AnalysisSummaryStep[]
   seed?: AnalysisSummaryStep
+  resumePii?: AnalysisResumePiiContext
+  resumePiiByComparisonId?: ReadonlyMap<string, AnalysisResumePiiContext | undefined>
   onCheckpoint?: (step: AnalysisSummaryStep) => Promise<void>
   onEvent?: SummaryTelemetrySink
 }
@@ -85,24 +90,43 @@ function draftFromResponse(content: string, kind: Kind, stage: Stage): AnalysisS
   return draft
 }
 
-function savedAnalysis(result: RealAnalysisResult, target: Omit<RealAnalysisAssessmentInput, 'resume'>) {
+function savedAnalysis(
+  result: RealAnalysisResult, target: Omit<RealAnalysisAssessmentInput, 'resume'>, pii?: AnalysisResumePiiContext,
+) {
   return {
     comparisonId: result.comparisonId,
     criteria: result.criteria.map(row => ({
       criterionId: row.criterionId,
       label: target.rubric.criteria.find(criterion => criterion.id === row.criterionId)?.label,
-      evidenceStatus: row.evidenceStatus, score: row.score, rationale: row.rationale,
-      evidence: row.citations.map(citation => ({ paragraphId: citation.paragraphId, quote: citation.quote })),
-      ...('limitation' in row && row.limitation ? { limitation: row.limitation } : {}),
+      evidenceStatus: row.evidenceStatus, score: row.score,
+      rationale: redactModelResumeText(row.rationale, pii),
+      evidence: row.citations.map(citation => ({
+        paragraphId: citation.paragraphId,
+        quote: redactModelResumeText(citation.quote, pii),
+      })),
+      ...('limitation' in row && row.limitation
+        ? { limitation: { ...row.limitation, message: redactModelResumeText(row.limitation.message, pii) } }
+        : {}),
     })),
     qualifications: result.qualifications.map(row => ({
       qualificationId: row.qualificationId,
       requirement: target.qualifications.find(qualification => qualification.id === row.qualificationId)?.text,
-      evidenceStatus: row.evidenceStatus, rationale: row.rationale,
-      evidence: row.citations.map(citation => ({ paragraphId: citation.paragraphId, quote: citation.quote })),
-      ...(row.limitation ? { limitation: row.limitation } : {}),
+      evidenceStatus: row.evidenceStatus,
+      rationale: redactModelResumeText(row.rationale, pii),
+      evidence: row.citations.map(citation => ({
+        paragraphId: citation.paragraphId,
+        quote: redactModelResumeText(citation.quote, pii),
+      })),
+      ...(row.limitation
+        ? { limitation: { ...row.limitation, message: redactModelResumeText(row.limitation.message, pii) } }
+        : {}),
     })),
-    overall: result.overall, coverage: result.coverage, limitations: result.limitations, summary: result.summary,
+    overall: result.overall, coverage: result.coverage,
+    limitations: result.limitations.map(limitation => ({
+      ...limitation,
+      message: redactModelResumeText(limitation.message, pii),
+    })),
+    summary: result.summary,
   }
 }
 
@@ -419,7 +443,7 @@ export async function generateCandidateSummary(
   try {
     const result = await session.generate('candidate', {
       kind: 'saved-analysis-summary', target: targetContext(captured.source),
-      analysis: savedAnalysis(captured.result, captured.source),
+      analysis: savedAnalysis(captured.result, captured.source, options.resumePii),
     }, captured.inputFingerprint)
     if (result.draft.kind !== 'candidate') throw new NarrativeModelError('invalid-input', 'A saved draft belongs to another summary kind.', 'candidate-generation')
     return {
@@ -437,7 +461,10 @@ async function targetSource(input: AnalysisTargetNarrativeModelInput, session: S
   let units: TargetUnit[] = input.binding.comparisons.map(comparison => ({
     members: [comparison.comparisonId],
     analysis: candidates.has(comparison.comparisonId)
-      ? savedAnalysis(candidates.get(comparison.comparisonId)!.result, input.target)
+      ? savedAnalysis(
+        candidates.get(comparison.comparisonId)!.result, input.target,
+        session.options.resumePiiByComparisonId?.get(comparison.comparisonId) ?? session.options.resumePii,
+      )
       : { comparisonId: comparison.comparisonId, status: comparison.status, assessment: 'Not assessed' },
   }))
   const frame = (values: TargetUnit[]) => ({ kind: 'saved-analysis-summary', target, records: values })

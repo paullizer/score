@@ -30,7 +30,7 @@ import { analysisIsRemoved, fencedAnalysisBlobs } from '../../server/analyses/gu
 import { prepareAnalysisNarrativeTransitions } from '../../server/analyses/narrative-scheduling'
 import { firstAnalysisWorkLane } from '../../server/analyses/work-lanes'
 import { systemClock, type Clock, type RubricModelOptions } from '../runtime'
-import { AnalysisModelError, assessResumeAgainstTarget } from './model'
+import { AnalysisModelError, assessResumeAgainstTarget, resumePiiFromSnapshot } from './model'
 import { emitAnalysisTelemetry, type AnalysisTelemetrySink } from './telemetry'
 import { runAnalysisNarrativeWork, type AnalysisNarrativeTelemetryEvent } from './narrative-runtime'
 import {
@@ -522,6 +522,7 @@ export async function processClaimedComparison(
       },
       resumeSnapshotSha256: comparison.record.resume.blob.sha256,
       targetSnapshotSha256: comparison.record.target.blob.sha256,
+      resumePii: resumePiiFromSnapshot(snapshots.resumeSnapshot),
     })
     stage = 'publication'
     const current = await lease.check()
