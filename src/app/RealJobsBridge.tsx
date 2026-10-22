@@ -22,6 +22,7 @@ import {
   getRealJobLifecycleImpact, changeRealJobLifecycle,
 } from '../services/realJobs'
 import { summarizeRubricQa, type RubricCheckState } from '../domain/rubric-approval'
+import { EVIDENCE_SCALE_VERSION } from '../domain/evidence-scale'
 import { requestRubricAssist } from '../services/rubricAssist'
 import type { Rubric } from '../domain/types'
 import { WorkspaceContext, type CloudWorkspaceStatus, type PendingLifecycleChange, type RenameEntityTarget, type WorkspaceContextValue } from './workspace-context'
@@ -378,6 +379,13 @@ export function RealJobsBridge({
     try {
       const detail = await mutate(() => saveRealJobRubric(workspaceId, jobId, rubric, summary.etag), remember, { kind: 'rubric', id: rubric.groupId })
       if (!detail.rubric || detail.job.rubricDeletedAt) throw new Error('The service did not acknowledge a current rubric. No older version was substituted.')
+      const saved = detail.rubric
+      const effectiveFeatures = features ? jobFeaturesWithPolicy(features, policy.settings) : null
+      if (effectiveFeatures?.rubricChecks === true && saved.scaleVersion === EVIDENCE_SCALE_VERSION) {
+        void runRealJobRubricChecks(workspaceId, jobId, saved.id, saved.version)
+          .then((state) => syncQaSummary(jobId, state))
+          .catch(() => {})
+      }
       base.notify(`${detail.rubric?.name ?? rubric.name} saved as reviewer-edited version ${detail.rubric?.version ?? rubric.version + 1}.`)
       return detail.rubric.id
     } catch (error) {

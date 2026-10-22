@@ -32,8 +32,8 @@ import { invokeStructuredModel } from './model-transport'
 import { runJobRubricReview } from './rubric-review'
 import { logJobEvent, type JobOutcome, type JobStage } from './job-telemetry'
 import { analysisHash } from '../server/analyses/deterministic'
-import { RUBRIC_QA_VERSION, rubricQaChecks } from '../src/domain/rubric-qa'
-import { rubricQaRecordId, type RubricQaRecord } from '../src/domain/rubric-approval'
+import { RUBRIC_QA_VERSION, rubricQaChecks, type RubricQaFinding } from '../src/domain/rubric-qa'
+import { buildRubricFixInstruction, rubricQaRecordId, type RubricQaRecord } from '../src/domain/rubric-approval'
 import { PromptPinError, resolveAcceptedPrompt, type ResolvedPrompt } from './prompts'
 import { EVIDENCE_SCALE_VERSION, EVIDENCE_SCALE_V1, checkCriterionLevels, parseCriterionLevels, renderEvidenceGuidance, renderEvidenceScale } from '../src/domain/evidence-scale'
 import { createSourcePassageCatalog, describeSourcePassageError, resolveSourceCitations } from './source-passages'
@@ -1299,6 +1299,7 @@ async function invokeModel(
   prompt: ResolvedPrompt,
   correction?: string[],
   signal?: AbortSignal,
+  repairInstruction?: string,
 ): Promise<{ content: string; model: string }> {
   const settings = modelProcessingSettings(options)
   const maxCriteria = settings?.settings.rubrics.jobs.maxCriteria ?? JOB_IMPORT_LIMITS.maxCriteria
@@ -1307,13 +1308,15 @@ async function invokeModel(
     properties: { ...RUBRIC_JSON_SCHEMA.schema.properties, criteria: { ...RUBRIC_JSON_SCHEMA.schema.properties.criteria, maxItems: maxCriteria } },
   }
   const source = modelSource(document)
+  const repairPrefix = repairInstruction ? `${repairInstruction}\n\n` : ''
+  const correctionPrefix = correction ? `The prior result was invalid. Correct all of these errors:\n${correction.join('\n')}\n\n` : ''
   return invokeStructuredModel(options, {
     taskId: 'jobRubric',
     name: RUBRIC_JSON_SCHEMA.name,
     schema,
     system: prompt.system,
     source,
-    user: `${correction ? `The prior result was invalid. Correct all of these errors:\n${correction.join('\n')}\n\n` : ''}SOURCE PASSAGE CATALOG JSON:\n${source}`,
+    user: `${repairPrefix}${correctionPrefix}SOURCE PASSAGE CATALOG JSON:\n${source}`,
     maxCompletionTokens: 8192,
   }, signal)
 }
@@ -1411,6 +1414,29 @@ export function validateModelRubric(value: unknown, document: SourceDocument, ma
   return errors
 }
 
+export const MAX_RUBRIC_REPAIR_ROUNDS = 2
+
+export function formatRubricRepairPrompt(
+  rubric: Rubric,
+  metadata: ModelRubricResult,
+  findings: readonly RubricQaFinding[],
+): string {
+  const criteriaSummary = metadata.criteria.map((criterion, index) => ({
+    ref: `C${index + 1}`,
+    label: criterion.label,
+    description: criterion.description,
+    weight: criterion.weight,
+    requirementType: criterion.requirementType,
+    sourcePassageIds: criterion.sourcePassageIds,
+  }))
+  return [
+    'PREVIOUS RUBRIC DRAFT CRITERIA:',
+    JSON.stringify(criteriaSummary),
+    '',
+    buildRubricFixInstruction(rubric, findings),
+  ].join('\n')
+}
+
 export async function generateGroundedRubric(
   document: SourceDocument,
   options: RubricModelOptions,
@@ -1418,6 +1444,7 @@ export async function generateGroundedRubric(
   jobId: string,
   now: string,
   signal?: AbortSignal,
+  repairInstruction?: string,
 ): Promise<{ rubric: Rubric; metadata: ModelRubricResult; warnings: string[] }> {
   let correction: string[] | undefined
   const settings = modelProcessingSettings(options)
@@ -1425,7 +1452,7 @@ export async function generateGroundedRubric(
   const prompt = resolveAcceptedPrompt(settings, 'jobRubric', JOB_RUBRIC_COMPILED_PROMPT,
     system => system.replace('1 to 20', `1 to ${settings?.settings.rubrics.jobs.maxCriteria ?? JOB_IMPORT_LIMITS.maxCriteria}`))
   for (let attempt = 0; attempt <= corrections; attempt += 1) {
-    const response = await invokeModel(document, options, prompt, correction, signal)
+    const response = await invokeModel(document, options, prompt, correction, signal, repairInstruction)
     let parsed: unknown
     try {
       parsed = JSON.parse(response.content)
@@ -2028,10 +2055,12 @@ export async function processClaimedJob(
     await controller.check()
     stage = 'rubric'
     report()
-    const generated = await generateGroundedRubric(
+    const validateGeneratedRubric = (rubric: Rubric, document: SourceDocument) =>
+      dependencies.validateRealRubric(rubric, document, artifact.source.originalContentType)
+    let generated = await generateGroundedRubric(
       artifact.document,
       dependencies.model,
-      (rubric, document) => dependencies.validateRealRubric(rubric, document, artifact.source.originalContentType),
+      validateGeneratedRubric,
       claimed.record.id,
       clock.now().toISOString(),
       controller.signal,
@@ -2039,7 +2068,8 @@ export async function processClaimedJob(
     await controller.check()
     stage = 'review'
     report()
-    const review = await runJobRubricReview({
+    let modelChecks = rubricQaChecks(generated.rubric)
+    let review = await runJobRubricReview({
       rubric: generated.rubric,
       jobTitle: generated.metadata.title ?? artifact.document.title,
       invoke: (request, signal) => invokeStructuredModel(dependencies.model, request, signal),
@@ -2050,6 +2080,44 @@ export async function processClaimedJob(
       deadlineAt,
     })
     await controller.check()
+    for (let repairRound = 0; repairRound < MAX_RUBRIC_REPAIR_ROUNDS; repairRound += 1) {
+      const findings = [...modelChecks, ...review.findings]
+      if (findings.length === 0) break
+      const repairInstruction = formatRubricRepairPrompt(generated.rubric, generated.metadata, findings)
+      try {
+        const repaired = await generateGroundedRubric(
+          artifact.document,
+          dependencies.model,
+          validateGeneratedRubric,
+          claimed.record.id,
+          clock.now().toISOString(),
+          controller.signal,
+          repairInstruction,
+        )
+        await controller.check()
+        const nextChecks = rubricQaChecks(repaired.rubric)
+        const nextReview = await runJobRubricReview({
+          rubric: repaired.rubric,
+          jobTitle: repaired.metadata.title ?? generated.metadata.title ?? artifact.document.title,
+          invoke: (request, signal) => invokeStructuredModel(dependencies.model, request, signal),
+          processingSettings: dependencies.model.processingSettings,
+          maxCorrections: snapshot.settings.ai.jobRubric.maxOutputCorrections,
+          signal: controller.signal,
+          now: () => clock.now().getTime(),
+          deadlineAt,
+        })
+        await controller.check()
+        generated = {
+          ...repaired,
+          warnings: [...new Set([...generated.warnings, ...repaired.warnings])],
+        }
+        modelChecks = nextChecks
+        review = nextReview
+      } catch {
+        await controller.check()
+        break
+      }
+    }
     const checks: RubricQaRecord = {
       id: rubricQaRecordId(generated.rubric.id, generated.rubric.version),
       workspaceId: claimed.record.workspaceId,
@@ -2059,7 +2127,7 @@ export async function processClaimedJob(
       version: generated.rubric.version,
       rubricHash: analysisHash(generated.rubric),
       qaVersion: RUBRIC_QA_VERSION,
-      checks: rubricQaChecks(generated.rubric),
+      checks: modelChecks,
       review,
       createdBy: claimed.record.createdBy,
       createdAt: clock.now().toISOString(),

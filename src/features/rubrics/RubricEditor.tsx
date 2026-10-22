@@ -65,7 +65,7 @@ function normalizedDraft(draft: Rubric): Rubric {
 export function RubricEditor({ rubric, onClose, onSaved, initialPanel = null, initialFocusCriterionId = null, initialAssistInstruction = null }: {
   rubric: Rubric
   onClose: () => void
-  onSaved: (id: string) => void
+  onSaved: (id: string, savedRubric?: Rubric) => void
   initialPanel?: 'assist' | 'source' | 'changes' | null
   initialFocusCriterionId?: string | null
   initialAssistInstruction?: string | null
@@ -305,12 +305,17 @@ export function RubricEditor({ rubric, onClose, onSaved, initialPanel = null, in
     guard.hold()
     setSaving(true)
     try {
+      const nextRubric: Rubric = {
+        ...savedDraft,
+        version: rubric.version + 1,
+        ...(session.draft.provenance ? { provenance: { ...session.draft.provenance, kind: 'edited' as const } } : {}),
+      }
       const id = await saveRubric({
         ...savedDraft,
         ...(session.draft.provenance ? { provenance: { ...session.draft.provenance, kind: 'edited' as const } } : {}),
       })
       guard.release()
-      onSaved(id)
+      onSaved(id, nextRubric)
     } catch (caught) {
       guard.settle()
       setError(caught instanceof Error ? caught.message : 'The rubric could not be saved. Your edits are still here; try again.')

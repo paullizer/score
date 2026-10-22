@@ -252,6 +252,16 @@ async function renderFlow({ records = [flowRecord(1), flowRecord(2)], role = 'ow
       workspace: { jobs: rows.map(item => item.job), rubrics: rows.map(item => item.rubric), documents: [fixture().document],
         lifecycle: { entities: Object.fromEntries(rows.flatMap(item => [[`job:${item.job.id}`, item.lifecycle ?? {}], [`rubric:${item.rubric.groupId}`, item.rubricLifecycle ?? {}]])) } },
       notify: message => calls.push(['notice', message]),
+      saveRubric: async (draft) => {
+        const nextVersion = draft.version + 1
+        const saved = { ...draft, version: nextVersion }
+        calls.push(['save-rubric', saved.id, nextVersion])
+        rowsRef.current = rowsRef.current.map(item => item.rubric.id === saved.id
+          ? { ...item, rubric: saved, rubricVersions: [...(item.rubricVersions ?? [item.rubric]), saved] }
+          : item)
+        setRows(rowsRef.current)
+        return saved.id
+      },
       cloud: {
         currentWorkspaceId: access.workspaceId,
         workspaces: [{ id: access.workspaceId, role: access.role, name: 'Fixture', etag: '"workspace"' }],
@@ -275,13 +285,21 @@ async function renderFlow({ records = [flowRecord(1), flowRecord(2)], role = 'ow
           },
           rubricChecks: async (jobId, rubricId, version, signal) => {
             calls.push(['read', jobId, rubricId, version])
-            const rubric = rowsRef.current.find(item => item.job.id === jobId).rubric
+            const row = rowsRef.current.find(item => item.job.id === jobId)
+            const rubric = (row.rubricVersions ?? [row.rubric]).find(item => item.version === version) ?? { ...row.rubric, version }
             return read ? read(rubric, signal) : flowReview(rubric)
           },
           runRubricChecks: async (jobId, rubricId, version) => {
             calls.push(['run', jobId, rubricId, version])
-            const rubric = rowsRef.current.find(item => item.job.id === jobId).rubric
-            return run ? run(rubric) : flowReview(rubric)
+            const row = rowsRef.current.find(item => item.job.id === jobId)
+            const rubric = (row.rubricVersions ?? [row.rubric]).find(item => item.version === version) ?? { ...row.rubric, version }
+            const result = run ? await run(rubric) : flowReview(rubric)
+            if (result.checks) {
+              const qaSummary = ui.summarizeRubricQa(result.checks)
+              rowsRef.current = rowsRef.current.map(item => item.job.id === jobId ? { ...item, rubricQaSummary: qaSummary } : item)
+              setRows(rowsRef.current)
+            }
+            return result
           },
           approveRubric: async (jobId, review, options) => {
             calls.push(['approve', jobId, review, options])
@@ -524,4 +542,34 @@ test('guided bulk approval steps through rubrics one by one with Approve & next'
   await click(button('Approve version 2', dialog()))
   assert.deepEqual(calls.filter(item => item[0] === 'approve').map(item => item[1]), ['job-1', 'job-2'])
 })
+
+test('saving an AI fix in bulk approval automatically runs checks on the new version and turns the approve button green', async () => {
+  const calls = await renderFlow({
+    page: 'batch',
+    records: [flowRecord(1)],
+    read: rubric => flowReview(rubric, rubric.version === 2 ? { warnings: [overlap] } : { missing: true }),
+    run: rubric => flowReview(rubric, { warnings: [] }),
+  })
+  assert.match(dialog().textContent, /Version 2/)
+  assert.match(dialog().textContent, /Ready for approval · 1 to review/)
+  assert.equal(button('Approve 1 checked rubric', dialog()).classList.contains('button-success'), false)
+
+  await click(button('Fix with AI', dialog()))
+  await pause(30)
+  const dialogs = [...document.querySelectorAll('[role="dialog"]')]
+  const editorModal = dialogs.at(-1)
+  await click(button('Save version 3', editorModal))
+  await click(button('Confirm and save version 3', editorModal))
+  await pause(30)
+
+  assert.deepEqual(calls.filter(item => item[0] === 'save-rubric'), [['save-rubric', 'rubric-1', 3]])
+  assert.deepEqual(calls.filter(item => item[0] === 'run'), [['run', 'job-1', 'rubric-1', 3]], 'Checks run automatically after saving without clicking Run missing checks')
+  assert.equal(findButton('Run missing checks (1)', dialog()), undefined)
+  assert.match(dialog().textContent, /Version 3/)
+  assert.match(dialog().textContent, /The checks found nothing to review\./)
+  const approveButton = button('Approve 1 checked rubric', dialog())
+  assert.equal(approveButton.disabled, false)
+  assert.equal(approveButton.classList.contains('button-success'), true, 'Approve button turns green when checks pass with 0 findings')
+})
+
 
