@@ -327,6 +327,17 @@ const RETRY_DELAYS_MILLISECONDS = [1_000, 2_000, 4_000, 8_000]
 const STEADY_RETRY_DELAY_MILLISECONDS = 15_000
 const MAX_RETRY_AFTER_MILLISECONDS = 30_000
 
+function isReplayableBody(body: BodyInit | null | undefined): boolean {
+  return body === undefined || body === null || typeof body === 'string' ||
+    body instanceof ArrayBuffer || ArrayBuffer.isView(body)
+}
+
+function isCloudRetryAfterFailure(error: unknown): error is CloudApiError & { retryAfterSeconds: number } {
+  return error instanceof CloudApiError && !(error instanceof CloudAuthError) &&
+    !(error instanceof CloudAccessChangedError) && error.retryAfterSeconds !== undefined &&
+    [409, 429, 503].includes(error.status)
+}
+
 /**
  * Failures that say nothing definite about the request: Score didn't answer in time, the connection
  * dropped, the platform answered instead of Score, or Score said to come back shortly.
@@ -334,7 +345,7 @@ const MAX_RETRY_AFTER_MILLISECONDS = 30_000
 export function isCloudRetryableFailure(error: unknown): boolean {
   if (error instanceof CloudTimeoutError || isCloudNetworkFailure(error)) return true
   if (!(error instanceof CloudApiError) || error instanceof CloudAuthError || error instanceof CloudAccessChangedError) return false
-  return error.transient || (error.retryAfterSeconds !== undefined && [409, 429, 503].includes(error.status))
+  return error.transient || isCloudRetryAfterFailure(error)
 }
 
 function retryDelay(attempt: number, error: unknown): number {
@@ -342,6 +353,34 @@ function retryDelay(attempt: number, error: unknown): number {
     return Math.min(Math.max(error.retryAfterSeconds * 1000, 1_000), MAX_RETRY_AFTER_MILLISECONDS)
   }
   return RETRY_DELAYS_MILLISECONDS[attempt - 1] ?? STEADY_RETRY_DELAY_MILLISECONDS
+}
+
+/**
+ * Sends an idempotent request and honors explicit Retry-After responses (such as HTTP 409 when
+ * another workspace mutation holds the workspace lease) by waiting and resending the identical
+ * bytes and Idempotency-Key. Definite conflicts without Retry-After and non-Retry-After errors
+ * fail immediately so callers can surface them without delay.
+ */
+export async function cloudRetryAfterJsonRequest<T>(
+  path: string, init: CloudRequestInit = {}, maxWaitMilliseconds = 60_000,
+): Promise<T> {
+  const headers = new Headers(init.headers)
+  if (!headers.get('Idempotency-Key')) throw new Error('Automatic re-sending requires an Idempotency-Key.')
+  if (!isReplayableBody(init.body)) throw new Error('Automatic re-sending requires a replayable body.')
+  const accessSignal = cloudAccessRequestSignal(path, init)
+  const stop = AbortSignal.any([...(init.signal ? [init.signal] : []), ...(accessSignal ? [accessSignal] : [])])
+  const started = cloudRetryClock.now()
+  for (let attempt = 1; ; attempt++) {
+    stop.throwIfAborted()
+    try {
+      return await cloudJsonRequest<T>(path, { ...init, headers })
+    } catch (error) {
+      if (!isCloudRetryAfterFailure(error)) throw error
+      const delay = retryDelay(attempt, error)
+      if (cloudRetryClock.now() - started + delay > maxWaitMilliseconds) throw error
+      await cloudRetryClock.sleep(delay, stop)
+    }
+  }
 }
 
 /**
@@ -353,7 +392,7 @@ function retryDelay(attempt: number, error: unknown): number {
 export async function cloudIdempotentJsonRequest<T>(path: string, init: CloudRequestInit, wait: CloudPatientWait): Promise<T> {
   const headers = new Headers(init.headers)
   if (!headers.get('Idempotency-Key')) throw new Error('Automatic re-sending requires an Idempotency-Key.')
-  if (init.body !== undefined && init.body !== null && typeof init.body !== 'string') throw new Error('Automatic re-sending requires a replayable text body.')
+  if (!isReplayableBody(init.body)) throw new Error('Automatic re-sending requires a replayable text body.')
   // Each try looks up access again, so the access in force at the start is kept to stop any later try after a change.
   const accessSignal = cloudAccessRequestSignal(path, init)
   const stop = AbortSignal.any([...(init.signal ? [init.signal] : []), ...(accessSignal ? [accessSignal] : [])])

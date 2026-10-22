@@ -39,6 +39,7 @@ test('The SPA shell is served for a BrowserRouter-style /workspaces/:id deep lin
     ]) {
       const response = await fetch(`${server.baseUrl}${routePath}`, { headers: authHeaders() })
       assert.equal(response.status, 200, `expected the SPA shell for ${routePath}`)
+      assert.equal(response.headers.get('cache-control'), 'no-store')
       assert.match(response.headers.get('content-type') ?? '', /text\/html/)
       assert.match(await response.text(), /Score test fixture shell/)
     }
