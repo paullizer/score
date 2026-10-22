@@ -1,5 +1,5 @@
 import type { PublicFeaturesResponse, PublicSettings } from '../domain/admin-settings'
-import { rubricAssistantEnabled, rubricExportsEnabled } from '../domain/feature-switches'
+import { rubricAssistantEnabled, rubricExportsEnabled, siTerminologyEnabled } from '../domain/feature-switches'
 import { JOB_IMPORT_LIMITS, type JobProcessingFeatures } from '../domain/real-jobs'
 import { RESUME_IMPORT_LIMITS, type ResumeProcessingFeatures } from '../domain/real-resumes'
 import { GRADE_LADDER_LIMITS, type GradeProcessingFeatures } from '../domain/real-grades'
@@ -87,6 +87,7 @@ export function jobFeaturesWithPolicy(features: JobProcessingFeatures, settings?
     // A policy the server enforces; an absent value is treated as the documented default.
     rubricApprovalRequired: features.rubricApprovalRequired !== false,
     rubricChecks: features.rubricChecks === true && !admissionReason(settings),
+    siTerminology: settings ? siTerminologyEnabled(settings) : features.siTerminology === true,
     limits: clampClientLimits(JOB_IMPORT_LIMITS, { ...limits, ...(intake ? {
       maxFileBytes: intake.maxFileBytes, maxPdfBytes: intake.maxFileBytes, maxMarkdownBytes: intake.maxFileBytes,
       maxPdfPages: intake.maxPdfPages, maxSourceCharacters: intake.maxSourceCharacters, maxBatchFiles: intake.maxBatchItems,

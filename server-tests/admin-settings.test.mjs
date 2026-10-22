@@ -614,6 +614,48 @@ test('rubric approval is an optional Admin switch that defaults on and is shown 
   } finally { await server.close() }
 })
 
+test('SI terminology is an optional Admin switch that defaults off and updates /api/features without altering snapshots', async () => {
+  const defaults = createDefaultAdminSettings()
+  assert.equal('siTerminology' in defaults.features, false, 'Compiled defaults and the legacy baseline keep their earlier shape')
+  assert.throws(() => parseAdminSettings({ ...defaults, features: { ...defaults.features, siTerminology: 'yes' } }))
+  const initialCapture = captureProcessingSettings(defaults, 'r-initial', '2026-09-21T12:00:00.000Z')
+  assert.equal('siTerminology' in initialCapture.settings.features, false, 'Captured snapshots are not rewritten with a default')
+  const capabilities = {
+    realJobImports: true, realGradeLadders: false, realResumeImports: false, realAnalyses: false,
+    analysisSummaryGeneration: false, wordDocumentImports: false, rubricAssistant: false,
+  }
+  const absentFeatures = effectiveFeatures(capabilities, initialCapture, true)
+  assert.equal(absentFeatures.siTerminology, false, 'An absent key means off')
+  assert.equal(absentFeatures.publicSettings.features.siTerminology, false)
+
+  const server = await start()
+  try {
+    const first = await server.request('/api/admin/settings')
+    const field = first.body.fields.find(item => item.path === 'features.siTerminology')
+    assert.ok(field, 'The switch is on the Admin settings page')
+    assert.equal(field.label, 'Use SI (Superintelligence) terminology')
+    assert.equal(field.control, 'boolean')
+    assert.equal(field.section, 'intake')
+    assert.equal(field.defaultValue, false, 'The effective default is reported even though the saved revision omits the key')
+    assert.equal(field.activation, 'next-refresh')
+    assert.deepEqual(field.prerequisites, [])
+    assert.match(field.description, /Superintelligence/)
+    assert.equal(first.body.settings.features.siTerminology, undefined)
+
+    const on = await server.request('/api/admin/settings', { method: 'PATCH', headers: { 'If-Match': first.body.etag }, body: { features: { siTerminology: true } } })
+    assert.equal(on.response.status, 200)
+    assert.equal(on.body.settings.features.siTerminology, true)
+    assert.equal(on.body.settings.features.rubricApprovalRequired, undefined, 'Only the switched key changes')
+    const history = await server.request('/api/admin/settings/history?limit=1')
+    assert.equal(history.body.revisions[0].changes.find(change => change.path === 'features.siTerminology')?.after, true)
+    const features = effectiveFeatures(capabilities, captureProcessingSettings(on.body.settings, on.body.revision, '2026-09-21T12:00:00.000Z'), true)
+    assert.equal(features.siTerminology, true)
+    assert.equal(features.publicSettings.features.siTerminology, true)
+    const paused = effectiveFeatures(capabilities, captureProcessingSettings({ ...on.body.settings, maintenance: { ...on.body.settings.maintenance, pauseNewWork: true } }, on.body.revision, '2026-09-21T12:00:00.000Z'), true)
+    assert.equal(paused.siTerminology, true, 'Pausing new work does not reset UI terminology')
+  } finally { await server.close() }
+})
+
 test('settings updates require exact ETags, publish atomic audit/history, and preserve stale drafts through conflicts', async () => {
   const server = await start()
   try {

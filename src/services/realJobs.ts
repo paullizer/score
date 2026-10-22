@@ -42,6 +42,7 @@ export async function fetchJobProcessingFeatures(signal?: AbortSignal): Promise<
     rubricExports: features.rubricExports === true,
     rubricApprovalRequired: features.rubricApprovalRequired !== false,
     rubricChecks: features.rubricChecks === true,
+    siTerminology: features.siTerminology === true,
     limits: {
       ...JOB_IMPORT_LIMITS,
       ...features.limits,

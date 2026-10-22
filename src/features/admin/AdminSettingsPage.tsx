@@ -10,6 +10,7 @@ import { diffAdminSettings } from '../../domain/admin-settings-resolver'
 import * as service from '../../services/adminSettings'
 import { useGradeLeaveGuard } from '../../app/grade-navigation-context'
 import { usePublicSettings } from '../../app/public-settings-context'
+import { aiTerminology } from '../../domain/ai-terminology'
 import { ThemeControl } from '../../app/ThemeControl'
 import { Badge, Button, InlineError, Modal, PageHeader, SearchField } from '../../components/ui'
 import { ModelSettingsEditor, type DeploymentDiscovery } from './ModelSettingsEditor'
@@ -225,6 +226,8 @@ export function AdminSettingsPage({ onLeave, onOpenUsers }: { onLeave: () => voi
     && (advanced || Boolean(search) || field.classification !== 'advanced'))
   const reviewChanges = review ? diffAdminSettings(base.settings, review.candidate) : []
   const appearance = policy.settings?.appearance ?? base.settings.appearance
+  const terms = aiTerminology(draft ?? policy.settings ?? base.settings)
+  const sectionTitles = sections.map(item => item.id === 'ai' ? { ...item, title: `${terms.ai} deployments & tasks` } : item)
   const workerVerification = base.environment.workerVerification
   const runtimeReadiness = base.environment.runtimeReadiness
   const paidProbe = probeKind !== 'connection'
@@ -281,7 +284,7 @@ export function AdminSettingsPage({ onLeave, onOpenUsers }: { onLeave: () => voi
       </section>}
       <div className="settings-toolbar"><SearchField value={search} onChange={setSearch} placeholder="Search settings, descriptions, or paths" label="Search application settings" />
         <label className="check-label"><input type="checkbox" checked={advanced} onChange={event => setAdvanced(event.target.checked)} />Show advanced controls</label></div>
-      <nav className="settings-tabs" aria-label="Settings sections">{sections.map(item => <button key={item.id} aria-current={section === item.id && !search ? 'page' : undefined}
+      <nav className="settings-tabs" aria-label="Settings sections">{sectionTitles.map(item => <button key={item.id} aria-current={section === item.id && !search ? 'page' : undefined}
         onClick={() => { setSection(item.id); setSearch('') }}>{item.title}</button>)}
         <button aria-current={section === 'history' && !search ? 'page' : undefined} onClick={() => { setSection('history'); setSearch(''); if (!historyLoaded) void loadHistory() }}><History size={14} />History & restore</button>
         <button aria-current={section === 'environment' && !search ? 'page' : undefined} onClick={() => { setSection('environment'); setSearch('') }}>Environment & readiness</button>
@@ -290,7 +293,7 @@ export function AdminSettingsPage({ onLeave, onOpenUsers }: { onLeave: () => voi
         errors={errors} onChange={update} discovery={discovery} discoveryAvailable={base.environment.model.inventoryAvailable}
         onRefreshDeployments={() => { void refreshDeployments().catch(() => undefined) }} disabled={pending} search={search} />}
       {fields.some(field => !field.path.startsWith('ai.tasks.') && field.path !== 'ai.defaultDeploymentId') && <section className="panel settings-section">
-        <h2>{search ? 'Matching settings' : sections.find(item => item.id === section)?.title}</h2>
+        <h2>{search ? 'Matching settings' : sectionTitles.find(item => item.id === section)?.title}</h2>
         <div className="settings-grid">{fields.filter(field => !field.path.startsWith('ai.tasks.') && field.path !== 'ai.defaultDeploymentId').map(field =>
           <SettingsField key={field.path} field={field} settings={draft} saved={base.settings} defaults={base.defaults} errors={errors} onChange={update} disabled={pending} />)}</div>
       </section>}
