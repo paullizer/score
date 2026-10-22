@@ -19,6 +19,8 @@ export function mountStaticSpa(app: Express, distDir: string): void {
       setHeaders(res, filePath) {
         if (filePath.startsWith(path.join(distDir, 'assets') + path.sep)) {
           res.setHeader('Cache-Control', 'public, max-age=31536000, immutable')
+        } else {
+          res.setHeader('Cache-Control', 'no-store')
         }
       },
     }),
@@ -26,6 +28,7 @@ export function mountStaticSpa(app: Express, distDir: string): void {
 
   app.get(/.*/, (req, res, next) => {
     if (API_PREFIX.test(req.path)) return next()
+    res.setHeader('Cache-Control', 'no-store')
     res.sendFile('index.html', { root: distDir })
   })
 }

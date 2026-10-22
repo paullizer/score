@@ -24,14 +24,31 @@ interface StateBlobContainer {
   getProperties(): Promise<unknown>
 }
 
+const DEFAULT_MUTATION_LEASE_WAIT_MS = 25_000
+const DEFAULT_MUTATION_LEASE_POLL_MS = 200
+
+export interface StateStoreOptions {
+  readonly acquireWaitMs?: number
+  readonly acquirePollMs?: number
+  readonly now?: () => number
+  readonly sleep?: (ms: number) => Promise<void>
+}
+
 /** Real Blob Storage-backed {@link StateStore}, authenticated with Azure AD (never account keys). */
 export function createAzureStateStore(config: StorageConfig, credential: TokenCredential): StateStore {
   const service = new BlobServiceClient(config.accountUrl, credential)
   const containerClient = service.getContainerClient(config.containerName)
-  return createStateStoreFromContainer(containerClient)
+  return createStateStoreFromContainer(containerClient, { acquireWaitMs: DEFAULT_MUTATION_LEASE_WAIT_MS })
 }
 
-export function createStateStoreFromContainer(containerClient: StateBlobContainer): StateStore {
+export function createStateStoreFromContainer(containerClient: StateBlobContainer, options: StateStoreOptions = {}): StateStore {
+  const acquireWaitMs = options.acquireWaitMs ?? 0
+  const acquirePollMs = options.acquirePollMs ?? DEFAULT_MUTATION_LEASE_POLL_MS
+  const now = options.now ?? (() => Date.now())
+  const sleep = options.sleep ?? ((ms: number) => new Promise((resolve) => setTimeout(resolve, ms)))
+  if (!Number.isInteger(acquireWaitMs) || acquireWaitMs < 0 || !Number.isInteger(acquirePollMs) || acquirePollMs < 1) {
+    throw new Error('Invalid workspace mutation lease wait configuration.')
+  }
   async function getState(workspaceId: string) {
     const blob = containerClient.getBlockBlobClient(blobPathFor(workspaceId))
     let response
@@ -74,11 +91,17 @@ export function createStateStoreFromContainer(containerClient: StateBlobContaine
       if (![409, 412].includes(statusCodeOf(error) ?? 0)) throw error
     }
     const lease = blob.getBlobLeaseClient()
-    try {
-      await lease.acquireLease(60)
-    } catch (error) {
-      if ([409, 412].includes(statusCodeOf(error) ?? 0)) throw new WorkspaceMutationBusyError()
-      throw error
+    const started = now()
+    for (;;) {
+      try {
+        await lease.acquireLease(60)
+        break
+      } catch (error) {
+        if (![409, 412].includes(statusCodeOf(error) ?? 0)) throw error
+        const elapsed = now() - started
+        if (elapsed >= acquireWaitMs) throw new WorkspaceMutationBusyError()
+        await sleep(Math.min(acquirePollMs, Math.max(1, acquireWaitMs - elapsed)))
+      }
     }
     return {
       async renew() {

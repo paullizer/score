@@ -7,7 +7,7 @@ import {
   type ResumeProcessingFeatures,
 } from '../domain/real-resumes'
 import { isSafeUploadedFilename, uploadedFileKind } from '../domain/source-files'
-import { cloudJsonRequest, cloudLifecycleRequest } from './cloudWorkspace'
+import { cloudJsonRequest, cloudLifecycleRequest, cloudRetryAfterJsonRequest } from './cloudWorkspace'
 import type { LifecycleAction, LifecycleImpact, LifecycleOperation } from '../domain/lifecycle'
 import { UPLOAD_CONTENT_TYPES, type UploadFormat } from '../domain/document-formats'
 import { requireUploadFile, uploadFileByteLimit } from './documentUploads'
@@ -106,7 +106,7 @@ async function importRealResumeUpload(
   signal?.throwIfAborted()
   const bytes = await file.arrayBuffer()
   signal?.throwIfAborted()
-  const result = await cloudJsonRequest<ResumeMutationResponse>(`${base(workspaceId)}/${kind === 'pdf' || kind === 'markdown' ? kind : 'file'}`, { method: 'POST', headers, body: bytes, signal })
+  const result = await cloudRetryAfterJsonRequest<ResumeMutationResponse>(`${base(workspaceId)}/${kind === 'pdf' || kind === 'markdown' ? kind : 'file'}`, { method: 'POST', headers, body: bytes, signal })
   return checked(result.resume, workspaceId)
 }
 
@@ -135,7 +135,7 @@ export async function importRealResumeUrl(
 ): Promise<RealResumeSummary> {
   requireImportUrl(url, 'resumes', settings)
   requireImportBatch(inputCount, 'resumes', settings)
-  const result = await cloudJsonRequest<ResumeMutationResponse>(`${base(workspaceId)}/url`, {
+  const result = await cloudRetryAfterJsonRequest<ResumeMutationResponse>(`${base(workspaceId)}/url`, {
     method: 'POST', headers: importHeaders(key, batchId, inputCount), body: JSON.stringify({ url }), signal,
   })
   return checked(result.resume, workspaceId)
