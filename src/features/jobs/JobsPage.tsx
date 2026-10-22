@@ -5,7 +5,7 @@ import { useWorkspace } from '../../app/workspace-context'
 import { clientAdmissionReason, originalDownloadReason, usePublicSettings } from '../../app/public-settings-context'
 import { effectiveFormats } from '../../services/publicSettings'
 import { useLibraryViewState } from '../../app/library-view-state'
-import type { Citation, Criterion, Job, SourceKind } from '../../domain/types'
+import type { Citation, Criterion, Job, Rubric, SourceKind } from '../../domain/types'
 import { documentPagination } from '../../domain/source-files'
 import { dateLabel } from '../../domain/selectors'
 import { sortTableRows, type TableSort } from '../../domain/tableSorting'
@@ -28,6 +28,7 @@ import { getDisplayName } from '../../domain/displayNames'
 import { RenameEntityButton, RenameEntityProvider } from '../../components/ui/RenameEntityButton'
 import { useRubricApprovals } from '../rubrics/useRubricApproval'
 import { PendingRubricNotice } from '../rubrics/PendingRubricNotice'
+import { BulkRubricApproval } from '../rubrics/BulkRubricApproval'
 
 const sourceNames = { pdf: 'PDF document', markdown: 'Markdown document', docx: 'Word DOCX', doc: 'Word DOC (97–2003)', url: 'Direct URL', website: 'Website' }
 const sourceIcons = { pdf: FileText, markdown: FileText, docx: FileText, doc: FileText, url: Link2, website: Globe2 }
@@ -64,6 +65,7 @@ function JobsLibrary() {
   const [selected, setSelected] = useState<string[]>([])
   const [selectedRealTargets, setSelectedRealTargets] = useState<Record<string, RealAnalysisTargetSelection>>({})
   const [importOpen, setImportOpen] = useState(false)
+  const [batch, setBatch] = useState<Rubric[] | null>(null)
   const [archiveFilter, setArchiveFilter] = useLibraryViewState<ArchiveFilter>('jobs:archive', 'default')
   const { canEdit } = useLifecycleAccess()
   const activeSort = sort ?? defaultJobSort
@@ -122,7 +124,8 @@ function JobsLibrary() {
   return <>
     <PageHeader eyebrow="A CLEARER STARTING POINT" title="Your jobs" description="Bring the roles together. Define what a great match looks like."
       actions={<><Button icon={Layers3} onClick={() => navigate('/rubrics')}>Rubric library</Button><Button variant="primary" icon={Plus} disabled={!canEdit || !canImport} title={importReason ?? undefined} onClick={() => setImportOpen(true)}>Add jobs</Button></>} />
-    <PendingRubricNotice />
+    <PendingRubricNotice onApproveAll={() => setBatch(approvals.pending)} />
+    {batch && <BulkRubricApproval rubrics={batch} onClose={() => setBatch(null)} />}
     {analyses && (analyses.targets.state === 'error' || (analyses.targets.state === 'ready' && analyses.targets.error)) &&
       <div className="mb-5"><InlineError>Analysis availability could not be loaded. <button className="underline" onClick={() => void analyses.refreshTargets()}>Retry available targets</button></InlineError></div>}
     {!canImport && <p className="mb-4 text-[12px] text-muted" role="status">{importReason ?? 'New job imports are unavailable.'} Saved jobs, rubrics, and evidence remain available.</p>}

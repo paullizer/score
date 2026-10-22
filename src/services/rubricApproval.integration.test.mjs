@@ -53,7 +53,7 @@ before(async () => {
     export { RealAnalysesContext } from './src/app/real-analyses-context'
     export { RealResumesContext } from './src/app/real-resumes-context'
     export { LibraryViewStateContext, createLibraryViewStore } from './src/app/library-view-state'
-    export { rubricApprovalPresentation } from './src/domain/rubric-approval'
+    export { rubricApprovalPresentation, summarizeRubricQa, buildRubricFixInstruction } from './src/domain/rubric-approval'
     export { BrowserRouter, Routes, Route } from 'react-router-dom'
   ` }, outfile: join(output, 'ui.mjs'), bundle: true, packages: 'external', format: 'esm', platform: 'node', jsx: 'automatic', logLevel: 'silent' })
   ui = await import(pathToFileURL(join(output, 'ui.mjs')).href)
@@ -256,12 +256,23 @@ async function renderFlow({ records = [flowRecord(1), flowRecord(2)], role = 'ow
         currentWorkspaceId: access.workspaceId,
         workspaces: [{ id: access.workspaceId, role: access.role, name: 'Fixture', etag: '"workspace"' }],
         realJobs: {
-          summaries: rows, features: { rubricApprovalRequired: required, rubricChecks: checks, realJobImports: true },
+          summaries: rows, features: { rubricApprovalRequired: required, rubricChecks: checks, realJobImports: true, rubricAssistant: true },
           detail: id => {
             const item = rows.find(item => item.job.id === id)
             return item ? { state: 'ready', value: { ...item, rubricVersions: item.rubricVersions ?? [item.rubric], document: fixture().document } } : { state: 'idle' }
           },
+          source: () => ({ kind: 'pdf', displayName: 'job.pdf', originalContentType: 'application/pdf' }),
           refresh: async () => { calls.push(['refresh-jobs']) },
+          assistRubric: async (jobId, request) => {
+            calls.push(['assist', jobId, request.instruction, request.focusCriterionId])
+            return {
+              outcome: 'changed',
+              reply: 'Separated the overlapping criteria.',
+              operations: [{ type: 'updateCriterion', criterionId: 'criterion-1', changes: { label: 'Quantitative analysis' } }],
+              warnings: [],
+              assistant: { promptVersion: 'score-rubric-assist-v2', model: 'fixture-model' },
+            }
+          },
           rubricChecks: async (jobId, rubricId, version, signal) => {
             calls.push(['read', jobId, rubricId, version])
             const rubric = rowsRef.current.find(item => item.job.id === jobId).rubric
@@ -476,3 +487,41 @@ test('an explicit older-approved-version link opens that preserved version, not 
   assert.match(text(), /Version 1/)
   assert.equal(findButton('Check and approve'), undefined)
 })
+
+test('rubric library cards distinguish clean Ready to approve drafts from flagged Review for approval drafts', async () => {
+  const cleanRow = flowRecord(1)
+  cleanRow.rubricQaSummary = ui.summarizeRubricQa({ ...qaRecord([], []), rubricId: cleanRow.rubric.id, version: cleanRow.rubric.version })
+  const flaggedRow = flowRecord(2)
+  flaggedRow.rubricQaSummary = ui.summarizeRubricQa({ ...qaRecord([], [overlap]), rubricId: flaggedRow.rubric.id, version: flaggedRow.rubric.version })
+  await renderFlow({ records: [cleanRow, flaggedRow] })
+  const readyButton = button('Ready to approve')
+  assert.ok(readyButton.classList.contains('button-success'), 'Clean rubric has a green Ready to approve button')
+  assert.ok(button('Review for approval (1)'), 'Flagged rubric shows issue count on its review button')
+  assert.doesNotMatch(text(), /Approve this rubric before using it in a new analysis/, 'Fresh pending cards omit redundant boilerplate text')
+})
+
+test('rubric detail places approval at the top, highlights overlapping criteria, and Fix with AI launches the assisted editor', async () => {
+  const flaggedRow = flowRecord(1)
+  flaggedRow.rubricQaSummary = ui.summarizeRubricQa({ ...qaRecord([], [overlap]), rubricId: flaggedRow.rubric.id, version: flaggedRow.rubric.version })
+  const calls = await renderFlow({ records: [flaggedRow], path: '/rubrics/rubric-1?job=job-1' })
+  assert.doesNotMatch(text(), /This exact version is not available for real analysis/, 'Robotic duplicate callout is removed')
+  assert.match(text(), /1 item to review/)
+  assert.equal(document.querySelectorAll('.criterion-card.is-flagged').length, 2, 'Overlapping criteria are highlighted inline')
+  await click(button('Fix with AI'))
+  await pause(30)
+  const assistCalls = calls.filter(item => item[0] === 'assist')
+  assert.equal(assistCalls.length, 1, 'Fix with AI automatically invokes the rubric assistant with the QA findings')
+  assert.match(assistCalls[0][2], /Both criteria may credit the same analysis work/)
+  assert.match(dialog().textContent, /Edit rubric/)
+})
+
+test('guided bulk approval steps through rubrics one by one with Approve & next', async () => {
+  const calls = await renderFlow({ page: 'batch' })
+  assert.match(dialog().textContent, /Step 1 of 2 · Role 1 rubric/)
+  await click(button('Approve & next', dialog()))
+  assert.deepEqual(calls.filter(item => item[0] === 'approve').map(item => item[1]), ['job-1'])
+  assert.match(dialog().textContent, /Step 2 of 2 · Role 2 rubric/)
+  await click(button('Approve version 2', dialog()))
+  assert.deepEqual(calls.filter(item => item[0] === 'approve').map(item => item[1]), ['job-1', 'job-2'])
+})
+

@@ -1,14 +1,16 @@
 import { useEffect, useRef, useState } from 'react'
 import { Link } from 'react-router-dom'
-import { BadgeCheck, ListChecks } from 'lucide-react'
+import { ArrowLeft, ArrowRight, BadgeCheck, ListChecks, Pencil, Sparkles } from 'lucide-react'
 import { useWorkspace } from '../../app/workspace-context'
 import { useRealAnalyses } from '../../app/real-analyses-context'
 import { useGradeLeaveGuard } from '../../app/grade-navigation-context'
 import { Badge, Button, InlineError, Modal } from '../../components/ui'
 import type { Rubric } from '../../domain/types'
-import type { RubricCheckState } from '../../domain/rubric-approval'
+import { buildRubricFixInstruction, type RubricCheckState } from '../../domain/rubric-approval'
+import type { RubricQaFinding } from '../../domain/rubric-qa'
 import { CloudApiError } from '../../services/cloudWorkspace'
 import { FindingList } from './RubricApproval'
+import { RubricEditor } from './RubricEditor'
 import { useRubricApprovals } from './useRubricApproval'
 
 interface ApprovalItem {
@@ -24,6 +26,8 @@ export function BulkRubricApproval({ rubrics, onClose }: { rubrics: Rubric[]; on
   const analyses = useRealAnalyses()
   const [scope] = useState(() => ({ workspaceId: context.cloud.currentWorkspaceId, userId: context.cloud.user.id }))
   const [items, setItems] = useState<ApprovalItem[]>(() => rubrics.map((rubric) => ({ rubric })))
+  const [stepIndex, setStepIndex] = useState(0)
+  const [editingStep, setEditingStep] = useState<{ rubric: Rubric; panel: 'assist' | null; focusCriterionId: string | null; assistInstruction: string | null } | null>(null)
   const [busy, setBusy] = useState<'loading' | 'checking' | 'approving' | null>('loading')
   const [progress, setProgress] = useState('')
   const [error, setError] = useState('')
@@ -108,6 +112,58 @@ export function BulkRubricApproval({ rubrics, onClose }: { rubrics: Rubric[]; on
   const missing = unresolved.filter((item) => !item.error && item.review && !item.review.checks && !item.review.blockers.length)
   const failed = unresolved.filter((item) => item.error)
   const approvedCount = items.filter((item) => item.approved).length
+  const currentStep = items[Math.min(stepIndex, Math.max(0, items.length - 1))]
+
+  async function approveOneAndAdvance(item: ApprovalItem) {
+    if (inFlight.current || !ready.includes(item) || !item.review) return
+    inFlight.current = true
+    setBusy('approving')
+    setError('')
+    guard.hold()
+    try {
+      assertScope()
+      assertItem(item.rubric)
+      await current.current.context.cloud.realJobs.approveRubric(item.rubric.jobId!, item.review, { notify: false })
+      assertScope()
+      update(item.rubric, { approved: true, error: undefined })
+      await current.current.context.cloud.realJobs.refresh()
+      await current.current.analyses?.refreshTargets()
+      const nextIndex = items.findIndex((candidate, idx) => idx > stepIndex && !candidate.approved)
+      const wrapIndex = items.findIndex((candidate, idx) => idx !== stepIndex && !candidate.approved)
+      if (nextIndex >= 0) setStepIndex(nextIndex)
+      else if (wrapIndex >= 0) setStepIndex(wrapIndex)
+    } catch (caught) {
+      if (alive.current) {
+        update(item.rubric, { error: caught instanceof Error ? caught.message : 'Approval was not acknowledged. Reload checks to verify the saved state.' })
+      }
+    } finally {
+      inFlight.current = false
+      if (alive.current) { setBusy(null); setProgress(''); guard.settle() }
+    }
+  }
+
+  function openStepEdit(rubric: Rubric, findings?: readonly RubricQaFinding[], focusCriterionId: string | null = null) {
+    if (rubric.jobId) void context.cloud.realJobs.ensureDetail(rubric.jobId)
+    setEditingStep({
+      rubric,
+      panel: findings?.length ? 'assist' : null,
+      focusCriterionId: focusCriterionId ?? findings?.[0]?.criterionIds[0] ?? null,
+      assistInstruction: findings?.length ? buildRubricFixInstruction(rubric, findings) : null,
+    })
+  }
+
+  function handleEditedVersionSaved(previousRubric: Rubric) {
+    setEditingStep(null)
+    const jobId = previousRubric.jobId
+    const detail = jobId ? current.current.context.cloud.realJobs.detail(jobId) : undefined
+    const latest = detail?.state === 'ready'
+      ? [...detail.value.rubricVersions].sort((a, b) => b.version - a.version)[0]
+      : current.current.context.workspace.rubrics.find((item) => item.id === previousRubric.id)
+    const nextRubric = latest ?? { ...previousRubric, version: previousRubric.version + 1 }
+    const nextItem: ApprovalItem = { rubric: nextRubric }
+    setItems((rows) => rows.map((row) => row.rubric.id === previousRubric.id ? nextItem : row))
+    void prepare([nextItem], true)
+  }
 
   async function approve() {
     if (inFlight.current || !ready.length) return
@@ -169,15 +225,99 @@ export function BulkRubricApproval({ rubrics, onClose }: { rubrics: Rubric[]; on
       <p className="text-[12px]" role="status">{progress || `${approvedCount} approved · ${ready.length} ready for your approval · ${unresolved.length - ready.length} need attention`}</p>
       <p className="text-[12px] text-muted">Only the checked versions labeled “Ready for approval” will be approved. Blocked or failed items stay listed. Completed approvals remain saved if another item fails or this browser closes; unfinished items do not continue in the background.</p>
       {missing.length > 0 && <p className="text-[12px] text-muted">Missing checks require one AI review per version. Run them before approving. {context.cloud.realJobs.features?.rubricChecks ? '' : 'New checks are unavailable while processing is paused or the model is unavailable.'}</p>}
+      {items.length > 1 && currentStep && (
+        <section className="rounded-xl border bg-soft p-4 space-y-3" aria-label="Step-by-step rubric review">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <p className="text-[12px] font-semibold">Step {stepIndex + 1} of {items.length} · {currentStep.rubric.name}</p>
+            <div className="flex items-center gap-1.5">
+              <Button size="sm" variant="ghost" icon={ArrowLeft} disabled={stepIndex === 0 || busy === 'approving'} onClick={() => setStepIndex((idx) => Math.max(0, idx - 1))}>Previous</Button>
+              <Button size="sm" variant="ghost" icon={ArrowRight} disabled={stepIndex >= items.length - 1 || busy === 'approving'} onClick={() => setStepIndex((idx) => Math.min(items.length - 1, idx + 1))}>Next</Button>
+            </div>
+          </div>
+          <div className="bulk-step-rail" role="tablist" aria-label="Rubrics in this batch">
+            {items.map((stepItem, idx) => {
+              const stepFindings = stepItem.review?.checks ? [...stepItem.review.checks.checks, ...stepItem.review.checks.review.findings] : []
+              const stepClean = ready.includes(stepItem) && stepFindings.length === 0
+              return (
+                <button
+                  key={`${stepItem.rubric.id}:${stepItem.rubric.version}`}
+                  type="button"
+                  role="tab"
+                  aria-selected={idx === stepIndex}
+                  className={`bulk-step-pill ${idx === stepIndex ? 'is-active' : ''} ${stepItem.approved ? 'is-approved' : ''}`}
+                  onClick={() => setStepIndex(idx)}
+                >
+                  <span>{idx + 1}. {stepItem.rubric.name}</span>
+                  <Badge tone={stepItem.approved ? 'success' : stepClean ? 'success' : stepFindings.length > 0 ? 'warning' : 'neutral'}>
+                    {stepItem.approved ? 'Approved' : stepClean ? 'Ready' : stepFindings.length > 0 ? `${stepFindings.length} to review` : 'Pending'}
+                  </Badge>
+                </button>
+              )
+            })}
+          </div>
+          {(() => {
+            const stepFindings = currentStep.review?.checks ? [...currentStep.review.checks.checks, ...currentStep.review.checks.review.findings] : []
+            const stepReady = ready.includes(currentStep)
+            const stepClean = stepReady && stepFindings.length === 0
+            const canAssist = Boolean(context.cloud.realJobs.features?.rubricAssistant)
+            return (
+              <div className="flex flex-wrap items-center justify-between gap-2 border-t pt-3">
+                <span className="text-[12px] text-muted">
+                  {currentStep.approved
+                    ? `Version ${currentStep.rubric.version} is approved.`
+                    : stepClean
+                      ? 'No overlapping criteria or issues found — ready to approve.'
+                      : stepFindings.length > 0
+                        ? `${stepFindings.length} ${stepFindings.length === 1 ? 'item' : 'items'} flagged below. Fix with AI, edit manually, or approve this version.`
+                        : 'Review checks for this rubric below.'}
+                </span>
+                <div className="flex flex-wrap items-center gap-2">
+                  {!currentStep.approved && stepFindings.length > 0 && canAssist && (
+                    <Button size="sm" variant="secondary" icon={Sparkles} disabled={busy !== null} onClick={() => openStepEdit(currentStep.rubric, stepFindings)}>
+                      Fix with AI ({stepFindings.length})
+                    </Button>
+                  )}
+                  {!currentStep.approved && (
+                    <Button size="sm" variant="ghost" icon={Pencil} disabled={busy !== null} onClick={() => openStepEdit(currentStep.rubric)}>
+                      Edit manually
+                    </Button>
+                  )}
+                  {stepReady && (
+                    <Button size="sm" variant={stepClean ? 'success' : 'primary'} icon={BadgeCheck} disabled={busy !== null || !scopeValid} onClick={() => void approveOneAndAdvance(currentStep)}>
+                      {stepIndex < items.length - 1 ? 'Approve & next' : `Approve version ${currentStep.rubric.version}`}
+                    </Button>
+                  )}
+                </div>
+              </div>
+            )
+          })()}
+        </section>
+      )}
       <ul className="divide-y">
-        {items.map((item) => {
+        {items.map((item, idx) => {
           const findings = item.review?.checks ? [...item.review.checks.checks, ...item.review.checks.review.findings] : []
           const isReady = ready.includes(item)
+          const isClean = isReady && findings.length === 0
           const state = approvals.forRubric(item.rubric)
-          return <li className="space-y-3 py-4" key={`${item.rubric.id}:${item.rubric.version}`}>
+          const canAssist = Boolean(context.cloud.realJobs.features?.rubricAssistant)
+          return <li className={`space-y-3 py-4 ${items.length > 1 && idx === stepIndex ? 'rounded-xl border px-4 bg-soft' : ''}`} key={`${item.rubric.id}:${item.rubric.version}`}>
             <div className="flex flex-wrap items-start justify-between gap-2">
               <div className="min-w-0"><h3 className="break-words text-[14px] font-semibold">{item.rubric.name}</h3><p className="text-[12px] text-muted">Version {item.rubric.version}</p></div>
-              <Badge tone={item.approved ? 'success' : isReady ? 'accent' : 'warning'}>{item.approved ? 'Approved' : isReady ? 'Ready for approval' : 'Needs attention'}</Badge>
+              <div className="flex flex-wrap items-center gap-2">
+                <Badge tone={item.approved ? 'success' : isClean ? 'success' : isReady ? 'accent' : 'warning'}>
+                  {item.approved ? 'Approved' : isClean ? 'Ready for approval' : isReady ? `Ready for approval · ${findings.length} to review` : 'Needs attention'}
+                </Badge>
+                {!item.approved && findings.length > 0 && canAssist && (
+                  <Button size="sm" variant="secondary" icon={Sparkles} disabled={busy !== null} onClick={() => openStepEdit(item.rubric, findings)}>
+                    Fix with AI
+                  </Button>
+                )}
+                {!item.approved && isReady && items.length === 1 && (
+                  <Button size="sm" variant="ghost" icon={Pencil} disabled={busy !== null} onClick={() => openStepEdit(item.rubric)}>
+                    Edit manually
+                  </Button>
+                )}
+              </div>
             </div>
             {item.error && <InlineError>{item.error}</InlineError>}
             {!item.approved && state.latestVersion !== item.rubric.version && <InlineError>A newer draft was saved. Review that version instead; it has not been substituted.</InlineError>}
@@ -187,8 +327,22 @@ export function BulkRubricApproval({ rubrics, onClose }: { rubrics: Rubric[]; on
               <summary className="cursor-pointer text-[12px] font-medium">Review findings ({findings.length})</summary>
               <div className="mt-3 space-y-3">
                 <p className="text-[12px]">{item.review.checks.review.summary}</p>
-                <FindingList rubric={item.rubric} title="Must fix before approval" findings={findings.filter((finding) => finding.severity === 'blocker')} tone="danger" />
-                <FindingList rubric={item.rubric} title="Review before approving" findings={findings.filter((finding) => finding.severity === 'warning')} tone="warning" />
+                <FindingList
+                  rubric={item.rubric}
+                  title="Must fix before approval"
+                  findings={findings.filter((finding) => finding.severity === 'blocker')}
+                  tone="danger"
+                  onFixWithAi={!item.approved && canAssist ? (finding) => openStepEdit(item.rubric, [finding], finding.criterionIds[0] ?? null) : undefined}
+                  onEditCriterion={!item.approved ? (id) => openStepEdit(item.rubric, undefined, id) : undefined}
+                />
+                <FindingList
+                  rubric={item.rubric}
+                  title="Review before approving"
+                  findings={findings.filter((finding) => finding.severity === 'warning')}
+                  tone="warning"
+                  onFixWithAi={!item.approved && canAssist ? (finding) => openStepEdit(item.rubric, [finding], finding.criterionIds[0] ?? null) : undefined}
+                  onEditCriterion={!item.approved ? (id) => openStepEdit(item.rubric, undefined, id) : undefined}
+                />
                 {!findings.length && <p className="text-[12px] text-muted">The checks found nothing to review.</p>}
               </div>
             </details>}
@@ -198,5 +352,16 @@ export function BulkRubricApproval({ rubrics, onClose }: { rubrics: Rubric[]; on
         })}
       </ul>
     </div>
+    {editingStep && (
+      <RubricEditor
+        key={`${editingStep.rubric.id}:${editingStep.rubric.version}`}
+        rubric={editingStep.rubric}
+        onClose={() => setEditingStep(null)}
+        onSaved={() => handleEditedVersionSaved(editingStep.rubric)}
+        initialPanel={editingStep.panel}
+        initialFocusCriterionId={editingStep.focusCriterionId}
+        initialAssistInstruction={editingStep.assistInstruction}
+      />
+    )}
   </Modal>
 }

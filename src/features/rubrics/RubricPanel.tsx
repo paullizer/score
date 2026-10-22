@@ -1,9 +1,11 @@
 import { useState } from 'react'
 import { Link } from 'react-router-dom'
-import { FileSearch, Layers3, Pencil, ShieldCheck, Sparkles } from 'lucide-react'
+import { AlertTriangle, FileSearch, Layers3, Pencil, ShieldCheck, Sparkles } from 'lucide-react'
 import { useWorkspace } from '../../app/workspace-context'
 import { Badge, Button, EmptyState, InlineError } from '../../components/ui'
 import { EVIDENCE_SCALE_V1 } from '../../domain/evidence-scale'
+import { buildRubricFixInstruction, criterionNames, findingCategoryLabel, type RubricCheckState } from '../../domain/rubric-approval'
+import type { RubricQaFinding } from '../../domain/rubric-qa'
 import type { Citation, Criterion, Rubric } from '../../domain/types'
 import { documentPagination, isUploadFormat, UPLOAD_CONTENT_TYPES } from '../../domain/document-formats'
 import { RubricEditor } from './RubricEditor'
@@ -25,6 +27,8 @@ export function RubricPanel({ rubric, onSelectCriterion, onVersionSaved, readOnl
   const [editing, setEditing] = useState(false)
   const [initialEditorPanel, setInitialEditorPanel] = useState<'assist' | 'source' | 'changes' | null>(null)
   const [initialFocusCriterionId, setInitialFocusCriterionId] = useState<string | null>(null)
+  const [initialAssistInstruction, setInitialAssistInstruction] = useState<string | null>(null)
+  const [loadedChecks, setLoadedChecks] = useState<RubricCheckState | null>(null)
   const [error, setError] = useState('')
   const { canEdit } = useLifecycleAccess({ kind: 'rubric', id: rubric.groupId })
   const job = workspace.jobs.find((item) => item.id === rubric.jobId)
@@ -40,7 +44,28 @@ export function RubricPanel({ rubric, onSelectCriterion, onVersionSaved, readOnl
   const assistantAvailable = Boolean(editable && job && detail?.state === 'ready' && document && cloud.realJobs.features?.rubricAssistant)
   const total = rubric.criteria.reduce((sum, criterion) => sum + criterion.weight, 0)
   const balanced = Number.isFinite(total) && Math.abs(total - 100) <= 0.000001
-  const { status: approvalStatus } = useRubricApproval(rubric)
+  const { status: approvalStatus, qaSummary } = useRubricApproval(rubric)
+  const activeFindings: RubricQaFinding[] = approvalStatus === 'draft'
+    ? (loadedChecks && loadedChecks.rubricId === rubric.id && loadedChecks.version === rubric.version && loadedChecks.checks
+      ? [...loadedChecks.checks.checks, ...loadedChecks.checks.review.findings]
+      : qaSummary?.findings ?? [])
+    : []
+
+  function openManualEdit(focusCriterionId: string | null = null) {
+    setError('')
+    setInitialEditorPanel(null)
+    setInitialFocusCriterionId(focusCriterionId)
+    setInitialAssistInstruction(null)
+    setEditing(true)
+  }
+
+  function openAiFix(findings: readonly RubricQaFinding[], focusCriterionId: string | null = null) {
+    setError('')
+    setInitialEditorPanel('assist')
+    setInitialFocusCriterionId(focusCriterionId ?? findings[0]?.criterionIds[0] ?? null)
+    setInitialAssistInstruction(buildRubricFixInstruction(rubric, findings))
+    setEditing(true)
+  }
 
   return <div className="min-w-0">
     <div className="section-heading">
@@ -51,6 +76,17 @@ export function RubricPanel({ rubric, onSelectCriterion, onVersionSaved, readOnl
     <div className="space-y-5 p-5">
       <LifecycleBanner target={{ kind: 'rubric', id: rubric.groupId }} />
       <EntityLifecycleActions target={{ kind: 'rubric', id: rubric.groupId }} name={rubric.name} />
+
+      <RubricApprovalCard
+        rubric={rubric}
+        readOnly={readOnly}
+        assistantAvailable={assistantAvailable}
+        editable={editable}
+        onFixWithAi={openAiFix}
+        onEditManually={openManualEdit}
+        onChecksLoaded={setLoadedChecks}
+      />
+
       <div>
         <div className="mb-3 flex flex-wrap gap-2">
           <Badge tone="accent">{rubric.provenance?.kind === 'edited' ? 'Reviewer edited' : 'Generated from source'}</Badge>
@@ -79,11 +115,9 @@ export function RubricPanel({ rubric, onSelectCriterion, onVersionSaved, readOnl
         </div>
       </div>
 
-      <RubricApprovalCard rubric={rubric} readOnly={readOnly} />
-
       {!readOnly && <div className="flex flex-wrap gap-2">
-        <Button icon={Pencil} size="sm" disabled={!editable} onClick={() => { setError(''); setInitialEditorPanel(null); setInitialFocusCriterionId(null); setEditing(true) }}>Edit rubric</Button>
-        {assistantAvailable && <Button icon={Sparkles} size="sm" variant="ghost" onClick={() => { setError(''); setInitialEditorPanel('assist'); setInitialFocusCriterionId(null); setEditing(true) }}>Edit with AI</Button>}
+        <Button icon={Pencil} size="sm" disabled={!editable} onClick={() => openManualEdit(null)}>Edit rubric</Button>
+        {assistantAvailable && <Button icon={Sparkles} size="sm" variant="ghost" onClick={() => { setError(''); setInitialEditorPanel('assist'); setInitialFocusCriterionId(null); setInitialAssistInstruction(null); setEditing(true) }}>Edit with AI</Button>}
       </div>}
       {!readOnly && !realGrade && <p className="text-[11px] text-muted">Edit rubric includes the name and description. Even a name-only save creates a new version; saved analyses keep their original rubric.</p>}
       {!readOnly && !editable && <p className="text-[11px] text-muted">{realGrade ? 'Open the real grade family to edit a draft with its separate grounding-review and approval safeguards.' : roleReadOnly ? 'This workspace is read-only. An owner or editor can change real rubrics.' : 'Finish the linked job import and load its source before editing this rubric.'}</p>}
@@ -98,7 +132,8 @@ export function RubricPanel({ rubric, onSelectCriterion, onVersionSaved, readOnl
         {rubric.criteria.map((criterion, index) => {
           const citations = criterion.sourceCitations?.length ? criterion.sourceCitations : []
           const source = document?.paragraphs.find((paragraph) => paragraph.id === (citations[0]?.paragraphId ?? criterion.sourceParagraphId))
-          return <article className="criterion-card" key={criterion.id}>
+          const criterionFindings = activeFindings.filter((finding) => finding.criterionIds.includes(criterion.id))
+          return <article className={`criterion-card ${criterionFindings.length > 0 ? 'is-flagged' : ''}`} key={criterion.id}>
             <div className="flex items-start gap-3">
               <span className="flex h-7 w-7 shrink-0 items-center justify-center rounded-lg border bg-soft font-mono text-[10px] text-muted">
                 {String(index + 1).padStart(2, '0')}
@@ -107,9 +142,11 @@ export function RubricPanel({ rubric, onSelectCriterion, onVersionSaved, readOnl
                 <div className="flex items-start justify-between gap-3">
                   <h4 className="text-[12px] font-semibold leading-5">{criterion.label}</h4>
                   <div className="flex shrink-0 flex-wrap items-center justify-end gap-2">
+                    {criterionFindings.length > 0 && <Badge tone={criterionFindings.some((item) => item.severity === 'blocker') ? 'danger' : 'warning'}>{findingCategoryLabel(criterionFindings[0]!.code)}</Badge>}
                     {assistantAvailable && <Button size="sm" variant="ghost" icon={Sparkles} aria-label={`Ask AI about ${criterion.label}`} onClick={() => {
                       setInitialEditorPanel('assist')
                       setInitialFocusCriterionId(criterion.id)
+                      setInitialAssistInstruction(null)
                       setEditing(true)
                     }}>Ask AI</Button>}
                     <span className="text-[12px] font-semibold tabular-nums text-accent">{criterion.weight}%</span>
@@ -117,6 +154,23 @@ export function RubricPanel({ rubric, onSelectCriterion, onVersionSaved, readOnl
                 </div>
                 <p className="mt-2 text-[11px] text-muted">{criterion.description}</p>
                 <div className="mt-2"><Badge tone={criterion.requirementType === 'preferred' ? 'neutral' : 'accent'}>{criterion.requirementType === 'preferred' ? 'Preferred' : 'Required'}</Badge></div>
+                {criterionFindings.map((finding, findingIndex) => (
+                  <div className="criterion-finding-callout" key={`${finding.code}-${findingIndex}`}>
+                    <div className="min-w-0 flex-1">
+                      <p className="flex flex-wrap items-center gap-1.5 font-medium">
+                        <AlertTriangle size={13} className="shrink-0" aria-hidden="true" />
+                        <span>{findingCategoryLabel(finding.code)}</span>
+                        {finding.criterionIds.length > 1 && <span className="text-[10px]">({criterionNames(rubric, finding)})</span>}
+                      </p>
+                      <p className="mt-1">{finding.message}</p>
+                    </div>
+                    {assistantAvailable && (
+                      <Button size="sm" variant="secondary" icon={Sparkles} onClick={() => openAiFix([finding], criterion.id)}>
+                        Fix with AI
+                      </Button>
+                    )}
+                  </div>
+                ))}
               </div>
             </div>
             <details className="mt-3 border-t pt-3 text-[11px]">
@@ -182,6 +236,7 @@ export function RubricPanel({ rubric, onSelectCriterion, onVersionSaved, readOnl
       onSaved={(id) => { setEditing(false); onVersionSaved?.(id) }}
       initialPanel={initialEditorPanel}
       initialFocusCriterionId={initialFocusCriterionId}
+      initialAssistInstruction={initialAssistInstruction}
     />}
   </div>
 }

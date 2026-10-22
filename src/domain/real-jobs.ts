@@ -3,7 +3,7 @@ import type { LifecycleMetadata } from './lifecycle'
 import type { OriginalContentType, UploadFormat, WordImportFeatures } from './document-formats'
 import { MAX_MARKDOWN_BYTES } from './source-files'
 import type { ProcessingSettingsSnapshot } from './admin-settings'
-import type { RubricApprovalPointer } from './rubric-approval'
+import type { RubricApprovalPointer, RubricQaSummary } from './rubric-approval'
 
 export const JOB_IMPORT_LIMITS = {
   maxFileBytes: 10 * 1024 * 1024,
@@ -76,6 +76,7 @@ export interface RealJobSummary {
   lifecycle?: LifecycleMetadata
   rubricLifecycle?: LifecycleMetadata
   rubricApproval?: RubricApprovalPointer
+  rubricQaSummary?: RubricQaSummary
 }
 
 export interface RealJobDetail extends RealJobSummary {
