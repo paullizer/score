@@ -3,40 +3,35 @@ import test from 'node:test'
 import { createLifecycleDependencies } from '../dist-server/app.mjs'
 import { legacyStateBody } from './helpers.mjs'
 
-test('seed blockers traverse every ladder page and resolve historical real rubric group identity', async () => {
-  const old = { id: 'old-version-id', groupId: 'stable-group', version: 1 }
-  const current = { id: 'new-version-id', groupId: 'stable-group', version: 2 }
-  const pages = []
-  const jobs = { store: {
-    async getRubric(_workspaceId, id) { return id === current.id ? current : undefined },
-    async listRubrics(_workspaceId, id) { return id === 'seed-job' ? [old, current] : [] },
-  } }
-  const grades = { store: {
-    async list(workspaceId, options) {
-      pages.push(options.continuationToken)
-      const page = Number(options.continuationToken ?? 0)
-      return {
-        items: [{ record: {
-          recordType: 'grade-ladder', workspaceId, id: `ladder-${page}`, name: `Ladder ${page}`,
-          seedJobId: page === 2 ? 'seed-job' : 'another-job', seedRubricId: old.id, seedRubricVersion: 1,
-          lifecycle: { archivedAt: '2026-09-18T15:00:00.000Z' },
-        }, etag: '"ladder"' }],
-        ...(page < 2 ? { continuationToken: String(page + 1) } : {}),
-      }
-    },
-  } }
-  const dependencies = createLifecycleDependencies(jobs, grades, true)
-  const blockers = await dependencies.impact('workspace-one', { kind: 'rubric', id: current.id })
-  assert.deepEqual(pages, [undefined, '1', '2'])
-  assert.deepEqual(blockers.map(item => item.id), ['ladder-2'])
-  assert.equal(blockers[0].kind, 'ladder')
+test('deletions never report seed ladder or analysis blockers', async () => {
+  const dependencies = createLifecycleDependencies(undefined, undefined, true, undefined, true)
+  for (const target of [
+    { kind: 'workspace', id: 'workspace-one' },
+    { kind: 'job', id: 'seed-job' },
+    { kind: 'rubric', id: 'new-version-id' },
+    { kind: 'ladder', id: 'ladder-1' },
+    { kind: 'resume', id: 'resume-1' },
+    { kind: 'analysis', id: 'analysis-1' },
+  ]) {
+    assert.deepEqual(await dependencies.impact('workspace-one', target), [])
+  }
 })
 
-test('unavailable real dependency storage and repeated pagination tokens fail closed', async () => {
-  await assert.rejects(createLifecycleDependencies(undefined, undefined, true).impact('workspace-one', { kind: 'job', id: 'seed' }), /could not be checked/)
-  await assert.rejects(createLifecycleDependencies(undefined, undefined, false, undefined, true).impact('workspace-one', { kind: 'analysis', id: 'analysis' }), /could not be checked/)
-  const grades = { store: { async list() { return { items: [], continuationToken: 'same' } } } }
-  await assert.rejects(createLifecycleDependencies(undefined, grades).impact('workspace-one', { kind: 'job', id: 'seed' }), /did not advance/)
+test('configured real stores do not block job, rubric, ladder, resume, or workspace deletion', async () => {
+  const jobs = { store: {
+    async getRubric() { assert.fail('Deletion impact must not query rubrics for blockers') },
+    async listRubrics() { assert.fail('Deletion impact must not list rubrics for blockers') },
+  } }
+  const grades = { store: {
+    async list() { assert.fail('Deletion impact must not scan grade ladders for blockers') },
+  } }
+  const analyses = { store: {
+    async list() { assert.fail('Deletion impact must not scan analyses for blockers') },
+  } }
+  const dependencies = createLifecycleDependencies(jobs, grades, true, analyses, true)
+  assert.deepEqual(await dependencies.impact('workspace-one', { kind: 'job', id: 'seed-job' }), [])
+  assert.deepEqual(await dependencies.impact('workspace-one', { kind: 'rubric', id: 'stable-group' }), [])
+  assert.deepEqual(await dependencies.impact('workspace-one', { kind: 'workspace', id: 'workspace-one' }), [])
 })
 
 test('legacy state blobs with sample runs are irrelevant to lifecycle dependencies', async () => {

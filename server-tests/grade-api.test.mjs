@@ -2345,27 +2345,13 @@ test('logical grade deletion checks blockers and removes every version without r
       input: { kind: 'review-grade', grade: 9, generationId: detail.ladder.generationId, sourceSetId: detail.ladder.sourceSetId, versionId: nine.version.id },
     }
     await api.grades.store.create(oldWork)
-    let blocked = true
-    const targets = []
-    const service = new gradeLifecycleTesting.GradeLifecycleService(api.grades, {
-      async impact(workspaceId, target) {
-        assert.equal(workspaceId, api.workspaceId)
-        targets.push(target)
-        return blocked ? [{ kind: 'analysis', id: 'archived-analysis', name: 'Archived comparison', href: '/analyses/archived-analysis' }] : []
-      },
-    }, () => new Date(NOW))
+    const service = new gradeLifecycleTesting.GradeLifecycleService(api.grades, undefined, () => new Date(NOW))
     const impact = await service.impact(api.workspaceId, detail.ladder.id, 9)
     assert.equal(impact.counts['grade-version'], 2)
     assert.equal(impact.counts['grade-approval'], 1)
-    assert.equal(impact.blockers[0].id, 'archived-analysis')
-    await assert.rejects(service.change(api.workspaceId, detail.ladder.id, 'delete', nine.head.etag, 9), error => error.status === 409)
-    const uncoordinated = new gradeLifecycleTesting.GradeLifecycleService(api.grades)
-    await assert.rejects(uncoordinated.change(api.workspaceId, detail.ladder.id, 'delete', nine.head.etag, 9), error => error.status === 503)
-    assert.ok(await api.grades.store.get(api.workspaceId, second.id))
-    blocked = false
+    assert.deepEqual(impact.blockers, [])
     const beforeBlobs = new Map(api.grades.blobs.values)
     assert.deepEqual(await service.change(api.workspaceId, detail.ladder.id, 'delete', nine.head.etag, 9), {})
-    assert.ok(targets.every(target => target.kind === 'rubric' && target.id === nine.head.record.id))
     let current = await (await api.request(address)).json()
     const empty = current.levels.find(level => level.head.grade === 9)
     assert.ok(empty.head.lifecycle.deletedAt)

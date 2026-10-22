@@ -135,14 +135,10 @@ beforeEach(() => {
     if (suffix === '/lifecycle') {
       if (method === 'GET') return json({ impact: {
         target: { kind: collection === 'resumes' ? 'resume' : 'analysis', id }, name: (record.resume ?? record.run).name,
-        counts: { records: 1 }, blockers: collection === 'resumes' ? state.analyses.filter((run) => run.resumes.some((item) => item.selection.resumeId === id))
-          .map((item) => ({ kind: 'analysis', id: item.run.id, name: item.run.name, href: `/analyses/${item.run.id}` })) : [],
+        counts: { records: 1 }, blockers: [],
       } })
       assert.equal(init.headers.get('If-Match'), record.etag, 'Lifecycle mutations use the freshly read exact target ETag')
       const { action } = JSON.parse(init.body)
-      if (action === 'delete' && collection === 'resumes' && state.analyses.some((run) => run.resumes.some((item) => item.selection.resumeId === id))) {
-        return json({ error: { code: 'conflict', message: 'Delete the retained analysis, including archived runs, first.' } }, 409)
-      }
       const queued = state.responses.shift()
       if (queued) return queued({ record, collection, action })
       if (action === 'delete') {
@@ -276,7 +272,7 @@ test('default cloud resume mode combines archive search, sorting, Word evidence 
   assert.equal(dom.window.localStorage.length, 0)
 })
 
-test('input archive preserves in-progress real snapshots and archived analyses remain deletion blockers', async () => {
+test('input archive preserves in-progress real snapshots and archived analyses do not block source deletion', async () => {
   const before = clone(state.analyses[0])
   const pair = clone(state.pairs[0])
   await mount('/analyses')
@@ -294,8 +290,7 @@ test('input archive preserves in-progress real snapshots and archived analyses r
   await search('Find a real analysis…', 'Evidence')
   assert.match(document.querySelector('tbody').textContent, /Archived/)
   const impact = await current.workspace.getLifecycleImpact({ kind: 'resume', id: 'resume-word' })
-  assert.deepEqual(impact.blockers.map((item) => item.id), ['run-one'])
-  await act(async () => assert.rejects(current.workspace.changeLifecycle({ kind: 'resume', id: 'resume-word' }, 'delete'), /changed in another session/))
+  assert.deepEqual(impact.blockers, [])
   await navigate('/analyses/run-one')
   assert.equal([...document.querySelectorAll('button')].find((item) => item.textContent === 'New run with these inputs').disabled, true)
   assert.equal([...document.querySelectorAll('button')].find((item) => item.textContent === 'Cancel unfinished').disabled, true)

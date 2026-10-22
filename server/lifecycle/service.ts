@@ -42,15 +42,12 @@ export class WorkspaceLifecycleService {
     return stored
   }
 
-  /** Counts and blockers come only from real feature stores; no legacy state document is read. */
+  /** Counts come only from real feature stores; no legacy state document is read. */
   private async savedImpact(stored: StoredMetadata): Promise<LifecycleImpact> {
     const id = stored.metadata.workspaceId
     const counts: Record<string, number> = {}
     for (const participant of this.deps.participants) {
       for (const [kind, count] of Object.entries(await participant.counts(id))) counts[kind] = (counts[kind] ?? 0) + count
-    }
-    if ((counts.analyses ?? 0) > 0 && !this.deps.lifecycle) {
-      throw unavailable('Real analysis dependencies must be checked before managing this workspace.')
     }
     const target = { kind: 'workspace' as const, id }
     const blockers = this.deps.lifecycle ? await this.deps.lifecycle.impact(id, target) : []
@@ -105,8 +102,7 @@ export class WorkspaceLifecycleService {
         }
         let recoveryPrincipalId: string | undefined
         if (action === 'delete') {
-          const impact = await this.savedImpact(stored)
-          if (impact.blockers.length) throw conflict(`Delete ${impact.blockers.length} associated ${impact.blockers.length === 1 ? 'analysis' : 'analyses'} first, including archived analyses.`)
+          await this.savedImpact(stored)
           const owners = (await this.deps.directory.listWorkspaceMemberships(id))
             .map(entry => entry.membership).filter(member => member.role === 'owner' &&
               member.workspaceId === id && member.principalType === 'user' &&

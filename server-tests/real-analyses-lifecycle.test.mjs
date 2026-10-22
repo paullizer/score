@@ -347,7 +347,7 @@ test('permanent deletion removes every owned record and artifact with exact ETag
   assert.equal((await participant(f).counts(f.workspaceId)).analyses, 1)
 })
 
-test('cleanup and blocker recovery traverse EMPTY continuation pages and retain dependency protection after manifest removal', async () => {
+test('cleanup recovery traverses EMPTY continuation pages and never reports deletion blockers', async () => {
   const f = fixture()
   const run = await createRun(f)
   await publishResult(f, run.run.id, comparisons(f, run.run.id)[0].record.id)
@@ -383,10 +383,8 @@ test('cleanup and blocker recovery traverse EMPTY continuation pages and retain 
     { kind: 'job', id: run.targets[0].record.id }, { kind: 'rubric', id: run.targets[0].rubric.groupId },
   ]) {
     const blockers = await api.realAnalysisDependencyBlockers(f.analysis, f.workspaceId, target)
-    assert.deepEqual(blockers.map(value => value.id), [run.run.id])
-    assert.equal(blockers[0].href, `/analyses/${run.run.id}`)
+    assert.deepEqual(blockers, [])
   }
-  assert.equal((await participant(f).counts(f.workspaceId)).analyses, 1, 'Partially deleted runs still block workspace deletion.')
   f.analysis.blobs._beforeDelete(undefined)
   await settle(f, run.run.id)
   assert.equal(await current(f, run.run.id), undefined)
@@ -394,40 +392,7 @@ test('cleanup and blocker recovery traverse EMPTY continuation pages and retain 
   assert.ok(pages.includes('analysis-run') && pages.includes('analysis-comparison'))
 })
 
-test('dependency blockers include archived old rubric versions beyond the first page and cleanup-pending newer references', async () => {
-  const f = fixture()
-  const resume = await seedResume(f)
-  const job = await seedJob(f)
-  const request = { name: 'Old rubric history', resumes: [resume.selection], targets: [job.selection] }
-  const old = await f.service.create(f.workspaceId, randomUUID(), request, ACTOR)
-  await change(f, old.run.id, 'archive')
-  f.now = LATER
-  const newer = { ...clone(job.rubric), id: `rubric-${randomUUID()}`, version: 2, createdAt: LATER, name: 'Saved newer rubric' }
-  f.rubricValues.set(`${f.workspaceId}/${job.record.id}`, [job.rubric, newer])
-  f.jobValues.set(`${f.workspaceId}/${job.record.id}`, {
-    record: { ...job.record, job: { ...job.record.job, rubricId: newer.id }, updatedAt: LATER }, etag: '"new-rubric"',
-  })
-  const selection = { ...job.selection, rubricId: newer.id, rubricVersion: 2, rubricHash: api.analysisHash(newer) }
-  let latest
-  for (let index = 0; index < 100; index++) {
-    latest = await f.service.create(f.workspaceId, randomUUID(), {
-      ...request, name: `Newer rubric history ${index}`, targets: [selection],
-    }, ACTOR)
-  }
-  f.analysis.blobs._beforeDelete(() => { throw new Error('Private cleanup is temporarily unavailable') })
-  assert.equal((await change(f, latest.run.id, 'delete')).pending, true)
-  f.resumeValues.clear()
-  f.jobValues.clear()
-  f.rubricValues.clear()
-  const blockers = await api.realAnalysisDependencyBlockers(f.analysis, f.workspaceId, { kind: 'rubric', id: job.rubric.groupId })
-  assert.equal(blockers.length, 101)
-  assert.ok(blockers.some(value => value.id === old.run.id) && blockers.some(value => value.id === latest.run.id))
-  assert.equal((await api.realAnalysisDependencyBlockers(f.analysis, f.workspaceId, { kind: 'rubric', id: job.rubric.id })).length, 1)
-  assert.equal((await api.realAnalysisDependencyBlockers(f.analysis, f.workspaceId, { kind: 'rubric', id: newer.id })).length, 100)
-  assert.equal((await api.realAnalysisDependencyBlockers(f.analysis, f.workspaceId, { kind: 'workspace', id: f.workspaceId })).length, 101)
-})
-
-test('unreadable dependency storage fails closed and archived historical versions bind stable groups without live source lookups', async () => {
+test('dependency blocker checks return empty arrays for all targets and validate workspace scope', async () => {
   const f = fixture()
   const resume = await seedResume(f)
   const job = await seedJob(f)
@@ -447,19 +412,30 @@ test('unreadable dependency storage fails closed and archived historical version
     { kind: 'rubric', id: job.rubric.groupId }, { kind: 'rubric', id: job.rubric.id },
     { kind: 'rubric', id: grade.head.id }, { kind: 'rubric', id: grade.version.id },
     { kind: 'ladder', id: grade.ladder.id }, { kind: 'workspace', id: f.workspaceId },
+    { kind: 'analysis', id: run.run.id },
   ]) {
-    assert.deepEqual((await api.realAnalysisDependencyBlockers(f.analysis, f.workspaceId, target)).map(value => value.id), [run.run.id])
+    assert.deepEqual(await api.realAnalysisDependencyBlockers(f.analysis, f.workspaceId, target), [])
   }
-  assert.deepEqual(await api.realAnalysisDependencyBlockers(f.analysis, f.workspaceId, { kind: 'analysis', id: run.run.id }), [])
-  assert.deepEqual(await api.realAnalysisDependencyBlockers(f.analysis, 'another-workspace', { kind: 'workspace', id: 'another-workspace' }), [])
-  const manifest = f.analysis.blobs.values.get(run.run.manifest.blobName)
+  await assert.rejects(api.realAnalysisDependencyBlockers(f.analysis, '../invalid', { kind: 'workspace', id: 'invalid' }), failStatus(404))
+})
+
+test('analysis deletion starts and finishes even when manifest or target snapshots are already absent, and deleted seed jobs do not break target discovery', async () => {
+  const f = fixture()
+  const resume = await seedResume(f)
+  const job = await seedJob(f)
+  const grade = await seedGrade(f, job)
+  const run = await f.service.create(f.workspaceId, randomUUID(), {
+    name: 'Resilient delete', resumes: [resume.selection], targets: [job.selection, grade.selection],
+  }, ACTOR)
+  for (const pair of comparisons(f, run.run.id)) {
+    await publishResult(f, run.run.id, pair.record.id)
+  }
   f.analysis.blobs.values.delete(run.run.manifest.blobName)
-  await assert.rejects(api.realAnalysisDependencyBlockers(f.analysis, f.workspaceId, { kind: 'resume', id: resume.record.id }), failStatus(503))
-  assert.equal((await api.realAnalysisDependencyBlockers(f.analysis, f.workspaceId, { kind: 'workspace', id: f.workspaceId })).length, 1)
-  f.analysis.blobs.values.set(run.run.manifest.blobName, manifest)
-  const first = comparisons(f, run.run.id)[0]
-  f.analysis.blobs.values.delete(first.record.target.blob.blobName)
-  await assert.rejects(api.realAnalysisDependencyBlockers(f.analysis, f.workspaceId, { kind: 'rubric', id: job.rubric.groupId }), failStatus(503))
+  assert.deepEqual(await change(f, run.run.id, 'delete'), { deleted: true })
+  assert.equal(await current(f, run.run.id), undefined)
+  f.jobValues.delete(`${f.workspaceId}/${job.record.id}`)
+  const targets = await f.service.listTargets(f.workspaceId)
+  assert.ok(targets.targets.some(item => item.kind === 'grade' && item.selection.ladderId === grade.ladder.id))
 })
 
 test('an in-flight source writer keeps deletion pending and cannot recreate content after the permanent fence', async () => {
@@ -543,20 +519,20 @@ for (const source of ['resume', 'job', 'rubric', 'ladder', 'head']) {
   })
 }
 
-test('workspace controls gate intake; workspace deletion stays blocked by all retained runs and terminal fences never downgrade', async () => {
+test('workspace controls gate intake; workspace deletion cascades to retained runs and terminal fences never downgrade', async () => {
   const f = fixture()
   const run = await createRun(f)
   await change(f, run.run.id, 'archive')
   assert.equal((await participant(f).counts(f.workspaceId)).analyses, 1)
-  assert.equal((await api.realAnalysisDependencyBlockers(f.analysis, f.workspaceId, { kind: 'workspace', id: f.workspaceId })).length, 1)
+  assert.equal((await api.realAnalysisDependencyBlockers(f.analysis, f.workspaceId, { kind: 'workspace', id: f.workspaceId })).length, 0)
   await participant(f).setState(f.workspaceId, 'archived', NOW)
   await assert.rejects(f.service.create(f.workspaceId, randomUUID(), run.request, ACTOR), failStatus(409))
   await assert.rejects(f.service.listTargets(f.workspaceId), failStatus(409))
   await participant(f).setState(f.workspaceId, 'deleting', NOW)
-  await assert.rejects(participant(f).purge(f.workspaceId, NOW), /retained real analyses/)
-  assert.ok(await current(f, run.run.id))
-  await change(f, run.run.id, 'delete')
+  await participant(f).cancel(f.workspaceId, NOW)
   await participant(f).purge(f.workspaceId, NOW)
+  assert.equal(await current(f, run.run.id), undefined)
+  assert.equal(f.analysis.blobs.values.size, 0)
   assert.equal((await f.analysis.store.getControl(f.workspaceId)).record.state, 'deleted')
   await participant(f).setState(f.workspaceId, 'deleting', LATER)
   await participant(f).resume(f.workspaceId, LATER)
