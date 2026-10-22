@@ -199,7 +199,7 @@ test('real selectors preserve saved index ties, natural names, null-last scores 
   const before = JSON.stringify(incoming)
   const ordered = (key, direction) => ui.selectRealComparisons(incoming, targets, browse({ sort: { key, direction } })).rows
   assert.deepEqual(indexes(ordered('name', 'asc')), [2, 3, 1, 0, 4, 5])
-  assert.deepEqual(indexes(ordered('name', 'desc')), [0, 1, 2, 3, 4, 5])
+  assert.deepEqual(indexes(ordered('name', 'desc')), [5, 4, 0, 1, 2, 3])
   assert.deepEqual(indexes(ordered('score', 'asc')), [1, 2, 3, 4, 0, 5])
   assert.deepEqual(indexes(ordered('score', 'desc')), [4, 2, 3, 1, 0, 5])
   const saved = ui.selectRealComparisons(incoming, targets, browse()).rows
@@ -379,11 +379,11 @@ test('real comparison headers and mobile selector share state, expose exact targ
   assert.match(element('[role="note"]').textContent, /Rubric versions differ for Shared target \(v1 · aaaaaaaa, v2 · 22222222\)\. Scores are comparable only within one exact version/)
   assert.equal([...element('select[aria-label="Sort comparisons"]').options].filter((option) => option.disabled).length, 2)
   await sortHeader('Saved resume')
-  assert.deepEqual(rowIndexes(), [1, 3, 4, 0, 2])
+  assert.deepEqual(rowIndexes(), [1, 3, 4, 2, 0])
   assert.equal(chosenSort(), 'Saved resume: A to Z')
   assert.equal(element('th[aria-sort]').getAttribute('aria-sort'), 'ascending')
   await sortHeader('Saved resume')
-  assert.deepEqual(rowIndexes(), [0, 4, 3, 1, 2])
+  assert.deepEqual(rowIndexes(), [0, 2, 4, 3, 1])
   await sortHeader('Exact target')
   assert.deepEqual(rowIndexes(), [4, 0, 1, 2, 3])
   await sortHeader('Exact target')

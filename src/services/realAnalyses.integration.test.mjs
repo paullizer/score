@@ -997,7 +997,7 @@ test('builder visibly rejects 501 comparisons without dropping inputs; viewer an
   await act(async () => root.unmount()); root = null
   await render(builder({ ...api, canWrite: false }, [resumeSummary('pending', 1, 'queued')], '/analyses/new?data=real'))
   assert.match(dom.window.document.body.textContent, /read-only/)
-  assert.equal(dom.window.document.querySelector('input[aria-label^="Include Name not stated"]').disabled, true)
+  assert.equal(dom.window.document.querySelector('input[aria-label^="Include resume.pdf"]').disabled, true)
 })
 
 test('builder reviews newer job versions without replacing the selected historical version', async () => {

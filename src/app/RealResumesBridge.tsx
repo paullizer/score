@@ -6,9 +6,8 @@ import { assertClientAdmission, clientAdmissionReason, usePublicSettings } from 
 import { boundedPollingInterval, effectiveFormats, requireImportBatch, resumeFeaturesWithPolicy } from '../services/publicSettings'
 import { CloudApiError, CloudConflictError, LifecycleOperationError, workspaceAccessStamp } from '../services/cloudWorkspace'
 import { lifecycleIsRemoved, type LifecycleAction, type LifecycleTarget } from '../domain/lifecycle'
-import { appendResumeInputs, resumeWorkActive, type RealResumeImportBatch, type RealResumeImportSource } from '../features/resumes/resumeImportUi'
+import { appendResumeInputs, resumeName, resumeWorkActive, type RealResumeImportBatch, type RealResumeImportSource } from '../features/resumes/resumeImportUi'
 import { WorkspaceContext, useWorkspace, type PendingLifecycleChange, type RenameEntityTarget } from './workspace-context'
-import { getDisplayName } from '../domain/displayNames'
 import { useGradeLeaveGuard } from './grade-navigation-context'
 import { RealResumesContext, type RealResumesContextValue } from './real-resumes-context'
 import { RealRequestScope, realRequestError, type RealLoadState, type RealMutationTicket } from './real-request-scope'
@@ -41,6 +40,7 @@ function RealResumesProvider({ workspaceId, children }: { workspaceId: string; c
   const detailsRef = useRef(details)
   const [pendingCount, setPendingCount] = useState(0)
   const [batches, setBatches] = useState<RealResumeImportBatch[]>([])
+  const [uploadNotice, setUploadNotice] = useState<string | null>(null)
   const batchesRef = useRef(batches)
   const [currentBatchId, setCurrentBatchId] = useState<string | null>(null)
   const currentBatchRef = useRef(currentBatchId)
@@ -81,7 +81,7 @@ function RealResumesProvider({ workspaceId, children }: { workspaceId: string; c
 
   useEffect(() => {
     setPendingLifecycle(reconcileLifecycleOperations(pendingLifecycleRef.current, summaries.map((summary) =>
-      discoveredLifecycle({ kind: 'resume', id: summary.resume.id }, getDisplayName(summary, summary.resume.name ?? summary.source.displayName), summary.lifecycle, summary.lifecycleOperation))))
+      discoveredLifecycle({ kind: 'resume', id: summary.resume.id }, resumeName(summary), summary.lifecycle, summary.lifecycleOperation))))
   }, [setPendingLifecycle, summaries])
 
   const ensureDetail = useCallback(async function loadDetail(id: string, force = false): Promise<void> {
@@ -236,6 +236,7 @@ function RealResumesProvider({ workspaceId, children }: { workspaceId: string; c
     const current = batchesRef.current.find((batch) => batch.id === currentBatchRef.current)
     if (current && current.inputCount === null) return current.id
     const batch: RealResumeImportBatch = { id: crypto.randomUUID(), inputCount: null, items: [] }
+    setUploadNotice(null)
     putBatches([...batchesRef.current, batch])
     currentBatchRef.current = batch.id
     setCurrentBatchId(batch.id)
@@ -316,7 +317,18 @@ function RealResumesProvider({ workspaceId, children }: { workspaceId: string; c
           ? { ...batch, items: batch.items.map(item => item.state === 'waiting' ? { ...item, state: 'pending', error } : item) } : batch))
       }
       throw caught
-    } finally { finishMutation(ticket) }
+    } finally {
+      finishMutation(ticket)
+      const completed = batchesRef.current.find(item => item.id === batchId)
+      if (scope.isOpen && completed?.items.length && completed.items.every(item => item.state === 'accepted')) {
+        putBatches(batchesRef.current.filter(item => item.id !== batchId))
+        if (currentBatchRef.current === batchId) {
+          currentBatchRef.current = null
+          setCurrentBatchId(null)
+        }
+        setUploadNotice(`${completed.items.length} ${completed.items.length === 1 ? 'resume uploaded' : 'resumes uploaded'}. Follow processing in your library.`)
+      }
+    }
   }
 
   function assertNewImports() {
@@ -331,7 +343,7 @@ function RealResumesProvider({ workspaceId, children }: { workspaceId: string; c
     retry: (id, etag) => mutate(`resume:${id}`, () => api.retryRealResume(workspaceId, id, etag), remember, false, id),
     cancel: (id, etag) => mutate(`resume:${id}`, () => api.cancelRealResume(workspaceId, id, etag), remember, false, id),
     originalUrl: (id) => api.realResumeOriginalUrl(workspaceId, id),
-    batches, currentBatchId, newBatch, stage, submitBatch,
+    batches, uploadNotice, currentBatchId, newBatch, stage, submitBatch,
     selectBatch: (id) => {
       if (!batchesRef.current.some((batch) => batch.id === id)) throw new Error('This batch is not available.')
       if (scope.pending('$import-batch')) throw new Error('Wait for the active uploads before switching batches.')
@@ -376,7 +388,7 @@ function RealResumesProvider({ workspaceId, children }: { workspaceId: string; c
       if (response.operation && response.operation.status !== 'complete') {
         const summary = summariesRef.current.find((item) => item.resume.id === target.id)
         setPendingLifecycle(reconcileLifecycleOperations(pendingLifecycleRef.current, [{
-          target, name: summary ? getDisplayName(summary, summary.resume.name ?? summary.source.displayName) : pending?.name ?? 'Real resume', operation: response.operation,
+          target, name: summary ? resumeName(summary) : pending?.name ?? 'Real resume', operation: response.operation,
         }]))
         if (action === 'delete') putDetail(target.id, { state: 'error', error: 'Deletion is still incomplete. Retry the lifecycle operation; cached source content has been cleared.' })
       } else if (response.deleted) removeResume(target.id, sequence)

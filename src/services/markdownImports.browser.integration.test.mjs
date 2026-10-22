@@ -64,17 +64,23 @@ for (const [count, width] of [[4, 1440], [10, 390]]) {
       }, files)
       try { await dialog.locator('.drop-zone').dispatchEvent('drop', { dataTransfer: transfer }) }
       finally { await transfer.dispose() }
-      await dialog.getByRole('button', { name: `Import ${count} valid inputs`, exact: true }).click()
+      await dialog.getByRole('button', { name: `Upload ${count} resumes`, exact: true }).click()
       await entered
       assert.equal(fixture.requests.filter(request => request.method === 'POST' && request.url === uploadPath).length, 1)
       assert.equal(await dialog.getByText('Waiting to upload — not sent yet', { exact: false }).count(), count - 1)
-      assert.equal(await dialog.getByRole('button', { name: 'Awaiting acceptance…', exact: true }).isDisabled(), true)
+      assert.equal(await dialog.getByRole('button', { name: 'Uploading…', exact: true }).isDisabled(), true)
       assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth), true)
       await dialog.getByRole('button', { name: 'Close — keep uploading', exact: true }).click()
       await dialog.waitFor({ state: 'hidden' })
       finishRelease()
       await page.getByRole('button', { name: 'Add resumes', exact: true }).click()
-      await dialog.getByText(`${count} accepted / ${count} inputs`, { exact: true }).waitFor()
+      await dialog.getByRole('button', { name: 'Choose files', exact: true }).waitFor({ state: 'visible' })
+      await page.waitForFunction(() => !document.querySelector('input[type=file]').disabled)
+      assert.equal(await dialog.getByRole('region', { name: 'Real resume import batch', exact: true }).count(), 0)
+      assert.equal(await dialog.getByRole('button', { name: /^Retry/ }).count(), 0)
+      assert.equal(await dialog.getByRole('link', { name: 'Inspect accepted resume', exact: true }).count(), 0)
+      assert.equal(await page.getByText(/^Resume uploads:/).count(), 0)
+      assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth), true)
       const uploads = fixture.requests.filter(request => request.method === 'POST' && request.url === uploadPath)
       assert.equal(uploads.length, count, 'Each source is sent once; no automatic or manual retry is needed')
       assert.equal(new Set(uploads.map(request => request.headers['idempotency-key'])).size, count)
@@ -151,8 +157,9 @@ test('browser imports Markdown through job drop and resume picker, then highligh
     await resumesDialog.locator('input[type=file]').setInputFiles({
       name: 'resume.MD', mimeType: 'application/octet-stream', buffer: markdownResume,
     })
-    await resumesDialog.getByRole('button', { name: 'Import 1 valid input', exact: true }).click()
-    await resumesDialog.getByText(/Accepted by the server/).waitFor({ state: 'visible' })
+    await resumesDialog.getByRole('button', { name: 'Upload 1 resume', exact: true }).click()
+    await page.waitForFunction(() => !document.querySelector('input[type=file]').disabled)
+    assert.equal(await resumesDialog.locator('[aria-label="Real resume import batch"]').count(), 0)
     await resumesDialog.getByRole('button', { name: 'Close', exact: true }).click()
     await resumesDialog.waitFor({ state: 'hidden' })
     const importedResume = [...fixture.resumes.store.values.values()].find(({ record }) => record.recordType === 'resume').record

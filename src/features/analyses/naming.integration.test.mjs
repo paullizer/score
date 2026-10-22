@@ -181,7 +181,8 @@ test('name rules bound suggestions without treating filenames as source-stated p
   const summary = realResume()
   assert.equal(ui.resumeName(summary), 'Review label')
   delete summary.displayName
-  assert.equal(ui.resumeName(summary), 'Name not stated')
+  assert.equal(ui.resumeName(summary), 'not-a-person.pdf')
+  assert.equal(summary.resume.name, null)
   assert.equal(summary.source.displayName, 'not-a-person.pdf')
 })
 

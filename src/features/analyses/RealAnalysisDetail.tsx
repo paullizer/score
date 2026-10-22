@@ -25,7 +25,7 @@ import {
 } from './realAnalysisCompletion'
 import { ArchivedBadge, EntityLifecycleActions, LifecycleBanner } from '../../components/lifecycle/LifecycleControls'
 import { useLifecycleAccess } from '../../components/lifecycle/useLifecycleAccess'
-import { getDisplayName } from '../../domain/displayNames'
+import { getDisplayName, getResumeDisplayName } from '../../domain/displayNames'
 import { RenameEntityButton, RenameEntityProvider } from '../../components/ui/RenameEntityButton'
 
 export function RealComparisonValue({ summary }: { summary: RealAnalysisComparisonSummary }) {
@@ -262,7 +262,7 @@ function RealAnalysisView({ id }: { id: string }) {
           const resume = comparison.resume.summary
           const target = comparison.target.summary
           const rowStage = realComparisonStage(pair, generation, summaryItems.get(comparison.id))
-          return <tr key={comparison.id}><td className="min-w-[180px]"><button className="row-title text-left" onClick={() => openPair(comparison.id)}>{getDisplayName(resume, resume.name?.trim() || 'Name not stated')}</button>
+          return <tr key={comparison.id}><td className="min-w-[180px]"><button className="row-title text-left" onClick={() => openPair(comparison.id)}>{getResumeDisplayName(resume)}</button>
             {resume.displayName && <p className="row-meta">Source name: {resume.name?.trim() || 'Name not stated'}</p>}
             <p className="row-meta">{resume.role ?? 'Role not stated'}</p><p className="row-meta break-all">{resume.sourceLabel}</p><p className="row-meta">Document v{resume.selection.documentVersion}</p></td>
             <td className="min-w-[210px]"><strong className="block text-[12px]">{getDisplayName(target, target.label)}</strong>{target.displayName && <p className="row-meta">Source title: {target.label}</p>}<p className="row-meta">{target.sublabel}</p><div className="mt-2"><Badge>{targetVersionLabel(target.selection)}</Badge></div>
@@ -274,7 +274,7 @@ function RealAnalysisView({ id }: { id: string }) {
               {comparison.nextAttemptAt && <p className="row-meta">Automatic retry {dateLabel(comparison.nextAttemptAt)}</p>}<p className="row-meta">Attempt {comparison.attempts} · manual retries {comparison.retryCount}</p></td>
             <td><div className="space-y-3">{pair.activeCorrection ? <ActiveCorrectionStatus active={pair.activeCorrection} table />
               : <div><Badge dot tone={rowStage.tone}>{rowStage.label}</Badge></div>}
-              <Button size="sm" variant="ghost" icon={ArrowUpRight} aria-label={`Review comparison ${comparison.index + 1}: ${getDisplayName(resume, resume.name?.trim() || 'Name not stated')} against ${getDisplayName(target, target.label)}`}
+              <Button size="sm" variant="ghost" icon={ArrowUpRight} aria-label={`Review comparison ${comparison.index + 1}: ${getResumeDisplayName(resume)} against ${getDisplayName(target, target.label)}`}
               onClick={() => openPair(comparison.id)}>Review saved pair</Button><RealComparisonActions summary={pair} /></div></td>
           </tr>
         })}</tbody>

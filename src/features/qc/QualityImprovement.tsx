@@ -13,6 +13,7 @@ import {
   type QcPromptFamily, type QcPromptHistoryEntry, type QcTrialResult,
 } from '../../domain/quality-improvement'
 import type { Citation } from '../../domain/types'
+import { getResumeDisplayName } from '../../domain/displayNames'
 import {
   actOnQcPlan, createQcPlan, getQcPeers, getQcPlan, getQcPlanHistory, getQcPromptHistory,
   getQcPrompts, listQcPlans, restoreQcPrompts, updateQcPlan, type QcPlanAction,
@@ -168,7 +169,7 @@ function CuratedCaseEditor({ value, workspaceId, disabled, selectedCount, update
       peers => update(current => ({ ...current, collected: true, continuationToken: peers.continuationToken,
         reviews: [...current.reviews, ...peers.submissions.filter(review => !current.reviews.some(row => row.id === review.id))] })))
   }
-  return <section className="qc-card qc-stack"><div className="qc-toolbar"><h2 className="qc-grow">{analysis.comparison.resume.summary.name ?? 'Name not stated'} → {analysis.targetSnapshot.summary.label}</h2>
+  return <section className="qc-card qc-stack"><div className="qc-toolbar"><h2 className="qc-grow">{getResumeDisplayName(analysis.comparison.resume.summary)} → {analysis.targetSnapshot.summary.label}</h2>
     <Button disabled={closed} size="sm" onClick={onRemove}>Remove case</Button></div>
     <Link to={qcReviewLink(context.scope)}>Inspect exact evidence and review</Link><QcResultPin scope={context.scope} />
     <p className="qc-muted">Rubric {rubric.id} v{rubric.version} · assessor prompt {analysis.result?.provenance.assessment.promptVersion ?? 'Not recorded'} · {context.submissionCount} submitted reviewers reported by context.</p>
