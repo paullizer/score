@@ -35,10 +35,10 @@ export function compiledPromptContractHash(templates = DEFAULT_PROMPT_TEMPLATES)
     guidance: baselineGuidance })
 }
 const baselineGuidance = {
-  jobRubric: 'Organize the substantive single-role description into distinct professional work criteria, including fictional or synthetic fixtures and internal or non-live descriptions. Preserve role-specific requirements and use concrete documentary evidence anchors rather than generic skill labels.',
+  jobRubric: 'Organize the substantive single-role description into distinct professional work criteria, including fictional or synthetic fixtures and internal or non-live descriptions. Preserve role-specific requirements and use illustrative documentary evidence anchors across the fixed 0-5 scale (including listed skills, tools, or related coursework at level 1) rather than narrow keyword checklists or generic skill labels.',
   gradeCompetencies: 'Align a concise common competency structure to the frozen role and source context. Keep competency meanings stable across requested grades without assuming unsupported grade distinctions.',
   gradeDraft: 'Explain the work-level meaning of the cited sources clearly. Distinguish scope, responsibility and complexity under the requested grade while preserving all source limitations.',
-  assessment: 'Apply each exact saved criterion and its documentary evidence anchors consistently. Explain the decisive evidence and any genuine borderline interpretation, without treating silence as personal inability.',
+  assessment: 'Apply each exact saved criterion and its documentary evidence anchors by matching substance rather than requiring verbatim example keywords. Explain the decisive evidence and any genuine borderline or partial interpretation, keep unflagged rows unchanged during corrections, and resolve unsupported findings in a single step without treating silence as personal inability.',
 } as const
 
 const draftInputSchema = z.strictObject({

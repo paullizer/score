@@ -24,7 +24,7 @@ export function useRubricApprovals() {
     const latestVersion = Math.max(rubric.version, summary?.rubric?.version ?? 0, ...versions)
     const presentation = rubricApprovalPresentation(rubric, approval, required, qaSummary)
     const active = Boolean(jobId && !access.archived && !access.removed && !access.deleting && !access.transitioning &&
-      record?.job.status === 'ready' && !record.job.rubricDeletedAt &&
+      record?.job?.status === 'ready' && !record.job?.rubricDeletedAt &&
       !isEntityArchived(workspace, { kind: 'rubric', id: rubric.groupId }) &&
       !isEntityRemoved(workspace, { kind: 'rubric', id: rubric.groupId }) &&
       !record.lifecycle?.archivedAt && !record.lifecycle?.deletingAt && !record.lifecycle?.deletedAt &&
