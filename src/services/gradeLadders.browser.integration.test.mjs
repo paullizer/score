@@ -436,7 +436,7 @@ test('draft-only source work keeps polling and cold rubric links resolve to real
     await visible(page.getByRole('heading', { name: seeded.first.version.rubric.name, exact: true }))
     await page.goto(`${fixture.origin}/workspaces/${fixture.workspaceId}/analyses/new?${new URLSearchParams({ data: 'samples', rubrics: seeded.first.version.id })}`)
     await visible(page.getByText('Analyses', { exact: true }).first())
-    await visible(page.getByText(/New real analyses are currently unavailable/))
+    await visible(page.getByText(/New analyses are currently unavailable/))
     assert.equal(new URL(page.url()).searchParams.get('data'), 'samples', 'Legacy data parameters are ignored, not stripped from the URL')
     assert.deepEqual(errors, [])
   } finally { await context.close(); await fixture.close() }

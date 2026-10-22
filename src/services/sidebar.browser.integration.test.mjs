@@ -222,7 +222,7 @@ for (const theme of ['light', 'dark']) test(`desktop sidebar collapses to a cent
   const aboutButton = sidebar.getByRole('button', { name: 'About Score', exact: true })
   await aboutButton.click()
   const about = page.getByRole('dialog', { name: 'About Score', exact: true })
-  await about.getByText('How it works, current limits, and privacy', { exact: true }).waitFor()
+  await about.getByText('How it works and current limits', { exact: true }).waitFor()
   assert.doesNotMatch(await about.innerText(), /UI preview|interactive preview/i)
   await about.getByRole('button', { name: 'Back to the workspace', exact: true }).click()
   await about.waitFor({ state: 'hidden' })

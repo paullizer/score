@@ -167,7 +167,7 @@ test('historical diagnostic absence never derives confidence from evidence cover
 
 test('normal frozen-evidence review does not render or fetch private QC confidence or feedback', async () => {
   await render('/analyses/run-one', { normalReview: true })
-  assert.match(document.body.textContent, /The evidence, criterion by criterion/)
+  assert.match(document.body.textContent, /CriteriaScored against rubric v1/)
   assert.match(document.body.textContent, /The frozen passage documents independent engineering work/)
   assert.equal(document.querySelector('.qc-criterion'), null)
   assert.equal(fixture.requests.some(item => item.url.includes('/qc/')), false)
@@ -603,7 +603,7 @@ test('curation loads only explicit authorized feedback and saving a draft never 
   await render('/qc/improvements/new')
   await fill(field('Plan name'), 'Curated evidence plan')
   await fill(field('Improvement objective'), 'Test one clearly bounded evidence hypothesis.')
-  await fill(field('Saved real analysis'), 'run-one')
+  await fill(field('Saved analysis'), 'run-one')
   await until(() => document.body.textContent.includes('Select exact result'), 'Completed comparison is selectable despite partial run')
   await click([...document.querySelectorAll('label')].find(label => label.textContent.includes('Select exact result')).querySelector('input'))
   assert.equal(fixture.requests.some(item => item.url.endsWith('/peers')), false)
@@ -628,7 +628,7 @@ test('curation loads only explicit authorized feedback and saving a draft never 
 
 test('blinded reviewers cannot select a case for planning before their own submission', async () => {
   await render('/qc/improvements/new')
-  await fill(field('Saved real analysis'), 'run-one')
+  await fill(field('Saved analysis'), 'run-one')
   await until(() => document.body.textContent.includes('Select exact result'), 'Saved context loads')
   const input = [...document.querySelectorAll('label')].find(label => label.textContent.includes('Select exact result')).querySelector('input')
   assert.equal(input.disabled, true)
@@ -642,7 +642,7 @@ test('curation records exclusions with reasons and never silently selects all av
   await render('/qc/improvements/new')
   await fill(field('Plan name'), 'Explicit curation')
   await fill(field('Improvement objective'), 'Retain individual opinions and record exclusions.')
-  await fill(field('Saved real analysis'), 'run-one')
+  await fill(field('Saved analysis'), 'run-one')
   await until(() => document.body.textContent.includes('Select exact result'), 'Case selector ready')
   await click([...document.querySelectorAll('label')].find(label => label.textContent.includes('Select exact result')).querySelector('input'))
   await click(button('Load authorized feedback for this case'))

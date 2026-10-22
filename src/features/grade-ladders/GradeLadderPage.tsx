@@ -8,7 +8,7 @@ import type { GradeLadderDetail, GradeLevelDetail, GradeWorkRecord } from '../..
 import { Badge, Button, EmptyState, InlineError, PageHeader, SegmentedControl } from '../../components/ui'
 import { GradeContextEditor } from './GradeContextEditor'
 import { GradeDraftEditor } from './GradeDraftEditor'
-import { GradeDisclaimer, GradeIssues } from './GradeShared'
+import { GradeIssues } from './GradeShared'
 import { GradeSourceInspector, type GradeSourceSelection } from './GradeSourceInspector'
 import { GradeSourcesReview } from './GradeSourcesReview'
 import { GradeMatrix } from './GradeMatrix'
@@ -29,10 +29,10 @@ export function GradeLadderPage({ ladderId: givenId }: { ladderId?: string }) {
   const { deleting } = useLifecycleAccess({ kind: 'ladder', id: ladderId ?? '' })
   useEffect(() => { if (ladderId && !deleting) void ensure?.(ladderId) }, [ensure, ladderId, detailState, api?.phase, deleting])
   if (!api) return <EmptyState icon={Layers3} title="Real ladders require a cloud workspace" description="Open this page from an authenticated workspace. Grade data is never stored in browser persistence." />
-  if (!ladderId) return <EmptyState title="No grade ladder selected" description="Open a real grade family from Rubrics." />
+  if (!ladderId) return <EmptyState title="No grade ladder selected" description="Open a grade ladder from Rubrics." />
   const entry = api.detail(ladderId)
   if (deleting) return <>
-    <Link className="back-link" to="/rubrics?kind=grade"><ArrowLeft size={14} aria-hidden="true" />Back to real grade families</Link>
+    <Link className="back-link" to="/rubrics?kind=grade"><ArrowLeft size={14} aria-hidden="true" />Back to grade ladders</Link>
     <PageHeader title={entry.state === 'ready' ? entry.value.ladder.name : api.summaries.find((item) => item.ladder.id === ladderId)?.ladder.name ?? 'Grade ladder cleanup'}
       description="Permanent deletion is incomplete. Only recovery status is available." />
     <LifecycleBanner target={{ kind: 'ladder', id: ladderId }} />
@@ -42,7 +42,7 @@ export function GradeLadderPage({ ladderId: givenId }: { ladderId?: string }) {
   if (api.phase === 'unavailable') return <EmptyState title="Grade processing is not enabled" description={api.error ?? 'This deployment does not have real grade storage and processing configured.'} action={<Button onClick={() => void api.refresh()}>Check availability</Button>} />
   if (api.phase === 'error' && entry.state !== 'ready') return <EmptyState title="The grade service is unavailable" description={api.error ?? 'Score could not confirm access to the grade service.'} action={<Button onClick={() => void api.refresh()}>Retry grade service</Button>} />
   if (entry.state === 'error') return <EmptyState title="This ladder could not be opened" description={entry.error} action={<Button onClick={() => void api.ensureDetail(ladderId, true)}>Retry ladder</Button>} />
-  if (entry.state !== 'ready') return <EmptyState icon={LoaderCircle} title="Loading private grade ladder" description="Opening the durable family, source captures, independent grade heads, and work progress." />
+  if (entry.state !== 'ready') return <EmptyState icon={LoaderCircle} title="Loading grade ladder" description="Opening the durable family, source captures, independent grade heads, and work progress." />
   return <GradeLadderWorkspace key={ladderId} detail={entry.value} loadError={entry.error ?? api.error ?? undefined} />
 }
 
@@ -115,17 +115,15 @@ function GradeLadderWorkspace({ detail, loadError }: { detail: GradeLadderDetail
   const generationBlocked = newWorkReason || (!editable ? 'Archived or read-only ladder: unarchive it and its workspace before generation.' : sourceDirty ? 'Confirm or discard unsaved source decisions first.' : !detail.sourceSet || detail.sourceSet.id !== detail.ladder.sourceSetId ? 'Review sources and confirm a current frozen source set first.' : active ? 'Wait for current discovery, extraction, generation, or review to finish, or cancel that work.' : '')
 
   return <>
-    <Link className="back-link" to="/rubrics?kind=grade"><ArrowLeft size={14} aria-hidden="true" />Back to real grade families</Link>
-    <PageHeader eyebrow="REAL GS GRADE LADDER" title={detail.ladder.name} description={`Series ${detail.ladder.context.series} · ${detail.ladder.context.agency || 'Agency unresolved'} · Seed rubric v${detail.ladder.seedRubricVersion}`}
+    <Link className="back-link" to="/rubrics?kind=grade"><ArrowLeft size={14} aria-hidden="true" />Back to grade ladders</Link>
+    <PageHeader title={detail.ladder.name} description={`Series ${detail.ladder.context.series} · ${detail.ladder.context.agency || 'Agency unresolved'} · Seed rubric v${detail.ladder.seedRubricVersion}`}
       actions={<><EntityLifecycleActions target={{ kind: 'ladder', id: detail.ladder.id }} name={detail.ladder.name} onComplete={(action) => { if (action === 'delete') navigate('/rubrics?kind=grade') }} /><Button icon={Pencil} disabled={!editable || busy || sourceDirty} title={sourceDirty ? 'Finish source decisions first.' : !editable ? 'Archived content and Reader access are read-only.' : undefined} onClick={() => setContextEditor(true)}>Context / add grades</Button>
         <Button icon={Play} variant="primary" disabled={busy || Boolean(generationBlocked)} title={generationBlocked || undefined}
           onClick={() => execute(() => api.generate(detail.ladder.id, detail.etag, keyFor('generate', [detail.ladder.id, detail.etag, detail.ladder.sourceSetId])), 'Generation accepted. Each grade is processed independently; closing the browser after acknowledgement does not stop durable work.')}>{detail.ladder.generationId ? 'Generate new revision' : 'Generate grade drafts'}</Button></>} />
     <LifecycleBanner target={{ kind: 'ladder', id: detail.ladder.id }} />
-    <p className="mb-4 text-[11px] text-muted">Use Context / add grades to edit this ladder’s name and scope. This is a context revision, not a cosmetic rename; changes may require renewed source confirmation before new work.</p>
-    <div className="detail-metadata"><Badge tone="accent">Real · private server records</Badge><ArchivedBadge target={{ kind: 'ladder', id: detail.ladder.id }} /><Badge>{detail.ladder.status.replaceAll('-', ' ')}</Badge><span>{detail.ladder.grades.map((item) => `GS-${item}`).join(' / ')}</span><span>{detail.ladder.context.supervision}</span><span>Seed: {detail.ladder.seedJobTitle}</span></div>
+    <div className="detail-metadata"><ArchivedBadge target={{ kind: 'ladder', id: detail.ladder.id }} /><Badge>{detail.ladder.status.replaceAll('-', ' ')}</Badge><span>{detail.ladder.grades.map((item) => `GS-${item}`).join(' / ')}</span><span>{detail.ladder.context.supervision}</span><span>Seed: {detail.ladder.seedJobTitle}</span></div>
     {detail.ladder.discovery && <div className="grade-discovery-context"><strong>{detail.ladder.discovery.seriesTitle || `Series ${detail.ladder.context.series}`}</strong><Badge tone={detail.ladder.discovery.seriesStatus === 'listed' ? 'neutral' : 'warning'}>{detail.ladder.discovery.seriesStatus} in discovered catalog</Badge><span>Catalog / adapter {detail.ladder.discovery.catalogVersion} · captured {detail.ladder.discovery.capturedAt}</span></div>}
     {generationBlocked && <p className="mb-4 text-[11px] text-muted">{generationBlocked}</p>}
-    <GradeDisclaimer />
     <div className="panel mb-5 px-5 pb-5"><ApprovedGradeAnalysis ladderId={detail.ladder.id} /></div>
     {!api.canWrite && <div className="info-callout mb-5"><p>This workspace is read-only. You can inspect captured evidence, grade drafts, and immutable history; only owners and editors can change or approve them.</p></div>}
     {loadError && <InlineError>{loadError} The last acknowledged detail is retained. <Button size="sm" onClick={() => void api.ensureDetail(detail.ladder.id, true)}>Reload from server</Button></InlineError>}

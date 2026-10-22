@@ -97,28 +97,28 @@ export function RealComparisonReview({ detail, actions, initialView, qc }: {
 
   return <>
     <section className="result-overview panel">
-      <div className="result-identity"><span className="target-symbol"><FileText size={18} aria-hidden="true" /></span><div><div className="eyebrow">SAVED REAL RESUME</div><h2>{resumeLabel}</h2>{savedResume.displayName && <p>Source name: {savedResume.name?.trim() || 'Name not stated'}</p>}<p>{savedResume.role ?? 'Role not stated'}</p><p className="break-all text-[10px] text-muted">{savedResume.sourceLabel}</p></div></div>
-      <div className="result-target"><div className="eyebrow">{target.kind === 'grade' ? 'EXACT APPROVED GS VERSION' : 'EXACT SAVED JOB RUBRIC'}</div><h3>{getDisplayName(target.summary, target.summary.label)}</h3>{target.summary.displayName && <><p>Source title: {target.summary.label}</p>{target.kind === 'job' && target.source?.displayName && <p>Original source: {target.source.displayName}</p>}</>}<p>{target.summary.sublabel}</p>
+      <div className="result-identity"><span className="target-symbol"><FileText size={18} aria-hidden="true" /></span><div><div className="eyebrow">RESUME</div><h2>{resumeLabel}</h2>{savedResume.displayName && <p>Source name: {savedResume.name?.trim() || 'Name not stated'}</p>}<p>{savedResume.role ?? 'Role not stated'}</p><p className="break-all text-[10px] text-muted">{savedResume.sourceLabel}</p></div></div>
+      <div className="result-target"><div className="eyebrow">{target.kind === 'grade' ? 'GS GRADE RUBRIC' : 'JOB RUBRIC'}</div><h3>{getDisplayName(target.summary, target.summary.label)}</h3>{target.summary.displayName && <><p>Source title: {target.summary.label}</p>{target.kind === 'job' && target.source?.displayName && <p>Original source: {target.source.displayName}</p>}</>}<p>{target.summary.sublabel}</p>
         <div className="mt-2 flex flex-wrap gap-1.5"><Badge>{targetVersionLabel(target.selection)}</Badge><Badge tone={result.completion === 'limited' ? 'warning' : 'success'}>{result.completion === 'limited' ? 'Complete · limited assessment' : 'Complete · assessed'}</Badge></div>
       </div>
-      <div className="overall-score"><div className="eyebrow">SERVER-CALCULATED EVIDENCE MATCH</div>
+      <div className="overall-score"><div className="eyebrow">OVERALL SCORE</div>
         {result.overall.status === 'available' ? <Score value={result.overall.score} large /> : <><strong className="text-lg">Score withheld</strong><p className="mt-2 text-[11px] text-muted">{result.overall.message}</p></>}
-        <span>{result.overall.status === 'available' ? 'Weighted saved criterion scores · not a ranking' : 'Not a zero and not a failed candidate'}</span></div>
+        <span>{result.overall.status === 'available' ? 'Weighted criterion score' : 'Score withheld'}</span></div>
       <div className="result-summary"><ShieldCheck size={16} aria-hidden="true" /><div><h3>Evidence-based assessment</h3><p>{result.summary}</p></div></div>
     </section>
     {!qc && <><AnalysisCorrectionDetails detail={detail} />
       <RealCandidateNarrative runId={comparison.runId} comparisonId={comparison.id} targetId={comparison.target.summary.id}
         resultSha256={comparison.result?.sha256} resultRevisionId={comparison.resultRevision?.id} /></>}
-    <section className="panel mt-5" aria-label="Evidence coverage and limitations"><div className="section-heading"><div><h2>Completion is separate from evidence coverage</h2>
+    <section className="panel mt-5" aria-label="Evidence coverage and limitations"><div className="section-heading"><div><h2>Evidence coverage</h2>
       <p>{result.coverage.supported} supported · {result.coverage.partial} partial · {result.coverage.missing} missing · {result.coverage.notAssessed} not assessed · {result.coverage.notApplicable} not applicable</p>
-      <p>{result.coverage.assessedWeight}% assessed weight / {result.coverage.totalWeight}% total weight. No client-side total or missing-criterion renormalization is used.</p></div></div>
+      <p>{result.coverage.assessedWeight}% of {result.coverage.totalWeight}% weight assessed</p></div></div>
       {result.limitations.length > 0 && <ul className="list-disc space-y-2 px-9 py-4 text-[11px] text-muted">{result.limitations.map((limitation, index) => <li key={index}>{limitation.message}</li>)}</ul>}
     </section>
     <div className="pane-switcher mt-5"><SegmentedControl label="Real result review view" value={pane} onChange={setPane}
       options={[{ value: 'criteria', label: 'Criterion breakdown' }, { value: 'evidence', label: 'Saved source evidence' }]} /></div>
     <div className="evidence-layout">
       <section className={`detail-panel ${pane !== 'criteria' ? 'mobile-pane-hidden' : ''}`} aria-label="Real criterion assessments">
-        <div className="section-heading"><div><h2>The evidence, criterion by criterion</h2><p>Scored against unchanged rubric v{rubric.version}; gaps and exclusions remain distinct.</p></div><Layers3 size={16} className="text-muted" aria-hidden="true" /></div>
+        <div className="section-heading"><div><h2>Criteria</h2><p>Scored against rubric v{rubric.version}</p></div><Layers3 size={16} className="text-muted" aria-hidden="true" /></div>
         <div className="criterion-results">{rubric.criteria.map((criterion, index) => {
           const assessment = result.criteria.find((item) => item.criterionId === criterion.id)
           const isOpen = expanded.includes(criterion.id)
@@ -143,7 +143,7 @@ export function RealComparisonReview({ detail, actions, initialView, qc }: {
               {assessment?.citations.length ? <div><div className="citation-heading"><span>SUPPORTING RESUME EVIDENCE</span></div>
                 <EvidenceButtons citations={assessment.citations} kind="resume" label={criterion.label} onSelect={showEvidence} active={selected} /></div>
                 : status === 'missing' && <div className="evidence-gap"><ScanLine size={17} aria-hidden="true" /><div><strong>No supporting passage located in the processed resume</strong><p>This is an evidence gap and a zero evidence-match score, not proof that the person lacks the skill.</p></div></div>}
-              <div className="mt-4 border-t pt-3"><div className="citation-heading"><span>SAVED REQUIREMENT EVIDENCE · NOT APPLICANT EVIDENCE</span></div>
+              <div className="mt-4 border-t pt-3"><div className="citation-heading"><span>REQUIREMENT CITATION</span></div>
                 {requirementCitations.length ? <EvidenceButtons citations={requirementCitations} kind="requirement" label={criterion.label} onSelect={showEvidence} active={selected} />
                   : <p className="text-[11px] text-muted">No saved source quotation was supplied for this requirement. The saved rubric wording above is retained; no citation is invented.</p>}
               </div>

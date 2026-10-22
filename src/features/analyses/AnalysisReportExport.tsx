@@ -8,7 +8,7 @@ import { AccessSuspendedContext } from '../../app/access-suspended-context'
 import { REPORT_FORMATS, reportDownloadType, type AnalysisReport, type AnalysisReportFormat, type ReportCandidate } from '../../domain/analysis-reports'
 import { createDefaultAdminSettings } from '../../domain/admin-settings-defaults'
 import type { RealAnalysisComparisonSummary, RealAnalysisRunDetail } from '../../domain/real-analyses'
-import { Badge, Button, CheckLabel, InlineError, Modal } from '../../components/ui'
+import { Button, CheckLabel, InlineError, Modal } from '../../components/ui'
 import { AnalysisSummaryStatus } from './AnalysisSummaries'
 import { getDisplayName } from '../../domain/displayNames'
 import { LocalApplicantMapping } from './LocalApplicantMapping'
@@ -224,7 +224,6 @@ export function AnalysisReportExport({ source, onManageSummaries }: { source: Re
         </Button>
       </>}>
       <div className="space-y-5">
-        <div className="flex flex-wrap gap-2"><Badge tone="accent">Saved real evidence</Badge></div>
         <div><label className="mb-2 block text-[12px] font-semibold" htmlFor={`${fieldId}-format`}>Report format</label>
           <select id={`${fieldId}-format`} className="filter-select w-full" value={format ?? ''} disabled={busy || reportPolicy.enabledFormats.length === 0} onChange={(event) => {
             const value = event.target.value

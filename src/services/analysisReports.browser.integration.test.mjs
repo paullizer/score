@@ -479,7 +479,7 @@ test('a read-only reviewer downloads genuine CSV, PDF, Word and PowerPoint files
     await visible(source.getByRole('heading', { name: 'Full saved job description', exact: true }))
     await visible(source.getByRole('heading', { name: saved.targetSnapshot.document.title, exact: true }))
     assert.equal(await source.locator('.is-highlighted').count(), 0)
-    await page.getByRole('link', { name: 'All saved comparisons', exact: true }).click()
+    await page.getByRole('link', { name: 'All comparisons', exact: true }).click()
     assert.equal(new URL(page.url()).searchParams.get('result'), null)
     assert.equal(new URL(page.url()).searchParams.get('view'), null)
     await page.goBack()
@@ -971,7 +971,7 @@ test('losing access to saved history clears local mapping and cancels a pending 
     await page.route(`**/api/workspaces/${fixture.workspaceId}/analyses**`, (route) => route.fulfill({
       status: 403, contentType: 'application/json', body: JSON.stringify({ error: { code: 'forbidden', message: 'Workspace access is no longer available.' } }),
     }))
-    await visible(page.getByRole('heading', { name: 'This real analysis could not be opened', exact: true }))
+    await visible(page.getByRole('heading', { name: 'This analysis could not be opened', exact: true }))
     await dialog.waitFor({ state: 'hidden' })
     release.resolve()
     await finished.promise
@@ -1107,7 +1107,7 @@ test('generated saved source links preserve workspace, access, missing-result, a
       status: 403, contentType: 'application/json', body: JSON.stringify({ error: { code: 'forbidden', message: 'Saved analysis access denied.' } }),
     }))
     await page.goto(row['Job/grade link'])
-    await visible(page.getByRole('heading', { name: 'This real analysis could not be opened', exact: true }))
+    await visible(page.getByRole('heading', { name: 'This analysis could not be opened', exact: true }))
     await visible(page.getByText('Saved analysis access denied.', { exact: true }).first())
     assert.equal(await page.locator('.document-viewer').count(), 0)
     await page.unroute(`**/api/workspaces/${fixture.workspaceId}/analyses**`)
@@ -1136,7 +1136,7 @@ test('generated saved source links preserve workspace, access, missing-result, a
     }
     assert.equal(removed.deleted, true)
     await page.goto(row['Resume link'])
-    await visible(page.getByRole('heading', { name: 'This real analysis could not be opened', exact: true }))
+    await visible(page.getByRole('heading', { name: 'This analysis could not be opened', exact: true }))
     assert.equal(await page.locator('.document-viewer').count(), 0)
     assert.equal(await page.getByRole('button', { name: 'Export report', exact: true }).count(), 0)
     assert.equal(stubs.modelCalls.length, models)
