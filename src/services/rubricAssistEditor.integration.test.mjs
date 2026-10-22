@@ -96,7 +96,7 @@ function fixture() {
   return { workspace: { jobs: [job], documents: [document], rubrics: [rubric] }, job, document, rubric, firstVersion }
 }
 
-function context({ assist, rubricAssistant = true, role = 'owner' } = {}) {
+function context({ assist, rubricAssistant = true, siTerminology = false, role = 'owner' } = {}) {
   const data = fixture()
   return frontendWorkspaceContext({
     workspace: data.workspace,
@@ -105,7 +105,7 @@ function context({ assist, rubricAssistant = true, role = 'owner' } = {}) {
       currentWorkspaceId: 'workspace-one',
       workspaces: [{ id: 'workspace-one', name: 'Fixture workspace', role, etag: '"workspace"' }],
       realJobs: {
-        features: { realJobImports: true, markdownJobImports: true, wordDocumentImports: true, rubricAssistant, limits: { maxCriteria: 20, maxBatchFiles: 10, maxFileBytes: 1, maxPdfBytes: 1, maxPdfPages: 1, maxSourceCharacters: 1000, maxUrlLength: 1000, maxMarkdownBytes: 1 } },
+        features: { realJobImports: true, markdownJobImports: true, wordDocumentImports: true, rubricAssistant, siTerminology, limits: { maxCriteria: 20, maxBatchFiles: 10, maxFileBytes: 1, maxPdfBytes: 1, maxPdfPages: 1, maxSourceCharacters: 1000, maxUrlLength: 1000, maxMarkdownBytes: 1 } },
         detail: () => ({ state: 'ready', value: { job: data.job, document: data.document, rubric: data.rubric, rubricVersions: [data.firstVersion, data.rubric], source: { kind: 'pdf', displayName: 'job.pdf' }, etag: '"job"', updatedAt: data.job.createdAt, attempts: 1, warnings: [] } }),
         source: () => ({ kind: 'pdf', displayName: 'job.pdf', originalContentType: 'application/pdf' }),
         assistRubric: async (jobId, request, signal) => {
@@ -477,4 +477,42 @@ test('AI entry points are hidden for viewers, read-only panels, and when the ass
   assert.equal(findButton('Ask AI about Analysis'), undefined)
   await click(button('Edit rubric'))
   assert.equal([...document.querySelectorAll('[role="tab"]')].some((item) => item.textContent.startsWith('Ask AI')), false)
+})
+
+test('SI terminology switch changes rubric assistant actions, badges, and status messages to SI and SI assistant', async () => {
+  const addedId = randomUUID()
+  let finish
+  await render({
+    siTerminology: true,
+    assist: () => new Promise((resolve) => {
+      finish = () => resolve(changed([
+        { type: 'updateCriterion', criterionId: 'criterion-1', changes: { label: 'Quantitative analysis', citation: [citation('Lead data analysis')] } },
+        { type: 'removeCriterion', criterionId: 'criterion-2' },
+        { type: 'addCriterion', afterCriterionId: null, criterion: { id: addedId, key: 'custom', label: 'Stakeholder reporting', description: 'Reports findings.', guidance: '0 none; 1 a; 2 b; 3 c; 4 d; 5 e.', weight: 40, requirementType: 'preferred', sourceParagraphId: 'p1', sourceCitations: [citation('communicate findings to stakeholders')] } },
+      ], 'Updated with SI.'))
+    }),
+  })
+  assert.ok(button('Edit with SI'))
+  assert.ok(button('Ask SI about Analysis'))
+  await click(button('Edit with SI'))
+  assert.equal(tab('Ask SI').getAttribute('aria-selected'), 'true')
+  assert.ok(document.querySelector('textarea[placeholder="Ask SI to change or explain this draft"]'))
+  assert.match(dialog().textContent, /Message SI assistant/)
+
+  await setValue(document.querySelector('textarea[placeholder="Ask SI to change or explain this draft"]'), 'Update and rebalance with SI')
+  await click(button('Send'))
+  await pause(20)
+  assert.match(dialog().textContent, /SI assistant is working…/)
+  await act(async () => { finish(); await pause() })
+
+  assert.match(highlight('criterion:criterion-1:label').textContent, /SI/)
+  assert.doesNotMatch(highlight('criterion:criterion-1:label').textContent, /SI assist/)
+  assert.match(dialog().textContent, /from SI/)
+  assert.match(document.querySelector(`[data-change-key="criterion:${addedId}"]`).textContent, /New · SI/)
+  assert.match(dialog().textContent, /Removed · Criterion 02 · Communication · by SI/)
+  const undo = buttons(dialog()).find((item) => item.textContent.trim() === 'Undo')
+  assert.match(undo.getAttribute('aria-label'), /^Undo SI change:/)
+
+  await click(button('Add criterion'))
+  assert.ok(buttons(dialog()).some((item) => item.textContent.trim() === 'Draft with SI'))
 })

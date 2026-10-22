@@ -1,4 +1,5 @@
 import { useCallback, useMemo, useReducer, useRef } from 'react'
+import { useAiTerminology } from '../../app/public-settings-context'
 import { ASSIST_LIMITS } from '../../domain/assist'
 import {
   aiChangeCount as countAiChanges,
@@ -250,6 +251,7 @@ export function useEditSession<TDraft>({
   now?: () => number
   newId?: () => string
 }): EditSession<TDraft> {
+  const terms = useAiTerminology()
   const [state, dispatch] = useReducer(reduce<TDraft>, baseline, createEditSessionState)
   const adapterRef = useLatest(adapter)
   const maxEntriesRef = useLatest(maxEntries)
@@ -305,8 +307,8 @@ export function useEditSession<TDraft>({
     cursor: state.cursor,
     canUndo,
     canRedo,
-    undoLabel: undoEntry ? `Undo ${undoEntry.origin === 'ai' ? 'AI change' : undoEntry.origin === 'restore' ? 'restore' : 'change'}: ${undoEntry.note}` : 'Undo',
-    redoLabel: redoEntry ? `Redo ${redoEntry.origin === 'ai' ? 'AI change' : redoEntry.origin === 'restore' ? 'restore' : 'change'}: ${redoEntry.note}` : 'Redo',
+    undoLabel: undoEntry ? `Undo ${undoEntry.origin === 'ai' ? `${terms.ai} change` : undoEntry.origin === 'restore' ? 'restore' : 'change'}: ${terms.text(undoEntry.note)}` : 'Undo',
+    redoLabel: redoEntry ? `Redo ${redoEntry.origin === 'ai' ? `${terms.ai} change` : redoEntry.origin === 'restore' ? 'restore' : 'change'}: ${terms.text(redoEntry.note)}` : 'Redo',
     evictedEntries: state.evictedEntries,
     highlight: useCallback((key: string) => highlightFor(key, state.baseline, state.draft, adapterRef.current, state.attribution), [adapterRef, state.attribution, state.baseline, state.draft]),
     previous: useCallback((key: string) => previousDisplay(key, state.baseline, state.draft, adapterRef.current), [adapterRef, state.baseline, state.draft]),

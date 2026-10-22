@@ -9,6 +9,7 @@ import type { Citation, SourceDocument, Workspace } from '../../domain/types'
 import type { ReferenceDocument } from '../../domain/real-grades'
 import { gradeHeadId } from '../../domain/real-grades'
 import { isEntityArchived, isEntityRemoved, type LifecycleTarget } from '../../domain/lifecycle'
+import { aiTerminology } from '../../domain/ai-terminology'
 import { readyRealResume, resumeName } from '../resumes/resumeImportUi'
 import { getDisplayName, getResumeDisplayName } from '../../domain/displayNames'
 
@@ -53,7 +54,7 @@ export const analysisDiagnosticReasons: Record<AnalysisDiagnosticReason, string>
   'grounding-disagreement': 'The independent review did not substantiate the draft assessment.',
 }
 
-export function analysisFailureExplanation(error: AnalysisProcessingError): { title: string; explanation: string; nextAction: string } {
+function baseAnalysisFailureExplanation(error: AnalysisProcessingError): { title: string; explanation: string; nextAction: string } {
   switch (error.code) {
     case 'invalid-citation': return {
       title: 'AI evidence references did not validate',
@@ -106,6 +107,17 @@ export function analysisFailureExplanation(error: AnalysisProcessingError): { ti
       nextAction: 'Inspect the saved stage and attempt ID, and ask a workspace administrator to investigate before retrying.',
     }
   }
+}
+
+export function analysisFailureExplanation(
+  error: AnalysisProcessingError,
+  siTerminology?: boolean | { features?: { siTerminology?: boolean } } | null,
+): { title: string; explanation: string; nextAction: string } {
+  const base = baseAnalysisFailureExplanation(error)
+  const terms = aiTerminology(siTerminology)
+  return terms.si
+    ? { title: terms.text(base.title), explanation: terms.text(base.explanation), nextAction: terms.text(base.nextAction) }
+    : base
 }
 
 export function currentAnalysisDiagnostic(comparison: RealAnalysisComparisonRecord): boolean {

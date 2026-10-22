@@ -114,6 +114,8 @@ export interface AdminSettings {
     analysisEvidenceCorrections?: boolean
     /** Optional so earlier revisions and captures keep their exact shape; absent means on. Read it with rubricApprovalRequired(). */
     rubricApprovalRequired?: boolean
+    /** Optional so earlier revisions and captures keep their exact shape; absent means off. Read it with siTerminologyEnabled(). */
+    siTerminology?: boolean
   }
   maintenance: { pauseNewWork: boolean; explanation: string }
   imports: {
@@ -290,6 +292,8 @@ export interface PublicFeaturesResponse extends SettingsDeploymentCapabilities {
   rubricApprovalRequired: boolean
   /** The rubric checks that come before approval can run: the job-rubric model is deployed and new work is admitted. */
   rubricChecks: boolean
+  /** Whether user-facing AI terminology is switched to SI (Superintelligence). */
+  siTerminology?: boolean
   /** Private QC is deployed and currently admitting new reviews and improvement changes. */
   qcReviews: boolean
   limits: RuntimeNumericLimits<typeof JOB_IMPORT_LIMITS>
@@ -429,4 +433,6 @@ export {
 } from './admin-settings-resolver'
 export {
   rubricAssistantEnabled, rubricExportsEnabled, qcReviewsEnabled, analysisEvidenceCorrectionsEnabled, rubricApprovalRequired,
+  siTerminologyEnabled,
 } from './feature-switches'
+export { aiTerminology, formatSiText, type AiTerminology } from './ai-terminology'

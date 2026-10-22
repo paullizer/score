@@ -3,7 +3,7 @@ import { useLocation } from 'react-router-dom'
 import { Download, LoaderCircle } from 'lucide-react'
 import { useWorkspace } from '../../app/workspace-context'
 import { useRealAnalyses } from '../../app/real-analyses-context'
-import { usePublicSettings } from '../../app/public-settings-context'
+import { useAiTerminology, usePublicSettings } from '../../app/public-settings-context'
 import { AccessSuspendedContext } from '../../app/access-suspended-context'
 import { REPORT_FORMATS, reportDownloadType, type AnalysisReport, type AnalysisReportFormat, type ReportCandidate } from '../../domain/analysis-reports'
 import { createDefaultAdminSettings } from '../../domain/admin-settings-defaults'
@@ -33,6 +33,7 @@ export function AnalysisReportExport({ source, onManageSummaries }: { source: Re
   const accessSuspended = useContext(AccessSuspendedContext)
   const { cloud } = useWorkspace()
   const publicSettings = usePublicSettings()
+  const terms = useAiTerminology()
   const reportPolicy = publicSettings.settings?.reports ?? createDefaultAdminSettings().reports
   const role = cloud?.workspaces.find(workspace => workspace.id === cloud.currentWorkspaceId)?.role
   const policyDisabledReason = publicSettings.cloud && (publicSettings.phase !== 'ready' || !publicSettings.settings)
@@ -214,7 +215,7 @@ export function AnalysisReportExport({ source, onManageSummaries }: { source: Re
       onClick={() => changeOpen(true)}>Export report</Button>
     {policyDisabledReason && <p className="text-[11px] text-muted" role="status">{policyDisabledReason}</p>}
     <Modal open={open} onOpenChange={changeOpen} title="Export analysis report"
-      description="Download the saved scores and evidence. Exporting does not run another AI assessment."
+      description={terms.text('Download the saved scores and evidence. Exporting does not run another AI assessment.')}
       footer={<>
         <Button onClick={() => changeOpen(false)}>{busy ? 'Cancel export' : 'Close'}</Button>
         <Button variant="primary" icon={busy ? LoaderCircle : Download}

@@ -2,6 +2,7 @@ import { useCallback, useState } from 'react'
 import { Link, useNavigate, useParams } from 'react-router-dom'
 import { FlaskConical, History, LoaderCircle, Plus, Save, ShieldCheck } from 'lucide-react'
 import { useGradeLeaveGuard } from '../../app/grade-navigation-context'
+import { useAiTerminology } from '../../app/public-settings-context'
 import { useWorkspace } from '../../app/workspace-context'
 import { Badge, Button, EmptyState, InlineError, Modal, PageHeader } from '../../components/ui'
 import {
@@ -96,6 +97,7 @@ export function CreateImprovementPlan({ workspaceId, capabilities }: QcPageProps
   const [objective, setObjective] = useState('')
   const [versionFilter, setVersionFilter] = useState('')
   const [confidenceFilter, setConfidenceFilter] = useState('')
+  const terms = useAiTerminology()
   const request = useQcRequest()
   const navigate = useNavigate()
   const guard = useGradeLeaveGuard(Boolean(cases.length || name || objective) || request.unresolved, request.pending, 'Unsaved improvement case selection')
@@ -109,7 +111,7 @@ export function CreateImprovementPlan({ workspaceId, capabilities }: QcPageProps
     setCases(current => current.map(item => qcScopeKey(item.context.scope) === key ? updateCase(item) : item))
   }
   return <div className="qc-stack"><PageHeader eyebrow="COLLECT AND CURATE" title="Create an improvement plan"
-    description="Select exact saved results across analyses. Deliberately load permitted feedback, preserve disagreement, and freeze a bounded selection before asking AI for a plan." />
+    description={terms.text('Select exact saved results across analyses. Deliberately load permitted feedback, preserve disagreement, and freeze a bounded selection before asking AI for a plan.')} />
     <p className="qc-notice">Limits: {QC_LIMITS.planCases} comparisons, {QC_LIMITS.selectedReviews} included review revisions, {QC_LIMITS.selectedReviews} explicit exclusions, and {QC_LIMITS.artifactBytes / 1024 / 1024} MiB for complete frozen evidence. Oversized cases must be narrowed, never silently truncated.</p>
     <fieldset disabled={disabled} className="qc-stack">
       <label className="qc-field"><span>Plan name</span><input value={name} maxLength={160} onChange={event => setName(event.target.value)} /></label>
@@ -137,12 +139,12 @@ export function CreateImprovementPlan({ workspaceId, capabilities }: QcPageProps
       return <div key={key} hidden={!matches}><CuratedCaseEditor value={item} workspaceId={workspaceId} disabled={disabled} selectedCount={selectedCount}
         update={change => update(key, change)} onRemove={() => setCases(current => current.filter(row => qcScopeKey(row.context.scope) !== key))} /></div>
     })}
-    <section className="qc-card qc-stack"><p>The server will freeze all selected evidence and settings. Saving this selection does not invoke AI. Opening the saved plan also does not invoke AI.</p>
+    <section className="qc-card qc-stack"><p>{terms.text('The server will freeze all selected evidence and settings. Saving this selection does not invoke AI. Opening the saved plan also does not invoke AI.')}</p>
       {problem && <p className="qc-notice">{problem}</p>}<QcRequestError request={request} />
       <Button variant="primary" icon={Save} disabled={disabled || Boolean(problem)} onClick={() => void request.run(JSON.stringify(input),
         (key, signal) => createQcPlan(workspaceId, input, key, signal), detail => {
           guard.release(); navigate(`/qc/improvements/${encodeURIComponent(detail.plan.id)}`)
-        })}>Save draft plan — no AI work</Button></section>
+        })}>{terms.text('Save draft plan — no AI work')}</Button></section>
   </div>
 }
 
@@ -235,6 +237,7 @@ export function ImprovementPlan({ workspaceId, capabilities }: QcPageProps) {
 
 function PlanEditor({ initial, workspaceId, capabilities }: QcPageProps & { initial: QcPlanDetail }) {
   const { cloud } = useWorkspace()
+  const terms = useAiTerminology()
   const [detail, setDetail] = useState(initial)
   const [proposal, setProposal] = useState<QcPlanProposal | null>(initial.plan.proposal)
   const [remote, setRemote] = useState<QcPlanDetail | null>(null)
@@ -341,7 +344,7 @@ function PlanEditor({ initial, workspaceId, capabilities }: QcPageProps & { init
         <p>Plan revision {plan.revision} · evaluated candidate <code>{detail.evaluation?.candidateHash}</code> · baseline {plan.baseline.revision}.</p>
         <PromptRationale label="Required administrator rationale" value={reason} disabled={request.pending || request.unresolved} onChange={setReason} />
         <p>Confirm the text is generalized guidance: no resume excerpts, personal names, reviewer comments, or source identifiers belong in app-wide instructions.</p></>
-        : confirmation === 'draft' || (confirmation === 'retry' && detail.work?.kind === 'plan') ? <><p>One durable AI planning job over {plan.cases.filter(item => item.purpose === 'drafting').length} drafting cases and their selected feedback. Holdout feedback is withheld from drafting.</p>
+        : confirmation === 'draft' || (confirmation === 'retry' && detail.work?.kind === 'plan') ? <><p>{terms.text(`One durable AI planning job over ${plan.cases.filter(item => item.purpose === 'drafting').length} drafting cases and their selected feedback. Holdout feedback is withheld from drafting.`)}</p>
           <p>Model generation may incur charges and bounded retries. A successful draft does not run evaluations or activate prompts.</p></>
           : <TrialScopePreview detail={detail} />}
         <label className="qc-check"><input type="checkbox" checked={confirmed} disabled={request.pending || request.unresolved} onChange={event => setConfirmed(event.target.checked)} />

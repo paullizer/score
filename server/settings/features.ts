@@ -1,6 +1,7 @@
 import {
   projectPublicSettings, rubricAssistantEnabled, rubricExportsEnabled, runtimeSettingsReadiness,
   qcReviewsEnabled, analysisEvidenceCorrectionsEnabled, rubricApprovalRequired as rubricApprovalSwitch,
+  siTerminologyEnabled,
 } from '../../src/domain/admin-settings'
 import type { ProcessingSettingsSnapshot, PublicFeaturesResponse, RuntimeSettingsReadiness, SettingsDeploymentCapabilities } from '../../src/domain/admin-settings'
 import { JOB_IMPORT_LIMITS } from '../../src/domain/real-jobs'
@@ -44,6 +45,8 @@ export function effectiveFeatures(
   const rubricExports = capabilities.realJobImports && rubricExportsEnabled(settings)
   // A policy rather than an admission: new analyses and grade ladders enforce it, and pausing new work doesn't change it.
   const rubricApprovalRequired = rubricApprovalSwitch(settings)
+  // Interface terminology preference; independent of deployment gates and new-work admission.
+  const siTerminology = siTerminologyEnabled(settings)
   // The checks before approval call the job-rubric model, so they need its deployment and new-work admission.
   const rubricChecks = capabilities.realJobImports && capabilities.rubricAssistant === true && admitting
   const reference = settings.grades.references
@@ -53,7 +56,7 @@ export function effectiveFeatures(
     ...publicSettings.features, jobImports: realJobImports, resumeImports: realResumeImports,
     gradeLadders: realGradeLadders, newAnalyses: realAnalyses, summaryGeneration: analysisSummaryGeneration, rubricAssistant,
     rubricExports,
-    qcReviews, analysisEvidenceCorrections, rubricApprovalRequired,
+    qcReviews, analysisEvidenceCorrections, rubricApprovalRequired, siTerminology,
   }
   for (const [kind, available] of [['jobs', realJobImports], ['resumes', realResumeImports]] as const) {
     publicSettings.imports[kind].allowedFormats = available
@@ -72,6 +75,7 @@ export function effectiveFeatures(
     rubricExports,
     rubricApprovalRequired,
     rubricChecks,
+    siTerminology,
     wordDocumentImports: capabilities.wordDocumentImports && (
       (realJobImports && jobPolicy.allowedFormats.some(format => format === 'doc' || format === 'docx')) ||
       (realResumeImports && resumePolicy.allowedFormats.some(format => format === 'doc' || format === 'docx'))

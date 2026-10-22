@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState, type KeyboardEvent, type ReactNode } from 'react'
 import type { LucideIcon } from 'lucide-react'
 import { PanelRightClose, PanelRightOpen, Redo2, Undo2 } from 'lucide-react'
+import { useAiTerminology } from '../../app/public-settings-context'
 import { Button } from '../../components/ui'
 import '../../styles/assisted-editing.css'
 
@@ -52,6 +53,7 @@ export function AssistedEditorShell({
   summary,
   busy = false,
 }: AssistedEditorShellProps) {
+  const terms = useAiTerminology()
   const firstPanelId = panels[0]?.id ?? null
   const selectedPanelId = activePanel && panels.some(panel => panel.id === activePanel) ? activePanel : firstPanelId
   const selectedPanel = panels.find(panel => panel.id === selectedPanelId)
@@ -101,7 +103,7 @@ export function AssistedEditorShell({
         </>}
       </div>
       {summaryVisible && summary && <div className="assisted-summary-bar" role="status">
-        <span>{summary.total.toLocaleString('en-US')} unsaved {summary.total === 1 ? 'change' : 'changes'} · {summary.ai.toLocaleString('en-US')} from AI assist</span>
+        <span>{summary.total.toLocaleString('en-US')} unsaved {summary.total === 1 ? 'change' : 'changes'} · {summary.ai.toLocaleString('en-US')} {terms.fromAssist}</span>
         <Button size="sm" variant="ghost" onClick={summary.onReview}>Review changes</Button>
         <Button size="sm" variant="ghost" onClick={summary.onNext}>Next change</Button>
       </div>}

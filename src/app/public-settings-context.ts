@@ -1,6 +1,8 @@
 import { createContext, useContext } from 'react'
 import type { PublicSettings } from '../domain/admin-settings'
+import { aiTerminology, type AiTerminology } from '../domain/ai-terminology'
 import { admissionReason, type NewWorkKind } from '../services/publicSettings'
+import { WorkspaceContext } from './workspace-context'
 
 export interface PublicSettingsContextValue {
   settings: PublicSettings | null
@@ -17,6 +19,14 @@ export const PublicSettingsContext = createContext<PublicSettingsContextValue>({
 })
 
 export function usePublicSettings() { return useContext(PublicSettingsContext) }
+
+export function useAiTerminology(override?: boolean | { features?: { siTerminology?: boolean } } | null): AiTerminology {
+  const { settings } = usePublicSettings()
+  const workspace = useContext(WorkspaceContext)
+  if (override !== undefined) return aiTerminology(override)
+  if (settings) return aiTerminology(settings)
+  return aiTerminology(workspace?.cloud?.realJobs?.features?.siTerminology === true)
+}
 
 export function originalDownloadReason(policy: PublicSettingsContextValue, role?: PublicSettings['documents']['originalDownloadRoles'][number]): string | null {
   if (policy.cloud && (policy.phase !== 'ready' || !policy.settings)) {

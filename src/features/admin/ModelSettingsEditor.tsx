@@ -2,6 +2,7 @@ import { RefreshCw } from 'lucide-react'
 import type {
   AdminSettings, DeploymentInventory, ModelDeployment, ModelTaskId, SettingsFieldError, SettingsFieldMetadata, TaskModelSettings,
 } from '../../domain/admin-settings'
+import { aiTerminology } from '../../domain/ai-terminology'
 import { MODEL_TASK_IDS } from '../../domain/admin-settings-tasks'
 import { Badge, Button } from '../../components/ui'
 import { SettingsField, SettingsFieldProvenance } from './SettingsField'
@@ -152,13 +153,14 @@ export function ModelSettingsEditor({
           ? inventory.deployments.length === 0 ? `Your Azure resource reported no deployments at ${checkedTime(inventory.checkedAt)}.`
             : `Found ${inventory.deployments.length === 1 ? '1 deployment' : `${inventory.deployments.length} deployments`} in your Azure resource at ${checkedTime(inventory.checkedAt)}.`
           : ''
+  const terms = aiTerminology(settings)
   const coverage = ownModel.length === 0
-    ? `All ${tasks.length} AI tasks use the default model.`
-    : `${tasks.length - ownModel.length} of ${tasks.length} AI tasks use the default model. ${ownModel.length === 1 ? 'One task uses its own model' : `${ownModel.length} tasks use their own model`}: ${ownModel.map(task => `${taskNames[task]} (${nameFor(task)})`).join(', ')}.`
+    ? `All ${tasks.length} ${terms.ai} tasks use the default model.`
+    : `${tasks.length - ownModel.length} of ${tasks.length} ${terms.ai} tasks use the default model. ${ownModel.length === 1 ? 'One task uses its own model' : `${ownModel.length} tasks use their own model`}: ${ownModel.map(task => `${taskNames[task]} (${nameFor(task)})`).join(', ')}.`
 
   return <div className="space-y-6">
-    {matches(`ai.defaultDeploymentId AI model default model ${names}`) && <section className="panel settings-section" aria-label="AI model">
-      <h2>AI model</h2>
+    {matches(`ai.defaultDeploymentId AI model SI model default model ${names}`) && <section className="panel settings-section" aria-label={`${terms.ai} model`}>
+      <h2>{terms.ai} model</h2>
       <p>Score sends job rubric, resume, assessment, summary, and QC work to a model deployment in your Azure resource. Changes apply to new work once you review and save them; work that has already started keeps its model.</p>
       <label className="field settings-model-picker"><span className="field-label">Default model</span>
         <select className="input" disabled={disabled} value={defaultId} onChange={event => choose('ai.defaultDeploymentId', event.target.value)}>
@@ -219,7 +221,7 @@ export function ModelSettingsEditor({
     })}
     {matches(`ai.deployments Azure deployments catalog Deployments Score can use ${names}`) && <section className="panel settings-section" aria-label="Deployments Score can use">
       <h2>Deployments Score can use</h2>
-      <p>Score sends AI work only to the deployments listed here. Choosing one from “Also in your Azure resource” in a list above adds it, and removing one here doesn’t delete it from Azure.</p>
+      <p>{terms.text('Score sends AI work only to the deployments listed here. Choosing one from “Also in your Azure resource” in a list above adds it, and removing one here doesn’t delete it from Azure.')}</p>
       <p className="field-hint"><SettingsFieldProvenance field={metadata('ai.deployments')} changed={JSON.stringify(deployments) !== JSON.stringify(saved.ai.deployments)} /></p>
       <ul className="settings-deployment-list">{deployments.map((deployment, index) => {
         const patch = (value: Partial<ModelDeployment>) => onChange('ai.deployments', deployments.map((item, at) => at === index ? { ...item, ...value } : item))

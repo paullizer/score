@@ -1,5 +1,6 @@
 import { useId, useState, type KeyboardEvent, type ReactNode } from 'react'
 import { AlertCircle, CornerDownLeft, LocateFixed, RotateCcw, Sparkles, X } from 'lucide-react'
+import { useAiTerminology } from '../../app/public-settings-context'
 import { ASSIST_LIMITS } from '../../domain/assist'
 import { Button, InlineError } from '../../components/ui'
 import type { AssistAppliedChange, AssistConversationUiTurn } from './useAssistConversation'
@@ -41,9 +42,11 @@ export function AssistConversation({
   onUndoTurn,
   onJump,
   onQuote,
-  placeholder = 'Ask AI to change or explain this draft',
+  placeholder,
   emptyState,
 }: AssistConversationProps) {
+  const terms = useAiTerminology()
+  const effectivePlaceholder = placeholder ?? terms.askPlaceholder
   const [text, setText] = useState('')
   const textareaId = useId()
   const counterId = useId()
@@ -72,7 +75,7 @@ export function AssistConversation({
     <div className="assist-log" role="log" aria-live="polite" aria-relevant="additions text">
       {turns.length === 0 ? <div className="assist-empty-state">{emptyState ?? <>Describe a change and it's applied to this draft for your review. Nothing is saved until you choose Save, and this conversation stays in this editor.</>}</div>
         : turns.map(turn => <article key={turn.id} className={`assist-turn is-${turn.role} is-${turn.status}`}>
-          <header><strong>{turn.role === 'user' ? 'You' : 'AI assist'}</strong>{turn.role === 'assistant' && turn.outcome && <span>{outcomeLabels[turn.outcome]}</span>}</header>
+          <header><strong>{turn.role === 'user' ? 'You' : terms.assistBadge}</strong>{turn.role === 'assistant' && turn.outcome && <span>{outcomeLabels[turn.outcome]}</span>}</header>
           <p className="assist-turn-text">{turn.text || (turn.status === 'pending' ? 'Working…' : '')}</p>
           {turn.role === 'assistant' && turn.changes && turn.changes.length > 0 && <div className="assist-change-card">
             <h4>Changes</h4>
@@ -99,12 +102,12 @@ export function AssistConversation({
           </InlineError>}
         </article>)}
     </div>
-    {pending && <div className="assist-pending" role="status"><Sparkles size={15} aria-hidden="true" />AI assist is working… {elapsedSeconds} s <Button size="sm" variant="ghost" onClick={onCancel}>Cancel</Button></div>}
-    {disabledReason && <p className="assist-disabled-note">{disabledReason}</p>}
+    {pending && <div className="assist-pending" role="status"><Sparkles size={15} aria-hidden="true" />{terms.assistantWorking} {elapsedSeconds} s <Button size="sm" variant="ghost" onClick={onCancel}>Cancel</Button></div>}
+    {disabledReason && <p className="assist-disabled-note">{terms.text(disabledReason)}</p>}
     <label className="assist-composer" htmlFor={textareaId}>
-      <span>Message AI assist</span>
+      <span>{terms.messageAssistant}</span>
       <textarea id={textareaId} value={text} onChange={event => setText(event.target.value)} onKeyDown={handleKeyDown}
-        placeholder={placeholder} maxLength={ASSIST_LIMITS.maxInstructionCharacters + 1} aria-describedby={counterId} disabled={Boolean(disabledReason)} />
+        placeholder={effectivePlaceholder} maxLength={ASSIST_LIMITS.maxInstructionCharacters + 1} aria-describedby={counterId} disabled={Boolean(disabledReason)} />
     </label>
     <div className="assist-composer-footer">
       <span id={counterId} aria-live="polite" className={overLimit ? 'is-over-limit' : ''}>{text.length.toLocaleString('en-US')} / {ASSIST_LIMITS.maxInstructionCharacters.toLocaleString('en-US')}</span>

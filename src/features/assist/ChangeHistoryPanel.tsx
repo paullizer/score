@@ -1,3 +1,4 @@
+import { useAiTerminology } from '../../app/public-settings-context'
 import { Badge, Button } from '../../components/ui'
 import type { DraftChange, HistoryEntry } from './types'
 
@@ -23,16 +24,6 @@ export interface ChangeHistoryPanelProps {
   onPreviewVersion?: (id: string) => void
   onUseVersion?: (id: string) => void
   disabled?: boolean
-}
-
-function authorLabel(author: 'ai' | 'user') {
-  return author === 'ai' ? 'AI assist' : 'You'
-}
-
-function originLabel(origin: 'ai' | 'user' | 'restore') {
-  if (origin === 'ai') return 'AI assist'
-  if (origin === 'restore') return 'Restored'
-  return 'You'
 }
 
 function groupedChanges(changes: DraftChange[]): [string, DraftChange[]][] {
@@ -65,6 +56,9 @@ export function ChangeHistoryPanel({
   onUseVersion,
   disabled = false,
 }: ChangeHistoryPanelProps) {
+  const terms = useAiTerminology()
+  const authorLabel = (author: 'ai' | 'user') => author === 'ai' ? terms.assistBadge : 'You'
+  const originLabel = (origin: 'ai' | 'user' | 'restore') => origin === 'ai' ? terms.assistBadge : origin === 'restore' ? 'Restored' : 'You'
   const newestEntries = [...entries].reverse()
   return <div className="change-history-panel">
     <section>
@@ -96,10 +90,10 @@ export function ChangeHistoryPanel({
             <div>
               <Badge tone="neutral">{originLabel(entry.origin)}</Badge>
               {current && <Badge tone="accent">Current</Badge>}
-              <strong>{entry.note}</strong>
+              <strong>{terms.text(entry.note)}</strong>
               <time>{new Date(entry.at).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}</time>
             </div>
-            <Button size="sm" variant="ghost" onClick={() => onRestore(entry.id)} disabled={disabled || current} aria-label={`Restore to here: ${entry.note}`}>Restore to here</Button>
+            <Button size="sm" variant="ghost" onClick={() => onRestore(entry.id)} disabled={disabled || current} aria-label={`Restore to here: ${terms.text(entry.note)}`}>Restore to here</Button>
           </li>
         })}
         <li className={cursor === -1 ? 'is-current' : ''}>

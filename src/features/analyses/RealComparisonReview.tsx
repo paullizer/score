@@ -1,6 +1,7 @@
 import { useEffect, useId, useRef, useState, type ReactNode } from 'react'
 import { ArrowUpRight, ChevronDown, FileText, Layers3, LoaderCircle, Quote, ScanLine, ShieldCheck } from 'lucide-react'
 import { useRealAnalyses } from '../../app/real-analyses-context'
+import { useAiTerminology } from '../../app/public-settings-context'
 import type { SavedReviewView } from '../../app/saved-review-navigation'
 import type { RealAnalysisComparisonDetail, RealAnalysisDocumentResponse, RealCriterionResult } from '../../domain/real-analyses'
 import type { Citation } from '../../domain/types'
@@ -38,6 +39,7 @@ export function RealComparisonReview({ detail, actions, initialView, qc }: {
   detail: RealAnalysisComparisonDetail; actions?: ReactNode; initialView?: SavedReviewView | null
   qc?: { renderCriterion: (criterionId: string) => ReactNode }
 }) {
+  const terms = useAiTerminology()
   const { comparison, resumeSnapshot: resume, targetSnapshot: target, result } = detail
   const savedResume = comparison.resume.summary
   const resumeLabel = getResumeDisplayName(savedResume)
@@ -85,11 +87,11 @@ export function RealComparisonReview({ detail, actions, initialView, qc }: {
       {comparison.nextAttemptAt && <p className="mt-1">Next automatic attempt: {comparison.nextAttemptAt}</p>}
     </div>
     {failure && comparison.error && <div className="border-t p-5 text-[12px]">
-      <h3 className="font-semibold">{failure.title}</h3><p className="mt-2">{failure.explanation}</p>
+      <h3 className="font-semibold">{terms.text(failure.title)}</h3><p className="mt-2">{terms.text(failure.explanation)}</p>
       <p className="mt-2 text-[11px] text-muted">Stage: {analysisFailureStages[comparison.error.stage]} ({comparison.error.stage}) · {comparison.error.code}</p>
-      <p className="mt-2"><strong>Next action: </strong>{failure.nextAction}</p>
+      <p className="mt-2"><strong>Next action: </strong>{terms.text(failure.nextAction)}</p>
     </div>}
-    <p className="border-t p-5 text-[12px]">Readable saved input is separate from AI validation. Processing failures are not zero scores. Missing evidence can be documented as a gap in a completed assessment, but an unaccepted draft is not a result.</p>
+    <p className="border-t p-5 text-[12px]">{terms.text('Readable saved input is separate from AI validation. Processing failures are not zero scores. Missing evidence can be documented as a gap in a completed assessment, but an unaccepted draft is not a result.')}</p>
   </section>
     {diagnostics}
     <section ref={sourcePanel} className="detail-panel evidence-panel mt-5" aria-label="Saved real source evidence">{sources}</section>
@@ -176,7 +178,7 @@ export function RealComparisonReview({ detail, actions, initialView, qc }: {
       <dl className="mt-4 space-y-3 break-words">
         <div><dt className="text-muted">Assessment model / deployment</dt><dd>{result.provenance.assessment.model} · {result.provenance.assessment.deployment}</dd></div>
         <div><dt className="text-muted">Prompt / schema / calculation version</dt><dd>{result.provenance.assessment.promptVersion} · {result.provenance.assessment.schemaVersion} · {result.provenance.calculationVersion}</dd></div>
-        <div><dt className="text-muted">Recorded AI review scope</dt><dd>{result.provenance.groundingReviews.length
+        <div><dt className="text-muted">Recorded {terms.ai} review scope</dt><dd>{result.provenance.groundingReviews.length
           ? <ul className="space-y-2">{result.provenance.groundingReviews.map(review => <li key={review.id}>
             {review.scope ? `Selected evidence-gap verification only (${review.scope.criterionIds.join(', ')})` : 'Full-assessment grounding review'}
             {' · '}{review.outcome} · {review.provenance.model} · {review.provenance.promptVersion}
