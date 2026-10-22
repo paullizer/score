@@ -32,8 +32,8 @@ before(async () => {
   options = {
     links: { origin: 'https://score.test', workspaceId: 'workspace-one' },
     fonts: {
-      regular: buffer(await readFile('src\\assets\\report-fonts\\NotoSans-Regular.ttf')),
-      bold: buffer(await readFile('src\\assets\\report-fonts\\NotoSans-Bold.ttf')),
+      regular: buffer(await readFile(resolve('src', 'assets', 'report-fonts', 'NotoSans-Regular.ttf'))),
+      bold: buffer(await readFile(resolve('src', 'assets', 'report-fonts', 'NotoSans-Bold.ttf'))),
     },
   }
 })
