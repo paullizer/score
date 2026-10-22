@@ -1167,7 +1167,7 @@ for (const kind of ['job', 'resume', 'reference']) {
       workspace.jobs = workspace.jobs.map(item => item.id === job.id ? job : item)
       const source = { kind: 'pdf', displayName: 'Captured job.pdf', originalContentType: original.contentType, bytes: original.bytes, sha256: original.sha256 }
       cloud = { realJobs: {
-        source: () => source, detail: () => ({ state: 'ready', value: {} }),
+        source: () => source, detail: () => ({ state: 'ready', value: { job, source } }),
         summaries: [{ job, source, etag: '"job-original"', warnings: [], attempts: 1 }],
         originalUrl: id => `/api/workspaces/${metadata.id}/jobs/${id}/original`,
       } }
