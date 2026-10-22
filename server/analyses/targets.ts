@@ -176,9 +176,10 @@ export class RealAnalysisTargets {
     if (!this.deps.jobs) throw unavailable('The approved grade seed eligibility is unavailable.')
     if ((await this.deps.jobs.store.getWorkspaceLifecycle(workspaceId)).state !== 'active') return false
     const seed = await this.deps.jobs.store.get(workspaceId, ladder.seedJobId)
-    if (!seed) throw notFound('The approved grade seed job is no longer available for a new analysis.')
+    if (!seed) return true
     const job = validateJob(seed.record, workspaceId, ladder.seedJobId)
-    return !analysisIsLocked(job.lifecycle) && !analysisIsLocked(job.rubricLifecycle) && !job.job.rubricDeletedAt
+    if (job.job.rubricDeletedAt && job.rubricLifecycle?.deletedAt) return true
+    return !analysisIsLocked(job.lifecycle) && !analysisIsLocked(job.rubricLifecycle)
   }
 
   private async gradeTarget(workspaceId: string, head: GradeHeadRecord, requested?: RealGradeTargetSelection): Promise<ResolvedGrade> {

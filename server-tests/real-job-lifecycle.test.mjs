@@ -285,13 +285,11 @@ test('missing job lifecycle capabilities cannot report successful cleanup', asyn
   } finally { await f.close() }
 })
 
-test('archived seed ladders on later pages block both job and logical rubric deletion', async () => {
+test('archived seed ladders do not block job or logical rubric deletion', async () => {
   const ladders = []
-  let pages = 0
   const grades = {
     store: {
       async list(workspaceId, options) {
-        pages += 1
         const offset = Number(options.continuationToken ?? 0)
         return {
           items: ladders.slice(offset, offset + 100).map(record => ({ record: { ...record, workspaceId }, etag: '"ladder"' })),
@@ -304,9 +302,6 @@ test('archived seed ladders on later pages block both job and logical rubric del
   const f = await fixture({ grades })
   try {
     const value = await ready(f, 3)
-    for (let index = 0; index < 100; index += 1) {
-      ladders.push({ id: `other-ladder-${index}`, recordType: 'grade-ladder', name: 'Other ladder', seedJobId: 'other-job', seedRubricId: 'other-rubric', seedRubricVersion: 1 })
-    }
     ladders.push({
       id: 'retained-ladder', recordType: 'grade-ladder', name: 'Archived seed ladder', seedJobId: f.jobId,
       seedRubricId: `rubric-${f.jobId}`, seedRubricVersion: 1, lifecycle: { archivedAt: timestamp },
@@ -315,18 +310,12 @@ test('archived seed ladders on later pages block both job and logical rubric del
       const preview = await fetch(`${f.base}/workspaces/${f.workspaceId}/jobs/${f.jobId}/lifecycle?scope=${scope}`, { headers: authHeaders() })
       assert.equal(preview.status, 200)
       const { impact } = await preview.json()
-      assert.equal(impact.blockers.length, 1)
-      assert.equal(impact.blockers[0].id, 'retained-ladder')
-      assert.match(impact.blockers[0].href, /grade-ladders/)
-      const response = await f.lifecycle('delete', scope, value.etag)
-      assert.equal(response.status, 409)
-      assert.equal((await response.json()).impact.blockers[0].name, 'Archived seed ladder')
+      assert.deepEqual(impact.blockers, [])
     }
-    assert.ok(pages >= 8, 'preview and mutation both recheck every dependency page')
-    assert.equal((await f.jobs.store.get(f.workspaceId, f.jobId)).etag, value.etag)
-    assert.equal((await f.jobs.store.listRubrics(f.workspaceId, f.jobId)).length, 3)
-    ladders.pop()
-    assert.equal((await f.lifecycle('delete', 'job', value.etag)).status, 200)
+    const rubricDeleted = await f.lifecycle('delete', 'rubric', value.etag)
+    assert.equal(rubricDeleted.status, 200)
+    const afterRubric = (await rubricDeleted.json()).job
+    assert.equal((await f.lifecycle('delete', 'job', afterRubric.etag)).status, 200)
   } finally { await f.close() }
 })
 

@@ -811,18 +811,14 @@ realAnalysisDependencyBlockers(
 The participant exposes `setState`, `cancel`, `purge`, `counts`,
 `pendingWorkspaces`, and `resume`. Counts include **every retained run**, including
 archived and cleanup-pending runs (`analyses`, `analysisComparisons`). Workspace
-deletion must combine these with other lifecycle blockers and must remain blocked
-until all runs are explicitly deleted. `purge` also enforces this rule; it is not
-an implicit analysis cascade. Run cleanup precedes resume/grade/job cleanup.
+deletion automatically cascades to all retained runs during `purge` without
+blocking workspace or source deletion. Run cleanup precedes resume/grade/job cleanup.
 
-Dependencies come from exact manifest/snapshot bindings, including source resume
-IDs, job IDs, stable logical rubric groups, historical rubric version IDs,
-`gradeHeadId(ladderId, grade)`, ladder IDs, and frozen GS seed jobs/rubrics. No
-mutable live-source lookup is needed. Unreadable dependency storage fails closed.
-Blocker links use `/analyses/<encodedId>`. A workspace target returns
-all retained real runs; an analysis target has no dependent-run blockers.
+`realAnalysisDependencyBlockers` validates the workspace scope and returns `[]`
+because analyses freeze their own immutable snapshots and never block deleting
+workspaces, jobs, rubrics, grade ladders, or resumes.
 
-Delete durably saves the dependency bindings before removing evidence, fences the
+Delete fences the
 run, and drains cancellation and Blob writers. It deletes comparisons and all
 owned snapshots/manifests/copied evidence/results/diagnostics using exact ETags and validated
 private prefixes. Cleanup follows empty continuation pages and restarts scans

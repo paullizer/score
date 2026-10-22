@@ -631,12 +631,7 @@ test('real lifecycle preserves frozen model evidence, blocks retained dependenci
     await change(runPath, 'archive')
     assert.deepEqual(await jsonResponse(await fixture.request(detailPath)), evidence)
     const impact = await jsonResponse(await fixture.request(`${resumePath}/lifecycle`))
-    assert.ok(impact.impact.blockers.some((item) => item.kind === 'analysis' && item.id === created.run.id))
-    const latestResume = await jsonResponse(await fixture.request(resumePath))
-    const blocked = await fixture.request(`${resumePath}/lifecycle`, {
-      method: 'POST', headers: { 'Content-Type': 'application/json', 'If-Match': latestResume.etag }, body: JSON.stringify({ action: 'delete' }),
-    })
-    assert.equal(blocked.status, 409, await blocked.text())
+    assert.deepEqual(impact.impact.blockers, [])
     await change(resumePath, 'unarchive')
     await change(`${base}/jobs/${job.job.id}`, 'unarchive', { scope: 'job' })
     await change(runPath, 'delete')

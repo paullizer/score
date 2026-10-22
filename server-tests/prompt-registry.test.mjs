@@ -60,6 +60,8 @@ function cosmos(options = {}) {
       },
       query(specification, options) {
         assert.equal(options.partitionKey, 'score')
+        assert.doesNotMatch(specification.query, /\bc\.value\b/)
+        assert.match(specification.query, /c\["value"\]\.activationId/)
         return { async fetchAll() {
           const params = new Map(specification.parameters.map(value => [value.name, value.value]))
           return { resources: [...documents.values()].filter(doc => doc.recordType === params.get('@type') &&

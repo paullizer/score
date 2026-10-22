@@ -155,7 +155,7 @@ export function createQcStoreFromContainer(container: Pick<Container, 'item' | '
       add('runId', options.runId, '(c.scope.runId = @runId OR c.runId = @runId OR ARRAY_CONTAINS(c.runIds, @runId) OR ' +
         'EXISTS(SELECT VALUE s FROM s IN c.cases WHERE s.scope.runId = @runId) OR ' +
         'EXISTS(SELECT VALUE s FROM s IN c.comparisons WHERE s.runId = @runId) OR ' +
-        'EXISTS(SELECT VALUE s FROM s IN c.value.cases WHERE s.scope.runId = @runId))')
+        'EXISTS(SELECT VALUE s FROM s IN c["value"].cases WHERE s.scope.runId = @runId))')
       add('comparisonId', options.comparisonId, 'c.scope.comparisonId = @comparisonId')
       add('resultSha256', options.resultSha256, 'c.scope.resultSha256 = @resultSha256')
       add('resultRevision', options.resultRevision, 'c.scope.resultRevision = @resultRevision')

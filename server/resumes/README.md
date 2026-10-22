@@ -193,9 +193,8 @@ or purge. A repeated `setState(..., 'deleting', ...)` against an already `delete
 without weakening the fence.
 
 `ResumeLifecycleService(resumes, lifecycle?, now?)` implements individual `impact` and `change`.
-The router's optional `lifecycle: LifecycleDependencies` callback must return every retained real
-analysis referencing `{ kind: 'resume', id }`, including archived analyses and historical versions.
-Delete fails closed when the callback is unavailable or reports blockers. The initial check and
+Deleting a resume is never blocked by retained analyses because analyses store their own frozen
+resume snapshots. The initial check and
 fence run under the same workspace mutation lease as analysis creation. Once admitted, a durable
 delete operation can be resumed without the original HTTP request.
 

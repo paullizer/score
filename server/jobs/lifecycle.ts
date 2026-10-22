@@ -50,10 +50,9 @@ export async function jobLifecycleImpact(
   jobs: RealJobsDeps,
   value: VersionedRealJob,
   scope: JobLifecycleScope,
-  dependencies: LifecycleDependencies | undefined,
+  dependencies?: LifecycleDependencies,
 ): Promise<LifecycleImpact> {
   requireJobLifecycle(jobs)
-  if (!dependencies) throw unavailable('Job lifecycle dependency checks are unavailable.')
   const { record } = value
   const versions = await jobs.store.listRubrics(record.workspaceId, record.id)
   const latest = versions.findLast(rubric => rubric.id === record.job.rubricId) ?? versions.at(-1)
@@ -68,7 +67,7 @@ export async function jobLifecycleImpact(
       rubrics: versions.length ? 1 : 0,
       rubricVersions: versions.length,
     },
-    blockers: await dependencies.impact(record.workspaceId, target),
+    blockers: dependencies ? await dependencies.impact(record.workspaceId, target) : [],
   }
 }
 

@@ -100,12 +100,9 @@ planner skips archived/removed heads. Parent archive state is inherited without
 setting child archive flags. Restoring a parent preserves independently archived
 heads. Unarchive never restarts cancelled work.
 
-Deletion always requires the cross-store `LifecycleDependencies.impact` provider
-and rechecks blockers before fencing. Retained analyses, including archived
-analyses and references to historical rubric versions/groups, block deletion.
-The surrounding web coordinator serializes workspace mutations under its
-recoverable state lease so another API request cannot add a dependency after the
-check. Existing ladders also protect their seed jobs and logical seed rubrics.
+Deletion is never blocked by retained analyses or seed ladders because both grade
+ladders and analyses retain their own immutable frozen snapshots. The surrounding
+web coordinator serializes workspace mutations under its recoverable state lease.
 New ladder creation rejects archived or removed seed jobs/rubrics, even when an
 unpublished initialization artifact already exists. It rechecks the live ready
 job and the exact saved rubric ID/version both before reusing preparation and
