@@ -6,6 +6,7 @@ import { assertReportResourceLimits } from './model'
 import { safeReportFilename } from './presentation'
 import { validatedReportLinkContext } from './links'
 import { captureReportSettings, reportGenerationPolicy, reportLimits } from './policy'
+import { validateApplicantIdentities } from './applicant-mapping'
 
 const MAX_FONT_BYTES = 4 * 1024 * 1024
 
@@ -66,13 +67,14 @@ export function assertReportFile(
 export async function generateReportInWorker(
   report: AnalysisReport,
   format: AnalysisReportFormat,
-  options: { signal: AbortSignal; onProgress?: (message: string) => void; links?: ReportLinkContext; rubricDetails?: boolean },
+  options: { signal: AbortSignal; onProgress?: (message: string) => void; links?: ReportLinkContext; rubricDetails?: boolean; applicantIdentities?: ReportGenerationOptions['applicantIdentities'] },
 ): Promise<ArrayBuffer> {
   options.signal.throwIfAborted()
   const startedAt = Date.now()
   const policy = reportGenerationPolicy(report, format)
   const limits = reportLimits(policy)
   assertReportResourceLimits(report, limits.maxInputBytes)
+  validateApplicantIdentities(report, options)
   const snapshot = structuredClone(report)
   snapshot.capture.settings = captureReportSettings(report.capture.settings)
   const links = validatedReportLinkContext(snapshot, options)
@@ -90,6 +92,7 @@ export async function generateReportInWorker(
     signal.throwIfAborted()
     const bytes = await runWorker(snapshot, format, signal, options.onProgress, {
       ...(links ? { links } : {}), ...(fonts ? { fonts } : {}), ...(options.rubricDetails ? { rubricDetails: true } : {}),
+      ...(options.applicantIdentities ? { applicantIdentities: structuredClone(options.applicantIdentities) } : {}),
     })
     signal.throwIfAborted()
     if (Date.now() - startedAt > limits.maxGenerationMilliseconds) throw new DOMException('Report generation timed out', 'TimeoutError')

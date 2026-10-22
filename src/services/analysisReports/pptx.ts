@@ -27,6 +27,7 @@ import {
 import type { DeckCell } from './pptx-primitives'
 import { addRubricSlides } from './rubric-pptx'
 import { rubricDetailsTitle, rubricDocumentFromReportGroup } from './rubric-model'
+import { applicantExportLabel, exportApplicant, LOCAL_MAPPING_NOTICE, validateApplicantIdentities } from './applicant-mapping'
 
 const REVIEW_TABLE_Y = 2.58
 const EXPLANATION_WIDTH = (BODY_WIDTH - COLUMN_GAP) / 2
@@ -329,18 +330,19 @@ function resumeDocumentReference(comparison: ReportComparison): string {
   return `Resume v${comparison.candidate.documentVersion}`
 }
 
-function candidateTooltip(comparison: ReportComparison): string {
-  const name = readableCandidateName(comparison.candidate)
-  return comparison.candidate.displayName !== undefined
+function candidateTooltip(comparison: ReportComparison, options?: ReportGenerationOptions): string {
+  const name = applicantExportLabel(comparison.candidate, readableCandidateName(comparison.candidate), options)
+  return comparison.candidate.displayName !== undefined || exportApplicant(comparison.candidate, options)
     ? `${name} · Source-stated name: ${comparison.candidate.name ?? 'Not stated'} · Source: ${comparison.candidate.sourceLabel}`
     : name
 }
 
 function overviewCandidateCell(
-  comparison: ReportComparison, number: number, links: ReviewLinks, width: number, overviewSlide?: number,
+  comparison: ReportComparison, number: number, links: ReviewLinks, width: number, overviewSlide?: number, options?: ReportGenerationOptions,
 ): DeckCell {
   const name = readableCandidateName(comparison.candidate)
-  const tooltip = candidateTooltip(comparison)
+  const tooltip = candidateTooltip(comparison, options)
+  if (options?.applicantIdentities) return { text: applicantExportLabel(comparison.candidate, name, options), url: links.analysis, tooltip }
   if (fits(name, width, 1.1, TABLE_FONT)) return { text: name, url: links.analysis, tooltip }
   const label = `Candidate ${number}`
   const source = fits(`${label}\n${comparison.candidate.sourceLabel}\nView analysis`, width, 1.4, TABLE_FONT)
@@ -382,7 +384,7 @@ function overview(deck: ReportDeck, group: ReportGroup, groupIndex: number, cand
     if (comparison.status !== 'complete') continue
     const row = [
       overviewCandidateCell(comparison, index + 1, deck.links(comparison), widths[0] - TABLE_PADDING_X * 2,
-        candidateOverviews.get(comparison.id)),
+        candidateOverviews.get(comparison.id), deck.options),
       { text: comparison.overall.status === 'available' ? overallScoreLabel(comparison.overall) : 'Withheld' },
       { text: [...candidateNarrativeDisclosures(comparison), candidateNarrativeOverview(comparison)].join('\n\n') },
     ]
@@ -390,18 +392,23 @@ function overview(deck: ReportDeck, group: ReportGroup, groupIndex: number, cand
     if (HEADER_HEIGHT + rowHeight > capacity) {
       if (rows.length) flush()
       let remaining = row[2].text
+      let identityRemaining = row[0].text
       let part = 0
       do {
         const fragment = takePptxText(remaining, widths[2] - TABLE_PADDING_X * 2,
           capacity - HEADER_HEIGHT - TABLE_PADDING_Y * 2, TABLE_FONT)
-        const continuedRow = [row[0], row[1], { text: fragment.text }]
+        const identityFragment = takePptxText(identityRemaining, widths[0] - TABLE_PADDING_X * 2,
+          capacity - HEADER_HEIGHT - TABLE_PADDING_Y * 2, TABLE_FONT)
+        const continuedRow = [deck.options?.applicantIdentities
+          ? { ...row[0], text: identityFragment.text || 'Applicant review (continued)' } : row[0], row[1], { text: fragment.text }]
         rows.push(continuedRow)
         heights.push(tableRowHeight(continuedRow, widths))
         continued = part++ > 0
         manualContinuation = comparison.narrative?.approval?.kind === 'manual'
         flush()
         remaining = fragment.rest
-      } while (remaining)
+        identityRemaining = identityFragment.rest
+      } while (remaining || identityRemaining)
       continue
     }
     if (rows.length && HEADER_HEIGHT + (rows.length + 1) * Math.max(rowHeight, ...heights) > capacity) flush()
@@ -562,10 +569,10 @@ function reviewPlan(group: ReportGroup, comparison: ReportComparison, links: Rev
 }
 
 function candidateLinks(
-  slide: PptxGenJS.Slide, group: ReportGroup, comparison: ReportComparison, links: ReviewLinks, key: string, fullDetails: boolean,
+  slide: PptxGenJS.Slide, group: ReportGroup, comparison: ReportComparison, links: ReviewLinks, key: string, fullDetails: boolean, options?: ReportGenerationOptions,
 ): void {
   const items = [
-    { label: 'View analysis', url: links.analysis, x: 0.6, w: 2.1, tooltip: candidateTooltip(comparison) },
+    { label: 'View analysis', url: links.analysis, x: 0.6, w: 2.1, tooltip: candidateTooltip(comparison, options) },
     { label: 'View resume', url: links.resume, x: 2.9, w: 2.0,
       tooltip: [comparison.candidate.sourceLabel, comparison.candidate.role].filter(Boolean).join('\n') },
     { label: group.target.kind === 'grade' ? 'View grade requirements' : 'View job', url: links.target, x: 5.1, w: 3.3 },
@@ -577,6 +584,7 @@ function candidateLinks(
 }
 
 interface CandidateLayout {
+  nameParts?: string[]
   nameFont: number
   nameHeight: number
   role: string
@@ -594,11 +602,12 @@ function candidateSummaryText(comparison: ReportComparison): string {
   return [...candidateNarrativeDisclosures(comparison), candidateNarrativeText(comparison)].join('\n\n')
 }
 
-function candidateLayout(comparison: ReportComparison): CandidateLayout {
-  const name = readableCandidateName(comparison.candidate)
+function candidateLayout(comparison: ReportComparison, options?: ReportGenerationOptions): CandidateLayout {
+  const name = applicantExportLabel(comparison.candidate, readableCandidateName(comparison.candidate), options)
   const role = comparison.candidate.role ? `Role: ${comparison.candidate.role}` : 'Role not recorded'
   const source = `Source: ${comparison.candidate.sourceLabel}`
-  const sourceName = comparison.candidate.displayName !== undefined ? `Source-stated name: ${comparison.candidate.name ?? 'Not stated'}` : null
+  const sourceName = comparison.candidate.displayName !== undefined || exportApplicant(comparison.candidate, options)
+    ? `Source-stated name: ${comparison.candidate.name ?? 'Not stated'}` : null
   const metadataWidth = 8.55
   const roleLabel = fits(role, metadataWidth, 0.62, 15) ? role : 'View recorded role'
   const sourceLabel = fits(source, metadataWidth, 0.57, 14) ? source : `Source: ${resumeDocumentReference(comparison)}`
@@ -618,13 +627,19 @@ function candidateLayout(comparison: ReportComparison): CandidateLayout {
       }
     }
   }
-  const nameFont = [30, 26, 22, 20].find(size => fits(name, BODY_WIDTH, 3.62, size))
+  let nameFont = [30, 26, 22, 20].find(size => fits(name, BODY_WIDTH, 3.62, size))
+  let nameParts: string[] | undefined
+  if (!nameFont && options?.applicantIdentities) {
+    nameFont = 20
+    nameParts = paginatePptxBlocks([{ key: 'applicant-identity', text: name, fontSize: nameFont }], BODY_WIDTH, 3.62)
+      .map(page => page.fragments.map(fragment => fragment.text).join('\n'))
+  }
   const narrativeFont = comparison.narrative?.summaryVersion === 2 ? 16
     : [16, 14].find(size => fits(narrative, BODY_WIDTH, CONTENT_BOTTOM - 1.82, size))
   if (!nameFont || !narrativeFont) {
     throw new Error(`PowerPoint cannot preserve the full candidate name and saved assessment at readable sizes within three slides. ${LIMIT_MESSAGE}`)
   }
-  return { nameFont, nameHeight: height(name, BODY_WIDTH, nameFont), role: roleLabel, roleHeight,
+  return { nameParts, nameFont, nameHeight: nameParts ? 3.62 : height(name, BODY_WIDTH, nameFont), role: roleLabel, roleHeight,
     source: sourceLabel, sourceHeight, sourceName: sourceNameLabel, sourceNameHeight,
     summaryY: 0, narrativeFont, separateNarrative: true }
 }
@@ -656,47 +671,51 @@ function candidateOverview(
   deck: ReportDeck, group: ReportGroup, comparison: ReportComparison, links: ReviewLinks, plan: ReviewPlan,
   layout: CandidateLayout, key: string, reference: string,
 ): void {
-  const slide = deck.slide('', reference)
-  const width = layout.separateNarrative ? BODY_WIDTH : 8.55
-  text(slide, readableCandidateName(comparison.candidate), {
-    x: 0.6, y: 1.12, w: width, h: layout.nameHeight,
-  }, layout.nameFont, { bold: true, objectName: `${key}-overview-name` })
-  let y = 1.12 + layout.nameHeight + 0.12
-  const metadata = [
-    { index: 0, value: layout.role, full: comparison.candidate.role ? `Role: ${comparison.candidate.role}` : 'Role not recorded',
-      h: layout.roleHeight, font: 15, url: links.analysis },
-    { index: 1, value: layout.source, full: `Source: ${comparison.candidate.sourceLabel}`, h: layout.sourceHeight, font: 14, url: links.resume },
-    ...(layout.sourceName === null ? [] : [{
-      index: 2, value: layout.sourceName, full: `Source-stated name: ${comparison.candidate.name ?? 'Not stated'}`,
-      h: layout.sourceNameHeight, font: 14, url: links.resume,
-    }]),
-  ]
-  for (const item of layout.separateNarrative ? [...metadata.slice(2), metadata[1], metadata[0]] : metadata) {
-    if (layout.separateNarrative && y + item.h > 5.25) continue
-    text(slide, item.value, { x: 0.6, y, w: 8.55, h: item.h }, item.font, {
-      color: C.muted, objectName: `${key}-metadata-${item.index}`,
-      ...(item.value !== item.full ? { color: C.accent, hyperlink: hyperlink(item.url, item.full) } : {}),
-    })
-    y += item.h + 0.08
+  const names = layout.nameParts ?? [applicantExportLabel(comparison.candidate, readableCandidateName(comparison.candidate), deck.options)]
+  for (const [pageIndex, name] of names.entries()) {
+    const slide = deck.slide('', `${reference}${pageIndex ? ' · Applicant identity (continued)' : ''}`)
+    const width = layout.separateNarrative ? BODY_WIDTH : 8.55
+    const nameHeight = layout.nameParts ? height(name, width, layout.nameFont) : layout.nameHeight
+    text(slide, name, {
+      x: 0.6, y: 1.12, w: width, h: nameHeight,
+    }, layout.nameFont, { bold: true, objectName: `${key}-overview-name` })
+    let y = 1.12 + nameHeight + 0.12
+    const metadata = [
+      { index: 0, value: layout.role, full: comparison.candidate.role ? `Role: ${comparison.candidate.role}` : 'Role not recorded',
+        h: layout.roleHeight, font: 15, url: links.analysis },
+      { index: 1, value: layout.source, full: `Source: ${comparison.candidate.sourceLabel}`, h: layout.sourceHeight, font: 14, url: links.resume },
+      ...(layout.sourceName === null ? [] : [{
+        index: 2, value: layout.sourceName, full: `Source-stated name: ${comparison.candidate.name ?? 'Not stated'}`,
+        h: layout.sourceNameHeight, font: 14, url: links.resume,
+      }]),
+    ]
+    for (const item of layout.separateNarrative ? [...metadata.slice(2), metadata[1], metadata[0]] : metadata) {
+      if (layout.separateNarrative && y + item.h > 5.25) continue
+      text(slide, item.value, { x: 0.6, y, w: 8.55, h: item.h }, item.font, {
+        color: C.muted, objectName: `${key}-metadata-${item.index}`,
+        ...(item.value !== item.full ? { color: C.accent, hyperlink: hyperlink(item.url, item.full) } : {}),
+      })
+      y += item.h + 0.08
+    }
+    scorePanel(slide, comparison, key, layout.separateNarrative)
+    const overview = [...candidateNarrativeDisclosures(comparison), candidateNarrativeOverview(comparison)].join('\n\n')
+    if (!layout.separateNarrative) {
+      rectangle(slide, { x: 0.6, y: layout.summaryY, w: BODY_WIDTH, h: CONTENT_BOTTOM - layout.summaryY }, C.paper, `${key}-summary-panel`)
+      text(slide, 'Assessment summary', { x: 0.8, y: layout.summaryY + 0.16, w: BODY_WIDTH - 0.4, h: 0.43 }, 18, {
+        bold: true, objectName: `${key}-summary-heading`,
+      })
+      text(slide, candidateSummaryText(comparison), {
+        x: 0.8, y: layout.summaryY + 0.66, w: BODY_WIDTH - 0.4, h: CONTENT_BOTTOM - layout.summaryY - 0.71,
+      }, layout.narrativeFont, {
+        objectName: `${key}-summary`, ...(comparison.narrative?.summaryVersion === 2 ? summaryLeading(layout.narrativeFont) : {}),
+      })
+    } else if (fits(overview, BODY_WIDTH, 5.21 - y, 16)) {
+      text(slide, overview, { x: 0.6, y: y + 0.12, w: BODY_WIDTH, h: 5.33 - y }, 16, {
+        objectName: `${key}-identity-overview`, ...(comparison.narrative?.summaryVersion === 2 ? summaryLeading(16) : {}),
+      })
+    }
+    candidateLinks(slide, group, comparison, links, key, plan.fullDetails, deck.options)
   }
-  scorePanel(slide, comparison, key, layout.separateNarrative)
-  const overview = [...candidateNarrativeDisclosures(comparison), candidateNarrativeOverview(comparison)].join('\n\n')
-  if (!layout.separateNarrative) {
-    rectangle(slide, { x: 0.6, y: layout.summaryY, w: BODY_WIDTH, h: CONTENT_BOTTOM - layout.summaryY }, C.paper, `${key}-summary-panel`)
-    text(slide, 'Assessment summary', { x: 0.8, y: layout.summaryY + 0.16, w: BODY_WIDTH - 0.4, h: 0.43 }, 18, {
-      bold: true, objectName: `${key}-summary-heading`,
-    })
-    text(slide, candidateSummaryText(comparison), {
-      x: 0.8, y: layout.summaryY + 0.66, w: BODY_WIDTH - 0.4, h: CONTENT_BOTTOM - layout.summaryY - 0.71,
-    }, layout.narrativeFont, {
-      objectName: `${key}-summary`, ...(comparison.narrative?.summaryVersion === 2 ? summaryLeading(layout.narrativeFont) : {}),
-    })
-  } else if (fits(overview, BODY_WIDTH, 5.21 - y, 16)) {
-    text(slide, overview, { x: 0.6, y: y + 0.12, w: BODY_WIDTH, h: 5.33 - y }, 16, {
-      objectName: `${key}-identity-overview`, ...(comparison.narrative?.summaryVersion === 2 ? summaryLeading(16) : {}),
-    })
-  }
-  candidateLinks(slide, group, comparison, links, key, plan.fullDetails)
 }
 
 function warnings(slide: PptxGenJS.Slide, plan: ReviewPlan, key: string, links: ReviewLinks): void {
@@ -712,12 +731,18 @@ function warnings(slide: PptxGenJS.Slide, plan: ReviewPlan, key: string, links: 
 }
 
 function candidateIdentity(
-  comparison: ReportComparison, number: number, width: number, suffix = '', referenceWidth = width,
+  comparison: ReportComparison, number: number, width: number, suffix = '', referenceWidth = width, options?: ReportGenerationOptions,
 ): { label: string; fontSize: number; reference: boolean } {
   const ending = suffix ? ` · ${suffix}` : ''
-  const full = `${readableCandidateName(comparison.candidate)}${ending}`
+  const full = `${applicantExportLabel(comparison.candidate, readableCandidateName(comparison.candidate), options).replace(/\n/g, ' - ')}${ending}`
   const fontSize = [20, 18].find(size => fits(full, width, 0.45, size))
   if (fontSize) return { label: full, fontSize, reference: false }
+  const identity = exportApplicant(comparison.candidate, options)
+  if (identity) {
+    const label = `${identity.identifier}${ending}`
+    const size = [20, 18].find(size => fits(label, referenceWidth, 0.45, size))
+    return { label: size ? label : `Applicant review${ending}`, fontSize: size ?? 18, reference: true }
+  }
   const source = `Candidate ${number} · ${comparison.candidate.sourceLabel}${ending}`
   const sourceFont = [20, 18].find(size => fits(source, referenceWidth, 0.45, size))
   if (sourceFont) return { label: source, fontSize: sourceFont, reference: true }
@@ -734,9 +759,9 @@ function candidateOverviewLink(slide: PptxGenJS.Slide, destination: number, key:
 }
 
 function candidateDetailHeading(
-  slide: PptxGenJS.Slide, comparison: ReportComparison, number: number, overviewSlide: number, key: string, keyCriteria: boolean,
+  slide: PptxGenJS.Slide, comparison: ReportComparison, number: number, overviewSlide: number, key: string, keyCriteria: boolean, options?: ReportGenerationOptions,
 ): void {
-  const identity = candidateIdentity(comparison, number, BODY_WIDTH, keyCriteria ? 'Key criteria' : '', 7.8)
+  const identity = candidateIdentity(comparison, number, BODY_WIDTH, keyCriteria ? 'Key criteria' : '', 7.8, options)
   text(slide, identity.label, { x: 0.6, y: 2.05, w: identity.reference ? 7.8 : BODY_WIDTH, h: 0.45 }, identity.fontSize, {
     bold: true, objectName: `${key}-heading`,
   })
@@ -748,7 +773,7 @@ function scorecard(
   plan: ReviewPlan, key: string, reference: string, number: number, overviewSlide: number,
 ): void {
   const slide = deck.slide(plan.combined ? 'Scorecard & evidence' : 'Scorecard', reference, `${key}-scorecard-name`)
-  candidateDetailHeading(slide, comparison, number, overviewSlide, `${key}-scorecard`, plan.keyCriteria)
+  candidateDetailHeading(slide, comparison, number, overviewSlide, `${key}-scorecard`, plan.keyCriteria, deck.options)
   table(slide, ['Criterion', 'Weight', 'Score', ...(plan.combined ? ['Evidence'] : [])],
     plan.rows, plan.widths, plan.rowHeights, REVIEW_TABLE_Y, `${key}-scorecard-table`)
   if (plan.criteria.some(criterion => /^[~<]/.test(criterion.weightLabel))) {
@@ -758,7 +783,7 @@ function scorecard(
     })
   }
   if (plan.combined) warnings(slide, plan, key, links)
-  candidateLinks(slide, group, comparison, links, key, plan.fullDetails)
+  candidateLinks(slide, group, comparison, links, key, plan.fullDetails, deck.options)
 }
 
 function explanationSlide(
@@ -766,7 +791,7 @@ function explanationSlide(
   plan: ReviewPlan, key: string, reference: string, number: number, overviewSlide: number,
 ): void {
   const slide = deck.slide('Why these scores', reference, `${key}-explanations-name`)
-  candidateDetailHeading(slide, comparison, number, overviewSlide, `${key}-explanations`, plan.keyCriteria)
+  candidateDetailHeading(slide, comparison, number, overviewSlide, `${key}-explanations`, plan.keyCriteria, deck.options)
   const rowStarts: number[] = []
   let rowY = REVIEW_TABLE_Y
   for (const rowHeight of explanationRows(plan.explanations, plan.split)) {
@@ -789,7 +814,7 @@ function explanationSlide(
     }
   }
   warnings(slide, plan, key, links)
-  candidateLinks(slide, group, comparison, links, key, plan.fullDetails)
+  candidateLinks(slide, group, comparison, links, key, plan.fullDetails, deck.options)
 }
 
 function featuredReview(deck: ReportDeck, group: ReportGroup, comparison: ReportComparison, groupIndex: number, index: number): number {
@@ -797,7 +822,7 @@ function featuredReview(deck: ReportDeck, group: ReportGroup, comparison: Report
   const links = deck.links(comparison)
   const key = `review-${groupIndex}-${index}`
   const reference = `${sectionReference(group, groupIndex)} · Candidate ${index + 1}`
-  const layout = candidateLayout(comparison)
+  const layout = candidateLayout(comparison, deck.options)
   const plan = reviewPlan(group, comparison, links, layout.separateNarrative)
   candidateOverview(deck, group, comparison, links, plan, layout, key, reference)
   if (layout.separateNarrative && comparison.narrative?.summaryVersion === 2) {
@@ -820,14 +845,14 @@ function featuredReview(deck: ReportDeck, group: ReportGroup, comparison: Report
           ...summaryLeading(fragment.fontSize),
         })
       }
-      candidateLinks(slide, group, comparison, links, key, plan.fullDetails)
+      candidateLinks(slide, group, comparison, links, key, plan.fullDetails, deck.options)
     })
   } else if (layout.separateNarrative) {
     const slide = deck.slide('', reference)
     text(slide, 'Assessment summary', { x: 0.6, y: 1.12, w: 3.65, h: 0.45 }, 20, {
       bold: true, objectName: `${key}-assessment-name`,
     })
-    const identity = candidateIdentity(comparison, index + 1, 4.0)
+    const identity = candidateIdentity(comparison, index + 1, 4.0, '', 4.0, deck.options)
     text(slide, identity.label, { x: 4.5, y: 1.12, w: 4.0, h: 0.45 }, identity.fontSize, {
       bold: true, objectName: `${key}-assessment-heading`,
     })
@@ -835,11 +860,11 @@ function featuredReview(deck: ReportDeck, group: ReportGroup, comparison: Report
     text(slide, candidateNarrativeText(comparison), {
       x: 0.6, y: 1.82, w: BODY_WIDTH, h: CONTENT_BOTTOM - 1.82,
     }, layout.narrativeFont, { objectName: `${key}-summary` })
-    candidateLinks(slide, group, comparison, links, key, plan.fullDetails)
+    candidateLinks(slide, group, comparison, links, key, plan.fullDetails, deck.options)
   }
   scorecard(deck, group, comparison, links, plan, key, reference, index + 1, before + 1)
   if (!layout.separateNarrative) explanationSlide(deck, group, comparison, links, plan, key, reference, index + 1, before + 1)
-  if (comparison.narrative?.summaryVersion !== 2 && deck.slideCount - before > 3) {
+  if (!deck.options?.applicantIdentities && comparison.narrative?.summaryVersion !== 2 && deck.slideCount - before > 3) {
     throw new Error('Legacy PowerPoint candidate reviews must not exceed three slides.')
   }
   return before + 1
@@ -851,10 +876,12 @@ export async function generatePptxReport(report: AnalysisReport, options?: Repor
   const policy = reportGenerationPolicy(report, 'pptx')
   const limits = reportLimits(policy)
   assertReportResourceLimits(report, limits.maxInputBytes)
+  validateApplicantIdentities(report, options)
   requireReportNarratives(report)
   validatedReportLinkContext(report, options)
   const deck = new ReportDeck(report, options, startedAt)
   opening(deck)
+  if (options?.applicantIdentities) reportNotice(deck, 'Local applicant names', [{ key: 'local-mapping-notice', text: LOCAL_MAPPING_NOTICE }])
   const mixedVersions = mixedRubricReportNotice(report.groups.map(group => group.target))
   if (mixedVersions) reportNotice(deck, 'Rubric versions differ', [{ key: 'mixed-rubric-versions', text: mixedVersions }])
   const agenda = reserveAgenda(deck)

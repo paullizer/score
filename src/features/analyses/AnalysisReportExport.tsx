@@ -1,15 +1,18 @@
-import { useEffect, useId, useRef, useState } from 'react'
+import { useContext, useEffect, useId, useMemo, useRef, useState } from 'react'
 import { useLocation } from 'react-router-dom'
 import { Download, LoaderCircle } from 'lucide-react'
 import { useWorkspace } from '../../app/workspace-context'
 import { useRealAnalyses } from '../../app/real-analyses-context'
 import { usePublicSettings } from '../../app/public-settings-context'
-import { REPORT_FORMATS, reportDownloadType, type AnalysisReport, type AnalysisReportFormat } from '../../domain/analysis-reports'
+import { AccessSuspendedContext } from '../../app/access-suspended-context'
+import { REPORT_FORMATS, reportDownloadType, type AnalysisReport, type AnalysisReportFormat, type ReportCandidate } from '../../domain/analysis-reports'
 import { createDefaultAdminSettings } from '../../domain/admin-settings-defaults'
 import type { RealAnalysisComparisonSummary, RealAnalysisRunDetail } from '../../domain/real-analyses'
 import { Badge, Button, CheckLabel, InlineError, Modal } from '../../components/ui'
 import { AnalysisSummaryStatus } from './AnalysisSummaries'
 import { getDisplayName } from '../../domain/displayNames'
+import { LocalApplicantMapping } from './LocalApplicantMapping'
+import { reportApplicants, resolveApplicantIdentities, type ApplicantMappingRow } from '../../services/analysisReports/applicant-mapping'
 
 export interface ReportSource {
   workspaceId: string
@@ -27,6 +30,7 @@ const descriptions: Record<AnalysisReportFormat, string> = {
 
 export function AnalysisReportExport({ source, onManageSummaries }: { source: ReportSource; onManageSummaries?: (targetId?: string) => void }) {
   const location = useLocation()
+  const accessSuspended = useContext(AccessSuspendedContext)
   const { cloud } = useWorkspace()
   const publicSettings = usePublicSettings()
   const reportPolicy = publicSettings.settings?.reports ?? createDefaultAdminSettings().reports
@@ -50,6 +54,7 @@ export function AnalysisReportExport({ source, onManageSummaries }: { source: Re
   const [progress, setProgress] = useState<{ completed: number; total: number } | null>(null)
   const [error, setError] = useState('')
   const [success, setSuccess] = useState('')
+  const [localMapping, setLocalMapping] = useState<ApplicantMappingRow[] | null | undefined>(undefined)
   const active = useRef<AbortController | null>(null)
   const identity = `${source.workspaceId}:${source.detail.run.id}`
   const historyAvailable = source.available
@@ -80,6 +85,7 @@ export function AnalysisReportExport({ source, onManageSummaries }: { source: Re
     setProgress(null)
     setError('')
     setSuccess('')
+    setLocalMapping(undefined)
     return () => { active.current?.abort(); active.current = null }
   }, [identity, location.key])
   useEffect(() => {
@@ -90,6 +96,22 @@ export function AnalysisReportExport({ source, onManageSummaries }: { source: Re
     setProgress(null)
     setError('Saved analysis access became unavailable. No file was downloaded. Reload the analysis before retrying.')
   }, [historyAvailable])
+  useEffect(() => {
+    if (!historyAvailable || policyDisabledReason || accessSuspended) {
+      setOpen(false)
+      setLocalMapping(undefined)
+      active.current?.abort()
+    }
+  }, [historyAvailable, policyDisabledReason, accessSuspended])
+  const mappingCandidates = useMemo((): ReportCandidate[] => (source.comparisons ?? []).flatMap(({ comparison }) => {
+    const resume = comparison.resume?.summary
+    if (comparison.status !== 'complete' || (targetId && comparison.target.summary.id !== targetId) || !resume) return []
+    return [{
+      id: resume.selection.resumeId, name: resume.name, role: resume.role, sourceLabel: resume.sourceLabel,
+      documentId: resume.selection.documentId, documentVersion: resume.selection.documentVersion,
+      documentSha256: resume.selection.documentSha256, snapshot: null,
+    }]
+  }), [source.comparisons, targetId])
 
   const targets = source.detail.targets.map((target) => ({ id: target.id, label: `${getDisplayName(target, target.label)} / rubric v${target.rubricVersion}` }))
   const targetLabelCounts = new Map<string, number>()
@@ -128,6 +150,7 @@ export function AnalysisReportExport({ source, onManageSummaries }: { source: Re
     if (!value) cancel()
     setError('')
     setSuccess('')
+    setLocalMapping(undefined)
     if (value) {
       setFormat(reportPolicy.defaultFormat)
       setRubricDetailsChosen(true)
@@ -135,7 +158,7 @@ export function AnalysisReportExport({ source, onManageSummaries }: { source: Re
     setOpen(value)
   }
   async function exportReport() {
-    if (active.current || !ready || complete === 0 || narrativeBlocked || policyDisabledReason || formatDisabledReason || scopeDisabledReason || format === null) return
+    if (active.current || !ready || complete === 0 || narrativeBlocked || policyDisabledReason || formatDisabledReason || scopeDisabledReason || format === null || localMapping === null) return
     const controller = new AbortController()
     active.current = controller
     const { signal } = controller
@@ -156,6 +179,7 @@ export function AnalysisReportExport({ source, onManageSummaries }: { source: Re
       })
       signal.throwIfAborted()
       if (!current()) return
+      const applicantIdentities = localMapping === undefined ? undefined : resolveApplicantIdentities(reportApplicants(report), localMapping)
       setProgress(null)
       setStage('Preparing report download')
       const { generateReportInWorker, downloadAnalysisReport } = await import('../../services/analysisReports/client')
@@ -164,6 +188,7 @@ export function AnalysisReportExport({ source, onManageSummaries }: { source: Re
         signal, onProgress: (message) => { if (current()) setStage(message) },
         links: { origin: window.location.origin, workspaceId: source.workspaceId },
         ...(rubricDetails ? { rubricDetails: true } : {}),
+        ...(applicantIdentities ? { applicantIdentities } : {}),
       })
       if (!current()) return
       if (requiresSummaries) {
@@ -193,7 +218,7 @@ export function AnalysisReportExport({ source, onManageSummaries }: { source: Re
       footer={<>
         <Button onClick={() => changeOpen(false)}>{busy ? 'Cancel export' : 'Close'}</Button>
         <Button variant="primary" icon={busy ? LoaderCircle : Download}
-          disabled={busy || !ready || complete === 0 || narrativeBlocked || Boolean(policyDisabledReason || formatDisabledReason || scopeDisabledReason)}
+          disabled={busy || !ready || complete === 0 || narrativeBlocked || localMapping === null || Boolean(policyDisabledReason || formatDisabledReason || scopeDisabledReason)}
           onClick={() => void exportReport()}>
           {busy ? 'Preparing report...' : format === null ? 'Exports disabled' : `Download ${reportDownloadType(format, rubricDetails).label}`}
         </Button>
@@ -225,6 +250,7 @@ export function AnalysisReportExport({ source, onManageSummaries }: { source: Re
             <option value="">Entire analysis - all jobs and grades</option>
             {targets.map((target) => <option key={target.id} value={target.id}>{target.label}{(targetLabelCounts.get(target.label) ?? 0) > 1 ? ` [${target.id}]` : ''}</option>)}
           </select></div>}
+        <LocalApplicantMapping candidates={mappingCandidates} disabled={busy} onChange={setLocalMapping} />
         <div className="rounded-xl border p-4 text-[12px]">
           <p className="font-semibold">Reporting on {complete} of {selected.length} {countLabel}</p>
           {complete < selected.length && <p className="mt-1 text-muted">{unfinished} still processing; {failed} could not be assessed; {cancelled} cancelled. Later completions are not added to this download.</p>}

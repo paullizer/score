@@ -21,6 +21,7 @@ import {
 import type { DocumentReportLayout } from './document-layout'
 import { writeRubricSection } from './rubric-document'
 import { RUBRIC_SECTION_SUBTITLE, rubricDetailsTitle, rubricDocumentFromReportGroup } from './rubric-model'
+import { applicantExportLabel, applicantExportName, exportApplicant, LOCAL_MAPPING_NOTICE, validateApplicantIdentities } from './applicant-mapping'
 
 const CONTENTS_DESTINATION = 'contents'
 
@@ -31,7 +32,7 @@ interface TargetSection {
   presentation: ReportTargetPresentation
 }
 
-function writeIntroduction<Color>(layout: DocumentReportLayout<Color>, report: AnalysisReport, sections: TargetSection[]): void {
+function writeIntroduction<Color>(layout: DocumentReportLayout<Color>, report: AnalysisReport, sections: TargetSection[], options?: ReportGenerationOptions): void {
   const title = reportPolicyTitle(report)
   layout.startSection({ section: 'Introduction', primary: title, primaryFallback: REPORT_TITLE, secondary: 'Saved analysis scope' })
   layout.paragraph(title, { size: 23, bold: true, leading: 32, after: 8, headingLevel: 1 })
@@ -55,6 +56,7 @@ function writeIntroduction<Color>(layout: DocumentReportLayout<Color>, report: A
   const mixedVersions = mixedRubricReportNotice(sections.map(section => section.group.target))
   if (mixedVersions) layout.paragraph(mixedVersions, { size: 11, leading: 16, bold: true, after: 8 })
   layout.paragraph(REPORT_HUMAN_REVIEW_NOTICE, { size: 9.5, leading: 14, color: layout.colors.muted, after: 8 })
+  if (options?.applicantIdentities) layout.paragraph(LOCAL_MAPPING_NOTICE, { size: 9.5, leading: 14, color: layout.colors.muted, after: 8 })
   layout.paragraph('Links open the saved analysis and its source documents. Application access is required.',
     { size: 9.5, leading: 14, color: layout.colors.muted, after: 10 })
 }
@@ -149,7 +151,7 @@ function writeCandidatesAtAGlance<Color>(
     completed.map(comparison => {
       const overview = [...candidateNarrativeDisclosures(comparison), candidateNarrativeOverview(comparison)].join('\n\n')
       return [
-        { text: readableCandidateName(comparison.candidate), url: reportReviewLinks(report, comparison, options).analysis },
+        { text: applicantExportLabel(comparison.candidate, readableCandidateName(comparison.candidate), options), url: reportReviewLinks(report, comparison, options).analysis },
         comparison.overall.status === 'available' ? overallScoreLabel(comparison.overall) : 'Withheld',
         comparison.overall.status === 'withheld' && !overview.includes(comparison.overall.message)
           ? `${overview}\nScore withheld: ${comparison.overall.message}` : overview,
@@ -203,7 +205,7 @@ function writeComparison<Color>(
   comparison: RankedReportComparison, index: number, options?: ReportGenerationOptions,
 ): void {
   const { group } = section
-  const name = readableCandidateName(comparison.candidate)
+  const name = applicantExportName(comparison.candidate, readableCandidateName(comparison.candidate), options)
   const links = reportReviewLinks(report, comparison, options)
   const summary = candidateNarrativeText(comparison)
   const criteria = criterionReviews(group.target, comparison)
@@ -213,8 +215,10 @@ function writeComparison<Color>(
     secondary: `${section.label} · Featured candidate ${index + 1}`,
   })
   layout.paragraph(name, { size: 22, leading: 31, bold: true, after: 6, keepWithNext: 30, headingLevel: 2 })
+  const identity = exportApplicant(comparison.candidate, options)
+  if (identity) layout.paragraph(`Applicant identifier: ${identity.identifier}`, { size: 10, leading: 15, after: 6 })
   writeTargetIdentity(layout, section, 12)
-  if (comparison.candidate.displayName !== undefined) {
+  if (comparison.candidate.displayName !== undefined || identity) {
     layout.paragraph(`Source-stated name: ${comparison.candidate.name ?? 'Not stated'}`, {
       size: 9.5, leading: 14, color: layout.colors.muted, after: 7,
     })
@@ -257,6 +261,7 @@ export function writeDocumentReport<Color>(
 ): void {
   const policy = reportGenerationPolicy(report)
   assertReportResourceLimits(report, reportLimits(policy).maxInputBytes)
+  validateApplicantIdentities(report, options)
   requireReportNarratives(report)
   validatedReportLinkContext(report, options)
   const sections = report.groups.filter(group => group.comparisons.some(comparison => comparison.status === 'complete'))
@@ -266,7 +271,7 @@ export function writeDocumentReport<Color>(
     }))
   if (!sections.length) throw new Error('At least one completed comparison is required for a document report.')
   const rubricDetails = options?.rubricDetails === true
-  writeIntroduction(layout, report, sections)
+  writeIntroduction(layout, report, sections, options)
   writeContents(layout, sections, rubricDetails)
   for (const section of sections) {
     writeTargetOverview(layout, report, section, options)

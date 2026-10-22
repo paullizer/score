@@ -13,6 +13,7 @@ import {
 } from './resumeAnalysis.test-support.mjs'
 import { seededLadder, seedRealJob } from './gradeLadders.test-support.mjs'
 import { readPdf } from './analysisReports/pdf-test-support.mjs'
+import { mappingWorkbookBytes } from './analysisReports/mapping-test-support.mjs'
 
 let runtime, browser
 const deferred = () => {
@@ -492,6 +493,118 @@ test('a read-only reviewer downloads genuine CSV, PDF, Word and PowerPoint files
   } finally { await context.close(); await fixture.close() }
 })
 
+test('local Excel/CSV mapping names all export formats, retains unmatched identifiers and never uploads or persists the mapping', { timeout: 180_000 }, async () => {
+  const { fixture, stubs, runId, pairs } = await completedFixture()
+  const { context, page, errors } = await newPage()
+  const requests = [], logs = []
+  const localName = 'HR Local Applicant Name'
+  page.on('request', request => requests.push(JSON.stringify({ url: request.url(), headers: request.headers(), body: request.postData() })))
+  page.on('console', message => logs.push(message.text()))
+  await page.addInitScript(() => {
+    window.mappingStorageWrites = []
+    for (const [prototype, methods] of [[Storage.prototype, ['setItem']], [IDBObjectStore.prototype, ['add', 'put']]]) {
+      for (const method of methods) {
+        const original = prototype[method]
+        prototype[method] = function (...args) {
+          window.mappingStorageWrites.push(JSON.stringify(args))
+          return original.apply(this, args)
+        }
+      }
+    }
+  })
+  try {
+    await page.goto(`${fixture.origin}/workspaces/${fixture.workspaceId}/analyses/${runId}`)
+    await visible(page.getByRole('heading', { name: 'Grouped report review', exact: true }))
+    await page.getByRole('button', { name: 'Export report', exact: true }).click()
+    const dialog = page.getByRole('dialog', { name: 'Export analysis report', exact: true })
+    const mapping = dialog.getByRole('region', { name: 'Local applicant name mapping', exact: true })
+    await mapping.getByRole('checkbox').check()
+    const firstSource = pairs[0].comparison.resume.summary.sourceLabel
+    const otherSource = pairs[1].comparison.resume.summary.sourceLabel
+    const identifier = firstSource.replace(/\.pdf$/i, '')
+    const unmatchedIdentifier = otherSource.replace(/\.pdf$/i, '')
+    const csv = Buffer.from(`Identifier,Full name\n${identifier},${localName}\n`)
+    async function selectColumns() {
+      await visible(mapping.getByLabel('Worksheet', { exact: true }))
+      await mapping.getByLabel('Applicant identifier column', { exact: true }).selectOption('0')
+      await mapping.getByLabel('Full name column', { exact: true }).selectOption('1')
+      await visible(mapping.getByText('1 matched; 1 unmatched of 2 unique applicants in completed reviews.', { exact: true }))
+    }
+    await mapping.getByLabel('Excel or CSV mapping', { exact: true }).setInputFiles({ name: 'local-only-mapping.csv', mimeType: 'text/csv', buffer: csv })
+    await selectColumns()
+    const modelsBefore = stubs.modelCalls.length
+    const savedBefore = JSON.stringify([...fixture.analyses.store.values.values()])
+    for (const format of ['csv', 'pdf', 'docx', 'pptx']) {
+      const { bytes } = await download(page, format)
+      let text
+      if (format === 'csv') {
+        const [headers, ...rows] = csvRows(bytes)
+        assert.equal(rows.length, 2)
+        const records = rows.map(row => Object.fromEntries(headers.map((header, index) => [header, row[index]])))
+        assert.equal(records.find(row => row.Source === firstSource)['Candidate name'], localName)
+        assert.equal(records.find(row => row.Source === otherSource)['Candidate name'], unmatchedIdentifier)
+        assert.ok(records.every(row => row['Applicant identifier'] && row['Overall score'] === '60'))
+        text = bytes.toString('utf8')
+      } else if (format === 'pdf') text = (await readPdf(bytes)).text
+      else text = (await xmlParts(bytes, format === 'docx' ? /^word\/document\.xml$/ : /^ppt\/slides\/slide\d+\.xml$/)).join('\n')
+      assert.ok(text.includes(localName), `${format} includes mapped name`)
+      assert.ok(text.includes(unmatchedIdentifier), `${format} retains unmatched applicant`)
+      assert.ok(text.includes(identifier), `${format} retains matched identifier`)
+      assert.ok(text.includes('attached locally'), `${format} identifies local name provenance`)
+    }
+    const zip = await zipEntries((await download(page, 'csv', { rubricDetails: true })).bytes)
+    assert.match(zip.get('analyses.csv').toString('utf8'), /HR Local Applicant Name/)
+    assert.doesNotMatch(zip.get('rubrics.csv').toString('utf8'), /HR Local Applicant Name/)
+    const workbook = mappingWorkbookBytes([{ name: 'Applicants', rows: [['Identifier', 'Full name'], [identifier, localName]] }])
+    await mapping.getByLabel('Excel or CSV mapping', { exact: true }).setInputFiles({
+      name: 'local-only-mapping.xlsx', mimeType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', buffer: Buffer.from(workbook),
+    })
+    await selectColumns()
+    assert.match((await download(page, 'csv')).bytes.toString('utf8'), /HR Local Applicant Name/)
+    if (process.env.SCORE_REPORT_QA_DIR) {
+      await page.screenshot({ path: join(process.env.SCORE_REPORT_QA_DIR, 'local-mapping-desktop.png'), animations: 'disabled' })
+      await page.setViewportSize({ width: 390, height: 844 })
+      await page.screenshot({ path: join(process.env.SCORE_REPORT_QA_DIR, 'local-mapping-mobile.png'), animations: 'disabled' })
+      assert.equal(await mapping.evaluate(element => element.scrollWidth > element.clientWidth), false)
+    }
+    await mapping.getByLabel('Excel or CSV mapping', { exact: true }).setInputFiles({
+      name: 'duplicate.csv', mimeType: 'text/csv', buffer: Buffer.from(`ID,Name\n${identifier},${localName}\n${identifier},Other\n`),
+    })
+    await mapping.getByLabel('Applicant identifier column', { exact: true }).selectOption('0')
+    await mapping.getByLabel('Full name column', { exact: true }).selectOption('1')
+    await visible(mapping.getByRole('alert'))
+    assert.equal(await dialog.getByRole('button', { name: /^Download / }).isDisabled(), true)
+    await mapping.getByRole('button', { name: 'Remove mapping', exact: true }).click()
+    assert.equal(await mapping.getByRole('checkbox').isChecked(), false)
+    const ordinary = await download(page, 'csv')
+    assert.doesNotMatch(ordinary.bytes.toString('utf8'), /HR Local Applicant Name|Applicant identifier/)
+    await mapping.getByRole('checkbox').check()
+    await mapping.getByLabel('Excel or CSV mapping', { exact: true }).setInputFiles({ name: 'local-only-mapping.csv', mimeType: 'text/csv', buffer: csv })
+    await selectColumns()
+    await dialog.getByRole('button', { name: 'Close', exact: true }).click()
+    await page.getByRole('button', { name: 'Export report', exact: true }).click()
+    assert.equal(await mapping.getByRole('checkbox').isChecked(), false)
+    assert.equal(await mapping.getByText(localName, { exact: true }).count(), 0)
+    await mapping.getByRole('checkbox').check()
+    await mapping.getByLabel('Excel or CSV mapping', { exact: true }).setInputFiles({ name: 'local-only-mapping.csv', mimeType: 'text/csv', buffer: csv })
+    await selectColumns()
+    await page.evaluate(url => {
+      window.history.pushState({ ...window.history.state, key: 'mapping-navigation' }, '', url)
+      window.dispatchEvent(new PopStateEvent('popstate', { state: window.history.state }))
+    }, `/workspaces/${fixture.workspaceId}/analyses/${runId}?result=${pairs[0].comparison.id}`)
+    await dialog.waitFor({ state: 'hidden' })
+    await page.getByRole('button', { name: 'Export report', exact: true }).click()
+    assert.equal(await mapping.getByRole('checkbox').isChecked(), false)
+    assert.equal(await mapping.getByText(localName, { exact: true }).count(), 0)
+    assert.equal(stubs.modelCalls.length, modelsBefore)
+    assert.equal(JSON.stringify([...fixture.analyses.store.values.values()]), savedBefore)
+    assert.equal(requests.some(request => request.includes(localName) || request.includes('local-only-mapping')), false)
+    assert.equal(logs.some(message => message.includes(localName)), false)
+    assert.equal(await page.evaluate(() => window.mappingStorageWrites.some(value => /HR Local Applicant Name|local-only-mapping/.test(value))), false)
+    assert.deepEqual(errors, [])
+  } finally { await context.close(); await fixture.close() }
+})
+
 test('reports end each job section with its rubric details by default, and CSV becomes analyses.csv plus rubrics.csv', { timeout: 180_000 }, async () => {
   const { fixture, stubs, runId, pairs } = await completedFixture()
   const { context, page, errors } = await newPage()
@@ -827,8 +940,8 @@ test('export permission failures are visible and cancelling a delayed evidence r
   } finally { release.resolve(); await context.close(); await fixture.close() }
 })
 
-test('losing access to saved history cancels a pending export without a late private download', { timeout: 90_000 }, async () => {
-  const { fixture, runId } = await completedFixture({ partial: true })
+test('losing access to saved history clears local mapping and cancels a pending export without a late private download', { timeout: 90_000 }, async () => {
+  const { fixture, runId, pairs } = await completedFixture({ partial: true })
   const { context, page, errors } = await newPage()
   const captured = deferred(), release = deferred(), finished = deferred()
   const downloads = []
@@ -844,6 +957,15 @@ test('losing access to saved history cancels a pending export without a late pri
     await page.getByRole('button', { name: 'Export report', exact: true }).click()
     const dialog = page.getByRole('dialog', { name: 'Export analysis report', exact: true })
     await chooseFormat(dialog, 'csv')
+    const mapping = dialog.getByRole('region', { name: 'Local applicant name mapping', exact: true })
+    const identifier = pairs.find(pair => pair.comparison.status === 'complete').comparison.resume.summary.sourceLabel.replace(/\.pdf$/i, '')
+    await mapping.getByRole('checkbox').check()
+    await mapping.getByLabel('Excel or CSV mapping', { exact: true }).setInputFiles({
+      name: 'private-access-mapping.csv', mimeType: 'text/csv', buffer: Buffer.from(`ID,Name\n${identifier},Private Local Name\n`),
+    })
+    await mapping.getByLabel('Applicant identifier column', { exact: true }).selectOption('0')
+    await mapping.getByLabel('Full name column', { exact: true }).selectOption('1')
+    await visible(mapping.getByText('Private Local Name', { exact: true }))
     await dialog.getByRole('button', { name: 'Download CSV', exact: true }).click()
     await captured.promise
     await page.route(`**/api/workspaces/${fixture.workspaceId}/analyses**`, (route) => route.fulfill({
@@ -854,6 +976,7 @@ test('losing access to saved history cancels a pending export without a late pri
     release.resolve()
     await finished.promise
     assert.equal(await page.getByRole('button', { name: 'Export report', exact: true }).count(), 0)
+    assert.equal(await mapping.count(), 0)
     assert.equal(downloads.length, 0)
     assert.deepEqual(errors, [])
   } finally { release.resolve(); await context.close(); await fixture.close() }
