@@ -1,6 +1,16 @@
 import { analysisHash } from '../../server/analyses/deterministic'
 import type { RealAnalysisAssessmentInput } from '../../src/domain/real-analyses'
 import { ANALYSIS_MODEL_LIMITS, type ModelResumeQuote } from './model-schema'
+import {
+  redactModelResumeHeading, redactModelResumeText, redactModelResumeTitle,
+  type AnalysisResumePiiContext,
+} from './pii-redaction'
+
+export {
+  redactModelAssessmentOutput, redactModelGroundingReview, redactModelResumeHeading,
+  redactModelResumeText, redactModelResumeTitle, resumePiiFromSnapshot,
+  type AnalysisResumePiiContext,
+} from './pii-redaction'
 
 export const ANALYSIS_EVIDENCE_CATALOG_VERSION = 'score-analysis-passages-v1'
 
@@ -53,13 +63,19 @@ function passageEnd(text: string, start: number): number {
   return whitespaceEnd >= minimum ? start + whitespaceEnd : end
 }
 
-export function createAnalysisEvidenceCatalog(resume: Resume): AnalysisEvidenceCatalog {
+export function createAnalysisEvidenceCatalog(
+  resume: Resume, pii?: AnalysisResumePiiContext,
+): AnalysisEvidenceCatalog {
   const passages: AnalysisEvidencePassage[] = []
   let sourceCharacters = 0
   const paragraphs = resume.paragraphs.map((paragraph, paragraphIndex): ModelParagraph => {
     const { text, ...metadata } = paragraph
     sourceCharacters += text.length
-    const view: ModelParagraph = { ...metadata, passages: [] }
+    const view: ModelParagraph = {
+      ...metadata,
+      heading: redactModelResumeHeading(metadata.heading, pii),
+      passages: [],
+    }
     for (let startOffset = 0; startOffset < text.length;) {
       const endOffset = passageEnd(text, startOffset)
       const slice = text.slice(startOffset, endOffset)
@@ -68,7 +84,10 @@ export function createAnalysisEvidenceCatalog(resume: Resume): AnalysisEvidenceC
       if (passageId !== null) passages.push({
         passageId, paragraphId: paragraph.id, paragraphIndex, startOffset, endOffset,
       })
-      view.passages.push({ passageId, text: slice })
+      view.passages.push({
+        passageId,
+        text: passageId === null ? slice : redactModelResumeText(slice, pii),
+      })
       startOffset = endOffset
     }
     return view
@@ -76,7 +95,8 @@ export function createAnalysisEvidenceCatalog(resume: Resume): AnalysisEvidenceC
   if (!passages.length) throw new AnalysisEvidenceBindingError()
   return {
     version: ANALYSIS_EVIDENCE_CATALOG_VERSION, documentSha256: analysisHash(resume),
-    sourceCharacters, passages, resume: { ...resume, paragraphs },
+    sourceCharacters, passages,
+    resume: { ...resume, title: redactModelResumeTitle(resume.title, pii), paragraphs },
   }
 }
 

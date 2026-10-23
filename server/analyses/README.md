@@ -12,6 +12,18 @@ Markdown and Word are file-upload only. Those jobs can also appear as captured G
 neither format is an independent agency/OPM reference upload or URL format. None of this starts scoring
 automatically.
 
+Extracted candidate profile metadata (`profile`, `resume.name`, `resume.location`), user-supplied
+`displayName` aliases, and `sourceLabel` filenames are retained on the frozen resume snapshot for
+workspace UI display and search only; they are never sent to the assessment, grounding-review,
+evidence-gap, or summary models. In addition, `worker/analyses/pii-redaction.ts` strips filename-based
+or PII-bearing document titles and redacts the candidate's extracted name (using grammar-aware
+neutral phrasing such as `"They are"` / `"their"` / `"they"`), email addresses, phone numbers,
+physical street addresses, and extracted location from all model-facing passages, grounding quotes,
+and summary inputs. Because the model selects integer `passageId` citations rather than writing quotes,
+`createAnalysisPassageResolver` resolves selected passages back to verbatim substrings of the original
+frozen `RealResumeDocument` so saved results, SHA-256 bindings, and the web app's evidence viewer
+preserve the original resume text.
+
 ## Composition and authorization
 
 ```ts

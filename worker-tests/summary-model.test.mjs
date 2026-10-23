@@ -454,3 +454,26 @@ test('the captured summary deadline bounds an uncooperative checkpoint callback 
   await rejection
   assert.equal(mock.calls.length, 0)
 })
+
+test('candidate and target summary requests redact candidate PII from saved evidence quotes', async () => {
+  const input = candidateFixture()
+  const originalText = 'Paul Leiser is a calibration lead (paul@example.com, 555-321-9876, 500 Pine Street, Seattle, WA 98101) who reduced variance by 12 percent.'
+  input.source.resume.paragraphs[0].text = originalText
+  input.binding.resumeSnapshot.sha256 = deterministic.analysisHash(input.source.resume)
+  input.result.provenance.resumeSnapshot.sha256 = input.binding.resumeSnapshot.sha256
+  input.result.provenance.groundingReviews[0].resumeSnapshotSha256 = input.binding.resumeSnapshot.sha256
+  input.result.criteria[0].citations[0].quote = originalText
+  refreshCandidate(input)
+  const mock = mockModel([draft(), supportedReview()])
+  await generateCandidateSummary(input, {
+    ...mock.options,
+    resumePii: { name: 'Paul Leiser', location: 'Seattle, WA', fileName: 'Paul_Leiser.pdf' },
+  })
+  assert.equal(mock.calls.length, 2)
+  for (const call of mock.calls) {
+    const serialized = JSON.stringify(call.body)
+    assert.doesNotMatch(serialized, /Paul|Leiser|paul@example\.com|321-9876|Pine Street|Seattle/)
+    assert.match(serialized, /They are a calibration lead \(\[redacted email\], \[redacted phone\], \[redacted address\]\)/)
+  }
+})
+

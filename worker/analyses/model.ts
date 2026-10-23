@@ -27,7 +27,10 @@ import {
   type AnalysisModelStage,
 } from './validation'
 import { analysisCitationRepairSources } from './citation-diagnostics'
-import { createAnalysisEvidenceCatalog, type AnalysisEvidenceCatalog } from './evidence-passages'
+import {
+  createAnalysisEvidenceCatalog, redactModelAssessmentOutput, redactModelGroundingReview,
+  type AnalysisEvidenceCatalog, type AnalysisResumePiiContext,
+} from './evidence-passages'
 import {
   analysisResponseRequestId, emitAnalysisTelemetry, type AnalysisTelemetryEvent, type AnalysisTelemetrySink,
 } from './telemetry'
@@ -46,6 +49,11 @@ export {
 export type { AnalysisModelErrorOptions, AnalysisModelStage } from './validation'
 export { ANALYSIS_MODEL_LIMITS, ANALYSIS_MODEL_SCHEMA_VERSIONS, ANALYSIS_CRITERION_BLOCKER_CODES } from './model-schema'
 export type { ModelAnalysisAssessment, ModelAnalysisGroundingReview, ModelResumeQuote } from './model-schema'
+export {
+  redactModelAssessmentOutput, redactModelGroundingReview, redactModelResumeHeading,
+  redactModelResumeText, redactModelResumeTitle, resumePiiFromSnapshot,
+  type AnalysisResumePiiContext,
+} from './evidence-passages'
 
 export const ANALYSIS_MODEL_PROMPT_VERSIONS = {
   assessment: 'score-analysis-assessment-v4',
@@ -115,6 +123,7 @@ export interface AnalysisAssessmentOptions {
   signal?: AbortSignal
   resumeSnapshotSha256: string
   targetSnapshotSha256: string
+  resumePii?: AnalysisResumePiiContext
   onEvent?: AnalysisTelemetrySink
   onDiagnostic?: (diagnostic: AnalysisAssessmentDiagnostic) => void
 }
@@ -468,7 +477,7 @@ export function prepareAnalysisContext(
     throw error
   }
   const clock = options.clock ?? options.model.clock ?? systemClock
-  const catalog = createAnalysisEvidenceCatalog(frozen.resume)
+  const catalog = createAnalysisEvidenceCatalog(frozen.resume, options.resumePii)
   const modelInput = { ...frozen, resume: catalog.resume }
   const groundingSchema = analysisStructuredSchema(groundingSelectionSchemaForInput(frozen, catalog.passages.length))
   return { options, frozen, clock, catalog, modelInput, groundingSchema }
@@ -537,13 +546,14 @@ function groundingRequest(
   context: ReturnType<typeof prepareAnalysisContext>, assessment: RealAnalysisAssessmentOutput,
   correction: Record<string, unknown> | undefined,
 ): StructuredModelRequest {
+  const modelAssessment = redactModelAssessmentOutput(assessment, context.options.resumePii)
   return {
     taskId: 'assessmentReview',
     name: 'resume_rubric_grounding_review',
     schema: context.groundingSchema, system: GROUNDING_SYSTEM,
-    source: JSON.stringify({ input: context.modelInput, assessment }),
+    source: JSON.stringify({ input: context.modelInput, assessment: modelAssessment }),
     user: JSON.stringify({
-      input: context.modelInput, assessment,
+      input: context.modelInput, assessment: modelAssessment,
       ...(correction ? { correction } : {}),
     }),
     maxCompletionTokens: ANALYSIS_MODEL_LIMITS.reviewCompletionTokens,
@@ -915,7 +925,9 @@ export async function assessResumeAgainstTarget(
           control.nextCorrection()
           outputEvent(scoped.response, 'grounding', 'correction', groundingDisagreement(scoped.review))
           assessmentCorrection = {
-            attempt: control.correctionCount, previousAssessment: assessed.assessment, groundingReview: scoped.review,
+            attempt: control.correctionCount,
+            previousAssessment: redactModelAssessmentOutput(assessed.assessment, options.resumePii),
+            groundingReview: redactModelGroundingReview(scoped.review, options.resumePii),
           }
           assessed = undefined
           reviewCorrection = undefined
@@ -969,7 +981,11 @@ export async function assessResumeAgainstTarget(
     disputedScope = disputedScopeFromReview(savedReview, assessed.assessment, assessed.qcDiagnostics?.criteria)
     control.nextCorrection()
     outputEvent(response, 'grounding', 'correction', reviewDiagnostics)
-    assessmentCorrection = { attempt: control.correctionCount, previousAssessment: assessed.assessment, groundingReview: review }
+    assessmentCorrection = {
+      attempt: control.correctionCount,
+      previousAssessment: redactModelAssessmentOutput(assessed.assessment, options.resumePii),
+      groundingReview: redactModelGroundingReview(review, options.resumePii),
+    }
     assessed = undefined
     reviewCorrection = undefined
   }

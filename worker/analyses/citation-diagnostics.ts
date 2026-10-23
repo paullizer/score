@@ -195,13 +195,16 @@ export function analysisCitationRepairSources(
   ]
   for (const passage of candidates) {
     const quote = resolve(passage.passageId)
+    const modelPassage = catalog.resume.paragraphs[passage.paragraphIndex]?.passages
+      .find(item => item.passageId === passage.passageId)
+    const text = modelPassage?.text ?? quote.quote
     if (sourcePassages.length >= ANALYSIS_MODEL_LIMITS.maxCorrectionSources ||
-      characters + quote.quote.length > ANALYSIS_MODEL_LIMITS.maxCorrectionSourceCharacters) {
+      characters + text.length > ANALYSIS_MODEL_LIMITS.maxCorrectionSourceCharacters) {
       omittedSourcePassages += 1
       continue
     }
-    sourcePassages.push({ passageId: passage.passageId, paragraphId: passage.paragraphId, text: quote.quote })
-    characters += quote.quote.length
+    sourcePassages.push({ passageId: passage.passageId, paragraphId: passage.paragraphId, text })
+    characters += text.length
   }
   return {
     catalogVersion: catalog.version, allowedPassageIds: { minimum: 1, maximum: catalog.passages.length },
