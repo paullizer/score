@@ -5,6 +5,7 @@ import { loadWorker } from './shared-model-loader.mjs'
 const {
   ANALYSIS_EVIDENCE_CATALOG_VERSION, AnalysisEvidenceBindingError,
   createAnalysisEvidenceCatalog, createAnalysisPassageResolver,
+  redactModelResumeText, redactModelResumeTitle, redactModelResumeHeading,
 } = await loadWorker('../worker/analyses/evidence-passages.ts')
 const {
   validateAnalysisAssessmentInput, validateAnalysisAssessmentSelections, validateAnalysisGroundingSelections,
@@ -242,3 +243,48 @@ test('model citation schemas use compact bounded integers rather than large para
   assert.equal(citation.additionalProperties, false)
   assert.ok(JSON.stringify(schema).length < 10000)
 })
+
+test('model-facing catalog redacts candidate names, emails, phones, addresses, locations, and filenames while passage resolution keeps verbatim original quotes for the UI', () => {
+  const originalFirst = 'Paul Leiser is really good at designing survey samples. Contact paul.leiser@example.com or (555) 234-5678 at 742 Evergreen Terrace, Apt 4B, Seattle, WA 98101.'
+  const originalSecond = "In Seattle, WA, Paul Leiser's team reviewed results, and Paul was responsible for statistical validation while Leiser has led cross-lab audits."
+  const input = validateAnalysisAssessmentInput({
+    ...fixture([originalFirst, originalSecond]),
+    resume: {
+      id: 'saved-resume', version: 3, kind: 'resume', sample: false, title: 'Paul_Leiser_Resume.pdf',
+      paragraphs: [
+        { id: 'p-1', page: 1, heading: 'Paul Leiser', text: originalFirst },
+        { id: 'p-2', page: 1, heading: 'Experience — Seattle, WA', text: originalSecond },
+      ],
+    },
+  })
+  const pii = { name: 'Dr. Paul Leiser, PhD', location: 'Seattle, WA', fileName: 'Paul_Leiser_Resume.pdf' }
+  const catalog = createAnalysisEvidenceCatalog(input.resume, pii)
+
+  assert.equal(catalog.resume.title, 'Resume')
+  assert.equal(catalog.resume.paragraphs[0].heading, 'Resume')
+  assert.equal(catalog.resume.paragraphs[1].heading, 'Experience — [redacted location]')
+  assert.equal(
+    catalog.resume.paragraphs[0].passages[0].text,
+    'They are really good at designing survey samples. Contact [redacted email] or [redacted phone] at [redacted address].',
+  )
+  assert.equal(
+    catalog.resume.paragraphs[1].passages[0].text,
+    'In [redacted location], their team reviewed results, and they were responsible for statistical validation while they have led cross-lab audits.',
+  )
+  assert.doesNotMatch(JSON.stringify(catalog.resume), /Paul|Leiser|paul\.leiser|555|234-5678|Evergreen|Seattle/)
+
+  const resolve = createAnalysisPassageResolver(catalog, input.resume)
+  assert.equal(resolve(1).quote, originalFirst)
+  assert.equal(resolve(2).quote, originalSecond)
+
+  const validated = validateAnalysisAssessmentSelections(assessment([{ passageId: 1 }, { passageId: 2 }]), input, catalog)
+  assert.equal(validated.criteria[0].citations[0].quote, originalFirst)
+  assert.equal(validated.criteria[0].citations[0].heading, 'Paul Leiser')
+  assert.equal(validated.criteria[0].citations[1].quote, originalSecond)
+  assert.equal(validated.criteria[0].citations[1].heading, 'Experience — Seattle, WA')
+
+  assert.equal(redactModelResumeTitle('Applicant 093.docx'), 'Resume')
+  assert.equal(redactModelResumeHeading('Contact: jane@example.org', {}), 'Contact: [redacted email]')
+  assert.equal(redactModelResumeText('P.O. Box 421, Austin, TX 78701 | +1 512-555-0199'), '[redacted address] | [redacted phone]')
+})
+

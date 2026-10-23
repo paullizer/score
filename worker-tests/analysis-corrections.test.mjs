@@ -425,7 +425,9 @@ test('an exact independently supported proposal publishes a separate revision, i
   const saved = (await head(f)).record
   assert.equal(saved.status, 'ready', JSON.stringify(saved.error))
   assert.equal(worker.calls.length, 1)
-  assert.deepEqual(worker.calls[0].body.assessment, proposal.assessment)
+  assert.doesNotMatch(JSON.stringify(worker.calls[0].body), /Jordan Example/)
+  assert.equal(worker.calls[0].body.assessment.criteria[0].citations[0].quote,
+    'They are an engineer. Evaluated engineering systems independently and explained evidence-based recommendations.')
   assert.equal(saved.published.revision.baseResultSha256, f.original.record.result.sha256)
   const run = (await f.analysis.store.get(f.workspaceId, f.runId)).record
   const projected = correction.projectAnalysisComparison(f.original.record, saved)

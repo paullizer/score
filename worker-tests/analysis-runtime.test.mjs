@@ -589,7 +589,8 @@ test('an actual cited assessment and independent review persist a result accepte
   assert.equal(catalog.sourceCharacters, detail.resumeSnapshot.document.paragraphs.reduce((sum, paragraph) => sum + paragraph.text.length, 0))
   assert.equal(catalog.paragraphCount, detail.resumeSnapshot.document.paragraphs.length)
   for (const call of mock.calls) {
-    assert.equal(assertLosslessResume(call.body.input.resume, detail.resumeSnapshot.document), catalog.passageCount)
+    assert.equal(assertLosslessResume(call.body.input.resume, detail.resumeSnapshot.document, detail.resumeSnapshot), catalog.passageCount)
+    assert.doesNotMatch(JSON.stringify(call.body), /Jordan Example/)
   }
   assert.ok(events.every(event => event.workspaceId === f.workspaceId && event.runId === created.run.id &&
     event.comparisonId === original.record.id && event.attemptId === detail.comparison.attemptId))
@@ -617,7 +618,8 @@ for (const format of ['docx', 'doc']) {
       assert.deepEqual(outcome, { claimed: 2, completed: 1 },
         JSON.stringify(comparisons(f, created.run.id).map(value => value.record.error)))
       assert.equal(mock.calls.length, 4, 'Scoring and its independent candidate narrative each receive generation and review.')
-      assertLosslessResume(mock.calls[0].body.input.resume, resume.document)
+      assertLosslessResume(mock.calls[0].body.input.resume, resume.document, resume.record)
+      assert.doesNotMatch(JSON.stringify(mock.calls), /Renée Example|Renee Example/)
       const detail = await f.service.comparisonDetail(f.workspaceId, created.run.id, comparisons(f, created.run.id)[0].record.id)
       assert.equal(detail.comparison.status, 'complete')
       assert.equal(detail.narrative, undefined)
@@ -1203,7 +1205,7 @@ test('missing snapshot retries stop after three attempts; manual retry uses orig
   assert.deepEqual(await f.analysis.store.get(f.workspaceId, second.record.id), completed)
   assert.deepEqual(f.analysis.blobs.values.get(completed.record.result.blobName), historical)
   const detail = await f.service.comparisonDetail(f.workspaceId, created.run.id, first.record.id)
-  assertLosslessResume(mock.calls.at(-2).body.input.resume, detail.resumeSnapshot.document)
+  assertLosslessResume(mock.calls.at(-2).body.input.resume, detail.resumeSnapshot.document, detail.resumeSnapshot)
 })
 
 function summaryProgress(f, runId) {

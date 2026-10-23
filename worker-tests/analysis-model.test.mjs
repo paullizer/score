@@ -3136,3 +3136,43 @@ test('model input uses the same immutable requirement derivation and exact order
     assert.equal(mock.calls.length, 0)
   }
 })
+
+test('assessment, grounding review, and reassessment requests redact candidate PII while returning verbatim original quotes for the UI', async () => {
+  const input = fixture()
+  const originalText = 'Paul Leiser is an estuarine calibration lead (paul.leiser@example.com, 555-867-5309, 100 Harbor Road, Boston, MA 02110). Paul Leiser resolved unusual estuarine isotope calibration drift, documented validation, and reduced measurement variance by 12 percent.'
+  input.resume.title = 'Paul_Leiser_CV.pdf'
+  input.resume.paragraphs[0].heading = 'Paul Leiser — Boston, MA'
+  input.resume.paragraphs[0].text = originalText
+  const resumePii = { name: 'Paul Leiser', location: 'Boston, MA', fileName: 'Paul_Leiser_CV.pdf' }
+
+  const initial = selectedAssessment(input, [4, 2, 1])
+  const needsCorrection = {
+    outcome: 'needs-correction',
+    issues: [{
+      code: 'unsupported-rationale',
+      message: 'Clarify the calibration scope in criterion 1.',
+      criterionId: input.rubric.criteria[0].id,
+      qualificationId: null,
+      citations: [selection(input, 0)],
+    }],
+  }
+  const revised = selectedAssessment(input, [4, 2, 1])
+  revised.criteria[0].rationale = 'They resolved unusual estuarine isotope calibration drift and documented method validation.'
+
+  const mock = mockModel([initial, needsCorrection, revised, supportedReview()])
+  const result = await assessResumeAgainstTarget(input, { ...mock.options, resumePii })
+
+  assert.equal(mock.calls.length, 4)
+  for (const call of mock.calls) {
+    const rawUserPayload = call.request.messages[1].content
+    assert.doesNotMatch(rawUserPayload, /Paul|Leiser|paul\.leiser|867-5309|Harbor Road|Boston/)
+    const parsed = JSON.parse(rawUserPayload)
+    assert.equal(parsed.input.resume.title, 'Resume')
+    assert.equal(parsed.input.resume.paragraphs[0].heading, 'They — [redacted location]')
+    assert.match(parsed.input.resume.paragraphs[0].passages[0].text, /^They are an estuarine calibration lead/)
+  }
+
+  assert.equal(result.assessment.criteria[0].citations[0].quote, originalText)
+  assert.equal(result.assessment.criteria[0].citations[0].heading, 'Paul Leiser — Boston, MA')
+})
+

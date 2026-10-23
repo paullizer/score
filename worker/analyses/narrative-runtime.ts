@@ -36,7 +36,7 @@ import {
 } from '../../server/analyses/validation'
 import { systemClock, type Clock } from '../runtime'
 import { NarrativeModelError } from './narrative-model'
-import { generateCandidateSummary, generateTargetSummary } from './summary-model'
+import { generateCandidateSummary, generateTargetSummary, resumePiiFromSnapshot, type AnalysisResumePiiContext } from './summary-model'
 import { emitSummaryTelemetry, logSummaryTelemetry, type SummaryTelemetryEvent } from './summary-telemetry'
 import type { AnalysisWorkerDependencies } from './runtime'
 import { operationSettings, retryBackoff, RuntimeSettingsError, safeSettingsMetadata } from '../settings'
@@ -263,7 +263,7 @@ function snapshotReader(deps: AnalysisWorkerDependencies, run: RealAnalysisRunRe
 }
 async function candidateInput(
   deps: AnalysisWorkerDependencies, inventory: AnalysisNarrativeInventory, comparisonId: string, signal: AbortSignal,
-): Promise<AnalysisCandidateNarrativeModelInput> {
+): Promise<{ input: AnalysisCandidateNarrativeModelInput; resumePii?: AnalysisResumePiiContext }> {
   const pair = inventory.comparisons.find(item => item.id === comparisonId)
   assertAnalysis(pair?.comparison?.status === 'complete' && pair.binding, 'Candidate generation requires its exact completed result.')
   const reader = snapshotReader(deps, inventory.run.record, 1, signal)
@@ -271,19 +271,23 @@ async function candidateInput(
   const result = await reader.result(pair.comparison, snapshots)
   assertAnalysis(result, 'Candidate generation has no saved result.')
   return {
-    binding: pair.binding, inputFingerprint: analysisHash(pair.binding),
-    source: { resume: snapshots.resumeSnapshot.document, ...targetSource(snapshots) }, result,
+    input: {
+      binding: pair.binding, inputFingerprint: analysisHash(pair.binding),
+      source: { resume: snapshots.resumeSnapshot.document, ...targetSource(snapshots) }, result,
+    },
+    resumePii: resumePiiFromSnapshot(snapshots.resumeSnapshot),
   }
 }
 async function targetInput(
   deps: AnalysisWorkerDependencies, inventory: AnalysisNarrativeInventory, signal: AbortSignal,
-): Promise<AnalysisTargetNarrativeModelInput> {
+): Promise<{ input: AnalysisTargetNarrativeModelInput; resumePiiByComparisonId: Map<string, AnalysisResumePiiContext | undefined> }> {
   if (inventory.comparisons.some(pair => pair.correctionPending)) throw new LostNarrativeWork()
   const selected = inventory.targets[0]
   assertAnalysis(inventory.targets.length === 1 && analysisTargetNarrativeCanGenerate(selected.binding, inventory.comparisons.map(pair => pair.id)),
     'Target generation requires every settled pair and current candidate narrative.')
   const reader = snapshotReader(deps, inventory.run.record, ANALYSIS_LIMITS.maxComparisons, signal)
   const candidates: AnalysisTargetNarrativeModelInput['candidates'] = []
+  const resumePiiByComparisonId = new Map<string, AnalysisResumePiiContext | undefined>()
   let target: AnalysisTargetNarrativeModelInput['target'] | undefined
   for (const pair of inventory.comparisons) {
     signal.throwIfAborted()
@@ -295,6 +299,7 @@ async function targetInput(
     const artifact = await readAnalysisNarrativePublication(deps.blobs, pair.narrative)
     assertAnalysis(result && artifact?.kind === 'candidate', 'A current candidate publication could not be read.')
     target ??= targetSource(snapshots)
+    resumePiiByComparisonId.set(pair.comparison.id, resumePiiFromSnapshot(snapshots.resumeSnapshot))
     candidates.push({
       binding: pair.binding, result, narrative: {
         dataKind: 'real', ...narrativePublicationVersion(pair.narrative.published), text: artifact.text, overview: artifact.overview,
@@ -303,7 +308,10 @@ async function targetInput(
     })
   }
   assertAnalysis(target && candidates.length > 0, 'A target with no completed comparisons does not require a model overview.')
-  return { binding: selected.binding, inputFingerprint: analysisHash(selected.binding), target, candidates }
+  return {
+    input: { binding: selected.binding, inputFingerprint: analysisHash(selected.binding), target, candidates },
+    resumePiiByComparisonId,
+  }
 }
 
 async function reconcileTarget(
@@ -538,9 +546,10 @@ export async function processClaimedNarrative(
     })
     const inventory = await lease.control.wait(() => readAnalysisNarrativeInventory(deps, run.record.workspaceId, run.record.id, narrative.record.targetId))
     const comparisonId = narrative.record.recordType === 'analysis-candidate-narrative' ? narrative.record.comparisonId : undefined
-    const input = comparisonId
+    const prepared = comparisonId
       ? await lease.control.wait(() => candidateInput(deps, inventory, comparisonId, lease.control.signal))
       : await lease.control.wait(() => targetInput(deps, inventory, lease.control.signal))
+    const input = prepared.input
     if (input.inputFingerprint !== narrative.record.inputFingerprint) throw new LostNarrativeWork()
     inputs = false
     await lease.check()
@@ -549,6 +558,7 @@ export async function processClaimedNarrative(
     knownFailure = savedRetryFailure(resume.steps)
     const modelOptions = {
       model: deps.model, clock, signal: lease.control.signal, deadlineAt: deadline, attemptId: narrative.record.attemptId!,
+      ...('resumePiiByComparisonId' in prepared ? { resumePiiByComparisonId: prepared.resumePiiByComparisonId } : { resumePii: prepared.resumePii }),
       ...resume, onEvent,
       async onCheckpoint(step: AnalysisSummaryStep) {
         knownFailure = step.error?.diagnostic?.retryAt ? step.error : undefined

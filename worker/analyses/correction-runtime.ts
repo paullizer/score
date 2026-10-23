@@ -32,7 +32,9 @@ import {
 import { systemClock, type Clock } from '../runtime'
 import { operationSettings, retryBackoff, RuntimeSettingsError, safeSettingsMetadata } from '../settings'
 import { PromptPinError } from '../prompts'
-import { AnalysisModelError, assessResumeAgainstTarget, reviewAnalysisAssessment, reviewAnalysisEvidenceGaps } from './model'
+import {
+  AnalysisModelError, assessResumeAgainstTarget, resumePiiFromSnapshot, reviewAnalysisAssessment, reviewAnalysisEvidenceGaps,
+} from './model'
 import type { AnalysisWorkerDependencies } from './runtime'
 import { emitAnalysisTelemetry } from './telemetry'
 
@@ -435,6 +437,7 @@ export async function processClaimedCorrection(
     const reviewOptions = {
       model: deps.model, clock, signal: lease.control.signal,
       resumeSnapshotSha256: correction.record.resumeSnapshot.sha256, targetSnapshotSha256: correction.record.targetSnapshot.sha256,
+      resumePii: resumePiiFromSnapshot(snapshots.resumeSnapshot),
       onEvent,
     }
     let result: RealAnalysisResult

@@ -10,7 +10,7 @@ import { gradeVersionHash, parseGradeEntity, validateGradeApproval } from '../..
 import { qcAssert, qcBytesHash, qcSettingsHash, qcValueHash, validateQcProposal } from '../../server/qc/validation'
 import { qcPlannerProvenanceSchema, type QcPlannerProvenance } from '../../server/qc/artifacts'
 import { validateGeneralizedQcGuidance } from '../../server/qc/plans'
-import { assessResumeAgainstTarget } from '../analyses/model'
+import { assessResumeAgainstTarget, resumePiiFromSnapshot } from '../analyses/model'
 import { draftGradeRubric, planGradeCompetencies, reviewGradeRubric } from '../grades/model'
 import { GradeModelError } from '../grades/model-errors'
 import { generateGroundedRubric, invokeStructuredModel, type RubricModelOptions, type StructuredModelRequest } from '../runtime'
@@ -185,6 +185,7 @@ export async function runQcTrial(
         model, clock: dependencies.clock, signal,
         resumeSnapshotSha256: entry.analysis.comparison.resume.blob.sha256,
         targetSnapshotSha256: entry.analysis.comparison.target.blob.sha256,
+        resumePii: resumePiiFromSnapshot(entry.analysis.resumeSnapshot),
       })
       const models: Record<string, string> = { assessment: assessed.assessmentProvenance.model }
       const reviewers = [...new Set(assessed.groundingReviews.map(review => review.provenance.model))]
