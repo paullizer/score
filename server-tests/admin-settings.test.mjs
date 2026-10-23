@@ -32,20 +32,22 @@ function fakeStore() {
     async getCurrent() {
       counters.reads++
       if (readError) throw readError
-      return current && structuredClone(current)
+      return current && JSON.parse(JSON.stringify(current))
     },
     async getRevision(revision) {
       if (readError) throw readError
-      return structuredClone(revisions.get(revision))
+      const value = revisions.get(revision)
+      return value && JSON.parse(JSON.stringify(value))
     },
     async initialize(revision) {
       counters.initializations++
       if (writeError) throw writeError
       if (current) return false
-      current = { revision: structuredClone(revision), etag: `"settings-${++counter}"` }
-      revisions.set(revision.revision, structuredClone(revision))
-      const { settings, ...audit } = revision
-      audits.set(revision.revision, structuredClone(audit))
+      const stored = JSON.parse(JSON.stringify(revision))
+      current = { revision: stored, etag: `"settings-${++counter}"` }
+      revisions.set(revision.revision, stored)
+      const { settings, ...audit } = stored
+      audits.set(revision.revision, audit)
       return true
     },
     async publish(revision, etag) {
@@ -53,11 +55,12 @@ function fakeStore() {
       if (current?.etag !== etag) throw new StoreConflictError()
       if (revisions.has(revision.revision)) throw new Error('Immutable revision collision.')
       counters.publications++
-      current = { revision: structuredClone(revision), etag: `"settings-${++counter}"` }
-      revisions.set(revision.revision, structuredClone(revision))
-      const { settings, ...audit } = revision
-      audits.set(revision.revision, structuredClone(audit))
-      return structuredClone(current)
+      const stored = JSON.parse(JSON.stringify(revision))
+      current = { revision: stored, etag: `"settings-${++counter}"` }
+      revisions.set(revision.revision, stored)
+      const { settings, ...audit } = stored
+      audits.set(revision.revision, audit)
+      return JSON.parse(JSON.stringify(current))
     },
     async history(limit, before) {
       const values = [...audits.values()].sort((a, b) => b.revision.localeCompare(a.revision))

@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import {
   StoreConflictError, createAzureSettingsModelAdapter, createDefaultAdminSettings, createSettingsReaderFromContainer, createSettingsStoreFromContainer,
-  resolveTaskModel,
+  diffAdminSettings, resolveTaskModel,
 } from '../dist-server/app.mjs'
 
 const time = '2026-09-21T12:00:00.000Z'
@@ -52,7 +52,7 @@ function cosmos() {
             return { code: status, result: failed }
           }
           const etag = `"cosmos-${++sequence}"`
-          next.set(id, { ...structuredClone(operation.resourceBody), _etag: etag, _rid: 'system-only', _ts: 1 })
+          next.set(id, { ...JSON.parse(JSON.stringify(operation.resourceBody)), _etag: etag, _rid: 'system-only', _ts: 1 })
           results.push({ statusCode: operation.operationType === 'Create' ? 201 : 200, eTag: etag })
         }
         documents.clear()
@@ -104,6 +104,33 @@ test('Cosmos settings transaction keeps pointer, immutable revision, and audit i
   assert.equal(operations[0].ifMatch, first.etag)
   assert.equal(operations[1].resourceBody.recordType, 'settings-revision')
   assert.equal(operations[2].resourceBody.recordType, 'settings-audit')
+
+  const withOptionalSwitch = revision('r-20260921120100000-si-on', next.revision)
+  withOptionalSwitch.settings = { ...structuredClone(next.settings), features: { ...next.settings.features, siTerminology: true } }
+  withOptionalSwitch.changes = diffAdminSettings(next.settings, withOptionalSwitch.settings)
+  assert.deepEqual(withOptionalSwitch.changes, [{ path: 'features.siTerminology', before: undefined, after: true }])
+  const publishedOptional = await store.publish(withOptionalSwitch, updated.etag)
+  const reloadedOptional = await store.getCurrent()
+  assert.equal(reloadedOptional.revision.settings.features.siTerminology, true)
+  assert.deepEqual(reloadedOptional.revision.changes, [{ path: 'features.siTerminology', before: undefined, after: true }])
+
+  const restoredBaseline = revision('r-20260921120200000-restore', withOptionalSwitch.revision)
+  restoredBaseline.reason = 'restore'
+  restoredBaseline.restoredFrom = first.revision.revision
+  restoredBaseline.settings = structuredClone(first.revision.settings)
+  restoredBaseline.changes = diffAdminSettings(withOptionalSwitch.settings, restoredBaseline.settings)
+  await store.publish(restoredBaseline, publishedOptional.etag)
+  const reloadedRestored = await store.getCurrent()
+  assert.equal('siTerminology' in reloadedRestored.revision.settings.features, false)
+  assert.deepEqual(
+    reloadedRestored.revision.changes.find(change => change.path === 'features.siTerminology'),
+    { path: 'features.siTerminology', before: true, after: undefined },
+  )
+  const historyPage = await store.history(10)
+  assert.deepEqual(
+    historyPage.revisions.find(item => item.revision === withOptionalSwitch.revision)?.changes,
+    [{ path: 'features.siTerminology', before: undefined, after: true }],
+  )
 })
 
 test('Cosmos CAS failures and transaction failures never leave revision/audit documents without publication', async () => {

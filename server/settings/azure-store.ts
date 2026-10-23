@@ -14,10 +14,13 @@ const actor = z.union([
   z.strictObject({ tenantId: z.string().regex(GUID_PATTERN), oid: z.string().regex(GUID_PATTERN) }),
   z.strictObject({ system: z.literal('initialization') }),
 ])
+const changeSchema = z.strictObject({
+  path: z.string().max(300), before: z.unknown().optional(), after: z.unknown().optional(),
+}).transform(({ path, before, after }) => ({ path, before, after }))
 export const settingsRevisionMetadataSchema = z.strictObject({
   revision: id, previousRevision: id.nullable(), createdAt: z.iso.datetime(), actor,
   reason: z.enum(['initialize', 'patch', 'restore', 'import']), restoredFrom: id.optional(),
-  changes: z.array(z.strictObject({ path: z.string().max(300), before: z.unknown(), after: z.unknown() })).max(500),
+  changes: z.array(changeSchema).max(500),
 })
 export const settingsRevisionSchema: z.ZodType<SettingsRevision> = settingsRevisionMetadataSchema.extend({ settings: adminSettingsSchema })
 const pointerSchema = z.strictObject({
@@ -91,21 +94,27 @@ export function createSettingsStoreFromContainer(container: Pick<Container, 'ite
     return { revision, etag: result.etag }
   }
   async function commit(value: SettingsRevision, expectedEtag?: string): Promise<string | undefined> {
-    const revision = settingsRevisionSchema.parse(value)
-    const pointer = { id: 'current', applicationId: SETTINGS_APPLICATION_ID, recordType: 'settings-current', revision: revision.revision }
+    const revision = settingsRevisionSchema.parse(JSON.parse(JSON.stringify(value)))
+    const pointer = pointerSchema.parse({
+      id: 'current', applicationId: SETTINGS_APPLICATION_ID, recordType: 'settings-current', revision: revision.revision,
+    })
     const metadata = Object.fromEntries(Object.entries(revision).filter(([key]) => key !== 'settings'))
+    const revisionBody = JSON.parse(JSON.stringify({
+      id: `revision:${revision.revision}`, applicationId: SETTINGS_APPLICATION_ID, recordType: 'settings-revision',
+      revision: revision.revision, value: revision,
+    }))
+    const auditBody = JSON.parse(JSON.stringify({
+      id: `audit:${revision.revision}`, applicationId: SETTINGS_APPLICATION_ID, recordType: 'settings-audit',
+      revision: revision.revision, value: metadata,
+    }))
+    revisionDocumentSchema.parse(revisionBody)
+    auditSchema.parse(auditBody)
     const operations: OperationInput[] = [
       expectedEtag === undefined
         ? { operationType: 'Create', resourceBody: pointer }
         : { operationType: 'Replace', id: 'current', ifMatch: expectedEtag, resourceBody: pointer },
-      { operationType: 'Create', resourceBody: {
-        id: `revision:${revision.revision}`, applicationId: SETTINGS_APPLICATION_ID, recordType: 'settings-revision',
-        revision: revision.revision, value: JSON.parse(JSON.stringify(revision)),
-      } },
-      { operationType: 'Create', resourceBody: {
-        id: `audit:${revision.revision}`, applicationId: SETTINGS_APPLICATION_ID, recordType: 'settings-audit',
-        revision: revision.revision, value: JSON.parse(JSON.stringify(metadata)),
-      } },
+      { operationType: 'Create', resourceBody: revisionBody },
+      { operationType: 'Create', resourceBody: auditBody },
     ]
     let response
     try { response = await container.items.batch(operations, SETTINGS_APPLICATION_ID) } catch (error) {

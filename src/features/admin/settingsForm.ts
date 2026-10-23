@@ -11,7 +11,8 @@ export function updateSetting(settings: AdminSettings, path: string, value: unkn
   const keys = path.split('.')
   let current: Record<string, unknown> = copy as unknown as Record<string, unknown>
   for (const key of keys.slice(0, -1)) current = current[key] as Record<string, unknown>
-  current[keys[keys.length - 1]] = value
+  if (value === undefined) delete current[keys[keys.length - 1]]
+  else current[keys[keys.length - 1]] = value
   return copy
 }
 
