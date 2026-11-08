@@ -439,6 +439,26 @@
   .criterion-toggle > svg { @apply shrink-0; color: var(--cp-text-soft); }
   .criterion-content { @apply px-5 pb-5; }
   .criterion-description { @apply mb-4 text-[11px]; color: var(--cp-text-soft); }
+  .scoring-guidance { @apply mb-4 overflow-hidden rounded-[10px] border; background: var(--cp-surface); }
+  .scoring-guidance > summary { @apply cursor-pointer px-4 py-3 text-[12px] font-semibold; }
+  .scoring-guidance > summary::marker { color: var(--cp-text-muted); }
+  .scoring-guidance > summary:hover { background: var(--cp-surface-soft); }
+  .scoring-guidance[open] > summary { @apply border-b; background: var(--cp-surface-soft); }
+  .scoring-guidance-levels { @apply m-0 list-none px-4; }
+  .scoring-guidance-levels > li { @apply grid gap-3 border-b py-4; grid-template-columns: 32px minmax(0, 1fr); }
+  .scoring-guidance-levels > li:last-child { border-bottom: 0; }
+  .scoring-guidance-number { @apply flex h-8 w-8 items-center justify-center rounded-lg border text-[15px] font-semibold tabular-nums; background: var(--cp-surface-soft); }
+  .is-saved-score .scoring-guidance-number { background: var(--cp-accent); border-color: var(--cp-accent); color: var(--cp-accent-fg); }
+  .scoring-guidance-body { @apply min-w-0; overflow-wrap: anywhere; }
+  .scoring-guidance-heading { @apply flex flex-wrap items-baseline justify-between gap-x-3 gap-y-1 text-[12px]; }
+  .scoring-guidance-heading > strong { @apply font-semibold; }
+  .scoring-guidance-saved { @apply text-[11px] font-semibold; color: var(--cp-accent); }
+  .scoring-guidance-body > p { @apply mt-1 text-[12px] leading-5; color: var(--cp-text-muted); }
+  .scoring-guidance-body > .scoring-guidance-example { @apply mt-2; }
+  .scoring-guidance-example > strong { @apply font-medium; color: var(--cp-text); }
+  .scoring-guidance-rule { @apply border-t px-4 py-3 text-[11px] leading-5; background: var(--cp-surface-soft); overflow-wrap: anywhere; }
+  .scoring-guidance-rule > p + p { @apply mt-1; color: var(--cp-text-soft); }
+  .scoring-guidance-legacy { @apply whitespace-pre-line px-4 py-3 text-[12px] leading-5; color: var(--cp-text-muted); overflow-wrap: anywhere; }
   .rationale { @apply mb-5; }
   .rationale > strong { @apply block text-[11px] font-semibold; }
   .rationale > p { @apply mt-1.5 text-[12px] leading-6; color: var(--cp-text-muted); }

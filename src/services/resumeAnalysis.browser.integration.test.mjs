@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict'
 import { after, before, test } from 'node:test'
 import { randomUUID } from 'node:crypto'
+import { mkdir } from 'node:fs/promises'
+import { join } from 'node:path'
 import { chromium } from 'playwright'
 import { seededLadder, seedRealJob } from './gradeLadders.test-support.mjs'
 import { diagnosticFixture, diagnosticReference, failedComparisonFixture, privateReviewReason } from './analysisDiagnostics.test-support.mjs'
@@ -552,6 +554,149 @@ async function routeDiagnosticScenario(page, fixture, scenario, diagnostics) {
     return route.continue()
   })
 }
+
+test('browser saved scoring guidance shows a read-only ladder, preserves legacy text, and distinguishes unscored states', { timeout: 120_000 }, async (t) => {
+  const fixture = await startResumeAnalysisFixture(runtime, { injectAuth: true })
+  t.after(() => fixture.close())
+  const scenario = await diagnosticBrowserScenario(fixture)
+  const scaled = structuredClone(scenario.accepted)
+  const criterion = scaled.targetSnapshot.rubric.criteria[0]
+  const assessment = scaled.result.criteria.find((item) => item.criterionId === criterion.id)
+  const examples = [
+    'Listed engineering training. <img src=x onerror="window.guidanceInjected=true">',
+    'Applied engineering methods on a documented project.',
+    'Repeated engineering work across multiple projects.',
+    `Independent engineering responsibility. ${'x'.repeat(500)}`,
+    'Originated an engineering program with documented organizational scope.',
+  ]
+  criterion.levels = examples.map((text, index) => ({ level: index + 1, examples: text }))
+  scaled.targetSnapshot.rubric.scaleVersion = runtime.api.EVIDENCE_SCALE_VERSION
+  // Every captured criterion must use the same named scale, including rows not expanded in this test.
+  for (const item of scaled.targetSnapshot.rubric.criteria) {
+    item.levels ??= criterion.levels
+    item.guidance = runtime.api.renderEvidenceGuidance(item.levels)
+  }
+  assessment.score = 5
+  assessment.evidenceStatus = 'supported'
+  scenario.detail = scaled
+  const frozen = JSON.stringify(scaled)
+  const { context, page, errors } = await newPage()
+  const guidance = page.locator('.criterion-content .scoring-guidance').first()
+  const summary = guidance.locator('summary')
+  const rows = guidance.locator('.scoring-guidance-levels > li')
+  try {
+    await routeDiagnosticScenario(page, fixture, scenario, () => assert.fail('Completed guidance must not request unpublished diagnostics.'))
+    await page.goto(scenario.url)
+    await visible(summary)
+    assert.equal(await guidance.evaluate((node) => node.open), false)
+    assert.equal(await rows.first().isVisible(), false)
+    await summary.focus()
+    await page.keyboard.press('Enter')
+    await visible(rows.first())
+    assert.deepEqual(await rows.locator('.scoring-guidance-number').allTextContents(), ['0', '1', '2', '3', '4', '5'])
+    assert.deepEqual(await rows.locator('.scoring-guidance-heading > strong').allTextContents(), [
+      'No relevant evidence', 'Mentioned only', 'One applied example', 'Repeated or ongoing work',
+      'Broad or complex work', 'Leading or originating the work',
+    ])
+    assert.equal(await rows.nth(0).locator('.scoring-guidance-example').count(), 0)
+    for (let index = 0; index < examples.length; index++) {
+      assert.equal(await rows.nth(index + 1).locator('.scoring-guidance-example').textContent(), `Examples: ${examples[index]}`)
+    }
+    assert.equal(await rows.nth(5).getByText('Saved score', { exact: true }).count(), 1)
+    assert.equal(await guidance.locator('button, input, select, textarea, img').count(), 0)
+    assert.equal(await page.evaluate(() => window.guidanceInjected), undefined)
+    assert.match(await rows.first().textContent(), /normal, neutral outcome, never a statement about ability/)
+    assert.match(await guidance.locator('.scoring-guidance-rule').textContent(), /choose the lower level/)
+    assert.match(await guidance.locator('.scoring-guidance-rule').textContent(), /strongest cited evidence/)
+    assert.equal(JSON.stringify(scaled), frozen, 'Displaying the ladder must not alter the captured rubric or assessment.')
+
+    for (const viewport of [{ width: 1440, height: 1100 }, { width: 390, height: 844 }]) {
+      await page.setViewportSize(viewport)
+      for (const theme of ['light', 'dark']) {
+        await page.evaluate((value) => document.documentElement.dataset.theme = value, theme)
+        assert.equal(await guidance.evaluate((node) => node.scrollWidth <= node.clientWidth), true,
+          `Guidance must wrap long examples at ${viewport.width}px in ${theme} mode.`)
+        assert.equal(await rows.nth(5).getByText('Saved score', { exact: true }).isVisible(), true)
+        const contrasts = await guidance.evaluate((node) => {
+          const rgb = (color) => color.match(/[\d.]+/g).slice(0, 3).map(Number)
+          const luminance = (color) => rgb(color).map((channel) => {
+            const value = channel / 255
+            return value <= 0.04045 ? value / 12.92 : ((value + 0.055) / 1.055) ** 2.4
+          }).reduce((sum, value, index) => sum + value * [0.2126, 0.7152, 0.0722][index], 0)
+          return [...node.querySelectorAll('summary, .scoring-guidance-number, .scoring-guidance-heading > strong, .scoring-guidance-saved, p')].map((text) => {
+            let background = text
+            while (getComputedStyle(background).backgroundColor === 'rgba(0, 0, 0, 0)') background = background.parentElement
+            const values = [luminance(getComputedStyle(text).color), luminance(getComputedStyle(background).backgroundColor)].sort((a, b) => a - b)
+            return { text: text.textContent, ratio: (values[1] + 0.05) / (values[0] + 0.05) }
+          })
+        })
+        assert.ok(contrasts.every(({ ratio }) => ratio >= 4.5), `Text contrast must reach 4.5:1 in ${theme} mode: ${JSON.stringify(contrasts)}`)
+        if (process.env.SCORE_TEST_SCREENSHOT_DIR) {
+          await mkdir(process.env.SCORE_TEST_SCREENSHOT_DIR, { recursive: true })
+          await guidance.screenshot({ path: join(process.env.SCORE_TEST_SCREENSHOT_DIR, `scoring-guidance-${viewport.width}-${theme}.png`), animations: 'disabled' })
+        }
+      }
+    }
+    await page.setViewportSize({ width: 1440, height: 1100 })
+    await page.evaluate(() => document.documentElement.style.zoom = '2')
+    assert.equal(await guidance.evaluate((node) => node.scrollWidth <= node.clientWidth), true, 'Guidance must wrap at 200% zoom.')
+    await page.evaluate(() => document.documentElement.style.zoom = '')
+    await summary.focus()
+    await page.keyboard.press('Space')
+    assert.equal(await guidance.evaluate((node) => node.open), false)
+    await page.setViewportSize({ width: 1440, height: 1100 })
+
+    for (const [status, score] of [['missing', 0], ['partial', 2], ['not-assessed', null], ['not-applicable', null]]) {
+      scenario.detail = structuredClone(scaled)
+      const result = scenario.detail.result.criteria.find((item) => item.criterionId === criterion.id)
+      result.evidenceStatus = status
+      result.score = score
+      if (status === 'not-assessed') result.limitation = { code: 'ambiguous-guidance', message: 'Controlled fixture needs human review.' }
+      if (status === 'not-applicable') {
+        result.weight = 0
+        delete scenario.detail.targetSnapshot.rubric.criteria[0].levels
+        scenario.detail.targetSnapshot.rubric.criteria[0].guidance = 'Saved exclusion guidance. This criterion is unscored.'
+      }
+      await page.reload()
+      await visible(summary)
+      assert.equal(await guidance.evaluate((node) => node.open), false)
+      await summary.click()
+      assert.equal(await guidance.locator('.scoring-guidance-saved').count(), score === null ? 0 : 1, status)
+      if (score !== null) assert.equal(await rows.nth(score).getByText('Saved score', { exact: true }).count(), 1)
+      if (status === 'not-applicable') {
+        assert.equal(await rows.count(), 0)
+        assert.equal(await guidance.locator('.scoring-guidance-legacy').textContent(), 'Saved exclusion guidance. This criterion is unscored.')
+      }
+    }
+
+    scenario.detail = structuredClone(scaled)
+    scenario.detail.result.criteria = scenario.detail.result.criteria.filter((item) => item.criterionId !== criterion.id)
+    await page.reload()
+    await visible(summary)
+    await summary.click()
+    assert.equal(await guidance.locator('.scoring-guidance-saved').count(), 0, 'An absent assessment is not a zero score.')
+
+    for (const withoutScale of [true, false]) {
+      scenario.detail = structuredClone(scaled)
+      const legacy = scenario.detail.targetSnapshot.rubric.criteria[0]
+      if (withoutScale) delete scenario.detail.targetSnapshot.rubric.scaleVersion
+      else delete legacy.levels
+      legacy.guidance = 'Saved custom guidance.\n0: Preserve the original wording.\n1: <script>window.guidanceInjected=true</script>'
+      await page.reload()
+      await visible(summary)
+      await summary.click()
+      assert.equal(await rows.count(), 0, 'Incomplete structured data must not invent a ladder.')
+      assert.equal(await guidance.locator('.scoring-guidance-legacy').textContent(), legacy.guidance)
+      assert.equal(await guidance.locator('.scoring-guidance-legacy').evaluate((node) => getComputedStyle(node).whiteSpace), 'pre-line')
+      assert.equal(await guidance.locator('script').count(), 0)
+      assert.equal(await page.evaluate(() => window.guidanceInjected), undefined)
+    }
+    const persisted = await jsonResponse(await fixture.request(scenario.pairPath))
+    assert.deepEqual(persisted.targetSnapshot, scenario.accepted.targetSnapshot)
+    assert.deepEqual(persisted.result, scenario.accepted.result)
+    assert.deepEqual(errors, [])
+  } finally { await context.close() }
+})
 
 test('browser failed diagnostics expose exact frozen sources, private review reasons, bounded history, and no draft scores', { timeout: 120_000 }, async (t) => {
   const fixture = await startResumeAnalysisFixture(runtime, { injectAuth: true })

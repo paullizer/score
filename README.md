@@ -347,6 +347,10 @@ Deploy and confirm readiness of API/UI readers that accept the optional `failure
 
 Passage selection changes only the worker's model-facing contract (assessment/grounding prompts v3, transport schemas v2, catalog `score-analysis-passages-v1`). Stored results keep their existing literal-citation format and schema; no source rewrite, new resource, model switch, or permission grant is needed. Investigating private source content still requires authorized workspace access: monitoring access alone does not grant access to the underlying resumes. A download affordance is not the scoring input; assessment uses its embedded frozen normalized document.
 
+### Saved scoring guidance
+
+In a saved analysis, **Saved rubric guidance / scoring anchors** stays collapsed until opened. Rubrics on the versioned evidence scale show a read-only ladder from 0 to 5, with separate level definitions and saved criterion-specific examples. The assessed level is labeled **Saved score**; unassessed or excluded criteria never receive a zero-score marker. The lower-level tie rule and evidence basis remain visible below the ladder. Older rubrics keep their original free-text guidance, without inferred anchors or changes to frozen inputs, scores, or citations.
+
 ### Saved analysis summaries
 
 Real analyses keep narrative summaries separately from the immutable scoring results. Each completed resume/job comparison has an assessment summary and a short overview; each exact job or grade has an overview of its saved assessments. Concise prose is guidance, not a publication gate. New version-2 summaries are not rejected for sentence counts, abbreviations, equivalent number formats, accurate mentions of saved scores, or omission of minor details. Basic nonempty response shapes and high technical resource bounds still apply. Summaries describe documented strengths, distinctions, and gaps; they do not turn scores into a hiring recommendation or official eligibility finding. The numerical scores, coverage, source quotations, and separate GS qualification notes remain unchanged.
