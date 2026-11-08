@@ -2,6 +2,12 @@
 
 The goal is repeatable document-evidence scores, not a required user workflow for model disagreements. Production scoring is unchanged by the offline evaluation tools. Human QC is separate from ordinary scoring; neither model agreement nor a higher mean score proves correctness.
 
+## Reading saved scoring guidance
+
+Saved analysis and QC comparison views keep scoring guidance behind the **Saved rubric guidance / scoring anchors** disclosure. Opening a versioned-scale rubric shows six numbered rows with the captured scale's definitions and that criterion's saved examples. **Saved score** marks the assessed level as read-only context, not an editable choice or a new assessment. A missing-evidence score of zero is marked only when zero was actually assessed; not-assessed and not-applicable results remain unmarked.
+
+The neutral level-zero definition, lower-level tie rule, and evidence basis are retained. Historical rubrics without structured scale data show their saved free text rather than an inferred ladder. This presentation does not change scoring, evidence, frozen snapshots, or the rubric library and editor.
+
 ## Offline implementation boundary
 
 `worker/evals` provides strict versioned suite, observation and reference contracts; ordinal repeat statistics; a bounded resumable executor; and a USD cost ledger with a durable milestone outbox. The explicit production adapter and paid runner reuse production model transports; the experimental evidence-first adapter is offline-only. These tools do not provision infrastructure, expose new API routes, edit global prompts, activate configurations or change ordinary scoring.

@@ -9,6 +9,7 @@ import { documentPagination, type DocumentPagination } from '../../domain/docume
 import { gradeSourcePagination } from '../grade-ladders/gradeUi'
 import { Badge, Button, EmptyState, InlineError, Score, SegmentedControl } from '../../components/ui'
 import { DocumentViewer } from '../../components/documents/DocumentViewer'
+import { ScoringGuidance } from '../../components/rubrics/ScoringGuidance'
 import { RealCandidateNarrative } from './AnalysisSummaries'
 import { getDisplayName, getResumeDisplayName } from '../../domain/displayNames'
 import { analysisFailureExplanation, analysisFailureStages, citationMatches, targetVersionLabel } from './realAnalysisUi'
@@ -138,7 +139,8 @@ export function RealComparisonReview({ detail, actions, initialView, qc }: {
             {isOpen && <div className="criterion-content" id={id}>
               <div className="mb-3 flex flex-wrap gap-2"><EvidenceStatus status={status} /><Badge>{criterion.requirementType === 'required' ? 'Required' : criterion.requirementType === 'preferred' ? 'Preferred' : 'Requirement type not stated'}</Badge></div>
               <p className="criterion-description">{criterion.description}</p>
-              <details className="mb-4 text-[11px]"><summary className="cursor-pointer font-medium">Saved rubric guidance / scoring anchors</summary><p className="mt-2 whitespace-pre-line text-muted">{criterion.guidance}</p></details>
+              <ScoringGuidance criterion={criterion} scaleVersion={rubric.scaleVersion}
+                savedScore={status === 'not-assessed' || status === 'not-applicable' ? null : assessment?.score} />
               <div className="rationale"><strong>Assessment</strong><p>{assessment?.rationale ?? 'This criterion has no saved assessment. No score is invented.'}</p></div>
               {status === 'not-assessed' && <div className="evidence-gap"><ScanLine size={17} aria-hidden="true" /><p>{assessment?.evidenceStatus === 'not-assessed' ? assessment.limitation.message : 'No assessment is available.'} Not assessed does not mean zero evidence or missing skill.</p></div>}
               {status === 'not-applicable' && <div className="evidence-gap"><p>This approved GS exclusion is unscored and has zero weight. It is not an applicant score of zero.</p></div>}
