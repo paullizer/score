@@ -361,6 +361,40 @@ function tableNames(selector = '.comparison-table') { return tableRows(selector)
 function rowIndexes() { return tableRows().map((row) => Number(row.querySelector('[aria-label^="Review comparison "]').getAttribute('aria-label').match(/^Review comparison (\d+):/)[1]) - 1) }
 function chosenSort(label = 'Sort comparisons') { return element(`select[aria-label="${label}"]`).selectedOptions[0].textContent }
 
+test('score distribution follows the exact target but not search or sorting, and hides inside a saved comparison', async () => {
+  const targets = [target(), target({ version: 2 })]
+  const pairs = [12, 56, 88].map((score, index) => pair(index, { score }))
+  pairs.push(...[0, 0, 100].map((score, index) => {
+    const value = pair(index + 3, { score, chosenTarget: targets[1] })
+    value.comparison.resume = pairs[index].comparison.resume
+    return value
+  }))
+  const api = apiFor(pairs, targets)
+  const detail = api.detail().value
+  api.detail = () => ({ state: 'ready', value: { ...detail, resumes: pairs.slice(0, 3).map(value => value.comparison.resume.summary) } })
+  await render(app({ api }))
+  const panel = () => element('.score-distribution')
+  const stats = () => panel().querySelector('.score-distribution-statistics').textContent
+  assert.match(panel().textContent, /Select one exact job or grade/)
+  assert.equal(panel().querySelector('figure'), null)
+  await chooseTarget(ui.targetIdentity(targets[0].selection))
+  assert.match(stats(), /Scored3 \/ 3Mean52\.0Median56\.0Range12-88/)
+  const before = stats()
+  await search('Candidate 1')
+  assert.equal(tableRows().length, 1)
+  await sortHeader('Score')
+  assert.equal(stats(), before)
+  await click('Candidate 1')
+  assert.equal(dom.window.document.querySelector('.score-distribution'), null)
+  await backLink('All comparisons')
+  assert.equal(stats(), before)
+  await chooseTarget(ui.targetIdentity(targets[1].selection))
+  assert.match(stats(), /Scored3 \/ 3Mean33\.3Median0\.0Range0-100/)
+  await chooseTarget('')
+  assert.equal(panel().querySelector('.score-distribution-statistics'), null)
+  assert.deepEqual(calls.filter(([kind]) => !['detail', 'pairs', 'result'].includes(kind)), [])
+})
+
 test('real comparison headers and mobile selector share state, expose exact targets, and reset unsafe score sorting', async () => {
   const targets = [target(), target({ version: 2 }), target({ kind: 'grade', id: 'ladder-a', label: 'Approved GS-9' })]
   const pairs = [pair(0, { name: 'Zeta', score: 0 }), pair(1, { name: 'Alpha', score: 72 }),
