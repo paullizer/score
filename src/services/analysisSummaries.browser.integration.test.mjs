@@ -156,6 +156,7 @@ async function setup(t, {
   features = { realAnalyses: false, analysisSummaryGeneration: true },
   beforeSubjectGet = null,
   fixture: inputFixture,
+  comparisonPageSize,
 } = {}) {
   const context = await browser.newContext({ viewport: { width: 1440, height: 1100 } })
   t.after(() => context.close())
@@ -175,6 +176,7 @@ async function setup(t, {
   const fixture = inputFixture ?? analysisSummaryFixture({ archived, secondStatus })
   const state = {
     fixture, liveTargets: structuredClone(fixture.targets), requests: [], options: { ...summaryOptions }, beforeGet: null, beforeSubjectGet, onPost: null,
+    beforeComparisonsGet: null,
     histories: new Map(), acknowledged: new Map(), beforeHistoryGet: null, onSummaryAction: null, summaryActions: 0,
     history(subject) {
       const key = `${subject.kind}:${subject.subjectId}`
@@ -218,7 +220,14 @@ async function setup(t, {
     if (url.pathname === `${base}/targets`) return respond({ targets: state.liveTargets })
     if (url.pathname === base) return respond({ runs: [fixture.summary] })
     if (url.pathname === `${base}/${summaryRunId}`) return respond({ ...fixture.detail, ...fixture.summary })
-    if (url.pathname === `${base}/${summaryRunId}/comparisons`) return respond({ comparisons: fixture.details })
+    if (url.pathname === `${base}/${summaryRunId}/comparisons`) {
+      const custom = await state.beforeComparisonsGet?.(record)
+      if (custom) return respond(custom.body, custom.status)
+      const offset = Number(record.cursor ?? 0)
+      const end = comparisonPageSize ? offset + comparisonPageSize : fixture.details.length
+      return respond({ comparisons: fixture.details.slice(offset, end),
+        ...(end < fixture.details.length ? { continuationToken: String(end) } : {}) })
+    }
     const comparison = fixture.details.find(({ comparison }) => url.pathname === `${base}/${summaryRunId}/comparisons/${comparison.id}`)
     if (comparison) return respond(comparison)
     const subjectRead = url.pathname.match(/\/summaries\/(candidate|target)\/([^/]+)$/)
@@ -324,6 +333,142 @@ async function openExport(page) {
 async function readyDownload(dialog) {
   await until(() => dialog.getByRole('button', { name: /^Download / }).isEnabled(), 'The selected report scope should be ready.')
 }
+
+function scoreDistributionFixture(scores, options) {
+  const fixture = analysisSummaryFixture(options)
+  const source = fixture.details[0]
+  fixture.targets = [fixture.targets[0]]
+  fixture.details = scores.map((score, index) => {
+    const value = structuredClone(source)
+    const resumeId = `resume-${index + 1}`
+    const snapshotId = `resume-snapshot-${index + 1}`
+    value.comparison.id = `comparison-${index + 1}`
+    value.comparison.index = index
+    value.comparison.resume.snapshotId = snapshotId
+    value.comparison.resume.summary.name = `Resume ${String(index + 1).padStart(2, '0')}`
+    value.comparison.resume.summary.selection.resumeId = resumeId
+    value.comparison.resultSummary.overall = { status: 'available', score }
+    value.resumeSnapshot.snapshotId = snapshotId
+    value.resumeSnapshot.selection.resumeId = resumeId
+    value.resumeSnapshot.resume.id = resumeId
+    value.result.comparisonId = value.comparison.id
+    value.result.overall = { status: 'available', score }
+    value.result.provenance.resumeSnapshot.snapshotId = snapshotId
+    return value
+  })
+  fixture.summary.run.progress = {
+    total: scores.length, initialized: scores.length, complete: scores.length, scored: scores.length,
+    queued: 0, running: 0, failed: 0, cancelled: 0, unscored: 0,
+  }
+  fixture.summary.run.initialization.nextComparisonIndex = scores.length
+  fixture.detail = { ...fixture.detail, ...fixture.summary, targets: fixture.targets,
+    resumes: fixture.details.map(value => value.comparison.resume.summary) }
+  return fixture
+}
+
+test('compact score distribution stays independent of summary failures and search, with keyboard counts in both mobile themes', async t => {
+  const fixture = scoreDistributionFixture([12, 28, 44, 51, 56, 62, 67, 73, 81, 88])
+  const { page, state } = await setup(t, { fixture, summaryOptions: { candidateStatus: 'failed', targetStatus: 'failed' } })
+  const panel = page.getByRole('region', { name: 'Score distribution', exact: true })
+  await visible(panel.locator('.score-distribution-statistics'))
+  assert.equal(await panel.locator('.score-distribution-statistics dd').nth(0).innerText(), '10 / 10')
+  assert.equal(await panel.locator('.score-distribution-statistics dd').nth(1).innerText(), '56.2')
+  assert.match(await panel.locator('.score-distribution-spread-caption').innerText(), /Middle half: 44-73/)
+  assert.equal(await panel.locator('.score-distribution-bin').count(), 10)
+  assert.match(await panel.evaluate(node => node.previousElementSibling.textContent), /Job overview/)
+  assert.match(await panel.evaluate(node => node.nextElementSibling.textContent), /Comparisons/)
+  await page.getByRole('searchbox', { name: 'Search comparisons', exact: true }).fill('Resume 01')
+  assert.equal(await page.locator('.comparison-table tbody tr').count(), 1)
+  await page.getByRole('button', { name: 'Sort Score: high to low', exact: true }).click()
+  assert.equal(await panel.locator('.score-distribution-statistics dd').nth(0).innerText(), '10 / 10')
+  assert.equal(await panel.locator('.score-distribution-statistics dd').nth(1).innerText(), '56.2')
+  const disclosure = panel.locator('summary')
+  await disclosure.focus()
+  await disclosure.press('Enter')
+  await visible(panel.locator('details[open]'))
+  assert.equal(await panel.locator('[aria-label="Exact score counts"] dt').count(), 10)
+  await panel.getByRole('region', { name: 'Scrollable exact score counts' }).focus()
+  for (const theme of ['light', 'dark']) {
+    await page.setViewportSize({ width: 390, height: 844 })
+    await page.evaluate(theme => document.documentElement.setAttribute('data-theme', theme), theme)
+    const box = await panel.boundingBox()
+    assert.ok(box.x >= 0 && box.x + box.width <= 390, `${theme} distribution fits the mobile viewport`)
+    const overflow = await panel.evaluate(node => node.scrollWidth > node.clientWidth)
+    assert.equal(overflow, false, `${theme} chart and count labels do not overflow`)
+    assert.equal(await panel.locator('.score-distribution-statistics').evaluate(node => getComputedStyle(node).gridTemplateColumns.split(' ').length), 2)
+    const textStyles = await panel.evaluate(node => {
+      const style = getComputedStyle(node)
+      return {
+        muted: style.getPropertyValue('--cp-text-muted').trim(), soft: style.getPropertyValue('--cp-text-soft').trim(),
+        fontSizes: [...node.querySelectorAll('.score-distribution-heading p, .score-distribution-note, .score-distribution-statistics dt')]
+          .map(label => Number.parseFloat(getComputedStyle(label).fontSize)),
+      }
+    })
+    assert.ok(textStyles.fontSizes.every(size => size >= 11), `${theme} labels keep readable fixed text sizes`)
+    if (theme === 'dark') assert.equal(textStyles.muted, textStyles.soft, 'Dark chart labels use the higher-contrast incumbent text token.')
+  }
+  assert.deepEqual(posts(state), [])
+  assert.equal(state.requests.some(request => /\/documents\//.test(request.path)), false)
+})
+
+test('score distribution includes all 500 comparisons across pages without extra narrative or evidence requests', async t => {
+  const fixture = scoreDistributionFixture(Array.from({ length: 500 }, (_, index) => index % 101))
+  const { page, state } = await setup(t, { fixture, comparisonPageSize: 100 })
+  const panel = page.getByRole('region', { name: 'Score distribution', exact: true })
+  await until(async () => await panel.locator('.score-distribution-statistics dd').nth(0).textContent() === '500 / 500', 'All saved score pages must be collected before plotting.')
+  assert.equal(await panel.locator('.score-distribution-statistics dd').nth(1).innerText(), '49.5')
+  assert.equal(await panel.locator('.score-distribution-bar-count').allTextContents().then(values => values.reduce((sum, value) => sum + Number(value), 0)), 500)
+  const reads = state.requests.filter(request => request.path.endsWith('/comparisons'))
+  assert.deepEqual(reads.slice(0, 5).map(request => request.cursor), [null, '100', '200', '300', '400'])
+  await panel.locator('summary').click()
+  const count = await panel.locator('[aria-label="Exact score counts"] dd').allTextContents()
+  assert.equal(count.reduce((sum, value) => sum + Number(value.split(' ')[0]), 0), 500)
+  assert.deepEqual(posts(state), [])
+  assert.equal(state.requests.some(request => /\/documents\//.test(request.path)), false)
+  assert.ok(subjectReads(state).every(request => request.path.endsWith('/target/target-job-v1')), 'Plotting never requests every candidate narrative.')
+})
+
+test('published score corrections refresh the chart while failed comparison reads retain disclosed saved totals', async t => {
+  const fixture = scoreDistributionFixture([60])
+  fixture.details[0].activeCorrection = { status: 'running', policyVersion: 'full-reassessment-v1', requestedAt: summaryTimestamp }
+  const { page, state } = await setup(t, { fixture })
+  const panel = page.getByRole('region', { name: 'Score distribution', exact: true })
+  await visible(panel.locator('.score-distribution-statistics'))
+  assert.equal(await panel.locator('.score-distribution-statistics dd').nth(1).innerText(), '60.0')
+  assert.match(await panel.innerText(), /Showing the last saved results until replacements are published/)
+  const original = JSON.stringify(fixture.details[0].resumeSnapshot)
+  delete fixture.details[0].activeCorrection
+  fixture.details[0].etag = '"published-correction"'
+  fixture.details[0].comparison.resultSummary.overall = { status: 'available', score: 100 }
+  fixture.details[0].result.overall = { status: 'available', score: 100 }
+  fixture.details[0].result.criteria[0].score = 5
+  await page.getByRole('button', { name: 'Refresh pairs', exact: true }).click()
+  await until(async () => await panel.locator('.score-distribution-statistics dd').nth(1).textContent() === '100.0', 'Published totals must replace only the saved score projection.')
+  assert.equal(JSON.stringify(fixture.details[0].resumeSnapshot), original)
+  assert.doesNotMatch(await panel.innerText(), /re-scores or corrections in progress/)
+  state.beforeComparisonsGet = () => ({ status: 503, body: { error: { code: 'service_unavailable', message: 'Fixture comparison refresh failed.' } } })
+  await page.getByRole('button', { name: 'Refresh pairs', exact: true }).click()
+  await visible(panel.getByRole('alert'))
+  assert.match(await panel.getByRole('alert').innerText(), /last loaded scores are shown/)
+  assert.equal(await panel.locator('.score-distribution-statistics dd').nth(1).innerText(), '100.0')
+  state.beforeComparisonsGet = null
+  await panel.getByRole('button', { name: 'Reload scores', exact: true }).click()
+  await until(async () => await panel.getByRole('alert').count() === 0, 'A successful comparison refresh clears only its stale-data notice.')
+  assert.equal(await panel.locator('.score-distribution-statistics dd').nth(1).innerText(), '100.0')
+  assert.deepEqual(posts(state), [])
+})
+
+test('viewers and archived analyses can read score distributions while new analyses are unavailable', async t => {
+  const fixture = scoreDistributionFixture([0, 100], { archived: true })
+  const { page, state } = await setup(t, { fixture, role: 'viewer', archived: true })
+  const panel = page.getByRole('region', { name: 'Score distribution', exact: true })
+  await visible(panel.locator('.score-distribution-statistics'))
+  assert.equal(await panel.locator('.score-distribution-statistics dd').nth(1).innerText(), '50.0')
+  assert.equal(await page.getByRole('button', { name: 'New run with these inputs', exact: true }).isDisabled(), true)
+  await panel.locator('summary').click()
+  await visible(panel.locator('details[open]'))
+  assert.deepEqual(posts(state), [])
+})
 
 test('summary management uses explicit saved-run or exact-grade scope, not table search, and preserves browsing', async (t) => {
   const { page, state, errors } = await setup(t)

@@ -17,6 +17,7 @@ import {
 import { RealComparisonReview } from './RealComparisonReview'
 import { AnalysisReportExport } from './AnalysisReportExport'
 import { ManageAnalysisSummaries, RealTargetNarrative } from './AnalysisSummaries'
+import { AnalysisScoreDistribution } from './AnalysisScoreDistribution'
 import { ActiveCorrectionStatus, ReviewWithheldScores } from './AnalysisCorrections'
 import { activeCorrectionProgress } from './analysisCorrectionState'
 import {
@@ -242,6 +243,9 @@ function RealAnalysisView({ id }: { id: string }) {
     </section>
     {mixedVersions && <div className="info-callout mt-5" role="note"><AlertTriangle size={18} aria-hidden="true" /><div><strong>Rubric versions differ</strong><p>{mixedVersions}</p></div></div>}
     {viewedTarget && <RealTargetNarrative runId={id} target={viewedTarget} />}
+    {!selectedId && <AnalysisScoreDistribution target={viewedTarget} comparisons={pairs?.state === 'ready' ? savedPairs : null}
+      planned={detail.resumes.length} error={pairs?.state === 'error' || pairs?.state === 'ready' ? pairs.error ?? api.error : api.error}
+      onRetry={() => { void api.refresh(); void api.ensureDetail(id, true); void api.ensureComparisons(id, true) }} />}
     {selectedId ? <SelectedRealComparison runId={id} comparisonId={selectedId} initialView={sourceView} /> : <section className="panel mt-5" aria-label="Real comparisons">
       <div className="section-heading"><div><h2>Comparisons</h2></div>
         <Button size="sm" icon={RotateCcw} onClick={() => { void api.ensureDetail(id, true); void api.ensureComparisons(id, true); void ensureStatus?.(id, true) }}>Refresh pairs</Button></div>
