@@ -11,6 +11,7 @@
 .qc-workspace a:hover { text-decoration: underline; }
 .qc-stack { display: flex; flex-direction: column; gap: 16px; min-width: 0; }
 .qc-stack > .button { align-self: flex-start; }
+#evaluation { scroll-margin-top: 84px; }
 .qc-grow { flex: 1; min-width: 0; }
 .qc-muted { color: var(--cp-text-muted); font-size: 0.75rem; overflow-wrap: anywhere; }
 .qc-prose { white-space: pre-wrap; overflow-wrap: anywhere; }

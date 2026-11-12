@@ -26,6 +26,7 @@ import { usePublicSettings } from './public-settings-context'
 import { ApplicationNavigationContext } from './application-navigation-context'
 import { AdminSettingsPage } from '../features/admin/AdminSettingsPage'
 import { AdminUsersPage } from '../features/admin/AdminUsersPage'
+import { QualityPipelinePage } from '../features/admin/quality-pipeline/QualityPipelinePage'
 import { AccessSuspendedContext } from './access-suspended-context'
 import { SessionRecovery, SessionRecoveryComplete } from './SessionRecovery'
 import { SESSION_RECOVERY_PATH } from '../services/sessionRecovery'
@@ -36,6 +37,7 @@ import '../styles/admin-settings.css'
 import '../styles/workspace-access.css'
 
 type Result = { ok: true } | { ok: false; message: string }
+type AdminView = 'settings' | 'users' | 'quality-pipeline'
 
 type Phase =
   | { kind: 'loading' }
@@ -43,13 +45,13 @@ type Phase =
   | { kind: 'unavailable'; message: string }
   | { kind: 'workspace-unavailable'; requestedId: string }
   | { kind: 'home' }
-  | { kind: 'admin'; view: 'settings' | 'users' }
+  | { kind: 'admin'; view: AdminView }
   | { kind: 'ready'; workspaceId: string }
 
 const WORKSPACE_PATH = /^\/workspaces\/([^/]+)(?:\/|$)/
-function adminViewFromPath(path: string): 'settings' | 'users' | null {
-  const view = /^\/admin\/(settings|users)\/?$/.exec(path)?.[1]
-  return view === 'settings' || view === 'users' ? view : null
+function adminViewFromPath(path: string): AdminView | null {
+  const view = /^\/admin\/(settings|users|quality-pipeline)\/?$/.exec(path)?.[1]
+  return view === 'settings' || view === 'users' || view === 'quality-pipeline' ? view : null
 }
 
 function resolveRequestedWorkspaceId(): string | null {
@@ -192,7 +194,7 @@ function CloudApplicationContent() {
     return () => { aliveRef.current = false; controller.abort(); setCloudSessionAccess(null) }
   }, [enterHome, initializationReady, publishDirectory, publishSession])
 
-  async function openAdminView(view: 'settings' | 'users') {
+  async function openAdminView(view: AdminView) {
     if (sessionRef.current?.capabilities?.applicationAdmin !== true || navigationPending.current || lifecyclePending.current) return
     if (phaseRef.current.kind === 'admin' && phaseRef.current.view === view) return
     navigationPending.current = true
@@ -203,7 +205,10 @@ function CloudApplicationContent() {
       if (!prepared.ok || !aliveRef.current || sessionRef.current?.capabilities?.applicationAdmin !== true) return
       adminLeaveRef.current?.releaseForLeave()
       const host = new URLSearchParams(window.location.search).get('scoutTheme') ?? policyRef.current.hostTheme
-      const path = `/admin/${view}${host === 'light' || host === 'dark' ? `?scoutTheme=${host}` : ''}`
+      const query = new URLSearchParams()
+      if (host === 'light' || host === 'dark') query.set('scoutTheme', host)
+      if (view === 'quality-pipeline' && phaseRef.current.kind === 'ready') query.set('workspace', phaseRef.current.workspaceId)
+      const path = `/admin/${view}${query.size ? `?${query}` : ''}`
       window.history.pushState(null, '', path)
       lastPathRef.current = path
       lastHistoryStateRef.current = window.history.state
@@ -226,6 +231,7 @@ function CloudApplicationContent() {
 
   const openAdminSettings = () => openAdminView('settings')
   const openAdminUsers = () => openAdminView('users')
+  const openQualityPipeline = () => openAdminView('quality-pipeline')
 
   async function switchWorkspace(id: string, availableSession = session, alreadyPrepared = false): Promise<Result> {
     if (!availableSession) return { ok: false, message: 'Your session is still loading. Try again in a moment.' }
@@ -258,7 +264,11 @@ function CloudApplicationContent() {
       if (!session) return
       const requested = resolveRequestedWorkspaceId()
       const adminRequested = adminViewFromPath(window.location.pathname)
-      if (phase.kind === 'admin' && phase.view === adminRequested) return
+      if (phase.kind === 'admin' && phase.view === adminRequested) {
+        lastPathRef.current = window.location.pathname + window.location.search + window.location.hash
+        lastHistoryStateRef.current = event.state
+        return
+      }
       if (phase.kind === 'ready' && phase.workspaceId === requested) return
       if (phase.kind === 'home' && requested === null && !adminRequested) {
         lastPathRef.current = window.location.pathname + window.location.search + window.location.hash
@@ -382,12 +392,13 @@ function CloudApplicationContent() {
       window.removeEventListener(CLOUD_ACCESS_REFRESH_EVENT, refresh)
     }
   }, [])
+  const directoryPage = phase.kind === 'home' || phase.kind === 'admin' && phase.view === 'quality-pipeline'
   useEffect(() => {
-    if (phase.kind !== 'home') return
+    if (!directoryPage) return
     void refreshWorkspaces().catch((error: unknown) => {
-      console.warn('Score could not refresh workspace home.', error instanceof Error ? error.name : 'UnknownError')
+      console.warn('Score could not refresh the workspace directory.', error instanceof Error ? error.name : 'UnknownError')
     })
-  }, [phase.kind, refreshWorkspaces])
+  }, [directoryPage, refreshWorkspaces])
 
   async function changeWorkspaceLifecycle(id: string, action: LifecycleAction) {
     if (lifecyclePending.current || navigationPending.current) throw new Error('Wait for the current workspace request.')
@@ -555,7 +566,10 @@ function CloudApplicationContent() {
     return <GradeNavigationProtectionProvider key={phase.view} workspaceId={`application-${phase.view}`} routePrefix={`/admin/${phase.view}`} apiRef={adminLeaveRef}>
       {!authorized ? denial : accessNotice}
       <AccessSuspendedContext.Provider value={!authorized}><div className="access-suspended" hidden={!authorized}>
-        {phase.view === 'users' ? <AdminUsersPage onLeave={onLeave} onOpenSettings={openAdminSettings} onAccessChanged={refreshWorkspaces} />
+        {phase.view === 'quality-pipeline' ? <QualityPipelinePage key={JSON.stringify([session.user.tenantId, session.user.id])}
+          user={session.user} workspaces={session.workspaces} directoryReady={directoryReady} directoryError={directoryError}
+          onRefreshDirectory={refreshWorkspaces} onLeave={onLeave} onOpenSettings={openAdminSettings} />
+          : phase.view === 'users' ? <AdminUsersPage onLeave={onLeave} onOpenSettings={openAdminSettings} onAccessChanged={refreshWorkspaces} />
           : <AdminSettingsPage onLeave={onLeave} onOpenUsers={openAdminUsers} />}
       </div></AccessSuspendedContext.Provider>
     </GradeNavigationProtectionProvider>
@@ -596,7 +610,7 @@ function CloudApplicationContent() {
       canCreateWorkspaces: session.capabilities?.canCreateWorkspaces === true,
       refreshWorkspaces, getWorkspaceLifecycleImpact, changeWorkspaceLifecycle }}
     recents={recents} directoryRevision={directoryRevision} directoryError={directoryError} directoryReady={directoryReady} applicationAdmin={session.capabilities?.applicationAdmin === true}
-    openAdminSettings={openAdminSettings} openAdminUsers={openAdminUsers} signOut={signOutFromHome} onAuthError={onAuthError} />
+    openAdminSettings={openAdminSettings} openAdminUsers={openAdminUsers} openQualityPipeline={openQualityPipeline} signOut={signOutFromHome} onAuthError={onAuthError} />
     </div></AccessSuspendedContext.Provider>
   </GradeNavigationProtectionProvider>
 
@@ -606,7 +620,7 @@ function CloudApplicationContent() {
   if (!activeSession) throw new Error('The cloud session is missing after initialization.')
   const viewScope = JSON.stringify([activeSession.user.tenantId, activeSession.user.id, workspaceId])
   // Keep leave protection above the router when browser history temporarily crosses its basename.
-  return <ApplicationNavigationContext.Provider value={{ applicationAdmin: activeSession.capabilities?.applicationAdmin === true, openAdminSettings, openAdminUsers, openWorkspaceHome, workspaceHomePath: homePath(), directoryError }}>
+  return <ApplicationNavigationContext.Provider value={{ applicationAdmin: activeSession.capabilities?.applicationAdmin === true, openAdminSettings, openAdminUsers, openQualityPipeline, openWorkspaceHome, workspaceHomePath: homePath(), directoryError }}>
     {!activeSession.workspaces.some(item => item.id === workspaceId && !item.deletedAt) && accessNotice}
     <LibraryViewStateProvider scopeKey={viewScope}><GradeNavigationProtectionProvider key={workspaceId} workspaceId={workspaceId} apiRef={gradeLeaveRef}><CloudWorkspaceProvider
         key={workspaceId}

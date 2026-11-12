@@ -182,6 +182,22 @@ test('browser: curate attributable feedback, save draft, and explicitly confirm 
   assert.equal(fixture.calls.paid, 1)
 })
 
+test('browser: evaluation deep links open the exact saved evaluation without starting work', async t => {
+  const { page, fixture } = await setup(t, { role: 'owner', admin: true })
+  fixture.plans.set('plan-one', qcPlanDetail({ status: 'ready', proposal: qcProposal(), admin: true }))
+  await go(page, '/qc/improvements/plan-one#evaluation')
+  const heading = page.getByRole('heading', { name: 'Pinned baseline / candidate evaluation', exact: true })
+  await heading.waitFor()
+  await page.waitForFunction(() => {
+    const heading = document.querySelector('#evaluation h2')
+    return heading && heading.getBoundingClientRect().top >= 0 && heading.getBoundingClientRect().top < 300
+  })
+  const box = await heading.boundingBox()
+  assert.ok(box && box.y >= 0 && box.y < 300, 'The saved evaluation anchor is brought into view')
+  assert.equal(fixture.calls.paid, 0)
+  assert.equal(writeCalls(fixture).length, 0)
+})
+
 test('browser: evaluated admin activation is explicit and mobile dark-mode revocation clears evidence', async t => {
   const { page, fixture } = await setup(t, { role: 'owner', admin: true, mobile: true })
   fixture.plans.set('plan-one', qcPlanDetail({ status: 'ready', proposal: qcProposal(), admin: true }))

@@ -15,7 +15,7 @@ await mkdir(path.dirname(output), { recursive: true })
 await build({
   stdin: {
     resolveDir: root,
-    contents: ['validation', 'azure-store', 'service', 'plans', 'lifecycle', 'artifacts', 'evidence', 'routes']
+    contents: ['validation', 'azure-store', 'service', 'plans', 'lifecycle', 'artifacts', 'evidence', 'routes', 'pipeline', 'pipeline-routes']
       .map(name => `export * from './server/qc/${name}.ts';`).join('\n') +
       "\nexport * from './server/settings/prompts.ts'; export * from './server/errors.ts';" +
       "\nexport * from './server/store.ts'; export * from './src/domain/quality-control.ts';" +
@@ -306,7 +306,8 @@ export async function qcHttp(f, configOverrides = {}) {
       next()
     },
     api.attachSettingsContext(config, { capture: async () => clone(f.settings) }),
-    api.createQcRouter({ repository, state, config, qc: f.qc, analyses: f.analysis, prompts: f.prompts, now: () => new Date(f.now) }))
+    api.createQcRouter({ repository, state, config, qc: f.qc, analyses: f.analysis, prompts: f.prompts, now: () => new Date(f.now) }),
+    api.createQualityPipelineRouter({ repository, config, qc: f.qc, analyses: f.analysis, now: () => new Date(f.now) }))
   app.use((error, _req, res, _next) => {
     const safe = error instanceof api.HttpError ? error : api.unavailable()
     res.status(safe.status).json(api.toCloudApiError(safe))
@@ -314,6 +315,7 @@ export async function qcHttp(f, configOverrides = {}) {
   const server = createServer(app)
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve))
   const base = `http://127.0.0.1:${server.address().port}/api/workspaces/${f.workspaceId}/qc`
+  const pipelineBase = `http://127.0.0.1:${server.address().port}/api/admin/quality-pipeline/workspaces/${f.workspaceId}/plans`
   return {
     memberships, repository, beforeLease: hook => { beforeLease = hook }, archive: () => { metadata.archivedAt = f.now },
     setAdmissionEnabled: enabled => { config.qcEnabled = enabled },
@@ -325,10 +327,13 @@ export async function qcHttp(f, configOverrides = {}) {
       }
     },
     async close() { await new Promise(resolve => server.close(resolve)) },
-    async request(suffix, method = 'GET', data, role = 'reviewer', headers = {}) {
+    pipeline(suffix = '', role = 'admin', headers = {}) {
+      return this.request(suffix, 'GET', undefined, role, headers, pipelineBase)
+    },
+    async request(suffix, method = 'GET', data, role = 'reviewer', headers = {}, prefix = base) {
       const identity = { auth_typ: 'aad', claims: [{ typ: 'tid', val: TENANT }, { typ: 'oid', val: OIDS[role] },
         ...roles.get(OIDS[role]).map(value => ({ typ: 'roles', val: value }))] }
-      return fetch(`${base}${suffix}`, { method, headers: {
+      return fetch(`${prefix}${suffix}`, { method, headers: {
         'x-ms-client-principal': Buffer.from(JSON.stringify(identity)).toString('base64'),
         ...(method === 'GET' ? {} : { origin: config.appOrigin, 'x-score-request': 'workspace', 'content-type': 'application/json', 'Idempotency-Key': randomUUID() }),
         ...headers,

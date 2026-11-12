@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import { ArrowRight, Clock3, Layers3, RefreshCw, Settings, Users } from 'lucide-react'
+import { ArrowRight, Clock3, GitBranch, Layers3, RefreshCw, Settings, Users } from 'lucide-react'
 import type { CloudUser, WorkspaceSummary } from '../../domain/cloud'
 import { ThemeControl } from '../../app/ThemeControl'
 import { ApplicationPolicyBanners } from '../../app/ApplicationPolicyBanners'
@@ -12,7 +12,7 @@ import { isActiveWorkspace, type RecentWorkspace } from '../../services/workspac
 import { useWorkspaceCounts, type WorkspaceCountsState } from './useWorkspaceCounts'
 import type { CloudAuthError } from '../../services/cloudWorkspace'
 
-export function WorkspaceHomePage({ user, directory, recents, directoryRevision, directoryError, directoryReady, applicationAdmin, openAdminSettings, openAdminUsers, signOut, onAuthError }: {
+export function WorkspaceHomePage({ user, directory, recents, directoryRevision, directoryError, directoryReady, applicationAdmin, openAdminSettings, openAdminUsers, openQualityPipeline, signOut, onAuthError }: {
   user: CloudUser
   directory: WorkspaceDirectoryActions
   recents: RecentWorkspace[]
@@ -22,6 +22,7 @@ export function WorkspaceHomePage({ user, directory, recents, directoryRevision,
   applicationAdmin: boolean
   openAdminSettings: () => Promise<void>
   openAdminUsers: () => Promise<void>
+  openQualityPipeline?: () => Promise<void>
   signOut: () => Promise<void>
   onAuthError: (error: CloudAuthError) => void
 }) {
@@ -58,6 +59,9 @@ export function WorkspaceHomePage({ user, directory, recents, directoryRevision,
     <header className="workspace-home-header">
       <a href={policy.hostTheme ? `/?scoutTheme=${policy.hostTheme}` : '/'} className="brand" aria-label={`${title} home`}><span className="brand-mark"><Layers3 size={22} strokeWidth={2} /></span><span>{title}</span></a>
       <div className="workspace-home-utilities">
+        {applicationAdmin && openQualityPipeline && <Button variant="ghost" icon={GitBranch} disabled={busy} onClick={() => {
+          void openQualityPipeline().catch(caught => setError(caught instanceof Error ? caught.message : 'Quality pipeline could not be opened.'))
+        }}>Quality pipeline</Button>}
         {applicationAdmin && <Button variant="ghost" icon={Settings} disabled={busy} onClick={() => {
           void openAdminSettings().catch((caught) => setError(caught instanceof Error ? caught.message : 'Application settings could not be opened.'))
         }}>Application settings</Button>}

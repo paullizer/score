@@ -43,6 +43,8 @@ function routesForRuntime() {
     'POST /api/workspaces/:workspaceId/jobs/:jobId/rubric/checks',
     'POST /api/workspaces/:workspaceId/jobs/:jobId/rubric/approve',
     'POST /api/workspaces/:workspaceId/grade-ladders/:ladderId/grades/:grade/approve',
+    'GET /api/admin/quality-pipeline/workspaces/:workspaceId/plans',
+    'GET /api/admin/quality-pipeline/workspaces/:workspaceId/plans/:planId',
   ]) {
     assert.ok(routes.some(route => `${route.method} ${route.fullPath}` === expected), `route inventory includes ${expected}`)
   }

@@ -1,6 +1,6 @@
 import { useRef, useState } from 'react'
 import { Link, NavLink, Navigate, Route, Routes, useLocation, useNavigate } from 'react-router-dom'
-import { ArrowUpRight, BarChart3, BookOpen, BriefcaseBusiness, Check, ChevronLeft, ChevronRight, CircleHelp, ClipboardCheck, Files, FlaskConical, Info, Layers3, LayoutGrid, LifeBuoy, Menu, Plus, Settings, ShieldCheck, Users, X } from 'lucide-react'
+import { ArrowUpRight, BarChart3, BookOpen, BriefcaseBusiness, Check, ChevronLeft, ChevronRight, CircleHelp, ClipboardCheck, Files, FlaskConical, GitBranch, Info, Layers3, LayoutGrid, LifeBuoy, Menu, Plus, Settings, ShieldCheck, Users, X } from 'lucide-react'
 import { useWorkspace } from './workspace-context'
 import { ThemeControl } from './ThemeControl'
 import { useSidebarCollapsed } from './sidebar-preference'
@@ -77,8 +77,14 @@ function Navigation({ onNavigate, collapsed = false }: { onNavigate?: () => void
 function SidebarLinks({ title, collapsed = false, onAbout, onLeave }: { title: string; collapsed?: boolean; onAbout: () => void; onLeave?: () => void }) {
   const application = useApplicationNavigation()
   const help = usePublicSettings().settings?.help
+  const [pipelineError, setPipelineError] = useState('')
   const tip = (label: string) => collapsed ? label : undefined
   return <div className="sidebar-links">
+    {application?.applicationAdmin && application.openQualityPipeline && <button type="button" className="nav-item" title={tip('Quality pipeline')} onClick={() => {
+      onLeave?.()
+      void application.openQualityPipeline?.().catch(caught => setPipelineError(caught instanceof Error ? caught.message : 'Quality pipeline could not be opened.'))
+    }}><GitBranch size={18} strokeWidth={1.7} aria-hidden="true" /><span className="nav-label">Quality pipeline</span></button>}
+    {pipelineError && <p role="alert">{pipelineError}</p>}
     {application?.applicationAdmin && <button type="button" className="nav-item" title={tip('Application settings')} onClick={() => { onLeave?.(); void application.openAdminSettings() }}>
       <Settings size={18} strokeWidth={1.7} aria-hidden="true" /><span className="nav-label">Application settings</span></button>}
     {application?.applicationAdmin && <button type="button" className="nav-item" title={tip('Users / user access')} onClick={() => { onLeave?.(); void application.openAdminUsers() }}>
