@@ -22,6 +22,7 @@ import type { AdminSettingsService } from './settings/service'
 import type { PromptRegistryService } from './settings/prompts'
 import type { QcDeps } from './qc/store'
 import { createQcRouter } from './qc/routes'
+import { createQualityPipelineRouter } from './qc/pipeline-routes'
 import { createQcLifecycleParticipant, createQcRunLifecycleHooks } from './qc/lifecycle'
 import { attachSettingsContext, getSavedSettings, getProcessingReadiness, getCurrentSettings } from './settings/request-context'
 import { effectiveFeatures } from './settings/features'
@@ -237,6 +238,7 @@ export function createApp(deps: AppDeps): Express {
   api.use(createAdminSettingsRouter(config, deps.settings, deps.prompts))
   api.use(createWorkspaceMembersRouter({ repository, directory, config, eligibleUsers: deps.eligibleUsers, now: deps.now }))
   api.use(createQcRouter({ repository, state, config, qc, analyses: analysisStorage, prompts: deps.prompts, now: deps.now }))
+  api.use(createQualityPipelineRouter({ repository, config, qc, analyses: analysisStorage, now: deps.now }))
   api.use(createAccessRouter(creationAccess, workspaceAccess, deps.eligibleUsers))
   api.get('/features', async (req, res) => {
     const snapshot = await getSavedSettings(req)

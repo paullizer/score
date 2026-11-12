@@ -1,4 +1,4 @@
-import { useCallback, useState } from 'react'
+import { useCallback, useEffect, useState } from 'react'
 import { Link, useNavigate, useParams } from 'react-router-dom'
 import { FlaskConical, History, LoaderCircle, Plus, Save, ShieldCheck } from 'lucide-react'
 import { useGradeLeaveGuard } from '../../app/grade-navigation-context'
@@ -437,7 +437,10 @@ function GuidanceDiff({ before, after }: { before: string; after: string }) {
 }
 
 function EvaluationView({ evaluation, current }: { evaluation: QcEvaluation; current: boolean }) {
-  return <section className="qc-stack"><h2>Pinned baseline / candidate evaluation</h2>
+  useEffect(() => {
+    if (window.location.hash === '#evaluation') document.getElementById('evaluation')?.scrollIntoView({ block: 'start' })
+  }, [evaluation.planId, evaluation.planRevision])
+  return <section id="evaluation" className="qc-stack"><h2>Pinned baseline / candidate evaluation</h2>
     <div className="qc-card qc-stack"><div className="qc-toolbar"><Badge tone={current && evaluation.eligible ? 'success' : 'warning'}>{current ? evaluation.eligible ? 'Server reports eligible' : 'Not eligible for activation' : 'Historical / invalidated by current edits'}</Badge>
       <span>Evaluated plan revision {evaluation.planRevision} · completed {evaluation.completedAt}</span></div>
       <details className="qc-pin"><summary>Exact evaluation and settings pins</summary><dl><dt>Baseline release</dt><dd>{evaluation.baselineRevision}</dd>

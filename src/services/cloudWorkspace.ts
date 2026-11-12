@@ -120,15 +120,16 @@ export function setCloudSessionAccess(session: CloudSession | null): void {
 export function cloudAccessRequestSignal(path: string, init: RequestInit = {}): AbortSignal | undefined {
   if (!sessionAccess) return
   const mutating = !['GET', 'HEAD', 'OPTIONS'].includes((init.method ?? 'GET').toUpperCase())
+  const pipeline = path.startsWith('/admin/quality-pipeline/workspaces/')
   if (path.startsWith('/admin/') && !sessionAccess.applicationAdmin) throw new CloudApiError('forbidden', 'Application administrator access is required. Workspace ownership does not grant application administration.', 403)
   if (path === '/workspaces' && mutating && !sessionAccess.canCreateWorkspaces) throw new CloudApiError('forbidden', 'An application administrator must grant you permission to create workspaces. Existing workspace access is unchanged.', 403)
-  if (path.startsWith('/admin/') || (path === '/workspaces' && mutating)) return capabilityController.signal
-  const match = /^\/workspaces\/([^/?]+)(\/[^?]*)?(?:\?|$)/.exec(path)
+  if (path.startsWith('/admin/') && !pipeline || (path === '/workspaces' && mutating)) return capabilityController.signal
+  const match = /^\/workspaces\/([^/?]+)(\/[^?]*)?(?:\?|$)/.exec(pipeline ? path.slice('/admin/quality-pipeline'.length) : path)
   if (!match) return
   const id = decodeURIComponent(match[1])
   const entry = workspaceAccess.get(id)
   if (!entry) throw new CloudApiError('not_found', 'This workspace is no longer available to your account. Refresh access or contact a workspace owner or application administrator.', 404)
-  const qc = /^\/qc(?:\/|$)/.test(match[2] ?? '')
+  const qc = pipeline || /^\/qc(?:\/|$)/.test(match[2] ?? '')
   if (qc && !workspaceCanReview(workspaceQcRole(entry.workspace), sessionAccess.applicationAdmin)) {
     throw new CloudApiError('forbidden', 'QC requires an explicit workspace membership and a reviewer, editor, owner, or application-admin role.', 403)
   }
@@ -141,7 +142,7 @@ export function cloudAccessRequestSignal(path: string, init: RequestInit = {}): 
   if (mutating && ((!qc && !workspaceCanEdit(entry.workspace.role)) || accessRefreshRequired.has(id))) {
     throw new CloudApiError('forbidden', 'Workspace changes are paused. Reader and Reviewer access cannot save ordinary edits; refresh current access before continuing. Unsaved drafts remain in this tab.', 403)
   }
-  return entry.controller.signal
+  return pipeline ? AbortSignal.any([capabilityController.signal, entry.controller.signal]) : entry.controller.signal
 }
 
 export function reportCloudAccessFailure(path: string, error: unknown) {
