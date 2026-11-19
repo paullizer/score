@@ -29,11 +29,51 @@ test('action admission verifies the release timestamp and resolves annotated tag
 })
 
 test('Microsoft image admission selects the exact tag and checks its digest-bound publication time', async () => {
-  const microsoftImage = { ...image, name: 'playwright', tag: 'v1.63.0-noble' }
+  const microsoftImage = { ...image, name: 'playwright', metadata: 'https://mcr.microsoft.com/api/v1/catalog/playwright/tags?reg=mar', tag: 'v1.63.0-noble' }
   const record = { name: microsoftImage.tag, digest, lastModifiedDate: '2026-09-04T23:48:51.0000000+00:00' }
   await verifyImage(microsoftImage, { now, fetchImpl: respond([{ name: 'latest', digest }, record]) })
   await assert.rejects(verifyImage(microsoftImage, { now, fetchImpl: respond([{ ...record, name: 'another-tag' }]) }), /pinned image digest/)
   await assert.rejects(verifyImage(microsoftImage, { now, fetchImpl: respond([{ ...record, lastModifiedDate: '2026-11-18T00:00:00Z' }]) }), /fresh/)
+})
+
+test('image admission rejects unapproved metadata destinations before making a request', async () => {
+  for (const metadata of [
+    'https://attacker.example/publish-times',
+    'https://127.0.0.1/publish-times',
+    image.metadata.replace('hub.docker.com', 'hub.docker.com.attacker.example'),
+    image.metadata.replace('hub.docker.com', 'hub.docker.com@attacker.example'),
+    image.metadata.replace('https:', 'http:'),
+    image.metadata.replace('hub.docker.com', 'hub.docker.com:8443'),
+    `${image.metadata}?redirect=https://attacker.example`,
+    `${image.metadata}#fragment`,
+    `${image.metadata}\n`,
+    image.metadata.replace('library/node', 'attacker/node'),
+    'https://mcr.microsoft.com/api/v1/catalog/playwright/tags?reg=mar&redirect=elsewhere',
+  ]) {
+    let called = false
+    await assert.rejects(verifyImage({ ...image, metadata }, {
+      now,
+      fetchImpl: async () => {
+        called = true
+        return new Response(JSON.stringify({ digest, tag_last_pushed: '2026-01-01T00:00:00Z' }))
+      },
+    }), /unapproved image publication metadata endpoint/)
+    assert.equal(called, false, metadata)
+  }
+})
+
+test('approved image metadata requests are unauthenticated and cannot follow redirects', async () => {
+  for (const metadata of [image.metadata, 'https://mcr.microsoft.com/api/v1/catalog/playwright/tags?reg=mar']) {
+    await assert.rejects(verifyImage({ ...image, metadata }, {
+      now,
+      fetchImpl: async (url, options) => {
+        assert.equal(url, metadata)
+        assert.equal(options.headers.Authorization, undefined)
+        assert.equal(options.redirect, 'error')
+        return Response.redirect('https://attacker.example/publish-times')
+      },
+    }), /HTTP 302/)
+  }
 })
 
 test('GitHub metadata authentication stays in the first-party request header, never the URL', async () => {

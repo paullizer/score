@@ -10,7 +10,13 @@ function assertOld(published, label, now) {
 }
 
 export async function verifyImage(image, { fetchImpl = globalThis.fetch, now = new Date() } = {}) {
-  const metadata = await fetchMetadata(image.metadata, { fetchImpl })
+  const dockerTag = /^https:\/\/hub\.docker\.com\/v2\/repositories\/library\/node\/tags\/([\w][\w.-]{0,127})$/.exec(image.metadata)?.[1]
+  const microsoftMetadata = 'https://mcr.microsoft.com/api/v1/catalog/playwright/tags?reg=mar'
+  const metadataUrl = dockerTag
+    ? `https://hub.docker.com/v2/repositories/library/node/tags/${dockerTag}`
+    : image.metadata === microsoftMetadata ? microsoftMetadata : undefined
+  if (!metadataUrl || metadataUrl !== image.metadata) throw new Error(`${image.name}: unapproved image publication metadata endpoint.`)
+  const metadata = await fetchMetadata(metadataUrl, { fetchImpl })
   const record = Array.isArray(metadata) ? metadata.find(item => item.name === image.tag) : metadata
   const digest = image.reference.split('@')[1]
   if (!/^sha256:[a-f0-9]{64}$/.test(digest ?? '') || record?.digest !== digest) {
