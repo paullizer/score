@@ -8,6 +8,7 @@ const ENV_DUMP = /JSON\.stringify\s*\(\s*process\.env|(?:^|[;&|]\s*)printenv(?:\
 const DECODE_EXEC = /(?:eval|Function|new\s+Function).*(?:atob|Buffer\.from)|(?:curl|wget)\b.*\|\s*(?:sh|bash)\b|(?:iwr|irm|Invoke-WebRequest|Invoke-RestMethod)\b.*\|\s*(?:iex|Invoke-Expression)\b|(?:-|\/)(?:EncodedCommand|enc)\s+[A-Za-z0-9+/=]{20,}|base64\s+-d\s*\|\s*sh\b/i
 const RISK_IMPORT = /\b(?:import|require)\s*(?:\(|\s).*['"](?:node:)?(?:child_process|vm|worker_threads)['"]/i
 const DYNAMIC_IMPORT = /\bimport\s*\(\s*(?:['"]data:|[A-Za-z_$][\w$]*|`[^`]*\$\{)/i
+const REMOTE_MODULE = /\b(?:import|export)\s+(?:[^;'"]*?\sfrom\s*)?['"](?:https?:|\/\/)|\b(?:import|require)\s*\(\s*['"](?:https?:|\/\/)/i
 const BLOB = /\b(?:[A-Za-z0-9+/]{200,}={0,2}|[a-f0-9]{200,})\b/i
 const LINT_DISABLE = /eslint-disable|@ts-ignore|@ts-nocheck/
 const TEST_SKIP_ONLY = /(?:\.(?:skip|only)\s*\(|\b(?:test|describe)\.(?:skip|only)\s*\(|\{\s*(?:skip|only)\s*:\s*true\s*\})/
@@ -90,6 +91,7 @@ export function checkContent(ctx) {
         }
         if (ENV_DUMP.test(text)) addFinding(findings, { rule: 'review/environment-dump', verdict: downgrade(file.path, BLOCKER), file: file.path, line, message: 'Environment or secrets dump was added.', hint: 'Log only specific non-secret values.' })
         if (DECODE_EXEC.test(text)) addFinding(findings, { rule: 'review/decode-and-execute', verdict: downgrade(file.path, BLOCKER), file: file.path, line, message: 'Decode-and-execute or pipe-to-shell pattern was added.', hint: 'Download, verify and execute scripts explicitly.' })
+        if (!prose && !isTestPath(file.path) && REMOTE_MODULE.test(text)) addFinding(findings, { rule: 'review/remote-executable', verdict: BLOCKER, file: file.path, line, message: 'Executable modules must not be imported from remote URLs.', hint: 'Vendor standalone scripts with provenance and licenses, or use exact-locked eligible npm packages.' })
         if (!securityTool && !prose && SUPPRESSION.test(text)) addFinding(findings, { rule: 'review/new-suppression', verdict: REVIEW, file: file.path, line, message: 'A new security-reviewed suppression was added.', hint: 'Confirm the suppression is necessary and specific.' })
         if (skipReviewRules) continue
         if (RISK_IMPORT.test(text)) addFinding(findings, { rule: 'review/risky-node-import', verdict: REVIEW, file: file.path, line, message: 'Sensitive Node module import was added.', hint: 'Review child process, vm or worker-thread usage.' })

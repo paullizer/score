@@ -35,6 +35,18 @@ function Set-EnvironmentValue {
 $root = Split-Path -Parent $PSScriptRoot
 Push-Location $root
 try {
+  $env:AZURE_EXTENSION_USE_DYNAMIC_INSTALL = 'no'
+  $env:AZURE_EXTENSION_DIR = Join-Path $root '.azure/no-extensions'
+  & node scripts\verify-artifacts.mjs --deployment-tools
+  if ($LASTEXITCODE -ne 0) { throw 'External artifact or deployment tool admission failed. Azure has not been modified.' }
+  & node scripts\verify-installations.mjs
+  if ($LASTEXITCODE -ne 0) { throw 'Dependency admission failed. Azure has not been modified.' }
+  $installationPolicy = Get-Content -LiteralPath (Join-Path $root 'scripts/security/policy/installations.json') -Raw | ConvertFrom-Json
+  $bootstrapImage = @($installationPolicy.images | Where-Object name -eq 'node')
+  if ($bootstrapImage.Count -ne 1 -or $bootstrapImage[0].reference -notmatch '^node:[^@]+@sha256:[a-f0-9]{64}$') {
+    throw 'Exactly one admitted, immutable Node bootstrap image is required. Azure has not been modified.'
+  }
+  $bootstrapImage = "docker.io/library/$($bootstrapImage[0].reference)"
   $subscription = (Invoke-Azure @('account', 'show', '--subscription', $SubscriptionId, '--output', 'json')) | ConvertFrom-Json
   if ($subscription.state -ne 'Enabled') { throw 'The selected Azure subscription is not enabled.' }
   $operator = (Invoke-Azure @('ad', 'signed-in-user', 'show', '--query', '{id:id,userPrincipalName:userPrincipalName}', '--output', 'json')) | ConvertFrom-Json
@@ -99,31 +111,31 @@ try {
   }
   $image = & azd env get-value AZURE_CONTAINER_IMAGE --environment $EnvironmentName 2>$null
   if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($image)) {
-    Set-EnvironmentValue 'AZURE_CONTAINER_IMAGE' 'mcr.microsoft.com/azure-app-service/placeholder:latest'
+    Set-EnvironmentValue 'AZURE_CONTAINER_IMAGE' $bootstrapImage
   }
   $workerImage = & azd env get-value AZURE_WORKER_CONTAINER_IMAGE --environment $EnvironmentName 2>$null
   if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($workerImage)) {
-    Set-EnvironmentValue 'AZURE_WORKER_CONTAINER_IMAGE' 'mcr.microsoft.com/k8se/quickstart-jobs:latest'
+    Set-EnvironmentValue 'AZURE_WORKER_CONTAINER_IMAGE' $bootstrapImage
   }
   $rendererImage = & azd env get-value AZURE_JOB_RENDERER_IMAGE --environment $EnvironmentName 2>$null
   if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($rendererImage)) {
-    Set-EnvironmentValue 'AZURE_JOB_RENDERER_IMAGE' 'mcr.microsoft.com/k8se/quickstart:latest'
+    Set-EnvironmentValue 'AZURE_JOB_RENDERER_IMAGE' $bootstrapImage
   }
   $gradeWorkerImage = & azd env get-value AZURE_GRADE_WORKER_CONTAINER_IMAGE --environment $EnvironmentName 2>$null
   if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($gradeWorkerImage)) {
-    Set-EnvironmentValue 'AZURE_GRADE_WORKER_CONTAINER_IMAGE' 'mcr.microsoft.com/k8se/quickstart-jobs:latest'
+    Set-EnvironmentValue 'AZURE_GRADE_WORKER_CONTAINER_IMAGE' $bootstrapImage
   }
   $resumeWorkerImage = & azd env get-value AZURE_RESUME_WORKER_CONTAINER_IMAGE --environment $EnvironmentName 2>$null
   if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($resumeWorkerImage)) {
-    Set-EnvironmentValue 'AZURE_RESUME_WORKER_CONTAINER_IMAGE' 'mcr.microsoft.com/k8se/quickstart-jobs:latest'
+    Set-EnvironmentValue 'AZURE_RESUME_WORKER_CONTAINER_IMAGE' $bootstrapImage
   }
   $analysisWorkerImage = & azd env get-value AZURE_ANALYSIS_WORKER_CONTAINER_IMAGE --environment $EnvironmentName 2>$null
   if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($analysisWorkerImage)) {
-    Set-EnvironmentValue 'AZURE_ANALYSIS_WORKER_CONTAINER_IMAGE' 'mcr.microsoft.com/k8se/quickstart-jobs:latest'
+    Set-EnvironmentValue 'AZURE_ANALYSIS_WORKER_CONTAINER_IMAGE' $bootstrapImage
   }
   $qcWorkerImage = & azd env get-value AZURE_QC_WORKER_CONTAINER_IMAGE --environment $EnvironmentName 2>$null
   if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($qcWorkerImage)) {
-    Set-EnvironmentValue 'AZURE_QC_WORKER_CONTAINER_IMAGE' 'mcr.microsoft.com/k8se/quickstart-jobs:latest'
+    Set-EnvironmentValue 'AZURE_QC_WORKER_CONTAINER_IMAGE' $bootstrapImage
   }
   Write-Host "Deploying Score to $Location in subscription $SubscriptionId."
   Write-Host "Initial guarded-ingress identity: $($user.userPrincipalName). Entra users/groups receive explicit Score.User or Score.Admin assignments."

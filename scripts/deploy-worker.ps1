@@ -3,6 +3,10 @@ Set-StrictMode -Version Latest
 
 Push-Location (Split-Path -Parent $PSScriptRoot)
 try {
+  $env:AZURE_EXTENSION_USE_DYNAMIC_INSTALL = 'no'
+  $env:AZURE_EXTENSION_DIR = Join-Path $PWD '.azure/no-extensions'
+  & node scripts\verify-artifacts.mjs --deployment-tools
+  if ($LASTEXITCODE -ne 0) { throw 'Worker artifact admission failed. No images have been built or changed.' }
   $json = & node scripts\azure-worker.mjs context
   if ($LASTEXITCODE -ne 0) { throw 'Could not load the worker deployment context.' }
   $context = $json | ConvertFrom-Json

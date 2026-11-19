@@ -15,7 +15,7 @@ export function loadTypeScript(repoRoot = process.cwd()) {
       // try the next location
     }
   }
-  throw new Error('The TypeScript compiler is not installed. Run npm ci first.')
+  throw new Error('The TypeScript compiler is not installed. Run node scripts/verify-installations.mjs, then npm ci --ignore-scripts.')
 }
 
 export function scriptKindFor(ts, file) {

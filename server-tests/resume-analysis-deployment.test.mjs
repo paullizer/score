@@ -1213,8 +1213,9 @@ test('worker build and shared container packaging include both new entry points 
     assert.ok(docker.includes(`'${output}'`))
   }
   for (const kind of ['RESUME', 'ANALYSIS', 'QC']) {
-    assert.ok(provision.includes(`Set-EnvironmentValue 'AZURE_${kind}_WORKER_CONTAINER_IMAGE' 'mcr.microsoft.com/k8se/quickstart-jobs:latest'`))
+    assert.ok(provision.includes(`Set-EnvironmentValue 'AZURE_${kind}_WORKER_CONTAINER_IMAGE' $bootstrapImage`))
   }
+  assert.doesNotMatch(provision, /:latest/)
   assert.ok(docker.includes("'word-parser'"))
   assert.ok(docker.includes('word-imports.json'))
   assert.ok(docker.includes(WORD_WORKER_CAPABILITY))

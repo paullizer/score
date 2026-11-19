@@ -21,5 +21,6 @@ Tick each item, or say why it doesn't apply.
 - [ ] Requests to user-supplied URLs go through `safeFetch` and `validatePublicUrl` in the workers, or the renderer's request policy.
 - [ ] No secrets, keys, tokens or connection strings in code, tests, docs or logs.
 - [ ] New product features are switched on and off in **Admin settings**, not with environment variables.
-- [ ] New or updated dependencies resolve through the npm registry or the public Microsoft mirror already in `package-lock.json`, and were published at least 7 days ago.
+- [ ] Dependencies resolve through the npm registry or the public Microsoft mirror already in `package-lock.json`; all external installations are exact-pinned and have authoritative evidence of at least 14 complete days of release age.
+- [ ] Standalone application executable scripts/assets are repository-local with provenance and licenses; no remote executable loading or download-and-execute installer was added.
 - [ ] Every new `security-reviewed:` comment names the rule and gives a real reason.

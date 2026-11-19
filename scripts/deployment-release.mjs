@@ -17,7 +17,7 @@ export async function sourceReleaseId() {
   }
   for (const path of ['src', 'server', 'worker', 'renderer', 'scripts', 'infra', 'server-tests', 'worker-tests', 'renderer-tests']) await visit(path)
   for (const path of ['package.json', 'package-lock.json', 'azure.yaml', 'Dockerfile', 'Dockerfile.worker', 'Dockerfile.renderer',
-    'tsconfig.json', 'tsconfig.app.json', 'tsconfig.node.json', 'tsconfig.server.json', 'tsconfig.worker.json', 'tsconfig.renderer.json', '.dockerignore']) {
+    'tsconfig.json', 'tsconfig.app.json', 'tsconfig.node.json', 'tsconfig.server.json', 'tsconfig.worker.json', 'tsconfig.renderer.json', '.dockerignore', '.npmrc']) {
     hash.update(path).update('\0').update(await readFile(path)).update('\0')
   }
   return hash.digest('hex')

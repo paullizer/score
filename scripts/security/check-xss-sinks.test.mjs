@@ -25,6 +25,23 @@ function repo(options) {
 }
 
 describe('xss sink analysis', () => {
+  test('requires local executable modules and bundled workers', () => {
+    for (const text of [
+      'import "https://cdn.example.invalid/remote.js"',
+      'export * from "//cdn.example.invalid/remote.js"',
+      'import("data:text/javascript,void 0")',
+      'new Worker("https://cdn.example.invalid/worker.js")',
+      'new SharedWorker(workerUrl)',
+      'navigator.serviceWorker.register(remoteUrl)',
+      'WebAssembly.instantiateStreaming(fetch(remoteUrl))',
+      'importScripts(remoteUrl)',
+    ]) {
+      assert.ok(findings('src/App.ts', text).some(item => item.rule === 'xss/remote-executable' && item.verdict === BLOCKER), text)
+    }
+    assert.ok(findings('src/App.ts', 'import(moduleUrl)').some(item => item.rule === 'xss/dynamic-module-load' && item.verdict === BLOCKER))
+    assert.deepEqual(findings('src/App.ts', 'new Worker(new URL("./local-worker.ts", import.meta.url))'), [])
+    assert.deepEqual(findings('src/App.ts', 'import "./local.js"; import React from "react"'), [])
+  })
   test('detects React and object inner HTML sinks', () => {
     const result = rules('src/App.tsx', `
       export const A = () => <div dangerouslySetInnerHTML={{ __html: html }} />
@@ -126,8 +143,8 @@ describe('xss sink analysis', () => {
     assert.ok(rules('src/App.ts', `export { marked } from 'marked'`).includes('blocker:xss/markup-renderer-import:1'))
     assert.deepEqual(findings('src/App.ts', `export type { marked } from 'marked'`)
       .filter(item => item.rule === 'xss/markup-renderer-import'), [])
-    assert.deepEqual(rules('src/App.ts', `import(name)`), ['review:xss/dynamic-module-load:1'])
-    assert.deepEqual(rules('src/App.ts', `require('marked-' + name)`), ['review:xss/dynamic-module-load:1'])
+    assert.deepEqual(rules('src/App.ts', `import(name)`), ['blocker:xss/dynamic-module-load:1'])
+    assert.deepEqual(rules('src/App.ts', `require('marked-' + name)`), ['blocker:xss/dynamic-module-load:1'])
     assert.deepEqual(findings('src/components/documents/docxPreviewSanitize.ts', `import createDOMPurify from 'dompurify'`)
       .filter(item => item.rule === 'xss/markup-renderer-import'), [])
     assert.deepEqual(findings('src/components/documents/docxPreviewConversion.ts', `import mammoth from 'mammoth'`)

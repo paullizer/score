@@ -1,16 +1,20 @@
-FROM node:24-bookworm-slim AS build
+FROM node:24.22.1-bookworm-slim@sha256:be8204d4bd327363357f532187b752ff62759c31bedf98e9e18fc08c9cbd605c AS build
 WORKDIR /app
-COPY package.json package-lock.json ./
-RUN npm ci --no-audit --no-fund
+COPY package.json package-lock.json .npmrc ./
+COPY scripts/verify-installations.mjs ./scripts/
+COPY scripts/security ./scripts/security
+RUN node scripts/verify-installations.mjs && npm ci --ignore-scripts --no-audit --no-fund
 COPY . .
-RUN npx tsc -p tsconfig.worker.json && npm run build:worker
+RUN node node_modules/typescript/bin/tsc -p tsconfig.worker.json && npm run build:worker
 RUN node --input-type=module -e "import { readFileSync, writeFileSync } from 'node:fs'; import { createHash } from 'node:crypto'; const artifacts = Object.fromEntries(['worker', 'runtime', 'grade-worker', 'grade-runtime', 'resume-worker', 'resume-runtime', 'analysis-worker', 'analysis-runtime', 'word-parser', 'qc-worker', 'qc-runtime'].map(name => [name + '.mjs', createHash('sha256').update(readFileSync('dist-worker/' + name + '.mjs')).digest('hex')])); writeFileSync('dist-worker/word-imports.json', JSON.stringify({ schemaVersion: 1, capability: 'word-document-imports-v1', runtimeSettingsVersion: 'score-runtime-settings-v2', promptRuntimeVersion: 'score-prompt-runtime-v3', qcRuntimeVersion: 'score-qc-worker-v1', artifacts }))"
 
-FROM node:24-bookworm-slim AS runtime
+FROM node:24.22.1-bookworm-slim@sha256:be8204d4bd327363357f532187b752ff62759c31bedf98e9e18fc08c9cbd605c AS runtime
 WORKDIR /app
 ENV NODE_ENV=production
-COPY package.json package-lock.json ./
-RUN npm ci --omit=dev --no-audit --no-fund && npm cache clean --force
+COPY package.json package-lock.json .npmrc ./
+COPY scripts/verify-installations.mjs ./scripts/
+COPY scripts/security ./scripts/security
+RUN node scripts/verify-installations.mjs && npm ci --omit=dev --ignore-scripts --no-audit --no-fund && npm cache clean --force
 COPY --from=build --chown=node:node /app/dist-worker ./dist-worker
 USER node
 CMD ["node", "dist-worker/worker.mjs"]

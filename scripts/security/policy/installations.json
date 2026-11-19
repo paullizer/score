@@ -1,0 +1,29 @@
+{
+  "nodeVersion": "24.22.1",
+  "images": [
+    {
+      "name": "node",
+      "reference": "node:24.22.1-bookworm-slim@sha256:be8204d4bd327363357f532187b752ff62759c31bedf98e9e18fc08c9cbd605c",
+      "metadata": "https://hub.docker.com/v2/repositories/library/node/tags/24.22.1-bookworm-slim"
+    },
+    {
+      "name": "playwright",
+      "reference": "mcr.microsoft.com/playwright:v1.64.1-noble@sha256:2f05f8a734509a7b3f26a912639488ee08f58a7b292d14d62271bcff9038768f",
+      "metadata": "https://mcr.microsoft.com/api/v1/catalog/playwright/tags?reg=mar",
+      "tag": "v1.64.1-noble"
+    }
+  ],
+  "actions": [
+    { "repository": "actions/checkout", "tag": "v7.0.1", "sha": "3d3c42e5aac5ba805825da76410c181273ba90b1" },
+    { "repository": "actions/setup-node", "tag": "v7.0.0", "sha": "820762786026740c76f36085b0efc47a31fe5020" },
+    { "repository": "actions/upload-artifact", "tag": "v7.0.1", "sha": "043fb46d1a93c77aae656e7c1c64a875d1fc6a0a" },
+    { "repository": "actions/dependency-review-action", "tag": "v5.0.0", "sha": "a1d282b36b6f3519aa1f3fc636f609c47dddb294" },
+    { "repository": "github/codeql-action", "tag": "v4.38.2", "sha": "2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2" }
+  ],
+  "deploymentTools": [
+    { "name": "node", "version": "26.13.0", "repository": "nodejs/node", "tag": "v26.13.0" },
+    { "name": "az", "version": "2.92.0", "repository": "Azure/azure-cli", "tag": "azure-cli-2.92.0" },
+    { "name": "azd", "version": "1.37.2", "repository": "Azure/azure-dev", "tag": "azure-dev-cli_1.37.2" },
+    { "name": "pwsh", "version": "7.6.9", "repository": "PowerShell/PowerShell", "tag": "v7.6.9" }
+  ]
+}

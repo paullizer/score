@@ -328,6 +328,16 @@ function analyzeTypeScript(file, text, ts, policy) {
 
     if (ts.isCallExpression(node)) {
       const callee = calleeName(ts, node)
+      if (callee === 'importScripts' || callee === 'self.importScripts' || callee === 'navigator.serviceWorker.register'
+        || callee === 'WebAssembly.instantiateStreaming' || callee === 'WebAssembly.compileStreaming') {
+        add({
+          rule: 'xss/remote-executable',
+          verdict: BLOCKER,
+          line: lineOf(source, node),
+          message: 'Executable content must be bundled from reviewed repository-local sources.',
+          hint: 'Use static imports or bundled local workers instead of runtime executable downloads.',
+        })
+      }
       if (callee && HTML_INSERTION_CALLEES.has(callee)) {
         addHtmlInsertion(add, source, node)
       } else if (callee && lastPart(callee) && HTML_INSERTION_CALLEES.has(lastPart(callee))) {
@@ -423,6 +433,21 @@ function analyzeTypeScript(file, text, ts, policy) {
         message: 'Function constructor executes strings as code.',
         hint: 'Use explicit functions or data-driven dispatch instead.',
       })
+    }
+    if (ts.isNewExpression(node) && ['Worker', 'SharedWorker'].includes(expressionName(ts, node.expression))) {
+      const target = node.arguments?.[0]
+      const url = target && ts.isNewExpression(target) && expressionName(ts, target.expression) === 'URL' ? target : null
+      const path = url?.arguments?.[0] ? literalValue(url.arguments[0]) : null
+      const base = url?.arguments?.[1]?.getText(source)
+      if (!path || !/^\.{1,2}\/[\w./-]+$/.test(path) || base !== 'import.meta.url') {
+        add({
+          rule: 'xss/remote-executable',
+          verdict: BLOCKER,
+          line: lineOf(source, node),
+          message: 'Workers must use a bundled local URL relative to import.meta.url.',
+          hint: 'Use new Worker(new URL("./local-worker.ts", import.meta.url)).',
+        })
+      }
     }
 
     if (isStringLiteralNode(ts, node) && !ancestors.some(parent => ts.isJsxAttribute(parent) || ts.isImportDeclaration(parent))) {
@@ -631,10 +656,20 @@ function addModuleLoadFinding(add, source, node, ts, policy, file) {
   if (!load.moduleName) {
     add({
       rule: 'xss/dynamic-module-load',
-      verdict: REVIEW,
+      verdict: BLOCKER,
       line: lineOf(source, load.node),
       message: 'Module load uses a non-literal specifier, so the checker cannot see which module loads.',
-      hint: 'Use a literal import/require specifier or manually review that no browser markup renderer can load.',
+      hint: 'Use a literal repository-local or exact-locked package import.',
+    })
+    return
+  }
+  if (/^(?:[a-z][a-z0-9+.-]*:|[/\\]{2})/i.test(load.moduleName)) {
+    add({
+      rule: 'xss/remote-executable',
+      verdict: BLOCKER,
+      line: lineOf(source, load.node),
+      message: 'Browser modules must not load from remote, data, or blob URLs.',
+      hint: 'Vendor standalone code with provenance and its license, or use an exact-locked npm package.',
     })
     return
   }

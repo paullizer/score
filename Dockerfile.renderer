@@ -1,21 +1,25 @@
-FROM node:24-bookworm-slim AS build
+FROM node:24.22.1-bookworm-slim@sha256:be8204d4bd327363357f532187b752ff62759c31bedf98e9e18fc08c9cbd605c AS build
 WORKDIR /app
-COPY package.json package-lock.json ./
-RUN npm ci --no-audit --no-fund
+COPY package.json package-lock.json .npmrc ./
+COPY scripts/verify-installations.mjs ./scripts/
+COPY scripts/security ./scripts/security
+RUN node scripts/verify-installations.mjs && npm ci --ignore-scripts --no-audit --no-fund
 COPY . .
-RUN npx tsc -p tsconfig.renderer.json && npm run build:renderer
+RUN node node_modules/typescript/bin/tsc -p tsconfig.renderer.json && npm run build:renderer
 
-FROM node:24-bookworm-slim AS runtime
+FROM build AS production-dependencies
+RUN npm prune --omit=dev --ignore-scripts --offline --no-audit --no-fund
+
+FROM mcr.microsoft.com/playwright:v1.64.1-noble@sha256:2f05f8a734509a7b3f26a912639488ee08f58a7b292d14d62271bcff9038768f AS runtime
 WORKDIR /app
 ENV NODE_ENV=production
 ENV PORT=8080
 ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
-COPY package.json package-lock.json ./
-RUN npm ci --omit=dev --no-audit --no-fund \
-    && npx playwright install --with-deps chromium \
-    && chmod -R a+rX /ms-playwright \
-    && npm cache clean --force
-COPY --from=build --chown=node:node /app/dist-renderer ./dist-renderer
-USER node
+COPY package.json package-lock.json .npmrc ./
+COPY --from=build /usr/local/bin/node /usr/local/bin/node
+COPY --from=production-dependencies --chown=pwuser:pwuser /app/node_modules ./node_modules
+COPY --from=build --chown=pwuser:pwuser /app/dist-renderer ./dist-renderer
+RUN test "$(node --version)" = "v24.22.1"
+USER pwuser
 EXPOSE 8080
 CMD ["node", "dist-renderer/renderer.mjs"]
