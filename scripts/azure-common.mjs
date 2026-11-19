@@ -1,6 +1,10 @@
 import { execFileSync } from 'node:child_process'
 import { parseEnv } from 'node:util'
+import { resolve } from 'node:path'
 import { AzureCliCredential } from '@azure/identity'
+
+process.env.AZURE_EXTENSION_USE_DYNAMIC_INSTALL = 'no'
+process.env.AZURE_EXTENSION_DIR = resolve('.azure/no-extensions')
 
 function selectedEnvironment() {
   return process.env.AZURE_ENV_NAME ? ['--environment', process.env.AZURE_ENV_NAME] : []

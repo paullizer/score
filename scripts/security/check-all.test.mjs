@@ -14,10 +14,10 @@ test('passes the shared range and options to every check', () => {
   assert.ok(!args.includes('--verify-release-age'))
 })
 
-test('verifies release age for the reviewer unless skipped or doing a full scan', () => {
+test('verifies release age for the reviewer, including full scans, unless explicitly offline', () => {
   assert.ok(buildArgs(reviewer, {}).includes('--verify-release-age'))
   assert.ok(!buildArgs(reviewer, { 'no-release-age': true }).includes('--verify-release-age'))
-  assert.ok(!buildArgs(reviewer, { 'full-scan': true }).includes('--verify-release-age'))
+  assert.ok(buildArgs(reviewer, { 'full-scan': true }).includes('--verify-release-age'))
 })
 
 test('combines exit codes with errors taking precedence', () => {

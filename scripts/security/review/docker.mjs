@@ -1,4 +1,4 @@
-import { BLOCKER, NOTE, REVIEW, addFinding } from './common.mjs'
+import { BLOCKER, REVIEW, addFinding } from './common.mjs'
 
 function isDockerfile(file) {
   return /(^|\/)Dockerfile[^/]*$/.test(file)
@@ -13,8 +13,11 @@ export function checkDocker(ctx) {
       const from = /^\s*FROM\s+([^\s]+)/i.exec(text)
       if (from) {
         const image = from[1]
-        if (!image.includes(':') || /:latest(?:@|$)/i.test(image)) addFinding(findings, { rule: 'review/docker-floating-from', verdict: REVIEW, file: file.path, line, message: 'Dockerfile base image uses latest or no tag.', hint: 'Pin to a specific tag.' })
-        else if (!image.includes('@sha256:')) addFinding(findings, { rule: 'review/docker-from-no-digest', verdict: NOTE, file: file.path, line, message: 'Dockerfile base image tag is not digest-pinned.', hint: 'Digest pinning is a follow-up hardening item.' })
+        const earlierStages = file.lines().slice(0, line - 1).map(value => /^\s*FROM\s+\S+\s+AS\s+(\S+)/i.exec(value)?.[1]).filter(Boolean)
+        if (!earlierStages.includes(image)) {
+          if (!image.includes(':') || /:latest(?:@|$)/i.test(image)) addFinding(findings, { rule: 'review/docker-floating-from', verdict: BLOCKER, file: file.path, line, message: 'Dockerfile base image uses latest or no tag.', hint: 'Use an approved version and immutable digest.' })
+          if (!/@sha256:[a-f0-9]{64}$/.test(image)) addFinding(findings, { rule: 'review/docker-from-no-digest', verdict: BLOCKER, file: file.path, line, message: 'Dockerfile base image is not pinned to a complete SHA-256 digest.', hint: 'Verify the exact image publication age with scripts/verify-artifacts.mjs.' })
+        }
       }
       if (/^\s*USER\s+(?:root|0)\s*$/i.test(text)) addFinding(findings, { rule: 'review/docker-root-user', verdict: REVIEW, file: file.path, line, message: 'Dockerfile sets the runtime user to root.', hint: 'Run containers as a non-root user.' })
     }

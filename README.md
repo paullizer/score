@@ -14,14 +14,15 @@ The diagram describes the base ingestion/analysis architecture, not the verified
 
 ## Run locally
 
-Use Node.js 24 and npm. `npm run dev` serves the authenticated app and proxies `/api` to a locally running Score API. There is no offline demo: without a reachable API, the app shows its cloud-service-unavailable screen.
+Use the approved pinned Node.js runtime and npm. Container builds and CI use Node.js **24.22.1**, which includes the CVE-2026-111497 Brotli fix. Before installing, run `node scripts/verify-installations.mjs`, then `npm ci --ignore-scripts`. The admission check verifies every locked package, including unchanged and transitive dependencies, against a minimum release age of **14 complete days**. Missing publication evidence blocks installation. `npm run dev` serves the authenticated app and proxies `/api` to a locally running Score API. There is no offline demo: without a reachable API, the app shows its cloud-service-unavailable screen.
 
 Vite proxies `/api` for both `npm run dev` and `npm run preview` to `SCORE_API_ORIGIN`, defaulting to `http://127.0.0.1:8080`. The Node-side proxy always strips any browser-supplied `X-Score-Dev-Principal` header; when `SCORE_DEV_PRINCIPAL` is set, it replaces that header with the configured value on proxied requests. That value is never exposed to the browser bundle.
 
 Install dependencies once:
 
 ```powershell
-npm install
+node scripts/verify-installations.mjs
+npm ci --ignore-scripts
 ```
 
 Run the API in one terminal. The API uses your Azure CLI login locally via `AzureCliCredential`, never account keys, so sign in with an account that has data-plane access to the configured Cosmos DB and Storage accounts. `SCORE_AUTH_MODE=dev-header` binds the API to 127.0.0.1 only.
@@ -530,7 +531,11 @@ The script preserves `AZURE_BOOTSTRAP_ADMIN_USER_IDS` when that parameter is omi
 
 ## Deployment to Azure
 
-The deployment uses Azure CLI (`az`), Azure Developer CLI (`azd`), Node.js 24, and PowerShell 7. Docker is not required locally: the web, worker, and renderer Linux images are built remotely in Azure Container Registry.
+The deployment uses exact tool versions recorded in `scripts/security/policy/installations.json`. Run `node scripts/verify-artifacts.mjs --deployment-tools` before deploying: it verifies pinned image identities, action release commits, runtime releases, and the installed deployment tools against authoritative publication metadata and the 14-day minimum. Unverifiable image age is a deployment blocker, not permission to substitute an image build timestamp or bypass the policy. Use an approved isolated toolchain instead of upgrading shared machine-wide tools. Docker is not required locally: the web, worker, and renderer Linux images are built remotely in Azure Container Registry.
+
+The web/API and every worker image use a digest-pinned Node.js 24.22.1 base. The renderer uses a digest-pinned Playwright browser/OS image with the patched Node binary copied from the approved Node image, without unpinned OS package or browser installation during builds. Verify the browser and OS decoder inventory in the final image as well as Node before releasing a deployment; a pinned image alone is not proof that every native component is patched. [Security scanning](docs/security-scanning.md) describes the installation gates and local-executable policy.
+
+When a new environment has no application images yet, provisioning uses the admitted immutable Node base instead of floating placeholder images. This bootstrap image does not serve Score; the environment remains unavailable until the guarded application deployment completes. Existing environment image settings are preserved.
 
 Sign in to the intended Microsoft Entra tenant with both tools, then run:
 

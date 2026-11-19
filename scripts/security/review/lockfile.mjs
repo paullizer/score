@@ -1,7 +1,6 @@
 import { allowedRegistries } from '../policy/review.mjs'
 import { BLOCKER, REVIEW, addFinding, lineMatcher } from './common.mjs'
-
-const MAX_PACKUMENT_BYTES = 25 * 1024 * 1024
+import { MINIMUM_RELEASE_AGE_DAYS, releaseAgeDays, verifyNpmReleaseAges } from '../lib/release-age.mjs'
 
 function lockfileKind(file) {
   return file.endsWith('npm-shrinkwrap.json') ? 'npm-shrinkwrap.json' : 'package-lock.json'
@@ -73,82 +72,11 @@ function keyLineFinder(text) {
   return key => lineOf(`"${key}": {`)
 }
 
-async function readCappedText(response, cap = MAX_PACKUMENT_BYTES) {
-  if (!response?.ok) throw new Error(`registry returned ${response?.status ?? 'no response'}`)
-  if (response.body?.getReader) {
-    const reader = response.body.getReader()
-    const chunks = []
-    let total = 0
-    for (;;) {
-      const { done, value } = await reader.read()
-      if (done) break
-      total += value.byteLength
-      if (total > cap) throw new Error('registry response exceeded size limit')
-      chunks.push(value)
-    }
-    return new TextDecoder().decode(Buffer.concat(chunks.map(chunk => Buffer.from(chunk))))
-  }
-  const text = await response.text()
-  if (Buffer.byteLength(text) > cap) throw new Error('registry response exceeded size limit')
-  return text
-}
-
-async function fetchPackument(fetchImpl, name) {
-  const controller = new AbortController()
-  const timer = setTimeout(() => controller.abort(), 20_000)
-  try {
-    // Scoped names keep a literal "@" and encode the "/" (for example @types%2Fnode), as the registry expects.
-    const encoded = name.startsWith('@') ? `@${encodeURIComponent(name.slice(1))}` : encodeURIComponent(name)
-    const url = `https://registry.npmjs.org/${encoded}`
-    const response = await fetchImpl(url, { signal: controller.signal })
-    return JSON.parse(await readCappedText(response))
-  } finally {
-    clearTimeout(timer)
-  }
-}
-
-async function mapLimit(items, limit, fn) {
-  const result = new Map()
-  let index = 0
-  async function worker() {
-    for (;;) {
-      const item = items[index++]
-      if (!item) return
-      result.set(item, await fn(item))
-    }
-  }
-  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker))
-  return result
-}
-
-async function verifyReleaseAges({ candidates, fetchImpl, now, days }) {
-  const byName = [...new Set(candidates.map(item => item.name))]
-  const packuments = await mapLimit(byName, 4, async name => {
-    try {
-      return { ok: true, packument: await fetchPackument(fetchImpl, name) }
-    } catch (error) {
-      return { ok: false, error: error instanceof Error ? error.message : String(error) }
-    }
-  })
-  const cutoff = now.getTime() - days * 24 * 60 * 60 * 1000
-  return candidates.map(item => {
-    const entry = packuments.get(item.name)
-    if (!entry?.ok) return { ...item, status: 'unverified', reason: entry?.error ?? 'registry lookup failed' }
-    const published = entry.packument?.time?.[item.version]
-    if (!published) return { ...item, status: 'unverified', reason: 'publish time was missing from the registry packument' }
-    const timestamp = Date.parse(published)
-    if (!Number.isFinite(timestamp)) return { ...item, status: 'unverified', reason: 'publish time was invalid' }
-    return { ...item, status: timestamp < cutoff ? 'old' : 'fresh', published }
-  })
-}
-
 export async function checkLockfiles(ctx, { fetchImpl = globalThis.fetch, now = new Date() } = {}) {
   const findings = []
   const candidates = []
   const verifyAge = !!ctx.options['verify-release-age']
-  const failUnverified = !!ctx.options['fail-on-unverified-release-age']
-  const releaseAgeDays = Number(ctx.options['release-age-days'] ?? 7)
-  if (ctx.fullScan && verifyAge) ctx.notes.push('Release age verification was skipped in full-scan mode because there is no base lockfile diff.')
+  const minimumAge = releaseAgeDays(ctx.options['release-age-days'] ?? MINIMUM_RELEASE_AGE_DAYS)
   for (const file of ctx.files.filter(item => /(^|\/)(?:package-lock|npm-shrinkwrap)\.json$/.test(item.path))) {
     if (/(^|\/)npm-shrinkwrap\.json$/.test(file.path) && ['A', 'M'].includes(file.status)) {
       addFinding(findings, {
@@ -216,7 +144,7 @@ export async function checkLockfiles(ctx, { fetchImpl = globalThis.fetch, now = 
           hint: 'Review the package before merging.',
         })
       }
-      if (verifyAge && !ctx.fullScan && installed && entry?.version && (!resolved || isAllowedResolved(resolved)) && !isFileGitOrTarballOnly(resolved) && changedEntry(baseEntry, entry)) {
+      if (verifyAge && installed && entry?.version && (!resolved || isAllowedResolved(resolved)) && !isFileGitOrTarballOnly(resolved) && (ctx.fullScan || changedEntry(baseEntry, entry))) {
         candidates.push({ file: file.path, line, name, version: entry.version })
       }
     }
@@ -226,7 +154,7 @@ export async function checkLockfiles(ctx, { fetchImpl = globalThis.fetch, now = 
       for (const item of candidates) {
         addFinding(findings, {
           rule: 'review/release-age-unverified',
-          verdict: failUnverified ? BLOCKER : REVIEW,
+          verdict: BLOCKER,
           file: item.file,
           line: item.line,
           message: `${item.name}@${item.version} publish age could not be verified.`,
@@ -234,24 +162,24 @@ export async function checkLockfiles(ctx, { fetchImpl = globalThis.fetch, now = 
         })
       }
     } else {
-      for (const result of await verifyReleaseAges({ candidates, fetchImpl, now, days: releaseAgeDays })) {
+      for (const result of await verifyNpmReleaseAges({ candidates, fetchImpl, now, days: minimumAge })) {
         if (result.status === 'fresh') {
           addFinding(findings, {
             rule: 'review/release-age-fresh',
             verdict: BLOCKER,
             file: result.file,
             line: result.line,
-            message: `${result.name}@${result.version} was published less than ${releaseAgeDays} days ago.`,
-            hint: 'Wait for the package to age or perform a manual supply-chain review.',
+            message: `${result.name}@${result.version} was published less than ${minimumAge} days ago.`,
+            hint: 'Select an eligible fixed release or wait until this release is at least fourteen days old.',
           })
         } else if (result.status === 'unverified') {
           addFinding(findings, {
             rule: 'review/release-age-unverified',
-            verdict: failUnverified ? BLOCKER : REVIEW,
+            verdict: BLOCKER,
             file: result.file,
             line: result.line,
             message: `${result.name}@${result.version} publish age could not be verified: ${result.reason}.`,
-            hint: 'Retry with npm registry access or review the package manually.',
+            hint: 'Retry with authoritative npm registry metadata. Unverified release ages block installation.',
           })
         }
       }

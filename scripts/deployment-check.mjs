@@ -4,6 +4,8 @@ import { deploymentManifest, sourceReleaseId } from './deployment-release.mjs'
 
 const before = await sourceReleaseId()
 const run = args => execFileSync(process.execPath, args, { stdio: 'inherit' })
+run(['scripts/verify-artifacts.mjs', '--deployment-tools'])
+run(['scripts/verify-installations.mjs'])
 run(['node_modules/typescript/bin/tsc', '-b'])
 run(['node_modules/typescript/bin/tsc', '-p', 'tsconfig.worker.json'])
 run(['scripts/build-server.mjs'])

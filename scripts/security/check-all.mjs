@@ -39,7 +39,7 @@ export function buildArgs(check, values) {
   if (values.repo) args.push('--repo', values.repo)
   if (values.quiet) args.push('--quiet')
   if (values['report-dir']) args.push('--report', path.join(values['report-dir'], `${check.id}.md`))
-  if (check.id === 'malicious-pr-review' && !values['no-release-age'] && !values['full-scan']) args.push('--verify-release-age')
+  if (check.id === 'malicious-pr-review' && !values['no-release-age']) args.push('--verify-release-age')
   return args
 }
 

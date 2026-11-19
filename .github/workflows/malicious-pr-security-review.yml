@@ -27,7 +27,7 @@ on:
         type: boolean
         default: false
       verify_release_age:
-        description: Verify changed package releases are at least seven days old
+        description: Verify package releases are at least fourteen days old
         required: true
         type: boolean
         default: true
@@ -40,7 +40,7 @@ on:
         description: Fail workflow_dispatch runs when package release age cannot be verified
         required: true
         type: boolean
-        default: false
+        default: true
 
 permissions: {}
 
@@ -67,7 +67,7 @@ jobs:
       - name: Set up Node.js
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: 24
+          node-version: 24.22.1
 
       - name: Run malicious PR review
         shell: bash

@@ -36,6 +36,7 @@ function specProblem(spec) {
   if (!value || ['*', 'latest', 'x', 'X'].includes(value)) return 'uses an unbounded dependency specifier'
   if (/^(?:git\+|git:|github:|gitlab:|bitbucket:|https?:|file:|link:|npm:)/i.test(value)) return 'uses a non-registry dependency specifier'
   if (/^[\w.-]+\/[\w.-]+(?:#.+)?$/.test(value)) return 'uses repository shorthand instead of a registry range'
+  if (!/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(value)) return 'is not pinned to an exact version'
   return null
 }
 
@@ -76,7 +77,7 @@ export function checkPackageJson(ctx) {
             file: file.path,
             line: lineOf(`"${name}"`),
             message: `${section}.${name} ${problem}.`,
-            hint: 'Use an npm registry semver range.',
+            hint: 'Use an exact eligible npm registry version and regenerate the lockfile.',
           })
         } else if (!ctx.fullScan && !(name in (base[section] ?? {}))) {
           addFinding(findings, {
@@ -99,7 +100,7 @@ export function checkPackageJson(ctx) {
           file: file.path,
           line: lineOf(`"${name.split(' > ').at(-1)}"`),
           message: `override ${name} ${problem}.`,
-          hint: 'Use an npm registry semver range.',
+          hint: 'Use an exact eligible npm registry version and regenerate the lockfile.',
         })
       }
     }

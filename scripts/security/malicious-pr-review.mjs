@@ -11,6 +11,7 @@ import { checkRegistryConfig } from './review/registry.mjs'
 import { checkSensitive } from './review/sensitive.mjs'
 import { checkUnicode } from './review/unicode.mjs'
 import { checkWorkflows } from './review/workflows.mjs'
+import { MINIMUM_RELEASE_AGE_DAYS } from './lib/release-age.mjs'
 
 export function createReviewSpec({ fetch = globalThis.fetch, now = () => new Date() } = {}) {
   return {
@@ -25,13 +26,13 @@ export function createReviewSpec({ fetch = globalThis.fetch, now = () => new Dat
     showChangedFiles: true,
     options: {
       'verify-release-age': { type: 'boolean', default: false },
-      'fail-on-unverified-release-age': { type: 'boolean', default: false },
-      'release-age-days': { type: 'string', default: '7' },
+      'fail-on-unverified-release-age': { type: 'boolean', default: true },
+      'release-age-days': { type: 'string', default: String(MINIMUM_RELEASE_AGE_DAYS) },
     },
     usage: `Malicious PR options:
-  --verify-release-age                Verify npm publish age for changed lockfile entries in diff mode.
-  --fail-on-unverified-release-age    Treat unverifiable release age as a blocker.
-  --release-age-days <n>              Minimum allowed npm package age in days (default: 7).`,
+  --verify-release-age                Verify changed entries, or every entry in full-scan mode.
+  --fail-on-unverified-release-age    Retained for compatibility; unverified age always blocks.
+  --release-age-days <n>              Minimum npm package age in days (default and floor: 14).`,
     async check(ctx) {
       const injected = { fetchImpl: fetch, now: now() }
       return [

@@ -21,6 +21,8 @@ hooks:
   predeploy:
     shell: pwsh
     run: |
+      $env:AZURE_EXTENSION_USE_DYNAMIC_INSTALL = 'no'
+      $env:AZURE_EXTENSION_DIR = Join-Path $PWD '.azure/no-extensions'
       node scripts\deployment-check.mjs
       if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       node scripts\azure-before-deploy.mjs
@@ -30,6 +32,10 @@ hooks:
   preprovision:
     shell: pwsh
     run: |
+      $env:AZURE_EXTENSION_USE_DYNAMIC_INSTALL = 'no'
+      $env:AZURE_EXTENSION_DIR = Join-Path $PWD '.azure/no-extensions'
+      node scripts\verify-artifacts.mjs --deployment-tools
+      if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       node scripts\azure-auth.mjs prepare
       if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       node scripts\azure-worker.mjs disable-admission --if-provisioned
@@ -37,6 +43,8 @@ hooks:
   postprovision:
     shell: pwsh
     run: |
+      $env:AZURE_EXTENSION_USE_DYNAMIC_INSTALL = 'no'
+      $env:AZURE_EXTENSION_DIR = Join-Path $PWD '.azure/no-extensions'
       az acr config authentication-as-arm update --registry $env:AZURE_CONTAINER_REGISTRY_NAME --status enabled --subscription $env:AZURE_SUBSCRIPTION_ID --output none
       if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       node scripts\azure-auth.mjs configure
@@ -49,6 +57,8 @@ hooks:
     shell: pwsh
     run: |
       $ErrorActionPreference = 'Stop'
+      $env:AZURE_EXTENSION_USE_DYNAMIC_INSTALL = 'no'
+      $env:AZURE_EXTENSION_DIR = Join-Path $PWD '.azure/no-extensions'
       & .\scripts\deploy-worker.ps1
       if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       node scripts\azure-finish.mjs
